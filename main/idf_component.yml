@@ -1,0 +1,11 @@
+dependencies:
+  idf:
+    version: ">=5.0"
+
+  # Root filesystem. VFS-backed, so apps get plain fopen()/opendir().
+  joltwallet/littlefs: "==1.22.3"
+
+  # Runtime ELF loader: relocates and runs natively-compiled apps read off the
+  # filesystem, plus dlopen()/dlsym() for shared objects.
+  # Supports esp32s3 / esp32p4 / esp32s31, which are espix's three targets.
+  espressif/elf_loader: "~1.3.3"

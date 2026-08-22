@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS
+        "cmds.c"
+        "cmd_fs.c"
+        "cmd_sys.c"
+        "cmd_run.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        espix_fs
+        espix_proc
+        espix_shell
+        espix_fault
+        freertos
+        esp_system
+        esp_timer
+        heap
+)

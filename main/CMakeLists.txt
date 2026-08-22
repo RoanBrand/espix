@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "espix_main.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        espix_kernel
+        espix_fault
+        espix_fs
+        espix_proc
+        espix_shell
+        espix_cmds
+)

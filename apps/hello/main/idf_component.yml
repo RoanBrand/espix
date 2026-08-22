@@ -1,0 +1,3 @@
+dependencies:
+  # Needed for the project_elf() CMake helper and the app-side link script.
+  espressif/elf_loader: "~1.3.3"

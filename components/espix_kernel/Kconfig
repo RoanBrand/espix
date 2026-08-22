@@ -1,0 +1,36 @@
+menu "espix kernel"
+
+    config ESPIX_KLOG_LINES
+        int "Kernel log ring size (lines)"
+        range 8 512
+        default 96
+        help
+            Number of lines retained by the kernel log ring that backs `dmesg`.
+            Each line costs ESPIX_KLOG_LINE_MAX + ~16 bytes of internal RAM,
+            allocated statically, so 96 lines is roughly 13 KB.
+
+    config ESPIX_KLOG_QUIET
+        bool "Keep kernel log lines out of the console (dmesg only)"
+        default n
+        help
+            By default espix_klog() output goes to stdout as well as to the ring,
+            the way a Linux kernel prints to the console as well as to kmsg.
+            Enable this to make the kernel log visible only through `dmesg`.
+
+            Lines captured from ESP_LOGx are never echoed either way — they are
+            already heading for the console on their own.
+
+            Phrased as an opt-out rather than an opt-in on purpose: an undefined
+            bool is indistinguishable from 'n', so a default-y option silently
+            disables itself if the sdkconfig ever fails to regenerate. This way
+            the failure mode is the behaviour we want.
+
+    config ESPIX_KLOG_CAPTURE_ESP_LOG
+        bool "Capture ESP-IDF log output into the kernel log"
+        default y
+        help
+            Install an esp_log_set_vprintf() hook so ESP_LOGx output from
+            ESP-IDF and its components also lands in `dmesg`. Output still goes
+            to the console as normal.
+
+endmenu

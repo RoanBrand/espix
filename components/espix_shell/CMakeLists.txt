@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "registry.c"
+        "session.c"
+        "tty_console.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+        espix_kernel
+    PRIV_REQUIRES
+        console
+        espix_fs
+        freertos
+        vfs
+        esp_driver_uart
+        esp_driver_usb_serial_jtag
+)

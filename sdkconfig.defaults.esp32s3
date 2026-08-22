@@ -1,0 +1,34 @@
+# espix — ESP32-S3 with 16MB flash and 8MB octal PSRAM (N16R8 modules).
+#
+# For a QSPI-PSRAM module (e.g. N8R2) switch SPIRAM_MODE_OCT -> SPIRAM_MODE_QUAD
+# and adjust ESPTOOLPY_FLASHSIZE to match the actual part.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+#
+# Flash
+#
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+#
+# PSRAM — apps get loaded here, so it is not optional on this target.
+#
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+#
+# Load relocated ELF text/data into PSRAM rather than internal SRAM. On S3 this
+# relies on the ibus/dbus address mirror (ELF_LOADER_BUS_ADDRESS_MIRROR, which
+# the component selects automatically for this target).
+#
+CONFIG_ELF_LOADER_LOAD_PSRAM=y
+
+#
+# CPU
+#
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

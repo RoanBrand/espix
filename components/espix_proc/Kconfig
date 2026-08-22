@@ -1,0 +1,41 @@
+menu "espix processes"
+
+    config ESPIX_PROC_MAX
+        int "Maximum tracked processes"
+        range 2 24
+        default 12
+        help
+            Size of the espix process table. Finished processes keep their slot
+            (so `ps` can show a recent exit status and `run` can collect it)
+            until the slot is needed for a new process, so this is the limit on
+            live plus recently-finished processes.
+
+            Capped at 24 because wait() uses one FreeRTOS event group bit per
+            slot.
+
+    config ESPIX_PROC_STACK_SIZE
+        int "Default stack size for a loaded app (bytes)"
+        range 2048 32768
+        default 8192
+        help
+            Stack given to the task that relocates and runs an ELF app. Apps
+            run on this stack, so it must accommodate the deepest call chain
+            the app makes, including printf.
+
+    config ESPIX_PROC_PRIORITY
+        int "Priority for loaded app tasks"
+        range 1 10
+        default 3
+        help
+            Kept below the shell session priority so a busy app cannot starve
+            the console.
+
+    config ESPIX_PROC_IMAGE_IN_PSRAM
+        bool "Read app images into PSRAM when available"
+        default y
+        help
+            Allocate the buffer holding the ELF file from PSRAM, falling back to
+            internal RAM. Independent of ELF_LOADER_LOAD_PSRAM, which controls
+            where the *relocated* image lives.
+
+endmenu

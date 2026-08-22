@@ -1,0 +1,17 @@
+menu "espix fault handling"
+
+    config ESPIX_FAULT_REAP
+        bool "Reap the faulting task instead of rebooting (NOT IMPLEMENTED)"
+        default n
+        help
+            Placeholder for the "a crashing app does not crash the system"
+            path: instead of delegating to ESP-IDF's panic handler (dump and
+            reboot), hand the faulting task to the espix reaper and resume.
+
+            This does nothing yet, and turning it on will not change behaviour.
+            Before it can, three things need solving — locks held by the dead
+            task, per-process ownership of heap/fds so reaping does not leak,
+            and deciding which fault classes are recoverable at all. See the
+            comments at the top of reaper.c.
+
+endmenu

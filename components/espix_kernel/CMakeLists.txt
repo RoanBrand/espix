@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "kernel.c"
+        "klog.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        esp_timer
+        esp_hw_support
+        esp_app_format
+        log
+        freertos
+)

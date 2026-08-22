@@ -1,0 +1,81 @@
+# espix — target-independent defaults.
+# Per-target settings live in sdkconfig.defaults.<target>.
+
+#
+# Partition table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+#
+# FreeRTOS — needed for `ps` / `top` style introspection.
+#
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+# One TLS slot is reserved for the per-task espix session pointer
+# (see espix_shell_set_current / espix_shell_current).
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=2
+
+#
+# Main task — app_main runs the boot sequence and then the console session.
+#
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+#
+# Post-mortem
+#
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+
+#
+# ELF loader (espressif/elf_loader) — the centerpiece: load native apps
+# cross-compiled on a PC off the filesystem at runtime.
+#
+CONFIG_ELF_LOADER=y
+CONFIG_ELF_DYNAMIC_LOAD_SHARED_OBJECT=y
+CONFIG_ELF_FILE_SYSTEM_BASE_PATH="/bin"
+CONFIG_ELF_LOADER_LIBC_SYMBOLS=y
+CONFIG_ELF_LOADER_ESPIDF_SYMBOLS=y
+
+#
+# Memory protection must be off for the ELF loader to work: it writes a
+# relocated image into memory and then executes it, which is exactly what the
+# PMS/PMP feature exists to prevent. Espressif's own elf_loader examples set
+# this. It is also, bluntly, part of why apps are not isolated from the kernel.
+#
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+#
+# LittleFS — mounted as the root filesystem. LITTLEFS_OBJ_NAME_LEN must match
+# the --name-max used by littlefs_create_partition_image().
+#
+CONFIG_LITTLEFS_MAX_PARTITIONS=3
+CONFIG_LITTLEFS_OBJ_NAME_LEN=64
+# Needed by elf_loader's dlopen(), which resolves an open fd back to its path.
+CONFIG_LITTLEFS_FCNTL_GET_PATH=y
+CONFIG_LITTLEFS_OPEN_DIR=y
+
+#
+# libc — pinned to newlib rather than IDF 6.1's new picolibc default.
+#
+# Two reasons: (1) under picolibc stdin/stdout are thread-local and linenoise
+# needs the TLS-stdio shim in components/console/private_include, which we
+# cannot include from outside that component; (2) elf_loader's libc symbol
+# table — how loaded apps resolve printf() and friends against the firmware —
+# is written against newlib.
+#
+CONFIG_LIBC_NEWLIB=y
+
+#
+# Console
+#
+CONFIG_VFS_SUPPORT_DIR=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+# Leave the compile-time maximum at INFO. Raising it to DEBUG does not just
+# allow debug output at runtime — espcoredump's macros gate on LOG_LOCAL_LEVEL
+# at compile time and write straight to esp_rom_printf, bypassing the runtime
+# level entirely, so a DEBUG maximum buries every crash under a page of
+# core-dump tracing. It also links in all those format strings.
