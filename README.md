@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="Repository Header Banner" width="80%" max-width="800px">
+</p>
+
 # espix
 
 A Unix(-like) kernel/runtime environment for ESP32, built on ESP-IDF.
