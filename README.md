@@ -245,9 +245,34 @@ file lands last and overrides. Partition tables live in
 [partitions/](partitions/) and are selected by the board file — 4MB app and
 11.9MB rootfs on 16MB parts, 3MB and 4.9MB on 8MB parts.
 
-**Switching boards later needs `set-target` re-run.** The defaults files only
-seed a *new* `sdkconfig`; editing them, or adding a board file, does nothing to
-one that already exists.
+**To change board on an existing checkout**, re-run `set-target` — the defaults
+files only seed a *new* `sdkconfig`, so adding a board file does nothing to one
+that already exists:
+
+```bash
+rm -f sdkconfig                                    # or: idf.py fullclean
+SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/esp32s3-n8r8.conf" \
+    idf.py set-target esp32s3
+idf.py build
+idf.py -p /dev/ttyUSB0 flash storage-flash monitor
+```
+
+Going *back* to the default N16R8 is the same without the variable:
+
+```bash
+rm -f sdkconfig && idf.py set-target esp32s3 && idf.py build
+```
+
+Check it took before you flash. A mistyped board *filename* is a hard CMake
+error, but a `sdkconfig` left over from the previous board is not — it just
+quietly keeps building for the wrong part:
+
+```bash
+grep -E 'FLASHSIZE=|PARTITION_TABLE_CUSTOM_FILENAME|SPIRAM_MODE' sdkconfig
+```
+
+The rootfs must be reflashed too when the flash size changes: the partition
+table moves, so whatever was at the old `storage` offset is no longer there.
 
 A board with **no PSRAM** will build, and both the ELF loader and espix's own
 image buffer fall back to internal RAM on their own — but WiFi, lwIP, SSH and
