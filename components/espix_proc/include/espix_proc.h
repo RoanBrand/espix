@@ -75,6 +75,13 @@ esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeou
  */
 esp_err_t espix_proc_kill(espix_pid_t pid);
 
+/*
+ * Kill every process still owned by `session`, as a hangup does when a terminal
+ * goes away. The session's stdio dies with it, so anything still holding it
+ * must not outlive it. Returns how many were killed.
+ */
+size_t espix_proc_hangup(const espix_session_t *session);
+
 /* Copy up to `n` live entries into `out`. Returns how many were written. */
 size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n);
 

@@ -7,13 +7,16 @@
  * shortcut around a missing feature, it is the feature.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "espix_auth.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_shell.h"
 #include "ssh_priv.h"
 
@@ -36,6 +39,9 @@
 /* Bound on packets read while waiting for the peer to open its window. A client
  * that never adjusts is broken or hostile; either way we should not spin. */
 #define WINDOW_WAIT_PACKETS 64
+
+/* How long a writing task waits for the read side before giving up on it. */
+#define RX_WAIT_MS 250
 
 typedef struct {
     ssh_conn_t *conn;
@@ -61,37 +67,99 @@ typedef struct {
     uint8_t     pending[MAX_PACKET];
     size_t      pending_len;
     size_t      pending_pos;
+
+    /*
+     * Once an app's stdout points here, two tasks can write to one connection.
+     * Packets must not interleave — they share out_buf and a sequence number
+     * the MAC covers — so tx serialises them. rx exists because a blocked write
+     * needs to read a window adjustment, and two readers on one socket would
+     * swallow each other's packets.
+     */
+    SemaphoreHandle_t tx_lock;      /* recursive: chan_write() nests send_data() */
+    SemaphoreHandle_t rx_lock;
 } ssh_chan_t;
 
 /* ------------------------------------------------------------------ */
 /* Sending                                                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Block until the peer reopens its window, servicing the adjustment ourselves.
+ * Only ever needed after a large burst of output.
+ */
+static esp_err_t wait_for_window(ssh_chan_t *ch)
+{
+    ssh_conn_t *c = ch->conn;
+
+    for (unsigned waited = 0;
+         ch->peer_window == 0 && waited < WINDOW_WAIT_PACKETS; waited++) {
+
+        if (xSemaphoreTake(ch->rx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) != pdTRUE) {
+            /*
+             * The shell task is parked in a read waiting for a keystroke, so
+             * only a backgrounded app reaches this. Racing it for the socket
+             * would cost the user their input; losing this output is the
+             * lesser harm, and it is at least said out loud.
+             */
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "window closed while the read side is busy; output lost");
+            return ESP_ERR_TIMEOUT;
+        }
+
+        const esp_err_t err = ssh_packet_read(c);
+        if (err == ESP_OK &&
+            c->in_payload[0] == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
+            ssh_buf_t in;
+            ssh_buf_read_from(&in, c->in_payload, c->in_len);
+            ssh_skip(&in, 1);
+            ssh_get_u32(&in);               /* recipient channel */
+            ch->peer_window += ssh_get_u32(&in);
+        }
+        /* Anything else read here is dropped, type-ahead included: the caller
+         * is mid-write and cannot hand it to the line editor. */
+        xSemaphoreGive(ch->rx_lock);
+
+        if (err != ESP_OK) {
+            ch->closed = true;
+            return ESP_FAIL;
+        }
+    }
+
+    if (ch->peer_window == 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "peer window never opened");
+        ch->closed = true;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* Write one packet under the transmit lock. */
+static esp_err_t send_packet(ssh_chan_t *ch, ssh_buf_t *b)
+{
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    const esp_err_t err = ssh_packet_write(ch->conn, b);
+    xSemaphoreGiveRecursive(ch->tx_lock);
+    return err;
+}
+
 static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
 {
     ssh_conn_t *c = ch->conn;
 
+    /* Held across the whole write, not per packet: a long line split over
+     * several packets must not have another task's output spliced into it. */
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+
+    esp_err_t err = ESP_OK;
+
     while (len > 0 && !ch->closed) {
         /* Wait for window rather than truncating: dropping output silently is
          * far worse to debug than a stalled write. */
-        unsigned waited = 0;
-        while (ch->peer_window == 0 && waited++ < WINDOW_WAIT_PACKETS) {
-            if (ssh_packet_read(c) != ESP_OK) {
-                ch->closed = true;
-                return ESP_FAIL;
-            }
-            if (c->in_payload[0] == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
-                ssh_buf_t in;
-                ssh_buf_read_from(&in, c->in_payload, c->in_len);
-                ssh_skip(&in, 1);
-                ssh_get_u32(&in);                   /* recipient channel */
-                ch->peer_window += ssh_get_u32(&in);
-            }
-        }
         if (ch->peer_window == 0) {
-            espix_klog(ESPIX_KLOG_WARN, TAG, "peer window never opened");
-            ch->closed = true;
-            return ESP_FAIL;
+            err = wait_for_window(ch);
+            if (err != ESP_OK) {
+                break;
+            }
         }
 
         size_t chunk = len;
@@ -113,7 +181,8 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
 
         if (ssh_packet_write(c, &b) != ESP_OK) {
             ch->closed = true;
-            return ESP_FAIL;
+            err = ESP_FAIL;
+            break;
         }
 
         ch->peer_window -= chunk;
@@ -121,7 +190,8 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
         len  -= chunk;
     }
 
-    return ESP_OK;
+    xSemaphoreGiveRecursive(ch->tx_lock);
+    return (ch->closed && err == ESP_OK) ? ESP_FAIL : err;
 }
 
 /*
@@ -134,24 +204,60 @@ static int chan_write(espix_session_t *s, const char *data, size_t len)
 {
     ssh_chan_t *ch = s->transport;
     size_t      start = 0;
+    int         result = (int)len;
 
-    for (size_t i = 0; i < len; i++) {
+    /* One write stays one burst even though it is emitted line by line, so an
+     * app's output and the shell's cannot end up interleaved mid-message. */
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+
+    for (size_t i = 0; i < len && result >= 0; i++) {
         if (data[i] != '\n') {
             continue;
         }
-        if (i > start && send_data(ch, data + start, i - start) != ESP_OK) {
-            return -1;
-        }
-        if (send_data(ch, "\r\n", 2) != ESP_OK) {
-            return -1;
+        if ((i > start && send_data(ch, data + start, i - start) != ESP_OK) ||
+            send_data(ch, "\r\n", 2) != ESP_OK) {
+            result = -1;
+            break;
         }
         start = i + 1;
     }
 
-    if (start < len && send_data(ch, data + start, len - start) != ESP_OK) {
-        return -1;
+    if (result >= 0 && start < len &&
+        send_data(ch, data + start, len - start) != ESP_OK) {
+        result = -1;
     }
-    return (int)len;
+
+    xSemaphoreGiveRecursive(ch->tx_lock);
+    return result;
+}
+
+/*
+ * stdio adapter for apps. A raw descriptor cannot be used — channel output has
+ * to be wrapped in CHANNEL_DATA and encrypted — so an app's stdout is a
+ * funopen() stream landing back in chan_write().
+ */
+static int chan_stream_write(void *cookie, const char *data, int len)
+{
+    if (len <= 0) {
+        return 0;
+    }
+    return (chan_write(cookie, data, (size_t)len) < 0) ? -1 : len;
+}
+
+/*
+ * One stream per caller. The task that receives it owns it: FreeRTOS teardown
+ * runs esp_cleanup_r(), which fcloses a task's stdout and stderr when they are
+ * not the global ones, so these must not be shared or closed here.
+ */
+static FILE *chan_open_stream(espix_session_t *s)
+{
+    FILE *f = funopen(s, NULL, chan_stream_write, NULL, NULL);
+    if (f != NULL) {
+        /* Line buffered: output should appear as it is produced, but a packet
+         * per character would be absurd. */
+        setvbuf(f, NULL, _IOLBF, 128);
+    }
+    return f;
 }
 
 static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
@@ -168,7 +274,7 @@ static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
     ssh_put_u32(&b, ch->peer_chan);
     ssh_put_u32(&b, add);
 
-    if (ssh_packet_write(ch->conn, &b) == ESP_OK) {
+    if (send_packet(ch, &b) == ESP_OK) {
         ch->local_window += add;
     }
 }
@@ -278,7 +384,11 @@ static int chan_read_line(espix_session_t *s, const char *prompt,
             }
         }
 
-        if (ssh_packet_read(c) != ESP_OK) {
+        xSemaphoreTake(ch->rx_lock, portMAX_DELAY);
+        const esp_err_t rd = ssh_packet_read(c);
+        xSemaphoreGive(ch->rx_lock);
+
+        if (rd != ESP_OK) {
             ch->closed = true;
             return -1;
         }
@@ -351,7 +461,7 @@ static esp_err_t reply_request(ssh_chan_t *ch, bool ok)
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, ok ? SSH_MSG_CHANNEL_SUCCESS : SSH_MSG_CHANNEL_FAILURE);
     ssh_put_u32(&b, ch->peer_chan);
-    return ssh_packet_write(ch->conn, &b);
+    return send_packet(ch, &b);
 }
 
 static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
@@ -429,7 +539,7 @@ static esp_err_t send_exit_status(ssh_chan_t *ch, uint32_t status)
     ssh_put_cstr(&b, "exit-status");
     ssh_put_u8(&b, 0);                  /* never wants a reply */
     ssh_put_u32(&b, status);
-    return ssh_packet_write(ch->conn, &b);
+    return send_packet(ch, &b);
 }
 
 static void close_channel(ssh_chan_t *ch)
@@ -439,29 +549,39 @@ static void close_channel(ssh_chan_t *ch)
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_EOF);
     ssh_put_u32(&b, ch->peer_chan);
-    ssh_packet_write(ch->conn, &b);
+    send_packet(ch, &b);
 
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_CLOSE);
     ssh_put_u32(&b, ch->peer_chan);
-    ssh_packet_write(ch->conn, &b);
+    send_packet(ch, &b);
 }
 
 esp_err_t ssh_channel_run(ssh_conn_t *c)
 {
+    esp_err_t err = ESP_OK;
+
     ssh_chan_t ch = {
         .conn         = c,
         .local_window = LOCAL_WINDOW,
         .cols         = 80,
         .rows         = 24,
+        .tx_lock      = xSemaphoreCreateRecursiveMutex(),
+        .rx_lock      = xSemaphoreCreateMutex(),
     };
+
+    if (ch.tx_lock == NULL || ch.rx_lock == NULL) {
+        goto out;
+    }
 
     /* CHANNEL_OPEN */
     if (ssh_packet_read(c) != ESP_OK) {
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto out;
     }
     if (c->in_payload[0] != SSH_MSG_CHANNEL_OPEN) {
-        return ESP_ERR_INVALID_RESPONSE;
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto out;
     }
 
     ssh_buf_t in;
@@ -475,7 +595,8 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     ch.peer_max_packet  = ssh_get_u32(&in);
 
     if (in.bad || type == NULL) {
-        return ESP_ERR_INVALID_SIZE;
+        err = ESP_ERR_INVALID_SIZE;
+        goto out;
     }
     if (type_len != strlen("session") ||
         memcmp(type, "session", type_len) != 0) {
@@ -487,7 +608,8 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         ssh_put_cstr(&b, "only session channels are supported");
         ssh_put_cstr(&b, "");
         ssh_packet_write(c, &b);
-        return ESP_ERR_NOT_SUPPORTED;
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto out;
     }
 
     {
@@ -499,14 +621,16 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         ssh_put_u32(&b, LOCAL_WINDOW);
         ssh_put_u32(&b, MAX_PACKET);
         if (ssh_packet_write(c, &b) != ESP_OK) {
-            return ESP_FAIL;
+            err = ESP_FAIL;
+            goto out;
         }
     }
 
     /* Requests until the client asks for a shell. */
     while (!ch.want_shell && !ch.closed) {
         if (ssh_packet_read(c) != ESP_OK) {
-            return ESP_FAIL;
+            err = ESP_FAIL;
+            goto out;
         }
 
         ssh_buf_t req;
@@ -518,7 +642,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         } else if (msg == SSH_MSG_CHANNEL_CLOSE ||
                    msg == SSH_MSG_CHANNEL_EOF ||
                    msg == SSH_MSG_DISCONNECT) {
-            return ESP_OK;
+            goto out;
         }
         /* Anything else before a shell is noise. */
     }
@@ -533,14 +657,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .write     = chan_write,
         .transport = &ch,
         .fg_pid    = ESPIX_PID_NONE,
-        /*
-         * Not fd-backed, despite there being a socket: everything must be
-         * wrapped in CHANNEL_DATA and encrypted, so a raw fd would bypass the
-         * protocol entirely. Giving apps their own stdout here needs a FILE*
-         * backed by a callback, which is the remaining piece.
-         */
-        .fd_in     = -1,
-        .fd_out    = -1,
+        .open_stream = chan_open_stream,
     };
     strlcpy(session.user, c->user, sizeof(session.user));
 
@@ -554,9 +671,40 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
 
     espix_shell_session_run(&session);
 
-    send_exit_status(&ch, (uint32_t)session.last_status);
-    close_channel(&ch);
+    /*
+     * Hang up: a backgrounded app writes through a stream whose cookie is this
+     * session, which lives on this stack, so nothing may outlive it.
+     */
+    const size_t orphans = espix_proc_hangup(&session);
+    if (orphans > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on logout",
+                   c->user, (unsigned)orphans, orphans == 1 ? "" : "es");
+    }
+
+    /*
+     * A process killed above may have died inside a write, still holding the
+     * transmit lock — espix_proc_kill() deletes the task outright and cannot
+     * unwind what it held. Probe the lock rather than block on it: closing the
+     * connection abruptly costs the client a warning, whereas waiting forever
+     * would strand this task and its buffers for the life of the system.
+     */
+    if (xSemaphoreTakeRecursive(ch.tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
+        xSemaphoreGiveRecursive(ch.tx_lock);
+        send_exit_status(&ch, (uint32_t)session.last_status);
+        close_channel(&ch);
+    } else {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "transmit lock held by a killed process; closing abruptly");
+    }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s logged out", c->user);
-    return ESP_OK;
+
+out:
+    if (ch.tx_lock != NULL) {
+        vSemaphoreDelete(ch.tx_lock);
+    }
+    if (ch.rx_lock != NULL) {
+        vSemaphoreDelete(ch.rx_lock);
+    }
+    return err;
 }

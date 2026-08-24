@@ -44,17 +44,29 @@ struct espix_session {
     char        user[ESPIX_SESSION_USER_MAX];
 
     /*
-     * Descriptors behind this session, or -1 when it is not fd-backed (the
-     * console goes through linenoise and stdio instead).
+     * Opens a fresh stdout/stderr stream for a spawned process, or NULL to
+     * leave the task's streams alone (which is what the console wants — its
+     * stdout is already the right place).
      *
-     * Present so a spawned process can inherit them: an app calls libc printf,
-     * which writes to its task's stdout, not through this struct's write().
-     * espix_proc rebinds those streams with fdopen() on these — the same trick
-     * ESP-IDF's own console REPL uses. Without them, `run` over SSH would print
-     * on the serial console.
+     * An app calls libc printf, which writes to its task's stdout, not through
+     * this struct's write(). espix_proc points that task's streams at what this
+     * returns, which under newlib rebinds only that task; without it, `run`
+     * over SSH would print on the serial console.
+     *
+     * A factory rather than one shared FILE, because ESP-IDF closes a task's
+     * streams when the task is deleted — esp_cleanup_r() in
+     * components/esp_libc/src/newlib_init.c fcloses stdin, stdout and stderr
+     * whenever they differ from the global ones. A shared stream would be torn
+     * down under the still-live session by the first app to exit, and closed
+     * twice over if stdout and stderr pointed at the same object. Each stream
+     * therefore belongs to one task, and that task's teardown closes it.
+     *
+     * Not a descriptor, despite SSH having a socket: channel output must be
+     * wrapped in CHANNEL_DATA and encrypted, so writing to the raw fd would
+     * bypass the protocol. The transport builds these with funopen() over its
+     * own write path.
      */
-    int         fd_in;
-    int         fd_out;
+    FILE *(*open_stream)(espix_session_t *s);
 
     /* Read one line, without the terminator. Returns the length, or a negative
      * value on EOF / transport error. */

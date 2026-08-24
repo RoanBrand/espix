@@ -127,6 +127,37 @@ static void proc_task(void *arg)
      * from this task reach whoever ran it. */
     espix_shell_set_current(slot->info.session);
 
+    /*
+     * Point this task's stdout and stderr at the session, so an app's own
+     * printf() lands where the user is rather than on the serial console.
+     *
+     * This works because ESP-IDF gives every task its own struct _reent whose
+     * streams are pre-pointed at the global ones (esp_reent_init), so the
+     * assignment affects this task alone. It is the same trick ESP-IDF's own
+     * console REPL uses.
+     *
+     * Two separate streams, and neither is closed here: task teardown calls
+     * esp_cleanup_r(), which fcloses whichever of stdin/stdout/stderr differ
+     * from the global ones. One object shared between stdout and stderr would
+     * be closed twice, which asserts inside the second fclose.
+     *
+     * Not applied to `>` redirection: that FILE is closed when the command
+     * returns, and a backgrounded app would outlive it.
+     */
+    espix_session_t *const session = slot->info.session;
+    const bool own_streams = (session != NULL && session->open_stream != NULL);
+
+    if (own_streams) {
+        FILE *const out = session->open_stream(session);
+        FILE *const err = session->open_stream(session);
+        if (out != NULL) {
+            stdout = out;
+        }
+        if (err != NULL) {
+            stderr = err;
+        }
+    }
+
     int  status = -1;
     bool ran    = false;
 
@@ -175,6 +206,17 @@ static void proc_task(void *arg)
     status = slot->elf.entry(slot->argc, slot->argv);
 
 done:
+    /*
+     * An app that printf()'d without a trailing newline still has bytes sitting
+     * in the stream buffer. Flush here rather than leaving it to the fclose in
+     * esp_cleanup_r(): the shell is released the moment this process is marked
+     * finished, so anything still buffered would land after its next prompt.
+     */
+    if (own_streams) {
+        fflush(stdout);
+        fflush(stderr);
+    }
+
     /* Tear the ELF down before releasing the file buffer: the relocated image
      * can still reference it until deinit. */
     espix_proc_release_resources(slot);

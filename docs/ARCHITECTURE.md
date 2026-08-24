@@ -71,7 +71,8 @@ their own `read_line` rather than sharing this one.
 
 Redirection (`>` / `>>`) is handled in dispatch, not per command, by setting
 `session->redirect` for the duration of the call. It therefore works for every
-command. It does *not* capture a spawned app's own stdout.
+command. It does *not* capture a spawned app's own stdout — see the stdio note
+below for why that is deliberate rather than unfinished.
 
 ### There is no working directory outside a session
 
@@ -276,27 +277,44 @@ reach it. That matches Linux, where kernel output goes to the console and remote
 users run `dmesg`. **Do not "fix" this later by routing klog through the current
 session** — the current behaviour is the correct one.
 
-There is a real gap in the same area, though, which the SSH milestone has to
-close: **a loaded app's `printf()` also goes to global stdout.**
-[exec.c](../components/espix_proc/exec.c) calls `espix_shell_set_current()`, but
-that sets espix's own session pointer for `espix_printf` — not libc's stdout. So
-`run /bin/hello` from an SSH session would print on the serial console and the
-remote user would see nothing.
-
-The mechanism already exists in ESP-IDF. `components/console/esp_console_common.c`
-does:
+A loaded app's own `printf()` is a separate matter, because it does not go
+through `session_out()` at all — it writes to its task's libc stdout. espix
+rebinds that per task, in `proc_task()`:
 
 ```c
-stdin = repl_com->_stdin;
-stdout = stderr = repl_com->_stdout;
+stdout = out;
+stderr = out;
 ```
 
-Under newlib `stdout` resolves through the per-task `_REENT`, so assigning it
-*inside a task* rebinds only that task's streams. `proc_task()` can do the same
-before calling the app's entry point, and for an SSH session the `FILE *` comes
-from `fdopen()` on the channel's socket. That is why `espix_session_t` will
-likely want file descriptors alongside its current `write`/`read_line`
-callbacks.
+This works because ESP-IDF gives every task its own `struct _reent` whose
+streams are pre-pointed at the global ones and whose `__sdidinit` is already
+set (`esp_reent_init`, `components/esp_libc/src/reent_init.c`). The assignment
+therefore affects one task and is never undone by a lazy `__sinit`. It is the
+same mechanism `components/console/esp_console_common.c` uses.
+
+Where that `FILE *` comes from is the part worth recording. The obvious answer —
+`fdopen()` on the channel's socket — is **wrong for SSH**: channel output has to
+be wrapped in `CHANNEL_DATA` and encrypted, so writing to the raw descriptor
+would put unframed plaintext on the wire and desynchronise the connection. The
+stream is built with `funopen()` over the transport's own write path instead,
+which is why `espix_session_t` carries a `FILE *out` rather than descriptors.
+The console leaves it `NULL`: its apps already print to the right place.
+
+Two consequences follow from an app's stdout reaching the transport:
+
+- **The connection acquires a second writer.** Packets share `out_buf` and a
+  sequence number the MAC covers, so `ssh_channel.c` serialises transmission
+  with a recursive mutex, held across a whole `chan_write()` so one message
+  cannot be spliced into another. The read side has its own lock, because a
+  write that blocks on the peer's window must read the adjustment, and two
+  readers on one socket would swallow each other's packets.
+- **A backgrounded app can outlive the session that owns its stdout.**
+  `espix_proc_hangup()` kills anything still owned by a session before its
+  stream is closed — which is what a hangup means on a real terminal.
+
+Redirection is deliberately *not* wired into this: `session->redirect` is closed
+when the command returns, and `run app > file &` would leave an app holding a
+dead `FILE *`. So `>` still captures a command's output and not an app's.
 
 ### The app network ABI is ours
 
@@ -350,9 +368,6 @@ costs ~6 KB of format strings).
   line editor.
 - **WiFi roaming and multiple networks.** One SSID, one AP, no BSSID
   reselection.
-- **Per-session stdout for loaded apps** — an SSH prerequisite. See the
-  `_REENT` note above: an app's `printf()` currently reaches the serial console
-  rather than the session that ran it.
 - **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the
   console prints a fixed banner instead. Printing motd at session start is the
   right home for it, and worth doing when SSH makes "logging in" a real event.

@@ -215,6 +215,34 @@ esp_err_t espix_proc_kill(espix_pid_t pid)
     return ESP_OK;
 }
 
+size_t espix_proc_hangup(const espix_session_t *session)
+{
+    if (session == NULL) {
+        return 0;
+    }
+
+    size_t killed = 0;
+
+    /*
+     * Snapshot first, then kill: espix_proc_kill() takes the table lock itself,
+     * and a process may well finish on its own in between — which it reports
+     * and we ignore, because that is the outcome we wanted anyway.
+     */
+    espix_proc_info_t procs[ESPIX_PROC_MAX];
+    const size_t      n = espix_proc_snapshot(procs, ESPIX_PROC_MAX);
+
+    for (size_t i = 0; i < n; i++) {
+        if (procs[i].session != session || state_is_finished(procs[i].state)) {
+            continue;
+        }
+        if (espix_proc_kill(procs[i].pid) == ESP_OK) {
+            killed++;
+        }
+    }
+
+    return killed;
+}
+
 size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n)
 {
     if (out == NULL || n == 0) {
