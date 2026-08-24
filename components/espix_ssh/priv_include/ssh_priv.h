@@ -132,6 +132,11 @@ typedef struct {
     uint8_t  session_id[SSH_HASH_LEN];
     bool     have_session_id;
 
+    /* Authenticated user. Wider than espix's own limit so an over-long name
+     * fails authentication rather than being silently truncated into a
+     * different, possibly valid, account. */
+    char     user[64];
+
     ssh_dir_t rx;
     ssh_dir_t tx;
 
@@ -179,6 +184,21 @@ esp_err_t ssh_hostkey_sign(const uint8_t *hash, size_t hash_len,
  * leaving c->rx and c->tx active. The next packet read or written is encrypted.
  */
 esp_err_t ssh_kex_run(ssh_conn_t *c);
+
+/* ------------------------------------------------------------------ */
+/* Authentication (ssh_auth.c)                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Handles SERVICE_REQUEST through to USERAUTH_SUCCESS, leaving the
+ * authenticated name in c->user. Returns non-OK if the client gave up, ran out
+ * of attempts, or misbehaved — in every one of those cases the caller should
+ * close the connection.
+ */
+esp_err_t ssh_auth_run(ssh_conn_t *c);
+
+/* Counted so `sshd` status can show them; incremented by ssh_auth.c. */
+void ssh_server_note_rejection(void);
 
 #ifdef __cplusplus
 }

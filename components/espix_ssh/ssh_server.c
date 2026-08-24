@@ -211,16 +211,22 @@ static void connection_task(void *arg)
             break;
         }
 
+        if (ssh_auth_run(c) != ESP_OK) {
+            /* ssh_auth_run has already sent whatever disconnect is warranted;
+             * saying more here would be a second, conflicting reason. */
+            break;
+        }
+
         /*
-         * Encrypted from here. Userauth and the session channel come next;
-         * until then the client reaches "expecting SSH2_MSG_SERVICE_ACCEPT"
-         * and gets this disconnect — which, being encrypted and MAC'd,
-         * proves the whole transport is working.
+         * Authenticated. The session channel comes next; until then the client
+         * reaches "Authenticated to ..." and then gets this when it tries to
+         * open a channel.
          */
         espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "encrypted; userauth not implemented yet");
+                   "%s logged in; session channel not implemented yet",
+                   c->user);
         ssh_send_disconnect(c, SSH_DISCONNECT_SERVICE_NOT_AVAILABLE,
-                            "espix: userauth not implemented yet");
+                            "espix: session channel not implemented yet");
     } while (0);
 
     close(c->fd);
@@ -330,4 +336,9 @@ void espix_ssh_status(espix_ssh_status_t *out)
     if (out != NULL) {
         *out = s_status;
     }
+}
+
+void ssh_server_note_rejection(void)
+{
+    s_status.rejected++;
 }

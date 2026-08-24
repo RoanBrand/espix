@@ -4,6 +4,7 @@ idf_component_register(
         "ssh_transport.c"
         "ssh_hostkey.c"
         "ssh_kex.c"
+        "ssh_auth.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
