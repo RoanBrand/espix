@@ -2,6 +2,8 @@ idf_component_register(
     SRCS
         "ssh_server.c"
         "ssh_transport.c"
+        "ssh_hostkey.c"
+        "ssh_kex.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

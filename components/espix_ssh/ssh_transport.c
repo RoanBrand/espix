@@ -93,6 +93,31 @@ void ssh_put_cstr(ssh_buf_t *b, const char *s)
     ssh_put_string(b, s, strlen(s));
 }
 
+void ssh_put_mpint(ssh_buf_t *b, const uint8_t *be, size_t len)
+{
+    /* Strip leading zeros: mpint is minimal-length. */
+    size_t i = 0;
+    while (i < len && be[i] == 0) {
+        i++;
+    }
+
+    if (i == len) {
+        ssh_put_u32(b, 0);      /* zero is the empty string */
+        return;
+    }
+
+    /* A set top bit would read as a negative two's-complement number, so a
+     * zero byte goes in front. Forgetting this breaks roughly half of all
+     * exchange hashes, at random, which is a memorable way to learn it. */
+    const bool pad = (be[i] & 0x80) != 0;
+
+    ssh_put_u32(b, (uint32_t)(len - i + (pad ? 1 : 0)));
+    if (pad) {
+        ssh_put_u8(b, 0);
+    }
+    ssh_put_raw(b, be + i, len - i);
+}
+
 static bool avail(ssh_buf_t *b, size_t n)
 {
     if (b->bad || b->pos + n > b->len) {
@@ -256,6 +281,40 @@ esp_err_t ssh_transport_banner(ssh_conn_t *c)
 /* Binary packet protocol (RFC 4253 §6)                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * With hmac-sha2-256-etm@openssh.com the length field stays in clear and the
+ * MAC covers the ciphertext, so a packet can be authenticated before anything
+ * is decrypted — which is both the Terrapin-era recommendation and much simpler
+ * than decrypting a block just to learn how much more to read.
+ *
+ * Note the block size changes with the cipher: 8 while unencrypted, 16 once
+ * AES is active. And the padded region differs too — before encryption the
+ * length field counts toward the multiple, with ETM it does not, because it is
+ * not part of the encrypted run.
+ */
+static size_t block_size(const ssh_dir_t *d)
+{
+    return d->active ? SSH_AES_IV_LEN : CIPHER_BLOCK;
+}
+
+/*
+ * The quantity that must be a multiple of the block size.
+ *
+ * In the clear it is packet_length ‖ padding_length ‖ payload ‖ padding — the
+ * 4-byte length field counts, even though packet_length does not include
+ * itself. Under ETM the length is not encrypted, so only the encrypted run
+ * aligns and those 4 bytes drop out.
+ *
+ * Deliberately one function used by both the reader and the writer. Writing the
+ * rule out twice is what produced the same off-by-four bug twice: once sending
+ * (a client reporting "padding error ... mod 4") and once receiving (rejecting
+ * a perfectly good 1564-byte packet).
+ */
+static size_t aligned_len(const ssh_dir_t *d, size_t packet_len)
+{
+    return d->active ? packet_len : 4 + packet_len;
+}
+
 esp_err_t ssh_packet_read(ssh_conn_t *c)
 {
     uint8_t header[4];
@@ -268,16 +327,53 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
                                 ((uint32_t)header[2] << 8) |
                                 (uint32_t)header[3];
 
-    /* Bound before allocating anything against it. The lower bound keeps a
-     * malformed length from underflowing the payload arithmetic below. */
-    if (packet_len < CIPHER_BLOCK || packet_len > SSH_MAX_PACKET - 4) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "bad packet length %u",
-                   (unsigned)packet_len);
+    /* Bound before it is used as a size. The lower bound also keeps a malformed
+     * length from underflowing the payload arithmetic below. */
+    const size_t blk = block_size(&c->rx);
+    if (packet_len < blk || packet_len > SSH_MAX_PACKET - 4 ||
+        (aligned_len(&c->rx, packet_len) % blk) != 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "bad packet length %u (blk %u)",
+                   (unsigned)packet_len, (unsigned)blk);
         return ESP_ERR_INVALID_SIZE;
     }
 
     if (read_exact(c->fd, c->in_buf, packet_len) != ESP_OK) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (c->rx.active) {
+        uint8_t mac[SSH_MAC_LEN];
+        if (read_exact(c->fd, mac, sizeof(mac)) != ESP_OK) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        /* MAC input is seq ‖ length ‖ ciphertext, in wire order. */
+        uint8_t seq[4];
+        seq[0] = (uint8_t)(c->seq_in >> 24);
+        seq[1] = (uint8_t)(c->seq_in >> 16);
+        seq[2] = (uint8_t)(c->seq_in >> 8);
+        seq[3] = (uint8_t)c->seq_in;
+
+        memcpy(c->frame, seq, 4);
+        memcpy(c->frame + 4, header, 4);
+        memcpy(c->frame + 8, c->in_buf, packet_len);
+
+        if (psa_mac_verify(c->rx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                           c->frame, 8 + packet_len, mac,
+                           sizeof(mac)) != PSA_SUCCESS) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "MAC mismatch on packet %u",
+                       (unsigned)c->seq_in);
+            return ESP_ERR_INVALID_MAC;
+        }
+
+        /* Authenticated: only now is it safe to decrypt in place. */
+        size_t produced = 0;
+        if (psa_cipher_update(&c->rx.cipher, c->in_buf, packet_len,
+                              c->in_buf, packet_len,
+                              &produced) != PSA_SUCCESS ||
+            produced != packet_len) {
+            return ESP_FAIL;
+        }
     }
 
     const uint8_t padding = c->in_buf[0];
@@ -304,53 +400,96 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    const size_t blk = block_size(&c->tx);
+
     /*
-     * RFC 4253 §6: the multiple-of-8 requirement covers
+     * RFC 4253 §6 requires
+     *     packet_length ‖ padding_length ‖ payload ‖ padding
+     * to be a multiple of the block size — the 4-byte length field counts,
+     * even though packet_length itself does not include it. Padding only the
+     * last three leaves every packet 4 bytes off, which a client reports as
+     * "padding error: need N block 8 mod 4".
      *
-     *     packet_length || padding_length || payload || padding
-     *
-     * so the 4-byte length field is *part of* the padded quantity even though
-     * packet_length itself does not count it. Padding only
-     * padding_length+payload+padding leaves every packet 4 bytes off, which a
-     * client reports as "padding error: need N block 8 mod 4".
+     * With ETM the length is *not* encrypted, so it is excluded and only the
+     * encrypted run has to align.
      */
-    const size_t framed  = 4 + 1 + b->len;
-    size_t       padding = CIPHER_BLOCK - (framed % CIPHER_BLOCK);
+    const size_t framed = aligned_len(&c->tx, 1 + b->len);
+    size_t padding = blk - (framed % blk);
     if (padding < MIN_PADDING) {
-        padding += CIPHER_BLOCK;
+        padding += blk;
     }
 
-    /* packet_length counts everything after itself. */
     const size_t packet_len = 1 + b->len + padding;
 
-    /*
-     * Check the invariant here rather than let the peer discover it. A framing
-     * error looks like a MAC failure or a corrupt packet from the other end,
-     * which is a long way from the arithmetic that caused it.
-     */
-    if ((4 + packet_len) % CIPHER_BLOCK != 0 || padding > 255) {
+    /* Check the invariant here rather than let the peer discover it: a framing
+     * error surfaces at the far end as a corrupt packet or a MAC failure, a
+     * long way from the arithmetic that caused it. */
+    const size_t aligned = aligned_len(&c->tx, packet_len);
+    if ((aligned % blk) != 0 || padding > 255 ||
+        packet_len + SSH_MAC_LEN + 8 > sizeof(c->frame)) {
         espix_klog(ESPIX_KLOG_ERROR, TAG,
-                   "framing bug: payload %u padding %u total %u",
-                   (unsigned)b->len, (unsigned)padding,
-                   (unsigned)(4 + packet_len));
+                   "framing bug: payload %u padding %u aligned %u blk %u",
+                   (unsigned)b->len, (unsigned)padding, (unsigned)aligned,
+                   (unsigned)blk);
         return ESP_FAIL;
     }
 
-    uint8_t frame[4 + 1];
+    uint8_t len_be[4];
+    len_be[0] = (uint8_t)(packet_len >> 24);
+    len_be[1] = (uint8_t)(packet_len >> 16);
+    len_be[2] = (uint8_t)(packet_len >> 8);
+    len_be[3] = (uint8_t)packet_len;
 
-    frame[0] = (uint8_t)(packet_len >> 24);
-    frame[1] = (uint8_t)(packet_len >> 16);
-    frame[2] = (uint8_t)(packet_len >> 8);
-    frame[3] = (uint8_t)packet_len;
-    frame[4] = (uint8_t)padding;
+    if (!c->tx.active) {
+        uint8_t pad[64] = {0};      /* zero padding is legal in the clear */
+        if (write_all(c->fd, len_be, sizeof(len_be)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        uint8_t padlen = (uint8_t)padding;
+        if (write_all(c->fd, &padlen, 1) != ESP_OK ||
+            write_all(c->fd, b->buf, b->len) != ESP_OK ||
+            write_all(c->fd, pad, padding) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        c->seq_out++;
+        return ESP_OK;
+    }
 
-    /* Zero padding is legal while unencrypted; once a cipher is active it must
-     * be random, which is a KEX-stage concern. */
-    uint8_t pad[CIPHER_BLOCK * 2] = {0};
+    /*
+     * Encrypted: assemble padding_length ‖ payload ‖ padding, encrypt it, then
+     * MAC over seq ‖ length ‖ ciphertext. Padding must be random now — it is
+     * the only unpredictable material in a short packet.
+     */
+    uint8_t *plain = c->frame + 8;
+    plain[0] = (uint8_t)padding;
+    memcpy(plain + 1, b->buf, b->len);
+    if (psa_generate_random(plain + 1 + b->len, padding) != PSA_SUCCESS) {
+        return ESP_FAIL;
+    }
 
-    if (write_all(c->fd, frame, sizeof(frame)) != ESP_OK ||
-        write_all(c->fd, b->buf, b->len) != ESP_OK ||
-        write_all(c->fd, pad, padding) != ESP_OK) {
+    size_t produced = 0;
+    if (psa_cipher_update(&c->tx.cipher, plain, packet_len, plain, packet_len,
+                          &produced) != PSA_SUCCESS || produced != packet_len) {
+        return ESP_FAIL;
+    }
+
+    c->frame[0] = (uint8_t)(c->seq_out >> 24);
+    c->frame[1] = (uint8_t)(c->seq_out >> 16);
+    c->frame[2] = (uint8_t)(c->seq_out >> 8);
+    c->frame[3] = (uint8_t)c->seq_out;
+    memcpy(c->frame + 4, len_be, 4);
+
+    uint8_t mac[SSH_MAC_LEN];
+    size_t  mac_len = 0;
+    if (psa_mac_compute(c->tx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                        c->frame, 8 + packet_len, mac, sizeof(mac),
+                        &mac_len) != PSA_SUCCESS || mac_len != SSH_MAC_LEN) {
+        return ESP_FAIL;
+    }
+
+    if (write_all(c->fd, len_be, sizeof(len_be)) != ESP_OK ||
+        write_all(c->fd, plain, packet_len) != ESP_OK ||
+        write_all(c->fd, mac, sizeof(mac)) != ESP_OK) {
         return ESP_FAIL;
     }
 

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "psa/crypto.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,31 @@ void           ssh_skip(ssh_buf_t *b, size_t len);
 
 /* ------------------------------------------------------------------ */
 
+/* Sizes fixed by the one algorithm set we offer. */
+#define SSH_AES_KEY_LEN   32    /* aes256 */
+#define SSH_AES_IV_LEN    16
+#define SSH_MAC_KEY_LEN   32    /* hmac-sha2-256 */
+#define SSH_MAC_LEN       32
+#define SSH_HASH_LEN      32    /* sha256 */
+#define SSH_X25519_LEN    32
+#define SSH_P256_POINT    65    /* 0x04 || X || Y */
+
+/*
+ * The exchange hash covers both complete KEXINIT payloads, so both must be kept
+ * from the moment they cross the wire until KEX completes. The client's is not
+ * small — OpenSSH offers long name-lists, ~1.3KB in practice — and this is the
+ * dominant per-connection cost.
+ */
+#define SSH_KEXINIT_MAX_C 1600
+#define SSH_KEXINIT_MAX_S 256
+
+typedef struct {
+    bool                  active;
+    psa_cipher_operation_t cipher;   /* CTR is a stream: one long operation */
+    mbedtls_svc_key_id_t  cipher_key;
+    mbedtls_svc_key_id_t  mac_key;
+} ssh_dir_t;
+
 typedef struct {
     int      fd;
     uint32_t seq_in;
@@ -95,11 +121,26 @@ typedef struct {
 
     char     client_version[SSH_VERSION_MAX];
 
+    uint8_t  kexinit_c[SSH_KEXINIT_MAX_C];
+    size_t   kexinit_c_len;
+    uint8_t  kexinit_s[SSH_KEXINIT_MAX_S];
+    size_t   kexinit_s_len;
+
+    /* Terrapin (CVE-2023-48795) mitigation, when the client offers it. */
+    bool     strict_kex;
+
+    uint8_t  session_id[SSH_HASH_LEN];
+    bool     have_session_id;
+
+    ssh_dir_t rx;
+    ssh_dir_t tx;
+
     uint8_t  in_buf[SSH_MAX_PACKET];
     uint8_t *in_payload;
     size_t   in_len;
 
     uint8_t  out_buf[SSH_MAX_PACKET];
+    uint8_t  frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8];
 } ssh_conn_t;
 
 esp_err_t ssh_transport_banner(ssh_conn_t *c);
@@ -107,8 +148,37 @@ esp_err_t ssh_packet_read(ssh_conn_t *c);
 esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b);
 esp_err_t ssh_send_disconnect(ssh_conn_t *c, uint32_t reason, const char *text);
 
+/* SSH mpint: two's-complement big-endian, leading zeros stripped, one 0x00
+ * prepended when the top bit would otherwise read as negative. */
+void ssh_put_mpint(ssh_buf_t *b, const uint8_t *be, size_t len);
+
 /* Our advertised identification string, also fed into the exchange hash. */
 extern const char *const ssh_server_version;
+
+/* ------------------------------------------------------------------ */
+/* Host key (ssh_hostkey.c)                                            */
+/* ------------------------------------------------------------------ */
+
+/* Load /etc/ssh/host_ecdsa_key, generating it on first call. */
+esp_err_t ssh_hostkey_init(void);
+
+/* SSH-encoded public host key: string("ecdsa-sha2-nistp256"),
+ * string("nistp256"), string(point). */
+esp_err_t ssh_hostkey_blob(uint8_t *out, size_t cap, size_t *out_len);
+
+/* ecdsa-sha2-nistp256 signature blob over `hash`. */
+esp_err_t ssh_hostkey_sign(const uint8_t *hash, size_t hash_len,
+                           uint8_t *out, size_t cap, size_t *out_len);
+
+/* ------------------------------------------------------------------ */
+/* Key exchange (ssh_kex.c)                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Runs from a received KEX_ECDH_INIT through NEWKEYS in both directions,
+ * leaving c->rx and c->tx active. The next packet read or written is encrypted.
+ */
+esp_err_t ssh_kex_run(ssh_conn_t *c);
 
 #ifdef __cplusplus
 }

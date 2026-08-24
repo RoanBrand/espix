@@ -39,7 +39,18 @@ static espix_ssh_status_t s_status;
  * get wrong, and every one of these is backed by PSA Crypto, which is already
  * linked for TLS.
  */
-static const char *const KEX_ALGS      = "curve25519-sha256";
+/*
+ * The strict-KEX marker is advertised as a pseudo "algorithm" alongside the
+ * real one — that is how OpenSSH signals it. It enables the Terrapin
+ * (CVE-2023-48795) mitigation: sequence numbers reset after NEWKEYS, so an
+ * attacker cannot delete packets from the unauthenticated prefix undetected.
+ * Terrapin attacks exactly the packet layer this file implements, so it is
+ * worth the handful of lines.
+ */
+static const char *const KEX_ALGS      = "curve25519-sha256,"
+                                         "kex-strict-s-v00@openssh.com";
+#define KEX_ALG_PRIMARY  "curve25519-sha256"
+#define KEX_STRICT_CLIENT "kex-strict-c-v00@openssh.com"
 static const char *const HOSTKEY_ALGS  = "ecdsa-sha2-nistp256";
 static const char *const CIPHER_ALGS   = "aes256-ctr";
 static const char *const MAC_ALGS      = "hmac-sha2-256-etm@openssh.com";
@@ -69,6 +80,14 @@ static esp_err_t send_kexinit(ssh_conn_t *c)
     ssh_put_cstr(&b, "");               /* languages, server to client */
     ssh_put_u8(&b, 0);                  /* no guessed KEX packet follows */
     ssh_put_u32(&b, 0);                 /* reserved */
+
+    if (b.bad || b.len > sizeof(c->kexinit_s)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* Kept because the exchange hash covers it verbatim. */
+    memcpy(c->kexinit_s, b.buf, b.len);
+    c->kexinit_s_len = b.len;
 
     return ssh_packet_write(c, &b);
 }
@@ -102,13 +121,22 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    /* Kept verbatim for the exchange hash, before any parsing consumes it. */
+    if (c->in_len > sizeof(c->kexinit_c)) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "client KEXINIT too large (%u)",
+                   (unsigned)c->in_len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(c->kexinit_c, c->in_payload, c->in_len);
+    c->kexinit_c_len = c->in_len;
+
     ssh_buf_t b;
     ssh_buf_read_from(&b, c->in_payload, c->in_len);
     ssh_skip(&b, 1);        /* message id */
     ssh_skip(&b, 16);       /* cookie */
 
     struct { const char *what; const char *need; } checks[] = {
-        { "kex",      KEX_ALGS },
+        { "kex",      KEX_ALG_PRIMARY },
         { "host key", HOSTKEY_ALGS },
         { "cipher",   CIPHER_ALGS },
         { "cipher",   CIPHER_ALGS },
@@ -122,6 +150,9 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
         if (b.bad) {
             return ESP_ERR_INVALID_SIZE;
         }
+        if (i == 0 && name_list_has(list, len, KEX_STRICT_CLIENT)) {
+            c->strict_kex = true;
+        }
         if (!name_list_has(list, len, checks[i].need)) {
             espix_klog(ESPIX_KLOG_WARN, TAG,
                        "client offers no %s we support (need %s)",
@@ -130,7 +161,8 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
         }
     }
 
-    espix_klog(ESPIX_KLOG_INFO, TAG, "algorithms agreed");
+    espix_klog(ESPIX_KLOG_INFO, TAG, "algorithms agreed%s",
+               c->strict_kex ? ", strict kex" : "");
     return ESP_OK;
 }
 
@@ -167,16 +199,28 @@ static void connection_task(void *arg)
             break;
         }
 
+        if (ssh_packet_read(c) != ESP_OK ||
+            c->in_payload[0] != SSH_MSG_KEX_ECDH_INIT) {
+            ssh_send_disconnect(c, SSH_DISCONNECT_PROTOCOL_ERROR,
+                                "expected KEX_ECDH_INIT");
+            break;
+        }
+        if (ssh_kex_run(c) != ESP_OK) {
+            ssh_send_disconnect(c, SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
+                                "key exchange failed");
+            break;
+        }
+
         /*
-         * Stage 1 ends here. Key exchange, NEWKEYS, userauth and the session
-         * channel come next; until then the client will report that the server
-         * closed the connection after KEXINIT, which is the expected result and
-         * exactly what `ssh -vvv` shows.
+         * Encrypted from here. Userauth and the session channel come next;
+         * until then the client reaches "expecting SSH2_MSG_SERVICE_ACCEPT"
+         * and gets this disconnect — which, being encrypted and MAC'd,
+         * proves the whole transport is working.
          */
         espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "KEXINIT complete; key exchange not implemented yet");
-        ssh_send_disconnect(c, SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
-                            "espix: key exchange not implemented yet");
+                   "encrypted; userauth not implemented yet");
+        ssh_send_disconnect(c, SSH_DISCONNECT_SERVICE_NOT_AVAILABLE,
+                            "espix: userauth not implemented yet");
     } while (0);
 
     close(c->fd);
@@ -266,6 +310,13 @@ esp_err_t espix_ssh_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    if (ssh_hostkey_init() != ESP_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "no host key; not accepting connections");
+        close(s_listen_fd);
+        s_listen_fd = -1;
+        return ESP_FAIL;
+    }
+
     s_status.running = true;
     s_status.port    = CONFIG_ESPIX_SSH_PORT;
 
@@ -279,10 +330,4 @@ void espix_ssh_status(espix_ssh_status_t *out)
     if (out != NULL) {
         *out = s_status;
     }
-}
-
-const char *espix_ssh_fingerprint(void)
-{
-    /* Filled in once ssh_hostkey.c exists. */
-    return "";
 }
