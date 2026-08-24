@@ -197,6 +197,9 @@ esp_err_t ssh_kex_run(ssh_conn_t *c);
  */
 esp_err_t ssh_auth_run(ssh_conn_t *c);
 
+/* Session channel: open, pty-req, shell, then the interactive session. */
+esp_err_t ssh_channel_run(ssh_conn_t *c);
+
 /* Counted so `sshd` status can show them; incremented by ssh_auth.c. */
 void ssh_server_note_rejection(void);
 

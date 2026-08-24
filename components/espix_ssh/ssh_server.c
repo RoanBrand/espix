@@ -217,16 +217,9 @@ static void connection_task(void *arg)
             break;
         }
 
-        /*
-         * Authenticated. The session channel comes next; until then the client
-         * reaches "Authenticated to ..." and then gets this when it tries to
-         * open a channel.
-         */
-        espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "%s logged in; session channel not implemented yet",
-                   c->user);
-        ssh_send_disconnect(c, SSH_DISCONNECT_SERVICE_NOT_AVAILABLE,
-                            "espix: session channel not implemented yet");
+        /* Authenticated: hand the connection to the session channel, which
+         * owns it until the user logs out. */
+        ssh_channel_run(c);
     } while (0);
 
     close(c->fd);
