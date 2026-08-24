@@ -174,6 +174,19 @@ Three things worth knowing:
 - **Credentials in `/etc/wifi.conf` are plaintext.** Consistent with the
   trusted-code-only model: there is no permissions system, and any app can
   already read any file.
+- **Retries back off, and distinguish two kinds of failure.** 5s doubling to a
+  60s ceiling, because a flat interval retried forever splats the prompt every
+  few seconds indefinitely and churns the 96-line klog ring until boot history
+  is gone. The reason code then separates the cases: credential rejections
+  (`AUTH_FAIL`, `HANDSHAKE_TIMEOUT`, `4WAY_HANDSHAKE_TIMEOUT`, `MIC_FAILURE`…)
+  cannot succeed on retry, so espix gives up after four and points at
+  `wifi connect` — but not on the first, since APs do emit spurious handshake
+  timeouts. Everything else (`NO_AP_FOUND` and its threshold variants, beacon
+  timeouts) means "not visible right now", so those retry at the ceiling
+  forever: a headless board must recover on its own when the router comes back,
+  and silently staying offline after a reboot would be worse than the noise the
+  backoff removes. A successful association clears the backoff, so a link that
+  flaps once does not carry a minute-long delay into its next outage.
 
 ### Asynchronous output clobbers the prompt, and that is accepted
 
@@ -335,12 +348,8 @@ costs ~6 KB of format strings).
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style
   line editor.
-- **WiFi retry backoff.** `RETRY_DELAY_MS` is a flat 5s with no limit, so a wrong
-  PSK retries forever, logging a warning each time: it splats the prompt every
-  five seconds indefinitely, and churns the 96-line klog ring so boot history is
-  lost within minutes. wpa_supplicant backs off and eventually gives up; espix
-  should too — widen the interval after a few attempts, and stop after enough
-  failures with a message pointing at `wifi connect`.
+- **WiFi roaming and multiple networks.** One SSID, one AP, no BSSID
+  reselection.
 - **Per-session stdout for loaded apps** — an SSH prerequisite. See the
   `_REENT` note above: an app's `printf()` currently reaches the serial console
   rather than the session that ran it.

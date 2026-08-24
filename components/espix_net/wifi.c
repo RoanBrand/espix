@@ -29,9 +29,26 @@
 #define WIFI_CONF_PATH  "/etc/wifi.conf"
 #define SCAN_MAX        24
 
-/* Retry with a ceiling rather than forever-fast: a wrong PSK should not spin
- * the radio, but a router rebooting should still be recovered from. */
-#define RETRY_DELAY_MS  5000
+/*
+ * Retry policy.
+ *
+ * A flat interval retried forever is wrong in both directions: it splats the
+ * shell prompt every few seconds indefinitely and churns the klog ring so boot
+ * history is lost, while still never succeeding against a bad password.
+ *
+ * So back off — 5s, 10s, 20s, 40s, then 60s forever — and treat two classes of
+ * failure differently, which the reason code tells us apart:
+ *
+ *  - Credentials rejected. More attempts cannot succeed, so give up after a few
+ *    and say so. Not on the first: APs do emit spurious handshake timeouts.
+ *  - Anything else (AP out of range, powered off, rebooting). Keep trying at the
+ *    ceiling forever. A headless board must come back on its own when the router
+ *    returns; silently staying offline after a router reboot would be worse than
+ *    the noise this replaces.
+ */
+#define RETRY_DELAY_MIN_MS   5000
+#define RETRY_DELAY_MAX_MS  60000
+#define RETRY_AUTH_GIVE_UP      4   /* consecutive credential rejections */
 
 static esp_netif_t          *s_sta;
 static espix_wifi_state_t    s_state;
@@ -47,6 +64,45 @@ static esp_timer_handle_t    s_retry_timer;
  * first and only one release is owed.
  */
 static bool s_boot_hold;
+
+/* Retry state, all touched only from the event loop and the shell command. */
+static unsigned s_retry_delay_ms = RETRY_DELAY_MIN_MS;
+static unsigned s_auth_failures;
+static bool     s_gave_up;
+static int      s_last_reason;
+static char     s_ssid[ESPIX_SSID_MAX];
+
+/*
+ * Did the AP reject who we are, as opposed to simply not being there?
+ *
+ * Only the first class is hopeless. NO_AP_FOUND and the various threshold
+ * variants mean "not visible right now", which a router reboot or moving the
+ * board can fix, so those must keep retrying.
+ */
+static bool reason_is_credential(int reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_MIC_FAILURE:
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+    case WIFI_REASON_INVALID_PMKID:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Fresh attempt: forget the backoff and the give-up decision. */
+static void reset_retry_state(void)
+{
+    s_retry_delay_ms = RETRY_DELAY_MIN_MS;
+    s_auth_failures  = 0;
+    s_gave_up        = false;
+    s_retries        = 0;
+}
 
 static void release_boot_hold(void)
 {
@@ -111,8 +167,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
 
     case WIFI_EVENT_STA_CONNECTED: {
         wifi_event_sta_connected_t *ev = data;
-        s_state   = ESPIX_WIFI_CONNECTED;
-        s_retries = 0;
+        s_state = ESPIX_WIFI_CONNECTED;
+        /* Success clears the backoff, so a link that flaps once does not carry
+         * a minute-long delay into its next outage. */
+        reset_retry_state();
         espix_klog(ESPIX_KLOG_INFO, TAG,
                    "wlan0: associated with %.*s on channel %u",
                    ev->ssid_len, (const char *)ev->ssid, ev->channel);
@@ -130,21 +188,52 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
          */
         release_boot_hold();
 
-        if (s_want_connect) {
-            s_retries++;
-            espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "wlan0: disconnected (reason %d), retry %u in %d ms",
-                       ev->reason, s_retries, RETRY_DELAY_MS);
-            /*
-             * Delayed via a timer, NOT vTaskDelay(): this runs on the default
-             * event loop task, so sleeping here would stall every other event
-             * — including the IP events we depend on — and let the event queue
-             * back up. Retrying instantly is also wrong; a bad PSK would spin
-             * the radio and flood the log.
-             */
-            esp_timer_start_once(s_retry_timer, RETRY_DELAY_MS * 1000ULL);
-        } else {
+        if (!s_want_connect) {
             espix_klog(ESPIX_KLOG_INFO, TAG, "wlan0: disconnected");
+            break;
+        }
+
+        s_retries++;
+        s_last_reason = ev->reason;
+
+        if (reason_is_credential(ev->reason)) {
+            s_auth_failures++;
+            if (s_auth_failures >= RETRY_AUTH_GIVE_UP) {
+                /* Retrying cannot help. Stop, and say what to do about it. */
+                s_want_connect  = false;
+                s_gave_up       = true;
+                s_state         = ESPIX_WIFI_IDLE;
+                s_retry_delay_ms = 0;
+                espix_klog(ESPIX_KLOG_ERROR, TAG,
+                           "wlan0: %s rejected our credentials %u times "
+                           "(reason %d); giving up",
+                           s_ssid, s_auth_failures, ev->reason);
+                espix_klog(ESPIX_KLOG_ERROR, TAG,
+                           "wlan0: fix /etc/wifi.conf and run 'wifi connect'");
+                break;
+            }
+        } else {
+            /* Transient: an AP that is absent now may return. */
+            s_auth_failures = 0;
+        }
+
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "wlan0: disconnected (reason %d), retry %u in %u ms",
+                   ev->reason, s_retries, s_retry_delay_ms);
+
+        /*
+         * Delayed via a timer, NOT vTaskDelay(): this runs on the default event
+         * loop task, so sleeping here would stall every other event — including
+         * the IP events we depend on — and let the event queue back up.
+         */
+        esp_timer_start_once(s_retry_timer, s_retry_delay_ms * 1000ULL);
+
+        /* Double for next time, to the ceiling. */
+        if (s_retry_delay_ms < RETRY_DELAY_MAX_MS) {
+            s_retry_delay_ms *= 2;
+            if (s_retry_delay_ms > RETRY_DELAY_MAX_MS) {
+                s_retry_delay_ms = RETRY_DELAY_MAX_MS;
+            }
         }
         break;
     }
@@ -339,8 +428,11 @@ esp_err_t espix_net_wifi_connect(const char *ssid, const char *psk)
     }
 
     s_want_connect = true;
-    s_retries      = 0;
     s_state        = ESPIX_WIFI_CONNECTING;
+    strlcpy(s_ssid, ssid, sizeof(s_ssid));
+
+    /* An explicit connect is a fresh start, including after giving up. */
+    reset_retry_state();
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "wlan0: connecting to %s", ssid);
 
@@ -416,8 +508,12 @@ esp_err_t espix_net_wifi_status(espix_wifi_status_t *out)
     }
 
     memset(out, 0, sizeof(*out));
-    out->state   = s_sta ? s_state : ESPIX_WIFI_OFF;
-    out->retries = s_retries;
+    out->state       = s_sta ? s_state : ESPIX_WIFI_OFF;
+    out->retries     = s_retries;
+    out->gave_up     = s_gave_up;
+    out->last_reason = s_last_reason;
+    out->retry_delay_ms =
+        (s_want_connect && s_state != ESPIX_WIFI_CONNECTED) ? s_retry_delay_ms : 0;
 
     wifi_ap_record_t ap;
     if (s_state == ESPIX_WIFI_CONNECTED &&

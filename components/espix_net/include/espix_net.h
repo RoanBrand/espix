@@ -112,6 +112,16 @@ typedef struct {
     int8_t             rssi;
     uint8_t            channel;
     unsigned           retries;
+
+    /*
+     * Why we stopped, when state is IDLE after failures. Without this an
+     * abandoned connect is indistinguishable from never having tried.
+     * `last_reason` is a wifi_err_reason_t, kept as int so this header does
+     * not drag in esp_wifi.
+     */
+    bool               gave_up;
+    int                last_reason;
+    unsigned           retry_delay_ms;   /* 0 when no retry is pending */
 } espix_wifi_status_t;
 
 /*

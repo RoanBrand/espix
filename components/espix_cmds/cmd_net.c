@@ -387,7 +387,8 @@ static int wifi_status(espix_session_t *s)
         return 1;
     }
 
-    espix_printf(s, "state:  %s\n", wifi_state_str(st.state));
+    espix_printf(s, "state:  %s%s\n", wifi_state_str(st.state),
+                 st.gave_up ? " (gave up)" : "");
     if (st.ssid[0] != '\0') {
         espix_printf(s, "ssid:   %s\n", st.ssid);
     }
@@ -395,7 +396,15 @@ static int wifi_status(espix_session_t *s)
         espix_printf(s, "signal: %d dBm\nchannel: %u\n", st.rssi, st.channel);
     }
     if (st.retries > 0) {
-        espix_printf(s, "retries: %u\n", st.retries);
+        espix_printf(s, "retries: %u (last reason %d)\n",
+                     st.retries, st.last_reason);
+    }
+    if (st.retry_delay_ms > 0) {
+        espix_printf(s, "next try: in up to %u s\n", st.retry_delay_ms / 1000);
+    }
+    if (st.gave_up) {
+        espix_printf(s, "         credentials rejected; fix /etc/wifi.conf "
+                        "and run 'wifi connect'\n");
     }
 
     espix_ifinfo_t info;
