@@ -200,45 +200,60 @@ static int console_write(espix_session_t *s, const char *data, size_t len)
 /* ------------------------------------------------------------------ */
 
 /*
- * Hold the first prompt until the kernel log has been quiet for a moment.
+ * Hold the FIRST prompt — and only the first — until boot has settled.
  *
- * Boot kicks off asynchronous work — a WiFi association, DHCP — that narrates
- * itself from other tasks. Drawing the prompt while that is in flight means it
- * is immediately overwritten, and since the session task then blocks inside
- * linenoise() (whose refreshLine() is static, so no outside caller can force a
- * redraw) the prompt stays stranded until the user presses Enter. Every boot,
- * as the first thing anyone sees.
+ * Boot kicks off asynchronous work that narrates itself from other tasks.
+ * Drawing the prompt while that is in flight means it is immediately
+ * overwritten, and since the session task then blocks inside linenoise() (whose
+ * refreshLine() is static, so no outside caller can force a redraw) the prompt
+ * stays stranded until the user presses Enter. Every boot, as the first thing
+ * anyone sees.
  *
- * Waiting on log silence rather than on the network keeps this subsystem-
- * agnostic and self-limiting: nothing here knows or cares what is booting.
+ * An earlier version waited purely for the kernel log to fall silent for 300ms.
+ * That releases too early, because the boot log has silent gaps of its own: WiFi
+ * association and the DHCP lease are ~1 to 1.4s apart, so the gate let go in the
+ * middle and the address lines landed on the fresh prompt. Log silence is a bad
+ * proxy for "settled" when the thing being waited on goes quiet mid-way, and no
+ * constant window fixes that — DHCP timing belongs to the AP, not to us.
+ *
+ * So the signal is now declared, not inferred: subsystems hold the kernel's boot
+ * barrier across their own asynchronous bring-up. The quiet window survives only
+ * as a small tail, so the banner is not glued to the last message.
+ *
+ * This is the console's own concern, not the shell's. It runs once, before the
+ * session loop is entered, and no other transport uses it: an SSH session can
+ * only exist after the network is up, and kernel messages never reach it anyway.
  */
-#define QUIET_WINDOW_MS 300
-#define QUIET_CAP_MS    3000
-#define QUIET_POLL_MS   50
+#define SETTLE_TAIL_MS 250
+#define SETTLE_CAP_MS  5000
+#define SETTLE_POLL_MS 50
 
-static void wait_for_quiet_log(void)
+static void wait_for_boot_settled(void)
 {
     const uint32_t start = esp_log_timestamp();
 
     for (;;) {
-        const uint32_t now  = esp_log_timestamp();
+        const uint32_t now = esp_log_timestamp();
+
+        /* Backstop only. Reached when a holder never resolves — an AP that is
+         * powered off answers neither association nor disconnect promptly — and
+         * a shell that never starts is worse than a clobbered prompt. */
+        if ((now - start) >= SETTLE_CAP_MS) {
+            return;
+        }
+
+        if (espix_kernel_boot_pending() > 0) {
+            vTaskDelay(pdMS_TO_TICKS(SETTLE_POLL_MS));
+            continue;
+        }
+
+        /* Settled. Let the tail of the log drain so the banner starts clean. */
         const uint32_t last = espix_klog_last_echo_ms();
-
-        if (last != 0 && (now - last) >= QUIET_WINDOW_MS) {
-            return;
-        }
-        /* Nothing has been echoed at all: no reason to wait. */
-        if (last == 0 && (now - start) >= QUIET_WINDOW_MS) {
-            return;
-        }
-        /* Cap matters when something logs on a repeating schedule — an
-         * unreachable AP retries every few seconds, which would otherwise keep
-         * resetting the window and never let the console start at all. */
-        if ((now - start) >= QUIET_CAP_MS) {
+        if (last == 0 || (now - last) >= SETTLE_TAIL_MS) {
             return;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(QUIET_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(SETTLE_POLL_MS));
     }
 }
 
@@ -282,7 +297,7 @@ esp_err_t espix_console_session_start(void)
 #endif
               );
 
-    wait_for_quiet_log();
+    wait_for_boot_settled();
 
     /* Fixed text rather than /etc/motd, which exists in the rootfs but is
      * deliberately not read yet. Printing it here is where it belongs — that

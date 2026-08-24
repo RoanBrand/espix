@@ -62,6 +62,25 @@ typedef struct {
  */
 void espix_kernel_early_init(void);
 
+/*
+ * Boot barrier.
+ *
+ * A subsystem whose bring-up continues asynchronously past its init call takes
+ * a hold, and releases it once it has settled one way or the other. Its only
+ * consumer is the console transport, which uses it to avoid drawing its first
+ * prompt into the middle of boot chatter — asynchronous output would overwrite
+ * it, and the session task is then blocked inside a line editor that offers no
+ * way to redraw.
+ *
+ * Deliberately a plain count rather than a set of named events: the shell must
+ * not need to know what is booting, and eth0/usb0/an SSH listener should slot in
+ * without it learning. Holders must guarantee a release on every path, including
+ * failure — the console's cap is a backstop, not the mechanism.
+ */
+void     espix_kernel_boot_hold(void);
+void     espix_kernel_boot_release(void);
+unsigned espix_kernel_boot_pending(void);
+
 /* Boot banner, written to stdout. Called once, before any session exists. */
 void espix_kernel_print_banner(void);
 

@@ -40,6 +40,22 @@ static bool                  s_want_connect;
 static EventGroupHandle_t    s_events;
 static esp_timer_handle_t    s_retry_timer;
 
+/*
+ * Boot barrier hold, taken only for the connect started at boot. Released once
+ * this interface has settled — either it has an address, or it has failed once
+ * and is now in a retry loop. Idempotent, because either outcome can arrive
+ * first and only one release is owed.
+ */
+static bool s_boot_hold;
+
+static void release_boot_hold(void)
+{
+    if (s_boot_hold) {
+        s_boot_hold = false;
+        espix_kernel_boot_release();
+    }
+}
+
 #define BIT_SCAN_DONE  BIT0
 
 /* Fires off the timer task, not the event loop, so calling back into
@@ -107,6 +123,13 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
         wifi_event_sta_disconnected_t *ev = data;
         s_state = s_want_connect ? ESPIX_WIFI_CONNECTING : ESPIX_WIFI_IDLE;
 
+        /*
+         * Boot is no longer settling once we have failed once: s_want_connect
+         * keeps us retrying forever, so there is no later "gave up" event to
+         * wait for, and holding the console until the cap would be wrong.
+         */
+        release_boot_hold();
+
         if (s_want_connect) {
             s_retries++;
             espix_klog(ESPIX_KLOG_WARN, TAG,
@@ -159,6 +182,10 @@ static void on_ip_event(void *arg, esp_event_base_t base,
             espix_klog(ESPIX_KLOG_INFO, TAG, "wlan0: nameserver %s",
                        espix_net_ip4str(dns[i], d, sizeof(d)));
         }
+
+        /* Last: the interface is fully up, and this is the message the console
+         * has been holding its first prompt for. */
+        release_boot_hold();
     } else if (id == IP_EVENT_STA_LOST_IP) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "wlan0: lost address");
     }
@@ -260,7 +287,20 @@ esp_err_t espix_net_wifi_start(void)
     }
 
     espix_net_conf_get(WIFI_CONF_PATH, "psk", psk, sizeof(psk));
-    return espix_net_wifi_connect(ssid, psk);
+
+    /*
+     * Only the boot connect holds the barrier. A later `wifi connect` from the
+     * shell must not — the console is already running by then, and there is
+     * nothing left to gate.
+     */
+    s_boot_hold = true;
+    espix_kernel_boot_hold();
+
+    const esp_err_t cerr = espix_net_wifi_connect(ssid, psk);
+    if (cerr != ESP_OK) {
+        release_boot_hold();
+    }
+    return cerr;
 }
 
 esp_err_t espix_net_wifi_connect(const char *ssid, const char *psk)

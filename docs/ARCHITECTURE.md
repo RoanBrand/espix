@@ -205,16 +205,50 @@ than a fixed list of quieted tags. Deferred.
 One case is not left alone, because it is not occasional: at boot the splat is
 *guaranteed*. `espix_console_session_start()` would draw its first prompt about a
 second in, while the WiFi association and DHCP it kicked off are still narrating.
-So the console holds its first prompt until klog has been quiet for ~300ms,
-capped at ~3s (`wait_for_quiet_log()` in
-[tty_console.c](../components/espix_shell/tty_console.c), reading
-`espix_klog_last_echo_ms()`).
+So the console holds its **first** prompt until boot has settled —
+`wait_for_boot_settled()` in
+[tty_console.c](../components/espix_shell/tty_console.c).
 
-It waits on **log silence, not on the network** — deliberately. Nothing in the
-shell should know what is booting, and a wait on quiescence is self-limiting
-where a wait on an interface is not. The cap earns its place when something logs
-on a schedule: an unreachable AP retries every few seconds, which would reset the
-window forever and mean the console never starts at all.
+The signal is *declared, not inferred*. `espix_kernel` keeps a boot-barrier count
+(`espix_kernel_boot_hold()` / `_release()` / `_pending()`); a subsystem whose
+bring-up continues past its init call takes a hold and drops it once it has
+settled either way. `espix_net` holds across the boot connect and releases on
+`IP_EVENT_STA_GOT_IP`, or on the first `WIFI_EVENT_STA_DISCONNECTED` — after one
+failure the retry loop is not "settling" and the shell should come up. A later
+`wifi connect` from the shell takes no hold at all.
+
+A plain count, rather than the console asking `espix_net` anything: `eth0`,
+`usb0` and an SSH listener are coming, and each should be able to declare its own
+bring-up without the shell learning about it.
+
+**Worth recording, because the obvious approach fails.** The first attempt waited
+purely for klog to fall silent for 300ms. It releases too early on real hardware:
+association and the DHCP lease are 1 to 1.4s apart, so the gate let go inside
+that gap and the address lines landed on a freshly drawn prompt. Log silence is a
+bad proxy for "settled" when the thing being waited on goes quiet mid-way, and no
+constant window fixes it — DHCP timing belongs to the AP. A 250ms quiet tail
+survives only so the banner is not glued to the last message.
+
+The cap (~5s) is a backstop, not the mechanism: an AP that is powered off answers
+neither association nor disconnect promptly, and a shell that never starts is
+worse than a clobbered prompt.
+
+Note which failures the cap does *not* cover, because it is easy to think you
+have tested it when you have not. A wrong PSK raises
+`WIFI_EVENT_STA_DISCONNECTED` with `WIFI_REASON_HANDSHAKE_TIMEOUT` (204) or
+`WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT` (15); an SSID that does not exist raises the
+*same event* with `WIFI_REASON_NO_AP_FOUND` (201). Both therefore resolve through
+release-on-first-disconnect, promptly. The cap is reached only when a hold is
+taken and neither GOT_IP nor a disconnect arrives at all — in practice
+"associated, but DHCP never answers", which needs an AP with DHCP disabled to
+reproduce. It is accepted on inspection rather than tested on hardware: the check
+is the first, unconditional statement in the loop, so no holder can bypass it,
+and the unsigned millisecond arithmetic is wrap-safe.
+
+Scope is deliberately narrow: once, before the session loop is entered, in the
+console transport only. `session.c` — the part SSH will share — has no gate, and
+an SSH session needs none, since it can only exist after the network is up and
+kernel messages never reach it anyway.
 
 ### Kernel messages go to the console, command output goes to the session
 
@@ -298,6 +332,15 @@ costs ~6 KB of format strings).
 - **A working directory for apps** — see the app ABI note above.
 - **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
   quieted driver tags.
+- **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
+  which is why it has not bitten yet, but anything larger wants an `ed`-style
+  line editor.
+- **WiFi retry backoff.** `RETRY_DELAY_MS` is a flat 5s with no limit, so a wrong
+  PSK retries forever, logging a warning each time: it splats the prompt every
+  five seconds indefinitely, and churns the 96-line klog ring so boot history is
+  lost within minutes. wpa_supplicant backs off and eventually gives up; espix
+  should too — widen the interval after a few attempts, and stop after enough
+  failures with a message pointing at `wifi connect`.
 - **Per-session stdout for loaded apps** — an SSH prerequisite. See the
   `_REENT` note above: an app's `printf()` currently reaches the serial console
   rather than the session that ran it.

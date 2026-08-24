@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_idf_version.h"
@@ -96,6 +98,42 @@ size_t espix_uptime_str(char *buf, size_t len)
     }
     return (size_t)snprintf(buf, len, "up %d min", mins);
 }
+
+/* ------------------------------------------------------------------ */
+/* Boot barrier                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Guarded by a spinlock rather than left as a bare volatile: holds and releases
+ * come from different tasks (init on the main task, release from the event
+ * loop), so the increment must not be split. */
+static unsigned     s_boot_pending;
+static portMUX_TYPE s_boot_lock = portMUX_INITIALIZER_UNLOCKED;
+
+void espix_kernel_boot_hold(void)
+{
+    portENTER_CRITICAL_SAFE(&s_boot_lock);
+    s_boot_pending++;
+    portEXIT_CRITICAL_SAFE(&s_boot_lock);
+}
+
+void espix_kernel_boot_release(void)
+{
+    portENTER_CRITICAL_SAFE(&s_boot_lock);
+    if (s_boot_pending > 0) {
+        s_boot_pending--;
+    }
+    portEXIT_CRITICAL_SAFE(&s_boot_lock);
+}
+
+unsigned espix_kernel_boot_pending(void)
+{
+    portENTER_CRITICAL_SAFE(&s_boot_lock);
+    const unsigned n = s_boot_pending;
+    portEXIT_CRITICAL_SAFE(&s_boot_lock);
+    return n;
+}
+
+/* ------------------------------------------------------------------ */
 
 void espix_kernel_early_init(void)
 {
