@@ -1,6 +1,11 @@
 dependencies:
+  # 6.1, not "5.0 or newer". espix's SSH and password hashing are written
+  # against PSA Crypto, which arrives with Mbed TLS 4.x / TF-PSA-Crypto in IDF
+  # 6.1; espix_kernel names CHIP_ESP32S31, added in the same release. Declaring
+  # this here means the component manager refuses with one clear line instead of
+  # letting an older IDF fail deep in a compile.
   idf:
-    version: ">=5.0"
+    version: ">=6.1"
 
   # Root filesystem. VFS-backed, so apps get plain fopen()/opendir().
   joltwallet/littlefs: "==1.22.3"

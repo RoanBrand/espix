@@ -5,8 +5,8 @@ story lives, and right now that story is "rebuild the filesystem image".
 
 ## Deploying an app today
 
-There is no SCP yet (roadmap item 4), so apps reach the device by being baked
-into the rootfs image and flashed:
+There is no SCP yet (deferred under roadmap item 5), so apps reach the device
+by being baked into the rootfs image and flashed:
 
 ```bash
 # 1. Build the app (a standalone IDF project producing a loadable ELF)

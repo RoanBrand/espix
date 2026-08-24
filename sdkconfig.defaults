@@ -2,10 +2,10 @@
 # Per-target settings live in sdkconfig.defaults.<target>.
 
 #
-# Partition table
+# Partition table. The layout itself is per-target and per-board, so the
+# filename is set in sdkconfig.defaults.<target> and overridden by boards/.
 #
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 #
 # FreeRTOS — needed for `ps` / `top` style introspection.

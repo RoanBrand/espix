@@ -375,7 +375,8 @@ costs ~6 KB of format strings).
   `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
   the network. Changing this later means reflashing everything, so it is worth
   deciding before the layout is in the field. A commented-out variant is in
-  `partitions.csv`.
+  [partitions/esp32s3-16mb.csv](../partitions/esp32s3-16mb.csv); the 8MB table
+  notes why the same shape does not fit there.
 - **Per-app heap arenas.** The allocation path in `espix_proc` is the seam.
   Would shrink the blast radius of a crashing app without needing an MMU.
 - **A real `top`.** `ps` reports cumulative CPU share since boot; an

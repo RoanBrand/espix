@@ -1,0 +1,22 @@
+# espix partition table — ESP32-S3, 8MB flash.
+#
+# Layout fills the flash exactly; last byte is 0x7FFFFF (ends at 0x800000).
+# The partition table itself lives at 0x8000 (CONFIG_PARTITION_TABLE_OFFSET).
+#
+# The app partition is 3MB rather than the 16MB layout's 4MB: espix.bin is
+# around 1MB today, so 3MB is ample headroom while leaving the rootfs a useful
+# size on a part half as large. Everything else matches the 16MB table, so a
+# core dump and the nvs layout behave identically across boards.
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+phy_init,   data, phy,      0xf000,    0x1000,
+factory,    app,  factory,  0x10000,   0x300000,
+coredump,   data, coredump, 0x310000,  0x10000,
+storage,    data, littlefs, 0x320000,  0x4E0000,
+
+# ---------------------------------------------------------------------------
+# OTA does not fit here in the form the 16MB table sketches: two 3MB slots plus
+# the rootfs would overrun 8MB. An 8MB board wanting OTA needs smaller app
+# slots (2MB each) and a ~3.8MB rootfs. Not written out because it has not been
+# needed; see partitions/esp32s3-16mb.csv for the shape.

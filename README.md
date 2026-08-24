@@ -177,29 +177,83 @@ display, networking) still to be finalized as the design matures.
 
 ## Building
 
-Requires ESP-IDF v6.1 or newer.
+**Requires ESP-IDF v6.1**, checked out by tag. It is still a beta, so a fresh
+`install.sh` on Ubuntu gives you 5.x or 6.0 unless you ask for it — and those
+will not work: espix's SSH and password hashing are written against PSA Crypto,
+which arrives with Mbed TLS 4.x in 6.1. Older releases are refused up front with
+a clear message rather than failing halfway through a compile.
 
 ```bash
 . $IDF_PATH/export.sh
-idf.py set-target esp32s3        # see Hardware Targets
+idf.py set-target esp32s3          # see Hardware Targets
 idf.py build
-idf.py -p <port> flash monitor
+idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-`idf.py flash` updates the firmware only. The filesystem is a separate
-image, flashed explicitly — a plain firmware flash deliberately leaves
-whatever is on the device alone:
+There is no separate download or configure step. `set-target` fetches the
+managed components (`elf_loader`, `littlefs`) at the versions pinned in
+`dependencies.lock` — it needs network the first time — and generates
+`sdkconfig` from the `sdkconfig.defaults*` files. No `menuconfig` required.
+
+`idf.py flash` updates the firmware only. The filesystem is a separate image,
+flashed explicitly — a plain firmware flash deliberately leaves whatever is on
+the device alone:
 
 ```bash
-idf.py -p <port> storage-flash   # WARNING: replaces the whole rootfs
+idf.py -p /dev/ttyUSB0 storage-flash   # WARNING: replaces the whole rootfs
 ```
 
 To build and deploy an app, see [tools/README.md](tools/README.md).
 
-Board assumptions live in
-[sdkconfig.defaults.esp32s3](sdkconfig.defaults.esp32s3) (16MB flash,
-8MB octal PSRAM) and [partitions.csv](partitions.csv) (4MB app,
-11.9MB rootfs).
+### On Linux
+
+Two things bite most people before anything espix-specific does:
+
+- Your user must be in the `dialout` group to open `/dev/ttyUSB0`, otherwise
+  esptool fails with a permission error: `sudo usermod -aG dialout $USER`, then
+  log out and back in.
+- On Ubuntu 22.04 and newer, `brltty` claims CH340 and CP210x adapters as
+  braille displays, and the port vanishes seconds after you plug it in.
+  `sudo apt remove brltty` if you do not use a braille display.
+
+### Board variants
+
+The default targets an **N16R8** module — 16MB flash, 8MB octal PSRAM, as on the
+ESP32-S3-DevKitC-1 v1.1. That is the only variant espix has actually been run
+on; the rest are build-verified only.
+
+For a different module, add a file from [boards/](boards/) to
+`SDKCONFIG_DEFAULTS`:
+
+```bash
+SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/esp32s3-n8r2.conf" \
+    idf.py set-target esp32s3
+idf.py build
+```
+
+| File | Module | Flash | PSRAM |
+|---|---|---|---|
+| *(none — the default)* | N16R8 | 16MB | 8MB octal |
+| [boards/esp32s3-n8r8.conf](boards/esp32s3-n8r8.conf) | N8R8 | 8MB | 8MB octal |
+| [boards/esp32s3-n8r2.conf](boards/esp32s3-n8r2.conf) | N8R2 | 8MB | 2MB quad |
+| [boards/esp32s3-n8.conf](boards/esp32s3-n8.conf) | N8 | 8MB | none — see below |
+
+PSRAM *size* is detected at runtime, so a board file only states quad vs octal.
+Listing `sdkconfig.defaults` first matters: the build system pulls in its
+target-specific twin `sdkconfig.defaults.esp32s3` right after it, so the board
+file lands last and overrides. Partition tables live in
+[partitions/](partitions/) and are selected by the board file — 4MB app and
+11.9MB rootfs on 16MB parts, 3MB and 4.9MB on 8MB parts.
+
+**Switching boards later needs `set-target` re-run.** The defaults files only
+seed a *new* `sdkconfig`; editing them, or adding a board file, does nothing to
+one that already exists.
+
+A board with **no PSRAM** will build, and both the ELF loader and espix's own
+image buffer fall back to internal RAM on their own — but WiFi, lwIP, SSH and
+the app image then compete for ~343K of internal heap instead of 8MB. Expect
+small apps to work and larger ones to fail on allocation. Untested; reports
+welcome.
 
 ## First boot
 
