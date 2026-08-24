@@ -31,7 +31,7 @@
 #define HASH_LEN        32
 #define PBKDF2_ITERS    20000   /* ~100ms on a 240MHz S3; tune if login drags */
 
-#define DEFAULT_USER    "esp"
+#define DEFAULT_USER    ESPIX_AUTH_DEFAULT_USER
 #define DEFAULT_PASS    "espix"
 #define DEFAULT_HOME    "/home/esp"
 

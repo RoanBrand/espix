@@ -5,6 +5,7 @@ idf_component_register(
         "cmd_sys.c"
         "cmd_run.c"
         "cmd_net.c"
+        "cmd_motd.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

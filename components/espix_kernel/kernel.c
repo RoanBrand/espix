@@ -7,7 +7,6 @@
 
 #include "freertos/FreeRTOS.h"
 
-#include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_idf_version.h"
 #include "esp_timer.h"
@@ -54,6 +53,13 @@ static const char *chip_model_name(esp_chip_model_t model)
     case CHIP_ESP32S31: return "ESP32-S31";
     default:           return CONFIG_IDF_TARGET;
     }
+}
+
+const char *espix_chip_model(void)
+{
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    return chip_model_name(chip.model);
 }
 
 size_t espix_uname(char *buf, size_t len, bool all)
@@ -140,21 +146,4 @@ void espix_kernel_early_init(void)
     espix_klog_install_esp_log_hook();
     espix_klog(ESPIX_KLOG_INFO, TAG, "espix %s starting on %s",
                s_version, CONFIG_IDF_TARGET);
-}
-
-void espix_kernel_print_banner(void)
-{
-    char uname[96];
-    espix_uname(uname, sizeof(uname), true);
-
-    const esp_app_desc_t *app = esp_app_get_description();
-
-    printf("\n"
-           "  ___  ___ _ __ (_)_  __\n"
-           " / _ \\/ __| '_ \\| \\ \\/ /   %s\n"
-           "|  __/\\__ \\ |_) | |>  <    built %s %s\n"
-           " \\___||___/ .__/|_/_/\\_\\\n"
-           "          |_|\n\n",
-           uname,
-           app ? app->date : "?", app ? app->time : "?");
 }

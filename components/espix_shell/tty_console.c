@@ -265,7 +265,8 @@ esp_err_t espix_console_session_start(void)
      * a full line before we ever see a keystroke. */
     setvbuf(stdin, NULL, _IONBF, 0);
 
-    if (linenoiseProbe() != 0) {
+    const bool ansi = (linenoiseProbe() == 0);
+    if (!ansi) {
         linenoiseSetDumbMode(1);
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "terminal lacks escape sequences; line editing disabled");
@@ -285,6 +286,7 @@ esp_err_t espix_console_session_start(void)
         .read_line = console_read_line,
         .write     = console_write,
         .fg_pid    = ESPIX_PID_NONE,
+        .ansi      = ansi,
         /* No stdio rebinding: linenoise owns stdin and output goes through
          * stdio, so a spawned app inherits the global streams — which for the
          * console is already the right place. */
@@ -303,13 +305,16 @@ esp_err_t espix_console_session_start(void)
 
     wait_for_boot_settled();
 
-    /* Fixed text rather than /etc/motd, which exists in the rootfs but is
-     * deliberately not read yet. Printing it here is where it belongs — that
-     * is what a message of the day is — but it only starts earning its keep
-     * once there are sessions worth logging into, i.e. SSH. */
-    espix_printf(&s_console,
-                 "Type 'help' for the command list. TAB completes, UP/DOWN "
-                 "walks history.\n\n");
+    /*
+     * The same greeting an SSH session gets, reached through the ordinary
+     * dispatch so this file needs no knowledge of what is in it.
+     *
+     * /etc/motd is still not read: the greeting now occupies that slot, and
+     * printing the file's directory guide at every login would be noise. It
+     * remains available with `cat /etc/motd`, and if it should appear here
+     * later it belongs directly under the spec block.
+     */
+    espix_shell_exec(&s_console, "motd");
 
     espix_shell_session_run(&s_console);
 

@@ -657,17 +657,14 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .write     = chan_write,
         .transport = &ch,
         .fg_pid    = ESPIX_PID_NONE,
+        .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,
     };
     strlcpy(session.user, c->user, sizeof(session.user));
 
-    espix_printf(&session, "espix %s\n", espix_version());
-    if (espix_auth_is_default()) {
-        espix_printf(&session,
-                     "warning: '%s' still has the default password\n",
-                     c->user);
-    }
-    espix_printf(&session, "\n");
+    /* Identical to what the serial console prints, by construction: both go
+     * through the same command. */
+    espix_shell_exec(&session, "motd");
 
     espix_shell_session_run(&session);
 

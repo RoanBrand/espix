@@ -316,6 +316,26 @@ Redirection is deliberately *not* wired into this: `session->redirect` is closed
 when the command returns, and `run app > file &` would leave an app holding a
 dead `FILE *`. So `>` still captures a command's output and not an app's.
 
+### The login greeting is a command
+
+Both transports open with the same fetch-style block — logo left, system facts
+right — and neither renders it. `espix_shell_exec(s, "motd")` does, from
+[cmd_motd.c](../components/espix_cmds/cmd_motd.c).
+
+That indirection is the point. Reporting uptime, heap, rootfs usage and an IP
+address means depending on `espix_kernel`, `espix_net`, `espix_fs` and `heap`;
+`espix_cmds` already does, while `espix_shell` and `espix_ssh` do not and should
+not acquire those dependencies to draw a banner. Routing through the registry
+keeps the arrows pointing one way, and makes the greeting re-runnable as
+`motd`, which is what anyone reaching for `fastfetch` wants anyway.
+
+Colour is gated on `session->ansi`, which the transport sets: the console takes
+it from `linenoiseProbe()`, an SSH session always has a pty here.
+
+There is no boot-time banner. The console session prints the greeting once the
+boot barrier releases, so boot shows kernel log lines and then a login — the
+order Unix uses, and the reason the two no longer overwrite each other.
+
 ### The app network ABI is ours
 
 lwip's `getaddrinfo`, `inet_ntop` and `ntohs` are *macros* over

@@ -21,6 +21,10 @@
 extern "C" {
 #endif
 
+/* The account seeded on first boot, named here so the login greeting can say
+ * which one still carries the shipped password. */
+#define ESPIX_AUTH_DEFAULT_USER "esp"
+
 #define ESPIX_USER_MAX      17      /* 16 + NUL */
 #define ESPIX_PASSWORD_MAX  65      /* 64 + NUL */
 

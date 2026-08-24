@@ -76,6 +76,13 @@ struct espix_session {
     /* Write raw bytes. Returns bytes written, or negative on error. */
     int (*write)(espix_session_t *s, const char *data, size_t len);
 
+    /*
+     * The terminal understands escape sequences. Set by the transport: the
+     * console learns it from linenoiseProbe(), an SSH session always has a pty
+     * in this build. Colour is emitted only when this is set.
+     */
+    bool        ansi;
+
     void       *transport;                 /* implementation-owned */
     espix_pid_t fg_pid;                    /* foreground process, or ESPIX_PID_NONE */
     int         last_status;               /* $? */

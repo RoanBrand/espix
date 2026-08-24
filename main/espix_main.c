@@ -37,7 +37,6 @@
 void app_main(void)
 {
     espix_kernel_early_init();
-    espix_kernel_print_banner();
 
     ESP_ERROR_CHECK(espix_fault_init());
     ESP_ERROR_CHECK(espix_fs_mount_root());

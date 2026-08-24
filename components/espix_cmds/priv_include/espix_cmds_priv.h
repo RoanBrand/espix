@@ -14,6 +14,10 @@ void espix_cmds_register_fs(void);
 void espix_cmds_register_sys(void);
 void espix_cmds_register_run(void);
 void espix_cmds_register_net(void);
+void espix_cmds_register_motd(void);
+
+/* The greeting every session opens with; also the `motd` command. */
+void espix_cmds_print_greeting(espix_session_t *s);
 
 /*
  * Resolve argv[i] against the session's cwd, reporting to the session and

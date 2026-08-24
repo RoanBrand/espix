@@ -81,11 +81,9 @@ void     espix_kernel_boot_hold(void);
 void     espix_kernel_boot_release(void);
 unsigned espix_kernel_boot_pending(void);
 
-/* Boot banner, written to stdout. Called once, before any session exists. */
-void espix_kernel_print_banner(void);
-
 const char *espix_version(void);        /* "0.1.0" */
 const char *espix_target(void);         /* "esp32s3" */
+const char *espix_chip_model(void);     /* "ESP32-S3" */
 int64_t espix_uptime_us(void);
 
 /*
