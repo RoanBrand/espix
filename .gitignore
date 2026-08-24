@@ -16,6 +16,7 @@ fsroot/bin/*
 !fsroot/bin/.keep
 
 # Editors / tooling
+.DS_Store
 .cache/
 .vscode/
 .continue/

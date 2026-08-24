@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.png" alt="Repository Header Banner" width="80%" max-width="800px">
+  <img src="docs/banner.png" alt="espix login greeting: ASCII logo beside OS, host, uptime, memory, storage and network" width="80%" max-width="800px">
 </p>
 
 # espix
@@ -18,11 +18,20 @@ environment purpose-built for ESP-IDF.
 
 Early, but running on hardware. Verified on an ESP32-S3 (16MB flash,
 8MB octal PSRAM) with ESP-IDF v6.1-beta1: LittleFS mounted as the real
-`/`, a transport-agnostic shell with ~23 commands, a process table, and
+`/`, a transport-agnostic shell with ~32 commands, a process table, and
 — the point of the exercise — an app cross-compiled on a PC, deployed
 as a file, and loaded and executed at runtime by the ELF loader, with
 argv and an exit status. Files created on the device survive a reboot
 and a firmware reflash.
+
+Networking works: WiFi station comes up as `wlan0`, takes a DHCP lease,
+installs a default route, and `ping` resolves names. On top of it runs an
+SSH server, so `ssh esp@esp32s3-cb5d74` reaches the same shell the serial
+console gets — same commands, same output, and an app's `printf()` lands
+in the session that ran it rather than on the console. See
+[First boot](#first-boot) to get there, and read
+[the note on the SSH server](#a-word-on-the-ssh-server) before putting one
+on an untrusted network.
 
 Fault interception is wired but only *reports*; it does not yet keep the
 system up (see [Crash Handling &
@@ -153,11 +162,17 @@ display, networking) still to be finalized as the design matures.
    on hardware with argv and an exit status.
 4. Make a crashing app actually not crash the system (the reaper, held
    locks, per-process resource ownership).
-5. Networking. WiFi station is up: `wlan0` appears in `ip addr`, takes a
-   DHCP lease, installs a default route, and `ping` works by name and by
-   address. Ethernet (P4/S31) and USB-NCM are next. Then SSH/SCP — which
-   is what turns the session abstraction into more than one session.
-6. `top`/`htop`-style live stats, a fuller command surface, pipes and
+5. ~~Networking, and a shell over it.~~ Done for WiFi: `wlan0` appears in
+   `ip addr`, takes a DHCP lease, installs a default route, `ping` works
+   by name and by address, and an SSH server serves the same shell as the
+   console. Ethernet (P4/S31) and USB-NCM are still to come, as are
+   SCP/SFTP and publickey authentication.
+6. A reentrant line editor, replacing linenoise on both transports.
+   linenoise reads and writes raw file descriptors and keeps its history
+   and callbacks in file-scope statics, so it cannot serve a connection
+   whose bytes arrive inside encrypted SSH packets — which is why an SSH
+   session today has no history or tab completion.
+7. `top`/`htop`-style live stats, a fuller command surface, pipes and
    job control.
 
 ## Building
@@ -185,6 +200,92 @@ Board assumptions live in
 [sdkconfig.defaults.esp32s3](sdkconfig.defaults.esp32s3) (16MB flash,
 8MB octal PSRAM) and [partitions.csv](partitions.csv) (4MB app,
 11.9MB rootfs).
+
+## First boot
+
+Flash the firmware and the rootfs together the first time, then watch it
+come up:
+
+```bash
+idf.py -p <port> flash storage-flash monitor
+```
+
+Boot prints kernel messages, then the console session prints the greeting at
+the top of this README — with `Network` reading `not connected` until you
+join one.
+
+`help` lists every command; `motd` reprints that block at any time.
+
+### Joining a WiFi network
+
+Credentials live in `/etc/wifi.conf` on the rootfs. Set them once, from the
+serial console:
+
+```
+espix:/# wifi connect <ssid> <passphrase>
+```
+
+That associates immediately *and* writes the file, so every later boot
+reconnects on its own — retrying with a backoff, and giving up rather than
+looping if the AP rejects the passphrase. `wifi status` shows where it got
+to, `wifi scan` lists what is nearby, and `ip addr` / `route` report the
+result. The file is plain `key=value` and editing it by hand does what you
+would expect.
+
+The hostname is derived from the MAC address — `esp32s3-cb5d74` — so it
+matches what the device already announces over DHCP. `hostname <name>`
+changes it.
+
+### Logging in over SSH
+
+`sshd` listens on port 22 from boot. Once `ip addr` shows an address:
+
+```bash
+ssh esp@esp32s3-cb5d74          # or the IP; .lan works if your router adds it
+```
+
+**The shipped account is `esp`, password `espix`.** Both the console and an
+SSH session say so on every login until you change it:
+
+```
+espix:/# passwd esp <new-password>
+```
+
+Passwords are stored in `/etc/passwd` as PBKDF2-SHA256 with a per-user salt,
+never in plaintext — unlike the WiFi passphrase, a login password is likely
+reused somewhere else.
+
+The host key is generated on first boot into `/etc/ssh/host_ecdsa_key`, and
+its fingerprint is printed on the serial console so you can compare it
+against what your client shows the first time it connects:
+
+```
+espix: sshkey: host key SHA256:Sts8sx9+JuATlAMgo/iW1qYjBTbel+wXeXb7E2V2xhg
+```
+
+One session at a time for now. The serial console stays independent, so you
+can watch kernel messages there while working over SSH — `dmesg` is how a
+remote user reads them, exactly as on Linux.
+
+### A word on the SSH server
+
+espix implements SSH itself rather than linking an existing one. The only
+SSH server on the ESP component registry is GPL-or-commercial, which would
+have forced the licence of any firmware image built on espix; mbed TLS was
+already linked and its PSA Crypto API covers everything the protocol needs.
+
+What that buys is one algorithm per role — `curve25519-sha256`,
+`ecdsa-sha2-nistp256`, `aes256-ctr`, `hmac-sha2-256-etm@openssh.com` — with
+the Terrapin (CVE-2023-48795) mitigation, and no negotiation logic to get
+wrong. Password authentication only; no publickey, no SCP/SFTP, no rekeying,
+so a session running for hours will eventually be dropped.
+
+What it costs is stated plainly: **this is a hand-rolled implementation of a
+security protocol and it has not been audited.** That is a reasonable trade
+on a trusted LAN and a bad one facing the internet — do not port-forward it.
+The host private key is also stored in plaintext on LittleFS, consistent
+with espix's trusted-code model: anyone who can read the filesystem can
+impersonate the device.
 
 ## License
 
