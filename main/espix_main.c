@@ -22,6 +22,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "espix_auth.h"
 #include "espix_cmds.h"
 #include "espix_fault.h"
 #include "espix_fs.h"
@@ -29,6 +30,7 @@
 #include "espix_net.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
+#include "espix_ssh.h"
 
 #define TAG "espix"
 
@@ -41,11 +43,23 @@ void app_main(void)
     ESP_ERROR_CHECK(espix_fs_mount_root());
     ESP_ERROR_CHECK(espix_proc_init());
 
+    /* Before networking: SSH will authenticate against this, and it warns while
+     * the shipped default password is still in place. */
+    ESP_ERROR_CHECK(espix_auth_init());
+
     /* Not fatal: no network is a perfectly usable espix. */
     const esp_err_t net_err = espix_net_init();
     if (net_err != ESP_OK) {
         ESP_LOGW(TAG, "networking unavailable: %s", esp_err_to_name(net_err));
     }
+
+#if CONFIG_ESPIX_SSH_ENABLED
+    /* Binds immediately and accepts asynchronously, so this does not wait for
+     * an address; a connection simply cannot arrive until one exists. */
+    if (net_err == ESP_OK && espix_ssh_start() != ESP_OK) {
+        ESP_LOGW(TAG, "ssh server did not start");
+    }
+#endif
 
     espix_cmds_register_all();
 

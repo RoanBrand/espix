@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 
+#include "espix_auth.h"
 #include "espix_cmds_priv.h"
 #include "espix_fault.h"
 #include "espix_kernel.h"
@@ -354,6 +355,51 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+static int cmd_passwd(espix_session_t *s, int argc, char **argv)
+{
+    const char *user = (argc > 1) ? argv[1] : "esp";
+
+    /*
+     * Taken as an argument rather than prompted for. Reading a password without
+     * echo needs terminal control the session abstraction does not expose yet,
+     * and prompting *with* echo would be worse than being honest about it.
+     * Revisit when the reentrant line editor lands.
+     */
+    if (argc < 3) {
+        espix_printf(s, "usage: passwd [user] <new-password>\n");
+        espix_printf(s, "note: the password is echoed and enters shell "
+                        "history; no-echo input needs the new line editor\n");
+        return 1;
+    }
+
+    const char *password = argv[argc - 1];
+    if (argc == 2) {
+        user = "esp";
+    }
+
+    const esp_err_t err = espix_auth_set_password(user, password);
+    if (err != ESP_OK) {
+        espix_printf(s, "passwd: %s: %s\n", user, esp_err_to_name(err));
+        return 1;
+    }
+
+    espix_printf(s, "password updated for %s\n", user);
+    return 0;
+}
+
+static int cmd_whoami(espix_session_t *s, int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    /* The console has no login step, so it is root-equivalent by construction.
+     * SSH sessions will carry the authenticated name on the session. */
+    espix_printf(s, "%s\n", (s != NULL && s->user[0] != '\0') ? s->user : "root");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+
 static espix_cmd_t s_sys_cmds[] = {
     { .name = "help",   .fn = cmd_help,
       .help = "list commands, or describe one", .usage = "help [command]" },
@@ -370,6 +416,12 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "coredump", .fn = cmd_coredump,
       .help = "show or erase the stored core dump",
       .usage = "coredump [erase]" },
+    { .name = "passwd", .fn = cmd_passwd,
+      .help = "set a user's password",
+      .usage = "passwd [user] <new-password>" },
+    { .name = "whoami", .fn = cmd_whoami,
+      .help = "print the current user",
+      .usage = "whoami" },
     { .name = "echo",   .fn = cmd_echo,
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,

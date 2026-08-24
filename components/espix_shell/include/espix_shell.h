@@ -29,6 +29,7 @@ extern "C" {
 
 #define ESPIX_LINE_MAX 256
 #define ESPIX_ARGS_MAX 16
+#define ESPIX_SESSION_USER_MAX 17   /* 16 + NUL; matches espix_auth's limit */
 
 /* FreeRTOS TLS slot holding the current session pointer. Index 0 is taken by
  * ESP-IDF's pthread implementation, hence the default of 1. Requires
@@ -38,6 +39,22 @@ extern "C" {
 struct espix_session {
     const char *name;                      /* "console", "ssh0", ... */
     char        cwd[ESPIX_PATH_MAX];
+
+    /* Authenticated user, empty for the console, which has no login step. */
+    char        user[ESPIX_SESSION_USER_MAX];
+
+    /*
+     * Descriptors behind this session, or -1 when it is not fd-backed (the
+     * console goes through linenoise and stdio instead).
+     *
+     * Present so a spawned process can inherit them: an app calls libc printf,
+     * which writes to its task's stdout, not through this struct's write().
+     * espix_proc rebinds those streams with fdopen() on these — the same trick
+     * ESP-IDF's own console REPL uses. Without them, `run` over SSH would print
+     * on the serial console.
+     */
+    int         fd_in;
+    int         fd_out;
 
     /* Read one line, without the terminator. Returns the length, or a negative
      * value on EOF / transport error. */

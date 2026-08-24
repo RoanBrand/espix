@@ -285,6 +285,11 @@ esp_err_t espix_console_session_start(void)
         .read_line = console_read_line,
         .write     = console_write,
         .fg_pid    = ESPIX_PID_NONE,
+        /* Not fd-backed: linenoise owns stdin and output goes through stdio,
+         * so a spawned app inherits the global streams, which for the console
+         * is the right answer anyway. */
+        .fd_in     = -1,
+        .fd_out    = -1,
     };
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "console session on %s",

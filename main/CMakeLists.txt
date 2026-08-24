@@ -11,4 +11,6 @@ idf_component_register(
         espix_shell
         espix_cmds
         espix_net
+        espix_auth
+        espix_ssh
 )

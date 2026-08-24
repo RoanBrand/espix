@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "auth.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        espix_fs
+        mbedtls
+)

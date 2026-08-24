@@ -18,6 +18,7 @@ idf_component_register(
         espix_shell
         espix_fault
         espix_net
+        espix_auth
         lwip
         freertos
         esp_system

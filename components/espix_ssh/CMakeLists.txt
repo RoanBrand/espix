@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "ssh_server.c"
+        "ssh_transport.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        espix_auth
+        espix_shell
+        espix_fs
+        lwip
+        mbedtls
+        esp_hw_support
+        freertos
+)
