@@ -10,4 +10,5 @@ idf_component_register(
         espix_proc
         espix_shell
         espix_cmds
+        espix_net
 )

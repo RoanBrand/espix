@@ -153,8 +153,10 @@ display, networking) still to be finalized as the design matures.
    on hardware with argv and an exit status.
 4. Make a crashing app actually not crash the system (the reaper, held
    locks, per-process resource ownership).
-5. Networking, then SSH/SCP — which is what turns the session
-   abstraction into more than one session.
+5. Networking. WiFi station is up: `wlan0` appears in `ip addr`, takes a
+   DHCP lease, installs a default route, and `ping` works by name and by
+   address. Ethernet (P4/S31) and USB-NCM are next. Then SSH/SCP — which
+   is what turns the session abstraction into more than one session.
 6. `top`/`htop`-style live stats, a fuller command surface, pipes and
    job control.
 

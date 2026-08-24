@@ -98,6 +98,16 @@ void espix_klog_foreach(espix_klog_iter_fn cb, void *ctx);
 size_t   espix_klog_count(void);
 uint32_t espix_klog_dropped(void);
 
+/*
+ * Timestamp of the most recent line echoed to the console, or 0 if none.
+ *
+ * Exists so a console session can hold its first prompt until boot chatter has
+ * stopped — otherwise the prompt is drawn while asynchronous bring-up is still
+ * narrating, and is immediately overwritten. Waiting on log silence rather than
+ * on any particular subsystem keeps this self-limiting and subsystem-agnostic.
+ */
+uint32_t espix_klog_last_echo_ms(void);
+
 #ifdef __cplusplus
 }
 #endif

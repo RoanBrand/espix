@@ -199,6 +199,49 @@ static int console_write(espix_session_t *s, const char *data, size_t len)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Hold the first prompt until the kernel log has been quiet for a moment.
+ *
+ * Boot kicks off asynchronous work — a WiFi association, DHCP — that narrates
+ * itself from other tasks. Drawing the prompt while that is in flight means it
+ * is immediately overwritten, and since the session task then blocks inside
+ * linenoise() (whose refreshLine() is static, so no outside caller can force a
+ * redraw) the prompt stays stranded until the user presses Enter. Every boot,
+ * as the first thing anyone sees.
+ *
+ * Waiting on log silence rather than on the network keeps this subsystem-
+ * agnostic and self-limiting: nothing here knows or cares what is booting.
+ */
+#define QUIET_WINDOW_MS 300
+#define QUIET_CAP_MS    3000
+#define QUIET_POLL_MS   50
+
+static void wait_for_quiet_log(void)
+{
+    const uint32_t start = esp_log_timestamp();
+
+    for (;;) {
+        const uint32_t now  = esp_log_timestamp();
+        const uint32_t last = espix_klog_last_echo_ms();
+
+        if (last != 0 && (now - last) >= QUIET_WINDOW_MS) {
+            return;
+        }
+        /* Nothing has been echoed at all: no reason to wait. */
+        if (last == 0 && (now - start) >= QUIET_WINDOW_MS) {
+            return;
+        }
+        /* Cap matters when something logs on a repeating schedule — an
+         * unreachable AP retries every few seconds, which would otherwise keep
+         * resetting the window and never let the console start at all. */
+        if ((now - start) >= QUIET_CAP_MS) {
+            return;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(QUIET_POLL_MS));
+    }
+}
+
 esp_err_t espix_console_session_start(void)
 {
     ESP_RETURN_ON_ERROR(console_hw_init(), TAG, "console hw init failed");
@@ -238,6 +281,8 @@ esp_err_t espix_console_session_start(void)
                "stdio"
 #endif
               );
+
+    wait_for_quiet_log();
 
     /* Fixed text rather than /etc/motd, which exists in the rootfs but is
      * deliberately not read yet. Printing it here is where it belongs — that

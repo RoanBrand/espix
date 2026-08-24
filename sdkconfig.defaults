@@ -70,6 +70,16 @@ CONFIG_LITTLEFS_OPEN_DIR=y
 CONFIG_LIBC_NEWLIB=y
 
 #
+# Networking. WiFi keeps calibration and its own state in NVS, which is what
+# finally uses the nvs partition reserved in partitions.csv.
+#
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+# Backstop only. espix sets the hostname on every netif it creates (lwip stores
+# it per-interface), so this is what a netif created outside our path would
+# report. Kept in sync with the generated <target>-<mac> form for consistency.
+CONFIG_LWIP_LOCAL_HOSTNAME="espix"
+
+#
 # Console
 #
 CONFIG_VFS_SUPPORT_DIR=y

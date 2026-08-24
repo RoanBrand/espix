@@ -11,8 +11,12 @@
  *                 reported on the next boot.
  *   3. fs       — the rootfs, which everything below reads from.
  *   4. proc     — the process table.
- *   5. commands — need the registry, and the filesystem to act on.
- *   6. console  — takes over this task and does not return.
+ *   5. net      — after the filesystem, since it reads /etc/hostname and
+ *                 /etc/wifi.conf. Returns immediately; association and DHCP
+ *                 run on the event loop, so an absent or unreachable network
+ *                 never delays the prompt.
+ *   6. commands — need the registry, and the filesystem to act on.
+ *   7. console  — takes over this task and does not return.
  */
 
 #include "esp_err.h"
@@ -22,6 +26,7 @@
 #include "espix_fault.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_net.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
 
@@ -35,6 +40,12 @@ void app_main(void)
     ESP_ERROR_CHECK(espix_fault_init());
     ESP_ERROR_CHECK(espix_fs_mount_root());
     ESP_ERROR_CHECK(espix_proc_init());
+
+    /* Not fatal: no network is a perfectly usable espix. */
+    const esp_err_t net_err = espix_net_init();
+    if (net_err != ESP_OK) {
+        ESP_LOGW(TAG, "networking unavailable: %s", esp_err_to_name(net_err));
+    }
 
     espix_cmds_register_all();
 

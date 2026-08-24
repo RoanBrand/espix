@@ -13,6 +13,7 @@ extern "C" {
 void espix_cmds_register_fs(void);
 void espix_cmds_register_sys(void);
 void espix_cmds_register_run(void);
+void espix_cmds_register_net(void);
 
 /*
  * Resolve argv[i] against the session's cwd, reporting to the session and

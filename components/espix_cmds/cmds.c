@@ -39,4 +39,5 @@ void espix_cmds_register_all(void)
     espix_cmds_register_fs();
     espix_cmds_register_sys();
     espix_cmds_register_run();
+    espix_cmds_register_net();
 }

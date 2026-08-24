@@ -1,8 +1,24 @@
 idf_component_register(
     SRCS
         "net.c"
+        "wifi.c"
+        "abi.c"
     INCLUDE_DIRS
         "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
     REQUIRES
         esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        espix_fs
+        esp_netif
+        esp_wifi
+        esp_event
+        esp_timer
+        esp_hw_support
+        nvs_flash
+        lwip
+        freertos
+        espressif__elf_loader
 )

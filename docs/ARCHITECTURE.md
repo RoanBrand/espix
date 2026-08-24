@@ -151,6 +151,119 @@ firmware — was written against.
 With it, every firmware flash would rewrite the filesystem and destroy anything
 created on the device. Flashing the rootfs is an explicit `idf.py storage-flash`.
 
+### Networking is a naming layer, not a stack
+
+`esp_netif` already provides what a Unix user expects — interfaces with
+addresses, a default route, DHCP, DNS. `espix_net` adds a table mapping
+`esp_netif_t*` to Linux-style names (`wlan0`, `eth0`, `usb0`, plus a synthesised
+`lo`), and `ip`/`ifconfig`/`route` render that one table so the modern and
+net-tools views cannot disagree. `ping` is `esp_ping_new_session()` from the
+lwip component.
+
+Three things worth knowing:
+
+- **The hostname is per-netif.** lwip stores it on each `netif`, so it is
+  applied in `espix_net_register_if()` rather than in the WiFi path — every
+  future interface inherits it. Skipping this is why a stock arduino-esp32 board
+  reports `esp32s3-xxxxxx` over WiFi but `espressif` over USB-NCM.
+- **Nothing on the network path may block the boot.** `espix_net_init()` returns
+  as soon as bring-up has *started*; association and DHCP run on the event loop.
+  Likewise the disconnect handler retries via an `esp_timer` one-shot, never
+  `vTaskDelay()` — it executes on the default event loop task, and sleeping
+  there stalls every other event, including the IP events we are waiting for.
+- **Credentials in `/etc/wifi.conf` are plaintext.** Consistent with the
+  trusted-code-only model: there is no permissions system, and any app can
+  already read any file.
+
+### Asynchronous output clobbers the prompt, and that is accepted
+
+The session task calls `linenoise()`, which writes the prompt and blocks on
+read. Anything logged from another task — a link event, a timer — writes to
+stdout meanwhile, so the line becomes `espix:/# I (1340) wifi:...` and the
+prompt is gone. `refreshLine()` is `static` in linenoise, so no caller outside
+that library can ask for a redraw.
+
+There is a second-order effect worth knowing before it looks like a bug. espix
+registers a hints callback for the `usage` strings, and `linenoiseEdit`'s ENTER
+case calls `refreshLine()` to strip the hint before the newline. That rewrites
+the *current* line, so with the prompt still where linenoise left it the refresh
+is invisible and Enter yields one prompt. Once async output has moved the cursor
+to a fresh line, the refresh draws a prompt *there*, `linenoiseRaw()` then emits
+`\n`, and the session loop draws another — so Enter appears to produce two
+prompts. It is a symptom of the splat, not an independent fault.
+
+espix does not try to repair the line. Coupling klog to the shell so it could
+wipe and redraw would cost a callback seam and still lose half-typed input,
+which linenoise does not expose. Instead the noise is cut at the source: the
+WiFi driver's chatty tags are lifted to WARN in `quiet_driver_logs()`, leaving
+espix's own four link messages, which are the ones worth seeing. Kernel messages
+landing on your terminal is what Linux does too.
+
+The honest long-term answer is a runtime console threshold — `dmesg -n` — rather
+than a fixed list of quieted tags. Deferred.
+
+One case is not left alone, because it is not occasional: at boot the splat is
+*guaranteed*. `espix_console_session_start()` would draw its first prompt about a
+second in, while the WiFi association and DHCP it kicked off are still narrating.
+So the console holds its first prompt until klog has been quiet for ~300ms,
+capped at ~3s (`wait_for_quiet_log()` in
+[tty_console.c](../components/espix_shell/tty_console.c), reading
+`espix_klog_last_echo_ms()`).
+
+It waits on **log silence, not on the network** — deliberately. Nothing in the
+shell should know what is booting, and a wait on quiescence is self-limiting
+where a wait on an interface is not. The cap earns its place when something logs
+on a schedule: an unreachable AP retries every few seconds, which would reset the
+window forever and mean the console never starts at all.
+
+### Kernel messages go to the console, command output goes to the session
+
+Two different paths, and the difference is load-bearing:
+
+- `klog.c` echoes with a bare `printf()` — stdout, i.e. the serial console.
+- Commands write via `session_out()` → `s->write`, i.e. whichever session invoked
+  them.
+
+So kernel messages will never splat an SSH session's prompt, because they never
+reach it. That matches Linux, where kernel output goes to the console and remote
+users run `dmesg`. **Do not "fix" this later by routing klog through the current
+session** — the current behaviour is the correct one.
+
+There is a real gap in the same area, though, which the SSH milestone has to
+close: **a loaded app's `printf()` also goes to global stdout.**
+[exec.c](../components/espix_proc/exec.c) calls `espix_shell_set_current()`, but
+that sets espix's own session pointer for `espix_printf` — not libc's stdout. So
+`run /bin/hello` from an SSH session would print on the serial console and the
+remote user would see nothing.
+
+The mechanism already exists in ESP-IDF. `components/console/esp_console_common.c`
+does:
+
+```c
+stdin = repl_com->_stdin;
+stdout = stderr = repl_com->_stdout;
+```
+
+Under newlib `stdout` resolves through the per-task `_REENT`, so assigning it
+*inside a task* rebinds only that task's streams. `proc_task()` can do the same
+before calling the app's entry point, and for an SSH session the `FILE *` comes
+from `fdopen()` on the channel's socket. That is why `espix_session_t` will
+likely want file descriptors alongside its current `write`/`read_line`
+callbacks.
+
+### The app network ABI is ours
+
+lwip's `getaddrinfo`, `inet_ntop` and `ntohs` are *macros* over
+`lwip_getaddrinfo`, `lwip_inet_ntop` and `lwip_htons`, so the symbol an app's
+object file actually references is the prefixed one — that is what
+[abi.c](../components/espix_net/abi.c) exports via `esp_elf_register_symbol()`.
+`ntohs`/`ntohl` need nothing, being macros onto `htons`/`htonl`, which the
+loader already exports. `gai_strerror` exists nowhere in lwip or esp_libc, so
+apps cannot use it.
+
+This is the seam where espix's syscall surface becomes something espix owns
+rather than inherits, and it costs no fork of the loader component.
+
 ## Two config traps, both hit once already
 
 Worth knowing before editing `sdkconfig.defaults` or a component `Kconfig`:
@@ -183,6 +296,11 @@ costs ~6 KB of format strings).
 - **A real `top`.** `ps` reports cumulative CPU share since boot; an
   instantaneous reading needs two samples.
 - **A working directory for apps** — see the app ABI note above.
+- **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
+  quieted driver tags.
+- **Per-session stdout for loaded apps** — an SSH prerequisite. See the
+  `_REENT` note above: an app's `printf()` currently reaches the serial console
+  rather than the session that ran it.
 - **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the
   console prints a fixed banner instead. Printing motd at session start is the
   right home for it, and worth doing when SSH makes "logging in" a real event.

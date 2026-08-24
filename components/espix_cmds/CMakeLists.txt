@@ -4,6 +4,7 @@ idf_component_register(
         "cmd_fs.c"
         "cmd_sys.c"
         "cmd_run.c"
+        "cmd_net.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -16,6 +17,8 @@ idf_component_register(
         espix_proc
         espix_shell
         espix_fault
+        espix_net
+        lwip
         freertos
         esp_system
         esp_timer

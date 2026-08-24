@@ -24,6 +24,10 @@ static espix_klog_entry_t s_ring[KLOG_LINES];
 static uint32_t           s_next;       /* total lines ever written */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* Plain uint32 read/written without the lock: a torn read is impossible on a
+ * 32-bit aligned word, and the only consumer wants "roughly when", not exactly. */
+static volatile uint32_t  s_last_echo_ms;
+
 /*
  * Copy `src` into `dst`, dropping ANSI escape sequences and trailing newlines.
  * ESP_LOG output arrives colourised and newline-terminated; neither is wanted
@@ -101,6 +105,7 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
         /* Outside the critical section: this is stdio, not a quick memcpy. */
         printf("espix: %s\n", staged.text);
         fflush(stdout);
+        s_last_echo_ms = staged.ts_ms;
     }
 #else
     (void)echo;
@@ -170,6 +175,11 @@ size_t espix_klog_count(void)
 uint32_t espix_klog_dropped(void)
 {
     return (s_next > KLOG_LINES) ? s_next - KLOG_LINES : 0;
+}
+
+uint32_t espix_klog_last_echo_ms(void)
+{
+    return s_last_echo_ms;
 }
 
 #if CONFIG_ESPIX_KLOG_CAPTURE_ESP_LOG
