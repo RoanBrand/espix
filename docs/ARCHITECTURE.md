@@ -458,8 +458,13 @@ costs ~6 KB of format strings).
   `sdkconfig.defaults` so every target inherits it.
 - **Per-app heap arenas.** The allocation path in `espix_proc` is the seam.
   Would shrink the blast radius of a crashing app without needing an MMU.
-- **A real `top`.** `ps` reports cumulative CPU share since boot; an
-  instantaneous reading needs two samples.
+- ~~**A real `top`.**~~ Done. `ps` still reports cumulative share since boot,
+  which is the right thing for a one-shot listing; `top` samples twice and
+  reports the difference. It leaves the idle tasks out of the table and uses
+  them for the busy figure instead: there is one per core, each soaks up
+  whatever nothing else wants, and sorted by CPU they would otherwise occupy the
+  top rows forever. Per-core occupancy falls out of the same numbers, since each
+  idle task is pinned to one core.
 - **A working directory for apps** — see the app ABI note above.
 - **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
   quieted driver tags.

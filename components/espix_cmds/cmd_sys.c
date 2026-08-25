@@ -1,5 +1,6 @@
 /*
- * System commands: help, uname, uptime, free, ps, dmesg, reboot, echo, clear.
+ * System commands: help, uname, uptime, free, ps, top, dmesg, reboot, echo,
+ * clear.
  */
 
 #include <inttypes.h>
@@ -10,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 
@@ -254,6 +256,309 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* top                                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `ps` reports each task's share of run time *since boot*, which stops meaning
+ * anything within a minute of uptime: a task that pegged a core during WiFi
+ * association still reads high an hour later. An instantaneous reading needs
+ * two samples, and this is them.
+ */
+
+#define TOP_INTERVAL_MS 1000
+#define TOP_SLICE_MS      50    /* how often Ctrl-C is checked between frames */
+#define TOP_ROWS_MAX      24    /* tasks listed; a terminal has only so many */
+
+typedef struct {
+    TaskHandle_t                 handle;
+    configRUN_TIME_COUNTER_TYPE  runtime;
+} top_prev_t;
+
+typedef struct {
+    const TaskStatus_t *task;
+    unsigned            pct;
+    bool                known;  /* false for a task first seen this frame */
+    bool                idle;   /* an idle task: counted, but not listed */
+} top_row_t;
+
+/* Descending by CPU. Sorting is the one thing top does that ps does not, and
+ * it is what makes the display worth watching rather than re-reading. */
+static int top_row_cmp(const void *a, const void *b)
+{
+    const top_row_t *x = a;
+    const top_row_t *y = b;
+
+    if (x->pct != y->pct) {
+        return (int)y->pct - (int)x->pct;
+    }
+    return strcmp(x->task->pcTaskName, y->task->pcTaskName);
+}
+
+/*
+ * The idle tasks are not listed, and are used only to work out how busy the
+ * machine is.
+ *
+ * There is one per core and each soaks up whatever nothing else wants, so they
+ * sit at 99% and 98% forever and, sorted by CPU, permanently occupy the top two
+ * rows -- burying the work you opened top to look at. Linux does not show an
+ * idle process either.
+ *
+ * Leaving them out also removes an oddity: with them listed the column sums to
+ * ~200% on a dual-core part, because FreeRTOS derives total run time from a
+ * single timer (wall time) while each core contributes its own occupancy
+ * against it. Every remaining task runs on one core at a time, so every
+ * percentage shown is out of 100 and needs no explaining.
+ */
+#define TOP_CORES_MAX 4
+
+static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
+                       const unsigned *idle_per_core, unsigned idle_pct)
+{
+    char uptime[64];
+    espix_uptime_str(uptime, sizeof(uptime));
+
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    const unsigned cores    = chip.cores > 0 ? chip.cores : 1;
+    const unsigned capacity = 100u * cores;
+    const unsigned busy     = idle_pct >= capacity ? 0 : capacity - idle_pct;
+
+    multi_heap_info_t internal;
+    multi_heap_info_t psram;
+    heap_caps_get_info(&internal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    heap_caps_get_info(&psram, MALLOC_CAP_SPIRAM);
+
+    const size_t int_total = internal.total_free_bytes + internal.total_allocated_bytes;
+    const size_t psr_total = psram.total_free_bytes + psram.total_allocated_bytes;
+
+    espix_printf(s, "top - %s\n", uptime);
+    espix_printf(s, "Mem:  internal %uK/%uK",
+                 (unsigned)(internal.total_allocated_bytes / 1024),
+                 (unsigned)(int_total / 1024));
+    if (psr_total > 0) {
+        espix_printf(s, "    psram %uK/%uK",
+                     (unsigned)(psram.total_allocated_bytes / 1024),
+                     (unsigned)(psr_total / 1024));
+    }
+    espix_printf(s, "\nCpu:  %u%% busy across %u core%s",
+                 busy / cores, cores, cores == 1 ? "" : "s");
+
+    /*
+     * Per core, which costs nothing to work out: each idle task is pinned to
+     * one core, so that core's occupancy is simply whatever its idle task did
+     * not take. Only shown when there is more than one, since on a single-core
+     * part it would just repeat the figure above.
+     */
+    if (cores > 1) {
+        for (unsigned c = 0; c < cores && c < TOP_CORES_MAX; c++) {
+            const unsigned idle = idle_per_core[c] > 100 ? 100 : idle_per_core[c];
+            espix_printf(s, "   core%u %u%%", c, 100u - idle);
+        }
+    }
+    espix_printf(s, "\n");
+    espix_printf(s, "Tasks: %u total, %u running\n\n",
+                 (unsigned)count, running);
+}
+
+static int cmd_top(espix_session_t *s, int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    /*
+     * Sized once and kept for the whole run rather than per frame: this is a
+     * loop, and uxTaskGetSystemState() wants a worst-case array anyway. The
+     * slack covers tasks created while top is running.
+     */
+    const UBaseType_t capacity = uxTaskGetNumberOfTasks() + 8;
+
+    TaskStatus_t *tasks = calloc(capacity, sizeof(TaskStatus_t));
+    top_prev_t   *prev  = calloc(capacity, sizeof(top_prev_t));
+    top_row_t    *rows  = calloc(capacity, sizeof(top_row_t));
+
+    if (tasks == NULL || prev == NULL || rows == NULL) {
+        espix_printf(s, "top: out of memory\n");
+        free(tasks); free(prev); free(rows);
+        return 1;
+    }
+
+    size_t                      prev_count   = 0;
+    configRUN_TIME_COUNTER_TYPE prev_total   = 0;
+    bool                        have_prev    = false;
+    bool                        interrupted  = false;
+
+    while (!interrupted) {
+        configRUN_TIME_COUNTER_TYPE total = 0;
+        const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, &total);
+
+        const configRUN_TIME_COUNTER_TYPE window = total - prev_total;
+
+        unsigned running = 0;
+        for (UBaseType_t i = 0; i < count; i++) {
+            if (tasks[i].eCurrentState == eRunning) {
+                running++;
+            }
+
+            rows[i].task  = &tasks[i];
+            rows[i].pct   = 0;
+            rows[i].known = false;
+
+            if (!have_prev || window == 0) {
+                continue;
+            }
+
+            /*
+             * Match by handle. A handle can be recycled after a task is
+             * deleted, so in principle a stale entry could be matched against a
+             * different task -- the cost is one wrong reading in one frame, and
+             * tracking task creation to avoid it is not worth the machinery.
+             */
+            for (size_t j = 0; j < prev_count; j++) {
+                if (prev[j].handle != tasks[i].xHandle) {
+                    continue;
+                }
+                const configRUN_TIME_COUNTER_TYPE used =
+                    tasks[i].ulRunTimeCounter - prev[j].runtime;
+
+                rows[i].pct   = (unsigned)((uint64_t)used * 100 / window);
+                rows[i].known = true;
+                break;
+            }
+        }
+
+        /* Idle share drives the "busy" figure and nothing else. Matched by
+         * name: TaskStatus_t does not carry the per-core idle handles. */
+        unsigned idle_pct = 0;
+        unsigned idle_per_core[TOP_CORES_MAX] = { 0 };
+
+        for (UBaseType_t i = 0; i < count; i++) {
+            rows[i].idle = strncmp(rows[i].task->pcTaskName, "IDLE", 4) == 0;
+            if (!rows[i].idle) {
+                continue;
+            }
+            idle_pct += rows[i].pct;
+
+            /*
+             * Attribute it to the core it is pinned to. xCoreID is authoritative
+             * where the build provides it; the trailing digit of "IDLE0" is the
+             * same answer from the only other place FreeRTOS states it.
+             */
+#if configTASKLIST_INCLUDE_COREID
+            const int core = (int)rows[i].task->xCoreID;
+#else
+            const char  d    = rows[i].task->pcTaskName[4];
+            const int   core = (d >= '0' && d <= '9') ? d - '0' : -1;
+#endif
+            if (core >= 0 && core < TOP_CORES_MAX) {
+                idle_per_core[core] += rows[i].pct;
+            }
+        }
+
+        qsort(rows, count, sizeof(rows[0]), top_row_cmp);
+
+        /*
+         * Home the cursor and erase downwards rather than clearing the screen,
+         * which would flicker once a second. Only when the terminal can take
+         * escape sequences: a dumb one is better served by a scrolling block
+         * than by literal ESC[2J.
+         */
+        if (s->ansi) {
+            espix_printf(s, "\033[H\033[J");
+        } else {
+            espix_printf(s, "\n");
+        }
+
+        top_header(s, count, running, idle_per_core, idle_pct);
+        espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s\n",
+                     "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
+
+        unsigned shown = 0;
+        for (UBaseType_t i = 0; i < count && shown < TOP_ROWS_MAX; i++) {
+            if (rows[i].idle) {
+                continue;
+            }
+            shown++;
+
+            const TaskStatus_t *t   = rows[i].task;
+            const espix_pid_t   pid = espix_proc_pid_of_task(t->xHandle);
+
+            char pid_str[12];
+            if (pid != ESPIX_PID_NONE) {
+                snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+            } else {
+                snprintf(pid_str, sizeof(pid_str), "-");
+            }
+
+            char core_str[12];
+#if configTASKLIST_INCLUDE_COREID
+            if (t->xCoreID == tskNO_AFFINITY) {
+                snprintf(core_str, sizeof(core_str), "any");
+            } else {
+                snprintf(core_str, sizeof(core_str), "%d", (int)t->xCoreID);
+            }
+#else
+            snprintf(core_str, sizeof(core_str), "-");
+#endif
+
+            /* A task first seen this frame has no delta to report. Printing its
+             * since-boot share here would be exactly the confusion this command
+             * exists to remove, so it shows nothing instead. */
+            char cpu[8];
+            if (rows[i].known) {
+                snprintf(cpu, sizeof(cpu), "%u%%", rows[i].pct);
+            } else {
+                snprintf(cpu, sizeof(cpu), "-");
+            }
+
+            espix_printf(s, "%5s %-16s %2c %4u %4s %6u %5s\n",
+                         pid_str, t->pcTaskName,
+                         task_state_char(t->eCurrentState),
+                         (unsigned)t->uxCurrentPriority,
+                         core_str,
+                         (unsigned)t->usStackHighWaterMark,
+                         cpu);
+        }
+
+        if (shown >= TOP_ROWS_MAX) {
+            espix_printf(s, "...\n");
+        }
+        espix_printf(s, "\nCtrl-C to quit\n");
+
+        /* Remember this sample for the next frame's delta. */
+        for (UBaseType_t i = 0; i < count; i++) {
+            prev[i].handle  = tasks[i].xHandle;
+            prev[i].runtime = tasks[i].ulRunTimeCounter;
+        }
+        prev_count = count;
+        prev_total = total;
+        have_prev  = true;
+
+        /*
+         * Sleep in slices so Ctrl-C is felt straight away rather than a whole
+         * frame later. poll_interrupt() consumes what is waiting either way,
+         * which is what stops keystrokes typed at top arriving at the next
+         * prompt.
+         */
+        for (unsigned waited = 0; waited < TOP_INTERVAL_MS; waited += TOP_SLICE_MS) {
+            if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
+                interrupted = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(TOP_SLICE_MS));
+        }
+    }
+
+    free(tasks);
+    free(prev);
+    free(rows);
+
+    /* Leave the prompt somewhere sensible rather than on top of the table. */
+    espix_printf(s, "\n");
+    return 0;
+}
+
 #else  /* !configUSE_TRACE_FACILITY */
 
 static int cmd_ps(espix_session_t *s, int argc, char **argv)
@@ -261,6 +566,14 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
     (void)argc;
     (void)argv;
     espix_printf(s, "ps: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
+    return 1;
+}
+
+static int cmd_top(espix_session_t *s, int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    espix_printf(s, "top: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
     return 1;
 }
 
@@ -454,6 +767,8 @@ static espix_cmd_t s_sys_cmds[] = {
       .help = "report memory usage",            .usage = "free" },
     { .name = "ps",     .fn = cmd_ps,
       .help = "list tasks and processes",       .usage = "ps" },
+    { .name = "top",    .fn = cmd_top,
+      .help = "live view of tasks and memory",  .usage = "top" },
     { .name = "dmesg",  .fn = cmd_dmesg,
       .help = "print the kernel log",           .usage = "dmesg" },
     { .name = "coredump", .fn = cmd_coredump,
