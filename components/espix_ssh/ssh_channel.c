@@ -217,11 +217,20 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
  * staircases down the screen. Translating here keeps every command unaware of
  * which transport it is writing to.
  */
-static int chan_write(espix_session_t *s, const char *data, size_t len)
+/*
+ * Write with LF turned into CR LF — the output half of a line discipline's job
+ * (ONLCR), matching the CR to LF we do on input. Without it a bare "\n" drops
+ * the cursor a row without returning it to column one, so every line starts
+ * indented under wherever the last one ended.
+ *
+ * The serial console never needs this: IDF's UART VFS is configured with
+ * ESP_LINE_ENDINGS_CRLF and does the same translation on write. Over SSH
+ * nothing sits between the editor and the client except us.
+ */
+static int send_cooked(ssh_chan_t *ch, const char *data, size_t len)
 {
-    ssh_chan_t *ch = s->transport;
-    size_t      start = 0;
-    int         result = (int)len;
+    size_t start = 0;
+    int    result = (int)len;
 
     /* One write stays one burst even though it is emitted line by line, so an
      * app's output and the shell's cannot end up interleaved mid-message. */
@@ -246,6 +255,11 @@ static int chan_write(espix_session_t *s, const char *data, size_t len)
 
     xSemaphoreGiveRecursive(ch->tx_lock);
     return result;
+}
+
+static int chan_write(espix_session_t *s, const char *data, size_t len)
+{
+    return send_cooked(s->transport, data, len);
 }
 
 /*
@@ -460,6 +474,13 @@ static ssize_t ssh_edit_read(int fd, void *buf, size_t count)
     }
 
     while (got < count) {
+        /* Hold ESC back so the editor reads it as the start of a sequence
+         * rather than as pasted text — see ESPIX_ESC_SETTLE_MS. */
+        if (got == 0 && ch->pending_pos < ch->pending_len &&
+            ch->pending[ch->pending_pos] == 0x1b) {
+            vTaskDelay(pdMS_TO_TICKS(ESPIX_ESC_SETTLE_MS));
+        }
+
         if (ch->pending_pos >= ch->pending_len) {
             if (got > 0) {
                 break;          /* deliver what we have rather than block */
@@ -515,10 +536,10 @@ static void inject(ssh_chan_t *ch, const char *fmt, ...)
 }
 
 /*
- * Output side. Deliberately send_data() and not chan_write(): the editor emits
- * its own CR LF and escape sequences, so the "\n" -> "\r\n" translation that
- * command output needs would corrupt them. chan_write() remains the session's
- * write(), and the two coexist on the same transmit lock.
+ * Output side, sharing the session's LF to CR LF translation. The editor emits
+ * bare newlines of its own — esp_linenoise_raw() ends every line with one —
+ * and they need cooking just as command output does. Its escape sequences are
+ * unaffected: they carry bare CR, never LF.
  *
  * Terminal geometry queries are answered here rather than forwarded. A real pty
  * does not ask the terminal how wide it is — the size is state the driver holds,
@@ -558,7 +579,7 @@ static ssize_t ssh_edit_write(int fd, const void *buf, size_t count)
         return (ssize_t)count;
     }
 
-    if (send_data(ch, buf, count) != ESP_OK) {
+    if (send_cooked(ch, buf, count) < 0) {
         return -1;
     }
     return (ssize_t)count;

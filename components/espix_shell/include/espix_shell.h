@@ -122,6 +122,23 @@ const espix_cmd_t *espix_shell_find(const char *name);
  * Per-session command history, newest at index 0. Each transport owns one, so
  * a serial user and a remote user cannot read each other's typing.
  */
+/*
+ * How long a transport holds back an ESC byte before handing it to the editor.
+ *
+ * esp_linenoise — and IDF's linenoise before it — treats bytes arriving less
+ * than 30ms apart as a clipboard paste and inserts them literally instead of
+ * interpreting them. That is right for text and wrong for escape sequences: an
+ * arrow key pressed twice quickly, or simply held down, arrives as "[A" in the
+ * command line. Delaying only ESC puts the sequence the right side of that
+ * threshold, and is imperceptible on the one keystroke it affects.
+ *
+ * 50ms, not 31: at the default 100Hz tick this rounds to five ticks, and
+ * vTaskDelay only guarantees the last full tick, so the shortest real delay is
+ * about 40ms. Asking for 35 would quantise to three ticks and could return in
+ * 20 — back under the threshold, which is exactly the trap.
+ */
+#define ESPIX_ESC_SETTLE_MS 50
+
 #define ESPIX_HISTORY_MAX 16
 
 typedef struct {

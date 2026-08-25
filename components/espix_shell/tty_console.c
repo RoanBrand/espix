@@ -13,6 +13,7 @@
  * file-scope statics and it reads raw file descriptors.
  */
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -111,6 +112,20 @@ static esp_err_t console_hw_init(void)
 
 static esp_linenoise_handle_t s_editor;
 static espix_history_t        s_history;
+
+/*
+ * Plain blocking read, with ESC held back so the editor's paste heuristic does
+ * not swallow an escape sequence — see ESPIX_ESC_SETTLE_MS.
+ */
+static ssize_t console_read_bytes(int fd, void *buf, size_t count)
+{
+    const ssize_t n = read(fd, buf, count);
+
+    if (n > 0 && *(const uint8_t *)buf == 0x1b) {
+        vTaskDelay(pdMS_TO_TICKS(ESPIX_ESC_SETTLE_MS));
+    }
+    return n;
+}
 
 /* ------------------------------------------------------------------ */
 /* Session callbacks                                                  */
@@ -246,6 +261,12 @@ esp_err_t espix_console_session_start(void)
     cfg.allow_empty_line    = true;
     cfg.completion_cb       = espix_shell_completion;
     cfg.hints_cb            = espix_shell_hint;
+    cfg.read_bytes_cb       = console_read_bytes;
+
+    /* Supplying a read callback means create_instance() no longer forces
+     * blocking mode for us, and the editor must block waiting for a key. */
+    const int flags = fcntl(cfg.in_fd, F_GETFL, 0);
+    fcntl(cfg.in_fd, F_SETFL, flags & ~O_NONBLOCK);
 
     ESP_RETURN_ON_ERROR(esp_linenoise_create_instance(&cfg, &s_editor),
                         TAG, "cannot create the line editor");
