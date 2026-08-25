@@ -20,6 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_timer.h"
+
 #include "espix_shell.h"
 
 void espix_history_push(espix_history_t *h, const char *line)
@@ -74,4 +79,18 @@ void espix_history_free(espix_history_t *h)
         free(h->entries[i]);
     }
     h->count = 0;
+}
+
+/* ------------------------------------------------------------------ */
+
+void espix_pace(int64_t *last_us)
+{
+    if (last_us == NULL) {
+        return;
+    }
+
+    if (esp_timer_get_time() - *last_us < ESPIX_PACE_MIN_US) {
+        vTaskDelay(pdMS_TO_TICKS(ESPIX_PACE_MS));
+    }
+    *last_us = esp_timer_get_time();
 }

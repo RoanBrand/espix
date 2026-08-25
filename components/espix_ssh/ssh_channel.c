@@ -68,6 +68,7 @@ typedef struct {
      * file-scope statics. */
     esp_linenoise_handle_t editor;
     espix_history_t        history;
+    int64_t                pace_us;
 
     /*
      * Bytes received but not yet consumed. One packet can hold more than one
@@ -474,11 +475,10 @@ static ssize_t ssh_edit_read(int fd, void *buf, size_t count)
     }
 
     while (got < count) {
-        /* Hold ESC back so the editor reads it as the start of a sequence
-         * rather than as pasted text — see ESPIX_ESC_SETTLE_MS. */
-        if (got == 0 && ch->pending_pos < ch->pending_len &&
-            ch->pending[ch->pending_pos] == 0x1b) {
-            vTaskDelay(pdMS_TO_TICKS(ESPIX_ESC_SETTLE_MS));
+        /* Pace delivery so the editor takes its refreshing path rather than
+         * its paste path — see ESPIX_PACE_MS. */
+        if (got == 0 && ch->pending_pos < ch->pending_len) {
+            espix_pace(&ch->pace_us);
         }
 
         if (ch->pending_pos >= ch->pending_len) {

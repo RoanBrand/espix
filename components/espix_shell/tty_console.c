@@ -114,15 +114,17 @@ static esp_linenoise_handle_t s_editor;
 static espix_history_t        s_history;
 
 /*
- * Plain blocking read, with ESC held back so the editor's paste heuristic does
- * not swallow an escape sequence — see ESPIX_ESC_SETTLE_MS.
+ * Plain blocking read, paced so the editor never mistakes typing for a paste —
+ * see ESPIX_PACE_MS. Replaces esp_linenoise's default, whose select()/eventfd
+ * path we have no use for without esp_linenoise_abort().
  */
 static ssize_t console_read_bytes(int fd, void *buf, size_t count)
 {
-    const ssize_t n = read(fd, buf, count);
+    static int64_t last_us;
 
-    if (n > 0 && *(const uint8_t *)buf == 0x1b) {
-        vTaskDelay(pdMS_TO_TICKS(ESPIX_ESC_SETTLE_MS));
+    const ssize_t n = read(fd, buf, count);
+    if (n > 0) {
+        espix_pace(&last_us);
     }
     return n;
 }

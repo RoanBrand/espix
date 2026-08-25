@@ -123,21 +123,34 @@ const espix_cmd_t *espix_shell_find(const char *name);
  * a serial user and a remote user cannot read each other's typing.
  */
 /*
- * How long a transport holds back an ESC byte before handing it to the editor.
+ * Input pacing.
  *
  * esp_linenoise — and IDF's linenoise before it — treats bytes arriving less
- * than 30ms apart as a clipboard paste and inserts them literally instead of
- * interpreting them. That is right for text and wrong for escape sequences: an
- * arrow key pressed twice quickly, or simply held down, arrives as "[A" in the
- * command line. Delaying only ESC puts the sequence the right side of that
- * threshold, and is imperceptible on the one keystroke it affects.
+ * than 30ms apart as a clipboard paste, and inserts them with a raw write
+ * instead of a refresh. That write never updates the editor's cursor or its
+ * high-water row count, so once a line wraps the terminal moves on while the
+ * editor's bookkeeping stands still. The next refresh then clears from the
+ * wrong row and redraws below the old copy, which is why typing quickly past
+ * the right margin duplicates the line on every keystroke. The same heuristic
+ * eats escape sequences, turning a held-down arrow key into "[A" in the buffer.
  *
- * 50ms, not 31: at the default 100Hz tick this rounds to five ticks, and
- * vTaskDelay only guarantees the last full tick, so the shortest real delay is
- * about 40ms. Asking for 35 would quantise to three ticks and could return in
- * 20 — back under the threshold, which is exactly the trap.
+ * So a transport hands bytes over no faster than that threshold. Only bytes
+ * that would otherwise arrive too close together are held; anything typed at
+ * human speed already clears it and is passed straight through, so ordinary
+ * editing gains no latency. A pasted block is the case that gets slowed, and
+ * correctness there is worth more than the milliseconds.
+ *
+ * 50ms rather than 31 because of tick granularity: at the default 100Hz,
+ * pdMS_TO_TICKS(35) is three ticks and vTaskDelay only guarantees the last
+ * full one, so the shortest real delay is about 20ms — back under the
+ * threshold, which is exactly the trap.
  */
-#define ESPIX_ESC_SETTLE_MS 50
+#define ESPIX_PACE_MS      50
+#define ESPIX_PACE_MIN_US  30000
+
+/* Delay if `last_us` is too recent, then stamp it. Shared so both transports
+ * pace identically. */
+void espix_pace(int64_t *last_us);
 
 #define ESPIX_HISTORY_MAX 16
 
