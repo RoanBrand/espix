@@ -31,4 +31,10 @@ include(elf_loader)
 # -shared happily producing an ELF anyway.
 set(ELF_COMPONENTS Adafruit_NeoPixel espressif__arduino-esp32)
 
+# Fold global C++ constructors into .data so the loader can relocate them, and
+# name their bounds so the startup shim can run them. See ctors.ld. project_elf()
+# appends ELF_LIBS verbatim to its link command; the comma form is required
+# because it puts the list through spaces2list().
+set(ELF_LIBS "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/ctors.ld")
+
 project_elf(neopixel)

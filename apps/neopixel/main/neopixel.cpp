@@ -13,16 +13,13 @@
  * Three small departures from a stock Arduino sketch, all forced and all
  * explained where they appear:
  *
- *   - `pixel` is a pointer (see setup)
  *   - printf() rather than Serial (see setup)
  *   - delays are multiples of 10ms (see loop)
  */
 
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
-
 #include <stdio.h>
-
 #include "espix_sketch.h"
 
 /* The onboard WS2812 on an ESP32-S3-DevKitC-1. Change it for a board that
@@ -40,26 +37,21 @@
 #define SWEEP_MS        6000
 
 /*
- * A pointer, where an Arduino sketch would write:
+ * At file scope, exactly as an Arduino sketch writes it.
  *
- *     Adafruit_NeoPixel pixel(1, LED_PIN, NEO_GRB + NEO_KHZ800);
- *
- * espix's ELF loader does not run global C++ constructors, and crashes trying —
- * during relocation, before the sketch's first instruction. So the object is
- * built in setup() instead, which is where an Arduino user expects
- * initialisation anyway. The cost is `->` in place of `.`.
+ * This needs ctors.ld and the startup shim to work: espix's ELF loader neither
+ * runs global constructors nor tolerates them, so a sketch like this used to
+ * take the process down during relocation. See the comment in ctors.ld.
  */
-Adafruit_NeoPixel *pixel;
+Adafruit_NeoPixel pixel(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 uint16_t hue = 0;
 
 void setup()
 {
-    pixel = new Adafruit_NeoPixel(1, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-    pixel->begin();
-    pixel->clear();
-    pixel->show();
+    pixel.begin();
+    pixel.clear();
+    pixel.show();
 
     /*
      * printf() rather than Serial.println(). espix gives every app a stdout
@@ -79,8 +71,8 @@ void loop()
      * response so the colours look equally bright. Both are the library's own;
      * hand-rolling either is what gets a NeoPixel demo looking lurid.
      */
-    pixel->setPixelColor(0, pixel->gamma32(pixel->ColorHSV(hue, 255, MAX_BRIGHTNESS)));
-    pixel->show();
+    pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(hue, 255, MAX_BRIGHTNESS)));
+    pixel.show();
 
     hue += 65536 / (SWEEP_MS / FRAME_MS);
 
@@ -94,8 +86,8 @@ void loop()
 
     /* espix: someone pressed Ctrl-C, or ran `kill`. Put the hardware back. */
     if (espixStopping()) {
-        pixel->clear();
-        pixel->show();
+        pixel.clear();
+        pixel.show();
 
         /*
          * Hand the RMT channel back. Without this the channel and its GPIO

@@ -65,11 +65,20 @@ and compiles with `-Dmain=app_main`. Without `extern "C"`, the entry is
 name-mangled, the linker says *"cannot find entry symbol app_main"*, and you get
 an ELF with no sections.
 
-**No global constructors.** The loader does not run `.ctors`, and worse, it
-crashes trying: a relocation against `.ctors` makes `esp_elf_map_sym()` return 0
-for a section it does not track, and the loader dereferences that without
-checking. A global C++ object therefore takes the process down during
-relocation, before your first instruction. Construct inside `main()`.
+**Global constructors need a linker script.** They work, but not for free. The
+loader resolves an address only inside five sections it knows by name —
+`.text`, `.data`, `.rodata`, `.data.rel.ro`, `.bss` — and a constructor pointer
+normally lands in `.ctors`, which is not one of them. `esp_elf_map_sym()` returns
+0 for it and the loader dereferences that, so the app dies during relocation,
+before its first instruction.
+
+`neopixel/ctors.ld` folds `.ctors` into `.data` and names its bounds, and the
+shim walks them before `setup()`. Copy that file and the `set(ELF_LIBS ...)`
+line from `neopixel/CMakeLists.txt` to get the same in another app. An app also
+needs to define `__dso_handle` (see `espix_sketch.cpp`): a global with a
+*destructor* registers it through `__cxa_atexit`, and `-nostdlib` never links
+the `crtbegin.o` that normally supplies that symbol — without it the link fails
+with the memorably unhelpful `final link failed: bad value`.
 
 **Static link order matters.** `ELF_COMPONENTS` becomes one link line of plain
 archives, resolved left to right. A library must be listed *before* the
