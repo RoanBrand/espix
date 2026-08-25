@@ -342,6 +342,12 @@ against what your client shows the first time it connects:
 espix: sshkey: host key SHA256:Sts8sx9+JuATlAMgo/iW1qYjBTbel+wXeXb7E2V2xhg
 ```
 
+Resizing the window while a command line is part-typed will garble that line:
+the editor samples the terminal width once per line, as every linenoise-derived
+editor does, so it keeps drawing at the old width while your terminal wraps at
+the new one. Enter or Ctrl-C gives a clean prompt at the new size, and
+everything after it is correct.
+
 One session at a time for now. The serial console stays independent, so you
 can watch kernel messages there while working over SSH — `dmesg` is how a
 remote user reads them, exactly as on Linux.

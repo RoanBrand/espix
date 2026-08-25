@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <sys/select.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -585,6 +587,38 @@ static ssize_t ssh_edit_write(int fd, const void *buf, size_t count)
     return (ssize_t)count;
 }
 
+/*
+ * Apply anything the client has already sent before the editor asks how wide
+ * the terminal is.
+ *
+ * window-change keeps ch->cols current, but packets are only read when the
+ * editor blocks for input. A resize that lands while a command is running
+ * therefore sits unprocessed, and the next get_line() measures before its first
+ * read — so the prompt after a resize would be drawn at the old width for no
+ * reason. The line that was already part-typed when the resize happened cannot
+ * be rescued (the editor samples the width once and offers no way to update
+ * it), but the one after it can.
+ */
+static void chan_drain_pending(ssh_chan_t *ch)
+{
+    while (!ch->closed && ch->pending_pos >= ch->pending_len) {
+        fd_set         rfds;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+
+        FD_ZERO(&rfds);
+        FD_SET(ch->conn->fd, &rfds);
+
+        if (select(ch->conn->fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            return;             /* nothing waiting */
+        }
+        if (chan_pump(ch) != ESP_OK) {
+            return;
+        }
+        /* A keystroke that arrived early belongs to the editor, and pumping
+         * again would overwrite the buffer holding it. */
+    }
+}
+
 static int chan_read_line(espix_session_t *s, const char *prompt,
                           char *buf, size_t len)
 {
@@ -593,6 +627,8 @@ static int chan_read_line(espix_session_t *s, const char *prompt,
     if (ch->closed) {
         return -1;
     }
+
+    chan_drain_pending(ch);
 
     esp_linenoise_set_prompt(ch->editor, prompt);
 
