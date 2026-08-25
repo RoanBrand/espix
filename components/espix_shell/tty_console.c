@@ -141,7 +141,24 @@ static espix_history_t       *s_history;
  * number of bytes that happen to arrive in it. A terminal that is going to
  * answer does so in about a millisecond.
  */
-#define REPORT_WINDOW_US 60000
+/*
+ * How long after asking we will still accept a cursor report.
+ *
+ * This was 60ms, chosen as "a terminal answers in about a millisecond". That is
+ * true of a terminal on the other end of a wire, and false of one reached
+ * through idf.py monitor, where the reply makes a round trip through a USB
+ * serial adapter and a terminal emulator. A real report arriving at ~150ms
+ * landed outside the window, was taken for typing, and ran as a command:
+ *
+ *     espix: [31;1R: command not found
+ *
+ * A generous window is nearly free now that shape decides what counts as a
+ * report (see report_byte_fits): anything that is not report-shaped ends the
+ * window immediately and is treated as input, so the only thing a long window
+ * costs is a user typing a literal ESC [ digit sequence within a second of a
+ * prompt appearing.
+ */
+#define REPORT_WINDOW_US 1000000
 
 /* Size claimed on behalf of a terminal that will not answer. */
 #define REPORT_COLS 80
@@ -149,6 +166,7 @@ static espix_history_t       *s_history;
 
 static bool    s_expect_report;
 static int64_t s_report_deadline_us;
+static unsigned s_report_pos;
 
 /*
  * Set once a query has gone unanswered. After that the query is not sent at
@@ -197,6 +215,24 @@ static void console_input_reset(void)
 
 /* Set only around esp_linenoise_create_instance(); see console_write_bytes. */
 static bool s_probe_in_progress;
+
+/*
+ * Does this byte continue a cursor/status report -- ESC [ digits ; digits R, or
+ * ESC [ digits n -- at the given position?
+ *
+ * Shape is what distinguishes the terminal answering us from the user typing,
+ * and it does so without relying on timing. It also cleanly separates a report
+ * from an arrow key: both start ESC [, but 'A' is not a digit, so ESC [ A ends
+ * the window and is delivered as the keystroke it is.
+ */
+static bool report_byte_fits(uint8_t c, unsigned pos)
+{
+    switch (pos) {
+    case 0:  return c == 0x1b;
+    case 1:  return c == '[';
+    default: return (c >= '0' && c <= '9') || c == ';' || c == 'R' || c == 'n';
+    }
+}
 
 static bool contains_seq(const void *buf, size_t count, const char *lit)
 {
@@ -254,12 +290,38 @@ static ssize_t console_write_bytes(int fd, const void *buf, size_t count)
         }
     } else if (cursor || status) {
         s_expect_report      = true;
+        s_report_pos         = 0;
         s_report_deadline_us = esp_timer_get_time() + REPORT_WINDOW_US;
     }
 
-    const ssize_t n = write(fd, buf, count);
-    if (n == (ssize_t)count) {
+    /*
+     * esp_linenoise writes its escape sequences with sizeof() rather than
+     * strlen(), so each one carries a trailing NUL onto the wire -- three per
+     * prompt, from ESC[6n, ESC[999C and ESC[6n again. Terminals are not
+     * required to ignore them, and this one renders them, which is the run of
+     * blank space that appears before the cursor after a reboot.
+     *
+     * Trimmed here rather than patched upstream, and only from the end: a
+     * terminal write that legitimately ends in NUL does not exist, while
+     * stripping them from the middle could corrupt an app's output.
+     *
+     * The caller is told the whole buffer went out, because it compares the
+     * return against the length it passed -- get_cursor_position() gives up
+     * and reports failure otherwise.
+     */
+    size_t out_len = count;
+    while (out_len > 0 && ((const uint8_t *)buf)[out_len - 1] == 0x00) {
+        out_len--;
+    }
+
+    if (out_len == 0) {
+        return (ssize_t)count;
+    }
+
+    const ssize_t n = write(fd, buf, out_len);
+    if (n == (ssize_t)out_len) {
         fsync(fd);
+        return (ssize_t)count;
     }
     return n;
 }
@@ -313,13 +375,24 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
             return 1;
         }
 
-        /* 'R' ends a cursor report, 'n' a device status report. The whole read
-         * is scanned: one byte per call is only how it happens to work today. */
-        for (ssize_t i = 0; i < n; i++) {
-            if (out[i] == 'R' || out[i] == 'n') {
-                s_expect_report = false;
-                break;
-            }
+        if (!report_byte_fits(out[0], s_report_pos)) {
+            /*
+             * Not part of a report, so the terminal is not answering and this
+             * is the user. End the window and let it through the normal paced
+             * path -- pacing matters, or the editor takes it for pasted input.
+             */
+            s_expect_report = false;
+            s_report_pos    = 0;
+            espix_pace(&last_us);
+            return n;
+        }
+
+        s_report_pos++;
+
+        /* 'R' ends a cursor report, 'n' a device status report. */
+        if (out[0] == 'R' || out[0] == 'n') {
+            s_expect_report = false;
+            s_report_pos    = 0;
         }
 
         /* Stamp it even though this was not paced, or the next real keystroke
