@@ -67,6 +67,21 @@ extern "C" int main(int argc, char **argv)
 
     Adafruit_NeoPixel pixel(1, pin, NEO_GRB + NEO_KHZ800);
 
+    /*
+     * begin() calls pinMode(), which is what produces
+     *
+     *     W rmt: GPIO N is not usable, maybe conflict with others
+     *
+     * on the first show(). It is benign and not espix's doing: pinMode() goes
+     * to gpio_config(), which reserves the pin, and RMT then reserves the same
+     * pin when it takes it over through the GPIO matrix -- two ESP-IDF
+     * subsystems both claiming it, exactly as the message says. Adafruit hit
+     * the same thing and removed pinMode() from espShow() (see the comment in
+     * the library's esp.c), but begin() still does it.
+     *
+     * Kept anyway, because every Arduino example begins this way and the pin
+     * ends up correctly driven regardless.
+     */
     pixel.begin();
     pixel.clear();
     pixel.show();
@@ -95,6 +110,20 @@ extern "C" int main(int argc, char **argv)
      * the sweep happened to reach. */
     pixel.clear();
     pixel.show();
+
+    /*
+     * Hand the RMT channel back. This looks redundant in a function that is
+     * about to return, and it is not: espix tears the process down without
+     * Arduino's peripheral manager knowing, so the channel and the GPIO
+     * reservation that rmt_del_channel() would revoke both survive the app.
+     *
+     * Leaking them shows up first as "GPIO %d is not usable, maybe conflict
+     * with others" on the next run, and eventually as a failure to allocate a
+     * channel at all -- RMT TX channels are a small fixed hardware resource.
+     *
+     * After the last show(), because that still needs the channel.
+     */
+    rmtDeinit(pin);
 
     printf("neopixel: stopped\n");
     return 0;
