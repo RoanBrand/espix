@@ -705,9 +705,9 @@ static int cmd_whoami(espix_session_t *s, int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    /* The console has no login step, so it is root-equivalent by construction.
-     * SSH sessions will carry the authenticated name on the session. */
-    espix_printf(s, "%s\n", (s != NULL && s->user[0] != '\0') ? s->user : "root");
+    /* Every session carries a name now -- "root" on the console, the
+     * authenticated one over SSH -- so there is no fallback to invent here. */
+    espix_printf(s, "%s\n", (s != NULL && s->user[0] != '\0') ? s->user : "?");
     return 0;
 }
 
@@ -720,7 +720,9 @@ static int cmd_whoami(espix_session_t *s, int argc, char **argv)
  */
 static int session_end(espix_session_t *s, int argc, char **argv, bool login_only)
 {
-    if (login_only && s->user[0] == '\0') {
+    /* Asking whether a login happened, not whether a user is named: the
+     * console is called root and still never logged in. */
+    if (login_only && !s->login) {
         espix_printf(s, "%s: not login shell: use `exit'\n", argv[0]);
         return 1;
     }

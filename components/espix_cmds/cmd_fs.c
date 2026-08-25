@@ -29,7 +29,13 @@ static int cmd_cd(espix_session_t *s, int argc, char **argv)
 {
     char abs[ESPIX_PATH_MAX];
 
-    if (!espix_cmd_path(s, (argc > 1) ? argv[1] : "/", abs, sizeof(abs))) {
+    /* Bare `cd` goes home, as everywhere else; `/` only for a session that has
+     * no home, which is the console. */
+    const char *target = (argc > 1)          ? argv[1]
+                       : (s->home[0] != '\0') ? s->home
+                                              : "/";
+
+    if (!espix_cmd_path(s, target, abs, sizeof(abs))) {
         return 1;
     }
 

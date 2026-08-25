@@ -178,9 +178,41 @@ int espix_shell_exec(espix_session_t *s, const char *line)
     return status;
 }
 
+/*
+ * `<user>:<cwd># `, with the home directory shown as `~`.
+ *
+ * The user used to be the literal "espix" -- the OS name sitting where a Unix
+ * prompt puts an identity, agreeing with neither `whoami` nor the greeting.
+ *
+ * `#` rather than `$` for everyone, including non-root. That is not sloppiness:
+ * espix has no permission model at all, LittleFS having no mode bits, so every
+ * session really can do anything and a `$` would be the misleading one.
+ */
 static void build_prompt(const espix_session_t *s, char *buf, size_t len)
 {
-    snprintf(buf, len, "espix:%s# ", s->cwd[0] != '\0' ? s->cwd : "/");
+    const char *cwd  = (s->cwd[0] != '\0') ? s->cwd : "/";
+    const char *user = (s->user[0] != '\0') ? s->user : "?";
+
+    /*
+     * Abbreviate the home prefix, but only on a path boundary: /home/esp is ~
+     * and /home/esp/x is ~/x, while /home/espionage is left alone.
+     */
+    if (s->home[0] != '\0') {
+        const size_t hlen = strlen(s->home);
+
+        if (strncmp(cwd, s->home, hlen) == 0) {
+            if (cwd[hlen] == '\0') {
+                snprintf(buf, len, "%s:~# ", user);
+                return;
+            }
+            if (cwd[hlen] == '/') {
+                snprintf(buf, len, "%s:~%s# ", user, cwd + hlen);
+                return;
+            }
+        }
+    }
+
+    snprintf(buf, len, "%s:%s# ", user, cwd);
 }
 
 void espix_shell_session_run(espix_session_t *s)

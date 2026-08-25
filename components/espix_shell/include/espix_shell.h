@@ -45,8 +45,31 @@ struct espix_session {
     const char *name;                      /* "console", "ssh0", ... */
     char        cwd[ESPIX_PATH_MAX];
 
-    /* Authenticated user, empty for the console, which has no login step. */
+    /*
+     * Who this session belongs to. Always set: an SSH session carries the
+     * authenticated name, the serial console is "root" because physical access
+     * to the board is the privilege, and there is nothing to authenticate it
+     * against. `whoami`, the prompt and the greeting all read this, so they
+     * cannot disagree the way they used to.
+     */
     char        user[ESPIX_SESSION_USER_MAX];
+
+    /*
+     * Home directory, or empty for a session that has none. The prompt shows it
+     * as `~`, and a bare `cd` returns to it. Root's is deliberately empty: the
+     * console starts at / and showing an absolute path there is honest.
+     */
+    char        home[ESPIX_PATH_MAX];
+
+    /*
+     * Whether a login happened to get here, which is what `logout` requires.
+     *
+     * Separate from `user` on purpose. That test used to be "is the user field
+     * empty", which happened to work only while the console had no name at all
+     * -- it was conflating having a user with being a login shell, and naming
+     * the console user broke it silently.
+     */
+    bool        login;
 
     /*
      * Opens a fresh stdout/stderr stream for a spawned process, or NULL to

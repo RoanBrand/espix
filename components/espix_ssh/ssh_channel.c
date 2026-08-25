@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include <sys/select.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -1093,6 +1094,30 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .open_stream = chan_open_stream,
     };
     strlcpy(session.user, c->user, sizeof(session.user));
+
+    /*
+     * A login shell, so `logout` is valid here, and it starts in the user's
+     * home directory the way a login does everywhere else. The home comes from
+     * the account record, whose `home` field espix_auth has always filled in
+     * and nothing has read until now.
+     *
+     * Falls back to / when the directory is not actually there. A rootfs can be
+     * replaced wholesale by storage-flash or edited on the device, and refusing
+     * to open a shell because a directory went missing would be a poor trade.
+     */
+    session.login = true;
+
+    espix_user_t account;
+    if (espix_auth_lookup(c->user, &account) == ESP_OK && account.home[0] != '\0') {
+        struct stat st;
+        if (stat(account.home, &st) == 0 && S_ISDIR(st.st_mode)) {
+            strlcpy(session.home, account.home, sizeof(session.home));
+            strlcpy(session.cwd,  account.home, sizeof(session.cwd));
+        } else {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no home at %s; starting at /",
+                       c->user, account.home);
+        }
+    }
 
     /* Identical to what the serial console prints, by construction: both go
      * through the same command. */

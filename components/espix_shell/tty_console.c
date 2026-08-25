@@ -641,6 +641,16 @@ esp_err_t espix_console_session_start(void)
     s_console = (espix_session_t) {
         .name      = "console",
         .cwd       = "/",
+        /*
+         * Physical access to the board is the privilege, so the console is
+         * root. It is a synthetic identity rather than an account in
+         * espix_auth: nothing authenticates here, so there would be nothing to
+         * verify a credential against, and inventing one would imply a login
+         * step that does not exist. Which is also why `login` is false and
+         * `logout` declines -- there was no login to undo.
+         */
+        .user      = "root",
+        .login     = false,
         .read_line = console_read_line,
         .write     = console_write,
         .poll_interrupt = console_poll_interrupt,
