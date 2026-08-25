@@ -1,0 +1,62 @@
+# Must match the firmware: the loader writes a relocated image into memory and
+# executes it, which memory protection would block.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+CONFIG_ELF_LOADER=y
+CONFIG_LIBC_NEWLIB=y
+
+# Arduino is a library here, never the OS: espix owns app_main.
+CONFIG_AUTOSTART_ARDUINO=n
+
+# Must match the firmware. Arduino ships 1000 and its CMakeLists checks for it
+# (bypassed with ARDUINO_SKIP_TICK_CHECK=1), but the tick rate is compiled into
+# pdMS_TO_TICKS on both sides, so disagreeing here would make every delay wrong
+# by 10x. See the note in main/neopixel.cpp about delay() granularity.
+CONFIG_FREERTOS_HZ=100
+
+# Compile only the Arduino core, not its whole bundled library set. Without
+# this, arduino-esp32 builds BLE, NetworkClientSecure, Matter and the rest --
+# slow, and each one imposes its own IDF config demands (PSK ciphersuites, for
+# one) that have nothing to do with driving an LED. The core is all a NeoPixel
+# sketch needs.
+CONFIG_ARDUINO_SELECTIVE_COMPILATION=y
+
+# ...and none of its bundled libraries: a NeoPixel sketch needs the core only.
+# Written out rather than left to default because each of these defaults to y,
+# and building them all is both slow and a source of unrelated config demands
+# (NetworkClientSecure wants mbedTLS PSK ciphersuites, for one).
+CONFIG_ARDUINO_SELECTIVE_ArduinoOTA=n
+CONFIG_ARDUINO_SELECTIVE_AsyncUDP=n
+CONFIG_ARDUINO_SELECTIVE_BLE=n
+CONFIG_ARDUINO_SELECTIVE_BluetoothSerial=n
+CONFIG_ARDUINO_SELECTIVE_DNSServer=n
+CONFIG_ARDUINO_SELECTIVE_EEPROM=n
+CONFIG_ARDUINO_SELECTIVE_ESP_SR=n
+CONFIG_ARDUINO_SELECTIVE_ESP_Video=n
+CONFIG_ARDUINO_SELECTIVE_ESPmDNS=n
+CONFIG_ARDUINO_SELECTIVE_Ethernet=n
+CONFIG_ARDUINO_SELECTIVE_FFat=n
+CONFIG_ARDUINO_SELECTIVE_FS=n
+CONFIG_ARDUINO_SELECTIVE_HTTPClient=n
+CONFIG_ARDUINO_SELECTIVE_Hash=n
+CONFIG_ARDUINO_SELECTIVE_Insights=n
+CONFIG_ARDUINO_SELECTIVE_LittleFS=n
+CONFIG_ARDUINO_SELECTIVE_Matter=n
+CONFIG_ARDUINO_SELECTIVE_NetBIOS=n
+CONFIG_ARDUINO_SELECTIVE_Network=n
+CONFIG_ARDUINO_SELECTIVE_NetworkClientSecure=n
+CONFIG_ARDUINO_SELECTIVE_OpenThread=n
+CONFIG_ARDUINO_SELECTIVE_PPP=n
+CONFIG_ARDUINO_SELECTIVE_Preferences=n
+CONFIG_ARDUINO_SELECTIVE_RainMaker=n
+CONFIG_ARDUINO_SELECTIVE_SD=n
+CONFIG_ARDUINO_SELECTIVE_SD_MMC=n
+CONFIG_ARDUINO_SELECTIVE_SPI=n
+CONFIG_ARDUINO_SELECTIVE_SPIFFS=n
+CONFIG_ARDUINO_SELECTIVE_SimpleBLE=n
+CONFIG_ARDUINO_SELECTIVE_Ticker=n
+CONFIG_ARDUINO_SELECTIVE_Update=n
+CONFIG_ARDUINO_SELECTIVE_WebServer=n
+CONFIG_ARDUINO_SELECTIVE_WiFi=n
+CONFIG_ARDUINO_SELECTIVE_WiFiProv=n
+CONFIG_ARDUINO_SELECTIVE_Wire=n
+CONFIG_ARDUINO_SELECTIVE_Zigbee=n

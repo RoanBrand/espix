@@ -2,6 +2,8 @@ idf_component_register(
     SRCS
         "proc.c"
         "exec.c"
+        "abi_cxx.cpp"
+        "abi_drivers.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -16,4 +18,7 @@ idf_component_register(
         espressif__elf_loader
         esp_timer
         heap
+        esp_driver_rmt
+        esp_driver_gpio
+        soc
 )

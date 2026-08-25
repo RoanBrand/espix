@@ -28,6 +28,14 @@ typedef struct {
     void  *argv_block;
     int    argc;
     char **argv;
+
+    /*
+     * Set when someone has asked this process to stop. Volatile because the
+     * app polls it from its own task while another task writes it, and no lock
+     * is taken on the read path: a single bool needs none, and an app should
+     * not block to ask whether it is still wanted.
+     */
+    volatile bool stop_requested;
 } espix_proc_slot_t;
 
 /* Table access. The lock covers slot allocation and state transitions; readers
@@ -52,6 +60,14 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
 
 /* Monotonic pid allocation; pids are never reused. Caller must hold the lock. */
 espix_pid_t espix_proc_next_pid(void);
+
+/* Publish the C++ runtime an app needs to resolve at load time. See
+ * abi_cxx.cpp, the one C++ translation unit in espix. */
+void espix_proc_abi_cxx_register(void);
+
+/* Publish the peripheral surface an app needs. See abi_drivers.c: naming a
+ * symbol there is also what keeps its driver linked into the firmware. */
+void espix_proc_abi_drivers_register(void);
 
 #ifdef __cplusplus
 }

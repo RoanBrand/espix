@@ -58,6 +58,11 @@ esp_err_t espix_proc_init(void)
      * see, so lift its threshold to warnings. */
     esp_log_level_set("ELF", ESP_LOG_WARN);
 
+    /* Publish the C++ runtime before any app can be loaded. See abi_cxx.cpp:
+     * espix itself is C, but a C++ app cannot resolve operator new without it. */
+    espix_proc_abi_cxx_register();
+    espix_proc_abi_drivers_register();
+
     espix_klog(ESPIX_KLOG_INFO, TAG, "process table ready (%d slots)",
                ESPIX_PROC_MAX);
     return ESP_OK;
@@ -176,8 +181,72 @@ esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeou
     return same ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
+/*
+ * How long a process gets to leave on its own after being asked. Long enough
+ * for an app polling once per animation frame to notice and tidy up, short
+ * enough that `kill` on an app which ignores the flag still feels immediate.
+ */
+#define STOP_GRACE_MS 400
+
+esp_err_t espix_proc_request_stop(espix_pid_t pid)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+    espix_proc_slot_t *slot = find_by_pid(pid);
+    if (slot == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (state_is_finished(slot->info.state)) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    slot->stop_requested = true;
+    xSemaphoreGive(g_espix_proc_lock);
+    return ESP_OK;
+}
+
+bool espix_app_stopping(void)
+{
+    const espix_pid_t pid = espix_proc_pid_of_task(xTaskGetCurrentTaskHandle());
+
+    if (pid == ESPIX_PID_NONE) {
+        return false;           /* not a process; nobody is asking it to stop */
+    }
+
+    /*
+     * Deliberately unlocked. This is polled from an app's inner loop, the value
+     * is a single bool, and a reader that is one iteration late is harmless —
+     * whereas taking the process lock here would let any app stall the table.
+     */
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        if (g_espix_procs[i].info.pid == pid) {
+            return g_espix_procs[i].stop_requested;
+        }
+    }
+    return false;
+}
+
 esp_err_t espix_proc_kill(espix_pid_t pid)
 {
+    /*
+     * Ask before deleting. An app that polls espix_app_stopping() gets to put
+     * its hardware back — an LED off, a motor stopped — which deleting the task
+     * outright never allows. An app that ignores it is no worse off than
+     * before, just STOP_GRACE_MS later.
+     */
+    const esp_err_t asked = espix_proc_request_stop(pid);
+    if (asked != ESP_OK) {
+        return asked;           /* no such pid, or already finished */
+    }
+
+    int exit_code = -1;
+    if (espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(STOP_GRACE_MS)) == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "pid %d stopped on request", (int)pid);
+        return ESP_OK;
+    }
+
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
 
     espix_proc_slot_t *slot = find_by_pid(pid);
@@ -206,7 +275,7 @@ esp_err_t espix_proc_kill(espix_pid_t pid)
         vTaskDelete(task);
     }
 
-    espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s)",
+    espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s): did not stop when asked",
                (int)pid, slot->info.name);
 
     espix_proc_release_resources(slot);

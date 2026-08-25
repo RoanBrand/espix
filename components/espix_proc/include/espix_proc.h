@@ -76,6 +76,29 @@ esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeou
 esp_err_t espix_proc_kill(espix_pid_t pid);
 
 /*
+ * Cooperative stop.
+ *
+ * espix_proc_kill() deletes a task outright, which on a system with no memory
+ * protection means whatever it held is held forever — and, more visibly, that
+ * an app driving hardware never gets to put it back. An LED stays lit, a motor
+ * keeps turning.
+ *
+ * So a kill now asks first: it sets this flag and gives the process a moment to
+ * leave on its own, falling back to deletion if it does not. An app polls
+ * espix_app_stopping() in its main loop, tidies up, and returns normally.
+ * Ignoring it costs nothing and behaves exactly as before.
+ *
+ * This is the smallest honest version of a signal. It is not one: there is no
+ * delivery, no handler, no interruption of a blocking call.
+ */
+esp_err_t espix_proc_request_stop(espix_pid_t pid);
+
+/* Called by a loaded app, from its own task, to ask whether it has been
+ * requested to stop. Exported to apps as part of the ABI. Returns false for a
+ * task that is not a process, so kernel tasks calling it see "carry on". */
+bool espix_app_stopping(void);
+
+/*
  * Kill every process still owned by `session`, as a hangup does when a terminal
  * goes away. The session's stdio dies with it, so anything still holding it
  * must not outlive it. Returns how many were killed.
