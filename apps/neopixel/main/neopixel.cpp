@@ -5,10 +5,11 @@
  * out. Adafruit_NeoPixel's genuine unmodified source and the Arduino core are
  * compiled into the app; espix itself knows nothing about Arduino.
  *
- * It is a normal setup()/loop() sketch. espix_sketch.h supplies the main() that
- * calls them, so the only espix-specific thing here is the `if` at the end of
- * loop() — an app someone can stop has to put its hardware back, which an
- * Arduino sketch never has to think about.
+ * It is a normal setup()/loop() sketch, plus a teardown() espix calls when
+ * someone stops the app — an Arduino sketch never needs one, because a board
+ * runs until the power goes. Nothing else here is espix-specific: the shim in
+ * espix_sketch.h supplies main(), and makes delay() the point at which a stop
+ * takes effect.
  *
  * Three small departures from a stock Arduino sketch, all forced and all
  * explained where they appear:
@@ -83,21 +84,28 @@ void loop()
      * unaffected either way: it comes from the RMT peripheral, not from ticks.
      */
     delay(FRAME_MS);
+}
 
-    /* espix: someone pressed Ctrl-C, or ran `kill`. Put the hardware back. */
-    if (espixStopping()) {
-        pixel.clear();
-        pixel.show();
+/*
+ * espix: called once when someone stops the app -- Ctrl-C, or `kill`. An
+ * Arduino sketch has no equivalent, because a board simply runs until the power
+ * goes; an espix app is a process, and what it switched on is its own to switch
+ * off.
+ *
+ * Reached from inside delay() above, which the shim makes a cancellation point.
+ */
+void teardown()
+{
+    pixel.clear();
+    pixel.show();
 
-        /*
-         * Hand the RMT channel back. Without this the channel and its GPIO
-         * reservation outlive the app, which shows up as "GPIO 48 is not
-         * usable" on the next run and eventually as no free channel at all.
-         * After the last show(), which still needs it.
-         */
-        rmtDeinit(LED_PIN);
+    /*
+     * Hand the RMT channel back. Without this the channel and its GPIO
+     * reservation outlive the app, which shows up as "GPIO 48 is not usable" on
+     * the next run and eventually as no free channel at all. After the last
+     * show(), which still needs it.
+     */
+    rmtDeinit(LED_PIN);
 
-        printf("neopixel: stopped\n");
-        espixExit();            /* does not return */
-    }
+    printf("neopixel: stopped\n");
 }

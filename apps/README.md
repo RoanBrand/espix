@@ -8,12 +8,21 @@ firmware. Each builds to a relocatable ELF that the device loads at runtime.
 | [hello](hello/) | the minimum: a C app, argv, an exit status |
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
 
-`neopixel` is a normal `setup()`/`loop()` sketch. The `main()` that calls them
-lives in `neopixel/main/espix_sketch.{h,cpp}` — the app's own shim, not
-something espix provides, so copying those two files beside a sketch of your own
-is all it takes to get the same shape. It also keeps the `extern "C"` off the
-sketch, and turns espix's cooperative stop into `espixStopping()` and
-`espixExit()`.
+`neopixel` is a normal `setup()`/`loop()` sketch with one addition: a
+`teardown()`, called when someone stops the app. An Arduino sketch never needs
+one, because a board runs until the power goes; an espix app is a process, and
+what it switched on is its own to switch off.
+
+The `main()` that calls all three lives in `neopixel/main/espix_sketch.{h,cpp}`
+— the app's own shim, not something espix provides. Copy those two files and
+`ctors.ld` beside a sketch of your own to get the same shape.
+
+**`delay()` is a cancellation point.** The shim wraps it, so a stop request ends
+the app inside whichever `delay()` is running: `teardown()` runs and that
+`delay()` never returns. Worth knowing, because it is the one place the sketch
+does not show you what is happening — a `delay(5000)` interrupted after 127ms
+looks like nothing until you know. A `loop()` that never delays is still
+stopped, checked between iterations.
 
 The sketch departs from stock Arduino in three places, each commented where it
 appears: the NeoPixel object is a pointer built in `setup()` (see the note on

@@ -35,6 +35,13 @@ set(ELF_COMPONENTS Adafruit_NeoPixel espressif__arduino-esp32)
 # name their bounds so the startup shim can run them. See ctors.ld. project_elf()
 # appends ELF_LIBS verbatim to its link command; the comma form is required
 # because it puts the list through spaces2list().
-set(ELF_LIBS "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/ctors.ld")
+# --wrap=delay lets the shim make delay() a cancellation point without defining
+# a second delay(): Arduino's lives in the same translation unit as micros() and
+# delayMicroseconds(), which Adafruit_NeoPixel uses, so that unit is linked and
+# a duplicate would collide. Arduino wraps its own panic handler the same way.
+#
+# One space-separated string, not a CMake list: project_elf() runs ELF_LIBS
+# through spaces2list(), so a list would arrive as a single "a;b" argument.
+set(ELF_LIBS "-Wl,--wrap=delay -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/ctors.ld")
 
 project_elf(neopixel)

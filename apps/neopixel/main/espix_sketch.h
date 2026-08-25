@@ -1,17 +1,18 @@
 /*
  * A setup()/loop() sketch on espix.
  *
- * This shim belongs to this app, not to espix. It exists so a sketch can look
- * like an Arduino sketch: it supplies the main() espix actually calls, and
- * keeps two espix-specific details out of the sketch entirely — the extern "C"
- * that the entry point needs, and how a running app learns it has been asked to
- * stop.
+ * This shim belongs to the app, not to espix. It supplies the main() espix
+ * actually calls, and keeps the espix-specific details out of the sketch: the
+ * extern "C" the entry point needs, running global constructors that the ELF
+ * loader does not, and stopping cleanly when someone asks.
  *
- * Copy these two files beside your own sketch to get the same shape.
+ * Copy these two files and ctors.ld beside your own sketch to get the same
+ * shape.
  */
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ */
 /* What your sketch provides                                           */
@@ -20,29 +21,44 @@
 void setup();
 void loop();
 
+/*
+ * Put your hardware back: turn the LED off, stop the motor, release the
+ * peripheral. Called once when the app is stopping, before it exits.
+ *
+ * Optional — there is an empty default, so a sketch that owns no hardware can
+ * leave it out. An Arduino sketch has no equivalent because a board runs until
+ * the power goes; an espix app is a process someone can stop, and espix cannot
+ * know what a given app switched on.
+ *
+ * Named teardown rather than shutdown on purpose: lwip's sockets.h defines
+ * shutdown as a two-argument macro, so a sketch that later added networking
+ * would stop compiling for a baffling reason.
+ */
+void teardown();
+
 /* ------------------------------------------------------------------ */
 /* What espix adds                                                     */
 /* ------------------------------------------------------------------ */
 
 /*
- * True once someone has asked this app to stop — Ctrl-C in the shell that
- * started it, or `kill` from anywhere else.
+ * delay() is a cancellation point.
  *
- * An Arduino sketch runs until the board is powered off, so nothing in Arduino
- * corresponds to this. On espix an app is a process someone can stop, and one
- * driving hardware is the reason it matters: the LED has to be turned off by
- * the app, because espix cannot know what a given app left switched on.
+ * The shim wraps Arduino's delay() so that a stop request — Ctrl-C in the shell
+ * that started the app, or `kill` from anywhere else — ends it there and then:
+ * teardown() runs and the app exits, and that delay() never returns. A sketch
+ * that delays anywhere in loop() is therefore interruptible with nothing
+ * written for it.
  *
- * Check it in loop() and tidy up when it goes true. An app that ignores it is
- * killed outright a fraction of a second later, hardware and all.
+ * A loop() that never delays is still stopped, checked between iterations.
  */
+
+/* True once a stop has been requested. Only needed by a loop() that does long
+ * work without delaying and wants to bail out mid-way; otherwise ignore it. */
 bool espixStopping();
 
 /*
- * End the app. Does not return — so anything after it in loop() does not run,
- * and loop() is not called again.
- *
- * `status` is what the shell reports: 0 is success, and a non-zero value shows
- * up as `[exit N]` the way any other command's failure does.
+ * End the app. Runs teardown() and does not return, so anything after it in
+ * loop() does not run. `status` is what the shell reports — non-zero shows up
+ * as `[exit N]`.
  */
 void espixExit(int status = 0) __attribute__((noreturn));
