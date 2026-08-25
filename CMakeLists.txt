@@ -18,3 +18,26 @@ project(espix)
 #
 # Provided by managed_components/joltwallet__littlefs/project_include.cmake.
 littlefs_create_partition_image(storage fsroot)
+
+# Build apps/ and stage the ELFs into fsroot/bin before that image is packaged.
+#
+# Apps are separate IDF projects rather than components, so `idf.py build` does
+# not otherwise produce them and a fresh clone would flash a rootfs with an
+# empty /bin. tools/build-apps.sh skips any app whose staged binary is already
+# newer than its sources, so the usual cost is a few seconds of idf.py startup.
+#
+# Turn it off while iterating on the firmware alone:
+#   idf.py -DESPIX_BUILD_APPS=OFF build
+option(ESPIX_BUILD_APPS "Build apps/ and stage them into fsroot/bin" ON)
+
+if(ESPIX_BUILD_APPS)
+    add_custom_target(espix_apps
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-apps.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Building apps/ and staging into fsroot/bin"
+        VERBATIM
+        USES_TERMINAL)
+
+    # The image is packaged from fsroot/, so staging has to have happened first.
+    add_dependencies(littlefs_storage_bin espix_apps)
+endif()

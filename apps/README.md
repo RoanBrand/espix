@@ -8,7 +8,12 @@ firmware. Each builds to a relocatable ELF that the device loads at runtime.
 | [hello](hello/) | the minimum: a C app, argv, an exit status |
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
 
-Build one, then stage it into the rootfs image or copy it over with `scp`:
+The firmware build builds and stages these for you — `idf.py build` runs
+`tools/build-apps.sh`, which drops each ELF into `fsroot/bin/` so
+`idf.py storage-flash` carries them. Skip it with
+`idf.py -DESPIX_BUILD_APPS=OFF build`.
+
+To build one by hand, or to iterate without reflashing the whole rootfs:
 
 ```bash
 cd apps/hello
@@ -16,6 +21,9 @@ idf.py -G 'Unix Makefiles' set-target esp32s3   # once; enables `idf.py elf`
 idf.py elf
 scp build/hello.app.elf esp@<host>:/bin/hello
 ```
+
+The staged binaries are build artifacts and are not committed; the sources here
+are.
 
 ## What an app may call
 

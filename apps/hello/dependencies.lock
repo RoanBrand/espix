@@ -37,6 +37,7 @@ dependencies:
     version: 6.1.0
 direct_dependencies:
 - espressif/elf_loader
-manifest_hash: 674f3aa9d431c91f372a925cbf5dc684931e6c469c1ca7364fa6e348ecfd66f4
+- idf
+manifest_hash: 96483ba927e1db1a562d5e5e658741e373766bb3bfc8750442eca88f576c19bd
 target: esp32s3
 version: 3.0.0

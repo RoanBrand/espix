@@ -9,6 +9,7 @@ apps/*/build/
 apps/*/sdkconfig
 apps/*/sdkconfig.old
 apps/*/managed_components/
+apps/*/build-apps.log
 
 # Apps staged into the rootfs image are build artifacts, not source.
 # Build them from apps/ and copy them in — see tools/README.md.
