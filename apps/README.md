@@ -8,6 +8,20 @@ firmware. Each builds to a relocatable ELF that the device loads at runtime.
 | [hello](hello/) | the minimum: a C app, argv, an exit status |
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
 
+`neopixel` is a normal `setup()`/`loop()` sketch. The `main()` that calls them
+lives in `neopixel/main/espix_sketch.{h,cpp}` — the app's own shim, not
+something espix provides, so copying those two files beside a sketch of your own
+is all it takes to get the same shape. It also keeps the `extern "C"` off the
+sketch, and turns espix's cooperative stop into `espixStopping()` and
+`espixExit()`.
+
+The sketch departs from stock Arduino in three places, each commented where it
+appears: the NeoPixel object is a pointer built in `setup()` (see the note on
+global constructors below), output is `printf` rather than `Serial` — espix
+gives each app a stdout belonging to whoever ran it, where `Serial` would write
+to the physical UART and be invisible over SSH — and delays are multiples of
+10ms, because espix runs a 100Hz tick and Arduino's `delay()` truncates.
+
 The firmware build builds and stages these for you — `idf.py build` runs
 `tools/build-apps.sh`, which drops each ELF into `fsroot/bin/` so
 `idf.py storage-flash` carries them. Skip it with
