@@ -103,6 +103,13 @@ static int take_redirect(espix_session_t *s, int argc, char **argv, FILE **out_f
     return argc;
 }
 
+static espix_exec_fallback_fn s_exec_fallback;
+
+void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn)
+{
+    s_exec_fallback = fn;
+}
+
 int espix_shell_exec(espix_session_t *s, const char *line)
 {
     if (line == NULL) {
@@ -133,6 +140,21 @@ int espix_shell_exec(espix_session_t *s, const char *line)
 
     const espix_cmd_t *cmd = espix_shell_find(argv[0]);
     if (cmd == NULL) {
+        /* Not a builtin: let it be resolved as a program, the way a shell
+         * falls through to PATH. */
+        if (s_exec_fallback != NULL) {
+            if (redirect != NULL && s != NULL) {
+                s->redirect = redirect;
+            }
+            const int status = s_exec_fallback(s, argc, argv);
+            if (redirect != NULL) {
+                if (s != NULL) {
+                    s->redirect = NULL;
+                }
+                fclose(redirect);
+            }
+            return status;
+        }
         if (redirect != NULL) {
             fclose(redirect);
         }

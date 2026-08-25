@@ -203,6 +203,12 @@ the device alone:
 idf.py -p /dev/ttyUSB0 storage-flash   # WARNING: replaces the whole rootfs
 ```
 
+Apps run like any other command — `hello world` searches `/bin`, and a name
+containing a slash is a path relative to the working directory. `run` still
+exists, and is what you want for `&`. There is no execute bit to set: LittleFS
+has no mode bits, so espix gates on the ELF header instead, which is why a
+non-program answers `Exec format error` rather than pretending not to exist.
+
 To build and deploy an app, see [tools/README.md](tools/README.md).
 
 ### On Linux

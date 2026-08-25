@@ -190,6 +190,18 @@ typedef bool (*espix_cmd_iter_fn)(void *ctx, const espix_cmd_t *cmd);
 void espix_shell_foreach(espix_cmd_iter_fn cb, void *ctx);
 
 /*
+ * Called when a command line's first word is not a registered command, so it
+ * can be resolved as a program instead. Returns the program's exit status, or
+ * ESPIX_SHELL_ENOENT if there is no such program either.
+ *
+ * A hook rather than a direct call because espix_proc depends on this header
+ * for espix_session_t; the shell calling espix_proc_spawn_elf() would close
+ * the loop. espix_cmds registers one at boot, since it already sees both.
+ */
+typedef int (*espix_exec_fallback_fn)(espix_session_t *s, int argc, char **argv);
+void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn);
+
+/*
  * Run one command line in the context of `s`. Returns the command's status,
  * or a negative espix status for "not found" / "empty line".
  */

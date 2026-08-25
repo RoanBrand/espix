@@ -16,6 +16,9 @@ void espix_cmds_register_run(void);
 void espix_cmds_register_net(void);
 void espix_cmds_register_motd(void);
 
+/* Resolves a non-builtin command name to a program in /bin or by path. */
+void espix_cmds_register_exec_fallback(void);
+
 /* The greeting every session opens with; also the `motd` command. */
 void espix_cmds_print_greeting(espix_session_t *s);
 
