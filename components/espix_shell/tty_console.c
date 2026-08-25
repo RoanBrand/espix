@@ -114,18 +114,76 @@ static esp_linenoise_handle_t s_editor;
 static espix_history_t       *s_history;
 
 /*
- * Plain blocking read, paced so the editor never mistakes typing for a paste —
- * see ESPIX_PACE_MS. Replaces esp_linenoise's default, whose select()/eventfd
- * path we have no use for without esp_linenoise_abort().
+ * The editor asks the terminal where the cursor is, once per line, to work out
+ * the width. The answer comes back as a burst — "\x1b[35;100R" — and pacing
+ * every byte of it costs about 400ms per query, twice per prompt. That was the
+ * whole of the roughly one-second pause before a serial prompt, and it bought
+ * nothing: pacing exists so the *editor's* paste heuristic does not mistake
+ * fast typing for a clipboard paste, and a cursor report is consumed by
+ * get_cursor_position()'s own loop, which never reaches that heuristic.
+ *
+ * So watch for the question on the way out and let the answer through
+ * unpaced. Everything a person types is still paced, which is all it was for.
  */
+static bool s_expect_report;
+static int  s_report_budget;
+
+static bool contains_seq(const void *buf, size_t count, const char *lit)
+{
+    const size_t n = strlen(lit);
+
+    if (count < n) {
+        return false;
+    }
+    for (size_t i = 0; i + n <= count; i++) {
+        if (memcmp((const uint8_t *)buf + i, lit, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Observes, it does not intercept: the query still goes to the terminal, whose
+ * answer is the only source of the real width on a serial line.
+ */
+static ssize_t console_write_bytes(int fd, const void *buf, size_t count)
+{
+    if (contains_seq(buf, count, "\x1b[6n") || contains_seq(buf, count, "\x1b[5n")) {
+        s_expect_report = true;
+        /* Bounded, so a terminal that never answers cannot leave pacing off
+         * for the rest of the session. */
+        s_report_budget = 24;
+    }
+
+    const ssize_t n = write(fd, buf, count);
+    if (n == (ssize_t)count) {
+        fsync(fd);
+    }
+    return n;
+}
+
 static ssize_t console_read_bytes(int fd, void *buf, size_t count)
 {
     static int64_t last_us;
 
     const ssize_t n = read(fd, buf, count);
-    if (n > 0) {
-        espix_pace(&last_us);
+
+    if (n <= 0) {
+        return n;
     }
+
+    if (s_expect_report) {
+        const uint8_t c = *(const uint8_t *)buf;
+
+        /* 'R' ends a cursor report, 'n' a device status report. */
+        if (c == 'R' || c == 'n' || --s_report_budget <= 0) {
+            s_expect_report = false;
+        }
+        return n;                       /* not paced: we asked for this */
+    }
+
+    espix_pace(&last_us);
     return n;
 }
 
@@ -264,6 +322,7 @@ esp_err_t espix_console_session_start(void)
     cfg.completion_cb       = espix_shell_completion;
     cfg.hints_cb            = espix_shell_hint;
     cfg.read_bytes_cb       = console_read_bytes;
+    cfg.write_bytes_cb      = console_write_bytes;
 
     /* Supplying a read callback means create_instance() no longer forces
      * blocking mode for us, and the editor must block waiting for a key. */
