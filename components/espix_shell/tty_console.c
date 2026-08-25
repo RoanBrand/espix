@@ -394,11 +394,25 @@ esp_err_t espix_console_session_start(void)
      * remains available with `cat /etc/motd`, and if it should appear here
      * later it belongs directly under the spec block.
      */
-    espix_shell_exec(&s_console, "motd");
+    /*
+     * A console session that ends starts another, which is what init does when
+     * a login shell exits on a terminal. There is no login to return to here,
+     * so `exit` resets the session rather than logging anyone out — and, more
+     * to the point, the alternative is a device with no shell until it reboots.
+     *
+     * History is deliberately not reset: it belongs to the user, and logging
+     * out and back in keeps it on any real system.
+     */
+    for (;;) {
+        s_console.want_exit   = false;
+        s_console.last_status = 0;
+        strlcpy(s_console.cwd, "/", sizeof(s_console.cwd));
 
-    espix_shell_session_run(&s_console);
+        espix_shell_exec(&s_console, "motd");
+        espix_shell_session_run(&s_console);
 
-    /* Only reached if the session asks to exit. */
-    espix_klog(ESPIX_KLOG_WARN, TAG, "console session ended");
-    return ESP_OK;
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "console session ended; starting another");
+    }
+
+    return ESP_OK;     /* not reached */
 }

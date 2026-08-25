@@ -347,6 +347,15 @@ against what your client shows the first time it connects:
 espix: sshkey: host key SHA256:Sts8sx9+JuATlAMgo/iW1qYjBTbel+wXeXb7E2V2xhg
 ```
 
+`exit` ends the session, with an optional status: `exit 3` closes an SSH
+connection and leaves `3` in the client's `$?`. `logout` is the same thing
+restricted to a login shell, so it works over SSH and declines on the serial
+console, which nobody logged in to. On the console `exit` starts a fresh
+session rather than ending the shell — there is no login to fall back to, and
+a device with no shell until it reboots would be worse than useless. Ctrl-D
+also ends an SSH session; Ctrl-C cancels the line on both, as it does
+everywhere else.
+
 Command history follows the user, not the connection: reconnecting as `esp`
 finds what you typed last time. It lives in RAM only, so a reboot clears it,
 and the serial console keeps a separate list because it has no login step. Two

@@ -11,6 +11,7 @@
 #include "esp_console.h"
 
 #include "espix_fs.h"
+#include "espix_kernel.h"
 #include "espix_shell.h"
 
 espix_session_t *espix_shell_current(void)

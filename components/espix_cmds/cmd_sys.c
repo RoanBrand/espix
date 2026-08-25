@@ -398,6 +398,49 @@ static int cmd_whoami(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * End the session, with an exit status.
+ *
+ * `exit` is the general form; `logout` is the same thing restricted to a login
+ * shell, which is how bash draws the line and why both work over SSH while
+ * only `exit` makes sense on a console nobody logged in to.
+ */
+static int session_end(espix_session_t *s, int argc, char **argv, bool login_only)
+{
+    if (login_only && s->user[0] == '\0') {
+        espix_printf(s, "%s: not login shell: use `exit'\n", argv[0]);
+        return 1;
+    }
+
+    /* Bare `exit` carries the last command's status, as $? does. */
+    int status = s->last_status;
+
+    if (argc > 1) {
+        char *end = NULL;
+        const long n = strtol(argv[1], &end, 10);
+
+        if (end == argv[1] || *end != '\0' || n < 0 || n > 255) {
+            espix_printf(s, "usage: %s [status]\n", argv[0]);
+            return 1;               /* refuse, and stay */
+        }
+        status = (int)n;
+    }
+
+    s->last_status = status;
+    s->want_exit   = true;
+    return status;
+}
+
+static int cmd_exit(espix_session_t *s, int argc, char **argv)
+{
+    return session_end(s, argc, argv, false);
+}
+
+static int cmd_logout(espix_session_t *s, int argc, char **argv)
+{
+    return session_end(s, argc, argv, true);
+}
+
 /* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_sys_cmds[] = {
@@ -426,6 +469,12 @@ static espix_cmd_t s_sys_cmds[] = {
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,
       .help = "clear the screen",               .usage = "clear" },
+    { .name = "exit",   .fn = cmd_exit,
+      .help = "end this session",
+      .usage = "exit [status]" },
+    { .name = "logout", .fn = cmd_logout,
+      .help = "end this session (login shells only)",
+      .usage = "logout" },
     { .name = "reboot", .fn = cmd_reboot,
       .help = "restart the system",             .usage = "reboot" },
 };

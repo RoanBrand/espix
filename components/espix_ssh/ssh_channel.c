@@ -8,6 +8,7 @@
  * runs, with its own instance and its own history.
  */
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -705,9 +706,16 @@ static int chan_read_line(espix_session_t *s, const char *prompt,
     buf[0] = '\0';
 
     if (esp_linenoise_get_line(ch->editor, buf, len) != ESP_OK) {
-        /* Ctrl-D on an empty line, or the connection went away. Either way the
-         * session is over — unlike the console, where there is nothing to log
-         * out of and a failed read just means "try again". */
+        /*
+         * Two very different keys land here. The editor sets errno to EAGAIN
+         * for Ctrl-C, which abandons the line and should leave the user at a
+         * fresh prompt, and leaves it alone for Ctrl-D on an empty line, which
+         * is end of input and ends the session. Treating both as the end
+         * dropped the connection on Ctrl-C — not what any other shell does.
+         */
+        if (errno == EAGAIN) {
+            return 0;
+        }
         return -1;
     }
 
