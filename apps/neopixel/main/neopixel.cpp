@@ -51,6 +51,16 @@ uint16_t hue = 0;
 void setup()
 {
     pixel.begin();
+
+    /*
+     * Dim here rather than in the colour. setBrightness() scales at show()
+     * time, which is *after* gamma correction -- the order that matters.
+     * Passing a dimmed value to gamma32() instead crushes every channel to
+     * single digits, and a WS2812 that low renders as a muddy red whatever hue
+     * you asked for.
+     */
+    pixel.setBrightness(MAX_BRIGHTNESS);
+
     pixel.clear();
     pixel.show();
 
@@ -71,8 +81,11 @@ void loop()
      * what makes the sweep even, and gamma32 corrects for the eye's non-linear
      * response so the colours look equally bright. Both are the library's own;
      * hand-rolling either is what gets a NeoPixel demo looking lurid.
+     *
+     * ColorHSV() is left at full value: gamma32() needs the whole range to work
+     * with, and setBrightness() in setup() does the dimming afterwards.
      */
-    pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(hue, 255, MAX_BRIGHTNESS)));
+    pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(hue)));
     pixel.show();
 
     hue += 65536 / (SWEEP_MS / FRAME_MS);
