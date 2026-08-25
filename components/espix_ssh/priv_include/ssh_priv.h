@@ -197,8 +197,29 @@ esp_err_t ssh_kex_run(ssh_conn_t *c);
  */
 esp_err_t ssh_auth_run(ssh_conn_t *c);
 
-/* Session channel: open, pty-req, shell, then the interactive session. */
+/* Session channel: open, pty-req, shell or sftp, then the session. */
 esp_err_t ssh_channel_run(ssh_conn_t *c);
+
+/*
+ * Raw channel I/O, for a subsystem carrying bytes rather than a terminal.
+ *
+ * The interactive path deliberately translates line endings in both
+ * directions, because espix is the pty. A file transfer must not go anywhere
+ * near that — LF becoming CR LF would corrupt every binary — so these two move
+ * bytes through the channel untouched.
+ *
+ * recv_raw hands back a pointer into the connection's packet buffer, valid
+ * until the next call.
+ */
+esp_err_t ssh_channel_send_raw(ssh_conn_t *c, const void *data, size_t len);
+esp_err_t ssh_channel_recv_raw(ssh_conn_t *c, uint8_t **out, size_t *out_len);
+
+/* ------------------------------------------------------------------ */
+/* SFTP subsystem (sftp.c)                                             */
+/* ------------------------------------------------------------------ */
+
+/* Serve SFTP on an already-open channel until the client goes away. */
+esp_err_t espix_sftp_run(ssh_conn_t *c);
 
 /* Counted so `sshd` status can show them; incremented by ssh_auth.c. */
 void ssh_server_note_rejection(void);

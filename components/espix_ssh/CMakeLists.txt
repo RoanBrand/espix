@@ -6,6 +6,7 @@ idf_component_register(
         "ssh_kex.c"
         "ssh_auth.c"
         "ssh_channel.c"
+        "sftp.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

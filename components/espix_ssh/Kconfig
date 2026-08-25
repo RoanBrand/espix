@@ -16,6 +16,21 @@ menu "espix SSH"
         range 1 65535
         default 22
 
+    config ESPIX_SSH_MAX_SESSIONS
+        int "Concurrent connections"
+        depends on ESPIX_SSH_ENABLED
+        range 1 4
+        default 2
+        help
+            How many SSH connections may be open at once.
+
+            Two is the useful minimum: scp and sftp open their own connection,
+            so with a limit of one no file could be transferred while an
+            interactive session was open. Each connection costs about 22KB —
+            roughly 14KB of packet buffers and stored key-exchange state, plus
+            the connection task's stack — so raising this is not free on a part
+            with a few hundred KB of internal RAM.
+
     config ESPIX_SSH_TASK_STACK
         int "Connection task stack (bytes)"
         depends on ESPIX_SSH_ENABLED

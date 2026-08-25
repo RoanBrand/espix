@@ -49,6 +49,20 @@
 /* How long a writing task waits for the read side before giving up on it. */
 #define RX_WAIT_MS 250
 
+/*
+ * Fallback terminal size, and the floor under whatever a client asks for.
+ *
+ * A client may legitimately request a pty of 0x0 when it has no terminal of its
+ * own, and the editor divides by the width to work out how many rows a line
+ * occupies — so a zero reaches it as a divide-by-zero exception and takes the
+ * connection task down. Clamping is not defensive padding: no terminal is zero
+ * columns wide, and the editor has no way to say so.
+ */
+#define TERM_COLS_MIN 20
+#define TERM_ROWS_MIN 2
+#define TERM_COLS_DEF 80
+#define TERM_ROWS_DEF 24
+
 /* Concurrent sessions the fd -> channel map has room for. ssh_server.c admits
  * one connection at a time today; the map is sized to outlive that. */
 #define SSH_MAX_SESSIONS 4
@@ -60,6 +74,7 @@ typedef struct {
     uint32_t    peer_max_packet;
     uint32_t    local_window;
     bool        want_shell;
+    bool        want_sftp;
     bool        closed;
 
     uint16_t    cols;
@@ -292,6 +307,23 @@ static FILE *chan_open_stream(espix_session_t *s)
         setvbuf(f, NULL, _IOLBF, 128);
     }
     return f;
+}
+
+/* Record a size a client asked for, refusing nonsense rather than passing it
+ * to an editor that will divide by it. */
+static void set_term_size(ssh_chan_t *ch, uint32_t cols, uint32_t rows)
+{
+    if (cols < TERM_COLS_MIN || cols > UINT16_MAX) {
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                   "client asked for %u columns; using %d", (unsigned)cols,
+                   TERM_COLS_DEF);
+        cols = TERM_COLS_DEF;
+    }
+    if (rows < TERM_ROWS_MIN || rows > UINT16_MAX) {
+        rows = TERM_ROWS_DEF;
+    }
+    ch->cols = (uint16_t)cols;
+    ch->rows = (uint16_t)rows;
 }
 
 static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
@@ -619,6 +651,42 @@ static void chan_drain_pending(ssh_chan_t *ch)
     }
 }
 
+/*
+ * Raw channel I/O for a subsystem. Deliberately not chan_write()/ssh_edit_read():
+ * those cook line endings for a terminal, which would corrupt binary data.
+ */
+static ssh_chan_t *s_raw_chan;
+
+esp_err_t ssh_channel_send_raw(ssh_conn_t *c, const void *data, size_t len)
+{
+    (void)c;
+    if (s_raw_chan == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return send_data(s_raw_chan, data, len);
+}
+
+esp_err_t ssh_channel_recv_raw(ssh_conn_t *c, uint8_t **out, size_t *out_len)
+{
+    (void)c;
+    ssh_chan_t *ch = s_raw_chan;
+
+    if (ch == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    while (ch->pending_pos >= ch->pending_len) {
+        if (ch->closed || chan_pump(ch) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+
+    *out     = ch->pending + ch->pending_pos;
+    *out_len = ch->pending_len - ch->pending_pos;
+    ch->pending_pos = ch->pending_len;
+    return ESP_OK;
+}
+
 static int chan_read_line(espix_session_t *s, const char *prompt,
                           char *buf, size_t len)
 {
@@ -679,8 +747,11 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
 
     if (REQ_IS("pty-req")) {
         ssh_get_string(in, NULL);       /* TERM */
-        ch->cols = (uint16_t)ssh_get_u32(in);
-        ch->rows = (uint16_t)ssh_get_u32(in);
+        {
+            const uint32_t cols = ssh_get_u32(in);
+            const uint32_t rows = ssh_get_u32(in);
+            set_term_size(ch, cols, rows);
+        }
         /* Pixel dimensions and the encoded terminal modes follow; neither
          * matters until there is something that draws. */
         espix_klog(ESPIX_KLOG_DEBUG, TAG, "pty %ux%u", ch->cols, ch->rows);
@@ -698,9 +769,30 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
         return ESP_OK;
     }
 
+    if (REQ_IS("subsystem")) {
+        size_t         name_len = 0;
+        const uint8_t *name = ssh_get_string(in, &name_len);
+        const bool     is_sftp = (!in->bad && name != NULL &&
+                                  name_len == strlen("sftp") &&
+                                  memcmp(name, "sftp", name_len) == 0);
+        if (is_sftp) {
+            ch->want_sftp = true;
+        } else {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "refused subsystem '%.*s'",
+                       (int)name_len, (const char *)(name ? name : (const uint8_t *)""));
+        }
+        if (want_reply) {
+            reply_request(ch, is_sftp);
+        }
+        return ESP_OK;
+    }
+
     if (REQ_IS("window-change")) {
-        ch->cols = (uint16_t)ssh_get_u32(in);
-        ch->rows = (uint16_t)ssh_get_u32(in);
+        {
+            const uint32_t cols = ssh_get_u32(in);
+            const uint32_t rows = ssh_get_u32(in);
+            set_term_size(ch, cols, rows);
+        }
         /* Never carries want_reply per RFC 4254 §6.7. Load-bearing: this is
          * what ssh_edit_write() answers cursor-position queries with, so a
          * resize takes effect on the next prompt. */
@@ -766,8 +858,8 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     ssh_chan_t ch = {
         .conn         = c,
         .local_window = LOCAL_WINDOW,
-        .cols         = 80,
-        .rows         = 24,
+        .cols         = TERM_COLS_DEF,
+        .rows         = TERM_ROWS_DEF,
         .tx_lock      = xSemaphoreCreateRecursiveMutex(),
         .rx_lock      = xSemaphoreCreateMutex(),
     };
@@ -829,7 +921,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     }
 
     /* Requests until the client asks for a shell. */
-    while (!ch.want_shell && !ch.closed) {
+    while (!ch.want_shell && !ch.want_sftp && !ch.closed) {
         if (ssh_packet_read(c) != ESP_OK) {
             err = ESP_FAIL;
             goto out;
@@ -847,6 +939,21 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             goto out;
         }
         /* Anything else before a shell is noise. */
+    }
+
+    /*
+     * A subsystem carries bytes, not a terminal: no editor, no session, no
+     * greeting. Everything below that belongs to an interactive shell would
+     * corrupt a transfer.
+     */
+    if (ch.want_sftp) {
+        s_raw_chan = &ch;
+        espix_sftp_run(c);
+        s_raw_chan = NULL;
+
+        send_exit_status(&ch, 0);
+        close_channel(&ch);
+        goto out;
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "shell for %s (%ux%u)", c->user,

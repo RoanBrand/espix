@@ -248,10 +248,12 @@ static void accept_task(void *arg)
             continue;
         }
 
-        if (s_status.sessions >= 1) {
-            /* One at a time for this milestone. Refusing cleanly beats letting
-             * a second connection half-work. */
-            espix_klog(ESPIX_KLOG_WARN, TAG, "refusing second connection");
+        if (s_status.sessions >= CONFIG_ESPIX_SSH_MAX_SESSIONS) {
+            /* Refusing cleanly beats letting a connection half-work. The limit
+             * is above one because scp and sftp open their own connection, and
+             * transferring a file while a shell is open is the normal case. */
+            espix_klog(ESPIX_KLOG_WARN, TAG, "refusing connection: %d already open",
+                       s_status.sessions);
             close(fd);
             continue;
         }

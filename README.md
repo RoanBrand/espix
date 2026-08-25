@@ -162,16 +162,15 @@ display, networking) still to be finalized as the design matures.
    on hardware with argv and an exit status.
 4. Make a crashing app actually not crash the system (the reaper, held
    locks, per-process resource ownership).
-5. ~~Networking, and a shell over it.~~ Done for WiFi: `wlan0` appears in
+5. ~~Networking, a shell over it, and file transfer.~~ Done for WiFi: `wlan0` appears in
    `ip addr`, takes a DHCP lease, installs a default route, `ping` works
    by name and by address, and an SSH server serves the same shell as the
-   console. Ethernet (P4/S31) and USB-NCM are still to come, as are
-   SCP/SFTP and publickey authentication.
-6. A reentrant line editor, replacing linenoise on both transports.
-   linenoise reads and writes raw file descriptors and keeps its history
-   and callbacks in file-scope statics, so it cannot serve a connection
-   whose bytes arrive inside encrypted SSH packets — which is why an SSH
-   session today has no history or tab completion.
+   console. `scp` and `sftp` move files both ways. Ethernet (P4/S31)
+   and USB-NCM are still to come, as is publickey authentication.
+6. ~~One line editor for both transports.~~ Done via
+   `espressif/esp_linenoise`, one instance per session: history, TAB
+   completion and multiline editing behave the same over serial and SSH,
+   and history follows the user rather than the connection.
 7. `top`/`htop`-style live stats, a fuller command surface, pipes and
    job control.
 
@@ -361,7 +360,30 @@ editor does, so it keeps drawing at the old width while your terminal wraps at
 the new one. Enter or Ctrl-C gives a clean prompt at the new size, and
 everything after it is correct.
 
-One session at a time for now. The serial console stays independent, so you
+### Copying files on and off
+
+`scp` and `sftp` work with no special flags:
+
+```bash
+scp build/hello.app.elf esp@esp32s3-cb5d74:/bin/hello
+scp esp@esp32s3-cb5d74:/etc/motd .
+sftp esp@esp32s3-cb5d74
+```
+
+espix implements the SFTP subsystem, which is what OpenSSH 9 and later use for
+`scp` by default — so plain `scp` works, and graphical clients do too. There is
+no `-O` needed and the legacy SCP protocol is not implemented.
+
+It is deliberately partial: enough for `get`, `put`, `ls`, `cd`, `mkdir` and
+`rm`. Permissions and timestamps are accepted and discarded, because LittleFS
+stores neither, and failing a transfer over a mode bit that could never be
+written would help nobody.
+
+This is how an app reaches the device now — build it on a PC, copy it into
+`/bin`, run it by name. No reflashing the filesystem image.
+
+Two connections may be open at once, which is what lets a transfer run while
+you are logged in. The serial console stays independent, so you
 can watch kernel messages there while working over SSH — `dmesg` is how a
 remote user reads them, exactly as on Linux.
 
@@ -375,7 +397,7 @@ already linked and its PSA Crypto API covers everything the protocol needs.
 What that buys is one algorithm per role — `curve25519-sha256`,
 `ecdsa-sha2-nistp256`, `aes256-ctr`, `hmac-sha2-256-etm@openssh.com` — with
 the Terrapin (CVE-2023-48795) mitigation, and no negotiation logic to get
-wrong. Password authentication only; no publickey, no SCP/SFTP, no rekeying,
+wrong. Password authentication only; no publickey, no rekeying,
 so a session running for hours will eventually be dropped.
 
 What it costs is stated plainly: **this is a hand-rolled implementation of a
@@ -392,7 +414,8 @@ MIT — see [LICENSE](LICENSE).
 Any code directly incorporated from other MIT-licensed projects (e.g.
 Esp32OS) retains its original license notice; see individual file
 headers / a `NOTICE.md` once added. None is incorporated today —
-`espressif/elf_loader` and `joltwallet/littlefs` are fetched at build
+`espressif/elf_loader`, `espressif/esp_linenoise` and
+`joltwallet/littlefs` are fetched at build
 time by the IDF component manager rather than vendored into this tree.
 
 ## Acknowledgements
