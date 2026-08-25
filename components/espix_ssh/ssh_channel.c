@@ -3,16 +3,20 @@
  *
  * One channel, of type "session", carrying an interactive shell. The client
  * requests a pty, which means it sends raw keystrokes and expects the *server*
- * to echo and to do the line editing — so the crude editor here is not a
- * shortcut around a missing feature, it is the feature.
+ * to echo and to do the line editing. That work is esp_linenoise's, driven
+ * through the read/write callbacks below — the same editor the serial console
+ * runs, with its own instance and its own history.
  */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+
+#include "esp_linenoise.h"
 
 #include "espix_auth.h"
 #include "espix_kernel.h"
@@ -43,6 +47,10 @@
 /* How long a writing task waits for the read side before giving up on it. */
 #define RX_WAIT_MS 250
 
+/* Concurrent sessions the fd -> channel map has room for. ssh_server.c admits
+ * one connection at a time today; the map is sized to outlive that. */
+#define SSH_MAX_SESSIONS 4
+
 typedef struct {
     ssh_conn_t *conn;
     uint32_t    peer_chan;
@@ -55,9 +63,11 @@ typedef struct {
     uint16_t    cols;
     uint16_t    rows;
 
-    /* Line being assembled from raw keystrokes. */
-    char        line[ESPIX_LINE_MAX];
-    size_t      line_len;
+    /* Line editing, one instance per session — which is the whole reason espix
+     * uses esp_linenoise rather than IDF's, whose history and callbacks are
+     * file-scope statics. */
+    esp_linenoise_handle_t editor;
+    espix_history_t        history;
 
     /*
      * Bytes received but not yet consumed. One packet can hold more than one
@@ -67,6 +77,13 @@ typedef struct {
     uint8_t     pending[MAX_PACKET];
     size_t      pending_len;
     size_t      pending_pos;
+    bool        last_was_cr;    /* for collapsing CR LF into one newline */
+
+    /* Answers to terminal queries we handle ourselves rather than forwarding
+     * to the client — see ssh_edit_write(). Read back before real input. */
+    uint8_t     injected[24];
+    size_t      injected_len;
+    size_t      injected_pos;
 
     /*
      * Once an app's stdout points here, two tasks can write to one connection.
@@ -283,172 +300,298 @@ static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
 /* Line editing                                                        */
 /* ------------------------------------------------------------------ */
 
-/*
- * Deliberately minimal: printable characters, backspace, Enter, Ctrl-C,
- * Ctrl-D. No history, no arrows, no completion — an escape sequence arrives as
- * ESC '[' 'A' and is simply discarded rather than being mistaken for input.
- *
- * The real editor is a separate piece of work, at which point the console moves
- * onto it too and linenoise retires. Until then this is enough to drive a shell.
- */
-static bool consume_byte(ssh_chan_t *ch, uint8_t byte, bool *want_exit)
-{
-    switch (byte) {
-    case '\r':
-    case '\n':
-        send_data(ch, "\r\n", 2);
-        return true;            /* line complete */
-
-    case 0x7f:                  /* DEL, which is what most terminals send */
-    case 0x08:                  /* BS */
-        if (ch->line_len > 0) {
-            ch->line_len--;
-            /* Move back, overwrite with a space, move back again. */
-            send_data(ch, "\b \b", 3);
-        }
-        return false;
-
-    case 0x03:                  /* Ctrl-C: abandon the line */
-        send_data(ch, "^C\r\n", 4);
-        ch->line_len = 0;
-        return true;
-
-    case 0x04:                  /* Ctrl-D: end of input, only on an empty line */
-        if (ch->line_len == 0) {
-            /* Close the prompt line first, or the client prints "Connection
-             * closed" onto the end of it. */
-            send_data(ch, "\r\n", 2);
-            *want_exit = true;
-            return true;
-        }
-        return false;
-
-    default:
-        break;
-    }
-
-    /* Ignore anything else non-printable, including the ESC that starts an
-     * arrow key. Echoing it would corrupt the display; storing it would corrupt
-     * the command. */
-    if (byte < 0x20 || byte >= 0x7f) {
-        return false;
-    }
-
-    if (ch->line_len + 1 < sizeof(ch->line)) {
-        ch->line[ch->line_len++] = (char)byte;
-        send_data(ch, (const char *)&byte, 1);
-    }
-    return false;
-}
-
 static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in);
 
 /*
- * Drives the packet loop while waiting for a complete line, because everything
- * else the client may send — window adjustments, a resized terminal, a close —
- * arrives interleaved with keystrokes and has to be serviced.
+ * esp_linenoise hands its read/write callbacks an int fd and no context
+ * pointer, so the fd has to identify the session. We pass the real socket —
+ * which is never read or written directly here, both callbacks being supplied,
+ * but is genuinely ours and already unique per connection.
+ *
+ * Only connection tasks touch this, and ssh_server.c admits one at a time.
  */
+static struct {
+    int         fd;
+    ssh_chan_t *ch;
+} s_editor_map[SSH_MAX_SESSIONS];
+
+static void editor_map_add(int fd, ssh_chan_t *ch)
+{
+    for (size_t i = 0; i < sizeof(s_editor_map) / sizeof(s_editor_map[0]); i++) {
+        if (s_editor_map[i].ch == NULL) {
+            s_editor_map[i].fd = fd;
+            s_editor_map[i].ch = ch;
+            return;
+        }
+    }
+}
+
+static void editor_map_remove(int fd)
+{
+    for (size_t i = 0; i < sizeof(s_editor_map) / sizeof(s_editor_map[0]); i++) {
+        if (s_editor_map[i].fd == fd) {
+            s_editor_map[i].ch = NULL;
+        }
+    }
+}
+
+static ssh_chan_t *editor_map_get(int fd)
+{
+    for (size_t i = 0; i < sizeof(s_editor_map) / sizeof(s_editor_map[0]); i++) {
+        if (s_editor_map[i].ch != NULL && s_editor_map[i].fd == fd) {
+            return s_editor_map[i].ch;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Read one packet and act on it. Everything the client may send — window
+ * adjustments, a resized terminal, a close — arrives interleaved with
+ * keystrokes and has to be serviced, which is why the editor's input path is a
+ * packet loop rather than a socket read.
+ */
+static esp_err_t chan_pump(ssh_chan_t *ch)
+{
+    ssh_conn_t *c = ch->conn;
+
+    xSemaphoreTake(ch->rx_lock, portMAX_DELAY);
+    const esp_err_t rd = ssh_packet_read(c);
+    xSemaphoreGive(ch->rx_lock);
+
+    if (rd != ESP_OK) {
+        ch->closed = true;
+        return ESP_FAIL;
+    }
+
+    ssh_buf_t in;
+    ssh_buf_read_from(&in, c->in_payload, c->in_len);
+    const uint8_t msg = ssh_get_u8(&in);
+
+    switch (msg) {
+    case SSH_MSG_CHANNEL_DATA: {
+        ssh_get_u32(&in);               /* recipient channel */
+        size_t         n = 0;
+        const uint8_t *data = ssh_get_string(&in, &n);
+        if (in.bad || data == NULL) {
+            return ESP_FAIL;
+        }
+
+        /* The client is bound by the maximum packet size we advertised, so
+         * anything larger is a protocol violation rather than a resize. */
+        if (n > sizeof(ch->pending)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "oversized channel data (%u)",
+                       (unsigned)n);
+            return ESP_FAIL;
+        }
+
+        /*
+         * Copied out of the packet buffer before anything else can run: the
+         * editor echoes as it consumes, echoing can block on the peer's window,
+         * and blocking reads a packet — which decrypts straight over the buffer
+         * these bytes would otherwise still be sitting in.
+         */
+        memcpy(ch->pending, data, n);
+        ch->pending_len = n;
+        ch->pending_pos = 0;
+        adjust_local_window(ch, (uint32_t)n);
+        break;
+    }
+
+    case SSH_MSG_CHANNEL_WINDOW_ADJUST:
+        ssh_get_u32(&in);
+        ch->peer_window += ssh_get_u32(&in);
+        break;
+
+    case SSH_MSG_CHANNEL_REQUEST:
+        handle_channel_request(ch, &in);
+        break;
+
+    case SSH_MSG_CHANNEL_EOF:
+    case SSH_MSG_CHANNEL_CLOSE:
+    case SSH_MSG_DISCONNECT:
+        ch->closed = true;
+        return ESP_FAIL;
+
+    case SSH_MSG_IGNORE:
+    case SSH_MSG_DEBUG:
+        break;
+
+    default:
+        /* Not fatal: an unknown request mid-session is better ignored than
+         * treated as a reason to drop someone's shell. */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "ignoring message %u", msg);
+        break;
+    }
+
+    return ESP_OK;
+}
+
+/*
+ * Input side of the editor: hand it whatever has arrived, pumping packets until
+ * something has. Returning 0 means end of input, which is how a dropped
+ * connection reaches the shell as EOF.
+ *
+ * Enter is translated from CR to LF on the way through, because the editor
+ * tests for LF and a pty client sends CR. The serial console never needed this:
+ * IDF's UART VFS is configured with ESP_LINE_ENDINGS_CR and does the same
+ * translation before the editor sees a byte. Here espix *is* the pty, so the
+ * line discipline's job — ICRNL — is ours. A CR LF pair collapses to one
+ * newline rather than submitting twice.
+ */
+static ssize_t ssh_edit_read(int fd, void *buf, size_t count)
+{
+    ssh_chan_t *ch = editor_map_get(fd);
+
+    if (ch == NULL || count == 0) {
+        return -1;
+    }
+
+    uint8_t *out = buf;
+    size_t   got = 0;
+
+    /* Synthetic replies jump the queue and bypass CR translation: they are ours
+     * and already correct. */
+    while (got < count && ch->injected_pos < ch->injected_len) {
+        out[got++] = ch->injected[ch->injected_pos++];
+    }
+    if (got > 0) {
+        return (ssize_t)got;
+    }
+
+    while (got < count) {
+        if (ch->pending_pos >= ch->pending_len) {
+            if (got > 0) {
+                break;          /* deliver what we have rather than block */
+            }
+            if (ch->closed || chan_pump(ch) != ESP_OK) {
+                return 0;
+            }
+            continue;
+        }
+
+        const uint8_t byte = ch->pending[ch->pending_pos++];
+
+        if (byte == '\n' && ch->last_was_cr) {
+            ch->last_was_cr = false;
+            continue;           /* second half of a CR LF pair */
+        }
+        ch->last_was_cr = (byte == '\r');
+
+        out[got++] = (byte == '\r') ? '\n' : byte;
+    }
+
+    return (ssize_t)got;
+}
+
+/*
+ * Does this write consist of exactly `lit`? The library builds these with
+ * sizeof() on a string literal, so the trailing NUL is usually included —
+ * accept it either way.
+ */
+static bool seq_is(const void *buf, size_t count, const char *lit)
+{
+    const size_t n = strlen(lit);
+    const uint8_t *b = buf;
+
+    if (count != n && count != n + 1) {
+        return false;
+    }
+    if (count == n + 1 && b[n] != '\0') {
+        return false;
+    }
+    return memcmp(b, lit, n) == 0;
+}
+
+static void inject(ssh_chan_t *ch, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf((char *)ch->injected, sizeof(ch->injected), fmt, ap);
+    va_end(ap);
+
+    ch->injected_len = (n > 0) ? (size_t)n : 0;
+    ch->injected_pos = 0;
+}
+
+/*
+ * Output side. Deliberately send_data() and not chan_write(): the editor emits
+ * its own CR LF and escape sequences, so the "\n" -> "\r\n" translation that
+ * command output needs would corrupt them. chan_write() remains the session's
+ * write(), and the two coexist on the same transmit lock.
+ *
+ * Terminal geometry queries are answered here rather than forwarded. A real pty
+ * does not ask the terminal how wide it is — the size is state the driver holds,
+ * and espix already has it from pty-req and window-change. Round-tripping the
+ * question to the client instead means racing the user's own keystrokes: an
+ * arrow key arriving while the reply is awaited gets parsed as the reply, which
+ * both corrupts the width and swallows the keypress. Answering locally also
+ * spares two round-trips before every prompt.
+ */
+static ssize_t ssh_edit_write(int fd, const void *buf, size_t count)
+{
+    ssh_chan_t *ch = editor_map_get(fd);
+
+    if (ch == NULL) {
+        return -1;
+    }
+    if (count == 0) {
+        return 0;
+    }
+
+    /* Cursor position: answer with the far corner, so the caller reads the same
+     * value whether it asks before or after moving to the right margin. It
+     * therefore measures the true width and skips its restore sequence. */
+    if (seq_is(buf, count, "\x1b[6n")) {
+        inject(ch, "\x1b[%u;%uR", (unsigned)ch->rows, (unsigned)ch->cols);
+        return (ssize_t)count;
+    }
+
+    /* Device status: the client asked for a pty, so it is a terminal. */
+    if (seq_is(buf, count, "\x1b[5n")) {
+        inject(ch, "\x1b[0n");
+        return (ssize_t)count;
+    }
+
+    /* Only ever sent to find the right margin, which we already know. */
+    if (seq_is(buf, count, "\x1b[999C")) {
+        return (ssize_t)count;
+    }
+
+    if (send_data(ch, buf, count) != ESP_OK) {
+        return -1;
+    }
+    return (ssize_t)count;
+}
+
 static int chan_read_line(espix_session_t *s, const char *prompt,
                           char *buf, size_t len)
 {
     ssh_chan_t *ch = s->transport;
-    ssh_conn_t *c  = ch->conn;
 
     if (ch->closed) {
         return -1;
     }
 
-    ch->line_len = 0;
-    if (prompt != NULL && send_data(ch, prompt, strlen(prompt)) != ESP_OK) {
+    esp_linenoise_set_prompt(ch->editor, prompt);
+
+    /* get_line() returns ESP_OK for an empty line without writing the buffer,
+     * so anything left here from last time would be run as a command. */
+    buf[0] = '\0';
+
+    if (esp_linenoise_get_line(ch->editor, buf, len) != ESP_OK) {
+        /* Ctrl-D on an empty line, or the connection went away. Either way the
+         * session is over — unlike the console, where there is nothing to log
+         * out of and a failed read just means "try again". */
         return -1;
     }
 
-    for (;;) {
-        /*
-         * Drain what has already arrived before asking for more. Copying out of
-         * the packet buffer is what makes this safe: echoing can block on the
-         * peer's window, and blocking reads a packet, which decrypts straight
-         * over the buffer the bytes would otherwise still be sitting in.
-         */
-        bool want_exit = false;
-        while (ch->pending_pos < ch->pending_len) {
-            const uint8_t key = ch->pending[ch->pending_pos++];
-            if (consume_byte(ch, key, &want_exit)) {
-                if (want_exit) {
-                    ch->closed = true;
-                    return -1;
-                }
-                ch->line[ch->line_len] = '\0';
-                strlcpy(buf, ch->line, len);
-                return (int)strlen(buf);
-            }
-        }
-
-        xSemaphoreTake(ch->rx_lock, portMAX_DELAY);
-        const esp_err_t rd = ssh_packet_read(c);
-        xSemaphoreGive(ch->rx_lock);
-
-        if (rd != ESP_OK) {
-            ch->closed = true;
-            return -1;
-        }
-
-        ssh_buf_t in;
-        ssh_buf_read_from(&in, c->in_payload, c->in_len);
-        const uint8_t msg = ssh_get_u8(&in);
-
-        switch (msg) {
-        case SSH_MSG_CHANNEL_DATA: {
-            ssh_get_u32(&in);           /* recipient channel */
-            size_t         n = 0;
-            const uint8_t *data = ssh_get_string(&in, &n);
-            if (in.bad || data == NULL) {
-                return -1;
-            }
-
-            /* The client is bound by the maximum packet size we advertised, so
-             * anything larger is a protocol violation rather than a resize. */
-            if (n > sizeof(ch->pending)) {
-                espix_klog(ESPIX_KLOG_WARN, TAG, "oversized channel data (%u)",
-                           (unsigned)n);
-                return -1;
-            }
-            memcpy(ch->pending, data, n);
-            ch->pending_len = n;
-            ch->pending_pos = 0;
-            adjust_local_window(ch, (uint32_t)n);
-            break;
-        }
-
-        case SSH_MSG_CHANNEL_WINDOW_ADJUST:
-            ssh_get_u32(&in);
-            ch->peer_window += ssh_get_u32(&in);
-            break;
-
-        case SSH_MSG_CHANNEL_REQUEST:
-            handle_channel_request(ch, &in);
-            break;
-
-        case SSH_MSG_CHANNEL_EOF:
-        case SSH_MSG_CHANNEL_CLOSE:
-            ch->closed = true;
-            return -1;
-
-        case SSH_MSG_IGNORE:
-        case SSH_MSG_DEBUG:
-            break;
-
-        case SSH_MSG_DISCONNECT:
-            ch->closed = true;
-            return -1;
-
-        default:
-            /* Not fatal: an unknown request mid-session is better ignored than
-             * treated as a reason to drop someone's shell. */
-            espix_klog(ESPIX_KLOG_DEBUG, TAG, "ignoring message %u", msg);
-            break;
-        }
+    if (buf[0] != '\0') {
+        espix_history_push(&ch->history, buf);
+        espix_history_apply(&ch->history, ch->editor);
     }
+
+    return (int)strlen(buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -501,7 +644,9 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
     if (REQ_IS("window-change")) {
         ch->cols = (uint16_t)ssh_get_u32(in);
         ch->rows = (uint16_t)ssh_get_u32(in);
-        /* Never carries want_reply per RFC 4254 §6.7. */
+        /* Never carries want_reply per RFC 4254 §6.7. Load-bearing: this is
+         * what ssh_edit_write() answers cursor-position queries with, so a
+         * resize takes effect on the next prompt. */
         return ESP_OK;
     }
 
@@ -650,6 +795,43 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     espix_klog(ESPIX_KLOG_INFO, TAG, "shell for %s (%ux%u)", c->user,
                ch.cols, ch.rows);
 
+    /*
+     * The editor identifies this session by the socket fd, since its callbacks
+     * carry no context pointer. Register before creating the instance: probing
+     * and the first prompt both call straight back into them.
+     */
+    editor_map_add(c->fd, &ch);
+
+    esp_linenoise_config_t ed_cfg;
+    esp_linenoise_get_instance_config_default(&ed_cfg);
+
+    ed_cfg.in_fd               = c->fd;
+    ed_cfg.out_fd              = c->fd;
+    ed_cfg.max_cmd_line_length = ESPIX_LINE_MAX;
+    ed_cfg.history_max_length  = 32;
+    ed_cfg.allow_multi_line    = true;
+    ed_cfg.allow_empty_line    = true;
+    ed_cfg.completion_cb       = espix_shell_completion;
+    ed_cfg.hints_cb            = espix_shell_hint;
+    ed_cfg.read_bytes_cb       = ssh_edit_read;
+    ed_cfg.write_bytes_cb      = ssh_edit_write;
+
+    if (esp_linenoise_create_instance(&ed_cfg, &ch.editor) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the line editor");
+        editor_map_remove(c->fd);
+        err = ESP_ERR_NO_MEM;
+        goto out;
+    }
+
+    /*
+     * No esp_linenoise_probe() here: it calls fcntl() on in_fd directly and
+     * gives up when that fails, and our fd is a socket the library never
+     * actually reads. The client asked for a pty, so escape sequences are a
+     * given. Terminal width still auto-detects, because the cursor-position
+     * query goes out through the write callback and its reply comes back
+     * through the read one.
+     */
+
     espix_session_t session = {
         .name      = "ssh",
         .cwd       = "/",
@@ -672,6 +854,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * Hang up: a backgrounded app writes through a stream whose cookie is this
      * session, which lives on this stack, so nothing may outlive it.
      */
+    esp_linenoise_delete_instance(ch.editor);
+    espix_history_free(&ch.history);
+    editor_map_remove(c->fd);
+
     const size_t orphans = espix_proc_hangup(&session);
     if (orphans > 0) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on logout",

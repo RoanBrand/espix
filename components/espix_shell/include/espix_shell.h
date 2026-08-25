@@ -9,8 +9,12 @@
  * console component copies every command line through a single shared static
  * buffer (s_tmp_line_buf in components/console/commands.c), so two concurrent
  * sessions would corrupt each other. We keep our own registry and reuse only
- * the reentrant parts of that component — esp_console_split_argv(), linenoise
- * and argtable3.
+ * esp_console_split_argv(), which is reentrant.
+ *
+ * Line editing is espressif/esp_linenoise, one instance per session. IDF's own
+ * linenoise keeps its history and callbacks in file-scope statics and reads raw
+ * descriptors, so it could serve exactly one fd-backed console and never an SSH
+ * session, whose bytes arrive inside encrypted packets.
  */
 #pragma once
 
@@ -20,6 +24,7 @@
 #include <stdio.h>
 
 #include "esp_err.h"
+#include "esp_linenoise.h"
 
 #include "espix_kernel.h"
 
@@ -78,8 +83,8 @@ struct espix_session {
 
     /*
      * The terminal understands escape sequences. Set by the transport: the
-     * console learns it from linenoiseProbe(), an SSH session always has a pty
-     * in this build. Colour is emitted only when this is set.
+     * console learns it from esp_linenoise_probe(), an SSH session always has a
+     * pty in this build. Colour is emitted only when this is set.
      */
     bool        ansi;
 
@@ -113,6 +118,33 @@ typedef struct espix_cmd {
 esp_err_t espix_shell_register(espix_cmd_t *cmd);
 const espix_cmd_t *espix_shell_find(const char *name);
 
+/*
+ * Per-session command history, newest at index 0. Each transport owns one, so
+ * a serial user and a remote user cannot read each other's typing.
+ */
+#define ESPIX_HISTORY_MAX 16
+
+typedef struct {
+    char  *entries[ESPIX_HISTORY_MAX];
+    size_t count;
+} espix_history_t;
+
+/* Record an accepted line, then push the list into the editor. Both are needed
+ * after every command; see history.c for why the editor's copy is rebuilt. */
+void espix_history_push(espix_history_t *h, const char *line);
+void espix_history_apply(const espix_history_t *h, esp_linenoise_handle_t ed);
+void espix_history_free(espix_history_t *h);
+
+/*
+ * Line-editor callbacks, shared by every transport so TAB completion and the
+ * usage hint behave the same over serial and SSH. Each session passes these to
+ * its own esp_linenoise instance; they read only the registry, so they need no
+ * per-session context.
+ */
+void  espix_shell_completion(const char *buf, void *cb_ctx,
+                             esp_linenoise_completion_cb_t cb);
+char *espix_shell_hint(const char *buf, int *color, int *bold);
+
 /* Walk the registry in name order. Return false from `cb` to stop. */
 typedef bool (*espix_cmd_iter_fn)(void *ctx, const espix_cmd_t *cmd);
 void espix_shell_foreach(espix_cmd_iter_fn cb, void *ctx);
@@ -141,8 +173,8 @@ int espix_printf(espix_session_t *s, const char *fmt, ...)
 
 /*
  * Console transport (UART or USB-Serial-JTAG, whichever the build selects).
- * Sets up the driver, line endings and linenoise, then runs the session loop
- * on the calling task. Normally never returns.
+ * Sets up the driver, line endings and the line editor, then runs the session
+ * loop on the calling task. Normally never returns.
  */
 esp_err_t espix_console_session_start(void);
 

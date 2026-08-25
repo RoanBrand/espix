@@ -14,6 +14,9 @@
 
 #include <sys/socket.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "espix_kernel.h"
 #include "ssh_priv.h"
 
@@ -194,6 +197,17 @@ static esp_err_t read_exact(int fd, void *dst, size_t len)
         }
         if (n < 0) {
             if (errno == EINTR) {
+                continue;
+            }
+            /*
+             * The socket is blocking, but it does not stay that way for its
+             * whole life: esp_linenoise's terminal probe sets O_NONBLOCK on the
+             * fd it is given and restores it afterwards, and this runs on that
+             * same descriptor. A transient EAGAIN is not a closed connection,
+             * so wait a tick rather than tearing the session down.
+             */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                vTaskDelay(1);
                 continue;
             }
             return ESP_FAIL;

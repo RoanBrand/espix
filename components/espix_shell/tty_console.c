@@ -2,14 +2,15 @@
  * espix console transport — the local UART / USB-Serial-JTAG session.
  *
  * This is the first espix_session_t implementation. It replicates the driver
- * and linenoise setup that components/console/esp_console_repl_chip.c performs
- * (that file is the reference), but deliberately does not call
- * esp_console_start_repl(): the REPL owns its own task and its own dispatch,
- * and espix needs dispatch to be shared with future SSH sessions.
+ * setup that components/console/esp_console_repl_chip.c performs (that file is
+ * the reference), but deliberately does not call esp_console_start_repl(): the
+ * REPL owns its own task and its own dispatch, and espix shares dispatch with
+ * SSH sessions.
  *
- * linenoise keeps global state and reads the calling task's stdin, so exactly
- * one console session may exist. That is by design — SSH sessions will supply
- * their own read_line() rather than sharing this one.
+ * Line editing is espressif/esp_linenoise, one instance per session, so this
+ * console and an SSH session get the same editing with separate histories.
+ * IDF's own linenoise could not do that: its history and callbacks are
+ * file-scope statics and it reads raw file descriptors.
  */
 
 #include <stdio.h>
@@ -22,7 +23,7 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "linenoise/linenoise.h"
+#include "esp_linenoise.h"
 #include "sdkconfig.h"
 
 #if CONFIG_ESP_CONSOLE_UART
@@ -97,7 +98,7 @@ static esp_err_t console_hw_init(void)
 
 #else
     /* USB CDC or a secondary console: stdio already works, but without a
-     * driver behind it linenoise cannot do escape sequences. */
+     * driver behind it the editor cannot do escape sequences. */
     espix_klog(ESPIX_KLOG_WARN, TAG,
                "no console driver for this backend; line editing disabled");
     return ESP_OK;
@@ -105,61 +106,11 @@ static esp_err_t console_hw_init(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* linenoise integration                                              */
+/* Line editing                                                        */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    const char           *prefix;
-    size_t                prefix_len;
-    linenoiseCompletions *lc;
-} completion_ctx_t;
-
-static bool completion_visit(void *ctx, const espix_cmd_t *cmd)
-{
-    completion_ctx_t *c = ctx;
-
-    if (strncmp(cmd->name, c->prefix, c->prefix_len) == 0) {
-        linenoiseAddCompletion(c->lc, cmd->name);
-    }
-    return true;
-}
-
-static void console_completion(const char *buf, linenoiseCompletions *lc)
-{
-    /* Only the command word completes; argument completion needs per-command
-     * knowledge and can come later. */
-    if (strchr(buf, ' ') != NULL) {
-        return;
-    }
-
-    completion_ctx_t ctx = {
-        .prefix     = buf,
-        .prefix_len = strlen(buf),
-        .lc         = lc,
-    };
-    espix_shell_foreach(completion_visit, &ctx);
-}
-
-static char *console_hint(const char *buf, int *color, int *bold)
-{
-    if (buf == NULL || buf[0] == '\0' || strchr(buf, ' ') != NULL) {
-        return NULL;
-    }
-
-    const espix_cmd_t *cmd = espix_shell_find(buf);
-    if (cmd == NULL || cmd->usage == NULL) {
-        return NULL;
-    }
-
-    /* linenoise prints the hint verbatim and, with no free-hints callback
-     * registered, does not take ownership — so a static buffer is safe here. */
-    static char hint[ESPIX_LINE_MAX];
-    snprintf(hint, sizeof(hint), " %s", cmd->usage);
-
-    *color = 33;    /* dim yellow */
-    *bold  = 0;
-    return hint;
-}
+static esp_linenoise_handle_t s_editor;
+static espix_history_t        s_history;
 
 /* ------------------------------------------------------------------ */
 /* Session callbacks                                                  */
@@ -170,20 +121,24 @@ static int console_read_line(espix_session_t *s, const char *prompt,
 {
     (void)s;
 
-    char *line = linenoise(prompt);
-    if (line == NULL) {
-        /* NULL means an empty line, or a momentarily unavailable backend (USB
-         * host disconnect). Neither ends the session; back off so a detached
-         * console cannot spin the CPU. */
+    esp_linenoise_set_prompt(s_editor, prompt);
+
+    /* get_line() returns ESP_OK for an empty line without writing the buffer,
+     * so anything left here from last time would be run as a command. */
+    buf[0] = '\0';
+
+    if (esp_linenoise_get_line(s_editor, buf, len) != ESP_OK) {
+        /* An empty line, or a momentarily unavailable backend (USB host
+         * disconnect). Neither ends the session; back off so a detached console
+         * cannot spin the CPU. */
         vTaskDelay(pdMS_TO_TICKS(10));
         return 0;
     }
 
-    strlcpy(buf, line, len);
     if (buf[0] != '\0') {
-        linenoiseHistoryAdd(buf);
+        espix_history_push(&s_history, buf);
+        espix_history_apply(&s_history, s_editor);
     }
-    linenoiseFree(line);
 
     return (int)strlen(buf);
 }
@@ -204,10 +159,9 @@ static int console_write(espix_session_t *s, const char *data, size_t len)
  *
  * Boot kicks off asynchronous work that narrates itself from other tasks.
  * Drawing the prompt while that is in flight means it is immediately
- * overwritten, and since the session task then blocks inside linenoise() (whose
- * refreshLine() is static, so no outside caller can force a redraw) the prompt
- * stays stranded until the user presses Enter. Every boot, as the first thing
- * anyone sees.
+ * overwritten, and since the session task then blocks inside the editor with no
+ * way for an outside caller to force a redraw, the prompt stays stranded until
+ * the user presses Enter. Every boot, as the first thing anyone sees.
  *
  * An earlier version waited purely for the kernel log to fall silent for 300ms.
  * That releases too early, because the boot log has silent gaps of its own: WiFi
@@ -261,24 +215,63 @@ esp_err_t espix_console_session_start(void)
 {
     ESP_RETURN_ON_ERROR(console_hw_init(), TAG, "console hw init failed");
 
-    /* linenoise reads the calling task's stdin; unbuffered, or it would sit on
-     * a full line before we ever see a keystroke. */
+    /* The editor reads this task's stdin; unbuffered, or it would sit on a
+     * full line before we ever see a keystroke. */
     setvbuf(stdin, NULL, _IONBF, 0);
 
-    const bool ansi = (linenoiseProbe() == 0);
-    if (!ansi) {
-        linenoiseSetDumbMode(1);
+    /*
+     * One editor instance, owned by this session. The default read/write
+     * callbacks are right here: the console genuinely is a pair of file
+     * descriptors, so the library's select()/eventfd path applies unchanged.
+     * An SSH session supplies its own callbacks instead — that per-instance
+     * split is the whole reason espix uses this rather than IDF's linenoise,
+     * whose history and callbacks are file-scope statics.
+     */
+    esp_linenoise_config_t cfg;
+    esp_linenoise_get_instance_config_default(&cfg);
+
+    /*
+     * fileno(), not STDIN_FILENO/STDOUT_FILENO. Those constants are 0 and 1 by
+     * POSIX convention, but ESP-IDF opens the console streams through the VFS
+     * and they land on whatever descriptors it hands out — 2 and 3 on this
+     * build. Writing to fd 1 fails, which costs the prompt, the echo and the
+     * terminal probe all at once. IDF's own linenoise uses fileno() throughout
+     * for exactly this reason.
+     */
+    cfg.in_fd               = fileno(stdin);
+    cfg.out_fd              = fileno(stdout);
+    cfg.max_cmd_line_length = ESPIX_LINE_MAX;
+    cfg.history_max_length  = 32;
+    cfg.allow_multi_line    = true;
+    cfg.allow_empty_line    = true;
+    cfg.completion_cb       = espix_shell_completion;
+    cfg.hints_cb            = espix_shell_hint;
+
+    ESP_RETURN_ON_ERROR(esp_linenoise_create_instance(&cfg, &s_editor),
+                        TAG, "cannot create the line editor");
+
+    /* History is in-memory only; persisting it to the rootfs would mean a
+     * flash write per command. esp_linenoise_history_save() is there if that
+     * trade ever looks different. */
+
+    /*
+     * Do NOT probe here. esp_linenoise_create_instance() already probed the
+     * terminal and set its mode from the result; probing again asks a question
+     * whose single reply has been consumed, fails, and — if the answer is then
+     * acted on — turns off editing on a terminal the library just confirmed as
+     * capable. Read the verdict instead.
+     *
+     * Note the name reads backwards: allow_dumb_mode means "use dumb mode",
+     * which is what get_line() branches on.
+     */
+    bool dumb = false;
+    esp_linenoise_is_dumb_mode(s_editor, &dumb);
+
+    const bool ansi = !dumb;
+    if (dumb) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "terminal lacks escape sequences; line editing disabled");
     }
-
-    linenoiseSetMultiLine(1);
-    linenoiseHistorySetMaxLen(32);
-    linenoiseSetMaxLineLen(ESPIX_LINE_MAX);
-    linenoiseSetCompletionCallback(console_completion);
-    linenoiseSetHintsCallback(console_hint);
-    /* History is in-memory only; persisting it to the rootfs would mean a
-     * flash write per command. */
 
     s_console = (espix_session_t) {
         .name      = "console",
@@ -287,7 +280,7 @@ esp_err_t espix_console_session_start(void)
         .write     = console_write,
         .fg_pid    = ESPIX_PID_NONE,
         .ansi      = ansi,
-        /* No stdio rebinding: linenoise owns stdin and output goes through
+        /* No stdio rebinding: the editor owns stdin and output goes through
          * stdio, so a spawned app inherits the global streams — which for the
          * console is already the right place. */
         .open_stream = NULL,

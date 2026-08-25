@@ -7,6 +7,7 @@
  * dispatch concurrently.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -88,4 +89,71 @@ void espix_shell_foreach(espix_cmd_iter_fn cb, void *ctx)
             return;
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Line-editor callbacks                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Completion and hints are pure registry lookups, so they live here rather than
+ * in either transport — the console and an SSH session pass the same two
+ * function pointers to their own editor instances, which is what makes TAB and
+ * the usage hint behave identically over both.
+ */
+
+typedef struct {
+    const char                   *prefix;
+    size_t                        prefix_len;
+    void                         *cb_ctx;
+    esp_linenoise_completion_cb_t cb;
+} completion_ctx_t;
+
+static bool completion_visit(void *ctx, const espix_cmd_t *cmd)
+{
+    completion_ctx_t *c = ctx;
+
+    if (strncmp(cmd->name, c->prefix, c->prefix_len) == 0) {
+        c->cb(c->cb_ctx, cmd->name);
+    }
+    return true;
+}
+
+void espix_shell_completion(const char *buf, void *cb_ctx,
+                            esp_linenoise_completion_cb_t cb)
+{
+    /* Only the command word completes; argument completion needs per-command
+     * knowledge and can come later. */
+    if (buf == NULL || strchr(buf, ' ') != NULL) {
+        return;
+    }
+
+    completion_ctx_t ctx = {
+        .prefix     = buf,
+        .prefix_len = strlen(buf),
+        .cb_ctx     = cb_ctx,
+        .cb         = cb,
+    };
+    espix_shell_foreach(completion_visit, &ctx);
+}
+
+char *espix_shell_hint(const char *buf, int *color, int *bold)
+{
+    if (buf == NULL || buf[0] == '\0' || strchr(buf, ' ') != NULL) {
+        return NULL;
+    }
+
+    const espix_cmd_t *cmd = espix_shell_find(buf);
+    if (cmd == NULL || cmd->usage == NULL) {
+        return NULL;
+    }
+
+    /* Printed verbatim and, with no free-hints callback registered, not owned
+     * by the editor — so a static buffer is safe here. */
+    static char hint[ESPIX_LINE_MAX];
+    snprintf(hint, sizeof(hint), " %s", cmd->usage);
+
+    *color = 33;    /* dim yellow */
+    *bold  = 0;
+    return hint;
 }

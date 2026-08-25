@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS
+        "history.c"
         "registry.c"
         "session.c"
         "tty_console.c"
@@ -8,6 +9,7 @@ idf_component_register(
     REQUIRES
         esp_common
         espix_kernel
+        espressif__esp_linenoise
     PRIV_REQUIRES
         console
         espix_fs

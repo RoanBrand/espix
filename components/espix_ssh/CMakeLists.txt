@@ -16,6 +16,7 @@ idf_component_register(
         espix_kernel
         espix_auth
         espix_shell
+        espressif__esp_linenoise
         espix_proc
         espix_fs
         lwip

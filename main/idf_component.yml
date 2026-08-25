@@ -10,6 +10,13 @@ dependencies:
   # Root filesystem. VFS-backed, so apps get plain fopen()/opendir().
   joltwallet/littlefs: "==1.22.3"
 
+  # Line editing, one instance per session. IDF's own linenoise keeps its
+  # history and callbacks in file-scope statics and reads raw descriptors, so it
+  # can serve exactly one fd-backed console; this one is handle-based and takes
+  # read/write callbacks, which is what lets an SSH session — whose bytes arrive
+  # inside encrypted packets — use the same editor as the serial console.
+  espressif/esp_linenoise: "^1.0.4"
+
   # Runtime ELF loader: relocates and runs natively-compiled apps read off the
   # filesystem, plus dlopen()/dlsym() for shared objects.
   # Supports esp32s3 / esp32p4 / esp32s31, which are espix's three targets.
