@@ -182,6 +182,43 @@ Two traps for anyone benchmarking this:
   streaming SFTP write; it was neither, and the streaming write was never a
   candidate anyway, since the fast figures were themselves measured with it.
 
+### The terminal probe's verdict is deliberately overruled
+
+`esp_linenoise_create_instance()` probes the terminal once and latches
+`allow_dumb_mode` from the result. On a device that probe runs as the console
+starts — before anyone has attached a terminal, and always before
+`idf.py monitor --no-reset` reattaches to a board already running. Nothing
+answers, so it fails, and the console stays in dumb mode until reboot.
+
+Dumb mode is not merely "no line editing". It has two defects that corrupt
+input:
+
+- The line is terminated one byte late — `buffer[count + 1] = '\0'` in
+  `esp_linenoise_dumb()` — so `buffer[count]` keeps a stale byte from the
+  previous command. `df` typed after `whoami` runs as `dfo`, because `buf[2]`
+  is still the `o`.
+- ESC is `<= UNIT_SEP`, so it is dropped as non-printable while the rest of the
+  sequence is kept: an arrow key is entered as the literal text `[A`.
+
+Both were reported as "the console goes strange until reboot". espix therefore
+calls `esp_linenoise_set_dumb_mode(false)` regardless of what the probe decided.
+Assuming a capable terminal and being wrong puts escape codes on screen;
+assuming a dumb one and being wrong costs editing, history, and the integrity of
+every command typed.
+
+The consequence is that raw mode now runs against terminals that may never
+answer a cursor-position query, and `get_cursor_position()` would block in a
+read loop that swallows up to 31 typed characters hunting for its `R`. So the
+console bounds that wait by wall-clock time, and once a query has gone
+unanswered it stops sending them and synthesises the reply — the same thing
+`ssh_channel.c` has always had to do, having no terminal to ask.
+
+A related trap for anyone touching this: the paste heuristic stamps the clock
+*before* the read and measures how long the read took, so it is really asking
+whether the byte was already waiting. Anything that makes a read return
+instantly turns typing into pasting, and pasted bytes bypass the escape parser
+entirely.
+
 ### Networking is a naming layer, not a stack
 
 `esp_netif` already provides what a Unix user expects — interfaces with

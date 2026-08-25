@@ -144,6 +144,12 @@ const espix_cmd_t *espix_shell_find(const char *name);
  * pdMS_TO_TICKS(35) is three ticks and vTaskDelay only guarantees the last
  * full one, so the shortest real delay is about 20ms — back under the
  * threshold, which is exactly the trap.
+ *
+ * The heuristic is really asking "was this byte already waiting?": it stamps
+ * the clock before the read and measures how long the read took. So anything
+ * that lets a read return instantly turns typing into pasting, which is why
+ * the console's window for unpaced cursor reports is bounded by wall-clock
+ * time rather than by a count of reads — see tty_console.c.
  */
 #define ESPIX_PACE_MS      50
 #define ESPIX_PACE_MIN_US  30000

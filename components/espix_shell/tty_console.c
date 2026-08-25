@@ -14,6 +14,7 @@
  */
 
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_linenoise.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 
 #if CONFIG_ESP_CONSOLE_UART
@@ -114,19 +116,86 @@ static esp_linenoise_handle_t s_editor;
 static espix_history_t       *s_history;
 
 /*
- * The editor asks the terminal where the cursor is, once per line, to work out
- * the width. The answer comes back as a burst — "\x1b[35;100R" — and pacing
- * every byte of it costs about 400ms per query, twice per prompt. That was the
- * whole of the roughly one-second pause before a serial prompt, and it bought
- * nothing: pacing exists so the *editor's* paste heuristic does not mistake
- * fast typing for a clipboard paste, and a cursor report is consumed by
+ * The editor asks the terminal where the cursor is, twice per prompt, to work
+ * out the width. The answer comes back as a burst — "\x1b[35;100R" — and pacing
+ * every byte of it costs about 400ms per query. That was the whole of the
+ * roughly one-second pause before a serial prompt, and it bought nothing:
+ * pacing exists so the *editor's* paste heuristic does not mistake fast typing
+ * for a clipboard paste, and a cursor report is consumed by
  * get_cursor_position()'s own loop, which never reaches that heuristic.
  *
- * So watch for the question on the way out and let the answer through
+ * So the question is watched for on the way out and the answer let through
  * unpaced. Everything a person types is still paced, which is all it was for.
+ *
+ * The bound on that window used to be a count of 24 reads, and that was the
+ * bug behind a console stuck echoing "[A" for arrow keys until reboot. A
+ * terminal that stops answering left pacing off for 24 reads per query and 48
+ * per line — longer than most commands — and every new prompt re-armed it
+ * before it could drain. With pacing off, esp_linenoise's heuristic sees each
+ * key as pasted input and insert_pasted_char() puts the raw byte in the line
+ * buffer without ever reaching the escape parser, so ESC itself lands in the
+ * command.
+ *
+ * What has to be bounded is the *time* pacing spends switched off, not the
+ * number of bytes that happen to arrive in it. A terminal that is going to
+ * answer does so in about a millisecond.
  */
-static bool s_expect_report;
-static int  s_report_budget;
+#define REPORT_WINDOW_US 60000
+
+/* Size claimed on behalf of a terminal that will not answer. */
+#define REPORT_COLS 80
+#define REPORT_ROWS 24
+
+static bool    s_expect_report;
+static int64_t s_report_deadline_us;
+
+/*
+ * Set once a query has gone unanswered. After that the query is not sent at
+ * all and the answer is synthesised, because an unanswered one also leaves
+ * get_cursor_position() blocked in a read loop that swallows up to 31 typed
+ * characters hunting for its terminator.
+ */
+static bool    s_terminal_mute;
+
+/*
+ * Answers we generate, handed back before real input. The same shape as
+ * inject() in espix_ssh/ssh_channel.c, which has always needed it because an
+ * SSH channel has no terminal to ask.
+ */
+static uint8_t s_injected[24];
+static size_t  s_injected_len;
+static size_t  s_injected_pos;
+
+/* A real byte read while an answer still had to be delivered ahead of it. */
+static int     s_pushback = -1;
+
+static void inject(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf((char *)s_injected, sizeof(s_injected), fmt, ap);
+    va_end(ap);
+
+    if (n <= 0) {
+        return;
+    }
+    s_injected_len = ((size_t)n < sizeof(s_injected)) ? (size_t)n
+                                                      : sizeof(s_injected) - 1;
+    s_injected_pos = 0;
+}
+
+/* A fresh session re-probes: the terminal on the other end may have changed. */
+static void console_input_reset(void)
+{
+    s_expect_report = false;
+    s_terminal_mute = false;
+    s_injected_len  = 0;
+    s_injected_pos  = 0;
+    s_pushback      = -1;
+}
+
+/* Set only around esp_linenoise_create_instance(); see console_write_bytes. */
+static bool s_probe_in_progress;
 
 static bool contains_seq(const void *buf, size_t count, const char *lit)
 {
@@ -144,16 +213,47 @@ static bool contains_seq(const void *buf, size_t count, const char *lit)
 }
 
 /*
- * Observes, it does not intercept: the query still goes to the terminal, whose
- * answer is the only source of the real width on a serial line.
+ * Normally observes rather than intercepts: the query still goes to the
+ * terminal, whose answer is the only source of the real width on a serial line.
+ * Once a terminal has proven silent it intercepts instead, and answers.
  */
 static ssize_t console_write_bytes(int fd, const void *buf, size_t count)
 {
-    if (contains_seq(buf, count, "\x1b[6n") || contains_seq(buf, count, "\x1b[5n")) {
-        s_expect_report = true;
-        /* Bounded, so a terminal that never answers cannot leave pacing off
-         * for the rest of the session. */
-        s_report_budget = 24;
+    const bool cursor = contains_seq(buf, count, "\x1b[6n");
+    const bool status = contains_seq(buf, count, "\x1b[5n");
+
+    /*
+     * create_instance() announces "your terminal does not support escape
+     * sequences" when its probe goes unanswered. We override that verdict
+     * below, so printing it would be telling the user something untrue on
+     * every boot where nothing was attached yet.
+     */
+    if (s_probe_in_progress &&
+        contains_seq(buf, count, "does not support escape sequences")) {
+        return (ssize_t)count;
+    }
+
+    if (s_terminal_mute) {
+        if (cursor) {
+            inject("\x1b[%u;%uR", REPORT_ROWS, REPORT_COLS);
+            return (ssize_t)count;      /* swallowed: nobody would answer it */
+        }
+        if (status) {
+            inject("\x1b[0n");
+            return (ssize_t)count;
+        }
+        /*
+         * The "go to the right margin" that sits between the two queries goes
+         * with them. get_columns() only emits a restore when the second report
+         * exceeds the first, and both of ours are the same number — so moving
+         * the cursor for real would park it at the margin for good.
+         */
+        if (contains_seq(buf, count, "\x1b[999C")) {
+            return (ssize_t)count;
+        }
+    } else if (cursor || status) {
+        s_expect_report      = true;
+        s_report_deadline_us = esp_timer_get_time() + REPORT_WINDOW_US;
     }
 
     const ssize_t n = write(fd, buf, count);
@@ -166,6 +266,25 @@ static ssize_t console_write_bytes(int fd, const void *buf, size_t count)
 static ssize_t console_read_bytes(int fd, void *buf, size_t count)
 {
     static int64_t last_us;
+    uint8_t       *out = buf;
+
+    if (count == 0) {
+        return 0;
+    }
+
+    /* Our own answers first, unpaced: they are ours and already correct. */
+    if (s_injected_pos < s_injected_len) {
+        out[0] = s_injected[s_injected_pos++];
+        return 1;
+    }
+
+    /* Then anything held back while an answer went ahead of it. */
+    if (s_pushback >= 0) {
+        out[0]     = (uint8_t)s_pushback;
+        s_pushback = -1;
+        espix_pace(&last_us);
+        return 1;
+    }
 
     const ssize_t n = read(fd, buf, count);
 
@@ -174,12 +293,37 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
     }
 
     if (s_expect_report) {
-        const uint8_t c = *(const uint8_t *)buf;
-
-        /* 'R' ends a cursor report, 'n' a device status report. */
-        if (c == 'R' || c == 'n' || --s_report_budget <= 0) {
+        if (esp_timer_get_time() > s_report_deadline_us) {
+            /*
+             * Too late to be a report, so this is someone typing. Answer the
+             * outstanding query so the editor's read loop stops swallowing
+             * input, and keep this byte for the next read.
+             */
             s_expect_report = false;
+            s_terminal_mute = true;
+            s_pushback      = out[0];
+            inject("\x1b[%u;%uR", REPORT_ROWS, REPORT_COLS);
+
+            espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                       "terminal does not answer cursor queries; assuming %ux%u",
+                       REPORT_COLS, REPORT_ROWS);
+
+            out[0] = s_injected[s_injected_pos++];
+            return 1;
         }
+
+        /* 'R' ends a cursor report, 'n' a device status report. The whole read
+         * is scanned: one byte per call is only how it happens to work today. */
+        for (ssize_t i = 0; i < n; i++) {
+            if (out[i] == 'R' || out[i] == 'n') {
+                s_expect_report = false;
+                break;
+            }
+        }
+
+        /* Stamp it even though this was not paced, or the next real keystroke
+         * sees a stale timestamp, skips its delay, and is taken for a paste. */
+        last_us = esp_timer_get_time();
         return n;                       /* not paced: we asked for this */
     }
 
@@ -329,8 +473,10 @@ esp_err_t espix_console_session_start(void)
     const int flags = fcntl(cfg.in_fd, F_GETFL, 0);
     fcntl(cfg.in_fd, F_SETFL, flags & ~O_NONBLOCK);
 
-    ESP_RETURN_ON_ERROR(esp_linenoise_create_instance(&cfg, &s_editor),
-                        TAG, "cannot create the line editor");
+    s_probe_in_progress = true;
+    const esp_err_t ed_err = esp_linenoise_create_instance(&cfg, &s_editor);
+    s_probe_in_progress = false;
+    ESP_RETURN_ON_ERROR(ed_err, TAG, "cannot create the line editor");
 
     /* The console has no login, so it is its own principal rather than sharing
      * a list with whoever logs in over SSH. */
@@ -342,23 +488,41 @@ esp_err_t espix_console_session_start(void)
      * trade ever looks different. */
 
     /*
-     * Do NOT probe here. esp_linenoise_create_instance() already probed the
-     * terminal and set its mode from the result; probing again asks a question
-     * whose single reply has been consumed, fails, and — if the answer is then
-     * acted on — turns off editing on a terminal the library just confirmed as
-     * capable. Read the verdict instead.
+     * Overrule the probe and keep line editing on. Note the name reads
+     * backwards: allow_dumb_mode means "use dumb mode".
      *
-     * Note the name reads backwards: allow_dumb_mode means "use dumb mode",
-     * which is what get_line() branches on.
+     * esp_linenoise_create_instance() probes exactly once, as the console
+     * starts — which on a device is before anyone has attached a terminal, and
+     * always before `idf.py monitor --no-reset` reattaches to a board that is
+     * already running. Nothing answers, so the probe fails and the instance
+     * latches into dumb mode for the life of the firmware.
+     *
+     * That is worth spelling out, because dumb mode does not merely disable
+     * editing. It drops ESC as a non-printable and keeps what follows, so an
+     * arrow key is entered as the literal text "[A"; and
+     * esp_linenoise_dumb() terminates the line one byte late --
+     * `buffer[count + 1] = '\0'` at src/esp_linenoise.c:1027 -- leaving a
+     * stale byte of the previous command on the end of this one, so `df` typed
+     * after `whoami` runs as `dfo`. Both were reported as a console that goes
+     * strange until reboot, and both are this.
+     *
+     * Every serial terminal in practical use handles escape sequences.
+     * Assuming a capable terminal and being wrong puts escape codes on the
+     * screen; assuming a dumb one and being wrong costs line editing, history,
+     * and the integrity of every command typed. The trade is not close.
+     *
+     * Do not probe again here either: the question has one reply and
+     * create_instance() consumed it.
      */
-    bool dumb = false;
-    esp_linenoise_is_dumb_mode(s_editor, &dumb);
-
-    const bool ansi = !dumb;
-    if (dumb) {
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "terminal lacks escape sequences; line editing disabled");
+    bool probed_dumb = false;
+    esp_linenoise_is_dumb_mode(s_editor, &probed_dumb);
+    if (probed_dumb) {
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                   "no answer to the terminal probe; assuming it is capable");
     }
+    esp_linenoise_set_dumb_mode(s_editor, false);
+
+    const bool ansi = true;
 
     s_console = (espix_session_t) {
         .name      = "console",
@@ -407,6 +571,7 @@ esp_err_t espix_console_session_start(void)
         s_console.want_exit   = false;
         s_console.last_status = 0;
         strlcpy(s_console.cwd, "/", sizeof(s_console.cwd));
+        console_input_reset();
 
         espix_shell_exec(&s_console, "motd");
         espix_shell_session_run(&s_console);
