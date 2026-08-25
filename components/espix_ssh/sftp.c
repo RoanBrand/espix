@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
+
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "ssh_priv.h"
@@ -75,12 +77,45 @@ enum {
 #define SFTP_HANDLES 4
 
 /*
- * Largest payload we will return for one READ. The client asks for far more —
- * OpenSSH requests 32KB — but every byte lives in the packet buffer alongside
- * the framing, and DIRAM is the scarce resource here. A smaller reply costs
- * round-trips, not correctness.
+ * Largest payload we will return for one READ. The client asks for more still —
+ * OpenSSH requests 32KB — but every byte lives in the reply buffer alongside
+ * the framing, so this is a straight memory-for-round-trips trade. 8KB rather
+ * than the original 2KB because the buffer can now live in PSRAM.
  */
-#define SFTP_READ_MAX 2048
+#define SFTP_READ_MAX 8192
+
+/* Reply buffer: a DATA reply is the largest thing we build, at SFTP_READ_MAX
+ * plus its type, request id and length. The rest have paths in them and are
+ * far smaller. */
+#define SFTP_OUT_MAX (SFTP_READ_MAX + 256)
+
+/*
+ * Reassembly buffer, which holds only packets that are *not* writes — a write
+ * streams straight to the file, so nothing here scales with transfer size.
+ *
+ * Sized so one arriving channel packet always fits alongside the largest
+ * partial packet we would ever retain, which lets espix_sftp_run() copy a whole
+ * chunk in one go. That matters for more than tidiness: see the aliasing note
+ * on the copy itself.
+ */
+#define SFTP_IN_MAX (SSH_MAX_PACKET + SSH_CHANNEL_MAX_PACKET)
+
+/*
+ * The fixed part of a WRITE: type, request id, handle string, 64-bit offset and
+ * the payload length — 25 bytes with the 4-byte handles we hand out. Rounded up
+ * for slack; a client sending a longer handle than it was given fails to parse
+ * and has its request refused, which is correct either way.
+ */
+#define SFTP_WRITE_HEAD 32
+
+/*
+ * Sanity bound on a single WRITE. SFTP sets no limit and the payload is
+ * streamed rather than buffered, so this is not a memory constraint — it guards
+ * only against a desynchronised or hostile client announcing a length that
+ * would have us writing for hours. OpenSSH's own server caps a message at
+ * 256KB.
+ */
+#define SFTP_WRITE_MAX (256 * 1024 + 1024)
 
 typedef struct {
     bool  used;
@@ -93,9 +128,10 @@ typedef struct {
 typedef struct {
     ssh_conn_t   *conn;
     sftp_handle_t handles[SFTP_HANDLES];
+
     /* Reassembly across CHANNEL_DATA boundaries: one SFTP packet does not have
-     * to arrive in one SSH packet, and a write of any size will not. */
-    uint8_t       in[SSH_MAX_PACKET];
+     * to arrive in one SSH packet. Writes bypass this entirely. */
+    uint8_t       in[SFTP_IN_MAX];
     size_t        in_len;
 
     /*
@@ -103,7 +139,26 @@ typedef struct {
      * send_data() assembles the CHANNEL_DATA framing, so a reply written there
      * would be overwritten by the packet meant to carry it.
      */
-    uint8_t       out[SSH_MAX_PACKET];
+    uint8_t       out[SFTP_OUT_MAX];
+
+    /*
+     * A WRITE being streamed to disk.
+     *
+     * The payload of a write is bounded only by the client's buffer size —
+     * OpenSSH sends 32KB by default and -B raises it — so it is written as it
+     * arrives instead of being reassembled. That is what makes an upload
+     * independent of any buffer here.
+     *
+     * While w_active, incoming bytes are file contents and must never be
+     * parsed as packets. w_file is NULL once the request has been refused or a
+     * write has failed: the payload is then discarded rather than abandoned,
+     * because the stream has to stay in step to report the error at all.
+     */
+    bool          w_active;
+    FILE         *w_file;
+    uint32_t      w_id;
+    size_t        w_left;       /* payload bytes still expected */
+    const char   *w_error;      /* NULL while the write is still good */
 } sftp_t;
 
 /* ------------------------------------------------------------------ */
@@ -481,28 +536,92 @@ static esp_err_t do_read(sftp_t *s, uint32_t id, ssh_buf_t *in)
     return sftp_send(s, &b);
 }
 
-static esp_err_t do_write(sftp_t *s, uint32_t id, ssh_buf_t *in)
+/* ------------------------------------------------------------------ */
+/* Writes, which stream rather than reassemble                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Parse a WRITE header and enter streaming mode. `pkt` points at the type byte;
+ * `plen` is the packet's own length word, which is what governs framing. The
+ * request's payload-length field is compared against it but never used to
+ * decide how many bytes to consume — a client whose two lengths disagreed would
+ * otherwise leave us reading the next packet from the wrong offset.
+ *
+ * Returns the number of header bytes consumed; everything after them, to
+ * `plen`, is payload. A request that cannot be honoured still streams, with the
+ * payload discarded, so the stream stays in step and the error reaches the
+ * client instead of the session dying.
+ */
+static size_t write_begin(sftp_t *s, uint8_t *pkt, size_t avail, size_t plen)
 {
-    sftp_handle_t *h = handle_get(s, in);
+    /* Bounded by plen as well as by what has arrived: reading past the packet
+     * would consume the head of the one behind it. */
+    ssh_buf_t in;
+    ssh_buf_read_from(&in, pkt, (avail < plen) ? avail : plen);
 
-    if (h == NULL || h->file == NULL) {
-        return send_status(s, id, SSH_FX_FAILURE, "bad handle");
+    ssh_get_u8(&in);                            /* type */
+    const uint32_t id = ssh_get_u32(&in);
+    sftp_handle_t *h  = handle_get(s, &in);
+
+    ssh_get_u32(&in);                           /* offset, high word */
+    const uint32_t offset = ssh_get_u32(&in);
+    const uint32_t len    = ssh_get_u32(&in);
+
+    s->w_active = true;
+    s->w_id     = id;
+    s->w_file   = NULL;
+    s->w_error  = NULL;
+
+    if (in.bad) {
+        /* Nothing after the type byte parsed, so only plen says where this
+         * packet ends. Skip all of it. */
+        s->w_left  = plen - 1;
+        s->w_error = "malformed write";
+        return 1;
     }
 
-    ssh_get_u32(in);                            /* offset, high word */
-    const uint32_t offset = ssh_get_u32(in);
+    s->w_left = plen - in.pos;
 
-    size_t         len  = 0;
-    const uint8_t *data = ssh_get_string(in, &len);
+    if (len != s->w_left) {
+        s->w_error = "inconsistent write length";
+    } else if (h == NULL || h->file == NULL) {
+        s->w_error = "bad handle";
+    } else if (fseek(h->file, (long)offset, SEEK_SET) != 0) {
+        s->w_error = "seek failed";
+    } else {
+        s->w_file = h->file;
+    }
 
-    if (in->bad || data == NULL) {
-        return send_status(s, id, SSH_FX_FAILURE, "malformed write");
+    return in.pos;
+}
+
+/* Hand payload to the file. Returns how much of `data` belonged to this write;
+ * anything left over is the next packet. */
+static size_t write_feed(sftp_t *s, const uint8_t *data, size_t len)
+{
+    const size_t take = (len < s->w_left) ? len : s->w_left;
+
+    if (s->w_file != NULL && take > 0 &&
+        fwrite(data, 1, take, s->w_file) != take) {
+        s->w_file  = NULL;              /* keep draining, but stop writing */
+        s->w_error = "write failed";
     }
-    if (fseek(h->file, (long)offset, SEEK_SET) != 0) {
-        return send_status(s, id, SSH_FX_FAILURE, "seek failed");
-    }
-    if (len > 0 && fwrite(data, 1, len, h->file) != len) {
-        return send_status(s, id, SSH_FX_FAILURE, "write failed");
+    s->w_left -= take;
+    return take;
+}
+
+static esp_err_t write_finish(sftp_t *s)
+{
+    const uint32_t id  = s->w_id;
+    const char    *err = s->w_error;
+
+    s->w_active = false;
+    s->w_file   = NULL;
+    s->w_error  = NULL;
+
+    if (err != NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "write failed: %s", err);
+        return send_status(s, id, SSH_FX_FAILURE, err);
     }
     return send_status(s, id, SSH_FX_OK, "");
 }
@@ -564,6 +683,8 @@ static esp_err_t do_rename(sftp_t *s, uint32_t id, ssh_buf_t *in)
 /* Dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
+/* Every request except WRITE, which pump() intercepts before it gets here
+ * because its payload is streamed rather than reassembled. */
 static esp_err_t dispatch(sftp_t *s, uint8_t *packet, size_t len)
 {
     ssh_buf_t in;
@@ -595,7 +716,6 @@ static esp_err_t dispatch(sftp_t *s, uint8_t *packet, size_t len)
     case SSH_FXP_OPENDIR:  return do_opendir(s, id, &in);
     case SSH_FXP_READDIR:  return do_readdir(s, id, &in);
     case SSH_FXP_READ:     return do_read(s, id, &in);
-    case SSH_FXP_WRITE:    return do_write(s, id, &in);
     case SSH_FXP_CLOSE:    return do_close(s, id, &in);
     case SSH_FXP_RENAME:   return do_rename(s, id, &in);
     case SSH_FXP_REMOVE:
@@ -616,11 +736,114 @@ static esp_err_t dispatch(sftp_t *s, uint8_t *packet, size_t len)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Session                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Drop `n` consumed bytes off the front of the reassembly buffer. */
+static void consume(sftp_t *s, size_t n)
+{
+    s->in_len -= n;
+    memmove(s->in, s->in + n, s->in_len);
+}
+
+/*
+ * Consume everything the reassembly buffer now holds: payload for a write in
+ * progress, then whole packets, leaving any partial one for the next chunk.
+ */
+static esp_err_t pump(sftp_t *s)
+{
+    for (;;) {
+        /* Bytes belonging to a write are file contents. Parsing them as
+         * packets is how a large upload used to derail the session. */
+        if (s->w_active) {
+            consume(s, write_feed(s, s->in, s->in_len));
+            if (s->w_left > 0) {
+                return ESP_OK;              /* the rest is still in flight */
+            }
+            if (write_finish(s) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            continue;
+        }
+
+        if (s->in_len < 4) {
+            return ESP_OK;
+        }
+
+        const uint32_t plen = ((uint32_t)s->in[0] << 24) |
+                              ((uint32_t)s->in[1] << 16) |
+                              ((uint32_t)s->in[2] << 8) | (uint32_t)s->in[3];
+
+        if (plen == 0) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "zero-length packet");
+            return ESP_FAIL;
+        }
+        if (s->in_len < 5) {
+            return ESP_OK;                  /* need the type byte to route it */
+        }
+
+        if (s->in[4] == SSH_FXP_WRITE) {
+            if (plen > SFTP_WRITE_MAX) {
+                espix_klog(ESPIX_KLOG_WARN, TAG, "write of %u bytes refused",
+                           (unsigned)plen);
+                return ESP_FAIL;
+            }
+            /* Only the fixed header has to be here; the payload follows it
+             * straight to the file. */
+            const size_t head = (plen < SFTP_WRITE_HEAD) ? plen
+                                                         : SFTP_WRITE_HEAD;
+            if (s->in_len < 4 + head) {
+                return ESP_OK;
+            }
+            consume(s, 4 + write_begin(s, s->in + 4, s->in_len - 4, plen));
+            continue;                       /* the branch above drains it */
+        }
+
+        /*
+         * Every other request is small — paths and attributes — so a length
+         * this buffer cannot hold means the stream has desynchronised. There is
+         * no recovering from that: resyncing on a length word found in the
+         * middle of someone's data is what filled the log with "bad packet
+         * length" instead of failing the transfer.
+         */
+        if (plen > SSH_MAX_PACKET - 4) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "bad packet length %u",
+                       (unsigned)plen);
+            return ESP_FAIL;
+        }
+        if (s->in_len < 4 + plen) {
+            return ESP_OK;                  /* wait for the rest */
+        }
+        if (dispatch(s, s->in + 4, plen) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        consume(s, 4 + plen);
+    }
+}
+
+/*
+ * PSRAM when the board has it: this is the largest allocation the SSH server
+ * makes, it lives only for the duration of a transfer, and nothing in it is a
+ * DMA target — recv() memcpy's out of lwIP's own buffers. Falls back to
+ * internal RAM, so a board without PSRAM behaves the same, only tighter.
+ */
+static sftp_t *sftp_alloc(void)
+{
+#if CONFIG_ESPIX_SSH_SFTP_IN_PSRAM
+    sftp_t *s = heap_caps_calloc(1, sizeof(sftp_t),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s != NULL) {
+        return s;
+    }
+#endif
+    return calloc(1, sizeof(sftp_t));
+}
+
 esp_err_t espix_sftp_run(ssh_conn_t *c)
 {
-    /* Two packet buffers plus the handle table: on the heap, so a device that
-     * never transfers a file does not carry them. */
-    sftp_t *s = calloc(1, sizeof(*s));
+    /* On the heap, so a device that never transfers a file does not carry it. */
+    sftp_t *s = sftp_alloc();
     if (s == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "out of memory for an sftp session");
         return ESP_ERR_NO_MEM;
@@ -639,6 +862,18 @@ esp_err_t espix_sftp_run(ssh_conn_t *c)
         if (n == 0) {
             continue;
         }
+
+        /*
+         * Copy the whole chunk before touching any of it, and never read
+         * `chunk` again below.
+         *
+         * It points into the channel's own receive buffer, and pump() sends
+         * replies: a send that runs out of peer window pumps the channel to
+         * collect the adjustment, which overwrites exactly that buffer. Holding
+         * the pointer across a reply would be reading whatever arrived next.
+         * SFTP_IN_MAX guarantees the copy fits in one go, which is what lets
+         * this be a single statement rather than a loop that has to re-read it.
+         */
         if (s->in_len + n > sizeof(s->in)) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "oversized packet; dropping session");
             break;
@@ -646,36 +881,7 @@ esp_err_t espix_sftp_run(ssh_conn_t *c)
         memcpy(s->in + s->in_len, chunk, n);
         s->in_len += n;
 
-        /*
-         * One CHANNEL_DATA is not one SFTP packet: a large write spans several
-         * and several small requests can share one. Consume whole packets and
-         * keep the remainder.
-         */
-        bool fatal = false;
-
-        while (!fatal && s->in_len >= 4) {
-            const uint32_t plen = ((uint32_t)s->in[0] << 24) |
-                                  ((uint32_t)s->in[1] << 16) |
-                                  ((uint32_t)s->in[2] << 8) | (uint32_t)s->in[3];
-
-            if (plen == 0 || plen > sizeof(s->in) - 4) {
-                espix_klog(ESPIX_KLOG_WARN, TAG, "bad packet length %u",
-                           (unsigned)plen);
-                s->in_len = 0;
-                break;
-            }
-            if (s->in_len < 4 + plen) {
-                break;                  /* wait for the rest */
-            }
-            if (dispatch(s, s->in + 4, plen) != ESP_OK) {
-                fatal = true;
-                break;
-            }
-            memmove(s->in, s->in + 4 + plen, s->in_len - 4 - plen);
-            s->in_len -= 4 + plen;
-        }
-
-        if (fatal) {
+        if (pump(s) != ESP_OK) {
             break;
         }
     }

@@ -26,10 +26,13 @@ menu "espix SSH"
 
             Two is the useful minimum: scp and sftp open their own connection,
             so with a limit of one no file could be transferred while an
-            interactive session was open. Each connection costs about 22KB —
-            roughly 14KB of packet buffers and stored key-exchange state, plus
-            the connection task's stack — so raising this is not free on a part
-            with a few hundred KB of internal RAM.
+            interactive session was open.
+
+            An idle connection costs about 25KB — roughly 14KB of packet
+            buffers and stored key-exchange state, 2KB of channel receive
+            buffer, and the connection task's stack. A transfer adds about 13KB
+            more. Only the stack has to be internal RAM; see the two PSRAM
+            options below for the rest.
 
     config ESPIX_SSH_TASK_STACK
         int "Connection task stack (bytes)"
@@ -39,6 +42,34 @@ menu "espix SSH"
         help
             The protocol logic is shallow, but the shell session runs on this
             stack, and commands run on it too.
+
+    config ESPIX_SSH_SFTP_IN_PSRAM
+        bool "Allocate SFTP transfer buffers from PSRAM when available"
+        depends on ESPIX_SSH_ENABLED
+        default y
+        help
+            The SFTP session buffers are the largest allocation the SSH server
+            makes and exist only while a file is being transferred. Nothing in
+            them is a DMA target -- recv() copies out of lwIP's own buffers --
+            so external RAM is safe here.
+
+            Falls back to internal RAM, so a board without PSRAM behaves
+            identically, only with less of it to spare.
+
+    config ESPIX_SSH_CONN_IN_PSRAM
+        bool "Allocate the per-connection state from PSRAM when available"
+        depends on ESPIX_SSH_ENABLED
+        default n
+        help
+            Moves roughly 14KB per connection out of internal RAM, which is
+            what limits how many sessions fit.
+
+            Off by default because unlike the SFTP buffers this holds the cipher
+            state and both packet buffers, and the AES driver bounces external
+            memory through an internal buffer before touching it
+            (mbedtls/port/aes/dma/esp_aes_dma_core.c) -- correct, but a copy per
+            block on the hot path. Turn it on if concurrent sessions matter more
+            than throughput, and measure.
 
     config ESPIX_SSH_TASK_PRIO
         int "SSH task priority"

@@ -21,6 +21,24 @@ extern "C" {
 #define SSH_MAX_PACKET   4096
 #define SSH_VERSION_MAX  256
 
+/*
+ * Largest payload we let a peer put in one CHANNEL_DATA, advertised in
+ * CHANNEL_OPEN_CONFIRMATION.
+ *
+ * It was 256 while the channel only ever carried keystrokes. That made a file
+ * transfer pay a 32-byte MAC for every 256 bytes — around 20% of the wire, and
+ * an HMAC and AES setup per packet — so a megabyte cost four thousand packets.
+ *
+ * 2048 is the largest value that needs no other buffer to grow: a CHANNEL_DATA
+ * carrying it needs 1 + 4 + 4 + 2048 bytes in out_buf, well inside
+ * SSH_MAX_PACKET. Overhead falls to about 2.6%. Going further would mean
+ * growing in_buf, out_buf and frame together, three times the memory for
+ * roughly one more percent.
+ *
+ * Shared with sftp.c, which has to size its reassembly buffer against it.
+ */
+#define SSH_CHANNEL_MAX_PACKET 2048
+
 /* Message numbers (RFC 4253 §12, RFC 4252 §6, RFC 4254 §9). */
 enum {
     SSH_MSG_DISCONNECT                = 1,

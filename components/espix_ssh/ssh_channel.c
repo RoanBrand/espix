@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <sys/select.h>
@@ -30,18 +31,17 @@
 #define TAG "sshchan"
 
 /*
- * Our receive window. The client only ever sends keystrokes, so this is never
- * under pressure; it is replenished at half consumption to keep the arithmetic
- * honest rather than because it matters.
+ * Our receive window: how much a peer may send before waiting for us to
+ * acknowledge it. Purely a number we advertise — adjust_local_window() tops it
+ * back up as bytes are consumed, and nothing buffers a window's worth — so a
+ * large one is free.
+ *
+ * It was 32768, chosen when the channel only carried keystrokes. That silently
+ * capped an upload at one window round-trip per 32KB, which an SFTP client
+ * pipelining 64 requests will hit immediately.
  */
-#define LOCAL_WINDOW  32768
+#define LOCAL_WINDOW  262144
 
-/*
- * Maximum payload we let the client put in one CHANNEL_DATA. Deliberately
- * small: it bounds the buffer keystrokes are copied into, and a channel
- * carrying typing never needs more. A paste simply arrives as several packets.
- */
-#define MAX_PACKET    256
 
 /* Bound on packets read while waiting for the peer to open its window. A client
  * that never adjusts is broken or hostile; either way we should not spin. */
@@ -93,7 +93,7 @@ typedef struct {
      * line — a paste does — and the surplus has to survive until the shell asks
      * for the next line, or those commands are silently swallowed.
      */
-    uint8_t     pending[MAX_PACKET];
+    uint8_t     pending[SSH_CHANNEL_MAX_PACKET];
     size_t      pending_len;
     size_t      pending_pos;
     bool        last_was_cr;    /* for collapsing CR LF into one newline */
@@ -863,16 +863,26 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
 {
     esp_err_t err = ESP_OK;
 
-    ssh_chan_t ch = {
-        .conn         = c,
-        .local_window = LOCAL_WINDOW,
-        .cols         = TERM_COLS_DEF,
-        .rows         = TERM_ROWS_DEF,
-        .tx_lock      = xSemaphoreCreateRecursiveMutex(),
-        .rx_lock      = xSemaphoreCreateMutex(),
-    };
+    /*
+     * On the heap, not this task's stack. The struct carries a whole channel
+     * packet in `pending`, so at SSH_CHANNEL_MAX_PACKET it is over 2KB — and
+     * this stack also runs every shell command, which needs the room far more
+     * than a receive buffer does.
+     */
+    ssh_chan_t *ch = calloc(1, sizeof(*ch));
+    if (ch == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "out of memory for a channel");
+        return ESP_ERR_NO_MEM;
+    }
 
-    if (ch.tx_lock == NULL || ch.rx_lock == NULL) {
+    ch->conn         = c;
+    ch->local_window = LOCAL_WINDOW;
+    ch->cols         = TERM_COLS_DEF;
+    ch->rows         = TERM_ROWS_DEF;
+    ch->tx_lock      = xSemaphoreCreateRecursiveMutex();
+    ch->rx_lock      = xSemaphoreCreateMutex();
+
+    if (ch->tx_lock == NULL || ch->rx_lock == NULL) {
         goto out;
     }
 
@@ -892,9 +902,9 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
 
     size_t         type_len = 0;
     const uint8_t *type = ssh_get_string(&in, &type_len);
-    ch.peer_chan        = ssh_get_u32(&in);
-    ch.peer_window      = ssh_get_u32(&in);
-    ch.peer_max_packet  = ssh_get_u32(&in);
+    ch->peer_chan        = ssh_get_u32(&in);
+    ch->peer_window      = ssh_get_u32(&in);
+    ch->peer_max_packet  = ssh_get_u32(&in);
 
     if (in.bad || type == NULL) {
         err = ESP_ERR_INVALID_SIZE;
@@ -905,7 +915,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         ssh_buf_t b;
         ssh_buf_init(&b, c->out_buf, sizeof(c->out_buf));
         ssh_put_u8(&b, SSH_MSG_CHANNEL_OPEN_FAILURE);
-        ssh_put_u32(&b, ch.peer_chan);
+        ssh_put_u32(&b, ch->peer_chan);
         ssh_put_u32(&b, 3);             /* unknown channel type */
         ssh_put_cstr(&b, "only session channels are supported");
         ssh_put_cstr(&b, "");
@@ -918,10 +928,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         ssh_buf_t b;
         ssh_buf_init(&b, c->out_buf, sizeof(c->out_buf));
         ssh_put_u8(&b, SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
-        ssh_put_u32(&b, ch.peer_chan);
+        ssh_put_u32(&b, ch->peer_chan);
         ssh_put_u32(&b, 0);             /* our channel id; only ever one */
         ssh_put_u32(&b, LOCAL_WINDOW);
-        ssh_put_u32(&b, MAX_PACKET);
+        ssh_put_u32(&b, SSH_CHANNEL_MAX_PACKET);
         if (ssh_packet_write(c, &b) != ESP_OK) {
             err = ESP_FAIL;
             goto out;
@@ -929,7 +939,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     }
 
     /* Requests until the client asks for a shell. */
-    while (!ch.want_shell && !ch.want_sftp && !ch.closed) {
+    while (!ch->want_shell && !ch->want_sftp && !ch->closed) {
         if (ssh_packet_read(c) != ESP_OK) {
             err = ESP_FAIL;
             goto out;
@@ -940,7 +950,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         const uint8_t msg = ssh_get_u8(&req);
 
         if (msg == SSH_MSG_CHANNEL_REQUEST) {
-            handle_channel_request(&ch, &req);
+            handle_channel_request(ch, &req);
         } else if (msg == SSH_MSG_CHANNEL_CLOSE ||
                    msg == SSH_MSG_CHANNEL_EOF ||
                    msg == SSH_MSG_DISCONNECT) {
@@ -954,29 +964,29 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * greeting. Everything below that belongs to an interactive shell would
      * corrupt a transfer.
      */
-    if (ch.want_sftp) {
-        s_raw_chan = &ch;
+    if (ch->want_sftp) {
+        s_raw_chan = ch;
         espix_sftp_run(c);
         s_raw_chan = NULL;
 
-        send_exit_status(&ch, 0);
-        close_channel(&ch);
+        send_exit_status(ch, 0);
+        close_channel(ch);
         goto out;
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "shell for %s (%ux%u)", c->user,
-               ch.cols, ch.rows);
+               ch->cols, ch->rows);
 
     /*
      * The editor identifies this session by the socket fd, since its callbacks
      * carry no context pointer. Register before creating the instance: probing
      * and the first prompt both call straight back into them.
      */
-    editor_map_add(c->fd, &ch);
+    editor_map_add(c->fd, ch);
 
     /* Belongs to the user and outlives this connection, so reconnecting finds
      * what was typed last time. Not freed at logout. */
-    ch.history = espix_history_for(c->user);
+    ch->history = espix_history_for(c->user);
 
     esp_linenoise_config_t ed_cfg;
     esp_linenoise_get_instance_config_default(&ed_cfg);
@@ -992,7 +1002,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     ed_cfg.read_bytes_cb       = ssh_edit_read;
     ed_cfg.write_bytes_cb      = ssh_edit_write;
 
-    if (esp_linenoise_create_instance(&ed_cfg, &ch.editor) != ESP_OK) {
+    if (esp_linenoise_create_instance(&ed_cfg, &ch->editor) != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the line editor");
         editor_map_remove(c->fd);
         err = ESP_ERR_NO_MEM;
@@ -1001,7 +1011,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
 
     /* Load the user's history into this instance up front; otherwise the first
      * arrow-up of a reconnected session finds nothing until a command runs. */
-    espix_history_apply(ch.history, ch.editor);
+    espix_history_apply(ch->history, ch->editor);
 
     /*
      * No esp_linenoise_probe() here: it calls fcntl() on in_fd directly and
@@ -1017,7 +1027,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .cwd       = "/",
         .read_line = chan_read_line,
         .write     = chan_write,
-        .transport = &ch,
+        .transport = ch,
         .fg_pid    = ESPIX_PID_NONE,
         .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,
@@ -1034,7 +1044,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * Hang up: a backgrounded app writes through a stream whose cookie is this
      * session, which lives on this stack, so nothing may outlive it.
      */
-    esp_linenoise_delete_instance(ch.editor);
+    esp_linenoise_delete_instance(ch->editor);
     editor_map_remove(c->fd);
 
     const size_t orphans = espix_proc_hangup(&session);
@@ -1050,10 +1060,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * connection abruptly costs the client a warning, whereas waiting forever
      * would strand this task and its buffers for the life of the system.
      */
-    if (xSemaphoreTakeRecursive(ch.tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
-        xSemaphoreGiveRecursive(ch.tx_lock);
-        send_exit_status(&ch, (uint32_t)session.last_status);
-        close_channel(&ch);
+    if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
+        xSemaphoreGiveRecursive(ch->tx_lock);
+        send_exit_status(ch, (uint32_t)session.last_status);
+        close_channel(ch);
     } else {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "transmit lock held by a killed process; closing abruptly");
@@ -1062,11 +1072,12 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s logged out", c->user);
 
 out:
-    if (ch.tx_lock != NULL) {
-        vSemaphoreDelete(ch.tx_lock);
+    if (ch->tx_lock != NULL) {
+        vSemaphoreDelete(ch->tx_lock);
     }
-    if (ch.rx_lock != NULL) {
-        vSemaphoreDelete(ch.rx_lock);
+    if (ch->rx_lock != NULL) {
+        vSemaphoreDelete(ch->rx_lock);
     }
+    free(ch);
     return err;
 }

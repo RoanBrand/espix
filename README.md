@@ -388,6 +388,19 @@ It is deliberately partial: enough for `get`, `put`, `ls`, `cd`, `mkdir` and
 stores neither, and failing a transfer over a mode bit that could never be
 written would help nobody.
 
+File size is not a limit. A write is streamed to the file as it arrives rather
+than reassembled in memory, so a transfer is independent of how much the client
+sends per request — the `-B` / `-X buffer=` knob changes throughput and nothing
+else. A megabyte moves at roughly 200KB/s up and 320KB/s down over 2.4GHz
+Wi-Fi.
+
+The buffers a transfer needs, about 15KB, come from PSRAM on boards that have
+it (`ESPIX_SSH_SFTP_IN_PSRAM`, on by default), falling back to internal RAM
+where they do not. `ESPIX_SSH_CONN_IN_PSRAM` does the same for the ~14KB of
+per-connection protocol state, but is off by default: that memory holds the
+cipher state, and the AES driver copies external memory through an internal
+bounce buffer before touching it.
+
 This is how an app reaches the device now — build it on a PC, copy it into
 `/bin`, run it by name. No reflashing the filesystem image.
 

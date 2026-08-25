@@ -18,6 +18,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_heap_caps.h"
+
 #include "espix_kernel.h"
 #include "espix_ssh.h"
 #include "sdkconfig.h"
@@ -168,13 +170,31 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * PSRAM only when asked for: this holds the cipher state and both packet
+ * buffers, and the AES driver bounces external memory through an internal
+ * buffer before using it, so the saving costs a copy per block. See
+ * CONFIG_ESPIX_SSH_CONN_IN_PSRAM.
+ */
+static ssh_conn_t *conn_alloc(void)
+{
+#if CONFIG_ESPIX_SSH_CONN_IN_PSRAM
+    ssh_conn_t *c = heap_caps_calloc(1, sizeof(ssh_conn_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (c != NULL) {
+        return c;
+    }
+#endif
+    return calloc(1, sizeof(ssh_conn_t));
+}
+
 static void connection_task(void *arg)
 {
     const int fd = (int)(intptr_t)arg;
 
     /* Heap, not stack: two 4KB packet buffers plus state would need a task
      * stack far larger than the protocol logic itself warrants. */
-    ssh_conn_t *c = calloc(1, sizeof(*c));
+    ssh_conn_t *c = conn_alloc();
     if (c == NULL) {
         close(fd);
         vTaskDelete(NULL);
