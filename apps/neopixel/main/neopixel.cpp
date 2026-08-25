@@ -27,8 +27,8 @@
  * wires the LED elsewhere. */
 #define LED_PIN         48
 
-/* 25% of full scale. A WS2812 at 255 is painful to look at directly. */
-#define MAX_BRIGHTNESS  64
+/* 20% of full scale. A WS2812 at 255 is painful to look at directly. */
+#define MAX_BRIGHTNESS  51
 
 /* 20ms per frame is 50fps. See the note in loop() about why it is a multiple
  * of ten. */
@@ -51,16 +51,7 @@ uint16_t hue = 0;
 void setup()
 {
     pixel.begin();
-
-    /*
-     * Dim here rather than in the colour. setBrightness() scales at show()
-     * time, which is *after* gamma correction -- the order that matters.
-     * Passing a dimmed value to gamma32() instead crushes every channel to
-     * single digits, and a WS2812 that low renders as a muddy red whatever hue
-     * you asked for.
-     */
     pixel.setBrightness(MAX_BRIGHTNESS);
-
     pixel.clear();
     pixel.show();
 
