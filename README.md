@@ -342,6 +342,13 @@ against what your client shows the first time it connects:
 espix: sshkey: host key SHA256:Sts8sx9+JuATlAMgo/iW1qYjBTbel+wXeXb7E2V2xhg
 ```
 
+Command history follows the user, not the connection: reconnecting as `esp`
+finds what you typed last time. It lives in RAM only, so a reboot clears it,
+and the serial console keeps a separate list because it has no login step. Two
+things are deliberately never recorded — a `passwd` command, since espix takes
+the new password as an argument, and any line you start with a space, which is
+the same escape hatch bash offers via `HISTCONTROL=ignorespace`.
+
 Resizing the window while a command line is part-typed will garble that line:
 the editor samples the terminal width once per line, as every linenoise-derived
 editor does, so it keeps drawing at the old width while your terminal wraps at

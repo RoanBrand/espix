@@ -159,8 +159,18 @@ typedef struct {
     size_t count;
 } espix_history_t;
 
+/*
+ * The list belonging to `user`, created on first use and kept for the life of
+ * the firmware — history follows the user between logins, as it does on Unix,
+ * rather than dying with the session. The console passes "": it has no login
+ * step, so it is its own principal. Never freed by the caller.
+ */
+espix_history_t *espix_history_for(const char *user);
+
 /* Record an accepted line, then push the list into the editor. Both are needed
- * after every command; see history.c for why the editor's copy is rebuilt. */
+ * after every command; see history.c for why the editor's copy is rebuilt.
+ * push() declines to remember a `passwd` command or a line starting with a
+ * space. */
 void espix_history_push(espix_history_t *h, const char *line);
 void espix_history_apply(const espix_history_t *h, esp_linenoise_handle_t ed);
 void espix_history_free(espix_history_t *h);

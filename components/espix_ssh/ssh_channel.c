@@ -69,7 +69,7 @@ typedef struct {
      * uses esp_linenoise rather than IDF's, whose history and callbacks are
      * file-scope statics. */
     esp_linenoise_handle_t editor;
-    espix_history_t        history;
+    espix_history_t       *history;   /* owned by the user, not by us */
     int64_t                pace_us;
 
     /*
@@ -644,8 +644,8 @@ static int chan_read_line(espix_session_t *s, const char *prompt,
     }
 
     if (buf[0] != '\0') {
-        espix_history_push(&ch->history, buf);
-        espix_history_apply(&ch->history, ch->editor);
+        espix_history_push(ch->history, buf);
+        espix_history_apply(ch->history, ch->editor);
     }
 
     return (int)strlen(buf);
@@ -859,6 +859,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      */
     editor_map_add(c->fd, &ch);
 
+    /* Belongs to the user and outlives this connection, so reconnecting finds
+     * what was typed last time. Not freed at logout. */
+    ch.history = espix_history_for(c->user);
+
     esp_linenoise_config_t ed_cfg;
     esp_linenoise_get_instance_config_default(&ed_cfg);
 
@@ -879,6 +883,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         err = ESP_ERR_NO_MEM;
         goto out;
     }
+
+    /* Load the user's history into this instance up front; otherwise the first
+     * arrow-up of a reconnected session finds nothing until a command runs. */
+    espix_history_apply(ch.history, ch.editor);
 
     /*
      * No esp_linenoise_probe() here: it calls fcntl() on in_fd directly and
@@ -912,7 +920,6 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * session, which lives on this stack, so nothing may outlive it.
      */
     esp_linenoise_delete_instance(ch.editor);
-    espix_history_free(&ch.history);
     editor_map_remove(c->fd);
 
     const size_t orphans = espix_proc_hangup(&session);

@@ -111,7 +111,7 @@ static esp_err_t console_hw_init(void)
 /* ------------------------------------------------------------------ */
 
 static esp_linenoise_handle_t s_editor;
-static espix_history_t        s_history;
+static espix_history_t       *s_history;
 
 /*
  * Plain blocking read, paced so the editor never mistakes typing for a paste —
@@ -153,8 +153,8 @@ static int console_read_line(espix_session_t *s, const char *prompt,
     }
 
     if (buf[0] != '\0') {
-        espix_history_push(&s_history, buf);
-        espix_history_apply(&s_history, s_editor);
+        espix_history_push(s_history, buf);
+        espix_history_apply(s_history, s_editor);
     }
 
     return (int)strlen(buf);
@@ -272,6 +272,11 @@ esp_err_t espix_console_session_start(void)
 
     ESP_RETURN_ON_ERROR(esp_linenoise_create_instance(&cfg, &s_editor),
                         TAG, "cannot create the line editor");
+
+    /* The console has no login, so it is its own principal rather than sharing
+     * a list with whoever logs in over SSH. */
+    s_history = espix_history_for("");
+    espix_history_apply(s_history, s_editor);
 
     /* History is in-memory only; persisting it to the rootfs would mean a
      * flash write per command. esp_linenoise_history_save() is there if that
