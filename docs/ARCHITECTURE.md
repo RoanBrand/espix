@@ -377,6 +377,18 @@ costs ~6 KB of format strings).
   deciding before the layout is in the field. A commented-out variant is in
   [partitions/esp32s3-16mb.csv](../partitions/esp32s3-16mb.csv); the 8MB table
   notes why the same shape does not fit there.
+- **A 1000Hz FreeRTOS tick.** `CONFIG_FREERTOS_HZ` is IDF's default 100, so a
+  tick is 10ms and an app calling `vTaskDelay(1)` or `usleep(1000)` sleeps ten
+  times longer than it asked, with no way to ask for less. Nothing in espix
+  itself needs finer granularity — its own delays are coarse timeouts, and the
+  console blocks in `read()` rather than polling — but espix is a platform for
+  other people's apps, and a sensor loop or a bit-banged protocol will trip
+  over this without the author knowing why. Arduino-ESP32 ships 1000. The cost
+  is roughly 1% of a core in extra tick interrupts and preemption; the risk is
+  that IDF's WiFi and lwIP are tested at 100. Worth doing with a measurement
+  (`ps` CPU shares and `free` before and after, plus an SSH throughput check)
+  rather than on reasoning, and it belongs in the target-independent
+  `sdkconfig.defaults` so every target inherits it.
 - **Per-app heap arenas.** The allocation path in `espix_proc` is the seam.
   Would shrink the blast radius of a crashing app without needing an MMU.
 - **A real `top`.** `ps` reports cumulative CPU share since boot; an
