@@ -82,6 +82,21 @@ struct espix_session {
     int (*write)(espix_session_t *s, const char *data, size_t len);
 
     /*
+     * Non-blocking: has the user pressed Ctrl-C? Polled while a foreground
+     * process runs, which is the one time nothing else is reading input.
+     *
+     * The transport consumes whatever is waiting either way. Anything typed at
+     * a program that is not reading has nowhere to go, and leaving it queued
+     * means it lands on the shell's next prompt instead — which is exactly what
+     * used to happen: a handful of unanswered Ctrl-Cs arriving as blank lines
+     * the moment the app exited.
+     *
+     * NULL for a transport that cannot poll; the foreground wait then simply
+     * cannot be interrupted.
+     */
+    bool (*poll_interrupt)(espix_session_t *s);
+
+    /*
      * The terminal understands escape sequences. Set by the transport: the
      * console learns it from esp_linenoise_probe(), an SSH session always has a
      * pty in this build. Colour is emitted only when this is set.

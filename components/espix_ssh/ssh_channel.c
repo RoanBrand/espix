@@ -279,6 +279,57 @@ static int send_cooked(ssh_chan_t *ch, const char *data, size_t len)
     return result;
 }
 
+static esp_err_t chan_pump(ssh_chan_t *ch);
+
+/*
+ * Ctrl-C while a foreground process runs. Same shape as chan_drain_pending(),
+ * but it inspects what it pumped rather than leaving it for the editor: the
+ * editor is not running, the shell is blocked on the process, and bytes left in
+ * the buffer would surface on the next prompt.
+ */
+static bool chan_poll_interrupt(espix_session_t *s)
+{
+    ssh_chan_t *ch  = s->transport;
+    bool        hit = false;
+
+    if (ch == NULL) {
+        return false;
+    }
+
+    for (;;) {
+        /* Anything already decrypted and waiting. */
+        while (ch->pending_pos < ch->pending_len) {
+            if (ch->pending[ch->pending_pos++] == 0x03) {
+                hit = true;
+            }
+        }
+
+        if (ch->closed) {
+            return hit;
+        }
+
+        fd_set         rfds;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+
+        FD_ZERO(&rfds);
+        FD_SET(ch->conn->fd, &rfds);
+
+        if (select(ch->conn->fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            return hit;                 /* nothing on the wire */
+        }
+
+        /*
+         * No rx_lock here: chan_pump() takes it itself, and it is not
+         * recursive, so wrapping the call deadlocks this task against itself.
+         * That is not hypothetical -- it hung every foreground Ctrl-C over SSH
+         * until it was removed.
+         */
+        if (chan_pump(ch) != ESP_OK) {
+            return hit;
+        }
+    }
+}
+
 static int chan_write(espix_session_t *s, const char *data, size_t len)
 {
     return send_cooked(s->transport, data, len);
@@ -1035,6 +1086,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .cwd       = "/",
         .read_line = chan_read_line,
         .write     = chan_write,
+        .poll_interrupt = chan_poll_interrupt,
         .transport = ch,
         .fg_pid    = ESPIX_PID_NONE,
         .ansi      = true,          /* the client asked for a pty */

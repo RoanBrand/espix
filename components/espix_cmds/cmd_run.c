@@ -20,6 +20,9 @@
 
 /* How long a foreground `run` waits before giving up on the app and leaving it
  * running in the background. */
+/* How often the foreground wait comes up for air to check for Ctrl-C. */
+#define RUN_POLL_MS 50
+
 #define RUN_FOREGROUND_TIMEOUT_MS 60000
 
 /*
@@ -45,9 +48,52 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
 
     s->fg_pid = pid;
 
-    int             exit_code = -1;
-    const esp_err_t wait_err =
-        espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(RUN_FOREGROUND_TIMEOUT_MS));
+    /*
+     * Wait in slices rather than one long block, so Ctrl-C can be noticed.
+     * Nothing else reads input while a foreground process runs -- the editor is
+     * not running and this task is the one that would be reading -- so without
+     * this a program that ignores its own exit conditions cannot be stopped
+     * from the session that started it, and the Ctrl-Cs surface as blank lines
+     * once it finally dies.
+     *
+     * 50ms is short enough to feel immediate and long enough that polling costs
+     * nothing measurable.
+     */
+    int       exit_code = -1;
+    esp_err_t wait_err  = ESP_ERR_TIMEOUT;
+    bool      asked     = false;
+
+    for (unsigned waited = 0; waited < RUN_FOREGROUND_TIMEOUT_MS;
+         waited += RUN_POLL_MS) {
+
+        wait_err = espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(RUN_POLL_MS));
+        if (wait_err != ESP_ERR_TIMEOUT) {
+            break;                      /* finished, one way or another */
+        }
+
+        /*
+         * Poll on every slice, even once the process has been asked to stop:
+         * the point is to keep *consuming* input, not just to notice the first
+         * Ctrl-C. Someone who presses it five times should not get five blank
+         * lines on the next prompt.
+         */
+        if (s->poll_interrupt != NULL && s->poll_interrupt(s) && !asked) {
+            /*
+             * Ask once. espix_proc_kill() escalates to deleting the task if the
+             * app does not take the hint, so a second Ctrl-C would only race
+             * that -- and an app that cleans up deserves the chance to finish.
+             */
+            asked = true;
+            espix_printf(s, "^C\n");
+            espix_proc_kill(pid);
+        }
+    }
+
+    /* Whatever was typed between the last poll and the process exiting is still
+     * queued, and would otherwise arrive at the next prompt. */
+    if (s->poll_interrupt != NULL) {
+        (void)s->poll_interrupt(s);
+    }
 
     s->fg_pid = ESPIX_PID_NONE;
 

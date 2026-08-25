@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/select.h>
 #include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
@@ -362,6 +363,46 @@ static int console_read_line(espix_session_t *s, const char *prompt,
     return (int)strlen(buf);
 }
 
+/*
+ * Ctrl-C while a foreground process runs. Nothing else is reading the console
+ * at that point -- the shell is blocked waiting on the process -- so this is
+ * the only thing standing between the user and a program they cannot stop.
+ *
+ * Everything waiting is consumed, not just the Ctrl-C: input typed at a program
+ * that is not reading has nowhere to go, and leaving it queued means it arrives
+ * on the next prompt instead.
+ */
+static bool console_poll_interrupt(espix_session_t *s)
+{
+    (void)s;
+
+    const int fd  = fileno(stdin);
+    bool      hit = false;
+
+    for (;;) {
+        fd_set         rfds;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            return hit;                 /* nothing waiting */
+        }
+
+        uint8_t     buf[32];
+        const ssize_t n = read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+            return hit;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == 0x03) {       /* ETX, which is what Ctrl-C sends */
+                hit = true;
+            }
+        }
+    }
+}
+
 static int console_write(espix_session_t *s, const char *data, size_t len)
 {
     (void)s;
@@ -529,6 +570,7 @@ esp_err_t espix_console_session_start(void)
         .cwd       = "/",
         .read_line = console_read_line,
         .write     = console_write,
+        .poll_interrupt = console_poll_interrupt,
         .fg_pid    = ESPIX_PID_NONE,
         .ansi      = ansi,
         /* No stdio rebinding: the editor owns stdin and output goes through
