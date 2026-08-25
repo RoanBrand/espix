@@ -152,6 +152,36 @@ firmware — was written against.
 With it, every firmware flash would rewrite the filesystem and destroy anything
 created on the device. Flashing the rootfs is an explicit `idf.py storage-flash`.
 
+### Upload throughput is bounded by flash erases, not by the network
+
+A 1MB `scp` upload runs at about 78KB/s on a filesystem that has been used, and
+about 195KB/s when the storage partition has just been erased. Downloads are
+unaffected, at ~355KB/s.
+
+Demonstrated on demand rather than inferred, on one board in one position:
+
+| storage partition | upload KB/s | download KB/s |
+|---|---|---|
+| used | 78.3 | 356.0 |
+| freshly erased (`storage-flash`) | 195.5 | 354.0 |
+| used again, after writing 12MB | 78.2 | 357.9 |
+
+Download is the control: it never erases a block, and it stays flat while upload
+swings by a factor of 2.5. LittleFS frees a block when a file is deleted but does
+not erase it, so every later write to that block pays an erase first. `df`
+reporting 0% used says nothing about how many blocks are dirty.
+
+Two traps for anyone benchmarking this:
+
+- **Signal strength moves downloads and not uploads.** Going from -66dBm to
+  -49dBm took downloads from 172 to 356KB/s and left uploads at 78KB/s either
+  side. Upload is device-bound; download is link-bound. A figure quoted without
+  the RSSI beside it is not a measurement.
+- **Upload is not a crypto or protocol benchmark.** It is a flash benchmark. It
+  was briefly suspected of being a PSRAM regression and of being a fault in the
+  streaming SFTP write; it was neither, and the streaming write was never a
+  candidate anyway, since the fast figures were themselves measured with it.
+
 ### Networking is a naming layer, not a stack
 
 `esp_netif` already provides what a Unix user expects — interfaces with

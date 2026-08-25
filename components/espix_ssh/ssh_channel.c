@@ -361,7 +361,7 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in);
  * which is never read or written directly here, both callbacks being supplied,
  * but is genuinely ours and already unique per connection.
  *
- * Only connection tasks touch this, and ssh_server.c admits one at a time.
+ * Only connection tasks touch this, one entry per live connection.
  */
 static struct {
     int         fd;

@@ -15,6 +15,10 @@ apps/*/managed_components/
 fsroot/bin/*
 !fsroot/bin/.keep
 
+# WiFi credentials written into the rootfs image. A passphrase must never be
+# committable; the device writes its own copy at /etc/wifi.conf either way.
+fsroot/etc/wifi.conf
+
 # Editors / tooling
 .DS_Store
 .cache/

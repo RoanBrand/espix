@@ -391,8 +391,15 @@ written would help nobody.
 File size is not a limit. A write is streamed to the file as it arrives rather
 than reassembled in memory, so a transfer is independent of how much the client
 sends per request — the `-B` / `-X buffer=` knob changes throughput and nothing
-else. A megabyte moves at roughly 200KB/s up and 320KB/s down over 2.4GHz
-Wi-Fi.
+else.
+
+Downloads run at about 355KB/s over 2.4GHz Wi-Fi and scale with signal strength.
+Uploads do not: they run at **about 78KB/s on a filesystem that has been used**,
+and around 195KB/s only when the storage partition is freshly erased. That is
+LittleFS paying a flash erase for every block it writes, and deleting a file
+frees the block without erasing it, so the fast figure is a one-off after
+`storage-flash` rather than something a running device sees. Measured, not
+assumed — see docs/ARCHITECTURE.md.
 
 The buffers a transfer needs, about 15KB, come from PSRAM on boards that have
 it (`ESPIX_SSH_SFTP_IN_PSRAM`), as does the 14760 bytes of per-connection
