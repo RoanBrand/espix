@@ -20,19 +20,22 @@ menu "espix SSH"
         int "Concurrent connections"
         depends on ESPIX_SSH_ENABLED
         range 1 4
-        default 2
+        default 4
         help
             How many SSH connections may be open at once.
 
             Two is the useful minimum: scp and sftp open their own connection,
             so with a limit of one no file could be transferred while an
-            interactive session was open.
+            interactive session was open. Four leaves room for a couple of
+            shells beside a transfer.
 
-            An idle connection costs about 25KB — roughly 14KB of packet
-            buffers and stored key-exchange state, 2KB of channel receive
-            buffer, and the connection task's stack. A transfer adds about 13KB
-            more. Only the stack has to be internal RAM; see the two PSRAM
-            options below for the rest.
+            With the PSRAM options below on, which is the default, a connection
+            costs 10344 bytes of internal RAM: its task stack, which can never
+            live in PSRAM, and the channel receive buffer. Everything else --
+            14760 bytes of packet buffers and key-exchange state, and about
+            15KB more while a transfer is running -- comes from PSRAM. Without
+            PSRAM all of it falls back to internal RAM, roughly 25KB per idle
+            connection, and four at once is no longer a comfortable fit.
 
     config ESPIX_SSH_TASK_STACK
         int "Connection task stack (bytes)"
@@ -59,17 +62,27 @@ menu "espix SSH"
     config ESPIX_SSH_CONN_IN_PSRAM
         bool "Allocate the per-connection state from PSRAM when available"
         depends on ESPIX_SSH_ENABLED
-        default n
+        default y
         help
-            Moves roughly 14KB per connection out of internal RAM, which is
-            what limits how many sessions fit.
+            Moves the 14760 bytes of packet buffers, cipher state and stored
+            key-exchange material per connection out of internal RAM, which is
+            what limits how many sessions fit. A connection then costs 10344
+            bytes of internal RAM: its task stack, which can never leave
+            internal RAM, and the channel receive buffer.
 
-            Off by default because unlike the SFTP buffers this holds the cipher
-            state and both packet buffers, and the AES driver bounces external
-            memory through an internal buffer before touching it
-            (mbedtls/port/aes/dma/esp_aes_dma_core.c) -- correct, but a copy per
-            block on the hot path. Turn it on if concurrent sessions matter more
-            than throughput, and measure.
+            This holds the cipher state and both packet buffers, and the AES
+            driver bounces external memory through an internal buffer before
+            using it (mbedtls/port/aes/dma/esp_aes_dma_core.c), so it was off
+            until the cost was measured. On an N16R8 over 2.4GHz WiFi the cost
+            is not measurable: download medians 175.6 KB/s against 172.3 with
+            the state in internal RAM (n=10 each), and login-to-prompt, which
+            is dominated by ECDH and ECDSA, is 4.08s against 4.07s. Internal
+            use per connection fell 13KB and the largest free internal block
+            rose from 84KB to 104KB.
+
+            The caveat is that at ~175KB/s the CPU is not saturated by bulk
+            AES, so a small per-block penalty would not show. A much faster
+            link could expose one.
 
     config ESPIX_SSH_TASK_PRIO
         int "SSH task priority"

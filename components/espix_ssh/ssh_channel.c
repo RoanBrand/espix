@@ -22,6 +22,8 @@
 
 #include "esp_linenoise.h"
 
+#include "sdkconfig.h"
+
 #include "espix_auth.h"
 #include "espix_kernel.h"
 #include "espix_proc.h"
@@ -64,9 +66,10 @@
 #define TERM_COLS_DEF 80
 #define TERM_ROWS_DEF 24
 
-/* Concurrent sessions the fd -> channel map has room for. ssh_server.c admits
- * one connection at a time today; the map is sized to outlive that. */
-#define SSH_MAX_SESSIONS 4
+/* Concurrent sessions the fd -> channel map has room for. Derived from the
+ * connection limit rather than written out again: an undersized map does not
+ * fail loudly, it leaves an editor unable to find its channel. */
+#define SSH_MAX_SESSIONS CONFIG_ESPIX_SSH_MAX_SESSIONS
 
 typedef struct {
     ssh_conn_t *conn;
@@ -374,6 +377,11 @@ static void editor_map_add(int fd, ssh_chan_t *ch)
             return;
         }
     }
+
+    /* Cannot happen while the map is sized from the connection limit, but the
+     * failure it would cause -- an editor whose callbacks find no channel --
+     * looks like a dead terminal rather than a full table. */
+    espix_klog(ESPIX_KLOG_ERROR, TAG, "editor map full; session will not work");
 }
 
 static void editor_map_remove(int fd)
