@@ -72,9 +72,6 @@ void loop()
      * what makes the sweep even, and gamma32 corrects for the eye's non-linear
      * response so the colours look equally bright. Both are the library's own;
      * hand-rolling either is what gets a NeoPixel demo looking lurid.
-     *
-     * ColorHSV() is left at full value: gamma32() needs the whole range to work
-     * with, and setBrightness() in setup() does the dimming afterwards.
      */
     pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(hue)));
     pixel.show();

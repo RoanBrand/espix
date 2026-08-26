@@ -18,8 +18,24 @@ extern "C" {
 #endif
 
 #define ESPIX_VERSION_MAJOR 0
-#define ESPIX_VERSION_MINOR 1
+#define ESPIX_VERSION_MINOR 2
 #define ESPIX_VERSION_PATCH 0
+
+/*
+ * The same three numbers as a string literal.
+ *
+ * espix_version() below is the way to ask at runtime, and what most callers
+ * want. This exists for the places that have to paste the version *inside* a
+ * wider constant at compile time -- the SSH identification banner is one, and
+ * it previously carried its own hand-written copy that a version bump would
+ * have left stale.
+ */
+#define ESPIX_STR_(x) #x
+#define ESPIX_STR(x)  ESPIX_STR_(x)
+
+#define ESPIX_VERSION_STR   ESPIX_STR(ESPIX_VERSION_MAJOR) "." \
+                            ESPIX_STR(ESPIX_VERSION_MINOR) "." \
+                            ESPIX_STR(ESPIX_VERSION_PATCH)
 
 /* Longest absolute path espix will handle. Kept small deliberately: paths get
  * embedded in per-session and per-process structs. */
@@ -81,7 +97,7 @@ void     espix_kernel_boot_hold(void);
 void     espix_kernel_boot_release(void);
 unsigned espix_kernel_boot_pending(void);
 
-const char *espix_version(void);        /* "0.1.0" */
+const char *espix_version(void);        /* e.g. "0.2.0" */
 const char *espix_target(void);         /* "esp32s3" */
 const char *espix_chip_model(void);     /* "ESP32-S3" */
 int64_t espix_uptime_us(void);

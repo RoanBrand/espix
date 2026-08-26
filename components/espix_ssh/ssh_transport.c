@@ -22,8 +22,14 @@
 
 #define TAG "ssh"
 
-/* RFC 4253 §4.2: "SSH-protoversion-softwareversion SP comments" then CR LF. */
-const char *const ssh_server_version = "SSH-2.0-espix_0.1.0";
+/*
+ * RFC 4253 §4.2: "SSH-protoversion-softwareversion SP comments" then CR LF.
+ *
+ * Built from ESPIX_VERSION_STR rather than written out, so the banner cannot
+ * drift from what `motd` and espix_version() report -- which it had, sitting at
+ * 0.1.0 through a release that had moved on.
+ */
+const char *const ssh_server_version = "SSH-2.0-espix_" ESPIX_VERSION_STR;
 
 /* Unencrypted packets pad to a multiple of 8 (RFC 4253 §6). */
 #define CIPHER_BLOCK 8

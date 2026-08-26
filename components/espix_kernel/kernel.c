@@ -17,12 +17,7 @@
 
 #define TAG "kernel"
 
-#define ESPIX_STR_(x) #x
-#define ESPIX_STR(x)  ESPIX_STR_(x)
-
-static const char *s_version = ESPIX_STR(ESPIX_VERSION_MAJOR) "."
-                               ESPIX_STR(ESPIX_VERSION_MINOR) "."
-                               ESPIX_STR(ESPIX_VERSION_PATCH);
+static const char *s_version = ESPIX_VERSION_STR;
 
 const char *espix_version(void)
 {
