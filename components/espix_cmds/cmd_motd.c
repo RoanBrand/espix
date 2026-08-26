@@ -24,10 +24,24 @@
 #include "espix_net.h"
 
 /*
- * Rendered as a fixed-width left column so the facts beside it stay aligned
- * without measuring anything. Trailing spaces are part of the art.
+ * The logo is two marks in one column: the wordmark, and the antenna beneath
+ * it. Each is drawn in a single colour, which is why they are separate arrays
+ * rather than one array of individually-coloured rows -- nothing here wants a
+ * row to differ from its neighbours.
+ *
+ * Every row of both is exactly LOGO_WIDTH *display columns*, so the facts
+ * beside them stay aligned without anything measuring. Columns, not bytes: the
+ * antenna's box-drawing characters are three bytes each, so those rows run
+ * 50-66 bytes wide. Count glyphs when editing, never strlen(). Trailing spaces
+ * are part of the art.
+ *
+ * The antenna is also the first non-ASCII espix puts on the wire -- the rest of
+ * the tree's non-ASCII is em-dashes in comments -- so the greeting now assumes
+ * a UTF-8 terminal where before it assumed nothing. There is no ASCII fallback
+ * because there is nothing to switch on: `ansi` describes colour support and
+ * says nothing about the character set.
  */
-static const char *const LOGO[] = {
+static const char *const WORDMARK[] = {
     "  ___  ___ _ __ (_)_  __ ",
     " / _ \\/ __| '_ \\| \\ \\/ / ",
     "|  __/\\__ \\ |_) | |>  <  ",
@@ -35,17 +49,81 @@ static const char *const LOGO[] = {
     "          |_|            ",
 };
 
-#define LOGO_LINES  (sizeof(LOGO) / sizeof(LOGO[0]))
+/*
+ * A PCB antenna, as etched on the module this runs on.
+ *
+ * The trace forks at the T and two verticals leave the bottom edge, which is
+ * drawn that way on purpose: the ESP32 module's antenna is an inverted-F, so
+ * alongside the meander there really is a feed line and a shorting stub. It is
+ * not a plain serpentine that lost its way, and should not be "corrected" into
+ * one.
+ *
+ * It sits directly under the wordmark with no separating row: the wordmark's
+ * last line is nearly all whitespace already, so a blank row between them opens
+ * a gap wide enough to read as two unrelated pictures.
+ */
+static const char *const ANTENNA[] = {
+    "   ┏━━┓  ┏━━┓  ┏━━┳━━┓   ",
+    "   ┃  ┃  ┃  ┃  ┃  ┃  ┃   ",
+    "   ┃  ┗━━┛  ┗━━┛  ┃  ┃   ",
+};
+
+#define WORDMARK_LINES  (sizeof(WORDMARK) / sizeof(WORDMARK[0]))
+#define ANTENNA_LINES   (sizeof(ANTENNA) / sizeof(ANTENNA[0]))
+#define LOGO_LINES      (WORDMARK_LINES + ANTENNA_LINES)
 #define LOGO_WIDTH  25
 #define GAP         "    "
 
 /* Kept modest so the widest row still fits an 80-column terminal. */
 #define VALUE_MAX   48
 
-#define ANSI_LOGO   "\033[36m"      /* cyan */
-#define ANSI_LABEL  "\033[1m"       /* bold */
-#define ANSI_WARN   "\033[33m"      /* yellow */
+#define ANSI_LOGO   "\033[36m"          /* cyan */
+#define ANSI_LABEL  "\033[1m"           /* bold */
+#define ANSI_WARN   "\033[33m"          /* yellow */
 #define ANSI_RESET  "\033[0m"
+
+/*
+ * Gold, for the antenna: the ENIG plating a module's antenna is actually
+ * finished in, which is a pale bright yellow against the black solder mask
+ * rather than the red-brown of bare copper. 222 is (255,215,135); the tan 179
+ * (215,175,95) that reads as "copper" on paper looks like mud on a terminal.
+ *
+ * Still deliberately clear of the yellow ANSI_WARN uses a few rows below, so
+ * bare trace and "your password is still the default" do not read as the same
+ * colour.
+ *
+ * Bold, and deliberately so. The glyphs are already the HEAVY box-drawing
+ * variants (U+250F, U+2501 and friends); SGR 1 renders those in the font's bold
+ * weight on top of that, which is what gives the trace its thickness. Drop the
+ * 1 and it thins out to a hairline. The wordmark beside it stays unbolded --
+ * ASCII art built from underscores and slashes gains nothing from weight, and
+ * the etched trace reading heavier than the letters is the point.
+ *
+ * The one 256-colour sequence espix emits. A terminal that does not know it
+ * drops the sequence rather than printing it, so the cost of being wrong is a
+ * monochrome antenna.
+ */
+#define ANSI_ANTENNA "\033[1;38;5;222m"
+
+/*
+ * The nth row of the logo and the colour its block is drawn in, or NULL once
+ * the art runs out -- which is what tells row() to switch to blank padding.
+ */
+static const char *logo_row(size_t n, const char **color)
+{
+    if (n < WORDMARK_LINES) {
+        *color = ANSI_LOGO;
+        return WORDMARK[n];
+    }
+    n -= WORDMARK_LINES;
+
+    if (n < ANTENNA_LINES) {
+        *color = ANSI_ANTENNA;
+        return ANTENNA[n];
+    }
+
+    return NULL;
+}
 
 typedef struct {
     espix_session_t *s;
@@ -59,12 +137,13 @@ typedef struct {
  */
 static void row(motd_ctx_t *ctx, const char *text)
 {
-    const bool  ansi = (ctx->s != NULL && ctx->s->ansi);
-    const char *art  = (ctx->line < LOGO_LINES) ? LOGO[ctx->line] : NULL;
+    const bool  ansi   = (ctx->s != NULL && ctx->s->ansi);
+    const char *color  = NULL;
+    const char *art    = logo_row(ctx->line, &color);
 
     if (art != NULL) {
         espix_printf(ctx->s, "%s%s%s" GAP "%s\n",
-                     ansi ? ANSI_LOGO : "", art, ansi ? ANSI_RESET : "",
+                     ansi ? color : "", art, ansi ? ANSI_RESET : "",
                      text != NULL ? text : "");
     } else if (text != NULL && text[0] != '\0') {
         espix_printf(ctx->s, "%*s" GAP "%s\n", LOGO_WIDTH, "", text);
