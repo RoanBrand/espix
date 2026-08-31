@@ -42,10 +42,7 @@ esp_err_t espix_net_wifi_start(void);
 /* abi.c: publish the network syscall surface to loadable apps. */
 void espix_net_abi_register(void);
 
-/* Config file helpers, shared by net.c and wifi.c. Both return false when the
- * file or key is absent — a missing config is normal, not an error. */
-bool espix_net_conf_get(const char *path, const char *key,
-                        char *out, size_t len);
+/* Rewrite /etc/wifi.conf. Reading it back is espix_fs_conf_get(). */
 esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk);
 
 #ifdef __cplusplus

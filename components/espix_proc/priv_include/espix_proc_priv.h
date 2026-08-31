@@ -68,6 +68,7 @@ void espix_proc_abi_cxx_register(void);
 /* Publish the peripheral surface an app needs. See abi_drivers.c: naming a
  * symbol there is also what keeps its driver linked into the firmware. */
 void espix_proc_abi_drivers_register(void);
+void espix_proc_abi_time_register(void);
 
 #ifdef __cplusplus
 }

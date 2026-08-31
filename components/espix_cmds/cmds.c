@@ -41,5 +41,6 @@ void espix_cmds_register_all(void)
     espix_cmds_register_run();
     espix_cmds_register_net();
     espix_cmds_register_motd();
+    espix_cmds_register_time();
     espix_cmds_register_exec_fallback();
 }

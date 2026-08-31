@@ -62,6 +62,7 @@ esp_err_t espix_proc_init(void)
      * espix itself is C, but a C++ app cannot resolve operator new without it. */
     espix_proc_abi_cxx_register();
     espix_proc_abi_drivers_register();
+    espix_proc_abi_time_register();
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "process table ready (%d slots)",
                ESPIX_PROC_MAX);

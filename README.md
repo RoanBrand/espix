@@ -20,7 +20,7 @@ Design notes and the reasoning behind the structure are in
 
 Early, but running on hardware. Verified on an ESP32-S3 (16MB flash, 8MB octal
 PSRAM) with ESP-IDF v6.1-beta1: LittleFS mounted as the real `/`, a
-transport-agnostic shell with 35 commands, a process table, and — the point of
+transport-agnostic shell with 37 commands, a process table, and — the point of
 the exercise — an app cross-compiled on a PC, copied over as a file, and loaded
 and executed at runtime with argv and an exit status.
 
@@ -137,6 +137,35 @@ espix: sshkey: host key SHA256:Sts8sx9+JuATlAMgo/iW1qYjBTbel+wXeXb7E2V2xhg
 starts a fresh session instead, since there is no login to fall back to and a
 device with no shell would be worse than useless.
 
+### The clock
+
+There is no battery-backed RTC, exactly as on a Raspberry Pi, so real time comes
+from the network. SNTP starts as soon as any interface has an address, taking
+the server from the DHCP lease (option 42) if one is offered and falling back to
+`pool.ntp.org`. Put a `server=` line in `/etc/ntp.conf` to override both.
+
+```
+root:/# date
+Mon 31 Aug 2026 09:12:53 UTC
+root:/# timedatectl
+               Local time: Mon 2026-08-31 11:12:53 SAST
+           Universal time: Mon 2026-08-31 09:12:53 UTC
+                Time zone: SAST-2
+System clock synchronized: yes (4min ago)
+               NTP server: 192.168.110.1 (dhcp)
+```
+
+**Before the first sync the clock reads 1970**, deliberately — an obviously
+wrong date is a better signal than a plausible one, and `timedatectl` says so.
+Files written in that window carry 1970 timestamps, which is the truth about
+them. A `reboot` keeps the time, because ESP-IDF holds it in an RTC register
+that survives a restart; only a power cycle starts over. `date -s` sets it by
+hand where there is no network.
+
+`/etc/timezone` holds a **POSIX TZ string**, not a zoneinfo name — espix ships
+no tzdata, so the rules live in the string: `SAST-2`, `EST5EDT,M3.2.0,M11.1.0`,
+or `UTC0` (the offset is not optional). `timedatectl set-timezone` writes it.
+
 ### Copying files on and off
 
 ```bash
@@ -207,7 +236,7 @@ merely missing.
 | Real signals and handlers | **planned** | `kill` cannot force today |
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
 | `grep`, `sed`, `head`, `tail`, `wc`, `sort`, `find` | **planned** | |
-| `date`, `sleep` | **planned** | needs a wall clock — see Networking |
+| `sleep` | **planned** | |
 | `fork()` / `exec()` | **no** | no MMU, no copy-on-write |
 | MMU-backed process isolation | **no** on S3 | possible later on S31 — see [Crash handling](#crash-handling-and-isolation) |
 
@@ -218,6 +247,7 @@ merely missing.
 | LittleFS mounted as the real `/` | **yes** | survives reboot and firmware reflash |
 | `ls` `cd` `pwd` `cat` `cp` `mv` `rm` `mkdir` `touch` `df` | **yes** | |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
+| File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
 | `/proc`, `mount` / `umount` | **planned** | |
 | Mode bits, `chmod`, `chown` | **planned** | LittleFS has no native mode bits, but custom attributes can carry them — the mtime the port already stores works exactly that way |
 | An executable bit | **planned** | today espix gates on the ELF header instead, which is why a non-program answers `Exec format error` |
@@ -234,7 +264,7 @@ merely missing.
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
-| Time of day (SNTP or RTC) | **planned** | no wall clock at all — `uptime` only |
+| Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
 
 ### Users
 

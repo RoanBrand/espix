@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "time.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        espix_fs
+        esp_netif
+        esp_event
+        esp_timer
+        lwip
+)

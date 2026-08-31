@@ -313,45 +313,6 @@ esp_err_t espix_net_set_hostname(const char *name, bool persist)
 }
 
 /* ------------------------------------------------------------------ */
-/* Config files                                                        */
-/* ------------------------------------------------------------------ */
-
-bool espix_net_conf_get(const char *path, const char *key,
-                        char *out, size_t len)
-{
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        return false;
-    }
-
-    const size_t key_len = strlen(key);
-    char  line[128];
-    bool  found = false;
-
-    while (fgets(line, sizeof(line), f) != NULL) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-        if (*p == '#' || *p == '\0') {
-            continue;
-        }
-        if (strncmp(p, key, key_len) != 0 || p[key_len] != '=') {
-            continue;
-        }
-
-        p += key_len + 1;
-        p[strcspn(p, "\r\n")] = '\0';
-        strlcpy(out, p, len);
-        found = true;
-        break;      /* first match wins */
-    }
-
-    fclose(f);
-    return found;
-}
-
-/* ------------------------------------------------------------------ */
 
 esp_err_t espix_net_init(void)
 {
@@ -374,7 +335,13 @@ esp_err_t espix_net_init(void)
     }
 
     ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* espix_time initialises before this and needs the same loop, so whichever
+     * gets there first creates it and the other accepts what it finds. */
+    const esp_err_t loop_err = esp_event_loop_create_default();
+    if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(loop_err);
+    }
 
     /* Before any interface is registered, so each one picks it up. */
     load_hostname();

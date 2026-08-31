@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -53,6 +54,40 @@ static int cmd_cd(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * The date column for `ls -l`.
+ *
+ * LittleFS has stored an mtime on every write all along (it keeps one in a
+ * custom attribute); espix simply never read it back until now. Which means
+ * files written before the clock was set carry 1970 dates, and that is the
+ * truth about them rather than a rendering bug -- see `timedatectl`.
+ *
+ * Recent files get "Aug 31 16:05" and older ones "Aug 31  2025", the same
+ * six-month switch coreutils makes, because a time of day is what you want for
+ * something touched today and a year for something that was not.
+ */
+static void ls_time(char *out, size_t len, time_t t)
+{
+    const time_t now = time(NULL);
+    struct tm    tm;
+
+    /*
+     * A file with no mtime attribute at all -- everything in the flashed rootfs
+     * image, because the image builder writes none. esp_littlefs reports that
+     * as -1, which rendered as "Dec 31 1969" and read like a bug rather than
+     * like the absence it is.
+     */
+    if (t <= 0) {
+        strlcpy(out, "-", len);
+        return;
+    }
+
+    localtime_r(&t, &tm);
+
+    const bool recent = (t <= now) && (now - t < 180L * 24 * 3600);
+    strftime(out, len, recent ? "%b %e %H:%M" : "%b %e  %Y", &tm);
+}
+
 static int cmd_ls(espix_session_t *s, int argc, char **argv)
 {
     bool        long_form = false;
@@ -80,7 +115,10 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
     /* A plain file argument just describes itself. */
     if (!S_ISDIR(st.st_mode)) {
         if (long_form) {
-            espix_printf(s, "-  %8ld  %s\n", (long)st.st_size, abs);
+            char when[20];
+            ls_time(when, sizeof(when), st.st_mtime);
+            espix_printf(s, "-  %8ld  %12s  %s\n",
+                         (long)st.st_size, when, abs);
         } else {
             espix_printf(s, "%s\n", abs);
         }
@@ -111,17 +149,25 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         if (snprintf(child, sizeof(child), "%s/%s",
                      (strcmp(abs, "/") == 0) ? "" : abs, ent->d_name)
             >= (int)sizeof(child)) {
-            espix_printf(s, "?  %8s  %s\n", "-", ent->d_name);
+            espix_printf(s, "?  %8s  %12s  %s\n", "-", "-", ent->d_name);
             continue;
         }
 
         struct stat cst;
+        char        when[20];
+
         if (stat(child, &cst) != 0) {
-            espix_printf(s, "?  %8s  %s\n", "-", ent->d_name);
-        } else if (S_ISDIR(cst.st_mode)) {
-            espix_printf(s, "d  %8s  %s/\n", "-", ent->d_name);
+            espix_printf(s, "?  %8s  %12s  %s\n", "-", "-", ent->d_name);
+            continue;
+        }
+
+        ls_time(when, sizeof(when), cst.st_mtime);
+
+        if (S_ISDIR(cst.st_mode)) {
+            espix_printf(s, "d  %8s  %12s  %s/\n", "-", when, ent->d_name);
         } else {
-            espix_printf(s, "-  %8ld  %s\n", (long)cst.st_size, ent->d_name);
+            espix_printf(s, "-  %8ld  %12s  %s\n",
+                         (long)cst.st_size, when, ent->d_name);
         }
     }
 

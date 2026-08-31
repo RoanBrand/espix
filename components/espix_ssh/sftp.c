@@ -14,9 +14,10 @@
  *
  * Deliberately partial: enough for scp in both directions, for sftp's ls, cd,
  * get, put, mkdir and rm, and no more. Attributes are the honest shape of the
- * filesystem underneath — LittleFS has neither permissions nor timestamps, so
- * SETSTAT succeeds without doing anything rather than failing a transfer over
- * a mode bit that could never be stored.
+ * filesystem underneath — LittleFS keeps a modification time but no permissions
+ * and no owner, so mtime is reported for real while SETSTAT succeeds without
+ * doing anything rather than failing a transfer over a mode bit that could
+ * never be stored.
  */
 
 #include <dirent.h>
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "esp_heap_caps.h"
@@ -61,6 +63,7 @@ enum {
 /* Attribute flags (§5). */
 #define SSH_FILEXFER_ATTR_SIZE        0x00000001
 #define SSH_FILEXFER_ATTR_PERMISSIONS 0x00000004
+#define SSH_FILEXFER_ATTR_ACMODTIME   0x00000008
 
 /* Open flags (§6.3). */
 #define SSH_FXF_READ   0x00000001
@@ -261,16 +264,32 @@ static uint32_t status_for(int err)
 }
 
 /*
- * Attributes, as far as this filesystem has any. Size and the directory bit
- * are real; the permission bits are a constant that only tells a client which
- * of the two it is looking at, because LittleFS stores neither owner nor mode.
+ * Attributes, as far as this filesystem has any. Size, the directory bit and
+ * the modification time are real; the permission bits are a constant that only
+ * tells a client which of the two it is looking at, because LittleFS stores
+ * neither owner nor mode.
+ *
+ * atime is sent because the protocol pairs the two in one flag and a client
+ * that asked for times expects both. LittleFS keeps no access time, so it
+ * repeats mtime rather than inventing one.
+ *
+ * A file written before the clock was set carries a 1970 mtime, and that is
+ * reported honestly: `sftp ls -l` showing 1970 is the filesystem telling the
+ * truth about when it thought that write happened.
  */
 static void put_attrs(ssh_buf_t *b, const struct stat *st)
 {
-    ssh_put_u32(b, SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_PERMISSIONS);
+    ssh_put_u32(b, SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_PERMISSIONS |
+                   SSH_FILEXFER_ATTR_ACMODTIME);
     ssh_put_u32(b, 0);                          /* size, high word */
     ssh_put_u32(b, (uint32_t)st->st_size);
     ssh_put_u32(b, S_ISDIR(st->st_mode) ? (S_IFDIR | 0755) : (S_IFREG | 0644));
+
+    /* SFTP v3 times are 32-bit seconds; espix's time_t is 64-bit, so this is
+     * the one place the 2038 problem is real. It is the protocol's, not
+     * espix's -- v4 widened the field, and nothing here speaks v4. */
+    ssh_put_u32(b, (uint32_t)st->st_mtime);     /* atime, see above */
+    ssh_put_u32(b, (uint32_t)st->st_mtime);
 }
 
 /* Resolve a client path against "/" — SFTP paths are absolute, and a client
@@ -473,14 +492,34 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
         st.st_mode = (de->d_type == DT_DIR) ? S_IFDIR : S_IFREG;
     }
 
-    /* The long name is what `sftp`'s ls prints; ls(1)'s shape is what clients
-     * expect to parse, so give them that even though the mode is nominal. */
+    /*
+     * The long name is what `sftp`'s ls prints; ls(1)'s shape is what clients
+     * expect to parse, so give them that even though the mode is nominal.
+     *
+     * The date has to be built into this string, not just into the attributes
+     * below: OpenSSH's `ls -l` renders the longname verbatim and never looks at
+     * the attrs, so a correct mtime in put_attrs() and a hardcoded one here
+     * shows the client the hardcoded one. Which is what it did -- espix's own
+     * `ls -l` said "Aug 31 08:21" while sftp said "Jan  1 00:00" for the same
+     * file.
+     */
+    char when[16];
+    if (st.st_mtime > 0) {
+        struct tm tm;
+        localtime_r(&st.st_mtime, &tm);
+        strftime(when, sizeof(when), "%b %e %H:%M", &tm);
+    } else {
+        /* No mtime attribute at all, which is every file in the flashed image.
+         * ls(1) has no spelling for that, so use the epoch it would show. */
+        strlcpy(when, "Jan  1  1970", sizeof(when));
+    }
+
     /* Sized for a full directory entry name, not a path: the two limits are
      * unrelated and dirent's is the larger. */
     char longname[sizeof(de->d_name) + 64];
-    snprintf(longname, sizeof(longname), "%s 1 esp esp %8u Jan  1 00:00 %s",
+    snprintf(longname, sizeof(longname), "%s 1 esp esp %8u %s %s",
              S_ISDIR(st.st_mode) ? "drwxr-xr-x" : "-rw-r--r--",
-             (unsigned)st.st_size, de->d_name);
+             (unsigned)st.st_size, when, de->d_name);
 
     ssh_buf_t b;
     ssh_buf_init(&b, s->out, sizeof(s->out));

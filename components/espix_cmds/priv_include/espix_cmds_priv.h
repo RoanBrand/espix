@@ -15,6 +15,7 @@ void espix_cmds_register_sys(void);
 void espix_cmds_register_run(void);
 void espix_cmds_register_net(void);
 void espix_cmds_register_motd(void);
+void espix_cmds_register_time(void);
 
 /* Resolves a non-builtin command name to a program in /bin or by path. */
 void espix_cmds_register_exec_fallback(void);

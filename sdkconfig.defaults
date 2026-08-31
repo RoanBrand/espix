@@ -89,3 +89,16 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # at compile time and write straight to esp_rom_printf, bypassing the runtime
 # level entirely, so a DEBUG maximum buries every crash under a page of
 # core-dump tracing. It also links in all those format strings.
+
+#
+# System time
+#
+# Take the NTP server from the DHCP lease (option 42), the way a Linux DHCP
+# client does. A network with a local time server but no route to the internet
+# then still gets the right time, and one without simply falls through to the
+# pool. Off by default in ESP-IDF.
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+# Two servers, not one: DHCP's answer takes slot 0 and espix re-registers its
+# own fallback at slot 1, so a DHCP-supplied server never displaces the pool
+# entirely. With one slot the fallback would be silently overwritten.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2

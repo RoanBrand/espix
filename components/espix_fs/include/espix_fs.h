@@ -49,6 +49,21 @@ esp_err_t espix_fs_resolve(const char *cwd, const char *path,
 /* Recursive delete, used by `rm -r`. */
 esp_err_t espix_fs_rm_rf(const char *abs_path);
 
+/*
+ * Read one `key=value` out of a config file under /etc.
+ *
+ * espix's config files are all the same shape — one `key=value` per line, `#`
+ * to end-of-line for comments, leading whitespace ignored, first match wins —
+ * because they are meant to be edited with `echo >>` and read with `cat`. This
+ * lives here rather than in whichever component happened to need it first, so
+ * /etc/wifi.conf, /etc/ntp.conf and whatever comes next all parse identically.
+ *
+ * Returns false if the file is absent or the key is not in it, which callers
+ * are expected to treat as "unconfigured" rather than as an error.
+ */
+bool espix_fs_conf_get(const char *path, const char *key,
+                       char *out, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

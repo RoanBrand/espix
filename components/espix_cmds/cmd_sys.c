@@ -7,12 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_system.h"
 
 #include "espix_auth.h"
@@ -591,24 +593,65 @@ static const char *klog_level_char(uint8_t level)
     }
 }
 
+/*
+ * The ring stores monotonic milliseconds, which is the right thing to store:
+ * it cannot be invalidated by the clock being set. Wall-clock rendering for
+ * `dmesg -T` is therefore derived here, from the offset between the two clocks
+ * *right now* -- exactly how Linux's dmesg -T works, and with the same happy
+ * side effect that lines logged before NTP answered come out with correct
+ * times afterwards.
+ */
+typedef struct {
+    espix_session_t *s;
+    bool             ctime;         /* -T */
+    time_t           wall_at_zero;  /* wall clock at monotonic ms == 0 */
+} dmesg_ctx_t;
+
 static bool dmesg_visit(void *ctx, const espix_klog_entry_t *e)
 {
-    espix_session_t *s = ctx;
+    dmesg_ctx_t *d = ctx;
 
-    espix_printf(s, "[%6u.%03u] %s %s\n",
-                 (unsigned)(e->ts_ms / 1000),
-                 (unsigned)(e->ts_ms % 1000),
-                 klog_level_char(e->level),
-                 e->text);
+    if (d->ctime) {
+        const time_t t = d->wall_at_zero + (time_t)(e->ts_ms / 1000);
+        struct tm    tm;
+        char         when[32];
+
+        localtime_r(&t, &tm);
+        strftime(when, sizeof(when), "%a %b %e %H:%M:%S %Y", &tm);
+
+        espix_printf(d->s, "[%s] %s %s\n",
+                     when, klog_level_char(e->level), e->text);
+    } else {
+        espix_printf(d->s, "[%6u.%03u] %s %s\n",
+                     (unsigned)(e->ts_ms / 1000),
+                     (unsigned)(e->ts_ms % 1000),
+                     klog_level_char(e->level),
+                     e->text);
+    }
     return true;
 }
 
 static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    dmesg_ctx_t ctx = { .s = s };
 
-    espix_klog_foreach(dmesg_visit, s);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--ctime") == 0) {
+            ctx.ctime = true;
+        } else {
+            espix_printf(s, "dmesg: unknown option '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (ctx.ctime) {
+        /* Once per invocation, not per line: every entry shares the offset,
+         * and re-reading the clock 96 times would be both slower and capable
+         * of straddling a second boundary mid-listing. */
+        ctx.wall_at_zero = time(NULL) - (time_t)(esp_log_timestamp() / 1000);
+    }
+
+    espix_klog_foreach(dmesg_visit, &ctx);
 
     const uint32_t dropped = espix_klog_dropped();
     if (dropped > 0) {
@@ -772,7 +815,7 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "top",    .fn = cmd_top,
       .help = "live view of tasks and memory",  .usage = "top" },
     { .name = "dmesg",  .fn = cmd_dmesg,
-      .help = "print the kernel log",           .usage = "dmesg" },
+      .help = "print the kernel log",           .usage = "dmesg [-T]" },
     { .name = "coredump", .fn = cmd_coredump,
       .help = "show or erase the stored core dump",
       .usage = "coredump [erase]" },

@@ -1,0 +1,16 @@
+# espix timezone.
+#
+# A POSIX TZ string, NOT a zoneinfo name. Linux puts "Africa/Johannesburg" in
+# this file and keeps the rules in /etc/localtime; espix ships no tzdata -- the
+# database is megabytes -- so the rules live here in the string itself.
+#
+#   UTC0                         no offset, no DST (the "0" is required)
+#   SAST-2                       UTC+2, no DST  (note the sign is inverted)
+#   GMT0BST,M3.5.0/1,M10.5.0     UK, with DST
+#   EST5EDT,M3.2.0,M11.1.0       US eastern, with DST
+#
+# The sign is backwards from what you expect: the number is what you add to
+# local time to get UTC, so UTC+2 is written -2. That is POSIX, not a typo.
+#
+# `timedatectl set-timezone <string>` rewrites this file.
+UTC0

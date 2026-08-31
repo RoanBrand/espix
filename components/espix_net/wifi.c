@@ -20,6 +20,7 @@
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_net_priv.h"
@@ -358,7 +359,7 @@ esp_err_t espix_net_wifi_start(void)
     char psk[ESPIX_PSK_MAX]   = {0};
 
     const bool have_ssid =
-        espix_net_conf_get(WIFI_CONF_PATH, "ssid", ssid, sizeof(ssid)) &&
+        espix_fs_conf_get(WIFI_CONF_PATH, "ssid", ssid, sizeof(ssid)) &&
         ssid[0] != '\0';
 
     /* Start the driver either way, so `wifi scan` works before any network is
@@ -375,7 +376,7 @@ esp_err_t espix_net_wifi_start(void)
         return ESP_ERR_NOT_FOUND;
     }
 
-    espix_net_conf_get(WIFI_CONF_PATH, "psk", psk, sizeof(psk));
+    espix_fs_conf_get(WIFI_CONF_PATH, "psk", psk, sizeof(psk));
 
     /*
      * Only the boot connect holds the barrier. A later `wifi connect` from the
@@ -400,11 +401,11 @@ esp_err_t espix_net_wifi_connect(const char *ssid, const char *psk)
     /* No arguments: re-read the file, so `wifi connect` after editing
      * /etc/wifi.conf by hand does what you would expect. */
     if (ssid == NULL) {
-        if (!espix_net_conf_get(WIFI_CONF_PATH, "ssid",
+        if (!espix_fs_conf_get(WIFI_CONF_PATH, "ssid",
                                 file_ssid, sizeof(file_ssid))) {
             return ESP_ERR_NOT_FOUND;
         }
-        espix_net_conf_get(WIFI_CONF_PATH, "psk", file_psk, sizeof(file_psk));
+        espix_fs_conf_get(WIFI_CONF_PATH, "psk", file_psk, sizeof(file_psk));
         ssid = file_ssid;
         psk  = file_psk;
     } else {
@@ -525,7 +526,7 @@ esp_err_t espix_net_wifi_status(espix_wifi_status_t *out)
     } else {
         /* Not associated: report what we are trying to reach. */
         char ssid[ESPIX_SSID_MAX] = {0};
-        if (espix_net_conf_get(WIFI_CONF_PATH, "ssid", ssid, sizeof(ssid))) {
+        if (espix_fs_conf_get(WIFI_CONF_PATH, "ssid", ssid, sizeof(ssid))) {
             strlcpy(out->ssid, ssid, sizeof(out->ssid));
         }
     }

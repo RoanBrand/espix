@@ -226,3 +226,55 @@ esp_err_t espix_fs_rm_rf(const char *abs_path)
     }
     return (rmdir(abs_path) == 0) ? ESP_OK : ESP_FAIL;
 }
+
+/* ------------------------------------------------------------------ */
+/* Config files                                                        */
+/* ------------------------------------------------------------------ */
+
+bool espix_fs_conf_get(const char *path, const char *key,
+                       char *out, size_t len)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        return false;
+    }
+
+    const size_t key_len = strlen(key);
+    char  line[128];
+    bool  found = false;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        /*
+         * A line longer than the buffer arrives in pieces, and the pieces
+         * after the first carry no leading '#' -- so the tail of a long
+         * comment can look like a setting. Drop the remainder and skip it.
+         * Nothing legitimate here is this long.
+         */
+        if (strchr(line, '\n') == NULL && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') {
+            }
+            continue;
+        }
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '#' || *p == '\0') {
+            continue;
+        }
+        if (strncmp(p, key, key_len) != 0 || p[key_len] != '=') {
+            continue;
+        }
+
+        p += key_len + 1;
+        p[strcspn(p, "\r\n")] = '\0';
+        strlcpy(out, p, len);
+        found = true;
+        break;      /* first match wins */
+    }
+
+    fclose(f);
+    return found;
+}

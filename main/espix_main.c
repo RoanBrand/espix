@@ -11,12 +11,15 @@
  *                 reported on the next boot.
  *   3. fs       — the rootfs, which everything below reads from.
  *   4. proc     — the process table.
- *   5. net      — after the filesystem, since it reads /etc/hostname and
+ *   5. time     — after the filesystem, since it reads /etc/timezone; before
+ *                 networking, because it starts the SNTP client from the
+ *                 IP_EVENT that networking is about to raise.
+ *   6. net      — after the filesystem, since it reads /etc/hostname and
  *                 /etc/wifi.conf. Returns immediately; association and DHCP
  *                 run on the event loop, so an absent or unreachable network
  *                 never delays the prompt.
- *   6. commands — need the registry, and the filesystem to act on.
- *   7. console  — takes over this task and does not return.
+ *   7. commands — need the registry, and the filesystem to act on.
+ *   8. console  — takes over this task and does not return.
  */
 
 #include "esp_err.h"
@@ -31,6 +34,7 @@
 #include "espix_proc.h"
 #include "espix_shell.h"
 #include "espix_ssh.h"
+#include "espix_time.h"
 
 #define TAG "espix"
 
@@ -45,6 +49,16 @@ void app_main(void)
     /* Before networking: SSH will authenticate against this, and it warns while
      * the shipped default password is still in place. */
     ESP_ERROR_CHECK(espix_auth_init());
+
+    /*
+     * Must precede networking: this registers the IP_EVENT handler that starts
+     * the SNTP client, and the address it waits for is about to arrive. Not
+     * fatal either -- a wrong clock is worse than no clock only to code that
+     * assumes it is right, and espix's own timestamps are monotonic.
+     */
+    if (espix_time_init() != ESP_OK) {
+        ESP_LOGW(TAG, "system time unavailable; the clock stays at the epoch");
+    }
 
     /* Not fatal: no network is a perfectly usable espix. */
     const esp_err_t net_err = espix_net_init();
