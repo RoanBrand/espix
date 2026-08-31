@@ -30,9 +30,21 @@
 /* Long enough for a full RFC-ish stamp with a zone name. */
 #define STAMP_MAX   80
 
-/* GNU date's default, near enough: "Mon 31 Aug 2026 16:05:33 SAST". espix uses
- * 24-hour because every other timestamp it prints is 24-hour. */
-#define DATE_FMT     "%a %d %b %Y %H:%M:%S %Z"
+/*
+ * POSIX defines date's default output as "%a %b %e %H:%M:%S %Z %Y", which is
+ * what `LC_ALL=C date` prints on Linux:
+ *
+ *     Mon Aug 31 11:49:16 SAST 2026
+ *
+ * Matched exactly rather than approximately, so espix's output can be diffed
+ * against a real system's instead of merely resembling it. A distribution's own
+ * `date` may look different -- Raspberry Pi OS renders 12-hour with %r and an
+ * AM/PM marker -- but that is its locale talking, and espix has no locales, so
+ * the C locale is the thing to match.
+ *
+ * %e, not %d: POSIX space-pads a single-digit day ("Sep  1", two spaces).
+ */
+#define DATE_FMT     "%a %b %e %H:%M:%S %Z %Y"
 
 /*
  * The -u form spells UTC out rather than using %Z, because newlib's %Z reads
@@ -40,7 +52,7 @@
  * handed -- so gmtime_r() output formatted with %Z claims the local zone.
  * Measured: `date -u` under TZ=SAST-2 printed the right hour labelled "SAST".
  */
-#define DATE_FMT_UTC "%a %d %b %Y %H:%M:%S UTC"
+#define DATE_FMT_UTC "%a %b %e %H:%M:%S UTC %Y"
 
 /* ------------------------------------------------------------------ */
 

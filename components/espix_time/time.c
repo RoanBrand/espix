@@ -67,6 +67,26 @@ static bool     s_from_conf;
  *
  * A POSIX TZ string, not a zoneinfo name: espix ships no tzdata, so the rules
  * have to be in the string itself. See the shipped /etc/timezone.
+ *
+ * The obvious question is why this is static configuration when the clock
+ * beside it comes off the network: surely the sync could bring the zone too?
+ * It cannot. NTP carries no timezone -- struct sntp_msg is a stratum, a poll
+ * interval, a precision, root delay and dispersion, a reference identifier and
+ * four timestamps, and every one of those timestamps is UTC. There has never
+ * been a field for it.
+ *
+ * Linux is in the same position and answers it the same way: the zone is
+ * written once at install time (the installer asks; on a Raspberry Pi the
+ * first-boot wizard or raspi-config does), and systemd-timesyncd only ever sets
+ * the clock. Where a machine *does* pick a zone up automatically it is from
+ * geolocation or a cellular network, not from time service. The only wire
+ * protocol that carries one is DHCP, options 100 and 101 of RFC 4833 -- which
+ * lwIP does not parse (its dhcp.h knows 42 and 58 and no more) and which
+ * essentially no router serves.
+ *
+ * So espix behaves as Linux does. What it does not have is an installer to ask
+ * the question, which is why the shipped default is UTC and `timedatectl
+ * set-timezone` is how you answer it.
  */
 static void apply_tz(const char *tz)
 {
