@@ -162,6 +162,11 @@ them. A `reboot` keeps the time, because ESP-IDF holds it in an RTC register
 that survives a restart; only a power cycle starts over. `date -s` sets it by
 hand where there is no network.
 
+That choice has real costs — every file espix creates for itself is written
+inside that window — and is the sort of thing worth reading the reasoning on
+before changing it; see the last entry under **Deferred** in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 `/etc/timezone` holds a **POSIX TZ string**, not a zoneinfo name — espix ships
 no tzdata, so the rules live in the string: `SAST-2`, `EST5EDT,M3.2.0,M11.1.0`,
 or `UTC0` (the offset is not optional). `timedatectl set-timezone` writes it.

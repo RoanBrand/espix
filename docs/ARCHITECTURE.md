@@ -477,3 +477,44 @@ costs ~6 KB of format strings).
   console prints a fixed banner instead. Printing motd at session start is the
   right home for it, and worth doing when SSH makes "logging in" a real event.
 - **`espix_net`**, and SSH/SCP on top of it.
+- **A floor under the clock before NTP answers.** On a cold boot espix reads
+  1970 until SNTP replies, deliberately: an obviously wrong date cannot be
+  mistaken for a real one, it costs no flash writes on a filesystem that pays a
+  block erase per write, and there is no persisted state to go stale. A soft
+  `reboot` keeps the clock — ESP-IDF holds the offset in an RTC retention
+  register, verified by setting 2035, removing `/etc/wifi.conf` so nothing could
+  re-sync, rebooting, and finding 2035 intact — so this is a cold-boot-only
+  window, about 6.5 seconds with a working network.
+
+  What makes it worth revisiting is *what* falls in that window. Everything
+  espix writes for itself does, structurally: those files are written during
+  boot, and boot is when the clock is wrong. On a fresh device `/etc/passwd`
+  (2.9s), `/etc/ssh/host_ecdsa_key` (3.4s), `/etc/hostname` and
+  `/etc/wifi.conf` are all created before the sync at 6.5s, and keep 1970
+  mtimes for good.
+
+  Three consequences, in increasing order of how much they will hurt. Time runs
+  backwards across a power cycle, so a file written before it is dated 2026 and
+  one written seconds after is dated 1970 — anything comparing mtimes (rsync,
+  an sftp client syncing a directory, "newest wins") is silently wrong. A device
+  with no network never gets a clock at all. And TLS is the forcing function:
+  certificate validity is checked against the clock, so HTTPS, OTA and MQTT all
+  fail at 1970, and the workaround people reach for is disabling validation,
+  which is worse than a wrong clock.
+
+  The argument for 1970 assumes the clock *value* is the signal that time is
+  unverified. It is not — `espix_time_is_synced()` is, and it stays false
+  whatever the clock reads. So a floor costs no honesty: it buys plausible file
+  timestamps *and* keeps an accurate "not confirmed this boot", which is the
+  split systemd already makes between `TimeEpoch` and timesyncd's state.
+
+  The fix, when it is done: floor the clock at the later of the firmware build
+  epoch (baked in by CMake, no writes at all) and a timestamp written when NTP
+  confirms and on `reboot` — roughly one write per boot, against the hourly cron
+  `fake-hwclock` uses on Raspberry Pi. Never move the clock backwards, and leave
+  `espix_time_is_synced()` meaning exactly what it means now.
+
+  Note while doing it that espix cites Raspberry Pi as precedent for having no
+  RTC, which is true and reads as support for the current behaviour — but RPi OS
+  runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
+  other way.
