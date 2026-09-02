@@ -256,34 +256,106 @@ Three things worth knowing:
   backoff removes. A successful association clears the backoff, so a link that
   flaps once does not carry a minute-long delay into its next outage.
 
-### Asynchronous output clobbers the prompt, and that is accepted
+### Asynchronous output is fitted around the prompt
 
-The session task calls `linenoise()`, which writes the prompt and blocks on
+The session task calls the line editor, which writes the prompt and blocks on
 read. Anything logged from another task — a link event, a timer — writes to
-stdout meanwhile, so the line becomes `espix:/# I (1340) wifi:...` and the
-prompt is gone. `refreshLine()` is `static` in linenoise, so no caller outside
-that library can ask for a redraw.
+stdout meanwhile. Left alone the line becomes
+`root:/# espix: wifi: wlan0: 192.168.110.55/24` and the prompt is gone; worse,
+it *looks* gone, so people wait instead of pressing Enter. That confused several
+people before it was fixed.
 
-There is a second-order effect worth knowing before it looks like a bug. espix
-registers a hints callback for the `usage` strings, and `linenoiseEdit`'s ENTER
-case calls `refreshLine()` to strip the hint before the newline. That rewrites
-the *current* line, so with the prompt still where linenoise left it the refresh
-is invisible and Enter yields one prompt. Once async output has moved the cursor
-to a fresh line, the refresh draws a prompt *there*, `linenoiseRaw()` then emits
-`\n`, and the session loop draws another — so Enter appears to produce two
-prompts. It is a symptom of the splat, not an independent fault.
+**This section used to argue the splat was unavoidable, and that argument no
+longer holds.** It rested on `refreshLine()` being `static` in classic
+linenoise, so nothing outside the library could force a redraw. espix has since
+moved to `espressif/esp_linenoise`, which still exposes no redraw and still
+warns that it is not thread safe — but it takes `read_bytes_cb` and
+`write_bytes_cb`, and espix supplies both. Every byte in and out of the editor
+passes through espix's own code, which is enough.
 
-espix does not try to repair the line. Coupling klog to the shell so it could
-wipe and redraw would cost a callback seam and still lose half-typed input,
-which linenoise does not expose. Instead the noise is cut at the source: the
-WiFi driver's chatty tags are lifted to WARN in `quiet_driver_logs()`, leaving
-espix's own four link messages, which are the ones worth seeing. Kernel messages
-landing on your terminal is what Linux does too.
+**Do not try to repair the line from outside the editor.** The first attempt at
+this did, and it is worth knowing why it failed before reaching for it again.
+`esp_linenoise_refresh_multi_line()` clears the rows it used last time by
+walking *upward* — `\r ESC[0K ESC[1A` repeated `max_rows_used - 1` times
+(`esp_linenoise.c:221`) — where `max_rows_used` is private, sticky within a
+line, and counted from where the editor believes its prompt sits. Wiping the
+prompt and redrawing it a row lower leaves that count wrong, and the next
+refresh walks up into rows now holding kernel output and erases them. Pressing
+Up for history is enough to see it: the recalled line appears and the message
+above it vanishes as the window scrolls.
 
-The honest long-term answer is a runtime console threshold — `dmesg -n` — rather
-than a fixed list of quieted tags. Deferred.
+Printing a fresh prompt below the message without erasing anything has the same
+defect — the prompt still ends up on a row the editor does not know about. The
+difference the first version made was that the prompt was now *interactive*, so a
+long-standing inconsistency became reachable. It survives while a line fits one
+row and breaks once one wraps to two, which the usage hints make reachable,
+since a hint is written but not counted in `rows`.
 
-One case is not left alone, because it is not occasional: at boot the splat is
+**What works is restarting the line, not repairing it.** `espix_kernel` publishes
+an `espix_klog_console_hooks_t` — one `output_done()` callback — that the console
+installs; both write points, klog's own echo and the forwarded ESP_LOGx path,
+call it after writing. Notification only: the kernel hands over no text, because
+the ESP_LOGx path forwards verbatim to the previous vprintf handler and a
+formatted string would have to be clipped at `ESPIX_KLOG_LINE_MAX`.
+
+The console sets a flag, and `console_read_bytes()` returns 0 when it sees it.
+That makes `esp_linenoise_edit()` return normally — `if (nread <= 0) return
+state->len;` (`esp_linenoise.c:772`) — so the session loop calls `get_line()`
+again, and `edit()` resets `max_rows_used`, both cursor positions and the column
+width on entry (`esp_linenoise.c:732-735`) before writing the prompt wherever
+the cursor now is. The editor's picture of the screen is correct by construction
+rather than by repair, and **multi-line editing keeps working**.
+
+The read waits on the console descriptor **and an eventfd** in one `select()`
+with no timeout, so the console task still sleeps until something actually
+happens — a keystroke or a message — and costs nothing while idle. An earlier
+draft polled on a 250ms timeout instead, which meant four wakeups a second
+forever on a device that spends most of its life sitting at a prompt. Polling
+was never necessary: the event is known exactly, the only problem was waking a
+task blocked in `read()`.
+
+That is also the mechanism the library uses for its own
+`esp_linenoise_abort()` — `state.abort_read_fd`, selected on by
+`esp_linenoise_default_read_bytes()`. espix has to repeat it because abort is
+documented as having no effect once a custom `read_bytes_cb` is supplied, which
+espix supplies.
+
+With the restart in place the erase becomes safe, so `output_begin()` does clear
+the prompt with `\r ESC[K` before the message — the stale row belief never
+survives long enough to be acted on, because the restart immediately follows and
+`edit()` re-reads everything. Without the erase, every message line would carry
+a dead `root:/#` prefix, which is worse than what it replaced.
+
+**The flag that gates this is a safety interlock, not a nicety.** `edit()`
+returns `state->len`, so restarting a line with half a command on it hands that
+half back through `get_line()` and the shell *runs it*. So `s_line_dirty` clears
+on almost nothing — only CR, LF, Ctrl-C and Ctrl-U — and every other byte sets
+it, TAB included, since completion can insert text with no printable byte behind
+it. Erring towards "dirty" costs a redraw that does not happen, at a moment when
+the user is visibly at the keyboard. Erring the other way executes a command
+nobody typed.
+
+One consequence to keep in mind when touching this: `edit()` adds an empty
+placeholder to its history on entry and only the ENTER path pops it, so every
+restart leaks one. `console_read_line()` therefore calls
+`espix_history_apply()` on *every* line rather than only accepted ones — it
+frees the editor's list and writes espix's own back, so the strays cannot
+accumulate against a 32-entry history.
+
+An earlier version of this note also described Enter appearing to produce two
+prompts, as a second-order effect of the hint callback refreshing a line the
+cursor had already left. That was a symptom of the splat and goes with it.
+
+Noise is still cut at the source as well, because fitting a message around the
+prompt is no reason to print one nobody wants: the WiFi driver's chatty tags are
+lifted to WARN in `quiet_driver_logs()`, leaving espix's own four link messages.
+Kernel messages landing on your terminal is what Linux does too — the complaint
+was never that they appear, only that they ate the prompt on the way.
+
+The honest long-term answer for *which* messages is a runtime console threshold
+— `dmesg -n` — rather than a fixed list of quieted tags. Deferred.
+
+Boot is handled separately, and still is, because there the splat is
 *guaranteed*. `espix_console_session_start()` would draw its first prompt about a
 second in, while the WiFi association and DHCP it kicked off are still narrating.
 So the console holds its **first** prompt until boot has settled —

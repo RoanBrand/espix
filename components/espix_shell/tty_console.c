@@ -28,6 +28,7 @@
 #include "esp_log.h"
 #include "esp_linenoise.h"
 #include "esp_timer.h"
+#include "esp_vfs_eventfd.h"
 #include "sdkconfig.h"
 
 #if CONFIG_ESP_CONSOLE_UART
@@ -188,6 +189,134 @@ static size_t  s_injected_pos;
 /* A real byte read while an answer still had to be delivered ahead of it. */
 static int     s_pushback = -1;
 
+/* ------------------------------------------------------------------ */
+/* Fitting kernel messages around the prompt                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * True while the session task is blocked inside esp_linenoise_get_line(), which
+ * is when a prompt is on screen and nothing is watching it.
+ */
+static volatile bool s_editing;
+
+/*
+ * Whether anything has been done to the current line.
+ *
+ * This is a safety interlock, not a cosmetic one. Ending the line early makes
+ * esp_linenoise_edit() return `state->len` -- the buffer as it stands -- and the
+ * shell runs whatever comes back. Restarting a line with half a command on it
+ * would therefore *execute* that half. So the line is only ever restarted when
+ * this is false.
+ *
+ * Which is why it clears on almost nothing: only the keys that genuinely end or
+ * abandon a line. Every other byte sets it, including TAB (completion can
+ * insert text with no printable byte behind it) and the bytes of an escape
+ * sequence. Erring towards "dirty" costs a redraw that does not happen, at a
+ * moment when the user is demonstrably looking at the terminal anyway. Erring
+ * the other way runs a command nobody typed.
+ */
+static volatile bool s_line_dirty;
+
+/*
+ * Set when kernel output has landed on a prompt that had nothing typed at it.
+ * Consumed by console_read_bytes(), which ends the line so the session loop
+ * draws a fresh one.
+ *
+ * Written by whichever task logged, read by the session task, so volatile --
+ * a torn read is impossible on a bool, a cached one is not. Same reasoning as
+ * s_last_echo_ms in klog.c.
+ */
+static volatile bool s_restart_line;
+
+/*
+ * An eventfd the logging task writes to, so the read below can wait on the
+ * console *and* on "a message just went out" in one select() and still block
+ * indefinitely when neither happens. No polling: the console task sleeps until
+ * something actually occurs, exactly as it did before any of this.
+ *
+ * This is the mechanism esp_linenoise uses for its own esp_linenoise_abort()
+ * -- state.abort_read_fd, selected on by esp_linenoise_default_read_bytes().
+ * espix has to do it here because the abort path is documented as having no
+ * effect once a custom read_bytes_cb is supplied, which espix supplies.
+ *
+ * -1 when unavailable, in which case the read blocks on the console alone and
+ * the prompt reappears on the next keystroke instead of by itself.
+ */
+static int s_wake_fd = -1;
+
+static void note_typed(uint8_t c)
+{
+    if (c == '\r' || c == '\n' || c == 0x03 /* Ctrl-C */ || c == 0x15 /* Ctrl-U */) {
+        s_line_dirty = false;
+    } else {
+        s_line_dirty = true;
+    }
+}
+
+/*
+ * Kernel output is about to be written from another task: take the prompt off
+ * the screen so the message does not land on it.
+ *
+ * Erasing alone is what the first version of this did, and it was wrong -- the
+ * editor's multi-line refresh clears the rows it last used by walking *upward*
+ * from a private, sticky row count anchored to where it believes its prompt is
+ * (esp_linenoise.c:221), so moving the prompt to a row it does not know about
+ * makes the next refresh erase rows now holding kernel output. Pressing Up was
+ * enough to see it.
+ *
+ * What makes the erase safe now is that it is always followed by a *restart*:
+ * output_done() below ends the input line, so esp_linenoise_edit() runs again
+ * and resets its row count, cursor positions and column width on entry
+ * (esp_linenoise.c:732-735) before drawing the prompt wherever the cursor has
+ * ended up. The stale belief never survives long enough to be acted on.
+ *
+ * Only when the line is untouched -- see s_line_dirty. With something typed,
+ * nothing is erased and nothing is restarted: the message lands beside the
+ * input as it always did, which is ugly but cannot lose what was typed.
+ */
+static void console_klog_output_begin(void)
+{
+    if (!s_editing || s_line_dirty) {
+        return;
+    }
+
+    /* Not on a terminal that has proven it ignores escape sequences: ESC[K
+     * would be rubbish on screen. The message just appends there. */
+    if (s_terminal_mute) {
+        return;
+    }
+
+    fputs("\r\033[K", stdout);
+    fflush(stdout);
+}
+
+/*
+ * Kernel output has been written. Wake the input read so the line restarts and
+ * the prompt is drawn again below the message.
+ *
+ * Signalled rather than done here: drawing from this task would race the
+ * editor's own writes, and only the editor can leave its row bookkeeping
+ * correct.
+ */
+static void console_klog_output_done(void)
+{
+    if (!s_editing || s_line_dirty || s_wake_fd < 0) {
+        return;
+    }
+
+    s_restart_line = true;
+
+    /* eventfd counts, so the value is irrelevant and a coalesced burst of
+     * messages costs one wakeup. Must be an 8-byte write. */
+    const uint64_t one = 1;
+    (void)write(s_wake_fd, &one, sizeof(one));
+}
+
+static const espix_klog_console_hooks_t k_console_hooks = {
+    .output_begin = console_klog_output_begin,
+    .output_done  = console_klog_output_done,
+};
+
 static void inject(const char *fmt, ...)
 {
     va_list ap;
@@ -345,11 +474,73 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
     if (s_pushback >= 0) {
         out[0]     = (uint8_t)s_pushback;
         s_pushback = -1;
+        note_typed(out[0]);
         espix_pace(&last_us);
         return 1;
     }
 
-    const ssize_t n = read(fd, buf, count);
+    /*
+     * Wait on the console and on the wake-up descriptor together, with no
+     * timeout: the task sleeps until a key is pressed or a kernel message goes
+     * out, and burns nothing in between. A poll would have been simpler and is
+     * not worth a wakeup several times a second on a device that spends most of
+     * its life idle at a prompt.
+     */
+    ssize_t n;
+
+    for (;;) {
+        fd_set    rfds;
+        const int maxfd = (s_wake_fd > fd) ? s_wake_fd : fd;
+
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        if (s_wake_fd >= 0) {
+            FD_SET(s_wake_fd, &rfds);
+        }
+
+        const int r = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (r < 0) {
+            return -1;
+        }
+
+        if (s_wake_fd >= 0 && FD_ISSET(s_wake_fd, &rfds)) {
+            /* Drain it whatever happens next, or select returns immediately
+             * for ever. eventfd reads are 8 bytes and reset the count. */
+            uint64_t sink = 0;
+            (void)read(s_wake_fd, &sink, sizeof(sink));
+
+            /*
+             * Returning 0 makes esp_linenoise_edit() return state->len, which
+             * for an untouched line is 0 (esp_linenoise.c:772): get_line()
+             * hands back an empty string, the session loop runs nothing and
+             * calls read_line() again, and the editor redraws its prompt with
+             * its row bookkeeping reset.
+             *
+             * Deliberately not the ENTER path, which would also work and would
+             * tidy up the editor's history placeholder for us: its refresh
+             * draws a prompt *before* returning, and the session loop then
+             * draws another. Two prompts is the very artifact this is meant to
+             * remove. The placeholder is dealt with in console_read_line().
+             *
+             * Not while a cursor report is outstanding: get_cursor_position()
+             * is inside its own read loop then, and cutting it short costs the
+             * terminal width for the rest of the line. The request is simply
+             * dropped -- the next message will make another.
+             */
+            const bool restart = s_restart_line && !s_expect_report;
+            s_restart_line = false;
+
+            if (restart) {
+                return 0;
+            }
+            if (!FD_ISSET(fd, &rfds)) {
+                continue;       /* nothing typed alongside it */
+            }
+        }
+
+        n = read(fd, buf, count);
+        break;
+    }
 
     if (n <= 0) {
         return n;
@@ -383,6 +574,7 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
              */
             s_expect_report = false;
             s_report_pos    = 0;
+            note_typed(out[0]);
             espix_pace(&last_us);
             return n;
         }
@@ -401,6 +593,7 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
         return n;                       /* not paced: we asked for this */
     }
 
+    note_typed(out[0]);
     espix_pace(&last_us);
     return n;
 }
@@ -420,7 +613,20 @@ static int console_read_line(espix_session_t *s, const char *prompt,
      * so anything left here from last time would be run as a command. */
     buf[0] = '\0';
 
-    if (esp_linenoise_get_line(s_editor, buf, len) != ESP_OK) {
+    /*
+     * Between these two the prompt is on screen and this task is blocked in
+     * read(), so kernel output from anywhere else has to be fitted around it --
+     * see console_klog_begin().
+     */
+    s_editing = true;
+    const esp_err_t line_err = esp_linenoise_get_line(s_editor, buf, len);
+    s_editing = false;
+
+    /* The editor has consumed the line either way; whatever was typed on it is
+     * gone from the screen, so the next message has nothing to protect. */
+    s_line_dirty = false;
+
+    if (line_err != ESP_OK) {
         /* An empty line, or a momentarily unavailable backend (USB host
          * disconnect). Neither ends the session; back off so a detached console
          * cannot spin the CPU. */
@@ -430,8 +636,19 @@ static int console_read_line(espix_session_t *s, const char *prompt,
 
     if (buf[0] != '\0') {
         espix_history_push(s_history, buf);
-        espix_history_apply(s_history, s_editor);
     }
+
+    /*
+     * Rebuilt on every line, not just accepted ones. esp_linenoise_edit() adds
+     * its own empty placeholder on entry (esp_linenoise.c:744) and only the
+     * ENTER path pops it again, so a line ended any other way -- Ctrl-C, or the
+     * restart in console_read_bytes() -- leaves one behind. A few dozen of those
+     * would push real commands out of a 32-entry history.
+     *
+     * espix_history_apply() frees the editor's list and writes espix's own back,
+     * so espix's copy stays authoritative and the strays never accumulate.
+     */
+    espix_history_apply(s_history, s_editor);
 
     return (int)strlen(buf);
 }
@@ -591,6 +808,35 @@ esp_err_t espix_console_session_start(void)
     const esp_err_t ed_err = esp_linenoise_create_instance(&cfg, &s_editor);
     s_probe_in_progress = false;
     ESP_RETURN_ON_ERROR(ed_err, TAG, "cannot create the line editor");
+
+    /*
+     * The descriptor the logging task pokes to wake the input read. Try to
+     * create one before registering the VFS: something else may already have
+     * done so, and register() would then fail where eventfd() succeeds.
+     */
+    s_wake_fd = eventfd(0, 0);
+    if (s_wake_fd < 0) {
+        const esp_vfs_eventfd_config_t ev = ESP_VFS_EVENTD_CONFIG_DEFAULT();
+        if (esp_vfs_eventfd_register(&ev) == ESP_OK) {
+            s_wake_fd = eventfd(0, 0);
+        }
+    }
+    if (s_wake_fd < 0) {
+        /* Not fatal. The prompt then reappears on the next keystroke rather
+         * than on its own, which is where this started. */
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "no eventfd; the prompt will not redraw itself after "
+                   "kernel messages");
+    }
+
+    /*
+     * Ask to be told when kernel output reaches the console, now that there is
+     * an editor whose line can be restarted. Safe to register before the
+     * greeting: s_editing is false until the first get_line(), so until then
+     * nothing is requested and messages print exactly as they always did --
+     * which is what wait_for_boot_settled() below still relies on.
+     */
+    espix_klog_set_console_hooks(&k_console_hooks);
 
     /* The console has no login, so it is its own principal rather than sharing
      * a list with whoever logs in over SSH. */

@@ -28,6 +28,35 @@ static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
  * 32-bit aligned word, and the only consumer wants "roughly when", not exactly. */
 static volatile uint32_t  s_last_echo_ms;
 
+/* Whoever owns the terminal, so kernel output can be fitted around a prompt
+ * rather than dropped on top of one. See espix_kernel.h. */
+static const espix_klog_console_hooks_t *s_console;
+
+void espix_klog_set_console_hooks(const espix_klog_console_hooks_t *hooks)
+{
+    s_console = hooks;
+}
+
+/* Read the pointer once into a local at each site: it can be cleared by another
+ * task between the test and the call. */
+static void console_output_begin(void)
+{
+    const espix_klog_console_hooks_t *h = s_console;
+
+    if (h != NULL && h->output_begin != NULL) {
+        h->output_begin();
+    }
+}
+
+static void console_output_done(void)
+{
+    const espix_klog_console_hooks_t *h = s_console;
+
+    if (h != NULL && h->output_done != NULL) {
+        h->output_done();
+    }
+}
+
 /*
  * Copy `src` into `dst`, dropping ANSI escape sequences and trailing newlines.
  * ESP_LOG output arrives colourised and newline-terminated; neither is wanted
@@ -103,8 +132,11 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
      * should not be on the terminal you are trying to work in. */
     if (echo && level <= ESPIX_KLOG_INFO) {
         /* Outside the critical section: this is stdio, not a quick memcpy. */
+        console_output_begin();
         printf("espix: %s\n", staged.text);
         fflush(stdout);
+        console_output_done();
+
         s_last_echo_ms = staged.ts_ms;
     }
 #else
@@ -228,7 +260,17 @@ static int klog_vprintf(const char *fmt, va_list ap)
     }
     va_end(ap_copy);
 
-    return s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
+    /*
+     * Forwarded verbatim rather than printed from `line` above, so a driver
+     * message longer than ESPIX_KLOG_LINE_MAX reaches the console whole -- the
+     * ring's copy is the one that gets clipped. Which is also why the console
+     * owner is only notified afterwards rather than handed the text.
+     */
+    console_output_begin();
+    const int n = s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
+    console_output_done();
+
+    return n;
 }
 
 void espix_klog_install_esp_log_hook(void)

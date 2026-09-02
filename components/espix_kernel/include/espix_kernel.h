@@ -141,6 +141,32 @@ uint32_t espix_klog_dropped(void);
  */
 uint32_t espix_klog_last_echo_ms(void);
 
+/*
+ * Told after kernel output reaches the console, so a shell can put its prompt
+ * back underneath instead of leaving it buried.
+ *
+ * Notification only -- the kernel does not ask the terminal owner to draw
+ * anything, and deliberately does not hand it the text. Repairing the line from
+ * out here would mean guessing where the editor thinks its prompt is, and being
+ * wrong about that is how the first attempt at this erased the wrong rows. The
+ * shell reacts by restarting its own input line, which is the one operation that
+ * leaves the editor's idea of the screen correct.
+ *
+ * Called *after* the write, not before: a shell acting on it mid-message would
+ * redraw its prompt into the middle of the line being printed.
+ *
+ * The transport supplies this, not the other way round -- espix_kernel is the
+ * bottom of the component graph and must not learn what a shell is.
+ */
+typedef struct {
+    void (*output_begin)(void);   /* about to write; clear a prompt if one is up */
+    void (*output_done)(void);    /* written; put a prompt back */
+} espix_klog_console_hooks_t;
+
+/* `hooks` must outlive the call -- it is held by pointer, not copied. NULL
+ * restores plain printing with no notification. */
+void espix_klog_set_console_hooks(const espix_klog_console_hooks_t *hooks);
+
 #ifdef __cplusplus
 }
 #endif
