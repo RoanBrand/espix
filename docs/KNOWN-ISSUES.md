@@ -111,15 +111,6 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   `scp -O` — the pre-9.0 protocol — is answered with a message pointing at
   SFTP, because espix implements no `scp` command for it to run.
 
-- **Each SSH connection leaks about 200 bytes.** Measured by running `free`
-  over 60 successive `exec` connections (172K → 195K internal free) and again
-  over 20 `sftp` sessions, which leak at the same rate. Not reclaimed: still
-  flat after 150 seconds of idle, so it is neither deferred task-stack freeing
-  nor TCP TIME_WAIT. Pre-existing and not in the channel layer — `sftp` does not
-  go through the session or exec paths at all. Around 4000 connections would
-  exhaust internal RAM, so a device that is connected to occasionally is fine
-  and one polled every few seconds is not.
-
 - **A client that decides to rekey hangs the session.** espix reads
   `SSH_MSG_KEXINIT` exactly once, during the handshake; one arriving mid-session
   falls through to the channel loop's `default:` case and is ignored. The client

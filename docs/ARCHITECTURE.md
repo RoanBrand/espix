@@ -635,6 +635,28 @@ There is no boot-time banner. The console session prints the greeting once the
 boot barrier releases, so boot shows kernel log lines and then a login — the
 order Unix uses, and the reason the two no longer overwrite each other.
 
+### A connection owns its session keys, and `free()` cannot reach them
+
+`ssh_conn_t` holds `mbedtls_svc_key_id_t` values, which are *identifiers* — the
+key material lives in mbedTLS's PSA key store. So `free(c)` releases the struct
+and orphans four slots (a cipher and a MAC key for each direction) plus two
+cipher operations, every connection. `ssh_kex_release_keys()` exists to give
+them back and is called from the connection teardown beside
+`kexinit_c_release()`, on every path including the ones where the handshake
+never finished.
+
+This was a real leak before it was a rule: roughly 200-400 bytes of internal
+heap per connection, never recovered, about 4000 connections from exhausting
+RAM. It stayed quiet because `MBEDTLS_PSA_KEY_STORE_DYNAMIC` is on by default in
+tf-psa-crypto, so slots are heap-allocated with no fixed count — under the
+static key store it would have failed a key exchange after
+`MBEDTLS_PSA_KEY_SLOT_COUNT / 4` connections, which is a far easier symptom to
+chase than a slow drain.
+
+The general shape, worth remembering for anything else that reaches for PSA:
+if a struct holds a PSA identifier, freeing the struct is not releasing the
+resource.
+
 ### `exec` and `shell` are one dispatch with two sources of lines
 
 `ssh host <cmd>` and an interactive SSH shell run the same code. The difference

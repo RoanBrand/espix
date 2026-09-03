@@ -395,3 +395,40 @@ out:
     mbedtls_platform_zeroize(secret, sizeof(secret));
     return ret;
 }
+
+/*
+ * Give back everything install_dir() took from the PSA key store.
+ *
+ * ssh_conn_t holds key *identifiers*, not keys: the slots live inside mbedTLS
+ * and free(c) does not touch them. Four slots and two cipher operations per
+ * connection went unreturned until this existed, which measured as roughly
+ * 200-400 bytes of internal heap consumed per connection and never recovered --
+ * about 4000 connections to exhaust the RAM. It never announced itself because
+ * MBEDTLS_PSA_KEY_STORE_DYNAMIC is on by default in tf-psa-crypto, so slots are
+ * heap-allocated with no fixed count; the static key store would have failed a
+ * key exchange after MBEDTLS_PSA_KEY_SLOT_COUNT / 4 connections instead.
+ *
+ * Must run on *every* exit path, including the ones where the handshake never
+ * finished -- missing the failure paths is how this class of bug survives. Safe
+ * there: ssh_conn_t is calloc'd, psa_destroy_key(0) is a documented no-op, and
+ * aborting a zeroed operation is valid.
+ *
+ * Not the host key. That one is imported once in ssh_hostkey.c and belongs to
+ * the process, not to a connection.
+ */
+void ssh_kex_release_keys(ssh_conn_t *c)
+{
+    ssh_dir_t *const dirs[] = { &c->rx, &c->tx };
+
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        ssh_dir_t *d = dirs[i];
+
+        psa_cipher_abort(&d->cipher);
+        psa_destroy_key(d->cipher_key);
+        psa_destroy_key(d->mac_key);
+
+        d->cipher_key = MBEDTLS_SVC_KEY_ID_INIT;
+        d->mac_key    = MBEDTLS_SVC_KEY_ID_INIT;
+        d->active     = false;
+    }
+}

@@ -218,6 +218,16 @@ esp_err_t ssh_hostkey_sign(const uint8_t *hash, size_t hash_len,
  */
 esp_err_t ssh_kex_run(ssh_conn_t *c);
 
+/*
+ * Destroy the session keys and cipher operations ssh_kex_run() installed.
+ *
+ * The connection owns them, and free(c) releases only the identifiers -- the
+ * slots themselves live in the PSA key store. Call on every path that ends a
+ * connection, whether or not the handshake got as far as installing anything;
+ * it is a no-op on a connection that did not.
+ */
+void ssh_kex_release_keys(ssh_conn_t *c);
+
 /* ------------------------------------------------------------------ */
 /* Authentication (ssh_auth.c)                                         */
 /* ------------------------------------------------------------------ */

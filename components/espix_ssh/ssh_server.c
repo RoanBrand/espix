@@ -297,6 +297,7 @@ static void connection_task(void *arg)
 
     close(c->fd);
     kexinit_c_release(c);   /* no-op on the happy path, which released earlier */
+    ssh_kex_release_keys(c);/* the PSA slots free(c) cannot reach */
     free(c);
 
     s_status.sessions--;
