@@ -255,6 +255,8 @@ merely missing.
 |---|---|---|
 | LittleFS mounted as the real `/` | **yes** | survives reboot and firmware reflash |
 | `ls` `cd` `pwd` `cat` `cp` `mv` `rm` `mkdir` `touch` `chmod` `df` | **yes** | |
+| `ls -1ahltr` | **yes** | sorted by name, or by mtime with `-t`; `-R` is not implemented |
+| `ls -i`, inode numbers | **no** | esp_littlefs reports `d_ino = 0` for every entry, and LittleFS exposes no file id |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
 | `/proc`, `mount` / `umount` | **planned** | |

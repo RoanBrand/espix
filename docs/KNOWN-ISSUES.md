@@ -47,6 +47,16 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## Filesystem
 
+- **`ls -a` cannot show `.` and `..`.** It shows dotfiles, which is what you
+  want it for, but the two directory entries themselves never arrive: the ESP
+  LittleFS port's `readdir()` reads in a loop until it gets what it calls "a
+  real object name", discarding both before espix sees them. So `-a` behaves as
+  GNU `ls`'s `-A` and there is no way to make it behave otherwise from here.
+
+- **`ls` holds at most 512 entries.** Sorting means buffering the directory, and
+  past that ceiling the listing stops and says `ls: stopped at 512 entries`
+  rather than silently ending. The same applies if the allocation fails partway.
+
 - **Only the execute bit is enforced.** `ls -l` and `sftp ls -l` show nine
   permission bits and `chmod` sets any of them, but read and write are metadata:
   `chmod 000 /etc/motd` does not stop `cat` reading it. Enforcing them would

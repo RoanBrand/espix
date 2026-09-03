@@ -152,3 +152,23 @@ how it interacts with the attributes `lfs_file_opencfg` rewrites on every sync
 and close -- which for the ESP port is every file, because of that mtime. It has
 been open and unanswered since February 2025. Test `chmod` on an open file
 rather than assuming.
+
+### `readdir()` reports no inode, and hides `.` and `..`
+
+Two smaller gaps in the same file, both defensible for an embedded port and
+both invisible until something wants them.
+
+`esp_littlefs.c` sets `entry->d_ino = 0` for every entry, and neither
+`lfs_stat()` nor `struct lfs_info` exposes the id LittleFS identifies a file by.
+There is therefore no inode number to report, which is why espix has no
+`ls -i` -- with no hard links either, the question it answers cannot arise.
+
+The same function reads in a loop:
+
+    do{ /* Read until we get a real object name */
+        res = lfs_dir_read(efs->fs, &dir->d, &info);
+    }while( res>0 && (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0));
+
+LittleFS itself synthesises `.` and `..`; the port discards them. Nothing above
+the VFS can see them, so `ls -a` shows dotfiles but not the directory entries,
+which is GNU `ls`'s `-A` rather than its `-a`.

@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,17 +89,148 @@ static void ls_time(char *out, size_t len, time_t t)
     strftime(out, len, recent ? "%b %e %H:%M" : "%b %e  %Y", &tm);
 }
 
+/*
+ * The size column, plain or -h.
+ *
+ * coreutils rounds up, and drops to one decimal only below 10: 1412 bytes is
+ * "1.4K" and 20796 is "21K", not "20.3K". Matching that exactly matters more
+ * than being arithmetically neat, because the point of -h is that the number
+ * looks like the one every other tool would have printed.
+ *
+ * Integer arithmetic throughout. The obvious version wants doubles and ceil(),
+ * which drags in libm for a column of a listing.
+ */
+static void ls_size(char *out, size_t len, off_t bytes, bool human)
+{
+    if (!human || bytes < 1024) {
+        snprintf(out, len, "%ld", (long)bytes);
+        return;
+    }
+
+    static const char units[] = { 'K', 'M', 'G' };
+    uint64_t          div     = 1024;
+    int               u       = 0;
+
+    while ((uint64_t)bytes >= div * 1024 && u < 2) {
+        div *= 1024;
+        u++;
+    }
+
+    /* Tenths, rounded up -- never report less than the file holds. */
+    const uint64_t tenths = ((uint64_t)bytes * 10 + div - 1) / div;
+
+    if (tenths < 100) {
+        snprintf(out, len, "%u.%u%c", (unsigned)(tenths / 10),
+                 (unsigned)(tenths % 10), units[u]);
+    } else {
+        snprintf(out, len, "%u%c", (unsigned)((tenths + 9) / 10), units[u]);
+    }
+}
+
+/*
+ * One directory entry, held rather than printed, because sorting needs the
+ * whole directory before any of it can be shown.
+ *
+ * The name is strdup'd rather than a fixed array: `struct dirent` carries
+ * d_name[256] while LittleFS caps a name at 64, so an inline copy would spend
+ * four times what the names actually cost. Same reasoning as the override table
+ * in espix_fs/mode.c.
+ */
+typedef struct {
+    char  *name;
+    time_t mtime;
+    off_t  size;
+    mode_t mode;
+    bool   is_dir;
+    bool   statted;    /* false renders the ?????????? row */
+} ls_entry_t;
+
+/* Ceiling on entries held at once. Said out loud when reached rather than
+ * dropped quietly -- `ps` silently losing its ninth process is already a
+ * known issue and is not worth repeating here. */
+#define LS_ENTRIES_MAX 512
+
+/*
+ * Two comparators rather than one that reads the flags, and -r reverses the
+ * sorted array instead of inverting the comparison.
+ *
+ * qsort() passes no context, so a flag-aware comparator needs file-scope state
+ * -- and the console and an SSH session can both be inside `ls` at once, which
+ * makes that a data race. qsort_r() would solve it and is not dependably in
+ * picolibc. Two context-free comparators and a reverse loop need neither.
+ */
+static int ls_cmp_name(const void *a, const void *b)
+{
+    return strcmp(((const ls_entry_t *)a)->name, ((const ls_entry_t *)b)->name);
+}
+
+static int ls_cmp_mtime(const void *a, const void *b)
+{
+    const ls_entry_t *x = a;
+    const ls_entry_t *y = b;
+
+    if (x->mtime != y->mtime) {
+        return (y->mtime > x->mtime) ? 1 : -1;      /* newest first */
+    }
+    return strcmp(x->name, y->name);                /* stable, and readable */
+}
+
+typedef struct {
+    bool long_form;
+    bool all;
+    bool human;
+    bool by_time;
+    bool reverse;
+} ls_flags_t;
+
+#define LS_USAGE "usage: ls [-1ahltr] [path]\n"
+
+/*
+ * Flags, bundled ("-lah") or separate, in any order. Anything that is not a
+ * flag is the path.
+ *
+ * An unknown letter is an error rather than a path. It used to be the latter:
+ * every argument except "-l" was taken as the operand, so `ls -z` reported
+ * "no such file or directory: /-z" and left you looking at the filesystem.
+ */
+static bool ls_parse(espix_session_t *s, int argc, char **argv,
+                     ls_flags_t *f, const char **target)
+{
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' || argv[i][1] == '\0') {
+            *target = argv[i];
+            continue;
+        }
+
+        for (const char *p = argv[i] + 1; *p != '\0'; p++) {
+            switch (*p) {
+            case 'l': f->long_form = true; break;
+            case 'a': f->all       = true; break;
+            case 'h': f->human     = true; break;
+            case 't': f->by_time   = true; break;
+            case 'r': f->reverse   = true; break;
+
+            /* Already the only behaviour: output is one entry per line, and
+             * there is no terminal width in espix_session_t to columnate
+             * against. Accepted so a script that says -1 works. */
+            case '1': break;
+
+            default:
+                espix_printf(s, "ls: unknown option '-%c'\n" LS_USAGE, *p);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static int cmd_ls(espix_session_t *s, int argc, char **argv)
 {
-    bool        long_form = false;
-    const char *target    = NULL;
+    ls_flags_t  f      = { 0 };
+    const char *target = NULL;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-l") == 0) {
-            long_form = true;
-        } else {
-            target = argv[i];
-        }
+    if (!ls_parse(s, argc, argv, &f, &target)) {
+        return 1;
     }
 
     char abs[ESPIX_PATH_MAX];
@@ -114,14 +246,15 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
 
     /* A plain file argument just describes itself. */
     if (!S_ISDIR(st.st_mode)) {
-        if (long_form) {
+        if (f.long_form) {
             char when[20];
             char perms[11];
+            char size[16];
             ls_time(when, sizeof(when), st.st_mtime);
+            ls_size(size, sizeof(size), st.st_size, f.human);
             espix_fs_mode_str(espix_fs_mode(abs, &st), false,
                               perms, sizeof(perms));
-            espix_printf(s, "%s  %8ld  %12s  %s\n",
-                         perms, (long)st.st_size, when, abs);
+            espix_printf(s, "%s  %8s  %12s  %s\n", perms, size, when, abs);
         } else {
             espix_printf(s, "%s\n", abs);
         }
@@ -134,56 +267,130 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    unsigned count = 0;
-    struct dirent *ent;
+    /*
+     * A stat costs a metadata read and the mode may open the file to sniff the
+     * ELF magic, so neither is done for a plain listing of names. -t needs the
+     * mtime to sort on even without -l.
+     */
+    const bool need_stat = f.long_form || f.by_time;
 
+    ls_entry_t          *ents      = NULL;
+    size_t               count     = 0;
+    size_t               cap       = 0;
+    bool                 truncated = false;
+    const struct dirent *ent;
+
+    /*
+     * No check for "." and ".." here, and none is possible: esp_littlefs's
+     * readdir skips them itself, in a loop that reads until it gets what it
+     * calls "a real object name". The guard this code used to carry could never
+     * fire. It is also why -a cannot show them -- see KNOWN-ISSUES.md.
+     */
     while ((ent = readdir(dir)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+        if (!f.all && ent->d_name[0] == '.') {
             continue;
         }
+        if (count == LS_ENTRIES_MAX) {
+            truncated = true;
+            break;
+        }
+
+        if (count == cap) {
+            const size_t want  = (cap == 0) ? 16 : cap * 2;
+            ls_entry_t  *grown = realloc(ents, want * sizeof(*ents));
+
+            if (grown == NULL) {
+                truncated = true;
+                break;
+            }
+            ents = grown;
+            cap  = want;
+        }
+
+        ls_entry_t *e = &ents[count];
+        memset(e, 0, sizeof(*e));
+
+        e->name = strdup(ent->d_name);
+        if (e->name == NULL) {
+            truncated = true;
+            break;
+        }
+        e->is_dir = (ent->d_type == DT_DIR);
         count++;
 
-        if (!long_form) {
-            espix_printf(s, "%s\n", ent->d_name);
+        if (!need_stat) {
             continue;
         }
 
-        char child[ESPIX_PATH_MAX];
+        char        child[ESPIX_PATH_MAX];
+        struct stat cst;
+
         if (snprintf(child, sizeof(child), "%s/%s",
                      (strcmp(abs, "/") == 0) ? "" : abs, ent->d_name)
-            >= (int)sizeof(child)) {
-            espix_printf(s, "?????????? %8s  %12s  %s\n", "-", "-", ent->d_name);
-            continue;
-        }
+                < (int)sizeof(child)
+            && stat(child, &cst) == 0) {
+            e->statted = true;
+            e->mtime   = cst.st_mtime;
+            e->size    = cst.st_size;
+            e->is_dir  = S_ISDIR(cst.st_mode);
 
-        struct stat cst;
-        char        when[20];
-        char        perms[11];
-
-        if (stat(child, &cst) != 0) {
-            espix_printf(s, "?????????? %8s  %12s  %s\n", "-", "-", ent->d_name);
-            continue;
-        }
-
-        ls_time(when, sizeof(when), cst.st_mtime);
-
-        const bool is_dir = S_ISDIR(cst.st_mode);
-        espix_fs_mode_str(espix_fs_mode(child, &cst), is_dir,
-                          perms, sizeof(perms));
-
-        if (is_dir) {
-            espix_printf(s, "%s  %8s  %12s  %s/\n",
-                         perms, "-", when, ent->d_name);
-        } else {
-            espix_printf(s, "%s  %8ld  %12s  %s\n",
-                         perms, (long)cst.st_size, when, ent->d_name);
+            if (f.long_form) {
+                e->mode = espix_fs_mode(child, &cst);
+            }
         }
     }
 
     closedir(dir);
 
-    if (long_form) {
-        espix_printf(s, "%u entr%s\n", count, count == 1 ? "y" : "ies");
+    qsort(ents, count, sizeof(*ents),
+          f.by_time ? ls_cmp_mtime : ls_cmp_name);
+
+    if (f.reverse && count > 0) {
+        for (size_t i = 0, j = count - 1; i < j; i++, j--) {
+            const ls_entry_t tmp = ents[i];
+            ents[i] = ents[j];
+            ents[j] = tmp;
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const ls_entry_t *e = &ents[i];
+
+        if (!f.long_form) {
+            espix_printf(s, "%s\n", e->name);
+            continue;
+        }
+        if (!e->statted) {
+            espix_printf(s, "?????????? %8s  %12s  %s\n", "-", "-", e->name);
+            continue;
+        }
+
+        char when[20];
+        char perms[11];
+        char size[16];
+
+        ls_time(when, sizeof(when), e->mtime);
+        espix_fs_mode_str(e->mode, e->is_dir, perms, sizeof(perms));
+
+        if (e->is_dir) {
+            espix_printf(s, "%s  %8s  %12s  %s/\n", perms, "-", when, e->name);
+        } else {
+            ls_size(size, sizeof(size), e->size, f.human);
+            espix_printf(s, "%s  %8s  %12s  %s\n", perms, size, when, e->name);
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        free(ents[i].name);
+    }
+    free(ents);
+
+    if (truncated) {
+        espix_printf(s, "ls: stopped at %u entries\n", (unsigned)count);
+    }
+    if (f.long_form) {
+        espix_printf(s, "%u entr%s\n",
+                     (unsigned)count, count == 1 ? "y" : "ies");
     }
     return 0;
 }
@@ -566,7 +773,7 @@ static espix_cmd_t s_fs_cmds[] = {
     { .name = "cd",    .fn = cmd_cd,
       .help = "change the working directory",    .usage = "cd [dir]" },
     { .name = "ls",    .fn = cmd_ls,
-      .help = "list directory contents",         .usage = "ls [-l] [path]" },
+      .help = "list directory contents",         .usage = "ls [-1ahltr] [path]" },
     { .name = "cat",   .fn = cmd_cat,
       .help = "print files",                     .usage = "cat <file>..." },
     { .name = "mkdir", .fn = cmd_mkdir,
