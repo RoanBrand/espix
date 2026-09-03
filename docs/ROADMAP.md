@@ -56,6 +56,13 @@ things are as they are.
   works because it asks for the `sftp` subsystem rather than exec'ing. The
   `subsystem` path already proves the shape; exec needs the command string
   routed to the shell's own dispatch instead of an interactive line editor.
+- **Rekeying.** RFC 4253 recommends new keys after an hour or a gigabyte;
+  espix does neither, and worse, ignores a client that asks — so a long or
+  high-volume session is dropped rather than degraded. Two things to know before
+  starting: the client's KEXINIT buffer is freed as soon as KEX finishes, on the
+  strength of nothing ever reading it again, so that lifetime has to be
+  revisited; and strict KEX resets sequence numbers after NEWKEYS, which a
+  second exchange must honour too.
 - **An ed25519 host key.** espix offers exactly one host key algorithm,
   `ecdsa-sha2-nistp256`. OpenSSH has been steadily narrowing its defaults, and a
   client release that drops ECDSA would lock every user out with no recourse

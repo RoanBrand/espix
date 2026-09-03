@@ -60,10 +60,14 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   they ask for the `sftp` subsystem rather than exec'ing a command. See
   [ROADMAP.md](ROADMAP.md#ssh).
 
-- **SSH never rekeys.** `SSH_MSG_KEXINIT` is read exactly once per connection.
-  Fine for a device, and load-bearing rather than incidental: the client's
-  KEXINIT buffer is freed as soon as KEX finishes, on the strength of nothing
-  ever reading it again.
+- **A client that decides to rekey hangs the session.** espix reads
+  `SSH_MSG_KEXINIT` exactly once, during the handshake; one arriving mid-session
+  falls through to the channel loop's `default:` case and is ignored. The client
+  has by then stopped sending ordinary traffic and is waiting for the server's
+  KEXINIT, so the connection stalls and dies. Rarely reached rather than
+  harmless: OpenSSH's default is 2^32 blocks, which for `aes256-ctr` is 64 GiB,
+  with no time-based limit — but `RekeyLimit 1G 1h` in a client's config gets
+  there in an hour. See [ROADMAP.md](ROADMAP.md#ssh).
 
 - **Client algorithm lists are not a stable surface.** OpenSSH 10.3 added
   post-quantum key exchange and pushed its KEXINIT to 1656 bytes, which outgrew
