@@ -5,6 +5,7 @@
  * execute it as a process.
  */
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,12 +19,24 @@
 #include "espix_proc.h"
 #include "espix_shell.h"
 
-/* How long a foreground `run` waits before giving up on the app and leaving it
- * running in the background. */
 /* How often the foreground wait comes up for air to check for Ctrl-C. */
 #define RUN_POLL_MS 50
 
+/* How long a foreground `run` waits before giving up on the app and leaving it
+ * running in the background. */
 #define RUN_FOREGROUND_TIMEOUT_MS 60000
+
+/*
+ * Ctrl-C presses before the shell stops asking and starts insisting.
+ *
+ * Ctrl-C sends SIGINT and nothing more, which is what Unix does and what makes
+ * a handler worth writing: an app is allowed to catch it, tidy up on its own
+ * schedule, or decline. But espix has one console and no second terminal to run
+ * `kill -9` from, so refusing to ever escalate would mean an app that ignores
+ * SIGINT could hold the only shell you have. The third press is that escape
+ * hatch, and it announces itself before it fires.
+ */
+#define RUN_INTERRUPTS_TO_KILL 3
 
 /*
  * Spawn `abs` with the given argv and, unless backgrounded, wait for it and
@@ -59,9 +72,9 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
      * 50ms is short enough to feel immediate and long enough that polling costs
      * nothing measurable.
      */
-    int       exit_code = -1;
-    esp_err_t wait_err  = ESP_ERR_TIMEOUT;
-    bool      asked     = false;
+    int       exit_code  = -1;
+    esp_err_t wait_err   = ESP_ERR_TIMEOUT;
+    unsigned  interrupts = 0;
 
     for (unsigned waited = 0; waited < RUN_FOREGROUND_TIMEOUT_MS;
          waited += RUN_POLL_MS) {
@@ -77,15 +90,35 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
          * Ctrl-C. Someone who presses it five times should not get five blank
          * lines on the next prompt.
          */
-        if (s->poll_interrupt != NULL && s->poll_interrupt(s) && !asked) {
-            /*
-             * Ask once. espix_proc_kill() escalates to deleting the task if the
-             * app does not take the hint, so a second Ctrl-C would only race
-             * that -- and an app that cleans up deserves the chance to finish.
-             */
-            asked = true;
-            espix_printf(s, "^C\n");
-            espix_proc_kill(pid);
+        if (s->poll_interrupt == NULL || !s->poll_interrupt(s)) {
+            continue;
+        }
+
+        espix_printf(s, "^C\n");
+        interrupts++;
+
+        /*
+         * SIGINT, and only SIGINT. The app may have a handler; running it and
+         * letting the app decide is the whole point of having signals, and
+         * deleting the task from under a handler that was about to put the
+         * hardware back would undo the reason any of this exists.
+         *
+         * A press only counts once per 50ms slice, since poll_interrupt()
+         * reports "something arrived" rather than how many -- which suits a
+         * person pressing a key and means a held-down Ctrl-C does not race
+         * straight to the kill.
+         */
+        if (interrupts < RUN_INTERRUPTS_TO_KILL) {
+            (void)espix_proc_signal(pid, SIGINT);
+
+            if (interrupts + 1 == RUN_INTERRUPTS_TO_KILL) {
+                espix_printf(s, "%s: pid %d is ignoring SIGINT; "
+                                "press Ctrl-C again to force it\n",
+                             who, (int)pid);
+            }
+        } else if (interrupts == RUN_INTERRUPTS_TO_KILL) {
+            espix_printf(s, "%s: killing pid %d\n", who, (int)pid);
+            (void)espix_proc_signal(pid, SIGKILL);
         }
     }
 
@@ -208,18 +241,86 @@ void espix_cmds_register_exec_fallback(void)
     espix_shell_set_exec_fallback(exec_fallback);
 }
 
+/* `kill -l`: every signal espix names, four to a row. */
+static void kill_list(espix_session_t *s)
+{
+    int shown = 0;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        const char *name = espix_signal_name(sig);
+
+        if (name == NULL) {
+            continue;
+        }
+        espix_printf(s, "%2d) SIG%-9s", sig, name);
+
+        if (++shown % 4 == 0) {
+            espix_printf(s, "\n");
+        }
+    }
+    if (shown % 4 != 0) {
+        espix_printf(s, "\n");
+    }
+}
+
 static int cmd_kill(espix_session_t *s, int argc, char **argv)
 {
+    int sig   = SIGTERM;
+    int first = 1;
+
     if (argc < 2) {
-        espix_printf(s, "usage: kill <pid>...\n");
+        espix_printf(s, "usage: kill [-s] <pid>...\n");
+        return 1;
+    }
+
+    /* A leading dash selects the signal: -9, -KILL, -SIGKILL all work. */
+    if (argv[1][0] == '-' && argv[1][1] != '\0') {
+        if (strcmp(argv[1], "-l") == 0) {
+            kill_list(s);
+            return 0;
+        }
+
+        sig = espix_signal_from_name(argv[1] + 1);
+        if (sig < 0) {
+            espix_printf(s, "kill: %s: invalid signal (try kill -l)\n",
+                         argv[1] + 1);
+            return 1;
+        }
+        first = 2;
+    }
+
+    if (first >= argc) {
+        espix_printf(s, "usage: kill [-s] <pid>...\n");
         return 1;
     }
 
     int status = 0;
 
-    for (int i = 1; i < argc; i++) {
-        const espix_pid_t pid = (espix_pid_t)strtol(argv[i], NULL, 10);
-        const esp_err_t   err = espix_proc_kill(pid);
+    for (int i = first; i < argc; i++) {
+        char      *end = NULL;
+        const long v   = strtol(argv[i], &end, 10);
+
+        /* Previously any unparsable argument became pid 0 and was reported as
+         * "no such process", which is a confusing way to say "that is not a
+         * number" -- and is what every `kill -9` attempt used to produce. */
+        if (end == argv[i] || *end != '\0') {
+            espix_printf(s, "kill: %s: arguments must be process ids\n", argv[i]);
+            status = 1;
+            continue;
+        }
+
+        const espix_pid_t pid = (espix_pid_t)v;
+
+        /*
+         * SIGTERM goes through espix_proc_kill(), which asks and then insists:
+         * `kill <pid>` is expected to end the process, and on a device whose
+         * only console may be the one you are typing into, an app that ignores
+         * SIGTERM staying alive is a worse default than the escalation.
+         * Any other signal is delivered and nothing more, which is what asking
+         * for a specific signal means.
+         */
+        const esp_err_t err = (sig == SIGTERM) ? espix_proc_kill(pid)
+                                               : espix_proc_signal(pid, sig);
 
         if (err == ESP_ERR_NOT_FOUND) {
             espix_printf(s, "kill: %d: no such process\n", (int)pid);
@@ -261,8 +362,8 @@ static espix_cmd_t s_run_cmds[] = {
       .help = "load and run an app from the filesystem",
       .usage = "run <path> [args...] [&]" },
     { .name = "kill",  .fn = cmd_kill,
-      .help = "terminate a process",
-      .usage = "kill <pid>..." },
+      .help = "send a signal to a process",
+      .usage = "kill [-SIG|-l] <pid>..." },
     { .name = "crash", .fn = cmd_crash,
       .help = "fault on purpose, to test fault reporting",
       .usage = "crash" },

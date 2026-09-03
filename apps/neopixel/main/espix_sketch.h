@@ -43,13 +43,18 @@ void teardown();
 /*
  * delay() is a cancellation point.
  *
- * The shim wraps Arduino's delay() so that a stop request — Ctrl-C in the shell
- * that started the app, or `kill` from anywhere else — ends it there and then:
- * teardown() runs and the app exits, and that delay() never returns. A sketch
- * that delays anywhere in loop() is therefore interruptible with nothing
- * written for it.
+ * The shim catches SIGTERM, SIGINT and SIGHUP — `kill`, Ctrl-C in the shell
+ * that started the app, and the session going away — and wraps Arduino's
+ * delay() so that any of them ends the sketch there and then: teardown() runs
+ * and the app exits, and that delay() never returns. A sketch that delays
+ * anywhere in loop() is therefore interruptible with nothing written for it,
+ * and a signal arriving mid-delay wakes it rather than waiting the delay out.
  *
  * A loop() that never delays is still stopped, checked between iterations.
+ *
+ * `kill -9` is not catchable and does not come through here: teardown() does
+ * not run, and whatever the sketch had switched on stays on. That is what
+ * SIGKILL means.
  */
 
 /* True once a stop has been requested. Only needed by a loop() that does long

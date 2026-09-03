@@ -221,10 +221,23 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
                              total_runtime);
         }
 
+        /*
+         * A process parked on SIGSTOP is blocked on a semaphore as far as
+         * FreeRTOS is concerned, which would read as a plain 'B' and be
+         * indistinguishable from one waiting on a queue. 'T' is what ps(1)
+         * shows for a stopped process, and it is the one state here that espix
+         * knows about and FreeRTOS does not.
+         */
+        char st = task_state_char(tasks[i].eCurrentState);
+        if (pid != ESPIX_PID_NONE &&
+            espix_proc_state_of(pid) == ESPIX_PROC_STOPPED) {
+            st = 'T';
+        }
+
         espix_printf(s, "%5s %-16s %2c %4u %4s %6u %4u%%\n",
                      pid_str,
                      tasks[i].pcTaskName,
-                     task_state_char(tasks[i].eCurrentState),
+                     st,
                      (unsigned)tasks[i].uxCurrentPriority,
                      core_str,
                      (unsigned)tasks[i].usStackHighWaterMark,
@@ -240,8 +253,12 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
     bool header = false;
     for (size_t i = 0; i < n; i++) {
+        /* STOPPED belongs with the living: it is listed above with a 'T', and
+         * reporting it here as finished would claim an exit that has not
+         * happened and an exit_code that means nothing yet. */
         if (procs[i].state == ESPIX_PROC_RUNNING ||
-            procs[i].state == ESPIX_PROC_READY) {
+            procs[i].state == ESPIX_PROC_READY ||
+            procs[i].state == ESPIX_PROC_STOPPED) {
             continue;
         }
         if (!header) {

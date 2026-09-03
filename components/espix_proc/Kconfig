@@ -27,8 +27,10 @@ menu "espix processes"
         range 1 10
         default 3
         help
-            Kept below the shell session priority so a busy app cannot starve
-            the console.
+            Above the console session, which runs on main_task at priority 1,
+            so a newly created app preempts the shell that started it. proc_task
+            waits on the process lock at entry because of that; see the comment
+            there before changing this.
 
     config ESPIX_PROC_IMAGE_IN_PSRAM
         bool "Read app images into PSRAM when available"

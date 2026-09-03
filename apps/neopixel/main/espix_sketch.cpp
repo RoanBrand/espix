@@ -3,17 +3,25 @@
  */
 
 #include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "espix_sketch.h"
 
 /*
- * espix's cooperative stop, resolved at load time against the table the
- * firmware publishes. Declared here rather than in the header so a sketch never
- * has to see it.
+ * espix's delivery point, resolved at load time against the table the firmware
+ * publishes. Declared here rather than in the header so a sketch never has to
+ * see it.
+ *
+ * Everything else this shim needs is ordinary POSIX -- signal() and usleep() --
+ * which espix publishes under their real names. This one has no POSIX
+ * equivalent, because POSIX delivers signals asynchronously and espix delivers
+ * them when the process calls in. A loop() that blocks on nothing has to say
+ * when that is.
  */
-extern "C" bool espix_app_stopping(void);
+extern "C" bool espix_sigcheck(void);
 
 /*
  * Arduino's real delay(), reached through the linker's --wrap. Defining our own
@@ -21,8 +29,33 @@ extern "C" bool espix_app_stopping(void);
  * delayMicroseconds(), which Adafruit_NeoPixel uses, so that unit is linked and
  * a second definition would collide. Arduino uses --wrap in the same file for
  * the panic handler, so the mechanism is known to fit this build.
+ *
+ * Only used once teardown() is running; see __wrap_delay().
  */
 extern "C" void __real_delay(uint32_t ms);
+
+/*
+ * Set by the handler, read by the loop. sig_atomic_t because that is what a
+ * signal handler is allowed to touch -- and here it is not merely a formality:
+ * the handler really does run in the middle of whatever the sketch was doing.
+ */
+static volatile sig_atomic_t s_stop;
+
+/*
+ * Every signal whose default action would end the process, caught so the sketch
+ * ends *tidily* instead: teardown() runs, the LED goes off, and main() returns
+ * a status. Without a handler the default action still stops the app, but at
+ * whatever point it next calls in rather than through finish().
+ *
+ * SIGKILL is deliberately absent. It cannot be caught, which is the point of
+ * it: `kill -9` on a sketch that has wedged itself must not be something the
+ * sketch can decline.
+ */
+static void on_stop(int sig)
+{
+    (void)sig;
+    s_stop = 1;
+}
 
 /*
  * Normally supplied by crtbegin.o, which -nostdlib never links. A file-scope
@@ -84,7 +117,13 @@ static void finish(int status)
 
 bool espixStopping()
 {
-    return espix_app_stopping();
+    /*
+     * The flag, not a fresh delivery point: by the time a sketch asks, the
+     * handler has already run at whatever call brought the signal in. Asking
+     * again would let a SIGSTOP park the sketch inside a query, which reads
+     * badly for a function that just answers a question.
+     */
+    return s_stop != 0;
 }
 
 void espixExit(int status)
@@ -93,9 +132,18 @@ void espixExit(int status)
 }
 
 /*
- * delay(), made a cancellation point. Sleeps a tick at a time and checks
- * between slices, because espix's stop is a polled flag with no notification
- * behind it -- there is nothing to wait on, so this is the honest shape.
+ * delay(), made a cancellation point.
+ *
+ * usleep() rather than Arduino's delay(): espix publishes an interruptible one,
+ * so a signal arriving mid-delay both wakes the sleep and runs the handler on
+ * the way out. Arduino's delay() is neither -- it would sleep through the
+ * signal, and on a long delay the process would still be asleep when the grace
+ * period ran out and be deleted with teardown() never run.
+ *
+ * Still sliced, for the case where the signal was *not* a stop: a handler that
+ * only counts something returns, and the loop carries on to the next slice
+ * rather than letting delay() return early. One slice is one 100Hz tick, so
+ * this costs nothing that a plain delay would not.
  */
 extern "C" void __wrap_delay(uint32_t ms)
 {
@@ -105,16 +153,20 @@ extern "C" void __wrap_delay(uint32_t ms)
     }
 
     while (ms >= TICK_MS) {
-        __real_delay(TICK_MS);
+        (void)usleep(TICK_MS * 1000u);
         ms -= TICK_MS;
 
-        if (espix_app_stopping()) {
+        if (s_stop) {
             finish(0);          /* does not return */
         }
     }
 
     if (ms > 0) {
-        __real_delay(ms);
+        (void)usleep(ms * 1000u);
+
+        if (s_stop) {
+            finish(0);
+        }
     }
 }
 
@@ -158,6 +210,15 @@ extern "C" int main(int argc, char **argv)
         return s_status;        /* arrived here from finish() */
     }
 
+    /*
+     * Installed before setup(), because setup() is where a sketch lights an LED
+     * or claims a peripheral, and a stop arriving during it should still reach
+     * teardown().
+     */
+    signal(SIGTERM, on_stop);       /* `kill` */
+    signal(SIGINT,  on_stop);       /* Ctrl-C */
+    signal(SIGHUP,  on_stop);       /* the session that started it went away */
+
     run_global_constructors();
     setup();
 
@@ -167,10 +228,11 @@ extern "C" int main(int argc, char **argv)
         /*
          * A loop() that never calls delay() would otherwise be uninterruptible,
          * and would starve every other task besides -- a millis()-driven loop
-         * is a common Arduino idiom. One flag read per iteration buys the
-         * guarantee.
+         * is a common Arduino idiom. This is the delivery point for that case:
+         * nothing else here calls into espix, so without it the handler above
+         * would never get the chance to run.
          */
-        if (espix_app_stopping()) {
+        if (espix_sigcheck() || s_stop) {
             finish(0);
         }
     }

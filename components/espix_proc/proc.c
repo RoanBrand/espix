@@ -2,8 +2,10 @@
  * espix process table: allocation, introspection, wait, kill.
  */
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>    /* strcasecmp, for `kill -TERM` */
 
 #include "esp_log.h"
 
@@ -25,6 +27,7 @@ const char *espix_proc_state_str(espix_proc_state_t state)
     case ESPIX_PROC_FREE:    return "free";
     case ESPIX_PROC_READY:   return "ready";
     case ESPIX_PROC_RUNNING: return "run";
+    case ESPIX_PROC_STOPPED: return "stop";
     case ESPIX_PROC_EXITED:  return "exit";
     case ESPIX_PROC_FAULTED: return "fault";
     case ESPIX_PROC_KILLED:  return "kill";
@@ -32,10 +35,20 @@ const char *espix_proc_state_str(espix_proc_state_t state)
     }
 }
 
-static bool state_is_finished(espix_proc_state_t s)
+/*
+ * Note what is absent: ESPIX_PROC_STOPPED. A stopped process is alive and will
+ * run again, so it must not be reaped by espix_proc_alloc_slot() looking for
+ * something to recycle, and espix_proc_wait() must not report it as an exit.
+ */
+bool espix_proc_state_is_finished(espix_proc_state_t s)
 {
     return s == ESPIX_PROC_EXITED || s == ESPIX_PROC_FAULTED ||
            s == ESPIX_PROC_KILLED;
+}
+
+static bool state_is_finished(espix_proc_state_t s)
+{
+    return espix_proc_state_is_finished(s);
 }
 
 esp_err_t espix_proc_init(void)
@@ -63,6 +76,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_cxx_register();
     espix_proc_abi_drivers_register();
     espix_proc_abi_time_register();
+    espix_proc_abi_signal_register();
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "process table ready (%d slots)",
                ESPIX_PROC_MAX);
@@ -113,6 +127,23 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->argv_block = NULL;
     slot->argv = NULL;
     slot->argc = 0;
+
+    free(slot->sig_handlers);
+    slot->sig_handlers = NULL;
+
+    /*
+     * Safe to delete only because the process is already gone by the time this
+     * runs -- either it returned from main(), or vTaskDelete() took it. A task
+     * still blocked in xSemaphoreTake() on this handle would be left waiting on
+     * freed memory.
+     */
+    if (slot->sig_cont != NULL) {
+        vSemaphoreDelete(slot->sig_cont);
+        slot->sig_cont = NULL;
+    }
+    slot->sig_stop_req = false;
+    slot->sig_pending  = 0;
+    slot->sig_blocked  = 0;
 }
 
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
@@ -133,11 +164,35 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     xEventGroupSetBits(g_espix_proc_events, (EventBits_t)1 << index);
 }
 
-static espix_proc_slot_t *find_by_pid(espix_pid_t pid)
+espix_proc_slot_t *espix_proc_find(espix_pid_t pid)
 {
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
         if (g_espix_procs[i].info.state != ESPIX_PROC_FREE &&
             g_espix_procs[i].info.pid == pid) {
+            return &g_espix_procs[i];
+        }
+    }
+    return NULL;
+}
+
+static espix_proc_slot_t *find_by_pid(espix_pid_t pid)
+{
+    return espix_proc_find(pid);
+}
+
+espix_proc_slot_t *espix_proc_self(void)
+{
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+
+    /*
+     * Unlocked, on the same reasoning espix_app_stopping() has always used: the
+     * caller is the process itself, so the one slot that matters cannot be
+     * recycled while it is asking, and taking the table lock here would let any
+     * app stall every other process by blocking inside a delivery point.
+     */
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        if (g_espix_procs[i].info.task == self &&
+            g_espix_procs[i].info.state != ESPIX_PROC_FREE) {
             return &g_espix_procs[i];
         }
     }
@@ -183,74 +238,225 @@ esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeou
 }
 
 /*
- * How long a process gets to leave on its own after being asked. Long enough
- * for an app polling once per animation frame to notice and tidy up, short
- * enough that `kill` on an app which ignores the flag still feels immediate.
+ * How long a process gets to leave on its own after SIGTERM.
+ *
+ * Longer than the 400ms this used to be, and the reason is that a signal now
+ * wakes a sleeping process instead of waiting for it to look up. An app that
+ * cooperates answers in about the time it takes to run its handler, so the
+ * grace is no longer the common path -- it is only what an app that ignores
+ * SIGTERM costs you. Spending that on letting a cleanup routine flush a file
+ * is a better trade than cutting one short.
  */
-#define STOP_GRACE_MS 400
+#define TERM_GRACE_MS 2000
 
-esp_err_t espix_proc_request_stop(espix_pid_t pid)
+/*
+ * Names without the "SIG", indexed by signal number, for `kill -l` and the
+ * name form of `kill -TERM`. Indexed by the <signal.h> macro rather than a
+ * literal, so this stays correct if the numbering ever moves under us -- which
+ * is not hypothetical, since these are the BSD numbers and not Linux's.
+ */
+static const char *const s_signames[NSIG] = {
+    [SIGHUP] = "HUP",   [SIGINT] = "INT",    [SIGQUIT] = "QUIT",
+    [SIGILL] = "ILL",   [SIGTRAP] = "TRAP",  [SIGABRT] = "ABRT",
+    [SIGEMT] = "EMT",   [SIGFPE] = "FPE",    [SIGKILL] = "KILL",
+    [SIGBUS] = "BUS",   [SIGSEGV] = "SEGV",  [SIGSYS] = "SYS",
+    [SIGPIPE] = "PIPE", [SIGALRM] = "ALRM",  [SIGTERM] = "TERM",
+    [SIGURG] = "URG",   [SIGSTOP] = "STOP",  [SIGTSTP] = "TSTP",
+    [SIGCONT] = "CONT", [SIGCHLD] = "CHLD",  [SIGTTIN] = "TTIN",
+    [SIGTTOU] = "TTOU", [SIGIO] = "IO",      [SIGXCPU] = "XCPU",
+    [SIGXFSZ] = "XFSZ", [SIGVTALRM] = "VTALRM", [SIGPROF] = "PROF",
+    [SIGWINCH] = "WINCH", [SIGLOST] = "LOST", [SIGUSR1] = "USR1",
+    [SIGUSR2] = "USR2",
+};
+
+const char *espix_signal_name(int sig)
 {
-    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-
-    espix_proc_slot_t *slot = find_by_pid(pid);
-    if (slot == NULL) {
-        xSemaphoreGive(g_espix_proc_lock);
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (state_is_finished(slot->info.state)) {
-        xSemaphoreGive(g_espix_proc_lock);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    slot->stop_requested = true;
-    xSemaphoreGive(g_espix_proc_lock);
-    return ESP_OK;
+    return (sig > 0 && sig < NSIG) ? s_signames[sig] : NULL;
 }
 
-bool espix_app_stopping(void)
+int espix_signal_from_name(const char *name)
 {
-    const espix_pid_t pid = espix_proc_pid_of_task(xTaskGetCurrentTaskHandle());
-
-    if (pid == ESPIX_PID_NONE) {
-        return false;           /* not a process; nobody is asking it to stop */
+    if (name == NULL || *name == '\0') {
+        return -1;
     }
 
-    /*
-     * Deliberately unlocked. This is polled from an app's inner loop, the value
-     * is a single bool, and a reader that is one iteration late is harmless —
-     * whereas taking the process lock here would let any app stall the table.
-     */
-    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        if (g_espix_procs[i].info.pid == pid) {
-            return g_espix_procs[i].stop_requested;
+    if (isdigit((unsigned char)*name)) {
+        char      *end = NULL;
+        const long v   = strtol(name, &end, 10);
+
+        return (end != NULL && *end == '\0' && v > 0 && v < NSIG) ? (int)v : -1;
+    }
+
+    if (strncasecmp(name, "SIG", 3) == 0) {
+        name += 3;
+    }
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (s_signames[sig] != NULL && strcasecmp(name, s_signames[sig]) == 0) {
+            return sig;
         }
     }
-    return false;
+    return -1;
 }
 
-esp_err_t espix_proc_kill(espix_pid_t pid)
+/*
+ * Signals whose default action is to do nothing. Everything else espix names
+ * defaults to terminating, which here means setting stop_requested and letting
+ * the process leave on its own.
+ */
+static bool sig_default_ignores(int sig)
+{
+    switch (sig) {
+    case SIGCHLD:       /* there are no children to report on */
+    case SIGURG:
+    case SIGWINCH:
+    case SIGCONT:       /* continuing already happened; nothing left to do */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void set_state(espix_proc_slot_t *slot, espix_proc_state_t st)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    /* Never walk a finished process back to life: it may be mid-teardown. */
+    if (!state_is_finished(slot->info.state)) {
+        slot->info.state = st;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+}
+
+/*
+ * Run the handlers for everything pending and unblocked. Returns what was
+ * delivered.
+ *
+ * One pass, not a loop until empty: a handler that re-raises its own signal
+ * would spin here for ever. A signal that arrives while a handler is running is
+ * picked up at the next delivery point instead, which is a delay of microseconds
+ * in an app that blocks and no worse than the alternative in one that does not.
+ */
+static uint32_t sig_dispatch(espix_proc_slot_t *slot)
 {
     /*
-     * Ask before deleting. An app that polls espix_app_stopping() gets to put
-     * its hardware back — an LED off, a motor stopped — which deleting the task
-     * outright never allows. An app that ignores it is no worse off than
-     * before, just STOP_GRACE_MS later.
+     * Fast path, unlocked. espix_app_stopping() sits in apps' inner loops and
+     * used to cost two linear scans of the table; it must not now cost a mutex
+     * on every iteration. Two volatile loads, and a reader one iteration behind
+     * is harmless.
      */
-    const esp_err_t asked = espix_proc_request_stop(pid);
-    if (asked != ESP_OK) {
-        return asked;           /* no such pid, or already finished */
-    }
-
-    int exit_code = -1;
-    if (espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(STOP_GRACE_MS)) == ESP_OK) {
-        espix_klog(ESPIX_KLOG_INFO, TAG, "pid %d stopped on request", (int)pid);
-        return ESP_OK;
+    if ((slot->sig_pending & ~slot->sig_blocked) == 0) {
+        return 0;
     }
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const uint32_t deliver = slot->sig_pending & ~slot->sig_blocked;
+    slot->sig_pending &= ~deliver;
+    xSemaphoreGive(g_espix_proc_lock);
 
-    espix_proc_slot_t *slot = find_by_pid(pid);
+    for (int sig = 1; sig < NSIG; sig++) {
+        if ((deliver & espix_sigbit(sig)) == 0) {
+            continue;
+        }
+
+        /*
+         * sig_handlers is only ever written by this process, from this task, so
+         * reading it here needs no lock. Another task can free it -- but only
+         * after the task is gone, which is to say never while we are here.
+         */
+        void (*handler)(int) = (slot->sig_handlers != NULL)
+                                   ? slot->sig_handlers[sig]
+                                   : SIG_DFL;
+
+        if (handler == SIG_IGN) {
+            continue;
+        }
+        if (handler != SIG_DFL) {
+            handler(sig);       /* app code; no lock held, by design */
+            continue;
+        }
+        if (!sig_default_ignores(sig)) {
+            slot->stop_requested = true;
+        }
+    }
+
+    return deliver;
+}
+
+/*
+ * Park while SIGSTOP stands.
+ *
+ * The process suspends *itself*, here, at a point where it demonstrably holds
+ * no libc, VFS or heap lock. Suspending it from outside would be the Unix
+ * behaviour and is not available: vTaskSuspend() on a task parked inside
+ * malloc() or a VFS call holds that mutex for as long as the stop lasts and
+ * wedges every other task that touches it -- the same hazard the fault reaper
+ * refuses to accept, and worse here because both cores are live.
+ */
+static void sig_park(espix_proc_slot_t *slot)
+{
+    while (slot->sig_stop_req) {
+        if (slot->sig_cont == NULL) {
+            slot->sig_stop_req = false;     /* nothing to park on */
+            break;
+        }
+
+        /*
+         * Discard a continue token left over from a stop that was lifted before
+         * this process got round to parking, or this stop would end the instant
+         * it began. Anything arriving after this point is a real SIGCONT, and
+         * the semaphore remembers it even if it lands before the take below --
+         * which is the whole reason this is a semaphore and not vTaskResume().
+         */
+        (void)xSemaphoreTake(slot->sig_cont, 0);
+
+        if (!slot->sig_stop_req) {
+            break;                          /* lifted while we tidied up */
+        }
+
+        set_state(slot, ESPIX_PROC_STOPPED);
+        (void)xSemaphoreTake(slot->sig_cont, portMAX_DELAY);
+        set_state(slot, ESPIX_PROC_RUNNING);
+
+        /* Whatever woke us may have been a signal rather than SIGCONT. */
+        (void)sig_dispatch(slot);
+    }
+}
+
+uint32_t espix_sigcheck_mask(void)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+
+    if (slot == NULL) {
+        return 0;           /* not a process; nobody is signalling it */
+    }
+
+    uint32_t got = sig_dispatch(slot);
+
+    sig_park(slot);
+
+    if (slot->stop_requested) {
+        got |= ESPIX_SIG_STOPPING;
+    }
+    return got;
+}
+
+bool espix_sigcheck(void)
+{
+    return (espix_sigcheck_mask() & ESPIX_SIG_STOPPING) != 0;
+}
+
+/*
+ * SIGKILL. Deleting another task on a system with no memory protection is a
+ * blunt instrument: anything it held at the time -- a VFS mutex, a heap block,
+ * an open file -- stays held or leaked. We reclaim what the process table owns
+ * (its ELF image and argv) and nothing more. This is the same accepted tradeoff
+ * described in the project's crash-handling model, and the reason espix_fault's
+ * reaper exists as a separate, deferred path.
+ */
+static esp_err_t proc_force_kill(espix_pid_t pid)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+    espix_proc_slot_t *slot = espix_proc_find(pid);
     if (slot == NULL) {
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_NOT_FOUND;
@@ -262,27 +468,122 @@ esp_err_t espix_proc_kill(espix_pid_t pid)
 
     TaskHandle_t task = slot->info.task;
     slot->info.task = NULL;
+
+    /* Copy the name while the lock still protects it: the slot can be recycled
+     * the moment espix_proc_finish() below wakes whoever was waiting. */
+    char name[ESPIX_PROC_NAME_MAX];
+    strlcpy(name, slot->info.name, sizeof(name));
+
     xSemaphoreGive(g_espix_proc_lock);
 
-    /*
-     * Deleting another task on a system with no memory protection is a blunt
-     * instrument: anything it was holding at the time — a VFS mutex, a heap
-     * block, an open file — stays held or leaked. We reclaim what the process
-     * table owns (its ELF image and argv) and nothing more. This is the same
-     * accepted tradeoff described in the project's crash-handling model, and
-     * the reason espix_fault's reaper exists as a separate, deferred path.
-     */
     if (task != NULL) {
         vTaskDelete(task);
     }
 
-    espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s): did not stop when asked",
-               (int)pid, slot->info.name);
+    espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s)", (int)pid, name);
 
     espix_proc_release_resources(slot);
     espix_proc_finish(slot, ESPIX_PROC_KILLED, -1);
 
     return ESP_OK;
+}
+
+esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
+{
+    if (espix_sigbit(sig) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sig == SIGKILL) {
+        return proc_force_kill(pid);
+    }
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+    espix_proc_slot_t *slot = espix_proc_find(pid);
+    if (slot == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (state_is_finished(slot->info.state)) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const bool was_stopped = slot->sig_stop_req;
+
+    if (sig == SIGSTOP) {
+        if (slot->sig_cont == NULL) {
+            slot->sig_cont = xSemaphoreCreateBinary();
+        }
+        if (slot->sig_cont == NULL) {
+            xSemaphoreGive(g_espix_proc_lock);
+            return ESP_ERR_NO_MEM;
+        }
+        slot->sig_stop_req = true;
+    } else {
+        slot->sig_pending |= espix_sigbit(sig);
+
+        /*
+         * Any other signal lifts a stop. POSIX would leave the process stopped
+         * with the signal pending until SIGCONT, but espix has no `fg` to
+         * deliver that: a stopped process left holding a SIGTERM would sit on
+         * it until the grace ran out and then be deleted, cleanup and all. So a
+         * stop here yields to anything else, and the process gets to act.
+         */
+        slot->sig_stop_req = false;
+    }
+
+    TaskHandle_t      task = slot->info.task;
+    SemaphoreHandle_t cont = slot->sig_cont;
+
+    xSemaphoreGive(g_espix_proc_lock);
+
+    /*
+     * Wake it. The pending bits are already set, so a target racing us into a
+     * blocking call sees them rather than sleeping through them -- which is why
+     * this is after the unlock and not before the write.
+     *
+     * xTaskAbortDelay returns pdFAIL for a task that was not blocked, and that
+     * is fine: it means the target is running and will reach a delivery point
+     * on its own. Signalling yourself skips it -- you are, definitionally, not
+     * blocked -- and raise() calls espix_sigcheck() directly instead.
+     */
+    if (sig != SIGSTOP && was_stopped && cont != NULL) {
+        (void)xSemaphoreGive(cont);
+    }
+    if (task != NULL && task != xTaskGetCurrentTaskHandle()) {
+        (void)xTaskAbortDelay(task);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t espix_proc_request_stop(espix_pid_t pid)
+{
+    return espix_proc_signal(pid, SIGTERM);
+}
+
+esp_err_t espix_proc_kill(espix_pid_t pid)
+{
+    /*
+     * Ask before deleting. An app that takes the hint gets to put its hardware
+     * back — an LED off, a motor stopped — which deleting the task outright
+     * never allows. An app that ignores it is no worse off than before, just
+     * TERM_GRACE_MS later.
+     */
+    const esp_err_t asked = espix_proc_signal(pid, SIGTERM);
+    if (asked != ESP_OK) {
+        return asked;           /* no such pid, or already finished */
+    }
+
+    int exit_code = -1;
+    if (espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(TERM_GRACE_MS)) == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "pid %d stopped on request", (int)pid);
+        return ESP_OK;
+    }
+
+    espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d did not stop when asked", (int)pid);
+    return proc_force_kill(pid);
 }
 
 size_t espix_proc_hangup(const espix_session_t *session)
@@ -291,26 +592,47 @@ size_t espix_proc_hangup(const espix_session_t *session)
         return 0;
     }
 
-    size_t killed = 0;
-
     /*
-     * Snapshot first, then kill: espix_proc_kill() takes the table lock itself,
-     * and a process may well finish on its own in between — which it reports
-     * and we ignore, because that is the outcome we wanted anyway.
+     * Snapshot first, then signal: espix_proc_signal() takes the table lock
+     * itself, and a process may well finish on its own in between — which it
+     * reports and we ignore, because that is the outcome we wanted anyway.
      */
     espix_proc_info_t procs[ESPIX_PROC_MAX];
     const size_t      n = espix_proc_snapshot(procs, ESPIX_PROC_MAX);
+
+    bool   targeted[ESPIX_PROC_MAX] = { false };
+    size_t ended = 0;
 
     for (size_t i = 0; i < n; i++) {
         if (procs[i].session != session || state_is_finished(procs[i].state)) {
             continue;
         }
-        if (espix_proc_kill(procs[i].pid) == ESP_OK) {
-            killed++;
-        }
+        targeted[i] = (espix_proc_signal(procs[i].pid, SIGHUP) == ESP_OK);
     }
 
-    return killed;
+    /*
+     * One grace shared across all of them rather than one each: a session with
+     * three apps on it should not hold the connection open for three times as
+     * long, and a hangup is usually the last thing a dropped SSH channel does
+     * before its stdio goes away.
+     */
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(TERM_GRACE_MS);
+
+    for (size_t i = 0; i < n; i++) {
+        if (!targeted[i]) {
+            continue;
+        }
+
+        const int32_t left = (int32_t)(deadline - xTaskGetTickCount());
+
+        if (espix_proc_wait(procs[i].pid, NULL, (left > 0) ? (TickType_t)left : 0)
+            != ESP_OK) {
+            (void)proc_force_kill(procs[i].pid);
+        }
+        ended++;
+    }
+
+    return ended;
 }
 
 size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n)
@@ -330,6 +652,17 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n)
     xSemaphoreGive(g_espix_proc_lock);
 
     return count;
+}
+
+espix_proc_state_t espix_proc_state_of(espix_pid_t pid)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *slot  = espix_proc_find(pid);
+    const espix_proc_state_t state = (slot != NULL) ? slot->info.state
+                                                    : ESPIX_PROC_FREE;
+    xSemaphoreGive(g_espix_proc_lock);
+
+    return state;
 }
 
 espix_pid_t espix_proc_pid_of_task(TaskHandle_t task)

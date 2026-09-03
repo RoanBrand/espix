@@ -123,6 +123,25 @@ static void proc_task(void *arg)
 {
     espix_proc_slot_t *slot = arg;
 
+    /*
+     * Wait until the parent has finished admitting us to the process table.
+     *
+     * xTaskCreate() starts this task at CONFIG_ESPIX_PROC_PRIORITY, which is
+     * *higher* than the console session's -- that runs on main_task at
+     * priority 1, whatever the Kconfig help used to claim -- so the child
+     * preempts the parent the instant it is created, before espix_proc_spawn_elf()
+     * has stored the task handle in the slot. An app that called getpid() or
+     * installed a signal handler in that window found no table entry for itself
+     * at all: its slot still read task=NULL, state=READY.
+     *
+     * The parent holds this lock across the whole admission, so taking it here
+     * is precisely "wait until I am fully in the table". The mutex carries
+     * priority inheritance, so the lower-priority parent is boosted to finish
+     * rather than left behind.
+     */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    xSemaphoreGive(g_espix_proc_lock);
+
     /* Inherit the launching session so the app's stdio and any espix_printf()
      * from this task reach whoever ran it. */
     espix_shell_set_current(slot->info.session);

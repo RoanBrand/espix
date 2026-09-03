@@ -158,11 +158,12 @@ static esp_elf_symbol_table_t s_cxx_syms[] = {
     { "fflush", reinterpret_cast<const void *>(fflush) },
 
     /*
-     * espix's own: how an app asks whether it has been told to stop. Not C++,
-     * but this is the only symbol table espix_proc publishes, and an app that
-     * drives hardware needs it to put that hardware back before it exits.
+     * espix_app_stopping() used to be published here -- the one way an app
+     * could ask whether it had been told to stop, back when a stop was a bare
+     * flag. It is gone: espix_sigcheck() answers the same question, and
+     * abi_signal.c publishes it alongside the POSIX signal calls it belongs
+     * with. An app that drives hardware now installs a SIGTERM handler.
      */
-    { "espix_app_stopping", reinterpret_cast<const void *>(espix_app_stopping) },
 
     { "_ZSt25__throw_bad_function_callv",
       reinterpret_cast<const void *>(_ZSt25__throw_bad_function_callv) },

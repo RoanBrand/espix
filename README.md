@@ -237,8 +237,9 @@ merely missing.
 |---|---|---|
 | Run a cross-compiled native app by name | **yes** | `/bin` search, argv, exit status |
 | `ps`, `top` | **yes** | live CPU and memory, per core |
-| Stop a running app — Ctrl-C, `kill` | **yes** | cooperative: the app polls a flag |
-| Real signals and handlers | **planned** | `kill` cannot force today |
+| Stop a running app — Ctrl-C, `kill` | **yes** | Ctrl-C is SIGINT; `kill` asks, then insists |
+| Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names; delivered when the app calls in, not asynchronously |
+| `kill -l`, `ps` showing `T` for stopped | **yes** | |
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
 | `grep`, `sed`, `head`, `tail`, `wc`, `sort`, `find` | **planned** | |
 | `sleep` | **planned** | |

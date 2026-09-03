@@ -126,6 +126,108 @@ It deliberately does *not* reap and resume. See the comment block at the top of
 no per-process ownership of heap and fds, and the fact that without an MMU most
 corruption never reaches the fault handler at all.
 
+### Signals are delivered when a process calls in, not asynchronously
+
+ESP-IDF ships the signal *vocabulary* and no machinery. `<signal.h>` declares
+`signal`, `sigaction`, `sigprocmask`, `sigsuspend`, `pause`, `alarm` and
+`pthread_kill`; the toolchain defines **none** of them — libc's `signal.o`
+holds one unused variable, because it was compiled with `SIGNAL_PROVIDED` on
+the assumption the platform supplies the rest. `kill()` resolves to a stub
+returning `ENOSYS` and `raise()` to one that calls `abort()`. IDF's pthread has
+no `pthread_kill`, and its `pthread_sigmask` returns success while doing
+nothing. FreeRTOS-Plus-POSIX, vendored as `components/rt`, is the message-queue
+slice only; upstream never implemented signals either.
+
+So all of it is espix's, in `abi_signal.c` — and because that namespace is
+unclaimed, it is written under the real names. An app calls `signal()` and
+`kill()`, not `espix_signal_*`. The numbers come from `<signal.h>` and espix
+defines none: the toolchain uses the BSD set, where `SIGUSR1` is **30** and
+`SIGUSR2` **31**, and a kernel carrying its own table would have disagreed
+silently with every app compiled against the real header.
+
+**A handler runs in the app's own task, at a delivery point, and returns to
+where execution was.** It is not asynchronous. A real kernel interrupts the
+thread at an arbitrary instruction and manufactures a signal frame on its
+stack; doing that here means rewriting a FreeRTOS task's saved program counter
+on windowed-register Xtensa, which is not a trade worth making. The delivery
+points are the blocking calls espix publishes — `sleep`, `usleep`,
+`nanosleep`, `pause` — which in practice is every app that ever waits.
+
+The honest limit: a pure compute loop that never calls into espix has no
+delivery point and never sees a signal. `espix_sigcheck()` is exported for
+exactly that app, and `kill -9` is the answer when it is somebody else's
+binary. `apps/sigtest spin` is the case in the flesh.
+
+**Signalling wakes a blocked process.** `espix_proc_signal()` sets the pending
+bit and then calls `xTaskAbortDelay()`, which cuts a `vTaskDelay()` short.
+Without it a process in `sleep(60)` would not reach a delivery point for a
+minute — long past the grace period — and would be deleted mid-sleep with its
+handler never run and its cleanup never done. Waking it is what makes a handler
+worth writing. Two properties to keep in mind: `xTaskAbortDelay` returns
+`pdFAIL` for a task that was not blocked, so the pending bit is written *first*
+and a target racing into a blocking call sees it rather than sleeping through
+it; and IDF discards the semaphore result in `esp_vfs_select()`, so an aborted
+`select()` returns 0 rather than `EINTR` and a woken task must consult its own
+pending mask. A per-process eventfd is the only way to break a task blocked in
+lwIP's `socket_select`, which `xTaskAbortDelay` cannot touch — deferred until
+an app does socket `select()`, with `tty_console.c` already holding the pattern
+to copy.
+
+**SIGSTOP parks the process in itself.** Not `vTaskSuspend()` from outside:
+suspending a task parked inside `malloc()`, stdio's `flockfile` or the VFS lock
+holds that mutex for as long as the stop lasts and wedges every other task that
+touches it — the same hazard `reaper.c` refuses to accept for the fault path,
+and worse here because both cores are live. So SIGSTOP sets a flag, and the
+target suspends itself at its next delivery point, where it demonstrably holds
+none of those locks. It parks on a per-process semaphore rather than
+`vTaskSuspend()` because a give that lands before the take is remembered:
+SIGCONT arriving in the window between deciding to park and actually parking
+cannot be lost, and the same race against `vTaskResume()` has no fix that does
+not involve polling `eTaskGetState()`.
+
+Two deliberate deviations from POSIX, both forced by having no job control:
+
+- **Any signal but SIGSTOP lifts a stop.** POSIX leaves the process stopped
+  with the signal pending until SIGCONT. espix has no `fg` to deliver that, so
+  a stopped process holding a SIGTERM would sit on it until the grace ran out
+  and then be deleted, cleanup and all.
+- **`kill <pid>` escalates.** SIGTERM, a two-second grace, then SIGKILL. Unix
+  would leave an app that ignores SIGTERM running, and on a device whose only
+  console may be the one you are typing into that is a worse default. Any
+  *named* signal (`kill -INT`, `-USR1`) is delivered and nothing more, which is
+  what asking for a specific signal means. Ctrl-C does not escalate either —
+  it sends SIGINT, and the third press is the escape hatch.
+
+`sa_mask` and `sa_flags` are accepted and ignored. There is no signal frame to
+apply a mask around, no restartable syscall for `SA_RESTART`, and nothing to
+put in a `siginfo_t`. Ignoring them lets ordinary code that fills in a
+`struct sigaction` work; pretending to honour them would be worse than either.
+
+### The app ABI intercepts symbols rather than adding to a table
+
+`espix_proc_abi_signal_register()` installs a resolver with
+`elf_set_symbol_resolver()` instead of registering another symbol table, and
+that is not a stylistic choice. `elf_find_sym_default()` searches the loader's
+*own* libc table first, and that table already answers for `sleep` and
+`usleep` — so a table registered with `esp_elf_register_symbol()` is consulted
+too late to shadow them, and an app's `sleep()` has to be one a signal can cut
+short. The loader documents the hook for "symbol interception and hooking",
+which is exactly this, and it costs no fork of the component.
+
+Every function in `abi_signal.c` is prefixed and mapped to its POSIX name by
+that resolver rather than being *named* `signal()` and `kill()`. The names
+espix could safely define are not the set apps need: `sleep` and `usleep` are
+real functions in the firmware already, and `getpid` and `raise` are
+force-linked by `esp_libc` with `-u`, so defining any of those would be a
+duplicate symbol. Prefixing all of them keeps one rule instead of four
+exceptions.
+
+This works because **an app links no libc at all.** `project_elf()` produces a
+relocatable ELF whose every libc call is an undefined symbol — `readelf
+--dyn-syms` on `sigtest.app.elf` shows `printf`, `sleep`, `getpid` and
+`signal` all `UND`. That is what makes interception total, and it is worth
+knowing before assuming a `--wrap` is needed somewhere: it is not.
+
 ### The ELF loader needs memory protection disabled
 
 `CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n` (and `ESP_SYSTEM_PMP_IDRAM_SPLIT=n` on
