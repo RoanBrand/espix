@@ -292,15 +292,11 @@ starts — before anyone has attached a terminal, and always before
 `idf.py monitor --no-reset` reattaches to a board already running. Nothing
 answers, so it fails, and the console stays in dumb mode until reboot.
 
-Dumb mode is not merely "no line editing". It has two defects that corrupt
-input:
-
-- The line is terminated one byte late — `buffer[count + 1] = '\0'` in
-  `esp_linenoise_dumb()` — so `buffer[count]` keeps a stale byte from the
-  previous command. `df` typed after `whoami` runs as `dfo`, because `buf[2]`
-  is still the `o`.
-- ESC is `<= UNIT_SEP`, so it is dropped as non-printable while the rest of the
-  sequence is kept: an arrow key is entered as the literal text `[A`.
+Dumb mode is not merely "no line editing". It has two defects that actively
+corrupt input — a line terminated one byte late, so a stale byte from the
+previous command survives, and ESC dropped as non-printable while the rest of
+its sequence is kept. Both are written up with the source references in
+[UPSTREAM.md](UPSTREAM.md#dumb-mode-corrupts-input-two-ways).
 
 Both were reported as "the console goes strange until reboot". espix therefore
 calls `esp_linenoise_set_dumb_mode(false)` regardless of what the probe decided.
@@ -455,7 +451,8 @@ Kernel messages landing on your terminal is what Linux does too — the complain
 was never that they appear, only that they ate the prompt on the way.
 
 The honest long-term answer for *which* messages is a runtime console threshold
-— `dmesg -n` — rather than a fixed list of quieted tags. Deferred.
+— `dmesg -n` — rather than a fixed list of quieted tags. On the
+[roadmap](ROADMAP.md#shell-and-console), not done.
 
 Boot is handled separately, and still is, because there the splat is
 *guaranteed*. `espix_console_session_start()` would draw its first prompt about a
@@ -610,95 +607,13 @@ at compile time and write via `esp_rom_printf`, bypassing the runtime level
 entirely, so a DEBUG ceiling buries every crash under a page of tracing (and
 costs ~6 KB of format strings).
 
-## Deferred
+## What is not done yet
 
-- **An ed25519 host key.** espix offers exactly one host key algorithm,
-  `ecdsa-sha2-nistp256`. OpenSSH has been steadily narrowing its defaults, and a
-  client release that drops ECDSA would lock every user out with no recourse
-  from the device side. Adding `ssh-ed25519` alongside means key generation,
-  storage and signing work in `ssh_kex.c` and the host-key path, and changes the
-  fingerprint users have already accepted — so it wants doing deliberately
-  rather than in a panic. Worth noting that the *reason* this is on the list is
-  that the neighbouring assumption already broke once: OpenSSH 10.3's KEXINIT
-  outgrew a fixed buffer and every connection was refused with a message
-  claiming no common algorithm. Algorithm lists are not a stable surface.
-- **OTA slots.** The partition table is `factory`-only. Two 4MB OTA slots plus
-  `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
-  the network. Changing this later means reflashing everything, so it is worth
-  deciding before the layout is in the field. A commented-out variant is in
-  [partitions/esp32s3-16mb.csv](../partitions/esp32s3-16mb.csv); the 8MB table
-  notes why the same shape does not fit there.
-- **A 1000Hz FreeRTOS tick.** `CONFIG_FREERTOS_HZ` is IDF's default 100, so a
-  tick is 10ms and an app calling `vTaskDelay(1)` or `usleep(1000)` sleeps ten
-  times longer than it asked, with no way to ask for less. Nothing in espix
-  itself needs finer granularity — its own delays are coarse timeouts, and the
-  console blocks in `read()` rather than polling — but espix is a platform for
-  other people's apps, and a sensor loop or a bit-banged protocol will trip
-  over this without the author knowing why. Arduino-ESP32 ships 1000. The cost
-  is roughly 1% of a core in extra tick interrupts and preemption; the risk is
-  that IDF's WiFi and lwIP are tested at 100. Worth doing with a measurement
-  (`ps` CPU shares and `free` before and after, plus an SSH throughput check)
-  rather than on reasoning, and it belongs in the target-independent
-  `sdkconfig.defaults` so every target inherits it.
-- **Per-app heap arenas.** The allocation path in `espix_proc` is the seam.
-  Would shrink the blast radius of a crashing app without needing an MMU.
-- ~~**A real `top`.**~~ Done. `ps` still reports cumulative share since boot,
-  which is the right thing for a one-shot listing; `top` samples twice and
-  reports the difference. It leaves the idle tasks out of the table and uses
-  them for the busy figure instead: there is one per core, each soaks up
-  whatever nothing else wants, and sorted by CPU they would otherwise occupy the
-  top rows forever. Per-core occupancy falls out of the same numbers, since each
-  idle task is pinned to one core.
-- **A working directory for apps** — see the app ABI note above.
-- **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
-  quieted driver tags.
-- **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
-  which is why it has not bitten yet, but anything larger wants an `ed`-style
-  line editor.
-- **WiFi roaming and multiple networks.** One SSID, one AP, no BSSID
-  reselection.
-- **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the
-  console prints a fixed banner instead. Printing motd at session start is the
-  right home for it, and worth doing when SSH makes "logging in" a real event.
-- **`espix_net`**, and SSH/SCP on top of it.
-- **A floor under the clock before NTP answers.** On a cold boot espix reads
-  1970 until SNTP replies, deliberately: an obviously wrong date cannot be
-  mistaken for a real one, it costs no flash writes on a filesystem that pays a
-  block erase per write, and there is no persisted state to go stale. A soft
-  `reboot` keeps the clock — ESP-IDF holds the offset in an RTC retention
-  register, verified by setting 2035, removing `/etc/wifi.conf` so nothing could
-  re-sync, rebooting, and finding 2035 intact — so this is a cold-boot-only
-  window, about 6.5 seconds with a working network.
+Open work has moved out of this file, so that it stays what its title says —
+why things are the way they are, rather than what they are not yet.
 
-  What makes it worth revisiting is *what* falls in that window. Everything
-  espix writes for itself does, structurally: those files are written during
-  boot, and boot is when the clock is wrong. On a fresh device `/etc/passwd`
-  (2.9s), `/etc/ssh/host_ecdsa_key` (3.4s), `/etc/hostname` and
-  `/etc/wifi.conf` are all created before the sync at 6.5s, and keep 1970
-  mtimes for good.
-
-  Three consequences, in increasing order of how much they will hurt. Time runs
-  backwards across a power cycle, so a file written before it is dated 2026 and
-  one written seconds after is dated 1970 — anything comparing mtimes (rsync,
-  an sftp client syncing a directory, "newest wins") is silently wrong. A device
-  with no network never gets a clock at all. And TLS is the forcing function:
-  certificate validity is checked against the clock, so HTTPS, OTA and MQTT all
-  fail at 1970, and the workaround people reach for is disabling validation,
-  which is worse than a wrong clock.
-
-  The argument for 1970 assumes the clock *value* is the signal that time is
-  unverified. It is not — `espix_time_is_synced()` is, and it stays false
-  whatever the clock reads. So a floor costs no honesty: it buys plausible file
-  timestamps *and* keeps an accurate "not confirmed this boot", which is the
-  split systemd already makes between `TimeEpoch` and timesyncd's state.
-
-  The fix, when it is done: floor the clock at the later of the firmware build
-  epoch (baked in by CMake, no writes at all) and a timestamp written when NTP
-  confirms and on `reboot` — roughly one write per boot, against the hourly cron
-  `fake-hwclock` uses on Raspberry Pi. Never move the clock backwards, and leave
-  `espix_time_is_synced()` meaning exactly what it means now.
-
-  Note while doing it that espix cites Raspberry Pi as precedent for having no
-  RTC, which is true and reads as support for the current behaviour — but RPi OS
-  runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
-  other way.
+- [ROADMAP.md](ROADMAP.md) — work espix might take on, and what it would cost.
+- [KNOWN-ISSUES.md](KNOWN-ISSUES.md) — behaviour already implemented that will
+  still surprise you.
+- [UPSTREAM.md](UPSTREAM.md) — defects in ESP-IDF and its components, with the
+  workaround espix carries for each.

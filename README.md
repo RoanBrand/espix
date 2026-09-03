@@ -14,7 +14,10 @@ not a Linux-compatible kernel; the target is closer to a nommu-Linux-style
 environment purpose-built for ESP-IDF.
 
 Design notes and the reasoning behind the structure are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). What is not done yet lives beside
+it: [ROADMAP.md](docs/ROADMAP.md) for work espix might take on,
+[KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) for behaviour that will surprise you,
+and [UPSTREAM.md](docs/UPSTREAM.md) for defects that belong to ESP-IDF.
 
 ## Status
 
@@ -269,6 +272,7 @@ merely missing.
 | `scp` / `sftp` | **yes** | SFTP subsystem; enough for `get`, `put`, `ls`, `cd`, `mkdir`, `rm` |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
+| `ssh host <cmd>` | **planned** | only `pty-req`/`shell`/`subsystem` today; `scp` is unaffected |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
 
