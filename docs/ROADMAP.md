@@ -65,7 +65,35 @@ things are as they are.
   prerequisite for `chown`, for setuid/setgid/sticky to be more than bits, and
   for `/etc/shadow` to be worth splitting out of `/etc/passwd` -- which
   `espix_auth.h` declined to do for exactly this reason. Note that read/write
-  enforcement needs more than this: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+  enforcement needs more than this: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md), and
+  the VFS entry below, which is what would make it possible at all.
+
+  Prior art worth reading before designing this: NuttX's
+  `CONFIG_SCHED_USER_IDENTITY` tracks a task's real and effective UID/GID and
+  checks file permissions against the effective one.
+
+- **Own the filesystem driver instead of consuming one.** espix mounts
+  `joltwallet/littlefs` and lives above it. It could instead drive LittleFS
+  itself and register its own VFS: ESP-IDF's VFS is pluggable through
+  `esp_vfs_register_fs*()` and `esp_vfs_fs_ops_t`, with
+  `ESP_VFS_FLAG_CONTEXT_PTR` for the mount context.
+
+  This is the entry that unblocks the others. Every `fopen()` an app makes is
+  dispatched by the VFS into the registered driver, so if that driver is
+  espix's, it can ask `xTaskGetCurrentTaskHandle()` ->
+  `espix_proc_pid_of_task()` -> the slot's session -> its user, and *enforce* a
+  mode rather than merely storing one. Read and write permissions are
+  unenforceable today precisely because that seam belongs to someone else --
+  which is also why NuttX, which owns its VFS, can do it and espix cannot. It
+  would additionally retire `tools/patch-littlefs.py`, since espix would hold
+  the `lfs_t` that patch exists to expose.
+
+  The cost, measured rather than guessed: `lfs.c` is 6558 lines of upstream
+  LittleFS and would be used unchanged. What espix would take on is the glue --
+  `esp_littlefs.c` is 3020 lines, though a good deal of that is multi-backend
+  support (SD/MMC, block devices, partitions) that a single-partition mount does
+  not need -- plus the 89-line flash block device in `littlefs_esp_part.c`. And
+  the maintenance: bugs joltwallet currently fixes would become espix's.
 
 ## Signals
 

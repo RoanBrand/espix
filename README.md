@@ -362,28 +362,91 @@ What it does **not** do yet — deliberately:
   an opt-in, without requiring a rewrite. S3 stays in "catch and reap" mode
   regardless.
 
-## Why not just use ESP32OS / esp32-running-linux / Linux-on-esp32-S3?
+## Why not NuttX or Zephyr?
 
-espix is inspired by prior art in this space, but diverges enough in
-architecture that it's being built as an independent project rather than a fork:
+Read this section first. It is the one most likely to talk you out of espix,
+which is why it comes before the others.
 
+**[Apache NuttX](https://nuttx.apache.org/) already does most of what espix
+does, on this chip, and has for years.** It loads ELF programs off a filesystem
+and runs them by name from its shell (`CONFIG_ELF`, `CONFIG_NSH_FILE_APP`,
+`CONFIG_LIBC_ENVPATH`) — which is espix's headline feature. It supports
+LittleFS. It serves a shell over SSH, via a Dropbear port in `netutils`, with
+password authentication and an ECDSA P-256 host key, which is feature for
+feature what espix's SSH server does. It has WiFi with WPA3, BLE, SMP and most
+ESP32-S3 peripherals. POSIX and ANSI compliance are stated project goals, not
+aspirations.
+
+It is also ahead where espix has written down that it is stuck. With
+`CONFIG_SCHED_USER_IDENTITY` NuttX tracks a task's real and effective UID/GID
+and enforces file permissions in the VFS. espix stores permission bits and
+enforces only the execute one, because an app reaches the filesystem through
+libc and the VFS underneath has no idea which process is calling — see
+[KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md). NuttX *owns* its VFS, so the question
+is answerable there. That is a difference in position, not in effort.
+
+**The actual difference is that espix is additive to ESP-IDF and NuttX is an
+alternative to it.** Choosing NuttX means leaving `idf.py`, the component
+registry, ESP-IDF's driver model, `esp_event`, NVS and OTA behind, and that is
+not a porting detail: parts of ESP-IDF are written against FreeRTOS
+synchronisation primitives, so IDF drivers and managed components do not travel
+to another RTOS. espix's own dependencies — the ELF loader, the line editor,
+the LittleFS port — are ESP-IDF components and would all have to be replaced.
+
+So the claim espix can defend is narrow: *you already have an ESP-IDF codebase,
+and you want a shell, a filesystem and runtime app loading without re-basing
+onto a different operating system.* If that is not your situation, NuttX is
+probably the better answer, and this README would rather say so than have you
+find out later.
+
+One concrete thing espix does better, for completeness: NuttX's Dropbear port
+implements no SFTP, so file transfer needs `scp -O` and the pre-9.0 protocol.
+espix implements the SFTP subsystem, so a current `scp` works unmodified.
+
+**[Zephyr](https://www.zephyrproject.org/)** is the same trade with a different
+ecosystem. Espressif supports it, and LLEXT gives it runtime-loadable ELF
+extensions, though that path is younger on ESP32 than NuttX's ELF loader.
+Zephyr's shell and filesystem are subsystems of an application rather than a
+Unix userland, which is a different thing to want.
+
+No performance or footprint comparison is offered here, because none has been
+measured.
+
+## Why not Linux on ESP32?
+
+- **[GrieferPig/esp32-s31-linux](https://github.com/GrieferPig/esp32-s31-linux)**
+  — genuine MMU RV32 Linux 6.18 booting natively on an ESP32-S31, executing in
+  place from flash with a Buildroot rootfs, and experimental WiFi, Bluetooth and
+  dual-core SMP. Self-described as experimental and not for production. It is
+  the strongest evidence that this is possible at all, and it makes espix's case
+  as much as its own: it needs an MMU part and 16MB of PSRAM alongside 16MB of
+  flash to get there. espix targets the S3, which has no MMU.
 - **[nodestark/esp32-running-linux](https://github.com/nodestark/esp32-running-linux)**
   and **[paulneja/Linux-on-esp32-S3](https://github.com/paulneja/Linux-on-esp32-S3)**
   — inspiration for the "why not just run something Linux-like on this chip"
   idea. Neither publishes clear numbers on flash/RAM headroom left for real
   applications after boot, which is the resource budget espix is explicitly
   designed around.
-- **[faizannazir/Esp32OS](https://github.com/faizannazir/Esp32OS)** — a similar
-  idea (FreeRTOS + ESP-IDF with a Linux-style shell, `ps`/`top`/`free`/`dmesg`,
-  process management commands). Good prior art for shell ergonomics, but its
-  "processes" are FreeRTOS tasks managed through a shell layer, it uses SPIFFS
-  (LittleFS is only a roadmap item there), and it has no ELF loader or dynamic
-  native app loading — which is espix's core requirement. Because that
-  requirement implies a different architecture (loader, syscall boundary,
-  LittleFS from day one) rather than incremental features, espix is being built
-  fresh instead of forked. Esp32OS is MIT-licensed with attribution/branding
-  requirements (see its `NOTICE.md` / `BRANDING_POLICY.md`); any code directly
-  reused from it will retain its license notice and be credited here.
+
+espix is deliberately not on this path. It is not a Linux kernel and does not
+try to be binary-compatible with one; the target is a nommu-Linux-*style*
+environment purpose-built for ESP-IDF, on hardware that cannot run the real
+thing.
+
+## Why not Esp32OS?
+
+**[faizannazir/Esp32OS](https://github.com/faizannazir/Esp32OS)** is the nearest
+neighbour — a similar idea (FreeRTOS + ESP-IDF with a Linux-style shell,
+`ps`/`top`/`free`/`dmesg`, process management commands). Good prior art for
+shell ergonomics, but its "processes" are FreeRTOS tasks managed through a shell
+layer, it uses SPIFFS (LittleFS is only a roadmap item there), and it has no ELF
+loader or dynamic native app loading — which is espix's core requirement.
+Because that requirement implies a different architecture (loader, syscall
+boundary, LittleFS from day one) rather than incremental features, espix is
+being built fresh instead of forked. Esp32OS is MIT-licensed with
+attribution/branding requirements (see its `NOTICE.md` / `BRANDING_POLICY.md`);
+any code directly reused from it will retain its license notice and be credited
+here.
 
 ## License
 
@@ -395,8 +458,19 @@ once added. None is incorporated today — `espressif/elf_loader`,
 `espressif/esp_linenoise` and `joltwallet/littlefs` are fetched at build time by
 the IDF component manager rather than vendored into this tree.
 
+`joltwallet/littlefs` is the one exception to "fetched and left alone": the
+build adds a public custom-attribute API to the downloaded copy, because espix
+keeps a file's mode in a LittleFS user attribute and the port exposes no way to
+reach one. Nothing is copied into this tree — see
+[tools/patch-littlefs.py](tools/patch-littlefs.py) and
+[docs/UPSTREAM.md](docs/UPSTREAM.md) — and the patch is written to be sent
+upstream, at which point it goes away.
+
 ## Acknowledgements
 
+- [Apache NuttX](https://nuttx.apache.org/) — prior art for nearly all of this,
+  and the honest first stop for anyone who does not need to stay on ESP-IDF
+- [GrieferPig/esp32-s31-linux](https://github.com/GrieferPig/esp32-s31-linux)
 - [nodestark/esp32-running-linux](https://github.com/nodestark/esp32-running-linux)
 - [paulneja/Linux-on-esp32-S3](https://github.com/paulneja/Linux-on-esp32-S3)
 - [faizannazir/Esp32OS](https://github.com/faizannazir/Esp32OS)
