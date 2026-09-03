@@ -163,6 +163,20 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
+    /*
+     * Same gate as the bare-name path below. Naming the file explicitly is not
+     * a way around the execute bit; `run` is a convenience, not a privilege.
+     *
+     * A missing file falls through to espix_proc_spawn_elf(), which reports it
+     * as not found -- checking the mode first would turn "no such file" into
+     * "permission denied", which is a worse answer and a false one.
+     */
+    struct stat rst;
+    if (stat(abs, &rst) == 0 && (espix_fs_mode(abs, &rst) & S_IXUSR) == 0) {
+        espix_printf(s, "run: %s: Permission denied\n", abs);
+        return 126;
+    }
+
     /* The app sees argv[0] as its own path, then its own arguments. */
     char *app_argv[ESPIX_ARGS_MAX];
     int   app_argc = 0;
@@ -183,10 +197,15 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
  * else is looked for in /bin. PATH is that one fixed directory for now, since
  * espix has no environment to put a real one in.
  *
- * There is no execute bit to check — LittleFS has no mode bits — so the ELF
- * magic is the gate, which is what espix_proc would test anyway. That makes
- * "present but not a program" a distinguishable answer rather than a silent
- * "not found".
+ * Two gates, in the order a shell applies them. The execute bit decides whether
+ * you are allowed to run it — `chmod -x` makes a program stop working, which is
+ * the whole point of having the bit — and the ELF magic then decides whether it
+ * is a program at all. Keeping both is what lets `Permission denied` and
+ * `Exec format error` stay different answers.
+ *
+ * The magic is also what sets the default mode in the first place, so a
+ * freshly-copied binary is executable without anyone running chmod; see the
+ * rule in espix_fs/mode.c.
  */
 static int exec_fallback(espix_session_t *s, int argc, char **argv)
 {
@@ -205,6 +224,11 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
         return ESPIX_SHELL_ENOENT;      /* reported as "command not found" */
     }
 
+    if ((espix_fs_mode(abs, &st) & S_IXUSR) == 0) {
+        espix_printf(s, "espix: %s: Permission denied\n", argv[0]);
+        return 126;                     /* what a shell returns for this */
+    }
+
     FILE *f = fopen(abs, "rb");
     if (f == NULL) {
         return ESPIX_SHELL_ENOENT;
@@ -215,7 +239,7 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
 
     if (got != sizeof(magic) || memcmp(magic, "\177ELF", sizeof(magic)) != 0) {
         espix_printf(s, "espix: %s: Exec format error\n", argv[0]);
-        return 126;                     /* what a shell returns for this */
+        return 126;
     }
 
     bool background = false;

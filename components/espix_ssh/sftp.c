@@ -60,8 +60,10 @@ enum {
     SSH_FX_OP_UNSUPPORTED = 8,
 };
 
-/* Attribute flags (§5). */
+/* Attribute flags (§5). UIDGID is never sent, only skipped over: espix records
+ * no owner, but a client may set one alongside the permissions it wants. */
 #define SSH_FILEXFER_ATTR_SIZE        0x00000001
+#define SSH_FILEXFER_ATTR_UIDGID      0x00000002
 #define SSH_FILEXFER_ATTR_PERMISSIONS 0x00000004
 #define SSH_FILEXFER_ATTR_ACMODTIME   0x00000008
 
@@ -264,10 +266,10 @@ static uint32_t status_for(int err)
 }
 
 /*
- * Attributes, as far as this filesystem has any. Size, the directory bit and
- * the modification time are real; the permission bits are a constant that only
- * tells a client which of the two it is looking at, because LittleFS stores
- * neither owner nor mode.
+ * Attributes. Size, the directory bit, the modification time and now the
+ * permission bits are all real -- `mode` is what espix_fs_mode() answered for
+ * this path, so a client sees the same nine bits the device's own `ls -l`
+ * shows. Owner and group are still absent, because no file records one.
  *
  * atime is sent because the protocol pairs the two in one flag and a client
  * that asked for times expects both. LittleFS keeps no access time, so it
@@ -277,13 +279,14 @@ static uint32_t status_for(int err)
  * reported honestly: `sftp ls -l` showing 1970 is the filesystem telling the
  * truth about when it thought that write happened.
  */
-static void put_attrs(ssh_buf_t *b, const struct stat *st)
+static void put_attrs(ssh_buf_t *b, const struct stat *st, mode_t mode)
 {
     ssh_put_u32(b, SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_PERMISSIONS |
                    SSH_FILEXFER_ATTR_ACMODTIME);
     ssh_put_u32(b, 0);                          /* size, high word */
     ssh_put_u32(b, (uint32_t)st->st_size);
-    ssh_put_u32(b, S_ISDIR(st->st_mode) ? (S_IFDIR | 0755) : (S_IFREG | 0644));
+    ssh_put_u32(b, (S_ISDIR(st->st_mode) ? S_IFDIR : S_IFREG) |
+                   (mode & ESPIX_MODE_BITS));
 
     /* SFTP v3 times are 32-bit seconds; espix's time_t is 64-bit, so this is
      * the one place the 2038 problem is real. It is the protocol's, not
@@ -358,7 +361,7 @@ static esp_err_t do_stat(sftp_t *s, uint32_t id, ssh_buf_t *in)
     ssh_buf_init(&b, s->out, sizeof(s->out));
     ssh_put_u8(&b, SSH_FXP_ATTRS);
     ssh_put_u32(&b, id);
-    put_attrs(&b, &st);
+    put_attrs(&b, &st, espix_fs_mode(abs, &st));
     return sftp_send(s, &b);
 }
 
@@ -375,7 +378,7 @@ static esp_err_t do_fstat(sftp_t *s, uint32_t id, ssh_buf_t *in)
     ssh_buf_init(&b, s->out, sizeof(s->out));
     ssh_put_u8(&b, SSH_FXP_ATTRS);
     ssh_put_u32(&b, id);
-    put_attrs(&b, &st);
+    put_attrs(&b, &st, espix_fs_mode(h->path, &st));
     return sftp_send(s, &b);
 }
 
@@ -487,14 +490,23 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
     struct stat st;
     memset(&st, 0, sizeof(st));
 
+    bool have_path = true;
+
     if (espix_fs_resolve(h->path, de->d_name, full, sizeof(full)) != ESP_OK ||
         stat(full, &st) != 0) {
         st.st_mode = (de->d_type == DT_DIR) ? S_IFDIR : S_IFREG;
+        have_path  = false;
     }
+
+    /* Without a resolvable path there is nothing to ask about the mode, so fall
+     * back to the same defaults the rule would have produced for a file it
+     * could not read. */
+    const mode_t mode = have_path ? espix_fs_mode(full, &st)
+                                  : (S_ISDIR(st.st_mode) ? 0755 : 0644);
 
     /*
      * The long name is what `sftp`'s ls prints; ls(1)'s shape is what clients
-     * expect to parse, so give them that even though the mode is nominal.
+     * expect to parse, so give them that.
      *
      * The date has to be built into this string, not just into the attributes
      * below: OpenSSH's `ls -l` renders the longname verbatim and never looks at
@@ -514,12 +526,21 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
         strlcpy(when, "Jan  1  1970", sizeof(when));
     }
 
-    /* Sized for a full directory entry name, not a path: the two limits are
-     * unrelated and dirent's is the larger. */
+    /*
+     * Sized for a full directory entry name, not a path: the two limits are
+     * unrelated and dirent's is the larger.
+     *
+     * The mode string is built from the real mode by the same function espix's
+     * own `ls -l` uses, so the two cannot drift apart. It used to be a pair of
+     * constants here, which meant an executable uploaded over scp showed as
+     * -rw-r--r-- in the client and -rwxr-xr-x on the device.
+     */
+    char perms[11];
+    espix_fs_mode_str(mode, S_ISDIR(st.st_mode), perms, sizeof(perms));
+
     char longname[sizeof(de->d_name) + 64];
     snprintf(longname, sizeof(longname), "%s 1 esp esp %8u %s %s",
-             S_ISDIR(st.st_mode) ? "drwxr-xr-x" : "-rw-r--r--",
-             (unsigned)st.st_size, when, de->d_name);
+             perms, (unsigned)st.st_size, when, de->d_name);
 
     ssh_buf_t b;
     ssh_buf_init(&b, s->out, sizeof(s->out));
@@ -528,7 +549,7 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
     ssh_put_u32(&b, 1);
     ssh_put_cstr(&b, de->d_name);
     ssh_put_cstr(&b, longname);
-    put_attrs(&b, &st);
+    put_attrs(&b, &st, mode);
     return sftp_send(s, &b);
 }
 
@@ -676,6 +697,81 @@ static esp_err_t do_close(sftp_t *s, uint32_t id, ssh_buf_t *in)
     return send_status(s, id, SSH_FX_OK, "");
 }
 
+/*
+ * SETSTAT and FSETSTAT: apply what espix can store, ignore the rest.
+ *
+ * Only the permission bits are acted on. Size would mean truncating, times
+ * would mean utime(), and neither is what a client sends these for on this
+ * device -- but a client that sends them alongside permissions must still find
+ * its permissions applied, so the fields before PERMISSIONS are read and
+ * skipped rather than causing a refusal.
+ *
+ * Two things are deliberately not errors. Setting the mode of a directory does
+ * nothing, because the rule already gives every directory 0755 and there is no
+ * traversal check to make it mean something. And setuid, setgid and sticky are
+ * masked off rather than rejected: SFTP has no partial-success status, so
+ * failing the request would fail the whole `scp -p` over a bit that was never
+ * going to be honoured. The shell's own chmod refuses them out loud instead,
+ * where there is a person to tell.
+ */
+static esp_err_t do_setstat(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
+{
+    char        abs[ESPIX_PATH_MAX];
+    const char *path = abs;
+
+    if (type == SSH_FXP_FSETSTAT) {
+        const sftp_handle_t *h = handle_get(s, in);
+        if (h == NULL) {
+            return send_status(s, id, SSH_FX_FAILURE, "bad handle");
+        }
+        path = h->path;
+    } else {
+        char given[ESPIX_PATH_MAX];
+        if (!take_path(in, given, sizeof(given)) ||
+            !resolve(given, abs, sizeof(abs))) {
+            return send_status(s, id, SSH_FX_FAILURE, "bad path");
+        }
+    }
+
+    const uint32_t flags = ssh_get_u32(in);
+
+    /* Fields arrive in flag order, so everything before PERMISSIONS has to be
+     * consumed to find it. */
+    if (flags & SSH_FILEXFER_ATTR_SIZE) {
+        ssh_get_u32(in);
+        ssh_get_u32(in);
+    }
+    if (flags & SSH_FILEXFER_ATTR_UIDGID) {
+        ssh_get_u32(in);
+        ssh_get_u32(in);
+    }
+
+    if ((flags & SSH_FILEXFER_ATTR_PERMISSIONS) == 0) {
+        return send_status(s, id, SSH_FX_OK, "");
+    }
+
+    const uint32_t perms = ssh_get_u32(in);
+    if (in->bad) {
+        return send_status(s, id, SSH_FX_FAILURE, "truncated attributes");
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return send_status(s, id, status_for(errno), "no such file");
+    }
+    if (S_ISDIR(st.st_mode)) {
+        return send_status(s, id, SSH_FX_OK, "");
+    }
+
+    const esp_err_t err = espix_fs_chmod(path, (mode_t)perms & ESPIX_MODE_BITS);
+    if (err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "chmod %s failed: %s",
+                   path, esp_err_to_name(err));
+        return send_status(s, id, SSH_FX_FAILURE, "cannot set permissions");
+    }
+    return send_status(s, id, SSH_FX_OK, "");
+}
+
 /* remove, mkdir and rmdir differ only in which call they make. */
 static esp_err_t do_path_op(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
 {
@@ -698,6 +794,10 @@ static esp_err_t do_path_op(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
     if (rc != 0) {
         return send_status(s, id, status_for(errno), "operation failed");
     }
+
+    if (type == SSH_FXP_REMOVE || type == SSH_FXP_RMDIR) {
+        espix_fs_mode_forget(abs);
+    }
     return send_status(s, id, SSH_FX_OK, "");
 }
 
@@ -715,6 +815,10 @@ static esp_err_t do_rename(sftp_t *s, uint32_t id, ssh_buf_t *in)
     if (rename(abs_from, abs_to) != 0) {
         return send_status(s, id, status_for(errno), "rename failed");
     }
+
+    /* The mode follows the file, as it would on a filesystem that stored it on
+     * the inode. SFTP and the shell's `mv` are the two renames espix can see. */
+    espix_fs_mode_rename(abs_from, abs_to);
     return send_status(s, id, SSH_FX_OK, "");
 }
 
@@ -761,13 +865,8 @@ static esp_err_t dispatch(sftp_t *s, uint8_t *packet, size_t len)
     case SSH_FXP_MKDIR:
     case SSH_FXP_RMDIR:    return do_path_op(s, id, &in, type);
 
-    /*
-     * Succeed without doing anything. scp sets permissions and times on every
-     * file it uploads; LittleFS can store neither, and failing here would fail
-     * the transfer over an attribute that was never going to survive.
-     */
     case SSH_FXP_SETSTAT:
-    case SSH_FXP_FSETSTAT: return send_status(s, id, SSH_FX_OK, "");
+    case SSH_FXP_FSETSTAT: return do_setstat(s, id, &in, type);
 
     default:
         espix_klog(ESPIX_KLOG_DEBUG, TAG, "unsupported request %u", type);

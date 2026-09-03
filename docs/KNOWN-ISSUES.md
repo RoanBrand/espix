@@ -45,6 +45,37 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   reported in `dmesg` on the next boot, and then the system reboots.
   `espix_fault_request_reap()` exists with no callers.
 
+## Filesystem
+
+- **Only the execute bit is enforced.** `ls -l` and `sftp ls -l` show nine
+  permission bits and `chmod` sets any of them, but read and write are metadata:
+  `chmod 000 /etc/motd` does not stop `cat` reading it. Enforcing them would
+  mean checking at every entry to the filesystem, and an app does not go through
+  espix to get there -- it calls libc, which reaches the VFS, which has no idea
+  which process is asking. Checking only in the shell's own commands would be a
+  boundary you could step around with `run`, which is worse than none. The
+  execute bit is different because espix *owns* the exec path, and so can be
+  asked.
+
+- **No file has an owner**, so `chown` does not exist and setuid, setgid and
+  sticky are refused by `chmod` rather than stored. There are two identities --
+  `root` on the console, `esp` over SSH -- but nothing records which of them a
+  file belongs to, and all three of those bits are defined in terms of one.
+
+- **An app calling `rename()` directly loses the file's mode.** Modes that
+  differ from the default live in `/etc/modes`, keyed by path, and espix follows
+  them across a rename in the two places it can see one: the shell's `mv` and
+  the SFTP server. A rename from inside a loaded app goes straight to the VFS
+  and leaves the entry behind, pointing at a path that no longer exists. Harmless
+  -- a stale entry is ignored and the new path falls back to the rule -- but the
+  mode is gone.
+
+- **SFTP silently drops setuid, setgid and sticky** where the shell's `chmod`
+  refuses them out loud. SFTP has no partial-success status, so failing the
+  request would fail an entire `scp -p` over a bit that was never going to be
+  honoured. Setting the mode of a *directory* over SFTP is accepted and ignored
+  for the same reason.
+
 ## Shell and console
 
 - **Kernel messages land on your prompt.** That is deliberate and matches Linux,

@@ -37,6 +37,37 @@ things are as they are.
   idle task is pinned to one core.
 - **A working directory for apps** — see the app ABI note above.
 
+## Filesystem
+
+- **A file surface for apps.** A loaded app cannot open a file. The ELF loader's
+  built-in tables export `close` and `fwrite` and nothing else of the family --
+  no `fopen`, `open`, `opendir`, `read`, `unlink`, `mkdir` or `rename` -- so an
+  app that touches the filesystem fails to *load*, not to work. This is why the
+  mode work stopped at the shell and SFTP and published no `chmod` to apps:
+  exporting a permissions call to programs that cannot open a file would be
+  scaffolding, not a feature. Doing it properly means one `abi_fs.c` covering
+  the surface, with `stat` reporting `espix_fs_mode()` so an app sees the same
+  bits `ls -l` does, and it should land before or alongside a working directory
+  for apps -- the two are the same complaint.
+
+- **Move file modes onto the file.** `/etc/modes` keys overrides by path, which
+  costs a rename hook in every place espix can see one and loses the mode when
+  an app renames a file itself. LittleFS user attributes are the right home and
+  the README always said so; what stops it is that nothing exposes the `lfs_t *`
+  they need. See [UPSTREAM.md](UPSTREAM.md) for the finding and the small patch
+  that would fix it upstream. Behind `espix_fs_mode()` and `espix_fs_chmod()`
+  this is a two-function change; the caveat to test first is
+  [littlefs#1076](https://github.com/littlefs-project/littlefs/issues/1076).
+
+- **An owner on a file, and a uid on a process.** espix already has two
+  identities -- `root` on the console, `esp` over SSH -- and `espix_proc_info_t`
+  already carries the session a process belongs to, so "who is asking" is
+  answerable. What is missing is who a *file* belongs to. That is the
+  prerequisite for `chown`, for setuid/setgid/sticky to be more than bits, and
+  for `/etc/shadow` to be worth splitting out of `/etc/passwd` -- which
+  `espix_auth.h` declined to do for exactly this reason. Note that read/write
+  enforcement needs more than this: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
 ## Signals
 
 - **Delivery during `select()` and `read()`.** The sleep family and `pause()`

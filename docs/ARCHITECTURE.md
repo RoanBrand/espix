@@ -45,6 +45,67 @@ longest-prefix match.
 This is documented but not a well-trodden path. If it misbehaves, the fallback
 is to mount at `/storage` and add a rewrite shim — contained to `espix_fs`.
 
+### File modes are a rule plus a list of exceptions
+
+LittleFS stores no permission bits: `esp_littlefs`'s `stat()` fills in `S_IFREG`
+or `S_IFDIR` and stops. So a mode is something espix has to keep somewhere, and
+the obvious somewhere turned out to be unreachable.
+
+LittleFS *does* have the right mechanism — user attributes, `lfs_setattr`, which
+the ESP port already uses to hold mtime — but nothing exposes the `lfs_t *` you
+need to call it with, and ESP-IDF's VFS has no `chmod` hook to route around it.
+Both findings, and the small upstream patch that would fix the first, are in
+[UPSTREAM.md](UPSTREAM.md).
+
+What espix does instead is split the question in two.
+
+A **rule** supplies the default: directories are `0755`, a file whose first four
+bytes are the ELF magic is `0755`, everything else is `0644`. Nothing is stored
+for any of that. Three things fall out of it, and they are the reason this shape
+was chosen over a mode-per-file:
+
+- the flashed rootfs image needs no mode data, and `/bin` is executable on a
+  fresh device without a byte having been written — which matters because the
+  image builder writes no attributes at all, the same gap that leaves every
+  shipped file with no mtime;
+- a flash write happens when you run `chmod` and at no other time, on a
+  filesystem that pays a block erase per write;
+- a device nobody has run `chmod` on has no mode state to be wrong.
+
+`/etc/modes` then records only what someone changed, one `path=octal` per line.
+A mode that matches the rule again is *removed* rather than stored, so the file
+cannot grow into a shadow copy of the filesystem — `chmod +x` followed by
+`chmod -x` on an ordinary file leaves no trace.
+
+The cost is that overrides are keyed by path, so espix has to follow a rename.
+It does, in the two places it can see one — the shell's `mv` and the SFTP server
+— and an app calling `rename()` itself gets away with it. That is a real limit
+and it is in [KNOWN-ISSUES.md](KNOWN-ISSUES.md); it is also exactly the limit
+that goes away if the attributes ever become reachable, because LittleFS moves
+those with the file itself.
+
+`espix_fs_mode()` and `espix_fs_chmod()` are the whole interface, which is what
+makes that swap a two-function change rather than a rewrite.
+
+### Only the execute bit is enforced, and that is not laziness
+
+Nine bits are stored and shown; one is consulted. The asymmetry is about where
+espix sits in the call path, not about how much work each would be.
+
+espix owns execution. `run` and the shell's fallback both go through
+`espix_proc_spawn_elf()`, so "may this run" is a question there is somewhere to
+ask. Reading and writing are not like that: an app opens a file by calling libc,
+which reaches the VFS, which knows nothing about processes — there is no seam
+between the two where espix could stand. Enforcing read permission in `cat`
+alone would produce a boundary you could step around with `run`, which is worse
+than admitting there is none.
+
+Two identities exist — `root` on the console, `esp` over SSH — so it is not that
+there is nobody to distinguish between. What is missing is an *owner* on the
+file, which is also why `chown` does not exist and why `chmod` refuses setuid,
+setgid and sticky rather than storing bits that name a privilege transition
+nothing performs. [ROADMAP.md](ROADMAP.md) carries what adding one would buy.
+
 ### espix does not use `esp_console_run()`
 
 The console component copies every command line through a single shared

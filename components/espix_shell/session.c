@@ -184,9 +184,12 @@ int espix_shell_exec(espix_session_t *s, const char *line)
  * The user used to be the literal "espix" -- the OS name sitting where a Unix
  * prompt puts an identity, agreeing with neither `whoami` nor the greeting.
  *
- * `#` rather than `$` for everyone, including non-root. That is not sloppiness:
- * espix has no permission model at all, LittleFS having no mode bits, so every
- * session really can do anything and a `$` would be the misleading one.
+ * `#` rather than `$` for everyone, including non-root. That is not sloppiness.
+ * espix does have mode bits now, but only the execute bit is enforced: read and
+ * write are recorded and displayed and nothing consults them, because an app
+ * reaches the filesystem through libc and the VFS underneath has no idea which
+ * process is calling. So every session really can still read and write
+ * anything, and a `$` would be the misleading one.
  */
 static void build_prompt(const espix_session_t *s, char *buf, size_t len)
 {

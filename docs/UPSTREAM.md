@@ -11,6 +11,20 @@ Verified against ESP-IDF v6.1-beta1 and xtensa-esp-elf GCC 15.2 unless noted.
 
 ## ESP-IDF
 
+### The VFS has no `chmod`
+
+`esp_vfs_fs_ops_t` carries `truncate`, `ftruncate` and `utime` and nothing else
+of that family, so a filesystem that *could* store a mode has no way to be told
+about one and `chmod()` cannot be implemented behind the standard interface at
+all. espix's `chmod` is therefore an espix call (`espix_fs_chmod()`), not a
+libc one.
+
+Not an oversight anyone has missed — IDF's own test says so:
+
+    //TODO f_chmod the file and re-test the access rights (this requires
+    // f_chmod support to be implemented in VFS)
+    -- components/vfs/test_apps/main/test_vfs_access.c
+
 ### `adjtime()` overflows, silently, and defeats smooth SNTP sync
 
 `delta->tv_sec * 1000000L` is computed in a 32-bit `long`. A 56-year correction
@@ -104,3 +118,37 @@ after it and cannot shadow them. The component provides
 `elf_set_symbol_resolver()` for exactly this, documented for "symbol
 interception and hooking", so no fork is needed — but a table alone will
 silently fail to override.
+
+## `joltwallet/littlefs`
+
+### Nothing can reach LittleFS custom attributes
+
+espix stores file modes in `/etc/modes` rather than on the file itself, and this
+is why.
+
+LittleFS has exactly the right mechanism. `lfs_setattr`, `lfs_getattr` and
+`lfs_removeattr` are public API in `lfs.h`, and `SPEC.md` describes user
+attributes as intended for "timestamps, hashes" -- metadata attached to the
+entry, moved by rename (`lfs.c`, `// move over all attributes`, via
+`LFS_FROM_MOVE`). The ESP port already uses one, type `'t'`, to store mtime.
+
+What is missing is any way to call them. `esp_littlefs.c` holds its state in
+`static esp_littlefs_t * _efs[CONFIG_LITTLEFS_MAX_PARTITIONS]` with every
+lookup `static`, and registers `PRIV_INCLUDE_DIRS src` so `littlefs_api.h` --
+where `esp_littlefs_t.fs` is declared -- is not on a dependent's include path.
+The public header offers register, unregister, mounted, format and info, and no
+handle. Checked against 1.22.3, the latest release, and against upstream
+`master`: identical.
+
+ESP-IDF's VFS cannot route around it either; see the `chmod` entry above.
+
+Two upstream changes would fix this, and the first is small: an
+`esp_littlefs_getattr`/`esp_littlefs_setattr` pair on the ESP port, of exactly
+the shape its own mtime code already uses internally. Worth filing.
+
+One caveat for whoever does: [littlefs#1076](https://github.com/littlefs-project/littlefs/issues/1076)
+asks whether `lfs_setattr` on a currently-open file is written immediately, and
+how it interacts with the attributes `lfs_file_opencfg` rewrites on every sync
+and close -- which for the ESP port is every file, because of that mtime. It has
+been open and unanswered since February 2025. Test `chmod` on an open file
+rather than assuming.

@@ -232,7 +232,7 @@ merely missing.
 | Input redirection `<`, `2>` as its own stream | **planned** | one output stream today |
 | Environment variables, `export` | **planned** | there is no environment at all yet |
 | Globbing `*` | **planned** | |
-| Shell scripts, `#!`, control flow | **planned** | `#!` shares a dispatch point with the executable bit: `run` already sniffs the ELF magic to decide what a file is |
+| Shell scripts, `#!`, control flow | **planned** | the executable bit is now real, so `#!` needs only the dispatch: a file that is executable but not an ELF is where the interpreter line would be read |
 
 ### Processes
 
@@ -254,12 +254,14 @@ merely missing.
 | | | |
 |---|---|---|
 | LittleFS mounted as the real `/` | **yes** | survives reboot and firmware reflash |
-| `ls` `cd` `pwd` `cat` `cp` `mv` `rm` `mkdir` `touch` `df` | **yes** | |
+| `ls` `cd` `pwd` `cat` `cp` `mv` `rm` `mkdir` `touch` `chmod` `df` | **yes** | |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
 | `/proc`, `mount` / `umount` | **planned** | |
-| Mode bits, `chmod`, `chown` | **planned** | LittleFS has no native mode bits, but custom attributes can carry them — the mtime the port already stores works exactly that way |
-| An executable bit | **planned** | today espix gates on the ELF header instead, which is why a non-program answers `Exec format error` |
+| Mode bits, `chmod` | **yes** | nine bits, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
+| An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
+| Read and write bits enforced | **no** | stored and displayed only; an app reaches the VFS through libc, which has no idea which process is calling |
+| `chown`, owner and group | **no** | no file records an owner — which is also why setuid, setgid and sticky are refused rather than stored |
 | Symlinks, `ln` | **no** | cost, not principle: LittleFS has no link type, and following one means loop detection in every path lookup |
 
 ### Networking

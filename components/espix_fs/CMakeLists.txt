@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "fs.c"
+        "mode.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

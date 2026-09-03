@@ -116,9 +116,12 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
     if (!S_ISDIR(st.st_mode)) {
         if (long_form) {
             char when[20];
+            char perms[11];
             ls_time(when, sizeof(when), st.st_mtime);
-            espix_printf(s, "-  %8ld  %12s  %s\n",
-                         (long)st.st_size, when, abs);
+            espix_fs_mode_str(espix_fs_mode(abs, &st), false,
+                              perms, sizeof(perms));
+            espix_printf(s, "%s  %8ld  %12s  %s\n",
+                         perms, (long)st.st_size, when, abs);
         } else {
             espix_printf(s, "%s\n", abs);
         }
@@ -149,25 +152,31 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         if (snprintf(child, sizeof(child), "%s/%s",
                      (strcmp(abs, "/") == 0) ? "" : abs, ent->d_name)
             >= (int)sizeof(child)) {
-            espix_printf(s, "?  %8s  %12s  %s\n", "-", "-", ent->d_name);
+            espix_printf(s, "?????????? %8s  %12s  %s\n", "-", "-", ent->d_name);
             continue;
         }
 
         struct stat cst;
         char        when[20];
+        char        perms[11];
 
         if (stat(child, &cst) != 0) {
-            espix_printf(s, "?  %8s  %12s  %s\n", "-", "-", ent->d_name);
+            espix_printf(s, "?????????? %8s  %12s  %s\n", "-", "-", ent->d_name);
             continue;
         }
 
         ls_time(when, sizeof(when), cst.st_mtime);
 
-        if (S_ISDIR(cst.st_mode)) {
-            espix_printf(s, "d  %8s  %12s  %s/\n", "-", when, ent->d_name);
+        const bool is_dir = S_ISDIR(cst.st_mode);
+        espix_fs_mode_str(espix_fs_mode(child, &cst), is_dir,
+                          perms, sizeof(perms));
+
+        if (is_dir) {
+            espix_printf(s, "%s  %8s  %12s  %s/\n",
+                         perms, "-", when, ent->d_name);
         } else {
-            espix_printf(s, "-  %8ld  %12s  %s\n",
-                         (long)cst.st_size, when, ent->d_name);
+            espix_printf(s, "%s  %8ld  %12s  %s\n",
+                         perms, (long)cst.st_size, when, ent->d_name);
         }
     }
 
@@ -276,6 +285,11 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
         } else if (unlink(abs) != 0) {
             espix_printf(s, "rm: %s: %s\n", abs, strerror(errno));
             status = 1;
+        } else {
+            /* Only on the non-recursive path: espix_fs_rm_rf() drops the
+             * overrides for everything it removes, since it is the only caller
+             * that knows what those paths were. */
+            espix_fs_mode_forget(abs);
         }
     }
 
@@ -344,6 +358,8 @@ static int cmd_mv(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "mv: %s -> %s: %s\n", src, dst, strerror(errno));
         return 1;
     }
+
+    espix_fs_mode_rename(src, dst);
     return 0;
 }
 
@@ -370,6 +386,150 @@ static int cmd_touch(espix_session_t *s, int argc, char **argv)
             continue;
         }
         fclose(f);
+    }
+
+    return status;
+}
+
+/*
+ * Parse one chmod spec against the current mode.
+ *
+ * Octal ("644") or symbolic ("+x", "u-w", "go=rx", and comma-separated clauses
+ * of those). On failure *err names the problem, because "chmod: invalid mode"
+ * for four different mistakes is how you end up debugging your own shell.
+ */
+static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
+                        const char **err)
+{
+    if (spec[0] == '\0') {
+        *err = "empty mode";
+        return false;
+    }
+
+    /*
+     * Anything starting with a digit is meant as octal, so it is diagnosed as
+     * octal even when it is not valid -- "chmod 999" reporting a symbolic
+     * syntax error would send you looking in the wrong place.
+     */
+    if (spec[0] >= '0' && spec[0] <= '9') {
+        char      *end = NULL;
+        const long v   = strtol(spec, &end, 8);
+
+        if (*end != '\0' || v < 0) {
+            *err = "not an octal mode (digits 0-7 only)";
+            return false;
+        }
+        if (v > ESPIX_MODE_BITS) {
+            *err = "setuid, setgid and sticky are not supported";
+            return false;
+        }
+        *out = (mode_t)v;
+        return true;
+    }
+
+    mode_t mode = cur;
+    const char *p = spec;
+
+    for (;;) {
+        mode_t who = 0;
+
+        for (; *p != '\0' && strchr("ugoa", *p) != NULL; p++) {
+            switch (*p) {
+            case 'u': who |= 0700; break;
+            case 'g': who |= 0070; break;
+            case 'o': who |= 0007; break;
+            default:  who |= 0777; break;
+            }
+        }
+        if (who == 0) {
+            who = 0777;          /* a bare "+x" means all three classes */
+        }
+
+        const char op = *p;
+        if (op != '+' && op != '-' && op != '=') {
+            *err = "expected +, - or = after u/g/o/a";
+            return false;
+        }
+        p++;
+
+        mode_t bits = 0;
+        for (; *p != '\0' && *p != ','; p++) {
+            switch (*p) {
+            case 'r': bits |= 0444; break;
+            case 'w': bits |= 0222; break;
+            case 'x': bits |= 0111; break;
+            case 's':
+                *err = "setuid and setgid are not supported";
+                return false;
+            case 't':
+                *err = "the sticky bit is not supported";
+                return false;
+            default:
+                *err = "expected r, w or x";
+                return false;
+            }
+        }
+
+        bits &= who;
+
+        if (op == '+') {
+            mode |= bits;
+        } else if (op == '-') {
+            mode &= ~bits;
+        } else {
+            mode = (mode & ~who) | bits;
+        }
+
+        if (*p != ',') {
+            break;
+        }
+        p++;
+    }
+
+    *out = mode & ESPIX_MODE_BITS;
+    return true;
+}
+
+static int cmd_chmod(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 3) {
+        espix_printf(s, "usage: chmod <mode> <path>...\n");
+        return 1;
+    }
+
+    int status = 0;
+
+    for (int i = 2; i < argc; i++) {
+        char abs[ESPIX_PATH_MAX];
+        if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
+            status = 1;
+            continue;
+        }
+
+        struct stat st;
+        if (stat(abs, &st) != 0) {
+            espix_printf(s, "chmod: %s: %s\n", abs, strerror(errno));
+            status = 1;
+            continue;
+        }
+
+        mode_t      mode = 0;
+        const char *err  = NULL;
+
+        if (!chmod_parse(argv[1], espix_fs_mode(abs, &st), &mode, &err)) {
+            espix_printf(s, "chmod: %s: %s\n", argv[1], err);
+            return 1;           /* the mode is wrong for every path, not one */
+        }
+
+        const esp_err_t rc = espix_fs_chmod(abs, mode);
+        if (rc == ESP_ERR_NO_MEM) {
+            espix_printf(s, "chmod: %s: no room left in %s\n",
+                         abs, ESPIX_MODES_PATH);
+            status = 1;
+        } else if (rc != ESP_OK) {
+            espix_printf(s, "chmod: %s: %s\n", abs, esp_err_to_name(rc));
+            status = 1;
+        }
     }
 
     return status;
@@ -419,6 +579,8 @@ static espix_cmd_t s_fs_cmds[] = {
       .help = "move or rename a file",           .usage = "mv <src> <dst>" },
     { .name = "touch", .fn = cmd_touch,
       .help = "create empty files",              .usage = "touch <file>..." },
+    { .name = "chmod", .fn = cmd_chmod,
+      .help = "change file mode bits",           .usage = "chmod <mode> <path>..." },
     { .name = "df",    .fn = cmd_df,
       .help = "report filesystem usage",         .usage = "df" },
 };
