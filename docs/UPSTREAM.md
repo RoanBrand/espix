@@ -123,35 +123,48 @@ silently fail to override.
 
 ### Nothing can reach LittleFS custom attributes
 
-espix stores file modes in `/etc/modes` rather than on the file itself, and this
-is why.
+LittleFS has exactly the right mechanism for POSIX-style metadata.
+`lfs_setattr`, `lfs_getattr` and `lfs_removeattr` are public API in `lfs.h`, and
+`SPEC.md` describes user attributes as intended for "timestamps, hashes" --
+metadata attached to the entry, moved by rename (`lfs.c`, `// move over all
+attributes`, via `LFS_FROM_MOVE`) and dropped with the file. The ESP port
+already uses one, type `'t'`, to store mtime.
 
-LittleFS has exactly the right mechanism. `lfs_setattr`, `lfs_getattr` and
-`lfs_removeattr` are public API in `lfs.h`, and `SPEC.md` describes user
-attributes as intended for "timestamps, hashes" -- metadata attached to the
-entry, moved by rename (`lfs.c`, `// move over all attributes`, via
-`LFS_FROM_MOVE`). The ESP port already uses one, type `'t'`, to store mtime.
+What is missing is any way to call them from outside. `esp_littlefs.c` holds its
+state in `static esp_littlefs_t * _efs[CONFIG_LITTLEFS_MAX_PARTITIONS]` with
+every lookup `static`, and registers `PRIV_INCLUDE_DIRS src` so
+`littlefs_api.h` -- where `esp_littlefs_t.fs` is declared -- is not on a
+dependent's include path. The public header offers register, unregister,
+mounted, format and info, and no handle. None of the 35 Kconfig options exposes
+attributes, and `fcntl` handles `F_GETFL` and `F_GETPATH` and returns `ENOSYS`
+for everything else.
 
-What is missing is any way to call them. `esp_littlefs.c` holds its state in
-`static esp_littlefs_t * _efs[CONFIG_LITTLEFS_MAX_PARTITIONS]` with every
-lookup `static`, and registers `PRIV_INCLUDE_DIRS src` so `littlefs_api.h` --
-where `esp_littlefs_t.fs` is declared -- is not on a dependent's include path.
-The public header offers register, unregister, mounted, format and info, and no
-handle. Checked against 1.22.3, the latest release, and against upstream
-`master`: identical.
+Checked against 1.22.3, the latest release, and against upstream `master`:
+identical. Not a version problem, and there is no alternative source -- the
+registry's other littlefs entries are wrappers and applications rather than
+ports, ESP-IDF bundles none, and `muvox-io/esp_littlefs`, the only real fork, is
+a 2023 PSRAM variant with no attribute API either.
 
-ESP-IDF's VFS cannot route around it either; see the `chmod` entry above.
+**espix patches it.** [tools/esp_littlefs-attrs.patch](../tools/esp_littlefs-attrs.patch)
+adds `esp_littlefs_setattr`/`getattr`/`removeattr`, modelled on the port's own
+mtime helpers and taking the same lock, and
+[tools/patch-littlefs.py](../tools/patch-littlefs.py) applies it to the
+downloaded copy from a CMake hook. That is the least clean of the options --
+it mutates a tree the build system treats as read-only, and `managed_components/`
+is gitignored so nothing records that it happened. It was chosen over vendoring
+the component (owning a 92KB file) and over a git-source dependency (maintaining
+a public fork) as the smallest thing that keeps the manifest honest. The patch
+file exists so the change can go upstream without being reconstructed; when it
+lands, the script, the patch and the hook all go.
 
-Two upstream changes would fix this, and the first is small: an
-`esp_littlefs_getattr`/`esp_littlefs_setattr` pair on the ESP port, of exactly
-the shape its own mtime code already uses internally. Worth filing.
-
-One caveat for whoever does: [littlefs#1076](https://github.com/littlefs-project/littlefs/issues/1076)
-asks whether `lfs_setattr` on a currently-open file is written immediately, and
-how it interacts with the attributes `lfs_file_opencfg` rewrites on every sync
-and close -- which for the ESP port is every file, because of that mtime. It has
-been open and unanswered since February 2025. Test `chmod` on an open file
-rather than assuming.
+One caveat found while doing it, now answered:
+[littlefs#1076](https://github.com/littlefs-project/littlefs/issues/1076) asks
+whether `lfs_setattr` on a currently-open file interacts badly with the
+attributes `lfs_file_opencfg` rewrites on every sync and close -- which for this
+port is every file, because of that mtime. Open and unanswered since February
+2025. Tested on device: a mode set with `lfs_setattr` survives both an appending
+and a truncating write to the same file, so an attribute the file config does
+not list is left alone.
 
 ### `readdir()` reports no inode, and hides `.` and `..`
 

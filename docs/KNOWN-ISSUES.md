@@ -72,14 +72,6 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   `root` on the console, `esp` over SSH -- but nothing records which of them a
   file belongs to, and all three of those bits are defined in terms of one.
 
-- **An app calling `rename()` directly loses the file's mode.** Modes that
-  differ from the default live in `/etc/modes`, keyed by path, and espix follows
-  them across a rename in the two places it can see one: the shell's `mv` and
-  the SFTP server. A rename from inside a loaded app goes straight to the VFS
-  and leaves the entry behind, pointing at a path that no longer exists. Harmless
-  -- a stale entry is ignored and the new path falls back to the rule -- but the
-  mode is gone.
-
 - **SFTP silently drops setuid, setgid and sticky** where the shell's `chmod`
   refuses them out loud. SFTP has no partial-success status, so failing the
   request would fail an entire `scp -p` over a bit that was never going to be

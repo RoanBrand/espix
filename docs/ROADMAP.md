@@ -50,16 +50,15 @@ things are as they are.
   bits `ls -l` does, and it should land before or alongside a working directory
   for apps -- the two are the same complaint.
 
-- **Move file modes onto the file.** `/etc/modes` keys overrides by path, which
-  costs a rename hook in every place espix can see one and loses the mode when
-  an app renames a file itself. LittleFS user attributes are the right home and
-  the README always said so; what stops it is that nothing exposes the `lfs_t *`
-  they need. See [UPSTREAM.md](UPSTREAM.md) for the finding and the small patch
-  that would fix it upstream. Behind `espix_fs_mode()` and `espix_fs_chmod()`
-  this is a two-function change; the caveat to test first is
-  [littlefs#1076](https://github.com/littlefs-project/littlefs/issues/1076).
+- ~~**Move file modes onto the file.**~~ Done. Modes live in a LittleFS user
+  attribute, so rename and delete are the filesystem's problem rather than
+  espix's. What remains is getting the accessor upstream: see
+  [UPSTREAM.md](UPSTREAM.md), and delete
+  [tools/patch-littlefs.py](../tools/patch-littlefs.py) when it lands.
 
-- **An owner on a file, and a uid on a process.** espix already has two
+- **An owner on a file, and a uid on a process.** The on-disk room is already
+  there: every stored mode carries `uid` and `gid` fields, written as zero and
+  read by nothing, so filling them in costs no rewrite. espix already has two
   identities -- `root` on the console, `esp` over SSH -- and `espix_proc_info_t`
   already carries the session a process belongs to, so "who is asking" is
   answerable. What is missing is who a *file* belongs to. That is the

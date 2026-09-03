@@ -7,6 +7,25 @@ cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(espix)
 
+# Give joltwallet/littlefs a public custom-attribute API, which is where espix
+# keeps a file's mode. The port uses LittleFS user attributes itself (mtime) but
+# exposes neither them nor the `lfs_t *` they need, and ESP-IDF's VFS has no
+# chmod hook to route around it — see docs/UPSTREAM.md.
+#
+# After project(), because that is when the component manager downloads; before
+# any compiling, because ninja reads the file later. The script is idempotent
+# and fails the build loudly if the version or the anchors moved.
+#
+# Temporary by construction: tools/esp_littlefs-attrs.patch is the same change
+# ready to send upstream, and this hook goes when it lands.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-littlefs.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_littlefs_patch_result)
+if(NOT espix_littlefs_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-littlefs.py failed; see the message above")
+endif()
+
 # Build fsroot/ into a LittleFS image for the "storage" partition. This is how
 # the initial rootfs (and, until SCP exists, cross-compiled apps) get onto the
 # device: `idf.py storage-flash`.

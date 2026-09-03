@@ -66,9 +66,6 @@ esp_err_t espix_fs_mount_root(void)
     s_mounted = true;
     ensure_skeleton();
 
-    /* After the skeleton, because /etc has to exist before /etc/modes can. */
-    espix_fs_mode_init();
-
     /* No chdir() here on purpose. ESP-IDF has no process-wide working
      * directory: chdir() is a hardcoded ENOSYS stub and getcwd() always answers
      * "/" (esp_libc/src/realpath.c). espix's cwd lives only in
@@ -191,11 +188,7 @@ esp_err_t espix_fs_rm_rf(const char *abs_path)
     }
 
     if (!S_ISDIR(st.st_mode)) {
-        if (unlink(abs_path) != 0) {
-            return ESP_FAIL;
-        }
-        espix_fs_mode_forget(abs_path);
-        return ESP_OK;
+        return (unlink(abs_path) == 0) ? ESP_OK : ESP_FAIL;
     }
 
     DIR *dir = opendir(abs_path);
@@ -231,11 +224,7 @@ esp_err_t espix_fs_rm_rf(const char *abs_path)
     if (err != ESP_OK) {
         return err;
     }
-    if (rmdir(abs_path) != 0) {
-        return ESP_FAIL;
-    }
-    espix_fs_mode_forget(abs_path);
-    return ESP_OK;
+    return (rmdir(abs_path) == 0) ? ESP_OK : ESP_FAIL;
 }
 
 /* ------------------------------------------------------------------ */

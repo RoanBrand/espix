@@ -22,6 +22,7 @@ fsroot/etc/wifi.conf
 
 # Editors / tooling
 .DS_Store
+__pycache__/
 .cache/
 .vscode/
 .continue/

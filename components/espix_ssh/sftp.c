@@ -795,9 +795,6 @@ static esp_err_t do_path_op(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
         return send_status(s, id, status_for(errno), "operation failed");
     }
 
-    if (type == SSH_FXP_REMOVE || type == SSH_FXP_RMDIR) {
-        espix_fs_mode_forget(abs);
-    }
     return send_status(s, id, SSH_FX_OK, "");
 }
 
@@ -816,9 +813,6 @@ static esp_err_t do_rename(sftp_t *s, uint32_t id, ssh_buf_t *in)
         return send_status(s, id, status_for(errno), "rename failed");
     }
 
-    /* The mode follows the file, as it would on a filesystem that stored it on
-     * the inode. SFTP and the shell's `mv` are the two renames espix can see. */
-    espix_fs_mode_rename(abs_from, abs_to);
     return send_status(s, id, SSH_FX_OK, "");
 }
 

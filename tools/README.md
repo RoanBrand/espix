@@ -26,6 +26,29 @@ An app needing build-time environment beyond `sdkconfig.defaults` puts it in
 `apps/<name>/build.env`; `apps/neopixel/build.env` is the example, carrying the
 `ARDUINO_SKIP_TICK_CHECK` that Arduino's 1000Hz assertion requires.
 
+## patch-littlefs.py
+
+Adds `esp_littlefs_setattr`/`getattr`/`removeattr` to the copy of
+`joltwallet/littlefs` the component manager downloads, which is where espix
+stores a file's mode. The port uses LittleFS user attributes itself, for mtime,
+but exposes neither them nor the `lfs_t *` they need — and ESP-IDF's VFS has no
+chmod hook to route around it. See [../docs/UPSTREAM.md](../docs/UPSTREAM.md).
+
+The firmware build runs it from a CMake hook, after `project()` because that is
+when the download happens. It is idempotent, and it fails the build with a clear
+message rather than skipping if the pinned version or either anchor moves —
+silently doing nothing would surface as an undefined reference pointing at
+espix instead of at the real cause.
+
+```bash
+./tools/patch-littlefs.py      # applied automatically; safe to run by hand
+```
+
+**Temporary by construction.** `esp_littlefs-attrs.patch` is the same change as
+a plain diff, ready to send to joltwallet/esp_littlefs. When it is upstreamed,
+delete both files and the `execute_process()` block in the top-level
+`CMakeLists.txt`, and bump the version in `main/idf_component.yml`.
+
 ## Deploying an app
 
 Build it on the host, copy it over, run it by name:

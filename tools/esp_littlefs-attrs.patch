@@ -1,0 +1,145 @@
+Add a public custom-attribute API
+
+LittleFS user attributes are the idiomatic place for POSIX-style metadata --
+SPEC.md describes them as intended for "timestamps, hashes", they ride the
+entry's metadata so rename moves them and delete drops them, and this port
+already uses one ('t') for mtime.
+
+But nothing outside the port can reach them. `_efs[]` is file-scope static,
+esp_littlefs_by_label() is static, and littlefs_api.h -- where esp_littlefs_t.fs
+lives -- is under PRIV_INCLUDE_DIRS. ESP-IDF's VFS cannot route around it
+either, having no chmod or attribute member in esp_vfs_fs_ops_t (IDF's own
+vfs/test_apps/main/test_vfs_access.c carries a TODO saying as much).
+
+So a project wanting to store, say, a file mode has no way to put it on the
+file. These three functions are modelled directly on the port's existing
+esp_littlefs_update_mtime_attr()/esp_littlefs_get_mtime_attr(), taking the same
+sem_take(efs) lock and the same label lookup.
+
+Paths are mount-relative, matching the rest of the internal API.
+
+--- a/include/esp_littlefs.h
++++ b/include/esp_littlefs.h
+@@ -288,7 +288,48 @@
+  */
+ esp_err_t esp_littlefs_blockdev_info(esp_blockdev_handle_t blockdev, size_t *total_bytes, size_t *used_bytes);
+ #endif
++
+ 
++/**
++ * @brief Set a LittleFS custom (user) attribute on a file or directory.
++ *
++ * Attributes are identified by an 8-bit type and are stored in the entry's
++ * metadata, which means LittleFS moves them with the file on rename and drops
++ * them with it on delete. Type 't' is used internally for mtime.
++ *
++ * @param partition_label  Label of the mounted partition, or NULL for the first
++ *                         partition with subtype "littlefs".
++ * @param path             Path relative to the mount point.
++ * @param type             Attribute type, 0x00-0xff.
++ * @param buf              Attribute value.
++ * @param size             Bytes of `buf`, at most LFS_ATTR_MAX.
++ *
++ * @return ESP_OK, ESP_ERR_NOT_FOUND if the partition is not mounted, or
++ *         ESP_FAIL if LittleFS rejected the write.
++ */
++esp_err_t esp_littlefs_setattr(const char *partition_label, const char *path,
++                               uint8_t type, const void *buf, size_t size);
++
++/**
++ * @brief Read a LittleFS custom (user) attribute.
++ *
++ * A stored attribute shorter than `size` is zero-padded; one longer is
++ * truncated. `out_size`, when non-NULL, receives the size actually stored,
++ * which may exceed `size`.
++ *
++ * @return ESP_OK, ESP_ERR_NOT_FOUND if the partition is not mounted or the
++ *         attribute does not exist, or ESP_FAIL on any other error.
++ */
++esp_err_t esp_littlefs_getattr(const char *partition_label, const char *path,
++                               uint8_t type, void *buf, size_t size,
++                               size_t *out_size);
++
++/**
++ * @brief Remove a LittleFS custom (user) attribute. Absent is not an error.
++ */
++esp_err_t esp_littlefs_removeattr(const char *partition_label, const char *path,
++                                  uint8_t type);
++
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif
+--- a/src/esp_littlefs.c
++++ b/src/esp_littlefs.c
+@@ -356,7 +356,71 @@
+     return _efs[index]->cache_size > 0;
+ }
+ #endif
++
++
++esp_err_t esp_littlefs_setattr(const char *partition_label, const char *path,
++                               uint8_t type, const void *buf, size_t size)
++{
++    int index;
++    esp_err_t err = esp_littlefs_by_label(partition_label, &index);
++    if (err != ESP_OK) return err;
++
++    esp_littlefs_t *efs = _efs[index];
++    sem_take(efs);
++    int res = lfs_setattr(efs->fs, path, type, buf, size);
++    sem_give(efs);
++
++    if (res < 0) {
++        errno = lfs_errno_remap(res);
++        ESP_LOGV(ESP_LITTLEFS_TAG, "Failed to set attr %u on \"%s\" (%d)",
++                 (unsigned)type, path, res);
++        return ESP_FAIL;
++    }
++    return ESP_OK;
++}
++
++esp_err_t esp_littlefs_getattr(const char *partition_label, const char *path,
++                               uint8_t type, void *buf, size_t size,
++                               size_t *out_size)
++{
++    int index;
++    esp_err_t err = esp_littlefs_by_label(partition_label, &index);
++    if (err != ESP_OK) return err;
++
++    esp_littlefs_t *efs = _efs[index];
++    sem_take(efs);
++    lfs_ssize_t res = lfs_getattr(efs->fs, path, type, buf, size);
++    sem_give(efs);
+ 
++    if (res < 0) {
++        if (res != LFS_ERR_NOATTR) {
++            errno = lfs_errno_remap(res);
++        }
++        return (res == LFS_ERR_NOATTR) ? ESP_ERR_NOT_FOUND : ESP_FAIL;
++    }
++    if (out_size) *out_size = (size_t)res;
++    return ESP_OK;
++}
++
++esp_err_t esp_littlefs_removeattr(const char *partition_label, const char *path,
++                                  uint8_t type)
++{
++    int index;
++    esp_err_t err = esp_littlefs_by_label(partition_label, &index);
++    if (err != ESP_OK) return err;
++
++    esp_littlefs_t *efs = _efs[index];
++    sem_take(efs);
++    int res = lfs_removeattr(efs->fs, path, type);
++    sem_give(efs);
++
++    if (res < 0 && res != LFS_ERR_NOATTR) {
++        errno = lfs_errno_remap(res);
++        return ESP_FAIL;
++    }
++    return ESP_OK;
++}
++
+ esp_err_t esp_littlefs_info(const char* partition_label, size_t *total_bytes, size_t *used_bytes){
+     int index;
+     esp_err_t err;

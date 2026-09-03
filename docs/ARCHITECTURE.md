@@ -45,47 +45,48 @@ longest-prefix match.
 This is documented but not a well-trodden path. If it misbehaves, the fallback
 is to mount at `/storage` and add a rewrite shim — contained to `espix_fs`.
 
-### File modes are a rule plus a list of exceptions
+### File modes are a rule plus an attribute on the file
 
 LittleFS stores no permission bits: `esp_littlefs`'s `stat()` fills in `S_IFREG`
-or `S_IFDIR` and stops. So a mode is something espix has to keep somewhere, and
-the obvious somewhere turned out to be unreachable.
+or `S_IFDIR` and stops. But it does carry *user attributes* -- small blobs in an
+entry's metadata, which `SPEC.md` describes as meant for exactly this and which
+the port already uses to hold mtime. That is where a mode belongs, and it is
+what the README always said this would use.
 
-LittleFS *does* have the right mechanism — user attributes, `lfs_setattr`, which
-the ESP port already uses to hold mtime — but nothing exposes the `lfs_t *` you
-need to call it with, and ESP-IDF's VFS has no `chmod` hook to route around it.
-Both findings, and the small upstream patch that would fix the first, are in
-[UPSTREAM.md](UPSTREAM.md).
+Reaching them needs the `lfs_t *` the port keeps private, so espix patches in a
+public accessor; the finding and the patch are in [UPSTREAM.md](UPSTREAM.md).
 
-What espix does instead is split the question in two.
+The mode is then split in two.
 
 A **rule** supplies the default: directories are `0755`, a file whose first four
 bytes are the ELF magic is `0755`, everything else is `0644`. Nothing is stored
-for any of that. Three things fall out of it, and they are the reason this shape
-was chosen over a mode-per-file:
+for any of that, and it is not an optimisation -- the image builder writes no
+attributes at all, so every file in a freshly flashed rootfs arrives without
+one, and without the rule nothing in `/bin` would be executable after a
+`storage-flash`. Two more things fall out of it: a flash write happens when you
+run `chmod` and at no other time, on a filesystem that pays a block erase per
+write; and a device nobody has chmod'd has no mode state to be wrong.
 
-- the flashed rootfs image needs no mode data, and `/bin` is executable on a
-  fresh device without a byte having been written — which matters because the
-  image builder writes no attributes at all, the same gap that leaves every
-  shipped file with no mtime;
-- a flash write happens when you run `chmod` and at no other time, on a
-  filesystem that pays a block erase per write;
-- a device nobody has run `chmod` on has no mode state to be wrong.
-
-`/etc/modes` then records only what someone changed, one `path=octal` per line.
-A mode that matches the rule again is *removed* rather than stored, so the file
-cannot grow into a shadow copy of the filesystem — `chmod +x` followed by
+The **attribute** then records only what someone changed. `LFS_ERR_NOATTR` means
+"use the rule", which is also what a portable littlefs implementation is
+supposed to do with an attribute it does not recognise. A mode matching the rule
+again *removes* the attribute rather than storing it, so `chmod +x` followed by
 `chmod -x` on an ordinary file leaves no trace.
 
-The cost is that overrides are keyed by path, so espix has to follow a rename.
-It does, in the two places it can see one — the shell's `mv` and the SFTP server
-— and an app calling `rename()` itself gets away with it. That is a real limit
-and it is in [KNOWN-ISSUES.md](KNOWN-ISSUES.md); it is also exactly the limit
-that goes away if the attributes ever become reachable, because LittleFS moves
-those with the file itself.
+The record is `{uint16 mode, uint16 uid, uint16 gid}` under type `0x70`. There
+is no registry of attribute types, so that is a local choice, and the port's
+mtime uses `'t'`. `uid` and `gid` are written as zero and read by nothing:
+fixing the layout now costs four bytes a file and saves rewriting every stored
+mode when there is an owner model to fill them in. That is a different call from
+the setuid one -- those bits would have been *displayed* as though they meant
+something, whereas these are storage that nothing renders.
 
-`espix_fs_mode()` and `espix_fs_chmod()` are the whole interface, which is what
-makes that swap a two-function change rather than a rewrite.
+What this shape avoids is bookkeeping. An earlier version kept the deviations in
+`/etc/modes` keyed by path, which meant every rename and every delete had to be
+followed by hand in `mv`, `rm`, `rm -r` and the SFTP server, and a rename espix
+could not see would have lost the mode. LittleFS moves an attribute with the
+entry and drops it with the file, so all of that code is gone and the cases it
+was covering cannot arise.
 
 ### Only the execute bit is enforced, and that is not laziness
 

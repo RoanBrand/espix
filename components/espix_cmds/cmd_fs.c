@@ -492,11 +492,6 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
         } else if (unlink(abs) != 0) {
             espix_printf(s, "rm: %s: %s\n", abs, strerror(errno));
             status = 1;
-        } else {
-            /* Only on the non-recursive path: espix_fs_rm_rf() drops the
-             * overrides for everything it removes, since it is the only caller
-             * that knows what those paths were. */
-            espix_fs_mode_forget(abs);
         }
     }
 
@@ -566,7 +561,6 @@ static int cmd_mv(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    espix_fs_mode_rename(src, dst);
     return 0;
 }
 
@@ -729,11 +723,7 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
         }
 
         const esp_err_t rc = espix_fs_chmod(abs, mode);
-        if (rc == ESP_ERR_NO_MEM) {
-            espix_printf(s, "chmod: %s: no room left in %s\n",
-                         abs, ESPIX_MODES_PATH);
-            status = 1;
-        } else if (rc != ESP_OK) {
+        if (rc != ESP_OK) {
             espix_printf(s, "chmod: %s: %s\n", abs, esp_err_to_name(rc));
             status = 1;
         }
