@@ -612,6 +612,16 @@ costs ~6 KB of format strings).
 
 ## Deferred
 
+- **An ed25519 host key.** espix offers exactly one host key algorithm,
+  `ecdsa-sha2-nistp256`. OpenSSH has been steadily narrowing its defaults, and a
+  client release that drops ECDSA would lock every user out with no recourse
+  from the device side. Adding `ssh-ed25519` alongside means key generation,
+  storage and signing work in `ssh_kex.c` and the host-key path, and changes the
+  fingerprint users have already accepted — so it wants doing deliberately
+  rather than in a panic. Worth noting that the *reason* this is on the list is
+  that the neighbouring assumption already broke once: OpenSSH 10.3's KEXINIT
+  outgrew a fixed buffer and every connection was refused with a message
+  claiming no common algorithm. Algorithm lists are not a stable surface.
 - **OTA slots.** The partition table is `factory`-only. Two 4MB OTA slots plus
   `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
   the network. Changing this later means reflashing everything, so it is worth

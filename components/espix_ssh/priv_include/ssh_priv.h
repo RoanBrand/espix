@@ -118,11 +118,26 @@ void           ssh_skip(ssh_buf_t *b, size_t len);
 
 /*
  * The exchange hash covers both complete KEXINIT payloads, so both must be kept
- * from the moment they cross the wire until KEX completes. The client's is not
- * small — OpenSSH offers long name-lists, ~1.3KB in practice — and this is the
- * dominant per-connection cost.
+ * from the moment they cross the wire until KEX completes — and not one moment
+ * longer.
+ *
+ * The server's is ours, fixed by the single algorithm set we offer, and small
+ * enough to hold inline. The client's is neither. This was a 1600-byte array,
+ * sized when "OpenSSH offers long name-lists, ~1.3KB in practice" was true;
+ * OpenSSH 10.3 sends 1656, having added post-quantum key exchange and a
+ * 560-byte host-key list, and every connection from it was refused. Those lists
+ * grow with every release, so a larger fixed number would only move the date.
+ *
+ * It is therefore a heap buffer, allocated at the size actually received and
+ * released the moment KEX is done. There is no rekey path — SSH_MSG_KEXINIT is
+ * read exactly once per connection — so nothing reads it again, and holding it
+ * inline meant a session carried 1600 bytes from login to logout to serve
+ * something live for a few hundred milliseconds.
+ *
+ * The bound is now the one ssh_packet_read() already enforces: a KEXINIT that
+ * reaches recv_kexinit() arrived in a buffer of SSH_MAX_PACKET, so it fits by
+ * construction and there is no second limit left to outgrow.
  */
-#define SSH_KEXINIT_MAX_C 1600
 #define SSH_KEXINIT_MAX_S 256
 
 typedef struct {
@@ -139,7 +154,7 @@ typedef struct {
 
     char     client_version[SSH_VERSION_MAX];
 
-    uint8_t  kexinit_c[SSH_KEXINIT_MAX_C];
+    uint8_t *kexinit_c;      /* heap, KEX only; see kexinit_c_release() */
     size_t   kexinit_c_len;
     uint8_t  kexinit_s[SSH_KEXINIT_MAX_S];
     size_t   kexinit_s_len;

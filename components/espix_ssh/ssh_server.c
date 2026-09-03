@@ -112,6 +112,31 @@ static bool name_list_has(const uint8_t *list, size_t len, const char *want)
     return false;
 }
 
+/*
+ * The same heap the connection itself comes from — see conn_alloc(). PSRAM when
+ * the build asks for it, falling back to internal so a KEXINIT cannot fail to
+ * allocate merely because PSRAM is full.
+ */
+static void *conn_mem(size_t n)
+{
+#if CONFIG_ESPIX_SSH_CONN_IN_PSRAM
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p != NULL) {
+        return p;
+    }
+#endif
+    return malloc(n);
+}
+
+/* Idempotent, so the teardown path can call it without knowing whether KEX got
+ * far enough to allocate or far enough to have already released. */
+static void kexinit_c_release(ssh_conn_t *c)
+{
+    free(c->kexinit_c);
+    c->kexinit_c     = NULL;
+    c->kexinit_c_len = 0;
+}
+
 static esp_err_t recv_kexinit(ssh_conn_t *c)
 {
     if (ssh_packet_read(c) != ESP_OK) {
@@ -123,11 +148,19 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    /* Kept verbatim for the exchange hash, before any parsing consumes it. */
-    if (c->in_len > sizeof(c->kexinit_c)) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "client KEXINIT too large (%u)",
+    /*
+     * Kept verbatim for the exchange hash, before any parsing consumes it, and
+     * released as soon as KEX is over. There is no size of our own to check:
+     * ssh_packet_read() has already refused anything that would not fit the
+     * buffer this arrived in.
+     */
+    kexinit_c_release(c);
+    c->kexinit_c = conn_mem(c->in_len);
+    if (c->kexinit_c == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "no memory for client KEXINIT (%u bytes)",
                    (unsigned)c->in_len);
-        return ESP_ERR_INVALID_SIZE;
+        return ESP_ERR_NO_MEM;
     }
     memcpy(c->kexinit_c, c->in_payload, c->in_len);
     c->kexinit_c_len = c->in_len;
@@ -213,9 +246,25 @@ static void connection_task(void *arg)
         if (send_kexinit(c) != ESP_OK) {
             break;
         }
-        if (recv_kexinit(c) != ESP_OK) {
-            ssh_send_disconnect(c, SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
-                                "no common algorithm");
+        const esp_err_t kex_err = recv_kexinit(c);
+        if (kex_err != ESP_OK) {
+            /*
+             * Say which one. Every failure here used to report "no common
+             * algorithm", so an oversized KEXINIT from a newer OpenSSH was
+             * indistinguishable from a genuine cipher mismatch — and got
+             * diagnosed as one, slowly, by pinning algorithms until it worked.
+             * recv_kexinit() has already logged the detail locally; this is
+             * what the client is told.
+             */
+            const char *why = "no common algorithm";
+            if (kex_err == ESP_ERR_NO_MEM) {
+                why = "out of memory for KEXINIT";
+            } else if (kex_err == ESP_ERR_INVALID_SIZE) {
+                why = "malformed KEXINIT";
+            } else if (kex_err == ESP_ERR_INVALID_RESPONSE) {
+                why = "expected KEXINIT";
+            }
+            ssh_send_disconnect(c, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, why);
             break;
         }
 
@@ -231,6 +280,10 @@ static void connection_task(void *arg)
             break;
         }
 
+        /* ssh_kex_run() is the last reader. What follows — authentication, then
+         * a shell that owns the connection until logout — has no use for it. */
+        kexinit_c_release(c);
+
         if (ssh_auth_run(c) != ESP_OK) {
             /* ssh_auth_run has already sent whatever disconnect is warranted;
              * saying more here would be a second, conflicting reason. */
@@ -243,6 +296,7 @@ static void connection_task(void *arg)
     } while (0);
 
     close(c->fd);
+    kexinit_c_release(c);   /* no-op on the happy path, which released earlier */
     free(c);
 
     s_status.sessions--;
