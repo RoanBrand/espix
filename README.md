@@ -276,7 +276,7 @@ merely missing.
 | `scp` / `sftp` | **yes** | SFTP subsystem; enough for `get`, `put`, `ls`, `cd`, `mkdir`, `rm` |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
-| `ssh host <cmd>` | **planned** | only `pty-req`/`shell`/`subsystem` today; `scp` is unaffected |
+| `ssh host <cmd>` | **yes** | same dispatch as the shell; real exit status, no stdin |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
 

@@ -96,10 +96,29 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## SSH
 
-- **`ssh host <cmd>` does not work.** espix answers `pty-req`, `shell` and
-  `subsystem` channel requests; `exec` is refused. `scp` and `sftp` are fine —
-  they ask for the `sftp` subsystem rather than exec'ing a command. See
-  [ROADMAP.md](ROADMAP.md#ssh).
+- **`ssh host <cmd>` has no stdin.** The command runs and its output and exit
+  status come back, but nothing on espix reads standard input — apps have no
+  file or stdin ABI at all — so `ssh host 'cat' < file` will not do what you
+  mean. Worse than merely unread: while a foreground process runs,
+  `chan_poll_interrupt()` consumes whatever has arrived looking for Ctrl-C, so
+  client-sent data is discarded rather than queued.
+
+- **`ssh host <cmd>` has no separate stderr.** espix has one output stream, so
+  errors arrive interleaved on stdout and `2>` at the client separates nothing.
+
+- **One command per `exec`.** The shell has no `;`, `&&` or pipes, so
+  `ssh host 'cd /bin && ls'` fails in the parser rather than in the channel.
+  `scp -O` — the pre-9.0 protocol — is answered with a message pointing at
+  SFTP, because espix implements no `scp` command for it to run.
+
+- **Each SSH connection leaks about 200 bytes.** Measured by running `free`
+  over 60 successive `exec` connections (172K → 195K internal free) and again
+  over 20 `sftp` sessions, which leak at the same rate. Not reclaimed: still
+  flat after 150 seconds of idle, so it is neither deferred task-stack freeing
+  nor TCP TIME_WAIT. Pre-existing and not in the channel layer — `sftp` does not
+  go through the session or exec paths at all. Around 4000 connections would
+  exhaust internal RAM, so a device that is connected to occasionally is fine
+  and one polled every few seconds is not.
 
 - **A client that decides to rekey hangs the session.** espix reads
   `SSH_MSG_KEXINIT` exactly once, during the handshake; one arriving mid-session

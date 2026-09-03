@@ -81,12 +81,6 @@ things are as they are.
 
 ## SSH
 
-- **`ssh host <cmd>`.** `ssh_channel.c` handles `pty-req`, `shell` and
-  `subsystem`, but an `exec` request is refused — so remote commands do not
-  work, and neither does anything that wants to script espix over SSH. `scp`
-  works because it asks for the `sftp` subsystem rather than exec'ing. The
-  `subsystem` path already proves the shape; exec needs the command string
-  routed to the shell's own dispatch instead of an interactive line editor.
 - **Rekeying.** RFC 4253 recommends new keys after an hour or a gigabyte;
   espix does neither, and worse, ignores a client that asks — so a long or
   high-volume session is dropped rather than degraded. Two things to know before

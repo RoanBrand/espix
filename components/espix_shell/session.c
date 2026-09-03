@@ -218,6 +218,45 @@ static void build_prompt(const espix_session_t *s, char *buf, size_t len)
     snprintf(buf, len, "%s:%s# ", user, cwd);
 }
 
+/*
+ * Run one line and report it the way a shell does.
+ *
+ * espix_shell_exec() answers ESPIX_SHELL_ENOENT for a first word it cannot
+ * resolve, and turning that into "command not found" and status 127 used to
+ * live in the loop below -- which was fine while the loop was the only caller.
+ * SSH's exec channel is a second one, and it hands the number straight to the
+ * client as an exit status: without this, `ssh host nosuchcmd` would report
+ * -127 and say nothing.
+ */
+int espix_shell_run_line(espix_session_t *s, const char *line)
+{
+    if (s == NULL || line == NULL) {
+        return 0;
+    }
+
+    const int status = espix_shell_exec(s, line);
+
+    if (status == ESPIX_SHELL_ENOENT) {
+        /*
+         * Name the command without its arguments. Copied rather than truncated
+         * in place: the REPL owns a mutable buffer and the exec path does not,
+         * and letting one caller write through this pointer is not a
+         * difference worth having.
+         */
+        char         name[ESPIX_LINE_MAX];
+        const size_t n = strcspn(line, " \t");
+
+        strlcpy(name, line, (n + 1 < sizeof(name)) ? n + 1 : sizeof(name));
+        espix_printf(s, "espix: %s: command not found\n", name);
+        s->last_status = 127;
+    } else if (status != ESPIX_SHELL_EMPTY) {
+        /* An empty line leaves $? alone, which is what every shell does. */
+        s->last_status = status;
+    }
+
+    return s->last_status;
+}
+
 void espix_shell_session_run(espix_session_t *s)
 {
     if (s == NULL || s->read_line == NULL) {
@@ -240,18 +279,7 @@ void espix_shell_session_run(espix_session_t *s)
             continue;
         }
 
-        const int status = espix_shell_exec(s, line);
-
-        if (status == ESPIX_SHELL_ENOENT) {
-            char *sp = strchr(line, ' ');
-            if (sp != NULL) {
-                *sp = '\0';
-            }
-            espix_printf(s, "espix: %s: command not found\n", line);
-            s->last_status = 127;
-        } else if (status != ESPIX_SHELL_EMPTY) {
-            s->last_status = status;
-        }
+        (void)espix_shell_run_line(s, line);
     }
 
     espix_shell_set_current(NULL);

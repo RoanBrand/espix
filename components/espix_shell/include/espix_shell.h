@@ -253,6 +253,17 @@ void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn);
 #define ESPIX_SHELL_EMPTY  (-1)
 int espix_shell_exec(espix_session_t *s, const char *line);
 
+/*
+ * espix_shell_exec() plus the reporting a shell does around it: prints
+ * "command not found" for a first word that resolves to nothing, and updates
+ * `last_status`. Returns the status a caller should report.
+ *
+ * Use this rather than espix_shell_exec() unless you mean to handle
+ * ESPIX_SHELL_ENOENT yourself. The REPL and SSH's exec channel both go through
+ * here so the two cannot disagree about what an unknown command looks like.
+ */
+int espix_shell_run_line(espix_session_t *s, const char *line);
+
 /* Read-eval-print loop for one session. Returns when the session ends. */
 void espix_shell_session_run(espix_session_t *s);
 

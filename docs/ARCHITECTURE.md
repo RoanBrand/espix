@@ -635,6 +635,34 @@ There is no boot-time banner. The console session prints the greeting once the
 boot barrier releases, so boot shows kernel log lines and then a login — the
 order Unix uses, and the reason the two no longer overwrite each other.
 
+### `exec` and `shell` are one dispatch with two sources of lines
+
+`ssh host <cmd>` and an interactive SSH shell run the same code. The difference
+is only where the line comes from: `esp_linenoise` in one case, a string out of
+the `exec` channel request in the other. Everything a terminal implies — the
+editor instance, history, the motd, `login` being true so `logout` means
+something — belongs to the shell path and not to exec.
+
+Two things were pulled out of the shell path so the two could not drift, rather
+than copied into the second one:
+
+- `espix_shell_run_line()` in `espix_shell`. `espix_shell_exec()` returns
+  `ESPIX_SHELL_ENOENT` for a first word it cannot resolve, and turning that into
+  `command not found` and status 127 used to live in the REPL. Exec hands its
+  status straight to the client, so calling `exec()` directly would have
+  reported `-127` and printed nothing.
+- `finish_session()` in `ssh_channel.c`, which hangs up the session's processes
+  and then *probes* the transmit lock rather than waiting on it, because a
+  process killed by the hangup may have died holding it. That subtlety was
+  written once for the shell and applies just as much to `ssh host 'app &'`.
+
+Output cooking is decided per channel, not per build. `send_cooked()` turns
+every `\n` into `\r\n`, which is what a terminal wants and what a pipe does
+not: `ssh host 'cat /etc/motd' > file` would otherwise put carriage returns in
+the file. So an exec channel with no `pty-req` writes raw, and `ssh -t host cmd`
+— which does send one — gets cooking and `ansi`. The interactive path is
+unconditionally cooked, deliberately unchanged.
+
 ### The app network ABI is ours
 
 lwip's `getaddrinfo`, `inet_ntop` and `ntohs` are *macros* over

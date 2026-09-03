@@ -82,6 +82,18 @@ typedef struct {
     bool        want_sftp;
     bool        closed;
 
+    /*
+     * `ssh host <cmd>`: the command the client asked to run, on the heap
+     * because it arrives in the packet buffer that the next read overwrites.
+     */
+    bool        want_exec;
+    char       *exec_cmd;
+
+    /* Whether the client asked for a terminal. Decides whether output is
+     * cooked and whether the session claims ANSI; see chan_write(). */
+    bool        has_pty;
+    bool        raw_out;
+
     uint16_t    cols;
     uint16_t    rows;
 
@@ -331,9 +343,22 @@ static bool chan_poll_interrupt(espix_session_t *s)
     }
 }
 
+/*
+ * Cooked for a terminal, raw otherwise.
+ *
+ * send_cooked() turns every \n into \r\n, which is right for a pty and wrong
+ * for `ssh host 'cat /etc/motd' > file` -- that would put carriage returns in
+ * the file. `raw_out` is set only when entering the exec path without a
+ * pty-req, so an interactive shell is unaffected whatever it asked for.
+ */
 static int chan_write(espix_session_t *s, const char *data, size_t len)
 {
-    return send_cooked(s->transport, data, len);
+    ssh_chan_t *ch = s->transport;
+
+    if (ch->raw_out) {
+        return (send_data(ch, data, len) == ESP_OK) ? (int)len : -1;
+    }
+    return send_cooked(ch, data, len);
 }
 
 /*
@@ -822,6 +847,7 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
         }
         /* Pixel dimensions and the encoded terminal modes follow; neither
          * matters until there is something that draws. */
+        ch->has_pty = true;
         espix_klog(ESPIX_KLOG_DEBUG, TAG, "pty %ux%u", ch->cols, ch->rows);
         if (want_reply) {
             reply_request(ch, true);
@@ -833,6 +859,40 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
         ch->want_shell = true;
         if (want_reply) {
             reply_request(ch, true);
+        }
+        return ESP_OK;
+    }
+
+    /*
+     * `ssh host <cmd>`. The command is one SSH string, and it points into the
+     * connection's packet buffer -- which the next read overwrites -- so it is
+     * copied before anything else can happen to it.
+     *
+     * Capped at the same length the line editor enforces on a typed line.
+     * Refused rather than truncated over that: half a command is a different
+     * command, and running one the client did not send is worse than failing.
+     */
+    if (REQ_IS("exec")) {
+        size_t         cmd_len = 0;
+        const uint8_t *cmd     = ssh_get_string(in, &cmd_len);
+        bool           ok      = false;
+
+        if (!in->bad && cmd != NULL && cmd_len > 0 && cmd_len < ESPIX_LINE_MAX) {
+            ch->exec_cmd = malloc(cmd_len + 1);
+            if (ch->exec_cmd != NULL) {
+                memcpy(ch->exec_cmd, cmd, cmd_len);
+                ch->exec_cmd[cmd_len] = '\0';
+                ch->want_exec = true;
+                ok = true;
+            }
+        } else if (cmd_len >= ESPIX_LINE_MAX) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "exec command of %u bytes exceeds the %d-byte limit",
+                       (unsigned)cmd_len, ESPIX_LINE_MAX - 1);
+        }
+
+        if (want_reply) {
+            reply_request(ch, ok);
         }
         return ESP_OK;
     }
@@ -876,8 +936,8 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
         return ESP_OK;
     }
 
-    /* exec and subsystem are how scp and sftp would arrive. Refusing cleanly
-     * means `scp` reports a sensible error instead of hanging. */
+    /* Refusing cleanly rather than ignoring: a client that asked for something
+     * espix does not do gets an error instead of a hang. */
     espix_klog(ESPIX_KLOG_INFO, TAG, "refused channel request '%.*s'",
                (int)type_len, (const char *)type);
     if (want_reply) {
@@ -917,6 +977,63 @@ static void close_channel(ssh_chan_t *ch)
     ssh_put_u8(&b, SSH_MSG_CHANNEL_CLOSE);
     ssh_put_u32(&b, ch->peer_chan);
     send_packet(ch, &b);
+}
+
+/*
+ * Start where a login would: the account's home directory.
+ *
+ * Falls back to / when the directory is not actually there. A rootfs can be
+ * replaced wholesale by storage-flash or edited on the device, and refusing to
+ * open a shell because a directory went missing would be a poor trade.
+ */
+static void apply_account(espix_session_t *session, const char *user)
+{
+    espix_user_t account;
+
+    if (espix_auth_lookup(user, &account) != ESP_OK ||
+        account.home[0] == '\0') {
+        return;
+    }
+
+    struct stat st;
+    if (stat(account.home, &st) == 0 && S_ISDIR(st.st_mode)) {
+        strlcpy(session->home, account.home, sizeof(session->home));
+        strlcpy(session->cwd,  account.home, sizeof(session->cwd));
+    } else {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no home at %s; starting at /",
+                   user, account.home);
+    }
+}
+
+/*
+ * End a session: kill what it owns, then report and close.
+ *
+ * Anything backgrounded writes through a stream whose cookie is the session,
+ * which lives on the caller's stack, so nothing may outlive it.
+ *
+ * The transmit lock is probed rather than waited on. A process killed just
+ * above may have died inside a write still holding it -- espix_proc_kill()
+ * deletes the task outright and cannot unwind what it held. Closing abruptly
+ * costs the client a warning; blocking forever would strand this task and its
+ * buffers for the life of the system.
+ */
+static void finish_session(ssh_chan_t *ch, espix_session_t *session)
+{
+    const size_t orphans = espix_proc_hangup(session);
+
+    if (orphans > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",
+                   session->user, (unsigned)orphans, orphans == 1 ? "" : "es");
+    }
+
+    if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
+        xSemaphoreGiveRecursive(ch->tx_lock);
+        send_exit_status(ch, (uint32_t)session->last_status);
+        close_channel(ch);
+    } else {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "transmit lock held by a killed process; closing abruptly");
+    }
 }
 
 esp_err_t ssh_channel_run(ssh_conn_t *c)
@@ -999,7 +1116,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     }
 
     /* Requests until the client asks for a shell. */
-    while (!ch->want_shell && !ch->want_sftp && !ch->closed) {
+    while (!ch->want_shell && !ch->want_sftp && !ch->want_exec && !ch->closed) {
         if (ssh_packet_read(c) != ESP_OK) {
             err = ESP_FAIL;
             goto out;
@@ -1031,6 +1148,56 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
 
         send_exit_status(ch, 0);
         close_channel(ch);
+        goto out;
+    }
+
+    /*
+     * `ssh host <cmd>`: the same dispatch an interactive shell uses, with one
+     * string standing in for the line editor. No editor, no history, no motd,
+     * and login is false so `logout` correctly declines -- nobody logged in to
+     * run one command.
+     */
+    if (ch->want_exec) {
+        espix_session_t session = {
+            .name      = "ssh-exec",
+            .cwd       = "/",
+            .write     = chan_write,
+            .poll_interrupt = chan_poll_interrupt,
+            .transport = ch,
+            .fg_pid    = ESPIX_PID_NONE,
+            .ansi      = ch->has_pty,
+            .open_stream = chan_open_stream,
+        };
+        strlcpy(session.user, c->user, sizeof(session.user));
+        apply_account(&session, c->user);
+
+        /* Without a terminal the client is a pipe, so newlines stay bare. */
+        ch->raw_out = !ch->has_pty;
+
+        espix_klog(ESPIX_KLOG_INFO, TAG, "exec for %s: %s", c->user,
+                   ch->exec_cmd);
+
+        /*
+         * scp's pre-9.0 protocol arrives as `scp -t <path>` on an exec channel,
+         * and espix has no such command -- so it used to be refused outright,
+         * which at least told the client something true. Now that exec works,
+         * the same request would reach the shell and come back as "command not
+         * found", which points at the wrong problem. Say what is actually
+         * wrong instead.
+         */
+        if (strncmp(ch->exec_cmd, "scp ", 4) == 0 ||
+            strcmp(ch->exec_cmd, "scp") == 0) {
+            espix_printf(&session,
+                         "espix: the scp protocol is not implemented; "
+                         "espix serves scp over SFTP, so drop -O\n");
+            session.last_status = 127;
+        } else {
+            espix_shell_set_current(&session);
+            (void)espix_shell_run_line(&session, ch->exec_cmd);
+            espix_shell_set_current(NULL);
+        }
+
+        finish_session(ch, &session);
         goto out;
     }
 
@@ -1106,18 +1273,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * to open a shell because a directory went missing would be a poor trade.
      */
     session.login = true;
-
-    espix_user_t account;
-    if (espix_auth_lookup(c->user, &account) == ESP_OK && account.home[0] != '\0') {
-        struct stat st;
-        if (stat(account.home, &st) == 0 && S_ISDIR(st.st_mode)) {
-            strlcpy(session.home, account.home, sizeof(session.home));
-            strlcpy(session.cwd,  account.home, sizeof(session.cwd));
-        } else {
-            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no home at %s; starting at /",
-                       c->user, account.home);
-        }
-    }
+    apply_account(&session, c->user);
 
     /* Identical to what the serial console prints, by construction: both go
      * through the same command. */
@@ -1125,34 +1281,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
 
     espix_shell_session_run(&session);
 
-    /*
-     * Hang up: a backgrounded app writes through a stream whose cookie is this
-     * session, which lives on this stack, so nothing may outlive it.
-     */
     esp_linenoise_delete_instance(ch->editor);
     editor_map_remove(c->fd);
 
-    const size_t orphans = espix_proc_hangup(&session);
-    if (orphans > 0) {
-        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on logout",
-                   c->user, (unsigned)orphans, orphans == 1 ? "" : "es");
-    }
-
-    /*
-     * A process killed above may have died inside a write, still holding the
-     * transmit lock — espix_proc_kill() deletes the task outright and cannot
-     * unwind what it held. Probe the lock rather than block on it: closing the
-     * connection abruptly costs the client a warning, whereas waiting forever
-     * would strand this task and its buffers for the life of the system.
-     */
-    if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
-        xSemaphoreGiveRecursive(ch->tx_lock);
-        send_exit_status(ch, (uint32_t)session.last_status);
-        close_channel(ch);
-    } else {
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "transmit lock held by a killed process; closing abruptly");
-    }
+    finish_session(ch, &session);
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s logged out", c->user);
 
@@ -1163,6 +1295,7 @@ out:
     if (ch->rx_lock != NULL) {
         vSemaphoreDelete(ch->rx_lock);
     }
+    free(ch->exec_cmd);
     free(ch);
     return err;
 }
