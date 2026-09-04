@@ -662,7 +662,7 @@ static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
             return false;
         }
         if (v > ESPIX_MODE_BITS) {
-            *err = "setuid, setgid and sticky are not supported";
+            *err = "mode out of range (at most four octal digits)";
             return false;
         }
         *out = (mode_t)v;
@@ -695,31 +695,45 @@ static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
         p++;
 
         mode_t bits = 0;
+        mode_t high = 0;        /* setuid/setgid/sticky: outside the triads */
+
         for (; *p != '\0' && *p != ','; p++) {
             switch (*p) {
             case 'r': bits |= 0444; break;
             case 'w': bits |= 0222; break;
             case 'x': bits |= 0111; break;
             case 's':
-                *err = "setuid and setgid are not supported";
-                return false;
+                /* Which of the two `s` means is decided by the class named:
+                 * `u+s` is setuid, `g+s` is setgid, `a+s` is both. */
+                if (who & 0700) high |= S_ISUID;
+                if (who & 0070) high |= S_ISGID;
+                break;
             case 't':
-                *err = "the sticky bit is not supported";
-                return false;
+                /* Written `+t` far more often than `o+t`, and it belongs to the
+                 * directory rather than to a class, so the class is ignored. */
+                high |= S_ISVTX;
+                break;
             default:
-                *err = "expected r, w or x";
+                *err = "expected r, w, x, s or t";
                 return false;
             }
         }
 
         bits &= who;
 
+        /* `=` replaces the named classes outright, high bits included, or
+         * `u=rw` would leave a setuid behind that nobody asked to keep. */
+        mode_t who_high = 0;
+        if (who & 0700) who_high |= S_ISUID;
+        if (who & 0070) who_high |= S_ISGID;
+        if (who & 0007) who_high |= S_ISVTX;
+
         if (op == '+') {
-            mode |= bits;
+            mode |= bits | high;
         } else if (op == '-') {
-            mode &= ~bits;
+            mode &= ~(bits | high);
         } else {
-            mode = (mode & ~who) | bits;
+            mode = (mode & ~(who | who_high)) | bits | high;
         }
 
         if (*p != ',') {
@@ -761,6 +775,32 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
         if (!chmod_parse(argv[1], st.st_mode & ESPIX_MODE_BITS, &mode, &err)) {
             espix_printf(s, "chmod: %s: %s\n", argv[1], err);
             return 1;           /* the mode is wrong for every path, not one */
+        }
+
+        /*
+         * espix acts on all twelve bits, but not on every bit for every kind of
+         * file. The combinations it would have to store and ignore are refused
+         * by name here rather than silently masked, which is the same call the
+         * octal range makes -- being told beats reading the mode back later and
+         * finding it did nothing.
+         *
+         * This is checked per path, not once, because the same `chmod +t` is
+         * right for a directory and meaningless for a file beside it.
+         */
+        const bool is_dir = S_ISDIR(st.st_mode);
+
+        if (is_dir && (mode & (S_ISUID | S_ISGID))) {
+            espix_printf(s, "chmod: %s: setuid and setgid on a directory mean "
+                            "group inheritance, which espix does not "
+                            "implement\n", abs);
+            status = 1;
+            continue;
+        }
+        if (!is_dir && (mode & S_ISVTX)) {
+            espix_printf(s, "chmod: %s: the sticky bit only applies to a "
+                            "directory\n", abs);
+            status = 1;
+            continue;
         }
 
         const esp_err_t rc = espix_fs_chmod(abs, mode);
