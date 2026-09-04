@@ -750,6 +750,22 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
         user = "esp";
     }
 
+    /*
+     * Your own password, or root changing anybody's.
+     *
+     * This check did not exist and did not need to: before accounts had uids
+     * nothing followed from being one user rather than another. It does now.
+     * root is seeded locked precisely so that nobody can log in as uid 0, and
+     * uid 0 skips every permission check -- so an unprivileged `passwd root
+     * hunter2` would have handed out the superuser, undoing the whole branch in
+     * one command.
+     */
+    if (s != NULL && s->uid != 0 && strcmp(user, s->user) != 0) {
+        espix_printf(s, "passwd: only root can change another user's "
+                        "password\n");
+        return 1;
+    }
+
     const esp_err_t err = espix_auth_set_password(user, password);
     if (err != ESP_OK) {
         espix_printf(s, "passwd: %s: %s\n", user, esp_err_to_name(err));
@@ -768,6 +784,34 @@ static int cmd_whoami(espix_session_t *s, int argc, char **argv)
     /* Every session carries a name now -- "root" on the console, the
      * authenticated one over SSH -- so there is no fallback to invent here. */
     espix_printf(s, "%s\n", (s != NULL && s->user[0] != '\0') ? s->user : "?");
+    return 0;
+}
+
+/*
+ * uid=1000(esp) gid=1000(esp), the way id(1) writes it.
+ *
+ * The name comes from the session and the number from the same field the
+ * filesystem checks, so if these two ever disagree the output says so rather
+ * than hiding it behind one of them.
+ */
+static int cmd_id(espix_session_t *s, int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (s == NULL) {
+        return 1;
+    }
+
+    const char *uname = espix_auth_name_for_uid(s->uid);
+    char        ubuf[ESPIX_USER_MAX];
+    strlcpy(ubuf, (uname != NULL) ? uname : s->user, sizeof(ubuf));
+
+    const char *gname = espix_auth_name_for_uid(s->gid);
+
+    espix_printf(s, "uid=%u(%s) gid=%u(%s)\n",
+                 (unsigned)s->uid, ubuf,
+                 (unsigned)s->gid, (gname != NULL) ? gname : ubuf);
     return 0;
 }
 
@@ -842,6 +886,9 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "whoami", .fn = cmd_whoami,
       .help = "print the current user",
       .usage = "whoami" },
+    { .name = "id",     .fn = cmd_id,
+      .help = "print the current user and group ids",
+      .usage = "id" },
     { .name = "echo",   .fn = cmd_echo,
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,
