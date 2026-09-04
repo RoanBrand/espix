@@ -136,6 +136,29 @@ things are as they are.
   component and on the parent for anything that creates or removes a name, not
   on every intermediate directory; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
+- ~~**A way up to root that is not the serial console.**~~ Done, as `sudo`:
+  `/etc/sudoers` lists the accounts that may run a command as uid 0, seeded with
+  the default account the way an installer puts the first user in the `sudo`
+  group. root stays locked, and `sudo passwd root <pw>` gives it a password if
+  somebody wants one, with `passwd -l root` to take it away again. What it does
+  not do is re-authenticate; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+- ~~**The other three mode bits.**~~ Done, and each is consulted: setuid and
+  setgid give a process the binary's ids at exec, and sticky lets a shared
+  directory allow writes without allowing deletions -- which is what made a 1777
+  `/tmp` possible, and `/tmp` is why the bit was worth having. The combinations
+  espix does not act on -- setuid or setgid on a directory, sticky on a file --
+  are refused by name rather than stored and ignored.
+
+  setuid is a guardrail rather than a boundary on the S3, which has no MMU. It
+  is implemented now because the S31 does.
+
+- **Check SFTP against the same rules as everything else.** It works on the
+  connection task, which is neither a process nor a session, so it is treated as
+  espix itself and skips the permission check entirely. Giving the SFTP server a
+  session carrying the connection's credentials would close it. Bounded today
+  only because `do_setstat()` masks the high bits off.
+
 - **Groups that are more than a number.** Every account's gid equals its uid and
   there is no `/etc/group`, but the gid is stored on every file and the group
   triad is checked, so the format and the check are already the right shape.

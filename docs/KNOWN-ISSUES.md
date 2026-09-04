@@ -75,6 +75,16 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   mode already costs an open and a four-byte read per file. Worth revisiting if
   path resolution ever caches directory modes.
 
+- **SFTP is not permission-checked.** It does its file work on the SSH
+  connection task, which is neither a process nor a session, so
+  `espix_fs_access_check()` treats it as espix itself and allows everything. An
+  authenticated SFTP client can therefore read and write files its shell login
+  would be refused. It is bounded rather than open — `do_setstat()` masks setuid,
+  setgid and sticky off, so this cannot be turned into a root escalation — but
+  it is the largest remaining hole, and closing it means giving the SFTP server
+  a session with the connection's credentials so that the ordinary check
+  applies.
+
 - **Permission checks apply to espix's own tools, not to espix itself.** A task
   that is neither a process nor inside a session -- SNTP, the WiFi driver, an
   SSH connection task before it has authenticated anyone -- is the kernel and is
@@ -84,12 +94,16 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   the same thing to `espix_auth` and to the ELF-magic probe, and which should
   stay at those two callers.
 
-- **`chown` cannot give a file away, and there is no `su`.** Only root may
-  change an owner, which is standard, but espix has no way to become root over
-  the network: the account is locked and there is no `su` or `sudo`. Root is the
-  serial console. That is deliberate while there is nothing to authorise such a
-  transition with, and it means an SSH user who needs to fix a root-owned file
-  needs the board.
+- **`sudo` does not ask for a password.** espix cannot read input without
+  echoing it, which is why `passwd` takes the password as an argument, so a
+  prompt would print what it was meant to protect. `sudo` therefore authorises
+  on `/etc/sudoers` membership alone: anyone who reaches an authenticated
+  session of a listed account can become root, including at a terminal its owner
+  walked away from. Linux closes that with a timestamp and a re-prompt. First
+  thing to revisit when the reentrant line editor lands.
+
+- **`su` does not exist.** `sudo` covers the need, and `su` is the command that
+  most wants the password prompt espix cannot yet give.
 
 
 - **A device VFS is usable but invisible.** `/dev/uart` is registered by

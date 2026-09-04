@@ -212,6 +212,21 @@ kernel messages.
 Support priority and per-chip feature availability (isolation model,
 display, networking) still to be finalized as the design matures.
 
+What the MMU rows in the matrix below rest on, since "has an MMU" covers two
+quite different things:
+
+- **The S31 has the kind that matters.** Espressif shipped a developer preview
+  of a Linux BSP for it in August 2026, and there are community RV32 Linux ports
+  running on the hardware. If Linux boots, per-process address spaces and
+  therefore `fork()` are available to espix too — which is why those rows say
+  *planned* rather than *no* now.
+- **The P4's is an address-translation MMU**, documented by ESP-IDF as mapping
+  physical to virtual so flash and PSRAM can be reached through a pointer. That
+  plus RISC-V PMP gives region-based protection between tasks — an MPU-shaped
+  boundary, not a `fork()`-shaped one. **Still to be confirmed against the P4
+  Technical Reference Manual** rather than promised: what espix would get there
+  is most likely fault isolation between tasks, not copy-on-write.
+
 ## Feature matrix
 
 What works today, against the Unix surface people expect. **planned** means
@@ -248,8 +263,9 @@ merely missing.
 | `sleep` | **planned** | |
 | Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`; `stat` reports the same mode `ls -l` shows |
 | Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |
-| `fork()` / `exec()` | **no** | no MMU, no copy-on-write |
-| MMU-backed process isolation | **no** on S3 | possible later on S31 — see [Crash handling](#crash-handling-and-isolation) |
+| `fork()` / `exec()` | **no** on S3, **planned** on S31 | needs an MMU for copy-on-write; the S31 has one |
+| MMU-backed process isolation | **no** on S3, **planned** on S31 | see [Hardware Targets](#hardware-targets) and [Crash handling](#crash-handling-and-isolation) |
+| setuid / setgid / sticky | **yes** | all three consulted; setuid is a guardrail on S3 and a boundary on S31 |
 
 ### Filesystem
 
@@ -292,7 +308,8 @@ merely missing.
 | uid/gid and file ownership | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
 | Enforced read/write/execute | **yes** | in espix's VFS, for builtins and loaded apps alike |
 | `chown`, `chgrp` | **yes** | changing an owner is root's, as in chown(2) |
-| `su`, `sudo` | **planned** | root is the serial console today; there is no way up over the network |
+| `sudo` | **yes** | gated by `/etc/sudoers`; does not re-prompt, see below |
+| `su` | **no** | `sudo` covers the need, and `su` wants the password prompt espix cannot give |
 | Groups with members, per-app capabilities | **planned** | every gid equals its uid for now; no `/etc/group` |
 
 Worth being clear about what that last row can buy on a chip with no MMU: an app
@@ -300,6 +317,19 @@ shares the address space with the kernel, so filesystem permissions are a
 guardrail against mistakes rather than a sandbox around hostile code. The real
 boundary is the ELF loader's export table — an app can only call what espix
 publishes to it. Permissions make that boundary usable; they do not replace it.
+The same caveat applies to setuid, which is implemented because the S31 makes it
+a real boundary rather than because it is one on the S3.
+
+Root follows the model Ubuntu uses: the account exists but is locked, so nothing
+can log in as it, and `sudo` is how you reach it. `sudo passwd root <pw>` gives
+it a password if you want one, and `passwd -l root` takes it away again.
+
+**`sudo` does not ask for your password.** espix cannot read input without
+echoing it — the same limitation that makes `passwd` take the password as an
+argument — so a prompt would print the thing it was protecting. The session is
+already authenticated, and sudo(8)'s timestamp caching means a real one often
+does not re-ask either, but an unattended terminal is a way in that Linux would
+have closed. It is the first thing to fix when the reentrant line editor lands.
 
 ## A word on the SSH server
 
