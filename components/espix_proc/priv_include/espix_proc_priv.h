@@ -43,6 +43,23 @@ typedef struct {
     volatile bool stop_requested;
 
     /*
+     * The process's working directory, so a relative path an app hands to
+     * fopen() means what it would on any Unix.
+     *
+     * Per process, not per session, and seeded from the spawning session: an
+     * app's chdir() must not move the shell that started it, which is what
+     * fork/exec gives you everywhere else.
+     *
+     * This is only reachable because espix owns the root VFS -- ESP-IDF's
+     * chdir() is an ENOSYS stub and its getcwd() always answers "/", but
+     * espix's VFS receives the caller's path verbatim and resolves it itself,
+     * so IDF's stubs never come into it. Here rather than in
+     * espix_proc_info_t for the usual reason: that struct is bulk-copied onto
+     * callers' stacks.
+     */
+    char cwd[ESPIX_PATH_MAX];
+
+    /*
      * Signal state.
      *
      * Here rather than in espix_proc_info_t deliberately. That struct is what
@@ -140,6 +157,12 @@ void espix_proc_abi_cxx_register(void);
  * symbol there is also what keeps its driver linked into the firmware. */
 void espix_proc_abi_drivers_register(void);
 void espix_proc_abi_time_register(void);
+
+/* Publish the filesystem an app needs: fopen, open, stat, opendir and the rest,
+ * plus espix's own chdir/getcwd because IDF's are stubs. See abi_fs.c -- almost
+ * all of it is unwrapped libc, because those calls already dispatch into
+ * espix's own VFS. */
+void espix_proc_abi_fs_register(void);
 
 /* Publish the POSIX signal surface, and interpose the blocking calls that have
  * to become delivery points. See abi_signal.c: this one installs a symbol

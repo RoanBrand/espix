@@ -94,6 +94,11 @@ typedef struct {
     bool        has_pty;
     bool        raw_out;
 
+    /* The client has sent CHANNEL_EOF: no more input will arrive, but the
+     * channel is still open for output. Distinct from `closed`, which means the
+     * channel is gone in both directions. */
+    bool        eof_seen;
+
     uint16_t    cols;
     uint16_t    rows;
 
@@ -542,7 +547,21 @@ static esp_err_t chan_pump(ssh_chan_t *ch)
         handle_channel_request(ch, &in);
         break;
 
+    /*
+     * EOF is the client saying "I will send no more input", not "stop sending
+     * output". Those are separate halves of a channel, and conflating them
+     * truncated every command that outlived the message.
+     *
+     * `ssh host <cmd>` sends it immediately, having no stdin to forward. So a
+     * foreground app's output was cut wherever chan_poll_interrupt() happened
+     * to pump next -- at a 50ms poll, which is why the loss was a different
+     * length every run and why a fast command never noticed. `eof_seen` marks
+     * the input side done so a reader can stop waiting; writes carry on.
+     */
     case SSH_MSG_CHANNEL_EOF:
+        ch->eof_seen = true;
+        return ESP_OK;
+
     case SSH_MSG_CHANNEL_CLOSE:
     case SSH_MSG_DISCONNECT:
         ch->closed = true;
@@ -605,7 +624,10 @@ static ssize_t ssh_edit_read(int fd, void *buf, size_t count)
             if (got > 0) {
                 break;          /* deliver what we have rather than block */
             }
-            if (ch->closed || chan_pump(ch) != ESP_OK) {
+            /* eof_seen as well as closed: EOF no longer closes the channel,
+             * and a reader that ignored it would spin forever waiting for
+             * input the client has promised never to send. */
+            if (ch->closed || ch->eof_seen || chan_pump(ch) != ESP_OK) {
                 return 0;
             }
             continue;
@@ -762,7 +784,10 @@ esp_err_t ssh_channel_recv_raw(ssh_conn_t *c, uint8_t **out, size_t *out_len)
     }
 
     while (ch->pending_pos >= ch->pending_len) {
-        if (ch->closed || chan_pump(ch) != ESP_OK) {
+        /* eof_seen ends the transfer as cleanly as a close would: the client
+         * has said it will send nothing further, so there is no next request
+         * to wait for. Without it this loop would never exit. */
+        if (ch->closed || ch->eof_seen || chan_pump(ch) != ESP_OK) {
             return ESP_FAIL;
         }
     }

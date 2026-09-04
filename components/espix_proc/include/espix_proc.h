@@ -165,6 +165,34 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n);
 espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);
 
 /*
+ * The calling process's working directory, or "/" for a task that is not a
+ * process -- the console, an SSH connection task, SNTP, the WiFi driver.
+ *
+ * espix's VFS calls this to resolve a relative path, which is what gives a
+ * loaded app a working directory at all. ESP-IDF has none to offer: its
+ * chdir() is an ENOSYS stub and its getcwd() always answers "/". espix's VFS
+ * receives the caller's path verbatim and resolves it here instead, so those
+ * stubs never come into it.
+ *
+ * Never NULL, and never blocks: it is on the path of every file operation in
+ * the system.
+ */
+const char *espix_proc_cwd(void);
+
+/*
+ * Move the calling process's working directory. `abs_path` must be absolute
+ * and must be a directory.
+ *
+ * Per process, so this does not move the session that spawned it -- an app
+ * calling chdir() leaves the shell where it was, as fork/exec does everywhere
+ * else.
+ *
+ * ESP_ERR_NOT_FOUND if the path is not a directory, ESP_ERR_INVALID_STATE for
+ * a caller that is not a process (there is nowhere to record it).
+ */
+esp_err_t espix_proc_chdir(const char *abs_path);
+
+/*
  * State of one process, or ESPIX_PROC_FREE if there is no such pid.
  *
  * For a caller that wants one process's state and not a whole snapshot —

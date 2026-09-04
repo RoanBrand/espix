@@ -281,6 +281,12 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     slot->info.pid        = espix_proc_next_pid();
     slot->info.state      = ESPIX_PROC_READY;
     slot->info.session    = session;
+
+    /* Inherited from whoever spawned it, like a child's cwd everywhere else.
+     * A session with no cwd, or no session at all, means "/". */
+    strlcpy(slot->cwd,
+            (session != NULL && session->cwd[0] != '\0') ? session->cwd : "/",
+            sizeof(slot->cwd));
     slot->info.started_us = esp_timer_get_time();
     slot->info.exit_code  = 0;
 

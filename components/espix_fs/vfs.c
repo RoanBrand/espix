@@ -58,6 +58,7 @@
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 
 #include "espix_fs_priv.h"
 
@@ -85,6 +86,48 @@ static int enosys(void)
     return -1;
 }
 
+/*
+ * Resolve a path the caller gave us against the caller's working directory.
+ *
+ * This is what gives a loaded app a working directory, and it only works
+ * because espix owns this VFS. ESP-IDF has none to offer -- its chdir() is a
+ * hardcoded ENOSYS stub and its getcwd() always answers "/" -- but a VFS
+ * registered at "" matches *any* path in get_vfs_for_path(), relative ones
+ * included, and translate_path() hands it over verbatim. So "data.txt" arrives
+ * here and espix resolves it itself; IDF's stubs never come into it.
+ *
+ * espix_fs_resolve() is the same normalisation every shell command goes
+ * through, so `cd ..` from the shell and chdir("..") from an app agree about
+ * what they mean.
+ *
+ * An absolute path still needs normalising, not just passing along: an app is
+ * free to open "/etc/../etc/motd", and the mode attribute is keyed by path, so
+ * two spellings of one file must not become two entries.
+ *
+ * Returns the buffer, or NULL if the result will not fit -- for which the
+ * caller reports ENAMETOOLONG.
+ */
+static const char *resolve(const char *path, char *buf, size_t len)
+{
+    if (path == NULL) {
+        return NULL;
+    }
+    if (espix_fs_resolve(espix_proc_cwd(), path, buf, len) != ESP_OK) {
+        return NULL;
+    }
+    return buf;
+}
+
+/* The path ops all start the same way; this keeps that from being eleven
+ * copies of five lines. */
+#define RESOLVE_OR_FAIL(path, fail)                                           \
+    char        resolved__[ESPIX_PATH_MAX];                                   \
+    const char *p = resolve((path), resolved__, sizeof(resolved__));          \
+    if (p == NULL) {                                                          \
+        errno = ENAMETOOLONG;                                                 \
+        return (fail);                                                        \
+    }
+
 /* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
@@ -92,8 +135,9 @@ static int enosys(void)
 static int vfs_open(void *ctx, const char *path, int flags, int mode)
 {
     const lower_t *l = ctx;
+    RESOLVE_OR_FAIL(path, -1);
 
-    const int err = espix_fs_access_check(path, ESPIX_FS_ACCESS_OPEN, flags);
+    const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_OPEN, flags);
     if (err != 0) {
         errno = err;
         return -1;
@@ -101,7 +145,7 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     if (NO_LOWER(l->ops->open_p)) {
         return enosys();
     }
-    return l->ops->open_p(l->ctx, path, flags, mode);
+    return l->ops->open_p(l->ctx, p, flags, mode);
 }
 
 static int vfs_close(void *ctx, int fd)
@@ -176,48 +220,89 @@ static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
  * espix does not do. Gating it would be stricter than Unix rather than closer
  * to it, and `ls -l` would start failing on directories you can list.
  */
+/*
+ * ...and this is where stat() starts telling the truth about a mode.
+ *
+ * LittleFS stores no permission bits, so the port fills in S_IFREG or S_IFDIR
+ * and stops. espix knows better -- espix_fs_mode() answers from the file's
+ * attribute or from the rule -- and this is the one place every caller passes
+ * through, so it belongs here rather than in each of them.
+ *
+ * It replaces three separate lookups. `ls -l`, the SFTP server and `run` each
+ * called espix_fs_mode() alongside stat() because stat() could not be trusted;
+ * now they read st_mode like any other program would, and an app that calls
+ * stat() sees exactly what `ls -l` shows without espix wrapping anything.
+ *
+ * espix_fs_mode() may open the file to sniff the ELF magic, which re-enters
+ * this VFS through open(). Safe, and not by luck: esp_vfs_open() holds no lock
+ * while calling a filesystem op, and nothing here is holding one either. It
+ * cannot recurse back into stat().
+ */
 static int vfs_stat(void *ctx, const char *path, struct stat *st)
 {
     const lower_t *l = ctx;
-    return NO_LOWER(l->dir->stat_p) ? enosys()
-                                    : l->dir->stat_p(l->ctx, path, st);
+
+    RESOLVE_OR_FAIL(path, -1);
+
+    if (NO_LOWER(l->dir->stat_p)) {
+        return enosys();
+    }
+
+    const int rc = l->dir->stat_p(l->ctx, p, st);
+    if (rc == 0) {
+        st->st_mode |= espix_fs_mode(p, st) & ESPIX_MODE_BITS;
+    }
+    return rc;
 }
 
 static int vfs_unlink(void *ctx, const char *path)
 {
     const lower_t *l = ctx;
 
-    const int err = espix_fs_access_check(path, ESPIX_FS_ACCESS_UNLINK, 0);
+    RESOLVE_OR_FAIL(path, -1);
+
+    const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_UNLINK, 0);
     if (err != 0) {
         errno = err;
         return -1;
     }
     return NO_LOWER(l->dir->unlink_p) ? enosys()
-                                      : l->dir->unlink_p(l->ctx, path);
+                                      : l->dir->unlink_p(l->ctx, p);
 }
 
 static int vfs_rename(void *ctx, const char *src, const char *dst)
 {
     const lower_t *l = ctx;
 
+    char abs_src[ESPIX_PATH_MAX];
+    char abs_dst[ESPIX_PATH_MAX];
+
+    if (resolve(src, abs_src, sizeof(abs_src)) == NULL ||
+        resolve(dst, abs_dst, sizeof(abs_dst)) == NULL) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
     /* Both ends: a rename removes a name here and creates one there. */
-    int err = espix_fs_access_check(src, ESPIX_FS_ACCESS_RENAME, 0);
+    int err = espix_fs_access_check(abs_src, ESPIX_FS_ACCESS_RENAME, 0);
     if (err == 0) {
-        err = espix_fs_access_check(dst, ESPIX_FS_ACCESS_RENAME, 0);
+        err = espix_fs_access_check(abs_dst, ESPIX_FS_ACCESS_RENAME, 0);
     }
     if (err != 0) {
         errno = err;
         return -1;
     }
-    return NO_LOWER(l->dir->rename_p) ? enosys()
-                                      : l->dir->rename_p(l->ctx, src, dst);
+    return NO_LOWER(l->dir->rename_p)
+               ? enosys() : l->dir->rename_p(l->ctx, abs_src, abs_dst);
 }
 
 static DIR *vfs_opendir(void *ctx, const char *name)
 {
     const lower_t *l = ctx;
 
-    const int err = espix_fs_access_check(name, ESPIX_FS_ACCESS_OPENDIR, 0);
+    RESOLVE_OR_FAIL(name, NULL);
+
+    const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_OPENDIR, 0);
     if (err != 0) {
         errno = err;
         return NULL;
@@ -226,7 +311,7 @@ static DIR *vfs_opendir(void *ctx, const char *name)
         errno = ENOSYS;
         return NULL;
     }
-    return l->dir->opendir_p(l->ctx, name);
+    return l->dir->opendir_p(l->ctx, p);
 }
 
 static struct dirent *vfs_readdir(void *ctx, DIR *pdir)
@@ -275,38 +360,44 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
 {
     const lower_t *l = ctx;
 
-    const int err = espix_fs_access_check(name, ESPIX_FS_ACCESS_MKDIR, 0);
+    RESOLVE_OR_FAIL(name, -1);
+
+    const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_MKDIR, 0);
     if (err != 0) {
         errno = err;
         return -1;
     }
     return NO_LOWER(l->dir->mkdir_p) ? enosys()
-                                     : l->dir->mkdir_p(l->ctx, name, mode);
+                                     : l->dir->mkdir_p(l->ctx, p, mode);
 }
 
 static int vfs_rmdir(void *ctx, const char *name)
 {
     const lower_t *l = ctx;
 
-    const int err = espix_fs_access_check(name, ESPIX_FS_ACCESS_RMDIR, 0);
+    RESOLVE_OR_FAIL(name, -1);
+
+    const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_RMDIR, 0);
     if (err != 0) {
         errno = err;
         return -1;
     }
-    return NO_LOWER(l->dir->rmdir_p) ? enosys() : l->dir->rmdir_p(l->ctx, name);
+    return NO_LOWER(l->dir->rmdir_p) ? enosys() : l->dir->rmdir_p(l->ctx, p);
 }
 
 static int vfs_truncate(void *ctx, const char *path, off_t length)
 {
     const lower_t *l = ctx;
 
-    const int err = espix_fs_access_check(path, ESPIX_FS_ACCESS_TRUNCATE, 0);
+    RESOLVE_OR_FAIL(path, -1);
+
+    const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_TRUNCATE, 0);
     if (err != 0) {
         errno = err;
         return -1;
     }
     return NO_LOWER(l->dir->truncate_p)
-               ? enosys() : l->dir->truncate_p(l->ctx, path, length);
+               ? enosys() : l->dir->truncate_p(l->ctx, p, length);
 }
 
 static int vfs_ftruncate(void *ctx, int fd, off_t length)
@@ -319,8 +410,10 @@ static int vfs_ftruncate(void *ctx, int fd, off_t length)
 static int vfs_utime(void *ctx, const char *path, const struct utimbuf *times)
 {
     const lower_t *l = ctx;
+    RESOLVE_OR_FAIL(path, -1);
+
     return NO_LOWER(l->dir->utime_p) ? enosys()
-                                     : l->dir->utime_p(l->ctx, path, times);
+                                     : l->dir->utime_p(l->ctx, p, times);
 }
 
 /* ------------------------------------------------------------------ */

@@ -246,6 +246,8 @@ merely missing.
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
 | `grep`, `sed`, `head`, `tail`, `wc`, `sort`, `find` | **planned** | |
 | `sleep` | **planned** | |
+| Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`; `stat` reports the same mode `ls -l` shows |
+| Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |
 | `fork()` / `exec()` | **no** | no MMU, no copy-on-write |
 | MMU-backed process isolation | **no** on S3 | possible later on S31 — see [Crash handling](#crash-handling-and-isolation) |
 
@@ -276,7 +278,7 @@ merely missing.
 | `scp` / `sftp` | **yes** | SFTP subsystem; enough for `get`, `put`, `ls`, `cd`, `mkdir`, `rm` |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
-| `ssh host <cmd>` | **yes** | same dispatch as the shell; real exit status, no stdin |
+| `ssh host <cmd>` | **partial** | works, but can truncate a long command's output — see [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
 

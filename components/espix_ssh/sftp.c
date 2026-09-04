@@ -14,10 +14,9 @@
  *
  * Deliberately partial: enough for scp in both directions, for sftp's ls, cd,
  * get, put, mkdir and rm, and no more. Attributes are the honest shape of the
- * filesystem underneath — LittleFS keeps a modification time but no permissions
- * and no owner, so mtime is reported for real while SETSTAT succeeds without
- * doing anything rather than failing a transfer over a mode bit that could
- * never be stored.
+ * filesystem underneath: mtime and the permission bits are both real and both
+ * come straight out of stat(), and SETSTAT applies a mode rather than
+ * pretending to. Owner and group are still absent, because no file records one.
  */
 
 #include <dirent.h>
@@ -267,9 +266,9 @@ static uint32_t status_for(int err)
 
 /*
  * Attributes. Size, the directory bit, the modification time and now the
- * permission bits are all real -- `mode` is what espix_fs_mode() answered for
- * this path, so a client sees the same nine bits the device's own `ls -l`
- * shows. Owner and group are still absent, because no file records one.
+ * permission bits are all real -- espix's VFS fills the mode into st_mode, so a
+ * client sees the same nine bits the device's own `ls -l` shows, from the same
+ * stat() call. Owner and group are still absent, because no file records one.
  *
  * atime is sent because the protocol pairs the two in one flag and a client
  * that asked for times expects both. LittleFS keeps no access time, so it
@@ -361,7 +360,7 @@ static esp_err_t do_stat(sftp_t *s, uint32_t id, ssh_buf_t *in)
     ssh_buf_init(&b, s->out, sizeof(s->out));
     ssh_put_u8(&b, SSH_FXP_ATTRS);
     ssh_put_u32(&b, id);
-    put_attrs(&b, &st, espix_fs_mode(abs, &st));
+    put_attrs(&b, &st, st.st_mode);
     return sftp_send(s, &b);
 }
 
@@ -378,7 +377,7 @@ static esp_err_t do_fstat(sftp_t *s, uint32_t id, ssh_buf_t *in)
     ssh_buf_init(&b, s->out, sizeof(s->out));
     ssh_put_u8(&b, SSH_FXP_ATTRS);
     ssh_put_u32(&b, id);
-    put_attrs(&b, &st, espix_fs_mode(h->path, &st));
+    put_attrs(&b, &st, st.st_mode);
     return sftp_send(s, &b);
 }
 
@@ -501,7 +500,7 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
     /* Without a resolvable path there is nothing to ask about the mode, so fall
      * back to the same defaults the rule would have produced for a file it
      * could not read. */
-    const mode_t mode = have_path ? espix_fs_mode(full, &st)
+    const mode_t mode = have_path ? st.st_mode
                                   : (S_ISDIR(st.st_mode) ? 0755 : 0644);
 
     /*

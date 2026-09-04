@@ -35,11 +35,19 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   exactly what `espix_sigcheck()` is exported for. `apps/sigtest spin` is the
   case in the flesh. SIGKILL is the answer when it is somebody else's binary.
 
-- **Apps have no working directory.** ESP-IDF has no process-wide cwd —
-  `chdir()` is a hardcoded `ENOSYS` stub and `getcwd()` always answers `/` — so
-  espix's cwd lives only in the session. A loaded app calling `fopen("data.txt")`
-  gets `/data.txt`, never the directory you `cd`'d into. Apps should take paths
-  as arguments.
+- **`ssh host <cmd>` can truncate a long-running command's output.**
+  Intermittent, roughly a third of runs with an app that does a few file
+  operations: output stops partway and no exit status arrives, so the client
+  reports 255. The same app is correct every time on the serial console and in
+  an interactive SSH session, so it is the exec path's teardown racing the
+  process rather than anything in the app or the filesystem.
+
+  Two contributing causes were found and fixed — the client's `CHANNEL_EOF` was
+  being treated as the channel closing, and a stale event-group bit made
+  `espix_proc_wait()` report a freshly spawned process as already finished (see
+  the commit). Both were real and both improved it; a third cause remains
+  unidentified. Until it is, prefer an interactive session for anything whose
+  output matters.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.

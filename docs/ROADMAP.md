@@ -78,16 +78,17 @@ things are as they are.
   that the console, sockets and eventfd all depend on, to be re-merged on every
   IDF upgrade. Worth revisiting if the eighty lines above turn out to be wrong.
 
-- **A file surface for apps.** A loaded app cannot open a file. The ELF loader's
-  built-in tables export `close` and `fwrite` and nothing else of the family --
-  no `fopen`, `open`, `opendir`, `read`, `unlink`, `mkdir` or `rename` -- so an
-  app that touches the filesystem fails to *load*, not to work. This is why the
-  mode work stopped at the shell and SFTP and published no `chmod` to apps:
-  exporting a permissions call to programs that cannot open a file would be
-  scaffolding, not a feature. Doing it properly means one `abi_fs.c` covering
-  the surface, with `stat` reporting `espix_fs_mode()` so an app sees the same
-  bits `ls -l` does, and it should land before or alongside a working directory
-  for apps -- the two are the same complaint.
+- ~~**A file surface for apps.**~~ Done. `abi_fs.c` publishes fopen, open,
+  read, stat, opendir and the rest, and almost all of it is unwrapped libc
+  because those calls already dispatch into espix's own VFS -- so they get the
+  permission check and the working-directory resolution for free. Three are
+  espix's own because IDF's are stubs: `chdir`, `getcwd` and `chmod`, the last
+  because IDF's returns success without doing anything (see
+  [UPSTREAM.md](UPSTREAM.md)).
+
+  `access` is still absent, deliberately: LittleFS's port never implemented it,
+  so espix's VFS leaves it NULL, and exporting a call that always fails would be
+  worse than an app failing to load and being told which symbol was missing.
 
 - ~~**Move file modes onto the file.**~~ Done. Modes live in a LittleFS user
   attribute, so rename and delete are the filesystem's problem rather than

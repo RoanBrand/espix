@@ -213,22 +213,33 @@ Redirection (`>` / `>>`) is handled in dispatch, not per command, by setting
 command. It does *not* capture a spawned app's own stdout — see the stdio note
 below for why that is deliberate rather than unfinished.
 
-### There is no working directory outside a session
+### A working directory, once espix owned the VFS
 
-ESP-IDF has no process-wide CWD at all: `chdir()` is a hardcoded
-`errno = ENOSYS; return -1;` stub and `getcwd()` unconditionally answers `"/"`
-(`components/esp_libc/src/realpath.c`). espix's cwd therefore lives only in
-`espix_session_t.cwd`, and every command resolves through `espix_fs_resolve()`
-to an absolute path before touching the filesystem.
+ESP-IDF offers none: `chdir()` is a hardcoded `errno = ENOSYS; return -1;` stub
+and `getcwd()` unconditionally answers `"/"`
+(`components/esp_libc/src/realpath.c`). For a long time espix's conclusion
+followed from that — the cwd lived only in `espix_session_t.cwd`, every command
+resolved through `espix_fs_resolve()` before touching the filesystem, and a
+loaded app calling `fopen("data.txt")` got `/data.txt`.
 
-The consequence lands on the app ABI: **a loaded app that calls
-`fopen("data.txt")` gets `/data.txt`**, never the directory you `cd`'d into.
-`run` resolves its own `argv[0]` against the session cwd, so
-`cd /home && run ./app` works, but an ambient cwd is not something apps can rely
-on. Apps should take paths as arguments. If this becomes painful, the fix is
-`--wrap` on `getcwd`/`chdir` backed by a per-task cwd and exported through the
-ELF symbol table — deliberately not done yet, because it is an addition to the
-app ABI and wants designing rather than bolting on.
+That conclusion stopped being true when espix took the root VFS, and the reason
+is worth knowing because it is not obvious. `get_vfs_for_path()` matches an
+entry with `path_prefix_len == 0` against *any* path — a relative one included,
+since `memcmp(path, "", 0)` always succeeds — and `translate_path()` then
+returns `src_path + 0`, the string verbatim. So `"data.txt"` arrives at espix's
+own `open()` unchanged, and espix resolves it against the caller itself.
+ESP-IDF's stubs never come into it, because espix never asks them.
+
+So a process has a real working directory: `cwd` on its slot in
+`espix_proc_slot_t`, seeded from the session that spawned it. Per process rather
+than per session, so an app's `chdir()` leaves the shell where it was — which is
+what fork/exec gives you everywhere else, and the difference shows the moment
+you run two things.
+
+`chdir()` and `getcwd()` are published to apps as espix's own
+(`abi_fs.c`), for the same reason `chmod` is: IDF's are stubs, and a stub that
+answers `"/"` to `getcwd()` is worse than absent because it looks like it
+worked.
 
 ### Apps are entered directly, not via esp_elf_request()
 

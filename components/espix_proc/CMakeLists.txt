@@ -4,6 +4,7 @@ idf_component_register(
         "exec.c"
         "abi_cxx.cpp"
         "abi_drivers.c"
+        "abi_fs.c"
         "abi_signal.c"
         "abi_time.c"
     INCLUDE_DIRS

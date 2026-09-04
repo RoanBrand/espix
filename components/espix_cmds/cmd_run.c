@@ -172,7 +172,7 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
      * "permission denied", which is a worse answer and a false one.
      */
     struct stat rst;
-    if (stat(abs, &rst) == 0 && (espix_fs_mode(abs, &rst) & S_IXUSR) == 0) {
+    if (stat(abs, &rst) == 0 && (rst.st_mode & S_IXUSR) == 0) {
         espix_printf(s, "run: %s: Permission denied\n", abs);
         return 126;
     }
@@ -224,7 +224,7 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
         return ESPIX_SHELL_ENOENT;      /* reported as "command not found" */
     }
 
-    if ((espix_fs_mode(abs, &st) & S_IXUSR) == 0) {
+    if ((st.st_mode & S_IXUSR) == 0) {
         espix_printf(s, "espix: %s: Permission denied\n", argv[0]);
         return 126;                     /* what a shell returns for this */
     }

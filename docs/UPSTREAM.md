@@ -25,6 +25,27 @@ Not an oversight anyone has missed — IDF's own test says so:
     // f_chmod support to be implemented in VFS)
     -- components/vfs/test_apps/main/test_vfs_access.c
 
+### `chmod()` returns success and does nothing
+
+`esp_libc/src/realpath.c`:
+
+    /* std::filesystem functions call chmod and exit with an exception if it
+     * fails, so not failing with ENOSYS seems a better solution. */
+    int chmod(const char *path, mode_t mode)
+    {
+        return 0;
+    }
+
+The reasoning is understandable and the result is a call that tells every
+caller it changed a mode and changed nothing. Same shape as `pthread_sigmask()`
+below: a no-op that reports success is worse than one that reports ENOSYS,
+because only the second can be detected.
+
+espix has a real `chmod`, so `abi_fs.c` publishes its own under that name rather
+than exporting libc's to apps. `chdir()` in the same file at least fails
+honestly with ENOSYS, and `getcwd()` answering `"/"` unconditionally is the
+same trap in a quieter form.
+
 ### `adjtime()` overflows, silently, and defeats smooth SNTP sync
 
 `delta->tv_sec * 1000000L` is computed in a 32-bit `long`. A 56-year correction

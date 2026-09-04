@@ -252,8 +252,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
             char size[16];
             ls_time(when, sizeof(when), st.st_mtime);
             ls_size(size, sizeof(size), st.st_size, f.human);
-            espix_fs_mode_str(espix_fs_mode(abs, &st), false,
-                              perms, sizeof(perms));
+            espix_fs_mode_str(st.st_mode, false, perms, sizeof(perms));
             espix_printf(s, "%s  %8s  %12s  %s\n", perms, size, when, abs);
         } else {
             espix_printf(s, "%s\n", abs);
@@ -268,9 +267,10 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
     }
 
     /*
-     * A stat costs a metadata read and the mode may open the file to sniff the
-     * ELF magic, so neither is done for a plain listing of names. -t needs the
-     * mtime to sort on even without -l.
+     * A stat costs a metadata read, and it is where the mode comes from too --
+     * espix's VFS fills st_mode in, so there is nothing extra to ask. Skipped
+     * entirely for a plain listing of names; -t needs the mtime to sort on even
+     * without -l.
      */
     const bool need_stat = f.long_form || f.by_time;
 
@@ -334,9 +334,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
             e->size    = cst.st_size;
             e->is_dir  = S_ISDIR(cst.st_mode);
 
-            if (f.long_form) {
-                e->mode = espix_fs_mode(child, &cst);
-            }
+            e->mode = cst.st_mode;
         }
     }
 
@@ -717,7 +715,7 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
         mode_t      mode = 0;
         const char *err  = NULL;
 
-        if (!chmod_parse(argv[1], espix_fs_mode(abs, &st), &mode, &err)) {
+        if (!chmod_parse(argv[1], st.st_mode & ESPIX_MODE_BITS, &mode, &err)) {
             espix_printf(s, "chmod: %s: %s\n", argv[1], err);
             return 1;           /* the mode is wrong for every path, not one */
         }

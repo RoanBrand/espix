@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>    /* strcasecmp, for `kill -TERM` */
+#include <sys/stat.h>   /* stat, for chdir's directory check */
 
 #include "esp_log.h"
 
@@ -77,10 +78,41 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_drivers_register();
     espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
+    espix_proc_abi_fs_register();
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "process table ready (%d slots)",
                ESPIX_PROC_MAX);
     return ESP_OK;
+}
+
+/*
+ * Clear this slot's "finished" bit before anything waits on it.
+ *
+ * espix_proc_wait() calls xEventGroupWaitBits() with xClearOnExit false, so
+ * that several waiters can all see one exit -- which means nothing ever cleared
+ * the bit either. A slot reused by a later process therefore started life with
+ * its predecessor's bit already set, and the first espix_proc_wait() on it
+ * returned "finished" immediately.
+ *
+ * The pid re-check in espix_proc_wait() cannot catch that: the pid in the slot
+ * *is* the one being waited on, because the process is real and just started.
+ * So `run` believed a freshly spawned app had already exited, reported its
+ * predecessor's exit code, and moved on while the app was still starting.
+ *
+ * Harmless-looking for a long time, because the shell simply returned to a
+ * prompt a fraction early. It surfaced over `ssh host <cmd>`, where returning
+ * early means finish_session() closes the channel underneath a still-running
+ * app: output truncated at whatever had made it out, and no exit status, so the
+ * client reported 255.
+ *
+ * Cleared at allocation rather than at exit because allocation is the point
+ * where the slot changes identity, and it happens under the table lock with
+ * the task not yet created -- so no one can be waiting on it yet.
+ */
+static void clear_finished_bit(const espix_proc_slot_t *slot)
+{
+    const int index = (int)(slot - g_espix_procs);
+    xEventGroupClearBits(g_espix_proc_events, (EventBits_t)1 << index);
 }
 
 espix_proc_slot_t *espix_proc_alloc_slot(void)
@@ -91,6 +123,7 @@ espix_proc_slot_t *espix_proc_alloc_slot(void)
         espix_proc_slot_t *s = &g_espix_procs[i];
 
         if (s->info.state == ESPIX_PROC_FREE) {
+            clear_finished_bit(s);
             return s;
         }
         if (state_is_finished(s->info.state)) {
@@ -105,6 +138,7 @@ espix_proc_slot_t *espix_proc_alloc_slot(void)
         /* Reclaiming a finished slot: its resources were released when it
          * finished, so only the bookkeeping needs clearing. */
         memset(oldest_done, 0, sizeof(*oldest_done));
+        clear_finished_bit(oldest_done);
     }
     return oldest_done;
 }
@@ -679,4 +713,50 @@ espix_pid_t espix_proc_pid_of_task(TaskHandle_t task)
         }
     }
     return ESPIX_PID_NONE;
+}
+
+/*
+ * Working directory of the calling process.
+ *
+ * Takes no lock, deliberately, because espix's VFS calls this on every file
+ * operation in the system -- a mutex here would serialise all I/O behind the
+ * process table. espix_proc_self() is safe without one for the reason given on
+ * its declaration: the caller *is* the process, so its slot cannot be recycled
+ * underneath it. The only writer of `cwd` is that same task, in
+ * espix_proc_chdir().
+ *
+ * "/" for a task espix does not know as a process -- the console, an SSH
+ * connection task, SNTP, the WiFi driver -- which is what they resolved
+ * against before this existed.
+ */
+const char *espix_proc_cwd(void)
+{
+    const espix_proc_slot_t *slot = espix_proc_self();
+
+    if (slot == NULL || slot->cwd[0] == '\0') {
+        return "/";
+    }
+    return slot->cwd;
+}
+
+esp_err_t espix_proc_chdir(const char *abs_path)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+
+    if (abs_path == NULL || abs_path[0] != '/') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (slot == NULL) {
+        /* A kernel task has nowhere to record one, and the sessions that do
+         * have a cwd manage it themselves. */
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    struct stat st;
+    if (stat(abs_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    strlcpy(slot->cwd, abs_path, sizeof(slot->cwd));
+    return ESP_OK;
 }
