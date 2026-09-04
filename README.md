@@ -259,7 +259,7 @@ merely missing.
 | `ls -i`, inode numbers | **no** | esp_littlefs reports `d_ino = 0` for every entry, and LittleFS exposes no file id |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
-| `/proc`, `mount` / `umount` | **planned** | |
+| `/proc`, `mount` / `umount` | **planned** | espix owns `/` but routes only `/`; a second mount needs its own routing table |
 | Mode bits, `chmod` | **yes** | nine bits, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
 | Read and write bits enforced | **no** | the seam exists — espix owns the root VFS, so every `open()` passes through it — but no file has an owner to check a mode against yet |

@@ -39,6 +39,24 @@ things are as they are.
 
 ## Filesystem
 
+- **`mount`, `umount` and `/proc`, with espix's own mount table.** espix owns
+  the root VFS but routes only the root: it holds one pointer to one filesystem.
+  Anything else mounted — FAT on an SD card, a second LittleFS partition,
+  `/proc` — would be registered with ESP-IDF's VFS at its own prefix and would
+  outrank espix's fallback, so espix would never see those calls and its
+  permission check would not apply to them.
+
+  Doing it properly means espix keeping a path-to-lower-ops table of its own and
+  routing internally, rather than letting IDF route. `esp_littlefs_mount()`
+  already returns exactly what such a table stores, and the FAT and SPIFFS ports
+  would need the same mount-without-registering split — which is the argument
+  for getting it upstream rather than carrying it (see
+  [UPSTREAM.md](UPSTREAM.md)). `/proc` is then espix's own ops rather than a
+  filesystem at all, which is what makes it the cheap one to do first.
+
+  Note this is a *precondition* for uniform permissions, not a nice-to-have
+  beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
+
 - **A file surface for apps.** A loaded app cannot open a file. The ELF loader's
   built-in tables export `close` and `fwrite` and nothing else of the family --
   no `fopen`, `open`, `opendir`, `read`, `unlink`, `mkdir` or `rename` -- so an

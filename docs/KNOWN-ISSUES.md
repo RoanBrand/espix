@@ -47,6 +47,34 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## Filesystem
 
+- **A second filesystem would not get espix's permission check.** espix
+  registers its VFS at `""`, which is the *fallback* — reached only by paths no
+  longer prefix claims. That is right for devices: IDF's UART driver registers
+  `/dev/uart` at its own prefix and outranks the fallback, and a device has no
+  mode to check; eventfd has no path at all
+  (`esp_vfs_register_fs_with_id()`). But mount FAT on an SD card at `/mnt/sd`
+  and ESP-IDF routes it straight there, with `espix_fs_access_check()` never
+  called. Only the root filesystem is covered today. See
+  [ROADMAP.md](ROADMAP.md#filesystem).
+
+- **Unmounting is two steps now, and `esp_vfs_littlefs_unregister()` is not one
+  of them.** espix mounts through `esp_littlefs_mount()` and never registers
+  LittleFS with the VFS, so the port's unregister has no registration to tear
+  down and would fail. Nothing calls it — espix has no `umount` — but whoever
+  adds one needs to unregister espix's VFS and unmount LittleFS separately,
+  mirroring the two halves that mounting became.
+
+- **`fcntl(F_GETPATH)` is untested.** `CONFIG_LITTLEFS_FCNTL_GET_PATH` is on and
+  the port answers by concatenating its `base_path` with the file's path; espix
+  sets that to `""`, so the answer should be the same absolute path espix uses.
+  Nothing in espix calls it, so that is reasoning rather than observation.
+
+- **Power-loss safety has not been re-tested since espix took the root VFS.** It
+  should be unaffected — crash safety lives in `lfs.c`, which espix does not
+  touch, and the on-disk format is unchanged — but every file operation now runs
+  through new code and the verification did not include pulling power
+  mid-write. Treat it as inherited, not as confirmed.
+
 - **`ls -a` cannot show `.` and `..`.** It shows dotfiles, which is what you
   want it for, but the two directory entries themselves never arrive: the ESP
   LittleFS port's `readdir()` reads in a loop until it gets what it calls "a
