@@ -49,6 +49,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -145,7 +146,20 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     if (NO_LOWER(l->ops->open_p)) {
         return enosys();
     }
-    return l->ops->open_p(l->ctx, p, flags, mode);
+
+    /*
+     * Whether this call is the one that brings the file into existence has to
+     * be decided before the open, not after: O_CREAT on a file that is already
+     * there must not re-stamp an owner.
+     */
+    struct stat before;
+    const bool  creating = (flags & O_CREAT) && stat(p, &before) != 0;
+
+    const int fd = l->ops->open_p(l->ctx, p, flags, mode);
+    if (fd >= 0 && creating) {
+        espix_fs_claim(p);
+    }
+    return fd;
 }
 
 static int vfs_close(void *ctx, int fd)
@@ -367,8 +381,15 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
         errno = err;
         return -1;
     }
-    return NO_LOWER(l->dir->mkdir_p) ? enosys()
-                                     : l->dir->mkdir_p(l->ctx, p, mode);
+    if (NO_LOWER(l->dir->mkdir_p)) {
+        return enosys();
+    }
+
+    const int rc = l->dir->mkdir_p(l->ctx, p, mode);
+    if (rc == 0) {
+        espix_fs_claim(p);
+    }
+    return rc;
 }
 
 static int vfs_rmdir(void *ctx, const char *name)

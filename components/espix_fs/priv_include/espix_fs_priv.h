@@ -35,6 +35,32 @@ typedef enum {
 int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags);
 
 /*
+ * May the caller change `abs_path`'s mode or owner?
+ *
+ * chmod and chown do not go through the VFS -- they are espix_fs calls that
+ * write a littlefs attribute directly -- so espix_fs_access_check() never sees
+ * them and cannot be what protects them. Without this, any user could take
+ * ownership of any file, which makes every other check pointless.
+ *
+ * Returns 0 to allow, or EPERM. Changing the owner is root's alone, the way
+ * chown(2) restricts it; changing the mode needs only to be the owner.
+ */
+int espix_fs_admin_check(const char *abs_path, bool changing_owner);
+
+/*
+ * Give a just-created path the caller's ownership.
+ *
+ * The ownership rule covers the ordinary case -- files under a home belong to
+ * whoever lives there -- and this covers the rest: a file created in a
+ * directory somebody has chmod'd or chowned into general use would otherwise be
+ * born belonging to root, and its own creator could not then write it.
+ *
+ * A no-op for espix itself and cheap when the rule already agrees, because
+ * espix_fs_chown() stores nothing it would derive anyway.
+ */
+void espix_fs_claim(const char *abs_path);
+
+/*
  * Publish espix's VFS as the root, forwarding to the filesystem described by
  * `lower_ops` and `lower_ctx` (as returned by esp_littlefs_mount()).
  */
