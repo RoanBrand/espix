@@ -14,6 +14,7 @@
 
 #include <sys/socket.h>
 
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -191,10 +192,17 @@ void ssh_skip(ssh_buf_t *b, size_t len)
 /* Socket helpers                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * How long a peer may leave a packet half-delivered before the connection is
+ * given up on. Only ever reached mid-packet; see the note in read_exact().
+ */
+#define PARTIAL_READ_TIMEOUT_MS 5000
+
 static esp_err_t read_exact(int fd, void *dst, size_t len)
 {
     uint8_t *p = dst;
     size_t   got = 0;
+    int64_t  stalled_since = 0;     /* us; 0 until a packet is part-read */
 
     while (got < len) {
         const ssize_t n = recv(fd, p + got, len - got, 0);
@@ -206,19 +214,51 @@ static esp_err_t read_exact(int fd, void *dst, size_t len)
                 continue;
             }
             /*
-             * The socket is blocking, but it does not stay that way for its
-             * whole life: esp_linenoise's terminal probe sets O_NONBLOCK on the
-             * fd it is given and restores it afterwards, and this runs on that
-             * same descriptor. A transient EAGAIN is not a closed connection,
-             * so wait a tick rather than tearing the session down.
+             * Two different waits arrive here as EAGAIN, and telling them apart
+             * is the whole point of this branch.
+             *
+             * The socket carries SO_RCVTIMEO (see ssh_server.c), and it is also
+             * briefly O_NONBLOCK whenever esp_linenoise's terminal probe runs
+             * on this same descriptor. So EAGAIN means "nothing right now",
+             * never "the peer is gone".
+             *
+             * With `got == 0` nothing of a packet has arrived, which is an idle
+             * session waiting on a keystroke and may legitimately last hours.
+             * Wait indefinitely.
+             *
+             * With `got > 0` a packet is half-delivered and the peer has stopped
+             * mid-message. That is broken or vanished, and waiting forever is
+             * what parked connection tasks permanently: the task never exited,
+             * so the server's session count never came back down, and after
+             * CONFIG_ESPIX_SSH_MAX_SESSIONS of them every new connection was
+             * refused. Bound it.
              */
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (got > 0) {
+                    /*
+                     * Measure the stall with a clock, not by counting turns of
+                     * this loop: each turn blocks for SO_RCVTIMEO and then
+                     * delays again, so a per-iteration tally bears no relation
+                     * to elapsed time.
+                     */
+                    const int64_t now = esp_timer_get_time();
+                    if (stalled_since == 0) {
+                        stalled_since = now;
+                    } else if (now - stalled_since >=
+                               (int64_t)PARTIAL_READ_TIMEOUT_MS * 1000) {
+                        espix_klog(ESPIX_KLOG_WARN, TAG,
+                                   "peer stopped %u bytes into a %u-byte packet",
+                                   (unsigned)got, (unsigned)len);
+                        return ESP_ERR_TIMEOUT;
+                    }
+                }
                 vTaskDelay(1);
                 continue;
             }
             return ESP_FAIL;
         }
         got += (size_t)n;
+        stalled_since = 0;          /* progress resets the patience */
     }
     return ESP_OK;
 }

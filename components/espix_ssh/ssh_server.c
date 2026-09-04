@@ -7,6 +7,7 @@
  */
 
 #include <errno.h>
+#include <stdio.h>      /* snprintf, for the refusal line */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,11 +15,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>   /* struct timeval, for SO_RCVTIMEO */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "espix_kernel.h"
 #include "espix_ssh.h"
@@ -221,6 +224,57 @@ static ssh_conn_t *conn_alloc(void)
     return calloc(1, sizeof(ssh_conn_t));
 }
 
+/*
+ * How long to wait for the peer to hang up before hanging up on it. A client
+ * that is answering takes milliseconds; one that has wandered off costs us this
+ * much and no more.
+ */
+#define LINGER_DRAIN_MS 600
+
+/*
+ * Say goodbye, then let the client hang up first.
+ *
+ * Closing the socket the moment the channel is done is what made roughly two
+ * connections in five print "Connection closed by remote host", and, when the
+ * close overtook the last packets, report 255 for a command that had succeeded.
+ * The server log looked identical either way -- every one of those connections
+ * reached "connection closed" normally -- because nothing was wrong with the
+ * session. It was only the goodbye.
+ *
+ * The refusal path in accept_task() needs this too: a reset there discards the
+ * "too many connections" line before the client can read it, which is how that
+ * message came to be written and never once seen.
+ *
+ * The fix is to let the client hang up first. For `ssh host <cmd>` the client
+ * drives the teardown: having taken exit-status and CHANNEL_CLOSE it sends its
+ * own close and a DISCONNECT, then goes away. Reading until recv() returns 0
+ * waits for exactly that, and empties the receive buffer on the way -- close()
+ * on a socket with data still unread sends an RST rather than a FIN, which
+ * would put us back where we started.
+ *
+ * Sending SSH_MSG_DISCONNECT ourselves was tried and is worse: it arrives while
+ * the client is still finishing the channel, which aborts it, and turned two
+ * connections in five into seven in fifteen reporting failure for a command
+ * that had worked.
+ */
+static void close_gracefully(int fd)
+{
+    const int64_t deadline = esp_timer_get_time() + LINGER_DRAIN_MS * 1000;
+    char          scratch[64];
+
+    while (esp_timer_get_time() < deadline) {
+        const ssize_t n = recv(fd, scratch, sizeof(scratch), 0);
+        if (n == 0) {
+            break;                  /* peer hung up: nothing left unread */
+        }
+        if (n < 0 && errno != EINTR) {
+            break;                  /* timed out or failed; stop either way */
+        }
+    }
+
+    close(fd);
+}
+
 static void connection_task(void *arg)
 {
     const int fd = (int)(intptr_t)arg;
@@ -295,7 +349,7 @@ static void connection_task(void *arg)
         ssh_channel_run(c);
     } while (0);
 
-    close(c->fd);
+    close_gracefully(c->fd);
     kexinit_c_release(c);   /* no-op on the happy path, which released earlier */
     ssh_kex_release_keys(c);/* the PSA slots free(c) cannot reach */
     free(c);
@@ -323,20 +377,66 @@ static void accept_task(void *arg)
             continue;
         }
 
-        if (s_status.sessions >= CONFIG_ESPIX_SSH_MAX_SESSIONS) {
-            /* Refusing cleanly beats letting a connection half-work. The limit
-             * is above one because scp and sftp open their own connection, and
-             * transferring a file while a shell is open is the normal case. */
-            espix_klog(ESPIX_KLOG_WARN, TAG, "refusing connection: %d already open",
-                       s_status.sessions);
-            close(fd);
-            continue;
-        }
-
         /* Disable Nagle: a shell echoes single keystrokes, and coalescing them
          * makes typing feel broken. */
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        /*
+         * Set before the session limit is checked, not after: the refusal
+         * path below reads from this socket too, and without a timeout that
+         * read blocks forever -- in the accept loop, which stops the server
+         * answering anything at all.
+         *
+         * A receive timeout, so no read can block this connection's task
+         * forever. read_exact() turns it into "wait indefinitely" between
+         * packets and "give up eventually" partway through one -- see the note
+         * there for why those must differ.
+         *
+         * Without it a peer that sent half a packet and stopped parked the task
+         * permanently. The task never exited, so s_status.sessions never came
+         * back down, and four such connections made the server refuse
+         * everything thereafter. It is also reachable by anything that can open
+         * a socket to port 22, which makes it a denial of service rather than
+         * only a bug.
+         */
+        const struct timeval rcv_timeout = {
+            .tv_sec  = 0,
+            .tv_usec = 250 * 1000,
+        };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+
+        if (s_status.sessions >= CONFIG_ESPIX_SSH_MAX_SESSIONS) {
+            /*
+             * Refusing cleanly beats letting a connection half-work. The limit
+             * is above one because scp and sftp open their own connection, and
+             * transferring a file while a shell is open is the normal case.
+             *
+             * Say why. RFC 4253 4.2 lets a server send arbitrary CRLF-terminated
+             * lines before its version string, and requires clients to cope with
+             * them -- it is how OpenSSH reports "Exceeded MaxStartups". The one
+             * rule is that such a line must not begin with "SSH-".
+             *
+             * Closing without a word is what this used to do, and the client
+             * then prints "Connection closed by remote host", which is
+             * indistinguishable from a crash, a hang, or a truncated command.
+             * That ambiguity cost real debugging time: refused connections were
+             * being read as truncated ones.
+             */
+            char msg[80];
+            const int n = snprintf(msg, sizeof(msg),
+                                   "espix: too many connections (%d of %d in use)\r\n",
+                                   s_status.sessions,
+                                   CONFIG_ESPIX_SSH_MAX_SESSIONS);
+            if (n > 0) {
+                (void)send(fd, msg, (size_t)n, 0);
+            }
+
+            espix_klog(ESPIX_KLOG_WARN, TAG, "refusing connection: %d already open",
+                       s_status.sessions);
+            close_gracefully(fd);   /* or the reset discards the line just sent */
+            continue;
+        }
 
         espix_klog(ESPIX_KLOG_INFO, TAG, "connection from %s",
                    inet_ntoa(peer.sin_addr));
