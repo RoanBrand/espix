@@ -738,8 +738,32 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
      * and prompting *with* echo would be worse than being honest about it.
      * Revisit when the reentrant line editor lands.
      */
+    /*
+     * `passwd -l <user>` takes a password away rather than setting one, which
+     * is how root goes back to being unreachable after somebody gave it one.
+     * Root's alone: locking an account is administration, not self-service, and
+     * locking your own would be a way to shut yourself out with one typo.
+     */
+    if (argc == 3 && strcmp(argv[1], "-l") == 0) {
+        if (s == NULL || s->uid != 0) {
+            espix_printf(s, "passwd: only root can lock an account\n");
+            return 1;
+        }
+
+        const esp_err_t err = espix_auth_lock(argv[2]);
+        if (err != ESP_OK) {
+            espix_printf(s, "passwd: %s: %s\n", argv[2],
+                         (err == ESP_ERR_NOT_FOUND) ? "no such user"
+                                                    : esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "%s can no longer log in\n", argv[2]);
+        return 0;
+    }
+
     if (argc < 3) {
         espix_printf(s, "usage: passwd [user] <new-password>\n");
+        espix_printf(s, "       passwd -l <user>    take the password away\n");
         espix_printf(s, "note: the password is echoed and enters shell "
                         "history; no-echo input needs the new line editor\n");
         return 1;
@@ -816,6 +840,75 @@ static int cmd_id(espix_session_t *s, int argc, char **argv)
 }
 
 /*
+ * Run one command as root.
+ *
+ * espix has no setuid path for builtins and no `su`, so this is the only way up
+ * to uid 0 that does not need the serial console. Gated by /etc/sudoers, which
+ * espix_auth reads -- the file is 0600 root and that component already holds
+ * the privilege to reach it.
+ *
+ * It does NOT ask for a password, and that is a real weakness rather than an
+ * oversight. espix cannot read input without echoing it, which is the same
+ * limitation that makes `passwd` take the password as an argument; prompting
+ * here would print it. The session is already authenticated as this user, and
+ * sudo(8)'s own timestamp caching means a real one frequently does not re-ask
+ * either -- but an unattended terminal is a way in that Linux would have shut.
+ * Revisit with the reentrant line editor cmd_passwd() is also waiting on.
+ *
+ * The credential is raised around the dispatch and restored on every path out,
+ * including the one where the command fails. A process spawned in between
+ * copies uid 0 at admission and keeps it, which is correct: it was started
+ * under sudo and may outlive the command that started it.
+ */
+static int cmd_sudo(espix_session_t *s, int argc, char **argv)
+{
+    if (s == NULL) {
+        return 1;
+    }
+    if (argc < 2) {
+        espix_printf(s, "usage: sudo <command> [args...]\n");
+        return 1;
+    }
+
+    if (s->uid != 0 && !espix_auth_may_sudo(s->user)) {
+        espix_printf(s, "sudo: %s is not in %s\n", s->user, "/etc/sudoers");
+        espix_klog(ESPIX_KLOG_WARN, "sudo", "%s: refused", s->user);
+        return 1;
+    }
+
+    /* Rejoin, because the dispatcher takes a line rather than an argv. Args
+     * that were quoted on the way in lose their quoting here, which is the
+     * same thing the shell's own re-parsing does elsewhere. */
+    char line[ESPIX_LINE_MAX];
+    size_t n = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const int wrote = snprintf(line + n, sizeof(line) - n, "%s%s",
+                                   (i > 1) ? " " : "", argv[i]);
+        if (wrote < 0 || (size_t)wrote >= sizeof(line) - n) {
+            espix_printf(s, "sudo: command line too long\n");
+            return 1;
+        }
+        n += (size_t)wrote;
+    }
+
+    const uint16_t saved_uid = s->uid;
+    const uint16_t saved_gid = s->gid;
+
+    espix_klog(ESPIX_KLOG_INFO, "sudo", "%s runs: %s", s->user, line);
+
+    s->uid = 0;
+    s->gid = 0;
+
+    const int status = espix_shell_run_line(s, line);
+
+    s->uid = saved_uid;
+    s->gid = saved_gid;
+
+    return status;
+}
+
+/*
  * End the session, with an exit status.
  *
  * `exit` is the general form; `logout` is the same thing restricted to a login
@@ -882,13 +975,16 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "coredump [erase]" },
     { .name = "passwd", .fn = cmd_passwd,
       .help = "set a user's password",
-      .usage = "passwd [user] <new-password>" },
+      .usage = "passwd [user] <new-password> | passwd -l <user>" },
     { .name = "whoami", .fn = cmd_whoami,
       .help = "print the current user",
       .usage = "whoami" },
     { .name = "id",     .fn = cmd_id,
       .help = "print the current user and group ids",
       .usage = "id" },
+    { .name = "sudo",   .fn = cmd_sudo,
+      .help = "run a command as root",
+      .usage = "sudo <command> [args...]" },
     { .name = "echo",   .fn = cmd_echo,
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,

@@ -83,6 +83,15 @@ esp_err_t espix_auth_init(void);
  */
 bool espix_auth_verify(const char *user, const char *password);
 
+/*
+ * Take away a user's password, so nothing can authenticate as them again.
+ *
+ * The reverse of espix_auth_set_password(), and the only way back after root
+ * has been given one: unlocking is just setting a password, but without this
+ * that door could never be shut again.
+ */
+esp_err_t espix_auth_lock(const char *user);
+
 /* Replace a user's password, rewriting /etc/passwd. */
 esp_err_t espix_auth_set_password(const char *user, const char *password);
 
@@ -97,6 +106,19 @@ esp_err_t espix_auth_lookup(const char *user, espix_user_t *out);
  * be held across anything that might change the file.
  */
 const char *espix_auth_name_for_uid(espix_uid_t uid);
+
+/*
+ * May `user` run a command as root?
+ *
+ * The list is /etc/sudoers, one account name per line, `#` to end of line. It
+ * is the espix equivalent of Ubuntu putting the first account in the `sudo`
+ * group: root is seeded locked, so this is the only way up to uid 0 that does
+ * not need the serial console.
+ *
+ * Read here rather than by whoever asks, because the file is 0600 root and this
+ * component already holds the privilege seam for reaching such a file.
+ */
+bool espix_auth_may_sudo(const char *user);
 
 /*
  * True if `user` has no usable password and so can never authenticate. root is

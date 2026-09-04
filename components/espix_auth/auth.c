@@ -35,6 +35,7 @@
 #define TAG "auth"
 
 #define PASSWD_PATH     "/etc/passwd"
+#define SUDOERS_PATH    "/etc/sudoers"
 /*
  * Long enough for the widest record the format allows: a 16-character name, the
  * algorithm tag, 20000, a 32-hex salt, a 64-hex hash, uid, gid and a 63-byte
@@ -532,6 +533,37 @@ esp_err_t espix_auth_set_password(const char *user, const char *password)
     return err;
 }
 
+esp_err_t espix_auth_lock(const char *user)
+{
+    if (user == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    record_t rec;
+    if (!find_record(user, &rec)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (rec.locked) {
+        return ESP_OK;          /* already shut; not an error */
+    }
+
+    /* Drop the hash as well as setting the flag: a locked record should not
+     * carry material that would come back if the flag were ever lost. */
+    rec.locked = true;
+    rec.iters  = 0;
+    memset(rec.salt, 0, sizeof(rec.salt));
+    memset(rec.hash, 0, sizeof(rec.hash));
+
+    const esp_err_t err = upsert(&rec);
+    if (err == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "locked account '%s'", user);
+        if (strcmp(user, DEFAULT_USER) == 0) {
+            s_is_default = false;
+        }
+    }
+    return err;
+}
+
 esp_err_t espix_auth_lookup(const char *user, espix_user_t *out)
 {
     record_t rec;
@@ -663,6 +695,84 @@ static bool owner_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
     return found;
 }
 
+/* ------------------------------------------------------------------ */
+/* Who may become root                                                 */
+/* ------------------------------------------------------------------ */
+
+bool espix_auth_may_sudo(const char *user)
+{
+    if (user == NULL || user[0] == '\0') {
+        return false;
+    }
+
+    espix_fs_priv_begin();
+    FILE *f = fopen(SUDOERS_PATH, "r");
+    espix_fs_priv_end();
+
+    if (f == NULL) {
+        return false;       /* no list is an empty list, not an open door */
+    }
+
+    char line[ESPIX_USER_MAX + 8];
+    bool found = false;
+
+    while (!found && fgets(line, sizeof(line), f) != NULL) {
+        char *hash = strchr(line, '#');
+        if (hash != NULL) {
+            *hash = '\0';
+        }
+        line[strcspn(line, " \t\r\n")] = '\0';
+
+        if (line[0] != '\0' && strcmp(line, user) == 0) {
+            found = true;
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
+/*
+ * Seed the list with the default account, the way a Linux installer puts the
+ * first user in the `sudo` group.
+ *
+ * Without this a shipped device has a locked root and no way to reach it except
+ * the serial console -- which is defensible, but is not what anyone expects
+ * from the account the device tells them to log in as.
+ */
+static void ensure_sudoers(void)
+{
+    espix_fs_priv_begin();
+    FILE *probe = fopen(SUDOERS_PATH, "r");
+    espix_fs_priv_end();
+
+    if (probe != NULL) {
+        fclose(probe);
+        return;
+    }
+
+    espix_fs_priv_begin();
+    FILE *f = fopen(SUDOERS_PATH, "w");
+    espix_fs_priv_end();
+
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot create %s", SUDOERS_PATH);
+        return;
+    }
+
+    fprintf(f, "# Accounts that may run commands as root, one per line.\n");
+    fprintf(f, "%s\n", DEFAULT_USER);
+    fclose(f);
+
+    const esp_err_t err = espix_fs_chmod(SUDOERS_PATH, 0600);
+    if (err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot restrict %s: %s",
+                   SUDOERS_PATH, esp_err_to_name(err));
+    }
+    espix_klog(ESPIX_KLOG_INFO, TAG, "created %s with '%s'", SUDOERS_PATH,
+               DEFAULT_USER);
+}
+
 /*
  * Rewrite /etc/passwd once, if anything in it predates uids.
  *
@@ -739,6 +849,7 @@ esp_err_t espix_auth_init(void)
     }
 
     migrate();
+    ensure_sudoers();
 
     /*
      * Nobody but root reads this file directly.
