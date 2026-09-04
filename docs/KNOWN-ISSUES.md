@@ -35,19 +35,30 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   exactly what `espix_sigcheck()` is exported for. `apps/sigtest spin` is the
   case in the flesh. SIGKILL is the answer when it is somebody else's binary.
 
-- **`ssh host <cmd>` can truncate a long-running command's output.**
-  Intermittent, roughly a third of runs with an app that does a few file
-  operations: output stops partway and no exit status arrives, so the client
-  reports 255. The same app is correct every time on the serial console and in
-  an interactive SSH session, so it is the exec path's teardown racing the
-  process rather than anything in the app or the filesystem.
+- **`ssh host <cmd>` was unreliable; the causes are now understood.** It
+  truncated output and reported 255 for commands that had succeeded, roughly a
+  third of the time, while the same app was correct every time on the serial
+  console. Five separate defects turned out to be involved, all now fixed:
 
-  Two contributing causes were found and fixed — the client's `CHANNEL_EOF` was
-  being treated as the channel closing, and a stale event-group bit made
-  `espix_proc_wait()` report a freshly spawned process as already finished (see
-  the commit). Both were real and both improved it; a third cause remains
-  unidentified. Until it is, prefer an interactive session for anything whose
-  output matters.
+  - The client's `CHANNEL_EOF` was treated as the channel closing.
+  - A stale event-group bit made `espix_proc_wait()` report a freshly spawned
+    process as already finished.
+  - `conn->out_buf` was filled outside the transmit lock at six sites, so one
+    writer overwrote another's packet in flight — usually the exit status.
+  - A use-after-free that rebooted the board: `esp_cleanup_r()` fcloses an app's
+    stdout at `vTaskDelete()`, writing through a session whose channel
+    `finish_session()` had already freed.
+  - The connection was closed with a bare `close()` the moment the channel
+    finished. The client's own `CHANNEL_CLOSE` was then still unread in the
+    receive buffer, and `close()` with unread data sends an RST rather than a
+    FIN — which discards whatever is still queued to send. That is what
+    produced "Connection closed by remote host", and when the reset overtook
+    the last packets the client lost the exit status and reported 255.
+
+  The last one hid the others for a long time because the server log is
+  identical either way: every one of those connections reaches "connection
+  closed" normally. Nothing is wrong with the session — only with the goodbye.
+
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
