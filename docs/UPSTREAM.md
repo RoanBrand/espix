@@ -159,6 +159,12 @@ LittleFS by pointer; see [ARCHITECTURE.md](ARCHITECTURE.md). The addition is
 `esp_vfs_littlefs_register()` minus its final `esp_vfs_register_fs()`, and that
 function could reasonably be reimplemented in terms of it.
 
+ESP-IDF already does this for itself, which is the argument that the shape is
+ordinary rather than odd: `esp_vfs_uart_get_vfs()` exists so IDF's own console
+code can hold the UART driver's ops table instead of routing to it by path. That
+one lives in an `esp_private/` header, so it is internal — but "hand me the ops
+table" is evidently the shape IDF reaches for when it needs the same thing.
+
 ### How espix carries both
 
 [tools/esp_littlefs-attrs.patch](../tools/esp_littlefs-attrs.patch) holds both —

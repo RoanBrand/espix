@@ -47,15 +47,27 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## Filesystem
 
-- **A second filesystem would not get espix's permission check.** espix
-  registers its VFS at `""`, which is the *fallback* — reached only by paths no
-  longer prefix claims. That is right for devices: IDF's UART driver registers
-  `/dev/uart` at its own prefix and outranks the fallback, and a device has no
-  mode to check; eventfd has no path at all
-  (`esp_vfs_register_fs_with_id()`). But mount FAT on an SD card at `/mnt/sd`
-  and ESP-IDF routes it straight there, with `espix_fs_access_check()` never
-  called. Only the root filesystem is covered today. See
-  [ROADMAP.md](ROADMAP.md#filesystem).
+- **A device VFS is usable but invisible.** `/dev/uart` is registered by
+  ESP-IDF's UART driver and is live in this build, and because its prefix is
+  longer than espix's `""` it outranks the root and routes straight to the
+  driver. Its ops table carries `open`, `read`, `write`, `close`, `fstat`,
+  `fcntl` and `fsync`, so those work — but `ls` cannot show it, for two
+  unrelated reasons. `ls /dev` fails because `/dev` is not a directory in the
+  root filesystem and `readdir` never merges mount points. `ls -l /dev/uart/0`
+  fails because the UART VFS's *directory* ops contain only `access` — there is
+  no `stat` for `ls` to call.
+
+  **Unchanged by espix owning the root VFS**, so this is not a regression to go
+  looking for: LittleFS was the fallback before too and `/dev/uart` outranked it
+  identically. Both causes belong to ESP-IDF's driver and to what the rootfs
+  happens to contain.
+
+- **Only the root filesystem gets espix's permission check.** Anything
+  registered at its own prefix is routed by ESP-IDF before espix sees it, so
+  mounting FAT on an SD card at `/mnt/sd` would leave
+  `espix_fs_access_check()` uncalled for every file on it. Harmless for
+  devices, which have no mode to check; the problem is a second *filesystem*.
+  See [ROADMAP.md](ROADMAP.md#filesystem) for what closing it costs.
 
 - **Unmounting is two steps now, and `esp_vfs_littlefs_unregister()` is not one
   of them.** espix mounts through `esp_littlefs_mount()` and never registers

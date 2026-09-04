@@ -54,8 +54,29 @@ things are as they are.
   [UPSTREAM.md](UPSTREAM.md)). `/proc` is then espix's own ops rather than a
   filesystem at all, which is what makes it the cheap one to do first.
 
+  **"Routing internally" is smaller than it sounds**, and worth costing before
+  rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the
+  global fd table either way; what espix adds is a prefix lookup (an array and a
+  longest-match `strncmp`, ~30 lines) and one wrinkle — with two filesystems
+  below, LittleFS fd 3 and FAT fd 3 collide when they come back into espix's
+  `read()`, so the mount index gets packed into the fd espix returns and
+  unpacked on the way in. About ten lines and no second table. Call it eighty
+  lines, not a VFS.
+
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
+
+  **Why not extend ESP-IDF's VFS instead?** It has no hook of any kind —
+  `esp_vfs.h` offers nothing to intercept with. Patching `$IDF_PATH` is a
+  non-starter: it is shared by every project on the machine, where
+  `managed_components/` is per-project and gitignored. The real alternative is
+  shadowing the `vfs` component with a patched copy in `components/vfs/`, which
+  a project component may do — and that is *architecturally the better answer*,
+  putting the check in `esp_vfs_open()` where Linux puts it and covering every
+  mount with no routing code in espix at all. It is not first choice only
+  because of what it costs: `vfs.c` and `vfs_calls.c` are ~58KB of core code
+  that the console, sockets and eventfd all depend on, to be re-merged on every
+  IDF upgrade. Worth revisiting if the eighty lines above turn out to be wrong.
 
 - **A file surface for apps.** A loaded app cannot open a file. The ELF loader's
   built-in tables export `close` and `fwrite` and nothing else of the family --
