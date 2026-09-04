@@ -1064,8 +1064,24 @@ static void apply_account(espix_session_t *session, const char *user)
 {
     espix_user_t account;
 
-    if (espix_auth_lookup(user, &account) != ESP_OK ||
-        account.home[0] == '\0') {
+    if (espix_auth_lookup(user, &account) != ESP_OK) {
+        /*
+         * Authentication passed but the account will not resolve -- /etc/passwd
+         * changed underneath the login, or will no longer parse. Run as nobody
+         * rather than leaving the credential as it was found: the session
+         * struct is zero-initialised, and zero is root.
+         */
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: no account record; running as nobody", user);
+        session->uid = ESPIX_UID_NOBODY;
+        session->gid = ESPIX_UID_NOBODY;
+        return;
+    }
+
+    session->uid = account.uid;
+    session->gid = account.gid;
+
+    if (account.home[0] == '\0') {
         return;
     }
 
@@ -1246,6 +1262,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .write     = chan_write,
             .poll_interrupt = chan_poll_interrupt,
             .transport = ch,
+            /* Overwritten by apply_account(); nobody rather than 0 so that a
+             * path which forgets to set it fails closed instead of open. */
+            .uid       = ESPIX_UID_NOBODY,
+            .gid       = ESPIX_UID_NOBODY,
             .fg_pid    = ESPIX_PID_NONE,
             .ansi      = ch->has_pty,
             .open_stream = chan_open_stream,
@@ -1338,6 +1358,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .write     = chan_write,
         .poll_interrupt = chan_poll_interrupt,
         .transport = ch,
+        /* Overwritten by apply_account(); nobody rather than 0 so that a
+         * path which forgets to set it fails closed instead of open. */
+        .uid       = ESPIX_UID_NOBODY,
+        .gid       = ESPIX_UID_NOBODY,
         .fg_pid    = ESPIX_PID_NONE,
         .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,

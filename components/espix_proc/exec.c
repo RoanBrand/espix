@@ -314,6 +314,13 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     slot->info.state      = ESPIX_PROC_READY;
     slot->info.session    = session;
 
+    /*
+     * Credentials, copied now rather than followed later. A session with no
+     * session at all is espix starting something itself, which is root.
+     */
+    slot->info.uid = (session != NULL) ? session->uid : 0;
+    slot->info.gid = (session != NULL) ? session->gid : 0;
+
     /* Inherited from whoever spawned it, like a child's cwd everywhere else.
      * A session with no cwd, or no session at all, means "/". */
     strlcpy(slot->cwd,

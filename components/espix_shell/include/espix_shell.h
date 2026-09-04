@@ -21,6 +21,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #include "esp_err.h"
@@ -53,6 +54,22 @@ struct espix_session {
      * cannot disagree the way they used to.
      */
     char        user[ESPIX_SESSION_USER_MAX];
+
+    /*
+     * The same identity as a number, which is what the filesystem compares
+     * against. Resolved once, when the session is set up, rather than looked up
+     * per file operation: /etc/passwd is the authority but it is not something
+     * to be re-read on the path of every open().
+     *
+     * uid 0 is the superuser and skips permission checks entirely. The console
+     * is 0 for the reason `user` is "root" -- whoever is holding the board has
+     * already won -- and an SSH session gets whatever its account carries.
+     *
+     * A process inherits these from the session that launched it; see
+     * espix_proc_cred_of_task(), which is what espix_fs_access_check() asks.
+     */
+    uint16_t    uid;
+    uint16_t    gid;
 
     /*
      * Home directory, or empty for a session that has none. The prompt shows it

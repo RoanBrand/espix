@@ -715,6 +715,26 @@ espix_pid_t espix_proc_pid_of_task(TaskHandle_t task)
     return ESPIX_PID_NONE;
 }
 
+bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid)
+{
+    if (task == NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        if (g_espix_procs[i].info.task == task) {
+            if (uid != NULL) {
+                *uid = g_espix_procs[i].info.uid;
+            }
+            if (gid != NULL) {
+                *gid = g_espix_procs[i].info.gid;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Working directory of the calling process.
  *
