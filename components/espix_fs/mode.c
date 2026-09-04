@@ -95,6 +95,24 @@ static bool looks_executable(const char *abs_path)
 static mode_t mode_from_rule(const char *abs_path, const struct stat *st)
 {
     if (S_ISDIR(st->st_mode)) {
+        /*
+         * /tmp is the one directory everybody is expected to be able to write,
+         * and 1777 is what every Unix gives it: writable by all, but the sticky
+         * bit means you may remove only what you own.
+         *
+         * In the rule rather than stamped on at boot, for the same reasons the
+         * rest of the rule exists. It costs no flash write, it survives a
+         * storage-flash -- the image carries no attributes at all -- and a
+         * deliberate chmod still wins, because a stored attribute always beats
+         * the rule.
+         *
+         * Without this, ownership made /tmp root's and 0755, and no ordinary
+         * user could write there at all. That was a regression the moment
+         * permissions started being enforced.
+         */
+        if (strcmp(abs_path, "/tmp") == 0) {
+            return 01777;
+        }
         return 0755;
     }
     return looks_executable(abs_path) ? 0755 : 0644;
@@ -321,19 +339,30 @@ esp_err_t espix_fs_chown(const char *abs_path, uint16_t uid, uint16_t gid)
         attr.gid = gid;
     }
 
+    /*
+     * Handing a file to somebody drops setuid and setgid, as chown(2) does.
+     *
+     * Not the main containment -- only root may chown at all, and only root can
+     * therefore produce a root-owned setuid binary -- but it closes the shape of
+     * the mistake where an administrator chowns a user's setuid program to root
+     * meaning to tidy up, and grants it the superuser instead.
+     */
+    attr.mode &= (uint16_t)~(S_ISUID | S_ISGID);
+
     return attr_store(abs_path, &st, &attr);
 }
 
 /*
- * "-rwxr-xr-x", the way ls writes it.
+ * "-rwxr-xr-x", or "drwxrwxrwt", the way ls writes it.
  *
- * Never emits s, S, t or T. espix stores nine bits, not twelve. Files have
- * owners now, so it is no longer that setuid, setgid and sticky have nothing to
- * be defined against; it is that espix does not act on them -- a process's
- * credentials come from its session and nothing else hands them out, and
- * nothing consults the sticky bit when deleting from a directory. Printing
- * those letters would report a protection that nothing implements, to someone
- * reading `ls -l` who would reasonably believe it.
+ * The three high bits fold into the execute column of the triad they belong to,
+ * as ls(1) does it: lowercase when that execute bit is also set, uppercase when
+ * it is not -- so `s` means setuid-and-executable and `S` means setuid on
+ * something nobody can execute, which is nearly always a mistake worth seeing.
+ *
+ * espix emits these now because it acts on all three; while it did not, printing
+ * them would have reported a protection nothing implemented to someone reading
+ * `ls -l` who would reasonably have believed it.
  */
 void espix_fs_mode_str(mode_t mode, bool is_dir, char *out, size_t len)
 {
@@ -343,6 +372,17 @@ void espix_fs_mode_str(mode_t mode, bool is_dir, char *out, size_t len)
     for (int i = 0; i < 9; i++) {
         /* Bit 8 is owner-read, bit 0 is other-execute. */
         s[1 + i] = (mode & (mode_t)(1u << (8 - i))) ? "rwx"[i % 3] : '-';
+    }
+
+    /* Each replaces the execute character of its own triad. */
+    if (mode & S_ISUID) {
+        s[3] = (mode & S_IXUSR) ? 's' : 'S';
+    }
+    if (mode & S_ISGID) {
+        s[6] = (mode & S_IXGRP) ? 's' : 'S';
+    }
+    if (mode & S_ISVTX) {
+        s[9] = (mode & S_IXOTH) ? 't' : 'T';
     }
     s[10] = '\0';
 

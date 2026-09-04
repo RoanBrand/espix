@@ -60,20 +60,35 @@ esp_err_t espix_fs_rm_rf(const char *abs_path);
 /* ------------------------------------------------------------------ */
 
 /*
- * espix implements nine permission bits and not twelve.
+ * All twelve bits, and every one of them is consulted somewhere.
  *
- * Files now have owners, so the reason has changed. It is no longer that
- * setuid, setgid and sticky have nothing to be defined against; it is that
- * espix does not act on them. There is no privilege for a setuid binary to
- * raise to that a process could not already reach, because a process's
- * credentials come from its session and nothing hands them out otherwise, and
- * nothing consults the sticky bit when deleting from a directory.
+ * espix stored nine for a long time, on the rule that it will not keep a bit it
+ * does not act on -- a mode someone can set and read back but which changes
+ * nothing is worse than an error. The other three now have somewhere to be
+ * read:
  *
- * So they would still be bits that could be stored, displayed and never
- * consulted, which is the thing worth refusing. chmod rejects them by name
- * rather than masking them away silently; see chmod_parse().
+ *   - setuid on a regular file: espix_proc gives the process the file's uid
+ *     instead of the launching session's.
+ *   - setgid on a regular file: the same for gid.
+ *   - sticky on a directory: espix_fs_access_check() lets you remove only what
+ *     you own, which is what makes a 1777 /tmp safe to share.
+ *
+ * The combinations that still mean nothing are refused by name rather than
+ * stored and ignored -- setuid or setgid on a *directory*, which Linux uses for
+ * group inheritance espix does not implement, and sticky on a *file*, which
+ * Linux ignores. See chmod_parse().
+ *
+ * Worth being honest about what setuid buys here: the S3 has no MMU, so an app
+ * already shares the address space with the kernel and setuid is a guardrail
+ * against mistakes rather than a boundary against hostile code. It is
+ * implemented now because the hardware that makes it a real boundary -- the
+ * S31, which has an MMU -- exists.
  */
-#define ESPIX_MODE_BITS 0777
+#define ESPIX_MODE_BITS 07777
+
+/* The nine permission bits alone, where the owner/group/other triads are meant
+ * rather than the whole stored mode. */
+#define ESPIX_PERM_BITS 0777
 
 /*
  * Where a mode lives when it differs from the rule: a LittleFS user attribute
