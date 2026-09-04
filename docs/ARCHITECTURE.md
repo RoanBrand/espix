@@ -34,16 +34,90 @@ begins.
 
 ## Decisions worth knowing
 
-### LittleFS is mounted as the real root `/`
+### `/` is real, and it is espix's
 
-`esp_vfs_littlefs_register()` is called with `base_path = ""`. ESP-IDF
-documents the empty base path as registering a *fallback* VFS that handles any
-path no other VFS claims, so paths are `/bin/hello` and `/etc/motd` rather than
-`/storage/bin/hello`, while `/dev/*` still resolves to its own driver by
-longest-prefix match.
+Paths are `/bin/hello` and `/etc/motd`, not `/storage/bin/hello`, because
+espix registers a VFS with `base_path = ""` — which ESP-IDF documents as a
+*fallback* handling any path no other VFS claims. `/dev/*` still reaches its own
+driver, by being a longer prefix.
 
-This is documented but not a well-trodden path. If it misbehaves, the fallback
-is to mount at `/storage` and add a rewrite shim — contained to `espix_fs`.
+That registration used to be LittleFS's. It is now espix's own VFS, with
+LittleFS mounted beneath it and holding no path of its own; the next section is
+why. The property described here is unchanged — one filesystem, at the real
+root — and the empty base path is still what delivers it.
+
+### espix owns the root VFS, and that is where permissions belong
+
+Every file call in the system — from a shell command or from an app loaded off
+the filesystem — goes through ESP-IDF's VFS, which routes by path prefix to
+whichever driver registered it. espix used to register joltwallet's LittleFS
+port at `""` (the fallback, which is what makes a filesystem the root) and live
+above it. That left espix nowhere to stand: an app calls `fopen()`, libc calls
+the VFS, the VFS calls the port, and no espix code runs on the path at all.
+
+**Linux and NuttX both check permissions in the VFS, not in filesystems.**
+`inode_permission()` / `generic_permission()` decide; ext4 and btrfs carry no
+permission checks and merely supply `i_mode`/`i_uid`/`i_gid`. So espix
+registers its own VFS as the root, with LittleFS underneath it, and
+`espix_fs_access_check()` sits in `open`, `opendir`, `unlink`, `rename`,
+`mkdir`, `rmdir` and `truncate`. Not `stat`: POSIX gates that on execute
+permission for each parent directory rather than read on the file, and espix
+does no path-traversal checks, so gating it would be stricter than Unix rather
+than closer.
+
+#### Stacked by pointer, not by path
+
+The obvious way to reach the layer below is to give it a base path — mount
+LittleFS at `/.lfs` and rewrite `/etc/motd` into `/.lfs/etc/motd`. That works,
+and it publishes a *second name for the root*: anything spelling `/.lfs/...`
+addresses the filesystem with the checks skipped. Which would make the whole
+exercise decorative.
+
+A stackable filesystem does not route through the namespace; it holds a pointer
+to the layer below. `esp_littlefs_mount()` — added by
+[tools/patch-littlefs.py](../tools/patch-littlefs.py) — mounts without
+registering a base path and returns the driver's ops and context, so LittleFS is
+live and reachable by **no path at all**. `ls /.lfs` answers "no such file or
+directory", and that is a test worth keeping.
+
+Two words hide in "mount", and separating them is the whole trick:
+
+| | what it means | the call |
+|---|---|---|
+| Mount the filesystem | read the superblock, make `lfs_t` live | `lfs_mount()` |
+| Publish a name | tell the VFS "paths under X route here" | `esp_vfs_register_fs()` |
+
+`esp_vfs_littlefs_register()` does both, which is why espix could never have one
+without the other. Note also that `""` and `"/"` are not two entries to divide
+between two filesystems: `is_path_prefix_valid()` requires two characters or
+more, so registering at `"/"` fails outright. `""` *is* the root, and one VFS
+holds it.
+
+Three things fall out of forwarding by pointer. No second name. No path
+translation, since the port wants a mount-relative path and espix's base is
+`""`. And no `DIR` wrapper — `esp_vfs_opendir()` stamps `dd_vfs_idx` on
+whatever handle comes back, marking LittleFS's handle as espix's, which is
+harmless only because forwarding is a direct call: the port's `readdir` casts
+the pointer to its own type and never reads that field. Routing through a path
+would have sent `readdir` back into espix, forever.
+
+`df` still reports `littlefs` on `/`, and that stays true: espix's VFS holds no
+storage, so the filesystem really is LittleFS. It resolves by partition label,
+not by path, so it never noticed the change.
+
+#### The check allows everything, for now
+
+`espix_fs_access_check()` resolves the caller — `xTaskGetCurrentTaskHandle()` →
+`espix_proc_pid_of_task()` → the slot's session → its user — treats a task with
+no pid as espix itself and unrestricted, and then returns "allow". Enforcement
+needs an owner on a file to compare a mode against, and no file records one yet.
+
+Landing the seam alone was the point: being on the path at all, for apps as well
+as commands, is the part that was impossible before, and it is provable on its
+own. The DEBUG log is that proof — the ELF loader reading `/bin/hello` appears
+as `D fs: pid 3: open /bin/hello`, a path no other seam in espix can observe. A
+shell command does *not* appear, because a session task is not a process, which
+is the discrimination working rather than a gap.
 
 ### File modes are a rule plus an attribute on the file
 
@@ -95,11 +169,14 @@ espix sits in the call path, not about how much work each would be.
 
 espix owns execution. `run` and the shell's fallback both go through
 `espix_proc_spawn_elf()`, so "may this run" is a question there is somewhere to
-ask. Reading and writing are not like that: an app opens a file by calling libc,
-which reaches the VFS, which knows nothing about processes — there is no seam
-between the two where espix could stand. Enforcing read permission in `cat`
-alone would produce a boundary you could step around with `run`, which is worse
-than admitting there is none.
+ask.
+
+Reading and writing had no such place until espix took the root VFS — an app
+opened a file through libc and the VFS reached the filesystem without passing
+espix, and enforcing in `cat` alone would have been a boundary you step around
+with `run`. That seam now exists (see above); what is still missing is an
+*owner* on a file to compare a mode against, so the check is wired and
+permissive.
 
 Two identities exist — `root` on the console, `esp` over SSH — so it is not that
 there is nobody to distinguish between. What is missing is an *owner* on the

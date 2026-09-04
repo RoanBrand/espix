@@ -2,12 +2,18 @@ idf_component_register(
     SRCS
         "fs.c"
         "mode.c"
+        "vfs.c"
+        "access.c"
     INCLUDE_DIRS
         "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
     REQUIRES
         esp_common
     PRIV_REQUIRES
         espix_kernel
+        espix_proc
+        espix_shell
         joltwallet__littlefs
         vfs
 )

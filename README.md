@@ -167,8 +167,8 @@ hand where there is no network.
 
 That choice has real costs — every file espix creates for itself is written
 inside that window — and is the sort of thing worth reading the reasoning on
-before changing it; see the last entry under **Deferred** in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+before changing it; see **Networking and time** in
+[docs/ROADMAP.md](docs/ROADMAP.md#networking-and-time).
 
 `/etc/timezone` holds a **POSIX TZ string**, not a zoneinfo name — espix ships
 no tzdata, so the rules live in the string: `SAST-2`, `EST5EDT,M3.2.0,M11.1.0`,
@@ -262,7 +262,7 @@ merely missing.
 | `/proc`, `mount` / `umount` | **planned** | |
 | Mode bits, `chmod` | **yes** | nine bits, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
-| Read and write bits enforced | **no** | stored and displayed only; an app reaches the VFS through libc, which has no idea which process is calling |
+| Read and write bits enforced | **no** | the seam exists — espix owns the root VFS, so every `open()` passes through it — but no file has an owner to check a mode against yet |
 | `chown`, owner and group | **no** | no file records an owner — which is also why setuid, setgid and sticky are refused rather than stored |
 | Symlinks, `ln` | **no** | cost, not principle: LittleFS has no link type, and following one means loop detection in every path lookup |
 
@@ -459,9 +459,11 @@ once added. None is incorporated today — `espressif/elf_loader`,
 the IDF component manager rather than vendored into this tree.
 
 `joltwallet/littlefs` is the one exception to "fetched and left alone": the
-build adds a public custom-attribute API to the downloaded copy, because espix
-keeps a file's mode in a LittleFS user attribute and the port exposes no way to
-reach one. Nothing is copied into this tree — see
+build adds two things to the downloaded copy — a public custom-attribute API,
+because espix keeps a file's mode in a LittleFS user attribute and the port
+exposes no way to reach one, and a mount-only entry point, because espix
+registers the root VFS itself and needs the filesystem mounted without a name
+of its own. Nothing is copied into this tree — see
 [tools/patch-littlefs.py](tools/patch-littlefs.py) and
 [docs/UPSTREAM.md](docs/UPSTREAM.md) — and the patch is written to be sent
 upstream, at which point it goes away.

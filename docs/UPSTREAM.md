@@ -145,10 +145,26 @@ registry's other littlefs entries are wrappers and applications rather than
 ports, ESP-IDF bundles none, and `muvox-io/esp_littlefs`, the only real fork, is
 a 2023 PSRAM variant with no attribute API either.
 
-**espix patches it.** [tools/esp_littlefs-attrs.patch](../tools/esp_littlefs-attrs.patch)
-adds `esp_littlefs_setattr`/`getattr`/`removeattr`, modelled on the port's own
-mtime helpers and taking the same lock, and
-[tools/patch-littlefs.py](../tools/patch-littlefs.py) applies it to the
+### Mounting and registering cannot be separated
+
+`esp_vfs_littlefs_register()` mounts the filesystem *and* registers the driver at
+a base path. A VFS stacked on top needs the first without the second — it has to
+be the only name in the namespace, because a base path on the layer beneath
+would reach the filesystem with the upper layer's checks bypassed. There is no
+mount-only entry point, and no way to obtain the ops table and context of an
+already-registered VFS.
+
+espix needs exactly that, since it registers the root VFS itself and forwards to
+LittleFS by pointer; see [ARCHITECTURE.md](ARCHITECTURE.md). The addition is
+`esp_vfs_littlefs_register()` minus its final `esp_vfs_register_fs()`, and that
+function could reasonably be reimplemented in terms of it.
+
+### How espix carries both
+
+[tools/esp_littlefs-attrs.patch](../tools/esp_littlefs-attrs.patch) holds both —
+the three attribute accessors, modelled on the port's own mtime helpers and
+taking the same lock, and `esp_littlefs_mount()` — and
+[tools/patch-littlefs.py](../tools/patch-littlefs.py) applies them to the
 downloaded copy from a CMake hook. That is the least clean of the options --
 it mutates a tree the build system treats as read-only, and `managed_components/`
 is gitignored so nothing records that it happened. It was chosen over vendoring

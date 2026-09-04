@@ -1,12 +1,17 @@
 /*
  * espix root filesystem.
  *
- * LittleFS is registered as the VFS *fallback* (empty base path), which makes
+ * espix registers its *own* VFS as the fallback (empty base path), which makes
  * it the real root: paths are /bin/hello, /etc/motd, /home/... rather than
  * /storage/bin/hello. ESP-IDF documents the empty-base-path case explicitly
  * ("a fallback VFS ... will handle paths which are not matched by any other
  * registered VFS"), so device VFSes such as /dev/uart keep working via
  * longest-prefix match.
+ *
+ * LittleFS sits underneath, mounted but registered at no path at all, reached
+ * through a pointer rather than a name -- see vfs.c. That is what puts espix on
+ * the path of every file call in the system, an app's fopen() included, which
+ * is where a permission check belongs and where it was previously impossible.
  */
 #pragma once
 

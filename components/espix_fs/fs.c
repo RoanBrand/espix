@@ -14,6 +14,8 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 
+#include "espix_fs_priv.h"
+
 #define TAG "fs"
 
 /* Created on first boot so a freshly-formatted filesystem still looks sane,
@@ -47,8 +49,27 @@ esp_err_t espix_fs_mount_root(void)
         return ESP_OK;
     }
 
-    /* base_path = "" registers the fallback VFS, i.e. this filesystem becomes
-     * the root. Anything a more specific VFS claims (/dev/...) still wins. */
+    /*
+     * Two steps, and keeping them apart is the point.
+     *
+     * esp_littlefs_mount() mounts the filesystem and hands back the driver
+     * without registering it at any base path, so littlefs is live and
+     * addressable by no path at all. espix then registers its own VFS at ""
+     * -- the fallback, which is what makes a filesystem the root -- and calls
+     * littlefs through the returned ops.
+     *
+     * That ordering is what gives espix somewhere to stand: every file call in
+     * the system now passes through espix_fs_access_check() before reaching
+     * the filesystem, including an app's fopen(), which used to bypass espix
+     * entirely. See vfs.c, and docs/ARCHITECTURE.md for why the check belongs
+     * at this layer rather than inside a filesystem.
+     *
+     * Registering littlefs at a path as well would undo it: that path would
+     * reach the filesystem with the checks skipped.
+     *
+     * base_path is "" rather than NULL so the port's F_GETPATH answers with
+     * the same absolute paths espix uses.
+     */
     const esp_vfs_littlefs_conf_t conf = {
         .base_path              = "",
         .partition_label        = ESPIX_FS_ROOT_PARTITION,
@@ -56,10 +77,18 @@ esp_err_t espix_fs_mount_root(void)
         .grow_on_mount          = true,
     };
 
-    esp_err_t err = esp_vfs_littlefs_register(&conf);
+    const esp_vfs_fs_ops_t *lower_ops = NULL;
+    void                   *lower_ctx = NULL;
+
+    esp_err_t err = esp_littlefs_mount(&conf, &lower_ops, &lower_ctx);
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "rootfs mount failed: %s",
                    esp_err_to_name(err));
+        return err;
+    }
+
+    err = espix_vfs_register_root(lower_ops, lower_ctx);
+    if (err != ESP_OK) {
         return err;
     }
 

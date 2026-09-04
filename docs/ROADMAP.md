@@ -72,28 +72,22 @@ things are as they are.
   `CONFIG_SCHED_USER_IDENTITY` tracks a task's real and effective UID/GID and
   checks file permissions against the effective one.
 
-- **Own the filesystem driver instead of consuming one.** espix mounts
-  `joltwallet/littlefs` and lives above it. It could instead drive LittleFS
-  itself and register its own VFS: ESP-IDF's VFS is pluggable through
-  `esp_vfs_register_fs*()` and `esp_vfs_fs_ops_t`, with
-  `ESP_VFS_FLAG_CONTEXT_PTR` for the mount context.
+- ~~**Own the filesystem driver instead of consuming one.**~~ Done differently,
+  and better. espix registers the root VFS and stacks LittleFS underneath it by
+  pointer rather than by path, so the permission seam exists without espix
+  taking on 3000 lines of POSIX-to-LittleFS translation or giving up SD/MMC and
+  the block-device layer. See [ARCHITECTURE.md](ARCHITECTURE.md). The remaining
+  work is the *policy*, which is the item above, and getting the two patched
+  entry points upstream, which is [UPSTREAM.md](UPSTREAM.md).
 
-  This is the entry that unblocks the others. Every `fopen()` an app makes is
-  dispatched by the VFS into the registered driver, so if that driver is
-  espix's, it can ask `xTaskGetCurrentTaskHandle()` ->
-  `espix_proc_pid_of_task()` -> the slot's session -> its user, and *enforce* a
-  mode rather than merely storing one. Read and write permissions are
-  unenforceable today precisely because that seam belongs to someone else --
-  which is also why NuttX, which owns its VFS, can do it and espix cannot. It
-  would additionally retire `tools/patch-littlefs.py`, since espix would hold
-  the `lfs_t` that patch exists to expose.
-
-  The cost, measured rather than guessed: `lfs.c` is 6558 lines of upstream
-  LittleFS and would be used unchanged. What espix would take on is the glue --
-  `esp_littlefs.c` is 3020 lines, though a good deal of that is multi-backend
-  support (SD/MMC, block devices, partitions) that a single-partition mount does
-  not need -- plus the 89-line flash block device in `littlefs_esp_part.c`. And
-  the maintenance: bugs joltwallet currently fixes would become espix's.
+- **Enforce read and write, once files have owners.** `espix_fs_access_check()`
+  is called from `open`, `opendir`, `unlink`, `rename`, `mkdir`, `rmdir` and
+  `truncate` and returns "allow" every time, because a mode needs a subject to
+  be checked against. Wiring the policy is small; the prerequisite is the item
+  above. Note that `stat` is deliberately not gated, and that `access` is left
+  unimplemented to match the port — implementing it from the mode espix already
+  knows would change the SFTP server's `O_EXCL` behaviour, which is worth doing
+  deliberately rather than as a side effect.
 
 ## Signals
 

@@ -752,6 +752,16 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
     espix_printf(s, "%-12s %9s %9s %9s %5s %s\n",
                  "Filesystem", "1K-blocks", "Used", "Available", "Use%",
                  "Mounted on");
+    /*
+     * Still "littlefs" on "/", and both halves are still true even though `/`
+     * is served by espix's own VFS now: that layer holds no storage, it holds
+     * the name and the policy. The filesystem underneath really is LittleFS.
+     * (Linux shows `overlay` for a stacking filesystem, but overlayfs has an
+     * upper layer with storage of its own; espix's does not.)
+     *
+     * espix_fs_stat_root() resolves by partition label rather than by path, so
+     * it never noticed the change.
+     */
     espix_printf(s, "%-12s %9u %9u %9u %4u%% %s\n",
                  "littlefs", total_k, used_k, total_k - used_k, pct, "/");
     return 0;

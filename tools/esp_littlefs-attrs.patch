@@ -1,31 +1,56 @@
-Add a public custom-attribute API
+Add a custom-attribute API and a mount-only entry point
+
+Two gaps, both of which stop a project building anything on top of this port.
+
+1. Custom attributes are unreachable.
 
 LittleFS user attributes are the idiomatic place for POSIX-style metadata --
 SPEC.md describes them as intended for "timestamps, hashes", they ride the
 entry's metadata so rename moves them and delete drops them, and this port
-already uses one ('t') for mtime.
+already uses one ('t') for mtime. But nothing outside the port can reach them:
+`_efs[]` is file-scope static, esp_littlefs_by_label() is static, and
+littlefs_api.h is under PRIV_INCLUDE_DIRS. ESP-IDF's VFS cannot route around it
+either, having no chmod or attribute member in esp_vfs_fs_ops_t -- IDF's own
+vfs/test_apps/main/test_vfs_access.c carries a TODO saying as much.
 
-But nothing outside the port can reach them. `_efs[]` is file-scope static,
-esp_littlefs_by_label() is static, and littlefs_api.h -- where esp_littlefs_t.fs
-lives -- is under PRIV_INCLUDE_DIRS. ESP-IDF's VFS cannot route around it
-either, having no chmod or attribute member in esp_vfs_fs_ops_t (IDF's own
-vfs/test_apps/main/test_vfs_access.c carries a TODO saying as much).
+esp_littlefs_setattr/getattr/removeattr are modelled directly on the port's
+existing esp_littlefs_update_mtime_attr()/esp_littlefs_get_mtime_attr(), taking
+the same sem_take(efs) lock and the same label lookup. Paths are
+mount-relative, matching the rest of the internal API.
 
-So a project wanting to store, say, a file mode has no way to put it on the
-file. These three functions are modelled directly on the port's existing
-esp_littlefs_update_mtime_attr()/esp_littlefs_get_mtime_attr(), taking the same
-sem_take(efs) lock and the same label lookup.
+2. Mounting and registering cannot be separated.
 
-Paths are mount-relative, matching the rest of the internal API.
+esp_vfs_littlefs_register() mounts the filesystem *and* registers the driver at
+a base path. A VFS stacked on top of this one -- adding permission checks, an
+overlay, a union mount -- needs the first without the second: it has to be the
+only name in the namespace, because if the layer beneath also has a base path
+then that path reaches the filesystem with the upper layer's checks bypassed.
+
+esp_littlefs_mount() does the mount and hands back the ops table and context so
+a caller can invoke the driver directly. It is esp_vfs_littlefs_register()
+minus its final esp_vfs_register_fs(), and that function could reasonably be
+reimplemented in terms of it.
+
+Note the public header now includes esp_vfs_ops.h, to name esp_vfs_fs_ops_t.
+`vfs` is currently in priv_requires; a maintainer may prefer it public, or
+prefer the out-params typed as void** to avoid the include.
 
 --- a/include/esp_littlefs.h
 +++ b/include/esp_littlefs.h
-@@ -288,7 +288,48 @@
+@@ -6,6 +6,7 @@
+ #include "esp_idf_version.h"
+ #include <stdbool.h>
+ #include "esp_partition.h"
++#include "esp_vfs_ops.h"   /* for esp_littlefs_mount()'s esp_vfs_fs_ops_t */
+ 
+ /** LittleFS over ESP-IDF Block Device Layer (`esp_blockdev`) is only built on ESP-IDF 6+ (non-ESP8266). */
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0) && !defined(ESP8266)
+@@ -288,7 +289,75 @@
   */
  esp_err_t esp_littlefs_blockdev_info(esp_blockdev_handle_t blockdev, size_t *total_bytes, size_t *used_bytes);
  #endif
 +
- 
++
 +/**
 + * @brief Set a LittleFS custom (user) attribute on a file or directory.
 + *
@@ -45,7 +70,7 @@ Paths are mount-relative, matching the rest of the internal API.
 + */
 +esp_err_t esp_littlefs_setattr(const char *partition_label, const char *path,
 +                               uint8_t type, const void *buf, size_t size);
-+
+ 
 +/**
 + * @brief Read a LittleFS custom (user) attribute.
 + *
@@ -65,6 +90,33 @@ Paths are mount-relative, matching the rest of the internal API.
 + */
 +esp_err_t esp_littlefs_removeattr(const char *partition_label, const char *path,
 +                                  uint8_t type);
++
++/**
++ * @brief Mount a LittleFS partition without publishing it in the VFS.
++ *
++ * esp_vfs_littlefs_register() does two separable things: it mounts the
++ * filesystem, and it registers the driver at a base path so that paths route to
++ * it. This does only the first, and hands back the driver so a caller can
++ * invoke it directly.
++ *
++ * That is what a stackable filesystem needs. A VFS layered on top of this one
++ * -- adding permission checks, a union mount, an overlay -- has to be the only
++ * name in the namespace, or the layer beneath it stays addressable and the
++ * layering can be bypassed by spelling the lower path. Holding the ops and
++ * context instead of routing through a second base path avoids that entirely.
++ *
++ * `conf->base_path` may be NULL or "". It is stored for the port's own
++ * F_GETPATH handling and is not registered anywhere.
++ *
++ * @param conf      Mount configuration, as for esp_vfs_littlefs_register().
++ * @param out_ops   Receives the driver's operations table.
++ * @param out_ctx   Receives the context to pass as those operations' first
++ *                  argument.
++ *
++ * @return ESP_OK, or the error esp_vfs_littlefs_register() would have given.
++ */
++esp_err_t esp_littlefs_mount(const esp_vfs_littlefs_conf_t *conf,
++                             const esp_vfs_fs_ops_t **out_ops, void **out_ctx);
 +
  #ifdef __cplusplus
  } // extern "C"
@@ -88,7 +140,7 @@ Paths are mount-relative, matching the rest of the internal API.
 +    sem_take(efs);
 +    int res = lfs_setattr(efs->fs, path, type, buf, size);
 +    sem_give(efs);
-+
+ 
 +    if (res < 0) {
 +        errno = lfs_errno_remap(res);
 +        ESP_LOGV(ESP_LITTLEFS_TAG, "Failed to set attr %u on \"%s\" (%d)",
@@ -110,7 +162,7 @@ Paths are mount-relative, matching the rest of the internal API.
 +    sem_take(efs);
 +    lfs_ssize_t res = lfs_getattr(efs->fs, path, type, buf, size);
 +    sem_give(efs);
- 
++
 +    if (res < 0) {
 +        if (res != LFS_ERR_NOATTR) {
 +            errno = lfs_errno_remap(res);
@@ -143,3 +195,37 @@ Paths are mount-relative, matching the rest of the internal API.
  esp_err_t esp_littlefs_info(const char* partition_label, size_t *total_bytes, size_t *used_bytes){
      int index;
      esp_err_t err;
+@@ -453,6 +517,33 @@
+ };
+ 
+ #endif // ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
++esp_err_t esp_littlefs_mount(const esp_vfs_littlefs_conf_t *conf,
++                             const esp_vfs_fs_ops_t **out_ops, void **out_ctx)
++{
++    int index;
++
++    if (conf == NULL || out_ops == NULL || out_ctx == NULL) {
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    esp_err_t err = esp_littlefs_init(conf, &index);
++    if (err != ESP_OK) {
++        ESP_LOGE(ESP_LITTLEFS_TAG, "Failed to initialize LittleFS");
++        return err;
++    }
++
++    /* Recorded for F_GETPATH, not registered. Unlike
++     * esp_vfs_littlefs_register() this tolerates a NULL base path, there being
++     * no base path to register. */
++    if (conf->base_path != NULL) {
++        strlcat(_efs[index]->base_path, conf->base_path, ESP_VFS_PATH_MAX + 1);
++    }
++
++    *out_ops = &s_vfs_littlefs;
++    *out_ctx = _efs[index];
++    return ESP_OK;
++}
++
+ esp_err_t esp_vfs_littlefs_register(const esp_vfs_littlefs_conf_t * conf)
+ {
+     int index;

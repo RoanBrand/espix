@@ -67,10 +67,11 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   execute bit is different because espix *owns* the exec path, and so can be
   asked.
 
-  Fixable, and the fix is structural rather than clever: a VFS espix registers
-  itself would be handed every `open()` and could ask which task is calling.
-  See [ROADMAP.md](ROADMAP.md#filesystem). NuttX enforces these bits for exactly
-  that reason — it owns its VFS.
+  The *seam* now exists: espix registers the root VFS itself, so every
+  `open()` — an app's included — passes through `espix_fs_access_check()`, which
+  resolves the calling task to a process to a session to a user. What is still
+  missing is an owner on a *file* to compare that against, so the check is wired
+  and permissive. See [ROADMAP.md](ROADMAP.md#filesystem).
 
 - **No file has an owner**, so `chown` does not exist and setuid, setgid and
   sticky are refused by `chmod` rather than stored. There are two identities --

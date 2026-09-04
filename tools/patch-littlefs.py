@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Add a public custom-attribute API to the downloaded joltwallet/littlefs.
+Add a custom-attribute API and a mount-only entry point to the downloaded
+joltwallet/littlefs.
 
 Why this exists
 ---------------
@@ -11,10 +12,17 @@ LittleFS carries POSIX-style metadata in user attributes -- `lfs_setattr`,
 under PRIV_INCLUDE_DIRS. ESP-IDF's VFS cannot route around it either, having no
 chmod or attribute concept in `esp_vfs_fs_ops_t`.
 
-So espix would have no way to put a file's mode on the file. This adds three
-functions, modelled directly on the port's own mtime helpers
+So espix would have no way to put a file's mode on the file. Three of the four
+additions fix that, modelled directly on the port's own mtime helpers
 (esp_littlefs_update_mtime_attr / esp_littlefs_get_mtime_attr), taking the same
 lock and the same label lookup.
+
+The fourth is esp_littlefs_mount(). esp_vfs_littlefs_register() both mounts the
+filesystem and registers it at a base path, and espix needs the first without
+the second: it registers its *own* VFS as the root -- which is where a
+permission check belongs, the same place Linux and NuttX put theirs -- and calls
+this driver through the returned ops. Were littlefs also published at a path,
+that path would address the filesystem with espix's checks bypassed.
 
 This is the least clean option available, and it is chosen deliberately over the
 alternatives rather than for want of them: the component is on the registry and
@@ -42,14 +50,67 @@ from pathlib import Path
 
 EXPECTED_VERSION = "1.22.3"
 COMPONENT = "joltwallet__littlefs"
-MARKER = "esp_littlefs_setattr"
+# Each insertion is guarded by a symbol unique to *it*, not one flag per file.
+# A single shared marker breaks the moment one file takes two insertions: the
+# second sees the first's symbol and skips, silently, which is exactly what it
+# did on the first clean-fetch test of the mount addition.
+MARK_INCLUDE = "esp_vfs_ops.h"
+MARK_ATTRS   = "esp_littlefs_setattr"
+# Not "esp_littlefs_mount": that is a substring of the port's pre-existing
+# esp_littlefs_mounted(), so it matches before anything has been added and the
+# insertion skips itself. The open paren is what distinguishes them.
+MARK_MOUNT   = "esp_littlefs_mount("
 
 HEADER_ANCHOR = '#ifdef __cplusplus\n} // extern "C"\n#endif'
+
+# The mount-only entry point names esp_vfs_fs_ops_t, so the public header has to
+# be able to see it. Added by its own anchor rather than inside the block below,
+# because an #include nested in `extern "C" {` is the kind of thing that works
+# until someone compiles the header from C++.
+INCLUDE_ANCHOR = '#include "esp_partition.h"'
+
+INCLUDE_ADDITION = '''#include "esp_partition.h"
+#include "esp_vfs_ops.h"   /* for esp_littlefs_mount()'s esp_vfs_fs_ops_t */'''
 
 SOURCE_ANCHOR = (
     "esp_err_t esp_littlefs_info(const char* partition_label, "
     "size_t *total_bytes, size_t *used_bytes){"
 )
+
+# Anchored on the definition (brace, not semicolon) so it does not match the
+# header. Must come after `static esp_vfs_fs_ops_t s_vfs_littlefs` is defined,
+# which this does; esp_littlefs_init() is forward-declared at the top.
+MOUNT_ANCHOR = ("esp_err_t esp_vfs_littlefs_register"
+                "(const esp_vfs_littlefs_conf_t * conf)\n{")
+
+MOUNT_ADDITION = '''esp_err_t esp_littlefs_mount(const esp_vfs_littlefs_conf_t *conf,
+                             const esp_vfs_fs_ops_t **out_ops, void **out_ctx)
+{
+    int index;
+
+    if (conf == NULL || out_ops == NULL || out_ctx == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = esp_littlefs_init(conf, &index);
+    if (err != ESP_OK) {
+        ESP_LOGE(ESP_LITTLEFS_TAG, "Failed to initialize LittleFS");
+        return err;
+    }
+
+    /* Recorded for F_GETPATH, not registered. Unlike
+     * esp_vfs_littlefs_register() this tolerates a NULL base path, there being
+     * no base path to register. */
+    if (conf->base_path != NULL) {
+        strlcat(_efs[index]->base_path, conf->base_path, ESP_VFS_PATH_MAX + 1);
+    }
+
+    *out_ops = &s_vfs_littlefs;
+    *out_ctx = _efs[index];
+    return ESP_OK;
+}
+
+'''
 
 HEADER_ADDITION = '''
 /**
@@ -91,6 +152,33 @@ esp_err_t esp_littlefs_getattr(const char *partition_label, const char *path,
  */
 esp_err_t esp_littlefs_removeattr(const char *partition_label, const char *path,
                                   uint8_t type);
+
+/**
+ * @brief Mount a LittleFS partition without publishing it in the VFS.
+ *
+ * esp_vfs_littlefs_register() does two separable things: it mounts the
+ * filesystem, and it registers the driver at a base path so that paths route to
+ * it. This does only the first, and hands back the driver so a caller can
+ * invoke it directly.
+ *
+ * That is what a stackable filesystem needs. A VFS layered on top of this one
+ * -- adding permission checks, a union mount, an overlay -- has to be the only
+ * name in the namespace, or the layer beneath it stays addressable and the
+ * layering can be bypassed by spelling the lower path. Holding the ops and
+ * context instead of routing through a second base path avoids that entirely.
+ *
+ * `conf->base_path` may be NULL or "". It is stored for the port's own
+ * F_GETPATH handling and is not registered anywhere.
+ *
+ * @param conf      Mount configuration, as for esp_vfs_littlefs_register().
+ * @param out_ops   Receives the driver's operations table.
+ * @param out_ctx   Receives the context to pass as those operations' first
+ *                  argument.
+ *
+ * @return ESP_OK, or the error esp_vfs_littlefs_register() would have given.
+ */
+esp_err_t esp_littlefs_mount(const esp_vfs_littlefs_conf_t *conf,
+                             const esp_vfs_fs_ops_t **out_ops, void **out_ctx);
 
 '''
 
@@ -193,11 +281,17 @@ def check_version(root):
         )
 
 
-def insert_after(path, anchor, addition, what):
+def insert_after(path, anchor, addition, what, marker, replacement=None):
+    """Put `addition` in front of `anchor`, or swap the anchor for `replacement`.
+
+    Named for what it does in the common case. The replacement form exists for
+    the one addition that has to go *at* a line rather than before a block --
+    adding an #include next to an existing one.
+    """
     text = path.read_text(encoding="utf-8")
 
-    if MARKER in text:
-        return False  # already patched; configure runs on every build
+    if marker in text:
+        return False  # this insertion is already in; configure runs every build
 
     n = text.count(anchor)
     if n != 1:
@@ -209,7 +303,8 @@ def insert_after(path, anchor, addition, what):
             f"loosening this check."
         )
 
-    path.write_text(text.replace(anchor, addition + anchor, 1), encoding="utf-8")
+    new = replacement if replacement is not None else addition + anchor
+    path.write_text(text.replace(anchor, new, 1), encoding="utf-8")
     return True
 
 
@@ -230,10 +325,18 @@ def main():
         if not p.is_file():
             die(f"expected {p} to exist")
 
-    a = insert_after(header, HEADER_ANCHOR, HEADER_ADDITION, "header")
-    b = insert_after(source, SOURCE_ANCHOR, SOURCE_ADDITION, "source")
+    done = [
+        insert_after(header, INCLUDE_ANCHOR, "", "header include",
+                     MARK_INCLUDE, replacement=INCLUDE_ADDITION),
+        insert_after(header, HEADER_ANCHOR, HEADER_ADDITION, "header",
+                     MARK_ATTRS),
+        insert_after(source, SOURCE_ANCHOR, SOURCE_ADDITION, "source attrs",
+                     MARK_ATTRS),
+        insert_after(source, MOUNT_ANCHOR, MOUNT_ADDITION, "source mount",
+                     MARK_MOUNT),
+    ]
 
-    if a or b:
+    if any(done):
         print("patch-littlefs: added the custom-attribute API to "
               f"{COMPONENT} {EXPECTED_VERSION}")
     return 0
