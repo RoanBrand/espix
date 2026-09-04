@@ -155,16 +155,23 @@ static void proc_task(void *arg)
      * assignment affects this task alone. It is the same trick ESP-IDF's own
      * console REPL uses.
      *
-     * Two separate streams, and neither is closed here: task teardown calls
-     * esp_cleanup_r(), which fcloses whichever of stdin/stdout/stderr differ
-     * from the global ones. One object shared between stdout and stderr would
-     * be closed twice, which asserts inside the second fclose.
+     * Two separate streams rather than one shared: esp_cleanup_r() fcloses
+     * whichever of stdin/stdout/stderr differ from the global ones, and one
+     * object behind both would be closed twice, which asserts inside the
+     * second fclose.
+     *
+     * We close them ourselves at `done:` rather than leaving them to that
+     * teardown -- see the note there. The previous values are kept so they can
+     * be put back, which is what makes esp_cleanup_r() find nothing to do.
      *
      * Not applied to `>` redirection: that FILE is closed when the command
      * returns, and a backgrounded app would outlive it.
      */
     espix_session_t *const session = slot->info.session;
     const bool own_streams = (session != NULL && session->open_stream != NULL);
+
+    FILE *const prev_stdout = stdout;
+    FILE *const prev_stderr = stderr;
 
     if (own_streams) {
         FILE *const out = session->open_stream(session);
@@ -226,14 +233,39 @@ static void proc_task(void *arg)
 
 done:
     /*
-     * An app that printf()'d without a trailing newline still has bytes sitting
-     * in the stream buffer. Flush here rather than leaving it to the fclose in
-     * esp_cleanup_r(): the shell is released the moment this process is marked
-     * finished, so anything still buffered would land after its next prompt.
+     * Close the session's streams here, and put the globals back, so that
+     * esp_cleanup_r() finds nothing of ours to close when this task is deleted.
+     *
+     * Flushing alone was not enough, and the difference was a use-after-free.
+     * These streams write through the session, whose transport for an SSH
+     * connection is the channel -- and the channel, its transmit lock included,
+     * is freed as soon as the session ends. The session ends when this process
+     * is marked finished, three lines below. So the fclose that esp_cleanup_r()
+     * performs at vTaskDelete() ran *after* the channel had been freed, took a
+     * deleted semaphore handle, and panicked in xQueueReceive with a
+     * LoadProhibited.
+     *
+     * That is why `ssh host <cmd>` truncated an app's output about a third of
+     * the time: the device rebooted mid-command. It never touched builtins,
+     * which run on the connection's own task and own no streams, nor an
+     * interactive session, which outlives the command, nor the console, whose
+     * open_stream is NULL.
+     *
+     * Nothing of this process may touch the session after espix_proc_finish().
      */
     if (own_streams) {
-        fflush(stdout);
-        fflush(stderr);
+        FILE *const out = stdout;
+        FILE *const err = stderr;
+
+        stdout = prev_stdout;
+        stderr = prev_stderr;
+
+        if (out != prev_stdout) {
+            fclose(out);            /* flushes on the way out */
+        }
+        if (err != prev_stderr) {
+            fclose(err);
+        }
     }
 
     /* Tear the ELF down before releasing the file buffer: the relocated image
