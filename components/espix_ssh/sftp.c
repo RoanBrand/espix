@@ -741,9 +741,19 @@ static esp_err_t do_close(sftp_t *s, uint32_t id, ssh_buf_t *in)
  * nothing, because the rule already gives every directory 0755 and there is no
  * traversal check to make it mean something. And setuid, setgid and sticky are
  * masked off rather than rejected: SFTP has no partial-success status, so
- * failing the request would fail the whole `scp -p` over a bit that was never
- * going to be honoured. The shell's own chmod refuses them out loud instead,
- * where there is a person to tell.
+ * failing the request would fail the whole `scp -p` over a bit the client
+ * probably copied from the local file without meaning anything by it. The
+ * shell's own chmod refuses them out loud instead, where there is a person to
+ * tell.
+ *
+ * The mask is ESPIX_PERM_BITS and not ESPIX_MODE_BITS, and that distinction is
+ * now load-bearing rather than tidy. espix acts on setuid, and this code runs
+ * on the connection task -- neither a process nor a session -- so
+ * espix_fs_access_check() treats it as espix itself and does not gate it.
+ * Passing the whole mode through would let anyone with an SFTP login set setuid
+ * on a root-owned binary and then run it. See docs/KNOWN-ISSUES.md: SFTP being
+ * unchecked is a wider gap than this one line, and this line is what stops that
+ * gap from being an escalation.
  */
 static esp_err_t do_setstat(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
 {
@@ -794,7 +804,7 @@ static esp_err_t do_setstat(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
         return send_status(s, id, SSH_FX_OK, "");
     }
 
-    const esp_err_t err = espix_fs_chmod(path, (mode_t)perms & ESPIX_MODE_BITS);
+    const esp_err_t err = espix_fs_chmod(path, (mode_t)perms & ESPIX_PERM_BITS);
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "chmod %s failed: %s",
                    path, esp_err_to_name(err));
