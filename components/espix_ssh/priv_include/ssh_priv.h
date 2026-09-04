@@ -177,6 +177,16 @@ typedef struct {
     uint8_t *in_payload;
     size_t   in_len;
 
+    /*
+     * The one outgoing packet buffer for this connection: every writer builds
+     * here, and ssh_packet_write() encrypts in place and bumps seq_out.
+     *
+     * A channel's tx_lock therefore has to be held from the first ssh_put_*
+     * until after the send -- not just around the send. Filling it unlocked
+     * overwrites whatever another task has in flight, which is how
+     * `ssh host <cmd>` came to truncate its output and lose its exit status
+     * about a third of the time.
+     */
     uint8_t  out_buf[SSH_MAX_PACKET];
     uint8_t  frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8];
 } ssh_conn_t;

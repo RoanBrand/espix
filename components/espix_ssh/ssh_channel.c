@@ -203,8 +203,16 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
 {
     ssh_conn_t *c = ch->conn;
 
-    /* Held across the whole write, not per packet: a long line split over
-     * several packets must not have another task's output spliced into it. */
+    /*
+     * Held across the whole write, not per packet: a long line split over
+     * several packets must not have another task's output spliced into it.
+     *
+     * And note what the lock is really guarding -- conn->out_buf, not just the
+     * socket. Every writer on this connection builds its packet in that one
+     * buffer, so the lock has to be held from the first ssh_put_* to the last
+     * send. Control packets used to be filled outside it, which quietly
+     * clobbered whatever was mid-flight.
+     */
     xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
 
     esp_err_t err = ESP_OK;
@@ -421,6 +429,20 @@ static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
 
     const uint32_t add = LOCAL_WINDOW - ch->local_window;
     ssh_buf_t      b;
+
+    /*
+     * The lock goes round the *building* of the packet as well as the send.
+     * conn->out_buf is one buffer shared by every writer on this connection,
+     * and send_data() holds this same lock while filling it -- so filling it
+     * here unlocked would overwrite whatever an app's task is midway through
+     * transmitting. That is not theoretical: it truncated `ssh host <cmd>`
+     * output about a third of the time, because the app writes from its own
+     * task while the connection task tears the session down.
+     *
+     * Recursive, so send_packet() taking it again is free.
+     */
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_WINDOW_ADJUST);
     ssh_put_u32(&b, ch->peer_chan);
@@ -429,6 +451,8 @@ static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
     if (send_packet(ch, &b) == ESP_OK) {
         ch->local_window += add;
     }
+
+    xSemaphoreGiveRecursive(ch->tx_lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -844,10 +868,17 @@ static int chan_read_line(espix_session_t *s, const char *prompt,
 static esp_err_t reply_request(ssh_chan_t *ch, bool ok)
 {
     ssh_buf_t b;
+
+    /* Locked across the fill; see the note in adjust_local_window(). */
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, ok ? SSH_MSG_CHANNEL_SUCCESS : SSH_MSG_CHANNEL_FAILURE);
     ssh_put_u32(&b, ch->peer_chan);
-    return send_packet(ch, &b);
+
+    const esp_err_t err = send_packet(ch, &b);
+    xSemaphoreGiveRecursive(ch->tx_lock);
+    return err;
 }
 
 static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
@@ -977,21 +1008,37 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
 /* Session                                                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Locked across the fill; see adjust_local_window(). This one is why the bug
+ * was worth chasing: when the buffer got clobbered it was usually *this*
+ * packet that lost, so the client received no exit status at all and reported
+ * 255 for a command that had succeeded.
+ */
 static esp_err_t send_exit_status(ssh_chan_t *ch, uint32_t status)
 {
     ssh_buf_t b;
+
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_REQUEST);
     ssh_put_u32(&b, ch->peer_chan);
     ssh_put_cstr(&b, "exit-status");
     ssh_put_u8(&b, 0);                  /* never wants a reply */
     ssh_put_u32(&b, status);
-    return send_packet(ch, &b);
+
+    const esp_err_t err = send_packet(ch, &b);
+    xSemaphoreGiveRecursive(ch->tx_lock);
+    return err;
 }
 
+/* One lock across both packets, not one each: EOF and CLOSE belong together and
+ * nothing should be able to land between them. */
 static void close_channel(ssh_chan_t *ch)
 {
     ssh_buf_t b;
+
+    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
 
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_EOF);
@@ -1002,6 +1049,8 @@ static void close_channel(ssh_chan_t *ch)
     ssh_put_u8(&b, SSH_MSG_CHANNEL_CLOSE);
     ssh_put_u32(&b, ch->peer_chan);
     send_packet(ch, &b);
+
+    xSemaphoreGiveRecursive(ch->tx_lock);
 }
 
 /*
@@ -1052,9 +1101,17 @@ static void finish_session(ssh_chan_t *ch, espix_session_t *session)
     }
 
     if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
-        xSemaphoreGiveRecursive(ch->tx_lock);
+        /*
+         * Held across the send, not released before it. Taking the lock and
+         * giving it straight back only proved the lock had been free a moment
+         * ago -- an app still finishing its output could acquire it in the gap
+         * and be inside send_data() when the packets below overwrote the
+         * buffer it was using. Keeping it means anything in flight has
+         * finished, which is what the check was for.
+         */
         send_exit_status(ch, (uint32_t)session->last_status);
         close_channel(ch);
+        xSemaphoreGiveRecursive(ch->tx_lock);
     } else {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "transmit lock held by a killed process; closing abruptly");
