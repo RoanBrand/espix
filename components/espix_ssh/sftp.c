@@ -30,6 +30,7 @@
 
 #include "esp_heap_caps.h"
 
+#include "espix_auth.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "ssh_priv.h"
@@ -472,6 +473,17 @@ static esp_err_t do_opendir(sftp_t *s, uint32_t id, ssh_buf_t *in)
  * round-trips on a long directory, and it keeps every name and its attributes
  * inside one packet buffer without a second-guess about the arithmetic.
  */
+/* An account's name for `id`, or the number itself when nothing claims it. */
+static void id_name(uint16_t id, char *out, size_t len)
+{
+    const char *name = espix_auth_name_for_uid(id);
+    if (name != NULL) {
+        strlcpy(out, name, len);
+    } else {
+        snprintf(out, len, "%u", (unsigned)id);
+    }
+}
+
 static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
 {
     sftp_handle_t *h = handle_get(s, in);
@@ -537,9 +549,29 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
     char perms[11];
     espix_fs_mode_str(mode, S_ISDIR(st.st_mode), perms, sizeof(perms));
 
-    char longname[sizeof(de->d_name) + 64];
-    snprintf(longname, sizeof(longname), "%s 1 esp esp %8u %s %s",
-             perms, (unsigned)st.st_size, when, de->d_name);
+    /*
+     * The owner, likewise, rather than the "esp esp" that used to be written
+     * here whatever the file said. A uid with no account prints as a number,
+     * which is what every other ls does and is more use than a wrong name.
+     *
+     * Copied rather than pointed at: espix_auth_name_for_uid() answers out of a
+     * single-entry cache, so asking it about the group would move the ground
+     * under a pointer still held for the owner.
+     */
+    uint16_t uid = 0;
+    uint16_t gid = 0;
+    if (have_path) {
+        espix_fs_owner(full, &st, &uid, &gid);
+    }
+
+    char owner[ESPIX_USER_MAX];
+    char group[ESPIX_USER_MAX];
+    id_name(uid, owner, sizeof(owner));
+    id_name(gid, group, sizeof(group));
+
+    char longname[sizeof(de->d_name) + 96];
+    snprintf(longname, sizeof(longname), "%s 1 %s %s %8u %s %s",
+             perms, owner, group, (unsigned)st.st_size, when, de->d_name);
 
     ssh_buf_t b;
     ssh_buf_init(&b, s->out, sizeof(s->out));
