@@ -62,14 +62,16 @@ esp_err_t espix_fs_rm_rf(const char *abs_path);
 /*
  * espix implements nine permission bits and not twelve.
  *
- * There are two identities -- `root` on the console and `esp` over SSH -- so it
- * is not that there is nobody to distinguish. What is missing is an *owner*:
- * no file records one, and setuid, setgid and sticky are all defined in terms
- * of the owner of the thing they are set on. Each would be a bit that could be
- * stored, displayed and never consulted.
+ * Files now have owners, so the reason has changed. It is no longer that
+ * setuid, setgid and sticky have nothing to be defined against; it is that
+ * espix does not act on them. There is no privilege for a setuid binary to
+ * raise to that a process could not already reach, because a process's
+ * credentials come from its session and nothing hands them out otherwise, and
+ * nothing consults the sticky bit when deleting from a directory.
  *
- * chmod refuses them by name rather than masking them away silently; see
- * chmod_parse().
+ * So they would still be bits that could be stored, displayed and never
+ * consulted, which is the thing worth refusing. chmod rejects them by name
+ * rather than masking them away silently; see chmod_parse().
  */
 #define ESPIX_MODE_BITS 0777
 
@@ -81,10 +83,10 @@ esp_err_t espix_fs_rm_rf(const char *abs_path);
  * There is no registry of attribute types -- SPEC.md says as much -- so 0x70
  * is a local choice. The ESP port uses 't' (0x74) for mtime; do not collide.
  *
- * uid and gid are stored from the start and read by nothing. Fixing the record
- * now costs four bytes a file and saves rewriting every stored mode when there
- * is an owner model to fill them in. They are storage only: unlike setuid,
- * nothing displays them as though they meant something.
+ * uid and gid were stored from the start and read by nothing, so that filling
+ * them in later would cost no rewrite of anything already on disk. This is
+ * later: they now carry a real owner, and espix_fs_access_check() compares
+ * against them.
  */
 #define ESPIX_FS_ATTR_POSIX 0x70
 
@@ -102,6 +104,65 @@ typedef struct __attribute__((packed)) {
  * takes its own. Returns 0 for a path that does not exist.
  */
 mode_t espix_fs_mode(const char *abs_path, const struct stat *st);
+
+/*
+ * The owner of `abs_path`: the stored attribute if there is one, else the rule.
+ *
+ * `st` is an already-taken stat to save a second one, as for espix_fs_mode().
+ * Either output pointer may be NULL. A path that does not exist, or a system
+ * with no owner rule installed, answers root -- which is also what a zero-filled
+ * attribute says, so the absence of information and the presence of uid 0 mean
+ * the same thing on purpose.
+ */
+void espix_fs_owner(const char *abs_path, const struct stat *st,
+                    uint16_t *uid, uint16_t *gid);
+
+/*
+ * Set the owner of an existing path and persist it.
+ *
+ * Pass ESPIX_FS_KEEP_ID for either field to leave it alone, which is what
+ * `chown user` (no group) and `chgrp` need.
+ *
+ * As with espix_fs_chmod(), an owner the rule already produces removes the
+ * attribute rather than storing one, so chowning a file back to where it
+ * started leaves no trace.
+ */
+#define ESPIX_FS_KEEP_ID ((uint16_t)0xFFFF)
+
+esp_err_t espix_fs_chown(const char *abs_path, uint16_t uid, uint16_t gid);
+
+/*
+ * Who owns a path that carries no stored attribute.
+ *
+ * espix_fs cannot answer this itself: it means reading /etc/passwd, and
+ * espix_auth already depends on espix_fs, so the call has to go the other way.
+ * espix_auth installs the rule once it has parsed the account file; until then,
+ * and if nothing ever installs one, everything belongs to root.
+ *
+ * Return false to decline, which means root.
+ */
+typedef bool (*espix_fs_owner_rule_t)(const char *abs_path, uint16_t *uid,
+                                      uint16_t *gid);
+
+void espix_fs_set_owner_rule(espix_fs_owner_rule_t rule);
+
+/*
+ * Run a stretch of file operations as root, for a component that owns a file
+ * the permission check would otherwise keep it out of.
+ *
+ * espix has no setuid, so there is no way for `passwd` -- a builtin, running
+ * with the credentials of whoever typed it -- to rewrite /etc/passwd, and no way
+ * for `ls -l` to read a name out of it when it is 0600 root. Unix solves that
+ * by making the binary setuid-root. espix solves it by letting the one component
+ * that understands the file reach it directly, and keeping everyone else out.
+ *
+ * Deliberately not a general capability: espix_auth is the only caller, the
+ * scope is a few lines around a fopen(), and the pairing is per task, so one
+ * session raising privilege cannot affect another. Nest freely; the depth is
+ * counted. Anything added here should be able to say why it is not a hole.
+ */
+void espix_fs_priv_begin(void);
+void espix_fs_priv_end(void);
 
 /*
  * Whether `abs_path` may be executed: a regular file whose mode has S_IXUSR.
