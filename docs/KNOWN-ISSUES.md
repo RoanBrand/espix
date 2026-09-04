@@ -66,6 +66,32 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## Filesystem
 
+- **A directory's mode does not hide what is inside it.** Unix requires search
+  (`x`) permission on every component of a path; espix checks the final
+  component, plus the parent for anything that creates or removes a name. So
+  `chmod 700 /home/esp` stops `ls /home/esp`, but a user who already knows the
+  full path can still `cat /home/esp/notes`. A full walk costs a stat per
+  component on every file operation in the system, and computing a rule-derived
+  mode already costs an open and a four-byte read per file. Worth revisiting if
+  path resolution ever caches directory modes.
+
+- **Permission checks apply to espix's own tools, not to espix itself.** A task
+  that is neither a process nor inside a session -- SNTP, the WiFi driver, an
+  SSH connection task before it has authenticated anyone -- is the kernel and is
+  not checked. That is what lets boot read `/etc/wifi.conf` before there is
+  anybody to be. It also means anything espix runs on such a task is, in effect,
+  root; the seam to watch is `espix_fs_priv_begin()`, which deliberately grants
+  the same thing to `espix_auth` and to the ELF-magic probe, and which should
+  stay at those two callers.
+
+- **`chown` cannot give a file away, and there is no `su`.** Only root may
+  change an owner, which is standard, but espix has no way to become root over
+  the network: the account is locked and there is no `su` or `sudo`. Root is the
+  serial console. That is deliberate while there is nothing to authorise such a
+  transition with, and it means an SSH user who needs to fix a root-owned file
+  needs the board.
+
+
 - **A device VFS is usable but invisible.** `/dev/uart` is registered by
   ESP-IDF's UART driver and is live in this build, and because its prefix is
   longer than espix's `""` it outranks the root and routes straight to the

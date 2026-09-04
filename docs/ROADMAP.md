@@ -96,21 +96,26 @@ things are as they are.
   [UPSTREAM.md](UPSTREAM.md), and delete
   [tools/patch-littlefs.py](../tools/patch-littlefs.py) when it lands.
 
-- **An owner on a file, and a uid on a process.** The on-disk room is already
-  there: every stored mode carries `uid` and `gid` fields, written as zero and
-  read by nothing, so filling them in costs no rewrite. espix already has two
-  identities -- `root` on the console, `esp` over SSH -- and `espix_proc_info_t`
-  already carries the session a process belongs to, so "who is asking" is
-  answerable. What is missing is who a *file* belongs to. That is the
-  prerequisite for `chown`, for setuid/setgid/sticky to be more than bits, and
-  for `/etc/shadow` to be worth splitting out of `/etc/passwd` -- which
-  `espix_auth.h` declined to do for exactly this reason. Note that read/write
-  enforcement needs more than this: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md), and
-  the VFS entry below, which is what would make it possible at all.
+- ~~**An owner on a file, and a uid on a process.**~~ Done. Accounts carry a uid
+  and a gid, `/etc/passwd` grew both fields with a one-time migration for older
+  three-field records, and `root` became a real account -- locked, so it is
+  reachable from the console but never over SSH. A session resolves its
+  credentials once at login and a process copies them at spawn rather than
+  following the session pointer, which would be a use-after-free for anything
+  backgrounded.
 
-  Prior art worth reading before designing this: NuttX's
-  `CONFIG_SCHED_USER_IDENTITY` tracks a task's real and effective UID/GID and
-  checks file permissions against the effective one.
+  Files get their owner from the stored attribute when there is one and from a
+  rule when there is not: the account whose home contains the path, longest home
+  winning, and root otherwise. Since root's home is `/`, that makes the rootfs
+  root's and `/home/esp` esp's with nothing written to flash to say so -- which
+  is what keeps a freshly imaged device free of attribute data and what makes a
+  storage-flash come back correct.
+
+  What is left of the case for `/etc/shadow`: very little. The file is 0600
+  root, and every reader goes through espix_auth, which raises privilege for its
+  own open -- espix has no setuid, so that seam is what stands in for it. A
+  split would separate the hashes from the names, which matters only once
+  something other than espix_auth needs to read the names.
 
 - ~~**Own the filesystem driver instead of consuming one.**~~ Done differently,
   and better. espix registers the root VFS and stacks LittleFS underneath it by
@@ -120,14 +125,23 @@ things are as they are.
   work is the *policy*, which is the item above, and getting the two patched
   entry points upstream, which is [UPSTREAM.md](UPSTREAM.md).
 
-- **Enforce read and write, once files have owners.** `espix_fs_access_check()`
-  is called from `open`, `opendir`, `unlink`, `rename`, `mkdir`, `rmdir` and
-  `truncate` and returns "allow" every time, because a mode needs a subject to
-  be checked against. Wiring the policy is small; the prerequisite is the item
-  above. Note that `stat` is deliberately not gated, and that `access` is left
-  unimplemented to match the port — implementing it from the mode espix already
-  knows would change the SFTP server's `O_EXCL` behaviour, which is worth doing
-  deliberately rather than as a side effect.
+- ~~**Enforce read and write, once files have owners.**~~ Done, and it applies
+  to builtins as well as to loaded apps: credentials come from the process when
+  there is one and from the task's current session otherwise, so `cat` and `rm`
+  over SSH are checked like anything else. Only espix itself -- a task that is
+  neither -- goes unchecked, which is what lets boot read its own configuration.
+
+  `stat` is still deliberately not gated, and `access` is still unimplemented to
+  match the port. What remains: search permission is checked on the final path
+  component and on the parent for anything that creates or removes a name, not
+  on every intermediate directory; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+- **Groups that are more than a number.** Every account's gid equals its uid and
+  there is no `/etc/group`, but the gid is stored on every file and the group
+  triad is checked, so the format and the check are already the right shape.
+  What is missing is membership: a way for two accounts to share a group, which
+  is the only thing that would make the middle triad say anything the owner
+  triad does not.
 
 ## Signals
 

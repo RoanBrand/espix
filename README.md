@@ -287,10 +287,13 @@ merely missing.
 | | | |
 |---|---|---|
 | Password authentication | **yes** | PBKDF2-SHA256, per-user salt, `/etc/passwd` |
-| `passwd`, `whoami` | **yes** | |
+| `passwd`, `whoami`, `id` | **yes** | `passwd` refuses to change another account's, unless root |
 | More than one account | **partial** | the file format holds them; no `adduser` yet |
-| uid/gid, file ownership, `su` | **planned** | a minimal user system, not a full POSIX one |
-| `sudo`, groups, per-app capabilities | **planned** | so an app need not run as root or see the whole filesystem |
+| uid/gid and file ownership | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
+| Enforced read/write/execute | **yes** | in espix's VFS, for builtins and loaded apps alike |
+| `chown`, `chgrp` | **yes** | changing an owner is root's, as in chown(2) |
+| `su`, `sudo` | **planned** | root is the serial console today; there is no way up over the network |
+| Groups with members, per-app capabilities | **planned** | every gid equals its uid for now; no `/etc/group` |
 
 Worth being clear about what that last row can buy on a chip with no MMU: an app
 shares the address space with the kernel, so filesystem permissions are a
@@ -379,13 +382,15 @@ feature what espix's SSH server does. It has WiFi with WPA3, BLE, SMP and most
 ESP32-S3 peripherals. POSIX and ANSI compliance are stated project goals, not
 aspirations.
 
-It is also ahead where espix has written down that it is stuck. With
+It was also ahead where espix had written down that it was stuck. With
 `CONFIG_SCHED_USER_IDENTITY` NuttX tracks a task's real and effective UID/GID
-and enforces file permissions in the VFS. espix stores permission bits and
-enforces only the execute one, because an app reaches the filesystem through
-libc and the VFS underneath has no idea which process is calling — see
-[KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md). NuttX *owns* its VFS, so the question
-is answerable there. That is a difference in position, not in effort.
+and enforces file permissions in the VFS; espix stored permission bits and
+enforced only the execute one, because an app reached the filesystem through
+libc and the VFS underneath had no idea which process was calling. That gap is
+closed — espix owns the root VFS now, so the question is answerable here too,
+and uid, gid and enforcement all landed on top of it. NuttX keeps the advantage
+on what surrounds it: real groups, `su`, and a task model that was designed for
+this rather than fitted to it.
 
 **The actual difference is that espix is additive to ESP-IDF and NuttX is an
 alternative to it.** Choosing NuttX means leaving `idf.py`, the component
