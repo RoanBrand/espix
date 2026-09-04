@@ -166,6 +166,43 @@ static bool may(const char *abs_path, uint16_t uid, uint16_t gid, mode_t want)
     return permitted(espix_fs_mode(abs_path, &st), f_uid, f_gid, uid, gid, want);
 }
 
+/*
+ * The extra rule a sticky directory adds: write permission on it lets you add
+ * names, but you may only remove one whose file you own.
+ *
+ * This is what makes a 1777 /tmp shareable rather than a free-for-all -- without
+ * it, "everyone may write the directory" means everyone may delete everyone
+ * else's files. Owning the directory itself is also enough, which is how root
+ * clears /tmp.
+ */
+static bool sticky_permits(const char *parent, const char *abs_path,
+                           uint16_t uid)
+{
+    struct stat pst;
+    if (stat(parent, &pst) != 0) {
+        return true;
+    }
+    if ((espix_fs_mode(parent, &pst) & S_ISVTX) == 0) {
+        return true;            /* not sticky; the directory check was enough */
+    }
+
+    uint16_t d_uid = 0;
+    espix_fs_owner(parent, &pst, &d_uid, NULL);
+    if (uid == d_uid) {
+        return true;
+    }
+
+    struct stat st;
+    if (stat(abs_path, &st) != 0) {
+        return true;            /* nothing there; let it fail on its own terms */
+    }
+
+    uint16_t f_uid = 0;
+    espix_fs_owner(abs_path, &st, &f_uid, NULL);
+
+    return uid == f_uid;
+}
+
 int espix_fs_admin_check(const char *abs_path, bool changing_owner)
 {
     uint16_t uid = 0;
@@ -308,6 +345,14 @@ int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags)
         char parent[ESPIX_PATH_MAX];
         parent_of(abs_path, parent, sizeof(parent));
         if (!may(parent, uid, gid, want)) {
+            goto denied;
+        }
+        /*
+         * mkdir creates a name rather than removing one, so the sticky rule has
+         * nothing to say about it -- it restricts *removal*, not addition.
+         */
+        if (op != ESPIX_FS_ACCESS_MKDIR &&
+            !sticky_permits(parent, abs_path, uid)) {
             goto denied;
         }
         return 0;
