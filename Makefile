@@ -13,7 +13,7 @@
 #   make apps             build apps/ and stage into fsroot/bin
 #   make test-app         build the test app into fsroot/home/esp
 #   make test             run the test suite       [SUITE=fs] [PORT=...]
-#   make stress           measure the known transport failure rate  [N=30]
+#   make stress           transport regression check, expects zero failures [N=30]
 #   make clean            fullclean, firmware and apps
 #
 # PORT= overrides serial port detection. IDF_PATH= overrides SDK discovery.

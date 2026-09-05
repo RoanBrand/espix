@@ -116,19 +116,35 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   to port 22 and read the first line. espix refuses in plain text, so it tells
   "wedged", "slots exhausted" and "healthy" apart in three lines of script.
 
-  **Still open, and unrelated to the above:** the socket carries `SO_RCVTIMEO`
-  but no `SO_SNDTIMEO`, and it is blocking. A peer that stops reading *and does
-  not close* therefore parks its connection task in `send()` for as long as it
-  stays silent; `BLOCKED_WRITE_TIMEOUT_MS` in `write_all()` cannot fire, because
-  a blocking socket never returns EAGAIN. Four such peers would exhaust
-  `CONFIG_ESPIX_SSH_MAX_SESSIONS`. A client that stops reading and then closes
-  is handled correctly — measured, the slot came straight back. The fix is
-  `SO_SNDTIMEO`, plus treating the timeout as fatal to the connection, since a
-  half-written packet cannot be recovered.
+  **A second defect found alongside it, also fixed:** the socket carried
+  `SO_RCVTIMEO` but no `SO_SNDTIMEO`, and it is blocking. A peer that stopped
+  reading *and did not close* therefore parked its connection task in `send()`
+  for as long as it stayed silent, and four such peers exhausted
+  `CONFIG_ESPIX_SSH_MAX_SESSIONS` — reachable by anyone who can open a socket to
+  port 22. `BLOCKED_WRITE_TIMEOUT_MS` in `write_all()` could not fire, because a
+  blocking socket never returns EAGAIN; that is also why an earlier
+  investigation's "zero EAGAIN on every connection" was true and meaningless.
+  (A peer that stopped reading and then *closed* was always handled.)
+
+  The comment on `SO_RCVTIMEO` in `ssh_server.c` already described this exact
+  failure, for the receive direction, and the same reasoning was never carried
+  to send — the third time in this file that a lesson learned for one direction
+  was not applied to the other.
+
+  Fixed by setting `SO_SNDTIMEO`, which makes `write_all()`'s existing retry
+  reachable, and by closing the channel in `send_packet()` when a write fails:
+  a partly-sent packet cannot be un-sent and the peer cannot resynchronise, so
+  continuing turns a dropped connection into a silently corrupt one.
+  `send_data()` already did this; `adjust_local_window()` did not.
+
+  Guarded by a case in `tests/suites/90-stress.sh`, which relays a session
+  through `tests/lib/stallproxy.py` and has that relay go quiet mid-stream while
+  holding both sockets open. Verified to discriminate: STRANDED after 197s
+  without the send timeout, reclaimed in ~15s with it.
 
   Reproduce the original with:
 
-      ./tests/run.sh --suite stress --stress --stress-lines 2000 --stress-limit 20
+      make stress
 
   and watch the serial console while it runs — the failure announces itself
   there as `ssh: MAC mismatch on packet N`, which is how it was finally caught.

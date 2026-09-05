@@ -121,26 +121,34 @@ notice.
 ## Stress, and why it is not in the default run
 
 ```bash
-make stress                 # 30 runs at 100 lines, expects zero failures
+make stress                 # 30 runs at 2000 lines, expects zero failures
 make stress N=100           # longer
-./tests/run.sh --suite stress --stress --stress-lines 200 --stress-limit 100
+./tests/run.sh --suite stress --stress --stress-lines 5000
 ```
 
-`make test` does not chase intermittent faults. A check that fails a few times
-in thirty would make the default run red for a bug that is already documented
-and open, and an intermittently red suite is ignored within a week — taking the
-credibility of every other assertion with it.
+`make test` does not chase intermittent faults, which is why this is separate: a
+check that fails a few times in thirty makes the default run red, and an
+intermittently red suite is ignored within a week — taking the credibility of
+every other assertion with it.
 
-The default sits at 100 lines **below** the threshold where the transport starts
-failing, so any failure there is a real regression. Above it — `--stress-lines
-200` — is the reproducer for the `Corrupted MAC` entry in
-[KNOWN-ISSUES](../docs/KNOWN-ISSUES.md), which turns out to be a cliff rather
-than a slope: clean at 8, 25, 50 and 100 lines, and 26 bad in 30 at 200.
+The default is 2000 lines, and the history is the reason. This suite was written
+to characterise the `Corrupted MAC` bug in
+[KNOWN-ISSUES](../docs/KNOWN-ISSUES.md), and it established that the fault was a
+cliff rather than a slope: clean at 8, 25, 50 and 100 lines, and 26 bad in 30 at
+200. While that was open the default sat at 100, *below* the cliff, so that any
+failure meant a new regression rather than the known bug.
 
-Two rules for anything that chases it. Do not add firmware logging: the fault
-vanishes under instrumentation (0/140 with per-packet tracing, 2/30 without).
-And do not trust a short clean run — 0/60 was recorded with the bug demonstrably
-present.
+The bug is fixed — the send and receive paths shared one buffer under two
+different locks — so the default now sits where the fault used to be reliable
+(6 runs in 8 at 2000 lines). It guards the regression instead of avoiding it.
+
+Two rules survive from chasing it, and they apply to the next intermittent fault
+as much as they did to this one. Do not add firmware logging: that fault
+vanished under instrumentation (0/140 with per-packet tracing, 2/30 without), so
+a fix has to be proven on a build with no tracing in it. And do not trust a short
+clean run — 0/60 was recorded with the bug demonstrably present. What finally
+caught it was none of this: it was watching the serial console, on `dmesg -n
+debug`, while the reproducer ran.
 
 ## A known flaky spot
 
@@ -150,9 +158,18 @@ answering esp_linenoise's cursor-position probe as it goes, and the sync is
 timing-sensitive. It retries the initial sync three times, which helps and does
 not cure it.
 
-If it fails, re-run it alone (`make test SUITE=console`) before believing it.
-That is an unsatisfying instruction to write in a document about trusting your
-tests, and it is better than a suite that quietly passes.
+**Check for a second reader first.** The most common cause by far is another
+process on the same port — a forgotten `idf.py monitor`, or a serial capture
+left running while debugging something else. `/dev/cu.*` is not exclusive on
+macOS, so both processes open it happily and then steal each other's bytes; the
+prompt `console.py` is waiting for is consumed by the other reader. It fails
+intermittently rather than always, which is worse, and it looks exactly like a
+device fault. `console.py` now names the offending process when it gives up, so
+read its stderr before suspecting espix.
+
+If it still fails, re-run it alone (`make test SUITE=console`) before believing
+it. That is an unsatisfying instruction to write in a document about trusting
+your tests, and it is better than a suite that quietly passes.
 
 ## The test app
 

@@ -583,9 +583,16 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
 
     const size_t packet_len = 1 + b->len + padding;
 
-    /* Check the invariant here rather than let the peer discover it: a framing
+    /*
+     * Check the invariant here rather than let the peer discover it: a framing
      * error surfaces at the far end as a corrupt packet or a MAC failure, a
-     * long way from the arithmetic that caused it. */
+     * long way from the arithmetic that caused it.
+     *
+     * The tx_frame bound is load-bearing, not merely a sanity check: the whole
+     * packet is assembled contiguously in tx_frame and sent in one call, so
+     * this is what guarantees the MAC has somewhere to go at
+     * tx_frame + 8 + packet_len.
+     */
     const size_t aligned = aligned_len(&c->tx, packet_len);
     if ((aligned % blk) != 0 || padding > 255 ||
         packet_len + SSH_MAC_LEN + 8 > sizeof(c->tx_frame)) {
@@ -603,14 +610,16 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
     len_be[3] = (uint8_t)packet_len;
 
     if (!c->tx.active) {
-        uint8_t pad[64] = {0};      /* zero padding is legal in the clear */
-        if (write_all(c->fd, len_be, sizeof(len_be)) != ESP_OK) {
-            return ESP_FAIL;
-        }
-        uint8_t padlen = (uint8_t)padding;
-        if (write_all(c->fd, &padlen, 1) != ESP_OK ||
-            write_all(c->fd, b->buf, b->len) != ESP_OK ||
-            write_all(c->fd, pad, padding) != ESP_OK) {
+        /* Assembled and sent as one packet, like the encrypted branch below.
+         * Handshake volume makes the syscall count irrelevant here; having one
+         * shape in this function rather than two is the point. */
+        uint8_t *out = c->tx_frame + 4;         /* length ‖ packet, contiguous */
+        memcpy(out, len_be, 4);
+        out[4] = (uint8_t)padding;
+        memcpy(out + 5, b->buf, b->len);
+        memset(out + 5 + b->len, 0, padding);   /* zero padding is legal in the clear */
+
+        if (write_all(c->fd, out, 4 + packet_len) != ESP_OK) {
             return ESP_FAIL;
         }
         c->seq_out++;
@@ -641,17 +650,28 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
     c->tx_frame[3] = (uint8_t)c->seq_out;
     memcpy(c->tx_frame + 4, len_be, 4);
 
-    uint8_t mac[SSH_MAC_LEN];
-    size_t  mac_len = 0;
+    /*
+     * The MAC goes straight after the ciphertext, which is where the wire wants
+     * it: tx_frame now holds seq ‖ length ‖ ciphertext ‖ mac, and everything
+     * from offset 4 onwards is the packet exactly as it is sent. The framing
+     * check above reserved this room.
+     */
+    size_t mac_len = 0;
     if (psa_mac_compute(c->tx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-                        c->tx_frame, 8 + packet_len, mac, sizeof(mac),
+                        c->tx_frame, 8 + packet_len,
+                        c->tx_frame + 8 + packet_len, SSH_MAC_LEN,
                         &mac_len) != PSA_SUCCESS || mac_len != SSH_MAC_LEN) {
         return ESP_FAIL;
     }
 
-    if (write_all(c->fd, len_be, sizeof(len_be)) != ESP_OK ||
-        write_all(c->fd, plain, packet_len) != ESP_OK ||
-        write_all(c->fd, mac, sizeof(mac)) != ESP_OK) {
+    /*
+     * One send, not three. Each is a mailbox round-trip and a context switch
+     * into lwIP's tcpip thread, and TCP_NODELAY is set, so sending the length,
+     * ciphertext and MAC separately could put a 60-byte line of app output on
+     * the wire as three segments carrying 4, 80 and 32 bytes.
+     */
+    if (write_all(c->fd, c->tx_frame + 4,
+                  4 + packet_len + SSH_MAC_LEN) != ESP_OK) {
         return ESP_FAIL;
     }
 

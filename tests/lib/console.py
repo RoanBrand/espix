@@ -24,6 +24,7 @@ Framing matches session.py: <<<ESPIX-CMD n>>> ... <<<ESPIX-END n>>>
 
 import argparse
 import re
+import subprocess
 import sys
 import time
 
@@ -119,6 +120,33 @@ class Console:
             pass
 
 
+def port_holder(port):
+    """Which process, if any, has the serial port open. Empty string if none.
+
+    lsof is on macOS and on most Linux images; if it is missing or says nothing
+    we simply do not know, and the caller says so rather than guessing.
+    """
+    try:
+        # No -t: it means "terse, pids only" and silently overrides -F, which
+        # made an earlier version of this report "nothing holds the port" every
+        # single time -- a check that could only ever say absent.
+        out = subprocess.run(["lsof", "-F", "cn", port],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+    pids, names = [], []
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pids.append(line[1:])
+        elif line.startswith("c"):
+            names.append(line[1:])
+    if not pids:
+        return ""
+    return ", ".join("%s (pid %s)" % (n, p)
+                     for n, p in zip(names or ["?"] * len(pids), pids))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", required=True)
@@ -153,8 +181,26 @@ def main():
             time.sleep(1)
 
     if not synced:
-        print("console.py: no prompt after three attempts -- is anything else "
-              "holding the port, and is the device up?", file=sys.stderr)
+        # Name the culprit rather than asking the reader to go and look.
+        #
+        # By far the most common cause of this failure is not espix and not the
+        # cable: it is a second reader on the same port -- a forgotten
+        # `idf.py monitor`, or a serial capture left running while debugging
+        # something else. Note that /dev/cu.* is *not* exclusive on macOS, so
+        # both processes open it happily and then steal each other's bytes:
+        # the prompt this is waiting for gets consumed by the other reader.
+        # That makes it fail intermittently rather than always, which is worse.
+        #
+        # "Is anything else holding the port?" is a question the program can
+        # answer for itself, so it does.
+        print("console.py: no prompt after three attempts", file=sys.stderr)
+        holder = port_holder(args.port)
+        if holder:
+            print("console.py: %s is holding %s -- stop it and re-run"
+                  % (holder, args.port), file=sys.stderr)
+        else:
+            print("console.py: nothing else holds %s, so check the device is "
+                  "up and the cable is in" % args.port, file=sys.stderr)
         c.close()
         return 1
 

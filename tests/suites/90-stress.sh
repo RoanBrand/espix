@@ -1,18 +1,17 @@
-# Measure the `Corrupted MAC` failure rate.
+# Transport regression checks: stream integrity under volume, and connection
+# reclaim when a peer goes silent. Both guard bugs that were real and are fixed.
 #
-# Not part of a normal run, and that is deliberate. The fault happens a few
-# times in thirty, so gating on it would make `make test` intermittently red for
-# a bug that is already known and open -- and an intermittently red suite gets
-# ignored within a week, taking the credibility of every other assertion with
-# it. This reports a *number to compare against* instead.
+# Not part of a normal run, and that is deliberate: these are slow (minutes, not
+# seconds) because both faults need volume or a timeout to show themselves.
 #
-# See docs/KNOWN-ISSUES.md, which records 2/30 on main and 3/30 on the IDF 6.1
-# build. A wildly different result here means this harness is wrong before it
-# means the bug moved.
+# Nothing in here may add logging to the firmware. The investigation into the
+# first of these died exactly there -- 0/140 with per-packet tracing, 2/30
+# without -- so a fix has to be proven on a build with no tracing in it, and a
+# short clean run proves nothing (0/60 was recorded with the bug still present).
 #
-# Nothing in here may add logging to the firmware. The previous investigation
-# died exactly there: 0/140 with per-packet tracing, 2/30 without. The fault
-# hides under instrumentation, so it has to be measured on a build with none.
+# What finally caught that bug was neither: it was the serial console at
+# `dmesg -n debug`, where the failure announces itself as
+# `ssh: MAC mismatch on packet N`. Worth having open while running this.
 #
 # PARALLEL_SAFE=no -- saturates the one transport it is measuring.
 
@@ -87,9 +86,110 @@ printf '  corrupted: %d of %d, truncated: %d of %d, clean: %d (%d%% bad)\n' \
        "$corrupt" "$N" "$short" "$N" "$ok" "$pct"
 
 if [ "$pct" -le "$LIMIT" ]; then
-    espix_pass "transport failure rate ${pct}% is within the known ${LIMIT}% ceiling"
+    espix_pass "transport failure rate ${pct}% is within the ${LIMIT}% ceiling"
 else
-    espix_fail "transport failure rate ${pct}% exceeds the known ${LIMIT}% ceiling" \
+    espix_fail "transport failure rate ${pct}% exceeds the ${LIMIT}% ceiling" \
                "corrupted: $corrupt, truncated: $short, clean: $ok, of $N" \
-               "KNOWN-ISSUES records 2/30 and 3/30 -- this is materially worse"
+               "this used to be a shared tx/rx buffer; see docs/KNOWN-ISSUES.md"
 fi
+
+# ---------------------------------------------------------------------------
+# A peer that stops reading and does not close must not keep a connection slot.
+#
+# The socket had SO_RCVTIMEO and no SO_SNDTIMEO, so a silent-but-open peer
+# parked its connection task inside send() forever. Four of them exhausted
+# CONFIG_ESPIX_SSH_MAX_SESSIONS and the server refused everything -- reachable
+# by anyone who can open a socket to port 22.
+#
+# Getting the signal right took two tries, both instructive. Counting *free
+# slots* is useless: only one of four is in use, so a slot is always free and the
+# check can never fail. Counting `sshd:conn` tasks is nearly as bad in the other
+# direction -- each poll opens its own connection and espix drains a closing one
+# for up to PARTIAL_READ_TIMEOUT_MS, so the previous poller is often still
+# present and the count never falls to 1 even after the peer is gone.
+#
+# Count `app:testapp` instead. The stalled session is the only thing running the
+# app; pollers run `ps`. So it reads 1 while the peer is stranded and 0 the
+# moment its connection is reclaimed, with nothing else able to muddy it.
+#
+# Verified to discriminate, which matters more than it sounds: on a build with
+# the send timeout removed this reports STRANDED after 197s, and with it the
+# connection is reclaimed in about 15s -- BLOCKED_WRITE_TIMEOUT_MS, as intended.
+#
+# Reclaim is not instant by design. SO_SNDTIMEO is only 250ms, but that merely
+# bounds one send() call; write_all() retries and gives up after 15s of *no
+# progress*, and progress resets that clock. A slow peer is tolerated, a stuck
+# one is dropped. Expect longer than 15s if the client buffers generously.
+# ---------------------------------------------------------------------------
+
+RECLAIM_TIMEOUT=${ESPIX_RECLAIM_TIMEOUT:-180}
+PROXY_PORT=${ESPIX_STALL_PORT:-2223}
+
+stall_dir=$(mktemp -d 2>/dev/null || mktemp -d -t espix-stall)
+marker="$stall_dir/stalled"
+proxy_log="$stall_dir/proxy.log"
+
+"${ESPIX_PYTHON:-python3}" "$ESPIX_ROOT/tests/lib/stallproxy.py" \
+    --port "$PROXY_PORT" --host "$ESPIX_HOST" --stall-after 8192 \
+    --marker "$marker" > "$proxy_log" 2>&1 &
+proxy_pid=$!
+
+# Wait for the listener before pointing ssh at it.
+waited=0
+while [ "$waited" -lt 50 ] && ! grep -q listening "$proxy_log" 2>/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
+
+if ! grep -q listening "$proxy_log" 2>/dev/null; then
+    kill "$proxy_pid" 2>/dev/null
+    espix_fail "stall proxy never started" "$(cat "$proxy_log" 2>/dev/null)"
+else
+    printf '  stalling a session mid-stream, then watching for the reclaim...\n'
+
+    # Hangs by design -- the proxy stops relaying its output. Backgrounded and
+    # killed at the end.
+    SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+        ssh $DEV_SSH_OPTS -p "$PROXY_PORT" "$ESPIX_USER@127.0.0.1" \
+        "run $APP out 20000" >/dev/null 2>&1 &
+    stalled_ssh=$!
+
+    waited=0
+    while [ "$waited" -lt 300 ] && [ ! -f "$marker" ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+
+    if [ ! -f "$marker" ]; then
+        espix_fail "the session never streamed enough to stall" \
+                   "$(cat "$proxy_log" 2>/dev/null)" \
+                   "without a stall this check measures nothing"
+    else
+        elapsed=0
+        held=1
+        while [ "$elapsed" -lt "$RECLAIM_TIMEOUT" ]; do
+            sleep 5
+            elapsed=$((elapsed + 5))
+            tasks=$(dev_once 'ps' | grep -c 'app:testapp')
+            if [ "$tasks" -eq 0 ]; then
+                held=0
+                break
+            fi
+        done
+
+        if [ "$held" -eq 0 ]; then
+            espix_pass "a silent peer's connection was reclaimed (${elapsed}s)"
+        else
+            espix_fail "a silent peer held its connection for ${elapsed}s" \
+                       "app:testapp tasks still $tasks, expected 0" \
+                       "SO_SNDTIMEO missing, or write_all no longer gives up"
+        fi
+    fi
+
+    kill "$stalled_ssh" 2>/dev/null
+    wait "$stalled_ssh" 2>/dev/null
+fi
+
+kill "$proxy_pid" 2>/dev/null
+wait "$proxy_pid" 2>/dev/null      # reap quietly; otherwise bash prints "Terminated"
+rm -rf "$stall_dir"

@@ -15,7 +15,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <sys/time.h>   /* struct timeval, for SO_RCVTIMEO */
+#include <sys/time.h>   /* struct timeval, for SO_RCVTIMEO and SO_SNDTIMEO */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -400,11 +400,33 @@ static void accept_task(void *arg)
          * a socket to port 22, which makes it a denial of service rather than
          * only a bug.
          */
-        const struct timeval rcv_timeout = {
+        const struct timeval io_timeout = {
             .tv_sec  = 0,
             .tv_usec = 250 * 1000,
         };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
+
+        /*
+         * And the same in the other direction, for the same reason -- which was
+         * missed the first time round, so the paragraph above stayed true of
+         * sends long after it stopped being true of reads.
+         *
+         * A peer that stops reading and does *not* close parks this task inside
+         * send() for as long as it stays silent: the window shuts, lwIP has
+         * nowhere to put the bytes, and a blocking socket simply waits. Four
+         * such peers exhaust CONFIG_ESPIX_SSH_MAX_SESSIONS, which is the same
+         * denial of service the receive timeout was added to close. (A peer
+         * that stops reading and then *closes* was always handled: the send
+         * fails and teardown runs.)
+         *
+         * This is also what makes write_all()'s EAGAIN branch reachable. On a
+         * blocking socket send() never returns EAGAIN, so that retry -- and the
+         * BLOCKED_WRITE_TIMEOUT_MS clock it keeps -- was dead code, and an
+         * earlier investigation's "zero EAGAIN on every connection" was true
+         * and meaningless. With a send timeout the branch does its intended
+         * job: retry while the peer is merely slow, give up when it is gone.
+         */
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
 
         if (s_status.sessions >= CONFIG_ESPIX_SSH_MAX_SESSIONS) {
             /*

@@ -329,8 +329,8 @@ merely missing.
 | `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
-| `ssh host <cmd>` | **partial** | works, but can truncate a long command's output — see [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
+| Raw lwIP / `netconn` for the SSH transport | **planned** | BSD sockets today, deliberately: apps get the same API. Cut calls before changing API — one `send()` per packet instead of three was worth 1.7× |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
 
 ### Users

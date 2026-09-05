@@ -204,12 +204,29 @@ static esp_err_t wait_for_window(ssh_chan_t *ch)
     return ESP_OK;
 }
 
-/* Write one packet under the transmit lock. */
+/*
+ * Write one packet under the transmit lock.
+ *
+ * A failure here closes the channel, because a packet that failed to send may
+ * have gone out in part: there is no way to un-send those bytes and no way for
+ * the peer to resynchronise, so the stream is finished either way. Carrying on
+ * turns a dropped connection into a silently corrupt one that reports a MAC
+ * failure several packets later -- which is precisely the shape of bug this
+ * file has already produced once, and it took three attempts to characterise.
+ *
+ * send_data() has always done this for the data path. adjust_local_window() did
+ * not: it skipped its window update and kept talking into a stream it had
+ * already damaged. Doing it here covers both, and every future caller.
+ */
 static esp_err_t send_packet(ssh_chan_t *ch, ssh_buf_t *b)
 {
     xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
     const esp_err_t err = ssh_packet_write(ch->conn, b);
     xSemaphoreGiveRecursive(ch->tx_lock);
+
+    if (err != ESP_OK) {
+        ch->closed = true;
+    }
     return err;
 }
 
