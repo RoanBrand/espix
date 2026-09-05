@@ -105,19 +105,49 @@ would have sent `readdir` back into espix, forever.
 storage, so the filesystem really is LittleFS. It resolves by partition label,
 not by path, so it never noticed the change.
 
-#### The check allows everything, for now
+#### What the check compares against
 
-`espix_fs_access_check()` resolves the caller — `xTaskGetCurrentTaskHandle()` →
-`espix_proc_pid_of_task()` → the slot's session → its user — treats a task with
-no pid as espix itself and unrestricted, and then returns "allow". Enforcement
-needs an owner on a file to compare a mode against, and no file records one yet.
+`espix_fs_access_check()` finds the caller in one of three places, in order: the
+process running on this task, whose credentials were copied from its session at
+spawn; failing that the task's current session, which is what covers builtins,
+since `cat` and `rm` run in the session task rather than as processes; failing
+that nobody, which means espix itself and is allowed.
 
-Landing the seam alone was the point: being on the path at all, for apps as well
-as commands, is the part that was impossible before, and it is provable on its
-own. The DEBUG log is that proof — the ELF loader reading `/bin/hello` appears
-as `D fs: pid 3: open /bin/hello`, a path no other seam in espix can observe. A
-shell command does *not* appear, because a session task is not a process, which
-is the discrimination working rather than a gap.
+Copying a process's credentials rather than following its session pointer is not
+an optimisation. The session lives on the stack of the command that started the
+process, and anything backgrounded outlives that frame — so reading through the
+pointer would be a use-after-free on the path that decides whether a file may be
+opened.
+
+uid 0 skips the checks. Otherwise the owner triad applies if the uids match, the
+group triad if the gids do, and the other triad if neither, with the first match
+final — so a file whose mode is `0077` is unreadable to its owner, which is Unix
+behaviour and surprises people. Creating and removing a name is checked against
+the *directory*, because that is whose list is being edited; getting that
+backwards would let anyone delete a file they cannot write.
+
+Two things sit outside the check because they cannot go through it.
+`espix_fs_chmod()` and `espix_fs_chown()` write a littlefs attribute directly
+rather than through the VFS, so they carry their own test — only the owner may
+change a mode, and only root may change an owner. And `espix_fs_priv_begin()`
+raises privilege for two callers that would otherwise deadlock the design:
+`espix_auth`, which owns a `/etc/passwd` that is 0600 root and must still be
+readable to `ls -l` and writable by `passwd` (espix has no setuid, and this seam
+is what stands in for it), and the ELF-magic probe inside the mode rule, which
+opens a file in order to answer what the permission check is asking about — left
+unprivileged it recursed until the stack was gone.
+
+The DEBUG log records refusals: `D fs: uid 1000 denied open /etc/passwd`.
+
+SFTP reaches the check the same way, though it took a second step to get there.
+It runs on the SSH connection task, which is neither a process nor a session, so
+for a while it was read as espix itself and skipped every check — an
+authenticated client could fetch files its own shell login was refused. It now
+gets a session carrying the connection's credentials and makes it the task's
+current one for the duration, which is all the check needed. The session is
+cleared before that call returns: the connection task lives on afterwards, and a
+pointer left behind to a caller's stack frame is the use-after-free that used to
+reboot the board from the exec path.
 
 ### File modes are a rule plus an attribute on the file
 
@@ -149,11 +179,20 @@ again *removes* the attribute rather than storing it, so `chmod +x` followed by
 
 The record is `{uint16 mode, uint16 uid, uint16 gid}` under type `0x70`. There
 is no registry of attribute types, so that is a local choice, and the port's
-mtime uses `'t'`. `uid` and `gid` are written as zero and read by nothing:
-fixing the layout now costs four bytes a file and saves rewriting every stored
-mode when there is an owner model to fill them in. That is a different call from
-the setuid one -- those bits would have been *displayed* as though they meant
-something, whereas these are storage that nothing renders.
+mtime uses `'t'`. `uid` and `gid` were written as zero and read by nothing for
+as long as there was no owner model, which cost four bytes a file and saved
+rewriting every stored mode once there was one — and that is exactly how it
+played out: ownership landed without touching a single file already on disk.
+
+Ownership follows the same two-part shape as the mode. A file with no stored
+attribute belongs to the account whose home directory contains it, longest home
+winning, and to root otherwise; root's home is `/`, so the rootfs is root's and
+`/home/esp` is esp's with nothing written to flash to say so. `chown` stores the
+attribute only when it disagrees with that rule, and removes it when it agrees
+again. Because the mode and the owner share one record, both are read through
+one path that fills the fields nobody is changing from the rules — otherwise a
+`chmod` would write a blank owner and quietly hand a file in `/home/esp` to
+root.
 
 What this shape avoids is bookkeeping. An earlier version kept the deviations in
 `/etc/modes` keyed by path, which meant every rename and every delete had to be

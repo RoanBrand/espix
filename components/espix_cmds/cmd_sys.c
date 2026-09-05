@@ -738,8 +738,32 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
      * and prompting *with* echo would be worse than being honest about it.
      * Revisit when the reentrant line editor lands.
      */
+    /*
+     * `passwd -l <user>` takes a password away rather than setting one, which
+     * is how root goes back to being unreachable after somebody gave it one.
+     * Root's alone: locking an account is administration, not self-service, and
+     * locking your own would be a way to shut yourself out with one typo.
+     */
+    if (argc == 3 && strcmp(argv[1], "-l") == 0) {
+        if (s == NULL || s->uid != 0) {
+            espix_printf(s, "passwd: only root can lock an account\n");
+            return 1;
+        }
+
+        const esp_err_t err = espix_auth_lock(argv[2]);
+        if (err != ESP_OK) {
+            espix_printf(s, "passwd: %s: %s\n", argv[2],
+                         (err == ESP_ERR_NOT_FOUND) ? "no such user"
+                                                    : esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "%s can no longer log in\n", argv[2]);
+        return 0;
+    }
+
     if (argc < 3) {
         espix_printf(s, "usage: passwd [user] <new-password>\n");
+        espix_printf(s, "       passwd -l <user>    take the password away\n");
         espix_printf(s, "note: the password is echoed and enters shell "
                         "history; no-echo input needs the new line editor\n");
         return 1;
@@ -750,9 +774,27 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
         user = "esp";
     }
 
+    /*
+     * Your own password, or root changing anybody's.
+     *
+     * This check did not exist and did not need to: before accounts had uids
+     * nothing followed from being one user rather than another. It does now.
+     * root is seeded locked precisely so that nobody can log in as uid 0, and
+     * uid 0 skips every permission check -- so an unprivileged `passwd root
+     * hunter2` would have handed out the superuser, undoing the whole branch in
+     * one command.
+     */
+    if (s != NULL && s->uid != 0 && strcmp(user, s->user) != 0) {
+        espix_printf(s, "passwd: only root can change another user's "
+                        "password\n");
+        return 1;
+    }
+
     const esp_err_t err = espix_auth_set_password(user, password);
     if (err != ESP_OK) {
-        espix_printf(s, "passwd: %s: %s\n", user, esp_err_to_name(err));
+        espix_printf(s, "passwd: %s: %s\n", user,
+                     (err == ESP_ERR_NOT_FOUND) ? "no such user"
+                                                : esp_err_to_name(err));
         return 1;
     }
 
@@ -769,6 +811,406 @@ static int cmd_whoami(espix_session_t *s, int argc, char **argv)
      * authenticated one over SSH -- so there is no fallback to invent here. */
     espix_printf(s, "%s\n", (s != NULL && s->user[0] != '\0') ? s->user : "?");
     return 0;
+}
+
+/*
+ * uid=1000(esp) gid=1000(esp), the way id(1) writes it.
+ *
+ * The name comes from the session and the number from the same field the
+ * filesystem checks, so if these two ever disagree the output says so rather
+ * than hiding it behind one of them.
+ */
+static int cmd_id(espix_session_t *s, int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (s == NULL) {
+        return 1;
+    }
+
+    const char *uname = espix_auth_name_for_uid(s->uid);
+    char        ubuf[ESPIX_USER_MAX];
+    strlcpy(ubuf, (uname != NULL) ? uname : s->user, sizeof(ubuf));
+
+    const char *gname = espix_auth_name_for_uid(s->gid);
+
+    espix_printf(s, "uid=%u(%s) gid=%u(%s)\n",
+                 (unsigned)s->uid, ubuf,
+                 (unsigned)s->gid, (gname != NULL) ? gname : ubuf);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Accounts and groups                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Every one of these is root's. Nothing below re-checks it. */
+static bool require_root(espix_session_t *s, const char *cmd)
+{
+    if (s != NULL && s->uid == 0) {
+        return true;
+    }
+    espix_printf(s, "%s: only root can do that\n", cmd);
+    return false;
+}
+
+static const char *auth_err(esp_err_t rc)
+{
+    switch (rc) {
+    case ESP_ERR_NOT_FOUND:      return "no such user or group";
+    case ESP_ERR_INVALID_STATE:  return "already exists";
+    case ESP_ERR_INVALID_ARG:    return "invalid name";
+    case ESP_ERR_NOT_ALLOWED:    return "not permitted";
+    case ESP_ERR_NO_MEM:         return "no room left";
+    default:                     return esp_err_to_name(rc);
+    }
+}
+
+/*
+ * useradd [-m] [-r] [-G group,...] <name>
+ *
+ * useradd(8) semantics, including the two that surprise people: no home
+ * directory unless -m, and no password ever. Both are right here -- a session
+ * whose home is missing already falls back to /, and leaving the password to
+ * `passwd` keeps the one command that has to take a password on the command
+ * line down to one.
+ */
+static int cmd_useradd(espix_session_t *s, int argc, char **argv)
+{
+    bool        system    = false;
+    bool        make_home = false;
+    const char *groups    = NULL;
+    const char *name      = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0) {
+            make_home = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            system = true;
+        } else if (strcmp(argv[i], "-G") == 0 && i + 1 < argc) {
+            groups = argv[++i];
+        } else if (argv[i][0] == '-') {
+            espix_printf(s, "useradd: %s: unsupported option\n", argv[i]);
+            return 1;
+        } else if (name == NULL) {
+            name = argv[i];
+        } else {
+            espix_printf(s, "useradd: one name at a time\n");
+            return 1;
+        }
+    }
+
+    if (name == NULL) {
+        espix_printf(s, "usage: useradd [-m] [-r] [-G group,...] <name>\n");
+        return 1;
+    }
+    if (!require_root(s, "useradd")) {
+        return 1;
+    }
+
+    esp_err_t rc = espix_auth_user_add(name, system, make_home);
+    if (rc != ESP_OK) {
+        espix_printf(s, "useradd: %s: %s\n", name, auth_err(rc));
+        return 1;
+    }
+
+    if (groups != NULL) {
+        rc = espix_auth_set_groups(name, groups, true);
+        if (rc != ESP_OK) {
+            espix_printf(s, "useradd: %s: added, but groups: %s\n", name,
+                         auth_err(rc));
+            return 1;
+        }
+    }
+
+    espix_printf(s, "%s created; it has no password until you set one\n", name);
+    return 0;
+}
+
+static int cmd_userdel(espix_session_t *s, int argc, char **argv)
+{
+    bool        remove_home = false;
+    const char *name        = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-r") == 0) {
+            remove_home = true;
+        } else if (argv[i][0] == '-') {
+            espix_printf(s, "userdel: %s: unsupported option\n", argv[i]);
+            return 1;
+        } else {
+            name = argv[i];
+        }
+    }
+
+    if (name == NULL) {
+        espix_printf(s, "usage: userdel [-r] <name>\n");
+        return 1;
+    }
+    if (!require_root(s, "userdel")) {
+        return 1;
+    }
+
+    const esp_err_t rc = espix_auth_user_del(name, remove_home);
+    if (rc != ESP_OK) {
+        espix_printf(s, "userdel: %s: %s\n", name, auth_err(rc));
+        return 1;
+    }
+    return 0;
+}
+
+/* usermod -aG a,b <user> to append, -G a,b to replace. */
+static int cmd_usermod(espix_session_t *s, int argc, char **argv)
+{
+    const char *groups = NULL;
+    const char *name   = NULL;
+    bool        append = false;
+    bool        seen   = false;
+
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-aG") == 0 || strcmp(argv[i], "-Ga") == 0) &&
+            i + 1 < argc) {
+            append = true;
+            seen   = true;
+            groups = argv[++i];
+        } else if (strcmp(argv[i], "-G") == 0 && i + 1 < argc) {
+            seen   = true;
+            groups = argv[++i];
+        } else if (argv[i][0] == '-') {
+            espix_printf(s, "usermod: %s: unsupported option\n", argv[i]);
+            return 1;
+        } else {
+            name = argv[i];
+        }
+    }
+
+    if (name == NULL || !seen) {
+        espix_printf(s, "usage: usermod -aG <group,...> <user>   append\n");
+        espix_printf(s, "       usermod -G <group,...> <user>    replace\n");
+        return 1;
+    }
+    if (!require_root(s, "usermod")) {
+        return 1;
+    }
+
+    const esp_err_t rc = espix_auth_set_groups(name, groups, append);
+    if (rc != ESP_OK) {
+        espix_printf(s, "usermod: %s: %s\n", name, auth_err(rc));
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
+{
+    bool        system = false;
+    const char *name   = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-r") == 0) {
+            system = true;
+        } else if (argv[i][0] == '-') {
+            espix_printf(s, "groupadd: %s: unsupported option\n", argv[i]);
+            return 1;
+        } else {
+            name = argv[i];
+        }
+    }
+
+    if (name == NULL) {
+        espix_printf(s, "usage: groupadd [-r] <name>\n");
+        return 1;
+    }
+    if (!require_root(s, "groupadd")) {
+        return 1;
+    }
+
+    const esp_err_t rc = espix_auth_group_add(name, system);
+    if (rc != ESP_OK) {
+        espix_printf(s, "groupadd: %s: %s\n", name, auth_err(rc));
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_groupdel(espix_session_t *s, int argc, char **argv)
+{
+    if (argc != 2) {
+        espix_printf(s, "usage: groupdel <name>\n");
+        return 1;
+    }
+    if (!require_root(s, "groupdel")) {
+        return 1;
+    }
+
+    const esp_err_t rc = espix_auth_group_del(argv[1]);
+    if (rc != ESP_OK) {
+        espix_printf(s, "groupdel: %s: %s\n", argv[1], auth_err(rc));
+        return 1;
+    }
+    return 0;
+}
+
+/* groups [user] -- the current session's if none is named. */
+static int cmd_groups(espix_session_t *s, int argc, char **argv)
+{
+    const char *user = (argc > 1) ? argv[1] : (s != NULL ? s->user : NULL);
+
+    if (user == NULL || user[0] == '\0') {
+        return 1;
+    }
+
+    espix_gid_t  gids[ESPIX_NGROUPS_MAX];
+    const size_t n = espix_auth_groups(user, gids, ESPIX_NGROUPS_MAX);
+
+    if (n == 0) {
+        espix_printf(s, "groups: %s: no such user\n", user);
+        return 1;
+    }
+
+    espix_printf(s, "%s :", user);
+    for (size_t i = 0; i < n; i++) {
+        const char *name = espix_auth_group_name(gids[i]);
+        if (name != NULL) {
+            espix_printf(s, " %s", name);
+        } else {
+            espix_printf(s, " %u", (unsigned)gids[i]);
+        }
+    }
+    espix_printf(s, "\n");
+    return 0;
+}
+
+/*
+ * Run one command as root.
+ *
+ * espix has no setuid path for builtins and no `su`, so this is the only way up
+ * to uid 0 that does not need the serial console. Gated by /etc/sudoers, which
+ * espix_auth reads -- the file is 0600 root and that component already holds
+ * the privilege to reach it.
+ *
+ * It does NOT ask for a password, and that is a real weakness rather than an
+ * oversight. espix cannot read input without echoing it, which is the same
+ * limitation that makes `passwd` take the password as an argument; prompting
+ * here would print it. The session is already authenticated as this user, and
+ * sudo(8)'s own timestamp caching means a real one frequently does not re-ask
+ * either -- but an unattended terminal is a way in that Linux would have shut.
+ * Revisit with the reentrant line editor cmd_passwd() is also waiting on.
+ *
+ * The credential is raised around the dispatch and restored on every path out,
+ * including the one where the command fails. A process spawned in between
+ * copies uid 0 at admission and keeps it, which is correct: it was started
+ * under sudo and may outlive the command that started it.
+ */
+static int cmd_sudo(espix_session_t *s, int argc, char **argv)
+{
+    if (s == NULL) {
+        return 1;
+    }
+    /*
+     * -u runs as somebody other than root, which is what a service account is
+     * for: `sudo -u www /bin/httpd &` and the app has its own identity without
+     * espix needing a service manager. No new authority -- anyone who may become
+     * root may already become anybody, by becoming root first.
+     */
+    int         first = 1;
+    const char *as    = NULL;
+
+    if (argc > 2 && strcmp(argv[1], "-u") == 0) {
+        as    = argv[2];
+        first = 3;
+    }
+
+    if (first >= argc) {
+        espix_printf(s, "usage: sudo [-u <user>] <command> [args...]\n");
+        return 1;
+    }
+
+    if (s->uid != 0 && !espix_auth_may_sudo(s->user)) {
+        espix_printf(s, "sudo: %s is not in %s\n", s->user, "/etc/sudoers");
+        espix_klog(ESPIX_KLOG_WARN, "sudo", "%s: refused", s->user);
+        return 1;
+    }
+
+    /* Resolve the target before touching the session, so a typo leaves the
+     * caller as they were rather than mid-way through becoming somebody. */
+    espix_user_t target;
+    espix_gid_t  target_groups[ESPIX_NGROUPS_MAX];
+    size_t       target_ngroups = 0;
+
+    if (as != NULL) {
+        if (espix_auth_lookup(as, &target) != ESP_OK) {
+            espix_printf(s, "sudo: %s: no such user\n", as);
+            return 1;
+        }
+        target_ngroups = espix_auth_groups(as, target_groups,
+                                           ESPIX_NGROUPS_MAX);
+    }
+
+    /* Rejoin, because the dispatcher takes a line rather than an argv. Args
+     * that were quoted on the way in lose their quoting here, which is the
+     * same thing the shell's own re-parsing does elsewhere. */
+    char line[ESPIX_LINE_MAX];
+    size_t n = 0;
+
+    for (int i = first; i < argc; i++) {
+        const int wrote = snprintf(line + n, sizeof(line) - n, "%s%s",
+                                   (i > first) ? " " : "", argv[i]);
+        if (wrote < 0 || (size_t)wrote >= sizeof(line) - n) {
+            espix_printf(s, "sudo: command line too long\n");
+            return 1;
+        }
+        n += (size_t)wrote;
+    }
+
+    /*
+     * The name goes with the numbers.
+     *
+     * Leaving `user` alone made the session run as one identity and answer to
+     * another: `id` said bob while `whoami` said esp, and a nested sudo checked
+     * esp's membership rather than bob's -- so `sudo -u bob sudo ...` was
+     * allowed on the strength of a name the session no longer had. Not an
+     * escalation, since the outer sudo had already granted the lot, but exactly
+     * the disagreement `id` exists to make visible.
+     */
+    const uint16_t saved_uid     = s->uid;
+    const uint16_t saved_gid     = s->gid;
+    const uint8_t  saved_ngroups = s->ngroups;
+    uint16_t       saved_groups[ESPIX_NGROUPS_MAX];
+    char           saved_user[ESPIX_SESSION_USER_MAX];
+
+    memcpy(saved_groups, s->groups, sizeof(saved_groups));
+    strlcpy(saved_user, s->user, sizeof(saved_user));
+
+    espix_klog(ESPIX_KLOG_INFO, "sudo", "%s runs as %s: %s", s->user,
+               (as != NULL) ? as : "root", line);
+
+    if (as != NULL) {
+        s->uid     = target.uid;
+        s->gid     = target.gid;
+        s->ngroups = (uint8_t)target_ngroups;
+        for (size_t i = 0; i < target_ngroups; i++) {
+            s->groups[i] = target_groups[i];
+        }
+        strlcpy(s->user, target.name, sizeof(s->user));
+    } else {
+        s->uid       = 0;
+        s->gid       = 0;
+        s->groups[0] = 0;
+        s->ngroups   = 1;
+        strlcpy(s->user, ESPIX_AUTH_ROOT_USER, sizeof(s->user));
+    }
+
+    const int status = espix_shell_run_line(s, line);
+
+    s->uid     = saved_uid;
+    s->gid     = saved_gid;
+    s->ngroups = saved_ngroups;
+    memcpy(s->groups, saved_groups, sizeof(saved_groups));
+    strlcpy(s->user, saved_user, sizeof(s->user));
+
+    return status;
 }
 
 /*
@@ -838,10 +1280,34 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "coredump [erase]" },
     { .name = "passwd", .fn = cmd_passwd,
       .help = "set a user's password",
-      .usage = "passwd [user] <new-password>" },
+      .usage = "passwd [user] <new-password> | passwd -l <user>" },
     { .name = "whoami", .fn = cmd_whoami,
       .help = "print the current user",
       .usage = "whoami" },
+    { .name = "id",     .fn = cmd_id,
+      .help = "print the current user and group ids",
+      .usage = "id" },
+    { .name = "useradd", .fn = cmd_useradd,
+      .help = "create a user account",
+      .usage = "useradd [-m] [-r] [-G group,...] <name>" },
+    { .name = "userdel", .fn = cmd_userdel,
+      .help = "remove a user account",
+      .usage = "userdel [-r] <name>" },
+    { .name = "usermod", .fn = cmd_usermod,
+      .help = "change a user's group membership",
+      .usage = "usermod -aG <group,...> <user>" },
+    { .name = "groupadd", .fn = cmd_groupadd,
+      .help = "create a group",
+      .usage = "groupadd [-r] <name>" },
+    { .name = "groupdel", .fn = cmd_groupdel,
+      .help = "remove a group",
+      .usage = "groupdel <name>" },
+    { .name = "groups", .fn = cmd_groups,
+      .help = "list a user's groups",
+      .usage = "groups [user]" },
+    { .name = "sudo",   .fn = cmd_sudo,
+      .help = "run a command as root, or as another user",
+      .usage = "sudo [-u <user>] <command> [args...]" },
     { .name = "echo",   .fn = cmd_echo,
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,

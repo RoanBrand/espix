@@ -42,6 +42,20 @@ extern "C" {
 #define ESPIX_PATH_MAX 128
 
 /*
+ * How many groups one identity can hold at once: a primary plus seven.
+ *
+ * Here rather than in espix_auth, which owns the concept, because a session and
+ * a process both have to carry the set and neither may depend on that component
+ * -- espix_auth depends on espix_fs, which depends on espix_shell. A number
+ * three components need is a kernel-wide number.
+ *
+ * It is a size as much as a limit: credentials are copied rather than looked up
+ * per file operation, so this costs 16 bytes a session and 192 across the whole
+ * process table.
+ */
+#define ESPIX_NGROUPS_MAX 8
+
+/*
  * Types shared across the espix component graph live here so that espix_proc
  * and espix_shell can reference each other's objects without a dependency
  * cycle: proc hands processes a session, sessions track a foreground process.

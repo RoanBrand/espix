@@ -96,21 +96,26 @@ things are as they are.
   [UPSTREAM.md](UPSTREAM.md), and delete
   [tools/patch-littlefs.py](../tools/patch-littlefs.py) when it lands.
 
-- **An owner on a file, and a uid on a process.** The on-disk room is already
-  there: every stored mode carries `uid` and `gid` fields, written as zero and
-  read by nothing, so filling them in costs no rewrite. espix already has two
-  identities -- `root` on the console, `esp` over SSH -- and `espix_proc_info_t`
-  already carries the session a process belongs to, so "who is asking" is
-  answerable. What is missing is who a *file* belongs to. That is the
-  prerequisite for `chown`, for setuid/setgid/sticky to be more than bits, and
-  for `/etc/shadow` to be worth splitting out of `/etc/passwd` -- which
-  `espix_auth.h` declined to do for exactly this reason. Note that read/write
-  enforcement needs more than this: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md), and
-  the VFS entry below, which is what would make it possible at all.
+- ~~**An owner on a file, and a uid on a process.**~~ Done. Accounts carry a uid
+  and a gid, `/etc/passwd` grew both fields with a one-time migration for older
+  three-field records, and `root` became a real account -- locked, so it is
+  reachable from the console but never over SSH. A session resolves its
+  credentials once at login and a process copies them at spawn rather than
+  following the session pointer, which would be a use-after-free for anything
+  backgrounded.
 
-  Prior art worth reading before designing this: NuttX's
-  `CONFIG_SCHED_USER_IDENTITY` tracks a task's real and effective UID/GID and
-  checks file permissions against the effective one.
+  Files get their owner from the stored attribute when there is one and from a
+  rule when there is not: the account whose home contains the path, longest home
+  winning, and root otherwise. Since root's home is `/`, that makes the rootfs
+  root's and `/home/esp` esp's with nothing written to flash to say so -- which
+  is what keeps a freshly imaged device free of attribute data and what makes a
+  storage-flash come back correct.
+
+  What is left of the case for `/etc/shadow`: very little. The file is 0600
+  root, and every reader goes through espix_auth, which raises privilege for its
+  own open -- espix has no setuid, so that seam is what stands in for it. A
+  split would separate the hashes from the names, which matters only once
+  something other than espix_auth needs to read the names.
 
 - ~~**Own the filesystem driver instead of consuming one.**~~ Done differently,
   and better. espix registers the root VFS and stacks LittleFS underneath it by
@@ -120,14 +125,63 @@ things are as they are.
   work is the *policy*, which is the item above, and getting the two patched
   entry points upstream, which is [UPSTREAM.md](UPSTREAM.md).
 
-- **Enforce read and write, once files have owners.** `espix_fs_access_check()`
-  is called from `open`, `opendir`, `unlink`, `rename`, `mkdir`, `rmdir` and
-  `truncate` and returns "allow" every time, because a mode needs a subject to
-  be checked against. Wiring the policy is small; the prerequisite is the item
-  above. Note that `stat` is deliberately not gated, and that `access` is left
-  unimplemented to match the port — implementing it from the mode espix already
-  knows would change the SFTP server's `O_EXCL` behaviour, which is worth doing
-  deliberately rather than as a side effect.
+- ~~**Enforce read and write, once files have owners.**~~ Done, and it applies
+  to builtins as well as to loaded apps: credentials come from the process when
+  there is one and from the task's current session otherwise, so `cat` and `rm`
+  over SSH are checked like anything else. Only espix itself -- a task that is
+  neither -- goes unchecked, which is what lets boot read its own configuration.
+
+  `stat` is still deliberately not gated, and `access` is still unimplemented to
+  match the port. What remains: search permission is checked on the final path
+  component and on the parent for anything that creates or removes a name, not
+  on every intermediate directory; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+- ~~**A way up to root that is not the serial console.**~~ Done, as `sudo`:
+  `/etc/sudoers` lists the accounts that may run a command as uid 0, seeded with
+  the default account the way an installer puts the first user in the `sudo`
+  group. root stays locked, and `sudo passwd root <pw>` gives it a password if
+  somebody wants one, with `passwd -l root` to take it away again. What it does
+  not do is re-authenticate; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+- ~~**The other three mode bits.**~~ Done, and each is consulted: setuid and
+  setgid give a process the binary's ids at exec, and sticky lets a shared
+  directory allow writes without allowing deletions -- which is what made a 1777
+  `/tmp` possible, and `/tmp` is why the bit was worth having. The combinations
+  espix does not act on -- setuid or setgid on a directory, sticky on a file --
+  are refused by name rather than stored and ignored.
+
+  setuid is a guardrail rather than a boundary on the S3, which has no MMU. It
+  is implemented now because the S31 does.
+
+- ~~**Check SFTP against the same rules as everything else.**~~ Done. The SFTP
+  subsystem gets a session carrying the connection's credentials and makes it
+  the task's current one, so `espix_fs_access_check()` finds a caller and every
+  transfer is checked exactly as the shell is. Uploads are now owned by the
+  account that made them, which follows from there being a session at all.
+
+  It also moved the client's starting directory from `/` to the account's home,
+  where every other SFTP server puts it. That had to land together: `/` is
+  root-owned, so enforcing the check while leaving the client there would have
+  broken `scp file host:` with no remote path — the commonest invocation there
+  is.
+
+- ~~**Groups that are more than a number.**~~ Done. `/etc/group` carries
+  `name:gid:members`, an identity holds a set of groups rather than one, and the
+  permission check matches the group triad against any of them — so two accounts
+  can share a file, which is the only thing that ever made that middle column
+  worth printing.
+
+  Credentials are resolved at login and copied into a process at spawn, so a
+  change to `/etc/group` takes effect at the next login rather than mid-session.
+  That is the same bargain espix already makes for the uid, and it is what
+  `newgrp` exists for on a real system.
+
+- ~~**More than one account.**~~ Done, with the `useradd` family rather than
+  Debian's `adduser` wrappers: one command per job, and the names that exist on
+  every distribution. `useradd -r` is a service account — locked, a uid in
+  100–999, no home — which with `sudo -u` is the whole mechanism for running an
+  app under its own identity. `passwd` no longer creates accounts, which is what
+  fixed it handing every new one uid 1000.
 
 ## Signals
 
@@ -164,7 +218,10 @@ things are as they are.
 
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style
-  line editor.
+  line editor. It is also why so much of espix's configuration ended up behind
+  commands — `wifi connect`, `passwd`, `useradd` — rather than as files to edit.
+  That is a reasonable shape for a device, but it should be a choice rather than
+  what happens because there is no alternative.
 - **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
   quieted driver tags.
 - **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the

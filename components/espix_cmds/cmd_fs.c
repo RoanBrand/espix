@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "espix_auth.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -141,9 +142,33 @@ typedef struct {
     time_t mtime;
     off_t  size;
     mode_t mode;
+    uint16_t uid;
+    uint16_t gid;
     bool   is_dir;
     bool   statted;    /* false renders the ?????????? row */
 } ls_entry_t;
+
+/*
+ * The name for `id`, or the number when nothing claims it.
+ *
+ * `is_group` picks which file to look in. It matters: a gid and a uid are
+ * different namespaces, and resolving a group through the account table was
+ * only ever right while every gid equalled its uid.
+ *
+ * Copied out rather than returned by pointer: espix_auth answers from a
+ * single-entry cache, so asking about the group would move what the owner
+ * pointer refers to.
+ */
+static void ls_id_name(uint16_t id, bool is_group, char *out, size_t len)
+{
+    const char *name = is_group ? espix_auth_group_name(id)
+                                : espix_auth_name_for_uid(id);
+    if (name != NULL) {
+        strlcpy(out, name, len);
+    } else {
+        snprintf(out, len, "%u", (unsigned)id);
+    }
+}
 
 /* Ceiling on entries held at once. Said out loud when reached rather than
  * dropped quietly -- `ps` silently losing its ninth process is already a
@@ -335,6 +360,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
             e->is_dir  = S_ISDIR(cst.st_mode);
 
             e->mode = cst.st_mode;
+            espix_fs_owner(child, &cst, &e->uid, &e->gid);
         }
     }
 
@@ -359,7 +385,8 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
             continue;
         }
         if (!e->statted) {
-            espix_printf(s, "?????????? %8s  %12s  %s\n", "-", "-", e->name);
+            espix_printf(s, "?????????? %-8s %-8s %8s  %12s  %s\n",
+                         "-", "-", "-", "-", e->name);
             continue;
         }
 
@@ -370,11 +397,21 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         ls_time(when, sizeof(when), e->mtime);
         espix_fs_mode_str(e->mode, e->is_dir, perms, sizeof(perms));
 
+        /* Left-aligned and padded to the widest name espix allows, so the
+         * columns line up whether an id resolves to a name or prints as a
+         * number. */
+        char owner[ESPIX_USER_MAX];
+        char group[ESPIX_USER_MAX];
+        ls_id_name(e->uid, false, owner, sizeof(owner));
+        ls_id_name(e->gid, true,  group, sizeof(group));
+
         if (e->is_dir) {
-            espix_printf(s, "%s  %8s  %12s  %s/\n", perms, "-", when, e->name);
+            espix_printf(s, "%s  %-8s %-8s %8s  %12s  %s/\n",
+                         perms, owner, group, "-", when, e->name);
         } else {
             ls_size(size, sizeof(size), e->size, f.human);
-            espix_printf(s, "%s  %8s  %12s  %s\n", perms, size, when, e->name);
+            espix_printf(s, "%s  %-8s %-8s %8s  %12s  %s\n",
+                         perms, owner, group, size, when, e->name);
         }
     }
 
@@ -597,6 +634,17 @@ static int cmd_touch(espix_session_t *s, int argc, char **argv)
  * of those). On failure *err names the problem, because "chmod: invalid mode"
  * for four different mistakes is how you end up debugging your own shell.
  */
+/* The words strerror() would use, for the espix_fs codes these commands see. */
+static const char *fs_err(esp_err_t rc)
+{
+    switch (rc) {
+    case ESP_ERR_NOT_FOUND:   return "no such file";
+    case ESP_ERR_NOT_ALLOWED: return "operation not permitted";
+    case ESP_ERR_INVALID_ARG: return "invalid argument";
+    default:                  return esp_err_to_name(rc);
+    }
+}
+
 static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
                         const char **err)
 {
@@ -619,7 +667,7 @@ static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
             return false;
         }
         if (v > ESPIX_MODE_BITS) {
-            *err = "setuid, setgid and sticky are not supported";
+            *err = "mode out of range (at most four octal digits)";
             return false;
         }
         *out = (mode_t)v;
@@ -652,31 +700,45 @@ static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
         p++;
 
         mode_t bits = 0;
+        mode_t high = 0;        /* setuid/setgid/sticky: outside the triads */
+
         for (; *p != '\0' && *p != ','; p++) {
             switch (*p) {
             case 'r': bits |= 0444; break;
             case 'w': bits |= 0222; break;
             case 'x': bits |= 0111; break;
             case 's':
-                *err = "setuid and setgid are not supported";
-                return false;
+                /* Which of the two `s` means is decided by the class named:
+                 * `u+s` is setuid, `g+s` is setgid, `a+s` is both. */
+                if (who & 0700) high |= S_ISUID;
+                if (who & 0070) high |= S_ISGID;
+                break;
             case 't':
-                *err = "the sticky bit is not supported";
-                return false;
+                /* Written `+t` far more often than `o+t`, and it belongs to the
+                 * directory rather than to a class, so the class is ignored. */
+                high |= S_ISVTX;
+                break;
             default:
-                *err = "expected r, w or x";
+                *err = "expected r, w, x, s or t";
                 return false;
             }
         }
 
         bits &= who;
 
+        /* `=` replaces the named classes outright, high bits included, or
+         * `u=rw` would leave a setuid behind that nobody asked to keep. */
+        mode_t who_high = 0;
+        if (who & 0700) who_high |= S_ISUID;
+        if (who & 0070) who_high |= S_ISGID;
+        if (who & 0007) who_high |= S_ISVTX;
+
         if (op == '+') {
-            mode |= bits;
+            mode |= bits | high;
         } else if (op == '-') {
-            mode &= ~bits;
+            mode &= ~(bits | high);
         } else {
-            mode = (mode & ~who) | bits;
+            mode = (mode & ~(who | who_high)) | bits | high;
         }
 
         if (*p != ',') {
@@ -720,9 +782,35 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
             return 1;           /* the mode is wrong for every path, not one */
         }
 
+        /*
+         * espix acts on all twelve bits, but not on every bit for every kind of
+         * file. The combinations it would have to store and ignore are refused
+         * by name here rather than silently masked, which is the same call the
+         * octal range makes -- being told beats reading the mode back later and
+         * finding it did nothing.
+         *
+         * This is checked per path, not once, because the same `chmod +t` is
+         * right for a directory and meaningless for a file beside it.
+         */
+        const bool is_dir = S_ISDIR(st.st_mode);
+
+        if (is_dir && (mode & (S_ISUID | S_ISGID))) {
+            espix_printf(s, "chmod: %s: setuid and setgid on a directory mean "
+                            "group inheritance, which espix does not "
+                            "implement\n", abs);
+            status = 1;
+            continue;
+        }
+        if (!is_dir && (mode & S_ISVTX)) {
+            espix_printf(s, "chmod: %s: the sticky bit only applies to a "
+                            "directory\n", abs);
+            status = 1;
+            continue;
+        }
+
         const esp_err_t rc = espix_fs_chmod(abs, mode);
         if (rc != ESP_OK) {
-            espix_printf(s, "chmod: %s: %s\n", abs, esp_err_to_name(rc));
+            espix_printf(s, "chmod: %s: %s\n", abs, fs_err(rc));
             status = 1;
         }
     }
@@ -765,6 +853,123 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * Resolve "esp", "1000" or "" into a uid.
+ *
+ * A bare number is taken as an id even when no account claims it, which is what
+ * lets ownership be handed to a user that does not exist yet -- the same
+ * latitude chown(1) gives, and the reason an unknown *name* is still an error:
+ * a typo should not silently become "leave it alone".
+ */
+static bool id_of(espix_session_t *s, const char *who, const char *cmd,
+                  bool is_group, uint16_t *out)
+{
+    if (who[0] == '\0') {
+        *out = ESPIX_FS_KEEP_ID;
+        return true;
+    }
+
+    char *end = NULL;
+    const unsigned long n = strtoul(who, &end, 10);
+    if (*end == '\0' && end != who) {
+        if (n > UINT16_MAX) {
+            espix_printf(s, "%s: %s: id out of range\n", cmd, who);
+            return false;
+        }
+        *out = (uint16_t)n;
+        return true;
+    }
+
+    /* The two are different namespaces. Resolving a group through the account
+     * table was only ever right while every gid equalled its uid. */
+    if (is_group) {
+        if (!espix_auth_group_id(who, out)) {
+            espix_printf(s, "%s: %s: no such group\n", cmd, who);
+            return false;
+        }
+        return true;
+    }
+
+    espix_user_t account;
+    if (espix_auth_lookup(who, &account) != ESP_OK) {
+        espix_printf(s, "%s: %s: no such user\n", cmd, who);
+        return false;
+    }
+    *out = account.uid;
+    return true;
+}
+
+/*
+ * chown [user][:group] <path>..., and chgrp through the same function.
+ *
+ * Nothing here checks for root. It does not have to: espix_fs_chown() writes
+ * through the same filesystem as everything else, so the permission check on
+ * the path is what refuses an unprivileged caller. One place to be right.
+ */
+static int cmd_chown(espix_session_t *s, int argc, char **argv)
+{
+    const bool is_chgrp = (strcmp(argv[0], "chgrp") == 0);
+
+    if (argc < 3) {
+        espix_printf(s, "usage: %s\n",
+                     is_chgrp ? "chgrp <group> <path>..."
+                              : "chown <user>[:<group>] <path>...");
+        return 1;
+    }
+
+    uint16_t uid = ESPIX_FS_KEEP_ID;
+    uint16_t gid = ESPIX_FS_KEEP_ID;
+
+    if (is_chgrp) {
+        if (!id_of(s, argv[1], argv[0], true, &gid)) {
+            return 1;
+        }
+    } else {
+        char spec[ESPIX_USER_MAX * 2 + 2];
+        strlcpy(spec, argv[1], sizeof(spec));
+
+        char *colon = strchr(spec, ':');
+        if (colon != NULL) {
+            *colon = '\0';
+            if (!id_of(s, colon + 1, argv[0], true, &gid)) {
+                return 1;
+            }
+        }
+        if (!id_of(s, spec, argv[0], false, &uid)) {
+            return 1;
+        }
+        /*
+         * `chown user file` moves the group to that user's *primary* group, the
+         * way chown(1) does. Taking the uid worked only while every account's
+         * gid equalled it; now that groups are real, the account record is the
+         * only thing that knows.
+         */
+        if (colon == NULL && uid != ESPIX_FS_KEEP_ID) {
+            espix_user_t account;
+            gid = (espix_auth_lookup(spec, &account) == ESP_OK) ? account.gid
+                                                                : uid;
+        }
+    }
+
+    int status = 0;
+
+    for (int i = 2; i < argc; i++) {
+        char abs[ESPIX_PATH_MAX];
+        if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
+            status = 1;
+            continue;
+        }
+
+        const esp_err_t rc = espix_fs_chown(abs, uid, gid);
+        if (rc != ESP_OK) {
+            espix_printf(s, "%s: %s: %s\n", argv[0], abs, fs_err(rc));
+            status = 1;
+        }
+    }
+
+    return status;
+}
+
 static espix_cmd_t s_fs_cmds[] = {
     { .name = "pwd",   .fn = cmd_pwd,
       .help = "print the working directory",     .usage = "pwd" },
@@ -786,6 +991,10 @@ static espix_cmd_t s_fs_cmds[] = {
       .help = "create empty files",              .usage = "touch <file>..." },
     { .name = "chmod", .fn = cmd_chmod,
       .help = "change file mode bits",           .usage = "chmod <mode> <path>..." },
+    { .name = "chown", .fn = cmd_chown,
+      .help = "change file owner",               .usage = "chown <user>[:<group>] <path>..." },
+    { .name = "chgrp", .fn = cmd_chown,
+      .help = "change file group",               .usage = "chgrp <group> <path>..." },
     { .name = "df",    .fn = cmd_df,
       .help = "report filesystem usage",         .usage = "df" },
 };

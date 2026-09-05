@@ -896,6 +896,18 @@ esp_err_t espix_console_session_start(void)
          * `logout` declines -- there was no login to undo.
          */
         .user      = "root",
+        /*
+         * 0 written out rather than named: espix_auth owns ESPIX_UID_ROOT, and
+         * espix_shell cannot include that header without closing a dependency
+         * cycle (espix_auth -> espix_fs -> espix_shell). Zero is what root means
+         * everywhere in espix and everywhere else.
+         */
+        .uid       = 0,
+        .gid       = 0,
+        /* root's own group, and no others. uid 0 skips the checks anyway, so
+         * this is for `groups` and `id` to have something true to print. */
+        .groups    = { 0 },
+        .ngroups   = 1,
         .login     = false,
         .read_line = console_read_line,
         .write     = console_write,

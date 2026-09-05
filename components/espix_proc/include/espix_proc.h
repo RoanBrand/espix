@@ -66,6 +66,18 @@ typedef struct {
     int64_t            started_us;
     size_t             image_bytes;   /* relocated ELF size, 0 for kernel tasks */
     espix_session_t   *session;       /* stdio/cwd owner, may be NULL */
+
+    /*
+     * Who the process runs as, copied from the launching session rather than
+     * read through it: the session lives on the caller's stack and a
+     * backgrounded process outlives the command that started it, so following
+     * the pointer at check time would be a use-after-free on exactly the path
+     * that decides whether a file may be opened.
+     */
+    uint16_t           uid;
+    uint16_t           gid;
+    uint16_t           groups[ESPIX_NGROUPS_MAX];
+    uint8_t            ngroups;
 } espix_proc_info_t;
 
 esp_err_t espix_proc_init(void);
@@ -163,6 +175,16 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n);
 /* Look up the process owning `task`, or ESPIX_PID_NONE. Safe to call from a
  * restricted context: it only reads the table. */
 espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);
+
+/*
+ * The credentials of the process running on `task`, or false if that task is
+ * not a process -- the console, an SSH connection task, SNTP, the WiFi driver.
+ *
+ * Takes no lock. It runs on the path of every file operation in the system, and
+ * the fields it reads are written once, before the process is admitted.
+ */
+bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
+                             uint16_t *groups, uint8_t *ngroups);
 
 /*
  * The calling process's working directory, or "/" for a task that is not a

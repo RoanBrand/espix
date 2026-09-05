@@ -1064,8 +1064,34 @@ static void apply_account(espix_session_t *session, const char *user)
 {
     espix_user_t account;
 
-    if (espix_auth_lookup(user, &account) != ESP_OK ||
-        account.home[0] == '\0') {
+    if (espix_auth_lookup(user, &account) != ESP_OK) {
+        /*
+         * Authentication passed but the account will not resolve -- /etc/passwd
+         * changed underneath the login, or will no longer parse. Run as nobody
+         * rather than leaving the credential as it was found: the session
+         * struct is zero-initialised, and zero is root.
+         */
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: no account record; running as nobody", user);
+        session->uid     = ESPIX_UID_NOBODY;
+        session->gid     = ESPIX_UID_NOBODY;
+        session->ngroups = 0;
+        return;
+    }
+
+    session->uid = account.uid;
+    session->gid = account.gid;
+
+    /*
+     * Every group this account is in, resolved now. The permission check reads
+     * the set rather than the file, so a change to /etc/group takes effect at
+     * the next login rather than mid-session -- which is what `newgrp` exists
+     * for on a real system and is the same bargain espix makes for the uid.
+     */
+    session->ngroups = (uint8_t)espix_auth_groups(user, session->groups,
+                                                  ESPIX_NGROUPS_MAX);
+
+    if (account.home[0] == '\0') {
         return;
     }
 
@@ -1219,13 +1245,30 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     }
 
     /*
-     * A subsystem carries bytes, not a terminal: no editor, no session, no
-     * greeting. Everything below that belongs to an interactive shell would
-     * corrupt a transfer.
+     * A subsystem carries bytes, not a terminal: no editor, no greeting, none
+     * of what an interactive shell prints, all of which would corrupt a
+     * transfer.
+     *
+     * It does get a session, though, which it did not before. Not for stdio --
+     * SFTP prints nothing and spawns nothing -- but because a session is where
+     * an identity lives, and without one every file operation SFTP made ran on
+     * a task espix_fs_access_check() reads as the kernel. An authenticated
+     * client could fetch files its own shell login was refused.
      */
     if (ch->want_sftp) {
+        espix_session_t session = {
+            .name      = "sftp",
+            .cwd       = "/",
+            .transport = ch,
+            .fg_pid    = ESPIX_PID_NONE,
+            .uid       = ESPIX_UID_NOBODY,
+            .gid       = ESPIX_UID_NOBODY,
+        };
+        strlcpy(session.user, c->user, sizeof(session.user));
+        apply_account(&session, c->user);
+
         s_raw_chan = ch;
-        espix_sftp_run(c);
+        espix_sftp_run(c, &session);
         s_raw_chan = NULL;
 
         send_exit_status(ch, 0);
@@ -1246,6 +1289,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .write     = chan_write,
             .poll_interrupt = chan_poll_interrupt,
             .transport = ch,
+            /* Overwritten by apply_account(); nobody rather than 0 so that a
+             * path which forgets to set it fails closed instead of open. */
+            .uid       = ESPIX_UID_NOBODY,
+            .gid       = ESPIX_UID_NOBODY,
             .fg_pid    = ESPIX_PID_NONE,
             .ansi      = ch->has_pty,
             .open_stream = chan_open_stream,
@@ -1338,6 +1385,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .write     = chan_write,
         .poll_interrupt = chan_poll_interrupt,
         .transport = ch,
+        /* Overwritten by apply_account(); nobody rather than 0 so that a
+         * path which forgets to set it fails closed instead of open. */
+        .uid       = ESPIX_UID_NOBODY,
+        .gid       = ESPIX_UID_NOBODY,
         .fg_pid    = ESPIX_PID_NONE,
         .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,

@@ -66,6 +66,69 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## Filesystem
 
+- **A directory's mode does not hide what is inside it.** Unix requires search
+  (`x`) permission on every component of a path; espix checks the final
+  component, plus the parent for anything that creates or removes a name. So
+  `chmod 700 /home/esp` stops `ls /home/esp`, but a user who already knows the
+  full path can still `cat /home/esp/notes`. A full walk costs a stat per
+  component on every file operation in the system, and computing a rule-derived
+  mode already costs an open and a four-byte read per file. Worth revisiting if
+  path resolution ever caches directory modes.
+
+- **Permission checks apply to espix's own tools, not to espix itself.** A task
+  that is neither a process nor inside a session -- SNTP, the WiFi driver, an
+  SSH connection task before it has authenticated anyone -- is the kernel and is
+  not checked. That is what lets boot read `/etc/wifi.conf` before there is
+  anybody to be. It also means anything espix runs on such a task is, in effect,
+  root; the seam to watch is `espix_fs_priv_begin()`, which deliberately grants
+  the same thing to `espix_auth` and to the ELF-magic probe, and which should
+  stay at those two callers.
+
+- **`sudo` does not ask for a password.** espix cannot read input without
+  echoing it, which is why `passwd` takes the password as an argument, so a
+  prompt would print what it was meant to protect. `sudo` therefore authorises
+  on `/etc/sudoers` membership alone: anyone who reaches an authenticated
+  session of a listed account can become root, including at a terminal its owner
+  walked away from. Linux closes that with a timestamp and a re-prompt. First
+  thing to revisit when the reentrant line editor lands.
+
+- **The name caches in espix_auth are shared and unlocked.** `ls -l` resolves a
+  uid and a gid to names through one-entry caches in file scope, and the console
+  and an SSH session can both be inside `ls` at once — the same race
+  `cmd_fs.c`'s comparators were written to avoid. The consequence is bounded to
+  a wrong or mangled *name* in a listing, since every write is a `strlcpy` into
+  a fixed buffer, but it is a race. A mutex would fix it; so would resolving
+  into the caller's own buffer and keeping no cache at all, at the cost of
+  re-reading the file per directory entry.
+
+- **A reused uid inherits the previous account's files.** `useradd` hands out
+  the lowest free id, so deleting an account and making another gives the new
+  one the old one's number — and every file still stamped with it. Standard Unix
+  behaviour, but likelier here: there are eight account slots and no `find -uid`
+  to hunt the leftovers down with. `userdel -r` clears the home directory;
+  anything the account owned elsewhere is yours to find.
+
+- **A group change needs a new login.** An identity's groups are resolved once,
+  when the session starts, and copied into a process at spawn — the file is the
+  authority but not something to re-read on the path of every `open()`. So
+  `usermod -aG` does not affect a session that is already open. A real system
+  has `newgrp` for that; espix has logging out.
+
+- **Eight groups, twelve entries, eight accounts.** `ESPIX_NGROUPS_MAX` is a
+  size as much as a limit, because credentials are copied rather than looked up.
+  Membership beyond the eighth group is silently not carried, which is the one
+  place these tables fail quietly rather than loudly.
+
+- **The shell drops an empty quoted argument.** `usermod -G "" esp` — the usual
+  way to clear somebody's supplementary groups — arrives as `usermod -G esp`,
+  so `-G` eats the username and the command prints its usage. Name a group you
+  do want instead, or use `userdel`. It is a shell limitation rather than a
+  usermod one.
+
+- **`su` does not exist.** `sudo` covers the need, and `su` is the command that
+  most wants the password prompt espix cannot yet give.
+
+
 - **A device VFS is usable but invisible.** `/dev/uart` is registered by
   ESP-IDF's UART driver and is live in this build, and because its prefix is
   longer than espix's `""` it outranks the root and routes straight to the

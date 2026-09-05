@@ -22,6 +22,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
@@ -313,6 +314,55 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     slot->info.pid        = espix_proc_next_pid();
     slot->info.state      = ESPIX_PROC_READY;
     slot->info.session    = session;
+
+    /*
+     * Credentials, copied now rather than followed later. A session with no
+     * session at all is espix starting something itself, which is root.
+     */
+    slot->info.uid     = (session != NULL) ? session->uid : 0;
+    slot->info.gid     = (session != NULL) ? session->gid : 0;
+    slot->info.ngroups = (session != NULL) ? session->ngroups : 0;
+    for (uint8_t i = 0; i < slot->info.ngroups; i++) {
+        slot->info.groups[i] = session->groups[i];
+    }
+
+    /*
+     * setuid and setgid: the process takes the *binary's* owner rather than the
+     * caller's. This is the one place in espix where a credential comes from
+     * somewhere other than the session, so it is the only place privilege can
+     * be raised without a password.
+     *
+     * What keeps that safe is that making a root-owned setuid binary already
+     * requires root: espix_fs_chown() refuses to change an owner for anyone
+     * else, and chowning clears these bits. Setting setuid on a file you own
+     * grants nothing, because it already ran as you.
+     *
+     * On the S3 this is a guardrail rather than a boundary -- there is no MMU,
+     * so a loaded app shares the address space with the kernel either way. It
+     * is implemented because the S31 has an MMU and that stops being true.
+     */
+    struct stat elf_st;
+    if (stat(abs_path, &elf_st) == 0) {
+        const mode_t m = espix_fs_mode(abs_path, &elf_st);
+
+        if (m & S_ISUID) {
+            espix_fs_owner(abs_path, &elf_st, &slot->info.uid, NULL);
+        }
+        if (m & S_ISGID) {
+            espix_fs_owner(abs_path, &elf_st, NULL, &slot->info.gid);
+
+            /* Into the set as well as the primary: the check matches against
+             * the set, so a gid that only landed in `gid` would be claimed and
+             * never usable. */
+            if (slot->info.ngroups < ESPIX_NGROUPS_MAX) {
+                slot->info.groups[slot->info.ngroups++] = slot->info.gid;
+            }
+        }
+        if (m & (S_ISUID | S_ISGID)) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: runs as uid %u gid %u", base,
+                       (unsigned)slot->info.uid, (unsigned)slot->info.gid);
+        }
+    }
 
     /* Inherited from whoever spawned it, like a child's cwd everywhere else.
      * A session with no cwd, or no session at all, means "/". */

@@ -16,7 +16,7 @@ CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 # One TLS slot is reserved for the per-task espix session pointer
 # (see espix_shell_set_current / espix_shell_current).
-CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=2
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=3
 
 #
 # Main task — app_main runs the boot sequence and then the console session.

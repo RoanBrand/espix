@@ -187,10 +187,13 @@ run it by name. No reflashing the filesystem. To build one, see
 [tools/README.md](tools/README.md).
 
 espix implements the SFTP subsystem that OpenSSH 9 and later use for `scp` by
-default, so plain `scp` and graphical clients both work, with no `-O` needed.
-Permissions a client sends are accepted and discarded, since there are no mode
-bits to apply them to yet. File size is not a limit: a write is streamed to the
-file as it arrives rather than reassembled in memory.
+default, so plain `scp` and graphical clients both work, with no `-O` needed. A
+transfer is checked against the same permissions a shell login would face — the
+two doors agree — and a client starts in its own home directory. Permissions a
+client sends are applied, except setuid, setgid and sticky, which are masked off
+rather than refused so that one bit cannot fail an entire `scp -p`. File size is
+not a limit: a write is streamed to the file as it arrives rather than
+reassembled in memory.
 
 Downloads run at about 355KB/s over 2.4GHz WiFi. Uploads are much slower, and
 bounded by LittleFS erasing a block per write rather than by the network — see
@@ -211,6 +214,21 @@ kernel messages.
 
 Support priority and per-chip feature availability (isolation model,
 display, networking) still to be finalized as the design matures.
+
+What the MMU rows in the matrix below rest on, since "has an MMU" covers two
+quite different things:
+
+- **The S31 has the kind that matters.** Espressif shipped a developer preview
+  of a Linux BSP for it in August 2026, and there are community RV32 Linux ports
+  running on the hardware. If Linux boots, per-process address spaces and
+  therefore `fork()` are available to espix too — which is why those rows say
+  *planned* rather than *no* now.
+- **The P4's is an address-translation MMU**, documented by ESP-IDF as mapping
+  physical to virtual so flash and PSRAM can be reached through a pointer. That
+  plus RISC-V PMP gives region-based protection between tasks — an MPU-shaped
+  boundary, not a `fork()`-shaped one. **Still to be confirmed against the P4
+  Technical Reference Manual** rather than promised: what espix would get there
+  is most likely fault isolation between tasks, not copy-on-write.
 
 ## Feature matrix
 
@@ -248,8 +266,9 @@ merely missing.
 | `sleep` | **planned** | |
 | Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`; `stat` reports the same mode `ls -l` shows |
 | Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |
-| `fork()` / `exec()` | **no** | no MMU, no copy-on-write |
-| MMU-backed process isolation | **no** on S3 | possible later on S31 — see [Crash handling](#crash-handling-and-isolation) |
+| `fork()` / `exec()` | **no** on S3, **planned** on S31 | needs an MMU for copy-on-write; the S31 has one |
+| MMU-backed process isolation | **no** on S3, **planned** on S31 | see [Hardware Targets](#hardware-targets) and [Crash handling](#crash-handling-and-isolation) |
+| setuid / setgid / sticky | **yes** | all three consulted; setuid is a guardrail on S3 and a boundary on S31 |
 
 ### Filesystem
 
@@ -262,10 +281,11 @@ merely missing.
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
 | `/proc`, `mount` / `umount` | **planned** | espix owns `/` but routes only `/`; a second mount needs its own routing table |
-| Mode bits, `chmod` | **yes** | nine bits, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
+| Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
-| Read and write bits enforced | **no** | the seam exists — espix owns the root VFS, so every `open()` passes through it — but no file has an owner to check a mode against yet |
-| `chown`, owner and group | **no** | no file records an owner — which is also why setuid, setgid and sticky are refused rather than stored |
+| Read and write bits enforced | **yes** | in espix's root VFS, so builtins, loaded apps and SFTP are all checked the same way |
+| `chown`, `chgrp`, owner and group | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
+| setuid, setgid, sticky | **yes** | each consulted; `/tmp` is `1777` and sticky is what makes that safe |
 | Symlinks, `ln` | **no** | cost, not principle: LittleFS has no link type, and following one means loop detection in every path lookup |
 
 ### Networking
@@ -275,7 +295,7 @@ merely missing.
 | WiFi station, DHCP lease, default route | **yes** | `wlan0`, reconnects on boot |
 | `ip`, `ifconfig`, `route`, `ping` | **yes** | `ping` resolves names |
 | SSH server | **yes** | password auth — [read this first](#a-word-on-the-ssh-server) |
-| `scp` / `sftp` | **yes** | SFTP subsystem; enough for `get`, `put`, `ls`, `cd`, `mkdir`, `rm` |
+| `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
 | `ssh host <cmd>` | **partial** | works, but can truncate a long command's output — see [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) |
@@ -287,16 +307,44 @@ merely missing.
 | | | |
 |---|---|---|
 | Password authentication | **yes** | PBKDF2-SHA256, per-user salt, `/etc/passwd` |
-| `passwd`, `whoami` | **yes** | |
-| More than one account | **partial** | the file format holds them; no `adduser` yet |
-| uid/gid, file ownership, `su` | **planned** | a minimal user system, not a full POSIX one |
-| `sudo`, groups, per-app capabilities | **planned** | so an app need not run as root or see the whole filesystem |
+| `passwd`, `whoami`, `id` | **yes** | `passwd` refuses to change another account's, unless root |
+| More than one account | **yes** | `useradd` allocates a free uid; 8 accounts and 12 groups |
+| uid/gid and file ownership | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
+| Enforced read/write/execute | **yes** | in espix's VFS, for builtins and loaded apps alike |
+| `chown`, `chgrp` | **yes** | changing an owner is root's, as in chown(2) |
+| `sudo`, `sudo -u <user>` | **yes** | gated by `/etc/sudoers`, which takes names or `%group`; does not re-prompt, see below |
+| `su` | **no** | `sudo` covers the need, and `su` wants the password prompt espix cannot give |
+| Groups with members | **yes** | `/etc/group`, supplementary membership, and the group triad actually checked |
+| `useradd`, `userdel`, `usermod` | **yes** | `-r` for a service account: locked, low uid, no home |
+| `groupadd`, `groupdel`, `groups` | **yes** | |
+| Per-app capabilities | **planned** | so an app need not see the whole filesystem |
+| An editor | **no** | no `nano` or `ed`, so editing a config on the device means `echo >` |
 
 Worth being clear about what that last row can buy on a chip with no MMU: an app
 shares the address space with the kernel, so filesystem permissions are a
 guardrail against mistakes rather than a sandbox around hostile code. The real
 boundary is the ELF loader's export table — an app can only call what espix
 publishes to it. Permissions make that boundary usable; they do not replace it.
+The same caveat applies to setuid, which is implemented because the S31 makes it
+a real boundary rather than because it is one on the S3.
+
+Root follows the model Debian uses: the account exists but is locked, so nothing
+can log in as it, and `sudo` is how you reach it. `sudo passwd root <pw>` gives
+it a password if you want one, and `passwd -l root` takes it away again.
+`/etc/sudoers` is seeded with `%sudo`, so membership of that group is what
+grants it — the arrangement Debian ships, where RHEL would say `%wheel`.
+
+Services get their own identity rather than running as whoever started them:
+`useradd -r www` makes a locked account with a low uid and no home, and
+`sudo -u www /bin/httpd &` runs the app as it. No service manager is involved —
+that is the whole mechanism.
+
+**`sudo` does not ask for your password.** espix cannot read input without
+echoing it — the same limitation that makes `passwd` take the password as an
+argument — so a prompt would print the thing it was protecting. The session is
+already authenticated, and sudo(8)'s timestamp caching means a real one often
+does not re-ask either, but an unattended terminal is a way in that Linux would
+have closed. It is the first thing to fix when the reentrant line editor lands.
 
 ## A word on the SSH server
 
@@ -379,13 +427,15 @@ feature what espix's SSH server does. It has WiFi with WPA3, BLE, SMP and most
 ESP32-S3 peripherals. POSIX and ANSI compliance are stated project goals, not
 aspirations.
 
-It is also ahead where espix has written down that it is stuck. With
+It was also ahead where espix had written down that it was stuck. With
 `CONFIG_SCHED_USER_IDENTITY` NuttX tracks a task's real and effective UID/GID
-and enforces file permissions in the VFS. espix stores permission bits and
-enforces only the execute one, because an app reaches the filesystem through
-libc and the VFS underneath has no idea which process is calling — see
-[KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md). NuttX *owns* its VFS, so the question
-is answerable there. That is a difference in position, not in effort.
+and enforces file permissions in the VFS; espix stored permission bits and
+enforced only the execute one, because an app reached the filesystem through
+libc and the VFS underneath had no idea which process was calling. That gap is
+closed — espix owns the root VFS now, so the question is answerable here too,
+and uid, gid and enforcement all landed on top of it. NuttX keeps the advantage
+on what surrounds it: real groups, `su`, and a task model that was designed for
+this rather than fitted to it.
 
 **The actual difference is that espix is additive to ESP-IDF and NuttX is an
 alternative to it.** Choosing NuttX means leaving `idf.py`, the component
