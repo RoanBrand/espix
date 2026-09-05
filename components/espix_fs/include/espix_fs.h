@@ -52,6 +52,19 @@ bool espix_fs_is_mounted(void);
 esp_err_t espix_fs_resolve(const char *cwd, const char *path,
                            char *out, size_t out_len);
 
+/*
+ * True if `abs_path` is `dir` or something underneath it. Both must already be
+ * absolute and normalised -- espix_fs_resolve() output, in other words.
+ *
+ * The subtlety worth having in one place is the boundary: a plain prefix match
+ * lets /home/esp claim /home/espix, which would hand one account's files to
+ * another whose name it happens to begin with. "/" contains everything.
+ *
+ * Two callers with the same requirement: the owner rule, matching a path
+ * against each account's home, and a process's root.
+ */
+bool espix_fs_within(const char *abs_path, const char *dir);
+
 /* Recursive delete, used by `rm -r`. */
 esp_err_t espix_fs_rm_rf(const char *abs_path);
 
@@ -199,6 +212,20 @@ bool espix_fs_is_executable(const char *abs_path);
  * storing it, so this is also how a file returns to having no stored mode.
  */
 esp_err_t espix_fs_chmod(const char *abs_path, mode_t mode);
+
+/*
+ * Set the mode only if it is not already what it should be.
+ *
+ * For a component that owns a file and wants it locked down every boot,
+ * whether or not this device has ever had it locked down before. The guard is
+ * the point: espix_fs_chmod() writes the attribute whenever it differs from
+ * the rule, so calling it unconditionally on every boot costs a LittleFS
+ * metadata write on every boot -- a block erase, forever, to arrive at the
+ * mode the file already had.
+ *
+ * ESP_OK when the mode already matched and nothing was written.
+ */
+esp_err_t espix_fs_ensure_mode(const char *abs_path, mode_t mode);
 
 /* Render "-rwxr-xr-x" into `out`. Never emits s, S, t or T. */
 void espix_fs_mode_str(mode_t mode, bool is_dir, char *out, size_t len);

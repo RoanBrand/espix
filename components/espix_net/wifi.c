@@ -129,6 +129,25 @@ static void retry_connect(void *arg)
 /* Config file                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The file holds the PSK in plaintext, so it is root's alone to read.
+ *
+ * Not a nicety: the rule in espix_fs gives an unstamped file 0644, and that
+ * default outlived the arrival of permissions -- until this, every account on
+ * the device could read the network's password. Discretionary permissions
+ * start out readable and are locked by someone remembering to; this is the
+ * remembering.
+ *
+ * Called after every write and again on the boot read, because a device
+ * flashed before this existed carries no stored mode and would otherwise stay
+ * 0644 forever. espix_fs_ensure_mode() is what makes the boot call free once
+ * it has been done once.
+ */
+static void secure_conf(void)
+{
+    (void)espix_fs_ensure_mode(WIFI_CONF_PATH, 0600);
+}
+
 esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk)
 {
     FILE *f = fopen(WIFI_CONF_PATH, "w");
@@ -144,6 +163,7 @@ esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk)
     fprintf(f, "# dhcp=yes is the default\n");
     fclose(f);
 
+    secure_conf();
     return ESP_OK;
 }
 
@@ -357,6 +377,10 @@ esp_err_t espix_net_wifi_start(void)
 {
     char ssid[ESPIX_SSID_MAX] = {0};
     char psk[ESPIX_PSK_MAX]   = {0};
+
+    /* Before the first read, so a device that predates this gets its mode
+     * corrected whether or not it ever runs `wifi connect` again. */
+    secure_conf();
 
     const bool have_ssid =
         espix_fs_conf_get(WIFI_CONF_PATH, "ssid", ssid, sizeof(ssid)) &&

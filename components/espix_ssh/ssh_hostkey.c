@@ -5,10 +5,11 @@
  * Ed25519 implementation — only a TLS 1.3 signature-algorithm constant. Every
  * OpenSSH client accepts ecdsa-sha2-nistp256.
  *
- * The private key lives in /etc/ssh/host_ecdsa_key as hex. That is plaintext on
- * a filesystem with no permissions, consistent with /etc/wifi.conf and the
- * trusted-code model — and stated in the README rather than glossed over. PSA
- * persistent key storage would be better but is not configured in this build.
+ * The private key lives in /etc/ssh/host_ecdsa_key as hex, mode 0600 and owned
+ * by root. It is still plaintext -- PSA persistent key storage would be better
+ * but is not configured in this build -- so the mode is the only thing standing
+ * between another account on the device and the host's identity. It was 0644
+ * until permissions grew teeth and nobody came back for it; see secure_key().
  */
 
 #include <ctype.h>
@@ -20,6 +21,7 @@
 #include "mbedtls/base64.h"
 #include "psa/crypto.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_ssh.h"
 #include "ssh_priv.h"
@@ -212,6 +214,20 @@ static void compute_fingerprint(void)
     snprintf(s_fingerprint, sizeof(s_fingerprint), "SHA256:%s", (char *)b64);
 }
 
+/*
+ * Root's alone to read, and re-asserted on load as well as on save.
+ *
+ * A device flashed before this existed carries no stored mode, so the rule
+ * answers 0644 and the key is world-readable; nothing would ever correct that
+ * if only save_key() set it, because the key is generated once and then only
+ * ever loaded. espix_fs_ensure_mode() is what keeps the load-path call from
+ * costing a LittleFS metadata write on every boot.
+ */
+static void secure_key(void)
+{
+    (void)espix_fs_ensure_mode(KEY_PATH, 0600);
+}
+
 static esp_err_t save_key(void)
 {
     uint8_t scalar[P256_SCALAR];
@@ -234,6 +250,8 @@ static esp_err_t save_key(void)
     to_hex(scalar, scalar_len, hex);
     fprintf(f, "%s\n", hex);
     fclose(f);
+
+    secure_key();
 
     /* Public half alongside it, so the identity is inspectable with cat even
      * though the private key is not meant to be read. */
@@ -266,6 +284,10 @@ static esp_err_t load_key(void)
     char line[P256_SCALAR * 2 + 4] = {0};
     const bool got = fgets(line, sizeof(line), f) != NULL;
     fclose(f);
+
+    /* After the close, not before: a stored attribute written against an open
+     * entry is the littlefs#1076 case, and there is no reason to take it here. */
+    secure_key();
 
     uint8_t scalar[P256_SCALAR];
     if (!got || strlen(line) < P256_SCALAR * 2 ||
