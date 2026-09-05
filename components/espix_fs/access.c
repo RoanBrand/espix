@@ -91,20 +91,52 @@ static const char *op_name(espix_fs_access_t op)
 
 /*
  * The caller's identity, or false if there is nobody to hold to account.
+ *
+ * A set of groups rather than one, because that is the only way two accounts
+ * can share access to a file: the primary gid alone could never say anything
+ * the uid did not already.
  */
-static bool subject(uint16_t *uid, uint16_t *gid)
+typedef struct {
+    uint16_t uid;
+    uint16_t gid;
+    uint16_t groups[ESPIX_NGROUPS_MAX];
+    uint8_t  ngroups;
+} subject_t;
+
+static bool subject(subject_t *out)
 {
-    if (espix_proc_cred_of_task(xTaskGetCurrentTaskHandle(), uid, gid)) {
+    memset(out, 0, sizeof(*out));
+
+    if (espix_proc_cred_of_task(xTaskGetCurrentTaskHandle(), &out->uid,
+                                &out->gid, out->groups, &out->ngroups)) {
         return true;
     }
 
     const espix_session_t *s = espix_shell_current();
     if (s != NULL) {
-        *uid = s->uid;
-        *gid = s->gid;
+        out->uid     = s->uid;
+        out->gid     = s->gid;
+        out->ngroups = s->ngroups;
+        for (uint8_t i = 0; i < s->ngroups; i++) {
+            out->groups[i] = s->groups[i];
+        }
         return true;
     }
 
+    return false;
+}
+
+/* Does the caller hold `gid`, primary or supplementary? */
+static bool holds_group(const subject_t *who, uint16_t gid)
+{
+    if (who->gid == gid) {
+        return true;
+    }
+    for (uint8_t i = 0; i < who->ngroups; i++) {
+        if (who->groups[i] == gid) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -118,13 +150,13 @@ static bool subject(uint16_t *uid, uint16_t *gid)
  * is what "the owner triad applies to the owner" means.
  */
 static bool permitted(mode_t mode, uint16_t f_uid, uint16_t f_gid,
-                      uint16_t uid, uint16_t gid, mode_t want)
+                      const subject_t *who, mode_t want)
 {
     int shift;
 
-    if (uid == f_uid) {
+    if (who->uid == f_uid) {
         shift = 0;
-    } else if (gid == f_gid) {
+    } else if (holds_group(who, f_gid)) {
         shift = 3;
     } else {
         shift = 6;
@@ -147,7 +179,7 @@ static void parent_of(const char *abs_path, char *out, size_t len)
 }
 
 /* Does `uid` hold `want` on `abs_path`? */
-static bool may(const char *abs_path, uint16_t uid, uint16_t gid, mode_t want)
+static bool may(const char *abs_path, const subject_t *who, mode_t want)
 {
     struct stat st;
     if (stat(abs_path, &st) != 0) {
@@ -163,7 +195,7 @@ static bool may(const char *abs_path, uint16_t uid, uint16_t gid, mode_t want)
     uint16_t f_gid = 0;
     espix_fs_owner(abs_path, &st, &f_uid, &f_gid);
 
-    return permitted(espix_fs_mode(abs_path, &st), f_uid, f_gid, uid, gid, want);
+    return permitted(espix_fs_mode(abs_path, &st), f_uid, f_gid, who, want);
 }
 
 /*
@@ -205,13 +237,12 @@ static bool sticky_permits(const char *parent, const char *abs_path,
 
 int espix_fs_admin_check(const char *abs_path, bool changing_owner)
 {
-    uint16_t uid = 0;
-    uint16_t gid = 0;
+    subject_t who;
 
     if (abs_path == NULL) {
         return EINVAL;
     }
-    if (privileged() || !subject(&uid, &gid) || uid == 0) {
+    if (privileged() || !subject(&who) || who.uid == 0) {
         return 0;
     }
     if (changing_owner) {
@@ -227,20 +258,19 @@ int espix_fs_admin_check(const char *abs_path, bool changing_owner)
     uint16_t f_gid = 0;
     espix_fs_owner(abs_path, NULL, &f_uid, &f_gid);
 
-    return (uid == f_uid) ? 0 : EPERM;
+    return (who.uid == f_uid) ? 0 : EPERM;
 }
 
 void espix_fs_claim(const char *abs_path)
 {
-    uint16_t uid = 0;
-    uint16_t gid = 0;
+    subject_t who;
 
     /*
      * espix creating something of its own leaves the rule to answer, which is
      * what keeps a boot that writes /etc/passwd or mkdir's the skeleton from
      * stamping an attribute onto every one of them.
      */
-    if (abs_path == NULL || privileged() || !subject(&uid, &gid)) {
+    if (abs_path == NULL || privileged() || !subject(&who)) {
         return;
     }
 
@@ -260,7 +290,7 @@ void espix_fs_claim(const char *abs_path)
     uint16_t rule_gid = 0;
     espix_fs_owner(abs_path, NULL, &rule_uid, &rule_gid);
 
-    if (rule_uid == uid && rule_gid == gid) {
+    if (rule_uid == who.uid && rule_gid == who.gid) {
         return;
     }
 
@@ -270,7 +300,7 @@ void espix_fs_claim(const char *abs_path)
      * now refuses the latter to anyone but root.
      */
     espix_fs_priv_begin();
-    (void)espix_fs_chown(abs_path, uid, gid);
+    (void)espix_fs_chown(abs_path, who.uid, who.gid);
     espix_fs_priv_end();
 }
 
@@ -284,12 +314,11 @@ int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags)
         return 0;
     }
 
-    uint16_t uid = 0;
-    uint16_t gid = 0;
-    if (!subject(&uid, &gid)) {
+    subject_t who;
+    if (!subject(&who)) {
         return 0;               /* espix itself */
     }
-    if (uid == 0) {
+    if (who.uid == 0) {
         return 0;               /* root is not asked */
     }
 
@@ -315,7 +344,7 @@ int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags)
 
             struct stat st;
             if (stat(abs_path, &st) != 0 &&
-                !may(parent, uid, gid, S_IWUSR | S_IXUSR)) {
+                !may(parent, &who, S_IWUSR | S_IXUSR)) {
                 goto denied;
             }
         }
@@ -344,7 +373,7 @@ int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags)
     if (on_parent) {
         char parent[ESPIX_PATH_MAX];
         parent_of(abs_path, parent, sizeof(parent));
-        if (!may(parent, uid, gid, want)) {
+        if (!may(parent, &who, want)) {
             goto denied;
         }
         /*
@@ -352,19 +381,19 @@ int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags)
          * nothing to say about it -- it restricts *removal*, not addition.
          */
         if (op != ESPIX_FS_ACCESS_MKDIR &&
-            !sticky_permits(parent, abs_path, uid)) {
+            !sticky_permits(parent, abs_path, who.uid)) {
             goto denied;
         }
         return 0;
     }
 
-    if (!may(abs_path, uid, gid, want)) {
+    if (!may(abs_path, &who, want)) {
         goto denied;
     }
     return 0;
 
 denied:
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "uid %u denied %s %s (flags 0x%x)",
-               (unsigned)uid, op_name(op), abs_path, (unsigned)flags);
+               (unsigned)who.uid, op_name(op), abs_path, (unsigned)flags);
     return EACCES;
 }

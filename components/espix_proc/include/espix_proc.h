@@ -76,6 +76,8 @@ typedef struct {
      */
     uint16_t           uid;
     uint16_t           gid;
+    uint16_t           groups[ESPIX_NGROUPS_MAX];
+    uint8_t            ngroups;
 } espix_proc_info_t;
 
 esp_err_t espix_proc_init(void);
@@ -181,7 +183,8 @@ espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);
  * Takes no lock. It runs on the path of every file operation in the system, and
  * the fields it reads are written once, before the process is admitted.
  */
-bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid);
+bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
+                             uint16_t *groups, uint8_t *ngroups);
 
 /*
  * The calling process's working directory, or "/" for a task that is not a

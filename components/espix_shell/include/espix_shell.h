@@ -72,6 +72,15 @@ struct espix_session {
     uint16_t    gid;
 
     /*
+     * Every group this identity is in, `gid` included, resolved once at login
+     * from /etc/group. The permission check matches its group triad if any of
+     * these matches the file's, which is what lets two accounts share access --
+     * the thing a gid that always equalled its uid could never express.
+     */
+    uint16_t    groups[ESPIX_NGROUPS_MAX];
+    uint8_t     ngroups;
+
+    /*
      * Home directory, or empty for a session that has none. The prompt shows it
      * as `~`, and a bare `cd` returns to it. Root's is deliberately empty: the
      * console starts at / and showing an absolute path there is honest.

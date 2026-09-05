@@ -319,8 +319,12 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      * Credentials, copied now rather than followed later. A session with no
      * session at all is espix starting something itself, which is root.
      */
-    slot->info.uid = (session != NULL) ? session->uid : 0;
-    slot->info.gid = (session != NULL) ? session->gid : 0;
+    slot->info.uid     = (session != NULL) ? session->uid : 0;
+    slot->info.gid     = (session != NULL) ? session->gid : 0;
+    slot->info.ngroups = (session != NULL) ? session->ngroups : 0;
+    for (uint8_t i = 0; i < slot->info.ngroups; i++) {
+        slot->info.groups[i] = session->groups[i];
+    }
 
     /*
      * setuid and setgid: the process takes the *binary's* owner rather than the
@@ -346,6 +350,13 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
         }
         if (m & S_ISGID) {
             espix_fs_owner(abs_path, &elf_st, NULL, &slot->info.gid);
+
+            /* Into the set as well as the primary: the check matches against
+             * the set, so a gid that only landed in `gid` would be claimed and
+             * never usable. */
+            if (slot->info.ngroups < ESPIX_NGROUPS_MAX) {
+                slot->info.groups[slot->info.ngroups++] = slot->info.gid;
+            }
         }
         if (m & (S_ISUID | S_ISGID)) {
             espix_klog(ESPIX_KLOG_INFO, TAG, "%s: runs as uid %u gid %u", base,

@@ -904,6 +904,10 @@ esp_err_t espix_console_session_start(void)
          */
         .uid       = 0,
         .gid       = 0,
+        /* root's own group, and no others. uid 0 skips the checks anyway, so
+         * this is for `groups` and `id` to have something true to print. */
+        .groups    = { 0 },
+        .ngroups   = 1,
         .login     = false,
         .read_line = console_read_line,
         .write     = console_write,

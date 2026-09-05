@@ -1073,13 +1073,23 @@ static void apply_account(espix_session_t *session, const char *user)
          */
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "%s: no account record; running as nobody", user);
-        session->uid = ESPIX_UID_NOBODY;
-        session->gid = ESPIX_UID_NOBODY;
+        session->uid     = ESPIX_UID_NOBODY;
+        session->gid     = ESPIX_UID_NOBODY;
+        session->ngroups = 0;
         return;
     }
 
     session->uid = account.uid;
     session->gid = account.gid;
+
+    /*
+     * Every group this account is in, resolved now. The permission check reads
+     * the set rather than the file, so a change to /etc/group takes effect at
+     * the next login rather than mid-session -- which is what `newgrp` exists
+     * for on a real system and is the same bargain espix makes for the uid.
+     */
+    session->ngroups = (uint8_t)espix_auth_groups(user, session->groups,
+                                                  ESPIX_NGROUPS_MAX);
 
     if (account.home[0] == '\0') {
         return;
