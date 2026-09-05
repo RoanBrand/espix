@@ -101,9 +101,18 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   here, since 0/60 was observed with the bug still present.
 
   On a failure the connection task blocks and its teardown is delayed by about
-  five seconds (`PARTIAL_READ_TIMEOUT_MS`), so `ps` briefly shows two
-  `sshd:conn` tasks and no "connection closed" line is logged for that session.
-  It does recover; it is not a permanent leak.
+  five seconds (`PARTIAL_READ_TIMEOUT_MS`), so `ps` shows two `sshd:conn` tasks
+  and no "connection closed" line is logged for that session.
+
+  **Usually that clears, but not always**, and the exception is not understood.
+  A device left running will sometimes keep one extra `sshd:conn` blocked
+  indefinitely -- observed at normal priority with a small stack, surviving
+  minutes of idle time. What it does *not* do is accumulate: ten further
+  connections after one appeared left the count at two, so it is one task stuck
+  once rather than a leak per connection, and the `CONFIG_ESPIX_SSH_MAX_SESSIONS`
+  ceiling of four is not being walked towards. A reboot clears it. Which event
+  strands it has not been pinned down -- it has been seen both after a
+  `Corrupted MAC` failure and after a run of ordinary connections with none.
 
   One thing found while chasing this *was* fixed, and it is worth knowing about
   because it could have produced exactly these symptoms: **a kernel log echoed
