@@ -374,7 +374,7 @@ static bool chan_poll_interrupt(espix_session_t *s)
  * Cooked for a terminal, raw otherwise.
  *
  * send_cooked() turns every \n into \r\n, which is right for a pty and wrong
- * for `ssh host 'cat /etc/motd' > file` -- that would put carriage returns in
+ * for `ssh host 'cat /etc/hostname' > file` -- that would put carriage returns in
  * the file. `raw_out` is set only when entering the exec path without a
  * pty-req, so an interactive shell is unaffected whatever it asked for.
  */

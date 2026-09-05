@@ -935,11 +935,6 @@ esp_err_t espix_console_session_start(void)
     /*
      * The same greeting an SSH session gets, reached through the ordinary
      * dispatch so this file needs no knowledge of what is in it.
-     *
-     * /etc/motd is still not read: the greeting now occupies that slot, and
-     * printing the file's directory guide at every login would be noise. It
-     * remains available with `cat /etc/motd`, and if it should appear here
-     * later it belongs directly under the spec block.
      */
     /*
      * A console session that ends starts another, which is what init does when

@@ -36,7 +36,7 @@ begins.
 
 ### `/` is real, and it is espix's
 
-Paths are `/bin/hello` and `/etc/motd`, not `/storage/bin/hello`, because
+Paths are `/bin/hello` and `/etc/hostname`, not `/storage/bin/hello`, because
 espix registers a VFS with `base_path = ""` — which ESP-IDF documents as a
 *fallback* handling any path no other VFS claims. `/dev/*` still reaches its own
 driver, by being a longer prefix.
@@ -68,8 +68,8 @@ than closer.
 #### Stacked by pointer, not by path
 
 The obvious way to reach the layer below is to give it a base path — mount
-LittleFS at `/.lfs` and rewrite `/etc/motd` into `/.lfs/etc/motd`. That works,
-and it publishes a *second name for the root*: anything spelling `/.lfs/...`
+LittleFS at `/.lfs` and rewrite `/etc/hostname` into `/.lfs/etc/hostname`. That
+works, and it publishes a *second name for the root*: anything spelling `/.lfs/...`
 addresses the filesystem with the checks skipped. Which would make the whole
 exercise decorative.
 
@@ -808,8 +808,8 @@ than copied into the second one:
 
 Output cooking is decided per channel, not per build. `send_cooked()` turns
 every `\n` into `\r\n`, which is what a terminal wants and what a pipe does
-not: `ssh host 'cat /etc/motd' > file` would otherwise put carriage returns in
-the file. So an exec channel with no `pty-req` writes raw, and `ssh -t host cmd`
+not: `ssh host 'cat /etc/hostname' > file` would otherwise put carriage returns
+in the file. So an exec channel with no `pty-req` writes raw, and `ssh -t host cmd`
 — which does send one — gets cooking and `ansi`. The interactive path is
 unconditionally cooked, deliberately unchanged.
 

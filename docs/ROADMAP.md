@@ -282,9 +282,17 @@ things are as they are.
   what happens because there is no alternative.
 - **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
   quieted driver tags.
-- **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the
-  console prints a fixed banner instead. Printing motd at session start is the
-  right home for it, and worth doing when SSH makes "logging in" a real event.
+- ~~**`/etc/motd`.**~~ Decided against, and the file is gone. The condition this
+  entry waited on -- "worth doing when SSH makes logging in a real event" -- did
+  arrive, and the answer turned out to be the other one: `cmd_motd.c` generates
+  a greeting from what the system actually knows (version, uptime, address, disk)
+  and both transports print it at session start. A static file repeating a
+  directory guide at every login is noise beside that, and it had already gone
+  stale -- it ended by telling you to edit it, on a system with no editor.
+
+  What a real `/etc/motd` is *for* is a local administrator's message, which is
+  worth having again once there is an editor to write one with. It would then be
+  printed alongside the generated greeting rather than instead of it.
 
 ## Platform
 

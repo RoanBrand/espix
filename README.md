@@ -178,7 +178,7 @@ or `UTC0` (the offset is not optional). `timedatectl set-timezone` writes it.
 
 ```bash
 scp build/hello.app.elf esp@esp32s3-cb5d74:/bin/hello
-scp esp@esp32s3-cb5d74:/etc/motd .
+scp esp@esp32s3-cb5d74:/etc/hostname .
 sftp esp@esp32s3-cb5d74
 ```
 
