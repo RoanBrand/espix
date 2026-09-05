@@ -118,6 +118,30 @@ misses a reboot, because two software reboots in a row read identically. That
 was caught by rebooting a device mid-check and watching the first version not
 notice.
 
+## Stress, and why it is not in the default run
+
+```bash
+make stress                 # 30 runs at 100 lines, expects zero failures
+make stress N=100           # longer
+./tests/run.sh --suite stress --stress --stress-lines 200 --stress-limit 100
+```
+
+`make test` does not chase intermittent faults. A check that fails a few times
+in thirty would make the default run red for a bug that is already documented
+and open, and an intermittently red suite is ignored within a week — taking the
+credibility of every other assertion with it.
+
+The default sits at 100 lines **below** the threshold where the transport starts
+failing, so any failure there is a real regression. Above it — `--stress-lines
+200` — is the reproducer for the `Corrupted MAC` entry in
+[KNOWN-ISSUES](../docs/KNOWN-ISSUES.md), which turns out to be a cliff rather
+than a slope: clean at 8, 25, 50 and 100 lines, and 26 bad in 30 at 200.
+
+Two rules for anything that chases it. Do not add firmware logging: the fault
+vanishes under instrumentation (0/140 with per-packet tracing, 2/30 without).
+And do not trust a short clean run — 0/60 was recorded with the bug demonstrably
+present.
+
 ## The test app
 
 `tests/app/` is its own IDF project, so `tools/build-apps.sh` — which globs

@@ -13,6 +13,7 @@
 #   make apps             build apps/ and stage into fsroot/bin
 #   make test-app         build the test app into fsroot/home/esp
 #   make test             run the test suite       [SUITE=fs] [PORT=...]
+#   make stress           measure the known transport failure rate  [N=30]
 #   make clean            fullclean, firmware and apps
 #
 # PORT= overrides serial port detection. IDF_PATH= overrides SDK discovery.
@@ -29,7 +30,7 @@ else
 endif
 
 .PHONY: all build flash fs flash-all monitor monitor-reset apps test-app \
-        test clean help
+        test stress clean help
 
 all: build
 
@@ -70,6 +71,15 @@ test: test-app
 	ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh \
 	    $(if $(SUITE),--suite $(SUITE),) \
 	    $(if $(PORT),--port $(PORT),--port $$(./tools/port.sh 2>/dev/null || true))
+
+# Measures the known transport failure rate rather than gating on it -- see
+# tests/suites/90-stress.sh. Separate from `make test` on purpose: a check that
+# fails a few times in thirty would make the default run intermittently red for
+# a bug that is already documented and open.
+stress: test-app
+	@eval "$$(./tools/idf.sh --env)"; \
+	ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh --suite stress --stress \
+	    $(if $(N),--stress-n $(N),)
 
 clean:
 	$(IDF) fullclean

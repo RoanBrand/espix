@@ -300,9 +300,30 @@ dev_health_check() {
         *) problems="$problems core-dump-present" ;;
     esac
 
+    # Connection tasks: told apart by persistence, not by counting.
+    #
+    # One is the connection asking the question. A second is usually the
+    # previous one still in teardown -- close_gracefully drains until the peer
+    # hangs up, bounded by PARTIAL_READ_TIMEOUT_MS at five seconds -- so
+    # back-to-back commands routinely show two, and complaining about that would
+    # cry wolf on every run.
+    #
+    # But KNOWN-ISSUES records that one sometimes does *not* clear, and simply
+    # tolerating two made that invisible to the check meant to catch it. So look
+    # again after the teardown window has passed: a closing connection is gone
+    # by then and a stranded one is not. The extra wait only happens on the rare
+    # path where the count is above one.
     conns=$(dev_once 'ps' | grep -c 'sshd:conn')
-    if [ "$conns" -gt 2 ]; then
-        problems="$problems sshd-conn-tasks=$conns"
+    if [ "$conns" -gt 1 ]; then
+        sleep 7
+        conns=$(dev_once 'ps' | grep -c 'sshd:conn')
+        if [ "$conns" -gt 1 ]; then
+            # "Something is holding connections", not a diagnosis: a person
+            # logged in at another terminal looks exactly like a stranded task
+            # from here, and reading one as the other has already put a wrong
+            # claim into KNOWN-ISSUES once.
+            problems="$problems sshd-conn-tasks-held=$conns(someone-logged-in?)"
+        fi
     fi
 
     if [ -n "$problems" ]; then

@@ -100,19 +100,56 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   proven on a build with no tracing in it, over a long run — 0/30 means nothing
   here, since 0/60 was observed with the bug still present.
 
+  **It is a cliff, not a slope**, which the test suite established and neither
+  earlier investigation knew. Measured with `tests/suites/90-stress.sh`, which
+  runs `run testapp out <n>` and checks both the MAC and the line count:
+
+  | lines | ≈ bytes | bad |
+  |---|---|---|
+  | 8, 25, 50, 100 | 0.5–6 KB | **0 of 20**, at every one |
+  | 200 | ~11 KB | **26 of 30** |
+
+  So the transport is not merely unreliable — it is clean below some threshold
+  between 6 KB and 11 KB of channel data and nearly unusable above it. Anything
+  proposed as the cause has to explain a cliff rather than a rate.
+
+  Ruled out while measuring: `wait_for_window()` is **not** involved. None of
+  its messages, nor the framing or overflow errors from `ssh_packet_write()`,
+  appears in `dmesg` across failing runs — so window exhaustion, and the
+  read-inside-a-send it performs, are not the mechanism.
+
+  Reproduce with:
+
+      ./tests/run.sh --suite stress --stress --stress-lines 200 --stress-limit 100
+
+  `make stress` defaults to 100 lines instead, below the cliff, where any
+  failure at all is a regression rather than the known bug.
+
   On a failure the connection task blocks and its teardown is delayed by about
   five seconds (`PARTIAL_READ_TIMEOUT_MS`), so `ps` shows two `sshd:conn` tasks
   and no "connection closed" line is logged for that session.
 
-  **Usually that clears, but not always**, and the exception is not understood.
-  A device left running will sometimes keep one extra `sshd:conn` blocked
-  indefinitely -- observed at normal priority with a small stack, surviving
-  minutes of idle time. What it does *not* do is accumulate: ten further
-  connections after one appeared left the count at two, so it is one task stuck
-  once rather than a leak per connection, and the `CONFIG_ESPIX_SSH_MAX_SESSIONS`
-  ceiling of four is not being walked towards. A reboot clears it. Which event
-  strands it has not been pinned down -- it has been seen both after a
-  `Corrupted MAC` failure and after a run of ordinary connections with none.
+  **Usually that clears. Whether it ever truly strands is not established**, and
+  the honest reason is that nothing here can tell a stranded task from a person
+  logged in at another terminal — both show as a blocked `sshd:conn` that
+  survives any amount of waiting.
+
+  Four tasks were once seen after thirty iterations above the cliff, and written
+  up here as proof that it accumulates towards the
+  `CONFIG_ESPIX_SSH_MAX_SESSIONS` ceiling of four. That claim has been withdrawn:
+  the developer was logging in from a separate terminal during that period, which
+  accounts for the extra tasks at least as well. The correlation with transport
+  failures was suggestive and is not evidence.
+
+  `tests/lib/device.sh` reports `stranded-sshd-conn-tasks=N` when more than one
+  survives the five-second teardown window, and that check inherits the same
+  blind spot: it will flag a colleague's shell exactly as loudly. Treat it as
+  "something is holding connections", not as a diagnosis.
+
+  Settling it needs a signal that separates the two — a per-connection log line
+  at open and close, or a `ps` that shows how long a task has been blocked. The
+  transport bug above is the better thing to fix first; if it is the cause, this
+  goes with it.
 
   One thing found while chasing this *was* fixed, and it is worth knowing about
   because it could have produced exactly these symptoms: **a kernel log echoed

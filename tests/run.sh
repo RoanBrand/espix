@@ -6,6 +6,7 @@
 #   tests/run.sh --suite fs          just the suite whose name contains "fs"
 #   tests/run.sh --host 10.0.0.5     a different device
 #   tests/run.sh --port /dev/ttyUSB0 enable the console suites
+#   tests/run.sh --stress [--stress-n 50]   include the stress suites
 #
 # bash 3.2 throughout -- macOS ships it and always will (GPLv3), so a bash-4-ism
 # here is green on Linux and red on the author's own machine. See README.md.
@@ -23,9 +24,18 @@ ESPIX_ROOT="$(cd "$ESPIX_TEST_DIR/.." && pwd)"
 export ESPIX_ROOT
 
 SUITE_FILTER=""
+: "${ESPIX_STRESS:=0}"
+: "${ESPIX_STRESS_N:=30}"
+: "${ESPIX_STRESS_LINES:=100}"
+: "${ESPIX_STRESS_LIMIT:=0}"
+export ESPIX_STRESS ESPIX_STRESS_N ESPIX_STRESS_LINES ESPIX_STRESS_LIMIT
 while [ $# -gt 0 ]; do
     case "$1" in
         --suite) SUITE_FILTER="$2"; shift 2 ;;
+        --stress) ESPIX_STRESS=1; shift ;;
+        --stress-n) ESPIX_STRESS_N="$2"; shift 2 ;;
+        --stress-lines) ESPIX_STRESS_LINES="$2"; shift 2 ;;
+        --stress-limit) ESPIX_STRESS_LIMIT="$2"; shift 2 ;;
         --host)  ESPIX_HOST="$2";   shift 2 ;;
         --user)  ESPIX_USER="$2";   shift 2 ;;
         --pass)  ESPIX_PASS="$2";   shift 2 ;;
