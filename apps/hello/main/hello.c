@@ -14,10 +14,50 @@
  */
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * `hello probe <path>...` -- open each path and say what happened.
+ *
+ * This exists to test something only a *process* can test. `run -R <dir>` gives
+ * a process a root it cannot name a path outside of, and shell builtins are
+ * never confined, so `cat` proves nothing about it: the check has to be made by
+ * a loaded app, from inside the confinement.
+ *
+ * The two answers that matter are different on purpose. A path a confined
+ * process may not name is ENOENT -- not there, as far as it can tell -- while
+ * EACCES is an ordinary permission refusal on a path it can see. Reporting
+ * "denied" for the first would confirm the file exists to something that is
+ * supposed to be unable to find out.
+ *
+ * errno is printed by number with the two interesting names spelled out rather
+ * than through strerror(). Every symbol here has to resolve out of the loader's
+ * export tables at load time or the app does not run at all, and this file is
+ * the ABI test as much as anything else; a numeric comparison needs nothing.
+ */
+static int probe(int argc, char **argv)
+{
+    for (int i = 0; i < argc; i++) {
+        FILE *f = fopen(argv[i], "r");
+
+        if (f != NULL) {
+            fclose(f);
+            printf("  %s: ok\n", argv[i]);
+            continue;
+        }
+
+        const int e = errno;
+        const char *name = (e == ENOENT)  ? " (ENOENT)"
+                           : (e == EACCES) ? " (EACCES)"
+                                           : "";
+        printf("  %s: errno %d%s\n", argv[i], e, name);
+    }
+    return 0;
+}
 
 /*
  * Everything below needs espix's filesystem ABI (see
@@ -85,6 +125,10 @@ static void show_filesystem(void)
 
 int main(int argc, char **argv)
 {
+    if (argc > 2 && strcmp(argv[1], "probe") == 0) {
+        return probe(argc - 2, argv + 2);
+    }
+
     printf("hello from an espix app\n");
     printf("  argc = %d\n", argc);
 

@@ -70,9 +70,14 @@ void espix_fs_priv_end(void)
     }
 }
 
-static bool privileged(void)
+bool espix_fs_priv_active(void)
 {
     return pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_FSPRIV_IDX) != NULL;
+}
+
+static bool privileged(void)
+{
+    return espix_fs_priv_active();
 }
 
 static const char *op_name(espix_fs_access_t op)

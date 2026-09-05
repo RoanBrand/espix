@@ -60,6 +60,49 @@ typedef struct {
     char cwd[ESPIX_PATH_MAX];
 
     /*
+     * The process's root: a directory it may not resolve a path outside of.
+     * Empty for the overwhelming majority of processes, which are unconfined.
+     *
+     * This answers the question permissions cannot. A uid decides whether a
+     * path may be *opened*; it never stops the path being *named*, and espix's
+     * mode rule hands out 0755 directories and 0644 files, so a service account
+     * can walk the whole tree and read nearly all of it. A root is the other
+     * default: nothing is reachable except what was handed over.
+     *
+     * Restriction rather than chroot -- paths stay globally absolute, so the
+     * process sees /srv/www/db and not /db. Real chroot needs getcwd()
+     * translation and, more to the point, needs mounts: a jail with no /bin, no
+     * /etc and no /tmp is not somewhere a program can run, and bind mounts are
+     * what would fill it. See docs/ROADMAP.md; the mount table is the
+     * precondition, and this is what is useful without it.
+     *
+     * Beside cwd rather than in espix_proc_info_t for the same reason cwd is.
+     */
+    char root[ESPIX_PATH_MAX];
+
+    /*
+     * Whether `root` is being enforced yet. Set once, by the process's own task,
+     * after its ELF is loaded and immediately before its entry point is called.
+     *
+     * The delay is not an implementation detail, it is the semantics: espix
+     * opens the binary, and the *app* is what gets confined. execve(2) draws
+     * the line in the same place -- the image is read through the caller's view
+     * of the filesystem, and only the new program runs in the new one. Arming
+     * at spawn instead means the loader is confined too, and a rooted process
+     * can never be given a program from outside its root, which makes -R
+     * useless without a copy of every binary in every jail.
+     *
+     * Raising privilege around the load would have been the other way to get
+     * there, and it is wrong: privilege bypasses the permission check as well,
+     * so `run -R ... /home/someone/private` would load a file the caller may
+     * not read. The load must stay unprivileged and merely unrooted.
+     *
+     * volatile and unlocked for the same reason as stop_requested: one writer,
+     * and the only reader that matters is the same task asking about itself.
+     */
+    volatile bool root_active;
+
+    /*
      * Signal state.
      *
      * Here rather than in espix_proc_info_t deliberately. That struct is what
@@ -125,6 +168,12 @@ static inline uint32_t espix_sigbit(int sig)
  * act -- the sleep would resume and the flag go unread until it expired.
  */
 uint32_t espix_sigcheck_mask(void);
+
+/*
+ * Begin enforcing the calling process's root. Called once by proc_task(), after
+ * the ELF is loaded and before the entry point runs; see root_active above.
+ */
+void espix_proc_root_arm(void);
 
 /* Table access. The lock covers slot allocation and state transitions; readers
  * that must not block (the fault path) read without it and tolerate a torn

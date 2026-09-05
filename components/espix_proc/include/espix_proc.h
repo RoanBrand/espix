@@ -87,9 +87,19 @@ esp_err_t espix_proc_init(void);
  * the process is admitted; use espix_proc_wait() to block for completion.
  *
  * `argv` is copied, so the caller's buffers need not outlive the call.
+ *
+ * `root` confines the process to that directory, or NULL leaves it able to
+ * name the whole filesystem -- see espix_proc_root(). It must be absolute, and
+ * if the *calling* process is itself confined it must lie within that root: a
+ * root narrows and never widens. The new process starts in `root` rather than
+ * inheriting a cwd that lies outside it.
+ *
+ * The binary itself is read before the process exists, so it may live anywhere;
+ * `run -R /srv/www /bin/httpd` is the ordinary shape rather than a loophole.
  */
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
-                               espix_session_t *session, espix_pid_t *out_pid);
+                               espix_session_t *session, const char *root,
+                               espix_pid_t *out_pid);
 
 /*
  * Block until `pid` leaves the running state. Returns ESP_ERR_TIMEOUT if it is
@@ -200,6 +210,24 @@ bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
  * the system.
  */
 const char *espix_proc_cwd(void);
+
+/*
+ * Root of the calling process: a directory outside of which it cannot resolve
+ * a path at all. "" when the process is unconfined, and for any task that is
+ * not a process.
+ *
+ * espix's VFS consults this in resolve(), which every path operation passes
+ * through -- so one test covers open, opendir, unlink, rename, mkdir, truncate
+ * and stat alike. A path outside is reported ENOENT rather than EACCES: the
+ * point is that it is not there, and "denied" would confirm that it is.
+ *
+ * A filesystem boundary and nothing more. Device VFSes register longer prefixes
+ * and are routed by ESP-IDF before espix sees them, which is what keeps a
+ * confined process's stdio working; and with no MMU an app shares the address
+ * space with the kernel either way. Like setuid, this is a guardrail against
+ * mistakes today and a real boundary on a part with an MMU.
+ */
+const char *espix_proc_root(void);
 
 /*
  * Move the calling process's working directory. `abs_path` must be absolute

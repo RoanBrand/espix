@@ -2,6 +2,8 @@
  * access policy it consults. */
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "esp_vfs_ops.h"
 
@@ -59,6 +61,15 @@ int espix_fs_admin_check(const char *abs_path, bool changing_owner);
  * espix_fs_chown() stores nothing it would derive anyway.
  */
 void espix_fs_claim(const char *abs_path);
+
+/*
+ * Is the calling task inside espix_fs_priv_begin()/end()?
+ *
+ * The public pair raises privilege; this asks. Both the permission check and
+ * the process-root test have to answer "yes, allow" for a raised task, and
+ * this is what keeps the two from disagreeing about what raised means.
+ */
+bool espix_fs_priv_active(void);
 
 /*
  * Publish espix's VFS as the root, forwarding to the filesystem described by
