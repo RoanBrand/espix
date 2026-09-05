@@ -35,7 +35,6 @@ things are as they are.
   whatever nothing else wants, and sorted by CPU they would otherwise occupy the
   top rows forever. Per-core occupancy falls out of the same numbers, since each
   idle task is pinned to one core.
-- **A working directory for apps** — see the app ABI note above.
 
 ## Filesystem
 

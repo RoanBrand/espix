@@ -74,12 +74,36 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   the obvious guess that the app task was overflowing its stack — it was tried,
   and the failure survived it.
 
-  The suspicion is the same shape as the `out_buf` defect above, one layer
-  further out: an app's `printf` reaches the channel from the app's own task,
-  while the session task can be writing to the same connection. That is a
-  hypothesis, not a finding — nobody has caught it in the act. Shell builtins,
-  `scp`, `sftp` and `ssh host uptime` show none of it; it takes an app writing
-  several lines.
+  **Ruled out by measurement, so nobody need pay for these twice:**
+
+  - *Not the app task overflowing its stack.* Doubling
+    `CONFIG_ESPIX_PROC_STACK_SIZE` to 16384 changed nothing.
+  - *Not `write_all()` abandoning a partial send on EAGAIN.* That was a real
+    defect and is fixed, but instrumenting the branch showed it is never taken:
+    zero EAGAIN on every connection, corruption anyway.
+  - *Not two tasks inside `ssh_packet_write()` at once* — the invariant
+    `ssh_priv.h` documents. A guard counting overlapping entries recorded zero
+    collisions across every connection, failing ones included.
+
+  **What the packet trace shows on a healthy run**, which is where the next
+  attempt should start: eight `CHANNEL_DATA` (type 94) written by the
+  `app:hello` task, then `CHANNEL_REQUEST`/exit-status (98), `CHANNEL_EOF` (96)
+  and `CHANNEL_CLOSE` (97) written by the `sshd:conn` task, sequence numbers
+  strictly consecutive and every send reporting success. Two tasks, correctly
+  serialised, so the handoff between the app's last write and the session's
+  closing packets is the remaining place to look.
+
+  **It hides under instrumentation**, which is the awkward part and worth
+  knowing before chasing it: 2/30 on a stock build, 1/31 and 2/56 on builds
+  carrying only counters, and **0/140 and 0/60** on builds that klog per packet.
+  Anything that adds work between packets makes it disappear, so a fix must be
+  proven on a build with no tracing in it, over a long run — 0/30 means nothing
+  here, since 0/60 was observed with the bug still present.
+
+  On a failure the connection task blocks and its teardown is delayed by about
+  five seconds (`PARTIAL_READ_TIMEOUT_MS`), so `ps` briefly shows two
+  `sshd:conn` tasks and no "connection closed" line is logged for that session.
+  It does recover; it is not a permanent leak.
 
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
