@@ -53,6 +53,20 @@ static const espix_klog_console_hooks_t *s_console;
  */
 static FILE *s_console_out;
 
+/* What reaches the console, as `dmesg -n` sets it; the ring keeps everything
+ * regardless. See espix_klog_set_console_level(). */
+static espix_klog_level_t s_console_level = ESPIX_KLOG_INFO;
+
+void espix_klog_set_console_level(espix_klog_level_t level)
+{
+    s_console_level = level;
+}
+
+espix_klog_level_t espix_klog_console_level(void)
+{
+    return s_console_level;
+}
+
 void espix_klog_set_console_hooks(const espix_klog_console_hooks_t *hooks)
 {
     s_console = hooks;
@@ -148,10 +162,11 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
     portEXIT_CRITICAL_SAFE(&s_lock);
 
 #if !CONFIG_ESPIX_KLOG_QUIET
-    /* Console gets INFO and above; DEBUG stays in the ring for `dmesg`. Same
-     * split Linux draws with its console loglevel — routine per-event chatter
-     * should not be on the terminal you are trying to work in. */
-    if (echo && level <= ESPIX_KLOG_INFO) {
+    /* Console gets INFO and above by default; DEBUG stays in the ring for
+     * `dmesg`. Same split Linux draws with its console loglevel — routine
+     * per-event chatter should not be on the terminal you are trying to work
+     * in — and `dmesg -n` moves the line at runtime. */
+    if (echo && level <= s_console_level) {
         if (s_console_out == NULL) {
             s_console_out = stdout;     /* boot, on the main task */
         }

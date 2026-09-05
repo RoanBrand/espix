@@ -648,6 +648,61 @@ static bool dmesg_visit(void *ctx, const espix_klog_entry_t *e)
     return true;
 }
 
+/* The names `dmesg -n` accepts beside a bare number, in level order so the
+ * index is the level. Linux takes both; a word is easier to remember and
+ * harder to get backwards than "is 1 louder or quieter than 3". */
+static const char *const k_level_names[] = { "err", "warn", "info", "debug" };
+
+static bool level_from_arg(const char *arg, espix_klog_level_t *out)
+{
+    for (size_t i = 0; i < sizeof(k_level_names) / sizeof(k_level_names[0]); i++) {
+        if (strcmp(arg, k_level_names[i]) == 0) {
+            *out = (espix_klog_level_t)i;
+            return true;
+        }
+    }
+
+    if (arg[0] >= '0' && arg[0] <= '3' && arg[1] == '\0') {
+        *out = (espix_klog_level_t)(arg[0] - '0');
+        return true;
+    }
+    return false;
+}
+
+/*
+ * `-n` on its own reports; `-n <level>` sets and is root's.
+ *
+ * Root because it is a property of the device rather than of the session that
+ * asked: one user quieting the console silences it for whoever is on the serial
+ * line too. Reading `dmesg` stays open to everyone, which is the same split
+ * Linux draws.
+ */
+static int dmesg_level(espix_session_t *s, const char *arg)
+{
+    if (arg == NULL) {
+        const espix_klog_level_t cur = espix_klog_console_level();
+        espix_printf(s, "console level: %d (%s)\n", (int)cur,
+                     k_level_names[cur]);
+        return 0;
+    }
+
+    espix_klog_level_t level;
+    if (!level_from_arg(arg, &level)) {
+        espix_printf(s, "dmesg: bad level '%s'; want 0-3 or "
+                        "err/warn/info/debug\n", arg);
+        return 1;
+    }
+    if (s != NULL && s->uid != 0) {
+        espix_printf(s, "dmesg: only root may change the console level\n");
+        return 1;
+    }
+
+    espix_klog_set_console_level(level);
+    espix_printf(s, "console level: %d (%s)\n", (int)level,
+                 k_level_names[level]);
+    return 0;
+}
+
 static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
 {
     dmesg_ctx_t ctx = { .s = s };
@@ -655,6 +710,11 @@ static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--ctime") == 0) {
             ctx.ctime = true;
+        } else if (strcmp(argv[i], "-n") == 0 ||
+                   strcmp(argv[i], "--console-level") == 0) {
+            /* Consumes the next argument if there is one, and reports
+             * otherwise. Returns either way: -n does not also list. */
+            return dmesg_level(s, (i + 1 < argc) ? argv[i + 1] : NULL);
         } else {
             espix_printf(s, "dmesg: unknown option '%s'\n", argv[i]);
             return 1;
@@ -1274,7 +1334,8 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "top",    .fn = cmd_top,
       .help = "live view of tasks and memory",  .usage = "top" },
     { .name = "dmesg",  .fn = cmd_dmesg,
-      .help = "print the kernel log",           .usage = "dmesg [-T]" },
+      .help = "print the kernel log",
+      .usage = "dmesg [-T] [-n <level>]" },
     { .name = "coredump", .fn = cmd_coredump,
       .help = "show or erase the stored core dump",
       .usage = "coredump [erase]" },

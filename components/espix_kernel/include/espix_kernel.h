@@ -181,6 +181,22 @@ typedef struct {
  * restores plain printing with no notification. */
 void espix_klog_set_console_hooks(const espix_klog_console_hooks_t *hooks);
 
+/*
+ * How much of the kernel log reaches the console, as `dmesg -n` sets it.
+ *
+ * Everything is always kept in the ring for `dmesg`; this only decides what is
+ * *echoed* while it happens. A message is echoed when its level is at or below
+ * this one, so ESPIX_KLOG_ERROR is the quietest useful setting and
+ * ESPIX_KLOG_DEBUG puts the lot on the terminal.
+ *
+ * The default is ESPIX_KLOG_INFO, which is the split Linux draws too: routine
+ * per-event chatter should not be on the terminal you are trying to work in.
+ * Not persisted -- a boot starts quiet again, deliberately, so a device left in
+ * a debugging setting does not stay there.
+ */
+void               espix_klog_set_console_level(espix_klog_level_t level);
+espix_klog_level_t espix_klog_console_level(void);
+
 #ifdef __cplusplus
 }
 #endif
