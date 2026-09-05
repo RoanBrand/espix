@@ -49,6 +49,14 @@ extern "C" {
 #define ESPIX_UID_FIRST     1000
 
 /*
+ * Service accounts live below the people, as they do on Debian: an app that
+ * wants its own identity so its files are not another app's gets an id here,
+ * a locked password and no home directory.
+ */
+#define ESPIX_UID_SYSTEM_FIRST  100
+#define ESPIX_UID_SYSTEM_LAST   999
+
+/*
  * The identity to fall back to when an account cannot be resolved.
  *
  * Never granted deliberately and owns nothing, so a session that ends up here
@@ -108,10 +116,54 @@ esp_err_t espix_auth_lookup(const char *user, espix_user_t *out);
 const char *espix_auth_name_for_uid(espix_uid_t uid);
 
 /*
+ * Every group `user` belongs to: the primary from their account record, then
+ * anything in /etc/group that names them. Returns how many landed in `out`.
+ *
+ * Resolved once when a session is set up, for the same reason the uid is: the
+ * file is the authority but not something to re-read on the path of every
+ * open().
+ */
+size_t espix_auth_groups(const char *user, espix_gid_t *out, size_t max);
+
+/* A group's id by name -- the reverse of espix_auth_group_name(), and what
+ * `chgrp somegroup` needs. */
+bool espix_auth_group_id(const char *name, espix_gid_t *out);
+
+/* The name of a group id, or NULL if no group claims it. Cached, and not
+ * reentrant, like espix_auth_name_for_uid(). */
+const char *espix_auth_group_name(espix_gid_t gid);
+
+/* Membership by name, which is what a `%group` line in /etc/sudoers needs. */
+bool espix_auth_in_group(const char *user, const char *group);
+
+/*
+ * Create an account, locked, with the next free id in the range `system`
+ * selects -- useradd(8) semantics, so nothing can log in as it until `passwd`
+ * gives it a password, and no home directory exists unless `make_home`.
+ *
+ * A group of the same name and id is created with it.
+ */
+esp_err_t espix_auth_user_add(const char *name, bool system, bool make_home);
+
+/* Remove an account, its private group and every membership naming it. Refuses
+ * uid 0. */
+esp_err_t espix_auth_user_del(const char *name, bool remove_home);
+
+esp_err_t espix_auth_group_add(const char *name, bool system);
+esp_err_t espix_auth_group_del(const char *name);
+
+/*
+ * Put `user` in the comma-separated `csv` groups. `append` keeps the
+ * memberships they already have; otherwise those are dropped first, which is
+ * the difference between usermod -aG and usermod -G.
+ */
+esp_err_t espix_auth_set_groups(const char *user, const char *csv, bool append);
+
+/*
  * May `user` run a command as root?
  *
  * The list is /etc/sudoers, one account name per line, `#` to end of line. It
- * is the espix equivalent of Ubuntu putting the first account in the `sudo`
+ * is the espix equivalent of Debian putting the first account in the `sudo`
  * group: root is seeded locked, so this is the only way up to uid 0 that does
  * not need the serial console.
  *

@@ -12,10 +12,6 @@
  * A `!` where the hash goes is a locked account: it has a name, a uid and a
  * home, and no password will ever match it. root is seeded that way.
  *
- * An older three-field line -- name:hash:home, from before there were uids --
- * still parses. It is given a uid by name and the file is rewritten once, on
- * the next boot; see migrate().
- *
  * Hashed rather than stored plaintext, unlike the WiFi PSK in /etc/wifi.conf.
  * The reasoning differs: a PSK protects one network the device is already on,
  * while a login password is very likely reused somewhere that matters.
@@ -23,6 +19,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,6 +33,7 @@
 
 #define PASSWD_PATH     "/etc/passwd"
 #define SUDOERS_PATH    "/etc/sudoers"
+#define GROUP_PATH      "/etc/group"
 /*
  * Long enough for the widest record the format allows: a 16-character name, the
  * algorithm tag, 20000, a 32-hex salt, a 64-hex hash, uid, gid and a 63-byte
@@ -71,6 +69,16 @@
 #define LOCKED_TAG      "!"
 
 #define MAX_ACCOUNTS    8
+#define MAX_GROUPS      12
+
+/* Every member name plus a separator, for the widest membership that fits the
+ * account table. */
+#define MEMBERS_MAX     (MAX_ACCOUNTS * ESPIX_USER_MAX)
+
+/* The group Debian puts administrators in, at the gid Debian uses. Seeded so a
+ * fresh /etc/sudoers can say %sudo and mean something. */
+#define SUDO_GROUP      "sudo"
+#define SUDO_GID        27
 
 static bool s_is_default;
 
@@ -194,7 +202,6 @@ typedef struct {
     espix_uid_t uid;
     espix_gid_t gid;
     bool        locked;     /* no password will match; still a real account */
-    bool        legacy;     /* parsed from a pre-uid line, so needs rewriting */
 } record_t;
 
 /*
@@ -216,8 +223,7 @@ static bool parse_id(const char *s, uint16_t *out)
     return true;
 }
 
-/* name:$pbkdf2-sha256$iters$salthex$hashhex:uid:gid:home, or the older
- * name:hash:home. */
+/* name:$pbkdf2-sha256$iters$salthex$hashhex:uid:gid:home */
 static bool parse_line(char *line, record_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -230,31 +236,19 @@ static bool parse_line(char *line, record_t *out)
      */
     char *name = strtok(line, ":");
     char *hash = strtok(NULL, ":");
-    char *f3   = strtok(NULL, ":\r\n");
-    char *f4   = strtok(NULL, ":\r\n");
-    char *f5   = strtok(NULL, ":\r\n");
+    char *uid  = strtok(NULL, ":\r\n");
+    char *gid  = strtok(NULL, ":\r\n");
+    char *home = strtok(NULL, ":\r\n");
 
     if (name == NULL || hash == NULL) {
         return false;
     }
-    strlcpy(out->name, name, sizeof(out->name));
-
-    if (f4 == NULL) {
-        /*
-         * Pre-uid: name:hash:home. Give it what it lacks rather than refusing
-         * it, or an upgrade would lock the only account out of its own device.
-         */
-        out->legacy = true;
-        out->uid    = (strcmp(name, ROOT_USER) == 0) ? ESPIX_UID_ROOT
-                                                     : ESPIX_UID_FIRST;
-        out->gid    = out->uid;
-        strlcpy(out->home, f3 != NULL ? f3 : "/", sizeof(out->home));
-    } else {
-        if (!parse_id(f3, &out->uid) || !parse_id(f4, &out->gid)) {
-            return false;
-        }
-        strlcpy(out->home, f5 != NULL ? f5 : "/", sizeof(out->home));
+    if (!parse_id(uid, &out->uid) || !parse_id(gid, &out->gid)) {
+        return false;
     }
+
+    strlcpy(out->name, name, sizeof(out->name));
+    strlcpy(out->home, home != NULL ? home : "/", sizeof(out->home));
 
     if (strcmp(hash, LOCKED_TAG) == 0) {
         out->locked = true;
@@ -514,16 +508,19 @@ esp_err_t espix_auth_set_password(const char *user, const char *password)
     }
 
     /*
-     * Keep the account's existing identity; only the password changes. An
-     * unknown user gets the next free uid rather than inheriting root's.
+     * Only ever changes an existing account. This used to create one, giving it
+     * ESPIX_UID_FIRST -- so a second `passwd bob hunter2` produced an account
+     * sharing esp's uid and therefore esp's ownership of everything. Creation
+     * belongs to useradd, which allocates a free id; moving it there is what
+     * fixes that rather than patching the fallback.
      */
-    record_t    rec;
-    const bool  known = find_record(user, &rec);
-    const char *home  = known ? rec.home : "/";
-    const espix_uid_t uid = known ? rec.uid : ESPIX_UID_FIRST;
-    const espix_gid_t gid = known ? rec.gid : ESPIX_UID_FIRST;
+    record_t rec;
+    if (!find_record(user, &rec)) {
+        return ESP_ERR_NOT_FOUND;
+    }
 
-    const esp_err_t err = write_record(user, password, uid, gid, home);
+    const esp_err_t err = write_record(user, password, rec.uid, rec.gid,
+                                       rec.home);
     if (err == ESP_OK) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "password changed for %s", user);
         if (strcmp(user, DEFAULT_USER) == 0) {
@@ -696,6 +693,616 @@ static bool owner_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
 }
 
 /* ------------------------------------------------------------------ */
+/* Groups                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * name:gid:member,member
+ *
+ * Linux's format without the vestigial password field, the same trimming
+ * /etc/passwd already does here. Members are kept as the raw comma-separated
+ * text rather than split on load: the list is short, it is written back
+ * verbatim, and testing membership is a walk either way.
+ *
+ * A group of the account's own name and gid exists for every user -- Debian's
+ * user private group scheme, which is what espix already had by accident when
+ * every gid equalled its uid. Anything else somebody belongs to is
+ * supplementary and lives only here.
+ */
+typedef struct {
+    char        name[ESPIX_USER_MAX];
+    espix_gid_t gid;
+    char        members[MEMBERS_MAX];
+} group_t;
+
+static bool parse_group_line(char *line, group_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    char *name    = strtok(line, ":");
+    char *gid     = strtok(NULL, ":\r\n");
+    char *members = strtok(NULL, ":\r\n");
+
+    if (name == NULL || !parse_id(gid, &out->gid)) {
+        return false;
+    }
+
+    strlcpy(out->name, name, sizeof(out->name));
+    if (members != NULL) {
+        strlcpy(out->members, members, sizeof(out->members));
+    }
+    return true;
+}
+
+static size_t groups_load(group_t *out, size_t max)
+{
+    espix_fs_priv_begin();
+    FILE *f = fopen(GROUP_PATH, "r");
+    espix_fs_priv_end();
+
+    if (f == NULL) {
+        return 0;
+    }
+
+    char   line[LINE_MAX_LEN];
+    size_t n = 0;
+
+    while (n < max && fgets(line, sizeof(line), f) != NULL) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+        if (parse_group_line(line, &out[n])) {
+            n++;
+        }
+    }
+
+    fclose(f);
+    return n;
+}
+
+static esp_err_t groups_store(const group_t *g, size_t count)
+{
+    espix_fs_priv_begin();
+    FILE *f = fopen(GROUP_PATH, "w");
+    espix_fs_priv_end();
+
+    if (f == NULL) {
+        return ESP_FAIL;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        fprintf(f, "%s:%u:%s\n", g[i].name, (unsigned)g[i].gid, g[i].members);
+    }
+
+    cache_invalidate();
+    return (fclose(f) == 0) ? ESP_OK : ESP_FAIL;
+}
+
+/* Is `user` named in a comma-separated member list? */
+static bool member_of(const char *members, const char *user)
+{
+    const size_t len = strlen(user);
+    const char  *p   = members;
+
+    while (*p != '\0') {
+        const char *comma = strchr(p, ',');
+        const size_t seg  = (comma != NULL) ? (size_t)(comma - p) : strlen(p);
+
+        if (seg == len && strncmp(p, user, len) == 0) {
+            return true;
+        }
+        if (comma == NULL) {
+            break;
+        }
+        p = comma + 1;
+    }
+    return false;
+}
+
+const char *espix_auth_group_name(espix_gid_t gid)
+{
+    static char        cached[ESPIX_USER_MAX];
+    static espix_gid_t cached_gid;
+    static bool        cached_valid;
+
+    if (cached_valid && cached_gid == gid) {
+        return cached;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return NULL;
+    }
+
+    const size_t count = groups_load(g, MAX_GROUPS);
+    const char  *found = NULL;
+
+    for (size_t i = 0; i < count; i++) {
+        if (g[i].gid == gid) {
+            strlcpy(cached, g[i].name, sizeof(cached));
+            cached_gid   = gid;
+            cached_valid = true;
+            found        = cached;
+            break;
+        }
+    }
+
+    free(g);
+    return found;
+}
+
+bool espix_auth_group_id(const char *name, espix_gid_t *out)
+{
+    if (name == NULL || out == NULL) {
+        return false;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return false;
+    }
+
+    const size_t count = groups_load(g, MAX_GROUPS);
+    bool         found = false;
+
+    for (size_t i = 0; i < count && !found; i++) {
+        if (strcmp(g[i].name, name) == 0) {
+            *out  = g[i].gid;
+            found = true;
+        }
+    }
+
+    free(g);
+    return found;
+}
+
+size_t espix_auth_groups(const char *user, espix_gid_t *out, size_t max)
+{
+    if (user == NULL || out == NULL || max == 0) {
+        return 0;
+    }
+
+    size_t n = 0;
+
+    /* The primary group first, from the account record, so a user with no
+     * /etc/group at all still has the gid their files are stamped with. */
+    espix_user_t account;
+    if (espix_auth_lookup(user, &account) == ESP_OK) {
+        out[n++] = account.gid;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return n;
+    }
+
+    const size_t count = groups_load(g, MAX_GROUPS);
+
+    for (size_t i = 0; i < count && n < max; i++) {
+        if (!member_of(g[i].members, user)) {
+            continue;
+        }
+        bool already = false;
+        for (size_t j = 0; j < n; j++) {
+            already = already || (out[j] == g[i].gid);
+        }
+        if (!already) {
+            out[n++] = g[i].gid;
+        }
+    }
+
+    free(g);
+    return n;
+}
+
+bool espix_auth_in_group(const char *user, const char *group)
+{
+    if (user == NULL || group == NULL) {
+        return false;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return false;
+    }
+
+    const size_t count = groups_load(g, MAX_GROUPS);
+    bool         found = false;
+
+    for (size_t i = 0; i < count && !found; i++) {
+        if (strcmp(g[i].name, group) != 0) {
+            continue;
+        }
+        /* Either named in the list, or it is this account's own group. */
+        found = member_of(g[i].members, user);
+        if (!found) {
+            espix_user_t account;
+            found = espix_auth_lookup(user, &account) == ESP_OK &&
+                    account.gid == g[i].gid;
+        }
+    }
+
+    free(g);
+    return found;
+}
+
+/* ------------------------------------------------------------------ */
+/* Making and unmaking accounts                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The lowest free id at or above `from`, searching both files.
+ *
+ * Both, not one: a user private group means a uid and a gid of the same number,
+ * so an id taken by either is taken by both. Allocating them apart is how you
+ * end up with a group whose gid belongs to somebody else's account.
+ */
+static bool next_free_id(uint16_t from, uint16_t to, uint16_t *out)
+{
+    record_t *recs = calloc(MAX_ACCOUNTS, sizeof(*recs));
+    group_t  *grps = calloc(MAX_GROUPS, sizeof(*grps));
+
+    if (recs == NULL || grps == NULL) {
+        free(recs);
+        free(grps);
+        return false;
+    }
+
+    const size_t nrec = load_all(recs, MAX_ACCOUNTS);
+    const size_t ngrp = groups_load(grps, MAX_GROUPS);
+    bool         ok   = false;
+
+    for (uint16_t id = from; id <= to && !ok; id++) {
+        bool taken = false;
+        for (size_t i = 0; i < nrec && !taken; i++) {
+            taken = (recs[i].uid == id) || (recs[i].gid == id);
+        }
+        for (size_t i = 0; i < ngrp && !taken; i++) {
+            taken = (grps[i].gid == id);
+        }
+        if (!taken) {
+            *out = id;
+            ok   = true;
+        }
+    }
+
+    free(recs);
+    free(grps);
+    return ok;
+}
+
+static bool id_range(bool system, uint16_t *from, uint16_t *to)
+{
+    *from = system ? ESPIX_UID_SYSTEM_FIRST : ESPIX_UID_FIRST;
+    *to   = system ? ESPIX_UID_SYSTEM_LAST  : (ESPIX_UID_NOBODY - 1);
+    return true;
+}
+
+esp_err_t espix_auth_group_add(const char *name, bool system)
+{
+    if (name == NULL || name[0] == '\0' ||
+        strlen(name) >= ESPIX_USER_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t count = groups_load(g, MAX_GROUPS);
+
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(g[i].name, name) == 0) {
+            free(g);
+            return ESP_ERR_INVALID_STATE;   /* already there */
+        }
+    }
+    if (count == MAX_GROUPS) {
+        free(g);
+        return ESP_ERR_NO_MEM;
+    }
+
+    uint16_t from, to, gid;
+    id_range(system, &from, &to);
+    if (!next_free_id(from, to, &gid)) {
+        free(g);
+        return ESP_ERR_NOT_FOUND;           /* the range is full */
+    }
+
+    strlcpy(g[count].name, name, sizeof(g[count].name));
+    g[count].gid        = gid;
+    g[count].members[0] = '\0';
+    count++;
+
+    const esp_err_t err = groups_store(g, count);
+    free(g);
+
+    if (err == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "added group '%s' (gid %u)", name,
+                   (unsigned)gid);
+    }
+    return err;
+}
+
+esp_err_t espix_auth_group_del(const char *name)
+{
+    if (name == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t count   = groups_load(g, MAX_GROUPS);
+    size_t out     = 0;
+    bool   removed = false;
+
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(g[i].name, name) == 0) {
+            removed = true;
+            continue;
+        }
+        if (out != i) {
+            g[out] = g[i];
+        }
+        out++;
+    }
+
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if (removed) {
+        err = groups_store(g, out);
+    }
+
+    free(g);
+    return err;
+}
+
+/* Add or remove `user` everywhere a member list names them. */
+static esp_err_t membership_purge(const char *user)
+{
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const size_t count   = groups_load(g, MAX_GROUPS);
+    bool         changed = false;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!member_of(g[i].members, user)) {
+            continue;
+        }
+
+        /* Rebuild the list without this name rather than splicing the string,
+         * which is where the off-by-one comma bugs live. */
+        char   rebuilt[MEMBERS_MAX] = { 0 };
+        size_t n                    = 0;
+        const char *p               = g[i].members;
+
+        while (*p != '\0') {
+            const char  *comma = strchr(p, ',');
+            const size_t seg   = (comma != NULL) ? (size_t)(comma - p)
+                                                 : strlen(p);
+
+            if (!(seg == strlen(user) && strncmp(p, user, seg) == 0)) {
+                n += (size_t)snprintf(rebuilt + n, sizeof(rebuilt) - n,
+                                      "%s%.*s", (n > 0) ? "," : "",
+                                      (int)seg, p);
+            }
+            if (comma == NULL) {
+                break;
+            }
+            p = comma + 1;
+        }
+
+        strlcpy(g[i].members, rebuilt, sizeof(g[i].members));
+        changed = true;
+    }
+
+    const esp_err_t err = changed ? groups_store(g, count) : ESP_OK;
+    free(g);
+    return err;
+}
+
+esp_err_t espix_auth_set_groups(const char *user, const char *csv, bool append)
+{
+    if (user == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    espix_user_t account;
+    if (espix_auth_lookup(user, &account) != ESP_OK) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* Replacing means starting from none; appending keeps what is there. */
+    if (!append) {
+        const esp_err_t err = membership_purge(user);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    if (csv == NULL || csv[0] == '\0') {
+        return ESP_OK;
+    }
+
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const size_t count = groups_load(g, MAX_GROUPS);
+    esp_err_t    err   = ESP_OK;
+    char         list[MEMBERS_MAX];
+    strlcpy(list, csv, sizeof(list));
+
+    for (char *name = strtok(list, ","); name != NULL && err == ESP_OK;
+         name = strtok(NULL, ",")) {
+        bool matched = false;
+
+        for (size_t i = 0; i < count && !matched; i++) {
+            if (strcmp(g[i].name, name) != 0) {
+                continue;
+            }
+            matched = true;
+            if (member_of(g[i].members, user)) {
+                continue;               /* already in it */
+            }
+            const size_t used = strlen(g[i].members);
+            if (snprintf(g[i].members + used, sizeof(g[i].members) - used,
+                         "%s%s", (used > 0) ? "," : "", user)
+                >= (int)(sizeof(g[i].members) - used)) {
+                err = ESP_ERR_NO_MEM;
+            }
+        }
+
+        if (!matched) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "no group '%s'", name);
+            err = ESP_ERR_NOT_FOUND;
+        }
+    }
+
+    if (err == ESP_OK) {
+        err = groups_store(g, count);
+    }
+
+    free(g);
+    return err;
+}
+
+esp_err_t espix_auth_user_add(const char *name, bool system, bool make_home)
+{
+    if (name == NULL || name[0] == '\0' || strlen(name) >= ESPIX_USER_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    record_t existing;
+    if (find_record(name, &existing)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t from, to, uid;
+    id_range(system, &from, &to);
+    if (!next_free_id(from, to, &uid)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * Home is /home/<name> for a person and / for a service, which is what root
+     * already uses. A service account has nowhere of its own to be, and giving
+     * it a directory that does not exist would only make apply_account() warn
+     * at every login it is not going to have.
+     */
+    char home[64];
+    if (system) {
+        strlcpy(home, "/", sizeof(home));
+    } else {
+        snprintf(home, sizeof(home), "/home/%s", name);
+    }
+
+    /*
+     * Created locked, with no password, which is what useradd(8) does: the
+     * account exists and nothing can authenticate as it until `passwd` gives it
+     * one. It also keeps the only command that takes a password on the command
+     * line down to that one.
+     */
+    const esp_err_t err = write_record(name, NULL, uid, uid, home);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* The user's own group, same name and id -- Debian's private groups, and
+     * what espix already had when every gid equalled its uid. */
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g != NULL) {
+        size_t count = groups_load(g, MAX_GROUPS);
+        if (count < MAX_GROUPS) {
+            strlcpy(g[count].name, name, sizeof(g[count].name));
+            g[count].gid = uid;
+            count++;
+            (void)groups_store(g, count);
+        }
+        free(g);
+    }
+
+    if (make_home && !system) {
+        espix_fs_priv_begin();
+        const int rc = mkdir(home, 0755);
+        espix_fs_priv_end();
+
+        if (rc == 0) {
+            (void)espix_fs_chown(home, uid, uid);
+        } else if (errno != EEXIST) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "cannot create %s: %s", home,
+                       strerror(errno));
+        }
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "added %s '%s' (uid %u)",
+               system ? "system account" : "account", name, (unsigned)uid);
+    return ESP_OK;
+}
+
+esp_err_t espix_auth_user_del(const char *name, bool remove_home)
+{
+    if (name == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    record_t rec;
+    if (!find_record(name, &rec)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (rec.uid == ESPIX_UID_ROOT) {
+        return ESP_ERR_NOT_ALLOWED;     /* uid 0 is not somebody's account */
+    }
+
+    record_t *recs = calloc(MAX_ACCOUNTS, sizeof(*recs));
+    if (recs == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const size_t count = load_all(recs, MAX_ACCOUNTS);
+    size_t       out   = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(recs[i].name, name) == 0) {
+            continue;
+        }
+        if (out != i) {
+            recs[out] = recs[i];
+        }
+        out++;
+    }
+
+    const esp_err_t err = store_all(recs, out);
+    free(recs);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    (void)membership_purge(name);
+    (void)espix_auth_group_del(name);       /* its private group */
+
+    if (remove_home && rec.home[0] != '\0' && strcmp(rec.home, "/") != 0) {
+        espix_fs_priv_begin();
+        const esp_err_t rm = espix_fs_rm_rf(rec.home);
+        espix_fs_priv_end();
+
+        if (rm != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "cannot remove %s", rec.home);
+        }
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "removed account '%s'", name);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* Who may become root                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -723,9 +1330,16 @@ bool espix_auth_may_sudo(const char *user)
         }
         line[strcspn(line, " \t\r\n")] = '\0';
 
-        if (line[0] != '\0' && strcmp(line, user) == 0) {
-            found = true;
+        if (line[0] == '\0') {
+            continue;
         }
+
+        /* `%name` is a group, as in a real sudoers file; anything else is an
+         * account. Debian ships %sudo, RHEL ships %wheel, and espix seeds the
+         * former -- but a bare name still works, because granting one account
+         * without inventing a group for it is ordinary. */
+        found = (line[0] == '%') ? espix_auth_in_group(user, line + 1)
+                                 : (strcmp(line, user) == 0);
     }
 
     fclose(f);
@@ -760,8 +1374,9 @@ static void ensure_sudoers(void)
         return;
     }
 
-    fprintf(f, "# Accounts that may run commands as root, one per line.\n");
-    fprintf(f, "%s\n", DEFAULT_USER);
+    fprintf(f, "# Who may run commands as root: an account name per line,\n");
+    fprintf(f, "# or %%name for every member of a group.\n");
+    fprintf(f, "%%%s\n", SUDO_GROUP);
     fclose(f);
 
     const esp_err_t err = espix_fs_chmod(SUDOERS_PATH, 0600);
@@ -769,40 +1384,56 @@ static void ensure_sudoers(void)
         espix_klog(ESPIX_KLOG_WARN, TAG, "cannot restrict %s: %s",
                    SUDOERS_PATH, esp_err_to_name(err));
     }
-    espix_klog(ESPIX_KLOG_INFO, TAG, "created %s with '%s'", SUDOERS_PATH,
-               DEFAULT_USER);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "created %s granting group '%s'",
+               SUDOERS_PATH, SUDO_GROUP);
 }
 
 /*
- * Rewrite /etc/passwd once, if anything in it predates uids.
+ * Seed /etc/group, if there is none.
  *
- * parse_line() already invented a uid for such a record, so the system works
- * either way; this is what stops it inventing the same one on every boot and
- * makes `cat /etc/passwd` agree with what espix believes.
+ * root's own group, the sudo group with the default account in it, and the
+ * default account's private group. That is the shape a Debian install has after
+ * its first user is created, and it is what makes the seeded `%sudo` in
+ * /etc/sudoers grant anything.
  */
-static void migrate(void)
+static void ensure_groups(void)
 {
-    record_t *recs = calloc(MAX_ACCOUNTS, sizeof(*recs));
-    if (recs == NULL) {
+    espix_fs_priv_begin();
+    FILE *probe = fopen(GROUP_PATH, "r");
+    espix_fs_priv_end();
+
+    if (probe != NULL) {
+        fclose(probe);
         return;
     }
 
-    const size_t count = load_all(recs, MAX_ACCOUNTS);
-    size_t       stale = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        if (recs[i].legacy) {
-            stale++;
-        }
+    group_t *g = calloc(3, sizeof(*g));
+    if (g == NULL) {
+        return;
     }
 
-    if (stale > 0 && store_all(recs, count) == ESP_OK) {
-        espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "%s: gave %u account%s a uid", PASSWD_PATH,
-                   (unsigned)stale, stale == 1 ? "" : "s");
+    strlcpy(g[0].name, ROOT_USER, sizeof(g[0].name));
+    g[0].gid = ESPIX_UID_ROOT;
+
+    strlcpy(g[1].name, SUDO_GROUP, sizeof(g[1].name));
+    g[1].gid = SUDO_GID;
+    strlcpy(g[1].members, DEFAULT_USER, sizeof(g[1].members));
+
+    strlcpy(g[2].name, DEFAULT_USER, sizeof(g[2].name));
+    g[2].gid = ESPIX_UID_FIRST;
+
+    if (groups_store(g, 3) == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "created %s with '%s' in '%s'",
+                   GROUP_PATH, DEFAULT_USER, SUDO_GROUP);
     }
 
-    free(recs);
+    free(g);
+
+    /*
+     * Readable by everyone, unlike /etc/passwd. It holds no secrets, and `ls -l`
+     * resolving a gid to a name should not need privilege for it.
+     */
+    (void)espix_fs_chmod(GROUP_PATH, 0644);
 }
 
 esp_err_t espix_auth_init(void)
@@ -848,7 +1479,7 @@ esp_err_t espix_auth_init(void)
                    ROOT_USER, ESPIX_UID_ROOT);
     }
 
-    migrate();
+    ensure_groups();
     ensure_sudoers();
 
     /*
