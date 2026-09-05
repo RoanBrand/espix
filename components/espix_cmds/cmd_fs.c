@@ -149,15 +149,20 @@ typedef struct {
 } ls_entry_t;
 
 /*
- * An account's name for `id`, or the number when nothing claims it.
+ * The name for `id`, or the number when nothing claims it.
+ *
+ * `is_group` picks which file to look in. It matters: a gid and a uid are
+ * different namespaces, and resolving a group through the account table was
+ * only ever right while every gid equalled its uid.
  *
  * Copied out rather than returned by pointer: espix_auth answers from a
  * single-entry cache, so asking about the group would move what the owner
  * pointer refers to.
  */
-static void ls_id_name(uint16_t id, char *out, size_t len)
+static void ls_id_name(uint16_t id, bool is_group, char *out, size_t len)
 {
-    const char *name = espix_auth_name_for_uid(id);
+    const char *name = is_group ? espix_auth_group_name(id)
+                                : espix_auth_name_for_uid(id);
     if (name != NULL) {
         strlcpy(out, name, len);
     } else {
@@ -397,8 +402,8 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
          * number. */
         char owner[ESPIX_USER_MAX];
         char group[ESPIX_USER_MAX];
-        ls_id_name(e->uid, owner, sizeof(owner));
-        ls_id_name(e->gid, group, sizeof(group));
+        ls_id_name(e->uid, false, owner, sizeof(owner));
+        ls_id_name(e->gid, true,  group, sizeof(group));
 
         if (e->is_dir) {
             espix_printf(s, "%s  %-8s %-8s %8s  %12s  %s/\n",
@@ -857,7 +862,7 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
  * a typo should not silently become "leave it alone".
  */
 static bool id_of(espix_session_t *s, const char *who, const char *cmd,
-                  uint16_t *out)
+                  bool is_group, uint16_t *out)
 {
     if (who[0] == '\0') {
         *out = ESPIX_FS_KEEP_ID;
@@ -872,6 +877,16 @@ static bool id_of(espix_session_t *s, const char *who, const char *cmd,
             return false;
         }
         *out = (uint16_t)n;
+        return true;
+    }
+
+    /* The two are different namespaces. Resolving a group through the account
+     * table was only ever right while every gid equalled its uid. */
+    if (is_group) {
+        if (!espix_auth_group_id(who, out)) {
+            espix_printf(s, "%s: %s: no such group\n", cmd, who);
+            return false;
+        }
         return true;
     }
 
@@ -906,7 +921,7 @@ static int cmd_chown(espix_session_t *s, int argc, char **argv)
     uint16_t gid = ESPIX_FS_KEEP_ID;
 
     if (is_chgrp) {
-        if (!id_of(s, argv[1], argv[0], &gid)) {
+        if (!id_of(s, argv[1], argv[0], true, &gid)) {
             return 1;
         }
     } else {
@@ -916,17 +931,23 @@ static int cmd_chown(espix_session_t *s, int argc, char **argv)
         char *colon = strchr(spec, ':');
         if (colon != NULL) {
             *colon = '\0';
-            if (!id_of(s, colon + 1, argv[0], &gid)) {
+            if (!id_of(s, colon + 1, argv[0], true, &gid)) {
                 return 1;
             }
         }
-        if (!id_of(s, spec, argv[0], &uid)) {
+        if (!id_of(s, spec, argv[0], false, &uid)) {
             return 1;
         }
-        /* `chown user file` moves the group too, the way chown(1) does when a
-         * user has a group of their own -- which here they always do. */
+        /*
+         * `chown user file` moves the group to that user's *primary* group, the
+         * way chown(1) does. Taking the uid worked only while every account's
+         * gid equalled it; now that groups are real, the account record is the
+         * only thing that knows.
+         */
         if (colon == NULL && uid != ESPIX_FS_KEEP_ID) {
-            gid = uid;
+            espix_user_t account;
+            gid = (espix_auth_lookup(spec, &account) == ESP_OK) ? account.gid
+                                                                : uid;
         }
     }
 

@@ -473,10 +473,12 @@ static esp_err_t do_opendir(sftp_t *s, uint32_t id, ssh_buf_t *in)
  * round-trips on a long directory, and it keeps every name and its attributes
  * inside one packet buffer without a second-guess about the arithmetic.
  */
-/* An account's name for `id`, or the number itself when nothing claims it. */
-static void id_name(uint16_t id, char *out, size_t len)
+/* The name for `id`, or the number itself when nothing claims it. `is_group`
+ * picks the namespace: a gid is not a uid, however alike they look here. */
+static void id_name(uint16_t id, bool is_group, char *out, size_t len)
 {
-    const char *name = espix_auth_name_for_uid(id);
+    const char *name = is_group ? espix_auth_group_name(id)
+                                : espix_auth_name_for_uid(id);
     if (name != NULL) {
         strlcpy(out, name, len);
     } else {
@@ -566,8 +568,8 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
 
     char owner[ESPIX_USER_MAX];
     char group[ESPIX_USER_MAX];
-    id_name(uid, owner, sizeof(owner));
-    id_name(gid, group, sizeof(group));
+    id_name(uid, false, owner, sizeof(owner));
+    id_name(gid, true,  group, sizeof(group));
 
     char longname[sizeof(de->d_name) + 96];
     snprintf(longname, sizeof(longname), "%s 1 %s %s %8u %s %s",
