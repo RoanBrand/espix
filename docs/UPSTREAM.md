@@ -7,7 +7,12 @@ someone else's to fix, and a future IDF release may remove the need for the
 workaround — at which point it is useful to know exactly what the workaround was
 for.
 
-Verified against ESP-IDF v6.1-beta1 and xtensa-esp-elf GCC 15.2 unless noted.
+Verified against ESP-IDF v6.1 and xtensa-esp-elf GCC 15.2 unless noted.
+
+Re-checked against the v6.1 release: the beta1-to-v6.1 changelog adds no VFS
+`chmod` hook, no `chmod()` fix, no LittleFS changes at all, no `adjtime()` fix,
+and nothing touching the signal vocabulary or FreeRTOS-Plus-POSIX -- so every
+entry below still stands and every workaround is still load-bearing.
 
 ## ESP-IDF
 

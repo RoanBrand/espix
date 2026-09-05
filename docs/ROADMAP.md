@@ -374,3 +374,27 @@ things are as they are.
   RTC, which is true and reads as support for the current behaviour — but RPi OS
   runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
   other way.
+
+## Further out
+
+Not costed, not committed to, and further from the current shape of espix than
+anything above. Kept because they are why the project has the targets it has --
+the P4's display and the S31's MMU are on the hardware list for these, not the
+other way round.
+
+- **Terminal output to a display**, and input from a USB keyboard and mouse. The
+  first is the interesting half: a framebuffer console is a second transport
+  beside UART and SSH, and the session layer was built transport-agnostic
+  precisely so a third one could be added without touching the shell. The P4 is
+  the target -- MIPI DSI, with an HDMI variant.
+
+- **A minimal 2D desktop environment**: a filesystem browser, a JPEG viewer, an
+  audio player for whatever formats decode cheaply, and video on the P4, which
+  has the hardware for it. These are *apps*, not kernel work -- which is the
+  point of the ELF loader and the export table, and the best argument for
+  keeping that boundary honest. The gap between here and there is mostly a
+  graphics stack and a windowing model, neither of which espix has any business
+  inventing.
+
+These arrived with the project and predate almost everything in this file; they
+are recorded here rather than in a separate note so there is one place to look.

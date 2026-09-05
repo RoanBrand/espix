@@ -5,7 +5,7 @@ non-obvious from the code, and the ones that were verified against ESP-IDF
 rather than assumed.
 
 Target of record for this skeleton: **ESP32-S3, 16MB flash, 8MB octal PSRAM**,
-on **ESP-IDF v6.1-beta1**.
+on **ESP-IDF v6.1**.
 
 ## Component graph
 

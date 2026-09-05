@@ -179,22 +179,28 @@ int espix_shell_exec(espix_session_t *s, const char *line)
 }
 
 /*
- * `<user>:<cwd># `, with the home directory shown as `~`.
+ * `<user>:<cwd>$ `, or `#` for root, with the home directory shown as `~`.
  *
  * The user used to be the literal "espix" -- the OS name sitting where a Unix
  * prompt puts an identity, agreeing with neither `whoami` nor the greeting.
  *
- * `#` rather than `$` for everyone, including non-root. That is not sloppiness.
- * espix does have mode bits now, but only the execute bit is enforced: read and
- * write are recorded and displayed and nothing consults them, because an app
- * reaches the filesystem through libc and the VFS underneath has no idea which
- * process is calling. So every session really can still read and write
- * anything, and a `$` would be the misleading one.
+ * The sigil used to be `#` for everyone, and there was a reason: espix had mode
+ * bits but enforced only the execute one, because an app reached the filesystem
+ * through libc and the VFS underneath could not tell which process was calling.
+ * Every session really could read and write anything, so `$` would have been
+ * the lie.
+ *
+ * That is no longer true in any part. espix owns the root VFS, resolves the
+ * calling task to a process to a session to a user, and enforces read and write
+ * -- an ordinary account cannot read /etc/passwd or write /etc. So the sigil
+ * means what it has always meant everywhere else, and `#` is now the misleading
+ * one: it says you can break things, and only root can.
  */
 static void build_prompt(const espix_session_t *s, char *buf, size_t len)
 {
     const char *cwd  = (s->cwd[0] != '\0') ? s->cwd : "/";
     const char *user = (s->user[0] != '\0') ? s->user : "?";
+    const char  mark = (s->uid == 0) ? '#' : '$';
 
     /*
      * Abbreviate the home prefix, but only on a path boundary: /home/esp is ~
@@ -205,17 +211,17 @@ static void build_prompt(const espix_session_t *s, char *buf, size_t len)
 
         if (strncmp(cwd, s->home, hlen) == 0) {
             if (cwd[hlen] == '\0') {
-                snprintf(buf, len, "%s:~# ", user);
+                snprintf(buf, len, "%s:~%c ", user, mark);
                 return;
             }
             if (cwd[hlen] == '/') {
-                snprintf(buf, len, "%s:~%s# ", user, cwd + hlen);
+                snprintf(buf, len, "%s:~%s%c ", user, cwd + hlen, mark);
                 return;
             }
         }
     }
 
-    snprintf(buf, len, "%s:%s# ", user, cwd);
+    snprintf(buf, len, "%s:%s%c ", user, cwd, mark);
 }
 
 /*

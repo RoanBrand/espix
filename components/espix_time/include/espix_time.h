@@ -84,8 +84,9 @@ size_t espix_time_zone(char *buf, size_t len);
 
 /*
  * Change the timezone, optionally writing it to /etc/timezone so it survives a
- * reboot. `tz` is a POSIX TZ string, not a zoneinfo name -- see the comment in
- * the shipped /etc/timezone.
+ * reboot -- the file does not exist until then, and the compiled-in default is
+ * UTC. `tz` is a POSIX TZ string, not a zoneinfo name; `timedatectl
+ * set-timezone` with no argument documents the format.
  */
 esp_err_t espix_time_set_zone(const char *tz, bool persist);
 
