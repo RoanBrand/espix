@@ -131,6 +131,20 @@ typedef struct {
      * the MAC covers — so tx serialises them. rx exists because a blocked write
      * needs to read a window adjustment, and two readers on one socket would
      * swallow each other's packets.
+     *
+     * Which is also why klog must never reach the console through a plain
+     * printf(). It used to, and in a loaded app's task printf() is not the
+     * console — proc_task() points stdout at the session, so a kernel log from
+     * anywhere on this path landed back in chan_write() and re-entered the send
+     * it was reporting on. tx_lock does not catch that: it is recursive by
+     * design so chan_write() can nest send_data(), so the same task is admitted
+     * rather than deadlocked, and the inner packet rebuilds out_buf and bumps
+     * seq_out while the outer send is still using them.
+     *
+     * klog now writes to a console stream captured at boot (see s_console_out
+     * in espix_kernel/klog.c), so the logs on this path can say what they mean
+     * at the level they deserve. Do not reintroduce a task-relative printf
+     * under here.
      */
     SemaphoreHandle_t tx_lock;      /* recursive: chan_write() nests send_data() */
     SemaphoreHandle_t rx_lock;

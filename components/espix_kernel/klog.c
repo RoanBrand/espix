@@ -32,6 +32,27 @@ static volatile uint32_t  s_last_echo_ms;
  * rather than dropped on top of one. See espix_kernel.h. */
 static const espix_klog_console_hooks_t *s_console;
 
+/*
+ * The console stream, captured once, because `stdout` is not a global here.
+ *
+ * newlib gives every task its own struct _reent, and `stdout` expands to the
+ * *calling task's* copy. espix_proc points a loaded app's at the session it was
+ * launched from, so inside an app's task printf() is not the console -- for an
+ * SSH session it is the encrypted channel.
+ *
+ * A kernel log echoing through that plain printf() therefore re-entered
+ * whatever transport the current task happened to own. In the SSH server that
+ * meant klog -> printf -> chan_write -> ssh_packet_write -> a klog on the same
+ * path -> unbounded recursion, on an 8KB app stack, with the inner packet
+ * rebuilding the shared out_buf and bumping seq_out underneath the outer send.
+ * The transmit lock does not catch it: it is recursive by design, so the same
+ * task is admitted rather than deadlocked.
+ *
+ * Captured lazily on the first echo, which happens during boot on the main
+ * task, before any app exists to have redirected anything.
+ */
+static FILE *s_console_out;
+
 void espix_klog_set_console_hooks(const espix_klog_console_hooks_t *hooks)
 {
     s_console = hooks;
@@ -131,10 +152,16 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
      * split Linux draws with its console loglevel — routine per-event chatter
      * should not be on the terminal you are trying to work in. */
     if (echo && level <= ESPIX_KLOG_INFO) {
-        /* Outside the critical section: this is stdio, not a quick memcpy. */
+        if (s_console_out == NULL) {
+            s_console_out = stdout;     /* boot, on the main task */
+        }
+
+        /* Outside the critical section: this is stdio, not a quick memcpy.
+         * To the captured console, never to the caller's stdout -- see the note
+         * on s_console_out for what that cost the SSH server. */
         console_output_begin();
-        printf("espix: %s\n", staged.text);
-        fflush(stdout);
+        fprintf(s_console_out, "espix: %s\n", staged.text);
+        fflush(s_console_out);
         console_output_done();
 
         s_last_echo_ms = staged.ts_ms;

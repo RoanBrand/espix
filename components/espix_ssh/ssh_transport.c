@@ -198,6 +198,14 @@ void ssh_skip(ssh_buf_t *b, size_t len)
  */
 #define PARTIAL_READ_TIMEOUT_MS 5000
 
+/*
+ * How long a peer may refuse to drain before a send is given up on. Longer than
+ * the read side's patience because the causes differ: a stalled read is a peer
+ * that stopped talking, while a stalled write is a peer that is merely slow to
+ * consume, which a large scp to a busy client legitimately is.
+ */
+#define BLOCKED_WRITE_TIMEOUT_MS 15000
+
 static esp_err_t read_exact(int fd, void *dst, size_t len)
 {
     uint8_t *p = dst;
@@ -263,20 +271,79 @@ static esp_err_t read_exact(int fd, void *dst, size_t len)
     return ESP_OK;
 }
 
+/*
+ * Send the whole buffer, retrying rather than abandoning it half-sent.
+ *
+ * The EAGAIN branch is the point. Every SSH packet goes out through here, and
+ * returning early leaves *half a packet on the wire*: the peer resynchronises
+ * onto the middle of a frame and the connection dies. Worse, seq_out is only
+ * bumped after all three sends succeed, so a partial send also desynchronises
+ * the sequence number the MAC is computed over -- every later packet would
+ * then fail to verify even if it were assembled perfectly.
+ *
+ * EAGAIN is expected on this descriptor, for the reason read_exact() spells out
+ * above: the socket is briefly O_NONBLOCK whenever esp_linenoise's terminal
+ * probe runs on it. O_NONBLOCK belongs to the descriptor and not to a
+ * direction, so it applies to send() as much as to recv(). The read side was
+ * taught to expect it; this side never was.
+ *
+ * Honesty about what this does *not* fix: it was written to explain the
+ * `Corrupted MAC` failures documented in KNOWN-ISSUES, and measurement says it
+ * does not. Instrumenting this branch showed it never being taken on a failing
+ * run -- zero EAGAIN across every connection, and the corruption happened
+ * anyway. It stays because abandoning a partially-written packet is wrong on
+ * its own terms and would eventually be somebody's very bad afternoon, not
+ * because it closes that bug.
+ *
+ * The stall is bounded whether or not anything has been sent yet, which is
+ * where this parts company with read_exact(). An idle read may legitimately
+ * wait hours for a keystroke; a send that cannot progress means the peer has
+ * stopped draining, and a connection task parked there forever is what once
+ * exhausted the session limit.
+ *
+ * DEBUG for the timeout because it is diagnostic and the failure surfaces to
+ * the caller anyway, not because a louder level would be unsafe -- it would
+ * have been, until klog stopped echoing through the calling task's stdout. See
+ * s_console_out in espix_kernel/klog.c: the first draft of this logged at WARN
+ * and re-entered write_all() from inside its own half-sent packet.
+ */
 static esp_err_t write_all(int fd, const void *src, size_t len)
 {
     const uint8_t *p = src;
     size_t         sent = 0;
+    int64_t        blocked_since = 0;   /* us; 0 while making progress */
 
     while (sent < len) {
         const ssize_t n = send(fd, p + sent, len - sent, 0);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) {
-                continue;
-            }
-            return ESP_FAIL;
+
+        if (n > 0) {
+            sent += (size_t)n;
+            blocked_since = 0;          /* progress resets the patience */
+            continue;
         }
-        sent += (size_t)n;
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* By the clock, not by counting turns: each turn delays for an
+             * interval of its own, so a per-iteration tally would bear no
+             * relation to elapsed time. Same correction read_exact() needed. */
+            const int64_t now = esp_timer_get_time();
+
+            if (blocked_since == 0) {
+                blocked_since = now;
+            } else if (now - blocked_since >=
+                       (int64_t)BLOCKED_WRITE_TIMEOUT_MS * 1000) {
+                /* DEBUG, and that is load-bearing: see the note above. */
+                espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                           "peer stopped reading %u bytes into a %u-byte send",
+                           (unsigned)sent, (unsigned)len);
+                return ESP_ERR_TIMEOUT;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -453,6 +520,7 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
 
 esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
 {
+
     if (b->bad) {
         /* A writer that overflowed would otherwise emit a truncated packet,
          * which the peer would read as a protocol error at a confusing point. */
