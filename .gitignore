@@ -11,14 +11,21 @@ apps/*/sdkconfig.old
 apps/*/managed_components/
 apps/*/build-apps.log
 
-# Apps staged into the rootfs image are build artifacts, not source.
-# Build them from apps/ and copy them in — see tools/README.md.
-fsroot/bin/*
-!fsroot/bin/.keep
-
-# WiFi credentials written into the rootfs image. A passphrase must never be
-# committable; the device writes its own copy at /etc/wifi.conf either way.
-fsroot/etc/wifi.conf
+# The rootfs image is staging, not source. Nothing under here is committed.
+#
+# espix builds its own filesystem on first boot: espix_fs creates the directory
+# skeleton, espix_auth writes /etc/passwd, /etc/group and /etc/sudoers and the
+# default account's home, espix_net writes /etc/hostname, and the SSH server
+# generates its host key. So an empty fsroot/ produces a device that comes up
+# correctly, and the things that did live here were either placeholders for
+# directories the device makes anyway or a default it already compiles in.
+#
+# What legitimately appears here is yours and nobody else's: apps staged by
+# tools/build-apps.sh (build artifacts), and /etc/wifi.conf, which holds a
+# passphrase and must never be committable.
+#
+# CMakeLists.txt creates the directory if it is missing, so a fresh clone builds.
+fsroot/
 
 # Editors / tooling
 .DS_Store

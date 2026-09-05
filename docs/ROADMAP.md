@@ -280,11 +280,33 @@ things are as they are.
   commands — `wifi connect`, `passwd`, `useradd` — rather than as files to edit.
   That is a reasonable shape for a device, but it should be a choice rather than
   what happens because there is no alternative.
-- **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
-  quieted driver tags.
-- **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the
-  console prints a fixed banner instead. Printing motd at session start is the
-  right home for it, and worth doing when SSH makes "logging in" a real event.
+- ~~**`dmesg -n`.**~~ Done. `klog_store()` echoed on a hardcoded
+  `level <= ESPIX_KLOG_INFO`; that is now a variable and `dmesg -n <0-3>` moves
+  it, taking `err`/`warn`/`info`/`debug` as well as numbers because remembering
+  which direction 3 is proves harder than it sounds. The ring is unaffected --
+  `dmesg` still lists everything, whatever the console is set to. Root's, since
+  it is a property of the device and one user quieting it silences the serial
+  line for whoever is sitting at it, and not persisted, so a device left in a
+  debugging setting does not stay there.
+
+  The original entry said this would replace "the hardcoded list of quieted
+  driver tags". It does not, and cannot: those are three `esp_log_level_set()`
+  calls in `coredump.c`, `wifi.c` and `proc.c`, which configure **ESP-IDF's**
+  logger. espix's klog is a separate ring with its own levels, and the two only
+  meet where `espix_kernel_early_init()` hooks esp_log's output into the ring.
+  Making the IDF tags runtime-settable is a different, smaller job that nobody
+  has asked for.
+- ~~**`/etc/motd`.**~~ Decided against, and the file is gone. The condition this
+  entry waited on -- "worth doing when SSH makes logging in a real event" -- did
+  arrive, and the answer turned out to be the other one: `cmd_motd.c` generates
+  a greeting from what the system actually knows (version, uptime, address, disk)
+  and both transports print it at session start. A static file repeating a
+  directory guide at every login is noise beside that, and it had already gone
+  stale -- it ended by telling you to edit it, on a system with no editor.
+
+  What a real `/etc/motd` is *for* is a local administrator's message, which is
+  worth having again once there is an editor to write one with. It would then be
+  printed alongside the generated greeting rather than instead of it.
 
 ## Platform
 

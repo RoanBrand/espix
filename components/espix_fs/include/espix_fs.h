@@ -2,7 +2,7 @@
  * espix root filesystem.
  *
  * espix registers its *own* VFS as the fallback (empty base path), which makes
- * it the real root: paths are /bin/hello, /etc/motd, /home/... rather than
+ * it the real root: paths are /bin/hello, /etc/hostname, /home/... rather than
  * /storage/bin/hello. ESP-IDF documents the empty-base-path case explicitly
  * ("a fallback VFS ... will handle paths which are not matched by any other
  * registered VFS"), so device VFSes such as /dev/uart keep working via

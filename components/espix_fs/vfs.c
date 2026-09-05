@@ -23,9 +23,10 @@
  * Stacked by pointer, not by path
  * -------------------------------
  * The obvious way to reach the layer below is to give it a base path --
- * mount littlefs at "/.lfs", and rewrite "/etc/motd" to "/.lfs/etc/motd". That
- * works, and it publishes a second name for the root: anything spelling
- * "/.lfs/..." addresses the filesystem with these checks skipped.
+ * mount littlefs at "/.lfs", and rewrite "/etc/hostname" to
+ * "/.lfs/etc/hostname". That works, and it publishes a second name for the
+ * root: anything spelling "/.lfs/..." addresses the filesystem with these
+ * checks skipped.
  *
  * A stackable filesystem does not route through the namespace; it holds a
  * pointer to the layer below. esp_littlefs_mount() (see
@@ -103,8 +104,8 @@ static int enosys(void)
  * what they mean.
  *
  * An absolute path still needs normalising, not just passing along: an app is
- * free to open "/etc/../etc/motd", and the mode attribute is keyed by path, so
- * two spellings of one file must not become two entries.
+ * free to open "/etc/../etc/hostname", and the mode attribute is keyed by
+ * path, so two spellings of one file must not become two entries.
  *
  * Which is also what makes the root test below sound. `..` is resolved by
  * popping segments *before* anything compares prefixes, so "/srv/www/../../etc"

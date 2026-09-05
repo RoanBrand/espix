@@ -244,22 +244,6 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   past that ceiling the listing stops and says `ls: stopped at 512 entries`
   rather than silently ending. The same applies if the allocation fails partway.
 
-- **Only the execute bit is enforced.** `ls -l` and `sftp ls -l` show nine
-  permission bits and `chmod` sets any of them, but read and write are metadata:
-  `chmod 000 /etc/motd` does not stop `cat` reading it. Enforcing them would
-  mean checking at every entry to the filesystem, and an app does not go through
-  espix to get there -- it calls libc, which reaches the VFS, which has no idea
-  which process is asking. Checking only in the shell's own commands would be a
-  boundary you could step around with `run`, which is worse than none. The
-  execute bit is different because espix *owns* the exec path, and so can be
-  asked.
-
-  The *seam* now exists: espix registers the root VFS itself, so every
-  `open()` — an app's included — passes through `espix_fs_access_check()`, which
-  resolves the calling task to a process to a session to a user. What is still
-  missing is an owner on a *file* to compare that against, so the check is wired
-  and permissive. See [ROADMAP.md](ROADMAP.md#filesystem).
-
 - **No file has an owner**, so `chown` does not exist and setuid, setgid and
   sticky are refused by `chmod` rather than stored. There are two identities --
   `root` on the console, `esp` over SSH -- but nothing records which of them a

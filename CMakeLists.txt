@@ -35,6 +35,13 @@ endif()
 # whose point is a persistent, mutable filesystem, flashing it has to be an
 # explicit act.
 #
+# fsroot/ is entirely gitignored -- see the note there -- so a fresh clone has
+# no such directory and the image rule below would fail on it. Create it here
+# rather than committing a placeholder: the device builds its own filesystem on
+# first boot, so an empty image is a perfectly good starting point, and
+# ESPIX_BUILD_APPS=OFF means nothing else would create it either.
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/fsroot")
+
 # Provided by managed_components/joltwallet__littlefs/project_include.cmake.
 littlefs_create_partition_image(storage fsroot)
 

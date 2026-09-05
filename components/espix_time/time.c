@@ -65,8 +65,10 @@ static bool     s_from_conf;
  * timezone" is setenv() plus tzset(); everything downstream -- localtime(),
  * mktime(), strftime()'s %Z -- follows from there.
  *
- * A POSIX TZ string, not a zoneinfo name: espix ships no tzdata, so the rules
- * have to be in the string itself. See the shipped /etc/timezone.
+ * A POSIX TZ string, not a zoneinfo name: Linux would put "Africa/Johannesburg"
+ * in /etc/timezone and keep the rules in /etc/localtime, but espix ships no
+ * tzdata -- the database is megabytes -- so the rules live in the string
+ * itself. `timedatectl set-timezone` documents the format; see cmd_time.c.
  *
  * The obvious question is why this is static configuration when the clock
  * beside it comes off the network: surely the sync could bring the zone too?
