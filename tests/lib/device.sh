@@ -171,6 +171,22 @@ dev_capture() {
     dev_once "$1 > /tmp/.espix-capture" >/dev/null
     dev_pull /tmp/.espix-capture "$2" >/dev/null
     dev_once "rm /tmp/.espix-capture" >/dev/null
+
+    # Empty is a failure, not a result. Two things produce it and both are
+    # silent: a command that wrote nothing, and -- the one that caught me -- a
+    # *loaded app*, whose output cannot be redirected at all. espix points an
+    # app's stdout at the session rather than the redirect FILE, deliberately
+    # (see the note in espix_proc/exec.c: the FILE is closed when the command
+    # returns and a backgrounded app would outlive it).
+    #
+    # Without this check, comparing two captured app outputs compares two empty
+    # files and reports that they match.
+    if [ ! -s "$2" ]; then
+        echo "dev_capture: '$1' produced nothing -- a loaded app's output" \
+             "cannot be redirected to a file; read it over the channel" >&2
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------- console ---

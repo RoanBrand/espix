@@ -60,12 +60,40 @@ publish an Arduino API: a sketch gets Arduino by linking the Arduino component
 into the app, which is why `apps/neopixel` carries that dependency and the
 firmware does not.
 
-Anything not in those tables fails the load with `Can't find symbol X`. To see
-what an app needs:
+Anything not in those tables fails the load with `Can't find symbol X` — the
+loader names it, on the line directly above espix's own `relocation failed`, and
+it is in `dmesg` too. Read both lines before going looking; the answer is
+usually already on the screen.
+
+To see what an app needs, before running it:
 
 ```bash
 xtensa-esp32s3-elf-readelf -sW build/app.app.elf | awk '$7=="UND"{print $8}' | sort -u
 ```
+
+And to see what is actually published, which is the other half of the question:
+
+```bash
+# bash, not zsh: zsh does not word-split an unquoted variable, so a file list
+# held in one gets searched as a single impossible filename and every symbol
+# looks missing.
+{ grep -o 'ESP_ELFSYM_EXPORT([a-zA-Z_0-9]*)'       managed_components/espressif__elf_loader/src/esp_elf_symbol.c
+  grep -ho 'ESP_ELFSYM_EXPORT([a-zA-Z_0-9]*)' components/espix_proc/abi_*.c
+} | sed 's/.*(\(.*\))//' | sort -u
+```
+
+### Why the list is hand-written
+
+elf_loader ships `tool/symbols.py`, which generates a complete table from a
+firmware ELF into `g_customer_elfsyms`. espix leaves it off on purpose.
+
+With no MMU, this table *is* the sandbox: an app shares the address space and is
+bounded only by what it can name. Generating it from the firmware would publish
+the WiFi driver, the flash API and espix's internals to every app. So the tables
+are an allowlist — `abi_fs.c`, `abi_time.c`, `abi_drivers.c` and `abi_libc.c`
+are it being curated. Adding a name is nearly free (a string and a pointer in
+the firmware, nothing in any app), but it should be something that cannot reach
+past the caller's own memory.
 
 ## Three things that will catch you
 

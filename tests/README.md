@@ -142,6 +142,18 @@ vanishes under instrumentation (0/140 with per-packet tracing, 2/30 without).
 And do not trust a short clean run — 0/60 was recorded with the bug demonstrably
 present.
 
+## A known flaky spot
+
+The console suite fails roughly one run in three or four, and it is the harness
+rather than espix: `console.py` drives a serial line with no flow control,
+answering esp_linenoise's cursor-position probe as it goes, and the sync is
+timing-sensitive. It retries the initial sync three times, which helps and does
+not cure it.
+
+If it fails, re-run it alone (`make test SUITE=console`) before believing it.
+That is an unsatisfying instruction to write in a document about trusting your
+tests, and it is better than a suite that quietly passes.
+
 ## The test app
 
 `tests/app/` is its own IDF project, so `tools/build-apps.sh` — which globs

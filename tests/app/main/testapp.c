@@ -120,15 +120,88 @@ static int cmd_read(const char *path)
  * no tracing in it, which is what that investigation concluded it needed and
  * never had.
  */
-static int cmd_out(const char *count)
+static int cmd_out(const char *count, const char *width)
 {
-    const long n = strtol(count, NULL, 10);
+    static const char filler_default[] =
+        "the quick brown fox jumps over the lazy dog";
+    static const char filler[] =
+        "the quick brown fox jumps over the lazy dog, and then does it again "
+        "and again and again until the line is as long as it needs to be, "
+        "which is the entire point of this particular piece of padding here.";
 
+    const long n = strtol(count, NULL, 10);
+    const long w = (width != NULL) ? strtol(width, NULL, 10) : 0;
+
+    /*
+     * `width` is what separates two variables that are otherwise welded
+     * together.
+     *
+     * An app's stdout is line-buffered with a 128-byte buffer (see
+     * chan_open_stream in ssh_channel.c), so every newline flushes and each
+     * line leaves as its own CHANNEL_DATA packet. `out 200` at the default
+     * width is therefore ~12KB *and* ~200 packets, and the cliff between 100
+     * and 200 could be caused by either.
+     *
+     * Padding the lines changes bytes without changing packet count, so the two
+     * can be measured apart:
+     *
+     *     out 200        ~12KB, 200 packets   the known-bad case
+     *     out 100 120    ~12KB, 100 packets   same bytes, half the packets
+     *     out 200 30      ~6KB, 200 packets   same packets, half the bytes
+     *
+     * setvbuf() would have been the tidier way to do this, and it is not
+     * available: neither setvbuf nor fflush is in the loader's exported symbol
+     * table, so an app cannot change its own buffering at all.
+     */
     for (long i = 0; i < n; i++) {
-        printf("line %ld of %ld: the quick brown fox jumps over the lazy dog\n",
-               i + 1, n);
+        if (w <= 0) {
+            printf("line %ld of %ld: %s\n", i + 1, n, filler_default);
+        } else {
+            /* One printf, so one newline and therefore one flush and one
+             * packet. The precision does the padding: snprintf would have been
+             * the obvious way and is not exported to apps either. */
+            long pad = w - 20;
+
+            if (pad < 1) {
+                pad = 1;
+            }
+            if ((size_t)pad > sizeof(filler) - 1) {
+                pad = (long)sizeof(filler) - 1;
+            }
+            printf("line %ld of %ld: %.*s\n", i + 1, n, (int)pad, filler);
+        }
     }
     return 0;
+}
+
+/*
+ * The same output as `out`, in far fewer packets.
+ *
+ * An app's stdout is line-buffered with a 128-byte buffer (chan_open_stream in
+ * ssh_channel.c), so every newline flushes and each line leaves as its own
+ * ~60-byte CHANNEL_DATA packet -- nowhere near the 2048-byte maximum, so
+ * nothing batches. `out 200` is therefore ~12KB *and* ~200 packets, and the
+ * cliff between 100 and 200 could be either.
+ *
+ * Full buffering sends the identical bytes in three or four packets, so the two
+ * can be told apart. The output must stay byte-for-byte identical to `out` or
+ * the comparison measures two things at once.
+ *
+ * This did not work until setvbuf was exported to apps -- see
+ * components/espix_proc/abi_libc.c, which exists because of this function.
+ */
+static int cmd_outbuf(const char *count)
+{
+    if (setvbuf(stdout, NULL, _IOFBF, 4096) != 0) {
+        printf("outbuf: setvbuf failed -- this run would silently measure the "
+               "same thing as `out`\n");
+        return 1;
+    }
+
+    const int rc = cmd_out(count, NULL);
+
+    fflush(stdout);
+    return rc;
 }
 
 static void usage(void)
@@ -141,7 +214,8 @@ static void usage(void)
            "  cd <path>           chdir then getcwd\n"
            "  write <path> <text> create and write\n"
            "  read <path>         read the first line back\n"
-           "  out <n>             print n lines\n"
+           "  out <n> [width]     print n lines, each padded to width bytes\n"
+           "  outbuf <n>          the same lines, 4KB-buffered (few packets)\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n");
 }
 
@@ -179,8 +253,11 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "read") == 0 && argc > 2) {
         return cmd_read(argv[2]);
     }
+    if (strcmp(cmd, "outbuf") == 0 && argc > 2) {
+        return cmd_outbuf(argv[2]);
+    }
     if (strcmp(cmd, "out") == 0 && argc > 2) {
-        return cmd_out(argv[2]);
+        return cmd_out(argv[2], (argc > 3) ? argv[3] : NULL);
     }
     if (strcmp(cmd, "sleep") == 0 && argc > 2) {
         sleep((unsigned)strtol(argv[2], NULL, 10));

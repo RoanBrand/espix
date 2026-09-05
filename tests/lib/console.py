@@ -133,13 +133,28 @@ def main():
         print(f"console.py: cannot open {args.port}: {exc}", file=sys.stderr)
         return 1
 
-    # A newline first: the console may be sitting mid-probe from an earlier
-    # reader, and this both answers it and gets a fresh prompt to sync on.
-    try:
-        c.ser.write(b"\r")
-        c.wait_prompt()
-    except TimeoutError as exc:
-        print(f"console.py: {exc}", file=sys.stderr)
+    # Sync on a prompt before sending anything, retrying a few times.
+    #
+    # One attempt is not enough in practice: the console may be sitting
+    # mid-probe from an earlier reader, or part-way through a line somebody left
+    # behind, and a single newline does not always shake that out. Ctrl-U first
+    # clears any partial line, then a newline asks for a fresh prompt. Observed
+    # failing about one run in three without this, which for a test suite is
+    # worse than failing every time.
+    synced = False
+    for _ in range(3):
+        try:
+            c.ser.write(b"\x15\r")
+            c.ser.flush()
+            c.wait_prompt()
+            synced = True
+            break
+        except TimeoutError:
+            time.sleep(1)
+
+    if not synced:
+        print("console.py: no prompt after three attempts -- is anything else "
+              "holding the port, and is the device up?", file=sys.stderr)
         c.close()
         return 1
 
