@@ -230,6 +230,14 @@ const char *espix_proc_cwd(void);
 const char *espix_proc_root(void);
 
 /*
+ * Both of the above in one walk of the process table, for the VFS, which wants
+ * both on every path it resolves. Either pointer may be NULL. On return they
+ * point at storage owned by the process table, valid for as long as the calling
+ * process is -- which, since the caller is that process, is long enough.
+ */
+void espix_proc_paths(const char **cwd, const char **root);
+
+/*
  * Move the calling process's working directory. `abs_path` must be absolute
  * and must be a directory.
  *

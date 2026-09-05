@@ -79,6 +79,14 @@ static int abi_chdir(const char *path)
         return -1;
     }
 
+    /*
+     * No root check here, and it is not an oversight: espix_proc_chdir() stats
+     * the target, that stat goes through espix's VFS, and the VFS refuses a
+     * path outside the process's root with ENOENT -- so a confined process
+     * cannot move out, and gets the same answer it would for a directory that
+     * is not there. abi_chmod() below is the one that needed its own check,
+     * because espix_fs_chmod() never re-enters the VFS.
+     */
     switch (espix_proc_chdir(abs)) {
     case ESP_OK:
         return 0;
@@ -108,6 +116,13 @@ static int abi_chdir(const char *path)
  *
  * (Same defect shape as pthread_sigmask, which is also a force-linked no-op
  * returning success -- see docs/UPSTREAM.md.)
+ */
+/*
+ * The root applies here through espix_fs_admin_check(), not through the VFS.
+ * This resolves its own path and calls espix_fs_chmod() directly, so resolve()
+ * never sees it -- the same reason espix_fs_admin_check() exists for ownership.
+ * Without that check a confined process could re-mode any file it owns
+ * anywhere on the device.
  */
 static int abi_chmod(const char *path, mode_t mode)
 {

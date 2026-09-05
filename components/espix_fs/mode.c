@@ -301,7 +301,14 @@ esp_err_t espix_fs_chmod(const char *abs_path, mode_t mode)
     if (abs_path == NULL || (mode & ~(mode_t)ESPIX_MODE_BITS) != 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (espix_fs_admin_check(abs_path, false) != 0) {
+    /* ENOENT is the root refusing, and has to stay distinguishable from the
+     * ownership refusal: callers map it to errno, and a path outside the root
+     * must read as absent rather than as an I/O failure. */
+    const int admin = espix_fs_admin_check(abs_path, false);
+    if (admin == ENOENT) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (admin != 0) {
         return ESP_ERR_NOT_ALLOWED;
     }
     if (stat(abs_path, &st) != 0) {
@@ -338,7 +345,11 @@ esp_err_t espix_fs_chown(const char *abs_path, uint16_t uid, uint16_t gid)
     if (abs_path == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (espix_fs_admin_check(abs_path, uid != ESPIX_FS_KEEP_ID) != 0) {
+    const int admin = espix_fs_admin_check(abs_path, uid != ESPIX_FS_KEEP_ID);
+    if (admin == ENOENT) {
+        return ESP_ERR_NOT_FOUND;      /* the root; see espix_fs_chmod() */
+    }
+    if (admin != 0) {
         return ESP_ERR_NOT_ALLOWED;
     }
     if (stat(abs_path, &st) != 0) {

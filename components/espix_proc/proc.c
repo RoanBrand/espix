@@ -746,46 +746,55 @@ bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
 }
 
 /*
- * Working directory of the calling process.
+ * Working directory and root of the calling process, in one lookup.
  *
- * Takes no lock, deliberately, because espix's VFS calls this on every file
- * operation in the system -- a mutex here would serialise all I/O behind the
+ * Both together because the VFS wants both on every path it resolves, and
+ * espix_proc_self() is a walk of the process table: asking twice doubles the
+ * cost of the single hottest operation in the system, and for the callers that
+ * are not processes at all -- the console, an SSH connection task, SNTP, the
+ * WiFi driver -- the walk runs to the end and finds nothing either time.
+ *
+ * Takes no lock, deliberately; a mutex here would serialise all I/O behind the
  * process table. espix_proc_self() is safe without one for the reason given on
  * its declaration: the caller *is* the process, so its slot cannot be recycled
  * underneath it. The only writer of `cwd` is that same task, in
- * espix_proc_chdir().
+ * espix_proc_chdir(), and `root` is written once at spawn.
  *
- * "/" for a task espix does not know as a process -- the console, an SSH
- * connection task, SNTP, the WiFi driver -- which is what they resolved
- * against before this existed.
+ * The defaults are what a task espix does not know as a process gets: "/" to
+ * resolve against, which is what those callers used before a cwd existed, and
+ * "" for the root, meaning unconfined.
  */
-const char *espix_proc_cwd(void)
+void espix_proc_paths(const char **cwd, const char **root)
 {
     const espix_proc_slot_t *slot = espix_proc_self();
 
-    if (slot == NULL || slot->cwd[0] == '\0') {
-        return "/";
+    if (cwd != NULL) {
+        *cwd = (slot == NULL || slot->cwd[0] == '\0') ? "/" : slot->cwd;
     }
-    return slot->cwd;
+    if (root != NULL) {
+        *root = (slot == NULL || !slot->root_active) ? "" : slot->root;
+    }
+}
+
+const char *espix_proc_cwd(void)
+{
+    const char *cwd = "/";
+
+    espix_proc_paths(&cwd, NULL);
+    return cwd;
 }
 
 /*
- * Root of the calling process, or "" for one that has none.
- *
- * Lock-free for exactly the reasons espix_proc_cwd() gives above -- espix's VFS
- * calls this on every path it resolves, and the caller is the process, so its
- * slot cannot be recycled underneath it. Stronger than cwd, even: `root` is
- * written once during spawn, before the task exists, and never again.
- *
- * "" for the console, an SSH connection task, SNTP, the WiFi driver and every
- * shell builtin, none of which are processes. Confinement is a property of a
- * process, not of a session.
+ * Root of the calling process, or "" for one that has none. The VFS uses
+ * espix_proc_paths() instead; this is for callers that want only the root, of
+ * which there is one -- the never-widen check in espix_proc_spawn_elf().
  */
 const char *espix_proc_root(void)
 {
-    const espix_proc_slot_t *slot = espix_proc_self();
+    const char *root = "";
 
-    return (slot == NULL || !slot->root_active) ? "" : slot->root;
+    espix_proc_paths(NULL, &root);
+    return root;
 }
 
 void espix_proc_root_arm(void)

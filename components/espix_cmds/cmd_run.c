@@ -159,7 +159,13 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
     const char *root  = NULL;
     int         first = 1;
 
-    if (argc >= 3 && strcmp(argv[1], "-R") == 0) {
+    /* Match the flag first and then require its argument, so a bare `run -R`
+     * is a usage error rather than an attempt to run a program called -R. */
+    if (argc >= 2 && strcmp(argv[1], "-R") == 0) {
+        if (argc < 3) {
+            espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
+            return 1;
+        }
         root  = argv[2];
         first = 3;
     }

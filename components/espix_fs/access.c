@@ -70,14 +70,33 @@ void espix_fs_priv_end(void)
     }
 }
 
-bool espix_fs_priv_active(void)
+static bool privileged(void)
 {
     return pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_FSPRIV_IDX) != NULL;
 }
 
-static bool privileged(void)
+bool espix_fs_root_permits(const char *abs_path)
 {
-    return espix_fs_priv_active();
+    if (abs_path == NULL) {
+        return true;            /* not a path question; let the caller fail */
+    }
+
+    /*
+     * Raised callers are exempt on the same terms they are exempt from the
+     * permission check: this is espix reaching a file of its own -- /etc/passwd,
+     * or the ELF magic the mode rule sniffs -- and which process happened to
+     * trigger it says nothing about whether espix may read it.
+     */
+    if (privileged()) {
+        return true;
+    }
+
+    const char *const root = espix_proc_root();
+
+    if (root[0] == '\0') {
+        return true;            /* unconfined, which is nearly everything */
+    }
+    return espix_fs_within(abs_path, root);
 }
 
 static const char *op_name(espix_fs_access_t op)
@@ -247,6 +266,28 @@ int espix_fs_admin_check(const char *abs_path, bool changing_owner)
     if (abs_path == NULL) {
         return EINVAL;
     }
+
+    /*
+     * The process's root, checked here and not only in the VFS.
+     *
+     * chmod and chown do not go through the VFS -- that is the whole reason
+     * this function exists, and the note below says so -- so resolve()'s root
+     * test never sees them. An app calling chmod() reaches espix_fs_chmod()
+     * through abi_fs.c, which resolves the path itself; without this a confined
+     * process could change the mode of any file it owns anywhere on the device.
+     *
+     * Before the uid short-circuit rather than after, deliberately. A root is
+     * not a permission and does not yield to one: a confined process running as
+     * uid 0 is still confined, which is most of why a root is worth having on
+     * top of ownership at all.
+     *
+     * ENOENT rather than EPERM, matching the VFS: outside the root a path does
+     * not exist, and saying "denied" would confirm that it does.
+     */
+    if (!espix_fs_root_permits(abs_path)) {
+        return ENOENT;
+    }
+
     if (privileged() || !subject(&who) || who.uid == 0) {
         return 0;
     }

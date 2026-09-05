@@ -178,9 +178,23 @@ things are as they are.
 
 - ~~**A root for an app.**~~ Done, as `run -R <dir>`: the process may not
   resolve a path outside that directory, and everything else answers ENOENT.
-  One test in `resolve()` in `espix_fs/vfs.c` covers it, because every path
-  operation in the system already passes through there -- including `stat` and
-  `utime`, which the permission check deliberately does not gate.
+  `resolve()` in `espix_fs/vfs.c` covers everything that reaches the
+  filesystem through the VFS -- which is every path operation an app makes,
+  including `stat` and `utime`, both of which the permission check deliberately
+  does not gate.
+
+  `chmod` and `chown` are checked separately, in `espix_fs_admin_check()`, and
+  that is not belt and braces: they never enter the VFS. `abi_fs.c` resolves
+  their paths itself and calls `espix_fs_chmod()` directly, because ESP-IDF's
+  `chmod` is a stub that returns success without doing anything. It is the same
+  gap `espix_fs_admin_check()` was written for in the first place -- it says so
+  in its own comment -- and the root shipped without covering it for exactly one
+  commit. `apps/hello chmod` is the regression test that keeps it covered.
+
+  The root is asked *before* the uid short-circuit there, so a confined process
+  running as uid 0 is still confined. A root is not a permission and does not
+  yield to one; that it survives the uid being wrong is much of why it is worth
+  having on top of ownership.
 
   **Why it is not what users already do.** Permissions decide whether a uid may
   *open* a path; they never stop it being *named*, and the mode rule gives

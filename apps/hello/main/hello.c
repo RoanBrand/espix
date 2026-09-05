@@ -16,6 +16,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -123,10 +124,52 @@ static void show_filesystem(void)
     }
 }
 
+/*
+ * `hello chmod <path> <octal>` -- the other half of the boundary test.
+ *
+ * chmod does not go through espix's VFS: abi_fs.c resolves the path itself and
+ * calls espix_fs_chmod() directly. So a process root that were only enforced in
+ * the VFS would not cover this, and a confined process could re-mode any file
+ * it owns anywhere on the device. That gap existed and was fixed; this is what
+ * keeps it fixed.
+ */
+static int do_chmod(const char *path, const char *octal)
+{
+    const mode_t mode = (mode_t)strtol(octal, NULL, 8);
+
+    if (chmod(path, mode) == 0) {
+        printf("  chmod %s %s: ok\n", path, octal);
+        return 0;
+    }
+
+    const int e = errno;
+    const char *name = (e == ENOENT)  ? " (ENOENT)"
+                       : (e == EACCES) ? " (EACCES)"
+                       : (e == EPERM)  ? " (EPERM)"
+                                       : "";
+    printf("  chmod %s %s: errno %d%s\n", path, octal, e, name);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && strcmp(argv[1], "probe") == 0) {
         return probe(argc - 2, argv + 2);
+    }
+    if (argc > 3 && strcmp(argv[1], "chmod") == 0) {
+        return do_chmod(argv[2], argv[3]);
+    }
+    if (argc > 2 && strcmp(argv[1], "cd") == 0) {
+        /* chdir then getcwd, so a confined process can be seen failing to
+         * leave and still reporting where it actually is. */
+        if (chdir(argv[2]) != 0) {
+            printf("  chdir %s: errno %d\n", argv[2], errno);
+        } else {
+            printf("  chdir %s: ok\n", argv[2]);
+        }
+        char cwd[128];
+        printf("  cwd = %s\n", getcwd(cwd, sizeof(cwd)) ? cwd : "(failed)");
+        return 0;
     }
 
     printf("hello from an espix app\n");

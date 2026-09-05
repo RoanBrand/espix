@@ -63,13 +63,19 @@ int espix_fs_admin_check(const char *abs_path, bool changing_owner);
 void espix_fs_claim(const char *abs_path);
 
 /*
- * Is the calling task inside espix_fs_priv_begin()/end()?
+ * May the calling process name `abs_path` at all?
  *
- * The public pair raises privilege; this asks. Both the permission check and
- * the process-root test have to answer "yes, allow" for a raised task, and
- * this is what keeps the two from disagreeing about what raised means.
+ * True unless the caller is a process with a root and the path falls outside
+ * it. Raised tasks are always true -- espix reaching a file of its own is not
+ * the confined process asking.
+ *
+ * Two callers, and they are not redundant. The VFS asks in resolve(), which
+ * covers every path operation that goes through the VFS; espix_fs_admin_check()
+ * asks because chmod and chown do not, for the same reason that function exists
+ * at all. `abs_path` must already be resolved and normalised, so that ".."
+ * cannot be used to spell a way out.
  */
-bool espix_fs_priv_active(void);
+bool espix_fs_root_permits(const char *abs_path);
 
 /*
  * Publish espix's VFS as the root, forwarding to the filesystem described by

@@ -404,6 +404,16 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      */
     strlcpy(slot->root, (root != NULL) ? root : "", sizeof(slot->root));
 
+    /*
+     * Explicitly, rather than trusting how the slot was obtained. A recycled
+     * slot is memset by espix_proc_alloc_slot() and a never-used one was
+     * cleared at init, so this is true today either way -- but a stale
+     * root_active confines the *loader*, and the app then dies with
+     * ESP_ERR_NOT_FOUND on a binary that is plainly there. That is not a
+     * failure anyone should have to debug twice.
+     */
+    slot->root_active = false;
+
     const char *const start =
         (session != NULL && session->cwd[0] != '\0') ? session->cwd : "/";
 

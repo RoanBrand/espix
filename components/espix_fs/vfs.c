@@ -119,27 +119,34 @@ static const char *resolve(const char *path, char *buf, size_t len)
         errno = ENAMETOOLONG;
         return NULL;
     }
-    if (espix_fs_resolve(espix_proc_cwd(), path, buf, len) != ESP_OK) {
+
+    /*
+     * One lookup for both, because this runs on every path operation in the
+     * system and espix_proc_cwd() and espix_proc_root() would each walk the
+     * process table to answer half of it. For the commonest callers -- an SSH
+     * session task, SFTP, the console, anything of espix's own -- that walk
+     * finds nothing and returns the default, so paying for it twice is pure
+     * waste on the hottest path there is.
+     */
+    const char *cwd  = "/";
+    const char *root = "";
+    espix_proc_paths(&cwd, &root);
+
+    if (espix_fs_resolve(cwd, path, buf, len) != ESP_OK) {
         errno = ENAMETOOLONG;
         return NULL;
     }
 
     /*
-     * The process's root, if it has one. Raised callers are exempt on the same
-     * terms espix_fs_access_check() exempts them: this is espix reaching a file
-     * of its own -- /etc/passwd, or the ELF magic the mode rule sniffs -- and
-     * which process happened to trigger it says nothing about whether espix may
-     * read it.
-     *
      * ENOENT rather than EACCES on purpose. "Permission denied" confirms the
      * path exists, and a confined process probing one path at a time would map
      * the filesystem it is supposed to be unable to see.
+     *
+     * espix_fs_root_permits() is asked rather than `root` compared here, so
+     * that this and espix_fs_admin_check() cannot drift apart about what a root
+     * means -- including the exemption for a raised task.
      */
-    const char *root = espix_proc_root();
-
-    if (root[0] != '\0' && !espix_fs_priv_active() &&
-        !espix_fs_within(buf, root)) {
-        espix_klog(ESPIX_KLOG_DEBUG, TAG, "outside root %s: %s", root, buf);
+    if (root[0] != '\0' && !espix_fs_root_permits(buf)) {
         errno = ENOENT;
         return NULL;
     }
