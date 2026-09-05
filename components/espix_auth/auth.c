@@ -645,29 +645,6 @@ const char *espix_auth_name_for_uid(espix_uid_t uid)
 }
 
 /*
- * True if `abs_path` is `dir` or something underneath it.
- *
- * The trailing check is what stops /home/esp claiming /home/espix: a prefix
- * match alone would hand one account's files to another whose name it happens
- * to begin with.
- */
-static bool path_within(const char *abs_path, const char *dir)
-{
-    if (dir[0] == '\0') {
-        return false;
-    }
-    if (strcmp(dir, "/") == 0) {
-        return true;            /* root's home; contains everything */
-    }
-
-    const size_t len = strlen(dir);
-    if (strncmp(abs_path, dir, len) != 0) {
-        return false;
-    }
-    return abs_path[len] == '\0' || abs_path[len] == '/';
-}
-
-/*
  * The espix_fs ownership rule: a file with no stored owner belongs to the
  * account whose home contains it, the longest home winning.
  *
@@ -686,7 +663,8 @@ static bool owner_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
 
     for (size_t i = 0; i < s_account_count; i++) {
         const size_t len = strlen(s_accounts[i].home);
-        if ((!found || len > best) && path_within(abs_path, s_accounts[i].home)) {
+        if ((!found || len > best) &&
+            espix_fs_within(abs_path, s_accounts[i].home)) {
             best   = len;
             *uid   = s_accounts[i].uid;
             *gid   = s_accounts[i].gid;

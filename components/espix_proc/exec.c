@@ -224,6 +224,14 @@ static void proc_task(void *arg)
     }
 
     /*
+     * The confinement starts here, not at spawn: everything above this line is
+     * espix loading a program, and everything below it is the program running.
+     * See root_active in espix_proc_priv.h -- arming any earlier means the
+     * loader cannot read a binary from outside the root, which is every binary.
+     */
+    espix_proc_root_arm();
+
+    /*
      * Called directly rather than through esp_elf_request(), which is
      * "elf->entry(argc, argv); return 0;" — it throws the app's return value
      * away, so an exit status could never reach the shell. This replicates its
@@ -282,13 +290,34 @@ done:
 }
 
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
-                               espix_session_t *session, espix_pid_t *out_pid)
+                               espix_session_t *session, const char *root,
+                               espix_pid_t *out_pid)
 {
     if (abs_path == NULL || abs_path[0] != '/' || argc < 1 || argv == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (root != NULL && root[0] != '/') {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (g_espix_proc_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * A root only ever narrows. If the caller is itself confined, the root it
+     * asks for must be inside its own -- otherwise a process could escape by
+     * spawning a child with a wider view and talking to it.
+     *
+     * Nothing can reach this today: only the shell spawns, and a session is
+     * never confined. It is here because it is the invariant that makes the
+     * feature worth anything, and it is cheaper to write now than to remember
+     * when espix grows a spawn call for apps.
+     */
+    const char *const caller_root = espix_proc_root();
+
+    if (caller_root[0] != '\0' &&
+        (root == NULL || !espix_fs_within(root, caller_root))) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
@@ -364,11 +393,39 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
         }
     }
 
-    /* Inherited from whoever spawned it, like a child's cwd everywhere else.
-     * A session with no cwd, or no session at all, means "/". */
-    strlcpy(slot->cwd,
-            (session != NULL && session->cwd[0] != '\0') ? session->cwd : "/",
-            sizeof(slot->cwd));
+    /*
+     * The root, and then the cwd that has to agree with it.
+     *
+     * Inherited cwd is right for an unconfined process -- a child starts where
+     * its parent stood, as everywhere else -- but a confined one cannot start
+     * at a session cwd that lies outside its root, or its very first relative
+     * path would resolve somewhere it may not name. The root is the sane
+     * starting point, and it is the one directory it is guaranteed to have.
+     */
+    strlcpy(slot->root, (root != NULL) ? root : "", sizeof(slot->root));
+
+    /*
+     * Explicitly, rather than trusting how the slot was obtained. A recycled
+     * slot is memset by espix_proc_alloc_slot() and a never-used one was
+     * cleared at init, so this is true today either way -- but a stale
+     * root_active confines the *loader*, and the app then dies with
+     * ESP_ERR_NOT_FOUND on a binary that is plainly there. That is not a
+     * failure anyone should have to debug twice.
+     */
+    slot->root_active = false;
+
+    const char *const start =
+        (session != NULL && session->cwd[0] != '\0') ? session->cwd : "/";
+
+    if (slot->root[0] != '\0' && !espix_fs_within(start, slot->root)) {
+        strlcpy(slot->cwd, slot->root, sizeof(slot->cwd));
+    } else {
+        strlcpy(slot->cwd, start, sizeof(slot->cwd));
+    }
+
+    if (slot->root[0] != '\0') {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: rooted at %s", base, slot->root);
+    }
     slot->info.started_us = esp_timer_get_time();
     slot->info.exit_code  = 0;
 

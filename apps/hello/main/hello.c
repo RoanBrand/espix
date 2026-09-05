@@ -14,10 +14,51 @@
  */
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * `hello probe <path>...` -- open each path and say what happened.
+ *
+ * This exists to test something only a *process* can test. `run -R <dir>` gives
+ * a process a root it cannot name a path outside of, and shell builtins are
+ * never confined, so `cat` proves nothing about it: the check has to be made by
+ * a loaded app, from inside the confinement.
+ *
+ * The two answers that matter are different on purpose. A path a confined
+ * process may not name is ENOENT -- not there, as far as it can tell -- while
+ * EACCES is an ordinary permission refusal on a path it can see. Reporting
+ * "denied" for the first would confirm the file exists to something that is
+ * supposed to be unable to find out.
+ *
+ * errno is printed by number with the two interesting names spelled out rather
+ * than through strerror(). Every symbol here has to resolve out of the loader's
+ * export tables at load time or the app does not run at all, and this file is
+ * the ABI test as much as anything else; a numeric comparison needs nothing.
+ */
+static int probe(int argc, char **argv)
+{
+    for (int i = 0; i < argc; i++) {
+        FILE *f = fopen(argv[i], "r");
+
+        if (f != NULL) {
+            fclose(f);
+            printf("  %s: ok\n", argv[i]);
+            continue;
+        }
+
+        const int e = errno;
+        const char *name = (e == ENOENT)  ? " (ENOENT)"
+                           : (e == EACCES) ? " (EACCES)"
+                                           : "";
+        printf("  %s: errno %d%s\n", argv[i], e, name);
+    }
+    return 0;
+}
 
 /*
  * Everything below needs espix's filesystem ABI (see
@@ -83,8 +124,54 @@ static void show_filesystem(void)
     }
 }
 
+/*
+ * `hello chmod <path> <octal>` -- the other half of the boundary test.
+ *
+ * chmod does not go through espix's VFS: abi_fs.c resolves the path itself and
+ * calls espix_fs_chmod() directly. So a process root that were only enforced in
+ * the VFS would not cover this, and a confined process could re-mode any file
+ * it owns anywhere on the device. That gap existed and was fixed; this is what
+ * keeps it fixed.
+ */
+static int do_chmod(const char *path, const char *octal)
+{
+    const mode_t mode = (mode_t)strtol(octal, NULL, 8);
+
+    if (chmod(path, mode) == 0) {
+        printf("  chmod %s %s: ok\n", path, octal);
+        return 0;
+    }
+
+    const int e = errno;
+    const char *name = (e == ENOENT)  ? " (ENOENT)"
+                       : (e == EACCES) ? " (EACCES)"
+                       : (e == EPERM)  ? " (EPERM)"
+                                       : "";
+    printf("  chmod %s %s: errno %d%s\n", path, octal, e, name);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && strcmp(argv[1], "probe") == 0) {
+        return probe(argc - 2, argv + 2);
+    }
+    if (argc > 3 && strcmp(argv[1], "chmod") == 0) {
+        return do_chmod(argv[2], argv[3]);
+    }
+    if (argc > 2 && strcmp(argv[1], "cd") == 0) {
+        /* chdir then getcwd, so a confined process can be seen failing to
+         * leave and still reporting where it actually is. */
+        if (chdir(argv[2]) != 0) {
+            printf("  chdir %s: errno %d\n", argv[2], errno);
+        } else {
+            printf("  chdir %s: ok\n", argv[2]);
+        }
+        char cwd[128];
+        printf("  cwd = %s\n", getcwd(cwd, sizeof(cwd)) ? cwd : "(failed)");
+        return 0;
+    }
+
     printf("hello from an espix app\n");
     printf("  argc = %d\n", argc);
 

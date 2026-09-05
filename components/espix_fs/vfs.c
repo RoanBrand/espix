@@ -88,7 +88,8 @@ static int enosys(void)
 }
 
 /*
- * Resolve a path the caller gave us against the caller's working directory.
+ * Resolve a path the caller gave us against the caller's working directory,
+ * and refuse it if the caller's process may not name it.
  *
  * This is what gives a loaded app a working directory, and it only works
  * because espix owns this VFS. ESP-IDF has none to offer -- its chdir() is a
@@ -105,27 +106,59 @@ static int enosys(void)
  * free to open "/etc/../etc/motd", and the mode attribute is keyed by path, so
  * two spellings of one file must not become two entries.
  *
- * Returns the buffer, or NULL if the result will not fit -- for which the
- * caller reports ENAMETOOLONG.
+ * Which is also what makes the root test below sound. `..` is resolved by
+ * popping segments *before* anything compares prefixes, so "/srv/www/../../etc"
+ * is already "/etc" when it is asked about -- a confined process cannot climb
+ * out by spelling its way there, and there is no second syntax to get wrong.
+ *
+ * Sets errno itself, because it now has two reasons to fail.
  */
 static const char *resolve(const char *path, char *buf, size_t len)
 {
     if (path == NULL) {
+        errno = ENAMETOOLONG;
         return NULL;
     }
-    if (espix_fs_resolve(espix_proc_cwd(), path, buf, len) != ESP_OK) {
+
+    /*
+     * One lookup for both, because this runs on every path operation in the
+     * system and espix_proc_cwd() and espix_proc_root() would each walk the
+     * process table to answer half of it. For the commonest callers -- an SSH
+     * session task, SFTP, the console, anything of espix's own -- that walk
+     * finds nothing and returns the default, so paying for it twice is pure
+     * waste on the hottest path there is.
+     */
+    const char *cwd  = "/";
+    const char *root = "";
+    espix_proc_paths(&cwd, &root);
+
+    if (espix_fs_resolve(cwd, path, buf, len) != ESP_OK) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    /*
+     * ENOENT rather than EACCES on purpose. "Permission denied" confirms the
+     * path exists, and a confined process probing one path at a time would map
+     * the filesystem it is supposed to be unable to see.
+     *
+     * espix_fs_root_permits() is asked rather than `root` compared here, so
+     * that this and espix_fs_admin_check() cannot drift apart about what a root
+     * means -- including the exemption for a raised task.
+     */
+    if (root[0] != '\0' && !espix_fs_root_permits(buf)) {
+        errno = ENOENT;
         return NULL;
     }
     return buf;
 }
 
 /* The path ops all start the same way; this keeps that from being eleven
- * copies of five lines. */
+ * copies of five lines. resolve() has set errno. */
 #define RESOLVE_OR_FAIL(path, fail)                                           \
     char        resolved__[ESPIX_PATH_MAX];                                   \
     const char *p = resolve((path), resolved__, sizeof(resolved__));          \
     if (p == NULL) {                                                          \
-        errno = ENAMETOOLONG;                                                 \
         return (fail);                                                        \
     }
 
@@ -291,9 +324,10 @@ static int vfs_rename(void *ctx, const char *src, const char *dst)
     char abs_src[ESPIX_PATH_MAX];
     char abs_dst[ESPIX_PATH_MAX];
 
+    /* No errno of its own: resolve() has set the right one, and overwriting it
+     * here would report a path outside the root as merely too long. */
     if (resolve(src, abs_src, sizeof(abs_src)) == NULL ||
         resolve(dst, abs_dst, sizeof(abs_dst)) == NULL) {
-        errno = ENAMETOOLONG;
         return -1;
     }
 

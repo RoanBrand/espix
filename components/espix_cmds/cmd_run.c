@@ -44,10 +44,11 @@
  * command name to a program.
  */
 static int run_program(espix_session_t *s, const char *abs, int argc,
-                       char **argv, bool background, const char *who)
+                       char **argv, bool background, const char *root,
+                       const char *who)
 {
     espix_pid_t     pid = ESPIX_PID_NONE;
-    const esp_err_t err = espix_proc_spawn_elf(abs, argc, argv, s, &pid);
+    const esp_err_t err = espix_proc_spawn_elf(abs, argc, argv, s, root, &pid);
 
     if (err != ESP_OK) {
         espix_printf(s, "%s: %s: %s\n", who, abs, esp_err_to_name(err));
@@ -145,10 +146,32 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
     return exit_code;
 }
 
+/*
+ * `run [-R <dir>] <path> [args...] [&]`
+ *
+ * -R gives the program a root: it can name nothing outside that directory, and
+ * starts there. The binary itself is read before the process exists, so it is
+ * normal for it to live outside -- `run -R /srv/www /bin/httpd` is the shape
+ * this is for, alongside `sudo -u www` giving the same program its own identity.
+ */
 static int cmd_run(espix_session_t *s, int argc, char **argv)
 {
-    if (argc < 2) {
-        espix_printf(s, "usage: run <path> [args...]\n");
+    const char *root  = NULL;
+    int         first = 1;
+
+    /* Match the flag first and then require its argument, so a bare `run -R`
+     * is a usage error rather than an attempt to run a program called -R. */
+    if (argc >= 2 && strcmp(argv[1], "-R") == 0) {
+        if (argc < 3) {
+            espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
+            return 1;
+        }
+        root  = argv[2];
+        first = 3;
+    }
+
+    if (argc <= first) {
+        espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
         return 1;
     }
 
@@ -157,9 +180,33 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
         background = true;
         argc--;
     }
+    if (argc <= first) {
+        espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
+        return 1;
+    }
+
+    /*
+     * The root is resolved and checked here rather than in spawn, so a typo is
+     * an error the user sees instead of a program that silently cannot reach
+     * anything. It must be a directory that exists: confining a process to a
+     * path that is not there gives it nothing at all.
+     */
+    char abs_root[ESPIX_PATH_MAX];
+    if (root != NULL) {
+        if (!espix_cmd_path(s, root, abs_root, sizeof(abs_root))) {
+            return 1;
+        }
+
+        struct stat rootst;
+        if (stat(abs_root, &rootst) != 0 || !S_ISDIR(rootst.st_mode)) {
+            espix_printf(s, "run: %s: not a directory\n", abs_root);
+            return 1;
+        }
+        root = abs_root;
+    }
 
     char abs[ESPIX_PATH_MAX];
-    if (!espix_cmd_path(s, argv[1], abs, sizeof(abs))) {
+    if (!espix_cmd_path(s, argv[first], abs, sizeof(abs))) {
         return 1;
     }
 
@@ -182,11 +229,11 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
     int   app_argc = 0;
 
     app_argv[app_argc++] = abs;
-    for (int i = 2; i < argc && app_argc < ESPIX_ARGS_MAX; i++) {
+    for (int i = first + 1; i < argc && app_argc < ESPIX_ARGS_MAX; i++) {
         app_argv[app_argc++] = argv[i];
     }
 
-    return run_program(s, abs, app_argc, app_argv, background, "run");
+    return run_program(s, abs, app_argc, app_argv, background, root, "run");
 }
 
 /*
@@ -257,7 +304,7 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
         app_argv[app_argc++] = argv[i];
     }
 
-    return run_program(s, abs, app_argc, app_argv, background, "espix");
+    return run_program(s, abs, app_argc, app_argv, background, NULL, "espix");
 }
 
 void espix_cmds_register_exec_fallback(void)
@@ -384,7 +431,7 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_run_cmds[] = {
     { .name = "run",   .fn = cmd_run,
       .help = "load and run an app from the filesystem",
-      .usage = "run <path> [args...] [&]" },
+      .usage = "run [-R <dir>] <path> [args...] [&]" },
     { .name = "kill",  .fn = cmd_kill,
       .help = "send a signal to a process",
       .usage = "kill [-SIG|-l] <pid>..." },

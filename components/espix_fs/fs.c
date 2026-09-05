@@ -205,6 +205,22 @@ esp_err_t espix_fs_resolve(const char *cwd, const char *path,
     return ESP_OK;
 }
 
+bool espix_fs_within(const char *abs_path, const char *dir)
+{
+    if (abs_path == NULL || dir == NULL || dir[0] == '\0') {
+        return false;
+    }
+    if (strcmp(dir, "/") == 0) {
+        return true;            /* contains everything */
+    }
+
+    const size_t len = strlen(dir);
+    if (strncmp(abs_path, dir, len) != 0) {
+        return false;
+    }
+    return abs_path[len] == '\0' || abs_path[len] == '/';
+}
+
 esp_err_t espix_fs_rm_rf(const char *abs_path)
 {
     if (abs_path == NULL || abs_path[0] != '/') {
