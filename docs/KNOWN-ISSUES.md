@@ -102,6 +102,23 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   walked away from. Linux closes that with a timestamp and a re-prompt. First
   thing to revisit when the reentrant line editor lands.
 
+- **A group change needs a new login.** An identity's groups are resolved once,
+  when the session starts, and copied into a process at spawn — the file is the
+  authority but not something to re-read on the path of every `open()`. So
+  `usermod -aG` does not affect a session that is already open. A real system
+  has `newgrp` for that; espix has logging out.
+
+- **Eight groups, twelve entries, eight accounts.** `ESPIX_NGROUPS_MAX` is a
+  size as much as a limit, because credentials are copied rather than looked up.
+  Membership beyond the eighth group is silently not carried, which is the one
+  place these tables fail quietly rather than loudly.
+
+- **The shell drops an empty quoted argument.** `usermod -G "" esp` — the usual
+  way to clear somebody's supplementary groups — arrives as `usermod -G esp`,
+  so `-G` eats the username and the command prints its usage. Name a group you
+  do want instead, or use `userdel`. It is a shell limitation rather than a
+  usermod one.
+
 - **`su` does not exist.** `sudo` covers the need, and `su` is the command that
   most wants the password prompt espix cannot yet give.
 

@@ -304,13 +304,17 @@ merely missing.
 |---|---|---|
 | Password authentication | **yes** | PBKDF2-SHA256, per-user salt, `/etc/passwd` |
 | `passwd`, `whoami`, `id` | **yes** | `passwd` refuses to change another account's, unless root |
-| More than one account | **partial** | the file format holds them; no `adduser` yet |
+| More than one account | **yes** | `useradd` allocates a free uid; 8 accounts and 12 groups |
 | uid/gid and file ownership | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
 | Enforced read/write/execute | **yes** | in espix's VFS, for builtins and loaded apps alike |
 | `chown`, `chgrp` | **yes** | changing an owner is root's, as in chown(2) |
-| `sudo` | **yes** | gated by `/etc/sudoers`; does not re-prompt, see below |
+| `sudo`, `sudo -u <user>` | **yes** | gated by `/etc/sudoers`, which takes names or `%group`; does not re-prompt, see below |
 | `su` | **no** | `sudo` covers the need, and `su` wants the password prompt espix cannot give |
-| Groups with members, per-app capabilities | **planned** | every gid equals its uid for now; no `/etc/group` |
+| Groups with members | **yes** | `/etc/group`, supplementary membership, and the group triad actually checked |
+| `useradd`, `userdel`, `usermod` | **yes** | `-r` for a service account: locked, low uid, no home |
+| `groupadd`, `groupdel`, `groups` | **yes** | |
+| Per-app capabilities | **planned** | so an app need not see the whole filesystem |
+| An editor | **no** | no `nano` or `ed`, so editing a config on the device means `echo >` |
 
 Worth being clear about what that last row can buy on a chip with no MMU: an app
 shares the address space with the kernel, so filesystem permissions are a
@@ -320,9 +324,16 @@ publishes to it. Permissions make that boundary usable; they do not replace it.
 The same caveat applies to setuid, which is implemented because the S31 makes it
 a real boundary rather than because it is one on the S3.
 
-Root follows the model Ubuntu uses: the account exists but is locked, so nothing
+Root follows the model Debian uses: the account exists but is locked, so nothing
 can log in as it, and `sudo` is how you reach it. `sudo passwd root <pw>` gives
 it a password if you want one, and `passwd -l root` takes it away again.
+`/etc/sudoers` is seeded with `%sudo`, so membership of that group is what
+grants it — the arrangement Debian ships, where RHEL would say `%wheel`.
+
+Services get their own identity rather than running as whoever started them:
+`useradd -r www` makes a locked account with a low uid and no home, and
+`sudo -u www /bin/httpd &` runs the app as it. No service manager is involved —
+that is the whole mechanism.
 
 **`sudo` does not ask for your password.** espix cannot read input without
 echoing it — the same limitation that makes `passwd` take the password as an

@@ -153,18 +153,36 @@ things are as they are.
   setuid is a guardrail rather than a boundary on the S3, which has no MMU. It
   is implemented now because the S31 does.
 
+- **An editor.** There is no `nano`, no `ed`, nothing. Editing a config on the
+  device means `echo >` and rewriting the whole file, which is why so much of
+  espix's configuration ended up behind commands — `wifi connect`, `passwd`,
+  `useradd` — rather than being left as files to edit. That is a reasonable
+  shape for a device, but it should be a choice rather than what happens because
+  there is no alternative.
+
 - **Check SFTP against the same rules as everything else.** It works on the
   connection task, which is neither a process nor a session, so it is treated as
   espix itself and skips the permission check entirely. Giving the SFTP server a
   session carrying the connection's credentials would close it. Bounded today
   only because `do_setstat()` masks the high bits off.
 
-- **Groups that are more than a number.** Every account's gid equals its uid and
-  there is no `/etc/group`, but the gid is stored on every file and the group
-  triad is checked, so the format and the check are already the right shape.
-  What is missing is membership: a way for two accounts to share a group, which
-  is the only thing that would make the middle triad say anything the owner
-  triad does not.
+- ~~**Groups that are more than a number.**~~ Done. `/etc/group` carries
+  `name:gid:members`, an identity holds a set of groups rather than one, and the
+  permission check matches the group triad against any of them — so two accounts
+  can share a file, which is the only thing that ever made that middle column
+  worth printing.
+
+  Credentials are resolved at login and copied into a process at spawn, so a
+  change to `/etc/group` takes effect at the next login rather than mid-session.
+  That is the same bargain espix already makes for the uid, and it is what
+  `newgrp` exists for on a real system.
+
+- ~~**More than one account.**~~ Done, with the `useradd` family rather than
+  Debian's `adduser` wrappers: one command per job, and the names that exist on
+  every distribution. `useradd -r` is a service account — locked, a uid in
+  100–999, no home — which with `sudo -u` is the whole mechanism for running an
+  app under its own identity. `passwd` no longer creates accounts, which is what
+  fixed it handing every new one uid 1000.
 
 ## Signals
 
