@@ -34,7 +34,7 @@ extern "C" {
  * 2048 is the largest value that needs no other buffer to grow: a CHANNEL_DATA
  * carrying it needs 1 + 4 + 4 + 2048 bytes in out_buf, well inside
  * SSH_MAX_PACKET. Overhead falls to about 2.6%. Going further would mean
- * growing in_buf, out_buf and frame together, three times the memory for
+ * growing in_buf, out_buf and tx_frame together, three times the memory for
  * roughly one more percent.
  *
  * Shared with sftp.c, which has to size its reassembly buffer against it.
@@ -190,7 +190,17 @@ typedef struct {
      * about a third of the time.
      */
     uint8_t  out_buf[SSH_MAX_PACKET];
-    uint8_t  frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8];
+
+    /*
+     * Transmit only, and the name says so because the alternative cost a long
+     * hunt: this held the outbound frame *and* was borrowed as scratch by the
+     * inbound MAC check. The send path keeps it live across write_all() -- the
+     * ciphertext on the wire is tx_frame + 8 -- so an inbound packet landing
+     * mid-send rewrote bytes that had already been MAC'd. tx_lock did not help,
+     * because the other party held rx_lock. The receive path now streams its
+     * MAC and touches nothing here; keep it that way.
+     */
+    uint8_t  tx_frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8];
 } ssh_conn_t;
 
 esp_err_t ssh_transport_banner(ssh_conn_t *c);

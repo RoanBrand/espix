@@ -28,25 +28,27 @@ fi
 
 N=${ESPIX_STRESS_N:-30}
 
-# 100 lines, not 200, and the difference is the finding this suite produced.
+# 2000 lines, and deliberately far above where this used to break.
 #
-# The transport is *clean* below a threshold and falls apart above it: 0 bad in
-# 20 at each of 8, 25, 50 and 100 lines, and 26 bad in 30 at 200. Not a gradual
-# degradation -- a cliff somewhere between 100 and 200 lines (roughly 6KB and
-# 11KB of channel data).
+# This suite's first job was to characterise a transport bug: the stream was
+# clean below a threshold and fell apart above it -- 0 bad in 20 at each of 8,
+# 25, 50 and 100 lines, and 26 bad in 30 at 200. A cliff, not a slope. While
+# that was unfixed the default sat *below* the cliff at 100, so that any failure
+# meant a new regression rather than the known bug reappearing.
 #
-# So the default sits below the cliff, where any failure at all is a real
-# regression rather than the known bug reappearing. `--stress-lines 200`
-# reproduces the fault on demand, which is what the two previous investigations
-# lacked.
-LINES=${ESPIX_STRESS_LINES:-100}
+# The bug is fixed (a buffer shared between the send and receive paths; see
+# docs/KNOWN-ISSUES.md), so the default now sits where the fault used to be
+# reliable -- it failed 6 runs in 8 at this volume. That makes this the
+# regression guard for it: anything above 0% here means it is back.
+LINES=${ESPIX_STRESS_LINES:-2000}
 APP="/home/$ESPIX_USER/testapp"
 
-# Zero, because at the default volume the transport is measurably clean. Raise
-# it only when deliberately measuring above the cliff, where failure is the
-# documented behaviour rather than news:
+# Zero, and it should stay zero: 77 consecutive clean runs above the old cliff
+# were measured after the fix (30 at 2000 lines, 20 more at 2000, 15 at 5000,
+# and 12 across concurrent sessions). Raise it only to measure a known-bad
+# build on purpose:
 #     make stress N=30                 regression check, expects 0%
-#     ./tests/run.sh --suite stress --stress --stress-lines 200 --stress-limit 100
+#     ./tests/run.sh --suite stress --stress --stress-lines 5000
 LIMIT=${ESPIX_STRESS_LIMIT:-0}
 
 printf '  running %d iterations of `run testapp out %d`...\n' "$N" "$LINES"

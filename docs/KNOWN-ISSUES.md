@@ -59,97 +59,79 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   identical either way: every one of those connections reaches "connection
   closed" normally. Nothing is wrong with the session — only with the goodbye.
 
-- **A sixth cause is still open: an app's output can corrupt the SSH stream.**
-  `ssh host 'run /bin/hello'`, whose app prints eight lines, fails about **2
-  runs in 30** with `Corrupted MAC on input` and
-  `ssh_dispatch_run_fatal: message authentication code incorrect`. The device is
-  unharmed — it stays up, records no core dump, and keeps exactly one
-  `sshd:conn` task — so this is a packet leaving the server malformed, not a
-  crash. Sometimes the first lines arrive and the corruption follows mid-stream.
+- **A sixth cause: an app's output could corrupt the SSH stream. Fixed.**
+  `ssh host 'run testapp out 2000'` failed most of the time with
+  `Corrupted MAC on input`, and espix sometimes logged a mismatch of its own on
+  an *inbound* packet. One bug produced both.
 
-  Measured deliberately rather than inferred: **2 of 30 on `main` at 8e3d545**,
-  and 2 of 30 on the branch that added the process root, which is the same rate
-  and settles that the root did not cause it. Doubling
-  `CONFIG_ESPIX_PROC_STACK_SIZE` to 16384 did not fix it either, which rules out
-  the obvious guess that the app task was overflowing its stack — it was tried,
-  and the failure survived it.
+  **The cause was a buffer shared between the two directions.** `ssh_conn_t`
+  had a single `frame`, and the transmit path does not merely build in it — the
+  ciphertext it hands to `write_all()` *is* `frame + 8`, so the buffer stays
+  live for the whole send. The inbound MAC check borrowed the same buffer as
+  scratch, assembling `seq ‖ length ‖ ciphertext` there to verify it. Sends hold
+  the channel's `tx_lock` and reads hold `rx_lock`, so nothing ever excluded the
+  two: an inbound packet arriving mid-send overwrote ciphertext that had already
+  been MAC'd. The peer then read a packet whose framing was perfect and whose
+  MAC could not verify. The same collision in the other order failed a perfectly
+  good inbound packet, which is the mismatch espix logged.
 
-  **Ruled out by measurement, so nobody need pay for these twice:**
+  That explains every symptom that made this hard: the cliff (it needs enough
+  outbound packets to overlap an inbound window adjust), the byte-perfect
+  framing in a wire capture (only the payload was rewritten, never the length),
+  and the implausible channel ids the client reported (fragments of an inbound
+  packet's ciphertext decrypted as garbage).
 
-  - *Not the app task overflowing its stack.* Doubling
-    `CONFIG_ESPIX_PROC_STACK_SIZE` to 16384 changed nothing.
-  - *Not `write_all()` abandoning a partial send on EAGAIN.* That was a real
-    defect and is fixed, but instrumenting the branch showed it is never taken:
-    zero EAGAIN on every connection, corruption anyway.
-  - *Not two tasks inside `ssh_packet_write()` at once* — the invariant
-    `ssh_priv.h` documents. A guard counting overlapping entries recorded zero
-    collisions across every connection, failing ones included.
+  **The fix removes the sharing rather than adding a lock**: the receive path
+  now streams its MAC through `psa_mac_verify_setup`/`update`/`verify_finish`
+  and needs no scratch buffer at all. A lock spanning both directions would
+  serialise reads against writes, which is precisely what a duplex transport
+  must not do. `frame` is now `tx_frame`, so the ownership is in the name.
 
-  **What the packet trace shows on a healthy run**, which is where the next
-  attempt should start: eight `CHANNEL_DATA` (type 94) written by the
-  `app:hello` task, then `CHANNEL_REQUEST`/exit-status (98), `CHANNEL_EOF` (96)
-  and `CHANNEL_CLOSE` (97) written by the `sshd:conn` task, sequence numbers
-  strictly consecutive and every send reporting success. Two tasks, correctly
-  serialised, so the handoff between the app's last write and the session's
-  closing packets is the remaining place to look.
+  **Measured after the fix**, on a build carrying no instrumentation: 0 of 20 at
+  `out 2000`, 0 of 15 at `out 5000` (2.5× past the old cliff), and 12 of 12
+  clean across four rounds of three concurrent sessions — with no `MAC
+  mismatch`, framing error or lost-output warning on the serial console
+  throughout. Before the fix the same reproducer failed 6 of 8.
 
-  **It hides under instrumentation**, which is the awkward part and worth
-  knowing before chasing it: 2/30 on a stock build, 1/31 and 2/56 on builds
-  carrying only counters, and **0/140 and 0/60** on builds that klog per packet.
-  Anything that adds work between packets makes it disappear, so a fix must be
-  proven on a build with no tracing in it, over a long run — 0/30 means nothing
-  here, since 0/60 was observed with the bug still present.
+  **Ruled out along the way, so nobody pays for these twice:** the app task
+  overflowing its stack (16 KB changed nothing); `write_all()` abandoning a
+  partial send on EAGAIN (that branch is unreachable — the socket is blocking,
+  so `send()` never returns EAGAIN); two tasks inside `ssh_packet_write()` (a
+  collision counter read zero, and correctly so — the colliding party was a
+  *reader* in another function holding another lock, which is exactly what that
+  counter could not see); `wait_for_window()`; the connection living in PSRAM
+  (`CONFIG_ESPIX_SSH_CONN_IN_PSRAM=n` was *worse*); and hardware AES
+  (`CONFIG_MBEDTLS_HARDWARE_AES=n` gave the same rate).
 
-  **It is a cliff, not a slope**, which the test suite established and neither
-  earlier investigation knew. Measured with `tests/suites/90-stress.sh`, which
-  runs `run testapp out <n>` and checks both the MAC and the line count:
+  **The stranded-connection claim, previously withdrawn, was right after all.**
+  It was withdrawn because nothing could separate a stranded task from a
+  developer logged in at another terminal. Two signals settle it: `ps` showed
+  four blocked `app:testapp` tasks alongside the four `sshd:conn` tasks — and
+  nobody logs in by running `testapp` — and a bare TCP connect to port 22
+  answered `espix: too many connections (4 of 4 in use)`. Every slot had leaked.
+  A corrupted stream made the client hang up mid-write and the session never
+  tore down. No strand has been seen in 47 runs since the fix.
 
-  | lines | ≈ bytes | bad |
-  |---|---|---|
-  | 8, 25, 50, 100 | 0.5–6 KB | **0 of 20**, at every one |
-  | 200 | ~11 KB | **26 of 30** |
+  That probe is the cheapest health check available and needs no keys: connect
+  to port 22 and read the first line. espix refuses in plain text, so it tells
+  "wedged", "slots exhausted" and "healthy" apart in three lines of script.
 
-  So the transport is not merely unreliable — it is clean below some threshold
-  between 6 KB and 11 KB of channel data and nearly unusable above it. Anything
-  proposed as the cause has to explain a cliff rather than a rate.
+  **Still open, and unrelated to the above:** the socket carries `SO_RCVTIMEO`
+  but no `SO_SNDTIMEO`, and it is blocking. A peer that stops reading *and does
+  not close* therefore parks its connection task in `send()` for as long as it
+  stays silent; `BLOCKED_WRITE_TIMEOUT_MS` in `write_all()` cannot fire, because
+  a blocking socket never returns EAGAIN. Four such peers would exhaust
+  `CONFIG_ESPIX_SSH_MAX_SESSIONS`. A client that stops reading and then closes
+  is handled correctly — measured, the slot came straight back. The fix is
+  `SO_SNDTIMEO`, plus treating the timeout as fatal to the connection, since a
+  half-written packet cannot be recovered.
 
-  Ruled out while measuring: `wait_for_window()` is **not** involved. None of
-  its messages, nor the framing or overflow errors from `ssh_packet_write()`,
-  appears in `dmesg` across failing runs — so window exhaustion, and the
-  read-inside-a-send it performs, are not the mechanism.
+  Reproduce the original with:
 
-  Reproduce with:
+      ./tests/run.sh --suite stress --stress --stress-lines 2000 --stress-limit 20
 
-      ./tests/run.sh --suite stress --stress --stress-lines 200 --stress-limit 100
-
-  `make stress` defaults to 100 lines instead, below the cliff, where any
-  failure at all is a regression rather than the known bug.
-
-  On a failure the connection task blocks and its teardown is delayed by about
-  five seconds (`PARTIAL_READ_TIMEOUT_MS`), so `ps` shows two `sshd:conn` tasks
-  and no "connection closed" line is logged for that session.
-
-  **Usually that clears. Whether it ever truly strands is not established**, and
-  the honest reason is that nothing here can tell a stranded task from a person
-  logged in at another terminal — both show as a blocked `sshd:conn` that
-  survives any amount of waiting.
-
-  Four tasks were once seen after thirty iterations above the cliff, and written
-  up here as proof that it accumulates towards the
-  `CONFIG_ESPIX_SSH_MAX_SESSIONS` ceiling of four. That claim has been withdrawn:
-  the developer was logging in from a separate terminal during that period, which
-  accounts for the extra tasks at least as well. The correlation with transport
-  failures was suggestive and is not evidence.
-
-  `tests/lib/device.sh` reports `stranded-sshd-conn-tasks=N` when more than one
-  survives the five-second teardown window, and that check inherits the same
-  blind spot: it will flag a colleague's shell exactly as loudly. Treat it as
-  "something is holding connections", not as a diagnosis.
-
-  Settling it needs a signal that separates the two — a per-connection log line
-  at open and close, or a `ps` that shows how long a task has been blocked. The
-  transport bug above is the better thing to fix first; if it is the cause, this
-  goes with it.
+  and watch the serial console while it runs — the failure announces itself
+  there as `ssh: MAC mismatch on packet N`, which is how it was finally caught.
 
   One thing found while chasing this *was* fixed, and it is worth knowing about
   because it could have produced exactly these symptoms: **a kernel log echoed

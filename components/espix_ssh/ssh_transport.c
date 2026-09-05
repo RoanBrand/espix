@@ -481,13 +481,42 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
         seq[2] = (uint8_t)(c->seq_in >> 8);
         seq[3] = (uint8_t)c->seq_in;
 
-        memcpy(c->frame, seq, 4);
-        memcpy(c->frame + 4, header, 4);
-        memcpy(c->frame + 8, c->in_buf, packet_len);
+        /*
+         * Streamed in three parts rather than assembled into one buffer.
+         *
+         * The assembled version used tx_frame as its scratch space -- and the
+         * transmit path keeps tx_frame live across its write_all(), because the
+         * ciphertext it is sending *is* tx_frame + 8. Receive runs under
+         * rx_lock and transmit under tx_lock, so the two never excluded each
+         * other: an inbound packet arriving mid-send overwrote ciphertext that
+         * had already been MAC'd, and the peer reported a corrupt MAC an
+         * unbounded distance from the cause. The same collision in the other
+         * order failed a perfectly good inbound packet.
+         *
+         * A lock big enough to cover both directions would serialise reads
+         * against writes, which is exactly what a duplex transport must not do.
+         * Streaming the MAC needs no shared buffer at all, so there is nothing
+         * left to race over.
+         */
+        psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
+        psa_status_t        st = psa_mac_verify_setup(
+            &op, c->rx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256));
 
-        if (psa_mac_verify(c->rx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-                           c->frame, 8 + packet_len, mac,
-                           sizeof(mac)) != PSA_SUCCESS) {
+        if (st == PSA_SUCCESS) {
+            st = psa_mac_update(&op, seq, sizeof(seq));
+        }
+        if (st == PSA_SUCCESS) {
+            st = psa_mac_update(&op, header, 4);
+        }
+        if (st == PSA_SUCCESS) {
+            st = psa_mac_update(&op, c->in_buf, packet_len);
+        }
+        if (st == PSA_SUCCESS) {
+            st = psa_mac_verify_finish(&op, mac, sizeof(mac));
+        }
+        psa_mac_abort(&op);         /* no-op once finish() has terminated it */
+
+        if (st != PSA_SUCCESS) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "MAC mismatch on packet %u",
                        (unsigned)c->seq_in);
             return ESP_ERR_INVALID_MAC;
@@ -518,6 +547,11 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
     return ESP_OK;
 }
 
+/*
+ * Everything here builds in c->tx_frame and steps c->tx.cipher, which is a
+ * stream cipher: two writers at once corrupt both, and the peer sees a MAC it
+ * cannot verify. Callers hold the channel's tx_lock for that reason.
+ */
 esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
 {
 
@@ -554,7 +588,7 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
      * long way from the arithmetic that caused it. */
     const size_t aligned = aligned_len(&c->tx, packet_len);
     if ((aligned % blk) != 0 || padding > 255 ||
-        packet_len + SSH_MAC_LEN + 8 > sizeof(c->frame)) {
+        packet_len + SSH_MAC_LEN + 8 > sizeof(c->tx_frame)) {
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "framing bug: payload %u padding %u aligned %u blk %u",
                    (unsigned)b->len, (unsigned)padding, (unsigned)aligned,
@@ -588,7 +622,7 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
      * MAC over seq ‖ length ‖ ciphertext. Padding must be random now — it is
      * the only unpredictable material in a short packet.
      */
-    uint8_t *plain = c->frame + 8;
+    uint8_t *plain = c->tx_frame + 8;
     plain[0] = (uint8_t)padding;
     memcpy(plain + 1, b->buf, b->len);
     if (psa_generate_random(plain + 1 + b->len, padding) != PSA_SUCCESS) {
@@ -601,16 +635,16 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
         return ESP_FAIL;
     }
 
-    c->frame[0] = (uint8_t)(c->seq_out >> 24);
-    c->frame[1] = (uint8_t)(c->seq_out >> 16);
-    c->frame[2] = (uint8_t)(c->seq_out >> 8);
-    c->frame[3] = (uint8_t)c->seq_out;
-    memcpy(c->frame + 4, len_be, 4);
+    c->tx_frame[0] = (uint8_t)(c->seq_out >> 24);
+    c->tx_frame[1] = (uint8_t)(c->seq_out >> 16);
+    c->tx_frame[2] = (uint8_t)(c->seq_out >> 8);
+    c->tx_frame[3] = (uint8_t)c->seq_out;
+    memcpy(c->tx_frame + 4, len_be, 4);
 
     uint8_t mac[SSH_MAC_LEN];
     size_t  mac_len = 0;
     if (psa_mac_compute(c->tx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-                        c->frame, 8 + packet_len, mac, sizeof(mac),
+                        c->tx_frame, 8 + packet_len, mac, sizeof(mac),
                         &mac_len) != PSA_SUCCESS || mac_len != SSH_MAC_LEN) {
         return ESP_FAIL;
     }
