@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 #define ESPIX_VERSION_MAJOR 0
-#define ESPIX_VERSION_MINOR 2
+#define ESPIX_VERSION_MINOR 3
 #define ESPIX_VERSION_PATCH 0
 
 /*

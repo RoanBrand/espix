@@ -22,7 +22,7 @@ and [UPSTREAM.md](docs/UPSTREAM.md) for defects that belong to ESP-IDF.
 ## Status
 
 Early, but running on hardware. Verified on an ESP32-S3 (16MB flash, 8MB octal
-PSRAM) with ESP-IDF v6.1-beta1: LittleFS mounted as the real `/`, a
+PSRAM) with ESP-IDF v6.1: LittleFS mounted as the real `/`, a
 transport-agnostic shell with 37 commands, a process table, and — the point of
 the exercise — an app cross-compiled on a PC, copied over as a file, and loaded
 and executed at runtime with argv and an exit status.
@@ -38,11 +38,12 @@ picture of what is and is not implemented, see the
 
 ## Getting started
 
-**Requires ESP-IDF v6.1**, checked out by tag. It is still a beta, so a fresh
-`install.sh` gives you 5.x or 6.0 unless you ask for it — and those will not
-work: espix's SSH and password hashing are written against PSA Crypto, which
-arrives with Mbed TLS 4.x in 6.1. Older releases are refused up front rather
-than failing halfway through a compile.
+**Requires ESP-IDF v6.1**, checked out by tag. Older releases will not work:
+espix's SSH and password hashing are written against PSA Crypto, which arrives
+with Mbed TLS 4.x in 6.1, and `espix_kernel` names `CHIP_ESP32S31`, added in the
+same release. `main/idf_component.yml` declares `idf: ">=6.1"`, so an older one
+is refused with a single clear line rather than failing halfway through a
+compile.
 
 ```bash
 . $IDF_PATH/export.sh
@@ -75,6 +76,20 @@ idf.py -p /dev/ttyUSB0 storage-flash    # WARNING: replaces the whole rootfs
 
 Keeping them separate is deliberate: reflashing firmware should not destroy what
 is on the device.
+
+**After changing ESP-IDF versions, clean twice.** `idf.py fullclean` covers the
+firmware, but each project under `apps/` is a *separate* IDF project with its
+own `build/` and `sdkconfig`, and they are not reached by it:
+
+```bash
+idf.py fullclean && rm -f sdkconfig
+rm -rf apps/*/build apps/*/sdkconfig
+```
+
+Without the second line the app build fails with `'.../python/vX/venv/bin/python'
+is currently active while the project was configured with '.../vY/...'`, which
+names the problem but not where it lives. Both `sdkconfig` files are generated
+from the tracked `sdkconfig.defaults*`, so deleting them loses nothing.
 
 ### Board variants
 
@@ -173,9 +188,13 @@ inside that window — and is the sort of thing worth reading the reasoning on
 before changing it; see **Networking and time** in
 [docs/ROADMAP.md](docs/ROADMAP.md#networking-and-time).
 
-`/etc/timezone` holds a **POSIX TZ string**, not a zoneinfo name — espix ships
-no tzdata, so the rules live in the string: `SAST-2`, `EST5EDT,M3.2.0,M11.1.0`,
-or `UTC0` (the offset is not optional). `timedatectl set-timezone` writes it.
+**The default zone is UTC**, and there is no `/etc/timezone` until you set one —
+`timedatectl set-timezone` writes the file, the same way `wifi connect` writes
+`/etc/wifi.conf`. It holds a **POSIX TZ string**, not a zoneinfo name, because
+espix ships no tzdata and the rules have to live in the string: `SAST-2`,
+`EST5EDT,M3.2.0,M11.1.0`, or `UTC0` (the offset is not optional). Run
+`timedatectl set-timezone` with no argument for the format, including why the
+sign is inverted.
 
 ### Copying files on and off
 
