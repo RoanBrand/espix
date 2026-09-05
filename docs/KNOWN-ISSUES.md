@@ -92,6 +92,22 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   walked away from. Linux closes that with a timestamp and a re-prompt. First
   thing to revisit when the reentrant line editor lands.
 
+- **The name caches in espix_auth are shared and unlocked.** `ls -l` resolves a
+  uid and a gid to names through one-entry caches in file scope, and the console
+  and an SSH session can both be inside `ls` at once — the same race
+  `cmd_fs.c`'s comparators were written to avoid. The consequence is bounded to
+  a wrong or mangled *name* in a listing, since every write is a `strlcpy` into
+  a fixed buffer, but it is a race. A mutex would fix it; so would resolving
+  into the caller's own buffer and keeping no cache at all, at the cost of
+  re-reading the file per directory entry.
+
+- **A reused uid inherits the previous account's files.** `useradd` hands out
+  the lowest free id, so deleting an account and making another gives the new
+  one the old one's number — and every file still stamped with it. Standard Unix
+  behaviour, but likelier here: there are eight account slots and no `find -uid`
+  to hunt the leftovers down with. `userdel -r` clears the home directory;
+  anything the account owned elsewhere is yours to find.
+
 - **A group change needs a new login.** An identity's groups are resolved once,
   when the session starts, and copied into a process at spawn — the file is the
   authority but not something to re-read on the path of every `open()`. So
