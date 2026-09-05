@@ -145,6 +145,28 @@ after it and cannot shadow them. The component provides
 interception and hooking", so no fork is needed — but a table alone will
 silently fail to override.
 
+### `esp_elf_relocate()` knows the missing symbol and will not say
+
+An app whose ELF references a name no registered table publishes fails to load,
+and the loader logs the name it wanted:
+
+    E (41906) ELF: Can't find symbol strtok
+
+It then returns a plain non-zero, so the caller gets "something failed" and
+cannot say which symbol without the user going to read the log themselves.
+
+What would fix it: return the name, or take a callback the caller can install.
+Either lets espix print `undefined symbol: strtok` in its own voice, which is
+what `ld.so` does on Linux and what anybody debugging an app expects.
+
+**Until then espix reads it back out of the kernel log.** espix captures esp_log
+into its ring, so the line is available; `missing_symbol_name()` in
+`espix_proc/exec.c` scans for `Can't find symbol ` and lifts the name. That is
+string-matching another component's log text and breaks silently if the wording
+changes — deliberately survivable, since it falls back to the old generic
+message. **Delete `missing_symbol_name()`, `missing_sym_visit()` and
+`ELF_MISSING_SYM_PREFIX` when this lands.**
+
 ## `joltwallet/littlefs`
 
 ### Nothing can reach LittleFS custom attributes

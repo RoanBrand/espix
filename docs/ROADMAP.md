@@ -375,6 +375,29 @@ things are as they are.
   runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
   other way.
 
+- **Real stdin, stdout and stderr — for the shell as much as for apps.** Today a
+  loaded app gets two `FILE *` from `session->open_stream()`, and they are two
+  objects writing to the *same place*: the reason there are two is not
+  separation but teardown, since `esp_cleanup_r()` fcloses whichever of the
+  three differ from the globals and one object behind both would be closed
+  twice. So `run app 2>/dev/null` cannot work.
+
+  The shell has less than that: `espix_printf(s, ...)` is a single path carrying
+  output and diagnostics alike, which is why `run app > file` captures espix's
+  own error messages into the file. That is not hypothetical tidiness — it cost
+  a wrong conclusion during the test-suite work, when a failed load's message
+  vanished into a redirect and the loader was wrongly blamed for not naming the
+  symbol it had named perfectly.
+
+  Doing it properly means a real stderr on `espix_session_t`, an
+  `espix_eprintf()` beside `espix_printf()`, and moving every builtin's
+  diagnostics onto it — around a hundred call sites — plus deciding what `2>`
+  and `2>&1` mean for each. The transports can already carry it: SSH opens a
+  stream per call, and the console has one descriptor. Nothing above them can.
+
+  Worth doing before job control, which will want to say things about jobs
+  without those lines landing in a redirect.
+
 ## Further out
 
 Not costed, not committed to, and further from the current shape of espix than

@@ -120,6 +120,58 @@ static esp_err_t copy_argv(int argc, char **argv, espix_proc_slot_t *slot)
     return ESP_OK;
 }
 
+/*
+ * TEMPORARY: recover the unresolved symbol's name from the kernel log.
+ *
+ * esp_elf_relocate() knows exactly which name it could not find -- it logs
+ * `ESP_LOGE(TAG, "Can't find symbol %s")` -- and then returns a generic
+ * failure, so the name never reaches the caller. espix captures esp_log into
+ * the klog ring (CONFIG_ESPIX_KLOG_CAPTURE_ESP_LOG), so the line is *here*,
+ * and this reads it back out.
+ *
+ * This is string-matching another component's log text and it will break
+ * silently if Espressif rewords the message. That is survivable because the
+ * fallback is exactly what espix printed before this existed, and it is why the
+ * caller must treat an empty answer as "say nothing extra" rather than build a
+ * sentence around it.
+ *
+ * DELETE THIS when the loader can report the name itself -- see
+ * docs/UPSTREAM.md, which carries the request and points back here. The same
+ * arrangement as tools/patch-littlefs.py: temporary by construction, with the
+ * condition for removing it written down next to it.
+ *
+ * Cost: the ring is CONFIG_ESPIX_KLOG_LINES entries of ESPIX_KLOG_LINE_MAX
+ * bytes, so this is ~96 short strstr calls, and it runs only after a load has
+ * already failed. Nothing on a working path reaches it.
+ */
+#define ELF_MISSING_SYM_PREFIX "Can't find symbol "
+
+typedef struct {
+    char name[64];
+} missing_sym_t;
+
+static bool missing_sym_visit(void *ctx, const espix_klog_entry_t *e)
+{
+    missing_sym_t *found = ctx;
+    const char    *at    = strstr(e->text, ELF_MISSING_SYM_PREFIX);
+
+    /* Keep looking rather than stopping: the ring is oldest-first and the most
+     * recent match is the one this load produced. */
+    if (at != NULL) {
+        strlcpy(found->name, at + strlen(ELF_MISSING_SYM_PREFIX),
+                sizeof(found->name));
+        found->name[strcspn(found->name, " \r\n")] = '\0';
+    }
+    return true;
+}
+
+static const char *missing_symbol_name(missing_sym_t *out)
+{
+    out->name[0] = '\0';
+    espix_klog_foreach(missing_sym_visit, out);
+    return out->name;
+}
+
 static void proc_task(void *arg)
 {
     espix_proc_slot_t *slot = arg;
@@ -185,7 +237,15 @@ static void proc_task(void *arg)
         }
     }
 
-    int  status = -1;
+    /*
+     * 126 unless something says otherwise, which is what a shell answers for
+     * "found it and could not run it" -- cmd_run.c already returns 126 for a
+     * missing execute bit and for a bad magic number. These four load failures
+     * are the same kind of answer and used to report -1, which is not a valid
+     * exit status at all: it shows as `[exit -1]` locally and as 255 over SSH,
+     * where it is indistinguishable from ssh's own transport failures.
+     */
+    int  status = 126;
     bool ran    = false;
 
     esp_err_t err = load_image(slot->info.path, &slot->image,
@@ -195,6 +255,8 @@ static void proc_task(void *arg)
                    (int)slot->info.pid, slot->info.path, esp_err_to_name(err));
         espix_printf(slot->info.session, "espix: %s: %s\n",
                      slot->info.path, esp_err_to_name(err));
+        /* Could not read the file at all: "not found", which is 127. */
+        status = 127;
         goto done;
     }
 
@@ -206,8 +268,18 @@ static void proc_task(void *arg)
     slot->elf_valid = true;
 
     if (esp_elf_relocate(&slot->elf, slot->image) != 0) {
-        espix_printf(slot->info.session, "espix: %s: relocation failed\n",
-                     slot->info.path);
+        missing_sym_t     missing;
+        const char *const sym = missing_symbol_name(&missing);
+
+        if (sym[0] != '\0') {
+            espix_printf(slot->info.session, "espix: %s: undefined symbol: %s\n",
+                         slot->info.path, sym);
+        } else {
+            /* The fallback is the exact wording from before the lookup existed,
+             * so a reworded upstream message costs nothing but the detail. */
+            espix_printf(slot->info.session, "espix: %s: relocation failed\n",
+                         slot->info.path);
+        }
         goto done;
     }
 

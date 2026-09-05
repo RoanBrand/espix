@@ -319,6 +319,16 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   - **Sessions are not confined, only processes.** There is no restricted login
     shell; `-R` applies to a program you run, not to whoever runs it.
 
+- **A command's diagnostics go to stdout, so a redirect swallows them.** espix
+  has no stderr: `espix_printf()` is one path for output and errors alike, so
+  `run /bin/nosuch > log` puts "no such file" in `log` rather than on the
+  terminal, and `2>/dev/null` silences nothing. A loaded app has distinct
+  `stdout` and `stderr` pointers but both write to the same channel, so the
+  same is true for apps. See **Shell and console** in [ROADMAP.md](ROADMAP.md).
+
+  Exit statuses *are* right: 127 when the file cannot be read, 126 when it is
+  there and will not run, and the app's own status otherwise.
+
 ## Shell and console
 
 - **Kernel messages land on your prompt.** That is deliberate and matches Linux,
