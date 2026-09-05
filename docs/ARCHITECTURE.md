@@ -139,6 +139,16 @@ unprivileged it recursed until the stack was gone.
 
 The DEBUG log records refusals: `D fs: uid 1000 denied open /etc/passwd`.
 
+SFTP reaches the check the same way, though it took a second step to get there.
+It runs on the SSH connection task, which is neither a process nor a session, so
+for a while it was read as espix itself and skipped every check — an
+authenticated client could fetch files its own shell login was refused. It now
+gets a session carrying the connection's credentials and makes it the task's
+current one for the duration, which is all the check needed. The session is
+cleared before that call returns: the connection task lives on afterwards, and a
+pointer left behind to a caller's stack frame is the use-after-free that used to
+reboot the board from the exec path.
+
 ### File modes are a rule plus an attribute on the file
 
 LittleFS stores no permission bits: `esp_littlefs`'s `stat()` fills in `S_IFREG`

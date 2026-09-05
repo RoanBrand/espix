@@ -153,18 +153,17 @@ things are as they are.
   setuid is a guardrail rather than a boundary on the S3, which has no MMU. It
   is implemented now because the S31 does.
 
-- **An editor.** There is no `nano`, no `ed`, nothing. Editing a config on the
-  device means `echo >` and rewriting the whole file, which is why so much of
-  espix's configuration ended up behind commands — `wifi connect`, `passwd`,
-  `useradd` — rather than being left as files to edit. That is a reasonable
-  shape for a device, but it should be a choice rather than what happens because
-  there is no alternative.
+- ~~**Check SFTP against the same rules as everything else.**~~ Done. The SFTP
+  subsystem gets a session carrying the connection's credentials and makes it
+  the task's current one, so `espix_fs_access_check()` finds a caller and every
+  transfer is checked exactly as the shell is. Uploads are now owned by the
+  account that made them, which follows from there being a session at all.
 
-- **Check SFTP against the same rules as everything else.** It works on the
-  connection task, which is neither a process nor a session, so it is treated as
-  espix itself and skips the permission check entirely. Giving the SFTP server a
-  session carrying the connection's credentials would close it. Bounded today
-  only because `do_setstat()` masks the high bits off.
+  It also moved the client's starting directory from `/` to the account's home,
+  where every other SFTP server puts it. That had to land together: `/` is
+  root-owned, so enforcing the check while leaving the client there would have
+  broken `scp file host:` with no remote path — the commonest invocation there
+  is.
 
 - ~~**Groups that are more than a number.**~~ Done. `/etc/group` carries
   `name:gid:members`, an identity holds a set of groups rather than one, and the
@@ -219,7 +218,10 @@ things are as they are.
 
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style
-  line editor.
+  line editor. It is also why so much of espix's configuration ended up behind
+  commands — `wifi connect`, `passwd`, `useradd` — rather than as files to edit.
+  That is a reasonable shape for a device, but it should be a choice rather than
+  what happens because there is no alternative.
 - **`dmesg -n`** — a runtime console loglevel, replacing the hardcoded list of
   quieted driver tags.
 - **`/etc/motd`.** The file exists in the rootfs but nothing reads it; the

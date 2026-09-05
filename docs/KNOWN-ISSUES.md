@@ -75,16 +75,6 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   mode already costs an open and a four-byte read per file. Worth revisiting if
   path resolution ever caches directory modes.
 
-- **SFTP is not permission-checked.** It does its file work on the SSH
-  connection task, which is neither a process nor a session, so
-  `espix_fs_access_check()` treats it as espix itself and allows everything. An
-  authenticated SFTP client can therefore read and write files its shell login
-  would be refused. It is bounded rather than open — `do_setstat()` masks setuid,
-  setgid and sticky off, so this cannot be turned into a root escalation — but
-  it is the largest remaining hole, and closing it means giving the SFTP server
-  a session with the connection's credentials so that the ordinary check
-  applies.
-
 - **Permission checks apply to espix's own tools, not to espix itself.** A task
   that is neither a process nor inside a session -- SNTP, the WiFi driver, an
   SSH connection task before it has authenticated anyone -- is the kernel and is

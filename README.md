@@ -187,10 +187,13 @@ run it by name. No reflashing the filesystem. To build one, see
 [tools/README.md](tools/README.md).
 
 espix implements the SFTP subsystem that OpenSSH 9 and later use for `scp` by
-default, so plain `scp` and graphical clients both work, with no `-O` needed.
-Permissions a client sends are accepted and discarded, since there are no mode
-bits to apply them to yet. File size is not a limit: a write is streamed to the
-file as it arrives rather than reassembled in memory.
+default, so plain `scp` and graphical clients both work, with no `-O` needed. A
+transfer is checked against the same permissions a shell login would face — the
+two doors agree — and a client starts in its own home directory. Permissions a
+client sends are applied, except setuid, setgid and sticky, which are masked off
+rather than refused so that one bit cannot fail an entire `scp -p`. File size is
+not a limit: a write is streamed to the file as it arrives rather than
+reassembled in memory.
 
 Downloads run at about 355KB/s over 2.4GHz WiFi. Uploads are much slower, and
 bounded by LittleFS erasing a block per write rather than by the network — see
@@ -278,10 +281,11 @@ merely missing.
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
 | `/proc`, `mount` / `umount` | **planned** | espix owns `/` but routes only `/`; a second mount needs its own routing table |
-| Mode bits, `chmod` | **yes** | nine bits, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
+| Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
-| Read and write bits enforced | **no** | the seam exists — espix owns the root VFS, so every `open()` passes through it — but no file has an owner to check a mode against yet |
-| `chown`, owner and group | **no** | no file records an owner — which is also why setuid, setgid and sticky are refused rather than stored |
+| Read and write bits enforced | **yes** | in espix's root VFS, so builtins, loaded apps and SFTP are all checked the same way |
+| `chown`, `chgrp`, owner and group | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
+| setuid, setgid, sticky | **yes** | each consulted; `/tmp` is `1777` and sticky is what makes that safe |
 | Symlinks, `ln` | **no** | cost, not principle: LittleFS has no link type, and following one means loop detection in every path lookup |
 
 ### Networking
@@ -291,7 +295,7 @@ merely missing.
 | WiFi station, DHCP lease, default route | **yes** | `wlan0`, reconnects on boot |
 | `ip`, `ifconfig`, `route`, `ping` | **yes** | `ping` resolves names |
 | SSH server | **yes** | password auth — [read this first](#a-word-on-the-ssh-server) |
-| `scp` / `sftp` | **yes** | SFTP subsystem; enough for `get`, `put`, `ls`, `cd`, `mkdir`, `rm` |
+| `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **planned** | IP network to USB host |
 | `ssh host <cmd>` | **partial** | works, but can truncate a long command's output — see [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) |
