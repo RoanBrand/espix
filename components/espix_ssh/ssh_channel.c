@@ -1245,13 +1245,30 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     }
 
     /*
-     * A subsystem carries bytes, not a terminal: no editor, no session, no
-     * greeting. Everything below that belongs to an interactive shell would
-     * corrupt a transfer.
+     * A subsystem carries bytes, not a terminal: no editor, no greeting, none
+     * of what an interactive shell prints, all of which would corrupt a
+     * transfer.
+     *
+     * It does get a session, though, which it did not before. Not for stdio --
+     * SFTP prints nothing and spawns nothing -- but because a session is where
+     * an identity lives, and without one every file operation SFTP made ran on
+     * a task espix_fs_access_check() reads as the kernel. An authenticated
+     * client could fetch files its own shell login was refused.
      */
     if (ch->want_sftp) {
+        espix_session_t session = {
+            .name      = "sftp",
+            .cwd       = "/",
+            .transport = ch,
+            .fg_pid    = ESPIX_PID_NONE,
+            .uid       = ESPIX_UID_NOBODY,
+            .gid       = ESPIX_UID_NOBODY,
+        };
+        strlcpy(session.user, c->user, sizeof(session.user));
+        apply_account(&session, c->user);
+
         s_raw_chan = ch;
-        espix_sftp_run(c);
+        espix_sftp_run(c, &session);
         s_raw_chan = NULL;
 
         send_exit_status(ch, 0);

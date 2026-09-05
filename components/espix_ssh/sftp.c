@@ -132,6 +132,14 @@ typedef struct {
 
 typedef struct {
     ssh_conn_t   *conn;
+
+    /*
+     * Who the client authenticated as. Held for two reasons: the permission
+     * check finds it through the task's current session, and resolve() roots
+     * relative paths at its cwd so a client lands in its own home.
+     */
+    espix_session_t *session;
+
     sftp_handle_t handles[SFTP_HANDLES];
 
     /* Reassembly across CHANNEL_DATA boundaries: one SFTP packet does not have
@@ -295,11 +303,31 @@ static void put_attrs(ssh_buf_t *b, const struct stat *st, mode_t mode)
     ssh_put_u32(b, (uint32_t)st->st_mtime);
 }
 
-/* Resolve a client path against "/" — SFTP paths are absolute, and a client
- * that sends "." expects the root it was given by REALPATH. */
-static bool resolve(const char *in, char *out, size_t len)
+/*
+ * The directory a relative client path is measured from, and what REALPATH
+ * hands back as the starting point.
+ *
+ * The account's home, as every other SFTP server does. It used to be "/", which
+ * was merely unusual until the permission check started applying here: / is
+ * root-owned and 0755, so `scp file host:` -- no remote path, the commonest
+ * invocation there is -- would have begun failing for everyone. A session whose
+ * home is missing already falls back to /, which is right for an account made
+ * without one.
+ */
+static const char *base_dir(const sftp_t *s)
 {
-    return espix_fs_resolve("/", (in != NULL && in[0] != '\0') ? in : "/",
+    if (s->session != NULL && s->session->cwd[0] != '\0') {
+        return s->session->cwd;
+    }
+    return "/";
+}
+
+/* Resolve a client path against the base directory. Absolute paths ignore it,
+ * which is what makes an absolute SFTP path mean what it says. */
+static bool resolve(const sftp_t *s, const char *in, char *out, size_t len)
+{
+    return espix_fs_resolve(base_dir(s),
+                            (in != NULL && in[0] != '\0') ? in : ".",
                             out, len) == ESP_OK;
 }
 
@@ -328,7 +356,7 @@ static esp_err_t do_realpath(sftp_t *s, uint32_t id, ssh_buf_t *in)
     char abs[ESPIX_PATH_MAX];
 
     if (!take_path(in, given, sizeof(given)) ||
-        !resolve(given, abs, sizeof(abs))) {
+        !resolve(s, given, abs, sizeof(abs))) {
         return send_status(s, id, SSH_FX_FAILURE, "bad path");
     }
 
@@ -350,7 +378,7 @@ static esp_err_t do_stat(sftp_t *s, uint32_t id, ssh_buf_t *in)
     struct stat st;
 
     if (!take_path(in, given, sizeof(given)) ||
-        !resolve(given, abs, sizeof(abs))) {
+        !resolve(s, given, abs, sizeof(abs))) {
         return send_status(s, id, SSH_FX_FAILURE, "bad path");
     }
     if (stat(abs, &st) != 0) {
@@ -412,7 +440,7 @@ static esp_err_t do_open(sftp_t *s, uint32_t id, ssh_buf_t *in)
     }
     sftp_handle_t *h = &s->handles[index];
 
-    if (!resolve(given, h->path, sizeof(h->path))) {
+    if (!resolve(s, given, h->path, sizeof(h->path))) {
         handle_close(h);
         return send_status(s, id, SSH_FX_FAILURE, "bad path");
     }
@@ -454,7 +482,7 @@ static esp_err_t do_opendir(sftp_t *s, uint32_t id, ssh_buf_t *in)
     sftp_handle_t *h = &s->handles[index];
     h->is_dir = true;
 
-    if (!resolve(given, h->path, sizeof(h->path))) {
+    if (!resolve(s, given, h->path, sizeof(h->path))) {
         handle_close(h);
         return send_status(s, id, SSH_FX_FAILURE, "bad path");
     }
@@ -771,7 +799,7 @@ static esp_err_t do_setstat(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
     } else {
         char given[ESPIX_PATH_MAX];
         if (!take_path(in, given, sizeof(given)) ||
-            !resolve(given, abs, sizeof(abs))) {
+            !resolve(s, given, abs, sizeof(abs))) {
             return send_status(s, id, SSH_FX_FAILURE, "bad path");
         }
     }
@@ -810,7 +838,16 @@ static esp_err_t do_setstat(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "chmod %s failed: %s",
                    path, esp_err_to_name(err));
-        return send_status(s, id, SSH_FX_FAILURE, "cannot set permissions");
+
+        /* espix_fs_chmod() answers in esp_err_t rather than errno, so this is
+         * the one place status_for() cannot be used. Only the owner may change
+         * a mode, and a client refused deserves to be told which of the two
+         * things went wrong. */
+        return (err == ESP_ERR_NOT_ALLOWED)
+                   ? send_status(s, id, SSH_FX_PERMISSION_DENIED,
+                                 "not the owner")
+                   : send_status(s, id, SSH_FX_FAILURE,
+                                 "cannot set permissions");
     }
     return send_status(s, id, SSH_FX_OK, "");
 }
@@ -822,7 +859,7 @@ static esp_err_t do_path_op(sftp_t *s, uint32_t id, ssh_buf_t *in, uint8_t type)
     char abs[ESPIX_PATH_MAX];
 
     if (!take_path(in, given, sizeof(given)) ||
-        !resolve(given, abs, sizeof(abs))) {
+        !resolve(s, given, abs, sizeof(abs))) {
         return send_status(s, id, SSH_FX_FAILURE, "bad path");
     }
 
@@ -848,8 +885,8 @@ static esp_err_t do_rename(sftp_t *s, uint32_t id, ssh_buf_t *in)
 
     if (!take_path(in, from, sizeof(from)) ||
         !take_path(in, to, sizeof(to)) ||
-        !resolve(from, abs_from, sizeof(abs_from)) ||
-        !resolve(to, abs_to, sizeof(abs_to))) {
+        !resolve(s, from, abs_from, sizeof(abs_from)) ||
+        !resolve(s, to, abs_to, sizeof(abs_to))) {
         return send_status(s, id, SSH_FX_FAILURE, "bad path");
     }
     if (rename(abs_from, abs_to) != 0) {
@@ -1015,7 +1052,7 @@ static sftp_t *sftp_alloc(void)
     return calloc(1, sizeof(sftp_t));
 }
 
-esp_err_t espix_sftp_run(ssh_conn_t *c)
+esp_err_t espix_sftp_run(ssh_conn_t *c, espix_session_t *session)
 {
     /* On the heap, so a device that never transfers a file does not carry it. */
     sftp_t *s = sftp_alloc();
@@ -1023,9 +1060,25 @@ esp_err_t espix_sftp_run(ssh_conn_t *c)
         espix_klog(ESPIX_KLOG_ERROR, TAG, "out of memory for an sftp session");
         return ESP_ERR_NO_MEM;
     }
-    s->conn = c;
+    s->conn    = c;
+    s->session = session;
 
-    espix_klog(ESPIX_KLOG_INFO, TAG, "sftp session for %s", c->user);
+    /*
+     * Make it this task's current session, which is how espix_fs_access_check()
+     * finds a caller. Without it every file operation below runs on a task that
+     * is neither a process nor a session, which the check reads as espix itself
+     * and allows -- so an authenticated client could fetch files its own shell
+     * login is refused.
+     *
+     * Cleared before returning, without exception. The connection task lives on
+     * after this call and `session` is a frame in its caller; leaving the
+     * pointer behind is the same use-after-free that used to reboot the board
+     * from the exec path.
+     */
+    espix_shell_set_current(session);
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "sftp session for %s at %s", c->user,
+               base_dir(s));
 
     for (;;) {
         uint8_t *chunk = NULL;
@@ -1066,6 +1119,8 @@ esp_err_t espix_sftp_run(ssh_conn_t *c)
             handle_close(&s->handles[i]);
         }
     }
+
+    espix_shell_set_current(NULL);
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "sftp session for %s ended", c->user);
     free(s);

@@ -8,6 +8,8 @@
 #include "esp_err.h"
 #include "psa/crypto.h"
 
+#include "espix_shell.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -272,7 +274,18 @@ esp_err_t ssh_channel_recv_raw(ssh_conn_t *c, uint8_t **out, size_t *out_len);
 /* ------------------------------------------------------------------ */
 
 /* Serve SFTP on an already-open channel until the client goes away. */
-esp_err_t espix_sftp_run(ssh_conn_t *c);
+/*
+ * Serve the SFTP subsystem until the client goes away.
+ *
+ * `session` carries the authenticated identity. It is not for stdio -- SFTP
+ * prints nothing -- but for espix_fs_access_check(), which finds a caller
+ * through the task's current session; without one, every file operation here
+ * runs as the kernel and is not checked at all.
+ *
+ * The session must outlive the call, and this makes it the task's current one
+ * for the duration and clears it before returning.
+ */
+esp_err_t espix_sftp_run(ssh_conn_t *c, espix_session_t *session);
 
 /* Counted so `sshd` status can show them; incremented by ssh_auth.c. */
 void ssh_server_note_rejection(void);
