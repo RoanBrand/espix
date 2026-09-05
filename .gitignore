@@ -35,8 +35,5 @@ __pycache__/
 .continue/
 compile_commands.json
 
-# Personal design notes, not part of the project
-PLAN.md
-
 # NOTE: dependencies.lock IS committed, deliberately — it pins the exact
 # component versions so builds are reproducible.
