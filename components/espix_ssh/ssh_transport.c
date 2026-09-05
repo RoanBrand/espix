@@ -300,6 +300,12 @@ static esp_err_t read_exact(int fd, void *dst, size_t len)
  * wait hours for a keystroke; a send that cannot progress means the peer has
  * stopped draining, and a connection task parked there forever is what once
  * exhausted the session limit.
+ *
+ * DEBUG for the timeout because it is diagnostic and the failure surfaces to
+ * the caller anyway, not because a louder level would be unsafe -- it would
+ * have been, until klog stopped echoing through the calling task's stdout. See
+ * s_console_out in espix_kernel/klog.c: the first draft of this logged at WARN
+ * and re-entered write_all() from inside its own half-sent packet.
  */
 static esp_err_t write_all(int fd, const void *src, size_t len)
 {
@@ -328,7 +334,8 @@ static esp_err_t write_all(int fd, const void *src, size_t len)
                 blocked_since = now;
             } else if (now - blocked_since >=
                        (int64_t)BLOCKED_WRITE_TIMEOUT_MS * 1000) {
-                espix_klog(ESPIX_KLOG_WARN, TAG,
+                /* DEBUG, and that is load-bearing: see the note above. */
+                espix_klog(ESPIX_KLOG_DEBUG, TAG,
                            "peer stopped reading %u bytes into a %u-byte send",
                            (unsigned)sent, (unsigned)len);
                 return ESP_ERR_TIMEOUT;

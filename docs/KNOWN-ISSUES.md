@@ -105,6 +105,25 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   `sshd:conn` tasks and no "connection closed" line is logged for that session.
   It does recover; it is not a permanent leak.
 
+  One thing found while chasing this *was* fixed, and it is worth knowing about
+  because it could have produced exactly these symptoms: **a kernel log echoed
+  through the calling task's `stdout`.** `klog_store()` printed with a plain
+  `printf()`, and newlib's `stdout` is per-task — `espix_proc` points a loaded
+  app's at the session it was launched from, so for an SSH session `printf()`
+  *is* the encrypted channel. Any klog at INFO or above from the send path
+  therefore re-entered that path: `klog` → `printf` → `chan_write` →
+  `ssh_packet_write` → another klog, unbounded, on an 8KB app stack, with the
+  inner packet rebuilding the shared `out_buf` and bumping `seq_out` underneath
+  the outer send. `tx_lock` does not catch it — it is recursive by design so
+  `chan_write()` can nest `send_data()`.
+
+  klog now writes to a console stream captured at boot. This is not offered as
+  the cause of the corruption above: the reachable sites are
+  `wait_for_window()`'s two warnings and `ssh_packet_write()`'s two framing
+  errors, and none of those strings appears anywhere in the several hundred
+  `dmesg` lines captured across ~350 runs, failing ones included. They do not
+  fire. A hazard closed, not a bug explained.
+
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
