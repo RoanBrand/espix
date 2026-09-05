@@ -24,22 +24,12 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 apps_dir="$root/apps"
 stage_dir="$root/fsroot/bin"
 
-# Locating idf.py is not as simple as looking on PATH. A plain `. export.sh`
-# puts it there, but some setups (including esp-idf's own activate scripts)
-# define idf.py as a *shell function* instead, which a child process cannot see.
-# Falling back to invoking it through IDF's python covers both.
-if command -v idf.py >/dev/null 2>&1; then
-    idf=(idf.py)
-elif [ -n "${IDF_PATH:-}" ] && [ -f "$IDF_PATH/tools/idf.py" ]; then
-    if [ -n "${IDF_PYTHON_ENV_PATH:-}" ] && [ -x "$IDF_PYTHON_ENV_PATH/bin/python" ]; then
-        idf=("$IDF_PYTHON_ENV_PATH/bin/python" "$IDF_PATH/tools/idf.py")
-    else
-        idf=(python3 "$IDF_PATH/tools/idf.py")
-    fi
-else
-    echo "build-apps: cannot find idf.py; activate the ESP-IDF environment first" >&2
-    exit 1
-fi
+# tools/idf.sh finds the SDK, puts the toolchain on PATH and sets the variables
+# idf.py needs, so nothing has to be sourced first. It used to be duplicated
+# here, badly: this script only knew how to use an environment somebody had
+# already activated, and said so with an error rather than doing anything about
+# it.
+idf=("$root/tools/idf.sh")
 
 target="${IDF_TARGET:-esp32s3}"
 mkdir -p "$stage_dir"
