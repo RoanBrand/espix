@@ -176,6 +176,51 @@ things are as they are.
   That is the same bargain espix already makes for the uid, and it is what
   `newgrp` exists for on a real system.
 
+- ~~**A root for an app.**~~ Done, as `run -R <dir>`: the process may not
+  resolve a path outside that directory, and everything else answers ENOENT.
+  One test in `resolve()` in `espix_fs/vfs.c` covers it, because every path
+  operation in the system already passes through there -- including `stat` and
+  `utime`, which the permission check deliberately does not gate.
+
+  **Why it is not what users already do.** Permissions decide whether a uid may
+  *open* a path; they never stop it being *named*, and the mode rule gives
+  directories 0755 and files 0644, so a service account could walk the whole
+  tree and read everything nobody had explicitly locked. Two things nobody had
+  locked were the WiFi PSK and the SSH host private key. That is the shape of
+  the difference: discretionary permissions are open by default and closed by
+  someone remembering, and a root is closed by default and opened by handing
+  something over. It also does not depend on the uid being right, and it is per
+  *app* where a uid can only be per *user*.
+
+  **Restriction, not chroot.** Paths stay globally absolute. Real chroot wants
+  `getcwd` translation and, far more importantly, bind mounts: a jail holding no
+  `/bin`, no `/etc` and no `/tmp` is not somewhere a program can run, and espix
+  has no mount table yet -- the first item in this section is the precondition.
+  When it lands, chroot semantics become worth building on top of this.
+
+  **The confinement starts after the ELF is loaded**, immediately before the
+  entry point, which is where `execve(2)` draws the same line: espix opens the
+  binary through the caller's view of the filesystem, and only the program runs
+  in the new one. Arming it at spawn instead confines the loader, and then no
+  rooted process could ever be given a program from outside its own root.
+  Raising privilege around the load was the other way to get there and is
+  wrong -- privilege bypasses the permission check too, so it would load files
+  the caller may not read.
+
+  What it is not: a sandbox. Device VFSes register longer prefixes and ESP-IDF
+  routes them before espix's fallback is consulted, which is exactly what keeps
+  a confined app's stdio working and also means this is a filesystem boundary
+  and nothing else. With no MMU an app shares the address space regardless. Like
+  setuid, it is a guardrail here and a real boundary on a part with an MMU.
+
+- **Per-app export tables.** The other half of what the README used to call
+  "per-app capabilities", and still open. espix publishes one fixed set of
+  symbols to every app it loads; an app that has no business calling
+  `esp_wifi_*` is handed it anyway. The loader resolves against a table, so
+  subsetting per app is a matter of choosing which table, and the cost is
+  deciding where the per-app policy is written down -- a manifest beside the
+  binary, or something in the ELF itself.
+
 - ~~**More than one account.**~~ Done, with the `useradd` family rather than
   Debian's `adduser` wrappers: one command per job, and the names that exist on
   every distribution. `useradd -r` is a service account — locked, a uid in

@@ -317,16 +317,38 @@ merely missing.
 | Groups with members | **yes** | `/etc/group`, supplementary membership, and the group triad actually checked |
 | `useradd`, `userdel`, `usermod` | **yes** | `-r` for a service account: locked, low uid, no home |
 | `groupadd`, `groupdel`, `groups` | **yes** | |
-| Per-app capabilities | **planned** | so an app need not see the whole filesystem |
+| A root for an app, `run -R <dir>` | **yes** | it cannot *name* a path outside, which is the question permissions never ask |
+| Restricting what an app may call | **partial** | the ELF loader's export table is one, but it is fixed rather than per-app |
 | An editor | **no** | no `nano` or `ed`, so editing a config on the device means `echo >` |
 
-Worth being clear about what that last row can buy on a chip with no MMU: an app
-shares the address space with the kernel, so filesystem permissions are a
-guardrail against mistakes rather than a sandbox around hostile code. The real
-boundary is the ELF loader's export table — an app can only call what espix
-publishes to it. Permissions make that boundary usable; they do not replace it.
-The same caveat applies to setuid, which is implemented because the S31 makes it
-a real boundary rather than because it is one on the S3.
+Those two rows were one row saying "per-app capabilities", which conflated a
+*filesystem view* with a *subset of what an app may call*. They are different
+things, and only the first is done.
+
+**Why a root, when the app already runs as its own user?** Because users answer
+"may uid X open path P" and never stop P being named. The mode rule here hands
+out `0755` directories and `0644` files, so a service account can walk the whole
+tree and read all of it bar what someone remembered to lock — and the two things
+nobody had remembered were `/etc/wifi.conf`, holding the WiFi PSK, and the SSH
+host private key, both world-readable until this landed. Discretionary
+permissions start out open and are closed by exception; a root is the other
+default, where nothing is reachable but what was handed over. It also survives
+getting the uid wrong, and it is per *app* rather than per *user*, which two
+services sharing an account cannot otherwise be.
+
+It restricts rather than chroots: paths stay globally absolute, so the app sees
+`/srv/www/db` and not `/db`. A real chroot needs bind mounts to be worth
+anything — a jail with no `/bin`, no `/etc` and no `/tmp` is not somewhere a
+program runs — and mounts are still on the roadmap. The binary is read before
+the confinement starts, exactly as `execve` does it, so it may live outside.
+
+Worth being clear about what any of this can buy on a chip with no MMU: an app
+shares the address space with the kernel, so filesystem permissions and a root
+alike are a guardrail against mistakes rather than a sandbox around hostile
+code. The real boundary is the ELF loader's export table — an app can only call
+what espix publishes to it. Permissions make that boundary usable; they do not
+replace it. The same caveat applies to setuid, which is implemented because the
+S31 makes it a real boundary rather than because it is one on the S3.
 
 Root follows the model Debian uses: the account exists but is locked, so nothing
 can log in as it, and `sudo` is how you reach it. `sudo passwd root <pw>` gives
@@ -336,8 +358,10 @@ grants it — the arrangement Debian ships, where RHEL would say `%wheel`.
 
 Services get their own identity rather than running as whoever started them:
 `useradd -r www` makes a locked account with a low uid and no home, and
-`sudo -u www /bin/httpd &` runs the app as it. No service manager is involved —
-that is the whole mechanism.
+`sudo -u www /bin/httpd &` runs the app as it. Add `run -R` and it gets its own
+view of the filesystem as well — `sudo -u www run -R /srv/www /bin/httpd &` is
+an account that owns nothing else and a process that can see nothing else. No
+service manager is involved — that is the whole mechanism.
 
 **`sudo` does not ask for your password.** espix cannot read input without
 echoing it — the same limitation that makes `passwd` take the password as an

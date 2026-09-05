@@ -59,6 +59,28 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   identical either way: every one of those connections reaches "connection
   closed" normally. Nothing is wrong with the session — only with the goodbye.
 
+- **A sixth cause is still open: an app's output can corrupt the SSH stream.**
+  `ssh host 'run /bin/hello'`, whose app prints eight lines, fails about **2
+  runs in 30** with `Corrupted MAC on input` and
+  `ssh_dispatch_run_fatal: message authentication code incorrect`. The device is
+  unharmed — it stays up, records no core dump, and keeps exactly one
+  `sshd:conn` task — so this is a packet leaving the server malformed, not a
+  crash. Sometimes the first lines arrive and the corruption follows mid-stream.
+
+  Measured deliberately rather than inferred: **2 of 30 on `main` at 8e3d545**,
+  and 2 of 30 on the branch that added the process root, which is the same rate
+  and settles that the root did not cause it. Doubling
+  `CONFIG_ESPIX_PROC_STACK_SIZE` to 16384 did not fix it either, which rules out
+  the obvious guess that the app task was overflowing its stack — it was tried,
+  and the failure survived it.
+
+  The suspicion is the same shape as the `out_buf` defect above, one layer
+  further out: an app's `printf` reaches the channel from the app's own task,
+  while the session task can be writing to the same connection. That is a
+  hypothesis, not a finding — nobody has caught it in the act. Shell builtins,
+  `scp`, `sftp` and `ssh host uptime` show none of it; it takes an app writing
+  several lines.
+
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
@@ -205,6 +227,24 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   request would fail an entire `scp -p` over a bit that was never going to be
   honoured. Setting the mode of a *directory* over SFTP is accepted and ignored
   for the same reason.
+
+- **A process root is a filesystem boundary, and only that.** `run -R <dir>`
+  stops a process resolving a path outside `<dir>` — see
+  [ROADMAP.md](ROADMAP.md) — but four things sit outside what it covers:
+
+  - **Other VFSes are not routed through it.** `/dev/uart` and sockets register
+    longer prefixes, and ESP-IDF matches those before espix's fallback, so espix
+    never sees the call. This is what keeps a confined app's stdio working, and
+    it is the reason the boundary is a filesystem one rather than a sandbox.
+  - **No MMU means it is a guardrail, not a sandbox.** A loaded app shares the
+    address space with the kernel and can call what the loader exported or write
+    memory directly. Same caveat as setuid, and the same reason to have built
+    it: the S31 makes both real.
+  - **`getcwd()` returns the true path**, so a confined app can see where its
+    root sits in the wider filesystem. That follows from restricting rather than
+    chrooting, and it is not a leak of anything it can reach.
+  - **Sessions are not confined, only processes.** There is no restricted login
+    shell; `-R` applies to a program you run, not to whoever runs it.
 
 ## Shell and console
 
