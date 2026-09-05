@@ -100,10 +100,15 @@ static char        s_name_cache[ESPIX_USER_MAX];
 static espix_uid_t s_name_cache_uid;
 static bool        s_name_cache_valid;
 
+static char        s_group_cache[ESPIX_USER_MAX];
+static espix_gid_t s_group_cache_gid;
+static bool        s_group_cache_valid;
+
 static void cache_invalidate(void)
 {
-    s_accounts_valid   = false;
-    s_name_cache_valid = false;
+    s_accounts_valid    = false;
+    s_name_cache_valid  = false;
+    s_group_cache_valid = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -801,12 +806,15 @@ static bool member_of(const char *members, const char *user)
 
 const char *espix_auth_group_name(espix_gid_t gid)
 {
-    static char        cached[ESPIX_USER_MAX];
-    static espix_gid_t cached_gid;
-    static bool        cached_valid;
-
-    if (cached_valid && cached_gid == gid) {
-        return cached;
+    /*
+     * File scope, not function statics, so cache_invalidate() can reach it.
+     * As locals this went stale in a way that took a specific sequence to see:
+     * next_free_id() hands out the lowest free number, so `groupdel shared`
+     * followed by `groupadd other` reuses the same gid, and `ls -l` went on
+     * printing the group that no longer existed.
+     */
+    if (s_group_cache_valid && s_group_cache_gid == gid) {
+        return s_group_cache;
     }
 
     group_t *g = calloc(MAX_GROUPS, sizeof(*g));
@@ -819,10 +827,10 @@ const char *espix_auth_group_name(espix_gid_t gid)
 
     for (size_t i = 0; i < count; i++) {
         if (g[i].gid == gid) {
-            strlcpy(cached, g[i].name, sizeof(cached));
-            cached_gid   = gid;
-            cached_valid = true;
-            found        = cached;
+            strlcpy(s_group_cache, g[i].name, sizeof(s_group_cache));
+            s_group_cache_gid   = gid;
+            s_group_cache_valid = true;
+            found               = s_group_cache;
             break;
         }
     }
@@ -1061,16 +1069,20 @@ esp_err_t espix_auth_group_del(const char *name)
 }
 
 /* Add or remove `user` everywhere a member list names them. */
-static esp_err_t membership_purge(const char *user)
+/*
+ * Take `user` out of every member list in `g`, in memory only.
+ *
+ * Separated from storing it deliberately. This used to load, edit and commit in
+ * one call, which meant espix_auth_set_groups() replacing somebody's groups had
+ * already written the removals to flash before it discovered that one of the
+ * groups being asked for did not exist -- so `usermod -G sduo esp` stripped esp
+ * of everything, sudo included, and then reported failure. On a device whose
+ * root is locked that is the serial console or nothing.
+ *
+ * A caller that edits then stores once cannot half-do it.
+ */
+static void membership_strip(group_t *g, size_t count, const char *user)
 {
-    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
-    if (g == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    const size_t count   = groups_load(g, MAX_GROUPS);
-    bool         changed = false;
-
     for (size_t i = 0; i < count; i++) {
         if (!member_of(g[i].members, user)) {
             continue;
@@ -1099,10 +1111,21 @@ static esp_err_t membership_purge(const char *user)
         }
 
         strlcpy(g[i].members, rebuilt, sizeof(g[i].members));
-        changed = true;
+    }
+}
+
+/* The committing form, for callers with nothing else to change. */
+static esp_err_t membership_purge(const char *user)
+{
+    group_t *g = calloc(MAX_GROUPS, sizeof(*g));
+    if (g == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
-    const esp_err_t err = changed ? groups_store(g, count) : ESP_OK;
+    const size_t    count = groups_load(g, MAX_GROUPS);
+    membership_strip(g, count, user);
+
+    const esp_err_t err = groups_store(g, count);
     free(g);
     return err;
 }
@@ -1118,17 +1141,6 @@ esp_err_t espix_auth_set_groups(const char *user, const char *csv, bool append)
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* Replacing means starting from none; appending keeps what is there. */
-    if (!append) {
-        const esp_err_t err = membership_purge(user);
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-    if (csv == NULL || csv[0] == '\0') {
-        return ESP_OK;
-    }
-
     group_t *g = calloc(MAX_GROUPS, sizeof(*g));
     if (g == NULL) {
         return ESP_ERR_NO_MEM;
@@ -1136,8 +1148,18 @@ esp_err_t espix_auth_set_groups(const char *user, const char *csv, bool append)
 
     const size_t count = groups_load(g, MAX_GROUPS);
     esp_err_t    err   = ESP_OK;
-    char         list[MEMBERS_MAX];
-    strlcpy(list, csv, sizeof(list));
+
+    /*
+     * Everything below happens to the loaded copy, and the file is written once
+     * at the end. A name that does not resolve therefore changes nothing at
+     * all, which is what a command that reports failure should have done.
+     */
+    if (!append) {
+        membership_strip(g, count, user);
+    }
+
+    char list[MEMBERS_MAX];
+    strlcpy(list, (csv != NULL) ? csv : "", sizeof(list));
 
     for (char *name = strtok(list, ","); name != NULL && err == ESP_OK;
          name = strtok(NULL, ",")) {
@@ -1217,13 +1239,25 @@ esp_err_t espix_auth_user_add(const char *name, bool system, bool make_home)
     /* The user's own group, same name and id -- Debian's private groups, and
      * what espix already had when every gid equalled its uid. */
     group_t *g = calloc(MAX_GROUPS, sizeof(*g));
-    if (g != NULL) {
+    if (g == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: no memory for its group; it has a gid nothing names",
+                   name);
+    } else {
         size_t count = groups_load(g, MAX_GROUPS);
+
         if (count < MAX_GROUPS) {
             strlcpy(g[count].name, name, sizeof(g[count].name));
             g[count].gid = uid;
             count++;
             (void)groups_store(g, count);
+        } else {
+            /* The account is real and usable; only the name for its gid is
+             * missing, so `groups` and `ls -l` will show a number. Said out
+             * loud rather than left to be discovered in a listing. */
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: /etc/group is full, so gid %u has no name", name,
+                       (unsigned)uid);
         }
         free(g);
     }
