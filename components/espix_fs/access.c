@@ -282,9 +282,19 @@ void espix_fs_claim(const char *abs_path)
      *
      * That is not only an optimisation. This runs from inside vfs_open(), with
      * the file the caller just created still open, and a littlefs attribute
-     * write against an open entry is the case littlefs#1076 is about and the
-     * one espix has not established is safe. Doing it only when the answer
-     * would actually differ keeps the ordinary path clear of it entirely.
+     * write against an open entry is the case littlefs#1076 is about.
+     *
+     * That case is no longer hypothetical: /tmp is 1777 and owned by root, so
+     * every file an ordinary user creates there disagrees with the rule and
+     * takes this path. It has been exercised rather than assumed -- 200 files
+     * uploaded into /tmp over SFTP as a non-root user, every one of them
+     * landing here, then read back byte-identical, then read back again after a
+     * reboot with their ownership intact and the stored modes of unrelated
+     * files unharmed. Nothing was corrupted and nothing was only true in RAM.
+     *
+     * Skipping it when the rule already agrees still matters, because that is
+     * the overwhelmingly common case and it costs a metadata write to get the
+     * same answer.
      */
     uint16_t rule_uid = 0;
     uint16_t rule_gid = 0;
