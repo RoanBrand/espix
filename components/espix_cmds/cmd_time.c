@@ -177,8 +177,26 @@ static int cmd_timedatectl(espix_session_t *s, int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "set-timezone") == 0) {
         if (argc < 3) {
-            espix_printf(s, "timedatectl: set-timezone needs a POSIX TZ "
-                            "string, e.g. SAST-2 or EST5EDT,M3.2.0,M11.1.0\n");
+            /*
+             * The format is the whole difficulty, so it is spelled out here
+             * rather than left to a man page espix does not have. This used to
+             * live as comments in a shipped /etc/timezone; the file is gone --
+             * its only content was the default espix already compiles in -- and
+             * this is where somebody setting a zone actually is.
+             */
+            espix_printf(s,
+                "timedatectl: set-timezone needs a POSIX TZ string, not a\n"
+                "zoneinfo name -- espix ships no tzdata, so the rules go in\n"
+                "the string:\n"
+                "\n"
+                "  UTC0                       no offset, no DST (the 0 is required)\n"
+                "  SAST-2                     UTC+2, no DST\n"
+                "  GMT0BST,M3.5.0/1,M10.5.0   UK, with DST\n"
+                "  EST5EDT,M3.2.0,M11.1.0     US eastern, with DST\n"
+                "\n"
+                "The sign is backwards from what you expect: the number is what\n"
+                "you add to local time to get UTC, so UTC+2 is written -2. That\n"
+                "is POSIX, not a typo.\n");
             return 1;
         }
         if (espix_time_set_zone(argv[2], true) != ESP_OK) {

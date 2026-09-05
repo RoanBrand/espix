@@ -1173,6 +1173,39 @@ esp_err_t espix_auth_set_groups(const char *user, const char *csv, bool append)
     return err;
 }
 
+/*
+ * Create an account's home directory, owned by the account.
+ *
+ * Shared by `useradd` and by the seeding of the default account, which is the
+ * point: the default account used to be the one exception, and /home/esp existed
+ * only because the rootfs image happened to ship an empty directory there. A
+ * device whose filesystem was rebuilt from an image without it -- which is now
+ * every device, since fsroot/ ships nothing -- had no home for its only user,
+ * so SSH started at / and `scp file host:` with no remote path had nowhere to
+ * land. Whoever creates an account creates its home.
+ *
+ * Raised over the mkdir alone: this runs at boot before there is any session to
+ * be checked, and from `useradd`, which is root's. EEXIST is the ordinary case
+ * on every boot after the first and says nothing worth logging.
+ */
+static void ensure_home(const char *home, espix_uid_t uid)
+{
+    if (home == NULL || home[0] == '\0' || strcmp(home, "/") == 0) {
+        return;                 /* a service account, or root */
+    }
+
+    espix_fs_priv_begin();
+    const int rc = mkdir(home, 0755);
+    espix_fs_priv_end();
+
+    if (rc == 0) {
+        (void)espix_fs_chown(home, uid, uid);
+    } else if (errno != EEXIST) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot create %s: %s", home,
+                   strerror(errno));
+    }
+}
+
 esp_err_t espix_auth_user_add(const char *name, bool system, bool make_home)
 {
     if (name == NULL || name[0] == '\0' || strlen(name) >= ESPIX_USER_MAX) {
@@ -1241,16 +1274,7 @@ esp_err_t espix_auth_user_add(const char *name, bool system, bool make_home)
     }
 
     if (make_home && !system) {
-        espix_fs_priv_begin();
-        const int rc = mkdir(home, 0755);
-        espix_fs_priv_end();
-
-        if (rc == 0) {
-            (void)espix_fs_chown(home, uid, uid);
-        } else if (errno != EEXIST) {
-            espix_klog(ESPIX_KLOG_WARN, TAG, "cannot create %s: %s", home,
-                       strerror(errno));
-        }
+        ensure_home(home, uid);
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "added %s '%s' (uid %u)",
@@ -1469,6 +1493,12 @@ esp_err_t espix_auth_init(void)
         espix_klog(ESPIX_KLOG_INFO, TAG, "created %s with user '%s'",
                    PASSWD_PATH, DEFAULT_USER);
     }
+
+    /* Every boot, not only the one that creates the account: the record and the
+     * directory are separate pieces of state, and a filesystem replaced under a
+     * surviving /etc/passwd would otherwise leave the account homeless. Cheap --
+     * mkdir returning EEXIST is the usual answer. */
+    ensure_home(DEFAULT_HOME, ESPIX_UID_FIRST);
 
     /*
      * root, locked.
