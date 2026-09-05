@@ -50,9 +50,12 @@ idf.py set-target esp32s3                              # see Hardware Targets
 idf.py -p /dev/ttyUSB0 flash storage-flash monitor     # macOS: /dev/cu.usbserial-*
 ```
 
-**That flash command writes two images, and a first boot needs both.** `flash`
-writes the firmware; `storage-flash` writes the rootfs — `/bin`, `/etc` and the
-rest. Flashing only the firmware leaves you at a shell with an empty filesystem.
+**That flash command writes two images.** `flash` writes the firmware;
+`storage-flash` writes the rootfs image, which holds the apps built out of
+`apps/` and nothing else. espix creates the rest for itself on first boot — the
+directory skeleton, `/etc/passwd`, `/etc/group`, `/etc/sudoers`, `/etc/hostname`,
+your home directory and the SSH host key — so skipping `storage-flash` costs you
+`/bin`, not a working system.
 
 There is no separate download or configure step. `set-target` fetches the
 managed components at the versions pinned in `dependencies.lock` — it needs
