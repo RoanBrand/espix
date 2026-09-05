@@ -51,6 +51,15 @@ idf.py set-target esp32s3                              # see Hardware Targets
 idf.py -p /dev/ttyUSB0 flash storage-flash monitor     # macOS: /dev/cu.usbserial-*
 ```
 
+Or through the Makefile, which finds the SDK and the serial port itself and
+needs nothing sourced first:
+
+```bash
+make flash-all      # firmware and rootfs
+make monitor        # attach without resetting
+make test           # the test suite -- see tests/README.md
+```
+
 **That flash command writes two images.** `flash` writes the firmware;
 `storage-flash` writes the rootfs image, which holds the apps built out of
 `apps/` and nothing else. espix creates the rest for itself on first boot — the

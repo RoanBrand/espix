@@ -4,6 +4,13 @@ sdkconfig
 sdkconfig.old
 managed_components/
 
+# The test app is a separate IDF project, with the same build artefacts.
+tests/app/build/
+tests/app/sdkconfig
+tests/app/sdkconfig.old
+tests/app/managed_components/
+tests/app/build-test-app.log
+
 # Cross-compiled apps under apps/ are separate IDF projects
 apps/*/build/
 apps/*/sdkconfig

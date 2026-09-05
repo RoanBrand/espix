@@ -1,0 +1,8 @@
+# Must match the firmware's setting: the loader writes a relocated image into
+# memory and executes it, which memory protection would block.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+CONFIG_ELF_LOADER=y
+
+# Keep the libc flavour aligned with the firmware — an app resolves printf()
+# and friends against the tables the firmware exports at load time.
+CONFIG_LIBC_NEWLIB=y
