@@ -14,11 +14,46 @@ session at once, and every tool that speaks IP rather than a terminal. On a
 bench that also makes it the dependable one, since WiFi is usually the least
 reliable thing in the room.
 
-## Which socket
+## Which socket, and whether your board can do this at all
 
 A development board normally has two USB sockets. One is a UART bridge and
 carries the serial console; the other is the chip's own USB peripheral, and that
 is the one this uses.
+
+That is the ESP32-S3 devkit's layout and it is not universal, so it is worth
+knowing the rule underneath it.
+
+**An ESP32 has exactly one general-purpose USB controller.**
+`SOC_USB_OTG_PERIPH_NUM` is 1 on the S3 and on the S31. Anything else on the
+board labelled USB is one of two other things:
+
+- **A UART bridge chip** (CP210x, CH34x and friends). It is a USB device in its
+  own right and connects to the chip's serial pins. Nothing to do with the
+  ESP32's own USB.
+- **The USB-Serial-JTAG controller**, which is a separate peripheral and, in
+  ESP-IDF's own words, "a fixed-function USB device that is implemented entirely
+  in hardware, meaning that it cannot be reconfigured to perform any function
+  other than a serial port and JTAG debugging functionality." It cannot carry
+  USB-NCM, and no firmware change will make it.
+
+**So the question for any board is: what does the OTG controller reach?** If it
+reaches a socket you can plug into a computer, USB-NCM works. If the board
+commits it to a **USB-A female** — a host socket, meant for plugging devices
+*into* — then there is nowhere for a device-mode feature to go, and that is a
+wiring decision no software can undo.
+
+A worked example, inferred from connector layout rather than a schematic. An
+S31 coreboard with three sockets — a USB-A female, a USB-C behind a programming
+chip, and a USB-C wired to the chip — is very likely UART bridge on the second
+and **USB-Serial-JTAG** on the third, because the S31's OTG controller is
+high-speed only (`SOC_USB_FSLS_PHY_NUM` is 0). A connector advertised as USB 1.1
+or full-speed therefore cannot be the OTG controller on that part; the speed
+label is a reliable tell. Which leaves the OTG controller on the USB-A socket,
+and USB-NCM with nowhere to run on that board.
+
+The **P4** is the exception worth knowing: `SOC_USB_OTG_PERIPH_NUM` is 2 there,
+with one full-speed and one high-speed PHY. It is the only espix target that
+could be a USB host on one port and run USB-NCM on the other at the same time.
 
 **Plug in one at a time unless you know your board is happy with both.** They
 are two independent 5V supplies and two independent grounds, and joining them is
