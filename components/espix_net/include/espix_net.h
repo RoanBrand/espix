@@ -135,6 +135,40 @@ esp_err_t espix_net_wifi_disconnect(void);
 esp_err_t espix_net_wifi_scan(espix_ap_t *out, size_t n, size_t *found);
 esp_err_t espix_net_wifi_status(espix_wifi_status_t *out);
 
+/* ------------------------------------------------------------------ */
+/* USB-NCM (usb0)                                                      */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    ESPIX_USB_MODE_SERVER = 0,  /* espix hands the computer an address */
+    ESPIX_USB_MODE_CLIENT,      /* espix asks the computer's network for one */
+} espix_usb_mode_t;
+
+typedef struct {
+    bool             built;     /* compiled in at all */
+    bool             started;   /* the interface exists */
+    bool             attached;  /* a host has enumerated the link */
+    espix_usb_mode_t mode;
+    bool             has_addr;
+    uint32_t         ip;
+    uint32_t         netmask;
+} espix_usb_status_t;
+
+/*
+ * Always answers, even when USB-NCM is not compiled in -- `built` is then false
+ * and the rest is zero, so `usb status` can say so rather than the command
+ * vanishing from a build and leaving the user to guess why.
+ */
+void espix_net_usb_status(espix_usb_status_t *out);
+
+/*
+ * Write the mode to /etc/usb.conf. Takes effect at the next boot: the DHCP
+ * server and client are different netif flags, fixed when the interface is
+ * created, so switching means recreating it -- which would race whatever is
+ * in flight, for a setting nobody changes twice in a day.
+ */
+esp_err_t espix_net_conf_write_usb(espix_usb_mode_t mode);
+
 /* Resolve a hostname or dotted-quad to an address. */
 esp_err_t espix_net_resolve(const char *host, uint32_t *out_ip);
 

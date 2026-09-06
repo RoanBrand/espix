@@ -21,3 +21,19 @@ dependencies:
   # filesystem, plus dlopen()/dlsym() for shared objects.
   # Supports esp32s3 / esp32p4 / esp32s31, which are espix's three targets.
   espressif/elf_loader: "~1.3.3"
+
+  # USB-NCM: Ethernet over the USB-OTG port, so the board is reachable over a
+  # cable with no network at all. Espressif's own additions to TinyUSB rather
+  # than raw tud_network_* callbacks, for one reason that matters:
+  # tinyusb_net_send_async() marshals the transmit onto TinyUSB's task via
+  # usbd_defer_func(), and tud_network_xmit() must run on that task rather than
+  # on whatever task esp_netif's output path happens to be.
+  #
+  # Targets esp32s3 / esp32p4 / esp32s31, which are espix's three.
+  #
+  # Fetched unconditionally, and note what CONFIG_ESPIX_USB_NCM_ENABLED does and
+  # does not do: the component manager resolves manifests before Kconfig exists,
+  # so it cannot key off a project option. Turning the option off drops espix's
+  # own driver and the TinyUSB stack from the *link*, which is where the flash
+  # and RAM go; the sources are still downloaded.
+  espressif/esp_tinyusb: "^2.2.1"

@@ -39,6 +39,12 @@ const char *espix_net_name_of(esp_netif_t *netif);
 /* wifi.c */
 esp_err_t espix_net_wifi_start(void);
 
+/* usb_ncm.c: bring up usb0. Absent when CONFIG_ESPIX_USB_NCM_ENABLED is off,
+ * so callers guard on it rather than relying on a stub. */
+#if CONFIG_ESPIX_USB_NCM_ENABLED
+esp_err_t espix_net_usb_start(void);
+#endif
+
 /* abi.c: publish the network syscall surface to loadable apps. */
 void espix_net_abi_register(void);
 

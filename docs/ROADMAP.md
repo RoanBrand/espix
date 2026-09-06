@@ -400,6 +400,28 @@ things are as they are.
 
 ## Networking and time
 
+- **Routing and NAT: be the bridge people buy a Raspberry Pi for.** With WiFi on
+  one side and USB-NCM or Ethernet on the other, espix is one feature short of
+  being an access point, a bridge or a range extender — which is a large part of
+  what a Pi gets bought and left plugged in behind a TV to do.
+
+  The plumbing is already in lwIP and simply switched off: `LWIP_IP_FORWARD`,
+  `LWIP_IPV4_NAPT` and `LWIP_IPV4_NAPT_PORTMAP` all exist in IDF 6.1 and are all
+  `n`. So this is not a stack to write; it is a Kconfig flip plus the policy and
+  the commands around it — somewhere to say which interfaces forward (a
+  `sysctl`-shaped `net.ipv4.ip_forward`, since that is the name everyone already
+  knows), and something `iptables`-shaped for masquerading and port forwards.
+
+  Two things to know before starting. Forwarding on a device with 300KB of
+  internal RAM is bounded by lwIP's pbuf pool long before it is bounded by the
+  CPU, so this wants measuring rather than assuming. And an AP on the WiFi side
+  means `ESPIX_IF_WIFI_AP`, which is in the interface-kind enum and has never
+  been used — `CONFIG_LWIP_DHCPS` is already on, so the DHCP server that
+  USB-NCM's server mode uses is the same one an AP would.
+
+  The S31 and P4 are on the hardware list partly for this: more RAM on one, and
+  a second real Ethernet MAC on the other.
+
 - **WiFi roaming and multiple networks.** One SSID, one AP, no BSSID
   reselection.
 - **A floor under the clock before NTP answers.** On a cold boot espix reads

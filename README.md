@@ -328,7 +328,7 @@ merely missing.
 | SSH server | **yes** | password auth — [read this first](#a-word-on-the-ssh-server) |
 | `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
-| USB-NCM | **planned** | IP network to USB host |
+| USB-NCM | **yes** | `usb0`: plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](docs/USB-NETWORKING.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Raw lwIP / `netconn` for the SSH transport | **planned** | BSD sockets today, deliberately: apps get the same API. Cut calls before changing API — one `send()` per packet instead of three was worth 1.7× |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |

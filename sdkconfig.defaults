@@ -102,3 +102,39 @@ CONFIG_LWIP_DHCP_GET_NTP_SRV=y
 # own fallback at slot 1, so a DHCP-supplied server never displaces the pool
 # entirely. With one slot the fallback would be silently overwritten.
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
+
+#
+# USB-NCM (usb0)
+#
+# NCM rather than ECM or RNDIS. All three carry Ethernet over USB; NCM is the
+# modern one and the only one every current host takes without help -- Linux,
+# macOS and Windows 11 all bind it from their own in-box drivers. ECM has never
+# worked on Windows without a third-party .inf, and RNDIS is the mirror image,
+# Microsoft's own protocol that Linux supports and macOS does not. NCM is also
+# the efficient one: it packs several Ethernet frames into one USB transfer
+# (the NTB below), where ECM sends one frame per transfer.
+CONFIG_TINYUSB_NET_MODE_NCM=y
+
+# NTB buffers: how many aggregate blocks are in flight each way, and how large
+# each may be. Three of 3200 bytes each way is Espressif's own recommendation
+# for NCM and costs about 19KB.
+#
+# The count is what stops "tud_network_can_xmit: request blocked" under load: a
+# single buffer each way means the link stalls whenever the host has not yet
+# collected the last block. espix drops a frame it cannot hand to TinyUSB and
+# lets TCP retransmit, which is correct but slow if it happens often.
+CONFIG_TINYUSB_NCM_OUT_NTB_BUFFS_COUNT=3
+CONFIG_TINYUSB_NCM_IN_NTB_BUFFS_COUNT=3
+CONFIG_TINYUSB_NCM_OUT_NTB_BUFF_MAX_SIZE=3200
+CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200
+
+# What the computer calls this thing. Without these it enumerates as "Espressif
+# Systems / Espressif Device", which is what every unconfigured TinyUSB project
+# on the machine also calls itself.
+#
+# The serial string stays at TinyUSB's default and is the same on every board,
+# which is worth knowing: two espix devices on one computer are told apart by
+# their MAC, which is derived per chip, and not by this. Making it per-device
+# means supplying string descriptors at runtime rather than from Kconfig.
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="espix"
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"

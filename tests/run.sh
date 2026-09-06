@@ -39,7 +39,8 @@ while [ $# -gt 0 ]; do
         --host)  ESPIX_HOST="$2";   shift 2 ;;
         --user)  ESPIX_USER="$2";   shift 2 ;;
         --pass)  ESPIX_PASS="$2";   shift 2 ;;
-        --port)  ESPIX_PORT="$2";   shift 2 ;;
+        --port)  [ $# -ge 2 ] || { echo "run.sh: --port needs a value" >&2; exit 2; }
+                 ESPIX_PORT="$2";   shift 2 ;;
         -h|--help) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "run.sh: unknown option '$1'" >&2; exit 2 ;;
     esac

@@ -359,5 +359,39 @@ esp_err_t espix_net_init(void)
                    esp_err_to_name(err));
     }
 
+#if CONFIG_ESPIX_USB_NCM_ENABLED
+    /*
+     * Same bargain as WiFi: usb0 is registered whether or not anything is
+     * plugged in, and a failure here costs the USB link rather than the boot.
+     * A board with no cable in the OTG socket is the common case, not an error.
+     */
+    err = espix_net_usb_start();
+    if (err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "usb-ncm start failed: %s",
+                   esp_err_to_name(err));
+    }
+#endif
+
     return ESP_OK;
 }
+
+#if !CONFIG_ESPIX_USB_NCM_ENABLED
+/*
+ * Stubs for a build without USB-NCM, so `usb` stays a command that explains
+ * itself. A command that disappears from a build leaves the user comparing
+ * their device against documentation and guessing; one that says it was not
+ * built in has answered the question.
+ */
+void espix_net_usb_status(espix_usb_status_t *out)
+{
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));   /* .built stays false */
+    }
+}
+
+esp_err_t espix_net_conf_write_usb(espix_usb_mode_t mode)
+{
+    (void)mode;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif

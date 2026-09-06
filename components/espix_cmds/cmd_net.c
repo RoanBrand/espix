@@ -114,7 +114,24 @@ static int ip_route(espix_session_t *s)
 static int cmd_ip(espix_session_t *s, int argc, char **argv)
 {
     const char *obj = (argc > 1) ? argv[1] : "addr";
-    const char *dev = (argc > 2) ? argv[2] : NULL;
+    int         i   = 2;
+
+    /*
+     * Skip `show` and `dev`, which iproute2 accepts and mostly ignores:
+     * `ip addr show wlan0`, `ip addr show dev wlan0` and `ip addr wlan0` are
+     * all the same command there. Without this, `show` is read as the interface
+     * name, matches nothing, and the output is silently empty -- which reads as
+     * "that interface does not exist" rather than "that word was not
+     * understood". Worth having because it is what fingers type: this suite's
+     * own author wrote `ip addr show wlan0` in a test without thinking about it,
+     * and spent a minute wondering why wlan0 had no address.
+     */
+    while (i < argc &&
+           (strcmp(argv[i], "show") == 0 || strcmp(argv[i], "dev") == 0)) {
+        i++;
+    }
+
+    const char *dev = (i < argc) ? argv[i] : NULL;
 
     /* Accept the usual abbreviations: ip a, ip l, ip r. */
     if (strncmp(obj, "a", 1) == 0) {
@@ -477,6 +494,104 @@ static int cmd_hostname(espix_session_t *s, int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* usb                                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * usb0's configuration, beside `wifi` and for the same reason: espix has no
+ * text editor, so a setting that lives in a file needs a command to write it.
+ */
+static int usb_status(espix_session_t *s)
+{
+    espix_usb_status_t st;
+    espix_net_usb_status(&st);
+
+    if (!st.built) {
+        espix_printf(s, "usb-ncm was not built into this image "
+                        "(CONFIG_ESPIX_USB_NCM_ENABLED)\n");
+        return 1;
+    }
+
+    espix_printf(s, "mode:   %s\n",
+                 (st.mode == ESPIX_USB_MODE_SERVER)
+                     ? "server (espix hands the computer an address)"
+                     : "client (espix asks the computer's network)");
+
+    if (!st.started) {
+        espix_printf(s, "state:  not started\n");
+        return 0;
+    }
+
+    /*
+     * "link" rather than "state", because it is the USB link being reported and
+     * not the interface: usb0 exists either way, and what changes is whether a
+     * computer is on the other end of the cable.
+     */
+    espix_printf(s, "link:   %s\n",
+                 st.attached ? "attached" : "no host (unplugged)");
+
+    if (st.has_addr) {
+        char ip[ESPIX_IP4STR_MAX];
+        espix_printf(s, "addr:   %s/%d\n",
+                     espix_net_ip4str(st.ip, ip, sizeof(ip)),
+                     espix_net_prefix_len(st.netmask));
+        if (st.mode == ESPIX_USB_MODE_SERVER) {
+            espix_printf(s, "        ssh %s from the computer\n",
+                         espix_net_ip4str(st.ip, ip, sizeof(ip)));
+        }
+    } else if (st.attached) {
+        espix_printf(s, "addr:   none yet\n");
+    }
+
+    return 0;
+}
+
+static int cmd_usb(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "status") == 0) {
+        return usb_status(s);
+    }
+
+    if (strcmp(argv[1], "mode") == 0) {
+        if (argc < 3) {
+            espix_printf(s, "usage: usb mode {server|client}\n");
+            return 1;
+        }
+
+        espix_usb_mode_t mode;
+        if (strcmp(argv[2], "server") == 0) {
+            mode = ESPIX_USB_MODE_SERVER;
+        } else if (strcmp(argv[2], "client") == 0) {
+            mode = ESPIX_USB_MODE_CLIENT;
+        } else {
+            espix_printf(s, "usb: %s: want 'server' or 'client'\n", argv[2]);
+            return 1;
+        }
+
+        const esp_err_t err = espix_net_conf_write_usb(mode);
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            espix_printf(s, "usb-ncm was not built into this image\n");
+            return 1;
+        }
+        if (err != ESP_OK) {
+            espix_printf(s, "usb: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+
+        /*
+         * Said plainly rather than left to be discovered. Server and client are
+         * different netif flags, fixed when the interface is created, so this
+         * cannot take effect until the interface is built again.
+         */
+        espix_printf(s, "written to /etc/usb.conf; takes effect after reboot\n");
+        return 0;
+    }
+
+    espix_printf(s, "usage: usb {status|mode {server|client}}\n");
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_net_cmds[] = {
     { .name = "ip",       .fn = cmd_ip,
@@ -494,6 +609,9 @@ static espix_cmd_t s_net_cmds[] = {
     { .name = "wifi",     .fn = cmd_wifi,
       .help = "scan, connect and inspect the WiFi station",
       .usage = "wifi {scan|connect [ssid] [psk]|disconnect|status}" },
+    { .name = "usb",      .fn = cmd_usb,
+      .help = "configure and inspect the USB-NCM link",
+      .usage = "usb {status|mode {server|client}}" },
     { .name = "hostname", .fn = cmd_hostname,
       .help = "show or set the hostname",
       .usage = "hostname [name]" },

@@ -70,7 +70,14 @@ test: test-app
 	@eval "$$(./tools/idf.sh --env)"; \
 	ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh \
 	    $(if $(SUITE),--suite $(SUITE),) \
-	    $(if $(PORT),--port $(PORT),--port $$(./tools/port.sh 2>/dev/null || true))
+	    $$(p="$(PORT)"; [ -n "$$p" ] || p=$$(./tools/port.sh 2>/dev/null || true); \
+	       [ -n "$$p" ] && printf -- '--port %s' "$$p")
+
+# The port argument is built in the shell rather than with $(if ...) because
+# there may not be one. `--port $$(./tools/port.sh)` passes a bare `--port` with
+# nothing after it when no board is attached, and run.sh then dies on an unbound
+# $2 -- which is a confusing way to be told "no serial port", and happens
+# routinely now that USB-NCM gives a reason to unplug the UART cable.
 
 # Measures the known transport failure rate rather than gating on it -- see
 # tests/suites/90-stress.sh. Separate from `make test` on purpose: a check that

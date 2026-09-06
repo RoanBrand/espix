@@ -1,0 +1,60 @@
+menu "espix networking"
+
+    config ESPIX_USB_NCM_ENABLED
+        bool "USB-NCM (Ethernet over the USB-OTG port)"
+        default y
+        depends on SOC_USB_OTG_SUPPORTED
+        help
+            Presents the board to a computer as a USB Ethernet adapter, so it
+            is reachable over the cable with no WiFi, no access point and no
+            router. The interface is usb0, and it goes up and down as the cable
+            is plugged and unplugged.
+
+            This does not touch the console. espix's console is the UART, with
+            USB-Serial-JTAG as a secondary; neither uses the USB-OTG peripheral
+            this claims, and on a devkit with two sockets both work at once.
+
+            Turning it off drops espix's driver and the whole TinyUSB stack from
+            the link, which is where the flash and RAM go. The component is
+            still downloaded either way -- the component manager resolves
+            manifests before Kconfig exists, so it cannot see this option.
+
+    choice ESPIX_USB_NCM_MODE_DEFAULT
+        prompt "Default mode, before /etc/usb.conf exists"
+        depends on ESPIX_USB_NCM_ENABLED
+        default ESPIX_USB_NCM_MODE_SERVER
+        help
+            What usb0 does on a device that has never been configured.
+            /etc/usb.conf overrides this, and `usb mode` writes that file.
+
+        config ESPIX_USB_NCM_MODE_SERVER
+            bool "server -- espix hands the computer an address"
+            help
+                espix takes a fixed address and runs a DHCP server on usb0, so
+                plugging the cable in is all it takes to reach the board. The
+                offer carries an address and netmask only: no router and no DNS,
+                because espix is not a router and a gateway in that offer can
+                take over the computer's default route and break its internet.
+
+        config ESPIX_USB_NCM_MODE_CLIENT
+            bool "client -- espix asks the computer's network for one"
+            help
+                espix runs a DHCP client on usb0. For a computer that bridges or
+                shares its own network over the USB link, which is how the board
+                joins a LAN through the machine it is plugged into.
+
+    endchoice
+
+    config ESPIX_USB_NCM_ADDRESS
+        string "Address for server mode"
+        depends on ESPIX_USB_NCM_ENABLED
+        default "192.168.7.1"
+        help
+            espix's own address on usb0 in server mode; the computer is offered
+            one from the same /24.
+
+            192.168.7.x rather than 192.168.4.x, which is ESP-IDF's WiFi access
+            point default -- keeping them apart means a future AP cannot collide
+            with the USB link.
+
+endmenu

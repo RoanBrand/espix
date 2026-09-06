@@ -16,6 +16,50 @@ entry below still stands and every workaround is still load-bearing.
 
 ## ESP-IDF
 
+### The DHCP server always advertises itself as a DNS server
+
+`dhcps_dns = 0` is documented as "do not offer DNS" and behaves as "offer
+myself". In `components/lwip/apps/dhcpserver/dhcpserver.c`, the block commented
+*"Add DNS option if either main or backup DNS is set"* has an `else` that emits
+the option anyway, carrying the server's own address:
+
+```c
+} else {
+    *optptr++ = DHCP_OPTION_DNS_SERVER;
+    *optptr++ = 4;
+    optptr = dhcps_option_ip(optptr, &ipadd);   /* the server's own IP */
+}
+```
+
+So there is no value of `ESP_NETIF_DOMAIN_NAME_SERVER` that removes the option.
+Setting it to 0 through `esp_netif_dhcps_option()` returns `ESP_OK`, clears
+`OFFER_DNS` as documented, and changes nothing on the wire, because the cleared
+flag simply selects the branch that hardcodes the server's address. Zeroing the
+address with `esp_netif_set_dns_info()` does not help either — that is the other
+half of the same `&&`, so it selects the same `else`.
+
+Measured rather than read: with both calls made and both returning `ESP_OK`, a
+macOS client still records
+
+    domain_name_server (ip_mult): {192.168.7.1}
+
+in `ipconfig getpacket`. The neighbouring router option *is* suppressible by the
+same mechanism and is verifiably absent from the same packet, which is what
+makes this a defect in one option rather than a misunderstanding of the API.
+
+**Why it matters.** A DHCP server that is not a resolver should not name itself
+as one. espix's USB-NCM link (`usb0` in server mode) hands a computer an address
+and then tells it to resolve names at an address where nothing is listening.
+The damage is limited — the client keeps its own default route and its own DNS,
+and both Linux and macOS scope a resolver to the interface that supplied it —
+but it is a pointer to a service that does not exist, and no caller can decline
+it.
+
+**espix's workaround: none, because there is none.** The router option is
+suppressed and the DNS option is documented as unavoidable. Worth re-testing if
+the DHCP server ever gains a real "offer nothing" value; `components/espix_net/usb_ncm.c`
+says so at the point where the suppression would go.
+
 ### The VFS has no `chmod`
 
 `esp_vfs_fs_ops_t` carries `truncate`, `ftruncate` and `utime` and nothing else
