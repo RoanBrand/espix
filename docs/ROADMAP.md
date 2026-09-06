@@ -422,6 +422,30 @@ things are as they are.
   The S31 and P4 are on the hardware list partly for this: more RAM on one, and
   a second real Ethernet MAC on the other.
 
+- **ESP-NOW, as a device rather than an ABI.** espix publishes lwIP sockets and
+  the resolver to apps and nothing else, so the radio is unreachable from an
+  app: no `esp_wifi_*`, no `esp_now_*`. USB-NCM makes that worth fixing, because
+  a board whose uplink is the cable has a radio doing nothing — and ESP-NOW
+  peers must sit on the station's channel while it is associated, so such a
+  board can choose its own channel instead of inheriting the access point's.
+
+  **Expose it as `/dev/espnow`**, not as exported symbols. An app opens it,
+  writes a frame, reads what arrives; peers are configuration rather than API
+  calls. That is what a Unix does with a radio, it keeps the ABI from growing an
+  `esp_now_*`-shaped hole that every future app links against, and it makes the
+  permission story fall out of the file mode instead of needing one of its own.
+
+  It would be espix's **first device driver of its own** -- `/dev/uart` is live
+  in this build but it is ESP-IDF's. Two things already in the way, both in
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md): `ls /dev` cannot list mount points, and a
+  device VFS with no `stat` cannot be listed by `ls -l`. So the driver would work
+  and be invisible, which makes this a good exercise and an unsatisfying one
+  until the mount table lands -- the first Filesystem item here.
+
+  Related to **Per-app export tables**: handing every loaded app a radio is
+  exactly the thing that item exists to stop, and a device node is how the
+  answer gets to be "chmod it" rather than "maintain a second symbol table".
+
 - **WiFi power save, decided rather than inherited.** espix never calls
   `esp_wifi_set_ps()`, so it runs IDF's default of `WIFI_PS_MIN_MODEM`: the
   station sleeps and wakes to hear a beacon once per DTIM period. That is the

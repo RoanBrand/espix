@@ -4,8 +4,14 @@ espix presents itself to a computer as a USB Ethernet adapter, so a board
 plugged into a laptop is reachable over the cable with no WiFi credentials, no
 access point and no router. The interface is `usb0`.
 
-This is the quickest way to reach a device that has never been configured, and
-the most dependable way to reach one on a bench, where WiFi is usually the least
+**What this is not** is the way to reach a device that has never been
+configured — that is what the serial console is for, and flashing and then
+`idf.py monitor` will always be the first contact with a new board. The console
+gives you a shell.
+
+What it adds is a *network*, without a network: `scp` and `sftp`, more than one
+session at once, and every tool that speaks IP rather than a terminal. On a
+bench that also makes it the dependable one, since WiFi is usually the least
 reliable thing in the room.
 
 ## Which socket
@@ -117,33 +123,33 @@ created, so switching means building it again.
 
 ## Setting up the computer for `client` mode
 
-This part is not espix. Everything below configures the machine at the other end
-of the cable, and it is included because `client` mode is useless without it —
-not because espix has any opinion about how you do it.
+This part is not espix. Everything here configures the machine at the other end
+of the cable, and it is included because `client` mode is useless without it.
 
-Two shapes to choose between:
+**The goal, in one sentence:** the computer already has an uplink that gives it
+a LAN address, a default gateway and DNS — put `usb0` on that same network, so
+espix gets the same three things from the same place everything else on the LAN
+does.
 
-- **Bridging** puts the board directly on your existing network. It gets an
-  address from the same DHCP server as everything else, and other machines on
-  the LAN can reach it. This is usually what you want.
-- **Sharing** (NAT) puts the board on a private network behind the computer. It
-  can reach out; nothing can reach in without a port forward.
+There are two ways, and which are available to you is decided by what that
+uplink is, not by preference:
 
-### Linux, bridging
+| | what it does | when you can use it |
+|---|---|---|
+| **Bridge** | `usb0` and the uplink become one segment. espix gets its address from the LAN's own DHCP server and other machines can reach it directly. | Uplink is **wired** |
+| **Share** (NAT) | The computer runs DHCP and NAT on `usb0`. espix sits on a private network behind it: it can reach out, nothing reaches in unsolicited. | **Any** uplink, and the only option on WiFi |
 
-The USB interface appears as `usb0`, or as `enx` followed by the device's MAC.
-Check `ip link` after plugging in.
+**WiFi uplinks cannot be bridged**, and it is worth knowing why before you spend
+an evening on it. An 802.11 frame from a station carries three addresses where
+bridging needs four, so a station cannot forward traffic on behalf of another
+MAC unless both ends do 4addr/WDS, which most access points and drivers do not.
+`nmcli` and `brctl` will accept the configuration without complaint and pass no
+traffic. If the computer is on WiFi, share instead.
 
-With NetworkManager, which is what most desktops run:
+### Linux — bridge to a wired uplink
 
-```bash
-nmcli connection add type bridge con-name br0 ifname br0 stp no
-nmcli connection add type bridge-slave ifname eth0 master br0
-nmcli connection add type bridge-slave ifname usb0 master br0
-nmcli connection up br0
-```
-
-Or, without NetworkManager, for one session:
+Names below are the usual ones: `eth0` is the computer's wired uplink, `usb0` is
+espix, `br0` is the bridge. Check yours with `ip link` first.
 
 ```bash
 sudo ip link add br0 type bridge
@@ -153,40 +159,100 @@ sudo ip link set br0 up
 sudo dhclient br0
 ```
 
-Note that bridging takes `eth0` into the bridge, so the machine's own address
-moves to `br0`. Doing this over a remote session to that machine will disconnect
-it.
+That is the whole thing. `br0` takes over `eth0`'s address, and espix picks up
+one of its own from the LAN's DHCP server:
 
-### Linux, sharing instead
+```
+$ ip link show master br0
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ... master br0 ...
+3: usb0: <BROADCAST,MULTICAST,UP,LOWER_UP> ... master br0 ...
+```
+
+The computer's own address moves from `eth0` onto `br0`, so **doing this over a
+remote session to that machine will disconnect it.** Run it from a local
+console, or from a script that finishes the job either way.
+
+It also does not survive a reboot. Making it permanent is however your
+distribution configures networking, and is out of scope here.
+
+### Linux — share, for any uplink
 
 ```bash
 nmcli connection modify <usb-connection> ipv4.method shared
 nmcli connection up <usb-connection>
 ```
 
-NetworkManager then runs a DHCP server and NAT on that interface. espix in
-`client` mode picks up an address from it.
+NetworkManager then runs DHCP and NAT on that interface. This is the one to use
+when the computer is on WiFi.
 
 ### macOS
 
 System Settings → General → Sharing → Internet Sharing. Share from Wi-Fi, to the
 USB Ethernet device that appeared when you plugged the board in, then switch it
-on. macOS runs DHCP and NAT on that interface, so this is the sharing shape
-rather than the bridging one.
+on.
 
-macOS has no supported bridging of a USB Ethernet device into the built-in
-network. If you need the board on the LAN proper, use a Linux machine or a
-single-board computer as the bridge.
+This is sharing, not bridging: macOS runs DHCP and NAT on that interface. There
+is no supported way to bridge a USB Ethernet device into the built-in network.
+If you need the board on the LAN proper, bridge from a Linux machine or a
+single-board computer instead.
 
 ### Windows
 
 Network Connections → right-click the adapter with the internet → Properties →
 Sharing → "Allow other network users to connect through this computer's Internet
-connection", and pick the USB Ethernet adapter. This is Internet Connection
-Sharing, which is again NAT rather than bridging.
+connection", and pick the USB Ethernet adapter. That is Internet Connection
+Sharing, which is NAT.
 
-Windows can also bridge: select both adapters, right-click, "Bridge
-Connections".
+Windows can also bridge, for a wired uplink: select both adapters, right-click,
+"Bridge Connections".
+
+### Confirming it worked, from espix
+
+`ip addr show usb0` is the test: in `client` mode the address comes from the
+LAN's DHCP server, so what you want to see is one in the computer's own range.
+An address of 192.168.7.1 means espix is still in `server` mode and none of the
+above is being used — check `usb status`, and remember `usb mode` only takes
+effect after a reboot. See [Checking it](#checking-it) for the rest.
+
+## Why bother — what the cable buys you
+
+Beyond having a network without needing one:
+
+- **No WiFi credentials on the device.** `/etc/wifi.conf` holds the PSK in
+  plaintext — it is 0600 and espix explains why — but a board that gets its
+  network over the cable never has one written at all. That is the difference
+  between losing a board and losing your network's password, and it matters for
+  anything handed to someone else or left where it might be picked up.
+- **A device with WiFi unconfigured is a supported setup, not a broken one.**
+  espix logs "no network configured", carries on booting, and everything works
+  over `usb0`. You can simply never run `wifi connect`.
+- **Latency that does not move.** No contention for airtime, no distance, no
+  access point having an afternoon, and no power-save sleep schedule to wait
+  on. The USB figure is the same on every run, which for an interactive shell
+  is worth more than a higher peak.
+- **Faster, on the parts where the USB is.** Careful here: the ESP32-S3's USB is
+  **full-speed only**, 12 Mbit/s, so the measurement below shows USB ahead by
+  about 12% and the bottleneck is the SSH transport rather than either link. The
+  P4 and S31 have **high-speed** USB at 480 Mbit/s, where the headroom is real
+  and the comparison would look quite different.
+- **Less power.** The radio is the expensive part of an ESP32, and a device that
+  never associates never pays for it — no scanning, no association, no beacons
+  to wake for.
+- **It stops competing with your own WiFi.** One more station associated is one
+  more thing contending for airtime on that channel, retrying, and taking its
+  turn. A board on a cable is off the air entirely, which matters most in the
+  places where boards accumulate.
+- **The radio is left free.** A station that is not holding an association is a
+  radio you could spend on something else: ESP-NOW, scanning, or an access point
+  for other devices. There is a real technical edge here rather than just spare
+  capacity — ESP-NOW peers have to sit on the station's channel while it is
+  associated, so a device whose uplink is the cable can choose its own channel
+  instead of inheriting the one the access point happened to pick.
+
+  **espix cannot use the radio that way yet.** Apps get lwIP sockets and the
+  resolver and nothing else; there is no `esp_wifi_*` or `esp_now_*` in the ABI.
+  The cable frees the radio, and giving apps a way to reach it is a roadmap item
+  — see [ROADMAP.md](ROADMAP.md).
 
 ## Checking it
 
@@ -222,10 +288,13 @@ Measured on an ESP32-S3, 5000 lines of app output over `ssh`, three runs each:
 | over `usb0` | 12.8s, about 389 lines/s |
 | over `wlan0` | 14.4s, about 347 lines/s |
 
-So USB is a little quicker, and that is not really the point — the difference is
-around 12%, where the link itself is full-speed USB and the bottleneck is the
-SSH transport at both ends. What USB gives you is a number that does not move:
-no contention, no distance, no access point having a bad afternoon.
+So USB is a little quicker, and on this part that is not really the point. The
+S3's USB is full-speed — 12 Mbit/s — so neither link is the bottleneck here; the
+SSH transport at both ends is, which is why the gap is 12% and not an order of
+magnitude. What USB gives you on an S3 is a number that does not move.
+
+The P4 and S31 have high-speed USB at 480 Mbit/s. There the link stops being
+comparable to WiFi at all, and this table would be worth measuring again.
 
 ## Building it out
 
