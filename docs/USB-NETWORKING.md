@@ -156,11 +156,27 @@ sudo ip link add br0 type bridge
 sudo ip link set eth0 master br0
 sudo ip link set usb0 master br0
 sudo ip link set br0 up
-sudo dhclient br0
 ```
 
-That is the whole thing. `br0` takes over `eth0`'s address, and espix picks up
-one of its own from the LAN's DHCP server:
+That is all espix needs. A bridge forwards at layer 2, so espix's DHCP request
+crosses it as a frame and your router answers it directly — the computer in the
+middle is not involved, and `br0` does not need an address of its own for any of
+it to work.
+
+What the computer *does* need is an address for itself. Enslaving `eth0` to the
+bridge means frames arriving on it go to `br0` instead of up `eth0`'s own IP
+stack, so the address that used to work there does not any more:
+
+```bash
+sudo dhclient br0        # only if nothing else is going to do it
+```
+
+On most distributions nothing needs typing, because whatever manages networking
+— `dhcpcd` or NetworkManager on a Raspberry Pi, depending on the release — sees
+a new interface and configures it. That is why this step is easy to have never
+run and not noticed.
+
+Check both ports joined:
 
 ```
 $ ip link show master br0
@@ -168,12 +184,13 @@ $ ip link show master br0
 3: usb0: <BROADCAST,MULTICAST,UP,LOWER_UP> ... master br0 ...
 ```
 
-The computer's own address moves from `eth0` onto `br0`, so **doing this over a
-remote session to that machine will disconnect it.** Run it from a local
-console, or from a script that finishes the job either way.
+Because the computer's address moves off `eth0`, **running this over a remote
+session to that machine will disconnect it** — there is a window between
+enslaving `eth0` and `br0` being configured. Do it from a local console, or from
+a script that gets to the end either way.
 
-It also does not survive a reboot. Making it permanent is however your
-distribution configures networking, and is out of scope here.
+None of it survives a reboot. Making it permanent is however your distribution
+configures networking, and is out of scope here.
 
 ### Linux — share, for any uplink
 
