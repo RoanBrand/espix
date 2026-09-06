@@ -211,6 +211,25 @@ things are as they are.
   has no mount table yet -- the first item in this section is the precondition.
   When it lands, chroot semantics become worth building on top of this.
 
+  **The closer relative is `unveil(2)`, not `chroot(2)`**, and it is worth being
+  precise because the name is a trap. chroot changes what `/` *means*: a process
+  under `chroot /srv/www` opens `/index.html` and the kernel hands it
+  `/srv/www/index.html`. espix rewrites nothing -- `resolve()` in
+  `espix_fs/vfs.c` resolves the path normally and *then* refuses anything
+  outside the root, so the program must still say `/srv/www/index.html`. That is
+  OpenBSD's `unveil(2)`, or Linux's Landlock: a visibility filter over ordinary
+  path resolution. Calling this `chroot` would silently break anyone porting a
+  real chroot invocation, which matters for a security feature. Whatever the
+  confinement launcher ends up being called (see the `run` item under Shell and
+  console), it should not be called chroot until it earns the name.
+
+  **It has no automated test**, which is the gap worth closing first. The only
+  coverage is `apps/hello`, run by hand. This is a boundary that already
+  regressed once -- `abi_chmod` resolved its own paths and bypassed the root for
+  a commit -- and `tests/suites/30-proc.sh` is where it belongs, beside the
+  existing "an app is refused /etc/passwd". Held back only so it lands with
+  whatever the command is finally called.
+
   **The confinement starts after the ELF is loaded**, immediately before the
   entry point, which is where `execve(2)` draws the same line: espix opens the
   binary through the caller's view of the filesystem, and only the program runs
@@ -273,6 +292,25 @@ things are as they are.
   claiming no common algorithm. Algorithm lists are not a stable surface.
 
 ## Shell and console
+
+- **Remove `run`.** It is redundant, and only history explains it: there was no
+  executable bit when it was written, so something had to say "this file is a
+  program". There is one now, and the shell's exec fallback
+  (`exec_fallback()` in `cmd_run.c`) already does everything a Unix shell does
+  with a command that is not a builtin -- resolves a name containing a slash as
+  a path and anything else in `/bin`, checks `S_ISREG`, checks the execute bit
+  and returns 126 `Permission denied`, checks the ELF magic and returns
+  `Exec format error`, honours a trailing `&`, and reports 127
+  `command not found` otherwise. `hello` and `/bin/hello` already work today.
+
+  `run` adds exactly one thing that fallback lacks: `-R`. So removing it is
+  really the question of where confinement lives, and under what name --
+  see **A root for an app** under Filesystem, and note that `chroot` is the
+  wrong name for what espix actually does.
+
+  The cost is about thirty references across `README.md`, `docs/`, `tests/` and
+  the help text in `cmd_sys.c`; the test suite invokes `run testapp ...`
+  throughout. Worth doing as its own change, where the diff is only about this.
 
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style

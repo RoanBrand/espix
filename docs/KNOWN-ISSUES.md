@@ -35,140 +35,6 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   exactly what `espix_sigcheck()` is exported for. `apps/sigtest spin` is the
   case in the flesh. SIGKILL is the answer when it is somebody else's binary.
 
-- **`ssh host <cmd>` was unreliable; the causes are now understood.** It
-  truncated output and reported 255 for commands that had succeeded, roughly a
-  third of the time, while the same app was correct every time on the serial
-  console. Five separate defects turned out to be involved, all now fixed:
-
-  - The client's `CHANNEL_EOF` was treated as the channel closing.
-  - A stale event-group bit made `espix_proc_wait()` report a freshly spawned
-    process as already finished.
-  - `conn->out_buf` was filled outside the transmit lock at six sites, so one
-    writer overwrote another's packet in flight — usually the exit status.
-  - A use-after-free that rebooted the board: `esp_cleanup_r()` fcloses an app's
-    stdout at `vTaskDelete()`, writing through a session whose channel
-    `finish_session()` had already freed.
-  - The connection was closed with a bare `close()` the moment the channel
-    finished. The client's own `CHANNEL_CLOSE` was then still unread in the
-    receive buffer, and `close()` with unread data sends an RST rather than a
-    FIN — which discards whatever is still queued to send. That is what
-    produced "Connection closed by remote host", and when the reset overtook
-    the last packets the client lost the exit status and reported 255.
-
-  The last one hid the others for a long time because the server log is
-  identical either way: every one of those connections reaches "connection
-  closed" normally. Nothing is wrong with the session — only with the goodbye.
-
-- **A sixth cause: an app's output could corrupt the SSH stream. Fixed.**
-  `ssh host 'run testapp out 2000'` failed most of the time with
-  `Corrupted MAC on input`, and espix sometimes logged a mismatch of its own on
-  an *inbound* packet. One bug produced both.
-
-  **The cause was a buffer shared between the two directions.** `ssh_conn_t`
-  had a single `frame`, and the transmit path does not merely build in it — the
-  ciphertext it hands to `write_all()` *is* `frame + 8`, so the buffer stays
-  live for the whole send. The inbound MAC check borrowed the same buffer as
-  scratch, assembling `seq ‖ length ‖ ciphertext` there to verify it. Sends hold
-  the channel's `tx_lock` and reads hold `rx_lock`, so nothing ever excluded the
-  two: an inbound packet arriving mid-send overwrote ciphertext that had already
-  been MAC'd. The peer then read a packet whose framing was perfect and whose
-  MAC could not verify. The same collision in the other order failed a perfectly
-  good inbound packet, which is the mismatch espix logged.
-
-  That explains every symptom that made this hard: the cliff (it needs enough
-  outbound packets to overlap an inbound window adjust), the byte-perfect
-  framing in a wire capture (only the payload was rewritten, never the length),
-  and the implausible channel ids the client reported (fragments of an inbound
-  packet's ciphertext decrypted as garbage).
-
-  **The fix removes the sharing rather than adding a lock**: the receive path
-  now streams its MAC through `psa_mac_verify_setup`/`update`/`verify_finish`
-  and needs no scratch buffer at all. A lock spanning both directions would
-  serialise reads against writes, which is precisely what a duplex transport
-  must not do. `frame` is now `tx_frame`, so the ownership is in the name.
-
-  **Measured after the fix**, on a build carrying no instrumentation: 0 of 20 at
-  `out 2000`, 0 of 15 at `out 5000` (2.5× past the old cliff), and 12 of 12
-  clean across four rounds of three concurrent sessions — with no `MAC
-  mismatch`, framing error or lost-output warning on the serial console
-  throughout. Before the fix the same reproducer failed 6 of 8.
-
-  **Ruled out along the way, so nobody pays for these twice:** the app task
-  overflowing its stack (16 KB changed nothing); `write_all()` abandoning a
-  partial send on EAGAIN (that branch is unreachable — the socket is blocking,
-  so `send()` never returns EAGAIN); two tasks inside `ssh_packet_write()` (a
-  collision counter read zero, and correctly so — the colliding party was a
-  *reader* in another function holding another lock, which is exactly what that
-  counter could not see); `wait_for_window()`; the connection living in PSRAM
-  (`CONFIG_ESPIX_SSH_CONN_IN_PSRAM=n` was *worse*); and hardware AES
-  (`CONFIG_MBEDTLS_HARDWARE_AES=n` gave the same rate).
-
-  **The stranded-connection claim, previously withdrawn, was right after all.**
-  It was withdrawn because nothing could separate a stranded task from a
-  developer logged in at another terminal. Two signals settle it: `ps` showed
-  four blocked `app:testapp` tasks alongside the four `sshd:conn` tasks — and
-  nobody logs in by running `testapp` — and a bare TCP connect to port 22
-  answered `espix: too many connections (4 of 4 in use)`. Every slot had leaked.
-  A corrupted stream made the client hang up mid-write and the session never
-  tore down. No strand has been seen in 47 runs since the fix.
-
-  That probe is the cheapest health check available and needs no keys: connect
-  to port 22 and read the first line. espix refuses in plain text, so it tells
-  "wedged", "slots exhausted" and "healthy" apart in three lines of script.
-
-  **A second defect found alongside it, also fixed:** the socket carried
-  `SO_RCVTIMEO` but no `SO_SNDTIMEO`, and it is blocking. A peer that stopped
-  reading *and did not close* therefore parked its connection task in `send()`
-  for as long as it stayed silent, and four such peers exhausted
-  `CONFIG_ESPIX_SSH_MAX_SESSIONS` — reachable by anyone who can open a socket to
-  port 22. `BLOCKED_WRITE_TIMEOUT_MS` in `write_all()` could not fire, because a
-  blocking socket never returns EAGAIN; that is also why an earlier
-  investigation's "zero EAGAIN on every connection" was true and meaningless.
-  (A peer that stopped reading and then *closed* was always handled.)
-
-  The comment on `SO_RCVTIMEO` in `ssh_server.c` already described this exact
-  failure, for the receive direction, and the same reasoning was never carried
-  to send — the third time in this file that a lesson learned for one direction
-  was not applied to the other.
-
-  Fixed by setting `SO_SNDTIMEO`, which makes `write_all()`'s existing retry
-  reachable, and by closing the channel in `send_packet()` when a write fails:
-  a partly-sent packet cannot be un-sent and the peer cannot resynchronise, so
-  continuing turns a dropped connection into a silently corrupt one.
-  `send_data()` already did this; `adjust_local_window()` did not.
-
-  Guarded by a case in `tests/suites/90-stress.sh`, which relays a session
-  through `tests/lib/stallproxy.py` and has that relay go quiet mid-stream while
-  holding both sockets open. Verified to discriminate: STRANDED after 197s
-  without the send timeout, reclaimed in ~15s with it.
-
-  Reproduce the original with:
-
-      make stress
-
-  and watch the serial console while it runs — the failure announces itself
-  there as `ssh: MAC mismatch on packet N`, which is how it was finally caught.
-
-  One thing found while chasing this *was* fixed, and it is worth knowing about
-  because it could have produced exactly these symptoms: **a kernel log echoed
-  through the calling task's `stdout`.** `klog_store()` printed with a plain
-  `printf()`, and newlib's `stdout` is per-task — `espix_proc` points a loaded
-  app's at the session it was launched from, so for an SSH session `printf()`
-  *is* the encrypted channel. Any klog at INFO or above from the send path
-  therefore re-entered that path: `klog` → `printf` → `chan_write` →
-  `ssh_packet_write` → another klog, unbounded, on an 8KB app stack, with the
-  inner packet rebuilding the shared `out_buf` and bumping `seq_out` underneath
-  the outer send. `tx_lock` does not catch it — it is recursive by design so
-  `chan_write()` can nest `send_data()`.
-
-  klog now writes to a console stream captured at boot. This is not offered as
-  the cause of the corruption above: the reachable sites are
-  `wait_for_window()`'s two warnings and `ssh_packet_write()`'s two framing
-  errors, and none of those strings appears anywhere in the several hundred
-  `dmesg` lines captured across ~350 runs, failing ones included. They do not
-  fire. A hazard closed, not a bug explained.
-
-
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
   `espix_fault_request_reap()` exists with no callers.
@@ -288,16 +154,15 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   past that ceiling the listing stops and says `ls: stopped at 512 entries`
   rather than silently ending. The same applies if the allocation fails partway.
 
-- **No file has an owner**, so `chown` does not exist and setuid, setgid and
-  sticky are refused by `chmod` rather than stored. There are two identities --
-  `root` on the console, `esp` over SSH -- but nothing records which of them a
-  file belongs to, and all three of those bits are defined in terms of one.
-
 - **SFTP silently drops setuid, setgid and sticky** where the shell's `chmod`
   refuses them out loud. SFTP has no partial-success status, so failing the
-  request would fail an entire `scp -p` over a bit that was never going to be
-  honoured. Setting the mode of a *directory* over SFTP is accepted and ignored
-  for the same reason.
+  request would fail an entire `scp -p` over one bit.
+
+  Note the reason has inverted since this was written. It used to be that the
+  bits were never honoured anyway, so dropping them cost nothing; espix now acts
+  on setuid, which is precisely why an upload must not be able to set it. The
+  silence is the part that remains wrong, not the dropping. Setting the mode of
+  a *directory* over SFTP is accepted and ignored for the same reason.
 
 - **A process root is a filesystem boundary, and only that.** `run -R <dir>`
   stops a process resolving a path outside `<dir>` — see
