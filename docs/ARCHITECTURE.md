@@ -740,7 +740,7 @@ Two consequences follow from an app's stdout reaching the transport:
   stream is closed — which is what a hangup means on a real terminal.
 
 Redirection is deliberately *not* wired into this: `session->redirect` is closed
-when the command returns, and `run app > file &` would leave an app holding a
+when the command returns, and `app > file &` would leave an app holding a
 dead `FILE *`. So `>` still captures a command's output and not an app's.
 
 ### The login greeting is a command

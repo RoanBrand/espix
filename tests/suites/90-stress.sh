@@ -50,14 +50,14 @@ APP="/home/$ESPIX_USER/testapp"
 #     ./tests/run.sh --suite stress --stress --stress-lines 5000
 LIMIT=${ESPIX_STRESS_LIMIT:-0}
 
-printf '  running %d iterations of `run testapp out %d`...\n' "$N" "$LINES"
+printf '  running %d iterations of `testapp out %d`...\n' "$N" "$LINES"
 
 corrupt=0
 short=0
 ok=0
 i=1
 while [ "$i" -le "$N" ]; do
-    out=$(dev_once "run $APP out $LINES")
+    out=$(dev_once "$APP out $LINES")
 
     case "$out" in
         *"Corrupted MAC"*|*"message authentication code incorrect"*|\
@@ -151,7 +151,7 @@ else
     # killed at the end.
     SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
         ssh $DEV_SSH_OPTS -p "$PROXY_PORT" "$ESPIX_USER@127.0.0.1" \
-        "run $APP out 20000" >/dev/null 2>&1 &
+        "$APP out 20000" >/dev/null 2>&1 &
     stalled_ssh=$!
 
     waited=0

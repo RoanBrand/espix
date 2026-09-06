@@ -171,6 +171,15 @@ If it still fails, re-run it alone (`make test SUITE=console`) before believing
 it. That is an unsatisfying instruction to write in a document about trusting
 your tests, and it is better than a suite that quietly passes.
 
+**It now fails fast.** Two things used to make a dead console cost minutes. The
+initial sync shared `--timeout` with the command wait, so three attempts at 30s
+was 92 seconds; sync has its own `--sync-timeout` (4s) now, because a console
+that is there answers a newline in milliseconds and one that is not will not
+start answering because we waited longer. And every `dev_console_run` spawns its
+own `console.py`, so that cost was paid *per assertion* — five commands, seven
+minutes, five failures reporting one fact. The suite now probes once and skips
+the rest if the console is not there. Worst case went from about 450s to 16s.
+
 ## The test app
 
 `tests/app/` is its own IDF project, so `tools/build-apps.sh` — which globs

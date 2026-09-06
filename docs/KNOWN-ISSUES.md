@@ -164,7 +164,7 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   silence is the part that remains wrong, not the dropping. Setting the mode of
   a *directory* over SFTP is accepted and ignored for the same reason.
 
-- **A process root is a filesystem boundary, and only that.** `run -R <dir>`
+- **A process root is a filesystem boundary, and only that.** `confine <dir>`
   stops a process resolving a path outside `<dir>` — see
   [ROADMAP.md](ROADMAP.md) — but four things sit outside what it covers:
 
@@ -184,7 +184,7 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 - **A command's diagnostics go to stdout, so a redirect swallows them.** espix
   has no stderr: `espix_printf()` is one path for output and errors alike, so
-  `run /bin/nosuch > log` puts "no such file" in `log` rather than on the
+  `/bin/nosuch > log` puts "no such file" in `log` rather than on the
   terminal, and `2>/dev/null` silences nothing. A loaded app has distinct
   `stdout` and `stderr` pointers but both write to the same channel, so the
   same is true for apps. See **Shell and console** in [ROADMAP.md](ROADMAP.md).

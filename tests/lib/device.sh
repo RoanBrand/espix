@@ -199,10 +199,17 @@ dev_capture() {
 # several commands in one call if it matters.
 dev_console_run() {
     [ -n "$ESPIX_PORT" ] || { echo "dev_console_run: no serial port"; return 1; }
-    local out
+    local out rc
     out=$(printf '%s\n' "$@" \
           | "$ESPIX_PYTHON" "$ESPIX_LIB_DIR/console.py" --port "$ESPIX_PORT" 2>&1)
+    rc=$?
+
+    # Captured before the filter and returned explicitly, because the obvious
+    # version returns sed's status instead -- always zero, so a console that
+    # never answered looked like a command that returned nothing. dev_push had
+    # this exact bug and it cost an afternoon.
     printf '%s' "$out" | sed -e '/^<<<ESPIX-/d'
+    return $rc
 }
 
 # --------------------------------------------------------------- test app ---

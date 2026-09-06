@@ -104,7 +104,7 @@ struct espix_session {
      *
      * An app calls libc printf, which writes to its task's stdout, not through
      * this struct's write(). espix_proc points that task's streams at what this
-     * returns, which under newlib rebinds only that task; without it, `run`
+     * returns, which under newlib rebinds only that task; without it, an app run
      * over SSH would print on the serial console.
      *
      * A factory rather than one shared FILE, because ESP-IDF closes a task's

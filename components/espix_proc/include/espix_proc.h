@@ -95,7 +95,7 @@ esp_err_t espix_proc_init(void);
  * inheriting a cwd that lies outside it.
  *
  * The binary itself is read before the process exists, so it may live anywhere;
- * `run -R /srv/www /bin/httpd` is the ordinary shape rather than a loophole.
+ * `confine /srv/www /bin/httpd` is the ordinary shape rather than a loophole.
  */
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
                                espix_session_t *session, const char *root,

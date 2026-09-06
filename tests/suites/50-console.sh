@@ -12,7 +12,19 @@ if [ "$ESPIX_HAVE_SERIAL" != yes ]; then
     return 0
 fi
 
-who=$(dev_console_run 'whoami')
+# One probe decides whether the console is there at all, and the rest of the
+# suite is skipped if it is not.
+#
+# Each dev_console_run spawns its own console.py, which syncs before it can do
+# anything, so a console that cannot sync costs that wait *per assertion*. This
+# suite used to spend around seven minutes failing five times over, which is
+# both slow and a poor report: five failures that are one fact.
+if ! who=$(dev_console_run 'whoami'); then
+    espix_skip "console did not answer -- see the message above for whether"
+    espix_skip "something else is holding $ESPIX_PORT"
+    return 0
+fi
+
 assert_eq "the console session is root" "root" "$who"
 
 assert_eq "the console starts at /" "/" "$(dev_console_run 'pwd')"

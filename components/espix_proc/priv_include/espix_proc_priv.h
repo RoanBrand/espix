@@ -94,7 +94,7 @@ typedef struct {
      *
      * Raising privilege around the load would have been the other way to get
      * there, and it is wrong: privilege bypasses the permission check as well,
-     * so `run -R ... /home/someone/private` would load a file the caller may
+     * so `confine ... /home/someone/private` would load a file the caller may
      * not read. The load must stay unprivileged and merely unrooted.
      *
      * volatile and unlocked for the same reason as stop_requested: one writer,

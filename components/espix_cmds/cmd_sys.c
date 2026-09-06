@@ -247,7 +247,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
     free(tasks);
 
     /* Processes that have finished keep their table slot, so report them too:
-     * that is where `run` gets an exit status from. */
+     * that is where a foreground command gets its exit status from. */
     espix_proc_info_t procs[8];
     const size_t n = espix_proc_snapshot(procs, sizeof(procs) / sizeof(procs[0]));
 

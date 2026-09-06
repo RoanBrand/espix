@@ -12,7 +12,7 @@
  * on the path at all.
  *
  * So permissions could not be enforced -- checking in `cat` alone is a boundary
- * you step around with `run`. This is exactly why NuttX enforces file
+ * you step around by running a program. This is exactly why NuttX enforces file
  * permissions and espix could not: NuttX owns its VFS.
  *
  * Linux and NuttX both check permissions in the *VFS*, not in filesystems --
@@ -276,7 +276,8 @@ static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
  * attribute or from the rule -- and this is the one place every caller passes
  * through, so it belongs here rather than in each of them.
  *
- * It replaces three separate lookups. `ls -l`, the SFTP server and `run` each
+ * It replaces three separate lookups. `ls -l`, the SFTP server and the exec
+ * path each
  * called espix_fs_mode() alongside stat() because stat() could not be trusted;
  * now they read st_mode like any other program would, and an app that calls
  * stat() sees exactly what `ls -l` shows without espix wrapping anything.

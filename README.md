@@ -276,7 +276,7 @@ merely missing.
 | Output redirection `>` `>>` | **yes** | |
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
-| Background jobs `&` | **partial** | `run cmd &` works; no `jobs`, `fg`, `bg`, Ctrl-Z |
+| Background jobs `&` | **partial** | `cmd &` works, but dies at logout; no `jobs`, `fg`, `bg`, Ctrl-Z |
 | Pipes <code>&#124;</code> | **planned** | |
 | Input redirection `<`, `2>` as its own stream | **planned** | one output stream today |
 | Environment variables, `export` | **planned** | there is no environment at all yet |
@@ -348,7 +348,7 @@ merely missing.
 | Groups with members | **yes** | `/etc/group`, supplementary membership, and the group triad actually checked |
 | `useradd`, `userdel`, `usermod` | **yes** | `-r` for a service account: locked, low uid, no home |
 | `groupadd`, `groupdel`, `groups` | **yes** | |
-| A root for an app, `run -R <dir>` | **yes** | it cannot *name* a path outside, which is the question permissions never ask |
+| A root for an app, `confine <dir>` | **yes** | it cannot *name* a path outside, which is the question permissions never ask |
 | Restricting what an app may call | **partial** | the ELF loader's export table is one, but it is fixed rather than per-app |
 | An editor | **no** | no `nano` or `ed`, so editing a config on the device means `echo >` |
 
@@ -389,8 +389,8 @@ grants it — the arrangement Debian ships, where RHEL would say `%wheel`.
 
 Services get their own identity rather than running as whoever started them:
 `useradd -r www` makes a locked account with a low uid and no home, and
-`sudo -u www /bin/httpd &` runs the app as it. Add `run -R` and it gets its own
-view of the filesystem as well — `sudo -u www run -R /srv/www /bin/httpd &` is
+`sudo -u www /bin/httpd &` runs the app as it. Add `confine` and it gets its own
+view of the filesystem as well — `sudo -u www confine /srv/www /bin/httpd &` is
 an account that owns nothing else and a process that can see nothing else. No
 service manager is involved — that is the whole mechanism.
 

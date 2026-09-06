@@ -30,7 +30,7 @@
 
 #define TAG "exec"
 
-/* Largest app image we will read into RAM. Guards against `run`ning something
+/* Largest app image we will read into RAM. Guards against running something
  * that is not an app at all. */
 #define EXEC_IMAGE_MAX (2 * 1024 * 1024)
 
@@ -283,7 +283,7 @@ static void proc_task(void *arg)
         goto done;
     }
 
-    /* Debug, not info: every `run` would otherwise print a line above the
+    /* Debug, not info: every spawn would otherwise print a line above the
      * app's own output. Still recorded, so `dmesg` can show it. */
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "pid %d: %s relocated (%u bytes)",
                (int)slot->info.pid, slot->info.name,

@@ -1,8 +1,13 @@
 /*
- * Process commands: run, kill, crash.
+ * Process commands: confine, kill, crash -- and the exec fallback, which is
+ * where a bare command name becomes a running program.
  *
- * `run` is the centerpiece: load an ELF built on a PC off the rootfs and
- * execute it as a process.
+ * There was a `run` command here once, for loading an ELF off the rootfs and
+ * executing it. It existed because there was no executable bit: something had
+ * to say "this file is a program". There is one now, and exec_fallback() below
+ * does what a shell does with a word that is not a builtin, so `hello` and
+ * `/bin/hello` work without ceremony. `run` was deleted rather than kept as a
+ * synonym: a second way to do the ordinary thing is a thing to explain.
  */
 
 #include <signal.h>
@@ -22,8 +27,8 @@
 /* How often the foreground wait comes up for air to check for Ctrl-C. */
 #define RUN_POLL_MS 50
 
-/* How long a foreground `run` waits before giving up on the app and leaving it
- * running in the background. */
+/* How long a foreground command waits before giving up on the app and leaving
+ * it running in the background. */
 #define RUN_FOREGROUND_TIMEOUT_MS 60000
 
 /*
@@ -40,8 +45,8 @@
 
 /*
  * Spawn `abs` with the given argv and, unless backgrounded, wait for it and
- * report its status. Shared by `run` and by the fallback that resolves a bare
- * command name to a program.
+ * report its status. Shared by `confine` and by the fallback that resolves a
+ * bare command name to a program.
  */
 static int run_program(espix_session_t *s, const char *abs, int argc,
                        char **argv, bool background, const char *root,
@@ -147,41 +152,93 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
 }
 
 /*
- * `run [-R <dir>] <path> [args...] [&]`
+ * The two gates a shell applies before executing, in the order Linux applies
+ * them. Returns 0 to proceed, -1 if there is no such file (the caller decides
+ * what that means), or the status the caller should return.
  *
- * -R gives the program a root: it can name nothing outside that directory, and
- * starts there. The binary itself is read before the process exists, so it is
- * normal for it to live outside -- `run -R /srv/www /bin/httpd` is the shape
- * this is for, alongside `sudo -u www` giving the same program its own identity.
+ * The execute bit decides whether you may run it -- `chmod -x` makes a program
+ * stop working, which is the whole point of having the bit -- and the format
+ * check then decides whether it is a program at all. Keeping both is what lets
+ * `Permission denied` and `Exec format error` stay different answers.
+ *
+ * **Do not drop the magic check on the grounds that the executable bit now
+ * exists.** Linux does exactly this too: execve() checks the bit, then hands
+ * the file to its binfmt handlers -- binfmt_elf matching \177ELF, binfmt_script
+ * matching #! -- and when none matches the call fails with ENOEXEC, which a
+ * shell reports as "Exec format error". EACCES before ENOEXEC, both 126.
+ *
+ * Two reasons of espix's own. Without it a +x file that is not an ELF reaches
+ * the loader, which has already claimed a process slot and started a task
+ * before it can fail, and says `ELF init failed` instead. And this is the seam
+ * where `#!` support hooks in: a file that is executable but not an ELF is
+ * exactly where the interpreter line would be read.
+ *
+ * The magic is also what sets the default mode in the first place, so a
+ * freshly-copied binary is executable without anyone running chmod; see the
+ * rule in espix_fs/mode.c.
  */
-static int cmd_run(espix_session_t *s, int argc, char **argv)
+static int program_gate(espix_session_t *s, const char *abs, const char *shown)
 {
-    const char *root  = NULL;
-    int         first = 1;
-
-    /* Match the flag first and then require its argument, so a bare `run -R`
-     * is a usage error rather than an attempt to run a program called -R. */
-    if (argc >= 2 && strcmp(argv[1], "-R") == 0) {
-        if (argc < 3) {
-            espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
-            return 1;
-        }
-        root  = argv[2];
-        first = 3;
+    struct stat st;
+    if (stat(abs, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return -1;
     }
 
-    if (argc <= first) {
-        espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
-        return 1;
+    if ((st.st_mode & S_IXUSR) == 0) {
+        espix_printf(s, "espix: %s: Permission denied\n", shown);
+        return 126;                     /* what a shell returns for this */
     }
+
+    FILE *f = fopen(abs, "rb");
+    if (f == NULL) {
+        return -1;
+    }
+    char         magic[4] = { 0 };
+    const size_t got = fread(magic, 1, sizeof(magic), f);
+    fclose(f);
+
+    if (got != sizeof(magic) || memcmp(magic, "\177ELF", sizeof(magic)) != 0) {
+        espix_printf(s, "espix: %s: Exec format error\n", shown);
+        return 126;
+    }
+    return 0;
+}
+
+/*
+ * `confine <dir> <path> [args...] [&]`
+ *
+ * Give the program a root: it can name nothing outside <dir>. The binary itself
+ * is read before the process exists, so it is normal for it to live outside --
+ * `confine /srv/www /bin/httpd` is the shape this is for, alongside
+ * `sudo -u www` giving the same program its own identity.
+ *
+ * A wrapper that adjusts one aspect of the execution context and then execs,
+ * in the family of env, nice, nohup, setsid, setpriv and timeout. Those compose
+ * by nesting and so does this: `sudo -u www confine /srv/www /bin/httpd` reads
+ * as the two restrictions it is, and needs no special case, because sudo
+ * re-dispatches a command line rather than spawning.
+ *
+ * **Not called chroot**, and the difference is not pedantry. chroot changes what
+ * `/` means, so a chrooted program opens /index.html and the kernel gives it
+ * /srv/www/index.html. espix resolves the path normally and *then* refuses
+ * anything outside the root, so paths stay globally absolute and the program
+ * must still say /srv/www/index.html. That is OpenBSD's unveil(2) -- a
+ * visibility filter over ordinary resolution -- and a chroot invocation ported
+ * here under that name would silently open the wrong paths.
+ */
+static int cmd_confine(espix_session_t *s, int argc, char **argv)
+{
+    static const char *const USAGE =
+        "usage: confine <dir> <path> [args...] [&]\n";
 
     bool background = false;
-    if (strcmp(argv[argc - 1], "&") == 0) {
+    if (argc > 1 && strcmp(argv[argc - 1], "&") == 0) {
         background = true;
         argc--;
     }
-    if (argc <= first) {
-        espix_printf(s, "usage: run [-R <dir>] <path> [args...]\n");
+
+    if (argc < 3) {
+        espix_printf(s, "%s", USAGE);
         return 1;
     }
 
@@ -192,36 +249,32 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
      * path that is not there gives it nothing at all.
      */
     char abs_root[ESPIX_PATH_MAX];
-    if (root != NULL) {
-        if (!espix_cmd_path(s, root, abs_root, sizeof(abs_root))) {
-            return 1;
-        }
+    if (!espix_cmd_path(s, argv[1], abs_root, sizeof(abs_root))) {
+        return 1;
+    }
 
-        struct stat rootst;
-        if (stat(abs_root, &rootst) != 0 || !S_ISDIR(rootst.st_mode)) {
-            espix_printf(s, "run: %s: not a directory\n", abs_root);
-            return 1;
-        }
-        root = abs_root;
+    struct stat rootst;
+    if (stat(abs_root, &rootst) != 0 || !S_ISDIR(rootst.st_mode)) {
+        espix_printf(s, "confine: %s: not a directory\n", abs_root);
+        return 1;
     }
 
     char abs[ESPIX_PATH_MAX];
-    if (!espix_cmd_path(s, argv[first], abs, sizeof(abs))) {
+    if (!espix_cmd_path(s, argv[2], abs, sizeof(abs))) {
         return 1;
     }
 
     /*
-     * Same gate as the bare-name path below. Naming the file explicitly is not
-     * a way around the execute bit; `run` is a convenience, not a privilege.
+     * The same gates a bare command name gets: naming the file explicitly is
+     * not a way around the execute bit, and confinement is not a privilege.
      *
-     * A missing file falls through to espix_proc_spawn_elf(), which reports it
-     * as not found -- checking the mode first would turn "no such file" into
-     * "permission denied", which is a worse answer and a false one.
+     * A missing file is left to espix_proc_spawn_elf(), which reports it as not
+     * found -- answering "permission denied" for a file that is not there would
+     * be a worse answer and a false one.
      */
-    struct stat rst;
-    if (stat(abs, &rst) == 0 && (rst.st_mode & S_IXUSR) == 0) {
-        espix_printf(s, "run: %s: Permission denied\n", abs);
-        return 126;
+    const int gate = program_gate(s, abs, abs);
+    if (gate > 0) {
+        return gate;
     }
 
     /* The app sees argv[0] as its own path, then its own arguments. */
@@ -229,11 +282,12 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
     int   app_argc = 0;
 
     app_argv[app_argc++] = abs;
-    for (int i = first + 1; i < argc && app_argc < ESPIX_ARGS_MAX; i++) {
+    for (int i = 3; i < argc && app_argc < ESPIX_ARGS_MAX; i++) {
         app_argv[app_argc++] = argv[i];
     }
 
-    return run_program(s, abs, app_argc, app_argv, background, root, "run");
+    return run_program(s, abs, app_argc, app_argv, background, abs_root,
+                       "confine");
 }
 
 /*
@@ -244,15 +298,9 @@ static int cmd_run(espix_session_t *s, int argc, char **argv)
  * else is looked for in /bin. PATH is that one fixed directory for now, since
  * espix has no environment to put a real one in.
  *
- * Two gates, in the order a shell applies them. The execute bit decides whether
- * you are allowed to run it — `chmod -x` makes a program stop working, which is
- * the whole point of having the bit — and the ELF magic then decides whether it
- * is a program at all. Keeping both is what lets `Permission denied` and
- * `Exec format error` stay different answers.
- *
- * The magic is also what sets the default mode in the first place, so a
- * freshly-copied binary is executable without anyone running chmod; see the
- * rule in espix_fs/mode.c.
+ * The two gates it then applies are program_gate() above, shared with
+ * `confine` so that naming a file explicitly cannot get past what a bare name
+ * has to satisfy.
  */
 static int exec_fallback(espix_session_t *s, int argc, char **argv)
 {
@@ -266,27 +314,11 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
         return ESPIX_SHELL_ENOENT;
     }
 
-    struct stat st;
-    if (stat(abs, &st) != 0 || !S_ISREG(st.st_mode)) {
-        return ESPIX_SHELL_ENOENT;      /* reported as "command not found" */
-    }
-
-    if ((st.st_mode & S_IXUSR) == 0) {
-        espix_printf(s, "espix: %s: Permission denied\n", argv[0]);
-        return 126;                     /* what a shell returns for this */
-    }
-
-    FILE *f = fopen(abs, "rb");
-    if (f == NULL) {
-        return ESPIX_SHELL_ENOENT;
-    }
-    char magic[4] = { 0 };
-    const size_t got = fread(magic, 1, sizeof(magic), f);
-    fclose(f);
-
-    if (got != sizeof(magic) || memcmp(magic, "\177ELF", sizeof(magic)) != 0) {
-        espix_printf(s, "espix: %s: Exec format error\n", argv[0]);
-        return 126;
+    /* Shown as the user typed it, not as resolved: `hello: Permission denied`
+     * is the answer they can act on. */
+    const int gate = program_gate(s, abs, argv[0]);
+    if (gate != 0) {
+        return (gate < 0) ? ESPIX_SHELL_ENOENT : gate;
     }
 
     bool background = false;
@@ -429,9 +461,9 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_run_cmds[] = {
-    { .name = "run",   .fn = cmd_run,
-      .help = "load and run an app from the filesystem",
-      .usage = "run [-R <dir>] <path> [args...] [&]" },
+    { .name = "confine", .fn = cmd_confine,
+      .help = "run a program that can name nothing outside <dir>",
+      .usage = "confine <dir> <path> [args...] [&]" },
     { .name = "kill",  .fn = cmd_kill,
       .help = "send a signal to a process",
       .usage = "kill [-SIG|-l] <pid>..." },

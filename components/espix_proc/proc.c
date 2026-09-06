@@ -97,7 +97,7 @@ esp_err_t espix_proc_init(void)
  *
  * The pid re-check in espix_proc_wait() cannot catch that: the pid in the slot
  * *is* the one being waited on, because the process is real and just started.
- * So `run` believed a freshly spawned app had already exited, reported its
+ * So the shell believed a freshly spawned app had already exited, reported its
  * predecessor's exit code, and moved on while the app was still starting.
  *
  * Harmless-looking for a long time, because the shell simply returned to a

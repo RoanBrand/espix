@@ -23,6 +23,7 @@ Framing matches session.py: <<<ESPIX-CMD n>>> ... <<<ESPIX-END n>>>
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -135,23 +136,28 @@ def port_holder(port):
     except (OSError, subprocess.SubprocessError):
         return ""
 
-    pids, names = [], []
+    # Skip ourselves. We have the port open by definition at the point this is
+    # called, and reporting "Python (pid 10283) is holding the port" when 10283
+    # is this very process is worse than saying nothing: it sends the reader
+    # hunting for a process that is not the problem.
+    me = str(os.getpid())
+    holders, pid = [], None
     for line in out.splitlines():
         if line.startswith("p"):
-            pids.append(line[1:])
-        elif line.startswith("c"):
-            names.append(line[1:])
-    if not pids:
-        return ""
-    return ", ".join("%s (pid %s)" % (n, p)
-                     for n, p in zip(names or ["?"] * len(pids), pids))
+            pid = line[1:]
+        elif line.startswith("c") and pid is not None and pid != me:
+            holders.append("%s (pid %s)" % (line[1:], pid))
+    return ", ".join(holders)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", required=True)
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--timeout", type=int, default=30,
+                    help="how long one command may take to produce a prompt")
+    ap.add_argument("--sync-timeout", type=int, default=4,
+                    help="how long to wait for the *initial* prompt, per attempt")
     ap.add_argument("--reset", action="store_true")
     args = ap.parse_args()
 
@@ -169,7 +175,18 @@ def main():
     # clears any partial line, then a newline asks for a fresh prompt. Observed
     # failing about one run in three without this, which for a test suite is
     # worse than failing every time.
+    #
+    # The sync gets its own, much shorter timeout. A console that is there
+    # answers a newline in milliseconds; one that is not will not start
+    # answering because we waited another twenty seconds. Sharing --timeout
+    # meant a wedged port cost 3 x 30s *per command*, and a suite of five
+    # commands spent seven minutes discovering something it knew in the first
+    # second. The command timeout stays long, because a command legitimately
+    # can be slow.
+    #
     synced = False
+    command_timeout = c.timeout
+    c.timeout = args.sync_timeout
     for _ in range(3):
         try:
             c.ser.write(b"\x15\r")
@@ -179,6 +196,7 @@ def main():
             break
         except TimeoutError:
             time.sleep(1)
+    c.timeout = command_timeout
 
     if not synced:
         # Name the culprit rather than asking the reader to go and look.

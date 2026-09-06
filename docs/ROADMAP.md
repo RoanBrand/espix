@@ -12,6 +12,37 @@ things are as they are.
 
 ## Processes
 
+- **An init and a service manager.** espix cannot run anything unattended.
+  There is no init, no autostart, no supervision and no `nohup`, `setsid` or
+  `disown`; `app_main()` is a boot sequence and nothing else, and nothing in the
+  tree spawns a program. Worse than absent: `finish_session()` calls
+  `espix_proc_hangup()`, which kills the session's processes on the way out and
+  logs "killed N processes on exit". So a backgrounded program dies when you log
+  out, by design and correctly -- there is nowhere else for it to belong.
+
+  This is the gap behind `confine` and `sudo -u`. Both exist to run a program as
+  a service with its own identity and its own view of the filesystem, and the
+  README's `sudo -u www confine /srv/www /bin/httpd &` cannot survive the login
+  that started it. The pieces are built; there is nothing to attach them to.
+
+  **The stream work is the precondition**, not an optional tidy-up: a service's
+  output cannot go to the SSH channel of the session that started it, because
+  that channel is freed when the session ends -- see "Real stdin, stdout and
+  stderr" under Networking and time. A service needs a log, and espix has klog
+  and a ring already, which is most of the answer.
+
+  Worth stealing systemd's shape rather than inventing one, because it settles
+  where policy lives: a unit is a *file* declaring identity and confinement
+  together (`User=` beside `ProtectSystem=strict` and `ReadWritePaths=`), which
+  is exactly the pair espix currently spells as two nested commands on a shell
+  line that nothing can replay at boot. `confine` and `sudo -u` would be
+  absorbed into that file rather than replaced by it -- they stay useful for the
+  interactive case, the way `systemd-run` does.
+
+  Not small: a unit parser, a supervisor task with restart policy, dependency
+  ordering, and `systemctl`-shaped commands to inspect it. But the alternative
+  is that espix stays a device you log into rather than one that runs something.
+
 - **Job control.** `jobs`, `fg`, `bg`, Ctrl-Z. SIGSTOP and SIGCONT landed with
   signals, which is the hard half — a stopped process parks itself at a delivery
   point and `ps` reports `T`. What is missing is the shell side: a job table, and
@@ -175,7 +206,7 @@ things are as they are.
   That is the same bargain espix already makes for the uid, and it is what
   `newgrp` exists for on a real system.
 
-- ~~**A root for an app.**~~ Done, as `run -R <dir>`: the process may not
+- ~~**A root for an app.**~~ Done, as `confine <dir>`: the process may not
   resolve a path outside that directory, and everything else answers ENOENT.
   `resolve()` in `espix_fs/vfs.c` covers everything that reaches the
   filesystem through the VFS -- which is every path operation an app makes,
@@ -293,24 +324,24 @@ things are as they are.
 
 ## Shell and console
 
-- **Remove `run`.** It is redundant, and only history explains it: there was no
-  executable bit when it was written, so something had to say "this file is a
-  program". There is one now, and the shell's exec fallback
-  (`exec_fallback()` in `cmd_run.c`) already does everything a Unix shell does
-  with a command that is not a builtin -- resolves a name containing a slash as
-  a path and anything else in `/bin`, checks `S_ISREG`, checks the execute bit
-  and returns 126 `Permission denied`, checks the ELF magic and returns
-  `Exec format error`, honours a trailing `&`, and reports 127
-  `command not found` otherwise. `hello` and `/bin/hello` already work today.
+- ~~**Remove `run`.**~~ Done. It was redundant, and only history explained it:
+  there was no executable bit when it was written, so something had to say "this
+  file is a program". The shell's exec fallback (`exec_fallback()` in
+  `cmd_run.c`) does everything a Unix shell does with a word that is not a
+  builtin -- resolves a name containing a slash as a path and anything else in
+  `/bin`, checks the execute bit for 126 `Permission denied`, checks the ELF
+  magic for `Exec format error`, honours a trailing `&`, and reports 127
+  otherwise. `hello` and `/bin/hello` are how you run a program.
 
-  `run` adds exactly one thing that fallback lacks: `-R`. So removing it is
-  really the question of where confinement lives, and under what name --
-  see **A root for an app** under Filesystem, and note that `chroot` is the
-  wrong name for what espix actually does.
+  The one thing `run` had that the fallback lacked, `-R`, became `confine`; see
+  **A root for an app** under Filesystem for why it is not called `chroot`.
 
-  The cost is about thirty references across `README.md`, `docs/`, `tests/` and
-  the help text in `cmd_sys.c`; the test suite invokes `run testapp ...`
-  throughout. Worth doing as its own change, where the diff is only about this.
+  The ELF magic check stayed, and the comment on `program_gate()` says why at
+  length, because "the executable bit exists now, so the magic check is
+  redundant" is a reasonable-sounding thing somebody will think later. Linux
+  does the same two gates in the same order -- execve() checks the bit, then
+  binfmt handlers read the first bytes and fail with ENOEXEC when none matches.
+  It is also the seam where `#!` support hooks in.
 
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style
@@ -418,10 +449,10 @@ things are as they are.
   objects writing to the *same place*: the reason there are two is not
   separation but teardown, since `esp_cleanup_r()` fcloses whichever of the
   three differ from the globals and one object behind both would be closed
-  twice. So `run app 2>/dev/null` cannot work.
+  twice. So `app 2>/dev/null` cannot work.
 
   The shell has less than that: `espix_printf(s, ...)` is a single path carrying
-  output and diagnostics alike, which is why `run app > file` captures espix's
+  output and diagnostics alike, which is why `app > file` captures espix's
   own error messages into the file. That is not hypothetical tidiness — it cost
   a wrong conclusion during the test-suite work, when a failed load's message
   vanished into a redirect and the loader was wrongly blamed for not naming the
