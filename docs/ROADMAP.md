@@ -422,6 +422,28 @@ things are as they are.
   The S31 and P4 are on the hardware list partly for this: more RAM on one, and
   a second real Ethernet MAC on the other.
 
+- **WiFi power save, decided rather than inherited.** espix never calls
+  `esp_wifi_set_ps()`, so it runs IDF's default of `WIFI_PS_MIN_MODEM`: the
+  station sleeps and wakes to hear a beacon once per DTIM period. That is the
+  right default for a sensor that speaks once a minute and the wrong one for a
+  device you hold an SSH session to, because every exchange can wait on the next
+  beacon -- typically 100-300ms depending on what the access point advertises.
+
+  Not the PHY rate, which was the first guess: that is rate-adaptive already,
+  and AMPDU is on in both directions with a 16-frame block-ack window. The sleep
+  schedule is the part nobody chose.
+
+  What makes it interesting is that neither answer is right all the time, so it
+  wants to be dynamic: `WIFI_PS_NONE` while a session or transfer is live, and
+  back to `MIN_MODEM` when the device is idle. espix already knows when that is
+  -- the SSH server tracks its sessions and `espix_proc` its processes -- so the
+  policy has somewhere to live, and the shape is the same one a laptop uses when
+  it stops power-saving on the interface you are actually using.
+
+  Worth measuring rather than assuming, and the measurement now exists: the same
+  `testapp out 5000` run over WiFi and over USB-NCM, where USB is the control
+  because it has no radio and no sleep schedule. 347 lines/s against 389 today.
+
 - **WiFi roaming and multiple networks.** One SSID, one AP, no BSSID
   reselection.
 - **A floor under the clock before NTP answers.** On a cold boot espix reads
