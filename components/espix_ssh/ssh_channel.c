@@ -19,6 +19,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
 #include "esp_linenoise.h"
@@ -44,6 +45,38 @@
  * pipelining 64 requests will hit immediately.
  */
 #define LOCAL_WINDOW  262144
+
+/*
+ * A process's stdin queue, and the free space chan_poll_interrupt() insists on
+ * before it will pump another packet.
+ *
+ * The queue has to be strictly larger than one maximum packet, and that is a
+ * correctness requirement rather than a tuning choice. chan_pump() reads up to
+ * SSH_CHANNEL_MAX_PACKET into `pending`, and the drain that follows pushes it
+ * on with no wait -- so unless a whole packet is guaranteed to fit, the tail
+ * of one is dropped silently. Refusing to pump below that mark is what
+ * provides the guarantee.
+ *
+ * Getting this wrong does not degrade, it deadlocks: with the queue at 1024
+ * and the mark at 2048 the check could never pass, nothing was ever pumped,
+ * and the first process to read stdin blocked until the foreground timeout.
+ */
+#define SSH_STDIN_QUEUE      2560
+#define SSH_STDIN_LOW_WATER  SSH_CHANNEL_MAX_PACKET
+
+/*
+ * How long a blocked stdin read waits before looking up.
+ *
+ * It has to wake even with nothing to read: a client that vanishes sends no
+ * CHANNEL_EOF, and the read is also where this process notices it has been
+ * signalled. A second is far below any human's patience and costs one wakeup
+ * per second per reader.
+ */
+#define STDIN_SLICE_MS       1000
+
+_Static_assert(SSH_STDIN_QUEUE > SSH_STDIN_LOW_WATER,
+               "stdin queue must hold a whole packet, or poll_interrupt can "
+               "never pump and a reader blocks for ever");
 
 
 /* Bound on packets read while waiting for the peer to open its window. A client
@@ -118,6 +151,26 @@ typedef struct {
     size_t      pending_len;
     size_t      pending_pos;
     bool        last_was_cr;    /* for collapsing CR LF into one newline */
+
+    /*
+     * A process's standard input.
+     *
+     * Not read from `pending` directly, and that is the crux of it: chan_pump()
+     * *overwrites* pending rather than appending, so two consumers of that
+     * buffer destroy each other's bytes. chan_poll_interrupt() already drains
+     * it on the connection task while a foreground process runs, so it stays
+     * the only consumer and hands over what is not a Ctrl-C.
+     *
+     * One producer (the connection task, inside chan_poll_interrupt) and one
+     * consumer (the process's own task, inside chan_stream_read), which is
+     * exactly what a stream buffer is for -- so no new lock, and none of the
+     * pending_pos races that sharing the packet buffer would have needed.
+     *
+     * Created with the channel rather than on demand: the producer tests this
+     * pointer from the other task, and a lazily-built queue would be a data
+     * race on the handle itself.
+     */
+    StreamBufferHandle_t stdin_q;
 
     /* Answers to terminal queries we handle ourselves rather than forwarding
      * to the client — see ssh_edit_write(). Read back before real input. */
@@ -230,7 +283,14 @@ static esp_err_t send_packet(ssh_chan_t *ch, ssh_buf_t *b)
     return err;
 }
 
-static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
+/*
+ * One writer for both streams. `ext` is 0 for ordinary CHANNEL_DATA, or a
+ * type code for CHANNEL_EXTENDED_DATA -- the packets differ only by that field,
+ * and they share a window, a lock and a channel, so splitting this in two would
+ * have meant duplicating every one of the subtleties below.
+ */
+static esp_err_t send_stream(ssh_chan_t *ch, const char *data, size_t len,
+                             uint32_t ext)
 {
     ssh_conn_t *c = ch->conn;
 
@@ -271,8 +331,14 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
 
         ssh_buf_t b;
         ssh_buf_init(&b, c->out_buf, sizeof(c->out_buf));
-        ssh_put_u8(&b, SSH_MSG_CHANNEL_DATA);
-        ssh_put_u32(&b, ch->peer_chan);
+        if (ext == 0) {
+            ssh_put_u8(&b, SSH_MSG_CHANNEL_DATA);
+            ssh_put_u32(&b, ch->peer_chan);
+        } else {
+            ssh_put_u8(&b, SSH_MSG_CHANNEL_EXTENDED_DATA);
+            ssh_put_u32(&b, ch->peer_chan);
+            ssh_put_u32(&b, ext);
+        }
         ssh_put_string(&b, data, chunk);
 
         if (ssh_packet_write(c, &b) != ESP_OK) {
@@ -290,6 +356,12 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
     return (ch->closed && err == ESP_OK) ? ESP_FAIL : err;
 }
 
+static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
+{
+    return send_stream(ch, data, len, 0);
+}
+
+
 /*
  * espix commands end lines with "\n". A pty expects "\r\n" — without the
  * carriage return every line starts where the previous one ended and the output
@@ -306,7 +378,8 @@ static esp_err_t send_data(ssh_chan_t *ch, const char *data, size_t len)
  * ESP_LINE_ENDINGS_CRLF and does the same translation on write. Over SSH
  * nothing sits between the editor and the client except us.
  */
-static int send_cooked(ssh_chan_t *ch, const char *data, size_t len)
+static int send_cooked(ssh_chan_t *ch, const char *data, size_t len,
+                       uint32_t ext)
 {
     size_t start = 0;
     int    result = (int)len;
@@ -319,8 +392,8 @@ static int send_cooked(ssh_chan_t *ch, const char *data, size_t len)
         if (data[i] != '\n') {
             continue;
         }
-        if ((i > start && send_data(ch, data + start, i - start) != ESP_OK) ||
-            send_data(ch, "\r\n", 2) != ESP_OK) {
+        if ((i > start && send_stream(ch, data + start, i - start, ext) != ESP_OK) ||
+            send_stream(ch, "\r\n", 2, ext) != ESP_OK) {
             result = -1;
             break;
         }
@@ -328,7 +401,7 @@ static int send_cooked(ssh_chan_t *ch, const char *data, size_t len)
     }
 
     if (result >= 0 && start < len &&
-        send_data(ch, data + start, len - start) != ESP_OK) {
+        send_stream(ch, data + start, len - start, ext) != ESP_OK) {
         result = -1;
     }
 
@@ -339,10 +412,25 @@ static int send_cooked(ssh_chan_t *ch, const char *data, size_t len)
 static esp_err_t chan_pump(ssh_chan_t *ch);
 
 /*
- * Ctrl-C while a foreground process runs. Same shape as chan_drain_pending(),
- * but it inspects what it pumped rather than leaving it for the editor: the
- * editor is not running, the shell is blocked on the process, and bytes left in
- * the buffer would surface on the next prompt.
+ * Ctrl-C while a foreground process runs, and delivery of everything else to
+ * that process's standard input.
+ *
+ * Same shape as chan_drain_pending(), but it inspects what it pumped rather
+ * than leaving it for the editor: the editor is not running, the shell is
+ * blocked on the process, and bytes left in the buffer would surface on the
+ * next prompt.
+ *
+ * This is also the *only* consumer of `pending` in this state, which is what
+ * makes it the right place to feed stdin. chan_pump() overwrites pending
+ * instead of appending, so a second reader on the process's own task would
+ * lose whichever bytes the other one pumped over. Handing them to a stream
+ * buffer here keeps one reader of the wire and gives the process a queue it
+ * can block on.
+ *
+ * 0x03 is taken as an interrupt and swallowed only when the client asked for a
+ * terminal. Without a pty there is no line discipline and no signal to raise:
+ * the client is a pipe, `ssh host prog < file` may legitimately contain 0x03,
+ * and eating it would corrupt the input.
  */
 static bool chan_poll_interrupt(espix_session_t *s)
 {
@@ -356,12 +444,37 @@ static bool chan_poll_interrupt(espix_session_t *s)
     for (;;) {
         /* Anything already decrypted and waiting. */
         while (ch->pending_pos < ch->pending_len) {
-            if (ch->pending[ch->pending_pos++] == 0x03) {
+            const uint8_t byte = ch->pending[ch->pending_pos++];
+
+            if (byte == 0x03 && ch->has_pty) {
                 hit = true;
+                continue;
+            }
+            /*
+             * No wait: this runs on the connection task, and blocking here
+             * would stop the poll that notices a Ctrl-C. A full queue is
+             * handled by not pumping more below, not by waiting -- so a
+             * refusal here means that guarantee has broken, and it is worth a
+             * line in the log rather than a hole in somebody's input.
+             */
+            if (ch->stdin_q != NULL
+                && xStreamBufferSend(ch->stdin_q, &byte, 1, 0) != 1) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "stdin queue full; dropped a byte");
             }
         }
 
         if (ch->closed) {
+            return hit;
+        }
+
+        /*
+         * Back-pressure. Pumping with a full queue would drop the middle of
+         * whatever is being sent, silently -- and a partial file is worse than
+         * a slow one. The process drains it and the next poll carries on.
+         */
+        if (ch->stdin_q != NULL
+            && xStreamBufferSpacesAvailable(ch->stdin_q) < SSH_STDIN_LOW_WATER) {
             return hit;
         }
 
@@ -402,7 +515,38 @@ static int chan_write(espix_session_t *s, const char *data, size_t len)
     if (ch->raw_out) {
         return (send_data(ch, data, len) == ESP_OK) ? (int)len : -1;
     }
-    return send_cooked(ch, data, len);
+    return send_cooked(ch, data, len, 0);
+}
+
+/*
+ * Diagnostics, mirroring chan_write() exactly but for the stream they land on.
+ *
+ * `raw_out` is `!has_pty` -- it means "exec, no terminal" -- and that single
+ * flag decides both questions at once:
+ *
+ *   no pty   raw (no CRLF, which would corrupt a redirected file) and stderr
+ *            goes out as CHANNEL_EXTENDED_DATA, so the client puts it on *its*
+ *            stderr and `ssh host cmd 2>/dev/null` discards it.
+ *   pty      cooked, and ordinary CHANNEL_DATA. RFC 4254 5.2 is explicit that
+ *            extended data is not for a channel with a pty -- a terminal is
+ *            precisely the thing that merges the two streams -- and an
+ *            interactive user has no way to redirect one of them anyway.
+ *
+ * Worth being exact about, because guessing cost two rounds here: a first
+ * version sent extended data on the pty session and hung a client driving
+ * espix through `ssh -tt`, and a second read `raw_out` as meaning sftp and so
+ * sent *ordinary* data on the exec path, which silently removed the feature
+ * while leaving every local test passing.
+ */
+static int chan_write_err(espix_session_t *s, const char *data, size_t len)
+{
+    ssh_chan_t *ch = s->transport;
+
+    if (ch->raw_out) {
+        return (send_stream(ch, data, len, SSH_EXTENDED_DATA_STDERR) == ESP_OK)
+                   ? (int)len : -1;
+    }
+    return send_cooked(ch, data, len, 0);
 }
 
 /*
@@ -418,14 +562,107 @@ static int chan_stream_write(void *cookie, const char *data, int len)
     return (chan_write(cookie, data, (size_t)len) < 0) ? -1 : len;
 }
 
+/* The same for an app's stderr. chan_write_err() decides between extended data
+ * and ordinary data by whether a pty was requested, so an app's own
+ * fprintf(stderr, ...) follows the same rule as a builtin's diagnostics. */
+static int chan_stream_write_err(void *cookie, const char *data, int len)
+{
+    if (len <= 0) {
+        return 0;
+    }
+    return (chan_write_err(cookie, data, (size_t)len) < 0) ? -1 : len;
+}
+
+/*
+ * An app's standard input.
+ *
+ * Reads the queue that chan_poll_interrupt() fills, never the socket: the
+ * connection task is the only reader of the wire, and chan_pump() overwrites
+ * `pending` rather than appending, so pulling from here would race that task
+ * for the packet buffer.
+ *
+ * Blocking, with a bounded wait rather than portMAX_DELAY, because EOF is not
+ * always announced -- a client that vanishes sends no CHANNEL_EOF, and a
+ * process blocked forever on a dead connection could never be signalled.
+ * Waking to re-test `closed` costs a wakeup a second and makes that case
+ * terminate.
+ *
+ * Returns 0 for end of input, which is what stdio turns into feof(). No CR
+ * translation and no espix_pace(): both belong to the line editor, and stdin
+ * here is a pipe. `ssh host prog < file` must deliver the file's bytes.
+ */
+static int chan_stream_read(void *cookie, char *buf, int len)
+{
+    espix_session_t *s  = cookie;
+    ssh_chan_t      *ch = s->transport;
+
+    if (ch == NULL || ch->stdin_q == NULL || len <= 0) {
+        return 0;
+    }
+
+    for (;;) {
+        const size_t got = xStreamBufferReceive(ch->stdin_q, buf, (size_t)len,
+                                                pdMS_TO_TICKS(STDIN_SLICE_MS));
+        if (got > 0) {
+            return (int)got;
+        }
+        /* Nothing arrived. Only now does EOF mean EOF: the queue has to be
+         * drained first, or the last packet before a CHANNEL_EOF is lost. */
+        if (ch->closed || ch->eof_seen) {
+            return 0;
+        }
+        /*
+         * A delivery point, like the sleeps espix publishes to apps.
+         *
+         * We are on the process's own task, so this runs its handlers here and
+         * now -- and if it has been asked to stop, ending the read is the only
+         * way to say so: there is no EINTR to hand back through fgets(). An
+         * app blocked on input would otherwise be unsignallable and could only
+         * ever be force-killed once the hangup grace expired, which is exactly
+         * the "no delivery point" trap espix_sigcheck() exists for.
+         */
+        if (espix_sigcheck()) {
+            return 0;
+        }
+    }
+}
+
 /*
  * One stream per caller. The task that receives it owns it: FreeRTOS teardown
  * runs esp_cleanup_r(), which fcloses a task's stdout and stderr when they are
  * not the global ones, so these must not be shared or closed here.
  */
-static FILE *chan_open_stream(espix_session_t *s)
+static FILE *chan_open_stream(espix_session_t *s, espix_stream_t which)
 {
-    FILE *f = funopen(s, NULL, chan_stream_write, NULL, NULL);
+    if (which == ESPIX_STREAM_IN) {
+        /* Unbuffered on the stdio side: the queue is already the buffer, and a
+         * second one would hold back bytes an interactive reader is waiting
+         * for. */
+        /*
+         * No closefn, deliberately.
+         *
+         * A first version reset the queue here so bytes typed at a process
+         * that never read them could not reach the next one. That was a race
+         * and a behaviour change at once: fclose runs on the *process's* task
+         * while chan_poll_interrupt() may be filling the queue from the
+         * connection task, and xStreamBufferReset() is not safe against a
+         * concurrent send.
+         *
+         * Leaving it alone is also the more Unix-like answer. Type-ahead at a
+         * terminal survives into the next reader; discarding it here would be
+         * espix inventing a rule that no shell has.
+         */
+        FILE *f = funopen(s, chan_stream_read, NULL, NULL, NULL);
+        if (f != NULL) {
+            setvbuf(f, NULL, _IONBF, 0);
+        }
+        return f;
+    }
+
+    FILE *f = funopen(s, NULL,
+                      (which == ESPIX_STREAM_ERR) ? chan_stream_write_err
+                                                  : chan_stream_write,
+                      NULL, NULL);
     if (f != NULL) {
         /* Line buffered: output should appear as it is produced, but a packet
          * per character would be absurd. */
@@ -776,7 +1013,7 @@ static ssize_t ssh_edit_write(int fd, const void *buf, size_t count)
         return (ssize_t)count;
     }
 
-    if (send_cooked(ch, buf, count) < 0) {
+    if (send_cooked(ch, buf, count, 0) < 0) {
         return -1;
     }
     return (ssize_t)count;
@@ -1198,7 +1435,12 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     ch->tx_lock      = xSemaphoreCreateRecursiveMutex();
     ch->rx_lock      = xSemaphoreCreateMutex();
 
-    if (ch->tx_lock == NULL || ch->rx_lock == NULL) {
+    /* Built here rather than when a process first asks for stdin: the producer
+     * is the connection task and the consumer is the process's own task, so a
+     * handle created on demand would be a race on the pointer itself. */
+    ch->stdin_q      = xStreamBufferCreate(SSH_STDIN_QUEUE, 1);
+
+    if (ch->tx_lock == NULL || ch->rx_lock == NULL || ch->stdin_q == NULL) {
         goto out;
     }
 
@@ -1318,6 +1560,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .name      = "ssh-exec",
             .cwd       = "/",
             .write     = chan_write,
+            .write_err = chan_write_err,
             .poll_interrupt = chan_poll_interrupt,
             .transport = ch,
             /* Overwritten by apply_account(); nobody rather than 0 so that a
@@ -1414,6 +1657,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .cwd       = "/",
         .read_line = chan_read_line,
         .write     = chan_write,
+            .write_err = chan_write_err,
         .poll_interrupt = chan_poll_interrupt,
         .transport = ch,
         /* Overwritten by apply_account(); nobody rather than 0 so that a
@@ -1458,6 +1702,9 @@ out:
     }
     if (ch->rx_lock != NULL) {
         vSemaphoreDelete(ch->rx_lock);
+    }
+    if (ch->stdin_q != NULL) {
+        vStreamBufferDelete(ch->stdin_q);
     }
     free(ch->exec_cmd);
     free(ch);

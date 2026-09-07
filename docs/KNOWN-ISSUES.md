@@ -15,9 +15,14 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   back there (`rmtDeinit()`), and without that the channel and its GPIO
   reservation outlive the app — which shows up as `GPIO 48 is not usable` on the
   next run and eventually as no free channel at all. `kill` and Ctrl-C ask first
-  and only escalate after the grace, so this is specific to `kill -9` and to an
-  app that ignores everything else. There is no address space to tear down and
-  no per-process ownership of heap or fds, so nothing can reclaim it for the app.
+  and only escalate after the grace — but they *do* escalate, so this is not
+  specific to `kill -9`: an app that ignores SIGTERM leaks exactly the same
+  way once `TERM_GRACE_MS` runs out. SIG_IGN buys the grace period, not
+  survival, which is itself a divergence from POSIX worth knowing —
+  `kill -TERM` on Unix leaves such a process running indefinitely.
+  There is no address space to tear down and no per-process ownership of heap
+  or fds, so nothing can reclaim it for the app. `tests/suites/35-signals.sh`
+  pins both halves.
 
 - **`ps` shows at most 8 finished processes.** `cmd_ps` stack-allocates
   `espix_proc_info_t procs[8]` while `ESPIX_PROC_MAX` is 12, so on a busy table
@@ -32,8 +37,27 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 - **A compute loop never sees a signal.** Delivery happens at the points where
   an app calls into espix — `sleep`, `usleep`, `nanosleep`, `pause`. A loop that
   blocks on nothing has no delivery point and will not run a handler, which is
-  exactly what `espix_sigcheck()` is exported for. `apps/sigtest spin` is the
-  case in the flesh. SIGKILL is the answer when it is somebody else's binary.
+  exactly what `espix_sigcheck()` is exported for. `testapp sig spin` is the
+  case in the flesh, and `tests/suites/35-signals.sh` covers it. SIGKILL is the answer when it is somebody else's binary.
+
+- **One unreproduced heap corruption, recorded rather than solved.** A single
+  panic during a full test run, on a build that had passed the same run twice
+  before it and has passed it since. The faulting task was `sshd:conn` and the
+  detection site was `tlsf_free` inside `esp_vfs_select`, reached from
+  `chan_poll_interrupt()` — which polls `select()` every 50ms while a
+  foreground process runs, so it is the most likely *detector* of damage done
+  anywhere, not evidence about the culprit. Heap corruption surfaces at
+  whatever frees next.
+
+  What has been tried: `CONFIG_HEAP_POISONING_COMPREHENSIVE`, which checks
+  canaries on every allocation and free, across three runs of the suite that
+  was executing when it faulted and one full run — no event. So the write is
+  either rare or outside a poisoned allocation.
+
+  Recorded because the next occurrence should not start from nothing. The
+  fastest route if it returns: reproduce with poisoning on and the serial
+  console open, since the abort names the block and the console is the one
+  channel that is not the thing under test.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
@@ -182,12 +206,22 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   - **Sessions are not confined, only processes.** There is no restricted login
     shell; `-R` applies to a program you run, not to whoever runs it.
 
-- **A command's diagnostics go to stdout, so a redirect swallows them.** espix
-  has no stderr: `espix_printf()` is one path for output and errors alike, so
-  `/bin/nosuch > log` puts "no such file" in `log` rather than on the
-  terminal, and `2>/dev/null` silences nothing. A loaded app has distinct
-  `stdout` and `stderr` pointers but both write to the same channel, so the
-  same is true for apps. See **Shell and console** in [ROADMAP.md](ROADMAP.md).
+- **A *backgrounded* app's output is not redirected.** `app > file &` writes to
+  the terminal and leaves `file` empty; `2>` likewise. A foreground app
+  redirects correctly, as do builtins, an app's exit status, and espix's own
+  diagnostics about it.
+
+  The reason is lifetime, and it is why the two cases differ at all: the
+  redirect `FILE` belongs to the shell and `redirects_release()` closes it when
+  the command returns. `run_program()` blocks in `espix_proc_wait()` for a
+  foreground process, so the `FILE` outlives it; a backgrounded one outlives
+  the `FILE`, and pointing its streams at one would be a use-after-free the
+  moment somebody typed `&`. See the stream note in `espix_proc/exec.c`, which
+  also records the one narrow hazard that remains — an app force-killed inside
+  an `fwrite` to a redirect leaves that `FILE`'s lock held.
+
+  Closing it properly needs the redirect to be reference-counted or handed to
+  the process outright, which is job-control territory.
 
   Exit statuses *are* right: 127 when the file cannot be read, 126 when it is
   there and will not run, and the app's own status otherwise.
@@ -202,15 +236,24 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## SSH
 
-- **`ssh host <cmd>` has no stdin.** The command runs and its output and exit
-  status come back, but nothing on espix reads standard input — apps have no
-  file or stdin ABI at all — so `ssh host 'cat' < file` will not do what you
-  mean. Worse than merely unread: while a foreground process runs,
-  `chan_poll_interrupt()` consumes whatever has arrived looking for Ctrl-C, so
-  client-sent data is discarded rather than queued.
+- **Only a *process* reads stdin, not a builtin.** `ssh host 'testapp cat'
+  < file` works: a loaded app gets a real `stdin` over the channel, and
+  `fgets`/`fread`/`read` are in its ABI. But no espix builtin reads standard
+  input, and there is no `<` redirection, so `ssh host 'cat' < file` still will
+  not do what you mean — the builtin `cat` takes paths and nothing else.
 
-- **`ssh host <cmd>` has no separate stderr.** espix has one output stream, so
-  errors arrive interleaved on stdout and `2>` at the client separates nothing.
+  Not much of a gap in practice: with no pipes and no `<`, a builtin has
+  nothing to read *from* except the network, which is the case an app already
+  covers. It becomes worth doing alongside pipes — see
+  [ROADMAP.md](ROADMAP.md).
+
+- **Only a foreground process reads stdin.** `chan_poll_interrupt()` is the
+  single consumer of the channel's receive buffer and the thing that fills a
+  process's stdin queue, and it runs from the foreground wait loop in
+  `cmd_run.c`. So a backgrounded app's `stdin` is open but nothing arrives on
+  it — it blocks until the session ends. `chan_pump()` overwrites that buffer
+  rather than appending, so a second reader is not a small change: it needs
+  the buffer to become a ring first.
 
 - **One command per `exec`.** The shell has no `;`, `&&` or pipes, so
   `ssh host 'cd /bin && ls'` fails in the parser rather than in the channel.

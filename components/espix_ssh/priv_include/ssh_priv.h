@@ -41,6 +41,13 @@ extern "C" {
  */
 #define SSH_CHANNEL_MAX_PACKET 2048
 
+/*
+ * Extended data type codes (RFC 4254 §5.2). Only stderr is defined by the RFC,
+ * and it is what makes `ssh host cmd 2>/dev/null` work at the *client* end: a
+ * client routes this to its own stderr rather than mixing it into stdout.
+ */
+#define SSH_EXTENDED_DATA_STDERR  1
+
 /* Message numbers (RFC 4253 §12, RFC 4252 §6, RFC 4254 §9). */
 enum {
     SSH_MSG_DISCONNECT                = 1,
@@ -63,6 +70,7 @@ enum {
     SSH_MSG_CHANNEL_OPEN_FAILURE      = 92,
     SSH_MSG_CHANNEL_WINDOW_ADJUST     = 93,
     SSH_MSG_CHANNEL_DATA              = 94,
+    SSH_MSG_CHANNEL_EXTENDED_DATA     = 95,
     SSH_MSG_CHANNEL_EOF               = 96,
     SSH_MSG_CHANNEL_CLOSE             = 97,
     SSH_MSG_CHANNEL_REQUEST           = 98,

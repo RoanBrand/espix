@@ -17,7 +17,7 @@ bool espix_cmd_path(espix_session_t *s, const char *arg,
     const char *cwd = (s != NULL && s->cwd[0] != '\0') ? s->cwd : "/";
 
     if (espix_fs_resolve(cwd, arg, out, out_len) != ESP_OK) {
-        espix_printf(s, "espix: %s: path too long\n", arg ? arg : "");
+        espix_eprintf(s, "espix: %s: path too long\n", arg ? arg : "");
         return false;
     }
     return true;

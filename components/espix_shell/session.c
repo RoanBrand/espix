@@ -36,6 +36,39 @@ static int session_out(espix_session_t *s, const char *data, size_t len)
     return s->write(s, data, len);
 }
 
+/*
+ * Diagnostics. Note what this does *not* consult: s->redirect.
+ *
+ * That single omission is the point of the whole split. `cmd > file` used to
+ * put espix's own error messages in the file, so a command that failed wrote
+ * nothing to the terminal and left the reason somewhere nobody looked.
+ *
+ * `2>&1` is the one case where diagnostics do follow output, and it routes
+ * through session_out() rather than duplicating the FILE * -- two handles on
+ * one stream would be closed twice.
+ */
+static int session_err(espix_session_t *s, const char *data, size_t len)
+{
+    if (s == NULL) {
+        return (int)fwrite(data, 1, len, stderr);
+    }
+    if (s->err_to_out) {
+        return session_out(s, data, len);
+    }
+    if (s->redirect_err != NULL) {
+        return (int)fwrite(data, 1, len, s->redirect_err);
+    }
+    if (s->write_err != NULL) {
+        return s->write_err(s, data, len);
+    }
+    /* No separate error path: the console has one descriptor and both streams
+     * belong on it, which is what a real terminal does too. */
+    if (s->write == NULL) {
+        return (int)fwrite(data, 1, len, stderr);
+    }
+    return s->write(s, data, len);
+}
+
 int espix_puts(espix_session_t *s, const char *str)
 {
     if (str == NULL) {
@@ -44,15 +77,14 @@ int espix_puts(espix_session_t *s, const char *str)
     return session_out(s, str, strlen(str));
 }
 
-int espix_printf(espix_session_t *s, const char *fmt, ...)
+/* Shared by espix_printf() and espix_eprintf(), which differ only in where the
+ * formatted line goes. */
+static int session_vprintf(espix_session_t *s, bool is_err,
+                           const char *fmt, va_list ap)
 {
-    char    buf[ESPIX_LINE_MAX];
-    va_list ap;
+    char buf[ESPIX_LINE_MAX];
 
-    va_start(ap, fmt);
     const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
     if (n < 0) {
         return n;
     }
@@ -61,47 +93,145 @@ int espix_printf(espix_session_t *s, const char *fmt, ...)
      * espix command legitimately emits a single line this long. */
     const size_t len = ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
 
-    return session_out(s, buf, len);
+    return is_err ? session_err(s, buf, len) : session_out(s, buf, len);
 }
 
-/*
- * Strip a trailing `> file` / `>> file` from argv and open the target.
- * Returns the new argc, or a negative value if the redirection is malformed.
- * On success *out_file is the stream to write to (NULL if none was requested).
- */
-static int take_redirect(espix_session_t *s, int argc, char **argv, FILE **out_file)
+int espix_printf(espix_session_t *s, const char *fmt, ...)
 {
-    *out_file = NULL;
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = session_vprintf(s, false, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int espix_eprintf(espix_session_t *s, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = session_vprintf(s, true, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+/* What one command line's redirections resolved to. */
+typedef struct {
+    FILE *out;          /* `>` / `>>`, or NULL */
+    FILE *err;          /* `2>` / `2>>`, or NULL */
+    bool  err_to_out;   /* `2>&1` */
+} redirects_t;
+
+/*
+ * Strip trailing redirections from argv and open their targets.
+ *
+ * Handles `>`, `>>`, `2>`, `2>>` and `2>&1`, in any combination, so
+ * `cmd > out 2> err` and `cmd > both 2>&1` both work. Returns the new argc, or
+ * a negative value if the redirection is malformed.
+ *
+ * Redirections must be trailing, which is what the single-target version
+ * enforced too: everything from the first operator to the end of the line has
+ * to be redirection, or it is a mistake worth reporting rather than guessing
+ * at.
+ *
+ * `2>&1` is order-insensitive here, unlike a real shell where `2>&1 > file`
+ * differs from `> file 2>&1`. Ordering matters there because the shell dups
+ * descriptors as it goes; espix has flags rather than a descriptor table, so
+ * the distinction has nothing to attach to. The common form does the common
+ * thing, and the rare one is not silently wrong -- it simply behaves as the
+ * common one.
+ */
+static int take_redirects(espix_session_t *s, int argc, char **argv,
+                          redirects_t *r)
+{
+    memset(r, 0, sizeof(*r));
+
+    int first = argc;
 
     for (int i = 0; i < argc; i++) {
-        const bool append = (strcmp(argv[i], ">>") == 0);
-        if (!append && strcmp(argv[i], ">") != 0) {
+        const char *tok = argv[i];
+
+        const bool to_out = (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0);
+        const bool to_err = (strcmp(tok, "2>") == 0 || strcmp(tok, "2>>") == 0);
+        const bool dup    = (strcmp(tok, "2>&1") == 0);
+
+        if (!to_out && !to_err && !dup) {
+            if (first != argc) {
+                espix_eprintf(s, "espix: %s: unexpected after a redirection\n",
+                              tok);
+                return -1;
+            }
             continue;
         }
 
-        if (i + 2 != argc) {
-            espix_printf(s, "espix: redirection needs exactly one target\n");
+        if (first == argc) {
+            first = i;
+        }
+
+        if (dup) {
+            r->err_to_out = true;
+            continue;
+        }
+
+        if (i + 1 >= argc) {
+            espix_eprintf(s, "espix: %s needs a target\n", tok);
             return -1;
         }
+
+        const bool append = (strlen(tok) > 1 && tok[strlen(tok) - 2] == '>');
 
         char abs[ESPIX_PATH_MAX];
         if (espix_fs_resolve(s != NULL ? s->cwd : "/", argv[i + 1],
                              abs, sizeof(abs)) != ESP_OK) {
-            espix_printf(s, "espix: %s: path too long\n", argv[i + 1]);
+            espix_eprintf(s, "espix: %s: path too long\n", argv[i + 1]);
             return -1;
         }
 
-        FILE *f = fopen(abs, append ? "ab" : "wb");
-        if (f == NULL) {
-            espix_printf(s, "espix: %s: cannot open for writing\n", abs);
+        FILE **slot = to_out ? &r->out : &r->err;
+        if (*slot != NULL) {
+            espix_eprintf(s, "espix: %s: redirected twice\n", tok);
             return -1;
         }
 
-        *out_file = f;
-        return i;                       /* argv[i..] dropped from the command */
+        *slot = fopen(abs, append ? "ab" : "wb");
+        if (*slot == NULL) {
+            espix_eprintf(s, "espix: %s: cannot open for writing\n", abs);
+            return -1;
+        }
+
+        i++;                            /* the target */
     }
 
-    return argc;
+    return first;
+}
+
+/* Point the session at the opened targets for the duration of one command. */
+static void redirects_apply(espix_session_t *s, const redirects_t *r)
+{
+    if (s == NULL) {
+        return;
+    }
+    s->redirect     = r->out;
+    s->redirect_err = r->err;
+    s->err_to_out   = r->err_to_out;
+}
+
+/* And take them away again, closing what was opened. Always paired with
+ * redirects_apply(), including on the paths that never ran a command. */
+static void redirects_release(espix_session_t *s, redirects_t *r)
+{
+    if (s != NULL) {
+        s->redirect     = NULL;
+        s->redirect_err = NULL;
+        s->err_to_out   = false;
+    }
+    if (r->out != NULL) {
+        fclose(r->out);
+        r->out = NULL;
+    }
+    if (r->err != NULL) {
+        fclose(r->err);
+        r->err = NULL;
+    }
 }
 
 static espix_exec_fallback_fn s_exec_fallback;
@@ -129,52 +259,42 @@ int espix_shell_exec(espix_session_t *s, const char *line)
         return ESPIX_SHELL_EMPTY;
     }
 
-    FILE *redirect = NULL;
-    argc = take_redirect(s, argc, argv, &redirect);
+    redirects_t redir;
+    argc = take_redirects(s, argc, argv, &redir);
     if (argc < 1) {
-        if (redirect != NULL) {
-            fclose(redirect);
-        }
+        redirects_release(s, &redir);
         return (argc < 0) ? 1 : ESPIX_SHELL_EMPTY;
     }
     argv[argc] = NULL;
 
     const espix_cmd_t *cmd = espix_shell_find(argv[0]);
-    if (cmd == NULL) {
-        /* Not a builtin: let it be resolved as a program, the way a shell
-         * falls through to PATH. */
-        if (s_exec_fallback != NULL) {
-            if (redirect != NULL && s != NULL) {
-                s->redirect = redirect;
-            }
-            const int status = s_exec_fallback(s, argc, argv);
-            if (redirect != NULL) {
-                if (s != NULL) {
-                    s->redirect = NULL;
-                }
-                fclose(redirect);
-            }
-            return status;
-        }
-        if (redirect != NULL) {
-            fclose(redirect);
-        }
+
+    if (cmd == NULL && s_exec_fallback == NULL) {
+        redirects_release(s, &redir);
         return ESPIX_SHELL_ENOENT;
     }
 
-    if (redirect != NULL && s != NULL) {
-        s->redirect = redirect;
+    redirects_apply(s, &redir);
+
+    /* Not a builtin: let it be resolved as a program, the way a shell falls
+     * through to PATH. */
+    const int status = (cmd != NULL) ? cmd->fn(s, argc, argv)
+                                     : s_exec_fallback(s, argc, argv);
+
+    /*
+     * Reported here, inside the redirection, rather than by the caller.
+     *
+     * It used to be printed by espix_shell_run_line() from the returned status,
+     * which is after redirects_release() has already put the streams back -- so
+     * `nosuchcmd 2> log` wrote the message to the terminal and left the log
+     * empty, which is precisely the bug the error stream exists to fix. It also
+     * means both callers get the message: the REPL and SSH's exec channel.
+     */
+    if (status == ESPIX_SHELL_ENOENT) {
+        espix_eprintf(s, "espix: %s: command not found\n", argv[0]);
     }
 
-    const int status = cmd->fn(s, argc, argv);
-
-    if (redirect != NULL) {
-        if (s != NULL) {
-            s->redirect = NULL;
-        }
-        fclose(redirect);
-    }
-
+    redirects_release(s, &redir);
     return status;
 }
 
@@ -243,17 +363,8 @@ int espix_shell_run_line(espix_session_t *s, const char *line)
     const int status = espix_shell_exec(s, line);
 
     if (status == ESPIX_SHELL_ENOENT) {
-        /*
-         * Name the command without its arguments. Copied rather than truncated
-         * in place: the REPL owns a mutable buffer and the exec path does not,
-         * and letting one caller write through this pointer is not a
-         * difference worth having.
-         */
-        char         name[ESPIX_LINE_MAX];
-        const size_t n = strcspn(line, " \t");
-
-        strlcpy(name, line, (n + 1 < sizeof(name)) ? n + 1 : sizeof(name));
-        espix_printf(s, "espix: %s: command not found\n", name);
+        /* The message itself is emitted by espix_shell_exec(), which still has
+         * the redirections applied; all that is left here is the status. */
         s->last_status = 127;
     } else if (status != ESPIX_SHELL_EMPTY) {
         /* An empty line leaves $? alone, which is what every shell does. */

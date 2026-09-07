@@ -144,7 +144,7 @@ static int cmd_ip(espix_session_t *s, int argc, char **argv)
         return ip_route(s);
     }
 
-    espix_printf(s, "usage: ip {addr|link|route} [dev]\n");
+    espix_eprintf(s, "usage: ip {addr|link|route} [dev]\n");
     return 1;
 }
 
@@ -188,7 +188,7 @@ static int cmd_ifconfig(espix_session_t *s, int argc, char **argv)
     }
 
     if (dev != NULL && !shown) {
-        espix_printf(s, "ifconfig: %s: no such interface\n", dev);
+        espix_eprintf(s, "ifconfig: %s: no such interface\n", dev);
         return 1;
     }
     return 0;
@@ -300,13 +300,13 @@ static int cmd_ping(espix_session_t *s, int argc, char **argv)
     }
 
     if (host == NULL) {
-        espix_printf(s, "usage: ping [-c count] <host>\n");
+        espix_eprintf(s, "usage: ping [-c count] <host>\n");
         return 1;
     }
 
     uint32_t addr = 0;
     if (espix_net_resolve(host, &addr) != ESP_OK) {
-        espix_printf(s, "ping: %s: Name or service not known\n", host);
+        espix_eprintf(s, "ping: %s: Name or service not known\n", host);
         return 1;
     }
 
@@ -334,7 +334,7 @@ static int cmd_ping(espix_session_t *s, int argc, char **argv)
 
     esp_ping_handle_t hdl = NULL;
     if (esp_ping_new_session(&cfg, &cbs, &hdl) != ESP_OK) {
-        espix_printf(s, "ping: cannot create session\n");
+        espix_eprintf(s, "ping: cannot create session\n");
         vEventGroupDelete(ctx.done);
         return 1;
     }
@@ -380,7 +380,7 @@ static int wifi_scan(espix_session_t *s)
 
     const esp_err_t err = espix_net_wifi_scan(aps, SCAN_MAX, &found);
     if (err != ESP_OK) {
-        espix_printf(s, "wifi: scan failed: %s\n", esp_err_to_name(err));
+        espix_eprintf(s, "wifi: scan failed: %s\n", esp_err_to_name(err));
         free(aps);
         return 1;
     }
@@ -460,18 +460,18 @@ static int cmd_wifi(espix_session_t *s, int argc, char **argv)
 
         const esp_err_t err = espix_net_wifi_connect(ssid, ssid ? psk : NULL);
         if (err == ESP_ERR_NOT_FOUND) {
-            espix_printf(s, "wifi: no ssid given and none in /etc/wifi.conf\n");
+            espix_eprintf(s, "wifi: no ssid given and none in /etc/wifi.conf\n");
             return 1;
         }
         if (err != ESP_OK) {
-            espix_printf(s, "wifi: %s\n", esp_err_to_name(err));
+            espix_eprintf(s, "wifi: %s\n", esp_err_to_name(err));
             return 1;
         }
         espix_printf(s, "connecting; watch 'wifi status' or dmesg\n");
         return 0;
     }
 
-    espix_printf(s, "usage: wifi {scan|connect [ssid] [psk]|disconnect|status}\n");
+    espix_eprintf(s, "usage: wifi {scan|connect [ssid] [psk]|disconnect|status}\n");
     return 1;
 }
 
@@ -487,7 +487,7 @@ static int cmd_hostname(espix_session_t *s, int argc, char **argv)
     }
 
     if (espix_net_set_hostname(argv[1], true) != ESP_OK) {
-        espix_printf(s, "hostname: cannot set\n");
+        espix_eprintf(s, "hostname: cannot set\n");
         return 1;
     }
     return 0;
@@ -507,7 +507,7 @@ static int usb_status(espix_session_t *s)
     espix_net_usb_status(&st);
 
     if (!st.built) {
-        espix_printf(s, "usb-ncm was not built into this image "
+        espix_eprintf(s, "usb-ncm was not built into this image "
                         "(CONFIG_ESPIX_USB_NCM_ENABLED)\n");
         return 1;
     }
@@ -554,7 +554,7 @@ static int cmd_usb(espix_session_t *s, int argc, char **argv)
 
     if (strcmp(argv[1], "mode") == 0) {
         if (argc < 3) {
-            espix_printf(s, "usage: usb mode {server|client}\n");
+            espix_eprintf(s, "usage: usb mode {server|client}\n");
             return 1;
         }
 
@@ -564,17 +564,17 @@ static int cmd_usb(espix_session_t *s, int argc, char **argv)
         } else if (strcmp(argv[2], "client") == 0) {
             mode = ESPIX_USB_MODE_CLIENT;
         } else {
-            espix_printf(s, "usb: %s: want 'server' or 'client'\n", argv[2]);
+            espix_eprintf(s, "usb: %s: want 'server' or 'client'\n", argv[2]);
             return 1;
         }
 
         const esp_err_t err = espix_net_conf_write_usb(mode);
         if (err == ESP_ERR_NOT_SUPPORTED) {
-            espix_printf(s, "usb-ncm was not built into this image\n");
+            espix_eprintf(s, "usb-ncm was not built into this image\n");
             return 1;
         }
         if (err != ESP_OK) {
-            espix_printf(s, "usb: %s\n", esp_err_to_name(err));
+            espix_eprintf(s, "usb: %s\n", esp_err_to_name(err));
             return 1;
         }
 
@@ -587,7 +587,7 @@ static int cmd_usb(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    espix_printf(s, "usage: usb {status|mode {server|client}}\n");
+    espix_eprintf(s, "usage: usb {status|mode {server|client}}\n");
     return 1;
 }
 

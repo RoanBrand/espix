@@ -60,7 +60,7 @@ static int cmd_help(espix_session_t *s, int argc, char **argv)
     espix_shell_foreach(help_visit, &ctx);
 
     if (ctx.want != NULL && !ctx.found) {
-        espix_printf(s, "help: %s: no such command\n", ctx.want);
+        espix_eprintf(s, "help: %s: no such command\n", ctx.want);
         return 1;
     }
     return 0;
@@ -181,7 +181,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
     TaskStatus_t *tasks = calloc(capacity, sizeof(TaskStatus_t));
     if (tasks == NULL) {
-        espix_printf(s, "ps: out of memory\n");
+        espix_eprintf(s, "ps: out of memory\n");
         return 1;
     }
 
@@ -398,7 +398,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
     top_row_t    *rows  = calloc(capacity, sizeof(top_row_t));
 
     if (tasks == NULL || prev == NULL || rows == NULL) {
-        espix_printf(s, "top: out of memory\n");
+        espix_eprintf(s, "top: out of memory\n");
         free(tasks); free(prev); free(rows);
         return 1;
     }
@@ -584,7 +584,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    espix_printf(s, "ps: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
+    espix_eprintf(s, "ps: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
     return 1;
 }
 
@@ -592,7 +592,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    espix_printf(s, "top: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
+    espix_eprintf(s, "top: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
     return 1;
 }
 
@@ -688,12 +688,12 @@ static int dmesg_level(espix_session_t *s, const char *arg)
 
     espix_klog_level_t level;
     if (!level_from_arg(arg, &level)) {
-        espix_printf(s, "dmesg: bad level '%s'; want 0-3 or "
+        espix_eprintf(s, "dmesg: bad level '%s'; want 0-3 or "
                         "err/warn/info/debug\n", arg);
         return 1;
     }
     if (s != NULL && s->uid != 0) {
-        espix_printf(s, "dmesg: only root may change the console level\n");
+        espix_eprintf(s, "dmesg: only root may change the console level\n");
         return 1;
     }
 
@@ -716,7 +716,7 @@ static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
              * otherwise. Returns either way: -n does not also list. */
             return dmesg_level(s, (i + 1 < argc) ? argv[i + 1] : NULL);
         } else {
-            espix_printf(s, "dmesg: unknown option '%s'\n", argv[i]);
+            espix_eprintf(s, "dmesg: unknown option '%s'\n", argv[i]);
             return 1;
         }
     }
@@ -745,7 +745,7 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "erase") == 0) {
         const esp_err_t err = espix_fault_coredump_erase();
         if (err != ESP_OK) {
-            espix_printf(s, "coredump: erase failed: %s\n",
+            espix_eprintf(s, "coredump: erase failed: %s\n",
                          esp_err_to_name(err));
             return 1;
         }
@@ -755,7 +755,7 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
 
     espix_coredump_info_t info;
     if (espix_fault_coredump_status(&info) != ESP_OK) {
-        espix_printf(s, "coredump: cannot read the coredump partition\n");
+        espix_eprintf(s, "coredump: cannot read the coredump partition\n");
         return 1;
     }
 
@@ -806,13 +806,13 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
      */
     if (argc == 3 && strcmp(argv[1], "-l") == 0) {
         if (s == NULL || s->uid != 0) {
-            espix_printf(s, "passwd: only root can lock an account\n");
+            espix_eprintf(s, "passwd: only root can lock an account\n");
             return 1;
         }
 
         const esp_err_t err = espix_auth_lock(argv[2]);
         if (err != ESP_OK) {
-            espix_printf(s, "passwd: %s: %s\n", argv[2],
+            espix_eprintf(s, "passwd: %s: %s\n", argv[2],
                          (err == ESP_ERR_NOT_FOUND) ? "no such user"
                                                     : esp_err_to_name(err));
             return 1;
@@ -822,10 +822,10 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
     }
 
     if (argc < 3) {
-        espix_printf(s, "usage: passwd [user] <new-password>\n");
-        espix_printf(s, "       passwd -l <user>    take the password away\n");
-        espix_printf(s, "note: the password is echoed and enters shell "
-                        "history; no-echo input needs the new line editor\n");
+        espix_eprintf(s, "usage: passwd [user] <new-password>\n");
+        espix_eprintf(s, "       passwd -l <user>    take the password away\n");
+        espix_eprintf(s, "note: the password is echoed and enters shell "
+                         "history; no-echo input needs the new line editor\n");
         return 1;
     }
 
@@ -845,14 +845,14 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
      * one command.
      */
     if (s != NULL && s->uid != 0 && strcmp(user, s->user) != 0) {
-        espix_printf(s, "passwd: only root can change another user's "
+        espix_eprintf(s, "passwd: only root can change another user's "
                         "password\n");
         return 1;
     }
 
     const esp_err_t err = espix_auth_set_password(user, password);
     if (err != ESP_OK) {
-        espix_printf(s, "passwd: %s: %s\n", user,
+        espix_eprintf(s, "passwd: %s: %s\n", user,
                      (err == ESP_ERR_NOT_FOUND) ? "no such user"
                                                 : esp_err_to_name(err));
         return 1;
@@ -911,7 +911,7 @@ static bool require_root(espix_session_t *s, const char *cmd)
     if (s != NULL && s->uid == 0) {
         return true;
     }
-    espix_printf(s, "%s: only root can do that\n", cmd);
+    espix_eprintf(s, "%s: only root can do that\n", cmd);
     return false;
 }
 
@@ -951,18 +951,18 @@ static int cmd_useradd(espix_session_t *s, int argc, char **argv)
         } else if (strcmp(argv[i], "-G") == 0 && i + 1 < argc) {
             groups = argv[++i];
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "useradd: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "useradd: %s: unsupported option\n", argv[i]);
             return 1;
         } else if (name == NULL) {
             name = argv[i];
         } else {
-            espix_printf(s, "useradd: one name at a time\n");
+            espix_eprintf(s, "useradd: one name at a time\n");
             return 1;
         }
     }
 
     if (name == NULL) {
-        espix_printf(s, "usage: useradd [-m] [-r] [-G group,...] <name>\n");
+        espix_eprintf(s, "usage: useradd [-m] [-r] [-G group,...] <name>\n");
         return 1;
     }
     if (!require_root(s, "useradd")) {
@@ -971,14 +971,14 @@ static int cmd_useradd(espix_session_t *s, int argc, char **argv)
 
     esp_err_t rc = espix_auth_user_add(name, system, make_home);
     if (rc != ESP_OK) {
-        espix_printf(s, "useradd: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "useradd: %s: %s\n", name, auth_err(rc));
         return 1;
     }
 
     if (groups != NULL) {
         rc = espix_auth_set_groups(name, groups, true);
         if (rc != ESP_OK) {
-            espix_printf(s, "useradd: %s: added, but groups: %s\n", name,
+            espix_eprintf(s, "useradd: %s: added, but groups: %s\n", name,
                          auth_err(rc));
             return 1;
         }
@@ -997,7 +997,7 @@ static int cmd_userdel(espix_session_t *s, int argc, char **argv)
         if (strcmp(argv[i], "-r") == 0) {
             remove_home = true;
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "userdel: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "userdel: %s: unsupported option\n", argv[i]);
             return 1;
         } else {
             name = argv[i];
@@ -1005,7 +1005,7 @@ static int cmd_userdel(espix_session_t *s, int argc, char **argv)
     }
 
     if (name == NULL) {
-        espix_printf(s, "usage: userdel [-r] <name>\n");
+        espix_eprintf(s, "usage: userdel [-r] <name>\n");
         return 1;
     }
     if (!require_root(s, "userdel")) {
@@ -1014,7 +1014,7 @@ static int cmd_userdel(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_user_del(name, remove_home);
     if (rc != ESP_OK) {
-        espix_printf(s, "userdel: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "userdel: %s: %s\n", name, auth_err(rc));
         return 1;
     }
     return 0;
@@ -1038,7 +1038,7 @@ static int cmd_usermod(espix_session_t *s, int argc, char **argv)
             seen   = true;
             groups = argv[++i];
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "usermod: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "usermod: %s: unsupported option\n", argv[i]);
             return 1;
         } else {
             name = argv[i];
@@ -1046,8 +1046,8 @@ static int cmd_usermod(espix_session_t *s, int argc, char **argv)
     }
 
     if (name == NULL || !seen) {
-        espix_printf(s, "usage: usermod -aG <group,...> <user>   append\n");
-        espix_printf(s, "       usermod -G <group,...> <user>    replace\n");
+        espix_eprintf(s, "usage: usermod -aG <group,...> <user>   append\n");
+        espix_eprintf(s, "       usermod -G <group,...> <user>    replace\n");
         return 1;
     }
     if (!require_root(s, "usermod")) {
@@ -1056,7 +1056,7 @@ static int cmd_usermod(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_set_groups(name, groups, append);
     if (rc != ESP_OK) {
-        espix_printf(s, "usermod: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "usermod: %s: %s\n", name, auth_err(rc));
         return 1;
     }
     return 0;
@@ -1071,7 +1071,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
         if (strcmp(argv[i], "-r") == 0) {
             system = true;
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "groupadd: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "groupadd: %s: unsupported option\n", argv[i]);
             return 1;
         } else {
             name = argv[i];
@@ -1079,7 +1079,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
     }
 
     if (name == NULL) {
-        espix_printf(s, "usage: groupadd [-r] <name>\n");
+        espix_eprintf(s, "usage: groupadd [-r] <name>\n");
         return 1;
     }
     if (!require_root(s, "groupadd")) {
@@ -1088,7 +1088,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_group_add(name, system);
     if (rc != ESP_OK) {
-        espix_printf(s, "groupadd: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "groupadd: %s: %s\n", name, auth_err(rc));
         return 1;
     }
     return 0;
@@ -1097,7 +1097,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
 static int cmd_groupdel(espix_session_t *s, int argc, char **argv)
 {
     if (argc != 2) {
-        espix_printf(s, "usage: groupdel <name>\n");
+        espix_eprintf(s, "usage: groupdel <name>\n");
         return 1;
     }
     if (!require_root(s, "groupdel")) {
@@ -1106,7 +1106,7 @@ static int cmd_groupdel(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_group_del(argv[1]);
     if (rc != ESP_OK) {
-        espix_printf(s, "groupdel: %s: %s\n", argv[1], auth_err(rc));
+        espix_eprintf(s, "groupdel: %s: %s\n", argv[1], auth_err(rc));
         return 1;
     }
     return 0;
@@ -1125,7 +1125,7 @@ static int cmd_groups(espix_session_t *s, int argc, char **argv)
     const size_t n = espix_auth_groups(user, gids, ESPIX_NGROUPS_MAX);
 
     if (n == 0) {
-        espix_printf(s, "groups: %s: no such user\n", user);
+        espix_eprintf(s, "groups: %s: no such user\n", user);
         return 1;
     }
 
@@ -1183,12 +1183,12 @@ static int cmd_sudo(espix_session_t *s, int argc, char **argv)
     }
 
     if (first >= argc) {
-        espix_printf(s, "usage: sudo [-u <user>] <command> [args...]\n");
+        espix_eprintf(s, "usage: sudo [-u <user>] <command> [args...]\n");
         return 1;
     }
 
     if (s->uid != 0 && !espix_auth_may_sudo(s->user)) {
-        espix_printf(s, "sudo: %s is not in %s\n", s->user, "/etc/sudoers");
+        espix_eprintf(s, "sudo: %s is not in %s\n", s->user, "/etc/sudoers");
         espix_klog(ESPIX_KLOG_WARN, "sudo", "%s: refused", s->user);
         return 1;
     }
@@ -1201,7 +1201,7 @@ static int cmd_sudo(espix_session_t *s, int argc, char **argv)
 
     if (as != NULL) {
         if (espix_auth_lookup(as, &target) != ESP_OK) {
-            espix_printf(s, "sudo: %s: no such user\n", as);
+            espix_eprintf(s, "sudo: %s: no such user\n", as);
             return 1;
         }
         target_ngroups = espix_auth_groups(as, target_groups,
@@ -1218,7 +1218,7 @@ static int cmd_sudo(espix_session_t *s, int argc, char **argv)
         const int wrote = snprintf(line + n, sizeof(line) - n, "%s%s",
                                    (i > first) ? " " : "", argv[i]);
         if (wrote < 0 || (size_t)wrote >= sizeof(line) - n) {
-            espix_printf(s, "sudo: command line too long\n");
+            espix_eprintf(s, "sudo: command line too long\n");
             return 1;
         }
         n += (size_t)wrote;
@@ -1285,7 +1285,7 @@ static int session_end(espix_session_t *s, int argc, char **argv, bool login_onl
     /* Asking whether a login happened, not whether a user is named: the
      * console is called root and still never logged in. */
     if (login_only && !s->login) {
-        espix_printf(s, "%s: not login shell: use `exit'\n", argv[0]);
+        espix_eprintf(s, "%s: not login shell: use `exit'\n", argv[0]);
         return 1;
     }
 
@@ -1297,7 +1297,7 @@ static int session_end(espix_session_t *s, int argc, char **argv, bool login_onl
         const long n = strtol(argv[1], &end, 10);
 
         if (end == argv[1] || *end != '\0' || n < 0 || n > 255) {
-            espix_printf(s, "usage: %s [status]\n", argv[0]);
+            espix_eprintf(s, "usage: %s [status]\n", argv[0]);
             return 1;               /* refuse, and stay */
         }
         status = (int)n;

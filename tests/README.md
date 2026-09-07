@@ -150,6 +150,45 @@ clean run — 0/60 was recorded with the bug demonstrably present. What finally
 caught it was none of this: it was watching the serial console, on `dmesg -n
 debug`, while the reproducer ran.
 
+## Two ways this harness lied, and what stops it now
+
+Both were found while finishing the stream work, and both had already cost a
+session apiece. They are recorded because the failure they produce looks
+nothing like their cause.
+
+**A dead session used to read as empty output.** `session.py` reported its
+errors only on stderr — into a file `device.sh` opened, never read, and then
+deleted — and broke its loop without closing the frame. `dev_run` read to EOF
+and returned `""`. Every subsequent assertion in that suite then compared
+against `""`, and **all seven** `assert_eq "..." ""` assertions in the tree are
+in `15-streams.sh`, so losing the session turned the suite covering the stream
+split green. `dev_run` now returns `<<<dead-session>>>` instead, which fails
+those comparisons instead of satisfying them.
+
+The fix needed two goes, and the reason is worth keeping: `dev_run` is almost
+always called as `$(dev_run ...)`, which is a subshell. Writing to the FIFO
+after `session.py` has gone killed that subshell with SIGPIPE *before any guard
+could run*, and command substitution renders a killed subshell as `""` — the
+very value being guarded against. So the function ignores `PIPE` and checks the
+write. It also cannot remember anything between calls, being a subshell, which
+is why the check is on the write rather than on a flag.
+
+**`espix_timeout` used to leave the process it killed.** It runs `"$@" &` and
+signalled that pid — but `run.sh`'s preflight passed it `dev_status`, a shell
+*function*, so the pid was a subshell and the `ssh` beneath it survived. espix
+accepts four connections and each orphan holds one until the machine is
+rebooted, so they accumulate across runs until the device answers nobody and
+every suite hangs with no output. Three were found alive on the author's
+machine — `uptime`, `coredump` and a mistyped command, hours apart — while
+investigating exactly that symptom, and it had been read as device flakiness.
+It now kills the process group, and the one-shot helpers wrap the `ssh` binary
+directly rather than a function of ours.
+
+The wider lesson, which is the same one the transport bug taught: prove the
+harness before believing what it says about the system. Both of these were
+confirmed by making the *old* behaviour fail a test that the new behaviour
+passes, not by reasoning about the code.
+
 ## A known flaky spot
 
 The console suite fails roughly one run in three or four, and it is the harness
@@ -170,6 +209,45 @@ read its stderr before suspecting espix.
 If it still fails, re-run it alone (`make test SUITE=console`) before believing
 it. That is an unsatisfying instruction to write in a document about trusting
 your tests, and it is better than a suite that quietly passes.
+
+**What has been ruled out**, so the next person need not re-do it. Observed
+shape: the probe answers, the *next* command gets zero bytes, and the console
+says nothing for the rest of the suite. Measured during the stream work —
+- not espix's firmware: two full runs on the *same* image, one green and one
+  not;
+- not a second reader: `lsof` on the port showed nothing, both during and after;
+- not an orphan of ours: no `console.py` or `ssh` left behind;
+- not the device: SSH answered throughout, and the health check found no reboot;
+- not the preceding suites: running fs, transfer, streams and signals first,
+  then the console, passes every time.
+
+The suite now reports it as **one** failure carrying the device's own `uptime`,
+task list and `dmesg`, fetched over SSH — and that immediately produced the
+finding the guesswork above had missed. On the next occurrence, `dmesg` said:
+
+```
+console: terminal does not answer cursor queries; assuming 80x24
+console: console session on uart
+```
+
+The device's **console session had restarted**, mid-suite, with no reset —
+`uptime` was unbroken and the reset reason still `power-on`. A new console
+session probes the terminal for its cursor position, and `console.py` is the
+thing that answers that probe, so a probe falling between two invocations has
+nobody to answer it, times out, and the next `console.py` then syncs against a
+session that is mid-probe rather than sitting at a prompt.
+
+That points at the harness shape the next paragraph already flags: **every
+`dev_console_run` spawns its own `console.py`**, so the port is opened and
+closed once per assertion, and something in that churn ends the device's
+console session. The fix is to hold one `console.py` for the whole suite the way
+`session.py` is held for SSH — the same FIFO plumbing as `dev_session_start` —
+which removes the open/close cycle rather than trying to time it. Not done
+here; the diagnosis was the expensive part.
+
+One thing is now confirmed rather than suspected: a second reader really does
+cause this. Running a `cat /dev/cu.*` capture alongside the suite reproduced it
+every time, and the report named it.
 
 **It now fails fast.** Two things used to make a dead console cost minutes. The
 initial sync shared `--timeout` with the command wait, so three attempts at 30s
@@ -196,6 +274,14 @@ The suite copies it only when it is stale, compared by a SHA-256 in a sidecar
 (`.testapp.sha`) because espix has no checksum command. Binary first, sidecar
 second: an interrupted copy then leaves a stale hash and the next run copies
 again, rather than a wrong binary vouched for by a correct one.
+
+`testapp sig` used to be a separate project, `apps/sigtest`. It sat in the
+*examples* directory, which meant `tools/build-apps.sh` built it on every
+firmware build and shipped it in every rootfs image, while `apps/README.md`'s
+table never listed it — and the signal behaviour it demonstrated had no
+automated coverage at all. Folding it in cost one binary, one build and one
+`scp` less than a second staging path would have, and bought
+`tests/suites/35-signals.sh`.
 
 Run `testapp` with no arguments for its subcommands. `out <n>` prints n lines
 and exists specifically to give the `Corrupted MAC` bug in

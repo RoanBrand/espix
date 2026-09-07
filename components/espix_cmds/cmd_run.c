@@ -53,10 +53,11 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
                        const char *who)
 {
     espix_pid_t     pid = ESPIX_PID_NONE;
-    const esp_err_t err = espix_proc_spawn_elf(abs, argc, argv, s, root, &pid);
+    const esp_err_t err = espix_proc_spawn_elf(abs, argc, argv, s, root,
+                                               !background, &pid);
 
     if (err != ESP_OK) {
-        espix_printf(s, "%s: %s: %s\n", who, abs, esp_err_to_name(err));
+        espix_eprintf(s, "%s: %s: %s\n", who, abs, esp_err_to_name(err));
         return 1;
     }
 
@@ -118,12 +119,12 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
             (void)espix_proc_signal(pid, SIGINT);
 
             if (interrupts + 1 == RUN_INTERRUPTS_TO_KILL) {
-                espix_printf(s, "%s: pid %d is ignoring SIGINT; "
-                                "press Ctrl-C again to force it\n",
-                             who, (int)pid);
+                espix_eprintf(s, "%s: pid %d is ignoring SIGINT; "
+                                 "press Ctrl-C again to force it\n",
+                              who, (int)pid);
             }
         } else if (interrupts == RUN_INTERRUPTS_TO_KILL) {
-            espix_printf(s, "%s: killing pid %d\n", who, (int)pid);
+            espix_eprintf(s, "%s: killing pid %d\n", who, (int)pid);
             (void)espix_proc_signal(pid, SIGKILL);
         }
     }
@@ -137,11 +138,11 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
     s->fg_pid = ESPIX_PID_NONE;
 
     if (wait_err == ESP_ERR_TIMEOUT) {
-        espix_printf(s, "%s: pid %d still running, detaching\n", who, (int)pid);
+        espix_eprintf(s, "%s: pid %d still running, detaching\n", who, (int)pid);
         return 1;
     }
     if (wait_err != ESP_OK) {
-        espix_printf(s, "%s: pid %d: %s\n", who, (int)pid, esp_err_to_name(wait_err));
+        espix_eprintf(s, "%s: pid %d: %s\n", who, (int)pid, esp_err_to_name(wait_err));
         return 1;
     }
 
@@ -185,7 +186,7 @@ static int program_gate(espix_session_t *s, const char *abs, const char *shown)
     }
 
     if ((st.st_mode & S_IXUSR) == 0) {
-        espix_printf(s, "espix: %s: Permission denied\n", shown);
+        espix_eprintf(s, "espix: %s: Permission denied\n", shown);
         return 126;                     /* what a shell returns for this */
     }
 
@@ -198,7 +199,7 @@ static int program_gate(espix_session_t *s, const char *abs, const char *shown)
     fclose(f);
 
     if (got != sizeof(magic) || memcmp(magic, "\177ELF", sizeof(magic)) != 0) {
-        espix_printf(s, "espix: %s: Exec format error\n", shown);
+        espix_eprintf(s, "espix: %s: Exec format error\n", shown);
         return 126;
     }
     return 0;
@@ -255,7 +256,7 @@ static int cmd_confine(espix_session_t *s, int argc, char **argv)
 
     struct stat rootst;
     if (stat(abs_root, &rootst) != 0 || !S_ISDIR(rootst.st_mode)) {
-        espix_printf(s, "confine: %s: not a directory\n", abs_root);
+        espix_eprintf(s, "confine: %s: not a directory\n", abs_root);
         return 1;
     }
 
@@ -372,7 +373,7 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
     int first = 1;
 
     if (argc < 2) {
-        espix_printf(s, "usage: kill [-s] <pid>...\n");
+        espix_eprintf(s, "usage: kill [-s] <pid>...\n");
         return 1;
     }
 
@@ -385,7 +386,7 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
 
         sig = espix_signal_from_name(argv[1] + 1);
         if (sig < 0) {
-            espix_printf(s, "kill: %s: invalid signal (try kill -l)\n",
+            espix_eprintf(s, "kill: %s: invalid signal (try kill -l)\n",
                          argv[1] + 1);
             return 1;
         }
@@ -393,7 +394,7 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
     }
 
     if (first >= argc) {
-        espix_printf(s, "usage: kill [-s] <pid>...\n");
+        espix_eprintf(s, "usage: kill [-s] <pid>...\n");
         return 1;
     }
 
@@ -407,7 +408,7 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
          * "no such process", which is a confusing way to say "that is not a
          * number" -- and is what every `kill -9` attempt used to produce. */
         if (end == argv[i] || *end != '\0') {
-            espix_printf(s, "kill: %s: arguments must be process ids\n", argv[i]);
+            espix_eprintf(s, "kill: %s: arguments must be process ids\n", argv[i]);
             status = 1;
             continue;
         }
@@ -426,13 +427,13 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
                                                : espix_proc_signal(pid, sig);
 
         if (err == ESP_ERR_NOT_FOUND) {
-            espix_printf(s, "kill: %d: no such process\n", (int)pid);
+            espix_eprintf(s, "kill: %d: no such process\n", (int)pid);
             status = 1;
         } else if (err == ESP_ERR_INVALID_STATE) {
-            espix_printf(s, "kill: %d: already finished\n", (int)pid);
+            espix_eprintf(s, "kill: %d: already finished\n", (int)pid);
             status = 1;
         } else if (err != ESP_OK) {
-            espix_printf(s, "kill: %d: %s\n", (int)pid, esp_err_to_name(err));
+            espix_eprintf(s, "kill: %d: %s\n", (int)pid, esp_err_to_name(err));
             status = 1;
         }
     }

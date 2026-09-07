@@ -139,6 +139,17 @@ typedef struct {
      */
     volatile bool     sig_stop_req;
     SemaphoreHandle_t sig_cont;
+
+    /*
+     * The shell is waiting for this process, so its `>` redirection is usable.
+     *
+     * Only a foreground process may write to the session's redirect FILE:
+     * redirects_release() closes it when the command returns, and a
+     * backgrounded process outlives that. run_program() blocks in
+     * espix_proc_wait() for a foreground one, which is exactly the guarantee
+     * the FILE needs -- see the note in exec.c.
+     */
+    bool              foreground;
 } espix_proc_slot_t;
 
 /* Bit for `sig`, or 0 if it is not a signal. Not sigaddset(): that macro is

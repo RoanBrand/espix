@@ -345,7 +345,8 @@ points are the blocking calls espix publishes — `sleep`, `usleep`,
 The honest limit: a pure compute loop that never calls into espix has no
 delivery point and never sees a signal. `espix_sigcheck()` is exported for
 exactly that app, and `kill -9` is the answer when it is somebody else's
-binary. `apps/sigtest spin` is the case in the flesh.
+binary. `testapp sig spin` (in `tests/app/`) is the case in the flesh, and
+`tests/suites/35-signals.sh` pins it.
 
 **Signalling wakes a blocked process.** `espix_proc_signal()` sets the pending
 bit and then calls `xTaskAbortDelay()`, which cuts a `vTaskDelay()` short.
@@ -413,7 +414,7 @@ exceptions.
 
 This works because **an app links no libc at all.** `project_elf()` produces a
 relocatable ELF whose every libc call is an undefined symbol — `readelf
---dyn-syms` on `sigtest.app.elf` shows `printf`, `sleep`, `getpid` and
+--dyn-syms` on `testapp.app.elf` shows `printf`, `sleep`, `getpid` and
 `signal` all `UND`. That is what makes interception total, and it is worth
 knowing before assuming a `--wrap` is needed somewhere: it is not.
 

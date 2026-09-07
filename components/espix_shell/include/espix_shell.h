@@ -42,6 +42,18 @@ extern "C" {
  * CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS > ESPIX_TLS_SESSION_IDX. */
 #define ESPIX_TLS_SESSION_IDX 1
 
+/*
+ * Which of a process's three streams open_stream() is being asked for.
+ *
+ * Was a `bool err`, which could not name a third case. Two implementations and
+ * one caller, so widening it was cheaper than carrying a second hook.
+ */
+typedef enum {
+    ESPIX_STREAM_IN,
+    ESPIX_STREAM_OUT,
+    ESPIX_STREAM_ERR,
+} espix_stream_t;
+
 struct espix_session {
     const char *name;                      /* "console", "ssh0", ... */
     char        cwd[ESPIX_PATH_MAX];
@@ -119,8 +131,13 @@ struct espix_session {
      * wrapped in CHANNEL_DATA and encrypted, so writing to the raw fd would
      * bypass the protocol. The transport builds these with funopen() over its
      * own write path.
+     *
+     * ESPIX_STREAM_IN is the same arrangement in reverse, and comes with one
+     * extra rule: the transport, not this stream, owns the queue behind it.
+     * Over SSH the connection task is the only reader of the wire, so the
+     * stream cannot pull from the socket itself -- see chan_stream_read().
      */
-    FILE *(*open_stream)(espix_session_t *s);
+    FILE *(*open_stream)(espix_session_t *s, espix_stream_t which);
 
     /* Read one line, without the terminator. Returns the length, or a negative
      * value on EOF / transport error. */
@@ -129,6 +146,18 @@ struct espix_session {
 
     /* Write raw bytes. Returns bytes written, or negative on error. */
     int (*write)(espix_session_t *s, const char *data, size_t len);
+
+    /*
+     * The same, for diagnostics. NULL means "no separate error path", and the
+     * error path then falls back to write() -- which is correct for the serial
+     * console, where there is one descriptor and both streams belong on the
+     * terminal, exactly as they do on a real one.
+     *
+     * SSH sets it, because SSH genuinely has somewhere else to put them:
+     * CHANNEL_EXTENDED_DATA, which the client routes to *its* stderr. That is
+     * what makes `ssh host cmd 2>/dev/null` behave on the far end.
+     */
+    int (*write_err)(espix_session_t *s, const char *data, size_t len);
 
     /*
      * Non-blocking: has the user pressed Ctrl-C? Polled while a foreground
@@ -160,9 +189,29 @@ struct espix_session {
     /*
      * Set for the duration of one command when its output was redirected with
      * `>` / `>>`. espix_puts()/espix_printf() honour it; a spawned app's own
-     * stdout does not, so `run app > file` still writes to the console.
+     * stdout does not, so `app > file` still writes to the console.
      */
     FILE       *redirect;
+
+    /*
+     * The same for `2>` / `2>>`, honoured by espix_eprintf() alone.
+     *
+     * Diagnostics deliberately ignore `redirect`. `cmd > file` used to capture
+     * espix's own error messages into the file, which is not merely untidy: it
+     * cost a wrong conclusion once, when a failed ELF load's message vanished
+     * into a redirect and the loader was blamed for not naming a symbol it had
+     * named perfectly.
+     */
+    FILE       *redirect_err;
+
+    /*
+     * `2>&1`: diagnostics follow output wherever it went.
+     *
+     * A flag rather than pointing redirect_err at the same FILE, because two
+     * handles on one stream get closed twice -- the same trap the app stream
+     * pair documents.
+     */
+    bool        err_to_out;
 };
 
 /*
@@ -302,6 +351,19 @@ void espix_shell_set_current(espix_session_t *s);
  * output goes to the console instead of the session that asked for it. */
 int espix_puts(espix_session_t *s, const char *str);
 int espix_printf(espix_session_t *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/*
+ * Diagnostics: anything the user did not ask for. Errors, warnings, usage after
+ * a mistake.
+ *
+ * The distinction is what `>` and `2>` are for, and it is a judgement per call
+ * rather than a rule about wording. `usage:` printed because somebody asked for
+ * help is output; the same line printed because they got the arguments wrong is
+ * a diagnostic. For a command whose whole job is reporting a problem, the
+ * report is its output.
+ */
+int espix_eprintf(espix_session_t *s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /*
