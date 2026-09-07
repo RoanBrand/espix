@@ -16,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 
 #include "espix_auth.h"
 #include "espix_cmds_priv.h"
@@ -185,9 +186,15 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    configRUN_TIME_COUNTER_TYPE total_runtime = 0;
-    const UBaseType_t count = uxTaskGetSystemState(tasks, capacity,
-                                                   &total_runtime);
+    /*
+     * The denominator is esp_timer's 64-bit microsecond clock, not
+     * uxTaskGetSystemState()'s total. That total is the same clock truncated
+     * to 32 bits, which wraps every 71.6 minutes -- and once it has wrapped
+     * below a task's own accumulated counter this ratio stays wrong for a long
+     * stretch, not for one reading.
+     */
+    const uint64_t    total_runtime = (uint64_t)esp_timer_get_time();
+    const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
     espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s\n",
                  "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
@@ -213,12 +220,21 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         snprintf(core_str, sizeof(core_str), "-");
 #endif
 
-        /* Cumulative share of run time since boot, not an instantaneous
-         * reading — a real `top` needs two samples and comes later. */
+        /*
+         * Cumulative share of run time since boot, not an instantaneous
+         * reading — a real `top` needs two samples, and `top` is where they
+         * are.
+         *
+         * Approximate at the top end: the per-task counter is still 32-bit and
+         * wraps after 71.6 minutes of *that task's* CPU, roughly a day for
+         * something 5% busy, and `ps` keeps no history to notice it. The clamp
+         * keeps the impossible out of the column; `top` is the honest reading.
+         */
         unsigned pct = 0;
         if (total_runtime > 0) {
-            pct = (unsigned)((uint64_t)tasks[i].ulRunTimeCounter * 100 /
-                             total_runtime);
+            const uint64_t share = (uint64_t)tasks[i].ulRunTimeCounter * 100 /
+                                   total_runtime;
+            pct = (share > 100) ? 100 : (unsigned)share;
         }
 
         /*
@@ -292,6 +308,17 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
 typedef struct {
     TaskHandle_t                 handle;
+    /*
+     * The handle alone is not an identity. It is the address of the task's
+     * control block, and FreeRTOS frees that block on vTaskDelete -- so the
+     * next task created is very often handed the same address, being an
+     * exact-size best fit for the block just released.
+     *
+     * xTaskNumber is what FreeRTOS calls "a number unique to the task",
+     * assigned at creation and never reused, so the pair tells a recycled
+     * address apart from a task that really is the one sampled last time.
+     */
+    UBaseType_t                  number;
     configRUN_TIME_COUNTER_TYPE  runtime;
 } top_prev_t;
 
@@ -333,7 +360,8 @@ static int top_row_cmp(const void *a, const void *b)
 #define TOP_CORES_MAX 4
 
 static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
-                       const unsigned *idle_per_core, unsigned idle_pct)
+                       const unsigned *idle_per_core, unsigned idle_pct,
+                       bool have_prev)
 {
     char uptime[64];
     espix_uptime_str(uptime, sizeof(uptime));
@@ -361,6 +389,22 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
                      (unsigned)(psram.total_allocated_bytes / 1024),
                      (unsigned)(psr_total / 1024));
     }
+    /*
+     * The first frame has nothing to subtract from, so every task reads 0% --
+     * including the idle tasks, which made "busy" come out as a confident
+     * 100%. It shows the same "-" the per-task column already uses for a task
+     * seen only once. Invisible until `top -n 1` made the first frame the
+     * whole output.
+     */
+    if (!have_prev) {
+        espix_printf(s, "\nCpu:  -%% busy across %u core%s",
+                     cores, cores == 1 ? "" : "s");
+        espix_printf(s, "\n");
+        espix_printf(s, "Tasks: %u total, %u running\n\n",
+                     (unsigned)count, running);
+        return;
+    }
+
     espix_printf(s, "\nCpu:  %u%% busy across %u core%s",
                  busy / cores, cores, cores == 1 ? "" : "s");
 
@@ -383,8 +427,42 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
 
 static int cmd_top(espix_session_t *s, int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    /*
+     * `-n <count>` stops after that many frames; without it top runs until
+     * Ctrl-C, as before.
+     *
+     * `-n` means *iterations*, following procps on Linux, and `-b` is accepted
+     * and ignored for the same reason -- espix takes its conventions from
+     * Linux and Raspberry Pi OS. Worth stating because macOS spells it
+     * differently: there `-n` is the number of *processes* to show, so
+     * `top -n 3` on a Mac lists three processes and keeps running. Anyone
+     * carrying that habit over will be surprised either way; matching the
+     * platform espix imitates everywhere else is the lesser surprise.
+     *
+     * It also exists so the test suite can reach this command at all. An
+     * endless loop cannot be driven by a harness that sends a line and waits
+     * for a prompt, which left the two-sample arithmetic below with no
+     * automated cover -- and that is exactly where `sshd:conn` came to be
+     * reported at 386491%.
+     */
+    long frames = 0;                    /* 0 = until interrupted */
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-b") == 0) {
+            continue;                   /* batch: what this already does */
+        }
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            frames = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || frames < 1) {
+                espix_eprintf(s, "top: -n wants a positive count\n");
+                return 1;
+            }
+            continue;
+        }
+        espix_eprintf(s, "usage: top [-b] [-n <frames>]\n");
+        return 1;
+    }
 
     /*
      * Sized once and kept for the whole run rather than per frame: this is a
@@ -404,15 +482,31 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
     }
 
     size_t                      prev_count   = 0;
-    configRUN_TIME_COUNTER_TYPE prev_total   = 0;
+    int64_t                     prev_us      = 0;
     bool                        have_prev    = false;
     bool                        interrupted  = false;
+    long                        drawn        = 0;
 
-    while (!interrupted) {
-        configRUN_TIME_COUNTER_TYPE total = 0;
-        const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, &total);
+    while (!interrupted && (frames == 0 || drawn < frames)) {
+        const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
-        const configRUN_TIME_COUNTER_TYPE window = total - prev_total;
+        /*
+         * The window comes from esp_timer rather than from
+         * uxTaskGetSystemState()'s total, and the reason is that the total is
+         * the same clock already thrown away:
+         *
+         *     configRUN_TIME_COUNTER_TYPE xPortGetRunTimeCounterValue(void)
+         *     { return (configRUN_TIME_COUNTER_TYPE) esp_timer_get_time(); }
+         *
+         * With a 32-bit counter that truncation wraps every 71.6 minutes of
+         * uptime, and `total - prev_total` then underflowed to something
+         * enormous, so one frame an hour reported every task at 0%. Reading
+         * the 64-bit clock ourselves costs one call and cannot wrap in any
+         * uptime this hardware will see.
+         */
+        const int64_t  now_us = esp_timer_get_time();
+        const uint64_t window = have_prev && now_us > prev_us
+                                    ? (uint64_t)(now_us - prev_us) : 0;
 
         unsigned running = 0;
         for (UBaseType_t i = 0; i < count; i++) {
@@ -429,19 +523,41 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             }
 
             /*
-             * Match by handle. A handle can be recycled after a task is
-             * deleted, so in principle a stale entry could be matched against a
-             * different task -- the cost is one wrong reading in one frame, and
-             * tracking task creation to avoid it is not worth the machinery.
+             * Matched on handle *and* task number. Matching on the handle alone
+             * cost `sshd:conn` a reading of 386491%: a connection task spends
+             * ~390ms on its key exchange, disconnects, its control block is
+             * freed, the next connection is handed the same address, and the
+             * new task's counter of ~0 minus the dead one's 390000 wrapped in
+             * unsigned 32-bit arithmetic to nearly 2^32. Sorted by CPU, it took
+             * first place in the table. A comment here used to guess the cost
+             * at "one wrong reading"; this is what it measured.
              */
             for (size_t j = 0; j < prev_count; j++) {
-                if (prev[j].handle != tasks[i].xHandle) {
+                if (prev[j].handle != tasks[i].xHandle ||
+                    prev[j].number != tasks[i].xTaskNumber) {
                     continue;
                 }
-                const configRUN_TIME_COUNTER_TYPE used =
-                    tasks[i].ulRunTimeCounter - prev[j].runtime;
 
-                rows[i].pct   = (unsigned)((uint64_t)used * 100 / window);
+                const configRUN_TIME_COUNTER_TYPE now = tasks[i].ulRunTimeCounter;
+                const configRUN_TIME_COUNTER_TYPE was = prev[j].runtime;
+
+                /*
+                 * Per-task counters are 32-bit microseconds, so one wraps after
+                 * 71.6 minutes of that task's *own* CPU -- about a day for
+                 * something 5% busy. Now that the entry is known to belong to
+                 * the same task, `now < was` can only mean exactly one wrap,
+                 * and the delta across it is recoverable.
+                 */
+                const uint64_t used = (now < was)
+                                          ? (uint64_t)(UINT32_MAX - was) + now + 1
+                                          : (uint64_t)(now - was);
+
+                unsigned pct = (unsigned)(used * 100 / window);
+
+                /* A backstop, not the fix: a task runs on one core at a time,
+                 * so anything above 100 is this arithmetic going wrong again
+                 * and should not be dressed up as a plausible number. */
+                rows[i].pct   = (pct > 100) ? 100 : pct;
                 rows[i].known = true;
                 break;
             }
@@ -489,7 +605,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             espix_printf(s, "\n");
         }
 
-        top_header(s, count, running, idle_per_core, idle_pct);
+        top_header(s, count, running, idle_per_core, idle_pct, have_prev);
         espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s\n",
                      "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
 
@@ -543,16 +659,26 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
         if (shown >= TOP_ROWS_MAX) {
             espix_printf(s, "...\n");
         }
-        espix_printf(s, "\nCtrl-C to quit\n");
+        if (frames == 0) {
+            espix_printf(s, "\nCtrl-C to quit\n");
+        }
+        drawn++;
 
         /* Remember this sample for the next frame's delta. */
         for (UBaseType_t i = 0; i < count; i++) {
             prev[i].handle  = tasks[i].xHandle;
+            prev[i].number  = tasks[i].xTaskNumber;
             prev[i].runtime = tasks[i].ulRunTimeCounter;
         }
         prev_count = count;
-        prev_total = total;
+        prev_us    = now_us;
         have_prev  = true;
+
+        /* No wait after the last frame of a bounded run: the interval exists to
+         * space out a *display*, and there is nothing left to space it from. */
+        if (frames != 0 && drawn >= frames) {
+            break;
+        }
 
         /*
          * Sleep in slices so Ctrl-C is felt straight away rather than a whole
@@ -1332,7 +1458,7 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "ps",     .fn = cmd_ps,
       .help = "list tasks and processes",       .usage = "ps" },
     { .name = "top",    .fn = cmd_top,
-      .help = "live view of tasks and memory",  .usage = "top" },
+      .help = "live view of tasks and memory",  .usage = "top [-b] [-n <frames>]" },
     { .name = "dmesg",  .fn = cmd_dmesg,
       .help = "print the kernel log",
       .usage = "dmesg [-T] [-n <level>]" },
