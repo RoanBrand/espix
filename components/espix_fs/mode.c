@@ -395,7 +395,15 @@ void espix_fs_mode_str(mode_t mode, bool is_dir, char *out, size_t len)
 {
     char s[11];
 
-    s[0] = is_dir ? 'd' : '-';
+    /*
+     * `is_dir` is passed separately because most callers already know it from a
+     * directory listing and would rather not pay a stat for it. The mode is
+     * still consulted for the one type espix has beyond files and directories:
+     * a character device, which /dev/null is. Without this it rendered as an
+     * ordinary file, which is a small lie in the one place people look to find
+     * out what something is.
+     */
+    s[0] = is_dir ? 'd' : (S_ISCHR(mode) ? 'c' : '-');
     for (int i = 0; i < 9; i++) {
         /* Bit 8 is owner-read, bit 0 is other-execute. */
         s[1 + i] = (mode & (mode_t)(1u << (8 - i))) ? "rwx"[i % 3] : '-';

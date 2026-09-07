@@ -4,6 +4,7 @@ idf_component_register(
         "mode.c"
         "vfs.c"
         "access.c"
+        "dev.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -11,6 +12,7 @@ idf_component_register(
     REQUIRES
         esp_common
     PRIV_REQUIRES
+        esp_partition
         espix_kernel
         espix_proc
         espix_shell

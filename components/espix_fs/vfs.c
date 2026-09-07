@@ -177,6 +177,17 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
         errno = err;
         return -1;
     }
+    /*
+     * Devices are answered here -- after the access check above, never before.
+     * That ordering is the reason the table lives inside this VFS at all: a
+     * filesystem registered at "/dev" would be reached without the check, which
+     * is precisely what fs.c warns about.
+     */
+    const void *dev = espix_dev_lookup(p);
+    if (dev != NULL) {
+        return espix_dev_open(dev, flags);
+    }
+
     if (NO_LOWER(l->ops->open_p)) {
         return enosys();
     }
@@ -190,6 +201,24 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     const bool  creating = (flags & O_CREAT) && stat(p, &before) != 0;
 
     const int fd = l->ops->open_p(l->ctx, p, flags, mode);
+
+    /*
+     * The device fd reservation, enforced rather than assumed. esp_vfs stores a
+     * local fd in a uint8_t, so devices take the top of that range; if the
+     * filesystem ever hands out an fd that far up, the two would alias and a
+     * read of somebody's file would come back as firmware. Refuse instead.
+     * littlefs indexes a cache that starts at a few entries and FD_SETSIZE here
+     * is MEMP_NUM_NETCONN, so this is unreachable in practice -- which is why
+     * it is worth a branch rather than a comment promising it cannot happen.
+     */
+    if (fd >= ESPIX_DEV_FD_BASE) {
+        if (!NO_LOWER(l->ops->close_p)) {
+            l->ops->close_p(l->ctx, fd);
+        }
+        errno = EMFILE;
+        return -1;
+    }
+
     if (fd >= 0 && creating) {
         espix_fs_claim(p);
     }
@@ -199,12 +228,18 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
 static int vfs_close(void *ctx, int fd)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_close(fd);
+    }
     return NO_LOWER(l->ops->close_p) ? enosys() : l->ops->close_p(l->ctx, fd);
 }
 
 static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_read(fd, dst, size);
+    }
     return NO_LOWER(l->ops->read_p) ? enosys()
                                     : l->ops->read_p(l->ctx, fd, dst, size);
 }
@@ -212,6 +247,9 @@ static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
 static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_write(fd, data, size);
+    }
     return NO_LOWER(l->ops->write_p) ? enosys()
                                      : l->ops->write_p(l->ctx, fd, data, size);
 }
@@ -219,6 +257,9 @@ static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
 static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_pread(fd, dst, size, off);
+    }
     return NO_LOWER(l->ops->pread_p)
                ? enosys() : l->ops->pread_p(l->ctx, fd, dst, size, off);
 }
@@ -227,6 +268,12 @@ static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
                           off_t off)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        /* Only /dev/null accepts writes, and it discards them, so the offset
+         * changes nothing. */
+        (void)off;
+        return espix_dev_write(fd, src, size);
+    }
     return NO_LOWER(l->ops->pwrite_p)
                ? enosys() : l->ops->pwrite_p(l->ctx, fd, src, size, off);
 }
@@ -234,6 +281,9 @@ static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
 static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_lseek(fd, size, mode);
+    }
     return NO_LOWER(l->ops->lseek_p) ? enosys()
                                      : l->ops->lseek_p(l->ctx, fd, size, mode);
 }
@@ -241,6 +291,9 @@ static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
 static int vfs_fstat(void *ctx, int fd, struct stat *st)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_fstat(fd, st);
+    }
     return NO_LOWER(l->ops->fstat_p) ? enosys()
                                      : l->ops->fstat_p(l->ctx, fd, st);
 }
@@ -248,12 +301,21 @@ static int vfs_fstat(void *ctx, int fd, struct stat *st)
 static int vfs_fsync(void *ctx, int fd)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        return espix_dev_fsync(fd);
+    }
     return NO_LOWER(l->ops->fsync_p) ? enosys() : l->ops->fsync_p(l->ctx, fd);
 }
 
 static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        /* Nothing here has flags worth reporting, and F_GETFL returning 0 is
+         * more useful to a caller than ENOSYS. */
+        (void)cmd; (void)arg;
+        return 0;
+    }
     return NO_LOWER(l->ops->fcntl_p) ? enosys()
                                      : l->ops->fcntl_p(l->ctx, fd, cmd, arg);
 }
@@ -292,6 +354,12 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
     const lower_t *l = ctx;
 
     RESOLVE_OR_FAIL(path, -1);
+
+    const void *dev = espix_dev_lookup(p);
+    if (dev != NULL) {
+        espix_dev_stat(dev, st);
+        return 0;
+    }
 
     if (NO_LOWER(l->dir->stat_p)) {
         return enosys();
@@ -460,6 +528,12 @@ static int vfs_truncate(void *ctx, const char *path, off_t length)
 static int vfs_ftruncate(void *ctx, int fd, off_t length)
 {
     const lower_t *l = ctx;
+    if (espix_dev_fd(fd)) {
+        /* /dev/null is already empty and /dev/factory is read-only. */
+        (void)length;
+        errno = EINVAL;
+        return -1;
+    }
     return NO_LOWER(l->dir->ftruncate_p)
                ? enosys() : l->dir->ftruncate_p(l->ctx, fd, length);
 }
