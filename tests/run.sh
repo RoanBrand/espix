@@ -28,6 +28,7 @@ SUITE_FILTER=""
 : "${ESPIX_STRESS_N:=30}"
 : "${ESPIX_STRESS_LINES:=2000}"
 : "${ESPIX_STRESS_LIMIT:=0}"
+: "${ESPIX_SUITE_TIMEOUT:=240}"
 export ESPIX_STRESS ESPIX_STRESS_N ESPIX_STRESS_LINES ESPIX_STRESS_LIMIT
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -74,7 +75,11 @@ printf 'espix tests -- %s@%s' "$ESPIX_USER" "$ESPIX_HOST"
 [ -n "$ESPIX_PORT" ] && printf ', console %s' "$ESPIX_PORT"
 printf '\n'
 
-if ! espix_timeout 20 dev_status 'uptime'; then
+# dev_status carries its own deadline now (see device.sh), so no wrapper here.
+# The wrapper is what created the orphans: espix_timeout was handed this shell
+# function, killed the subshell it got back, and left ssh holding a connection
+# slot on every failed preflight.
+if ! dev_status 'uptime'; then
     fatal "cannot reach $ESPIX_HOST as $ESPIX_USER (is it up, and is the password right?)"
 fi
 
@@ -98,8 +103,24 @@ for suite in "$ESPIX_TEST_DIR"/suites/*.sh; do
 
     # Each suite gets a fresh session: one login amortised over its assertions,
     # and a suite that wedges its session cannot poison the next one.
-    dev_session_start
-    . "$suite"
+    if dev_session_start; then
+        suite_start=$SECONDS
+        . "$suite"
+
+        # Reported after the fact, not enforced: the suite is sourced into
+        # this shell, so there is nothing to signal. What stops a run hanging
+        # is that every device call inside now carries its own deadline (see
+        # ESPIX_SSH_TIMEOUT in device.sh); this catches the suite that stays
+        # under each of those and still takes far longer than it should, which
+        # is what a device with connection slots held looks like.
+        if [ "$name" != "90-stress" ] \
+           && [ $((SECONDS - suite_start)) -gt "$ESPIX_SUITE_TIMEOUT" ]; then
+            espix_fail "$name: suite exceeded ${ESPIX_SUITE_TIMEOUT}s" \
+                       "took $((SECONDS - suite_start))s"
+        fi
+    else
+        espix_fail "$name: could not open a session"
+    fi
     dev_session_stop
 
     SUITES_RUN=$((SUITES_RUN + 1))

@@ -13,6 +13,19 @@ DEV_SESSION_DIR=""
 DEV_SESSION_PID=""
 DEV_PROMPT=""
 
+# Set when the shared session is known to be gone. Once it is, every dev_run
+# returns DEV_DEAD rather than "".
+#
+# Why a sentinel *value* rather than an exit status: suites use dev_run inside
+# `$( )` and compare the string, so `assert_eq "..." "" "$(dev_run ...)"` never
+# looks at a status. A dead session used to answer "" to everything, which is
+# exactly what several of those assertions expect -- so losing the session made
+# them pass. All seven empty-expecting assertions in the tree are in
+# 15-streams.sh, the suite covering the stream split, so the failure mode was
+# aimed squarely at the work it was meant to verify.
+DEV_SESSION_DEAD=""
+DEV_DEAD="<<<dead-session>>>"
+
 # ---------------------------------------------------------------- session ---
 #
 # session.py holds one login for a whole suite, because a login costs a key
@@ -37,6 +50,9 @@ dev_session_start() {
     # First thing session.py emits is the prompt it synced on, so a suite can
     # assert on the sigil without having to see one in command output (dev_run
     # strips them, and should).
+    DEV_SESSION_DEAD=""
+    DEV_PROMPT=""
+
     local line
     while IFS= read -r line <&8; do
         case "$line" in
@@ -44,8 +60,24 @@ dev_session_start() {
                 DEV_PROMPT="${line#<<<ESPIX-PROMPT }"
                 DEV_PROMPT="${DEV_PROMPT%>>>}"
                 break ;;
+            '<<<ESPIX-ERROR '*)
+                break ;;
         esac
     done
+
+    # No prompt means no session. This used to fall out of the loop on EOF and
+    # carry on with DEV_PROMPT empty, so the suite ran its whole way through
+    # against a login that never happened.
+    if [ -z "$DEV_PROMPT" ]; then
+        DEV_SESSION_DEAD=yes
+        printf '  %s could not open a session to %s\n' \
+               "$(_espix_red FAIL)" "$ESPIX_HOST" >&2
+        if [ -s "$DEV_SESSION_DIR/err" ]; then
+            sed 's/^/       /' "$DEV_SESSION_DIR/err" >&2
+        fi
+        return 1
+    fi
+    return 0
 }
 
 dev_session_stop() {
@@ -63,17 +95,66 @@ dev_session_stop() {
 # No exit status: espix's shell has no $?, so use dev_status when the number is
 # the thing being asserted.
 dev_run() {
-    local line out=""
-    printf '%s\n' "$1" >&9
+    # SIGPIPE ignored, and the write checked, because dev_run is almost always
+    # called as `$(dev_run ...)` -- which is a subshell, and that has two
+    # consequences that between them made a lost session invisible:
+    #
+    #  - Writing to the FIFO after session.py is gone killed the subshell with
+    #    SIGPIPE (status 141) before a single line below could run, and command
+    #    substitution renders a killed subshell as the empty string. Which is
+    #    precisely what several assertions in 15-streams.sh expect, so losing
+    #    the session made them pass. Measured, not surmised: the first version
+    #    of this guard did not work for exactly this reason.
+    #  - Nothing assigned in here outlives the call, so "the session is dead"
+    #    cannot be remembered between calls. Each one has to find out for
+    #    itself, which is why the check is on the write rather than on a flag.
+    if [ -n "$DEV_SESSION_DEAD" ] || [ -z "$DEV_SESSION_PID" ]; then
+        printf '%s' "$DEV_DEAD"
+        return 1
+    fi
+
+    local line out="" closed="" why=""
+
+    # The trap is scoped to the write, in its own subshell, rather than set for
+    # the whole function: `trap '' PIPE` here would otherwise persist in the
+    # *calling* shell whenever dev_run is used outside `$( )`, quietly changing
+    # how every later pipeline in the run behaves. The write is the only place
+    # SIGPIPE can arrive -- everything after it reads.
+    if ! ( trap '' PIPE; printf '%s\n' "$1" >&9 ) 2>/dev/null; then
+        printf '  %s session gone before: %s\n' "$(_espix_red FAIL)" "$1" >&2
+        printf '%s' "$DEV_DEAD"
+        return 1
+    fi
     # Frame markers come from session.py; read to the closing one.
     while IFS= read -r line <&8; do
         case "$line" in
-            '<<<ESPIX-CMD '*) continue ;;
-            '<<<ESPIX-END '*) break ;;
+            '<<<ESPIX-CMD '*)   continue ;;
+            '<<<ESPIX-END '*)   closed=yes; break ;;
+            '<<<ESPIX-ERROR '*) why="${line#<<<ESPIX-ERROR }"; why="${why%>>>}" ;;
             *) out="$out$line
 " ;;
         esac
     done
+
+    # An unclosed frame means the session went away mid-command -- session.py
+    # timed out, or the connection dropped. Returning the accumulated output
+    # (usually nothing) would report that as a command which printed nothing.
+    if [ -z "$closed" ]; then
+        DEV_SESSION_DEAD=yes
+        printf '  %s session lost while running: %s\n' \
+               "$(_espix_red FAIL)" "$1" >&2
+        [ -n "$why" ] && printf '       %s\n' "$why" >&2
+        printf '%s' "$DEV_DEAD"
+        return 1
+    fi
+
+    # A framed error with a closed frame: the command itself was refused (an
+    # unsupported `;`, say). The session is still good.
+    if [ -n "$why" ]; then
+        printf '%s' "$DEV_DEAD"
+        return 1
+    fi
+
     printf '%s' "$out" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
 }
 
@@ -108,10 +189,35 @@ dev_askpass_cleanup() {
 # already sent this project down a wrong path once.
 DEV_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
+# ConnectTimeout bounds the *connect* and nothing after it, so a device that
+# accepts a connection and then never answers held a run open indefinitely --
+# dev_health_begin calls dev_once twice before the first suite, with no output
+# to say what it was waiting for. These are the whole-command deadlines.
+: "${ESPIX_SSH_TIMEOUT:=30}"
+: "${ESPIX_SCP_TIMEOUT:=90}"
+
+# The environment and the deadline, in one place.
+#
+# espix_timeout is handed the ssh *binary*, through env, and never a shell
+# function: `"$@" &` on a function gives back a subshell pid, and killing that
+# leaves ssh alive holding one of espix's four connection slots. run.sh's
+# preflight did exactly that, and the orphans accumulate until the device
+# answers nobody. See the note in portable.sh.
+_dev_ssh() {
+    espix_timeout "$ESPIX_SSH_TIMEOUT" \
+        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+        ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
+}
+
+_dev_scp() {
+    espix_timeout "$ESPIX_SCP_TIMEOUT" \
+        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+        scp $DEV_SSH_OPTS "$@"
+}
+
 # dev_status <command> -- run it in its own connection, return its exit status.
 dev_status() {
-    SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-        ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$1" >/dev/null 2>&1
+    _dev_ssh "$1" >/dev/null 2>&1
 }
 
 # Everything below prints the command's output with ssh's host-key notice
@@ -128,15 +234,13 @@ _dev_filter() {
 # dev_once <command> -- own connection, echo output, discard status.
 dev_once() {
     local out
-    out=$(SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-          ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$1" 2>&1)
+    out=$(_dev_ssh "$1" 2>&1)
     _dev_filter "$out"
 }
 
 dev_push() {
     local out rc
-    out=$(SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-          scp $DEV_SSH_OPTS "$1" "$ESPIX_USER@$ESPIX_HOST:$2" 2>&1)
+    out=$(_dev_scp "$1" "$ESPIX_USER@$ESPIX_HOST:$2" 2>&1)
     rc=$?
     _dev_filter "$out"
     return $rc
@@ -144,8 +248,7 @@ dev_push() {
 
 dev_pull() {
     local out rc
-    out=$(SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-          scp $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST:$1" "$2" 2>&1)
+    out=$(_dev_scp "$ESPIX_USER@$ESPIX_HOST:$1" "$2" 2>&1)
     rc=$?
     _dev_filter "$out"
     return $rc
@@ -156,7 +259,8 @@ dev_pull() {
 # fails at the login with a message about permissions that looks like the
 # device refusing you.
 dev_sftp() {
-    SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+    espix_timeout "$ESPIX_SCP_TIMEOUT" \
+        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
         sftp $DEV_SSH_OPTS -o BatchMode=no -b "$1" \
         "$ESPIX_USER@$ESPIX_HOST" 2>&1
 }
