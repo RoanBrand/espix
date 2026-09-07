@@ -65,6 +65,26 @@
 #define SSH_STDIN_QUEUE   256
 #define STDIN_POLL_MS     10
 
+/*
+ * How many times chan_poll_interrupt() will refill the stdin queue before
+ * handing the connection task back to its caller.
+ *
+ * The cap matters in both directions: without it a client that never stops
+ * sending would keep this task here and Ctrl-C would never be noticed, and
+ * with it too low the inbound rate collapses to one queue per poll interval.
+ */
+#define STDIN_DRAIN_SPINS 64
+
+/* How long the connection task will wait for the reader to make room, on a
+ * channel with no terminal -- where there is no Ctrl-C for it to delay. */
+#define STDIN_SEND_WAIT_MS 50
+
+/* How long it waits for the next packet on such a channel, so a transfer is
+ * not rationed to one packet per RUN_POLL_MS slice. */
+#define STDIN_WIRE_WAIT_MS 20
+
+
+
 
 /* Bound on packets read while waiting for the peer to open its window. A client
  * that never adjusts is broken or hostile; either way we should not spin. */
@@ -441,8 +461,41 @@ static bool drain_pending_to_stdin(ssh_chan_t *ch, bool *hit)
                  * processes had a stdin at all. */
                 ch->pending_pos = run;
             } else {
+                /*
+                 * A pipe waits for room; a terminal never does.
+                 *
+                 * Waiting here is what makes the hand-off event-driven: the
+                 * reading task's next receive wakes this one immediately,
+                 * instead of both sides polling on a 100Hz tick and capping the
+                 * rate at one queue per tick -- 256 bytes per 10ms, which
+                 * measured 22 KB/s and is what a `prog < file` used to crawl
+                 * at.
+                 *
+                 * Never for a pty: this is the connection task, and blocking it
+                 * would stop the poll that notices Ctrl-C, at exactly the
+                 * moment somebody is reaching for it. A terminal's overflow is
+                 * dropped instead, which is what a tty does.
+                 */
+                /*
+                 * A pipe waits for room; a terminal never does.
+                 *
+                 * Waiting is what keeps the rate off the poll interval. The
+                 * producer only runs from cmd_run's wait loop, once per
+                 * RUN_POLL_MS, so returning when the queue is full moves one
+                 * queue per 50ms -- 256 bytes per 50ms, ~5 KB/s, slow enough
+                 * that a 2MB `prog < file` hit the foreground timeout and was
+                 * truncated mid-stream. Measured both ways.
+                 *
+                 * Never for a pty: this is the connection task, and blocking it
+                 * stops the poll that notices Ctrl-C at exactly the moment
+                 * somebody is reaching for it. A terminal's overflow is dropped
+                 * instead, as a tty does.
+                 */
+                const TickType_t wait = ch->has_pty
+                                            ? 0
+                                            : pdMS_TO_TICKS(STDIN_SEND_WAIT_MS);
                 const size_t sent = xStreamBufferSend(
-                    ch->stdin_q, &ch->pending[ch->pending_pos], span, 0);
+                    ch->stdin_q, &ch->pending[ch->pending_pos], span, wait);
 
                 ch->pending_pos += sent;
 
@@ -491,17 +544,59 @@ static bool chan_poll_interrupt(espix_session_t *s)
         return false;
     }
 
-    for (;;) {
+    /*
+     * Bounded: a client that never stops sending must not hold the connection
+     * task here for ever, or a foreground process would never be reaped.
+     */
+    for (unsigned spins = 0; spins < STDIN_DRAIN_SPINS; spins++) {
         if (!drain_pending_to_stdin(ch, &hit)) {
-            return hit;         /* queue full; `pending` still holds the rest */
+            /*
+             * The queue was still full when the send above gave up waiting.
+             * Retry within the spin budget rather than returning: returning
+             * hands the task back to a RUN_POLL_MS sleep, which is the 50ms
+             * cap this whole arrangement exists to avoid.
+             */
+            continue;
         }
 
         if (ch->closed) {
             return hit;
         }
 
+        /*
+         * A channel with a reader waits briefly for the next packet; a
+         * terminal does not wait at all.
+         *
+         * With a zero timeout this returned the instant the socket was empty,
+         * which is immediately after draining one packet -- so the caller slept
+         * out its RUN_POLL_MS slice and the next packet waited 50ms for it.
+         * That is one packet per poll, and it measured 21 KB/s regardless of
+         * queue size or whether either side of the hand-off blocked, which is
+         * what finally identified it: the bottleneck was never the hand-off, it
+         * was getting bytes off the wire.
+         *
+         * Never for a pty: this is the connection task and waiting here is
+         * waiting to notice Ctrl-C.
+         */
+        /*
+         * A channel with a reader waits briefly for the next packet; a terminal
+         * does not wait at all.
+         *
+         * With a zero timeout this returns the instant the socket is empty --
+         * which is immediately after draining one packet -- so the caller slept
+         * out its RUN_POLL_MS slice and the next packet waited 50ms for it.
+         * One packet per poll is not enough to keep a transfer alive: without
+         * this the 2MB case still hit the foreground timeout and truncated,
+         * even with the queue hand-off fixed.
+         *
+         * Never for a pty, for the same reason as the send above.
+         */
         fd_set         rfds;
         struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+
+        if (!ch->has_pty && ch->stdin_q != NULL) {
+            tv.tv_usec = STDIN_WIRE_WAIT_MS * 1000;
+        }
 
         FD_ZERO(&rfds);
         FD_SET(ch->conn->fd, &rfds);
@@ -520,6 +615,10 @@ static bool chan_poll_interrupt(espix_session_t *s)
             return hit;
         }
     }
+
+    /* Spun the budget with data still arriving; `pending` and the queue are
+     * both intact, so the next slice continues where this stopped. */
+    return hit;
 }
 
 /*
@@ -643,7 +742,27 @@ static int chan_stream_read(void *cookie, char *buf, int len)
          * espix_proc_signal() already calls xTaskAbortDelay(), so a signal
          * ends the wait at once rather than up to a second later.
          */
-        const size_t got = xStreamBufferReceive(ch->stdin_q, buf, (size_t)len, 0);
+        /*
+         * Blocking, with a timeout -- not polling.
+         *
+         * This polled once, with vTaskDelay() between tries, on the theory that
+         * a task deleted while blocked here left its handle registered in the
+         * buffer. The theory was wrong: the crash was newlib's FILE lock, held
+         * across fgets() and taken again by esp_cleanup_r() on the killer's
+         * task, and proc_force_kill() lets the process out of libc first now.
+         *
+         * Polling cost what polling costs. Both sides woke on a 100Hz tick, so
+         * the hand-off moved one queue per tick -- 256 bytes per 10ms, 22 KB/s
+         * measured, linear in the transfer size. Blocking here makes the
+         * producer's send wake this task directly, and the rate follows the
+         * wire instead of the scheduler.
+         *
+         * The timeout remains because EOF is not always announced: a client
+         * that vanishes sends no CHANNEL_EOF, and this is also where a
+         * signalled process notices.
+         */
+        const size_t got = xStreamBufferReceive(ch->stdin_q, buf, (size_t)len,
+                                                pdMS_TO_TICKS(STDIN_POLL_MS));
         if (got > 0) {
             return (int)got;
         }
@@ -672,7 +791,6 @@ static int chan_stream_read(void *cookie, char *buf, int len)
         if (espix_sigcheck()) {
             return 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(STDIN_POLL_MS));
     }
 }
 
@@ -684,9 +802,20 @@ static int chan_stream_read(void *cookie, char *buf, int len)
 static FILE *chan_open_stream(espix_session_t *s, espix_stream_t which)
 {
     if (which == ESPIX_STREAM_IN) {
-        /* Unbuffered on the stdio side: the queue is already the buffer, and a
-         * second one would hold back bytes an interactive reader is waiting
-         * for. */
+        /*
+         * Buffered, and the reasoning that first said otherwise was wrong.
+         *
+         * This was _IONBF on the grounds that the queue is already a buffer.
+         * What it actually bought was newlib issuing a readfn call per byte,
+         * and the inbound rate pinned at 21 KB/s no matter what happened
+         * underneath -- unmoved by blocking either side of the hand-off or by
+         * waiting on the wire. That insensitivity was the clue: the cost sat
+         * above all of it, in the number of calls.
+         *
+         * Small, so an interactive reader is not left waiting for a buffer to
+         * fill: chan_stream_read() returns as soon as it has anything rather
+         * than waiting for the whole request.
+         */
         /*
          * No closefn, deliberately.
          *
@@ -703,7 +832,7 @@ static FILE *chan_open_stream(espix_session_t *s, espix_stream_t which)
          */
         FILE *f = funopen(s, chan_stream_read, NULL, NULL, NULL);
         if (f != NULL) {
-            setvbuf(f, NULL, _IONBF, 0);
+            setvbuf(f, NULL, _IOFBF, 512);
         }
         return f;
     }

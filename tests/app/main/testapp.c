@@ -404,6 +404,48 @@ static int cmd_sig(const char *mode)
     return 2;
 }
 
+/*
+ * Read stdin to the end and report how much arrived.
+ *
+ * This is the only thing that exercises the inbound path espix gained with a
+ * process stdin -- chan_pump -> pending -> drain_pending_to_stdin -> stream
+ * buffer -> chan_stream_read. scp reaches none of it: an sftp channel gets no
+ * stdin queue at all, so the throughput suite's scp measurements would pass
+ * with that whole path broken.
+ *
+ * The buffer is large deliberately. malloc above
+ * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16384) is served from PSRAM, so asking
+ * for 64KB keeps this off the internal heap without the app naming a capability
+ * it has no ABI for -- and it makes each fread a real block read rather than a
+ * measurement of per-call overhead.
+ *
+ * The count is the point as much as the speed: a transfer that ends early is a
+ * failure, and without it a truncated read looks like a fast one.
+ */
+static int cmd_sink(void)
+{
+    enum { SINK_BUF = 64 * 1024 };
+
+    char *buf = malloc(SINK_BUF);
+    if (buf == NULL) {
+        printf("sink: out of memory\n");
+        return 1;
+    }
+
+    unsigned long total = 0;
+    for (;;) {
+        const size_t got = fread(buf, 1, SINK_BUF, stdin);
+        if (got == 0) {
+            break;
+        }
+        total += (unsigned long)got;
+    }
+
+    free(buf);
+    printf("sink: %lu bytes\n", total);
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -418,6 +460,7 @@ static void usage(void)
            "  outbuf <n>          the same lines, 4KB-buffered (few packets)\n"
            "  both                one line to stdout, one to stderr\n"
            "  cat                 echo stdin, then its byte count\n"
+           "  sink                read stdin, report the byte count only\n"
            "  sig [mode]          handlers (default) | ignore | spin\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n");
 }
@@ -464,6 +507,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "cat") == 0) {
         return cmd_cat();
+    }
+    if (strcmp(cmd, "sink") == 0) {
+        return cmd_sink();
     }
     if (strcmp(cmd, "sig") == 0) {
         return cmd_sig((argc > 2) ? argv[2] : NULL);

@@ -60,6 +60,23 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   blocked one was harmless too. `tests/suites/15-streams.sh` pins both kill
   paths, and both were made to fail before they were made to pass.
 
+- **A second unexplained fault, once, under sustained inbound traffic.** During
+  a throughput run: `exccause 0x47` (CacheError) inside
+  `Cache_WriteBack_Addr`, reached from `psa_mac_update` → `esp_sha256_update`
+  → `esp_sha_dma_process` → `esp_cache_msync`, on the SSH receive buffer.
+
+  That buffer is `ssh_conn_t.in_buf`, and the connection struct is allocated
+  from PSRAM, so the SHA driver takes its DMA path over external RAM. This is
+  not espix misusing the API — `sha.c` explicitly handles an external-RAM input
+  with a cache sync — but espix is what puts a PSRAM buffer there, and inbound
+  throughput went from 5 KB/s to 226 KB/s in the same change, so that path now
+  runs constantly where it used to be reached by interactive traffic only.
+
+  Not reproduced since: two further throughput runs, a full suite, and a
+  targeted stress of concurrent flash reads against SSH crypto were all clean.
+  Recorded with the exccause and the stack because the next occurrence should
+  not start from nothing, and because "it went away" is not a diagnosis.
+
 - **One earlier heap corruption remains unexplained.** A single panic during a
   full run, before the two kill bugs above were found: faulting task
   `sshd:conn`, detected in `tlsf_free` inside `esp_vfs_select` from
@@ -273,6 +290,20 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   it — it blocks until the session ends. `chan_pump()` overwrites that buffer
   rather than appending, so a second reader is not a small change: it needs
   the buffer to become a ring first.
+
+- **Two concurrent SFTP transfers break.** Reproducible, and not new: two
+  `scp` downloads started at the same time end with one connection failing
+  (rc=255, a partial file) and the other hanging until it is killed. `ps` during
+  the hang shows an `sshd:conn` task sitting at priority 18 — the tcpip task's
+  priority, inherited — so tcpip is waiting on a mutex that connection holds.
+
+  The control matters, because this was first noticed through `/dev/factory`
+  and looked like a bug in it: two concurrent downloads of an ordinary file
+  (`/bin/neopixel`) fail exactly the same way, and a single 4MB `/dev/factory`
+  download succeeds every time. So it is SFTP concurrency, not the device.
+
+  One transfer at a time is the working configuration, which is what the test
+  suite does and probably what anyone does by hand.
 
 - **One command per `exec`.** The shell has no `;`, `&&` or pipes, so
   `ssh host 'cd /bin && ls'` fails in the parser rather than in the channel.
