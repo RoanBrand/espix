@@ -47,36 +47,23 @@
 #define LOCAL_WINDOW  262144
 
 /*
- * A process's stdin queue, and the free space chan_poll_interrupt() insists on
- * before it will pump another packet.
+ * A process's stdin queue, and how long a blocked read waits before looking up.
  *
- * The queue has to be strictly larger than one maximum packet, and that is a
- * correctness requirement rather than a tuning choice. chan_pump() reads up to
- * SSH_CHANNEL_MAX_PACKET into `pending`, and the drain that follows pushes it
- * on with no wait -- so unless a whole packet is guaranteed to fit, the tail
- * of one is dropped silently. Refusing to pump below that mark is what
- * provides the guarantee.
+ * Small on purpose. It is a hand-off between two tasks, not a buffer for a
+ * transfer: chan_pump() only refills `pending` once that buffer is drained, so
+ * a queue that fills mid-drain simply stops and the remainder waits in
+ * `pending` for the next poll. Nothing is lost by being small -- an earlier
+ * version demanded room for a whole 2048-byte packet before it would pump,
+ * which forced 2560 bytes on every connection including sftp, ~10KB across
+ * four sessions, for no benefit.
  *
- * Getting this wrong does not degrade, it deadlocks: with the queue at 1024
- * and the mark at 2048 the check could never pass, nothing was ever pumped,
- * and the first process to read stdin blocked until the foreground timeout.
+ * The poll interval is what a reader waits when the queue is empty. It must
+ * wake with nothing to read: a client that vanishes sends no CHANNEL_EOF, and
+ * this is also where the process notices it has been signalled. One tick at
+ * the default 100Hz.
  */
-#define SSH_STDIN_QUEUE      2560
-#define SSH_STDIN_LOW_WATER  SSH_CHANNEL_MAX_PACKET
-
-/*
- * How long a blocked stdin read waits before looking up.
- *
- * It has to wake even with nothing to read: a client that vanishes sends no
- * CHANNEL_EOF, and the read is also where this process notices it has been
- * signalled. A second is far below any human's patience and costs one wakeup
- * per second per reader.
- */
-#define STDIN_SLICE_MS       1000
-
-_Static_assert(SSH_STDIN_QUEUE > SSH_STDIN_LOW_WATER,
-               "stdin queue must hold a whole packet, or poll_interrupt can "
-               "never pump and a reader blocks for ever");
+#define SSH_STDIN_QUEUE   256
+#define STDIN_POLL_MS     10
 
 
 /* Bound on packets read while waiting for the peer to open its window. A client
@@ -412,6 +399,76 @@ static int send_cooked(ssh_chan_t *ch, const char *data, size_t len,
 static esp_err_t chan_pump(ssh_chan_t *ch);
 
 /*
+ * Move what is waiting in `pending` into the process's stdin queue, taking
+ * Ctrl-C out of it on a pty.
+ *
+ * Returns false when the queue filled and the remainder was left in `pending`
+ * on purpose, so the caller must not pump more over the top of it.
+ *
+ * Contiguous runs rather than a byte at a time: each xStreamBufferSend() takes
+ * the buffer's lock, and one byte per call meant ~2048 lock acquisitions per
+ * packet for `prog < file`.
+ *
+ * The two channel kinds genuinely differ, and the difference is Ctrl-C:
+ *
+ *   pty    0x03 is a signal, not data, so the whole buffer has to be scanned
+ *          for it even when the queue is full -- a full queue is exactly when
+ *          somebody reaches for Ctrl-C, and refusing to look would be the one
+ *          case where it cannot get through. What will not fit is dropped,
+ *          which is what a tty input buffer does when it overflows.
+ *   pipe   0x03 is data. Stop draining and leave the rest where it is; the
+ *          process drains the queue and the next poll continues. Real flow
+ *          control, and `prog < file` must not lose the middle of the file.
+ */
+static bool drain_pending_to_stdin(ssh_chan_t *ch, bool *hit)
+{
+    while (ch->pending_pos < ch->pending_len) {
+        size_t run = ch->pending_pos;
+
+        if (ch->has_pty) {
+            while (run < ch->pending_len && ch->pending[run] != 0x03) {
+                run++;
+            }
+        } else {
+            run = ch->pending_len;
+        }
+
+        const size_t span = run - ch->pending_pos;
+
+        if (span > 0) {
+            if (ch->stdin_q == NULL) {
+                /* Nobody can read it: discard, exactly as this did before
+                 * processes had a stdin at all. */
+                ch->pending_pos = run;
+            } else {
+                const size_t sent = xStreamBufferSend(
+                    ch->stdin_q, &ch->pending[ch->pending_pos], span, 0);
+
+                ch->pending_pos += sent;
+
+                if (sent < span) {
+                    if (!ch->has_pty) {
+                        return false;           /* leave it; flow control */
+                    }
+                    espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                               "stdin queue full; dropped %u typed byte%s",
+                               (unsigned)(span - sent),
+                               (span - sent) == 1 ? "" : "s");
+                    ch->pending_pos = run;
+                }
+            }
+        }
+
+        if (run < ch->pending_len && ch->pending[run] == 0x03) {
+            *hit = true;
+            ch->pending_pos = run + 1;
+        }
+    }
+
+    return true;
+}
+
+/*
  * Ctrl-C while a foreground process runs, and delivery of everything else to
  * that process's standard input.
  *
@@ -423,14 +480,7 @@ static esp_err_t chan_pump(ssh_chan_t *ch);
  * This is also the *only* consumer of `pending` in this state, which is what
  * makes it the right place to feed stdin. chan_pump() overwrites pending
  * instead of appending, so a second reader on the process's own task would
- * lose whichever bytes the other one pumped over. Handing them to a stream
- * buffer here keeps one reader of the wire and gives the process a queue it
- * can block on.
- *
- * 0x03 is taken as an interrupt and swallowed only when the client asked for a
- * terminal. Without a pty there is no line discipline and no signal to raise:
- * the client is a pipe, `ssh host prog < file` may legitimately contain 0x03,
- * and eating it would corrupt the input.
+ * lose whichever bytes the other one pumped over.
  */
 static bool chan_poll_interrupt(espix_session_t *s)
 {
@@ -442,39 +492,11 @@ static bool chan_poll_interrupt(espix_session_t *s)
     }
 
     for (;;) {
-        /* Anything already decrypted and waiting. */
-        while (ch->pending_pos < ch->pending_len) {
-            const uint8_t byte = ch->pending[ch->pending_pos++];
-
-            if (byte == 0x03 && ch->has_pty) {
-                hit = true;
-                continue;
-            }
-            /*
-             * No wait: this runs on the connection task, and blocking here
-             * would stop the poll that notices a Ctrl-C. A full queue is
-             * handled by not pumping more below, not by waiting -- so a
-             * refusal here means that guarantee has broken, and it is worth a
-             * line in the log rather than a hole in somebody's input.
-             */
-            if (ch->stdin_q != NULL
-                && xStreamBufferSend(ch->stdin_q, &byte, 1, 0) != 1) {
-                espix_klog(ESPIX_KLOG_WARN, TAG,
-                           "stdin queue full; dropped a byte");
-            }
+        if (!drain_pending_to_stdin(ch, &hit)) {
+            return hit;         /* queue full; `pending` still holds the rest */
         }
 
         if (ch->closed) {
-            return hit;
-        }
-
-        /*
-         * Back-pressure. Pumping with a full queue would drop the middle of
-         * whatever is being sent, silently -- and a partial file is worse than
-         * a slow one. The process drains it and the next poll carries on.
-         */
-        if (ch->stdin_q != NULL
-            && xStreamBufferSpacesAvailable(ch->stdin_q) < SSH_STDIN_LOW_WATER) {
             return hit;
         }
 
@@ -601,14 +623,42 @@ static int chan_stream_read(void *cookie, char *buf, int len)
     }
 
     for (;;) {
-        const size_t got = xStreamBufferReceive(ch->stdin_q, buf, (size_t)len,
-                                                pdMS_TO_TICKS(STDIN_SLICE_MS));
+        /*
+         * Non-blocking, and that is a correctness requirement rather than a
+         * style choice.
+         *
+         * A *blocking* xStreamBufferReceive() registers this task in the
+         * buffer (stream_buffer.c: `xTaskWaitingToReceive =
+         * xTaskGetCurrentTaskHandle()`) and FreeRTOS never deregisters a task
+         * that is deleted while it waits. espix force-kills processes -- on
+         * `kill -9`, on the third Ctrl-C, and on hangup once TERM_GRACE_MS
+         * expires -- so a process asleep in here got deleted with its handle
+         * still registered, and the connection task's next send then notified
+         * a freed TCB. Measured, not theorised: `kill -9` on a backgrounded
+         * `testapp cat` took the device down every time, while the same kill
+         * on an app that never *read* stdin was harmless.
+         *
+         * vTaskDelay() has no such problem -- a deleted task is simply removed
+         * from the delayed list -- and it is better on every other axis too:
+         * espix_proc_signal() already calls xTaskAbortDelay(), so a signal
+         * ends the wait at once rather than up to a second later.
+         */
+        const size_t got = xStreamBufferReceive(ch->stdin_q, buf, (size_t)len, 0);
         if (got > 0) {
             return (int)got;
         }
-        /* Nothing arrived. Only now does EOF mean EOF: the queue has to be
-         * drained first, or the last packet before a CHANNEL_EOF is lost. */
-        if (ch->closed || ch->eof_seen) {
+        /*
+         * End of input, but only when there is nothing left *anywhere*: the
+         * queue empty and the connection task holding no undrained packet.
+         *
+         * Testing the queue alone reported EOF while the very first packet was
+         * still sitting in `pending`, because a client redirecting a file
+         * sends the data and CHANNEL_EOF back to back -- so `prog < file` read
+         * zero bytes. The earlier blocking version hid this by waiting a
+         * second first, which gave chan_poll_interrupt() time to drain.
+         */
+        if ((ch->closed || ch->eof_seen)
+            && ch->pending_pos >= ch->pending_len) {
             return 0;
         }
         /*
@@ -617,13 +667,12 @@ static int chan_stream_read(void *cookie, char *buf, int len)
          * We are on the process's own task, so this runs its handlers here and
          * now -- and if it has been asked to stop, ending the read is the only
          * way to say so: there is no EINTR to hand back through fgets(). An
-         * app blocked on input would otherwise be unsignallable and could only
-         * ever be force-killed once the hangup grace expired, which is exactly
-         * the "no delivery point" trap espix_sigcheck() exists for.
+         * app blocked on input would otherwise be unsignallable.
          */
         if (espix_sigcheck()) {
             return 0;
         }
+        vTaskDelay(pdMS_TO_TICKS(STDIN_POLL_MS));
     }
 }
 
@@ -1435,12 +1484,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
     ch->tx_lock      = xSemaphoreCreateRecursiveMutex();
     ch->rx_lock      = xSemaphoreCreateMutex();
 
-    /* Built here rather than when a process first asks for stdin: the producer
-     * is the connection task and the consumer is the process's own task, so a
-     * handle created on demand would be a race on the pointer itself. */
-    ch->stdin_q      = xStreamBufferCreate(SSH_STDIN_QUEUE, 1);
-
-    if (ch->tx_lock == NULL || ch->rx_lock == NULL || ch->stdin_q == NULL) {
+    if (ch->tx_lock == NULL || ch->rx_lock == NULL) {
         goto out;
     }
 
@@ -1528,6 +1572,28 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * a task espix_fs_access_check() reads as the kernel. An authenticated
      * client could fetch files its own shell login was refused.
      */
+    /*
+     * The stdin queue, now that the channel's kind is known and before
+     * anything that could spawn a process exists.
+     *
+     * Not lazily, on the first open_stream(ESPIX_STREAM_IN): the producer is
+     * the connection task and the consumer is the process's own task, so a
+     * handle built on demand would be a race on the pointer itself. And not
+     * unconditionally at channel setup either, which is where it started --
+     * that charged every sftp connection for a queue nothing on it can read.
+     *
+     * A failure here is not fatal. stdin_q == NULL means input is discarded
+     * exactly as it was before processes had a stdin, and chan_stream_read()
+     * reports end of input; the session is worth more than its stdin.
+     */
+    if (!ch->want_sftp) {
+        ch->stdin_q = xStreamBufferCreate(SSH_STDIN_QUEUE, 1);
+        if (ch->stdin_q == NULL) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "no memory for stdin; processes will see end of input");
+        }
+    }
+
     if (ch->want_sftp) {
         espix_session_t session = {
             .name      = "sftp",

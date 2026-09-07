@@ -487,8 +487,67 @@ bool espix_sigcheck(void)
  * described in the project's crash-handling model, and the reason espix_fault's
  * reaper exists as a separate, deferred path.
  */
+/*
+ * How long proc_force_kill() lets a process leave a libc call before deleting
+ * it. Long enough for one tick plus the unwinding; short enough that `kill -9`
+ * still feels immediate.
+ */
+#define KILL_UNWIND_MS 250
+
+/*
+ * Let the target out of any libc call it is inside, then delete it.
+ *
+ * Deleting a task that is blocked *inside newlib stdio* takes the device down,
+ * and not subtly: vTaskDelete() frees the TCB and then runs _reclaim_reent()
+ * -> esp_cleanup_r() on the killer's task, which fcloses the dead task's
+ * streams -- and fclose needs the very FILE lock the deleted task was holding.
+ * Measured, with a control: `kill -9` on a process blocked in fgets(stdin)
+ * reset the board every time, while the same kill on one blocked in sleep()
+ * was harmless, and SIGTERM on the blocked one was harmless too because it
+ * unwinds first.
+ *
+ * So do what SIGTERM demonstrably does, without making SIGKILL catchable.
+ * Setting stop_requested is not a signal -- no handler runs -- but it is what
+ * espix_sigcheck() reports, and espix's blocking calls poll that and return.
+ * A process reading stdin therefore leaves fgets() on its own, releases the
+ * lock and usually exits, so there is nothing left to delete.
+ *
+ * An app that ignores it is deleted anyway when the grace runs out, exactly as
+ * before: this weakens `kill -9`'s promptness by a quarter of a second and
+ * weakens nothing else.
+ */
+static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
+{
+    if (task == NULL || task == xTaskGetCurrentTaskHandle()) {
+        return;
+    }
+
+    espix_proc_slot_t *slot = espix_proc_find(pid);
+    if (slot != NULL) {
+        slot->stop_requested = true;
+    }
+
+    /* Cut short whatever delay it is in, so it reaches the check now rather
+     * than at the end of its slice. */
+    (void)xTaskAbortDelay(task);
+
+    /* Finished on its own is the good outcome, and the common one. */
+    (void)espix_proc_wait(pid, NULL, pdMS_TO_TICKS(KILL_UNWIND_MS));
+}
+
 static esp_err_t proc_force_kill(espix_pid_t pid)
 {
+    /*
+     * Outside the table lock: espix_proc_wait() blocks, and holding the lock
+     * across it would stop the very task we are waiting for from finishing.
+     */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    espix_proc_slot_t *pre = espix_proc_find(pid);
+    TaskHandle_t       pre_task = (pre != NULL) ? pre->info.task : NULL;
+    xSemaphoreGive(g_espix_proc_lock);
+
+    kill_unwind(pid, pre_task);
+
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
 
     espix_proc_slot_t *slot = espix_proc_find(pid);

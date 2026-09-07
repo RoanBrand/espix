@@ -172,6 +172,30 @@ static const char *missing_symbol_name(missing_sym_t *out)
     return out->name;
 }
 
+/*
+ * A loaded process's stdout and stderr, for a foreground process.
+ *
+ * Deliberately routed through the session rather than bound to whatever the
+ * redirection happened to be at spawn time: espix_session_write() resolves
+ * `>`, `2>` and `2>&1` on every write, so the process never holds the shell's
+ * FILE. See the long note in proc_task() for what holding it cost.
+ */
+static int proc_write_out(void *cookie, const char *data, int len)
+{
+    if (len <= 0) {
+        return 0;
+    }
+    return (espix_session_write(cookie, data, (size_t)len, false) < 0) ? -1 : len;
+}
+
+static int proc_write_err(void *cookie, const char *data, int len)
+{
+    if (len <= 0) {
+        return 0;
+    }
+    return (espix_session_write(cookie, data, (size_t)len, true) < 0) ? -1 : len;
+}
+
 static void proc_task(void *arg)
 {
     espix_proc_slot_t *slot = arg;
@@ -221,20 +245,32 @@ static void proc_task(void *arg)
      * teardown -- see the note there. The previous values are kept so they can
      * be put back, which is what makes esp_cleanup_r() find nothing to do.
      *
-     * `>` and `2>` are honoured for a *foreground* process only. The redirect
-     * FILE belongs to the shell and redirects_release() closes it when the
-     * command returns, so a backgrounded process pointed at one would be
-     * writing through a freed handle the moment somebody typed `&`.
-     * run_program() blocks in espix_proc_wait() for a foreground process,
-     * which is precisely the lifetime the FILE needs. Ownership is tracked per
-     * stream below, because a redirect must not be closed here -- the shell
-     * closes it, and closing it twice is the trap this whole comment is about.
+     * `>` and `2>` are honoured, and for a *foreground* process only -- but
+     * never by handing this task the shell's redirect FILE.
      *
-     * One narrow hazard, recorded rather than fixed: an app force-killed
-     * (`kill -9`, or the third Ctrl-C) exactly inside an fwrite to a redirect
-     * leaves that FILE's newlib lock held, and the shell's fclose would then
-     * block. The same window exists on the channel's tx_lock and is handled
-     * there with a timed acquire; there is no timed fclose to match it.
+     * That is not fastidiousness. It was written that way first, and for
+     * `app > f 2>&1` both stdout and stderr then pointed at one object owned
+     * by the shell; esp_cleanup_r() fcloses all three streams independently
+     * when a task is deleted, so a force-killed process closed it twice and
+     * the second close asserted inside newlib on a lock the first had already
+     * destroyed -- `assert failed: spinlock_acquire ... lock->count == 0`,
+     * reached through prvDeleteTCB -> _reclaim_reent. redirects_release()
+     * would then have closed it a third time. A clean exit restores the
+     * globals below before returning, which is exactly why the test suite
+     * never saw it.
+     *
+     * So a foreground process gets funopen() streams of its own over
+     * espix_session_write(), which resolves the redirection per write. The
+     * shell's FILE is written *through* and never held, the two streams are
+     * always distinct objects, and `2>&1` needs no special case here because
+     * session_err() already implements it -- an app and a builtin cannot
+     * disagree about it.
+     *
+     * A backgrounded process outlives redirects_release(), so it must not
+     * consult the redirection at all: it keeps the transport's own streams.
+     *
+     * All of it is gated on open_stream, so the console -- which deliberately
+     * has none, its apps writing to the real UART -- is untouched.
      */
     espix_session_t *const session = slot->info.session;
 
@@ -242,59 +278,38 @@ static void proc_task(void *arg)
     FILE *const prev_stdout = stdout;
     FILE *const prev_stderr = stderr;
 
-    /* Streams this task created and must close. A redirect FILE is the
-     * shell's, so it is assigned but never owned. */
     bool own_in = false, own_out = false, own_err = false;
 
-    if (session != NULL) {
-        FILE *const rd_out = slot->foreground ? session->redirect : NULL;
-        FILE *const rd_err = slot->foreground
-                                 ? (session->err_to_out ? session->redirect
-                                                        : session->redirect_err)
-                                 : NULL;
+    if (session != NULL && session->open_stream != NULL) {
+        FILE *out = NULL;
+        FILE *err = NULL;
 
-        /*
-         * `2>&1` with no `>` at all: there is no redirect FILE to share, so
-         * diagnostics have to follow output to the transport's *output*
-         * stream. Two FILE objects with one destination, which is the shape
-         * the pair had before stderr existed -- and it has to stay two, or
-         * esp_cleanup_r() closes one object twice.
-         *
-         * Without this an app's stderr went out as CHANNEL_EXTENDED_DATA
-         * while a builtin's, routed through session_err(), followed stdout --
-         * so `ssh host 'app 2>&1' > file` on the client kept the app's
-         * diagnostics out of the file and a builtin's in it.
-         */
-        const espix_stream_t err_kind = session->err_to_out
-                                            ? ESPIX_STREAM_OUT
-                                            : ESPIX_STREAM_ERR;
-
-        if (rd_out != NULL) {
-            stdout = rd_out;
-        } else if (session->open_stream != NULL) {
-            FILE *const f = session->open_stream(session, ESPIX_STREAM_OUT);
-            if (f != NULL) {
-                stdout  = f;
-                own_out = true;
-            }
+        if (slot->foreground) {
+            out = funopen(session, NULL, proc_write_out, NULL, NULL);
+            err = funopen(session, NULL, proc_write_err, NULL, NULL);
+            /* Line buffered, matching what the transport's own streams do:
+             * output should appear as it is produced, and a packet per
+             * character would be absurd. */
+            if (out != NULL) { setvbuf(out, NULL, _IOLBF, 128); }
+            if (err != NULL) { setvbuf(err, NULL, _IOLBF, 128); }
+        } else {
+            out = session->open_stream(session, ESPIX_STREAM_OUT);
+            err = session->open_stream(session, ESPIX_STREAM_ERR);
         }
 
-        if (rd_err != NULL) {
-            stderr = rd_err;
-        } else if (session->open_stream != NULL) {
-            FILE *const f = session->open_stream(session, err_kind);
-            if (f != NULL) {
-                stderr  = f;
-                own_err = true;
-            }
+        if (out != NULL) {
+            stdout  = out;
+            own_out = true;
+        }
+        if (err != NULL) {
+            stderr  = err;
+            own_err = true;
         }
 
-        if (session->open_stream != NULL) {
-            FILE *const f = session->open_stream(session, ESPIX_STREAM_IN);
-            if (f != NULL) {
-                stdin  = f;
-                own_in = true;
-            }
+        FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
+        if (in != NULL) {
+            stdin  = in;
+            own_in = true;
         }
     }
 
@@ -401,24 +416,21 @@ done:
         FILE *const err = stderr;
 
         /* Restore first, unconditionally, so esp_cleanup_r() finds nothing to
-         * close whether or not we owned what was there. */
+         * close whether or not anything was opened. Every stream we assigned
+         * is one we made, so each is closed exactly once -- and closing the
+         * out/err wrappers flushes them through espix_session_write() while
+         * the redirect FILE is still the shell's to close. */
         stdin  = prev_stdin;
         stdout = prev_stdout;
         stderr = prev_stderr;
 
-        if (own_out && out != prev_stdout) {
+        if (own_out) {
             fclose(out);            /* flushes on the way out */
-        } else if (out != prev_stdout) {
-            /* A redirect, owned by the shell. Flush what we wrote so it is in
-             * the file before the command returns; do not close it. */
-            fflush(out);
         }
-        if (own_err && err != prev_stderr) {
+        if (own_err) {
             fclose(err);
-        } else if (err != prev_stderr) {
-            fflush(err);
         }
-        if (own_in && in != prev_stdin) {
+        if (own_in) {
             fclose(in);
         }
     }

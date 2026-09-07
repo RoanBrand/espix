@@ -367,6 +367,21 @@ int espix_eprintf(espix_session_t *s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /*
+ * Raw write to one of the session's two output paths, resolving `>`, `2>` and
+ * `2>&1` exactly as espix_printf()/espix_eprintf() do.
+ *
+ * Exists for a loaded process's stdio: espix_proc builds funopen() streams over
+ * this so an app's printf() and fprintf(stderr, ...) land wherever the shell
+ * says, without the process ever *holding* the shell's redirect FILE. It held
+ * one once, and a force-killed process then had stdout and stderr pointing at
+ * the same object -- which esp_cleanup_r() fclosed twice on task deletion, the
+ * second close asserting inside newlib on a lock the first had already
+ * destroyed.
+ */
+int espix_session_write(espix_session_t *s, const char *data, size_t len,
+                        bool err);
+
+/*
  * Console transport (UART or USB-Serial-JTAG, whichever the build selects).
  * Sets up the driver, line endings and the line editor, then runs the session
  * loop on the calling task. Normally never returns.

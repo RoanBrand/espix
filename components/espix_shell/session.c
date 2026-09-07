@@ -114,6 +114,15 @@ int espix_eprintf(espix_session_t *s, const char *fmt, ...)
     return n;
 }
 
+int espix_session_write(espix_session_t *s, const char *data, size_t len,
+                        bool err)
+{
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+    return err ? session_err(s, data, len) : session_out(s, data, len);
+}
+
 /* What one command line's redirections resolved to. */
 typedef struct {
     FILE *out;          /* `>` / `>>`, or NULL */

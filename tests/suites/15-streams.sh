@@ -65,8 +65,13 @@ assert_contains "unredirected, a diagnostic is still visible" "not found" "$both
 # `ssh host cmd 2>/dev/null` would still show the error.
 # ---------------------------------------------------------------------------
 
+# Deadlined, like the helpers in device.sh, and for the reason recorded there:
+# a raw ssh to a device that has stopped answering hangs until TCP gives up,
+# which wedged this suite for twenty minutes when a kill test panicked the
+# board. espix_timeout is given the ssh *binary* so the kill reaches it.
 _ssh() {
-    SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+    espix_timeout "$ESPIX_SSH_TIMEOUT" \
+        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
         ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
 }
 
@@ -168,6 +173,74 @@ if dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
         "$(_ssh "$APP cat" < /dev/null)"
 
     rm -rf "$(dirname "$stdin_src")"
+
+    # ---------------------------------------------------------------------
+    # Force-killing a process must not take the device with it.
+    #
+    # Two crash paths, each needing a kill at a moment nothing else in this
+    # suite produces -- which is exactly why 118 passing assertions did not
+    # see either of them. Both are about what a *deleted* task leaves behind:
+    # ESP-IDF runs esp_cleanup_r() on task deletion, which fcloses stdin,
+    # stdout and stderr independently whenever each differs from the global
+    # one, and FreeRTOS never deregisters a deleted task from a stream buffer.
+    # ---------------------------------------------------------------------
+
+    mins_before=$(dev_uptime_minutes)
+
+    # A foreground app with `> f 2>&1` had stdout *and* stderr pointing at one
+    # FILE -- the shell's. A clean exit restores the globals first, so this only
+    # bites on a kill: esp_cleanup_r() fclosed it twice and redirects_release()
+    # then closed it a third time.
+    ( _ssh "$APP sleep 20 > $T/killed 2>&1" >/dev/null 2>&1 ) &
+    victim=$!
+    sleep 4
+
+    pid=$(dev_run 'ps' | sed -n 's/^ *\([0-9][0-9]*\) app:testapp.*/\1/p' | head -1)
+    if [ -z "$pid" ]; then
+        espix_fail "a redirected foreground app is running to be killed" \
+                   "no app:testapp in ps; nothing was killed, so the next" \
+                   "assertion would pass without testing anything"
+    else
+        dev_run "kill -9 $pid" >/dev/null
+        sleep 2
+        assert_contains "the session survives force-killing a redirected app" \
+            "$ESPIX_USER" "$(dev_run 'whoami')"
+    fi
+    wait "$victim" 2>/dev/null
+
+    # A process killed while blocked reading stdin left its task handle
+    # registered in the channel's stream buffer. The next blocking reader on
+    # the same channel then trips FreeRTOS's own
+    # configASSERT(xTaskWaitingToReceive == NULL) -- and before that, any send
+    # from the connection task notifies a freed TCB.
+    #
+    # Backgrounded on purpose: nothing pumps input for a background process, so
+    # `cat` is guaranteed to be sitting in the read when the kill lands.
+    pid=$(dev_run "$APP cat &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+    if [ -z "$pid" ]; then
+        espix_fail "a stdin reader is running to be killed" "no [pid] line"
+    else
+        sleep 2
+        dev_run "kill -9 $pid" >/dev/null
+        sleep 1
+
+        pid2=$(dev_run "$APP cat &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+        sleep 2
+        assert_contains "a second stdin reader survives the first being killed" \
+            "$ESPIX_USER" "$(dev_run 'whoami')"
+        [ -n "$pid2" ] && dev_run "kill -9 $pid2" >/dev/null 2>&1
+    fi
+
+    # The cheapest possible check that neither of the above rebooted the board:
+    # uptime cannot go backwards on a device that stayed up.
+    mins_after=$(dev_uptime_minutes)
+    if [ "$mins_before" -ge 0 ] && [ "$mins_after" -ge 0 ] \
+       && [ "$mins_after" -lt "$mins_before" ]; then
+        espix_fail "the device did not reboot during the kill tests" \
+                   "uptime went ${mins_before}min -> ${mins_after}min"
+    else
+        espix_pass "the device did not reboot during the kill tests"
+    fi
 else
     espix_skip "test app not built -- run 'make test-app'"
 fi
