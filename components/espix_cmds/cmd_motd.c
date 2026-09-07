@@ -52,12 +52,6 @@ static const char *const WORDMARK[] = {
 /*
  * A PCB antenna, as etched on the module this runs on.
  *
- * The trace forks at the T and two verticals leave the bottom edge, which is
- * drawn that way on purpose: the ESP32 module's antenna is an inverted-F, so
- * alongside the meander there really is a feed line and a shorting stub. It is
- * not a plain serpentine that lost its way, and should not be "corrected" into
- * one.
- *
  * It sits directly under the wordmark with no separating row: the wordmark's
  * last line is nearly all whitespace already, so a blank row between them opens
  * a gap wide enough to read as two unrelated pictures.
