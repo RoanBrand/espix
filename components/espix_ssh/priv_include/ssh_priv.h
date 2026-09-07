@@ -21,6 +21,29 @@ extern "C" {
  * treated as abuse and drops the connection.
  */
 #define SSH_MAX_PACKET   4096
+
+/*
+ * Cache-line alignment for the buffers the crypto accelerators touch.
+ *
+ * These live inside a connection struct that comes from PSRAM, and mbedtls
+ * drives SHA and AES by DMA over whatever pointer it is handed. ESP-IDF is
+ * explicit about both halves of what that requires: a DMA buffer in external
+ * RAM wants MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, and "cache memory
+ * synchronization to an unaligned address region may silently corrupt the
+ * memory" -- which is precisely what esp_sha_dma_process() does, calling
+ * esp_cache_msync(..., ESP_CACHE_MSYNC_FLAG_UNALIGNED) on the input it is
+ * given.
+ *
+ * At an arbitrary offset inside the struct, a write-back of the region the MAC
+ * covers rounds out to whole cache lines and can take neighbouring heap memory
+ * with it. Aligning the start to a cache line, with each buffer a whole number
+ * of lines long, keeps that rounding inside the buffer itself: the head is on a
+ * boundary and the tail can only spill into the rest of the same array.
+ *
+ * SSH_MAX_PACKET is a multiple of 64, so only the start needs stating.
+ */
+#define SSH_DMA_ALIGN 64
+
 #define SSH_VERSION_MAX  256
 
 /*
@@ -183,7 +206,7 @@ typedef struct {
     ssh_dir_t rx;
     ssh_dir_t tx;
 
-    uint8_t  in_buf[SSH_MAX_PACKET];
+    uint8_t  in_buf[SSH_MAX_PACKET] __attribute__((aligned(SSH_DMA_ALIGN)));
     uint8_t *in_payload;
     size_t   in_len;
 
@@ -197,7 +220,7 @@ typedef struct {
      * `ssh host <cmd>` came to truncate its output and lose its exit status
      * about a third of the time.
      */
-    uint8_t  out_buf[SSH_MAX_PACKET];
+    uint8_t  out_buf[SSH_MAX_PACKET] __attribute__((aligned(SSH_DMA_ALIGN)));
 
     /*
      * Transmit only, and the name says so because the alternative cost a long
@@ -208,7 +231,8 @@ typedef struct {
      * because the other party held rx_lock. The receive path now streams its
      * MAC and touches nothing here; keep it that way.
      */
-    uint8_t  tx_frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8];
+    uint8_t  tx_frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8]
+        __attribute__((aligned(SSH_DMA_ALIGN)));
 } ssh_conn_t;
 
 esp_err_t ssh_transport_banner(ssh_conn_t *c);

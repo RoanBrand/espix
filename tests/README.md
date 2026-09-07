@@ -237,13 +237,25 @@ thing that answers that probe, so a probe falling between two invocations has
 nobody to answer it, times out, and the next `console.py` then syncs against a
 session that is mid-probe rather than sitting at a prompt.
 
-That points at the harness shape the next paragraph already flags: **every
-`dev_console_run` spawns its own `console.py`**, so the port is opened and
-closed once per assertion, and something in that churn ends the device's
-console session. The fix is to hold one `console.py` for the whole suite the way
-`session.py` is held for SSH — the same FIFO plumbing as `dev_session_start` —
-which removes the open/close cycle rather than trying to time it. Not done
-here; the diagnosis was the expensive part.
+One `console.py` is now held for the whole suite, the way `session.py` is held
+for SSH, which removes the open/close cycle rather than trying to time it.
+
+**It did not cure the flakiness, and that is worth stating plainly.** Both the
+old code and the new pass five consecutive runs on their own and both still
+fail in some full runs, with the same shape: the first command answers, the
+next gets nothing, and `dmesg` shows the console session having restarted. So
+the per-command open/close was a real cause and evidently not the only one.
+
+Quietening the kernel log for the suite (`dmesg -n warn`, since klog lands on
+the console prompt and a full run generates a steady stream of it) was tried on
+the same reasoning and reverted: it could not be shown to help either, and it
+made the suite need root for something unrelated to what it tests.
+
+What is known: the device stays up throughout, SSH keeps answering, `main` --
+the task running the console session -- is alive and blocked on input, and
+`lsof` shows nothing else on the port. At one point the port went silent at the
+raw level (a bare `pyserial` read returned zero bytes) while SSH was perfectly
+healthy, which a reboot cleared. That is the next thread to pull.
 
 One thing is now confirmed rather than suspected: a second reader really does
 cause this. Running a `cat /dev/cu.*` capture alongside the suite reproduced it

@@ -64,3 +64,4 @@ assert_contains "the console can read a root-only file" "root:" \
     "$(dev_console_run 'cat /etc/passwd')"
 
 # The sigil is the other half of the prompt change: root gets '#'.
+
