@@ -40,24 +40,43 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   exactly what `espix_sigcheck()` is exported for. `testapp sig spin` is the
   case in the flesh, and `tests/suites/35-signals.sh` covers it. SIGKILL is the answer when it is somebody else's binary.
 
-- **One unreproduced heap corruption, recorded rather than solved.** A single
-  panic during a full test run, on a build that had passed the same run twice
-  before it and has passed it since. The faulting task was `sshd:conn` and the
-  detection site was `tlsf_free` inside `esp_vfs_select`, reached from
-  `chan_poll_interrupt()` — which polls `select()` every 50ms while a
-  foreground process runs, so it is the most likely *detector* of damage done
-  anywhere, not evidence about the culprit. Heap corruption surfaces at
-  whatever frees next.
+- **A hard kill will not survive a process inside libc.** `proc_force_kill()`
+  deletes the task, and `vTaskDelete()` then runs newlib's cleanup *on the
+  killer's task* — `_reclaim_reent()` → `esp_cleanup_r()`, which fcloses the
+  dead task's three streams. `fclose` needs each `FILE`'s lock, and the deleted
+  task may have been holding one: it is exactly what `fgets(stdin)` does for as
+  long as it waits.
 
-  What has been tried: `CONFIG_HEAP_POISONING_COMPREHENSIVE`, which checks
-  canaries on every allocation and free, across three runs of the suite that
-  was executing when it faulted and one full run — no event. So the write is
-  either rare or outside a poisoned allocation.
+  That reset the board every time until `proc_force_kill()` learned to let the
+  target out first — it sets `stop_requested` (not a signal, so nothing
+  becomes catchable) and gives it `KILL_UNWIND_MS` to leave libc, which a
+  process blocked on input does at once because espix's blocking calls poll
+  `espix_sigcheck()`. The residue is what remains: a process that ignores the
+  hint *and* sits inside libc is still deleted at the end of that grace, and
+  that case is unsafe. Nothing in espix does it today, and an app could.
 
-  Recorded because the next occurrence should not start from nothing. The
-  fastest route if it returns: reproduce with poisoning on and the serial
-  console open, since the abort names the block and the console is the one
-  channel that is not the thing under test.
+  The control worth keeping, because it is what identified this: the same
+  `kill -9` on a process blocked in `sleep()` was harmless, and SIGTERM on the
+  blocked one was harmless too. `tests/suites/15-streams.sh` pins both kill
+  paths, and both were made to fail before they were made to pass.
+
+- **One earlier heap corruption remains unexplained.** A single panic during a
+  full run, before the two kill bugs above were found: faulting task
+  `sshd:conn`, detected in `tlsf_free` inside `esp_vfs_select` from
+  `chan_poll_interrupt()`. That is a *detector* rather than a culprit — it
+  polls `select()` every 50ms while a foreground process runs, so it frees more
+  often than anything else and corruption surfaces at whatever frees next.
+
+  It has not recurred since the kill fixes, and its signature is consistent
+  with the stdio-lock one, which corrupts silently rather than asserting. But
+  the run that produced it used neither `2>&1` nor stdin, so that is a
+  resemblance and not a diagnosis.
+
+  `CONFIG_HEAP_POISONING_COMPREHENSIVE` found nothing across four runs, and
+  would not be expected to: it checks canaries around *allocations*, and a
+  write through a stale task handle lands inside a live TCB. If it returns, the
+  serial console with poisoning on is the fastest route — the console being the
+  one channel that is not the thing under test.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
