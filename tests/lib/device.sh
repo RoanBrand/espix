@@ -301,19 +301,94 @@ dev_capture() {
 # the console suite is small, there is only one port so nothing can overlap
 # anyway, and a second FIFO pair to manage would cost more than it saves. Pass
 # several commands in one call if it matters.
+# One console.py for the whole suite, started on first use.
+#
+# It used to be one process per command, and that was the cause of the console
+# suite's long-standing flakiness rather than a symptom of it. Closing and
+# reopening the port ends the device's console session; espix starts another,
+# which probes the terminal for its cursor position -- and console.py is the
+# thing that answers that probe, so a probe landing between two invocations has
+# nobody to answer it, times out ("terminal does not answer cursor queries"),
+# and the next console.py syncs against a session that is mid-probe rather than
+# at a prompt. dmesg caught it in the act: `console session on uart` appearing
+# in the middle of a run that never rebooted.
+#
+# Holding the port for the suite removes the open/close cycle entirely, which is
+# the same reason session.py is held for the SSH side.
+DEV_CONSOLE_DIR=""
+DEV_CONSOLE_PID=""
+
+dev_console_start() {
+    [ -n "$ESPIX_PORT" ] || return 1
+    [ -z "$DEV_CONSOLE_PID" ] || return 0
+
+    DEV_CONSOLE_DIR=$(espix_mktemp_dir)
+    mkfifo "$DEV_CONSOLE_DIR/in" "$DEV_CONSOLE_DIR/out"
+
+    "$ESPIX_PYTHON" "$ESPIX_LIB_DIR/console.py" --port "$ESPIX_PORT" \
+        < "$DEV_CONSOLE_DIR/in" > "$DEV_CONSOLE_DIR/out" \
+        2> "$DEV_CONSOLE_DIR/err" &
+    DEV_CONSOLE_PID=$!
+
+    # Order matters: opening a FIFO blocks until the other end is open.
+    exec 7> "$DEV_CONSOLE_DIR/in"
+    exec 6< "$DEV_CONSOLE_DIR/out"
+    return 0
+}
+
+dev_console_stop() {
+    [ -n "$DEV_CONSOLE_PID" ] || return 0
+    exec 7>&- 2>/dev/null
+    exec 6<&- 2>/dev/null
+    wait "$DEV_CONSOLE_PID" 2>/dev/null
+    rm -rf "$DEV_CONSOLE_DIR"
+    DEV_CONSOLE_PID=""
+    DEV_CONSOLE_DIR=""
+}
+
 dev_console_run() {
     [ -n "$ESPIX_PORT" ] || { echo "dev_console_run: no serial port"; return 1; }
-    local out rc
-    out=$(printf '%s\n' "$@" \
-          | "$ESPIX_PYTHON" "$ESPIX_LIB_DIR/console.py" --port "$ESPIX_PORT" 2>&1)
-    rc=$?
 
-    # Captured before the filter and returned explicitly, because the obvious
-    # version returns sed's status instead -- always zero, so a console that
-    # never answered looked like a command that returned nothing. dev_push had
-    # this exact bug and it cost an afternoon.
-    printf '%s' "$out" | sed -e '/^<<<ESPIX-/d'
-    return $rc
+    if [ -z "$DEV_CONSOLE_PID" ] && ! dev_console_start; then
+        echo "dev_console_run: could not open $ESPIX_PORT"
+        return 1
+    fi
+
+    # SIGPIPE ignored around the write for the same reason dev_run does it: this
+    # runs inside `$( )`, and writing to a FIFO whose reader has gone kills that
+    # subshell before any guard can report why, which command substitution then
+    # renders as an empty string.
+    local cmd line out="" closed=""
+    for cmd in "$@"; do
+        if ! ( trap '' PIPE; printf '%s\n' "$cmd" >&7 ) 2>/dev/null; then
+            echo "dev_console_run: the console session is gone"
+            DEV_CONSOLE_PID=""
+            return 1
+        fi
+
+        closed=""
+        while IFS= read -r line <&6; do
+            case "$line" in
+                '<<<ESPIX-CMD '*) continue ;;
+                '<<<ESPIX-END '*) closed=yes; break ;;
+                *) out="$out$line
+" ;;
+            esac
+        done
+
+        if [ -z "$closed" ]; then
+            # EOF without a closing frame: console.py died mid-command. Its
+            # stderr is the only place that says why, so print it rather than
+            # returning silence.
+            echo "dev_console_run: the console stopped answering"
+            [ -s "$DEV_CONSOLE_DIR/err" ] && sed 's/^/       /' "$DEV_CONSOLE_DIR/err"
+            DEV_CONSOLE_PID=""
+            return 1
+        fi
+    done
+
+    printf '%s' "$out" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+    return 0
 }
 
 # --------------------------------------------------------------- test app ---
@@ -362,6 +437,7 @@ dev_testapp_sync() {
 
 DEV_HEALTH_REASON=""
 DEV_HEALTH_MINUTES=-1
+DEV_HEALTH_CONNS=1
 
 # espix prints one of three shapes (espix_kernel/kernel.c):
 #   up N min          up H:MM          up N days, H:MM
@@ -402,6 +478,14 @@ dev_health_reason() {
 dev_health_begin() {
     DEV_HEALTH_REASON=$(dev_health_reason)
     DEV_HEALTH_MINUTES=$(dev_uptime_minutes)
+
+    # Whatever is already connected before the run starts is somebody else's,
+    # and the leak check below is measured against it rather than against zero.
+    DEV_HEALTH_CONNS=$(dev_once 'ps' | grep -c 'sshd:conn')
+    if [ "${DEV_HEALTH_CONNS:-0}" -gt 1 ]; then
+        printf '  %s %d connections already open; leak detection is relative to that\n' \
+               "$(_espix_dim note:)" "$DEV_HEALTH_CONNS"
+    fi
 }
 
 # Returns non-zero and explains if the device rebooted, dumped core, or is
@@ -427,29 +511,34 @@ dev_health_check() {
         *) problems="$problems core-dump-present" ;;
     esac
 
-    # Connection tasks: told apart by persistence, not by counting.
+    # Connection tasks: told apart by persistence and by *growth*, not by count.
     #
     # One is the connection asking the question. A second is usually the
     # previous one still in teardown -- close_gracefully drains until the peer
     # hangs up, bounded by PARTIAL_READ_TIMEOUT_MS at five seconds -- so
     # back-to-back commands routinely show two, and complaining about that would
-    # cry wolf on every run.
+    # cry wolf on every run. Looking again after the teardown window separates
+    # the two: a closing connection is gone by then and a stranded one is not.
     #
-    # But KNOWN-ISSUES records that one sometimes does *not* clear, and simply
-    # tolerating two made that invisible to the check meant to catch it. So look
-    # again after the teardown window has passed: a closing connection is gone
-    # by then and a stranded one is not. The extra wait only happens on the rare
-    # path where the count is above one.
+    # Counting was still wrong, though, and in the direction that matters: a
+    # person watching `top` from another window is indistinguishable from a
+    # stranded task by count alone, so an entirely healthy run failed twelve
+    # times over with the message admitting it did not know
+    # ("someone-logged-in?"). A check that fires on correct behaviour gets
+    # ignored, which costs more than the check is worth.
+    #
+    # The baseline from dev_health_begin() fixes that without weakening it: what
+    # is watched for is a connection count *above what was already there*, which
+    # is what a leak looks like and what a spectator does not.
+    local base="${DEV_HEALTH_CONNS:-1}"
+    [ "$base" -lt 1 ] && base=1
+
     conns=$(dev_once 'ps' | grep -c 'sshd:conn')
-    if [ "$conns" -gt 1 ]; then
+    if [ "$conns" -gt "$base" ]; then
         sleep 7
         conns=$(dev_once 'ps' | grep -c 'sshd:conn')
-        if [ "$conns" -gt 1 ]; then
-            # "Something is holding connections", not a diagnosis: a person
-            # logged in at another terminal looks exactly like a stranded task
-            # from here, and reading one as the other has already put a wrong
-            # claim into KNOWN-ISSUES once.
-            problems="$problems sshd-conn-tasks-held=$conns(someone-logged-in?)"
+        if [ "$conns" -gt "$base" ]; then
+            problems="$problems sshd-conn-tasks-held=$conns(was $base at start)"
         fi
     fi
 

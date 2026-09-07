@@ -69,7 +69,7 @@ fi
 export ESPIX_HAVE_SERIAL
 
 dev_askpass_init
-trap 'dev_session_stop; dev_askpass_cleanup' EXIT
+trap 'dev_session_stop; dev_console_stop; dev_askpass_cleanup' EXIT
 
 printf 'espix tests -- %s@%s' "$ESPIX_USER" "$ESPIX_HOST"
 [ -n "$ESPIX_PORT" ] && printf ', console %s' "$ESPIX_PORT"
