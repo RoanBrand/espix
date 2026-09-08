@@ -117,6 +117,10 @@ CONFIG_LWIP_MAX_SOCKETS=20
 # throughput *rose*, 562 -> 612 KB/s up and 476 -> 594 KB/s down, because flash
 # operations no longer stall the core. The seed that had just panicked ran 147
 # assertions green.
+#
+# Boot cost is 88ms of the 836ms to user code: 17ms copying rodata and 71ms
+# copying instructions, per the mmu_psram lines in the boot log. For scale,
+# CONFIG_SPIRAM_MEMTEST in the same log costs 376ms.
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 
 #

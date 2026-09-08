@@ -63,22 +63,32 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   blocked one was harmless too. `tests/suites/15-streams.sh` pins both kill
   paths, and both were made to fail before they were made to pass.
 
-- **A second unexplained fault, once, under sustained inbound traffic.** During
-  a throughput run: `exccause 0x47` (CacheError) inside
-  `Cache_WriteBack_Addr`, reached from `psa_mac_update` → `esp_sha256_update`
-  → `esp_sha_dma_process` → `esp_cache_msync`, on the SSH receive buffer.
+- ~~**A second unexplained fault, once, under sustained inbound traffic.**~~
+  **Explained and fixed.** Kept in full, because what it looked like the day
+  before it was understood is the useful part: the entry reasons its way to the
+  doorstep and stops.
 
-  That buffer is `ssh_conn_t.in_buf`, and the connection struct is allocated
-  from PSRAM, so the SHA driver takes its DMA path over external RAM. This is
-  not espix misusing the API — `sha.c` explicitly handles an external-RAM input
-  with a cache sync — but espix is what puts a PSRAM buffer there, and inbound
-  throughput went from 5 KB/s to 226 KB/s in the same change, so that path now
-  runs constantly where it used to be reached by interactive traffic only.
+  What was recorded at the time: during a throughput run, `exccause 0x47`
+  (CacheError) inside `Cache_WriteBack_Addr`, reached from `psa_mac_update` →
+  `esp_sha256_update` → `esp_sha_dma_process` → `esp_cache_msync`, on the SSH
+  receive buffer. That buffer is `ssh_conn_t.in_buf`, and the connection struct
+  is allocated from PSRAM, so the SHA driver takes its DMA path over external
+  RAM. "This is not espix misusing the API — `sha.c` explicitly handles an
+  external-RAM input with a cache sync — but espix is what puts a PSRAM buffer
+  there." Not reproduced since: two further throughput runs, a full suite, and a
+  targeted stress of concurrent flash reads against SSH crypto, all clean.
 
-  Not reproduced since: two further throughput runs, a full suite, and a
-  targeted stress of concurrent flash reads against SSH crypto were all clean.
-  Recorded with the exccause and the stack because the next occurrence should
-  not start from nothing, and because "it went away" is not a diagnosis.
+  Every one of those observations was right. The missing piece was a rule, not a
+  fact: **`esp_cache_msync()` must not be called during a flash operation.** A
+  flash write disables the cache, and cache maintenance inside that window does
+  not stall, it faults. The "targeted stress of concurrent flash reads against
+  SSH crypto" came closest and was clean because a *read* through the cache is
+  not the hazard — an erase or a write is.
+
+  It became reproducible when the test suite started running four suites at once
+  (about one run in three) and was fixed by `CONFIG_SPIRAM_XIP_FROM_PSRAM`, which
+  moves `.text` and `.rodata` into PSRAM so a flash operation no longer needs the
+  cache off. See [GOTCHAS.md](GOTCHAS.md), "What a flash write actually stops".
 
 - ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
   double free in espix's own command history, and the whole shape of it is worth
@@ -130,15 +140,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   no check that the length is above zero. Nothing espix does reaches it, and
   nothing stops it either.
 
-- **Loading an app can fault the cache while something else touches flash.**
+- **Loading an app can fault the cache — latent since XIP, not fixed.**
   Faulting task `app:testapp`, `exccause 0x47 (CacheError)` in
   `Cache_WriteBack_Items` ← `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
-  `esp_elf_relocate`. Seen once in eight parallel test runs, and understood:
-  the `elf_loader` component writes back the whole cache *outside* the flash
-  lock it takes on the very next line, so a concurrent flash operation pulls the
-  cache out from under it. Written up in [UPSTREAM.md](UPSTREAM.md).
+  `esp_elf_relocate`, seen once in eight parallel test runs. The `elf_loader`
+  component writes back the whole cache *outside* the flash lock it takes on the
+  very next line, so a concurrent flash operation pulled the cache out from
+  under it. Written up in [UPSTREAM.md](UPSTREAM.md).
 
-  Three ways out, none free, which is why none is taken yet:
+  `CONFIG_SPIRAM_XIP_FROM_PSRAM` closes the window rather than the bug: a flash
+  operation no longer disables the cache, so there is nothing to be pulled out
+  from under. Three full parallel runs since without a recurrence, which is
+  consistency and not proof — the sample before the change was one occurrence in
+  eight runs, so three clean runs would be unsurprising either way.
+
+  It stays here rather than moving to fixed, because the ordering upstream is
+  still wrong and the fault returns the moment XIP is off. The three
+  espix-side ways out, none free, remain the same:
 
   - Turn off `CONFIG_ELF_LOADER_LOAD_PSRAM`. The flush is not called at all
     then — but every loaded app's image moves into internal RAM, and this board
@@ -147,9 +165,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
     operation already funnels through `espix_fs_access_check()`, so there is one
     place to put it, at the cost of a lock across all filesystem I/O.
   - Wait for the component, and pin the version when it is fixed.
-
-  In the meantime it is rare and it is loud: the fault handler records it, and
-  the test runner aborts the run and says which suites were in flight.
 
 - **A session occasionally dies under parallel load, and nothing explains it
   yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH

@@ -99,7 +99,20 @@ keeping DMA'd buffers in internal RAM caps how many sessions fit, and "just do
 not overlap flash I/O with crypto" is not something an application with more
 than one task can promise.
 
-Note how the cost reads. Nothing "used" 1075K — the region is reserved *before*
+The boot cost is **88ms**, measured off the serial log's own timestamps:
+
+```
+I (364) esp_psram: Speed: 80MHz
+I (381) mmu_psram: Read only data copied and mapped to SPIRAM      <- 17ms
+I (452) mmu_psram: Instructions copied and mapped to SPIRAM        <- 71ms
+```
+
+against 836ms from reset to user code. Worth having the number, and worth
+noticing what is next to it in the same log: `CONFIG_SPIRAM_MEMTEST` costs
+**376ms** on this board, four times the copy, and has nothing to do with any of
+this.
+
+Note how the memory cost reads. Nothing "used" 1075K — the region is reserved *before*
 the heap is created, so it never becomes heap at all. `free` reports the heap,
 so the change shows up as the **total** falling rather than the used column
 rising. That also makes it the easiest way to check the setting took: 8189K of

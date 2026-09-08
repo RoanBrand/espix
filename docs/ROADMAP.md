@@ -425,6 +425,44 @@ things are as they are.
   the memory that decides how many SSH sessions fit. And a per-app IRAM budget
   needs a policy — an app asking for 64KB of it should be refused, not obeyed.
 
+- **Detect the flash chip and say which cache strategy the board can have.**
+  espix ships `CONFIG_SPIRAM_XIP_FROM_PSRAM` because a flash write otherwise
+  disables the cache and faults any crypto that is mid-`esp_cache_msync` — see
+  [GOTCHAS.md](GOTCHAS.md). It costs ~1MB of PSRAM and 88ms of boot.
+
+  `CONFIG_SPI_FLASH_AUTO_SUSPEND` is the better answer where it is available:
+  the flash chip suspends an erase to serve a read, so the cache is never
+  disabled, the code stays in flash and the PSRAM stays free. It is not
+  available here, and whether it is available anywhere is a property of the
+  board rather than of the chip family.
+
+  ESP-IDF whitelists it **per flash chip ID**, in the `get_caps` of each
+  `spi_flash_chip_*.c`:
+
+  | driver | IDs claiming `SPI_FLASH_CHIP_CAP_SUSPEND` |
+  |---|---|
+  | GigaDevice | `0xC84016`, `0xC84017`, `0xC84018`, `0xC84319` |
+  | Winbond | `0xEF4017` only |
+  | everything else, Boya included | none |
+
+  So a DevKitC-1 may or may not qualify: the ESP32-S3-WROOM-1 datasheet does not
+  name the flash vendor and it varies by production batch. A 16MB GigaDevice is
+  on the list; a 16MB Winbond is not, because only the 8MB `0xEF4017` appears.
+  This board reports `0x68`, Boya, and IDF's driver says "flash-suspend is not
+  supported" in a comment before omitting the flag.
+
+  The shape of the work: a `tools/flash-caps.sh` that reads the ID off the
+  attached board with `esptool flash-id`, matches it against IDF's own tables —
+  *grepped from the SDK source rather than copied*, so it stays right as
+  Espressif adds chips — and reports which strategy fits and which is
+  configured.
+
+  Two constraints, so the design is not re-derived later. It cannot be a Kconfig
+  `depends on`: a build has to work with no board attached, which is how CI
+  builds. And it should not prompt mid-build, for the same reason. A tool the
+  developer runs, plus one line from `make flash` when the detected chip and the
+  configured strategy disagree, is the shape that works.
+
 - **OTA slots.** The partition table is `factory`-only. Two 4MB OTA slots plus
   `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
   the network. Changing this later means reflashing everything, so it is worth
