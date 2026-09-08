@@ -18,6 +18,26 @@
 # there is nothing to coordinate with.
 : "${ESPIX_RUNDIR:=}"
 
+# The run has given up.
+#
+# Written by the monitor when the device reboots or dumps core, and read by
+# every call that would otherwise wait on a device that is not there. Without
+# it a panic four minutes into a run cost another 577 seconds: each remaining
+# suite still opened a session (60s login timeout), and every assertion in it
+# still spent a 30s command deadline and four refusal retries before failing.
+#
+# A file rather than a variable, because the workers are separate processes and
+# nothing assigned in one is visible in another.
+dev_aborted() {
+    [ -n "$ESPIX_RUNDIR" ] && [ -f "$ESPIX_RUNDIR/abort" ]
+}
+
+dev_abort() {   # <reason>
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    printf '%s\n' "$1" > "$ESPIX_RUNDIR/abort" 2>/dev/null
+    return 0
+}
+
 # Let transfers overlap. Off by default: concurrent SFTP transfers are a
 # documented, pre-existing fault (docs/KNOWN-ISSUES.md), so the default run
 # serialises them rather than going red on a bug it is not testing. Turn it on
@@ -50,6 +70,13 @@ DEV_DEAD="<<<dead-session>>>"
 # `coproc` is bash 4, and macOS ships 3.2.
 
 dev_session_start() {
+    # Nothing to log in to once the run has given up; see dev_aborted().
+    if dev_aborted; then
+        DEV_SESSION_DEAD=yes
+        DEV_PROMPT=""
+        return 1
+    fi
+
     DEV_SESSION_DIR=$(espix_mktemp_dir)
     mkfifo "$DEV_SESSION_DIR/in" "$DEV_SESSION_DIR/out"
 
@@ -126,7 +153,7 @@ dev_run() {
     #  - Nothing assigned in here outlives the call, so "the session is dead"
     #    cannot be remembered between calls. Each one has to find out for
     #    itself, which is why the check is on the write rather than on a flag.
-    if [ -n "$DEV_SESSION_DEAD" ] || [ -z "$DEV_SESSION_PID" ]; then
+    if [ -n "$DEV_SESSION_DEAD" ] || [ -z "$DEV_SESSION_PID" ] || dev_aborted; then
         printf '%s' "$DEV_DEAD"
         return 1
     fi
@@ -345,11 +372,13 @@ _dev_ssh_once() {
 # cannot duplicate any.
 _dev_ssh() {
     local rc tries=0
+    dev_aborted && return 255
     while :; do
         _dev_ssh_once "$@"
         rc=$?
         [ "$rc" = 255 ] || return $rc
         [ "$tries" -lt "$DEV_SSH_MAX_RETRIES" ] || return $rc
+        dev_aborted && return $rc
         _dev_refused_for_capacity || return $rc
         tries=$((tries + 1))
         _dev_note_retry
@@ -365,12 +394,13 @@ _dev_scp_once() {
 
 _dev_scp() {
     local rc tries=0
+    dev_aborted && return 255
     _dev_xfer_lock
     while :; do
         _dev_scp_once "$@"
         rc=$?
         if [ "$rc" = 255 ] && [ "$tries" -lt "$DEV_SSH_MAX_RETRIES" ] \
-           && _dev_refused_for_capacity; then
+           && ! dev_aborted && _dev_refused_for_capacity; then
             tries=$((tries + 1))
             _dev_note_retry
             sleep 2
@@ -427,6 +457,7 @@ dev_pull() {
 # device refusing you.
 dev_sftp() {
     local rc
+    dev_aborted && return 255
     _dev_xfer_lock
     espix_timeout "$ESPIX_SCP_TIMEOUT" \
         env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
@@ -823,6 +854,11 @@ _dev_monitor_alert() {      # <rundir> <reason>
 
     printf '%s\nsuites running at the time:%s\n' "$reason" "$running" \
         > "$dir/health.alert"
+
+    # And stop everything else waiting on a device that is not answering. The
+    # alert is for the report; this is for the twelve minutes of timeouts that
+    # would otherwise follow it.
+    dev_abort "$reason"
 }
 
 # Poll until <rundir>/stop appears. Intended to be backgrounded.

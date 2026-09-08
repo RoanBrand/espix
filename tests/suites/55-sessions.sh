@@ -98,14 +98,17 @@ sess_settle() {
 
 free_idle=$(sess_free_line)
 base=$(sess_count)
-if [ "${base:-0}" -ne 1 ]; then
-    # This suite runs alone, so the only connection should be its own session.
-    # Anything else is a person watching, or a leak, and either way the
-    # arithmetic below would be off by that much.
+case "${base:-0}" in ''|*[!0-9]*) base=0 ;; esac
+
+# This suite runs alone, but "alone" is two: its own session, and the runner's
+# health monitor, which holds one for the whole run. Everything below is
+# relative to `base` rather than to one, so the exact number does not matter --
+# only that it is small enough to leave room to fill the rest.
+if [ "$base" -lt 1 ] || [ "$base" -gt 3 ]; then
     espix_skip "$base connections already open; cannot measure the limit cleanly"
     return 0
 fi
-espix_pass "idle: one connection (this session), internal heap $free_idle"
+espix_pass "idle: $base connection(s) held by the harness, internal heap $free_idle"
 
 # ---------------------------------------------------------------------------
 # Fill it. One at a time, counting through the session we already have, so

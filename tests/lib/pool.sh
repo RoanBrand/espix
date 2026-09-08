@@ -93,6 +93,15 @@ pool_run_suite() {  # <dir> <name> <how: pool|serial|rerun>
     local file="$ESPIX_TEST_DIR/suites/$name.sh"
     local t0=$SECONDS
 
+    # Do not start a suite against a device that has already gone. Its
+    # assertions would all fail, and the report would then carry twenty
+    # failures whose single cause was a reboot -- which is how a run once
+    # reported 37 of them.
+    if dev_aborted; then
+        printf '0 0 0 0 aborted\n' > "$dir/res/$name.res"
+        return 0
+    fi
+
     ESPIX_PROGRESS="$dir/w$ESPIX_WORKER.prog"
     export ESPIX_PROGRESS
     rm -f "$ESPIX_PROGRESS" "$ESPIX_PROGRESS.fail"
@@ -136,6 +145,11 @@ pool_run_suite() {  # <dir> <name> <how: pool|serial|rerun>
     # simply exits, so nothing else would ever close it.
     dev_console_stop
 
+    # A suite the device died underneath is not a suite that failed. Its
+    # assertions are recorded, because the ones before the reboot are real, but
+    # the verdict is "aborted" and the report counts it separately.
+    dev_aborted && how=aborted
+
     printf '%s %s %s\n' "$(espix_counters_line)" "$((SECONDS - t0))" "$how" \
         > "$dir/res/$name.res"
     rm -f "$dir/w$ESPIX_WORKER.cur"
@@ -150,7 +164,20 @@ pool_worker() {     # <dir> <n>
     ESPIX_WORKER="$2"
     export ESPIX_WORKER
 
-    while [ ! -f "$dir/stop" ]; do
+    # A worker is a subshell and inherits whatever session the runner had open,
+    # descriptors and all. It must not: two processes framing commands down one
+    # FIFO pair interleave and wedge. The runner closes its preflight session
+    # before starting workers, so this is belt as well as braces -- but it is
+    # the kind of belt that costs nothing and has already saved an afternoon in
+    # tools/soak.sh, where the ordering was the other way round.
+    DEV_SESSION_PID=""
+    DEV_SESSION_DIR=""
+    DEV_SESSION_DEAD=""
+    DEV_PROMPT=""
+    exec 8<&- 2>/dev/null
+    exec 9>&- 2>/dev/null
+
+    while [ ! -f "$dir/stop" ] && ! dev_aborted; do
         name=$(_pool_pop "$dir")
         [ -n "$name" ] || break
         pool_run_suite "$dir" "$name" pool
