@@ -149,6 +149,7 @@ PBKDF2-HMAC-SHA256 for a 32-byte key, all four producing identical output:
 | via `psa_key_derivation_*`, software SHA | **1936 ms** |
 | via `mbedtls_pkcs5_pbkdf2_hmac_ext()`, hardware SHA | **1675 ms** |
 | driving `psa_hash_clone()` directly, hardware SHA | **1116 ms** |
+| driving `mbedtls_sha256_*` directly, software, no allocation | **919 ms** |
 
 Row two is the tell. Turning the SHA accelerator *off* made it slightly faster,
 which is only possible if the hashing is a minority of the work — accelerating a
@@ -166,8 +167,8 @@ same hardware driver through the MD layer and pays that per-hash setup on all
 used carefully — which says the cost is in the driver's per-operation overhead,
 not in any one caller.
 
-espix works around it in `components/espix_auth/auth.c`: absorb ipad and opad
-once, then `psa_hash_clone()` those states per iteration. Same construction and
+espix works around it in `components/espix_auth/auth.c`: absorb
+ipad and opad once, then `psa_hash_clone()` those states per iteration. Same construction and
 byte-identical output — checked three ways: against RFC 7914 §11's first vector
 at init, against `mbedtls_pkcs5_pbkdf2_hmac_ext()` directly, and by every
 existing `/etc/passwd` record still verifying — for 45% less time and no extra
@@ -178,6 +179,38 @@ Worth fixing upstream because the API shape already supports it:
 one operation across iterations. Mbed-TLS issue
 [#7801](https://github.com/Mbed-TLS/mbedtls/issues/7801) is already cited in a
 comment two lines above this loop, for a different quirk in the same function.
+
+### `psa_hash_clone()` allocates, and the API does not read that way
+
+A second defect in the same driver, found while trying to remove the first, and
+worth reporting separately because it survives any fix to PBKDF2.
+`psa_crypto_driver_esp_sha.c`:
+
+```c
+psa_status_t esp_sha_hash_setup(...) { ... heap_caps_malloc(..., MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL); }  /* :161 */
+psa_status_t esp_sha_hash_clone(...) { ... heap_caps_malloc(ctx_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL); }  /* :386 */
+```
+
+Cloning a hash operation allocates a DMA-capable **internal**-RAM context and
+frees it at finish. A cloned hash state is a fixed-size struct; the equivalent
+`mbedtls_sha256_clone()` is a plain assignment. On a part where internal
+DMA-capable RAM is the binding constraint — espix fits eight SSH sessions in
+~145K and counts every kilobyte — an allocation hidden behind a copy is
+expensive twice over: the time, and the fragmentation of forty thousand
+transient allocations per password check.
+
+**The last row of the table is what to take from this.** Bypassing PSA entirely
+and cloning a raw `mbedtls_sha256_context` — no allocator, no dispatch, no
+hardware lock — reached only 919 ms, against 1116 ms through PSA. So the
+allocation is worth about 200 ms of the total and the remaining ~900 ms is the
+software compression itself, at roughly 23 microseconds per 64-byte block.
+
+Which is the real indictment: the SHA accelerator does a block in low
+single-digit microseconds, so a driver whose per-operation overhead did not
+swamp it would put this whole derivation near **100 ms**. The hardware is there
+and unreachable at this granularity. espix kept the PSA version — 1.2x is not
+worth a dependency on a private header — so this stays a report rather than a
+workaround.
 
 ### The VFS has no `chmod`
 

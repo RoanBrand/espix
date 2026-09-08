@@ -245,6 +245,42 @@ under a minute, so a poller on a ten-second cadence can arrive after the evidenc
 is gone. espix counts in `espix_fault_wdt_count()` and reports it from `uptime`,
 which is the line anything monitoring the machine already reads.
 
+### `psa_hash_clone()` allocates, and X25519 has a fast path you cannot reach
+
+Two crypto-performance traps on ESP-IDF, both found by measuring a slow SSH
+login rather than by reading anything.
+
+**Cloning a PSA hash operation is not a struct copy.** It reads like one, and
+`mbedtls_sha256_clone()` genuinely is one, but ESP-IDF's PSA SHA driver does
+`heap_caps_malloc(ctx_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)` on every
+clone (`psa_crypto_driver_esp_sha.c:386`) and frees it at finish.
+`psa_hash_setup()` does the same at `:161`. Anything that hashes in a tight loop
+is therefore allocating from the **scarcest pool on the part** at the loop rate:
+PBKDF2 at 20000 iterations does it 40000 times per password check.
+
+Measured cost of the allocation alone: ~200 ms of a 1116 ms derivation. Worth
+knowing before assuming a hash loop is bounded by hashing.
+
+Also worth knowing what is *not* the fix: turning `CONFIG_MBEDTLS_HARDWARE_SHA`
+off measured slightly **faster** (1936 ms vs 2030 ms on the same workload),
+because the per-operation overhead swamps what the accelerator saves. An
+accelerator only helps if you can reach it at the right granularity.
+
+**X25519 runs through mbedtls's generic ECP path**, at roughly 140 ms per
+scalar multiplication on a 240 MHz S3 — and the S3 has no ECC accelerator at all
+(`SOC_ECC_SUPPORTED` is absent; `MBEDTLS_HARDWARE_MPI` assists the big-integer
+arithmetic and that is the extent of it). `CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM`
+helps only base-point multiplication — ECDSA's k·G, where it took a nistp256
+signature from 593 ms to 319 ms — and does nothing for the variable-point half
+of a key agreement.
+
+mbedtls ships **Everest**, a much faster formally-verified Curve25519, and it is
+already compiled into an IDF build (`libeverest.a` is in `build/`). But
+`MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED` is commented out in `crypto_config.h`,
+IDF exposes no Kconfig for it, and there is no supported hook for adding an
+mbedtls define — so reaching it means patching a vendored config, and it is
+unverified whether PSA's `psa_raw_key_agreement()` would route to it even then.
+
 ### Flash auto-suspend is the tidier fix, and depends on your flash chip
 
 `CONFIG_SPI_FLASH_AUTO_SUSPEND` is the option that makes the machine behave the

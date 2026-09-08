@@ -198,12 +198,49 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
     place to put it, at the cost of a lock across all filesystem I/O.
   - Wait for the component, and pin the version when it is fixed.
 
+- ~~**A gone SSH client left its command running, holding the session slot.**~~
+  **Fixed.** `chan_poll_interrupt()` is the poll a foreground command runs every
+  slice to notice Ctrl-C, and it answered "no interrupt" for a dead peer:
+
+  ```c
+  if (ch->closed)              { return hit; }   /* hit is false here */
+  ...
+  if (chan_pump(ch) != ESP_OK) { return hit; }
+  ```
+
+  FIN makes the socket readable, so `select()` fires and `chan_pump()` fails on
+  EOF -- and the command is told nothing happened. It carried on writing into a
+  socket nobody would read, each write blocking until TCP gave up.
+
+  **Never a `top` bug**, though that is what exposed it. The poll has two
+  callers and the other matters more: `cmd_run.c:100`, the foreground-app wait.
+  Any app run in the foreground kept running after its client vanished, with the
+  connection task waiting on it. `top` is simply what `55-sessions.sh` holds its
+  connections with.
+
+  **Present since `bca0fd2` (2026-08-25)**, the commit that introduced Ctrl-C.
+  It hid because drain time depends on how many writes the held command has
+  left, which varies: the same suite recorded "back to 2 after 4s" one morning
+  and over 30s the same evening. Slots now return in **1s**, and `55-sessions`
+  went from 50s with two failures to 14s green.
+
+  Found while chasing what looked like a 25K memory regression from
+  `MBEDTLS_ECP_FIXED_POINT_OPTIM`. That was wrong: with teardown fixed the same
+  measurement reads 45K with the option on and 44K off, and the missing 24K was
+  connections not yet gone being counted as live. **A number measured on a
+  broken system is not a baseline.**
+
 - **A session occasionally dies under parallel load, and nothing explains it
   yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
   session partway through and the harness reported seven failures that were one
   event — `session gone before: ps`, then everything downstream comparing
   against the dead-session sentinel. The device was fine throughout: no reboot,
   no core dump, and the very next run was 149 assertions green.
+
+  **Check the entry above first.** A gone client used to leave its foreground
+  command running with the session slot held, which is intermittent, load
+  dependent, leaves no crash, and looks from the harness exactly like a session
+  that died. Fixed 2026-09-08; if this does not recur, that was it.
 
   It is not new and it is not the panics. The same shape turned up early in the
   parallel work, before any of the fixes: one login failure in nine rounds of
