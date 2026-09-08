@@ -2,7 +2,9 @@
 #
 # Capture the serial console to a timestamped log, and keep capturing.
 #
-#   tools/serlog.sh [port] [logfile]
+#   tools/serlog.sh [port] [logfile]     start (backgrounds itself)
+#   tools/serlog.sh stop [logfile]       stop the one this started
+#   tools/serlog.sh status [logfile]     is it running, and who holds the port
 #
 # WHY THIS EXISTS, and it is not "so we have logs".
 #
@@ -24,19 +26,15 @@
 #
 # HOW TO USE IT WHEN HUNTING A PANIC
 #
-#   tools/serlog.sh &                        # takes the port
-#   ./tests/run.sh -j4                       # note: NO --port
+#   tools/serlog.sh                          # takes the port, backgrounds
+#   ./tests/run.sh -j 4                      # note: NO --port
 #   ssh esp@<host> top                       # in another terminal; see below
+#   tools/serlog.sh stop                     # before the next flash
 #
 # Run the suite *without* --port. run.sh then sets ESPIX_HAVE_SERIAL=no and the
 # console suites skip, leaving this the only reader. That matters: macOS does
 # not give exclusive access to a cu.* device, so two readers simply race and
-# split the bytes between them. The first version of this died mid-run with
-# "device reports readiness to read but returned no data (device disconnected or
-# multiple access on port?)" the instant 50-console opened the same port -- the
-# console suite passed and the capture was lost, which is the wrong one to lose.
-# It now rides that out (see the retry loop), but skipping the console suites is
-# still the honest arrangement rather than two readers each seeing half a line.
+# split the bytes between them.
 #
 # The `top` session is a reproduction lever, not decoration. A busy SSH session
 # keeps HMAC-SHA running continuously over the connection buffers in PSRAM, and
@@ -45,17 +43,94 @@
 #
 # This never writes to the port -- no reset, no keystrokes. The board being
 # watched has to be the board that would have run anyway.
+#
+# THREE THINGS IT DOES THAT THE FIRST VERSION DID NOT, each paid for:
+#
+#  1. A pidfile and a `stop`. The first version ended in `exec "$PY" ...`, so
+#     the running process's command line was the interpreter and a heredoc --
+#     the string "serlog" was gone from it, and `pkill -f serlog` silently did
+#     nothing. It survived being "stopped" three times, and one survivor later
+#     broke an `idf.py flash` outright.
+#
+#  2. It refuses to start when something already holds the port, and says what.
+#     Two readers on one cu.* device split the byte stream, so a second copy
+#     does not just waste effort -- it corrupts both captures.
+#
+#  3. A heartbeat every HEARTBEAT_S of silence. Without it a dead capture and an
+#     idle board are indistinguishable: the log simply stops. That cost three
+#     wrong readings in one session, including "the device is emitting nothing"
+#     about a board that was answering commands normally at the time. A log that
+#     says `# quiet` once a minute cannot make that mistake.
 
 set -u
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+ACTION=start
+case "${1:-}" in
+    stop|status) ACTION="$1"; shift ;;
+esac
 
 PORT="${1:-}"
 LOG="${2:-serial.log}"
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# `stop`/`status` are addressed by logfile, since that is what identifies a
+# capture -- the port may already have been taken by something else.
+if [ "$ACTION" != start ]; then
+    LOG="${1:-serial.log}"
+fi
+PIDFILE="$LOG.pid"
+
+port_holder() {
+    command -v lsof >/dev/null 2>&1 || return 1
+    lsof "$1" 2>/dev/null | awk 'NR>1 {print $1" (pid "$2")"; exit}'
+}
+
+case "$ACTION" in
+stop)
+    if [ ! -f "$PIDFILE" ]; then
+        echo "serlog: no pidfile at $PIDFILE" >&2
+        exit 1
+    fi
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        # It is reading a serial port with a timeout, so it wakes and exits
+        # promptly; escalate only if it does not.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        echo "serlog: stopped $pid"
+    else
+        echo "serlog: pid $pid is not running (stale pidfile)"
+    fi
+    rm -f "$PIDFILE"
+    exit 0
+    ;;
+status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "serlog: running as pid $(cat "$PIDFILE") -> $LOG"
+    else
+        echo "serlog: not running"
+    fi
+    exit 0
+    ;;
+esac
 
 if [ -z "$PORT" ]; then
     PORT=$("$here/port.sh" 2>/dev/null || true)
     [ -n "$PORT" ] || { echo "serlog: no serial port found; pass one" >&2; exit 2; }
+fi
+
+# Refuse rather than race. See note 2 above.
+holder=$(port_holder "$PORT")
+if [ -n "$holder" ]; then
+    echo "serlog: $PORT is already held by $holder" >&2
+    echo "serlog: two readers split the byte stream; stop that one first" >&2
+    echo "serlog:   tools/serlog.sh stop [logfile]   if it is a previous capture" >&2
+    exit 3
 fi
 
 # The IDF virtualenv has pyserial; the system python usually does not.
@@ -67,52 +142,12 @@ PY="${ESPIX_PYTHON:-python3}"
 "$PY" -c 'import serial' 2>/dev/null \
     || { echo "serlog: $PY has no pyserial" >&2; exit 2; }
 
-echo "serlog: $PORT -> $LOG  (^C to stop)" >&2
+# Backgrounded here rather than by the caller, so the pidfile is written by the
+# thing that knows the pid. Not `exec`: the shell stays out of the way but the
+# child keeps a command line with "serlog" in it, so pkill works as anyone would
+# expect even though `stop` no longer needs it to.
+"$PY" "$here/serlog.py" "$PORT" "$LOG" &
+child=$!
+echo "$child" > "$PIDFILE"
 
-exec "$PY" - "$PORT" "$LOG" <<'PY'
-import sys, time, serial
-
-port, out = sys.argv[1], sys.argv[2]
-
-# Append, never truncate: a second invocation against the same file must not
-# throw away the panic the first one caught.
-f = open(out, 'ab', buffering=0)
-f.write(b'=== serlog start %s ===\n' % time.strftime('%Y-%m-%d %H:%M:%S').encode())
-
-buf = b''
-ser = None
-while True:
-    try:
-        if ser is None:
-            # timeout, not zero: a blocking-with-deadline read costs no CPU
-            # between lines, and there are long quiet stretches in a test run.
-            ser = serial.Serial(port, 115200, timeout=0.2)
-        chunk = ser.read(4096)
-    except (serial.SerialException, OSError) as e:
-        # Reached when something else opens the same cu.* device -- macOS
-        # permits that and both readers then get partial reads. Dying here is
-        # what lost the capture the first time, so reopen and carry on: a gap in
-        # the log beats no log.
-        f.write(b'%s [serlog] %s -- reopening\n'
-                % (time.strftime('%H:%M:%S').encode(), str(e).encode()))
-        try:
-            if ser is not None:
-                ser.close()
-        except Exception:
-            pass
-        ser = None
-        time.sleep(0.5)
-        continue
-
-    if not chunk:
-        continue
-
-    buf += chunk
-    while b'\n' in buf:
-        line, buf = buf.split(b'\n', 1)
-        # Timestamped per line, because attributing a panic to the suites that
-        # were running at that moment is the point; run.sh's monitor records
-        # which those were, with the same clock.
-        f.write(b'%s %s\n' % (time.strftime('%H:%M:%S').encode(),
-                              line.rstrip(b'\r')))
-PY
+echo "serlog: $PORT -> $LOG  (pid $child; tools/serlog.sh stop $LOG)" >&2
