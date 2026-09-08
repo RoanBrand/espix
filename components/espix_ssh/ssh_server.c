@@ -365,7 +365,38 @@ static void connection_task(void *arg)
      * stack far larger than the protocol logic itself warrants. */
     ssh_conn_t *c = conn_alloc();
     if (c == NULL) {
-        close(fd);
+        /*
+         * Say why, for the same reason the session limit does.
+         *
+         * Closing without a word makes the client print "Connection closed by
+         * remote host", which is indistinguishable from a crash, a hang or a
+         * truncated command -- an ambiguity that has already cost this project
+         * debugging time once, which is why the refusal above sends a line.
+         * Out of memory is if anything more confusing to meet in silence: the
+         * device is up, answering, and simply cannot afford another session.
+         *
+         * RFC 4253 4.2 lets a server send CRLF-terminated lines before its
+         * version string and requires clients to cope; the one rule is that
+         * such a line must not begin with "SSH-". The free figure is included
+         * because it is the number that decides whether to wait and retry or
+         * to go and look at what is holding memory.
+         */
+        char      msg[96];
+        const int n = snprintf(msg, sizeof(msg),
+                               "espix: out of memory for another connection "
+                               "(%u KB internal free)\r\n",
+                               (unsigned)(heap_caps_get_free_size(
+                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
+        if (n > 0) {
+            (void)send(fd, msg, (size_t)n, 0);
+        }
+
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "no memory for a connection; %u KB internal free",
+                   (unsigned)(heap_caps_get_free_size(
+                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
+
+        close_gracefully(fd);   /* or the reset discards the line just sent */
         sessions_release();
         vTaskDelete(NULL);
         return;

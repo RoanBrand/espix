@@ -425,6 +425,33 @@ things are as they are.
   the memory that decides how many SSH sessions fit. And a per-app IRAM budget
   needs a policy — an app asking for 64KB of it should be refused, not obeyed.
 
+- **An app's `malloc()` should prefer PSRAM, the way espix's own allocations
+  do.** Today it does not: an app calls the firmware's `malloc`, which uses
+  IDF's default policy — internal for anything under
+  `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (16KB), external above it. So a dozen
+  small allocations in an app come out of the 145K of internal RAM that decides
+  how many SSH sessions fit, while eight megabytes sit unused.
+
+  espix already makes the opposite choice for itself where it matters —
+  `conn_alloc()` asks for `MALLOC_CAP_SPIRAM` and falls back to internal — and
+  the ELF loader puts every app *section* in PSRAM. It is only the app's runtime
+  allocations that go the other way.
+
+  The mechanism is now in place: publish `malloc`, `calloc`, `realloc`, `free`
+  and `strdup` through `abi_resolver.c` the way `getenv` is, backed by
+  `heap_caps_malloc(MALLOC_CAP_SPIRAM)` with an internal fallback. `free()`
+  needs no override in principle — `heap_caps_free()` handles either region —
+  but publishing it alongside keeps the pair legible.
+
+  Three things to settle before doing it. A PSRAM buffer handed to DMA inherits
+  the cache-alignment contract (see [GOTCHAS.md](GOTCHAS.md)), so an app doing
+  its own DMA would need to know; small allocations from PSRAM are slower to
+  reach than internal ones, which is why IDF's default is what it is; and a
+  board with no PSRAM at all must fall back cleanly, which wants a build and a
+  boot to prove rather than an argument. That last one is worth doing anyway:
+  espix has never been built with `CONFIG_SPIRAM=n`, and XIP-from-PSRAM would
+  have to come off with it.
+
 - **Detect the flash chip and say which cache strategy the board can have.**
   espix ships `CONFIG_SPIRAM_XIP_FROM_PSRAM` because a flash write otherwise
   disables the cache and faults any crypto that is mid-`esp_cache_msync` — see
