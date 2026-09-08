@@ -59,7 +59,23 @@ both the alignment rule and the no-flash-operations rule **without ever calling
 the cache API**, just by allocating a packet buffer with `MALLOC_CAP_SPIRAM`.
 
 espix hit it as `exccause 0x47 (CacheError)` inside `Cache_WriteBack_Addr`, with
-SSH sessions encrypting while another task read 4MB out of a flash partition.
+SSH sessions encrypting while another task touched flash — about one parallel
+test run in three, under both `esp_aes_process_dma()` and
+`esp_sha_dma_process()`.
+
+**The way out is `CONFIG_SPIRAM_XIP_FROM_PSRAM`, and the name reads backwards.**
+It does not execute anything *from flash*; it stops doing so. `.text` and
+`.rodata` are copied into PSRAM at boot and fetched from there, so a flash write
+no longer has to disable the cache at all and the forbidden window closes —
+which is the exception the docs carve out.
+
+Measured on an N16R8 rather than assumed: PSRAM total falls 8189K → 7114K
+(1075K for the image, out of eight megabytes), internal RAM is unchanged, and
+scp throughput went **up** — 562 → 612 KB/s uploading, 476 → 594 KB/s
+downloading — because flash operations stop stalling the core. The alternatives
+are worse: keeping DMA'd buffers in internal RAM caps how many sessions fit, and
+"just do not overlap flash I/O with crypto" is not something an application with
+more than one task can promise.
 
 The threshold for "this goes through DMA" is low and differs by part — 256
 bytes on the S3, 512 on the P4, 128 elsewhere

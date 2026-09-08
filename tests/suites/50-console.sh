@@ -5,8 +5,24 @@
 # unlocking the root account for the network. It is also the only interface
 # that survives the network being broken, which is when you need it most.
 #
-# RESOURCES: console -- there is one serial port. Nothing else in the tree
-# wants it, so this still runs in the pool beside the SSH suites.
+# RESOURCES: exclusive -- and that is a retreat from `console`, deliberately.
+#
+# There is one serial port and nothing else in the tree wants it, so this could
+# run in the pool. It did, and it failed there about half the time: console.py
+# frames answers on the prompt, and a console competing for CPU with four SSH
+# sessions emits them slowly enough and interleaved enough that the framing
+# slips a command -- `uname -a` came back holding the tail of `id`.
+#
+# Quieting the kernel log (below) fixed most of it and not all. Rather than keep
+# hardening a parser against a transport that is starved, the suite runs in the
+# quiet phase, where it takes twelve seconds and passes. What it claims to test
+# -- that the shell is one implementation with two transports, and that the
+# console is root -- is tested just as well there.
+#
+# "The console stays usable while the network is saturated" is a different and
+# genuinely interesting claim. It is not currently true; see the note on klog
+# interleaving in docs/KNOWN-ISSUES.md. Testing it deserves its own suite that
+# says so, rather than being smuggled in as a side effect of scheduling.
 
 if [ "$ESPIX_HAVE_SERIAL" != yes ]; then
     espix_skip "no serial port given (--port) or no pyserial"

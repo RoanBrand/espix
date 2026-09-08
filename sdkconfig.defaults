@@ -90,6 +90,36 @@ CONFIG_LWIP_LOCAL_HOSTNAME="espix"
 CONFIG_LWIP_MAX_SOCKETS=20
 
 #
+# Execute from PSRAM instead of flash.
+#
+# Not a performance option, though it turns out to be one. It closes a crash.
+#
+# A flash write or erase forces ESP-IDF to disable the flash cache -- you cannot
+# fetch instructions through a cache backed by a chip that is mid-erase. Inside
+# that window, cache maintenance faults: Cache_WriteBack_Addr is manipulating a
+# cache being switched off underneath it, and the CPU takes exccause 0x47,
+# CacheError.
+#
+# espix walks into that window constantly. With the SSH connection state in
+# PSRAM, IDF's AES and SHA drivers call esp_cache_msync() on every packet they
+# encrypt or authenticate -- and espix reads and writes flash from other tasks
+# all the time, because that is what a filesystem is. Running four test suites
+# at once panicked the board this way about one run in three, in
+# Cache_WriteBack_Addr under both esp_aes_process_dma() and esp_sha_dma_process().
+#
+# With .text and .rodata copied into PSRAM at boot, a flash operation no longer
+# has to disable the cache, and the window closes. ESP-IDF documents exactly
+# this exception: "if XIP_From_PSRAM is enabled, you can call this API during
+# Flash operations."
+#
+# Measured on an N16R8. PSRAM total falls from 8189K to 7114K -- 1075K for the
+# image, out of eight megabytes. Internal RAM is unchanged at 145K free. scp
+# throughput *rose*, 562 -> 612 KB/s up and 476 -> 594 KB/s down, because flash
+# operations no longer stall the core. The seed that had just panicked ran 147
+# assertions green.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+#
 # Console
 #
 CONFIG_VFS_SUPPORT_DIR=y

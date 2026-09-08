@@ -189,9 +189,20 @@ if dev_testapp_present; then
     # then closed it a third time.
     ( _ssh "$APP sleep 20 > $T/killed 2>&1" >/dev/null 2>&1 ) &
     victim=$!
-    sleep 4
 
-    pid=$(dev_run 'ps' | sed -n 's/^ *\([0-9][0-9]*\) app:testapp.*/\1/p' | head -1)
+    # Wait for it to appear rather than sleeping a guess at how long a login
+    # plus an ELF load takes. Four seconds was the guess and it was enough on a
+    # quiet device and not on a busy one -- the assertion then reported "nothing
+    # was killed", which is true and is not what it was asking about.
+    pid=""
+    wait_i=0
+    while [ "$wait_i" -lt 20 ]; do
+        pid=$(dev_run 'ps' | sed -n 's/^ *\([0-9][0-9]*\) app:testapp.*/\1/p' | head -1)
+        [ -n "$pid" ] && break
+        sleep 1
+        wait_i=$((wait_i + 1))
+    done
+
     if [ -z "$pid" ]; then
         espix_fail "a redirected foreground app is running to be killed" \
                    "no app:testapp in ps; nothing was killed, so the next" \
