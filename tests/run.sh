@@ -201,7 +201,7 @@ FAILED_POOL=""
 
 run_serial_list() {     # <how> <name>...
     local how="$1"; shift
-    local name outdir="$RUNDIR"
+    local name outdir="$RUNDIR" rc serial_pid waited
 
     [ "$how" = rerun ] && outdir="$RUNDIR/rerun"
     for name in "$@"; do
@@ -209,7 +209,54 @@ run_serial_list() {     # <how> <name>...
         if [ "$POOL_CAPTURE" = 1 ]; then
             printf '  %s ' "$(_espix_dim "-> $name")"
         fi
-        pool_run_suite "$outdir" "$name" "$how"
+
+        # Deadlined, like everything in the pool.
+        #
+        # The pool's grid loop enforces ESPIX_SUITE_TIMEOUT and for a while
+        # these phases did not, so a wedged suite hung the whole run with no
+        # output: 50-console held the serial port for twenty-five minutes during
+        # a re-run while the runner waited for a frame that was never coming. A
+        # deadline covering three phases out of four is not a deadline.
+        #
+        # Backgrounded here rather than handed to espix_timeout, and that is not
+        # a style choice. **espix_timeout does not nest** when the inner call
+        # has a redirected stdin: wrap a function that runs
+        # `espix_timeout ... cmd < file` and the inner command reads nothing at
+        # all. It is reproducible in four lines and it cost this a run --
+        # 45-throughput reported `sink: 0 bytes` and a stdin rate of zero, in a
+        # suite that had passed minutes earlier. Backgrounding it directly, in
+        # its own process group, is the shape the pool workers already use and
+        # is known to keep stdin.
+        set -m
+        pool_run_suite "$outdir" "$name" "$how" &
+        serial_pid=$!
+        set +m
+
+        rc=0
+        waited=0
+        while kill -0 "$serial_pid" 2>/dev/null; do
+            if [ "$waited" -ge "$ESPIX_SUITE_TIMEOUT" ]; then
+                { kill -KILL "-$serial_pid" 2>/dev/null \
+                    || kill -KILL "$serial_pid" 2>/dev/null; } 2>/dev/null
+                rc=124
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        wait "$serial_pid" 2>/dev/null || true
+
+        if [ "$rc" = 124 ]; then
+            printf '0 1 0 %s timeout\n' "$ESPIX_SUITE_TIMEOUT" \
+                > "$outdir/res/$name.res"
+            printf '  %s %s: exceeded %ss and was killed\n' \
+                "$(_espix_red FAIL)" "$name" "$ESPIX_SUITE_TIMEOUT" \
+                >> "$outdir/out/$name.log"
+            [ "$POOL_CAPTURE" = 1 ] && printf 'killed after %ss\n' "$ESPIX_SUITE_TIMEOUT"
+            dev_console_stop
+            continue
+        fi
+
         if [ "$POOL_CAPTURE" = 1 ] && [ -f "$outdir/res/$name.res" ]; then
             read -r p f s secs rest < "$outdir/res/$name.res"
             printf '%ss, %s ok, %s fail, %s skip\n' "$secs" "$p" "$f" "$s"

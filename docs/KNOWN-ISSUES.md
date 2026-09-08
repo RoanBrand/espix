@@ -307,6 +307,31 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Shell and console
 
+- **Kernel log lines land in the middle of what you are typing.** espix writes
+  klog straight to the same UART the line editor is drawing on, with nothing
+  between them, so a message arriving mid-keystroke splits the echo. Typing
+  `whoami` while the network was busy produced
+
+  ```
+  root:/# whoam
+  espix: sshchan: esp logged out
+  iespix: sshd: connection closed
+  ```
+
+  — the `i` on the far side of two log lines. The command still runs; it is the
+  display, and anything parsing the display, that is wrecked.
+
+  Arguably correct: a Unix console does this too, which is why `dmesg -n`
+  exists, and espix has it. It became worth writing down when the test suite
+  started running four SSH suites at once, which generates a connection message
+  every few seconds and turned an occasional annoyance into the normal case --
+  `tests/suites/50-console.sh` now quiets the console for its duration and puts
+  the level back.
+
+  Doing better means holding the console's write path while a klog line is
+  emitted and redrawing the prompt afterwards, the way Linux does. Worth having;
+  not done.
+
 - **Kernel messages land on your prompt.** That is deliberate and matches Linux,
   where kernel output goes to the console and remote users run `dmesg`. Since
   the console-prompt work the line is ended and reissued underneath, so the

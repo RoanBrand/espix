@@ -108,23 +108,32 @@ _pool_pop() {       # <dir>
 # <dir>/out/<name>.log   everything the suite printed
 # <dir>/res/<name>.res   "<pass> <fail> <skip> <seconds> <how>"
 pool_run_suite() {  # <dir> <name> <how: pool|serial|rerun>
-    local dir="$1" name="$2" how="$3"
-    local file="$ESPIX_TEST_DIR/suites/$name.sh"
-    local t0=$SECONDS
+    # Every local is prefixed, and that is not decoration.
+    #
+    # bash's `local` is *dynamically* scoped, and this function sources a suite
+    # into its own scope -- so a suite assigning an ordinary-looking name
+    # silently overwrites the runner's variable of the same name. It happened:
+    # 45-throughput times its transfers with `t0=$(now_ms)`, which clobbered the
+    # `t0` this function had set from $SECONDS, and the suite's duration was
+    # reported as -1788865855341s. `name`, `file` and `dir` are the next three
+    # accidents waiting, and they are the most ordinary variable names there are.
+    local _p_dir="$1" _p_name="$2" _p_how="$3"
+    local _p_file="$ESPIX_TEST_DIR/suites/$_p_name.sh"
+    local _p_t0=$SECONDS
 
     # Do not start a suite against a device that has already gone. Its
     # assertions would all fail, and the report would then carry twenty
     # failures whose single cause was a reboot -- which is how a run once
     # reported 37 of them.
     if dev_aborted; then
-        printf '0 0 0 0 aborted\n' > "$dir/res/$name.res"
+        printf '0 0 0 0 aborted\n' > "$_p_dir/res/$_p_name.res"
         return 0
     fi
 
-    ESPIX_PROGRESS="$dir/w$ESPIX_WORKER.prog"
+    ESPIX_PROGRESS="$_p_dir/w$ESPIX_WORKER.prog"
     export ESPIX_PROGRESS
     rm -f "$ESPIX_PROGRESS" "$ESPIX_PROGRESS.fail"
-    printf '%s %s\n' "$name" "$(date +%s)" > "$dir/w$ESPIX_WORKER.cur"
+    printf '%s %s\n' "$_p_name" "$(date +%s)" > "$_p_dir/w$ESPIX_WORKER.cur"
 
     espix_counters_reset
 
@@ -138,19 +147,19 @@ pool_run_suite() {  # <dir> <name> <how: pool|serial|rerun>
     # four suites interleaving their lines is not readable by anyone.
     if [ "${POOL_CAPTURE:-1}" = 1 ]; then
         {
-            espix_suite_begin "$name"
+            espix_suite_begin "$_p_name"
             if dev_session_start; then
-                . "$file"
+                . "$_p_file"
             else
                 espix_fail "$name: could not open a session"
             fi
             dev_session_stop
-        } > "$dir/out/$name.log" 2>&1
+        } > "$_p_dir/out/$_p_name.log" 2>&1
     else
         {
-            espix_suite_begin "$name"
+            espix_suite_begin "$_p_name"
             if dev_session_start; then
-                . "$file"
+                . "$_p_file"
             else
                 espix_fail "$name: could not open a session"
             fi
@@ -167,11 +176,11 @@ pool_run_suite() {  # <dir> <name> <how: pool|serial|rerun>
     # A suite the device died underneath is not a suite that failed. Its
     # assertions are recorded, because the ones before the reboot are real, but
     # the verdict is "aborted" and the report counts it separately.
-    dev_aborted && how=aborted
+    dev_aborted && _p_how=aborted
 
-    printf '%s %s %s\n' "$(espix_counters_line)" "$((SECONDS - t0))" "$how" \
-        > "$dir/res/$name.res"
-    rm -f "$dir/w$ESPIX_WORKER.cur"
+    printf '%s %s %s\n' "$(espix_counters_line)" "$((SECONDS - _p_t0))" "$_p_how" \
+        > "$_p_dir/res/$_p_name.res"
+    rm -f "$_p_dir/w$ESPIX_WORKER.cur"
     return 0
 }
 

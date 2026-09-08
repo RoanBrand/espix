@@ -20,9 +20,52 @@ fi
 # anything, so a console that cannot sync costs that wait *per assertion*. This
 # suite used to spend around seven minutes failing five times over, which is
 # both slow and a poor report: five failures that are one fact.
-if ! who=$(dev_console_run 'whoami'); then
+# Quiet the kernel log on the console first, and put it back at the end.
+#
+# Not tidiness: espix writes klog lines straight to the same UART the line
+# editor is drawing on, so under load a log line lands in the middle of the
+# echo and splits it -- `whoami` came back as `whoam` + a log line + `i`, and
+# every assertion after it compared against rubble. Four suites running over
+# SSH generate a connection message every few seconds, so this is the normal
+# case now rather than an unlucky one.
+#
+# That interleaving is espix behaviour and arguably correct -- a Unix console
+# does it too, which is why `dmesg -n` exists -- so it is recorded in
+# KNOWN-ISSUES rather than worked around in the firmware. What this suite tests
+# is the shell over serial, and it cannot test that through a channel something
+# else is writing to.
+CONSOLE_LEVEL_SAVED=""
+
+console_restore() {
+    case "${CONSOLE_LEVEL_SAVED:-}" in
+        ''|*[!0-9]*) dev_console_run 'dmesg -n info' >/dev/null 2>&1 ;;
+        *)           dev_console_run "dmesg -n $CONSOLE_LEVEL_SAVED" >/dev/null 2>&1 ;;
+    esac
+}
+
+# The first call has to be both the probe and the quieting, and it is one call
+# because it cannot be two.
+#
+# The probe must come first: it is the one call allowed to find a console that
+# is not there, and everything after it may assume one that is. But the log has
+# to be quiet *before* anything is parsed, or a klog line splits the answer. Put
+# the quieting ahead of the probe and you have an unguarded console call in
+# front of the guard -- a run spent twenty-five minutes waiting on exactly that.
+#
+# `dmesg -n` with no argument only reads, so it is a safe first thing to say,
+# and its answer doubles as the level to restore.
+if ! CONSOLE_LEVEL_SAVED=$(dev_console_run 'dmesg -n'); then
     espix_skip "console did not answer -- see the message above for whether"
     espix_skip "something else is holding $ESPIX_PORT"
+    return 0
+fi
+CONSOLE_LEVEL_SAVED=$(printf '%s' "$CONSOLE_LEVEL_SAVED" |
+                      sed -n 's/.*console level: \([0-9]*\).*/\1/p')
+dev_console_run 'dmesg -n warn' >/dev/null 2>&1
+
+if ! who=$(dev_console_run 'whoami'); then
+    espix_skip "console stopped answering after the first command"
+    console_restore
     return 0
 fi
 
@@ -53,6 +96,7 @@ case "$pwd_out" in
     *"no console prompt"*|*"no prompt after"*)
         console_gone
         espix_skip "the rest of the console suite -- one fact, not four failures"
+        console_restore
         return 0 ;;
     *)  assert_eq "the console starts at /" "/" "$pwd_out" ;;
 esac
@@ -66,3 +110,4 @@ assert_contains "the console can read a root-only file" "root:" \
 
 # The sigil is the other half of the prompt change: root gets '#'.
 
+console_restore

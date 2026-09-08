@@ -26,6 +26,21 @@
 # investigating exactly that symptom, and reading it as device flakiness cost a
 # whole session. `set -m` puts the child in its own process group so the
 # negative pid reaches everything it started.
+# It does not nest, and the failure is silent.
+#
+# `espix_timeout N outer`, where `outer` itself runs
+# `espix_timeout M cmd < file`, leaves the inner command reading nothing --
+# no error, no diagnostic, an empty answer. Four lines reproduce it:
+#
+#     g() { espix_timeout 10 cat < /tmp/f; }
+#     g                      # prints the file
+#     espix_timeout 10 g     # prints nothing
+#
+# It cost a run: 45-throughput reported `sink: 0 bytes` and a stdin rate of
+# zero, in a suite that had measured 215 KB/s minutes before, because the
+# runner had started wrapping suites in a deadline. Background the outer thing
+# yourself with `set -m` and poll for it -- that shape keeps stdin, and it is
+# what run.sh does now.
 espix_timeout() {
     local secs="$1"; shift
     local pid rc start

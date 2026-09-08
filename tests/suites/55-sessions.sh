@@ -208,10 +208,34 @@ fi
 # ---------------------------------------------------------------------------
 
 sess_release
-sleep 10
+
+# Wait for the count to come back rather than sleeping a guess at it.
+#
+# A fixed ten seconds was the guess, and it was wrong often enough to matter:
+# close_gracefully() drains each connection until its peer hangs up, bounded at
+# five seconds *each*, and eight of them closing together do not all finish
+# inside one bound. The assertion is that the slots come back, not that they
+# come back within some particular second, so it waits and then says how long
+# it took.
+released_after=0
+i=0
+while [ "$i" -lt 30 ]; do
+    sleep 1
+    i=$((i + 1))
+    back=$(sess_count)
+    case "$back" in ''|*[!0-9]*) continue ;; esac
+    if [ "$back" -le "$base" ]; then
+        released_after=$i
+        break
+    fi
+done
 
 back=$(sess_count)
-assert_eq "closing them frees the slots" "$base" "$back"
+if [ "$back" -le "$base" ]; then
+    espix_pass "closing them frees the slots (back to $back after ${released_after}s)"
+else
+    espix_fail "closing them frees the slots" "expected: $base" "actual:   $back"
+fi
 
 free_after=$(sess_free_line)
 after_k=$(printf '%s' "$free_after" | awk '{print $3+0}')
