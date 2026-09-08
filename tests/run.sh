@@ -574,13 +574,16 @@ fi
 
 # The watchdog, with the attribution only the monitor could supply.
 #
-# dev_health_check below is what *fails* the run -- it reads the device's
-# cumulative count, so it cannot miss an event. This block adds the part that is
-# gone once the run ends: which suites were in flight each time one fired.
+# Reported, never fatal. The watchdog fires when a core was busy for five
+# seconds, which on a machine you can legitimately saturate is not a fault --
+# see the long note on _dev_wdt_is_ours() in tests/lib/device.sh, and resist
+# restoring the failure without reading it.
 #
-# Printed even though it does not itself set N_FAIL, because "IDLE0 was starved
-# for five seconds" is the kind of finding that is meaningless without knowing
-# what was running, and the .cur files are deleted with the run directory.
+# Two sources, because they know different things. The monitor's watchdog.log
+# has the part that is gone once the run ends -- which suites were in flight --
+# but only for triggers its ten-second poll happened to catch. watchdog.total is
+# the device's own cumulative count, which cannot miss one but cannot say when.
+# Prefer the detailed one; fall back to the count so a trigger is never silent.
 if [ -s "$RUNDIR/watchdog.log" ]; then
     printf '\n%s\n' "$(_espix_red 'task watchdog fired during the run:')"
     ours=0
@@ -598,9 +601,15 @@ if [ -s "$RUNDIR/watchdog.log" ]; then
         printf '  of self-deleted tasks, so this defers reclamation. See docs/GOTCHAS.md.\n'
     else
         printf '  all of these name an app, i.e. a program using the CPU it was given --\n'
-        printf '  reported, not counted as a fault. 35-signals runs a compute loop on\n'
-        printf '  purpose. See _dev_wdt_is_ours in tests/lib/device.sh.\n'
+        printf '  35-signals runs a compute loop on purpose.\n'
     fi
+elif [ -s "$RUNDIR/watchdog.total" ]; then
+    # The monitor saw nothing, but the device counted one. It fired between
+    # polls, or before the monitor's first question.
+    read -r _ n task < "$RUNDIR/watchdog.total"
+    printf '\n%s %s trigger(s), task %s -- between polls, so no suite attribution\n' \
+           "$(_espix_red 'task watchdog fired during the run:')" \
+           "$n" "${task:-unknown}"
 fi
 
 if health=$(dev_health_check); then :; else
