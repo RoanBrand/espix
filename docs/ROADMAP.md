@@ -556,8 +556,37 @@ things are as they are.
   and AMPDU is on in both directions with a 16-frame block-ack window. The sleep
   schedule is the part nobody chose.
 
-  What makes it interesting is that neither answer is right all the time, so it
-  wants to be dynamic: `WIFI_PS_NONE` while a session or transfer is live, and
+  **Measured, and it is not the problem. 2026-09-08.** The dynamic hold below was
+  built and instrumented -- `WIFI_PS_NONE` held from the first SSH session to the
+  last, off the existing session refcount -- and it changed nothing that could be
+  measured:
+
+  | | power save default | held off while connected |
+  |---|---|---|
+  | login, total | ~3.5s | ~3.5s |
+  | ...of which key exchange | 1037 ms | 1031 ms |
+  | scp upload / download | 815 / 720 KB/s | 807 / 674 KB/s |
+  | ssh stdin | 236 KB/s | 237 KB/s |
+  | ping RTT, 3s gaps | 55.9 ms avg | 62.1 ms avg |
+
+  The ping A/B is the direct test and needed care to get right: pinging every
+  0.5s keeps the radio awake in *both* arms, so the first attempt compared
+  nothing. Re-run with three-second gaps -- long enough to sleep between -- the
+  two arms produce the same descending 89/54/21 ms sawtooth, which is the access
+  point's behaviour and not the station's sleep schedule.
+
+  So the 100-300ms beacon penalty reasoned about below is real in principle and
+  absent on this link. The login is slow for an entirely different reason:
+  **PBKDF2 costs 2030 ms of pure CPU**, against the "~100ms" its own comment
+  claims. See the auth entry.
+
+  Kept open rather than closed, because "no benefit here" is not "no benefit" --
+  a different access point with a longer DTIM could still show it. But it is no
+  longer a latency fix, and holding power save off costs energy for nothing, so
+  it should not be adopted without measuring on the link in question.
+
+  What made it look interesting is that neither answer is right all the time, so
+  it wants to be dynamic: `WIFI_PS_NONE` while a session or transfer is live, and
   back to `MIN_MODEM` when the device is idle. espix already knows when that is
   -- the SSH server tracks its sessions and `espix_proc` its processes -- so the
   policy has somewhere to live, and the shape is the same one a laptop uses when

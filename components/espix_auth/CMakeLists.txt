@@ -8,5 +8,6 @@ idf_component_register(
     PRIV_REQUIRES
         espix_kernel
         espix_fs
+        esp_timer
         mbedtls
 )

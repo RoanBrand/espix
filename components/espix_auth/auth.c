@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_timer.h"
 #include "psa/crypto.h"
 
 #include "espix_auth.h"
@@ -43,7 +44,21 @@
 #define LINE_MAX_LEN    256
 #define SALT_LEN        16
 #define HASH_LEN        32
-#define PBKDF2_ITERS    20000   /* ~100ms on a 240MHz S3; tune if login drags */
+/*
+ * MEASURED 2026-09-08: 2030 ms, not the ~100ms this comment used to claim.
+ *
+ * That is ~101us per iteration. An HMAC-SHA256 over a 32-byte input is a
+ * handful of 64-byte compressions and the S3's hardware accelerator does a
+ * block in low single-digit microseconds, so the overwhelming majority of that
+ * is *not* hashing -- it is per-iteration overhead. The task watchdog caught it
+ * in the act: esp_sha_hash_setup() calls heap_caps_malloc() on every HMAC, so
+ * this is twenty thousand malloc/free pairs per login.
+ *
+ * Which is why the number below has not been reduced. Cutting iterations would
+ * shorten the login by weakening password hashing, to work around an allocator
+ * problem that costs nothing to fix properly. See docs/ROADMAP.md.
+ */
+#define PBKDF2_ITERS    20000
 
 #define DEFAULT_USER    ESPIX_AUTH_DEFAULT_USER
 #define DEFAULT_PASS    "espix"
@@ -497,11 +512,27 @@ bool espix_auth_verify(const char *user, const char *password)
         return false;
     }
 
+    /*
+     * The one phase of a login with no I/O in it, so its wall time is its CPU
+     * time -- which makes it the number that decides whether a slow login is
+     * computation or network. DEBUG, so it costs nothing at the default level.
+     *
+     * PBKDF2_ITERS carries the comment "~100ms on a 240MHz S3". That has never
+     * been measured, and the watchdog backtrace shows a heap_caps_malloc per
+     * HMAC iteration underneath it, so the cost may be the allocator rather
+     * than the crypto. Those want different fixes and only one of them is free.
+     */
+    const int64_t t0 = esp_timer_get_time();
+
     uint8_t candidate[HASH_LEN];
     if (derive(password, rec.salt, rec.iters, candidate,
                sizeof(candidate)) != ESP_OK) {
         return false;
     }
+
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "timing: pbkdf2 %u iters, %lld ms",
+               (unsigned)rec.iters,
+               (long long)((esp_timer_get_time() - t0) / 1000));
 
     return equal_ct(candidate, rec.hash, HASH_LEN);
 }

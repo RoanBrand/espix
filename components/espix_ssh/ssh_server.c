@@ -405,6 +405,19 @@ static void connection_task(void *arg)
 
     s_status.accepted++;
 
+    /*
+     * Handshake phase timings, at DEBUG so they cost nothing at the default
+     * level. A login measures ~3.5s from the client and nobody knew what that
+     * was made of -- PBKDF2, the key exchange, or waiting on WiFi beacons,
+     * which are three different fixes. Guessing picked the wrong one twice.
+     *
+     * Read them together with the derive() figure from espix_auth: that one is
+     * the only phase with no I/O in it, so its wall time is its CPU time. If it
+     * is small and the totals are large, the wait is on the network.
+     */
+    const int64_t t_start = esp_timer_get_time();
+    int64_t       t_kex   = t_start;
+
     do {
         if (ssh_transport_banner(c) != ESP_OK) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "version exchange failed");
@@ -447,6 +460,10 @@ static void connection_task(void *arg)
             break;
         }
 
+        t_kex = esp_timer_get_time();
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "timing: kex %lld ms",
+                   (long long)((t_kex - t_start) / 1000));
+
         /* ssh_kex_run() is the last reader. What follows — authentication, then
          * a shell that owns the connection until logout — has no use for it. */
         kexinit_c_release(c);
@@ -456,6 +473,11 @@ static void connection_task(void *arg)
              * saying more here would be a second, conflicting reason. */
             break;
         }
+
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                   "timing: auth %lld ms, handshake %lld ms total",
+                   (long long)((esp_timer_get_time() - t_kex) / 1000),
+                   (long long)((esp_timer_get_time() - t_start) / 1000));
 
         /* Authenticated: hand the connection to the session channel, which
          * owns it until the user logs out. */
