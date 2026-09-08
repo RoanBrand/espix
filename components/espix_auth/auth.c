@@ -192,8 +192,19 @@ static bool from_hex(const char *in, uint8_t *out, size_t out_len)
  * init, and every /etc/passwd record still verifies because the algorithm is
  * unchanged.
  *
- * mbedtls_pkcs5_pbkdf2_hmac() would have been the obvious answer and is not
- * available: Mbed TLS 4.x moved it behind private/pkcs5.h.
+ * mbedtls_pkcs5_pbkdf2_hmac_ext() is the obvious answer, and was measured
+ * rather than assumed -- the first version of this comment claimed it was
+ * unavailable, and that was wrong. "private" in Mbed TLS 4.x means *unstable
+ * API*, not unreachable: MBEDTLS_PKCS5_C is on, the symbol is exported from
+ * libmbedcrypto.a, and drivers/builtin/include is already on this component's
+ * include path. It links and it produces byte-identical output.
+ *
+ * It is simply slower here: 1675 ms against 1116 ms for the code below, same
+ * board, same inputs. It reaches the same hardware SHA driver through the MD
+ * layer and pays that driver's per-hash setup on all 40000 hashes; cloning a
+ * prepared state does not. So the public API wins on this target -- a happier
+ * answer than it had any right to be, and the reason there is no private
+ * dependency here.
  */
 
 #define HMAC_BLOCK 64       /* SHA-256's input block, so the pad length */

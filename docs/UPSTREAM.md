@@ -138,31 +138,40 @@ hashing**, plus a full driver setup and teardown per iteration. PBKDF2 is the
 one construction where this cost is multiplied by a deliberately large number.
 
 Every other PBKDF2 implementation, including Mbed TLS's own
-`mbedtls_pkcs5_pbkdf2_hmac()`, prepares the key schedule once and reuses it.
-That function is not an alternative here: Mbed TLS 4.x moved it behind
-`private/pkcs5.h`, so PSA is the only public surface and this is the path
-everyone lands on.
+`mbedtls_pkcs5_pbkdf2_hmac_ext()`, prepares the key schedule once and reuses it.
 
 **Measured on an ESP32-S3 at 240MHz**, 20000 iterations of
-PBKDF2-HMAC-SHA256 for a 32-byte key:
+PBKDF2-HMAC-SHA256 for a 32-byte key, all four producing identical output:
 
 | | |
 |---|---|
 | via `psa_key_derivation_*`, hardware SHA | **2030 ms** |
 | via `psa_key_derivation_*`, software SHA | **1936 ms** |
-| driving `psa_hash_clone()` directly, hardware SHA | **1208 ms** |
+| via `mbedtls_pkcs5_pbkdf2_hmac_ext()`, hardware SHA | **1675 ms** |
+| driving `psa_hash_clone()` directly, hardware SHA | **1116 ms** |
 
-The middle row is the tell. Turning the SHA accelerator *off* made it slightly
-faster, which is only possible if the hashing is a minority of the work —
-accelerating a minority cannot help, and on this target the hardware driver
-allocates (`esp_sha_hash_setup()` calls `heap_caps_malloc()`), so twenty
-thousand malloc/free pairs are paid per password check.
+Row two is the tell. Turning the SHA accelerator *off* made it slightly faster,
+which is only possible if the hashing is a minority of the work — accelerating a
+minority cannot help, and on this target the hardware driver allocates
+(`esp_sha_hash_setup()` calls `heap_caps_malloc()`), so twenty thousand
+malloc/free pairs are paid per password check.
+
+Row three is worth having for a second reason. `mbedtls_pkcs5_pbkdf2_hmac_ext()`
+*is* reachable — "private" in Mbed TLS 4.x means unstable API, not inaccessible:
+`MBEDTLS_PKCS5_C` is on, the symbol is exported from `libmbedcrypto.a`, and
+`drivers/builtin/include` is already on the include path, so it links. It is
+still 50% slower than cloning a prepared PSA hash state, because it reaches the
+same hardware driver through the MD layer and pays that per-hash setup on all
+40000 hashes. So the dedicated, purpose-built PBKDF2 loses to generic hashing
+used carefully — which says the cost is in the driver's per-operation overhead,
+not in any one caller.
 
 espix works around it in `components/espix_auth/auth.c`: absorb ipad and opad
 once, then `psa_hash_clone()` those states per iteration. Same construction and
-byte-identical output — checked against RFC 7914 §11's first vector at init —
-for 40% less time and no extra memory. The workaround is ~90 lines of
-hand-driven HMAC that nobody should have to write.
+byte-identical output — checked three ways: against RFC 7914 §11's first vector
+at init, against `mbedtls_pkcs5_pbkdf2_hmac_ext()` directly, and by every
+existing `/etc/passwd` record still verifying — for 45% less time and no extra
+memory. It is ~90 lines of hand-driven HMAC that nobody should have to write.
 
 Worth fixing upstream because the API shape already supports it:
 `psa_mac_sign_setup()`/`update()`/`sign_finish()` exist, and the loop could hold

@@ -10,6 +10,7 @@
 
 #include <string.h>
 
+#include "esp_timer.h"
 #include "psa/crypto.h"
 
 #include "espix_kernel.h"
@@ -241,6 +242,17 @@ esp_err_t ssh_kex_run(ssh_conn_t *c)
     psa_set_key_bits(&attr, 255);
 
     mbedtls_svc_key_id_t eph = MBEDTLS_SVC_KEY_ID_INIT;
+    /*
+     * Phase timings, DEBUG. The handshake spends ~1040ms here and the S3 has no
+     * ECC accelerator (no SOC_ECC_SUPPORTED), so all of X25519 and the P-256
+     * signature are software with only the MPI peripheral assisting. Which of
+     * them dominates decides whether MBEDTLS_ECP_FIXED_POINT_OPTIM -- off in
+     * this build, and precisely the optimisation for base-point multiplication
+     * -- is worth its memory.
+     */
+    const int64_t t_kex0 = esp_timer_get_time();
+    int64_t       t_mark = t_kex0;
+
     const psa_status_t gen = psa_generate_key(&attr, &eph);
     psa_reset_key_attributes(&attr);
     if (gen != PSA_SUCCESS) {
@@ -259,12 +271,20 @@ esp_err_t ssh_kex_run(ssh_conn_t *c)
         n != SSH_X25519_LEN) {
         goto out;
     }
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "timing: x25519 keygen %lld ms",
+               (long long)((esp_timer_get_time() - t_mark) / 1000));
+    t_mark = esp_timer_get_time();
+
     if (psa_raw_key_agreement(PSA_ALG_ECDH, eph, qc_copy, sizeof(qc_copy),
                               secret, sizeof(secret), &n) != PSA_SUCCESS ||
         n != SSH_X25519_LEN) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "X25519 agreement failed");
         goto out;
     }
+
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "timing: x25519 agreement %lld ms",
+               (long long)((esp_timer_get_time() - t_mark) / 1000));
+    t_mark = esp_timer_get_time();
 
     uint8_t host_blob[128];
     size_t  host_blob_len = 0;
@@ -293,12 +313,21 @@ esp_err_t ssh_kex_run(ssh_conn_t *c)
                (unsigned)host_blob_len, (unsigned)c->kexinit_c_len,
                (unsigned)c->kexinit_s_len);
 
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "timing: exchange hash %lld ms",
+               (long long)((esp_timer_get_time() - t_mark) / 1000));
+    t_mark = esp_timer_get_time();
+
     uint8_t sig[128];
     size_t  sig_len = 0;
     if (ssh_hostkey_sign(h, SSH_HASH_LEN, sig, sizeof(sig),
                          &sig_len) != ESP_OK) {
         goto out;
     }
+
+    espix_klog(ESPIX_KLOG_DEBUG, TAG,
+               "timing: ecdsa sign %lld ms, kex compute %lld ms total",
+               (long long)((esp_timer_get_time() - t_mark) / 1000),
+               (long long)((esp_timer_get_time() - t_kex0) / 1000));
 
     {
         ssh_buf_t b;

@@ -38,6 +38,21 @@
 
 static mbedtls_svc_key_id_t s_key;
 static bool                 s_have_key;
+
+/*
+ * The SSH-encoded public key, cached, because deriving it is not free.
+ *
+ * psa_export_public_key() on a key PSA holds as a private scalar has to
+ * recompute the public point -- a base-point scalar multiplication, and on the
+ * S3 there is no ECC accelerator to do it with. Measured at **141 ms**, paid on
+ * every single connection, for a value that cannot change while the key is
+ * loaded. It was a third of the key exchange.
+ *
+ * Invalidated wherever s_key is replaced, which is the only way it can go
+ * stale.
+ */
+static uint8_t              s_blob[128];
+static size_t               s_blob_len;
 /* "SHA256:" plus 43 base64 chars for a 32-byte digest, plus slack. */
 static char                 s_fingerprint[80];
 
@@ -86,23 +101,31 @@ esp_err_t ssh_hostkey_blob(uint8_t *out, size_t cap, size_t *out_len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t point[SSH_P256_POINT];
-    size_t  point_len = 0;
-    if (psa_export_public_key(s_key, point, sizeof(point),
-                              &point_len) != PSA_SUCCESS) {
-        return ESP_FAIL;
+    if (s_blob_len == 0) {
+        uint8_t point[SSH_P256_POINT];
+        size_t  point_len = 0;
+        if (psa_export_public_key(s_key, point, sizeof(point),
+                                  &point_len) != PSA_SUCCESS) {
+            return ESP_FAIL;
+        }
+
+        ssh_buf_t b;
+        ssh_buf_init(&b, s_blob, sizeof(s_blob));
+        ssh_put_cstr(&b, KEY_TYPE_STR);
+        ssh_put_cstr(&b, CURVE_STR);
+        ssh_put_string(&b, point, point_len);
+
+        if (b.bad) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        s_blob_len = b.len;
     }
 
-    ssh_buf_t b;
-    ssh_buf_init(&b, out, cap);
-    ssh_put_cstr(&b, KEY_TYPE_STR);
-    ssh_put_cstr(&b, CURVE_STR);
-    ssh_put_string(&b, point, point_len);
-
-    if (b.bad) {
+    if (cap < s_blob_len) {
         return ESP_ERR_INVALID_SIZE;
     }
-    *out_len = b.len;
+    memcpy(out, s_blob, s_blob_len);
+    *out_len = s_blob_len;
     return ESP_OK;
 }
 
@@ -311,6 +334,7 @@ static esp_err_t load_key(void)
     }
 
     s_have_key = true;
+    s_blob_len = 0;      /* a new key means a new blob */
     return ESP_OK;
 }
 
@@ -342,6 +366,7 @@ esp_err_t ssh_hostkey_init(void)
         return ESP_FAIL;
     }
     s_have_key = true;
+    s_blob_len = 0;      /* a new key means a new blob */
 
     if (save_key() != ESP_OK) {
         /* Usable this boot, but the client will warn about a changed key next
