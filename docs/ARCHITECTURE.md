@@ -452,16 +452,61 @@ unaffected, at ~355KB/s.
 
 Demonstrated on demand rather than inferred, on one board in one position:
 
-| storage partition | upload KB/s | download KB/s |
-|---|---|---|
-| used | 78.3 | 356.0 |
-| freshly erased (`storage-flash`) | 195.5 | 354.0 |
-| used again, after writing 12MB | 78.2 | 357.9 |
+| storage partition | upload KB/s | download KB/s | when |
+|---|---|---|---|
+| used | 78.3 | 356.0 | before XIP |
+| freshly erased (`storage-flash`) | 195.5 | 354.0 | before XIP |
+| used again, after writing 12MB | 78.2 | 357.9 | before XIP |
+| **used** | **121, 124** | **173, 179** | **after XIP, -54 dBm** |
 
-Download is the control: it never erases a block, and it stays flat while upload
-swings by a factor of 2.5. LittleFS frees a block when a file is deleted but does
-not erase it, so every later write to that block pays an erase first. `df`
-reporting 0% used says nothing about how many blocks are dirty.
+Download was the control: it never erases a block, and it stayed flat while
+upload swung by a factor of 2.5. LittleFS frees a block when a file is deleted
+but does not erase it, so every later write to that block pays an erase first.
+`df` reporting 0% used says nothing about how many blocks are dirty.
+
+### What `CONFIG_SPIRAM_XIP_FROM_PSRAM` changed here, and what it did not explain
+
+The last row was taken after code moved out of flash and into PSRAM, on a used
+filesystem at -54 dBm, two samples each.
+
+**Upload improved by more than half**, 78 → ~122 KB/s, which is what the model
+predicts: a flash erase used to suspend every task in the system for its
+duration, and now it does not. The erase still costs what it costs; it no longer
+costs everybody else as well.
+
+**Download halved, 356 → ~176, and nothing here explains it.** Two candidates
+were checked and neither survives:
+
+- *Not the link.* A 4MB download straight off a partition — `/dev/factory`, no
+  filesystem in the path — measured **594 KB/s** in the same session, at the same
+  -54 dBm. The radio is not the limit.
+- *Probably not dirt either*, tempting as that is. `df` reports 1% used, which as
+  above means nothing — but the **third row of this very table** does: it was
+  taken deliberately after writing 12MB to dirty the partition, and download came
+  back at 357.9, unmoved. Dirtiness demonstrably did not touch downloads then.
+
+So whatever bounds a littlefs download now is the filesystem rather than the
+network, which is the opposite of what "download is the control" assumed, and it
+is not the explanation nearest to hand. Recorded rather than guessed at. Note
+also that upload improved *against* a headwind — the partition has had months of
+test runs through it since the first three rows, which should have made uploads
+worse, not better.
+
+### There is no defrag; only a reflash re-erases
+
+The obvious follow-up — "can the filesystem be tidied up afterwards?" — has a
+disappointing answer, so it is written down here to save asking twice.
+
+`lfs_fs_gc()` does exist in the vendored littlefs (2.11), and it is not that. Its
+own header lists exactly three things: run `mkconsistent` if needed, compact
+metadata pairs over `compact_thresh`, and populate the block allocator. **Erasing
+free blocks is not one of them**, and `esp_littlefs.h` does not expose the call
+in any case. So there is no TRIM, no defragment, and no way to buy back the
+erase-on-next-write cost.
+
+The only thing that re-erases the partition is `idf.py storage-flash`, which
+destroys the filesystem — which is why the middle row of that table is a
+laboratory condition and not a maintenance procedure.
 
 Two traps for anyone benchmarking this:
 

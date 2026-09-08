@@ -392,6 +392,39 @@ things are as they are.
   (`ps` CPU shares and `free` before and after, plus an SSH throughput check)
   rather than on reasoning, and it belongs in the target-independent
   `sdkconfig.defaults` so every target inherits it.
+- **Let a loaded app have real IRAM.** `IRAM_ATTR` in an app compiles, links,
+  loads, runs and does nothing: espix's ELF loader has one allocator for every
+  section and, with `CONFIG_ELF_LOADER_LOAD_PSRAM`, hands out PSRAM regardless
+  of the `exec` flag it is passed. The whole app is in PSRAM.
+
+  Since XIP from PSRAM this is much less serious than it was — the usual reason
+  to mark a handler `IRAM_ATTR` is surviving the cache being disabled during a
+  flash write, and the cache is no longer disabled. What is left is timing:
+  instruction fetch from PSRAM is slower and jitterier than internal SRAM, so a
+  handler with a sub-microsecond deadline can still miss it.
+
+  It matters because of what espix wants to run. A portable C app never asks for
+  this and should not — it knows only `malloc()`, and where its code lives is a
+  build option of the system it lands on. But **Arduino sketches** use
+  `attachInterrupt` with `IRAM_ATTR` handlers as a matter of course, and
+  **stock IDF examples** are written the same way; espix already ships one of
+  the former (`apps/neopixel`, whose WS2812 routine is marked and does not get
+  it). Both build and load today, silently short of what they asked for.
+
+  The shape for a fix is already in the loader: `esp_elf_malloc()` takes an
+  `exec` flag and its non-PSRAM branch already uses `MALLOC_CAP_EXEC`. It needs
+  a section slot for `.iram1.*` allocated `MALLOC_CAP_INTERNAL | MALLOC_CAP_EXEC`
+  — and note the loader captures sections *by name* and silently skips the rest,
+  so an app whose link preserves `.iram1` today has that code dropped rather
+  than misplaced. It also needs an app-side link that keeps the section: the
+  shipped neopixel ELF has no `.iram1` at all, its functions having been folded
+  into `.text`.
+
+  Two costs to weigh before doing it. Internal RAM is the same pool as the heap
+  (see [GOTCHAS.md](GOTCHAS.md)), so every app that asks for IRAM takes it from
+  the memory that decides how many SSH sessions fit. And a per-app IRAM budget
+  needs a policy — an app asking for 64KB of it should be refused, not obeyed.
+
 - **OTA slots.** The partition table is `factory`-only. Two 4MB OTA slots plus
   `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
   the network. Changing this later means reflashing everything, so it is worth

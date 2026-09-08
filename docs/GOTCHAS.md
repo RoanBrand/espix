@@ -63,19 +63,46 @@ SSH sessions encrypting while another task touched flash — about one parallel
 test run in three, under both `esp_aes_process_dma()` and
 `esp_sha_dma_process()`.
 
-**The way out is `CONFIG_SPIRAM_XIP_FROM_PSRAM`, and the name reads backwards.**
+### What a flash write actually stops, and what XIP gives back
+
+Worth being precise, because the usual summary is "ISRs need `IRAM_ATTR`", and
+that undersells it. From
+[spi_flash_concurrency](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/spi_flash/spi_flash_concurrency.html),
+on the default configuration:
+
+> caches are disabled during SPI1 operations (read/write) … all non-IRAM-safe
+> interrupts will be disabled, and all other tasks are suspended
+
+**All other tasks are suspended.** Saving a file stops the whole system for the
+duration, not just the interrupt handlers — and cache *maintenance* running at
+that moment does not merely stall, it faults.
+
+**`CONFIG_SPIRAM_XIP_FROM_PSRAM` is the way out, and the name reads backwards.**
 It does not execute anything *from flash*; it stops doing so. `.text` and
 `.rodata` are copied into PSRAM at boot and fetched from there, so a flash write
-no longer has to disable the cache at all and the forbidden window closes —
-which is the exception the docs carve out.
+no longer needs the cache off.
 
-Measured on an N16R8 rather than assumed: PSRAM total falls 8189K → 7114K
-(1075K for the image, out of eight megabytes), internal RAM is unchanged, and
-scp throughput went **up** — 562 → 612 KB/s uploading, 476 → 594 KB/s
-downloading — because flash operations stop stalling the core. The alternatives
-are worse: keeping DMA'd buffers in internal RAM caps how many sessions fit, and
-"just do not overlap flash I/O with crypto" is not something an application with
-more than one task can promise.
+Two things not to overstate, because the popular summaries do:
+
+- The doc says the cache will not be disabled "**in most cases**", not never.
+- The named exception is **cache-mapped flash**: a region from
+  `esp_partition_mmap()` or `spi_flash_mmap()` still cannot be read during an
+  erase or write, so the cache is still disabled for that. espix uses neither —
+  checked — so it does not meet the exception, but an app that mmaps a partition
+  brings the whole hazard back with it.
+
+Measured on an N16R8 rather than assumed: PSRAM total falls 8189K → 7114K —
+1075K for the image, out of eight megabytes — internal RAM is unchanged, and scp
+throughput went **up**, 562 → 612 KB/s uploading and 476 → 594 KB/s downloading,
+because flash operations stop stalling the core. The alternatives are worse:
+keeping DMA'd buffers in internal RAM caps how many sessions fit, and "just do
+not overlap flash I/O with crypto" is not something an application with more
+than one task can promise.
+
+Note how the cost reads. Nothing "used" 1075K — the region is reserved *before*
+the heap is created, so it never becomes heap at all. `free` reports the heap,
+so the change shows up as the **total** falling rather than the used column
+rising.
 
 The threshold for "this goes through DMA" is low and differs by part — 256
 bytes on the S3, 512 on the P4, 128 elsewhere
@@ -103,6 +130,87 @@ From `components/soc/<target>/include/soc/soc_caps.h`. Two surprises in there:
   port.
 
 ## Things that look like POSIX or like FreeRTOS, and are not
+
+### "IRAM" is internal RAM, and its free space is your heap
+
+The naming invites the wrong mental model, and the wrong model leads to a plan
+that cannot work.
+
+There is **one** pool of internal SRAM — 512KB on the S3. Most of it is
+**DIRAM**: dual-ported, reachable both as instruction memory (the IRAM bus) and
+as data memory (the DRAM bus). "IRAM" is not a separate chip and not a separate
+budget; it is internal SRAM addressed as code. `idf.py size` splits it in a way
+that is easy to misread:
+
+| | used | remaining | total |
+|---|---|---|---|
+| IRAM | 16,384 | **0** | 16,384 |
+| DIRAM | 173,770 | 167,990 | 341,760 |
+
+The `IRAM` row is a small dedicated slice holding vectors and IDF's IRAM-safe
+code, and it is full. The `DIRAM` row is the dual-ported pool — and **its
+"remaining" is the heap**. Every byte of code you move into internal RAM is a
+byte `malloc()` will not have.
+
+That is the trap: "put the hot code in IRAM" reads like spending spare capacity
+and is actually spending the heap. On espix the heap is what decides how many
+SSH sessions fit, at about 12K each — so the question "should the kernel run
+from internal RAM?" is really "how many sessions is this worth?", and for 864KB
+of `.text` against a 512KB pool the answer is that it does not fit at any price.
+
+What internal RAM genuinely buys is the thing `IRAM_ATTR` exists for: code there
+is not fetched through the flash cache, so it keeps running while the cache is
+off. Once XIP from PSRAM is on, the cache does not go off, and that reason is
+gone. Speed is the only motive left — and moving espix's code out of the flash
+cache into PSRAM made scp *faster*, so PSRAM fetch was not the bottleneck.
+
+### `IRAM_ATTR` in an app loaded from the filesystem does nothing
+
+`IRAM_ATTR` is an instruction to the **linker**, at build time: put this
+function in internal RAM. It works for code linked into the firmware.
+
+Code loaded at runtime is never linked into the firmware. espix's ELF loader
+reads the file and copies it into memory itself, through one allocator for every
+section (`managed_components/espressif__elf_loader/src/esp_elf_adapter.c:33`):
+
+```c
+void *esp_elf_malloc(uint32_t n, bool exec)
+{
+#ifdef CONFIG_ELF_LOADER_LOAD_PSRAM
+    caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+```
+
+One `caps` for everything, and the `exec` argument ignored outright in that
+branch.
+
+`IRAM_ATTR` expands to `section(".iram1.N")` (`esp_attr.h:24`), and there are two
+ways that ends badly, both silent. Measured on the shipped `apps/neopixel`,
+which marks its WS2812 output routine `IRAM_ATTR` because the bit timing is
+tight: the built ELF has **no `.iram1` section at all** — `readelf -S` shows only
+`.text`, `.rodata`, `.data`, `.bss` — so the app's link folded those functions
+into `.text`, and they load and run from PSRAM like everything else. Had the link
+preserved the section instead, it would be worse: the loader captures sections by
+name (`.text`, `.data`, `.rodata`, `.dram0.*`, `.bss`) and silently skips
+anything else, so the code would not be loaded at all.
+
+Either way the attribute compiles, links, loads, runs, and delivers nothing.
+
+**What that costs is smaller than it looks, since XIP.** The usual reason IDF
+code marks an ISR `IRAM_ATTR` is so it survives the cache being disabled during a
+flash write — and with `CONFIG_SPIRAM_XIP_FROM_PSRAM` the cache is not disabled,
+so a PSRAM-resident handler in an app keeps working for the same reason the
+kernel's does. The remaining reason is **timing**: instruction fetch from PSRAM
+is slower and jitterier than from internal SRAM, so a handler with a
+sub-microsecond deadline — bit-banging WS2812, say — can still miss it where an
+IRAM one would not.
+
+This matters for espix specifically because two of the kinds of code it wants to
+run use the attribute idiomatically: Arduino sketches with `attachInterrupt`
+handlers, and IDF examples pasted in more or less unchanged. Both will build and
+load; neither gets what it asked for. Honouring it would mean giving the loader
+an IRAM section slot — the shape is already there, since `esp_elf_malloc()`
+takes an `exec` flag and the non-PSRAM branch already uses `MALLOC_CAP_EXEC` —
+plus an app link that preserves `.iram1.*`. See [ROADMAP.md](ROADMAP.md).
 
 ### `xTaskCreate()` takes a stack size in **bytes**
 
