@@ -65,15 +65,11 @@ assert_contains "unredirected, a diagnostic is still visible" "not found" "$both
 # `ssh host cmd 2>/dev/null` would still show the error.
 # ---------------------------------------------------------------------------
 
-# Deadlined, like the helpers in device.sh, and for the reason recorded there:
-# a raw ssh to a device that has stopped answering hangs until TCP gives up,
-# which wedged this suite for twenty minutes when a kill test panicked the
-# board. espix_timeout is given the ssh *binary* so the kill reaches it.
-_ssh() {
-    espix_timeout "$ESPIX_SSH_TIMEOUT" \
-        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-        ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
-}
+# dev_ssh_raw is device.sh's: deadlined, budgeted against the device's session
+# limit, and retried if the device says it is full. This suite used to carry its
+# own copy of those four lines, which meant its own connection went unbudgeted
+# and a refusal under load read as "the app produced no output".
+_ssh() { dev_ssh_raw "$@"; }
 
 assert_eq "the client's 2>/dev/null swallows a diagnostic" "" \
     "$(_ssh /bin/nosuchprogram 2>/dev/null)"

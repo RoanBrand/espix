@@ -35,14 +35,18 @@ SUITE_FILTER=""
 : "${ESPIX_STRESS_LIMIT:=0}"
 : "${ESPIX_SUITE_TIMEOUT:=240}"
 : "${ESPIX_RUN_TIMEOUT:=1200}"
-# One at a time by default, for now.
+# Four at a time.
 #
-# The pool works; the device does not survive it. Running suites concurrently
-# panics this board within minutes -- two workers are enough -- and the cause is
-# a memory corruption that predates the pool (see docs/KNOWN-ISSUES.md). A
-# default run that reliably reboots the device is not a suite anyone will trust,
-# so `-j` is opt-in until that is closed, and `-j 4` is the reproducer.
-: "${ESPIX_JOBS:=1}"
+# The number comes from the device: CONFIG_ESPIX_SSH_MAX_SESSIONS is 8, and four
+# workers means four long-lived sessions plus the health monitor, with room left
+# for the one-shot connection a suite opens for an exit status or a transfer and
+# for somebody watching `top` from another window.
+#
+# This was 1 for exactly as long as it took to find out why concurrency
+# rebooted the board -- a double free in shared command history, fixed. If a
+# parallel run starts panicking again, `--serial` is the way to get a trustworthy
+# answer while tools/soak.sh finds out why.
+: "${ESPIX_JOBS:=4}"
 : "${ESPIX_SEED:=}"
 export ESPIX_STRESS ESPIX_STRESS_N ESPIX_STRESS_LINES ESPIX_STRESS_LIMIT
 

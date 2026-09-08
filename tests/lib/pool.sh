@@ -43,8 +43,27 @@ print("\n".join(items))
 #   exclusive   the whole device -- measurements, and anything that saturates it
 pool_resources() {  # <suite file>
     local r
-    r=$(sed -n 's/^# RESOURCES: *//p' "$1" | head -1)
-    printf '%s' "${r:-none}"
+
+    # The first word, and only the first word.
+    #
+    # The declaration carries its reasoning on the same line -- "exclusive --
+    # these are measurements" -- and the first version of this returned all of
+    # it. `case "$r" in exclusive)` then matched nothing, so every suite was
+    # treated as `none` and the measurement suites ran *inside* the pool: 25-cpu
+    # churning logins, 55-sessions filling all eight slots, and 45-throughput
+    # pulling 4MB out of a flash partition, all beside four other suites. It
+    # cost a run and a wrong diagnosis before the parse was checked.
+    r=$(sed -n 's/^# RESOURCES: *//p' "$1" | head -1 | awk '{print $1}')
+
+    case "${r:-none}" in
+        none|console|exclusive) printf '%s' "${r:-none}" ;;
+        *)
+            # Loud, not silently permissive. A typo here would put an exclusive
+            # suite in the pool, which is the failure this function just had.
+            printf 'run.sh: %s declares unknown RESOURCES "%s"; treating as exclusive\n' \
+                   "$(basename "$1")" "$r" >&2
+            printf 'exclusive' ;;
+    esac
 }
 
 # ------------------------------------------------------------------- queue ---

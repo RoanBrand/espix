@@ -70,11 +70,7 @@ report "scp download" "$(rate_kbs 0 $(( t_db - t_dt )) 0 4096)" 180
 # newlib was reading a byte at a time.
 # ---------------------------------------------------------------------------
 
-_ssh_in() {
-    espix_timeout "$ESPIX_SSH_TIMEOUT" \
-        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-        ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
-}
+_ssh_in() { dev_ssh_raw "$@"; }
 
 APP="/home/$ESPIX_USER/testapp"
 

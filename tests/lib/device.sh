@@ -263,6 +263,59 @@ DEV_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Con
 : "${ESPIX_SSH_TIMEOUT:=30}"
 : "${ESPIX_SCP_TIMEOUT:=90}"
 
+# --------------------------------------------------- the one-shot connection budget ---
+#
+# How many connections *besides* the long-lived sessions may be open at once.
+#
+# The device allows CONFIG_ESPIX_SSH_MAX_SESSIONS of them, eight. A parallel run
+# already holds one per worker plus one for the health monitor, so at -j 4 that
+# is five, and every dev_status, dev_once, scp and sftp wants a sixth. Several
+# suites reaching for one at the same moment take the device past eight, and it
+# refuses -- correctly, and with a clear message, but a refused `dev_status`
+# reads as `exit status 255` and a refused `ssh app < file` as an empty answer.
+# A run measured five such failures across two suites, all of them "passes
+# alone".
+#
+# Retrying is not enough on its own: the retry sits in _dev_ssh below and is
+# bounded, and a busy patch outlasts it. So the host rations them instead, and
+# keeps the retry as the backstop for whatever slips through -- including the
+# person watching `top` from another window, whom the arithmetic cannot see.
+#
+# K token directories, because mkdir is atomic and bash 3.2 has nothing better.
+: "${ESPIX_ONESHOT_MAX:=2}"
+
+_dev_oneshot_acquire() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+
+    local waited=0 i
+    while :; do
+        i=1
+        while [ "$i" -le "$ESPIX_ONESHOT_MAX" ]; do
+            if mkdir "$ESPIX_RUNDIR/oneshot.$i.lock" 2>/dev/null; then
+                DEV_ONESHOT_TOKEN=$i
+                return 0
+            fi
+            i=$((i + 1))
+        done
+        sleep 0.2
+        waited=$((waited + 1))
+        if [ "$waited" -gt 300 ]; then     # a minute: go anyway
+            DEV_ONESHOT_TOKEN=""
+            return 0
+        fi
+    done
+}
+
+_dev_oneshot_release() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    [ -n "${DEV_ONESHOT_TOKEN:-}" ] || return 0
+    rmdir "$ESPIX_RUNDIR/oneshot.$DEV_ONESHOT_TOKEN.lock" 2>/dev/null
+    DEV_ONESHOT_TOKEN=""
+    return 0
+}
+
+DEV_ONESHOT_TOKEN=""
+
 # ----------------------------------------------------------- the transfer lock ---
 #
 # One transfer in flight at a time across the whole run.
@@ -373,13 +426,17 @@ _dev_ssh_once() {
 _dev_ssh() {
     local rc tries=0
     dev_aborted && return 255
+    _dev_oneshot_acquire
     while :; do
         _dev_ssh_once "$@"
         rc=$?
-        [ "$rc" = 255 ] || return $rc
-        [ "$tries" -lt "$DEV_SSH_MAX_RETRIES" ] || return $rc
-        dev_aborted && return $rc
-        _dev_refused_for_capacity || return $rc
+        if [ "$rc" != 255 ] \
+           || [ "$tries" -ge "$DEV_SSH_MAX_RETRIES" ] \
+           || dev_aborted \
+           || ! _dev_refused_for_capacity; then
+            _dev_oneshot_release
+            return $rc
+        fi
         tries=$((tries + 1))
         _dev_note_retry
         sleep 2
@@ -395,6 +452,7 @@ _dev_scp_once() {
 _dev_scp() {
     local rc tries=0
     dev_aborted && return 255
+    _dev_oneshot_acquire
     _dev_xfer_lock
     while :; do
         _dev_scp_once "$@"
@@ -409,7 +467,23 @@ _dev_scp() {
         break
     done
     _dev_xfer_unlock
+    _dev_oneshot_release
     return $rc
+}
+
+# dev_ssh_raw <command> [args...] -- own connection, output unfiltered.
+#
+# For the handful of assertions that have to see exactly what the *client*
+# printed -- which stream a diagnostic arrived on, what `2>/dev/null` swallows --
+# and for the ones that pipe a file into a process's stdin.
+#
+# It exists because 15-streams.sh and 45-throughput.sh had each grown their own
+# copy of the same four lines, and a private copy of a connection helper is a
+# copy that does not take the one-shot budget, does not retry a refusal, and
+# does not stop when the run has aborted. Two of the three failures that made a
+# parallel run red were exactly that.
+dev_ssh_raw() {
+    _dev_ssh "$@"
 }
 
 # dev_status <command> -- run it in its own connection, return its exit status.
@@ -458,6 +532,7 @@ dev_pull() {
 dev_sftp() {
     local rc
     dev_aborted && return 255
+    _dev_oneshot_acquire
     _dev_xfer_lock
     espix_timeout "$ESPIX_SCP_TIMEOUT" \
         env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
@@ -465,6 +540,7 @@ dev_sftp() {
         "$ESPIX_USER@$ESPIX_HOST" 2>&1
     rc=$?
     _dev_xfer_unlock
+    _dev_oneshot_release
     return $rc
 }
 
