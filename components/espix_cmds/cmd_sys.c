@@ -231,10 +231,123 @@ static char task_state_char(eTaskState state)
     }
 }
 
+/*
+ * `ps -d [seconds]` -- who actually used the CPU during a window, in
+ * microseconds.
+ *
+ * The CPU% columns in `ps` and `top` are shares, and a share rounds to zero for
+ * exactly the thing you most want to find: a task that wakes briefly and often.
+ * A station on WiFi power save wakes for a beacon roughly every 102ms and does
+ * a few hundred microseconds of work -- a fraction of a percent of one core,
+ * printed as 0, and invisible in every view espix had.
+ *
+ * So this reports the raw number and the window it was measured over, and
+ * leaves the division to the reader. Anything periodic shows a small non-zero
+ * figure that grows with the window; anything genuinely asleep stays at 0
+ * however long you watch, which is the distinction that was missing.
+ *
+ * Matched on handle *and* task number, the way top's frame-to-frame delta is,
+ * because a handle is an address and addresses get reused -- a task that died
+ * and another created in its place would otherwise be differenced against each
+ * other.
+ */
+typedef struct {
+    TaskHandle_t handle;
+    UBaseType_t  number;
+    uint32_t     runtime;
+} ps_sample_t;
+
+static int ps_delta(espix_session_t *s, unsigned secs)
+{
+    const UBaseType_t capacity = uxTaskGetNumberOfTasks() + 8;
+
+    TaskStatus_t *a    = calloc(capacity, sizeof(TaskStatus_t));
+    TaskStatus_t *b    = calloc(capacity, sizeof(TaskStatus_t));
+    ps_sample_t  *seen = calloc(capacity, sizeof(ps_sample_t));
+
+    if (a == NULL || b == NULL || seen == NULL) {
+        free(a); free(b); free(seen);
+        espix_eprintf(s, "ps: out of memory\n");
+        return 1;
+    }
+
+    const int64_t     t0 = esp_timer_get_time();
+    const UBaseType_t na = uxTaskGetSystemState(a, capacity, NULL);
+
+    for (UBaseType_t i = 0; i < na; i++) {
+        seen[i].handle  = a[i].xHandle;
+        seen[i].number  = a[i].xTaskNumber;
+        seen[i].runtime = (uint32_t)a[i].ulRunTimeCounter;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(secs * 1000));
+
+    const UBaseType_t nb = uxTaskGetSystemState(b, capacity, NULL);
+    const int64_t     dt = esp_timer_get_time() - t0;
+
+    espix_printf(s, "over %lld ms:\n\n", (long long)(dt / 1000));
+    espix_printf(s, "%5s %-16s %4s %10s\n", "PID", "NAME", "CORE", "CPU(us)");
+
+    for (UBaseType_t i = 0; i < nb; i++) {
+        uint32_t before = 0;
+        bool     known  = false;
+
+        for (UBaseType_t k = 0; k < na; k++) {
+            if (seen[k].handle == b[i].xHandle &&
+                seen[k].number == b[i].xTaskNumber) {
+                before = seen[k].runtime;
+                known  = true;
+                break;
+            }
+        }
+
+        /* Unsigned throughout, so a counter that wrapped inside the window
+         * still differences correctly. */
+        const uint32_t used = (uint32_t)b[i].ulRunTimeCounter - before;
+
+        const espix_pid_t pid = espix_proc_pid_of_task(b[i].xHandle);
+        char pid_str[12];
+        if (pid != ESPIX_PID_NONE) {
+            snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+        } else {
+            snprintf(pid_str, sizeof(pid_str), "-");
+        }
+
+        char core_str[12];
+#if configTASKLIST_INCLUDE_COREID
+        if (b[i].xCoreID == tskNO_AFFINITY) {
+            snprintf(core_str, sizeof(core_str), "any");
+        } else {
+            snprintf(core_str, sizeof(core_str), "%d", (int)b[i].xCoreID);
+        }
+#else
+        snprintf(core_str, sizeof(core_str), "-");
+#endif
+
+        espix_printf(s, "%5s %-16s %4s %10u%s\n",
+                     pid_str, b[i].pcTaskName, core_str, (unsigned)used,
+                     known ? "" : "  (appeared during the window)");
+    }
+
+    free(a); free(b); free(seen);
+    return 0;
+}
+
 static int cmd_ps(espix_session_t *s, int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
+        unsigned secs = 2;
+        if (argc > 2) {
+            char *end = NULL;
+            const unsigned long v = strtoul(argv[2], &end, 10);
+            if (end == argv[2] || *end != '\0' || v < 1 || v > 30) {
+                espix_eprintf(s, "ps: -d wants a window of 1..30 seconds\n");
+                return 1;
+            }
+            secs = (unsigned)v;
+        }
+        return ps_delta(s, secs);
+    }
 
     const UBaseType_t capacity = uxTaskGetNumberOfTasks() + 4;
 
@@ -1514,7 +1627,8 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "free",   .fn = cmd_free,
       .help = "report memory usage",            .usage = "free" },
     { .name = "ps",     .fn = cmd_ps,
-      .help = "list tasks and processes",       .usage = "ps" },
+      .help = "list tasks and processes",
+      .usage = "ps [-d [seconds]]" },
     { .name = "top",    .fn = cmd_top,
       .help = "live view of tasks and memory",  .usage = "top [-b] [-n <frames>]" },
     { .name = "dmesg",  .fn = cmd_dmesg,
