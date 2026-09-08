@@ -189,86 +189,41 @@ harness before believing what it says about the system. Both of these were
 confirmed by making the *old* behaviour fail a test that the new behaviour
 passes, not by reasoning about the code.
 
-## A known flaky spot
+## The console suite used to be flaky, and why it was not the harness
 
-The console suite fails roughly one run in three or four, and it is the harness
-rather than espix: `console.py` drives a serial line with no flow control,
-answering esp_linenoise's cursor-position probe as it goes, and the sync is
-timing-sensitive. It retries the initial sync three times, which helps and does
-not cure it.
+For a long time this suite failed about one full run in three while passing
+every time on its own, and it was written up here as a harness problem. That was
+wrong, and the way it was wrong is worth keeping.
 
-**Check for a second reader first.** The most common cause by far is another
-process on the same port — a forgotten `idf.py monitor`, or a serial capture
-left running while debugging something else. `/dev/cu.*` is not exclusive on
-macOS, so both processes open it happily and then steal each other's bytes; the
-prompt `console.py` is waiting for is consumed by the other reader. It fails
-intermittently rather than always, which is worse, and it looks exactly like a
-device fault. `console.py` now names the offending process when it gives up, so
-read its stderr before suspecting espix.
-
-If it still fails, re-run it alone (`make test SUITE=console`) before believing
-it. That is an unsatisfying instruction to write in a document about trusting
-your tests, and it is better than a suite that quietly passes.
-
-**What has been ruled out**, so the next person need not re-do it. Observed
-shape: the probe answers, the *next* command gets zero bytes, and the console
-says nothing for the rest of the suite. Measured during the stream work —
-- not espix's firmware: two full runs on the *same* image, one green and one
-  not;
-- not a second reader: `lsof` on the port showed nothing, both during and after;
-- not an orphan of ours: no `console.py` or `ssh` left behind;
-- not the device: SSH answered throughout, and the health check found no reboot;
-- not the preceding suites: running fs, transfer, streams and signals first,
-  then the console, passes every time.
-
-The suite now reports it as **one** failure carrying the device's own `uptime`,
-task list and `dmesg`, fetched over SSH — and that immediately produced the
-finding the guesswork above had missed. On the next occurrence, `dmesg` said:
+The device's console genuinely stopped: silent in both directions, `main` alive
+and blocked, nothing on the host holding the port, SSH perfectly healthy
+throughout, and only a reset recovering it. A core dump taken *while wedged* --
+`crash` over SSH, then reading the `main` thread rather than the faulting one --
+named it in one step:
 
 ```
-console: terminal does not answer cursor queries; assuming 80x24
-console: console session on uart
+esp_linenoise_get_columns -> esp_linenoise_get_cursor_position
+  -> console_read_bytes -> esp_vfs_select(..., timeout=0x0)
 ```
 
-The device's **console session had restarted**, mid-suite, with no reset —
-`uptime` was unbroken and the reset reason still `power-on`. A new console
-session probes the terminal for its cursor position, and `console.py` is the
-thing that answers that probe, so a probe falling between two invocations has
-nobody to answer it, times out, and the next `console.py` then syncs against a
-session that is mid-probe rather than sitting at a prompt.
+The editor asks the terminal where the cursor is twice per prompt and then reads
+until it gets an answer. `console_read_bytes()` waited with a NULL timeout,
+deliberately, so an idle prompt costs nothing. With no terminal attached the
+answer never came, and the timeout that was supposed to cover exactly this --
+`s_report_deadline_us`, with `s_terminal_mute` and a synthesised reply behind it
+-- was only ever consulted *after a byte arrived*. No byte, no deadline check,
+console parked for good.
 
-One `console.py` is now held for the whole suite, the way `session.py` is held
-for SSH, which removes the open/close cycle rather than trying to time it.
+The fix is to bound the wait to what is left of the report window while a report
+is outstanding, which makes the existing timeout reachable. See
+`console_read_bytes()` in `tty_console.c`.
 
-**It did not cure the flakiness, and that is worth stating plainly.** Both the
-old code and the new pass five consecutive runs on their own and both still
-fail in some full runs, with the same shape: the first command answers, the
-next gets nothing, and `dmesg` shows the console session having restarted. So
-the per-command open/close was a real cause and evidently not the only one.
-
-Quietening the kernel log for the suite (`dmesg -n warn`, since klog lands on
-the console prompt and a full run generates a steady stream of it) was tried on
-the same reasoning and reverted: it could not be shown to help either, and it
-made the suite need root for something unrelated to what it tests.
-
-What is known: the device stays up throughout, SSH keeps answering, `main` --
-the task running the console session -- is alive and blocked on input, and
-`lsof` shows nothing else on the port. At one point the port went silent at the
-raw level (a bare `pyserial` read returned zero bytes) while SSH was perfectly
-healthy, which a reboot cleared. That is the next thread to pull.
-
-One thing is now confirmed rather than suspected: a second reader really does
-cause this. Running a `cat /dev/cu.*` capture alongside the suite reproduced it
-every time, and the report named it.
-
-**It now fails fast.** Two things used to make a dead console cost minutes. The
-initial sync shared `--timeout` with the command wait, so three attempts at 30s
-was 92 seconds; sync has its own `--sync-timeout` (4s) now, because a console
-that is there answers a newline in milliseconds and one that is not will not
-start answering because we waited longer. And every `dev_console_run` spawns its
-own `console.py`, so that cost was paid *per assertion* — five commands, seven
-minutes, five failures reporting one fact. The suite now probes once and skips
-the rest if the console is not there. Worst case went from about 450s to 16s.
+Two things this cost, both avoidable. The suite spawning a `console.py` per
+command was blamed first; that was a real fault and worth fixing, but fixing it
+changed nothing here, and "the obvious suspect improved and the symptom
+remained" should have been the signal to stop guessing and take a dump. And the
+harness was blamed before the device, when the device was answering every
+question put to it over SSH the whole time.
 
 ## The test app
 

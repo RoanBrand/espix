@@ -480,11 +480,30 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
     }
 
     /*
-     * Wait on the console and on the wake-up descriptor together, with no
-     * timeout: the task sleeps until a key is pressed or a kernel message goes
-     * out, and burns nothing in between. A poll would have been simpler and is
-     * not worth a wakeup several times a second on a device that spends most of
-     * its life idle at a prompt.
+     * Wait on the console and on the wake-up descriptor together.
+     *
+     * No timeout while simply waiting for a keystroke: the task sleeps until a
+     * key is pressed or a kernel message goes out, and burns nothing in
+     * between. A poll would have been simpler and is not worth a wakeup several
+     * times a second on a device that spends most of its life idle at a prompt.
+     *
+     * *Except* while a cursor report is outstanding, and that exception is the
+     * whole of this fix. The editor asks the terminal where the cursor is twice
+     * per prompt (esp_linenoise_get_columns -> get_cursor_position) and then
+     * reads until it has an answer. With nothing attached to the other end of
+     * the wire, no answer ever comes -- and a blocking select() meant the
+     * deadline below was never reached, because it is only consulted once a
+     * byte has arrived. The console then sat in that read for ever: silent in
+     * both directions, unrecoverable without a reset, while the rest of the
+     * system carried on perfectly.
+     *
+     * A core dump of the wedged device named it exactly:
+     *
+     *     esp_linenoise_get_columns -> esp_linenoise_get_cursor_position
+     *       -> console_read_bytes -> esp_vfs_select(..., timeout=0x0)
+     *
+     * Bounding the wait to what is left of the report window makes the timeout
+     * that was always intended actually reachable.
      */
     ssize_t n;
 
@@ -498,9 +517,42 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
             FD_SET(s_wake_fd, &rfds);
         }
 
-        const int r = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        struct timeval  tv;
+        struct timeval *tvp = NULL;
+
+        if (s_expect_report) {
+            int64_t left = s_report_deadline_us - esp_timer_get_time();
+            if (left < 0) {
+                left = 0;
+            }
+            tv.tv_sec  = (time_t)(left / 1000000);
+            tv.tv_usec = (suseconds_t)(left % 1000000);
+            tvp        = &tv;
+        }
+
+        const int r = select(maxfd + 1, &rfds, NULL, NULL, tvp);
         if (r < 0) {
             return -1;
+        }
+
+        if (r == 0) {
+            /*
+             * The window closed with nothing on the wire, so there is no
+             * terminal to answer. Give the editor the reply it is blocked
+             * waiting for -- the same answer the byte-arrived path below
+             * synthesises -- and stop asking from here on.
+             */
+            s_expect_report = false;
+            s_report_pos    = 0;
+            s_terminal_mute = true;
+            inject("\x1b[%u;%uR", REPORT_ROWS, REPORT_COLS);
+
+            espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                       "no terminal answered the cursor query; assuming %ux%u",
+                       REPORT_COLS, REPORT_ROWS);
+
+            out[0] = s_injected[s_injected_pos++];
+            return 1;
         }
 
         if (s_wake_fd >= 0 && FD_ISSET(s_wake_fd, &rfds)) {
