@@ -79,6 +79,16 @@ CONFIG_ESP_WIFI_NVS_ENABLED=y
 # report. Kept in sync with the generated <target>-<mac> form for consistency.
 CONFIG_LWIP_LOCAL_HOSTNAME="espix"
 
+# One socket per SSH connection, plus the listener, plus whatever DHCP and SNTP
+# hold. ESP-IDF's default of 10 was enough while the SSH server accepted four
+# connections; at CONFIG_ESPIX_SSH_MAX_SESSIONS=8 it is not, and the failure
+# would be an accept() that returns EMFILE rather than anything naming sockets.
+#
+# This is also FD_SETSIZE, which is why select() in the console and the SSH
+# server keep working as it rises, and why espix's device fds sit at 240-255
+# (see espix_fs/dev.c) -- far above anything lwIP will hand out.
+CONFIG_LWIP_MAX_SOCKETS=20
+
 #
 # Console
 #
@@ -138,3 +148,12 @@ CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200
 # means supplying string descriptors at runtime rather than from Kconfig.
 CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="espix"
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"
+
+#
+# espix
+#
+# The Kconfig default is 8 as well; repeating it here is what makes a fresh
+# checkout build with it, since sdkconfig is not tracked and an existing one
+# would otherwise keep whatever it already had. Neither of these overrides an
+# sdkconfig that already names the option -- delete it, or edit it by hand.
+CONFIG_ESPIX_SSH_MAX_SESSIONS=8

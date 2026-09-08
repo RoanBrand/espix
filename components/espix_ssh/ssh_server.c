@@ -311,6 +311,52 @@ static void close_gracefully(int fd)
     close(fd);
 }
 
+/*
+ * The session count moves under a spinlock: the accept task takes slots and
+ * every connection task releases one as it exits, on either core.
+ */
+static portMUX_TYPE s_sessions_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/*
+ * Take a slot, or report that the limit is reached.
+ *
+ * The test and the increment happen together, and in the accept loop rather
+ * than in the connection task, because they used to be neither. The check was
+ * here and the increment was in connection_task() after conn_alloc(), so
+ * between xTaskCreate() returning and the new task first running the counter
+ * had not moved -- and every connection arriving in that window was admitted
+ * against a stale number.
+ *
+ * One client at a time never opened that window, which is why it survived this
+ * long. The parallel test harness opens a connection per worker at once on
+ * every run, and each overshoot costs 8KB of internal task stack that, at the
+ * upper end of the range, is not there.
+ */
+static bool sessions_take(void)
+{
+    bool taken;
+
+    portENTER_CRITICAL(&s_sessions_mux);
+    taken = (s_status.sessions < CONFIG_ESPIX_SSH_MAX_SESSIONS);
+    if (taken) {
+        s_status.sessions++;
+    }
+    portEXIT_CRITICAL(&s_sessions_mux);
+
+    return taken;
+}
+
+static void sessions_release(void)
+{
+    portENTER_CRITICAL(&s_sessions_mux);
+    if (s_status.sessions > 0) {
+        s_status.sessions--;
+    }
+    portEXIT_CRITICAL(&s_sessions_mux);
+}
+
+/* Runs with a slot already taken by the accept loop; it releases it on every
+ * exit path, including the early one. */
 static void connection_task(void *arg)
 {
     const int fd = (int)(intptr_t)arg;
@@ -320,12 +366,12 @@ static void connection_task(void *arg)
     ssh_conn_t *c = conn_alloc();
     if (c == NULL) {
         close(fd);
+        sessions_release();
         vTaskDelete(NULL);
         return;
     }
     c->fd = fd;
 
-    s_status.sessions++;
     s_status.accepted++;
 
     do {
@@ -390,7 +436,7 @@ static void connection_task(void *arg)
     ssh_kex_release_keys(c);/* the PSA slots free(c) cannot reach */
     free(c);
 
-    s_status.sessions--;
+    sessions_release();
     espix_klog(ESPIX_KLOG_INFO, TAG, "connection closed");
 
     vTaskDelete(NULL);
@@ -431,7 +477,7 @@ static void accept_task(void *arg)
          *
          * Without it a peer that sent half a packet and stopped parked the task
          * permanently. The task never exited, so s_status.sessions never came
-         * back down, and four such connections made the server refuse
+         * back down, and enough such connections made the server refuse
          * everything thereafter. It is also reachable by anything that can open
          * a socket to port 22, which makes it a denial of service rather than
          * only a bug.
@@ -449,7 +495,7 @@ static void accept_task(void *arg)
          *
          * A peer that stops reading and does *not* close parks this task inside
          * send() for as long as it stays silent: the window shuts, lwIP has
-         * nowhere to put the bytes, and a blocking socket simply waits. Four
+         * nowhere to put the bytes, and a blocking socket simply waits. Enough
          * such peers exhaust CONFIG_ESPIX_SSH_MAX_SESSIONS, which is the same
          * denial of service the receive timeout was added to close. (A peer
          * that stops reading and then *closes* was always handled: the send
@@ -464,11 +510,16 @@ static void accept_task(void *arg)
          */
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
 
-        if (s_status.sessions >= CONFIG_ESPIX_SSH_MAX_SESSIONS) {
+        if (!sessions_take()) {
             /*
              * Refusing cleanly beats letting a connection half-work. The limit
              * is above one because scp and sftp open their own connection, and
              * transferring a file while a shell is open is the normal case.
+             *
+             * The count in the message is what the test harness reads to learn
+             * the device's real limit, rather than trusting a sdkconfig that
+             * may predate the Kconfig default -- so keep the "(N of M in use)"
+             * shape.
              *
              * Say why. RFC 4253 4.2 lets a server send arbitrary CRLF-terminated
              * lines before its version string, and requires clients to cope with
@@ -503,6 +554,7 @@ static void accept_task(void *arg)
                         CONFIG_ESPIX_SSH_TASK_STACK, (void *)(intptr_t)fd,
                         CONFIG_ESPIX_SSH_TASK_PRIO, NULL) != pdPASS) {
             espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start connection task");
+            sessions_release();     /* the task that would have done this never ran */
             close(fd);
         }
     }

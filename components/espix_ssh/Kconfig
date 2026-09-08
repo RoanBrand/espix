@@ -19,23 +19,45 @@ menu "espix SSH"
     config ESPIX_SSH_MAX_SESSIONS
         int "Concurrent connections"
         depends on ESPIX_SSH_ENABLED
-        range 1 4
-        default 4
+        range 1 16
+        default 8
         help
             How many SSH connections may be open at once.
 
             Two is the useful minimum: scp and sftp open their own connection,
             so with a limit of one no file could be transferred while an
-            interactive session was open. Four leaves room for a couple of
-            shells beside a transfer.
+            interactive session was open.
 
-            With the PSRAM options below on, which is the default, a connection
-            costs 10344 bytes of internal RAM: its task stack, which can never
-            live in PSRAM, and the channel receive buffer. Everything else --
-            14760 bytes of packet buffers and key-exchange state, and about
-            15KB more while a transfer is running -- comes from PSRAM. Without
-            PSRAM all of it falls back to internal RAM, roughly 25KB per idle
-            connection, and four at once is no longer a comfortable fit.
+            Eight is the default because the test harness runs suites in
+            parallel over several sessions at once, each of which may open a
+            second connection for a transfer or an exit status. Four -- the old
+            default -- gave four workers no headroom at all.
+
+            The cost is internal RAM, and only while a connection is actually
+            open: nothing here is preallocated. With the PSRAM options below on,
+            which is the default, a connection costs 10344 bytes of internal
+            RAM -- its task stack, which can never live in PSRAM, and the
+            channel receive buffer. Everything else, 14760 bytes of packet
+            buffers and key-exchange state plus about 15KB more while a transfer
+            is running, comes from PSRAM.
+
+            Measured on an N16R8 rather than added up, because the sum leaves
+            things out -- an lwIP socket and the session's own state put the
+            real figure nearer 12K. Idle, `free` reports 146K of internal heap
+            free with a 72K largest block. With eight connections open it
+            reports 50K free, a 31K largest block, and 39K as the minimum since
+            boot; closing them returns it to 144K, so nothing here leaks.
+
+            That is the reason for the default and for the shape of the range.
+            Eight fits with about 50K to spare. Sixteen would want 192K on a
+            board that has 146K, so the range top is a ceiling for
+            configurations this code must survive and not a recommendation:
+            over-asking degrades into refused connections rather than a crash,
+            but it degrades. tests/suites/55-sessions.sh takes these numbers
+            again on the real device instead of trusting this paragraph.
+
+            Without PSRAM all of it falls back to internal RAM, roughly 25KB per
+            idle connection, and anything above two or three will not fit.
 
     config ESPIX_SSH_TASK_STACK
         int "Connection task stack (bytes)"
