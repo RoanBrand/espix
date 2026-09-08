@@ -168,11 +168,19 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   ESP-IDF's UART driver and is live in this build, and because its prefix is
   longer than espix's `""` it outranks the root and routes straight to the
   driver. Its ops table carries `open`, `read`, `write`, `close`, `fstat`,
-  `fcntl` and `fsync`, so those work — but `ls` cannot show it, for two
-  unrelated reasons. `ls /dev` fails because `/dev` is not a directory in the
-  root filesystem and `readdir` never merges mount points. `ls -l /dev/uart/0`
-  fails because the UART VFS's *directory* ops contain only `access` — there is
-  no `stat` for `ls` to call.
+  `fcntl` and `fsync`, so those work — but `ls` cannot show it.
+  `ls -l /dev/uart/0` fails because the UART VFS's *directory* ops contain only
+  `access` — there is no `stat` for `ls` to call, and `readdir` never merges
+  mount points, so it does not appear in a listing of `/dev` either.
+
+  **`ls /dev` itself now works and is still empty**, for a second and separate
+  reason. `/dev` is a real directory since espix started creating it in the boot
+  skeleton, so the listing succeeds — but espix's own device nodes, `/dev/null`
+  and `/dev/factory`, live in a table consulted by `vfs_open()` and `vfs_stat()`
+  and are not wired into `readdir`. They work perfectly when named and are
+  invisible when listed. So there are two unrelated reasons something can be
+  missing from that directory: a mount point `readdir` will not merge, and a
+  device espix answers for without enumerating.
 
   **Unchanged by espix owning the root VFS**, so this is not a regression to go
   looking for: LittleFS was the fallback before too and `/dev/uart` outranked it
