@@ -96,10 +96,16 @@ esp_err_t espix_proc_init(void);
  *
  * The binary itself is read before the process exists, so it may live anywhere;
  * `confine /srv/www /bin/httpd` is the ordinary shape rather than a loophole.
+ *
+ * `foreground` says the caller will block in espix_proc_wait() for this
+ * process. It decides one thing: whether the process's stdout and stderr may
+ * be pointed at the session's `>` / `2>` redirection, whose FILE the shell
+ * closes as soon as the command returns. A backgrounded process outlives that,
+ * so it writes to the terminal instead -- see the stream note in exec.c.
  */
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
                                espix_session_t *session, const char *root,
-                               espix_pid_t *out_pid);
+                               bool foreground, espix_pid_t *out_pid);
 
 /*
  * Block until `pid` leaves the running state. Returns ESP_ERR_TIMEOUT if it is

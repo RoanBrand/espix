@@ -21,7 +21,7 @@
 /* Created on first boot so a freshly-formatted filesystem still looks sane,
  * even without the baked fsroot image. */
 static const char *const k_skeleton[] = {
-    "/bin", "/etc", "/home", "/tmp", "/var", "/var/log",
+    "/bin", "/dev", "/etc", "/home", "/tmp", "/var", "/var/log",
 };
 
 static bool s_mounted;
@@ -86,6 +86,10 @@ esp_err_t espix_fs_mount_root(void)
                    esp_err_to_name(err));
         return err;
     }
+
+    /* Before the root is registered, so the first open cannot race the table's
+     * mutex being created. */
+    espix_dev_init();
 
     err = espix_vfs_register_root(lower_ops, lower_ctx);
     if (err != ESP_OK) {

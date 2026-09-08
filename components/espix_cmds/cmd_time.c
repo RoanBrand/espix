@@ -118,27 +118,27 @@ static int cmd_date(espix_session_t *s, int argc, char **argv)
             utc = true;
         } else if (strcmp(argv[i], "-s") == 0) {
             if (i + 1 >= argc) {
-                espix_printf(s, "date: -s needs a time, "
+                espix_eprintf(s, "date: -s needs a time, "
                                 "as \"YYYY-MM-DD HH:MM:SS\"\n");
                 return 1;
             }
 
             time_t t;
             if (!parse_stamp(argv[i + 1], &t)) {
-                espix_printf(s, "date: cannot parse '%s'; "
+                espix_eprintf(s, "date: cannot parse '%s'; "
                                 "expected \"YYYY-MM-DD HH:MM:SS\"\n",
                              argv[i + 1]);
                 return 1;
             }
             if (espix_time_set(t) != ESP_OK) {
-                espix_printf(s, "date: could not set the clock\n");
+                espix_eprintf(s, "date: could not set the clock\n");
                 return 1;
             }
             i++;
         } else if (argv[i][0] == '+') {
             fmt = argv[i] + 1;
         } else {
-            espix_printf(s, "date: unknown option '%s'\n", argv[i]);
+            espix_eprintf(s, "date: unknown option '%s'\n", argv[i]);
             return 1;
         }
     }
@@ -184,7 +184,7 @@ static int cmd_timedatectl(espix_session_t *s, int argc, char **argv)
              * its only content was the default espix already compiles in -- and
              * this is where somebody setting a zone actually is.
              */
-            espix_printf(s,
+            espix_eprintf(s,
                 "timedatectl: set-timezone needs a POSIX TZ string, not a\n"
                 "zoneinfo name -- espix ships no tzdata, so the rules go in\n"
                 "the string:\n"
@@ -200,13 +200,13 @@ static int cmd_timedatectl(espix_session_t *s, int argc, char **argv)
             return 1;
         }
         if (espix_time_set_zone(argv[2], true) != ESP_OK) {
-            espix_printf(s, "timedatectl: could not set the timezone\n");
+            espix_eprintf(s, "timedatectl: could not set the timezone\n");
             return 1;
         }
         return 0;
     }
     if (argc > 1) {
-        espix_printf(s, "timedatectl: unknown argument '%s'\n", argv[1]);
+        espix_eprintf(s, "timedatectl: unknown argument '%s'\n", argv[1]);
         return 1;
     }
 

@@ -274,11 +274,12 @@ merely missing.
 | Interactive shell over serial and SSH | **yes** | same dispatch, same output on both |
 | Line editing, history, TAB completion | **yes** | history follows the user, not the connection |
 | Output redirection `>` `>>` | **yes** | |
+| Error redirection `2>` `2>>` `2>&1` | **yes** | diagnostics are their own stream; over SSH they arrive as `CHANNEL_EXTENDED_DATA`, so the client's `2>` separates them too |
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
 | Background jobs `&` | **partial** | `cmd &` works, but dies at logout; no `jobs`, `fg`, `bg`, Ctrl-Z |
 | Pipes <code>&#124;</code> | **planned** | |
-| Input redirection `<`, `2>` as its own stream | **planned** | one output stream today |
+| Input redirection `<` | **planned** | a loaded app has a real `stdin` (`ssh host 'prog' < file` works); no builtin reads it, and there is no `<` |
 | Environment variables, `export` | **planned** | there is no environment at all yet |
 | Globbing `*` | **planned** | |
 | Shell scripts, `#!`, control flow | **planned** | the executable bit is now real, so `#!` needs only the dispatch: a file that is executable but not an ELF is where the interpreter line would be read |

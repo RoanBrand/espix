@@ -16,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 
 #include "espix_auth.h"
 #include "espix_cmds_priv.h"
@@ -60,7 +61,7 @@ static int cmd_help(espix_session_t *s, int argc, char **argv)
     espix_shell_foreach(help_visit, &ctx);
 
     if (ctx.want != NULL && !ctx.found) {
-        espix_printf(s, "help: %s: no such command\n", ctx.want);
+        espix_eprintf(s, "help: %s: no such command\n", ctx.want);
         return 1;
     }
     return 0;
@@ -181,13 +182,19 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
     TaskStatus_t *tasks = calloc(capacity, sizeof(TaskStatus_t));
     if (tasks == NULL) {
-        espix_printf(s, "ps: out of memory\n");
+        espix_eprintf(s, "ps: out of memory\n");
         return 1;
     }
 
-    configRUN_TIME_COUNTER_TYPE total_runtime = 0;
-    const UBaseType_t count = uxTaskGetSystemState(tasks, capacity,
-                                                   &total_runtime);
+    /*
+     * The denominator is esp_timer's 64-bit microsecond clock, not
+     * uxTaskGetSystemState()'s total. That total is the same clock truncated
+     * to 32 bits, which wraps every 71.6 minutes -- and once it has wrapped
+     * below a task's own accumulated counter this ratio stays wrong for a long
+     * stretch, not for one reading.
+     */
+    const uint64_t    total_runtime = (uint64_t)esp_timer_get_time();
+    const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
     espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s\n",
                  "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
@@ -213,12 +220,21 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         snprintf(core_str, sizeof(core_str), "-");
 #endif
 
-        /* Cumulative share of run time since boot, not an instantaneous
-         * reading — a real `top` needs two samples and comes later. */
+        /*
+         * Cumulative share of run time since boot, not an instantaneous
+         * reading — a real `top` needs two samples, and `top` is where they
+         * are.
+         *
+         * Approximate at the top end: the per-task counter is still 32-bit and
+         * wraps after 71.6 minutes of *that task's* CPU, roughly a day for
+         * something 5% busy, and `ps` keeps no history to notice it. The clamp
+         * keeps the impossible out of the column; `top` is the honest reading.
+         */
         unsigned pct = 0;
         if (total_runtime > 0) {
-            pct = (unsigned)((uint64_t)tasks[i].ulRunTimeCounter * 100 /
-                             total_runtime);
+            const uint64_t share = (uint64_t)tasks[i].ulRunTimeCounter * 100 /
+                                   total_runtime;
+            pct = (share > 100) ? 100 : (unsigned)share;
         }
 
         /*
@@ -292,6 +308,17 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
 typedef struct {
     TaskHandle_t                 handle;
+    /*
+     * The handle alone is not an identity. It is the address of the task's
+     * control block, and FreeRTOS frees that block on vTaskDelete -- so the
+     * next task created is very often handed the same address, being an
+     * exact-size best fit for the block just released.
+     *
+     * xTaskNumber is what FreeRTOS calls "a number unique to the task",
+     * assigned at creation and never reused, so the pair tells a recycled
+     * address apart from a task that really is the one sampled last time.
+     */
+    UBaseType_t                  number;
     configRUN_TIME_COUNTER_TYPE  runtime;
 } top_prev_t;
 
@@ -333,7 +360,8 @@ static int top_row_cmp(const void *a, const void *b)
 #define TOP_CORES_MAX 4
 
 static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
-                       const unsigned *idle_per_core, unsigned idle_pct)
+                       const unsigned *idle_per_core, unsigned idle_pct,
+                       bool have_prev)
 {
     char uptime[64];
     espix_uptime_str(uptime, sizeof(uptime));
@@ -361,6 +389,22 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
                      (unsigned)(psram.total_allocated_bytes / 1024),
                      (unsigned)(psr_total / 1024));
     }
+    /*
+     * The first frame has nothing to subtract from, so every task reads 0% --
+     * including the idle tasks, which made "busy" come out as a confident
+     * 100%. It shows the same "-" the per-task column already uses for a task
+     * seen only once. Invisible until `top -n 1` made the first frame the
+     * whole output.
+     */
+    if (!have_prev) {
+        espix_printf(s, "\nCpu:  -%% busy across %u core%s",
+                     cores, cores == 1 ? "" : "s");
+        espix_printf(s, "\n");
+        espix_printf(s, "Tasks: %u total, %u running\n\n",
+                     (unsigned)count, running);
+        return;
+    }
+
     espix_printf(s, "\nCpu:  %u%% busy across %u core%s",
                  busy / cores, cores, cores == 1 ? "" : "s");
 
@@ -383,8 +427,42 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
 
 static int cmd_top(espix_session_t *s, int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    /*
+     * `-n <count>` stops after that many frames; without it top runs until
+     * Ctrl-C, as before.
+     *
+     * `-n` means *iterations*, following procps on Linux, and `-b` is accepted
+     * and ignored for the same reason -- espix takes its conventions from
+     * Linux and Raspberry Pi OS. Worth stating because macOS spells it
+     * differently: there `-n` is the number of *processes* to show, so
+     * `top -n 3` on a Mac lists three processes and keeps running. Anyone
+     * carrying that habit over will be surprised either way; matching the
+     * platform espix imitates everywhere else is the lesser surprise.
+     *
+     * It also exists so the test suite can reach this command at all. An
+     * endless loop cannot be driven by a harness that sends a line and waits
+     * for a prompt, which left the two-sample arithmetic below with no
+     * automated cover -- and that is exactly where `sshd:conn` came to be
+     * reported at 386491%.
+     */
+    long frames = 0;                    /* 0 = until interrupted */
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-b") == 0) {
+            continue;                   /* batch: what this already does */
+        }
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            frames = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || frames < 1) {
+                espix_eprintf(s, "top: -n wants a positive count\n");
+                return 1;
+            }
+            continue;
+        }
+        espix_eprintf(s, "usage: top [-b] [-n <frames>]\n");
+        return 1;
+    }
 
     /*
      * Sized once and kept for the whole run rather than per frame: this is a
@@ -398,21 +476,37 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
     top_row_t    *rows  = calloc(capacity, sizeof(top_row_t));
 
     if (tasks == NULL || prev == NULL || rows == NULL) {
-        espix_printf(s, "top: out of memory\n");
+        espix_eprintf(s, "top: out of memory\n");
         free(tasks); free(prev); free(rows);
         return 1;
     }
 
     size_t                      prev_count   = 0;
-    configRUN_TIME_COUNTER_TYPE prev_total   = 0;
+    int64_t                     prev_us      = 0;
     bool                        have_prev    = false;
     bool                        interrupted  = false;
+    long                        drawn        = 0;
 
-    while (!interrupted) {
-        configRUN_TIME_COUNTER_TYPE total = 0;
-        const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, &total);
+    while (!interrupted && (frames == 0 || drawn < frames)) {
+        const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
-        const configRUN_TIME_COUNTER_TYPE window = total - prev_total;
+        /*
+         * The window comes from esp_timer rather than from
+         * uxTaskGetSystemState()'s total, and the reason is that the total is
+         * the same clock already thrown away:
+         *
+         *     configRUN_TIME_COUNTER_TYPE xPortGetRunTimeCounterValue(void)
+         *     { return (configRUN_TIME_COUNTER_TYPE) esp_timer_get_time(); }
+         *
+         * With a 32-bit counter that truncation wraps every 71.6 minutes of
+         * uptime, and `total - prev_total` then underflowed to something
+         * enormous, so one frame an hour reported every task at 0%. Reading
+         * the 64-bit clock ourselves costs one call and cannot wrap in any
+         * uptime this hardware will see.
+         */
+        const int64_t  now_us = esp_timer_get_time();
+        const uint64_t window = have_prev && now_us > prev_us
+                                    ? (uint64_t)(now_us - prev_us) : 0;
 
         unsigned running = 0;
         for (UBaseType_t i = 0; i < count; i++) {
@@ -429,19 +523,41 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             }
 
             /*
-             * Match by handle. A handle can be recycled after a task is
-             * deleted, so in principle a stale entry could be matched against a
-             * different task -- the cost is one wrong reading in one frame, and
-             * tracking task creation to avoid it is not worth the machinery.
+             * Matched on handle *and* task number. Matching on the handle alone
+             * cost `sshd:conn` a reading of 386491%: a connection task spends
+             * ~390ms on its key exchange, disconnects, its control block is
+             * freed, the next connection is handed the same address, and the
+             * new task's counter of ~0 minus the dead one's 390000 wrapped in
+             * unsigned 32-bit arithmetic to nearly 2^32. Sorted by CPU, it took
+             * first place in the table. A comment here used to guess the cost
+             * at "one wrong reading"; this is what it measured.
              */
             for (size_t j = 0; j < prev_count; j++) {
-                if (prev[j].handle != tasks[i].xHandle) {
+                if (prev[j].handle != tasks[i].xHandle ||
+                    prev[j].number != tasks[i].xTaskNumber) {
                     continue;
                 }
-                const configRUN_TIME_COUNTER_TYPE used =
-                    tasks[i].ulRunTimeCounter - prev[j].runtime;
 
-                rows[i].pct   = (unsigned)((uint64_t)used * 100 / window);
+                const configRUN_TIME_COUNTER_TYPE now = tasks[i].ulRunTimeCounter;
+                const configRUN_TIME_COUNTER_TYPE was = prev[j].runtime;
+
+                /*
+                 * Per-task counters are 32-bit microseconds, so one wraps after
+                 * 71.6 minutes of that task's *own* CPU -- about a day for
+                 * something 5% busy. Now that the entry is known to belong to
+                 * the same task, `now < was` can only mean exactly one wrap,
+                 * and the delta across it is recoverable.
+                 */
+                const uint64_t used = (now < was)
+                                          ? (uint64_t)(UINT32_MAX - was) + now + 1
+                                          : (uint64_t)(now - was);
+
+                unsigned pct = (unsigned)(used * 100 / window);
+
+                /* A backstop, not the fix: a task runs on one core at a time,
+                 * so anything above 100 is this arithmetic going wrong again
+                 * and should not be dressed up as a plausible number. */
+                rows[i].pct   = (pct > 100) ? 100 : pct;
                 rows[i].known = true;
                 break;
             }
@@ -489,7 +605,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             espix_printf(s, "\n");
         }
 
-        top_header(s, count, running, idle_per_core, idle_pct);
+        top_header(s, count, running, idle_per_core, idle_pct, have_prev);
         espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s\n",
                      "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
 
@@ -543,16 +659,26 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
         if (shown >= TOP_ROWS_MAX) {
             espix_printf(s, "...\n");
         }
-        espix_printf(s, "\nCtrl-C to quit\n");
+        if (frames == 0) {
+            espix_printf(s, "\nCtrl-C to quit\n");
+        }
+        drawn++;
 
         /* Remember this sample for the next frame's delta. */
         for (UBaseType_t i = 0; i < count; i++) {
             prev[i].handle  = tasks[i].xHandle;
+            prev[i].number  = tasks[i].xTaskNumber;
             prev[i].runtime = tasks[i].ulRunTimeCounter;
         }
         prev_count = count;
-        prev_total = total;
+        prev_us    = now_us;
         have_prev  = true;
+
+        /* No wait after the last frame of a bounded run: the interval exists to
+         * space out a *display*, and there is nothing left to space it from. */
+        if (frames != 0 && drawn >= frames) {
+            break;
+        }
 
         /*
          * Sleep in slices so Ctrl-C is felt straight away rather than a whole
@@ -584,7 +710,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    espix_printf(s, "ps: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
+    espix_eprintf(s, "ps: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
     return 1;
 }
 
@@ -592,7 +718,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    espix_printf(s, "top: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
+    espix_eprintf(s, "top: rebuild with CONFIG_FREERTOS_USE_TRACE_FACILITY=y\n");
     return 1;
 }
 
@@ -688,12 +814,12 @@ static int dmesg_level(espix_session_t *s, const char *arg)
 
     espix_klog_level_t level;
     if (!level_from_arg(arg, &level)) {
-        espix_printf(s, "dmesg: bad level '%s'; want 0-3 or "
+        espix_eprintf(s, "dmesg: bad level '%s'; want 0-3 or "
                         "err/warn/info/debug\n", arg);
         return 1;
     }
     if (s != NULL && s->uid != 0) {
-        espix_printf(s, "dmesg: only root may change the console level\n");
+        espix_eprintf(s, "dmesg: only root may change the console level\n");
         return 1;
     }
 
@@ -716,7 +842,7 @@ static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
              * otherwise. Returns either way: -n does not also list. */
             return dmesg_level(s, (i + 1 < argc) ? argv[i + 1] : NULL);
         } else {
-            espix_printf(s, "dmesg: unknown option '%s'\n", argv[i]);
+            espix_eprintf(s, "dmesg: unknown option '%s'\n", argv[i]);
             return 1;
         }
     }
@@ -745,7 +871,7 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "erase") == 0) {
         const esp_err_t err = espix_fault_coredump_erase();
         if (err != ESP_OK) {
-            espix_printf(s, "coredump: erase failed: %s\n",
+            espix_eprintf(s, "coredump: erase failed: %s\n",
                          esp_err_to_name(err));
             return 1;
         }
@@ -755,7 +881,7 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
 
     espix_coredump_info_t info;
     if (espix_fault_coredump_status(&info) != ESP_OK) {
-        espix_printf(s, "coredump: cannot read the coredump partition\n");
+        espix_eprintf(s, "coredump: cannot read the coredump partition\n");
         return 1;
     }
 
@@ -806,13 +932,13 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
      */
     if (argc == 3 && strcmp(argv[1], "-l") == 0) {
         if (s == NULL || s->uid != 0) {
-            espix_printf(s, "passwd: only root can lock an account\n");
+            espix_eprintf(s, "passwd: only root can lock an account\n");
             return 1;
         }
 
         const esp_err_t err = espix_auth_lock(argv[2]);
         if (err != ESP_OK) {
-            espix_printf(s, "passwd: %s: %s\n", argv[2],
+            espix_eprintf(s, "passwd: %s: %s\n", argv[2],
                          (err == ESP_ERR_NOT_FOUND) ? "no such user"
                                                     : esp_err_to_name(err));
             return 1;
@@ -822,10 +948,10 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
     }
 
     if (argc < 3) {
-        espix_printf(s, "usage: passwd [user] <new-password>\n");
-        espix_printf(s, "       passwd -l <user>    take the password away\n");
-        espix_printf(s, "note: the password is echoed and enters shell "
-                        "history; no-echo input needs the new line editor\n");
+        espix_eprintf(s, "usage: passwd [user] <new-password>\n");
+        espix_eprintf(s, "       passwd -l <user>    take the password away\n");
+        espix_eprintf(s, "note: the password is echoed and enters shell "
+                         "history; no-echo input needs the new line editor\n");
         return 1;
     }
 
@@ -845,14 +971,14 @@ static int cmd_passwd(espix_session_t *s, int argc, char **argv)
      * one command.
      */
     if (s != NULL && s->uid != 0 && strcmp(user, s->user) != 0) {
-        espix_printf(s, "passwd: only root can change another user's "
+        espix_eprintf(s, "passwd: only root can change another user's "
                         "password\n");
         return 1;
     }
 
     const esp_err_t err = espix_auth_set_password(user, password);
     if (err != ESP_OK) {
-        espix_printf(s, "passwd: %s: %s\n", user,
+        espix_eprintf(s, "passwd: %s: %s\n", user,
                      (err == ESP_ERR_NOT_FOUND) ? "no such user"
                                                 : esp_err_to_name(err));
         return 1;
@@ -911,7 +1037,7 @@ static bool require_root(espix_session_t *s, const char *cmd)
     if (s != NULL && s->uid == 0) {
         return true;
     }
-    espix_printf(s, "%s: only root can do that\n", cmd);
+    espix_eprintf(s, "%s: only root can do that\n", cmd);
     return false;
 }
 
@@ -951,18 +1077,18 @@ static int cmd_useradd(espix_session_t *s, int argc, char **argv)
         } else if (strcmp(argv[i], "-G") == 0 && i + 1 < argc) {
             groups = argv[++i];
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "useradd: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "useradd: %s: unsupported option\n", argv[i]);
             return 1;
         } else if (name == NULL) {
             name = argv[i];
         } else {
-            espix_printf(s, "useradd: one name at a time\n");
+            espix_eprintf(s, "useradd: one name at a time\n");
             return 1;
         }
     }
 
     if (name == NULL) {
-        espix_printf(s, "usage: useradd [-m] [-r] [-G group,...] <name>\n");
+        espix_eprintf(s, "usage: useradd [-m] [-r] [-G group,...] <name>\n");
         return 1;
     }
     if (!require_root(s, "useradd")) {
@@ -971,14 +1097,14 @@ static int cmd_useradd(espix_session_t *s, int argc, char **argv)
 
     esp_err_t rc = espix_auth_user_add(name, system, make_home);
     if (rc != ESP_OK) {
-        espix_printf(s, "useradd: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "useradd: %s: %s\n", name, auth_err(rc));
         return 1;
     }
 
     if (groups != NULL) {
         rc = espix_auth_set_groups(name, groups, true);
         if (rc != ESP_OK) {
-            espix_printf(s, "useradd: %s: added, but groups: %s\n", name,
+            espix_eprintf(s, "useradd: %s: added, but groups: %s\n", name,
                          auth_err(rc));
             return 1;
         }
@@ -997,7 +1123,7 @@ static int cmd_userdel(espix_session_t *s, int argc, char **argv)
         if (strcmp(argv[i], "-r") == 0) {
             remove_home = true;
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "userdel: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "userdel: %s: unsupported option\n", argv[i]);
             return 1;
         } else {
             name = argv[i];
@@ -1005,7 +1131,7 @@ static int cmd_userdel(espix_session_t *s, int argc, char **argv)
     }
 
     if (name == NULL) {
-        espix_printf(s, "usage: userdel [-r] <name>\n");
+        espix_eprintf(s, "usage: userdel [-r] <name>\n");
         return 1;
     }
     if (!require_root(s, "userdel")) {
@@ -1014,7 +1140,7 @@ static int cmd_userdel(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_user_del(name, remove_home);
     if (rc != ESP_OK) {
-        espix_printf(s, "userdel: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "userdel: %s: %s\n", name, auth_err(rc));
         return 1;
     }
     return 0;
@@ -1038,7 +1164,7 @@ static int cmd_usermod(espix_session_t *s, int argc, char **argv)
             seen   = true;
             groups = argv[++i];
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "usermod: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "usermod: %s: unsupported option\n", argv[i]);
             return 1;
         } else {
             name = argv[i];
@@ -1046,8 +1172,8 @@ static int cmd_usermod(espix_session_t *s, int argc, char **argv)
     }
 
     if (name == NULL || !seen) {
-        espix_printf(s, "usage: usermod -aG <group,...> <user>   append\n");
-        espix_printf(s, "       usermod -G <group,...> <user>    replace\n");
+        espix_eprintf(s, "usage: usermod -aG <group,...> <user>   append\n");
+        espix_eprintf(s, "       usermod -G <group,...> <user>    replace\n");
         return 1;
     }
     if (!require_root(s, "usermod")) {
@@ -1056,7 +1182,7 @@ static int cmd_usermod(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_set_groups(name, groups, append);
     if (rc != ESP_OK) {
-        espix_printf(s, "usermod: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "usermod: %s: %s\n", name, auth_err(rc));
         return 1;
     }
     return 0;
@@ -1071,7 +1197,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
         if (strcmp(argv[i], "-r") == 0) {
             system = true;
         } else if (argv[i][0] == '-') {
-            espix_printf(s, "groupadd: %s: unsupported option\n", argv[i]);
+            espix_eprintf(s, "groupadd: %s: unsupported option\n", argv[i]);
             return 1;
         } else {
             name = argv[i];
@@ -1079,7 +1205,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
     }
 
     if (name == NULL) {
-        espix_printf(s, "usage: groupadd [-r] <name>\n");
+        espix_eprintf(s, "usage: groupadd [-r] <name>\n");
         return 1;
     }
     if (!require_root(s, "groupadd")) {
@@ -1088,7 +1214,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_group_add(name, system);
     if (rc != ESP_OK) {
-        espix_printf(s, "groupadd: %s: %s\n", name, auth_err(rc));
+        espix_eprintf(s, "groupadd: %s: %s\n", name, auth_err(rc));
         return 1;
     }
     return 0;
@@ -1097,7 +1223,7 @@ static int cmd_groupadd(espix_session_t *s, int argc, char **argv)
 static int cmd_groupdel(espix_session_t *s, int argc, char **argv)
 {
     if (argc != 2) {
-        espix_printf(s, "usage: groupdel <name>\n");
+        espix_eprintf(s, "usage: groupdel <name>\n");
         return 1;
     }
     if (!require_root(s, "groupdel")) {
@@ -1106,7 +1232,7 @@ static int cmd_groupdel(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t rc = espix_auth_group_del(argv[1]);
     if (rc != ESP_OK) {
-        espix_printf(s, "groupdel: %s: %s\n", argv[1], auth_err(rc));
+        espix_eprintf(s, "groupdel: %s: %s\n", argv[1], auth_err(rc));
         return 1;
     }
     return 0;
@@ -1125,7 +1251,7 @@ static int cmd_groups(espix_session_t *s, int argc, char **argv)
     const size_t n = espix_auth_groups(user, gids, ESPIX_NGROUPS_MAX);
 
     if (n == 0) {
-        espix_printf(s, "groups: %s: no such user\n", user);
+        espix_eprintf(s, "groups: %s: no such user\n", user);
         return 1;
     }
 
@@ -1183,12 +1309,12 @@ static int cmd_sudo(espix_session_t *s, int argc, char **argv)
     }
 
     if (first >= argc) {
-        espix_printf(s, "usage: sudo [-u <user>] <command> [args...]\n");
+        espix_eprintf(s, "usage: sudo [-u <user>] <command> [args...]\n");
         return 1;
     }
 
     if (s->uid != 0 && !espix_auth_may_sudo(s->user)) {
-        espix_printf(s, "sudo: %s is not in %s\n", s->user, "/etc/sudoers");
+        espix_eprintf(s, "sudo: %s is not in %s\n", s->user, "/etc/sudoers");
         espix_klog(ESPIX_KLOG_WARN, "sudo", "%s: refused", s->user);
         return 1;
     }
@@ -1201,7 +1327,7 @@ static int cmd_sudo(espix_session_t *s, int argc, char **argv)
 
     if (as != NULL) {
         if (espix_auth_lookup(as, &target) != ESP_OK) {
-            espix_printf(s, "sudo: %s: no such user\n", as);
+            espix_eprintf(s, "sudo: %s: no such user\n", as);
             return 1;
         }
         target_ngroups = espix_auth_groups(as, target_groups,
@@ -1218,7 +1344,7 @@ static int cmd_sudo(espix_session_t *s, int argc, char **argv)
         const int wrote = snprintf(line + n, sizeof(line) - n, "%s%s",
                                    (i > first) ? " " : "", argv[i]);
         if (wrote < 0 || (size_t)wrote >= sizeof(line) - n) {
-            espix_printf(s, "sudo: command line too long\n");
+            espix_eprintf(s, "sudo: command line too long\n");
             return 1;
         }
         n += (size_t)wrote;
@@ -1285,7 +1411,7 @@ static int session_end(espix_session_t *s, int argc, char **argv, bool login_onl
     /* Asking whether a login happened, not whether a user is named: the
      * console is called root and still never logged in. */
     if (login_only && !s->login) {
-        espix_printf(s, "%s: not login shell: use `exit'\n", argv[0]);
+        espix_eprintf(s, "%s: not login shell: use `exit'\n", argv[0]);
         return 1;
     }
 
@@ -1297,7 +1423,7 @@ static int session_end(espix_session_t *s, int argc, char **argv, bool login_onl
         const long n = strtol(argv[1], &end, 10);
 
         if (end == argv[1] || *end != '\0' || n < 0 || n > 255) {
-            espix_printf(s, "usage: %s [status]\n", argv[0]);
+            espix_eprintf(s, "usage: %s [status]\n", argv[0]);
             return 1;               /* refuse, and stay */
         }
         status = (int)n;
@@ -1332,7 +1458,7 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "ps",     .fn = cmd_ps,
       .help = "list tasks and processes",       .usage = "ps" },
     { .name = "top",    .fn = cmd_top,
-      .help = "live view of tasks and memory",  .usage = "top" },
+      .help = "live view of tasks and memory",  .usage = "top [-b] [-n <frames>]" },
     { .name = "dmesg",  .fn = cmd_dmesg,
       .help = "print the kernel log",
       .usage = "dmesg [-T] [-n <level>]" },

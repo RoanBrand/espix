@@ -11,12 +11,56 @@
 #
 # Returns the command's status, or 124 if it was killed for running long --
 # matching GNU timeout so callers can test for it.
+#
+# The kill goes to the process *group*, and that is not a refinement.
+#
+# `"$@" &` gives back the pid of a subshell whenever the argument is a shell
+# function -- and the first caller of this, run.sh's preflight, passed
+# `dev_status`, which is one. Signalling that pid killed the subshell and left
+# its `ssh` child running. espix accepts four connections; each orphan holds one
+# for as long as the machine is up, so they accumulate silently across runs
+# until the device answers nobody and every suite hangs with no output.
+#
+# That is not a hypothesis about this code: three such orphans were found alive
+# on this machine -- `uptime`, `coredump` and a bad command, hours apart -- while
+# investigating exactly that symptom, and reading it as device flakiness cost a
+# whole session. `set -m` puts the child in its own process group so the
+# negative pid reaches everything it started.
 espix_timeout() {
     local secs="$1"; shift
     local pid rc start
 
-    "$@" &
+    # Keep the caller's standard input.
+    #
+    # Backgrounding with `&` gives the job /dev/null for stdin, so wrapping a
+    # command in this quietly severed it -- which broke
+    # `_ssh 'prog' < file` in 15-streams.sh the moment that helper gained a
+    # deadline. The app read zero bytes and it read exactly like a firmware
+    # bug; the same command by hand worked perfectly. A saved descriptor is the
+    # only way back, because an explicit `0<&0` on an async command is applied
+    # *after* the /dev/null substitution and so re-duplicates /dev/null.
+    # Braces round the exec, and they are not decoration: `exec` with no
+    # command makes its redirections *permanent*, so `exec 7<&0 2>/dev/null`
+    # silences the shell's stderr for good -- which swallowed ssh's own
+    # diagnostics and broke the one assertion that checks a client's `2>&1`.
+    # Grouping scopes the 2>/dev/null to the group while fd 7 still lands on
+    # the shell.
+    local have_stdin=""
+    if { exec 7<&0; } 2>/dev/null; then
+        have_stdin=yes
+    fi
+
+    # Job control off again immediately: leaving it on changes how later
+    # background jobs in the same shell report themselves.
+    set -m
+    if [ -n "$have_stdin" ]; then
+        "$@" <&7 &
+    else
+        "$@" &
+    fi
     pid=$!
+    set +m
+    [ -n "$have_stdin" ] && { exec 7<&-; } 2>/dev/null
     start=$SECONDS
 
     while kill -0 "$pid" 2>/dev/null; do
@@ -24,10 +68,14 @@ espix_timeout() {
             # Braces with stderr closed: bash announces "Terminated: 15" for a
             # killed background job, and that lands in the middle of test output
             # looking like a failure.
+            #
+            # Group first, then the pid alone as a fallback -- if `set -m` did
+            # not take (a shell built without job control), the negative form
+            # fails and the child would otherwise survive the timeout entirely.
             {
-                kill -TERM "$pid" 2>/dev/null
+                kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
                 sleep 1
-                kill -KILL "$pid" 2>/dev/null
+                kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
                 wait "$pid"
             } 2>/dev/null
             return 124

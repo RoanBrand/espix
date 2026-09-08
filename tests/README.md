@@ -150,35 +150,80 @@ clean run — 0/60 was recorded with the bug demonstrably present. What finally
 caught it was none of this: it was watching the serial console, on `dmesg -n
 debug`, while the reproducer ran.
 
-## A known flaky spot
+## Two ways this harness lied, and what stops it now
 
-The console suite fails roughly one run in three or four, and it is the harness
-rather than espix: `console.py` drives a serial line with no flow control,
-answering esp_linenoise's cursor-position probe as it goes, and the sync is
-timing-sensitive. It retries the initial sync three times, which helps and does
-not cure it.
+Both were found while finishing the stream work, and both had already cost a
+session apiece. They are recorded because the failure they produce looks
+nothing like their cause.
 
-**Check for a second reader first.** The most common cause by far is another
-process on the same port — a forgotten `idf.py monitor`, or a serial capture
-left running while debugging something else. `/dev/cu.*` is not exclusive on
-macOS, so both processes open it happily and then steal each other's bytes; the
-prompt `console.py` is waiting for is consumed by the other reader. It fails
-intermittently rather than always, which is worse, and it looks exactly like a
-device fault. `console.py` now names the offending process when it gives up, so
-read its stderr before suspecting espix.
+**A dead session used to read as empty output.** `session.py` reported its
+errors only on stderr — into a file `device.sh` opened, never read, and then
+deleted — and broke its loop without closing the frame. `dev_run` read to EOF
+and returned `""`. Every subsequent assertion in that suite then compared
+against `""`, and **all seven** `assert_eq "..." ""` assertions in the tree are
+in `15-streams.sh`, so losing the session turned the suite covering the stream
+split green. `dev_run` now returns `<<<dead-session>>>` instead, which fails
+those comparisons instead of satisfying them.
 
-If it still fails, re-run it alone (`make test SUITE=console`) before believing
-it. That is an unsatisfying instruction to write in a document about trusting
-your tests, and it is better than a suite that quietly passes.
+The fix needed two goes, and the reason is worth keeping: `dev_run` is almost
+always called as `$(dev_run ...)`, which is a subshell. Writing to the FIFO
+after `session.py` has gone killed that subshell with SIGPIPE *before any guard
+could run*, and command substitution renders a killed subshell as `""` — the
+very value being guarded against. So the function ignores `PIPE` and checks the
+write. It also cannot remember anything between calls, being a subshell, which
+is why the check is on the write rather than on a flag.
 
-**It now fails fast.** Two things used to make a dead console cost minutes. The
-initial sync shared `--timeout` with the command wait, so three attempts at 30s
-was 92 seconds; sync has its own `--sync-timeout` (4s) now, because a console
-that is there answers a newline in milliseconds and one that is not will not
-start answering because we waited longer. And every `dev_console_run` spawns its
-own `console.py`, so that cost was paid *per assertion* — five commands, seven
-minutes, five failures reporting one fact. The suite now probes once and skips
-the rest if the console is not there. Worst case went from about 450s to 16s.
+**`espix_timeout` used to leave the process it killed.** It runs `"$@" &` and
+signalled that pid — but `run.sh`'s preflight passed it `dev_status`, a shell
+*function*, so the pid was a subshell and the `ssh` beneath it survived. espix
+accepts four connections and each orphan holds one until the machine is
+rebooted, so they accumulate across runs until the device answers nobody and
+every suite hangs with no output. Three were found alive on the author's
+machine — `uptime`, `coredump` and a mistyped command, hours apart — while
+investigating exactly that symptom, and it had been read as device flakiness.
+It now kills the process group, and the one-shot helpers wrap the `ssh` binary
+directly rather than a function of ours.
+
+The wider lesson, which is the same one the transport bug taught: prove the
+harness before believing what it says about the system. Both of these were
+confirmed by making the *old* behaviour fail a test that the new behaviour
+passes, not by reasoning about the code.
+
+## The console suite used to be flaky, and why it was not the harness
+
+For a long time this suite failed about one full run in three while passing
+every time on its own, and it was written up here as a harness problem. That was
+wrong, and the way it was wrong is worth keeping.
+
+The device's console genuinely stopped: silent in both directions, `main` alive
+and blocked, nothing on the host holding the port, SSH perfectly healthy
+throughout, and only a reset recovering it. A core dump taken *while wedged* --
+`crash` over SSH, then reading the `main` thread rather than the faulting one --
+named it in one step:
+
+```
+esp_linenoise_get_columns -> esp_linenoise_get_cursor_position
+  -> console_read_bytes -> esp_vfs_select(..., timeout=0x0)
+```
+
+The editor asks the terminal where the cursor is twice per prompt and then reads
+until it gets an answer. `console_read_bytes()` waited with a NULL timeout,
+deliberately, so an idle prompt costs nothing. With no terminal attached the
+answer never came, and the timeout that was supposed to cover exactly this --
+`s_report_deadline_us`, with `s_terminal_mute` and a synthesised reply behind it
+-- was only ever consulted *after a byte arrived*. No byte, no deadline check,
+console parked for good.
+
+The fix is to bound the wait to what is left of the report window while a report
+is outstanding, which makes the existing timeout reachable. See
+`console_read_bytes()` in `tty_console.c`.
+
+Two things this cost, both avoidable. The suite spawning a `console.py` per
+command was blamed first; that was a real fault and worth fixing, but fixing it
+changed nothing here, and "the obvious suspect improved and the symptom
+remained" should have been the signal to stop guessing and take a dump. And the
+harness was blamed before the device, when the device was answering every
+question put to it over SSH the whole time.
 
 ## The test app
 
@@ -196,6 +241,14 @@ The suite copies it only when it is stale, compared by a SHA-256 in a sidecar
 (`.testapp.sha`) because espix has no checksum command. Binary first, sidecar
 second: an interrupted copy then leaves a stale hash and the next run copies
 again, rather than a wrong binary vouched for by a correct one.
+
+`testapp sig` used to be a separate project, `apps/sigtest`. It sat in the
+*examples* directory, which meant `tools/build-apps.sh` built it on every
+firmware build and shipped it in every rootfs image, while `apps/README.md`'s
+table never listed it — and the signal behaviour it demonstrated had no
+automated coverage at all. Folding it in cost one binary, one build and one
+`scp` less than a second staging path would have, and bought
+`tests/suites/35-signals.sh`.
 
 Run `testapp` with no arguments for its subcommands. `out <n>` prints n lines
 and exists specifically to give the `Corrupted MAC` bug in

@@ -186,6 +186,11 @@ class Session:
             pass
 
 
+def _one_line(exc):
+    """An exception as one short line, safe to put inside a marker."""
+    return str(exc).replace("\n", " ").replace("\r", " ")[:300]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
@@ -197,6 +202,10 @@ def main():
     try:
         s = Session(args.host, args.user, args.password, args.timeout)
     except Exception as exc:                      # noqa: BLE001
+        # Framed on stdout as well as on stderr. Nothing reads our stderr --
+        # device.sh redirects it to a file it never opens and then deletes --
+        # so a login failure reported only there reached the suite as silence.
+        print(f"<<<ESPIX-ERROR {_one_line(exc)}>>>", flush=True)
         print(f"session.py: cannot log in: {exc}", file=sys.stderr)
         return 1
 
@@ -212,6 +221,15 @@ def main():
             try:
                 print(s.run(cmd), flush=True)
             except Exception as exc:              # noqa: BLE001
+                # Report *inside the frame*, then close it.
+                #
+                # This used to print to stderr and break, leaving the CMD
+                # marker open and no END. dev_run then read to EOF and returned
+                # the empty string -- indistinguishable from a command that
+                # printed nothing, which silently turned every
+                # empty-expecting assertion in 15-streams.sh green.
+                print(f"<<<ESPIX-ERROR {_one_line(exc)}>>>", flush=True)
+                print(f"<<<ESPIX-END {n}>>>", flush=True)
                 print(f"session.py: {exc}", file=sys.stderr)
                 rc = 1
                 break

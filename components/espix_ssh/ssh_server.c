@@ -123,12 +123,25 @@ static bool name_list_has(const uint8_t *list, size_t len, const char *want)
 static void *conn_mem(size_t n)
 {
 #if CONFIG_ESPIX_SSH_CONN_IN_PSRAM
-    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /*
+     * Aligned and DMA-capable, because mbedtls drives SHA and AES by DMA over
+     * buffers inside this allocation. ESP-IDF requires MALLOC_CAP_DMA for a DMA
+     * buffer in external RAM, and warns that synchronising the cache for an
+     * unaligned region can silently corrupt memory around it. The struct's
+     * crypto buffers are cache-line aligned within it (see ssh_priv.h); this is
+     * the other half, aligning the base so those offsets land where they claim.
+     */
+    void *p = heap_caps_aligned_alloc(SSH_DMA_ALIGN, n,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT |
+                                      MALLOC_CAP_DMA);
     if (p != NULL) {
         return p;
     }
 #endif
-    return malloc(n);
+    /* Internal RAM is DMA-capable and cache-coherent, so the fallback needs
+     * only the alignment. */
+    return heap_caps_aligned_alloc(SSH_DMA_ALIGN, n,
+                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 /* Idempotent, so the teardown path can call it without knowing whether KEX got
@@ -208,20 +221,43 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
 
 /*
  * PSRAM only when asked for: this holds the cipher state and both packet
- * buffers, and the AES driver bounces external memory through an internal
- * buffer before using it, so the saving costs a copy per block. See
- * CONFIG_ESPIX_SSH_CONN_IN_PSRAM.
+ * buffers. See CONFIG_ESPIX_SSH_CONN_IN_PSRAM.
+ *
+ * A note here used to reason that external memory was safe because "the AES
+ * driver bounces external memory through an internal buffer before using it".
+ * That is true of AES and not of SHA: esp_sha_dma_process() takes the pointer
+ * it is given and calls esp_cache_msync() on it, which ESP-IDF documents as
+ * able to "silently corrupt the memory" when the region is unaligned -- and a
+ * buffer at an arbitrary offset inside a calloc'd struct always is. Rounding a
+ * write-back out to whole cache lines can then carry neighbouring heap memory
+ * with it.
+ *
+ * So the allocation is cache-line aligned and DMA-capable, and the buffers are
+ * aligned within the struct (ssh_priv.h). Both halves are needed: aligning the
+ * members means nothing if the base is off a line, and aligning the base means
+ * nothing if the members sit at odd offsets from it.
  */
 static ssh_conn_t *conn_alloc(void)
 {
+    ssh_conn_t *c = NULL;
+
 #if CONFIG_ESPIX_SSH_CONN_IN_PSRAM
-    ssh_conn_t *c = heap_caps_calloc(1, sizeof(ssh_conn_t),
-                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (c != NULL) {
-        return c;
-    }
+    c = heap_caps_aligned_alloc(SSH_DMA_ALIGN, sizeof(ssh_conn_t),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT |
+                                MALLOC_CAP_DMA);
 #endif
-    return calloc(1, sizeof(ssh_conn_t));
+    if (c == NULL) {
+        /* Internal RAM is DMA-capable and cache-coherent, so it needs only the
+         * alignment. */
+        c = heap_caps_aligned_alloc(SSH_DMA_ALIGN, sizeof(ssh_conn_t),
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (c != NULL) {
+        /* No aligned calloc, so zero it here: the code below relies on a clean
+         * struct, and a stale one would look like a half-open connection. */
+        memset(c, 0, sizeof(*c));
+    }
+    return c;
 }
 
 /*

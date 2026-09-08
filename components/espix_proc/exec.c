@@ -172,6 +172,30 @@ static const char *missing_symbol_name(missing_sym_t *out)
     return out->name;
 }
 
+/*
+ * A loaded process's stdout and stderr, for a foreground process.
+ *
+ * Deliberately routed through the session rather than bound to whatever the
+ * redirection happened to be at spawn time: espix_session_write() resolves
+ * `>`, `2>` and `2>&1` on every write, so the process never holds the shell's
+ * FILE. See the long note in proc_task() for what holding it cost.
+ */
+static int proc_write_out(void *cookie, const char *data, int len)
+{
+    if (len <= 0) {
+        return 0;
+    }
+    return (espix_session_write(cookie, data, (size_t)len, false) < 0) ? -1 : len;
+}
+
+static int proc_write_err(void *cookie, const char *data, int len)
+{
+    if (len <= 0) {
+        return 0;
+    }
+    return (espix_session_write(cookie, data, (size_t)len, true) < 0) ? -1 : len;
+}
+
 static void proc_task(void *arg)
 {
     espix_proc_slot_t *slot = arg;
@@ -200,40 +224,92 @@ static void proc_task(void *arg)
     espix_shell_set_current(slot->info.session);
 
     /*
-     * Point this task's stdout and stderr at the session, so an app's own
-     * printf() lands where the user is rather than on the serial console.
+     * Point this task's stdin, stdout and stderr at the session, so an app's
+     * own printf() lands where the user is rather than on the serial console,
+     * and its getchar() reads what the user sent rather than the UART.
      *
      * This works because ESP-IDF gives every task its own struct _reent whose
      * streams are pre-pointed at the global ones (esp_reent_init), so the
      * assignment affects this task alone. It is the same trick ESP-IDF's own
      * console REPL uses.
      *
-     * Two separate streams rather than one shared: esp_cleanup_r() fcloses
-     * whichever of stdin/stdout/stderr differ from the global ones, and one
-     * object behind both would be closed twice, which asserts inside the
-     * second fclose.
+     * Three separate objects because they genuinely go to different places:
+     * over SSH stdout is CHANNEL_DATA, stderr is CHANNEL_EXTENDED_DATA, and
+     * stdin is the queue the connection task fills. They had to be distinct
+     * even when two of them landed in the same place, and that reason still
+     * holds: esp_cleanup_r() fcloses whichever of the three differ from the
+     * global ones, so one object behind two of them would be closed twice,
+     * which asserts inside the second fclose.
      *
      * We close them ourselves at `done:` rather than leaving them to that
      * teardown -- see the note there. The previous values are kept so they can
      * be put back, which is what makes esp_cleanup_r() find nothing to do.
      *
-     * Not applied to `>` redirection: that FILE is closed when the command
-     * returns, and a backgrounded app would outlive it.
+     * `>` and `2>` are honoured, and for a *foreground* process only -- but
+     * never by handing this task the shell's redirect FILE.
+     *
+     * That is not fastidiousness. It was written that way first, and for
+     * `app > f 2>&1` both stdout and stderr then pointed at one object owned
+     * by the shell; esp_cleanup_r() fcloses all three streams independently
+     * when a task is deleted, so a force-killed process closed it twice and
+     * the second close asserted inside newlib on a lock the first had already
+     * destroyed -- `assert failed: spinlock_acquire ... lock->count == 0`,
+     * reached through prvDeleteTCB -> _reclaim_reent. redirects_release()
+     * would then have closed it a third time. A clean exit restores the
+     * globals below before returning, which is exactly why the test suite
+     * never saw it.
+     *
+     * So a foreground process gets funopen() streams of its own over
+     * espix_session_write(), which resolves the redirection per write. The
+     * shell's FILE is written *through* and never held, the two streams are
+     * always distinct objects, and `2>&1` needs no special case here because
+     * session_err() already implements it -- an app and a builtin cannot
+     * disagree about it.
+     *
+     * A backgrounded process outlives redirects_release(), so it must not
+     * consult the redirection at all: it keeps the transport's own streams.
+     *
+     * All of it is gated on open_stream, so the console -- which deliberately
+     * has none, its apps writing to the real UART -- is untouched.
      */
     espix_session_t *const session = slot->info.session;
-    const bool own_streams = (session != NULL && session->open_stream != NULL);
 
+    FILE *const prev_stdin  = stdin;
     FILE *const prev_stdout = stdout;
     FILE *const prev_stderr = stderr;
 
-    if (own_streams) {
-        FILE *const out = session->open_stream(session);
-        FILE *const err = session->open_stream(session);
+    bool own_in = false, own_out = false, own_err = false;
+
+    if (session != NULL && session->open_stream != NULL) {
+        FILE *out = NULL;
+        FILE *err = NULL;
+
+        if (slot->foreground) {
+            out = funopen(session, NULL, proc_write_out, NULL, NULL);
+            err = funopen(session, NULL, proc_write_err, NULL, NULL);
+            /* Line buffered, matching what the transport's own streams do:
+             * output should appear as it is produced, and a packet per
+             * character would be absurd. */
+            if (out != NULL) { setvbuf(out, NULL, _IOLBF, 128); }
+            if (err != NULL) { setvbuf(err, NULL, _IOLBF, 128); }
+        } else {
+            out = session->open_stream(session, ESPIX_STREAM_OUT);
+            err = session->open_stream(session, ESPIX_STREAM_ERR);
+        }
+
         if (out != NULL) {
-            stdout = out;
+            stdout  = out;
+            own_out = true;
         }
         if (err != NULL) {
-            stderr = err;
+            stderr  = err;
+            own_err = true;
+        }
+
+        FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
+        if (in != NULL) {
+            stdin  = in;
+            own_in = true;
         }
     }
 
@@ -253,7 +329,7 @@ static void proc_task(void *arg)
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "pid %d: cannot load %s: %s",
                    (int)slot->info.pid, slot->info.path, esp_err_to_name(err));
-        espix_printf(slot->info.session, "espix: %s: %s\n",
+        espix_eprintf(slot->info.session, "espix: %s: %s\n",
                      slot->info.path, esp_err_to_name(err));
         /* Could not read the file at all: "not found", which is 127. */
         status = 127;
@@ -261,7 +337,7 @@ static void proc_task(void *arg)
     }
 
     if (esp_elf_init(&slot->elf) != 0) {
-        espix_printf(slot->info.session, "espix: %s: ELF init failed\n",
+        espix_eprintf(slot->info.session, "espix: %s: ELF init failed\n",
                      slot->info.path);
         goto done;
     }
@@ -272,12 +348,12 @@ static void proc_task(void *arg)
         const char *const sym = missing_symbol_name(&missing);
 
         if (sym[0] != '\0') {
-            espix_printf(slot->info.session, "espix: %s: undefined symbol: %s\n",
+            espix_eprintf(slot->info.session, "espix: %s: undefined symbol: %s\n",
                          slot->info.path, sym);
         } else {
             /* The fallback is the exact wording from before the lookup existed,
              * so a reworded upstream message costs nothing but the detail. */
-            espix_printf(slot->info.session, "espix: %s: relocation failed\n",
+            espix_eprintf(slot->info.session, "espix: %s: relocation failed\n",
                          slot->info.path);
         }
         goto done;
@@ -290,7 +366,7 @@ static void proc_task(void *arg)
                (unsigned)slot->info.image_bytes);
 
     if (slot->elf.entry == NULL) {
-        espix_printf(slot->info.session, "espix: %s: no entry point\n",
+        espix_eprintf(slot->info.session, "espix: %s: no entry point\n",
                      slot->info.path);
         goto done;
     }
@@ -334,18 +410,28 @@ done:
      *
      * Nothing of this process may touch the session after espix_proc_finish().
      */
-    if (own_streams) {
+    {
+        FILE *const in  = stdin;
         FILE *const out = stdout;
         FILE *const err = stderr;
 
+        /* Restore first, unconditionally, so esp_cleanup_r() finds nothing to
+         * close whether or not anything was opened. Every stream we assigned
+         * is one we made, so each is closed exactly once -- and closing the
+         * out/err wrappers flushes them through espix_session_write() while
+         * the redirect FILE is still the shell's to close. */
+        stdin  = prev_stdin;
         stdout = prev_stdout;
         stderr = prev_stderr;
 
-        if (out != prev_stdout) {
+        if (own_out) {
             fclose(out);            /* flushes on the way out */
         }
-        if (err != prev_stderr) {
+        if (own_err) {
             fclose(err);
+        }
+        if (own_in) {
+            fclose(in);
         }
     }
 
@@ -363,7 +449,7 @@ done:
 
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
                                espix_session_t *session, const char *root,
-                               espix_pid_t *out_pid)
+                               bool foreground, espix_pid_t *out_pid)
 {
     if (abs_path == NULL || abs_path[0] != '/' || argc < 1 || argv == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -415,6 +501,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     slot->info.pid        = espix_proc_next_pid();
     slot->info.state      = ESPIX_PROC_READY;
     slot->info.session    = session;
+    slot->foreground      = foreground;
 
     /*
      * Credentials, copied now rather than followed later. A session with no

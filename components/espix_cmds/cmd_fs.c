@@ -44,11 +44,11 @@ static int cmd_cd(espix_session_t *s, int argc, char **argv)
 
     struct stat st;
     if (stat(abs, &st) != 0) {
-        espix_printf(s, "cd: %s: no such file or directory\n", abs);
+        espix_eprintf(s, "cd: %s: no such file or directory\n", abs);
         return 1;
     }
     if (!S_ISDIR(st.st_mode)) {
-        espix_printf(s, "cd: %s: not a directory\n", abs);
+        espix_eprintf(s, "cd: %s: not a directory\n", abs);
         return 1;
     }
 
@@ -241,7 +241,7 @@ static bool ls_parse(espix_session_t *s, int argc, char **argv,
             case '1': break;
 
             default:
-                espix_printf(s, "ls: unknown option '-%c'\n" LS_USAGE, *p);
+                espix_eprintf(s, "ls: unknown option '-%c'\n" LS_USAGE, *p);
                 return false;
             }
         }
@@ -265,7 +265,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
 
     struct stat st;
     if (stat(abs, &st) != 0) {
-        espix_printf(s, "ls: %s: no such file or directory\n", abs);
+        espix_eprintf(s, "ls: %s: no such file or directory\n", abs);
         return 1;
     }
 
@@ -287,7 +287,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
 
     DIR *dir = opendir(abs);
     if (dir == NULL) {
-        espix_printf(s, "ls: %s: cannot open\n", abs);
+        espix_eprintf(s, "ls: %s: cannot open\n", abs);
         return 1;
     }
 
@@ -421,7 +421,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
     free(ents);
 
     if (truncated) {
-        espix_printf(s, "ls: stopped at %u entries\n", (unsigned)count);
+        espix_eprintf(s, "ls: stopped at %u entries\n", (unsigned)count);
     }
     if (f.long_form) {
         espix_printf(s, "%u entr%s\n",
@@ -433,7 +433,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
 static int cmd_cat(espix_session_t *s, int argc, char **argv)
 {
     if (argc < 2) {
-        espix_printf(s, "usage: cat <file>...\n");
+        espix_eprintf(s, "usage: cat <file>...\n");
         return 1;
     }
 
@@ -448,7 +448,7 @@ static int cmd_cat(espix_session_t *s, int argc, char **argv)
 
         FILE *f = fopen(abs, "rb");
         if (f == NULL) {
-            espix_printf(s, "cat: %s: %s\n", abs, strerror(errno));
+            espix_eprintf(s, "cat: %s: %s\n", abs, strerror(errno));
             status = 1;
             continue;
         }
@@ -468,7 +468,7 @@ static int cmd_cat(espix_session_t *s, int argc, char **argv)
 static int cmd_mkdir(espix_session_t *s, int argc, char **argv)
 {
     if (argc < 2) {
-        espix_printf(s, "usage: mkdir <dir>...\n");
+        espix_eprintf(s, "usage: mkdir <dir>...\n");
         return 1;
     }
 
@@ -481,7 +481,7 @@ static int cmd_mkdir(espix_session_t *s, int argc, char **argv)
             continue;
         }
         if (mkdir(abs, 0755) != 0) {
-            espix_printf(s, "mkdir: %s: %s\n", abs, strerror(errno));
+            espix_eprintf(s, "mkdir: %s: %s\n", abs, strerror(errno));
             status = 1;
         }
     }
@@ -500,7 +500,7 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
     }
 
     if (first >= argc) {
-        espix_printf(s, "usage: rm [-r] <path>...\n");
+        espix_eprintf(s, "usage: rm [-r] <path>...\n");
         return 1;
     }
 
@@ -513,7 +513,7 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
             continue;
         }
         if (strcmp(abs, "/") == 0) {
-            espix_printf(s, "rm: refusing to remove /\n");
+            espix_eprintf(s, "rm: refusing to remove /\n");
             status = 1;
             continue;
         }
@@ -521,11 +521,11 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
         if (recursive) {
             const esp_err_t err = espix_fs_rm_rf(abs);
             if (err != ESP_OK) {
-                espix_printf(s, "rm: %s: %s\n", abs, esp_err_to_name(err));
+                espix_eprintf(s, "rm: %s: %s\n", abs, esp_err_to_name(err));
                 status = 1;
             }
         } else if (unlink(abs) != 0) {
-            espix_printf(s, "rm: %s: %s\n", abs, strerror(errno));
+            espix_eprintf(s, "rm: %s: %s\n", abs, strerror(errno));
             status = 1;
         }
     }
@@ -536,7 +536,7 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
 static int cmd_cp(espix_session_t *s, int argc, char **argv)
 {
     if (argc != 3) {
-        espix_printf(s, "usage: cp <src> <dst>\n");
+        espix_eprintf(s, "usage: cp <src> <dst>\n");
         return 1;
     }
 
@@ -549,13 +549,13 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
 
     FILE *in = fopen(src, "rb");
     if (in == NULL) {
-        espix_printf(s, "cp: %s: %s\n", src, strerror(errno));
+        espix_eprintf(s, "cp: %s: %s\n", src, strerror(errno));
         return 1;
     }
 
     FILE *out = fopen(dst, "wb");
     if (out == NULL) {
-        espix_printf(s, "cp: %s: %s\n", dst, strerror(errno));
+        espix_eprintf(s, "cp: %s: %s\n", dst, strerror(errno));
         fclose(in);
         return 1;
     }
@@ -566,7 +566,7 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
 
     while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0) {
         if (fwrite(chunk, 1, n, out) != n) {
-            espix_printf(s, "cp: %s: write failed\n", dst);
+            espix_eprintf(s, "cp: %s: write failed\n", dst);
             status = 1;
             break;
         }
@@ -580,7 +580,7 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
 static int cmd_mv(espix_session_t *s, int argc, char **argv)
 {
     if (argc != 3) {
-        espix_printf(s, "usage: mv <src> <dst>\n");
+        espix_eprintf(s, "usage: mv <src> <dst>\n");
         return 1;
     }
 
@@ -592,7 +592,7 @@ static int cmd_mv(espix_session_t *s, int argc, char **argv)
     }
 
     if (rename(src, dst) != 0) {
-        espix_printf(s, "mv: %s -> %s: %s\n", src, dst, strerror(errno));
+        espix_eprintf(s, "mv: %s -> %s: %s\n", src, dst, strerror(errno));
         return 1;
     }
 
@@ -602,7 +602,7 @@ static int cmd_mv(espix_session_t *s, int argc, char **argv)
 static int cmd_touch(espix_session_t *s, int argc, char **argv)
 {
     if (argc < 2) {
-        espix_printf(s, "usage: touch <file>...\n");
+        espix_eprintf(s, "usage: touch <file>...\n");
         return 1;
     }
 
@@ -617,7 +617,7 @@ static int cmd_touch(espix_session_t *s, int argc, char **argv)
 
         FILE *f = fopen(abs, "ab");
         if (f == NULL) {
-            espix_printf(s, "touch: %s: %s\n", abs, strerror(errno));
+            espix_eprintf(s, "touch: %s: %s\n", abs, strerror(errno));
             status = 1;
             continue;
         }
@@ -754,7 +754,7 @@ static bool chmod_parse(const char *spec, mode_t cur, mode_t *out,
 static int cmd_chmod(espix_session_t *s, int argc, char **argv)
 {
     if (argc < 3) {
-        espix_printf(s, "usage: chmod <mode> <path>...\n");
+        espix_eprintf(s, "usage: chmod <mode> <path>...\n");
         return 1;
     }
 
@@ -769,7 +769,7 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
 
         struct stat st;
         if (stat(abs, &st) != 0) {
-            espix_printf(s, "chmod: %s: %s\n", abs, strerror(errno));
+            espix_eprintf(s, "chmod: %s: %s\n", abs, strerror(errno));
             status = 1;
             continue;
         }
@@ -778,7 +778,7 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
         const char *err  = NULL;
 
         if (!chmod_parse(argv[1], st.st_mode & ESPIX_MODE_BITS, &mode, &err)) {
-            espix_printf(s, "chmod: %s: %s\n", argv[1], err);
+            espix_eprintf(s, "chmod: %s: %s\n", argv[1], err);
             return 1;           /* the mode is wrong for every path, not one */
         }
 
@@ -795,14 +795,14 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
         const bool is_dir = S_ISDIR(st.st_mode);
 
         if (is_dir && (mode & (S_ISUID | S_ISGID))) {
-            espix_printf(s, "chmod: %s: setuid and setgid on a directory mean "
+            espix_eprintf(s, "chmod: %s: setuid and setgid on a directory mean "
                             "group inheritance, which espix does not "
                             "implement\n", abs);
             status = 1;
             continue;
         }
         if (!is_dir && (mode & S_ISVTX)) {
-            espix_printf(s, "chmod: %s: the sticky bit only applies to a "
+            espix_eprintf(s, "chmod: %s: the sticky bit only applies to a "
                             "directory\n", abs);
             status = 1;
             continue;
@@ -810,7 +810,7 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
 
         const esp_err_t rc = espix_fs_chmod(abs, mode);
         if (rc != ESP_OK) {
-            espix_printf(s, "chmod: %s: %s\n", abs, fs_err(rc));
+            espix_eprintf(s, "chmod: %s: %s\n", abs, fs_err(rc));
             status = 1;
         }
     }
@@ -825,7 +825,7 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
 
     espix_fs_info_t info;
     if (espix_fs_stat_root(&info) != ESP_OK) {
-        espix_printf(s, "df: rootfs not mounted\n");
+        espix_eprintf(s, "df: rootfs not mounted\n");
         return 1;
     }
 
@@ -873,7 +873,7 @@ static bool id_of(espix_session_t *s, const char *who, const char *cmd,
     const unsigned long n = strtoul(who, &end, 10);
     if (*end == '\0' && end != who) {
         if (n > UINT16_MAX) {
-            espix_printf(s, "%s: %s: id out of range\n", cmd, who);
+            espix_eprintf(s, "%s: %s: id out of range\n", cmd, who);
             return false;
         }
         *out = (uint16_t)n;
@@ -884,7 +884,7 @@ static bool id_of(espix_session_t *s, const char *who, const char *cmd,
      * table was only ever right while every gid equalled its uid. */
     if (is_group) {
         if (!espix_auth_group_id(who, out)) {
-            espix_printf(s, "%s: %s: no such group\n", cmd, who);
+            espix_eprintf(s, "%s: %s: no such group\n", cmd, who);
             return false;
         }
         return true;
@@ -892,7 +892,7 @@ static bool id_of(espix_session_t *s, const char *who, const char *cmd,
 
     espix_user_t account;
     if (espix_auth_lookup(who, &account) != ESP_OK) {
-        espix_printf(s, "%s: %s: no such user\n", cmd, who);
+        espix_eprintf(s, "%s: %s: no such user\n", cmd, who);
         return false;
     }
     *out = account.uid;
@@ -911,7 +911,7 @@ static int cmd_chown(espix_session_t *s, int argc, char **argv)
     const bool is_chgrp = (strcmp(argv[0], "chgrp") == 0);
 
     if (argc < 3) {
-        espix_printf(s, "usage: %s\n",
+        espix_eprintf(s, "usage: %s\n",
                      is_chgrp ? "chgrp <group> <path>..."
                               : "chown <user>[:<group>] <path>...");
         return 1;

@@ -84,6 +84,41 @@ bool espix_fs_root_permits(const char *abs_path);
 esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
                                   void *lower_ctx);
 
+
+/* ------------------------------------------------------------------ */
+/* Device nodes -- see dev.c                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Device fds occupy the top of the range esp_vfs can carry. Its `local_fd_t` is
+ * a uint8_t on every target but Linux, so anything above 255 is silently
+ * truncated -- which is why this is 240 and not something conspicuous like
+ * 0x1000. vfs_open() refuses a lower-filesystem fd that reaches the base, so
+ * the reservation is enforced rather than assumed.
+ */
+#define ESPIX_DEV_FD_BASE   240
+#define ESPIX_DEV_FD_COUNT  16
+
+void        espix_dev_init(void);
+
+/* NULL when the path is not a device. The handle is opaque to vfs.c. */
+const void *espix_dev_lookup(const char *abs_path);
+void        espix_dev_stat(const void *handle, struct stat *st);
+int         espix_dev_open(const void *handle, int flags);
+
+static inline bool espix_dev_fd(int fd)
+{
+    return fd >= ESPIX_DEV_FD_BASE;
+}
+
+int     espix_dev_close(int fd);
+ssize_t espix_dev_read(int fd, void *dst, size_t size);
+ssize_t espix_dev_pread(int fd, void *dst, size_t size, off_t off);
+ssize_t espix_dev_write(int fd, const void *data, size_t size);
+off_t   espix_dev_lseek(int fd, off_t off, int whence);
+int     espix_dev_fstat(int fd, struct stat *st);
+int     espix_dev_fsync(int fd);
+
 #ifdef __cplusplus
 }
 #endif

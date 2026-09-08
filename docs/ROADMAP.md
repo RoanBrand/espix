@@ -25,11 +25,12 @@ things are as they are.
   README's `sudo -u www confine /srv/www /bin/httpd &` cannot survive the login
   that started it. The pieces are built; there is nothing to attach them to.
 
-  **The stream work is the precondition**, not an optional tidy-up: a service's
-  output cannot go to the SSH channel of the session that started it, because
-  that channel is freed when the session ends -- see "Real stdin, stdout and
-  stderr" under Networking and time. A service needs a log, and espix has klog
-  and a ring already, which is most of the answer.
+  **A service still needs somewhere for its output to go.** It cannot be the
+  SSH channel of the session that started it, because that channel is freed
+  when the session ends -- which is the same lifetime problem that limits a
+  backgrounded app's redirection today (see KNOWN-ISSUES). The stream split
+  itself has landed; what a service needs is a *destination that outlives a
+  login*, and espix has klog and a ring already, which is most of the answer.
 
   Worth stealing systemd's shape rather than inventing one, because it settles
   where policy lives: a unit is a *file* declaring identity and confinement
@@ -512,28 +513,28 @@ things are as they are.
   runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
   other way.
 
-- **Real stdin, stdout and stderr — for the shell as much as for apps.** Today a
-  loaded app gets two `FILE *` from `session->open_stream()`, and they are two
-  objects writing to the *same place*: the reason there are two is not
-  separation but teardown, since `esp_cleanup_r()` fcloses whichever of the
-  three differ from the globals and one object behind both would be closed
-  twice. So `app 2>/dev/null` cannot work.
+- **Pipes, `<` redirection, and stdin for builtins.** The three streams
+  themselves are done: `espix_eprintf()` sits beside `espix_printf()`, `2>`,
+  `2>>` and `2>&1` work, SSH carries diagnostics as `CHANNEL_EXTENDED_DATA`,
+  and a loaded app gets a real `stdin`, `stdout` and `stderr` — see
+  `tests/suites/15-streams.sh`.
 
-  The shell has less than that: `espix_printf(s, ...)` is a single path carrying
-  output and diagnostics alike, which is why `app > file` captures espix's
-  own error messages into the file. That is not hypothetical tidiness — it cost
-  a wrong conclusion during the test-suite work, when a failed load's message
-  vanished into a redirect and the loader was wrongly blamed for not naming the
-  symbol it had named perfectly.
+  What is missing is the plumbing between commands. A builtin cannot read
+  standard input, and there is no `<`; both are cheap on their own and neither
+  is worth much without the other, because with no pipes there is nothing for
+  a builtin to read *from*. So they go together, and `|` is the one that makes
+  them pay: it needs a command's output to become another's input, which means
+  a pipe object with two ends and a lifetime that outlives neither.
 
-  Doing it properly means a real stderr on `espix_session_t`, an
-  `espix_eprintf()` beside `espix_printf()`, and moving every builtin's
-  diagnostics onto it — around a hundred call sites — plus deciding what `2>`
-  and `2>&1` mean for each. The transports can already carry it: SSH opens a
-  stream per call, and the console has one descriptor. Nothing above them can.
+  Two known constraints from the stream work. `chan_poll_interrupt()` is the
+  only consumer of the SSH channel's receive buffer and `chan_pump()`
+  overwrites that buffer rather than appending, so a second reader needs it to
+  become a ring first — which is also what a backgrounded process would need
+  to read stdin at all. And the shell's redirect `FILE` is owned by the
+  command, not the process, which is why only a foreground app can be pointed
+  at one; pipes will want that ownership reference-counted.
 
-  Worth doing before job control, which will want to say things about jobs
-  without those lines landing in a redirect.
+  Job control wants the same objects, so the two are worth designing together.
 
 ## Further out
 

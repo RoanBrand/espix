@@ -15,9 +15,14 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   back there (`rmtDeinit()`), and without that the channel and its GPIO
   reservation outlive the app — which shows up as `GPIO 48 is not usable` on the
   next run and eventually as no free channel at all. `kill` and Ctrl-C ask first
-  and only escalate after the grace, so this is specific to `kill -9` and to an
-  app that ignores everything else. There is no address space to tear down and
-  no per-process ownership of heap or fds, so nothing can reclaim it for the app.
+  and only escalate after the grace — but they *do* escalate, so this is not
+  specific to `kill -9`: an app that ignores SIGTERM leaks exactly the same
+  way once `TERM_GRACE_MS` runs out. SIG_IGN buys the grace period, not
+  survival, which is itself a divergence from POSIX worth knowing —
+  `kill -TERM` on Unix leaves such a process running indefinitely.
+  There is no address space to tear down and no per-process ownership of heap
+  or fds, so nothing can reclaim it for the app. `tests/suites/35-signals.sh`
+  pins both halves.
 
 - **`ps` shows at most 8 finished processes.** `cmd_ps` stack-allocates
   `espix_proc_info_t procs[8]` while `ESPIX_PROC_MAX` is 12, so on a busy table
@@ -32,8 +37,63 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 - **A compute loop never sees a signal.** Delivery happens at the points where
   an app calls into espix — `sleep`, `usleep`, `nanosleep`, `pause`. A loop that
   blocks on nothing has no delivery point and will not run a handler, which is
-  exactly what `espix_sigcheck()` is exported for. `apps/sigtest spin` is the
-  case in the flesh. SIGKILL is the answer when it is somebody else's binary.
+  exactly what `espix_sigcheck()` is exported for. `testapp sig spin` is the
+  case in the flesh, and `tests/suites/35-signals.sh` covers it. SIGKILL is the answer when it is somebody else's binary.
+
+- **A hard kill will not survive a process inside libc.** `proc_force_kill()`
+  deletes the task, and `vTaskDelete()` then runs newlib's cleanup *on the
+  killer's task* — `_reclaim_reent()` → `esp_cleanup_r()`, which fcloses the
+  dead task's three streams. `fclose` needs each `FILE`'s lock, and the deleted
+  task may have been holding one: it is exactly what `fgets(stdin)` does for as
+  long as it waits.
+
+  That reset the board every time until `proc_force_kill()` learned to let the
+  target out first — it sets `stop_requested` (not a signal, so nothing
+  becomes catchable) and gives it `KILL_UNWIND_MS` to leave libc, which a
+  process blocked on input does at once because espix's blocking calls poll
+  `espix_sigcheck()`. The residue is what remains: a process that ignores the
+  hint *and* sits inside libc is still deleted at the end of that grace, and
+  that case is unsafe. Nothing in espix does it today, and an app could.
+
+  The control worth keeping, because it is what identified this: the same
+  `kill -9` on a process blocked in `sleep()` was harmless, and SIGTERM on the
+  blocked one was harmless too. `tests/suites/15-streams.sh` pins both kill
+  paths, and both were made to fail before they were made to pass.
+
+- **A second unexplained fault, once, under sustained inbound traffic.** During
+  a throughput run: `exccause 0x47` (CacheError) inside
+  `Cache_WriteBack_Addr`, reached from `psa_mac_update` → `esp_sha256_update`
+  → `esp_sha_dma_process` → `esp_cache_msync`, on the SSH receive buffer.
+
+  That buffer is `ssh_conn_t.in_buf`, and the connection struct is allocated
+  from PSRAM, so the SHA driver takes its DMA path over external RAM. This is
+  not espix misusing the API — `sha.c` explicitly handles an external-RAM input
+  with a cache sync — but espix is what puts a PSRAM buffer there, and inbound
+  throughput went from 5 KB/s to 226 KB/s in the same change, so that path now
+  runs constantly where it used to be reached by interactive traffic only.
+
+  Not reproduced since: two further throughput runs, a full suite, and a
+  targeted stress of concurrent flash reads against SSH crypto were all clean.
+  Recorded with the exccause and the stack because the next occurrence should
+  not start from nothing, and because "it went away" is not a diagnosis.
+
+- **One earlier heap corruption remains unexplained.** A single panic during a
+  full run, before the two kill bugs above were found: faulting task
+  `sshd:conn`, detected in `tlsf_free` inside `esp_vfs_select` from
+  `chan_poll_interrupt()`. That is a *detector* rather than a culprit — it
+  polls `select()` every 50ms while a foreground process runs, so it frees more
+  often than anything else and corruption surfaces at whatever frees next.
+
+  It has not recurred since the kill fixes, and its signature is consistent
+  with the stdio-lock one, which corrupts silently rather than asserting. But
+  the run that produced it used neither `2>&1` nor stdin, so that is a
+  resemblance and not a diagnosis.
+
+  `CONFIG_HEAP_POISONING_COMPREHENSIVE` found nothing across four runs, and
+  would not be expected to: it checks canaries around *allocations*, and a
+  write through a stale task handle lands inside a live TCB. If it returns, the
+  serial console with poisoning on is the fastest route — the console being the
+  one channel that is not the thing under test.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
@@ -108,11 +168,19 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   ESP-IDF's UART driver and is live in this build, and because its prefix is
   longer than espix's `""` it outranks the root and routes straight to the
   driver. Its ops table carries `open`, `read`, `write`, `close`, `fstat`,
-  `fcntl` and `fsync`, so those work — but `ls` cannot show it, for two
-  unrelated reasons. `ls /dev` fails because `/dev` is not a directory in the
-  root filesystem and `readdir` never merges mount points. `ls -l /dev/uart/0`
-  fails because the UART VFS's *directory* ops contain only `access` — there is
-  no `stat` for `ls` to call.
+  `fcntl` and `fsync`, so those work — but `ls` cannot show it.
+  `ls -l /dev/uart/0` fails because the UART VFS's *directory* ops contain only
+  `access` — there is no `stat` for `ls` to call, and `readdir` never merges
+  mount points, so it does not appear in a listing of `/dev` either.
+
+  **`ls /dev` itself now works and is still empty**, for a second and separate
+  reason. `/dev` is a real directory since espix started creating it in the boot
+  skeleton, so the listing succeeds — but espix's own device nodes, `/dev/null`
+  and `/dev/factory`, live in a table consulted by `vfs_open()` and `vfs_stat()`
+  and are not wired into `readdir`. They work perfectly when named and are
+  invisible when listed. So there are two unrelated reasons something can be
+  missing from that directory: a mount point `readdir` will not merge, and a
+  device espix answers for without enumerating.
 
   **Unchanged by espix owning the root VFS**, so this is not a regression to go
   looking for: LittleFS was the fallback before too and `/dev/uart` outranked it
@@ -182,12 +250,22 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   - **Sessions are not confined, only processes.** There is no restricted login
     shell; `-R` applies to a program you run, not to whoever runs it.
 
-- **A command's diagnostics go to stdout, so a redirect swallows them.** espix
-  has no stderr: `espix_printf()` is one path for output and errors alike, so
-  `/bin/nosuch > log` puts "no such file" in `log` rather than on the
-  terminal, and `2>/dev/null` silences nothing. A loaded app has distinct
-  `stdout` and `stderr` pointers but both write to the same channel, so the
-  same is true for apps. See **Shell and console** in [ROADMAP.md](ROADMAP.md).
+- **A *backgrounded* app's output is not redirected.** `app > file &` writes to
+  the terminal and leaves `file` empty; `2>` likewise. A foreground app
+  redirects correctly, as do builtins, an app's exit status, and espix's own
+  diagnostics about it.
+
+  The reason is lifetime, and it is why the two cases differ at all: the
+  redirect `FILE` belongs to the shell and `redirects_release()` closes it when
+  the command returns. `run_program()` blocks in `espix_proc_wait()` for a
+  foreground process, so the `FILE` outlives it; a backgrounded one outlives
+  the `FILE`, and pointing its streams at one would be a use-after-free the
+  moment somebody typed `&`. See the stream note in `espix_proc/exec.c`, which
+  also records the one narrow hazard that remains — an app force-killed inside
+  an `fwrite` to a redirect leaves that `FILE`'s lock held.
+
+  Closing it properly needs the redirect to be reference-counted or handed to
+  the process outright, which is job-control territory.
 
   Exit statuses *are* right: 127 when the file cannot be read, 126 when it is
   there and will not run, and the app's own status otherwise.
@@ -202,15 +280,38 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
 
 ## SSH
 
-- **`ssh host <cmd>` has no stdin.** The command runs and its output and exit
-  status come back, but nothing on espix reads standard input — apps have no
-  file or stdin ABI at all — so `ssh host 'cat' < file` will not do what you
-  mean. Worse than merely unread: while a foreground process runs,
-  `chan_poll_interrupt()` consumes whatever has arrived looking for Ctrl-C, so
-  client-sent data is discarded rather than queued.
+- **Only a *process* reads stdin, not a builtin.** `ssh host 'testapp cat'
+  < file` works: a loaded app gets a real `stdin` over the channel, and
+  `fgets`/`fread`/`read` are in its ABI. But no espix builtin reads standard
+  input, and there is no `<` redirection, so `ssh host 'cat' < file` still will
+  not do what you mean — the builtin `cat` takes paths and nothing else.
 
-- **`ssh host <cmd>` has no separate stderr.** espix has one output stream, so
-  errors arrive interleaved on stdout and `2>` at the client separates nothing.
+  Not much of a gap in practice: with no pipes and no `<`, a builtin has
+  nothing to read *from* except the network, which is the case an app already
+  covers. It becomes worth doing alongside pipes — see
+  [ROADMAP.md](ROADMAP.md).
+
+- **Only a foreground process reads stdin.** `chan_poll_interrupt()` is the
+  single consumer of the channel's receive buffer and the thing that fills a
+  process's stdin queue, and it runs from the foreground wait loop in
+  `cmd_run.c`. So a backgrounded app's `stdin` is open but nothing arrives on
+  it — it blocks until the session ends. `chan_pump()` overwrites that buffer
+  rather than appending, so a second reader is not a small change: it needs
+  the buffer to become a ring first.
+
+- **Two concurrent SFTP transfers break.** Reproducible, and not new: two
+  `scp` downloads started at the same time end with one connection failing
+  (rc=255, a partial file) and the other hanging until it is killed. `ps` during
+  the hang shows an `sshd:conn` task sitting at priority 18 — the tcpip task's
+  priority, inherited — so tcpip is waiting on a mutex that connection holds.
+
+  The control matters, because this was first noticed through `/dev/factory`
+  and looked like a bug in it: two concurrent downloads of an ordinary file
+  (`/bin/neopixel`) fail exactly the same way, and a single 4MB `/dev/factory`
+  download succeeds every time. So it is SFTP concurrency, not the device.
+
+  One transfer at a time is the working configuration, which is what the test
+  suite does and probably what anyone does by hand.
 
 - **One command per `exec`.** The shell has no `;`, `&&` or pipes, so
   `ssh host 'cd /bin && ls'` fails in the parser rather than in the channel.
