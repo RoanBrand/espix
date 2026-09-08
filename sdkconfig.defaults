@@ -191,3 +191,19 @@ CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"
 # would otherwise keep whatever it already had. Neither of these overrides an
 # sdkconfig that already names the option -- delete it, or edit it by hand.
 CONFIG_ESPIX_SSH_MAX_SESSIONS=8
+
+# Precomputation for base-point scalar multiplication, which is what ECDSA does
+# for k*G -- and signing the exchange hash with the nistp256 host key is the
+# largest single cost in an SSH key exchange here. The ESP32-S3 has no ECC
+# accelerator (no SOC_ECC_SUPPORTED), so this is all software with only the MPI
+# peripheral assisting, and IDF leaves the option off to save memory.
+#
+# Measured on an N16R8: the ECDSA signature falls from 593ms to 319ms, taking
+# the whole key exchange from 1060ms to 650ms. It costs about 1K of internal
+# heap with eight sessions open -- 45K free against 44K without -- and ~22K of
+# image, which under XIP lives in PSRAM rather than internal RAM.
+#
+# It does nothing for X25519, at ~140ms each way: mbedtls drives Curve25519
+# through the generic ECP path, and the agreement half is a variable-point
+# multiplication that no amount of base-point precomputation helps.
+CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
