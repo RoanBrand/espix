@@ -559,8 +559,24 @@ static bool chan_poll_interrupt(espix_session_t *s)
             continue;
         }
 
+        /*
+         * A gone peer stops a foreground command, exactly as Ctrl-C does.
+         *
+         * This used to `return hit` -- false -- so a dead client was
+         * indistinguishable from "nothing happened", and a long-running writer
+         * carried on into a socket nobody would ever read. `top -b -n 200` did
+         * precisely that: killing the client left the connection task blocked
+         * on writes for tens of seconds while it worked through its remaining
+         * frames, holding a session slot the whole time. Eight of them at once
+         * is 55-sessions failing to get its slots back.
+         *
+         * Reporting an interrupt is the honest answer to "should this command
+         * keep going": there is no longer anyone to keep going for. The command
+         * unwinds through the same path Ctrl-C uses, which is already correct
+         * about cleanup.
+         */
         if (ch->closed) {
-            return hit;
+            return true;
         }
 
         /*
@@ -611,8 +627,14 @@ static bool chan_poll_interrupt(espix_session_t *s)
          * That is not hypothetical -- it hung every foreground Ctrl-C over SSH
          * until it was removed.
          */
+        /*
+         * select() said readable and the pump could not read a packet, which
+         * for a stream socket means EOF or a broken connection -- the peer is
+         * gone. Same answer as above, and reached first in practice: FIN makes
+         * the socket readable, so this is where a killed client lands.
+         */
         if (chan_pump(ch) != ESP_OK) {
-            return hit;
+            return true;
         }
     }
 
