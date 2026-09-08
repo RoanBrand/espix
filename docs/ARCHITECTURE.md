@@ -480,17 +480,23 @@ were checked and neither survives:
 - *Not the link.* A 4MB download straight off a partition — `/dev/factory`, no
   filesystem in the path — measured **594 KB/s** in the same session, at the same
   -54 dBm. The radio is not the limit.
-- *Probably not dirt either*, tempting as that is. `df` reports 1% used, which as
-  above means nothing — but the **third row of this very table** does: it was
-  taken deliberately after writing 12MB to dirty the partition, and download came
-  back at 357.9, unmoved. Dirtiness demonstrably did not touch downloads then.
+- *Dirt is the leading candidate*, and the table's own third row is weaker
+  evidence against it than it looks. That row wrote 12MB **once**; what the
+  partition has had since is months of test runs creating and deleting files
+  over and over, which is a different kind of wear. Repeated create-and-delete
+  cycling is known on this project to leave the whole filesystem slow even after
+  `df` returns to 1% — and `df` reporting 1%, as above, says nothing at all
+  about how many blocks are dirty.
 
 So whatever bounds a littlefs download now is the filesystem rather than the
-network, which is the opposite of what "download is the control" assumed, and it
-is not the explanation nearest to hand. Recorded rather than guessed at. Note
-also that upload improved *against* a headwind — the partition has had months of
-test runs through it since the first three rows, which should have made uploads
-worse, not better.
+network, which is the opposite of what "download is the control" assumed. If
+fragmentation is the answer, the mechanism has to be read-side — more metadata
+to traverse for a scattered file — because the erase-on-write story explains
+uploads and says nothing about reads.
+
+Note also that upload improved *against* that headwind: a partition this used
+should upload worse than the 78 KB/s row, not 50% better. Whatever the download
+number is telling us, the XIP effect on uploads is larger than it looks.
 
 ### There is no defrag; only a reflash re-erases
 

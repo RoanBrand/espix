@@ -102,7 +102,59 @@ than one task can promise.
 Note how the cost reads. Nothing "used" 1075K — the region is reserved *before*
 the heap is created, so it never becomes heap at all. `free` reports the heap,
 so the change shows up as the **total** falling rather than the used column
-rising.
+rising. That also makes it the easiest way to check the setting took: 8189K of
+PSRAM means the image is in flash, 7114K means it is in PSRAM.
+
+**Turning it off is not the same as un-setting it.** The behaviour is gated on
+`MMAP_EXECUTABLES_FROM_FLASH`, which is
+
+```c
+#define MMAP_EXECUTABLES_FROM_FLASH \
+    (!((CONFIG_SPIRAM_FETCH_INSTRUCTIONS && CONFIG_SPIRAM_RODATA) || CONFIG_APP_BUILD_TYPE_RAM))
+```
+
+— `spi_flash/include/esp_private/flash_mmap.h:17`. `CONFIG_SPIRAM_XIP_FROM_PSRAM`
+is a convenience that *selects* those two, and Kconfig `select` does not
+un-select: clearing the umbrella on its own leaves both children set and changes
+nothing whatsoever. Worth knowing before spending a build cycle proving a
+negative that is not one, which is how this was found.
+
+### Flash auto-suspend is the tidier fix, and depends on your flash chip
+
+`CONFIG_SPI_FLASH_AUTO_SUSPEND` is the option that makes the machine behave the
+way a general-purpose computer does: the flash chip suspends an erase or program
+to service a read, so the cache never has to be disabled at all — no XIP, no
+megabyte in PSRAM, code stays where it is. In `spi_flash_os_func_app.c` it takes
+a mutex and nothing else; the whole `cache_disable()` branch is compiled out.
+
+It is off by default, and the Kconfig is unusually cautious about it — "READ
+DOCS FIRST", "supported only for specific flash chips", "contact Espressif
+Business support to check if the module has the flash that supports this
+feature". The reason is that it needs the *flash chip*, not just the SoC, to
+implement suspend/resume.
+
+Two things decide whether it is available to you, and both are checkable in a
+minute:
+
+- **The SoC.** `CONFIG_SOC_SPI_MEM_SUPPORT_AUTO_SUSPEND` — set on the S3. It
+  also requires `CONFIG_SPI_FLASH_ROM_IMPL` to be off.
+- **The flash chip.** Read the manufacturer byte with
+  `esptool flash-id`, then look at the matching `spi_flash_chip_*.c` in
+  ESP-IDF: the driver either sets `SPI_FLASH_CHIP_CAP_SUSPEND` in its
+  `get_caps` or it does not. Only the **GigaDevice** and **Winbond** drivers do.
+
+This board reports manufacturer `0x68`, Boya, and
+`spi_flash/spi_flash_chip_boya.c` says so in a comment before omitting the flag:
+
+```c
+// 32-bit-address flash is not supported
+// flash-suspend is not supported
+caps_flags |= SPI_FLASH_CHIP_CAP_UNIQUE_ID;
+```
+
+So it is unavailable here, and XIP from PSRAM is the fallback rather than the
+first choice. On a Winbond or GigaDevice module it is worth evaluating first —
+it costs no PSRAM and leaves the code in flash.
 
 The threshold for "this goes through DMA" is low and differs by part — 256
 bytes on the S3, 512 on the P4, 128 elsewhere

@@ -37,98 +37,93 @@ case "$(dev_run 'coredump')" in
         return 0 ;;
 esac
 
-FS_BATCH=25         # commands per timed batch
-FS_ERASERS=2        # concurrent erase loops during the busy batch
-FS_CEILING=150      # busy batch may be at most this % of the quiet one
+# What this can and cannot check, established by building it both ways.
+#
+# It cannot check the stall by timing. Two measurements were tried against a
+# build with XIP genuinely disabled -- the step that turns a regression test
+# into one known to test something -- and neither separates the builds:
+#
+#   a 64KB erase          506ms with XIP,  510ms without
+#   a 25-command batch     99% with XIP,   102% without, against its own baseline
+#
+# An earlier run appeared to show 32ms against 400ms, and that was a measurement
+# artefact rather than a finding: it opened a fresh connection per sample, so a
+# 400ms quantity was being read out of a 3400ms login, and the same erase
+# measured 192ms, -5ms and 401ms on consecutive tries. A negative time for an
+# erase is the measurement saying it is not measuring. Over the already-open
+# session the samples tighten to within 5% -- and say the two builds are the
+# same.
+#
+# So the difference XIP makes is not visible in latency at this load. It is
+# visible in whether the board crashes, and a suite cannot assert that.
+#
+# What it can check is that the image really is in PSRAM, which is the thing
+# that closes the window. That is observable directly: with .text and .rodata
+# copied there at boot, the PSRAM heap starts about a megabyte smaller.
+#
+# Board-specific, deliberately, and it says so when it fails: on the N16R8 that
+# is espix's target of record, `free` reports 8189K of PSRAM with the image in
+# flash and 7114K with it in PSRAM.
+
+FS_PSRAM_CEILING_K=7800     # between 7114 (in PSRAM) and 8189 (in flash)
+FS_SAMPLES=5
+FS_BATCH=25
+FS_ERASERS=2
 
 now_ms() { "$ESPIX_PYTHON" -c 'import time;print(int(time.time()*1000))'; }
-
-# A batch of cheap commands over the session that is already open, timed as a
-# whole. Two clock reads for the batch rather than two per command: python
-# startup is tens of milliseconds and would swamp what is being measured.
-timed_batch() {
-    local i=0 t0
-    t0=$(now_ms)
-    while [ "$i" -lt "$FS_BATCH" ]; do
-        dev_run 'uptime' >/dev/null 2>&1
-        i=$((i + 1))
-    done
-    echo $(( $(now_ms) - t0 ))
-}
+median_of() { printf '%s\n' "$@" | sort -n | sed -n "$(( ($# + 1) / 2 ))p"; }
 
 # ---------------------------------------------------------------------------
-# The control first: is the erase actually happening, and what does it cost?
-#
-# Without this the whole suite is vacuous -- if `coredump erase` were a no-op,
-# the busy batch would match the quiet one and the test would pass by doing
-# nothing. The comparison is against `uptime` over the same connection shape, so
-# the login cost cancels and what is left is the erase.
+# The assertion: is the image in PSRAM?
 # ---------------------------------------------------------------------------
 
-t0=$(now_ms); dev_ssh_raw 'uptime'        >/dev/null 2>&1; t_noop=$(( $(now_ms) - t0 ))
-t0=$(now_ms); dev_ssh_raw 'coredump erase' >/dev/null 2>&1; t_erase=$(( $(now_ms) - t0 ))
-erase_ms=$(( t_erase - t_noop ))
+psram_k=$(dev_run 'free' | awk '/^psram/ {print $2}')
+case "${psram_k:-}" in
+    ''|*[!0-9]*)
+        espix_fail "free reports a PSRAM total" "got '${psram_k:-}'"
+        return 0 ;;
+esac
 
-if [ "$erase_ms" -ge 20 ]; then
-    espix_pass "control: erasing 64KB of flash costs ${erase_ms}ms"
+if [ "$psram_k" -le "$FS_PSRAM_CEILING_K" ]; then
+    espix_pass "the image is in PSRAM, so a flash write need not disable the cache (${psram_k}K PSRAM heap)"
 else
-    espix_fail "control: erasing 64KB of flash costs measurable time" \
-               "measured ${erase_ms}ms against a ${t_noop}ms no-op" \
-               "if the erase is not happening, nothing below tests anything"
-    return 0
+    espix_fail "the image is in PSRAM" \
+               "PSRAM heap is ${psram_k}K, above the ${FS_PSRAM_CEILING_K}K ceiling" \
+               "that is the size it has when .text and .rodata are still in flash" \
+               "check CONFIG_SPIRAM_FETCH_INSTRUCTIONS and CONFIG_SPIRAM_RODATA --" \
+               "note that clearing CONFIG_SPIRAM_XIP_FROM_PSRAM alone does nothing," \
+               "because Kconfig select does not un-select what it selected" \
+               "see docs/GOTCHAS.md, 'What a flash write actually stops'"
 fi
 
 # ---------------------------------------------------------------------------
-# Quiet, then the same batch with erases in flight.
+# The timings, reported and not asserted.
 #
-# The comparison is inside one run, against the same board in the same minute,
-# rather than against a number written down once -- WiFi latency moves too much
-# between sessions for an absolute threshold to mean anything.
+# Kept because they are what anyone will reach for first, and because having the
+# numbers here saves them re-deriving that these do not discriminate. If a
+# future change does make the stall measurable, this is where it will show.
 # ---------------------------------------------------------------------------
 
-quiet_ms=$(timed_batch)
-
-erase_loop() {
-    while [ -f "$FS_FLAG" ]; do
-        dev_ssh_raw 'coredump erase' >/dev/null 2>&1
-    done
-}
-
-FS_FLAG=$(espix_mktemp_dir)/running
-: > "$FS_FLAG"
-
-fs_pids=""
 i=0
-while [ "$i" -lt "$FS_ERASERS" ]; do
-    # Own connection, not the suite's session: a background subshell inherits
-    # the session's descriptors, and two writers framing commands down one FIFO
-    # pair interleave and wedge. dev_ssh_raw takes a connection of its own and
-    # is budgeted against the device's session limit.
-    erase_loop &
-    fs_pids="$fs_pids $!"
+noops=""
+erases=""
+while [ "$i" -lt "$FS_SAMPLES" ]; do
+    t0=$(now_ms); dev_run 'uptime'         >/dev/null 2>&1; n=$(( $(now_ms) - t0 ))
+    t0=$(now_ms); dev_run 'coredump erase' >/dev/null 2>&1; e=$(( $(now_ms) - t0 ))
+    noops="$noops $n"
+    erases="$erases $(( e - n ))"
     i=$((i + 1))
 done
 
-busy_ms=$(timed_batch)
+erase_ms=$(median_of $erases)
 
-rm -f "$FS_FLAG"
-for p in $fs_pids; do wait "$p" 2>/dev/null; done
-rmdir "$(dirname "$FS_FLAG")" 2>/dev/null
-
-# ---------------------------------------------------------------------------
-
-if [ "$quiet_ms" -le 0 ]; then
-    espix_fail "the quiet batch took measurable time" "got ${quiet_ms}ms"
-    return 0
-fi
-
-pct=$(( busy_ms * 100 / quiet_ms ))
-
-if [ "$pct" -le "$FS_CEILING" ]; then
-    espix_pass "flash erases do not stall the system (${quiet_ms}ms quiet, ${busy_ms}ms with $FS_ERASERS erasers -- ${pct}%)"
+# One real assertion here after all: the erase has to be happening. If
+# `coredump erase` were a no-op the numbers above would be meaningless, and so
+# would any future attempt to time the stall with them.
+if [ "$erase_ms" -ge 50 ]; then
+    espix_pass "control: erasing 64KB of flash costs ${erase_ms}ms (samples$erases)"
 else
-    espix_fail "flash erases do not stall the system" \
-               "${quiet_ms}ms quiet, ${busy_ms}ms with $FS_ERASERS erasers -- ${pct}% of baseline, ceiling ${FS_CEILING}%" \
-               "this is what CONFIG_SPIRAM_XIP_FROM_PSRAM buys; check it is still on" \
-               "see docs/GOTCHAS.md, 'What a flash write actually stops'"
+    espix_fail "control: erasing 64KB of flash costs measurable time" \
+               "median ${erase_ms}ms of$erases against round trips of$noops" \
+               "if the erase is not happening, this suite measures nothing"
 fi
