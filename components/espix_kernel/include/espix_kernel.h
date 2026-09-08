@@ -117,6 +117,15 @@ const char *espix_chip_model(void);     /* "ESP32-S3" */
 int64_t espix_uptime_us(void);
 
 /*
+ * Which build is running, as git describes it: "2ebf416-dirty", or "unknown" if
+ * the image carries no description. Not the same question as espix_version(),
+ * and the difference matters -- this is the only thing that can tell you the
+ * board is not running the tree in front of you. tests/run.sh compares it
+ * against build/espix.bin and refuses to start when they differ.
+ */
+const char *espix_build_id(void);
+
+/*
  * Fill `buf` with a uname-style string. `all` selects the long form
  * (kernel + version + chip + revision + cores + IDF version).
  */

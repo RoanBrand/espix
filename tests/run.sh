@@ -177,9 +177,86 @@ else
     printf '   -j%s  seed %s\n' "$JOBS" "$ESPIX_SEED"
 fi
 
+# --------------------------------------------------- is this the build? ---
+#
+# `make test` builds the test app and runs the suite. It does not flash. So the
+# board runs whatever was last written to it, which after any `idf.py build` is
+# not the tree in front of you -- and nothing in a green run would tell you.
+#
+# This is not a hypothetical tidiness check. A -j4 run panicked, and a day went
+# into explaining a CacheError that turned out to be in an image built from an
+# uncommitted working tree twenty-eight minutes older than build/: the board had
+# `72354c6-dirty`, build/ had `b5f4232-dirty`. The core dump would not even
+# decode. Every address resolved against the wrong ELF, and the only reason that
+# was caught is that espcoredump compares SHAs and refused.
+#
+# The git describe lives at offset 0x30 of the app description, which is 0x20
+# into the image -- so it is readable from build/espix.bin with dd, no toolchain
+# and no second build. The device reports the same string in `uname -a`.
+# Both halves of the identity, assembled the same way espix_build_id() does:
+# the git describe from esp_app_desc_t.version at 0x30, and the first
+# CONFIG_APP_RETRIEVE_LEN_ELF_SHA (9) hex characters of app_elf_sha256 at 0xB0.
+#
+# The SHA is the half that does the work. `-dirty` is the same string for every
+# modified tree, so a rebuild-without-flash at the same commit would compare
+# equal on the describe alone -- and that is the case this exists to catch.
+_local_build_id() {
+    local bin="$ESPIX_ROOT/build/espix.bin" ver sha
+    [ -f "$bin" ] || return 1
+    ver=$(dd if="$bin" bs=1 skip=48  count=32 2>/dev/null | LC_ALL=C tr -d '\000')
+    sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null | od -An -tx1 -v |
+          tr -d ' \n' | cut -c1-9)
+    [ -n "$ver" ] && [ -n "$sha" ] || return 1
+    printf '%s+%s' "$ver" "$sha"
+}
+
+# Over the preflight session when there is one, and over its own connection when
+# there is not -- the check is worth a login on the rare path where the
+# persistent session could not be opened, because that path is already degraded
+# and is the last place to also be running the wrong image blind.
+_device_build_id() {
+    local out
+    if [ -n "${DEV_SESSION_PID:-}" ]; then
+        out=$(dev_run 'uname -a')
+    else
+        out=$(dev_once 'uname -a')
+    fi
+    printf '%s' "$out" | sed -n 's/^espix [^ ]* (\([^)]*\)).*/\1/p'
+}
+
+# Absent is not mismatched, and neither is unknown. A clean checkout has no
+# build/, and a board running firmware from before espix reported its build id
+# answers nothing -- refusing in either case would be a guard that fires on the
+# wrong thing. Both are said out loud rather than passed over, because "the
+# check did not run" and "the check passed" must not look alike.
+check_build_matches() {
+    local on_device on_disk
+    on_disk=$(_local_build_id) || {
+        printf '  %s no build/espix.bin; cannot check what the board is running\n' \
+               "$(_espix_dim note:)"
+        return 0
+    }
+    on_device=$(_device_build_id)
+
+    if [ -z "$on_device" ]; then
+        printf '  %s the board does not report a build id (firmware predates it);\n' \
+               "$(_espix_dim note:)"
+        printf '        cannot confirm it is running %s\n' "$on_disk"
+        return 0
+    fi
+    [ "$on_device" = "$on_disk" ] && return 0
+
+    printf '\n%s the board is running %s, build/ holds %s\n' \
+           "$(_espix_red 'STALE FIRMWARE:')" "$on_device" "$on_disk" >&2
+    printf 'A run against an image you did not build tells you about code that is\n' >&2
+    printf 'not in front of you. Flash it first:\n\n    make flash\n\n' >&2
+    return 1
+}
+
 # One session for the whole preflight: the health baseline and the test app,
 # which between them used to cost four logins before a single assertion ran.
 if dev_session_start; then
+    check_build_matches || { dev_session_stop; exit 2; }
     dev_health_begin
     # The test app goes over once, here, before any worker exists. Four suites
     # used to sync it themselves, which is a race the moment two of them run at
@@ -191,6 +268,7 @@ if dev_session_start; then
 else
     printf '  %s no preflight session; health baseline taken over one-shots\n' \
            "$(_espix_dim note:)"
+    check_build_matches || exit 2
     dev_health_begin
 fi
 

@@ -7,6 +7,7 @@
 
 #include "freertos/FreeRTOS.h"
 
+#include "esp_app_desc.h"
 #include "esp_chip_info.h"
 #include "esp_idf_version.h"
 #include "esp_timer.h"
@@ -22,6 +23,54 @@ static const char *s_version = ESPIX_VERSION_STR;
 const char *espix_version(void)
 {
     return s_version;
+}
+
+/*
+ * Which build this is, as opposed to which release: the git describe that
+ * CONFIG_APP_PROJECT_VER carries, `2ebf416-dirty` and the like.
+ *
+ * Separate from espix_version() because the two answer different questions and
+ * conflating them is what made this necessary. `espix 0.3.0` is a promise about
+ * behaviour; this is the identity of the bytes actually running, and only the
+ * second one can tell you the board is not running what you just compiled.
+ *
+ * That is not hypothetical. `make test` builds the test app and runs the suite;
+ * it does not flash. A board can therefore be tested for hours against an image
+ * from an uncommitted tree that no longer exists, and nothing in espix's output
+ * would have contradicted you -- which is exactly what happened, and cost a
+ * debugging session spent explaining a panic in code nobody could check out.
+ * tests/run.sh now refuses to start when this disagrees with build/espix.bin.
+ */
+const char *espix_build_id(void)
+{
+    static char id[48];
+
+    if (id[0] != '\0') {
+        return id;
+    }
+
+    const esp_app_desc_t *desc = esp_app_get_description();
+    const char *ver = (desc != NULL && desc->version[0] != '\0')
+                          ? desc->version : "unknown";
+
+    /*
+     * Two halves, because neither is sufficient on its own.
+     *
+     * The git describe is what a person recognises, and it is what makes the
+     * mismatch message mean something at a glance. But it says `-dirty` for
+     * *any* modified tree, so two different working trees at the same commit
+     * produce the same string -- and "I rebuilt without flashing" is precisely
+     * the case that must not slip through.
+     *
+     * So it carries the ELF SHA prefix too, which is a content hash and cannot
+     * collide that way. It is the same identity espcoredump uses to decide
+     * whether a stored dump belongs to the running image, and espix already
+     * compares it for that in espix_fault/coredump.c -- so this is the
+     * established answer to "are these the same bytes", not a second one.
+     */
+    const char *sha = esp_app_get_elf_sha256_str();
+    snprintf(id, sizeof(id), "%s+%s", ver, (sha != NULL) ? sha : "?");
+    return id;
 }
 
 const char *espix_target(void)
@@ -70,9 +119,17 @@ size_t espix_uname(char *buf, size_t len, bool all)
     esp_chip_info_t chip;
     esp_chip_info(&chip);
 
+    /*
+     * The build id sits where Linux puts its own -- `uname -a` there reads
+     * `Linux host 6.1.0 #1 SMP PREEMPT_DYNAMIC ... x86_64`, and the `#1 SMP...`
+     * field is precisely "which build of this kernel is running". Same job, so
+     * same place, rather than a command of its own that nobody would think to
+     * run at the moment it matters.
+     */
     return (size_t)snprintf(buf, len,
-                            "espix %s %s rev%d.%d %d-core IDF %s",
+                            "espix %s (%s) %s rev%d.%d %d-core IDF %s",
                             s_version,
+                            espix_build_id(),
                             chip_model_name(chip.model),
                             chip.revision / 100, chip.revision % 100,
                             chip.cores,
