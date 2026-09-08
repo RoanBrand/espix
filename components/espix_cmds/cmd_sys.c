@@ -18,6 +18,11 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+/* For flash_mmap_remain(): the condition that decides whether a flash write
+ * disables the cache. Private because IDF does not expect an application to
+ * care; espix does, because its crypto DMA is what faults when it happens. */
+#include "esp_private/flash_mmap.h"
+
 #include "espix_auth.h"
 #include "espix_cmds_priv.h"
 #include "espix_fault.h"
@@ -154,6 +159,36 @@ static int cmd_free(espix_session_t *s, int argc, char **argv)
     espix_printf(s, "min free internal since boot: %u K\n",
                  (unsigned)(heap_caps_get_minimum_free_size(
                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
+
+    /*
+     * Whether a flash write still has to switch the cache off, which is not a
+     * memory statistic so much as the invariant the rest of the system rests
+     * on, and there is nowhere else to see it.
+     *
+     * CONFIG_SPIRAM_XIP_FROM_PSRAM is supposed to make the answer "no" -- that
+     * is the entire reason espix executes from PSRAM rather than flash. With
+     * the cache left on, crypto DMA calling esp_cache_msync() cannot fault
+     * against a concurrent erase. But IDF's actual condition
+     * (spi_flash_os_func_app.c, spi1_start) is narrower than the summary:
+     *
+     *     a write or erase keeps the cache only while no mmap region is live
+     *
+     * and s_mmap_remain_count is a global that is only ever decremented by a
+     * matching munmap. A single mapping taken without BLOCKS_WRITE is counted
+     * for the rest of the boot and quietly puts every later write back on the
+     * cache-disable path -- the exact path that panics with a CacheError in
+     * Cache_WriteBack_Addr when SSH crypto is running at the same time.
+     *
+     * Nothing else about the system looks different when that happens, which
+     * is why it is printed rather than assumed. See docs/GOTCHAS.md, "What a
+     * flash write actually stops", and tests/suites/65-flashstall.sh, which
+     * asserts it.
+     */
+    const bool mapped = flash_mmap_remain();
+
+    espix_printf(s, "flash mmap: %s; a write %s\n",
+                 mapped ? "regions live" : "none live",
+                 mapped ? "must disable the cache" : "leaves the cache on");
     return 0;
 }
 

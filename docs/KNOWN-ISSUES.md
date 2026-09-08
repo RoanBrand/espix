@@ -90,6 +90,33 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   moves `.text` and `.rodata` into PSRAM so a flash operation no longer needs the
   cache off. See [GOTCHAS.md](GOTCHAS.md), "What a flash write actually stops".
 
+  **Measured afterwards, because "fixed" was still an inference.** The claim
+  rested on reading IDF's source, plus three clean runs. It is now a reading off
+  the device: `free` reports `flash mmap: none live`, which is the actual
+  condition in `spi1_start()` — a write keeps the cache only while
+  `flash_mmap_remain()` is false. `tests/suites/65-flashstall.sh` asserts it, so
+  the day something maps a partition and forgets to unmap it, a suite says so
+  instead of the board panicking. The suite's older timing evidence (506ms vs
+  510ms for an erase) was never capable of settling this either way — it was
+  underpowered, not negative; the suite now says so in its own comment.
+
+  **One recurrence since, and it does not reopen this.** A `-j4` run panicked
+  with the same signature — `Cache_WriteBack_Addr` ← `cache_hal_writeback_addr`
+  (`esp_cache_msync`) in `sshd:conn`, `exccause 71`, `EXCVADDR` 0. But the board
+  turned out to be running an image built from an uncommitted working tree that
+  no longer exists (`72354c6-dirty`, while `build/` held `b5f4232-dirty`) —
+  `make test` does not flash. So it is not evidence about any committed code.
+  `tests/run.sh` now refuses to start when the board and `build/` disagree, and
+  `uname -a` carries the build id that makes that checkable.
+
+  Two things learned from that dump are worth keeping regardless, and both are
+  in [GOTCHAS.md](GOTCHAS.md) under "Reading a CacheError panic": `exccause 71`
+  is `PANIC_RSN_CACHEERR + XCHAL_EXCCAUSE_NUM`, and *"Cache disabled but cached
+  memory region accessed"* is only the **fallback** of seven possible cache
+  errors — the specific one is printed to the UART and stored nowhere else. This
+  entry's original diagnosis assumed the fallback. It may well have been right,
+  but it was not read.
+
 - ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
   double free in espix's own command history, and the whole shape of it is worth
   keeping, because almost nothing about the way it presented pointed at the
@@ -153,6 +180,11 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   from under. Three full parallel runs since without a recurrence, which is
   consistency and not proof — the sample before the change was one occurrence in
   eight runs, so three clean runs would be unsurprising either way.
+
+  The "no longer disables the cache" half is now measured rather than reasoned
+  — see the `flash mmap: none live` note in the entry above — so what remains
+  unproven here is only whether the window is *fully* closed, not whether it
+  narrowed.
 
   It stays here rather than moving to fixed, because the ordering upstream is
   still wrong and the fault returns the moment XIP is off. The three

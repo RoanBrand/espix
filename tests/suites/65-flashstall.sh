@@ -54,12 +54,22 @@ esac
 # session the samples tighten to within 5% -- and say the two builds are the
 # same.
 #
-# So the difference XIP makes is not visible in latency at this load. It is
+# Read those numbers as "underpowered", not as "there is nothing to see". A
+# 500ms stall inside a 25-command batch that takes several seconds over SSH is a
+# few percent, which is inside the spread those two runs had -- the experiment
+# could not have detected the thing it was looking for even if it were happening
+# at full strength. That is a different statement from the one this comment used
+# to make, and the difference matters: the original wording was later cited as
+# evidence that XIP had made no difference.
+#
+# So the difference XIP makes is not visible in latency *at this load*. It is
 # visible in whether the board crashes, and a suite cannot assert that.
 #
-# What it can check is that the image really is in PSRAM, which is the thing
-# that closes the window. That is observable directly: with .text and .rodata
-# copied there at boot, the PSRAM heap starts about a megabyte smaller.
+# What it can check is two things that are observable directly. First, that the
+# image really is in PSRAM: with .text and .rodata copied there at boot, the
+# PSRAM heap starts about a megabyte smaller. Second -- and this is the one that
+# actually decides whether a write disables the cache -- that no flash mapping
+# is live. The first is a proxy for the second and does not imply it.
 #
 # Board-specific, deliberately, and it says so when it fails: on the N16R8 that
 # is espix's target of record, `free` reports 8189K of PSRAM with the image in
@@ -85,7 +95,7 @@ case "${psram_k:-}" in
 esac
 
 if [ "$psram_k" -le "$FS_PSRAM_CEILING_K" ]; then
-    espix_pass "the image is in PSRAM, so a flash write need not disable the cache (${psram_k}K PSRAM heap)"
+    espix_pass "the image is in PSRAM (${psram_k}K PSRAM heap)"
 else
     espix_fail "the image is in PSRAM" \
                "PSRAM heap is ${psram_k}K, above the ${FS_PSRAM_CEILING_K}K ceiling" \
@@ -95,6 +105,41 @@ else
                "because Kconfig select does not un-select what it selected" \
                "see docs/GOTCHAS.md, 'What a flash write actually stops'"
 fi
+
+# ---------------------------------------------------------------------------
+# And the property the placement is only a proxy for.
+#
+# "The image is in PSRAM" does not by itself mean a flash write leaves the cache
+# alone, and reading it as though it did is what let this go unmeasured for a
+# week. IDF's actual condition is in spi_flash_os_func_app.c, spi1_start():
+#
+#     if (!(flags & NO_READ) || !flash_mmap_remain()) { keep the cache }
+#     else                                            { cache_disable(NULL); }
+#
+# So a write or erase keeps the cache only while **no mmap region is live**, and
+# s_mmap_remain_count is a plain global that only a matching munmap decrements.
+# One mapping taken without ESP_PARTITION_MMAP_BLOCKS_WRITE stays counted for
+# the rest of the boot and silently puts every later write back on the
+# cache-disable path -- with the image still in PSRAM, this suite still green,
+# and the panic back.
+#
+# `free` reports it because there is nowhere else to see it; see cmd_sys.c.
+mmap_line=$(dev_run 'free' | sed -n 's/^flash mmap: //p')
+
+case "${mmap_line:-}" in
+    "none live"*)
+        espix_pass "no flash mapping is live, so a write leaves the cache on" ;;
+    "regions live"*)
+        espix_fail "no flash mapping is live" \
+                   "free says: flash mmap: $mmap_line" \
+                   "a flash write will disable the cache while this is true, and" \
+                   "esp_cache_msync() from SSH crypto faults when it does --" \
+                   "exccause 71 in Cache_WriteBack_Addr, the panic XIP was meant" \
+                   "to have closed. Find what mapped a partition and did not" \
+                   "unmap it, or gave up BLOCKS_WRITE" ;;
+    *)
+        espix_skip "free does not report the flash mmap state (older firmware?)" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # The timings, reported and not asserted.

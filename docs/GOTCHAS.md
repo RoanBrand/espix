@@ -85,11 +85,39 @@ no longer needs the cache off.
 Two things not to overstate, because the popular summaries do:
 
 - The doc says the cache will not be disabled "**in most cases**", not never.
-- The named exception is **cache-mapped flash**: a region from
-  `esp_partition_mmap()` or `spi_flash_mmap()` still cannot be read during an
-  erase or write, so the cache is still disabled for that. espix uses neither —
-  checked — so it does not meet the exception, but an app that mmaps a partition
-  brings the whole hazard back with it.
+- The named exception is **cache-mapped flash**, and the exact condition is
+  worth having rather than the prose version, because it is sharper and nastier
+  than "you cannot read a mapped region during an erase". From
+  `spi_flash/spi_flash_os_func_app.c`, `spi1_start()`:
+
+  ```c
+  if (!(flags & ESP_FLASH_START_FLAG_NO_READ) || !flash_mmap_remain()) {
+      ctx->current_op_type = OP_TYPE_MMAP_LOCK;   /* cache stays on */
+  } else {
+      cache_disable(NULL);                        /* cache goes off */
+      ctx->current_op_type = OP_TYPE_CACHE_DIS;
+  }
+  ```
+
+  A write or erase keeps the cache **only while no mmap region is live at all** —
+  not "only while the region being written is mapped". `flash_mmap_remain()` reads
+  `s_mmap_remain_count`, a single global incremented per mapping and decremented
+  only by a matching `munmap`. So **one** mapping taken without
+  `ESP_PARTITION_MMAP_BLOCKS_WRITE` — those release the mmap lock immediately and
+  leave the count raised, `flash_mmap.c:293` and `:324` — stays counted for the
+  rest of the boot and silently returns every later write to the cache-disable
+  path. XIP is then buying nothing, the image is still in PSRAM, and the only
+  symptom is that the crashes come back.
+
+  Do not take the S3's counter for a no-op on the strength of the `#if` around
+  it: the empty-macro branch in `flash_mmap.c` is guarded by
+  `#else //!CONFIG_IDF_TARGET_ESP32`, so it is the **ESP32** that does no
+  counting. The S3 counts.
+
+  espix maps nothing — checked, and now asserted rather than checked once:
+  `free` prints `flash mmap: none live` and `tests/suites/65-flashstall.sh`
+  fails if it ever says otherwise. An app that mmaps a partition brings the
+  whole hazard back with it.
 
 Measured on an N16R8 rather than assumed: PSRAM total falls 8189K → 7114K —
 1075K for the image, out of eight megabytes — internal RAM is unchanged, and scp
@@ -131,6 +159,49 @@ is a convenience that *selects* those two, and Kconfig `select` does not
 un-select: clearing the umbrella on its own leaves both children set and changes
 nothing whatsoever. Worth knowing before spending a build cycle proving a
 negative that is not one, which is how this was found.
+
+### Reading a CacheError panic: "cache disabled" is a guess, not a reading
+
+Two traps here, and between them they cost a day.
+
+**`exccause 71` is not a real Xtensa cause.** The table in
+`panic_arch.c` stops at 38, so 71 decodes as "Unknown" and gdb will not help.
+It is a *pseudo*-cause: `core_dump_port.c` does
+`s_exc_frame->exccause += XCHAL_EXCCAUSE_NUM` (64) for these, so
+
+```
+71 == PANIC_RSN_CACHEERR (7) + 64
+```
+
+Same arithmetic for the others in `xtensa/include/esp_private/panic_reason.h`.
+Useful in a core dump, where `EXCVADDR` is 0 and there is nothing else to go on
+— and useful as a discriminator, because a wild pointer gives you
+LoadProhibited or StoreProhibited with a real faulting address instead.
+
+**"CacheError" is seven different faults.** From
+`esp_system/port/soc/esp32s3/cache_err_int.c`, `esp_cache_err_get_panic_info()`
+walks the status bits and prints the first that is set:
+
+| cause | typically means |
+|---|---|
+| Icache/Dcache **sync** parameter configuration error | a manual writeback/invalidate given an address or size the hardware rejects |
+| Icache/Dcache **preload** parameter configuration error | same, for a preload |
+| Write back error … dcache tries to **write back to flash** | a dirty line whose address maps to read-only flash |
+| **MMU entry fault** | access through an unmapped MMU entry |
+| Dbus write to cache **rejected** | a write to a region the Dbus will not take |
+| *(no bit set)* | **"Cache disabled but cached memory region accessed"** |
+
+That last one is the **fallback**, printed when none of the others matched — and
+it is also the one everybody quotes, so it is easy to assume a cache error means
+a disabled cache when it means one of six other things.
+
+**And the string exists in exactly one place: the UART.** It is not in the core
+dump. espcoredump's `PANIC_DETAILS` note is only ever written for watchdog
+panics (`elf_add_wdt_panic_details`), so after a reboot all seven look identical
+— faulting task, a PC, and `exccause 71`. Capture the console *before*
+reproducing, or the reproduction is wasted: `tools/serlog.sh`, and run the suite
+without `--port` so nothing competes for the device (macOS lets two readers open
+the same `cu.*` and simply splits the bytes between them).
 
 ### Flash auto-suspend is the tidier fix, and depends on your flash chip
 
