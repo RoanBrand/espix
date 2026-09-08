@@ -266,6 +266,44 @@ correct. See the console section of [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## `espressif/elf_loader`
 
+### `esp_elf_arch_flush()` writes back the cache outside the lock it then takes
+
+`esp_elf_adapter.c:129` does, for every target but the S31:
+
+```c
+extern void Cache_WriteBack_All(void);
+Cache_WriteBack_All();
+spi_flash_disable_interrupts_caches_and_other_cpu();
+spi_flash_enable_interrupts_caches_and_other_cpu();
+```
+
+The second and third lines exist only to force an instruction-cache invalidate
+by toggling the flash lock — so the author plainly knew the lock was there. The
+write-back on the first line is outside it. Another task starting a flash
+operation at that moment disables the cache underneath it, and the write-back
+faults with `exccause 0x47 (CacheError)` inside `Cache_WriteBack_Items`.
+
+Reached on espix by loading an app while other tasks were busy: faulting task
+`app:testapp`, `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
+`esp_elf_relocate`. It needs `CONFIG_ELF_LOADER_LOAD_PSRAM`, which is the
+default, and it needs something else touching flash — a filesystem read is
+enough, and on espix every app load *is* a filesystem read, so the window is
+open on every launch.
+
+Ordering it correctly is awkward rather than obvious: the write-back needs the
+cache **on**, and the only public call that excludes concurrent flash
+operations turns the cache **off**. The clean answer is probably
+`esp_cache_msync()` over the relocated image's own address range, which is what
+the S31 branch above stopped doing for a different reason.
+
+**Workaround.** None carried yet; the alternatives all cost something. Turning
+off `CONFIG_ELF_LOADER_LOAD_PSRAM` removes the call entirely but moves every
+loaded app's image into internal RAM, which on a board already carrying eight
+SSH sessions is not free. Recorded in [KNOWN-ISSUES](KNOWN-ISSUES.md) with the
+options.
+
+
+
 Not a defect, but a constraint worth knowing: `elf_find_sym_default()` searches
 the loader's own libc table **first**, and that table already answers for
 `sleep` and `usleep`. A table added with `esp_elf_register_symbol()` is consulted

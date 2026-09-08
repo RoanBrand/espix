@@ -130,6 +130,27 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   no check that the length is above zero. Nothing espix does reaches it, and
   nothing stops it either.
 
+- **Loading an app can fault the cache while something else touches flash.**
+  Faulting task `app:testapp`, `exccause 0x47 (CacheError)` in
+  `Cache_WriteBack_Items` ← `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
+  `esp_elf_relocate`. Seen once in eight parallel test runs, and understood:
+  the `elf_loader` component writes back the whole cache *outside* the flash
+  lock it takes on the very next line, so a concurrent flash operation pulls the
+  cache out from under it. Written up in [UPSTREAM.md](UPSTREAM.md).
+
+  Three ways out, none free, which is why none is taken yet:
+
+  - Turn off `CONFIG_ELF_LOADER_LOAD_PSRAM`. The flush is not called at all
+    then — but every loaded app's image moves into internal RAM, and this board
+    already spends ~12K of it per open SSH session.
+  - Serialise espix's own flash traffic against app loading. Every file
+    operation already funnels through `espix_fs_access_check()`, so there is one
+    place to put it, at the cost of a lock across all filesystem I/O.
+  - Wait for the component, and pin the version when it is fixed.
+
+  In the meantime it is rare and it is loud: the fault handler records it, and
+  the test runner aborts the run and says which suites were in flight.
+
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
   `espix_fault_request_reap()` exists with no callers.
