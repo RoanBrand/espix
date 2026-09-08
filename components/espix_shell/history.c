@@ -53,14 +53,70 @@ static struct {
     espix_history_t hist;
 } s_users[HISTORY_USERS];
 
-static uint32_t          s_seq;
-static SemaphoreHandle_t s_lock;
+static uint32_t s_seq;
 
-static void history_lazy_init(void)
+/*
+ * One lock over the whole table, held for every read and every write.
+ *
+ * It used to cover only espix_history_for(), the slot lookup -- and that was
+ * enough for exactly as long as one session ran at a time. It is not a
+ * per-session list: two people (or two of the test harness's workers) logged in
+ * as the same account are handed the *same* espix_history_t, and every
+ * mutation after the lookup ran unlocked. Two of them arriving at a full list
+ * together both did
+ *
+ *     free(h->entries[h->count - 1]);
+ *     h->count--;
+ *
+ * on the same pointer, which is a double free. It presented as
+ * `assert failed: tlsf_free ... "block already marked as free"` in one
+ * sshd:conn task, and elsewhere as heap corruption noticed by whoever freed
+ * next -- an unrelated task in esp_vfs_select, a garbage pointer inside
+ * esp_linenoise's own history, a CacheError. Four signatures, one cause.
+ *
+ * Found by running the test suite's suites concurrently and then bisecting with
+ * tools/soak.sh: 209 logins with no commands ran clean for ten minutes, while
+ * three sessions typing commands panicked in 99 seconds. History is pushed per
+ * *command*, which is what that pair of results points at.
+ *
+ * Static storage for the mutex so the lazy creation can happen inside a
+ * critical section; xSemaphoreCreateMutex() allocates, and allocating with
+ * interrupts off is not allowed. Without the critical section the creation is
+ * itself the race it is trying to fix.
+ */
+static SemaphoreHandle_t s_lock;
+static StaticSemaphore_t s_lock_storage;
+static portMUX_TYPE      s_init_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void history_lock(void)
 {
     if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateMutex();
+        portENTER_CRITICAL(&s_init_mux);
+        if (s_lock == NULL) {
+            s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
+        }
+        portEXIT_CRITICAL(&s_init_mux);
     }
+    if (s_lock != NULL) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+}
+
+static void history_unlock(void)
+{
+    if (s_lock != NULL) {
+        xSemaphoreGive(s_lock);
+    }
+}
+
+/* The body of espix_history_free(), for callers that already hold the lock. */
+static void history_free_locked(espix_history_t *h)
+{
+    for (size_t i = 0; i < h->count; i++) {
+        free(h->entries[i]);
+        h->entries[i] = NULL;
+    }
+    h->count = 0;
 }
 
 espix_history_t *espix_history_for(const char *user)
@@ -69,10 +125,7 @@ espix_history_t *espix_history_for(const char *user)
         user = "";
     }
 
-    history_lazy_init();
-    if (s_lock != NULL) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-    }
+    history_lock();
 
     int slot = -1;
 
@@ -100,7 +153,7 @@ espix_history_t *espix_history_for(const char *user)
                 slot = i;
             }
         }
-        espix_history_free(&s_users[slot].hist);
+        history_free_locked(&s_users[slot].hist);
     }
 
     if (!s_users[slot].claimed || strcmp(s_users[slot].user, user) != 0) {
@@ -111,9 +164,7 @@ espix_history_t *espix_history_for(const char *user)
 
     espix_history_t *h = &s_users[slot].hist;
 
-    if (s_lock != NULL) {
-        xSemaphoreGive(s_lock);
-    }
+    history_unlock();
     return h;
 }
 
@@ -145,24 +196,33 @@ void espix_history_push(espix_history_t *h, const char *line)
         return;
     }
 
-    /* A command repeated straight away is noise in the list, not history. */
+    history_lock();
+
+    /* A command repeated straight away is noise in the list, not history.
+     * Inside the lock, because it reads entries[0] that another session may be
+     * in the middle of moving. */
     if (h->count > 0 && strcmp(h->entries[0], line) == 0) {
+        history_unlock();
         return;
     }
 
     char *copy = strdup(line);
     if (copy == NULL) {
+        history_unlock();
         return;             /* history is a convenience; never fail a command */
     }
 
     if (h->count == ESPIX_HISTORY_MAX) {
         free(h->entries[h->count - 1]);
+        h->entries[h->count - 1] = NULL;
         h->count--;
     }
 
     memmove(h->entries + 1, h->entries, sizeof(h->entries[0]) * h->count);
     h->entries[0] = copy;
     h->count++;
+
+    history_unlock();
 }
 
 void espix_history_apply(const espix_history_t *h, esp_linenoise_handle_t ed)
@@ -177,9 +237,15 @@ void espix_history_apply(const espix_history_t *h, esp_linenoise_handle_t ed)
      * starts scrolling, so it must exist and must not be one of ours. */
     esp_linenoise_history_add(ed, "");
 
+    /* Locked for the walk. The editor handle belongs to this session alone, so
+     * nothing inside esp_linenoise can come back round to the table -- but the
+     * table itself is shared, and reading entries[i] while another session
+     * memmoves them is how a freed pointer ends up in the editor's own list. */
+    history_lock();
     for (size_t i = 0; i < h->count; i++) {
         esp_linenoise_history_add(ed, h->entries[i]);
     }
+    history_unlock();
 }
 
 void espix_history_free(espix_history_t *h)
@@ -187,10 +253,9 @@ void espix_history_free(espix_history_t *h)
     if (h == NULL) {
         return;
     }
-    for (size_t i = 0; i < h->count; i++) {
-        free(h->entries[i]);
-    }
-    h->count = 0;
+    history_lock();
+    history_free_locked(h);
+    history_unlock();
 }
 
 /* ------------------------------------------------------------------ */

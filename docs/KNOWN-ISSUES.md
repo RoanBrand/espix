@@ -77,70 +77,55 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   Recorded with the exccause and the stack because the next occurrence should
   not start from nothing, and because "it went away" is not a diagnosis.
 
-- **One earlier heap corruption remains unexplained.** A single panic during a
-  full run, before the two kill bugs above were found: faulting task
-  `sshd:conn`, detected in `tlsf_free` inside `esp_vfs_select` from
-  `chan_poll_interrupt()`. That is a *detector* rather than a culprit — it
-  polls `select()` every 50ms while a foreground process runs, so it frees more
-  often than anything else and corruption surfaces at whatever frees next.
+- ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
+  double free in espix's own command history, and the whole shape of it is worth
+  keeping, because almost nothing about the way it presented pointed at the
+  cause.
 
-  It has not recurred since the kill fixes, and its signature is consistent
-  with the stdio-lock one, which corrupts silently rather than asserting. But
-  the run that produced it used neither `2>&1` nor stdin, so that is a
-  resemblance and not a diagnosis.
+  Command history is owned by the *user* rather than the session, so two
+  sessions logged in as the same account are handed the same `espix_history_t`.
+  The module had a mutex and it covered only `espix_history_for()`, the slot
+  lookup. Every mutation after that ran unlocked, and two sessions arriving at a
+  full list together both ran `free(h->entries[h->count - 1]); h->count--;` on
+  the same pointer.
 
-  **It is reproducible now.** Running the test suite four suites at a time
-  (`tests/run.sh -j 4`, the default since the pool was added) panics the device
-  inside about seven minutes, with the same signature to the frame: faulting
-  task `sshd:conn`, `remove_free_block` -> `block_merge_next` -> `tlsf_free`
-  from `free(vfs_fds_triple)` at the end of `esp_vfs_select`, called from
-  `chan_poll_interrupt()`, on the **PSRAM** heap (`heap=0x3c110000`). What
-  changed is only the load: several sessions running processes at once, so the
-  50ms `select()` poll runs in several tasks rather than one.
+  It surfaced as four different panics, none of them in `history.c`:
+  `tlsf_free` inside `esp_vfs_select` from `chan_poll_interrupt()` on the PSRAM
+  heap, a `CacheError` on IDLE0, a `free(0x15)` inside `esp_linenoise`'s own
+  history, and only once as the double free itself. A corrupted heap is noticed
+  by whoever frees next, and `chan_poll_interrupt()` polls `select()` every
+  50ms, so it usually got there first.
 
-  Two workers are enough -- `-j 2` panicked in 208 seconds -- so this is not
-  about the session limit going from four to eight. It is about two sessions
-  doing anything at once, which the old serial harness never did.
+  Reading the code did not find it. The leading theory for most of a day was a
+  cache-line spill from DMA over the PSRAM crypto buffers -- plausible,
+  documented as a real hazard, and wrong. `tools/soak.sh` found it in four runs
+  by separating two knobs: **209 logins with no commands ran clean for ten
+  minutes**, while **three sessions typing commands panicked in 99 seconds**.
+  History is pushed per command. Taking the SSH buffers out of PSRAM entirely
+  then changed nothing except which heap the corruption landed on, which
+  finished the PSRAM theory off in a single run.
 
-  And it is not one signature. Four runs produced four panics: this one, a
-  `CacheError` (exccause 0x47) on IDLE0, the `esp_linenoise` free below, and the
-  SHA abort that is now fixed. Different detectors, one likely cause -- memory
-  being corrupted somewhere else and noticed by whoever touches it next.
+  The fix is the whole table under one lock. Confirmed on an uninstrumented
+  build with PSRAM restored: the arm that panicked in 99s ran clean for 900s.
 
-  This is the entry to work on next, and it now has a handle: a reproducer that
-  takes minutes rather than a fault seen once. Two things to hold on to when
-  picking it up. The frame that asserts is the detector and not the culprit --
-  something else corrupted the heap earlier and this is merely the next free.
-  And the fault predates every part of the parallel work: this entry was written
-  before it, describing the same three frames.
-
-  `CONFIG_HEAP_POISONING_COMPREHENSIVE` found nothing across four runs, and
-  would not be expected to: it checks canaries around *allocations*, and a
-  write through a stale task handle lands inside a live TCB. If it returns, the
-  serial console with poisoning on is the fastest route — the console being the
-  one channel that is not the thing under test.
-
-- **`esp_linenoise` frees a garbage pointer under load.** Seen once, on the
-  serial console, during a four-worker run: faulting task `main`, `free(0x15)`
-  inside `esp_linenoise_history_free()` from `espix_history_apply()` in
-  `console_read_line()`, tripping heap_caps_base.c's "free() target pointer is
+- **`esp_linenoise` was handed a garbage pointer under load -- and it was ours.**
+  Seen once, on the serial console, during a four-worker run: faulting task
+  `main`, `free(0x15)` inside `esp_linenoise_history_free()` from
+  `espix_history_apply()`, tripping heap_caps_base.c's "free() target pointer is
   outside heap areas".
 
-  0x15 is not a pointer, so the editor's history array held something that was
-  never allocated. Two candidates, neither confirmed: memory corruption from
-  elsewhere -- there is no MMU, and the entry above is loose in the same system
-  -- or `esp_linenoise_edit()`'s ENTER case, which does
-  `state->history_length--; free(config->history[state->history_length]);` with
-  no check that the length is above zero. espix's `espix_history_apply()`
-  rebuilds the editor's list on every prompt and adds a `""` placeholder that
-  `esp_linenoise_history_add()` then refuses as a duplicate, which is a way to
-  arrive at ENTER with a length of one that becomes zero -- but reaching an
-  actual underflow from there needs a read that skips the rebuild, and that path
-  has not been found.
+  Written up here as a probable defect in the component. It was not.
+  `espix_history_apply()` walks the shared list and hands each entry to
+  `esp_linenoise_history_add()`, and the entry above is why that list could hold
+  a pointer another session had already freed. The editor stored it and freed it
+  again later. Kept as an entry because "the crash is inside the library" was
+  the wrong first instinct, and the correction is the useful part.
 
-  The console is only reachable over the UART, so this needs somebody at the
-  serial line while the network is busy. Recorded rather than chased because it
-  has been seen once.
+  One genuine gap does remain in the component, worth reporting rather than
+  working around: `esp_linenoise_edit()`'s ENTER case does
+  `state->history_length--; free(config->history[state->history_length]);` with
+  no check that the length is above zero. Nothing espix does reaches it, and
+  nothing stops it either.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.

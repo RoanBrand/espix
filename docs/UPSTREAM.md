@@ -196,6 +196,36 @@ source to draw on.
 
 ## `espressif/esp_linenoise`
 
+### ENTER decrements the history length without checking it
+
+`esp_linenoise_edit()` handles a newline like this:
+
+```c
+case ENTER:
+    state->history_length--;
+    free(config->history[state->history_length]);
+```
+
+and `CTRL_D` on an empty line does the same. Neither checks that
+`history_length` is above zero first. At zero the decrement underflows and the
+`free()` reads one pointer *before* the array — whatever the heap happens to
+have put there.
+
+Reaching zero is not obviously impossible from outside the component.
+`esp_linenoise_edit_start()` adds a `""` placeholder for the line being typed,
+but `esp_linenoise_history_add()` refuses a line identical to the last entry —
+so an application that rebuilds the editor's history itself and leaves `""` at
+the end (which is what espix's `espix_history_apply()` does when the user's list
+is empty) gets no placeholder added, and ENTER then takes the length from one to
+zero. One more read down that path and the decrement is an underflow.
+
+**Workaround.** None carried: espix has not been able to construct the second
+read, and the one crash that looked like this turned out to be espix's own
+double free feeding the editor a stale pointer (see
+[KNOWN-ISSUES](KNOWN-ISSUES.md)). Recorded because a missing `> 0` on a
+decrement that indexes a `free()` is worth a line upstream regardless of who
+can currently reach it.
+
 ### Dumb mode corrupts input, two ways
 
 The terminal probe runs as the console starts — before anyone has attached a
