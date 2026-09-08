@@ -412,6 +412,37 @@ static int wifi_status(espix_session_t *s)
     if (st.state == ESPIX_WIFI_CONNECTED) {
         espix_printf(s, "signal: %d dBm\nchannel: %u\n", st.rssi, st.channel);
     }
+    /*
+     * Whether the radio sleeps, in words.
+     *
+     * Not decoration: on the default MIN_MODEM the station wakes once per DTIM
+     * to hear the AP's beacon, so every exchange can wait on the next one --
+     * and espix never calls esp_wifi_set_ps(), so nothing in this source says
+     * which mode is in force. Working that out otherwise means reading IDF's
+     * defaults and doing arithmetic on beacon intervals, which is a poor way to
+     * answer "why is my board blinking".
+     *
+     * No beacon interval is printed alongside, deliberately. A station cannot
+     * read the AP's schedule through the public API -- wifi_ap_record_t has no
+     * such field, and beacon_interval exists only in wifi_ap_config_t, for a
+     * soft-AP. Printing 100 TU because it is the usual default would be a
+     * number that looks measured and is not.
+     */
+    switch (st.ps) {
+    case ESPIX_WIFI_PS_NONE:
+        espix_printf(s, "power:  off (radio stays on)\n");
+        break;
+    case ESPIX_WIFI_PS_MIN_MODEM:
+        espix_printf(s, "power:  modem sleep (wakes for the AP's beacon)\n");
+        break;
+    case ESPIX_WIFI_PS_MAX_MODEM:
+        espix_printf(s, "power:  modem sleep, long listen interval\n");
+        break;
+    case ESPIX_WIFI_PS_UNKNOWN:
+    default:
+        break;      /* driver not started; the state line already says so */
+    }
+
     if (st.retries > 0) {
         espix_printf(s, "retries: %u (last reason %d)\n",
                      st.retries, st.last_reason);

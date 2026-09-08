@@ -97,6 +97,25 @@ typedef enum {
     ESPIX_WIFI_CONNECTED,   /* associated; may still be waiting on DHCP */
 } espix_wifi_state_t;
 
+/*
+ * Whether the station sleeps between beacons.
+ *
+ * espix's own enum rather than wifi_ps_type_t, for the reason this header
+ * already gives about `last_reason` below: it does not drag in esp_wifi. That
+ * also keeps the numbering ours, so a renderer cannot quietly depend on IDF's.
+ *
+ * espix never calls esp_wifi_set_ps(), so in practice this reports IDF's
+ * default of MIN_MODEM -- which is worth being able to see, because it costs a
+ * beacon interval of latency on every exchange and there is nothing else in the
+ * system that says so.
+ */
+typedef enum {
+    ESPIX_WIFI_PS_UNKNOWN = 0,  /* driver not started, or the query failed */
+    ESPIX_WIFI_PS_NONE,         /* radio stays on */
+    ESPIX_WIFI_PS_MIN_MODEM,    /* wakes per DTIM to hear the beacon */
+    ESPIX_WIFI_PS_MAX_MODEM,    /* as above, plus a longer listen interval */
+} espix_wifi_ps_t;
+
 typedef struct {
     char     ssid[ESPIX_SSID_MAX];
     uint8_t  bssid[6];
@@ -122,6 +141,8 @@ typedef struct {
     bool               gave_up;
     int                last_reason;
     unsigned           retry_delay_ms;   /* 0 when no retry is pending */
+
+    espix_wifi_ps_t    ps;               /* sleep behaviour; see above */
 } espix_wifi_status_t;
 
 /*

@@ -540,6 +540,24 @@ esp_err_t espix_net_wifi_status(espix_wifi_status_t *out)
     out->retry_delay_ms =
         (s_want_connect && s_state != ESPIX_WIFI_CONNECTED) ? s_retry_delay_ms : 0;
 
+    /*
+     * Asked rather than assumed. espix sets no mode, so this reports whatever
+     * IDF defaulted to -- and reporting the default is the point: it is not
+     * discoverable from espix's own source, which never mentions it.
+     */
+    out->ps = ESPIX_WIFI_PS_UNKNOWN;
+    if (s_sta != NULL) {
+        wifi_ps_type_t ps;
+        if (esp_wifi_get_ps(&ps) == ESP_OK) {
+            switch (ps) {
+            case WIFI_PS_NONE:      out->ps = ESPIX_WIFI_PS_NONE;      break;
+            case WIFI_PS_MIN_MODEM: out->ps = ESPIX_WIFI_PS_MIN_MODEM; break;
+            case WIFI_PS_MAX_MODEM: out->ps = ESPIX_WIFI_PS_MAX_MODEM; break;
+            default:                out->ps = ESPIX_WIFI_PS_UNKNOWN;   break;
+            }
+        }
+    }
+
     wifi_ap_record_t ap;
     if (s_state == ESPIX_WIFI_CONNECTED &&
         esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
