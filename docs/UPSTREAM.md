@@ -115,6 +115,61 @@ path for the crash handler. Note that any application calling
 no unusual configuration and no unusual hardware, only a second task using SHA
 at the wrong moment. TLS does, and so does anything hashing a password.
 
+### PSA's PBKDF2 re-derives the HMAC key on every iteration
+
+`psa_key_derivation_pbkdf2_generate_block()`
+(`tf-psa-crypto/core/psa_crypto.c`, around line 6187) runs its iteration loop
+through the **one-shot** MAC entry point, passing the raw password each time:
+
+```c
+for (i = 1; i < pbkdf2->input_cost; i++) {
+    status = psa_driver_wrapper_mac_compute(attributes,
+                                            pbkdf2->password,      /* the key */
+                                            pbkdf2->password_length,
+                                            prf_alg, U_i, prf_output_length,
+                                            U_i, prf_output_length,
+                                            &mac_output_length);
+```
+
+So every iteration re-derives the HMAC key schedule from scratch — hash the key
+if oversized, build the 64-byte ipad and opad, absorb both — before doing the
+two compressions the algorithm actually needs. That is roughly **twice the
+hashing**, plus a full driver setup and teardown per iteration. PBKDF2 is the
+one construction where this cost is multiplied by a deliberately large number.
+
+Every other PBKDF2 implementation, including Mbed TLS's own
+`mbedtls_pkcs5_pbkdf2_hmac()`, prepares the key schedule once and reuses it.
+That function is not an alternative here: Mbed TLS 4.x moved it behind
+`private/pkcs5.h`, so PSA is the only public surface and this is the path
+everyone lands on.
+
+**Measured on an ESP32-S3 at 240MHz**, 20000 iterations of
+PBKDF2-HMAC-SHA256 for a 32-byte key:
+
+| | |
+|---|---|
+| via `psa_key_derivation_*`, hardware SHA | **2030 ms** |
+| via `psa_key_derivation_*`, software SHA | **1936 ms** |
+| driving `psa_hash_clone()` directly, hardware SHA | **1208 ms** |
+
+The middle row is the tell. Turning the SHA accelerator *off* made it slightly
+faster, which is only possible if the hashing is a minority of the work —
+accelerating a minority cannot help, and on this target the hardware driver
+allocates (`esp_sha_hash_setup()` calls `heap_caps_malloc()`), so twenty
+thousand malloc/free pairs are paid per password check.
+
+espix works around it in `components/espix_auth/auth.c`: absorb ipad and opad
+once, then `psa_hash_clone()` those states per iteration. Same construction and
+byte-identical output — checked against RFC 7914 §11's first vector at init —
+for 40% less time and no extra memory. The workaround is ~90 lines of
+hand-driven HMAC that nobody should have to write.
+
+Worth fixing upstream because the API shape already supports it:
+`psa_mac_sign_setup()`/`update()`/`sign_finish()` exist, and the loop could hold
+one operation across iterations. Mbed-TLS issue
+[#7801](https://github.com/Mbed-TLS/mbedtls/issues/7801) is already cited in a
+comment two lines above this loop, for a different quirk in the same function.
+
 ### The VFS has no `chmod`
 
 `esp_vfs_fs_ops_t` carries `truncate`, `ftruncate` and `utime` and nothing else
