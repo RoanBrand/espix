@@ -140,7 +140,12 @@ if ! dev_session_start; then
     exit 1
 fi
 BEFORE_UP=$(_dev_parse_uptime "$(dev_run 'uptime')")
-printf 'soak: device up %s min at the start\n' "$BEFORE_UP"
+BEFORE_REASON=$(dev_run 'uptime' | sed -n 's/.*last reset: //p')
+printf 'soak: device up %s min at the start (last reset: %s)\n' \
+       "$BEFORE_UP" "$BEFORE_REASON"
+
+# Clear any stored dump, so "a dump appeared" is evidence about *this* run.
+dev_run 'coredump erase' >/dev/null 2>&1
 
 n=1
 while [ "$n" -le "$WORKERS" ]; do
@@ -190,6 +195,17 @@ done
 # connection and a reboot look identical from here. So reconnect and ask.
 
 if [ "$VERDICT" = clean ]; then
+    # Ask before claiming it. A reboot between two polls that the watcher
+    # happened to survive would otherwise be reported as a clean run.
+    end_reason=$(dev_run 'uptime' | sed -n 's/.*last reset: //p')
+    end_cores=$(dev_run 'coredump' | head -1)
+    case "$end_cores" in
+        *"core dump: "*)
+            printf 'soak: NOT CLEAN -- ran %ss without losing the session, but a ' "$CAP"
+            printf 'core dump appeared (last reset: %s)\n      %s\n' \
+                   "$end_reason" "$end_cores"
+            exit 1 ;;
+    esac
     printf 'soak: CLEAN for %ss (%s logins, n=%s, reconnect %ss)\n' \
            "$CAP" "$logins" "$WORKERS" "$RECONNECT"
     exit 0
@@ -213,9 +229,22 @@ after_up=$(_dev_parse_uptime "$(dev_run 'uptime')")
 reason=$(dev_run 'uptime' | sed -n 's/.*last reset: //p')
 cores=$(dev_run 'coredump' | head -1)
 
-if [ "$after_up" -ge 0 ] && [ "$BEFORE_UP" -ge 0 ] && [ "$after_up" -lt "$BEFORE_UP" ]; then
-    printf 'soak: PANIC after %ss (%s logins, n=%s, reconnect %ss)\n' \
-           "$LOST_AT" "$logins" "$WORKERS" "$RECONNECT"
+# Three ways to know it rebooted, because one of them is not enough.
+#
+# Uptime alone is not: it is printed in whole minutes, so a device that panics
+# during its first minute goes from "up 0 min" to "up 0 min" and the comparison
+# says nothing happened. This tool reported exactly that -- "not a panic" -- for
+# a run whose reset reason said `panic`, which is the harness lying about the
+# device, the one thing it must never do.
+rebooted=""
+[ "$after_up" -ge 0 ] && [ "$BEFORE_UP" -ge 0 ] && [ "$after_up" -lt "$BEFORE_UP" ] \
+    && rebooted="uptime went backwards"
+[ "$reason" = panic ] && [ "$BEFORE_REASON" != panic ] && rebooted="reset reason is now panic"
+case "$cores" in *"core dump: "*) rebooted="a core dump appeared" ;; esac
+
+if [ -n "$rebooted" ]; then
+    printf 'soak: PANIC after %ss (%s logins, n=%s, reconnect %ss) -- %s\n' \
+           "$LOST_AT" "$logins" "$WORKERS" "$RECONNECT" "$rebooted"
     printf '      last reset: %s\n      %s\n' "$reason" "$cores"
     exit 1
 fi
