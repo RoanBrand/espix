@@ -572,6 +572,28 @@ if [ -n "${FAILED_POOL:-}" ]; then
     done
 fi
 
+# The watchdog, with the attribution only the monitor could supply.
+#
+# dev_health_check below is what *fails* the run -- it reads the device's
+# cumulative count, so it cannot miss an event. This block adds the part that is
+# gone once the run ends: which suites were in flight each time one fired.
+#
+# Printed even though it does not itself set N_FAIL, because "IDLE0 was starved
+# for five seconds" is the kind of finding that is meaningless without knowing
+# what was running, and the .cur files are deleted with the run directory.
+if [ -s "$RUNDIR/watchdog.log" ]; then
+    printf '\n%s\n' "$(_espix_red 'task watchdog fired during the run:')"
+    while IFS='|' read -r when n running; do
+        [ -n "$when" ] || continue
+        printf '  %s  %s trigger(s) while running:%s\n' \
+               "$(date -r "$when" '+%H:%M:%S' 2>/dev/null || echo "$when")" \
+               "$n" "$running"
+    done < "$RUNDIR/watchdog.log"
+    printf '  a core was held long enough to starve its IDLE task; nothing rebooted\n'
+    printf '  (CONFIG_ESP_TASK_WDT_PANIC is off), but IDLE is what frees deleted\n'
+    printf '  tasks, so this defers reclamation. See docs/GOTCHAS.md.\n'
+fi
+
 if health=$(dev_health_check); then :; else
     printf '\n%s %s\n' "$(_espix_red 'device health after the run:')" "$health"
     N_FAIL=$((N_FAIL + 1))

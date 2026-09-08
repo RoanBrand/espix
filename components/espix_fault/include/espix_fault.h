@@ -62,6 +62,19 @@ const espix_fault_record_t *espix_fault_last(void);
 const char *espix_fault_reset_reason_str(void);
 
 /*
+ * How many times the task watchdog has triggered since boot.
+ *
+ * Non-zero means something held a core long enough to starve its IDLE task --
+ * five seconds by default. Nothing reboots (CONFIG_ESP_TASK_WDT_PANIC is off),
+ * but IDLE is what frees deleted tasks' stacks, so it is a real event and not
+ * only a log line. Counted from ESP-IDF's weak esp_task_wdt_isr_user_handler()
+ * hook, which is additive: IDF still prints the offending tasks and backtrace.
+ *
+ * The test runner reads this through `uptime` and fails a run that raises it.
+ */
+uint32_t espix_fault_wdt_count(void);
+
+/*
  * Ask for `task` to be torn down from normal context. Safe to call from the
  * panic path (queue send only, no allocation). Currently unused — see the
  * header comment.

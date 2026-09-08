@@ -7,6 +7,7 @@
  * supported seam rather than a trick.
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -129,6 +130,44 @@ void __wrap_esp_panic_handler(void *info)
 const espix_fault_record_t *espix_fault_last(void)
 {
     return s_have_last ? &s_last : NULL;
+}
+
+/*
+ * Task watchdog triggers since boot.
+ *
+ * The watchdog watches the IDLE tasks, and IDLE runs at priority 0 -- so it only
+ * runs when nothing else is ready. Any task that stays runnable for the timeout
+ * starves it on that core, and IDF says so and carries on:
+ * CONFIG_ESP_TASK_WDT_PANIC is off, so this never resets the board.
+ *
+ * That is not cosmetic here even though nothing crashes. IDLE performs FreeRTOS's
+ * deferred task cleanup -- freeing the TCB and stack of anything that called
+ * vTaskDelete() -- and espix creates and destroys a task per process and per SSH
+ * connection. A starved IDLE defers exactly the reclamation espix leans on
+ * hardest, so a trigger is a real event worth counting.
+ *
+ * Counted rather than left to the log, because the log cannot be trusted to
+ * still hold it: klog is CONFIG_ESPIX_KLOG_LINES entries and four parallel test
+ * workers churn that in well under a minute, while the test runner polls every
+ * ten seconds. A counter cannot be missed by a reader that arrives late.
+ *
+ * esp_task_wdt_isr_user_handler() is a *weak* hook ESP-IDF's own task_wdt_isr()
+ * calls between printing the offending tasks and handling the timeout -- not an
+ * override. Defining it adds this and takes nothing away: the "did not reset the
+ * watchdog in time" lines, the running-task list and the backtrace all still
+ * happen. No IRAM_ATTR: task_wdt_isr() itself is not in IRAM, so putting this
+ * there would buy nothing and cost internal RAM.
+ */
+static volatile uint32_t s_wdt_events;
+
+void esp_task_wdt_isr_user_handler(void)
+{
+    s_wdt_events++;
+}
+
+uint32_t espix_fault_wdt_count(void)
+{
+    return s_wdt_events;
 }
 
 const char *espix_fault_reset_reason_str(void)

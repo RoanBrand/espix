@@ -203,6 +203,48 @@ reproducing, or the reproduction is wasted: `tools/serlog.sh`, and run the suite
 without `--port` so nothing competes for the device (macOS lets two readers open
 the same `cu.*` and simply splits the bytes between them).
 
+### The task watchdog watches IDLE, and IDLE is not what you think
+
+`CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1` subscribe the **idle tasks**, so
+"task watchdog got triggered ... IDLE0" does not mean the idle task is broken.
+It means something else held that core for the whole timeout (5s by default) and
+IDLE, at priority 0, never became the highest-ready task. FreeRTOS is preemptive
+but not fair: a runnable task at any priority above 0 starves IDLE on its core,
+by design.
+
+**It is not necessarily a reboot.** `CONFIG_ESP_TASK_WDT_PANIC` is off by
+default, and off in espix: the ISR prints the offending tasks and a backtrace and
+execution continues. Check that config before assuming a watchdog line explains a
+reset — it usually does not.
+
+**It is not cosmetic either**, and this is the part that is easy to wave away.
+IDLE runs FreeRTOS's deferred cleanup: `prvCheckTasksWaitingTermination()` is
+what actually frees the TCB and stack of a task that has called
+`vTaskDelete()`. Starve IDLE and that memory is not reclaimed for as long as the
+starvation lasts. Any design that creates and destroys tasks — espix makes one
+per process and one per SSH connection — is leaning on the thing being starved.
+
+**Linux does not do this, and the comparison is instructive.** There is no
+idle-task watchdog there. The soft-lockup detector watches for *kernel* code
+that fails to schedule for ~20s and the NMI hard-lockup detector for a CPU stuck
+with interrupts off; a userspace process pinning a core at 100% for hours trips
+neither, because the scheduler simply time-slices around it. The ESP-IDF
+watchdog is closer to the soft-lockup detector, aimed at a system where a task
+that never yields is usually a bug rather than a busy program.
+
+**Counting triggers: `esp_task_wdt_isr_user_handler()`.** It is a *weak* symbol
+that `task_wdt_isr()` calls between printing the running tasks and handling the
+timeout. Defining it is **additive, not an override** — IDF's own reporting all
+still happens, so there is no original behaviour to reimplement. It runs in ISR
+context, and `task_wdt_isr()` is not itself in IRAM, so putting the hook in IRAM
+buys nothing.
+
+Prefer a counter to scraping the log. A log ring wraps; espix's is
+`CONFIG_ESPIX_KLOG_LINES` entries and four parallel test workers churn it in well
+under a minute, so a poller on a ten-second cadence can arrive after the evidence
+is gone. espix counts in `espix_fault_wdt_count()` and reports it from `uptime`,
+which is the line anything monitoring the machine already reads.
+
 ### Flash auto-suspend is the tidier fix, and depends on your flash chip
 
 `CONFIG_SPI_FLASH_AUTO_SUSPEND` is the option that makes the machine behave the

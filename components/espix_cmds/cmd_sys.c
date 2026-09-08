@@ -91,8 +91,31 @@ static int cmd_uptime(espix_session_t *s, int argc, char **argv)
 
     char buf[48];
     espix_uptime_str(buf, sizeof(buf));
-    espix_printf(s, "%s, last reset: %s\n", buf,
-                 espix_fault_reset_reason_str());
+
+    /*
+     * The watchdog count rides along here, and only when it is non-zero, so a
+     * healthy device reads exactly as it always has.
+     *
+     * Here rather than in a command of its own because this is the line anything
+     * watching the machine already reads -- the test runner's monitor polls
+     * `uptime` every ten seconds for the reset reason, so it gets this for free,
+     * with no extra command and no extra login. A separate command would be one
+     * nobody runs at the moment it would have mattered.
+     *
+     * "warning" is the right word: CONFIG_ESP_TASK_WDT_PANIC is off, so nothing
+     * reset. Something held a core long enough to starve its IDLE task, which
+     * defers freeing deleted tasks. See espix_fault_wdt_count().
+     */
+    const uint32_t wdt = espix_fault_wdt_count();
+
+    if (wdt == 0) {
+        espix_printf(s, "%s, last reset: %s\n", buf,
+                     espix_fault_reset_reason_str());
+    } else {
+        espix_printf(s, "%s, last reset: %s, %u watchdog warning%s\n", buf,
+                     espix_fault_reset_reason_str(), (unsigned)wdt,
+                     (wdt == 1) ? "" : "s");
+    }
     return 0;
 }
 

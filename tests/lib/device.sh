@@ -739,6 +739,7 @@ dev_testapp_sync() {
 DEV_HEALTH_REASON=""
 DEV_HEALTH_MINUTES=-1
 DEV_HEALTH_CONNS=1
+DEV_HEALTH_WDT=0
 
 # espix prints one of three shapes (espix_kernel/kernel.c):
 #   up N min          up H:MM          up N days, H:MM
@@ -801,13 +802,66 @@ dev_uptime_minutes() {
     _dev_parse_uptime "$(_dev_ask 'uptime')"
 }
 
+# Everything below parses one `uptime` line rather than fetching its own.
+#
+# Not a tidy-up: fetching separately is a race, and it bit. dev_health_begin took
+# the reset reason, the minutes and the watchdog count in three calls, each of
+# which is a login -- and on this device a login is ~3.5s. A watchdog trigger
+# landing between the first and third made the baseline disagree with itself:
+# the reason said "6 warnings", the count said 7, and the end-of-run check then
+# reported a *reset reason change* that had not happened while missing the
+# watchdog event that had. One read, parsed three ways, cannot do that.
+_dev_parse_reason() {   # <uptime output>
+    # Stops at the first comma so the watchdog suffix is not swallowed into the
+    # reason -- "power-on, 7 watchdog warnings" is not a reset reason.
+    printf '%s' "$1" | sed -n 's/.*last reset: \([^,]*\).*/\1/p'
+}
+
 dev_health_reason() {
-    _dev_ask 'uptime' | sed -n 's/.*last reset: //p'
+    _dev_parse_reason "$(_dev_ask 'uptime')"
+}
+
+# Task watchdog triggers since the device booted, from the tail of `uptime`:
+#
+#     up 5 min, last reset: power-on, 2 watchdog warnings
+#
+# Absent when the count is zero, which is why this answers 0 rather than failing
+# on a line that does not have it -- a healthy device and an old firmware look
+# the same here, and neither is a finding.
+#
+# Read from `uptime` rather than from `dmesg` deliberately. The klog ring is
+# CONFIG_ESPIX_KLOG_LINES entries and four workers churn it in well under a
+# minute, so a ten-second poll can arrive after the evidence has scrolled away.
+# The count on the device is cumulative and cannot be missed by a late reader.
+_dev_parse_wdt() {      # <uptime output>
+    local n
+    n=$(printf '%s' "$1" | sed -n 's/.*, \([0-9][0-9]*\) watchdog warning.*/\1/p')
+    case "${n:-0}" in
+        ''|*[!0-9]*) echo 0 ;;
+        *)           echo "$n" ;;
+    esac
+}
+
+dev_wdt_count() {
+    _dev_parse_wdt "$(_dev_ask 'uptime')"
 }
 
 dev_health_begin() {
-    DEV_HEALTH_REASON=$(dev_health_reason)
-    DEV_HEALTH_MINUTES=$(dev_uptime_minutes)
+    local up
+    up=$(_dev_ask 'uptime')
+
+    DEV_HEALTH_REASON=$(_dev_parse_reason "$up")
+    DEV_HEALTH_MINUTES=$(_dev_parse_uptime "$up")
+
+    # Relative to whatever the device had already, for the same reason the
+    # connection count is: a trigger from before this run started is not this
+    # run's finding. Parsed from the same line as the two above so the three
+    # cannot describe different moments -- see _dev_parse_reason.
+    DEV_HEALTH_WDT=$(_dev_parse_wdt "$up")
+    if [ "${DEV_HEALTH_WDT:-0}" -gt 0 ]; then
+        printf '  %s %d watchdog warning(s) already recorded; counting from there\n' \
+               "$(_espix_dim note:)" "$DEV_HEALTH_WDT"
+    fi
 
     # Whatever is already connected before the run starts is somebody else's,
     # and the leak check below is measured against it rather than against zero.
@@ -827,14 +881,15 @@ dev_health_begin() {
 # while the run is in progress; this is the backstop for anything that happened
 # between its last poll and the end.
 dev_health_check() {
-    local reason mins cores conns problems=""
+    local reason mins cores conns wdt up problems=""
 
-    reason=$(dev_health_reason)
+    up=$(_dev_ask 'uptime')
+    reason=$(_dev_parse_reason "$up")
     if [ -n "$DEV_HEALTH_REASON" ] && [ "$reason" != "$DEV_HEALTH_REASON" ]; then
         problems="$problems reset-reason-changed('$DEV_HEALTH_REASON'->'$reason')"
     fi
 
-    mins=$(dev_uptime_minutes)
+    mins=$(_dev_parse_uptime "$up")
     if [ "$DEV_HEALTH_MINUTES" -ge 0 ] && [ "$mins" -ge 0 ] \
        && [ "$mins" -lt "$DEV_HEALTH_MINUTES" ]; then
         problems="$problems rebooted(uptime ${DEV_HEALTH_MINUTES}min->${mins}min)"
@@ -857,6 +912,15 @@ dev_health_check() {
         '')               problems="$problems coredump-unanswered" ;;
         *)                problems="$problems coredump-unrecognised" ;;
     esac
+
+    # The watchdog backstop. Cumulative on the device, so this one read catches
+    # every trigger in the run including any the monitor's cadence straddled --
+    # the monitor exists to say *which suites were running*, not to be the only
+    # thing that notices.
+    wdt=$(_dev_parse_wdt "$up")
+    if [ "${wdt:-0}" -gt "${DEV_HEALTH_WDT:-0}" ]; then
+        problems="$problems task-watchdog($(( wdt - DEV_HEALTH_WDT )))"
+    fi
 
     # Connection tasks: told apart by persistence and by *growth*, not by count.
     #
@@ -918,8 +982,8 @@ dev_health_check() {
 
 DEV_MONITOR_PERIOD=10
 
-_dev_monitor_alert() {      # <rundir> <reason>
-    local dir="$1" reason="$2" running="" f name
+_dev_monitor_running() {    # <rundir> -- the suites in flight right now
+    local dir="$1" running="" f name
 
     for f in "$dir"/w*.cur; do
         [ -f "$f" ] || continue
@@ -927,6 +991,13 @@ _dev_monitor_alert() {      # <rundir> <reason>
         [ -n "$name" ] && running="$running $name"
     done
     [ -n "$running" ] || running=" (nothing recorded as running)"
+    printf '%s' "$running"
+}
+
+_dev_monitor_alert() {      # <rundir> <reason>
+    local dir="$1" reason="$2" running
+
+    running=$(_dev_monitor_running "$dir")
 
     printf '%s\nsuites running at the time:%s\n' "$reason" "$running" \
         > "$dir/health.alert"
@@ -940,7 +1011,7 @@ _dev_monitor_alert() {      # <rundir> <reason>
 # Poll until <rundir>/stop appears. Intended to be backgrounded.
 dev_monitor_run() {
     local dir="$1"
-    local up cores mins last=-1 i
+    local up cores mins last=-1 i wdt wdt_last=-1
 
     if ! dev_session_start >/dev/null 2>&1; then
         printf 'monitor could not open a session\n' > "$dir/health.log"
@@ -976,6 +1047,23 @@ dev_monitor_run() {
             fi
             continue
         fi
+
+        # Watchdog triggers, from the `uptime` already in hand -- no extra
+        # command and no extra login.
+        #
+        # Recorded, not alerted. A core dump means the device rebooted and every
+        # assertion after it is meaningless, so that aborts; a watchdog warning
+        # means a core was held too long, which is a real defect but leaves the
+        # run's remaining assertions perfectly valid. Cutting the run short here
+        # would throw away good evidence to report something the end-of-run
+        # check catches anyway. What only the monitor can add is *which suites
+        # were running at the time*, so that is what it writes down.
+        wdt=$(_dev_parse_wdt "$up")
+        if [ "$wdt_last" -ge 0 ] && [ "${wdt:-0}" -gt "$wdt_last" ]; then
+            printf '%s|%d|%s\n' "$(date +%s)" "$(( wdt - wdt_last ))" \
+                   "$(_dev_monitor_running "$dir")" >> "$dir/watchdog.log"
+        fi
+        [ "${wdt:-0}" -ge 0 ] && wdt_last=$wdt
 
         cores=$(dev_run 'coredump')
         mins=$(_dev_parse_uptime "$up")
