@@ -9,6 +9,10 @@ for.
 
 Verified against ESP-IDF v6.1 and xtensa-esp-elf GCC 15.2 unless noted.
 
+For behaviour that is documented and merely surprising, rather than broken --
+the platform differing from what a POSIX or FreeRTOS habit expects -- see
+[GOTCHAS.md](GOTCHAS.md).
+
 Re-checked against the v6.1 release: the beta1-to-v6.1 changelog adds no VFS
 `chmod` hook, no `chmod()` fix, no LittleFS changes at all, no `adjtime()` fix,
 and nothing touching the signal vocabulary or FreeRTOS-Plus-POSIX -- so every

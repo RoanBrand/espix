@@ -6,7 +6,10 @@ writing down — the purpose is that it gets recognised rather than debugged fro
 scratch a second time.
 
 For work espix might take on see [ROADMAP.md](ROADMAP.md); for defects that
-belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
+belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md); and for
+the platform surprises that keep causing entries here — what may not be used
+together, and where ESP32/IDF differs from what a POSIX or FreeRTOS habit
+expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Processes
 
