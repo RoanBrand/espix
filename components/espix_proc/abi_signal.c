@@ -406,14 +406,13 @@ static int espix_abi_pause(void)
     }
 }
 
-/* ------------------------------------------------------------------- resolver */
-
-typedef struct {
-    const char *name;
-    uintptr_t   addr;
-} abi_sym_t;
-
-#define ABI_SYM(posix_name, fn) { (posix_name), (uintptr_t)(void *)(fn) }
+/* --------------------------------------------------------------- the overrides */
+/*
+ * abi_sym_t and ABI_SYM now live in espix_proc_priv.h, and the resolver itself
+ * in abi_resolver.c: elf_set_symbol_resolver() takes one function for the whole
+ * system, and this was never the only subsystem that needs to shadow a libc
+ * name. See the header of that file.
+ */
 
 static const abi_sym_t s_signal_syms[] = {
     /* Dispositions. */
@@ -447,24 +446,10 @@ static const abi_sym_t s_signal_syms[] = {
     ABI_SYM("espix_sigcheck", espix_sigcheck),
 };
 
-static uintptr_t espix_symbol_resolver(const char *sym_name)
-{
-    if (sym_name != NULL) {
-        for (size_t i = 0; i < sizeof(s_signal_syms) / sizeof(s_signal_syms[0]);
-             i++) {
-            if (strcmp(sym_name, s_signal_syms[i].name) == 0) {
-                return s_signal_syms[i].addr;
-            }
-        }
-    }
-
-    /* Everything else, including the whole libc and IDF surface, unchanged. */
-    return elf_find_sym_default(sym_name);
-}
-
 void espix_proc_abi_signal_register(void)
 {
-    elf_set_symbol_resolver(espix_symbol_resolver);
+    espix_abi_resolver_add(s_signal_syms,
+                           sizeof(s_signal_syms) / sizeof(s_signal_syms[0]));
 
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "signal syscalls published to apps");
 }

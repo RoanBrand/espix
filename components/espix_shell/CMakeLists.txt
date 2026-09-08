@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS
+        "env.c"
         "history.c"
         "registry.c"
         "session.c"

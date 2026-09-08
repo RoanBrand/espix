@@ -250,6 +250,134 @@ void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn)
     s_exec_fallback = fn;
 }
 
+/*
+ * Expand $VAR, ${VAR} and $? into `out`.
+ *
+ * Into a second buffer rather than in place: split_argv() leaves argv[]
+ * pointing into the caller's scratch, and an expansion is usually longer than
+ * what it replaces -- $HOME is five characters and /home/esp is nine. Writing
+ * back would run one token into the next.
+ *
+ * Not re-split afterwards, deliberately. Re-splitting is where shells get their
+ * sharp edges, and espix has no quoting machinery to defend it: a value with a
+ * space in it stays one argument, which is the behaviour people actually want
+ * and the one they cannot get from sh without quotes.
+ *
+ * Returns false if the result would not fit, so the caller can refuse the line
+ * rather than run a truncated one.
+ */
+static bool expand_token(const espix_session_t *s, const char *in,
+                         char *out, size_t out_len)
+{
+    size_t o = 0;
+
+    for (const char *p = in; *p != '\0'; p++) {
+        /* \$ is a literal dollar; every other backslash is left alone, since
+         * espix has no escape processing elsewhere and inventing some here
+         * would surprise anyone typing a Windows path. */
+        if (p[0] == '\\' && p[1] == '$') {
+            if (o + 1 >= out_len) { return false; }
+            out[o++] = '$';
+            p++;
+            continue;
+        }
+        if (p[0] != '$' || p[1] == '\0') {
+            if (o + 1 >= out_len) { return false; }
+            out[o++] = *p;
+            continue;
+        }
+
+        /* $? -- the status of the last command, which the session has always
+         * tracked and never been able to say. */
+        if (p[1] == '?') {
+            char num[12];
+            const int n = snprintf(num, sizeof(num), "%d",
+                                   (s != NULL) ? s->last_status : 0);
+            if (n < 0 || o + (size_t)n >= out_len) { return false; }
+            memcpy(out + o, num, (size_t)n);
+            o += (size_t)n;
+            p++;
+            continue;
+        }
+
+        char        name[ESPIX_ENV_NAME_MAX + 1];
+        size_t      nl    = 0;
+        const bool  brace = (p[1] == '{');
+        const char *q     = p + (brace ? 2 : 1);
+
+        while (*q != '\0' && nl < sizeof(name) - 1 &&
+               ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+                (*q >= '0' && *q <= '9') || *q == '_')) {
+            name[nl++] = *q++;
+        }
+        name[nl] = '\0';
+
+        if (nl == 0 || (brace && *q != '}')) {
+            /* Not a reference: `$` alone, `${}`, `${bad`. Left as typed, which
+             * is what sh does and what makes `echo $` harmless. */
+            if (o + 1 >= out_len) { return false; }
+            out[o++] = *p;
+            continue;
+        }
+
+        const char *val = espix_env_get(s, name);
+        if (val != NULL) {
+            const size_t vl = strlen(val);
+            if (o + vl >= out_len) { return false; }
+            memcpy(out + o, val, vl);
+            o += vl;
+        }
+        /* Unset expands to nothing, as sh does. */
+
+        p = brace ? q : q - 1;
+    }
+
+    out[o] = '\0';
+    return true;
+}
+
+/*
+ * Consume leading NAME=value words as assignments for this command only.
+ *
+ * The standard rule, and the one that makes `FOO=bar cmd` decidable: words at
+ * the front that look like assignments are assignments, and the first word that
+ * does not is the command. `espix_env_name_ok()` is what "looks like" means, so
+ * `./a=b` and `x-y=1` are commands, not assignments.
+ *
+ * Returns how many were taken, or -1 if one could not be applied -- reported by
+ * the caller, because a refused assignment must not run the command as though
+ * it had worked.
+ */
+static int take_assignments(espix_session_t *s, int argc, char **argv,
+                            espix_env_scope_t *scope)
+{
+    int taken = 0;
+
+    while (taken < argc) {
+        char *eq = strchr(argv[taken], '=');
+        if (eq == NULL || eq == argv[taken]) {
+            break;
+        }
+        *eq = '\0';
+        if (!espix_env_name_ok(argv[taken])) {
+            *eq = '=';
+            break;
+        }
+
+        const esp_err_t err = espix_env_scope_set(s, scope, argv[taken], eq + 1);
+        *eq = '=';
+        if (err != ESP_OK) {
+            espix_eprintf(s, "espix: %s\n",
+                          (err == ESP_ERR_INVALID_SIZE)
+                              ? "value too long"
+                              : "too many variables");
+            return -1;
+        }
+        taken++;
+    }
+    return taken;
+}
+
 int espix_shell_exec(espix_session_t *s, const char *line)
 {
     if (line == NULL) {
@@ -268,18 +396,71 @@ int espix_shell_exec(espix_session_t *s, const char *line)
         return ESPIX_SHELL_EMPTY;
     }
 
+    /*
+     * Expanded before take_redirects() and before assignments are read, because
+     * both consume argv entries: expanding afterwards would leave `> $HOME/log`
+     * writing to a file literally called `$HOME/log`.
+     */
+    char expanded[ESPIX_LINE_MAX];
+    size_t used = 0;
+    for (int i = 0; i < argc; i++) {
+        char *dst = expanded + used;
+        if (used >= sizeof(expanded) ||
+            !expand_token(s, argv[i], dst, sizeof(expanded) - used)) {
+            espix_eprintf(s, "espix: line too long after expansion\n");
+            return 1;
+        }
+        argv[i] = dst;
+        used += strlen(dst) + 1;
+    }
+
+    espix_env_scope_t scope;
+    espix_env_scope_init(&scope);
+
+    const int assigned = take_assignments(s, argc, argv, &scope);
+    if (assigned < 0) {
+        espix_env_scope_end(s, &scope);
+        return 1;
+    }
+    argc -= assigned;
+    if (argc == 0) {
+        /*
+         * `FOO=bar` with no command. sh keeps it as a shell variable rather
+         * than discarding it, so the scope must not undo this one: re-set it
+         * unexported, which is what a bare assignment means.
+         */
+        for (int i = 0; i < assigned; i++) {
+            char *eq = strchr(argv[i], '=');
+            if (eq != NULL) {
+                *eq = '\0';
+                const esp_err_t err = espix_env_scope_keep(s, &scope, argv[i]);
+                if (err != ESP_OK) {
+                    espix_eprintf(s, "espix: %s: cannot set\n", argv[i]);
+                }
+                *eq = '=';
+            }
+        }
+        espix_env_scope_end(s, &scope);
+        return 0;
+    }
+    /* A pointer past the assignments, not `argv += assigned`: argv is an array
+     * here and cannot be reseated. */
+    char **av = argv + assigned;
+
     redirects_t redir;
-    argc = take_redirects(s, argc, argv, &redir);
+    argc = take_redirects(s, argc, av, &redir);
     if (argc < 1) {
         redirects_release(s, &redir);
+        espix_env_scope_end(s, &scope);
         return (argc < 0) ? 1 : ESPIX_SHELL_EMPTY;
     }
-    argv[argc] = NULL;
+    av[argc] = NULL;
 
-    const espix_cmd_t *cmd = espix_shell_find(argv[0]);
+    const espix_cmd_t *cmd = espix_shell_find(av[0]);
 
     if (cmd == NULL && s_exec_fallback == NULL) {
         redirects_release(s, &redir);
+        espix_env_scope_end(s, &scope);
         return ESPIX_SHELL_ENOENT;
     }
 
@@ -287,8 +468,8 @@ int espix_shell_exec(espix_session_t *s, const char *line)
 
     /* Not a builtin: let it be resolved as a program, the way a shell falls
      * through to PATH. */
-    const int status = (cmd != NULL) ? cmd->fn(s, argc, argv)
-                                     : s_exec_fallback(s, argc, argv);
+    const int status = (cmd != NULL) ? cmd->fn(s, argc, av)
+                                     : s_exec_fallback(s, argc, av);
 
     /*
      * Reported here, inside the redirection, rather than by the caller.
@@ -300,10 +481,14 @@ int espix_shell_exec(espix_session_t *s, const char *line)
      * means both callers get the message: the REPL and SSH's exec channel.
      */
     if (status == ESPIX_SHELL_ENOENT) {
-        espix_eprintf(s, "espix: %s: command not found\n", argv[0]);
+        espix_eprintf(s, "espix: %s: command not found\n", av[0]);
     }
 
     redirects_release(s, &redir);
+
+    /* After the command, so `FOO=bar cmd` leaves the session as it found it --
+     * including a spawned app, which copied what it needed at spawn. */
+    espix_env_scope_end(s, &scope);
     return status;
 }
 

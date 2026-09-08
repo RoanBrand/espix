@@ -36,6 +36,7 @@ void espix_cmds_register_table(espix_cmd_t *table, size_t count)
 
 void espix_cmds_register_all(void)
 {
+    espix_cmds_register_env();
     espix_cmds_register_fs();
     espix_cmds_register_sys();
     espix_cmds_register_run();

@@ -16,6 +16,9 @@ extern "C" {
 
 #define ESPIX_PROC_MAX CONFIG_ESPIX_PROC_MAX
 
+/* Room for an app to add variables of its own beyond what it inherited. */
+#define ESPIX_PROC_ENV_ADDED_MAX 8
+
 typedef struct {
     espix_proc_info_t info;
 
@@ -28,6 +31,22 @@ typedef struct {
     void  *argv_block;
     int    argc;
     char **argv;
+
+    /* The environment this process inherited, same packing as argv_block: the
+     * char* array then the strings, one free() for the lot. Built at spawn
+     * from the system environment and the session's exports (copy_env), so
+     * nothing is shared with the session it came from. NULL when empty. */
+    void  *env_block;
+    char **envp;
+
+    /*
+     * Variables the app added with setenv() after it started, kept apart from
+     * the inherited block rather than merged into it: that block is one
+     * allocation with interior pointers, so growing it would invalidate every
+     * char* the app is already holding onto from a previous getenv().
+     */
+    char  *env_added[ESPIX_PROC_ENV_ADDED_MAX];
+    int    env_added_count;
 
     /*
      * Set when someone has asked this process to stop. Volatile because the
@@ -229,6 +248,25 @@ void espix_proc_abi_libc_register(void);
  * to become delivery points. See abi_signal.c: this one installs a symbol
  * resolver rather than only adding a table, because the loader's own libc table
  * is searched first and already answers for sleep() and usleep(). */
+/*
+ * A name an app sees, and the espix function behind it. Used by the one symbol
+ * resolver (abi_resolver.c) to shadow libc where espix has to: an app's sleep()
+ * must be one a signal can cut short, and its getenv() must read the process's
+ * own environment rather than the machine's.
+ */
+typedef struct {
+    const char *name;
+    uintptr_t   addr;
+} abi_sym_t;
+
+#define ABI_SYM(posix_name, fn) { (posix_name), (uintptr_t)(void *)(fn) }
+
+/* Publish a table of overrides. Registration order decides a clash, and a
+ * clash is reported. */
+void espix_abi_resolver_add(const abi_sym_t *syms, size_t count);
+void espix_proc_abi_resolver_register(void);
+void espix_proc_abi_env_register(void);
+
 void espix_proc_abi_signal_register(void);
 
 /* The slot for `pid`, or NULL. Caller must hold the lock. */

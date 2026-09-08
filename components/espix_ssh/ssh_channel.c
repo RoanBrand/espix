@@ -1549,6 +1549,9 @@ static void apply_account(espix_session_t *session, const char *user)
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no home at %s; starting at /",
                    user, account.home);
     }
+
+    /* Last, because USER, HOME and TERM are read from what was just settled. */
+    espix_env_set_login_defaults(session);
 }
 
 /*
@@ -1566,6 +1569,10 @@ static void apply_account(espix_session_t *session, const char *user)
 static void finish_session(ssh_chan_t *ch, espix_session_t *session)
 {
     const size_t orphans = espix_proc_hangup(session);
+
+    /* Before the processes are gone rather than after would be wrong: each
+     * copied what it needed at spawn, so this frees the session's table only. */
+    espix_env_free(session);
 
     if (orphans > 0) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",

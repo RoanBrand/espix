@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "cmds.c"
+        "cmd_env.c"
         "cmd_fs.c"
         "cmd_sys.c"
         "cmd_run.c"

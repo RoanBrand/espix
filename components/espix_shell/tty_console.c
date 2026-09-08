@@ -1001,10 +1001,16 @@ esp_err_t espix_console_session_start(void)
         s_console.want_exit   = false;
         s_console.last_status = 0;
         strlcpy(s_console.cwd, "/", sizeof(s_console.cwd));
+        strlcpy(s_console.home, "/", sizeof(s_console.home));
+        espix_env_set_login_defaults(&s_console);
         console_input_reset();
 
         espix_shell_exec(&s_console, "motd");
         espix_shell_session_run(&s_console);
+
+        /* The console logs out and logs straight back in, so its variables end
+         * with the session that set them, exactly as an SSH login's do. */
+        espix_env_free(&s_console);
 
         espix_klog(ESPIX_KLOG_DEBUG, TAG, "console session ended; starting another");
     }

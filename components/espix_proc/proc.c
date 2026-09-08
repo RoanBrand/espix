@@ -74,10 +74,14 @@ esp_err_t espix_proc_init(void)
 
     /* Publish the C++ runtime before any app can be loaded. See abi_cxx.cpp:
      * espix itself is C, but a C++ app cannot resolve operator new without it. */
+    /* The resolver first: every table below registers into it. */
+    espix_proc_abi_resolver_register();
+
     espix_proc_abi_cxx_register();
     espix_proc_abi_drivers_register();
     espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
+    espix_proc_abi_env_register();
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
 
@@ -162,6 +166,16 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->argv_block = NULL;
     slot->argv = NULL;
     slot->argc = 0;
+
+    free(slot->env_block);
+    slot->env_block = NULL;
+    slot->envp = NULL;
+
+    for (int i = 0; i < slot->env_added_count; i++) {
+        free(slot->env_added[i]);
+        slot->env_added[i] = NULL;
+    }
+    slot->env_added_count = 0;
 
     free(slot->sig_handlers);
     slot->sig_handlers = NULL;

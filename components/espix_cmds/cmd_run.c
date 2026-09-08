@@ -296,8 +296,12 @@ static int cmd_confine(espix_session_t *s, int argc, char **argv)
  * falls through to PATH.
  *
  * A name containing a slash is a path, relative to the session's cwd; anything
- * else is looked for in /bin. PATH is that one fixed directory for now, since
- * espix has no environment to put a real one in.
+ * else is looked for in each directory of PATH in turn, defaulting to /bin when
+ * the session has not set one -- which is where this looked unconditionally
+ * before there was an environment to hold the alternative.
+ *
+ * An empty PATH means "nowhere", as sh does, rather than silently meaning /bin:
+ * `PATH= hello` should fail, and a user who has emptied it has said something.
  *
  * The two gates it then applies are program_gate() above, shared with
  * `confine` so that naming a file explicitly cannot get past what a bare name
@@ -311,8 +315,46 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
         if (!espix_cmd_path(s, argv[0], abs, sizeof(abs))) {
             return 1;
         }
-    } else if ((size_t)snprintf(abs, sizeof(abs), "/bin/%s", argv[0]) >= sizeof(abs)) {
-        return ESPIX_SHELL_ENOENT;
+    } else {
+        const char *path = espix_env_get(s, "PATH");
+        if (path == NULL) {
+            path = "/bin";
+        }
+
+        /*
+         * First hit wins, and "hit" means the file exists -- not that it is
+         * runnable. A directory earlier in PATH holding an unreadable `hello`
+         * shadows a later one, which is what every shell does and what makes
+         * the resulting "Permission denied" the truth rather than a puzzle.
+         */
+        bool found = false;
+        for (const char *p = path; *p != '\0' && !found; ) {
+            const char  *sep = strchr(p, ':');
+            const size_t len = (sep != NULL) ? (size_t)(sep - p) : strlen(p);
+
+            if (len > 0) {
+                char dir[ESPIX_PATH_MAX];
+                if (len < sizeof(dir)) {
+                    memcpy(dir, p, len);
+                    dir[len] = '\0';
+
+                    if ((size_t)snprintf(abs, sizeof(abs), "%s/%s", dir,
+                                         argv[0]) < sizeof(abs)) {
+                        struct stat st;
+                        if (stat(abs, &st) == 0) {
+                            found = true;
+                        }
+                    }
+                }
+            }
+            p = (sep != NULL) ? sep + 1 : p + len;
+        }
+
+        if (!found) {
+            /* Nothing in PATH. Report against the first entry so the message
+             * names a real path rather than the bare word. */
+            return ESPIX_SHELL_ENOENT;
+        }
     }
 
     /* Shown as the user typed it, not as resolved: `hello: Permission denied`

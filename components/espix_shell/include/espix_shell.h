@@ -33,6 +33,21 @@
 extern "C" {
 #endif
 
+/*
+ * Session variables. A cap rather than an unbounded table, in the style of
+ * ESPIX_NGROUPS_MAX: a shell on a device with 145K of internal RAM should
+ * refuse the twenty-fifth variable and say so, not discover the limit as an
+ * allocation failure somewhere else.
+ */
+#define ESPIX_ENV_MAX        24
+#define ESPIX_ENV_NAME_MAX   32
+#define ESPIX_ENV_VALUE_MAX  192
+
+/* Assignments in front of one command: `A=1 B=2 cmd`. */
+#define ESPIX_ENV_SCOPE_MAX  8
+
+typedef struct espix_env espix_env_t;
+
 #define ESPIX_LINE_MAX 256
 #define ESPIX_ARGS_MAX 16
 #define ESPIX_SESSION_USER_MAX 17   /* 16 + NUL; matches espix_auth's limit */
@@ -57,6 +72,13 @@ typedef enum {
 struct espix_session {
     const char *name;                      /* "console", "ssh0", ... */
     char        cwd[ESPIX_PATH_MAX];
+
+    /*
+     * This login's variables, allocated on first use and owned outright -- no
+     * two sessions ever share one. NULL until something is set, so a session
+     * that never touches a variable costs nothing. See env.c.
+     */
+    espix_env_t *env;
 
     /*
      * Who this session belongs to. Always set: an SSH session carries the
@@ -270,6 +292,74 @@ const espix_cmd_t *espix_shell_find(const char *name);
 /* Delay if `last_us` is too recent, then stamp it. Shared so both transports
  * pace identically. */
 void espix_pace(int64_t *last_us);
+
+/* ------------------------------------------------------------------ */
+/* Session variables and the environment. See env.c for the three tiers. */
+
+/*
+ * The session's value for `name`, or the system environment's if the session
+ * has none, or NULL. Never the caller's to free.
+ */
+const char *espix_env_get(const espix_session_t *s, const char *name);
+
+/*
+ * Set or replace. `exported` is sticky: exporting an existing variable exports
+ * it, and assigning to an already-exported one leaves it exported, as sh does.
+ *
+ * ESP_ERR_INVALID_ARG for a name that is not a POSIX identifier,
+ * ESP_ERR_INVALID_SIZE for an over-long value, ESP_ERR_NO_MEM when the table is
+ * full -- all of which the caller is expected to report rather than swallow.
+ */
+esp_err_t espix_env_set(espix_session_t *s, const char *name,
+                        const char *value, bool exported);
+
+/* True if it was there. Removes it from the session only; the system
+ * environment is not the session's to change. */
+bool espix_env_unset(espix_session_t *s, const char *name);
+
+/* Walk the session's own variables -- `slot` runs 0..ESPIX_ENV_MAX-1 and false
+ * means "nothing here", not "end". Used by `env` and `export` to list, and by
+ * the spawn path to collect what is exported. */
+bool espix_env_at(const espix_session_t *s, size_t slot, const char **name,
+                  const char **value, bool *exported);
+
+size_t espix_env_count(const espix_session_t *s);
+
+/* Release the table. Called when a session ends. */
+void espix_env_free(espix_session_t *s);
+
+/* USER, HOME, PATH and TERM for a fresh login. Call once the session's user,
+ * cwd and `ansi` are settled -- they are what these are derived from. */
+void espix_env_set_login_defaults(espix_session_t *s);
+
+/* Is this a name the shell will accept? POSIX's rule, and what makes
+ * `FOO=bar cmd` decidable from `cmd` at all. */
+bool espix_env_name_ok(const char *name);
+
+/*
+ * Assignments that last for one command. The scope holds whatever was shadowed
+ * and puts it back, so `FOO=bar cmd` leaves the session exactly as it found it.
+ * Stack-allocated by the caller; init, set, run the command, end.
+ */
+typedef struct {
+    struct {
+        char *name;
+        char *value;
+        bool  exported;
+        bool  existed;
+    } saved[ESPIX_ENV_SCOPE_MAX];
+    int n;
+} espix_env_scope_t;
+
+void      espix_env_scope_init(espix_env_scope_t *scope);
+/* Keep one assignment rather than undoing it -- `FOO=bar` with no command. */
+esp_err_t espix_env_scope_keep(espix_session_t *s, espix_env_scope_t *scope,
+                               const char *name);
+esp_err_t espix_env_scope_set(espix_session_t *s, espix_env_scope_t *scope,
+                              const char *name, const char *value);
+void      espix_env_scope_end(espix_session_t *s, espix_env_scope_t *scope);
+
+/* ------------------------------------------------------------------ */
 
 #define ESPIX_HISTORY_MAX 16
 

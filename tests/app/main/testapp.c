@@ -446,6 +446,52 @@ static int cmd_sink(void)
     return 0;
 }
 
+/*
+ * The environment, from the app's side of the ABI.
+ *
+ * `env get NAME` is the assertion that matters: it must reach espix's getenv
+ * and not newlib's. A variable exported by the session is in the process's own
+ * copy and *not* in the firmware's global `environ`, so a value coming back
+ * here proves which implementation answered -- newlib's would print nothing.
+ *
+ * `env set NAME=value` then `env get NAME` proves the app can change its own
+ * copy, and the shell checking afterwards proves the change did not leak back.
+ */
+static int cmd_env(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[0], "get") == 0) {
+        const char *v = getenv(argv[1]);
+        printf("env %s=%s\n", argv[1], (v != NULL) ? v : "(unset)");
+        return (v != NULL) ? 0 : 1;
+    }
+
+    if (argc > 1 && strcmp(argv[0], "set") == 0) {
+        char *eq = strchr(argv[1], '=');
+        if (eq == NULL) {
+            printf("env: set wants NAME=value\n");
+            return 2;
+        }
+        *eq = '\0';
+        if (setenv(argv[1], eq + 1, 1) != 0) {
+            printf("env: setenv failed\n");
+            return 1;
+        }
+        const char *v = getenv(argv[1]);
+        printf("env %s=%s\n", argv[1], (v != NULL) ? v : "(unset)");
+        return 0;
+    }
+
+    if (argc > 1 && strcmp(argv[0], "unset") == 0) {
+        (void)unsetenv(argv[1]);
+        const char *v = getenv(argv[1]);
+        printf("env %s=%s\n", argv[1], (v != NULL) ? v : "(unset)");
+        return (v == NULL) ? 0 : 1;
+    }
+
+    printf("env: want get|set|unset\n");
+    return 2;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -462,7 +508,10 @@ static void usage(void)
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
            "  sig [mode]          handlers (default) | ignore | spin\n"
-           "  sleep <secs>        sleep, for signal and job-control tests\n");
+           "  sleep <secs>        sleep, for signal and job-control tests\n"
+           "  env get <NAME>      print a variable as the app sees it\n"
+           "  env set <N=V>       setenv in this process, then read it back\n"
+           "  env unset <NAME>    unsetenv, then read it back\n");
 }
 
 int main(int argc, char **argv)
@@ -516,6 +565,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "out") == 0 && argc > 2) {
         return cmd_out(argv[2], (argc > 3) ? argv[3] : NULL);
+    }
+    if (strcmp(cmd, "env") == 0 && argc > 2) {
+        return cmd_env(argc - 2, argv + 2);
     }
     if (strcmp(cmd, "sleep") == 0 && argc > 2) {
         sleep((unsigned)strtol(argv[2], NULL, 10));

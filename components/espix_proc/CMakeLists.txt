@@ -4,6 +4,8 @@ idf_component_register(
         "exec.c"
         "abi_cxx.cpp"
         "abi_drivers.c"
+        "abi_env.c"
+        "abi_resolver.c"
         "abi_fs.c"
         "abi_libc.c"
         "abi_signal.c"

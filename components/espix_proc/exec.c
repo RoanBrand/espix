@@ -121,6 +121,113 @@ static esp_err_t copy_argv(int argc, char **argv, espix_proc_slot_t *slot)
 }
 
 /*
+ * Pack the environment a process inherits into a single allocation, the same
+ * shape as copy_argv() above and freed on the same path.
+ *
+ * Flat, and merged here rather than looked up later. The system environment
+ * (newlib's `environ` -- TZ and whatever else is machine-wide) goes in first,
+ * then the session's exported variables over the top of it. A name in both
+ * appears once, with the session's value: that is what "the session wins" means
+ * concretely, and doing it at spawn is what lets `unset` actually remove a
+ * system variable from the child's view. A lookup that fell back to the global
+ * could override but never remove.
+ *
+ * The result is a NUL-terminated char** of "NAME=value", which is the POSIX
+ * layout -- so espix_abi_getenv() is a strncmp loop over it, and it is the
+ * thing this would hand an app as `environ` if that is ever wanted.
+ */
+static bool env_name_is(const char *entry, const char *name)
+{
+    const size_t n = strlen(name);
+    return strncmp(entry, name, n) == 0 && entry[n] == '=';
+}
+
+static esp_err_t copy_env(espix_session_t *session, espix_proc_slot_t *slot)
+{
+    extern char **environ;
+
+    /* Two passes: size it, then fill it. The alternative is a realloc loop for
+     * a table that is a dozen entries at most. */
+    size_t count = 0;
+    size_t bytes = 0;
+
+    for (char **e = environ; e != NULL && *e != NULL; e++) {
+        bool shadowed = false;
+        for (size_t i = 0; i < ESPIX_ENV_MAX; i++) {
+            const char *n = NULL;
+            bool        ex = false;
+            if (espix_env_at(session, i, &n, NULL, &ex) && ex &&
+                env_name_is(*e, n)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (!shadowed) {
+            count++;
+            bytes += strlen(*e) + 1;
+        }
+    }
+
+    for (size_t i = 0; i < ESPIX_ENV_MAX; i++) {
+        const char *n = NULL, *v = NULL;
+        bool        ex = false;
+        if (espix_env_at(session, i, &n, &v, &ex) && ex) {
+            count++;
+            bytes += strlen(n) + 1 + strlen(v) + 1;
+        }
+    }
+
+    if (count == 0) {
+        slot->env_block = NULL;
+        slot->envp      = NULL;
+        return ESP_OK;
+    }
+
+    char **vec = malloc(sizeof(char *) * (count + 1) + bytes);
+    if (vec == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char  *strings = (char *)(vec + count + 1);
+    size_t at      = 0;
+
+    for (char **e = environ; e != NULL && *e != NULL; e++) {
+        bool shadowed = false;
+        for (size_t i = 0; i < ESPIX_ENV_MAX; i++) {
+            const char *n = NULL;
+            bool        ex = false;
+            if (espix_env_at(session, i, &n, NULL, &ex) && ex &&
+                env_name_is(*e, n)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (shadowed) {
+            continue;
+        }
+        const size_t len = strlen(*e) + 1;
+        memcpy(strings, *e, len);
+        vec[at++] = strings;
+        strings += len;
+    }
+
+    for (size_t i = 0; i < ESPIX_ENV_MAX; i++) {
+        const char *n = NULL, *v = NULL;
+        bool        ex = false;
+        if (espix_env_at(session, i, &n, &v, &ex) && ex) {
+            const int len = sprintf(strings, "%s=%s", n, v);
+            vec[at++] = strings;
+            strings += len + 1;
+        }
+    }
+    vec[at] = NULL;
+
+    slot->env_block = vec;
+    slot->envp      = vec;
+    return ESP_OK;
+}
+
+/*
  * TEMPORARY: recover the unresolved symbol's name from the kernel log.
  *
  * esp_elf_relocate() knows exactly which name it could not find -- it logs
@@ -493,6 +600,17 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
         return err;
     }
 
+    /* Copied here, under the table lock and before the task exists, for the
+     * same reason the credentials are: the session lives on the caller's stack
+     * and a backgrounded process outlives the command that started it. */
+    err = copy_env(session, slot);
+    if (err != ESP_OK) {
+        free(slot->argv_block);
+        memset(slot, 0, sizeof(*slot));
+        xSemaphoreGive(g_espix_proc_lock);
+        return err;
+    }
+
     const char *base = strrchr(abs_path, '/');
     base = (base != NULL) ? base + 1 : abs_path;
 
@@ -603,6 +721,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
                                       CONFIG_ESPIX_PROC_PRIORITY, &task);
     if (ok != pdPASS) {
         free(slot->argv_block);
+        free(slot->env_block);
         memset(slot, 0, sizeof(*slot));
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_NO_MEM;
