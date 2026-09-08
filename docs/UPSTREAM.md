@@ -9,6 +9,10 @@ for.
 
 Verified against ESP-IDF v6.1 and xtensa-esp-elf GCC 15.2 unless noted.
 
+For behaviour that is documented and merely surprising, rather than broken --
+the platform differing from what a POSIX or FreeRTOS habit expects -- see
+[GOTCHAS.md](GOTCHAS.md).
+
 Re-checked against the v6.1 release: the beta1-to-v6.1 changelog adds no VFS
 `chmod` hook, no `chmod()` fix, no LittleFS changes at all, no `adjtime()` fix,
 and nothing touching the signal vocabulary or FreeRTOS-Plus-POSIX -- so every
@@ -59,6 +63,57 @@ it.
 suppressed and the DNS option is documented as unavoidable. Worth re-testing if
 the DHCP server ever gains a real "offer nothing" value; `components/espix_net/usb_ncm.c`
 says so at the point where the suppression would go.
+
+### `esp_core_dump_image_check()` drives the SHA peripheral with no lock
+
+`espcoredump` checksums with the **ROM** SHA on every target but the original
+ESP32 (`components/espcoredump/src/core_dump_sha.c`):
+
+```c
+static void core_dump_sha256_start(core_dump_sha_ctx_t *sha_ctx)
+{
+    ets_sha_enable();                 /* resets the peripheral */
+    ets_sha_init(&sha_ctx->ctx, SHA2_256);
+}
+...
+static void core_dump_sha256_finish(core_dump_sha_ctx_t *sha_ctx)
+{
+    ets_sha_finish(&sha_ctx->ctx, sha_ctx->result);
+    ets_sha_disable();                /* turns it off */
+}
+```
+
+Those ROM calls take no lock. That is correct for the panic path they were
+written for, where nothing else is running -- but `esp_core_dump_image_check()`,
+`esp_core_dump_image_get()` and `esp_core_dump_get_summary()` are public APIs
+called from ordinary tasks, and they go through the same checksum.
+
+So a runtime call lands in the middle of another task's SHA. `ets_sha_enable()`
+resets the peripheral and `ets_sha_disable()` turns it off under the other
+operation, which then reads its digest state back as all zeroes -- and IDF's own
+fault-injection guard in `sha_hal_read_digest()`
+(`components/esp_hal_security/sha_hal.c:128`) calls `abort()` on precisely that.
+The device panics and reboots.
+
+Reproduced on an ESP32-S3 running four test suites at once: a health monitor
+asking `coredump` every ten seconds beside SSH logins, each of which is PBKDF2
+at 20 000 iterations of HMAC-SHA256. The core dump named it in one step -- one
+`sshd:conn` task in `sha_hal_read_digest()` under
+`psa_key_derivation_output_bytes()`, another `sshd:conn` sitting in
+`esp_core_dump_image_check()`.
+
+**Workaround.** espix takes `esp_crypto_sha_aes_lock_acquire()` -- the same lock
+`esp_sha_acquire_hardware()` uses -- around every espcoredump call that verifies
+an image; see `components/espix_fault/coredump.c`. Nothing inside those calls
+takes it again, the ROM SHA being lockless, so there is no re-entry to deadlock
+on.
+
+**The fix upstream** would be for espcoredump to take that lock itself when it
+is not on the panic path, or to use the mbedtls port at runtime and keep the ROM
+path for the crash handler. Note that any application calling
+`esp_core_dump_image_check()` from a task is exposed, not just this one: it needs
+no unusual configuration and no unusual hardware, only a second task using SHA
+at the wrong moment. TLS does, and so does anything hashing a password.
 
 ### The VFS has no `chmod`
 
@@ -145,6 +200,36 @@ source to draw on.
 
 ## `espressif/esp_linenoise`
 
+### ENTER decrements the history length without checking it
+
+`esp_linenoise_edit()` handles a newline like this:
+
+```c
+case ENTER:
+    state->history_length--;
+    free(config->history[state->history_length]);
+```
+
+and `CTRL_D` on an empty line does the same. Neither checks that
+`history_length` is above zero first. At zero the decrement underflows and the
+`free()` reads one pointer *before* the array — whatever the heap happens to
+have put there.
+
+Reaching zero is not obviously impossible from outside the component.
+`esp_linenoise_edit_start()` adds a `""` placeholder for the line being typed,
+but `esp_linenoise_history_add()` refuses a line identical to the last entry —
+so an application that rebuilds the editor's history itself and leaves `""` at
+the end (which is what espix's `espix_history_apply()` does when the user's list
+is empty) gets no placeholder added, and ENTER then takes the length from one to
+zero. One more read down that path and the decrement is an underflow.
+
+**Workaround.** None carried: espix has not been able to construct the second
+read, and the one crash that looked like this turned out to be espix's own
+double free feeding the editor a stale pointer (see
+[KNOWN-ISSUES](KNOWN-ISSUES.md)). Recorded because a missing `> 0` on a
+decrement that indexes a `free()` is worth a line upstream regardless of who
+can currently reach it.
+
 ### Dumb mode corrupts input, two ways
 
 The terminal probe runs as the console starts — before anyone has attached a
@@ -180,6 +265,44 @@ one, which is the single operation that leaves the editor's idea of the screen
 correct. See the console section of [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## `espressif/elf_loader`
+
+### `esp_elf_arch_flush()` writes back the cache outside the lock it then takes
+
+`esp_elf_adapter.c:129` does, for every target but the S31:
+
+```c
+extern void Cache_WriteBack_All(void);
+Cache_WriteBack_All();
+spi_flash_disable_interrupts_caches_and_other_cpu();
+spi_flash_enable_interrupts_caches_and_other_cpu();
+```
+
+The second and third lines exist only to force an instruction-cache invalidate
+by toggling the flash lock — so the author plainly knew the lock was there. The
+write-back on the first line is outside it. Another task starting a flash
+operation at that moment disables the cache underneath it, and the write-back
+faults with `exccause 0x47 (CacheError)` inside `Cache_WriteBack_Items`.
+
+Reached on espix by loading an app while other tasks were busy: faulting task
+`app:testapp`, `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
+`esp_elf_relocate`. It needs `CONFIG_ELF_LOADER_LOAD_PSRAM`, which is the
+default, and it needs something else touching flash — a filesystem read is
+enough, and on espix every app load *is* a filesystem read, so the window is
+open on every launch.
+
+Ordering it correctly is awkward rather than obvious: the write-back needs the
+cache **on**, and the only public call that excludes concurrent flash
+operations turns the cache **off**. The clean answer is probably
+`esp_cache_msync()` over the relocated image's own address range, which is what
+the S31 branch above stopped doing for a different reason.
+
+**Workaround.** None carried yet; the alternatives all cost something. Turning
+off `CONFIG_ELF_LOADER_LOAD_PSRAM` removes the call entirely but moves every
+loaded app's image into internal RAM, which on a board already carrying eight
+SSH sessions is not free. Recorded in [KNOWN-ISSUES](KNOWN-ISSUES.md) with the
+options.
+
+
 
 Not a defect, but a constraint worth knowing: `elf_find_sym_default()` searches
 the loader's own libc table **first**, and that table already answers for

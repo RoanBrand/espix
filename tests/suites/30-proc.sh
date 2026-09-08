@@ -1,12 +1,17 @@
 # Processes and the app ABI, through the test app.
 #
-# PARALLEL_SAFE=no -- writes files under /tmp and pushes a binary.
+# RESOURCES: none -- its /tmp paths carry the worker number, and the test app
+# is staged once by the runner rather than by each suite that wants it.
 
-if ! dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
     return 0
 fi
 espix_pass "test app is present and current"
+
+# Everything this suite makes on the device carries the worker number, so a
+# second copy of it running beside this one is invisible to it.
+APPTXT=/tmp/espix-app-$ESPIX_WORKER.txt
 
 APP="/home/$ESPIX_USER/testapp"
 
@@ -21,11 +26,11 @@ assert_status "an app's exit status reaches the client" 7 dev_status "$APP exit 
 assert_status "and zero is zero"                        0 dev_status "$APP exit 0"
 
 # The file ABI: an app reaching the filesystem through libc, checked by espix.
-dev_run "rm /tmp/espix-app.txt" >/dev/null 2>&1
+dev_run "rm $APPTXT" >/dev/null 2>&1
 assert_contains "an app can create a file" "ok" \
-    "$(dev_run "$APP write /tmp/espix-app.txt hello-from-app")"
+    "$(dev_run "$APP write $APPTXT hello-from-app")"
 assert_contains "and read it back" "[hello-from-app]" \
-    "$(dev_run "$APP read /tmp/espix-app.txt")"
+    "$(dev_run "$APP read $APPTXT")"
 
 # Permissions apply to apps exactly as to builtins -- checking in the shell
 # alone would be a boundary you step around by running a program.
@@ -37,7 +42,7 @@ assert_contains "an app can read a world-readable file" "ok" \
 # ps sees the processes that ran.
 assert_contains "ps lists finished processes" "testapp" "$(dev_run 'ps')"
 
-dev_run "rm /tmp/espix-app.txt" >/dev/null 2>&1
+dev_run "rm $APPTXT" >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # Confinement: `confine <dir> <cmd>` -- the process may not name a path outside
@@ -50,7 +55,7 @@ dev_run "rm /tmp/espix-app.txt" >/dev/null 2>&1
 # against a root that did nothing.
 # ---------------------------------------------------------------------------
 
-JAIL=/tmp/espix-jail
+JAIL=/tmp/espix-jail-$ESPIX_WORKER
 dev_run "rm $JAIL/inside.txt" >/dev/null 2>&1
 dev_run "rm -r $JAIL"         >/dev/null 2>&1
 dev_run "mkdir $JAIL"         >/dev/null 2>&1
@@ -76,7 +81,7 @@ assert_contains "and the binary may live outside the root" "argc" \
 # is root-owned, so the confined chmod failed on permissions and would have
 # passed just as happily with the root bypassed. Hence the control below -- the
 # same call, the same file, differing only in the confinement.
-OUTSIDE=/tmp/espix-outside.txt
+OUTSIDE=/tmp/espix-outside-$ESPIX_WORKER.txt
 dev_run "rm $OUTSIDE" >/dev/null 2>&1
 dev_run "$APP write $OUTSIDE owned-by-the-app" >/dev/null 2>&1
 

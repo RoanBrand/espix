@@ -26,6 +26,21 @@
 # investigating exactly that symptom, and reading it as device flakiness cost a
 # whole session. `set -m` puts the child in its own process group so the
 # negative pid reaches everything it started.
+# It does not nest, and the failure is silent.
+#
+# `espix_timeout N outer`, where `outer` itself runs
+# `espix_timeout M cmd < file`, leaves the inner command reading nothing --
+# no error, no diagnostic, an empty answer. Four lines reproduce it:
+#
+#     g() { espix_timeout 10 cat < /tmp/f; }
+#     g                      # prints the file
+#     espix_timeout 10 g     # prints nothing
+#
+# It cost a run: 45-throughput reported `sink: 0 bytes` and a stdin rate of
+# zero, in a suite that had measured 215 KB/s minutes before, because the
+# runner had started wrapping suites in a deadline. Background the outer thing
+# yourself with `set -m` and poll for it -- that shape keeps stdin, and it is
+# what run.sh does now.
 espix_timeout() {
     local secs="$1"; shift
     local pid rc start
@@ -40,13 +55,19 @@ espix_timeout() {
     # only way back, because an explicit `0<&0` on an async command is applied
     # *after* the /dev/null substitution and so re-duplicates /dev/null.
     # Braces round the exec, and they are not decoration: `exec` with no
-    # command makes its redirections *permanent*, so `exec 7<&0 2>/dev/null`
+    # command makes its redirections *permanent*, so `exec 19<&0 2>/dev/null`
     # silences the shell's stderr for good -- which swallowed ssh's own
     # diagnostics and broke the one assertion that checks a client's `2>&1`.
-    # Grouping scopes the 2>/dev/null to the group while fd 7 still lands on
+    # Grouping scopes the 2>/dev/null to the group while fd 19 still lands on
     # the shell.
+    # Descriptor 19, not 7. device.sh already owns 6 and 7 for the console
+    # FIFOs and 8 and 9 for the session, so `exec 7<&0` here would quietly take
+    # the console's write end away from it the first time a console suite
+    # reached for a deadline. Nothing does that today, which is exactly the kind
+    # of thing that stays true until it does not. bash 3.2 has no {var}<&0 to
+    # allocate one, so the number is picked by hand and written down.
     local have_stdin=""
-    if { exec 7<&0; } 2>/dev/null; then
+    if { exec 19<&0; } 2>/dev/null; then
         have_stdin=yes
     fi
 
@@ -54,13 +75,13 @@ espix_timeout() {
     # background jobs in the same shell report themselves.
     set -m
     if [ -n "$have_stdin" ]; then
-        "$@" <&7 &
+        "$@" <&19 &
     else
         "$@" &
     fi
     pid=$!
     set +m
-    [ -n "$have_stdin" ] && { exec 7<&-; } 2>/dev/null
+    [ -n "$have_stdin" ] && { exec 19<&-; } 2>/dev/null
     start=$SECONDS
 
     while kill -0 "$pid" 2>/dev/null; do

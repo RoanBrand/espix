@@ -1,10 +1,14 @@
 # espix tests
 
 ```bash
-make test                            # everything
+make test                            # everything, four suites at a time
+make test J=8                        # more workers
+make test SERIAL=1                   # one at a time, printing as it goes
+make test SEED=48213                 # replay a particular random order
 make test SUITE=fs                   # suites whose name contains "fs"
 make test PORT=/dev/ttyUSB0          # include the serial-console suites
 ./tests/run.sh --host 10.0.0.5       # a device somewhere else
+./tests/run.sh --overlap-transfers   # let transfers run concurrently
 ```
 
 `make test` finds the ESP-IDF and the serial port for itself, builds the test
@@ -14,7 +18,8 @@ app if it is stale, and copies it over. Nothing needs to be sourced first.
 
 | | |
 |---|---|
-| `run.sh` | finds the suites, runs them, checks the device between each, reports |
+| `run.sh` | finds the suites, schedules them, watches the device, reports |
+| `lib/pool.sh` | the worker pool, the random order, and the live grid |
 | `lib/portable.sh` | the macOS/Linux differences, and the bash 3.2 floor |
 | `lib/assert.sh` | `assert_eq`, `assert_contains`, `assert_status`, and the counters |
 | `lib/device.sh` | connections, transfers, the test app, the health check |
@@ -31,14 +36,32 @@ already available and there is no boilerplate:
 ```sh
 # What this covers, and why.
 #
-# PARALLEL_SAFE=no -- says whether it can ever run beside another suite.
+# RESOURCES: none -- what it needs the device to itself for, if anything.
 
 assert_eq "pwd is the home" "/home/$ESPIX_USER" "$(dev_run 'pwd')"
 assert_contains "id reports a uid" "uid=" "$(dev_run 'id')"
 assert_status "a bad command exits 127" 127 dev_status 'nosuchthing'
 ```
 
-Number them so the order is obvious; cheap and read-only first.
+Number them so a listing reads in a sensible order — they no longer *run* in
+that order, see below. Even `--serial` runs the `exclusive` ones last rather
+than in numeric order, so that the measurements mean the same thing in both
+modes.
+
+`RESOURCES:` is read by the runner and decides how the suite is scheduled:
+
+| | |
+|---|---|
+| `none` | runs beside anything. The default when the line is missing. |
+| `console` | needs the one serial port |
+| `exclusive` | needs the whole device: measurements, and anything that saturates it |
+
+A `none` suite must not depend on the device being otherwise idle, and anything
+it creates on the device must carry `$ESPIX_WORKER` in its name — two workers
+share one filesystem, and a fixed name is a collision waiting for a fast enough
+machine. Note the shape of that carefully: `10-fs.sh` asserts against a listing
+of `/tmp`, where a *neighbour's* `espix-test-fs-2` is also sitting, so it matches
+the full name and not the stem.
 
 ### Which helper to reach for
 
@@ -88,7 +111,14 @@ in `lib/`, not left to memory.
   regression.
 - **No SSH multiplexing.** espix's server has exactly one channel per connection
   (`"our channel id; only ever one"`), so `ControlMaster` cannot help. The
-  long-lived session in `session.py` is the speed answer instead.
+  long-lived session in `session.py` is the speed answer, and running several of
+  them at once is the parallel answer — several *connections*, not several
+  channels on one.
+- **Never a bare `wait`, and never background a shell function.** `wait` with no
+  argument waits for `session.py` too, which never exits; that hung a run for
+  half an hour. And `func &` gives back a *subshell* pid, so signalling it
+  leaves the `ssh` underneath alive holding a session slot until the device
+  reboots. Background the binary, and `wait` a named pid.
 
 ## Speed, and parallelism
 
@@ -96,20 +126,92 @@ A login costs a key exchange plus PBKDF2 at 20 000 iterations, so the runner
 logs in **once per suite** and `dev_run` reuses it. `dev_status` is the
 exception and is deliberately rationed.
 
-Nothing runs in parallel yet, and that is a choice rather than an omission. The
-device is one target with four session slots and one serial port, and suites
-share filesystem state. This project's actual problem is *not trusting results*;
-a flaky suite is worse than a slow one. Each suite declares `PARALLEL_SAFE` so
-it can be switched on later against evidence.
+Four suites run at once by default. That is a speed change and a coverage
+change, and the second is the one that matters: unrelated suites running side by
+side put the device under a shape of load nothing else here produces — several
+sessions, several shells, transfers beside them. **A failure that only appears
+under the pool is a finding, not flakiness**, and the runner is built to tell
+the difference rather than to avoid the question.
+
+The device allows eight concurrent SSH sessions
+(`CONFIG_ESPIX_SSH_MAX_SESSIONS`), which is where four workers came from: one
+long-lived session each, and room for the one-shot connections a suite opens for
+an exit status or a transfer, with slack left over for a person watching `top`
+from another window. `55-sessions.sh` measures that limit on the device rather
+than trusting the config.
+
+### The order is random, and the seed comes back
+
+Suites are shuffled and handed to workers as they free up, so successive runs
+try different combinations rather than the same one for ever. Dynamic rather
+than a static split: suite durations here differ by an order of magnitude, and a
+static split leaves three workers idle while the fourth finishes the long one.
+
+The seed is printed at the top of every run and taken back by `--seed`, and that
+is not a nicety. A random order that cannot be replayed makes a concurrency
+finding worthless — it is the difference between "this failed once" and "this
+fails".
+
+Not `$RANDOM`: bash seeds it per implementation, so one seed gives a different
+order under bash 3.2 and bash 5, and a seed that silently fails to replay is
+worse than no seed at all. `awk`'s `srand()` has the same problem. The shuffle
+goes through python, whose Mersenne Twister is stable across versions.
+
+### Three phases, and why the measurements are last
+
+1. **The pool.** Everything tagged `none` or `console`, shuffled, N at a time.
+2. **A settle**, then **serial re-runs of anything that failed**.
+3. **The measurements, alone**, on a quiet device: `25-cpu`, `45-throughput`,
+   `55-sessions`, `90-stress`.
+
+Throughput floors and CPU-share invariants measure the machine, so measuring
+them beside three other suites measures the pool instead. Running them last and
+alone is what makes the numbers in a parallel run comparable with the ones from
+`--serial`.
+
+### What a red suite means, and how the runner says which
+
+Any suite that fails in the pool is re-run **alone**, and the report says which
+of two things it was:
+
+```
+failures found by the pool, re-run alone:
+  40-transfer    fails alone too (2) -- a bug, not a collision
+  15-streams     passes alone -- only fails under load; seed 48213 reproduces it
+```
+
+The two want completely different next steps, and guessing which one you have is
+how a real concurrency bug gets written off as a flaky test.
+
+### Transfers do not overlap
+
+`device.sh` holds a lock across every `scp` and `sftp`. Concurrent SFTP
+transfers break, and did so long before there was a parallel runner (see
+[KNOWN-ISSUES](../docs/KNOWN-ISSUES.md); proven pre-existing by a control with an
+ordinary file). A default run that goes red on a known bug it is not testing
+teaches everyone to ignore the colour. `--overlap-transfers` removes the lock
+for anyone who wants that bug rather than the run.
+
+Today exactly one pool suite transfers, so the lock is a guard rather than a
+bottleneck — it is there so the next transfer-using suite is safe by default.
 
 ## The health check
 
-After every suite the runner asks the device how it is: reset reason, uptime
-going backwards, a new core dump, and how many `sshd:conn` tasks are alive. A
-failure is attributed to the suite that just ran.
+A background monitor with **one persistent session** asks the device how it is
+every ten seconds: uptime going backwards, and a new core dump. A reboot or a
+dump stops the run, and the alert names the suites that were running at the
+time — which under a pool is better attribution than "the suite that just
+finished", not worse.
 
-This exists because the most expensive bug in this project's history presented
-as a WiFi-task assert and an ipc0 scheduler fault, and was really a filesystem
+This used to run after every suite, over four *one-shot* logins each time. At
+roughly four seconds a login and twelve suites that was around three minutes of
+a ten-minute run spent asking the device how it feels. It also cannot work under
+a pool at all: its leak test counts `sshd:conn` tasks, and with N workers holding
+a session each, the count it reads is the runner itself. So the leak test moved
+to the end of the run, where the number means something again.
+
+It exists because the most expensive bug in this project's history presented as a
+WiFi-task assert and an ipc0 scheduler fault, and was really a filesystem
 recursion — found only once somebody thought to ask the device how it was.
 Nobody remembers to ask, so the runner does.
 
@@ -117,6 +219,14 @@ Note the uptime comparison in particular: checking the *reset reason* alone
 misses a reboot, because two software reboots in a row read identically. That
 was caught by rebooting a device mid-check and watching the first version not
 notice.
+
+And note what the core-dump check matches on. It used to look for the *absence*
+of "no core dump stored", so a query that simply went unanswered — empty output —
+reported a core dump that did not exist. It did exactly that once, against a
+device that answered "no core dump stored" to the very next question. It now
+matches the positive form, `core dump: N bytes at flash`, and reports an
+unanswered query as an unanswered query. A check that invents findings is worse
+than no check, because the next real one gets waved away with it.
 
 ## Stress, and why it is not in the default run
 
@@ -150,11 +260,17 @@ clean run — 0/60 was recorded with the bug demonstrably present. What finally
 caught it was none of this: it was watching the serial console, on `dmesg -n
 debug`, while the reproducer ran.
 
-## Two ways this harness lied, and what stops it now
+## Ways this harness has lied, and what stops them now
 
-Both were found while finishing the stream work, and both had already cost a
-session apiece. They are recorded because the failure they produce looks
-nothing like their cause.
+Each of these had already cost a session before it was found. They are recorded
+because the failure they produce looks nothing like their cause, and because
+this project's real problem has never been finding bugs — it has been trusting
+what the harness says about them.
+
+A third belongs in this list and is written up under [The health
+check](#the-health-check) instead, because that is where the code is: the
+core-dump test matched on the *absence* of "no core dump stored", so a query
+that went unanswered reported a dump that did not exist.
 
 **A dead session used to read as empty output.** `session.py` reported its
 errors only on stderr — into a file `device.sh` opened, never read, and then

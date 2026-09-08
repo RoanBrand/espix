@@ -10,9 +10,11 @@
 # from /dev/factory, so the suite can run as often as it likes without wearing
 # flash -- littlefs's cost is in its writes.
 #
-# PARALLEL_SAFE=no -- saturates the link.
+# RESOURCES: exclusive -- these are measurements. They run alone, after the
+# pool has drained and the device has settled, so the floors below mean the
+# same thing in a parallel run as in a serial one.
 
-if ! dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
     return 0
 fi
@@ -68,11 +70,7 @@ report "scp download" "$(rate_kbs 0 $(( t_db - t_dt )) 0 4096)" 180
 # newlib was reading a byte at a time.
 # ---------------------------------------------------------------------------
 
-_ssh_in() {
-    espix_timeout "$ESPIX_SSH_TIMEOUT" \
-        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-        ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
-}
+_ssh_in() { dev_ssh_raw "$@"; }
 
 APP="/home/$ESPIX_USER/testapp"
 

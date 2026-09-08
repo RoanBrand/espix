@@ -15,7 +15,8 @@
 # The invariant is simple enough to state and impossible to satisfy by accident:
 # no task can use more than one core-second per second.
 #
-# PARALLEL_SAFE=no -- opens and closes connections as fast as it can.
+# RESOURCES: exclusive -- opens and closes connections as fast as it can, and
+# asserts an invariant about how CPU is shared. Runs alone, at the end.
 
 if [ -z "${DEV_PROMPT:-}" ]; then
     espix_skip "no session"

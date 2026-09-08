@@ -5,7 +5,24 @@
 # unlocking the root account for the network. It is also the only interface
 # that survives the network being broken, which is when you need it most.
 #
-# PARALLEL_SAFE=no -- there is one serial port.
+# RESOURCES: exclusive -- and that is a retreat from `console`, deliberately.
+#
+# There is one serial port and nothing else in the tree wants it, so this could
+# run in the pool. It did, and it failed there about half the time: console.py
+# frames answers on the prompt, and a console competing for CPU with four SSH
+# sessions emits them slowly enough and interleaved enough that the framing
+# slips a command -- `uname -a` came back holding the tail of `id`.
+#
+# Quieting the kernel log (below) fixed most of it and not all. Rather than keep
+# hardening a parser against a transport that is starved, the suite runs in the
+# quiet phase, where it takes twelve seconds and passes. What it claims to test
+# -- that the shell is one implementation with two transports, and that the
+# console is root -- is tested just as well there.
+#
+# "The console stays usable while the network is saturated" is a different and
+# genuinely interesting claim. It is not currently true; see the note on klog
+# interleaving in docs/KNOWN-ISSUES.md. Testing it deserves its own suite that
+# says so, rather than being smuggled in as a side effect of scheduling.
 
 if [ "$ESPIX_HAVE_SERIAL" != yes ]; then
     espix_skip "no serial port given (--port) or no pyserial"
@@ -19,9 +36,51 @@ fi
 # anything, so a console that cannot sync costs that wait *per assertion*. This
 # suite used to spend around seven minutes failing five times over, which is
 # both slow and a poor report: five failures that are one fact.
+# Quiet the kernel log on the console first, and put it back at the end.
+#
+# Not tidiness: espix writes klog lines straight to the same UART the line
+# editor is drawing on, so under load a log line lands in the middle of the
+# echo and splits it -- `whoami` came back as `whoam` + a log line + `i`, and
+# every assertion after it compared against rubble. Four suites running over
+# SSH generate a connection message every few seconds, so this is the normal
+# case now rather than an unlucky one.
+#
+# That interleaving is espix behaviour and arguably correct -- a Unix console
+# does it too, which is why `dmesg -n` exists -- so it is recorded in
+# KNOWN-ISSUES rather than worked around in the firmware. What this suite tests
+# is the shell over serial, and it cannot test that through a channel something
+# else is writing to.
+# Quieted over SSH, not over the console, and it has to be that way round.
+#
+# The console cannot quiet its own log: setting the level takes a command, and
+# typing a command is the thing the log breaks. The first attempt did it from
+# the console and produced this --
+#
+#     root:/# dmesg -n w
+#     root:/# dmesg -n wa
+#     espix: sshchan: esp logged out
+#
+# -- the editor redrawing after every keystroke while klog lines landed between
+# the redraws, so console.py saw a prompt mid-command and framed the answer
+# wrong. Over SSH there is no such problem: `dmesg -n` is global, and sudo
+# reaches root from the `esp` account.
+CONSOLE_LEVEL_SAVED=$(dev_run 'sudo dmesg -n' |
+                      sed -n 's/.*console level: \([0-9]*\).*/\1/p')
+dev_run 'sudo dmesg -n warn' >/dev/null 2>&1
+
+console_restore() {
+    case "${CONSOLE_LEVEL_SAVED:-}" in
+        ''|*[!0-9]*) dev_run 'sudo dmesg -n info' >/dev/null 2>&1 ;;
+        *)           dev_run "sudo dmesg -n $CONSOLE_LEVEL_SAVED" >/dev/null 2>&1 ;;
+    esac
+}
+
+# One probe decides whether the console is there, and it comes first among the
+# console calls -- everything after may assume a console that answers.
 if ! who=$(dev_console_run 'whoami'); then
     espix_skip "console did not answer -- see the message above for whether"
     espix_skip "something else is holding $ESPIX_PORT"
+    console_restore
     return 0
 fi
 
@@ -52,6 +111,7 @@ case "$pwd_out" in
     *"no console prompt"*|*"no prompt after"*)
         console_gone
         espix_skip "the rest of the console suite -- one fact, not four failures"
+        console_restore
         return 0 ;;
     *)  assert_eq "the console starts at /" "/" "$pwd_out" ;;
 esac
@@ -65,3 +125,4 @@ assert_contains "the console can read a root-only file" "root:" \
 
 # The sigil is the other half of the prompt change: root gets '#'.
 
+console_restore

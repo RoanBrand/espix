@@ -392,6 +392,77 @@ things are as they are.
   (`ps` CPU shares and `free` before and after, plus an SSH throughput check)
   rather than on reasoning, and it belongs in the target-independent
   `sdkconfig.defaults` so every target inherits it.
+- **Let a loaded app have real IRAM.** `IRAM_ATTR` in an app compiles, links,
+  loads, runs and does nothing: espix's ELF loader has one allocator for every
+  section and, with `CONFIG_ELF_LOADER_LOAD_PSRAM`, hands out PSRAM regardless
+  of the `exec` flag it is passed. The whole app is in PSRAM.
+
+  Since XIP from PSRAM this is much less serious than it was — the usual reason
+  to mark a handler `IRAM_ATTR` is surviving the cache being disabled during a
+  flash write, and the cache is no longer disabled. What is left is timing:
+  instruction fetch from PSRAM is slower and jitterier than internal SRAM, so a
+  handler with a sub-microsecond deadline can still miss it.
+
+  It matters because of what espix wants to run. A portable C app never asks for
+  this and should not — it knows only `malloc()`, and where its code lives is a
+  build option of the system it lands on. But **Arduino sketches** use
+  `attachInterrupt` with `IRAM_ATTR` handlers as a matter of course, and
+  **stock IDF examples** are written the same way; espix already ships one of
+  the former (`apps/neopixel`, whose WS2812 routine is marked and does not get
+  it). Both build and load today, silently short of what they asked for.
+
+  The shape for a fix is already in the loader: `esp_elf_malloc()` takes an
+  `exec` flag and its non-PSRAM branch already uses `MALLOC_CAP_EXEC`. It needs
+  a section slot for `.iram1.*` allocated `MALLOC_CAP_INTERNAL | MALLOC_CAP_EXEC`
+  — and note the loader captures sections *by name* and silently skips the rest,
+  so an app whose link preserves `.iram1` today has that code dropped rather
+  than misplaced. It also needs an app-side link that keeps the section: the
+  shipped neopixel ELF has no `.iram1` at all, its functions having been folded
+  into `.text`.
+
+  Two costs to weigh before doing it. Internal RAM is the same pool as the heap
+  (see [GOTCHAS.md](GOTCHAS.md)), so every app that asks for IRAM takes it from
+  the memory that decides how many SSH sessions fit. And a per-app IRAM budget
+  needs a policy — an app asking for 64KB of it should be refused, not obeyed.
+
+- **Detect the flash chip and say which cache strategy the board can have.**
+  espix ships `CONFIG_SPIRAM_XIP_FROM_PSRAM` because a flash write otherwise
+  disables the cache and faults any crypto that is mid-`esp_cache_msync` — see
+  [GOTCHAS.md](GOTCHAS.md). It costs ~1MB of PSRAM and 88ms of boot.
+
+  `CONFIG_SPI_FLASH_AUTO_SUSPEND` is the better answer where it is available:
+  the flash chip suspends an erase to serve a read, so the cache is never
+  disabled, the code stays in flash and the PSRAM stays free. It is not
+  available here, and whether it is available anywhere is a property of the
+  board rather than of the chip family.
+
+  ESP-IDF whitelists it **per flash chip ID**, in the `get_caps` of each
+  `spi_flash_chip_*.c`:
+
+  | driver | IDs claiming `SPI_FLASH_CHIP_CAP_SUSPEND` |
+  |---|---|
+  | GigaDevice | `0xC84016`, `0xC84017`, `0xC84018`, `0xC84319` |
+  | Winbond | `0xEF4017` only |
+  | everything else, Boya included | none |
+
+  So a DevKitC-1 may or may not qualify: the ESP32-S3-WROOM-1 datasheet does not
+  name the flash vendor and it varies by production batch. A 16MB GigaDevice is
+  on the list; a 16MB Winbond is not, because only the 8MB `0xEF4017` appears.
+  This board reports `0x68`, Boya, and IDF's driver says "flash-suspend is not
+  supported" in a comment before omitting the flag.
+
+  The shape of the work: a `tools/flash-caps.sh` that reads the ID off the
+  attached board with `esptool flash-id`, matches it against IDF's own tables —
+  *grepped from the SDK source rather than copied*, so it stays right as
+  Espressif adds chips — and reports which strategy fits and which is
+  configured.
+
+  Two constraints, so the design is not re-derived later. It cannot be a Kconfig
+  `depends on`: a build has to work with no board attached, which is how CI
+  builds. And it should not prompt mid-build, for the same reason. A tool the
+  developer runs, plus one line from `make flash` when the detected chip and the
+  configured strategy disagree, is the shape that works.
+
 - **OTA slots.** The partition table is `factory`-only. Two 4MB OTA slots plus
   `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
   the network. Changing this later means reflashing everything, so it is worth

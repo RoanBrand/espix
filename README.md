@@ -17,7 +17,10 @@ Design notes and the reasoning behind the structure are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). What is not done yet lives beside
 it: [ROADMAP.md](docs/ROADMAP.md) for work espix might take on,
 [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) for behaviour that will surprise you,
-and [UPSTREAM.md](docs/UPSTREAM.md) for defects that belong to ESP-IDF.
+[UPSTREAM.md](docs/UPSTREAM.md) for defects that belong to ESP-IDF, and
+[GOTCHAS.md](docs/GOTCHAS.md) for the ESP32/IDF surprises — where the platform
+differs from what a POSIX or FreeRTOS habit expects, and what may not be used
+together.
 
 ## Status
 

@@ -6,9 +6,9 @@
 # message vanished into a redirect and the loader was blamed for not naming a
 # symbol it had named perfectly. That specific failure is the first check here.
 #
-# PARALLEL_SAFE=no -- writes files under /tmp with fixed names.
+# RESOURCES: none -- its /tmp paths carry the worker number.
 
-T=/tmp/espix-streams
+T=/tmp/espix-streams-$ESPIX_WORKER
 dev_run "rm -r $T" >/dev/null 2>&1
 dev_run "mkdir $T" >/dev/null 2>&1
 
@@ -65,15 +65,11 @@ assert_contains "unredirected, a diagnostic is still visible" "not found" "$both
 # `ssh host cmd 2>/dev/null` would still show the error.
 # ---------------------------------------------------------------------------
 
-# Deadlined, like the helpers in device.sh, and for the reason recorded there:
-# a raw ssh to a device that has stopped answering hangs until TCP gives up,
-# which wedged this suite for twenty minutes when a kill test panicked the
-# board. espix_timeout is given the ssh *binary* so the kill reaches it.
-_ssh() {
-    espix_timeout "$ESPIX_SSH_TIMEOUT" \
-        env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-        ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
-}
+# dev_ssh_raw is device.sh's: deadlined, budgeted against the device's session
+# limit, and retried if the device says it is full. This suite used to carry its
+# own copy of those four lines, which meant its own connection went unbudgeted
+# and a refusal under load read as "the app produced no output".
+_ssh() { dev_ssh_raw "$@"; }
 
 assert_eq "the client's 2>/dev/null swallows a diagnostic" "" \
     "$(_ssh /bin/nosuchprogram 2>/dev/null)"
@@ -96,7 +92,7 @@ esac
 # diagnostics do.
 # ---------------------------------------------------------------------------
 
-if dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if dev_testapp_present; then
     APP="/home/$ESPIX_USER/testapp"
 
     both=$(dev_run "$APP both")
@@ -193,9 +189,20 @@ if dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
     # then closed it a third time.
     ( _ssh "$APP sleep 20 > $T/killed 2>&1" >/dev/null 2>&1 ) &
     victim=$!
-    sleep 4
 
-    pid=$(dev_run 'ps' | sed -n 's/^ *\([0-9][0-9]*\) app:testapp.*/\1/p' | head -1)
+    # Wait for it to appear rather than sleeping a guess at how long a login
+    # plus an ELF load takes. Four seconds was the guess and it was enough on a
+    # quiet device and not on a busy one -- the assertion then reported "nothing
+    # was killed", which is true and is not what it was asking about.
+    pid=""
+    wait_i=0
+    while [ "$wait_i" -lt 20 ]; do
+        pid=$(dev_run 'ps' | sed -n 's/^ *\([0-9][0-9]*\) app:testapp.*/\1/p' | head -1)
+        [ -n "$pid" ] && break
+        sleep 1
+        wait_i=$((wait_i + 1))
+    done
+
     if [ -z "$pid" ]; then
         espix_fail "a redirected foreground app is running to be killed" \
                    "no app:testapp in ps; nothing was killed, so the next" \

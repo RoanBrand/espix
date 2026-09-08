@@ -79,6 +79,50 @@ CONFIG_ESP_WIFI_NVS_ENABLED=y
 # report. Kept in sync with the generated <target>-<mac> form for consistency.
 CONFIG_LWIP_LOCAL_HOSTNAME="espix"
 
+# One socket per SSH connection, plus the listener, plus whatever DHCP and SNTP
+# hold. ESP-IDF's default of 10 was enough while the SSH server accepted four
+# connections; at CONFIG_ESPIX_SSH_MAX_SESSIONS=8 it is not, and the failure
+# would be an accept() that returns EMFILE rather than anything naming sockets.
+#
+# This is also FD_SETSIZE, which is why select() in the console and the SSH
+# server keep working as it rises, and why espix's device fds sit at 240-255
+# (see espix_fs/dev.c) -- far above anything lwIP will hand out.
+CONFIG_LWIP_MAX_SOCKETS=20
+
+#
+# Execute from PSRAM instead of flash.
+#
+# Not a performance option, though it turns out to be one. It closes a crash.
+#
+# A flash write or erase forces ESP-IDF to disable the flash cache -- you cannot
+# fetch instructions through a cache backed by a chip that is mid-erase. Inside
+# that window, cache maintenance faults: Cache_WriteBack_Addr is manipulating a
+# cache being switched off underneath it, and the CPU takes exccause 0x47,
+# CacheError.
+#
+# espix walks into that window constantly. With the SSH connection state in
+# PSRAM, IDF's AES and SHA drivers call esp_cache_msync() on every packet they
+# encrypt or authenticate -- and espix reads and writes flash from other tasks
+# all the time, because that is what a filesystem is. Running four test suites
+# at once panicked the board this way about one run in three, in
+# Cache_WriteBack_Addr under both esp_aes_process_dma() and esp_sha_dma_process().
+#
+# With .text and .rodata copied into PSRAM at boot, a flash operation no longer
+# has to disable the cache, and the window closes. ESP-IDF documents exactly
+# this exception: "if XIP_From_PSRAM is enabled, you can call this API during
+# Flash operations."
+#
+# Measured on an N16R8. PSRAM total falls from 8189K to 7114K -- 1075K for the
+# image, out of eight megabytes. Internal RAM is unchanged at 145K free. scp
+# throughput *rose*, 562 -> 612 KB/s up and 476 -> 594 KB/s down, because flash
+# operations no longer stall the core. The seed that had just panicked ran 147
+# assertions green.
+#
+# Boot cost is 88ms of the 836ms to user code: 17ms copying rodata and 71ms
+# copying instructions, per the mmu_psram lines in the boot log. For scale,
+# CONFIG_SPIRAM_MEMTEST in the same log costs 376ms.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
 #
 # Console
 #
@@ -138,3 +182,12 @@ CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200
 # means supplying string descriptors at runtime rather than from Kconfig.
 CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="espix"
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"
+
+#
+# espix
+#
+# The Kconfig default is 8 as well; repeating it here is what makes a fresh
+# checkout build with it, since sdkconfig is not tracked and an existing one
+# would otherwise keep whatever it already had. Neither of these overrides an
+# sdkconfig that already names the option -- delete it, or edit it by hand.
+CONFIG_ESPIX_SSH_MAX_SESSIONS=8

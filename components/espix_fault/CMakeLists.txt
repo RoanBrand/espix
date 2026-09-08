@@ -17,6 +17,10 @@ idf_component_register(
         esp_timer
         espcoredump
         esp_app_format
+        # esp_crypto_lock.h: espcoredump's checksum drives the ROM SHA with no
+        # lock, so coredump.c takes the SHA/AES lock around it. See the note
+        # there.
+        esp_security
     # __wrap_esp_panic_handler is referenced only by the linker, so without
     # WHOLE_ARCHIVE the object holding it gets dropped from the static library
     # and the wrap silently does nothing.

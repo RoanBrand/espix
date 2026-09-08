@@ -13,14 +13,14 @@
 # `dmesg -n debug`, where the failure announces itself as
 # `ssh: MAC mismatch on packet N`. Worth having open while running this.
 #
-# PARALLEL_SAFE=no -- saturates the one transport it is measuring.
+# RESOURCES: exclusive -- saturates the one transport it is measuring.
 
 if [ "${ESPIX_STRESS:-0}" != 1 ]; then
     espix_skip "stress suites need --stress (or 'make stress')"
     return 0
 fi
 
-if ! dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
     return 0
 fi

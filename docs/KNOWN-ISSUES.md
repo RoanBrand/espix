@@ -6,7 +6,10 @@ writing down — the purpose is that it gets recognised rather than debugged fro
 scratch a second time.
 
 For work espix might take on see [ROADMAP.md](ROADMAP.md); for defects that
-belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
+belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md); and for
+the platform surprises that keep causing entries here — what may not be used
+together, and where ESP32/IDF differs from what a POSIX or FreeRTOS habit
+expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Processes
 
@@ -60,40 +63,128 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   blocked one was harmless too. `tests/suites/15-streams.sh` pins both kill
   paths, and both were made to fail before they were made to pass.
 
-- **A second unexplained fault, once, under sustained inbound traffic.** During
-  a throughput run: `exccause 0x47` (CacheError) inside
-  `Cache_WriteBack_Addr`, reached from `psa_mac_update` → `esp_sha256_update`
-  → `esp_sha_dma_process` → `esp_cache_msync`, on the SSH receive buffer.
+- ~~**A second unexplained fault, once, under sustained inbound traffic.**~~
+  **Explained and fixed.** Kept in full, because what it looked like the day
+  before it was understood is the useful part: the entry reasons its way to the
+  doorstep and stops.
 
-  That buffer is `ssh_conn_t.in_buf`, and the connection struct is allocated
-  from PSRAM, so the SHA driver takes its DMA path over external RAM. This is
-  not espix misusing the API — `sha.c` explicitly handles an external-RAM input
-  with a cache sync — but espix is what puts a PSRAM buffer there, and inbound
-  throughput went from 5 KB/s to 226 KB/s in the same change, so that path now
-  runs constantly where it used to be reached by interactive traffic only.
+  What was recorded at the time: during a throughput run, `exccause 0x47`
+  (CacheError) inside `Cache_WriteBack_Addr`, reached from `psa_mac_update` →
+  `esp_sha256_update` → `esp_sha_dma_process` → `esp_cache_msync`, on the SSH
+  receive buffer. That buffer is `ssh_conn_t.in_buf`, and the connection struct
+  is allocated from PSRAM, so the SHA driver takes its DMA path over external
+  RAM. "This is not espix misusing the API — `sha.c` explicitly handles an
+  external-RAM input with a cache sync — but espix is what puts a PSRAM buffer
+  there." Not reproduced since: two further throughput runs, a full suite, and a
+  targeted stress of concurrent flash reads against SSH crypto, all clean.
 
-  Not reproduced since: two further throughput runs, a full suite, and a
-  targeted stress of concurrent flash reads against SSH crypto were all clean.
-  Recorded with the exccause and the stack because the next occurrence should
-  not start from nothing, and because "it went away" is not a diagnosis.
+  Every one of those observations was right. The missing piece was a rule, not a
+  fact: **`esp_cache_msync()` must not be called during a flash operation.** A
+  flash write disables the cache, and cache maintenance inside that window does
+  not stall, it faults. The "targeted stress of concurrent flash reads against
+  SSH crypto" came closest and was clean because a *read* through the cache is
+  not the hazard — an erase or a write is.
 
-- **One earlier heap corruption remains unexplained.** A single panic during a
-  full run, before the two kill bugs above were found: faulting task
-  `sshd:conn`, detected in `tlsf_free` inside `esp_vfs_select` from
-  `chan_poll_interrupt()`. That is a *detector* rather than a culprit — it
-  polls `select()` every 50ms while a foreground process runs, so it frees more
-  often than anything else and corruption surfaces at whatever frees next.
+  It became reproducible when the test suite started running four suites at once
+  (about one run in three) and was fixed by `CONFIG_SPIRAM_XIP_FROM_PSRAM`, which
+  moves `.text` and `.rodata` into PSRAM so a flash operation no longer needs the
+  cache off. See [GOTCHAS.md](GOTCHAS.md), "What a flash write actually stops".
 
-  It has not recurred since the kill fixes, and its signature is consistent
-  with the stdio-lock one, which corrupts silently rather than asserting. But
-  the run that produced it used neither `2>&1` nor stdin, so that is a
-  resemblance and not a diagnosis.
+- ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
+  double free in espix's own command history, and the whole shape of it is worth
+  keeping, because almost nothing about the way it presented pointed at the
+  cause.
 
-  `CONFIG_HEAP_POISONING_COMPREHENSIVE` found nothing across four runs, and
-  would not be expected to: it checks canaries around *allocations*, and a
-  write through a stale task handle lands inside a live TCB. If it returns, the
-  serial console with poisoning on is the fastest route — the console being the
-  one channel that is not the thing under test.
+  Command history is owned by the *user* rather than the session, so two
+  sessions logged in as the same account are handed the same `espix_history_t`.
+  The module had a mutex and it covered only `espix_history_for()`, the slot
+  lookup. Every mutation after that ran unlocked, and two sessions arriving at a
+  full list together both ran `free(h->entries[h->count - 1]); h->count--;` on
+  the same pointer.
+
+  It surfaced as four different panics, none of them in `history.c`:
+  `tlsf_free` inside `esp_vfs_select` from `chan_poll_interrupt()` on the PSRAM
+  heap, a `CacheError` on IDLE0, a `free(0x15)` inside `esp_linenoise`'s own
+  history, and only once as the double free itself. A corrupted heap is noticed
+  by whoever frees next, and `chan_poll_interrupt()` polls `select()` every
+  50ms, so it usually got there first.
+
+  Reading the code did not find it. The leading theory for most of a day was a
+  cache-line spill from DMA over the PSRAM crypto buffers -- plausible,
+  documented as a real hazard, and wrong. `tools/soak.sh` found it in four runs
+  by separating two knobs: **209 logins with no commands ran clean for ten
+  minutes**, while **three sessions typing commands panicked in 99 seconds**.
+  History is pushed per command. Taking the SSH buffers out of PSRAM entirely
+  then changed nothing except which heap the corruption landed on, which
+  finished the PSRAM theory off in a single run.
+
+  The fix is the whole table under one lock. Confirmed on an uninstrumented
+  build with PSRAM restored: the arm that panicked in 99s ran clean for 900s.
+
+- **`esp_linenoise` was handed a garbage pointer under load -- and it was ours.**
+  Seen once, on the serial console, during a four-worker run: faulting task
+  `main`, `free(0x15)` inside `esp_linenoise_history_free()` from
+  `espix_history_apply()`, tripping heap_caps_base.c's "free() target pointer is
+  outside heap areas".
+
+  Written up here as a probable defect in the component. It was not.
+  `espix_history_apply()` walks the shared list and hands each entry to
+  `esp_linenoise_history_add()`, and the entry above is why that list could hold
+  a pointer another session had already freed. The editor stored it and freed it
+  again later. Kept as an entry because "the crash is inside the library" was
+  the wrong first instinct, and the correction is the useful part.
+
+  One genuine gap does remain in the component, worth reporting rather than
+  working around: `esp_linenoise_edit()`'s ENTER case does
+  `state->history_length--; free(config->history[state->history_length]);` with
+  no check that the length is above zero. Nothing espix does reaches it, and
+  nothing stops it either.
+
+- **Loading an app can fault the cache — latent since XIP, not fixed.**
+  Faulting task `app:testapp`, `exccause 0x47 (CacheError)` in
+  `Cache_WriteBack_Items` ← `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
+  `esp_elf_relocate`, seen once in eight parallel test runs. The `elf_loader`
+  component writes back the whole cache *outside* the flash lock it takes on the
+  very next line, so a concurrent flash operation pulled the cache out from
+  under it. Written up in [UPSTREAM.md](UPSTREAM.md).
+
+  `CONFIG_SPIRAM_XIP_FROM_PSRAM` closes the window rather than the bug: a flash
+  operation no longer disables the cache, so there is nothing to be pulled out
+  from under. Three full parallel runs since without a recurrence, which is
+  consistency and not proof — the sample before the change was one occurrence in
+  eight runs, so three clean runs would be unsurprising either way.
+
+  It stays here rather than moving to fixed, because the ordering upstream is
+  still wrong and the fault returns the moment XIP is off. The three
+  espix-side ways out, none free, remain the same:
+
+  - Turn off `CONFIG_ELF_LOADER_LOAD_PSRAM`. The flush is not called at all
+    then — but every loaded app's image moves into internal RAM, and this board
+    already spends ~12K of it per open SSH session.
+  - Serialise espix's own flash traffic against app loading. Every file
+    operation already funnels through `espix_fs_access_check()`, so there is one
+    place to put it, at the cost of a lock across all filesystem I/O.
+  - Wait for the component, and pin the version when it is fixed.
+
+- **A session occasionally dies under parallel load, and nothing explains it
+  yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
+  session partway through and the harness reported seven failures that were one
+  event — `session gone before: ps`, then everything downstream comparing
+  against the dead-session sentinel. The device was fine throughout: no reboot,
+  no core dump, and the very next run was 149 assertions green.
+
+  It is not new and it is not the panics. The same shape turned up early in the
+  parallel work, before any of the fixes: one login failure in nine rounds of
+  "open a session, then open four connections at once", which the login-timeout
+  change did **not** explain — a login measures 4.0s alone and 8.7–11.7s with
+  five at once, nowhere near the 25s budget it was blamed on.
+
+  What is known: the connection goes away rather than hanging, the device does
+  not notice anything, and it is rare enough that a rate needs tens of runs to
+  measure. What would settle it is the serial console open with `dmesg -n debug`
+  while a parallel run goes, so the device's own account of the disconnect is
+  captured — which is how the `Corrupted MAC` bug was eventually caught, and for
+  the same reason: never debug a transport through itself.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
@@ -271,6 +362,31 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   there and will not run, and the app's own status otherwise.
 
 ## Shell and console
+
+- **Kernel log lines land in the middle of what you are typing.** espix writes
+  klog straight to the same UART the line editor is drawing on, with nothing
+  between them, so a message arriving mid-keystroke splits the echo. Typing
+  `whoami` while the network was busy produced
+
+  ```
+  root:/# whoam
+  espix: sshchan: esp logged out
+  iespix: sshd: connection closed
+  ```
+
+  — the `i` on the far side of two log lines. The command still runs; it is the
+  display, and anything parsing the display, that is wrecked.
+
+  Arguably correct: a Unix console does this too, which is why `dmesg -n`
+  exists, and espix has it. It became worth writing down when the test suite
+  started running four SSH suites at once, which generates a connection message
+  every few seconds and turned an occasional annoyance into the normal case --
+  `tests/suites/50-console.sh` now quiets the console for its duration and puts
+  the level back.
+
+  Doing better means holding the console's write path while a klog line is
+  emitted and redrawing the prompt afterwards, the way Linux does. Worth having;
+  not done.
 
 - **Kernel messages land on your prompt.** That is deliberate and matches Linux,
   where kernel output goes to the console and remote users run `dmesg`. Since

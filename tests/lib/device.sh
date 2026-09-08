@@ -7,6 +7,43 @@
 : "${ESPIX_PYTHON:=python3}"
 : "${ESPIX_PORT:=}"
 
+# Which worker this shell is: 0 in a serial run, 1..N under the pool. Every
+# path this file names on the *device* carries it, because two workers running
+# at once share one filesystem and a fixed name is a collision waiting for a
+# fast enough machine.
+: "${ESPIX_WORKER:=0}"
+
+# The run's scratch directory, shared by the runner and its workers. Empty in a
+# plain serial run, in which case the cross-worker locks below are no-ops --
+# there is nothing to coordinate with.
+: "${ESPIX_RUNDIR:=}"
+
+# The run has given up.
+#
+# Written by the monitor when the device reboots or dumps core, and read by
+# every call that would otherwise wait on a device that is not there. Without
+# it a panic four minutes into a run cost another 577 seconds: each remaining
+# suite still opened a session (60s login timeout), and every assertion in it
+# still spent a 30s command deadline and four refusal retries before failing.
+#
+# A file rather than a variable, because the workers are separate processes and
+# nothing assigned in one is visible in another.
+dev_aborted() {
+    [ -n "$ESPIX_RUNDIR" ] && [ -f "$ESPIX_RUNDIR/abort" ]
+}
+
+dev_abort() {   # <reason>
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    printf '%s\n' "$1" > "$ESPIX_RUNDIR/abort" 2>/dev/null
+    return 0
+}
+
+# Let transfers overlap. Off by default: concurrent SFTP transfers are a
+# documented, pre-existing fault (docs/KNOWN-ISSUES.md), so the default run
+# serialises them rather than going red on a bug it is not testing. Turn it on
+# to hunt that bug deliberately.
+: "${ESPIX_OVERLAP_TRANSFERS:=0}"
+
 ESPIX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DEV_SESSION_DIR=""
@@ -33,11 +70,19 @@ DEV_DEAD="<<<dead-session>>>"
 # `coproc` is bash 4, and macOS ships 3.2.
 
 dev_session_start() {
+    # Nothing to log in to once the run has given up; see dev_aborted().
+    if dev_aborted; then
+        DEV_SESSION_DEAD=yes
+        DEV_PROMPT=""
+        return 1
+    fi
+
     DEV_SESSION_DIR=$(espix_mktemp_dir)
     mkfifo "$DEV_SESSION_DIR/in" "$DEV_SESSION_DIR/out"
 
     "$ESPIX_PYTHON" "$ESPIX_LIB_DIR/session.py" \
         --host "$ESPIX_HOST" --user "$ESPIX_USER" --password "$ESPIX_PASS" \
+        --login-timeout "$ESPIX_LOGIN_TIMEOUT" \
         < "$DEV_SESSION_DIR/in" > "$DEV_SESSION_DIR/out" \
         2> "$DEV_SESSION_DIR/err" &
     DEV_SESSION_PID=$!
@@ -108,7 +153,7 @@ dev_run() {
     #  - Nothing assigned in here outlives the call, so "the session is dead"
     #    cannot be remembered between calls. Each one has to find out for
     #    itself, which is why the check is on the write rather than on a flag.
-    if [ -n "$DEV_SESSION_DEAD" ] || [ -z "$DEV_SESSION_PID" ]; then
+    if [ -n "$DEV_SESSION_DEAD" ] || [ -z "$DEV_SESSION_PID" ] || dev_aborted; then
         printf '%s' "$DEV_DEAD"
         return 1
     fi
@@ -189,12 +234,178 @@ dev_askpass_cleanup() {
 # already sent this project down a wrong path once.
 DEV_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
+# How long session.py waits for a login, as against for a command.
+#
+# They used to be the same 25 seconds. Separating them is a budget correction
+# and not, as first supposed, the cure for anything: a login costs a key
+# exchange plus PBKDF2 at 20 000 iterations and gets slower when several happen
+# together, while a command that takes 25 seconds is a fault and should still be
+# reported as one.
+#
+# Measured on this device, because the guess it replaced was wrong and worth
+# recording as wrong. One login on an idle device: 3986 ms. Five simultaneous
+# logins: 8710, 10843, 11312, 11649, 11653 ms. A login while four other
+# connections stream `top -b`: 4307, 4114, 4040 ms -- that load is not the
+# expensive part; the concurrent key exchanges are.
+#
+# So the worst measured case is under twelve seconds against a budget of
+# twenty-five, which means the intermittent "could not open a session" seen
+# while building the pool -- once in ten rounds, then not once in twelve -- is
+# NOT explained by this. It is still open. The budget goes up because half of
+# it was already being used on the ordinary path, not because doing so fixed
+# that.
+: "${ESPIX_LOGIN_TIMEOUT:=60}"
+
 # ConnectTimeout bounds the *connect* and nothing after it, so a device that
 # accepts a connection and then never answers held a run open indefinitely --
 # dev_health_begin calls dev_once twice before the first suite, with no output
 # to say what it was waiting for. These are the whole-command deadlines.
 : "${ESPIX_SSH_TIMEOUT:=30}"
 : "${ESPIX_SCP_TIMEOUT:=90}"
+
+# --------------------------------------------------- the one-shot connection budget ---
+#
+# How many connections *besides* the long-lived sessions may be open at once.
+#
+# The device allows CONFIG_ESPIX_SSH_MAX_SESSIONS of them, eight. A parallel run
+# already holds one per worker plus one for the health monitor, so at -j 4 that
+# is five, and every dev_status, dev_once, scp and sftp wants a sixth. Several
+# suites reaching for one at the same moment take the device past eight, and it
+# refuses -- correctly, and with a clear message, but a refused `dev_status`
+# reads as `exit status 255` and a refused `ssh app < file` as an empty answer.
+# A run measured five such failures across two suites, all of them "passes
+# alone".
+#
+# Retrying is not enough on its own: the retry sits in _dev_ssh below and is
+# bounded, and a busy patch outlasts it. So the host rations them instead, and
+# keeps the retry as the backstop for whatever slips through -- including the
+# person watching `top` from another window, whom the arithmetic cannot see.
+#
+# K token directories, because mkdir is atomic and bash 3.2 has nothing better.
+: "${ESPIX_ONESHOT_MAX:=2}"
+
+_dev_oneshot_acquire() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+
+    local waited=0 i
+    while :; do
+        i=1
+        while [ "$i" -le "$ESPIX_ONESHOT_MAX" ]; do
+            if mkdir "$ESPIX_RUNDIR/oneshot.$i.lock" 2>/dev/null; then
+                DEV_ONESHOT_TOKEN=$i
+                return 0
+            fi
+            i=$((i + 1))
+        done
+        sleep 0.2
+        waited=$((waited + 1))
+        if [ "$waited" -gt 300 ]; then     # a minute: go anyway
+            DEV_ONESHOT_TOKEN=""
+            return 0
+        fi
+    done
+}
+
+_dev_oneshot_release() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    [ -n "${DEV_ONESHOT_TOKEN:-}" ] || return 0
+    rmdir "$ESPIX_RUNDIR/oneshot.$DEV_ONESHOT_TOKEN.lock" 2>/dev/null
+    DEV_ONESHOT_TOKEN=""
+    return 0
+}
+
+DEV_ONESHOT_TOKEN=""
+
+# ----------------------------------------------------------- the transfer lock ---
+#
+# One transfer in flight at a time across the whole run.
+#
+# Concurrent SFTP transfers break, and have since long before there was a
+# parallel runner (docs/KNOWN-ISSUES.md; proven pre-existing by a control with
+# an ordinary file). Running suites in parallel makes that reachable by
+# accident, and a default run that goes red on a known bug it is not testing
+# teaches everyone to ignore the colour.
+#
+# So it is a guard rather than a bottleneck -- today exactly one pool suite
+# transfers -- and ESPIX_OVERLAP_TRANSFERS removes it for anyone who wants the
+# bug rather than the run.
+#
+# A directory, because mkdir is atomic on APFS and on ext4 and bash 3.2 has no
+# other portable primitive. The wait is bounded and then simply takes the lock:
+# a worker killed mid-transfer would otherwise wedge every later one, and a
+# stuck run that says nothing is worse than an overlapping transfer.
+_dev_xfer_lock() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    [ "$ESPIX_OVERLAP_TRANSFERS" = 1 ] && return 0
+
+    local waited=0
+    while ! mkdir "$ESPIX_RUNDIR/xfer.lock" 2>/dev/null; do
+        sleep 0.2
+        waited=$((waited + 1))
+        if [ "$waited" -gt 900 ]; then      # three minutes
+            printf 'transfer lock held for 180s; taking it\n' \
+                >> "$ESPIX_RUNDIR/notes" 2>/dev/null
+            return 0
+        fi
+    done
+    return 0
+}
+
+_dev_xfer_unlock() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    [ "$ESPIX_OVERLAP_TRANSFERS" = 1 ] && return 0
+    rmdir "$ESPIX_RUNDIR/xfer.lock" 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------------------ refused, or gone ---
+#
+# ssh exits 255 and says "Connection closed by <host> port 22" both when the
+# device refuses a connection for capacity and when one genuinely drops. The
+# difference matters: the first is contention and should be retried, the second
+# is a fault and must not be papered over.
+#
+# espix says which, and says it on the wire before the version string -- RFC
+# 4253 4.2 allows exactly that, which is how OpenSSH reports "Exceeded
+# MaxStartups". OpenSSH does not show such a line without -v, so read it from a
+# bare socket instead. Confirmed on the device:
+#
+#   b'espix: too many connections (8 of 8 in use)\r\n'
+#
+# The probe costs a TCP connection and no session slot: a refused connection
+# never becomes one.
+# The greeting espix sends before its version string, read from a bare socket.
+# Empty when the server has nothing to say, which is the ordinary case.
+dev_banner() {
+    "$ESPIX_PYTHON" - "$ESPIX_HOST" <<'PY' 2>/dev/null
+import socket, sys
+try:
+    s = socket.create_connection((sys.argv[1], 22), 5)
+    s.settimeout(5)
+    sys.stdout.write(s.recv(200).decode("utf-8", "replace"))
+    s.close()
+except Exception:
+    pass
+PY
+}
+
+_dev_refused_for_capacity() {
+    case "$(dev_banner)" in
+        *"too many connections"*) return 0 ;;
+        *)                        return 1 ;;
+    esac
+}
+
+# Retries are counted rather than hidden. A run that needed a few is healthy
+# contention; a run that needed dozens is a worker count the device cannot feed,
+# and the report says so.
+_dev_note_retry() {
+    [ -n "$ESPIX_RUNDIR" ] || return 0
+    printf 'w%s\n' "$ESPIX_WORKER" >> "$ESPIX_RUNDIR/retries" 2>/dev/null
+    return 0
+}
+
+DEV_SSH_MAX_RETRIES=4
 
 # The environment and the deadline, in one place.
 #
@@ -203,16 +414,76 @@ DEV_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Con
 # leaves ssh alive holding one of espix's four connection slots. run.sh's
 # preflight did exactly that, and the orphans accumulate until the device
 # answers nobody. See the note in portable.sh.
-_dev_ssh() {
+_dev_ssh_once() {
     espix_timeout "$ESPIX_SSH_TIMEOUT" \
         env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
         ssh $DEV_SSH_OPTS "$ESPIX_USER@$ESPIX_HOST" "$@"
 }
 
-_dev_scp() {
+# Retried only when the device itself says it is full; every other 255 is
+# returned as it stands. A refused connection produced no output, so retrying
+# cannot duplicate any.
+_dev_ssh() {
+    local rc tries=0
+    dev_aborted && return 255
+    _dev_oneshot_acquire
+    while :; do
+        _dev_ssh_once "$@"
+        rc=$?
+        if [ "$rc" != 255 ] \
+           || [ "$tries" -ge "$DEV_SSH_MAX_RETRIES" ] \
+           || dev_aborted \
+           || ! _dev_refused_for_capacity; then
+            _dev_oneshot_release
+            return $rc
+        fi
+        tries=$((tries + 1))
+        _dev_note_retry
+        sleep 2
+    done
+}
+
+_dev_scp_once() {
     espix_timeout "$ESPIX_SCP_TIMEOUT" \
         env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
         scp $DEV_SSH_OPTS "$@"
+}
+
+_dev_scp() {
+    local rc tries=0
+    dev_aborted && return 255
+    _dev_oneshot_acquire
+    _dev_xfer_lock
+    while :; do
+        _dev_scp_once "$@"
+        rc=$?
+        if [ "$rc" = 255 ] && [ "$tries" -lt "$DEV_SSH_MAX_RETRIES" ] \
+           && ! dev_aborted && _dev_refused_for_capacity; then
+            tries=$((tries + 1))
+            _dev_note_retry
+            sleep 2
+            continue
+        fi
+        break
+    done
+    _dev_xfer_unlock
+    _dev_oneshot_release
+    return $rc
+}
+
+# dev_ssh_raw <command> [args...] -- own connection, output unfiltered.
+#
+# For the handful of assertions that have to see exactly what the *client*
+# printed -- which stream a diagnostic arrived on, what `2>/dev/null` swallows --
+# and for the ones that pipe a file into a process's stdin.
+#
+# It exists because 15-streams.sh and 45-throughput.sh had each grown their own
+# copy of the same four lines, and a private copy of a connection helper is a
+# copy that does not take the one-shot budget, does not retry a refusal, and
+# does not stop when the run has aborted. Two of the three failures that made a
+# parallel run red were exactly that.
+dev_ssh_raw() {
+    _dev_ssh "$@"
 }
 
 # dev_status <command> -- run it in its own connection, return its exit status.
@@ -259,10 +530,18 @@ dev_pull() {
 # fails at the login with a message about permissions that looks like the
 # device refusing you.
 dev_sftp() {
+    local rc
+    dev_aborted && return 255
+    _dev_oneshot_acquire
+    _dev_xfer_lock
     espix_timeout "$ESPIX_SCP_TIMEOUT" \
         env SSH_ASKPASS="$DEV_ASKPASS" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
         sftp $DEV_SSH_OPTS -o BatchMode=no -b "$1" \
         "$ESPIX_USER@$ESPIX_HOST" 2>&1
+    rc=$?
+    _dev_xfer_unlock
+    _dev_oneshot_release
+    return $rc
 }
 
 # dev_capture <remote command> <local file>
@@ -272,9 +551,14 @@ dev_sftp() {
 # the transport being tested, so reading it inline makes the transport part of
 # the measurement.
 dev_capture() {
-    dev_once "$1 > /tmp/.espix-capture" >/dev/null
-    dev_pull /tmp/.espix-capture "$2" >/dev/null
-    dev_once "rm /tmp/.espix-capture" >/dev/null
+    # Per worker: two of these running at once would otherwise each fetch the
+    # other's file, and the comparison that follows would be of the wrong thing
+    # rather than obviously broken.
+    local remote="/tmp/.espix-capture.$ESPIX_WORKER"
+
+    dev_once "$1 > $remote" >/dev/null
+    dev_pull "$remote" "$2" >/dev/null
+    dev_once "rm $remote" >/dev/null
 
     # Empty is a failure, not a result. Two things produce it and both are
     # silent: a command that wrote nothing, and -- the one that caught me -- a
@@ -396,9 +680,26 @@ dev_console_run() {
 DEV_TESTAPP="/home/$ESPIX_USER/testapp"
 DEV_TESTAPP_SHA="/home/$ESPIX_USER/.testapp.sha"
 
+# Is the test app on the device? A read, and nothing else.
+#
+# The suites used to call dev_testapp_sync() themselves -- four of them did --
+# which was fine while they ran one after another and is a race as soon as they
+# do not: two workers deciding to push the same path at the same moment. The
+# push now happens once, in run.sh's preflight, before any worker exists. What
+# is left for a suite is this question, which is safe to ask from anywhere.
+dev_testapp_present() {
+    case "$(dev_run "ls -l $DEV_TESTAPP")" in
+        *"no such file"*|*"No such file"*|"$DEV_DEAD"|'') return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # Put the test app on the device, but only when the one there is not the one we
 # just built. espix has no checksum command among its 48, so the hash travels
 # with the binary in a sidecar and `cat` does the comparison.
+#
+# Called once from the runner's preflight; see dev_testapp_present() above for
+# why not from the suites.
 dev_testapp_sync() {
     local local_elf="$1" want have
 
@@ -441,6 +742,12 @@ DEV_HEALTH_CONNS=1
 
 # espix prints one of three shapes (espix_kernel/kernel.c):
 #   up N min          up H:MM          up N days, H:MM
+#
+# The 10# prefixes are not decoration. `up 5:08` gives mins="08", and bash reads
+# a leading zero as octal, where 8 is not a digit -- so the arithmetic failed
+# outright with "value too great for base" on any run that happened to start in
+# the first nine minutes of an hour. It printed one line to stderr and returned
+# nothing, which the reboot check then compared against.
 # Turned into minutes so a *decrease* can be spotted, which is the only
 # dependable sign of a reboot: comparing the reset reason alone misses the
 # common case, since two software reboots in a row read identically.
@@ -448,9 +755,8 @@ DEV_HEALTH_CONNS=1
 # Minute granularity, so a reboot and recovery inside the same minute could
 # slip past. Suites take tens of seconds, and the core-dump check covers the
 # crash case regardless.
-dev_uptime_minutes() {
-    local line days hours mins
-    line=$(dev_once 'uptime')
+_dev_parse_uptime() {
+    local line="$1" days hours mins
 
     case "$line" in
         *day*)
@@ -458,21 +764,45 @@ dev_uptime_minutes() {
             hours=$(printf '%s' "$line" | sed -n 's/.*, \([0-9]*\):[0-9]*.*/\1/p')
             mins=$(printf '%s' "$line" | sed -n 's/.*:\([0-9]*\),.*/\1/p')
             [ -n "$mins" ] || mins=$(printf '%s' "$line" | sed -n 's/.*:\([0-9]*\).*/\1/p')
-            printf '%s' "$(( ${days:-0} * 1440 + ${hours:-0} * 60 + ${mins:-0} ))" ;;
+            printf '%s' "$(( 10#${days:-0} * 1440 + 10#${hours:-0} * 60 + 10#${mins:-0} ))" ;;
         *min*)
             mins=$(printf '%s' "$line" | sed -n 's/^up \([0-9]*\) min.*/\1/p')
-            printf '%s' "${mins:-0}" ;;
+            printf '%s' "$(( 10#${mins:-0} ))" ;;
         *:*)
             hours=$(printf '%s' "$line" | sed -n 's/^up \([0-9]*\):[0-9]*.*/\1/p')
             mins=$(printf '%s' "$line" | sed -n 's/^up [0-9]*:\([0-9]*\).*/\1/p')
-            printf '%s' "$(( ${hours:-0} * 60 + ${mins:-0} ))" ;;
+            printf '%s' "$(( 10#${hours:-0} * 60 + 10#${mins:-0} ))" ;;
         *)
             printf '%s' "-1" ;;
     esac
 }
 
+# Ask through the shared session when there is one, and pay for a connection
+# only when there is not.
+#
+# The health questions used to be one-shot logins without exception, three of
+# them before the first suite and four after every one -- roughly three minutes
+# of a ten-minute run spent logging in to ask how things are. They are ordinary
+# read-only commands and there is nothing about them that needs its own
+# connection.
+_dev_ask() {
+    local out
+    if [ -n "$DEV_SESSION_PID" ] && [ -z "$DEV_SESSION_DEAD" ]; then
+        out=$(dev_run "$1")
+        if [ "$out" != "$DEV_DEAD" ]; then
+            printf '%s' "$out"
+            return 0
+        fi
+    fi
+    dev_once "$1"
+}
+
+dev_uptime_minutes() {
+    _dev_parse_uptime "$(_dev_ask 'uptime')"
+}
+
 dev_health_reason() {
-    dev_once 'uptime' | sed -n 's/.*last reset: //p'
+    _dev_ask 'uptime' | sed -n 's/.*last reset: //p'
 }
 
 dev_health_begin() {
@@ -481,15 +811,21 @@ dev_health_begin() {
 
     # Whatever is already connected before the run starts is somebody else's,
     # and the leak check below is measured against it rather than against zero.
-    DEV_HEALTH_CONNS=$(dev_once 'ps' | grep -c 'sshd:conn')
+    DEV_HEALTH_CONNS=$(_dev_ask 'ps' | grep -c 'sshd:conn')
     if [ "${DEV_HEALTH_CONNS:-0}" -gt 1 ]; then
         printf '  %s %d connections already open; leak detection is relative to that\n' \
                "$(_espix_dim note:)" "$DEV_HEALTH_CONNS"
     fi
 }
 
-# Returns non-zero and explains if the device rebooted, dumped core, or is
-# leaking connection tasks.
+# The end-of-run check: did the device reboot, dump core, or leak connection
+# tasks? Called once, after every worker and the monitor have stopped -- which
+# is the only moment the connection count means anything, since a running pool
+# holds one session per worker by design.
+#
+# The reboot and core-dump halves are watched continuously by dev_monitor_run()
+# while the run is in progress; this is the backstop for anything that happened
+# between its last poll and the end.
 dev_health_check() {
     local reason mins cores conns problems=""
 
@@ -505,10 +841,21 @@ dev_health_check() {
     fi
     [ "$mins" -ge 0 ] && DEV_HEALTH_MINUTES=$mins
 
-    cores=$(dev_once 'coredump')
+    # Matched on what a stored dump actually prints -- "core dump: N bytes at
+    # flash 0x..." -- rather than on the absence of "no core dump stored".
+    #
+    # The absence test was wrong in the direction that costs the most: an
+    # unanswered query is empty, empty does not contain "no core dump", and the
+    # run then reports a core dump that is not there. It did exactly that once,
+    # on a device that answered "no core dump stored" to the very next question.
+    # A check that invents findings is worse than no check, because the next
+    # real one gets waved away too.
+    cores=$(_dev_ask 'coredump')
     case "$cores" in
+        *"core dump: "*)  problems="$problems core-dump-present" ;;
         *"no core dump"*) ;;
-        *) problems="$problems core-dump-present" ;;
+        '')               problems="$problems coredump-unanswered" ;;
+        *)                problems="$problems coredump-unrecognised" ;;
     esac
 
     # Connection tasks: told apart by persistence and by *growth*, not by count.
@@ -533,10 +880,10 @@ dev_health_check() {
     local base="${DEV_HEALTH_CONNS:-1}"
     [ "$base" -lt 1 ] && base=1
 
-    conns=$(dev_once 'ps' | grep -c 'sshd:conn')
+    conns=$(_dev_ask 'ps' | grep -c 'sshd:conn')
     if [ "$conns" -gt "$base" ]; then
         sleep 7
-        conns=$(dev_once 'ps' | grep -c 'sshd:conn')
+        conns=$(_dev_ask 'ps' | grep -c 'sshd:conn')
         if [ "$conns" -gt "$base" ]; then
             problems="$problems sshd-conn-tasks-held=$conns(was $base at start)"
         fi
@@ -546,5 +893,121 @@ dev_health_check() {
         printf '%s' "$problems"
         return 1
     fi
+    return 0
+}
+
+
+# ---------------------------------------------------------------- monitor ---
+#
+# The health check used to run after every suite, and it cost four one-shot
+# logins each time -- reset reason, uptime, coredump, ps. At roughly four
+# seconds a login and twelve suites that is around three minutes of a ten-minute
+# run spent asking the device how it feels.
+#
+# It also cannot work under a pool. Its leak test counts `sshd:conn` tasks, and
+# with N workers holding a session each the count it reads is the runner itself.
+#
+# So it becomes a background subshell with one *persistent* session, polling
+# every ten seconds. Every question then costs no login at all, the answers are
+# timestamped, and attribution improves rather than degrades: instead of "the
+# suite that just finished", a reboot is attributed to whichever suites were
+# actually running when it happened, which is what the .cur files below record.
+#
+# The connection-leak test moves to the end of the run, where the count is
+# meaningful again -- see dev_health_check, which run.sh now calls once.
+
+DEV_MONITOR_PERIOD=10
+
+_dev_monitor_alert() {      # <rundir> <reason>
+    local dir="$1" reason="$2" running="" f name
+
+    for f in "$dir"/w*.cur; do
+        [ -f "$f" ] || continue
+        name=$(cut -d' ' -f1 "$f" 2>/dev/null)
+        [ -n "$name" ] && running="$running $name"
+    done
+    [ -n "$running" ] || running=" (nothing recorded as running)"
+
+    printf '%s\nsuites running at the time:%s\n' "$reason" "$running" \
+        > "$dir/health.alert"
+
+    # And stop everything else waiting on a device that is not answering. The
+    # alert is for the report; this is for the twelve minutes of timeouts that
+    # would otherwise follow it.
+    dev_abort "$reason"
+}
+
+# Poll until <rundir>/stop appears. Intended to be backgrounded.
+dev_monitor_run() {
+    local dir="$1"
+    local up cores mins last=-1 i
+
+    if ! dev_session_start >/dev/null 2>&1; then
+        printf 'monitor could not open a session\n' > "$dir/health.log"
+        return 1
+    fi
+
+    while [ ! -f "$dir/stop" ]; do
+        up=$(dev_run 'uptime')
+        if [ "$up" = "$DEV_DEAD" ]; then
+            # Losing the monitor's own session is not by itself a device fault,
+            # so it reconnects rather than crying wolf. But it must keep trying
+            # for longer than a reboot takes, and this is why: the first version
+            # gave up after one attempt two seconds later, which is exactly when
+            # a rebooting device is not yet accepting connections. So the one
+            # event the monitor exists to catch was also the one event that
+            # silently switched it off, and the run carried on with nobody
+            # watching. The panic that taught it this was found afterwards, in
+            # the end-of-run health check, which is far too late to stop
+            # anything.
+            dev_session_stop
+            i=0
+            while [ "$i" -lt 12 ] && [ ! -f "$dir/stop" ]; do
+                sleep 5
+                if dev_session_start >/dev/null 2>&1; then
+                    break
+                fi
+                i=$((i + 1))
+            done
+            if [ -z "$DEV_PROMPT" ]; then
+                [ -f "$dir/stop" ] || _dev_monitor_alert "$dir" \
+                    "the device stopped answering and did not come back in 60s"
+                break
+            fi
+            continue
+        fi
+
+        cores=$(dev_run 'coredump')
+        mins=$(_dev_parse_uptime "$up")
+        printf '%s|%s|%s\n' "$(date +%s)" "$up" \
+               "$(printf '%s' "$cores" | head -1)" >> "$dir/health.log"
+
+        # Positive evidence only; see the note in dev_health_check. Stopping a
+        # whole run on a query that merely failed to answer would be the same
+        # mistake with a bigger blast radius.
+        case "$cores" in
+            *"core dump: "*)
+                _dev_monitor_alert "$dir" "a core dump appeared during the run"
+                break ;;
+        esac
+
+        if [ "$mins" -ge 0 ] && [ "$last" -ge 0 ] && [ "$mins" -lt "$last" ]; then
+            _dev_monitor_alert "$dir" \
+                "the device rebooted during the run (uptime ${last}min -> ${mins}min)"
+            break
+        fi
+        [ "$mins" -ge 0 ] && last=$mins
+
+        # Sleep in slices so `stop` is noticed promptly; a monitor that takes
+        # ten seconds to notice the run ended holds a session for ten seconds
+        # that the final leak check is about to count.
+        i=0
+        while [ $i -lt $((DEV_MONITOR_PERIOD * 2)) ] && [ ! -f "$dir/stop" ]; do
+            sleep 0.5
+            i=$((i + 1))
+        done
+    done
+
+    dev_session_stop
     return 0
 }

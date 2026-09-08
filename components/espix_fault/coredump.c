@@ -12,6 +12,7 @@
 
 #include "esp_app_desc.h"
 #include "esp_core_dump.h"
+#include "esp_crypto_lock.h"
 #include "esp_log.h"
 
 #include "espix_fault.h"
@@ -19,6 +20,36 @@
 
 #define TAG "coredump"
 
+/*
+ * Every espcoredump call that verifies an image has to hold the SHA/AES lock.
+ *
+ * espcoredump checksums with the *ROM* SHA on every target but the original
+ * ESP32 -- ets_sha_enable(), ets_sha_init(), ets_sha_update(), ets_sha_finish(),
+ * ets_sha_disable() (components/espcoredump/src/core_dump_sha.c). Those drive
+ * the SHA peripheral directly and take no lock of any kind, which is right for
+ * the panic path they were written for, where nothing else is running.
+ *
+ * esp_core_dump_image_check() is not the panic path. It is a public API called
+ * from an ordinary task, and here it is reachable from a shell command, so it
+ * can land in the middle of somebody else's SHA. When it does, ets_sha_enable()
+ * resets the peripheral and ets_sha_disable() turns it off underneath the other
+ * operation, which then reads its digest back as all zeroes -- and IDF's
+ * fault-injection check in sha_hal_read_digest() calls abort() on exactly that.
+ * The whole device reboots.
+ *
+ * Found by running the test suite four suites at a time: the health monitor
+ * asked `coredump` every ten seconds while workers logged in, and a login is
+ * PBKDF2 at 20 000 iterations of HMAC-SHA256. The dump named it in one step --
+ * a panic in sha_hal_read_digest() under psa_key_derivation_output_bytes() in
+ * one sshd:conn task, while the other sat in esp_core_dump_image_check().
+ *
+ * esp_crypto_sha_aes_lock is the same lock esp_sha_acquire_hardware() takes, so
+ * holding it here puts the ROM path back in the same queue as everything else.
+ * Nothing inside these calls takes it again -- the ROM SHA is lockless, which is
+ * the entire problem -- so there is no re-entry to deadlock on.
+ *
+ * Reported upstream; see docs/UPSTREAM.md.
+ */
 esp_err_t espix_fault_coredump_status(espix_coredump_info_t *out)
 {
     if (out == NULL) {
@@ -31,15 +62,25 @@ esp_err_t espix_fault_coredump_status(espix_coredump_info_t *out)
 
     memset(out, 0, sizeof(*out));
 
+    size_t                  addr = 0;
+    size_t                  size = 0;
+    esp_core_dump_summary_t summary;
+    bool                    present     = false;
+    bool                    has_summary = false;
+
+    esp_crypto_sha_aes_lock_acquire();
     /* image_check() verifies the checksum, so a half-written dump from a panic
      * during a panic reports absent rather than garbage. */
-    if (esp_core_dump_image_check() != ESP_OK) {
-        return ESP_OK;
+    if (esp_core_dump_image_check() == ESP_OK &&
+        esp_core_dump_image_get(&addr, &size) == ESP_OK) {
+        present = true;
+        /* Summary is best-effort: a valid dump whose summary cannot be parsed
+         * is still worth reporting and still worth pulling off with idf.py. */
+        has_summary = (esp_core_dump_get_summary(&summary) == ESP_OK);
     }
+    esp_crypto_sha_aes_lock_release();
 
-    size_t addr = 0;
-    size_t size = 0;
-    if (esp_core_dump_image_get(&addr, &size) != ESP_OK) {
+    if (!present) {
         return ESP_OK;
     }
 
@@ -47,10 +88,7 @@ esp_err_t espix_fault_coredump_status(espix_coredump_info_t *out)
     out->flash_addr = addr;
     out->size       = size;
 
-    /* Summary is best-effort: a valid dump whose summary cannot be parsed is
-     * still worth reporting and still worth pulling off with idf.py. */
-    esp_core_dump_summary_t summary;
-    if (esp_core_dump_get_summary(&summary) == ESP_OK) {
+    if (has_summary) {
         strlcpy(out->task, summary.exc_task, sizeof(out->task));
         out->pc = summary.exc_pc;
 
