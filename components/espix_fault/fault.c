@@ -160,14 +160,54 @@ const espix_fault_record_t *espix_fault_last(void)
  */
 static volatile uint32_t s_wdt_events;
 
+/*
+ * And *who* was holding the core, because the count alone cannot tell the two
+ * cases apart and they want opposite responses.
+ *
+ * A watchdog warning naming an app is a user program using the CPU it was
+ * given -- `testapp sig spin` in tests/suites/35-signals.sh exists to do
+ * exactly that, and the suite asserts it must work. One naming an espix task is
+ * espix starving its own machine. Reporting only "a core was busy" makes those
+ * indistinguishable, which is how the last full run ended with a failure nobody
+ * could act on.
+ *
+ * Both cores are recorded because the hook is not told which one starved: IDF's
+ * task_wdt_isr() works out `cpus_fail` and does not pass it. Only the most
+ * recent trigger is kept -- a count plus the latest offender is enough to act
+ * on, and a history would need a lock in an ISR to be worth anything.
+ *
+ * pcTaskGetName(xTaskGetCurrentTaskHandleForCore()) is what IDF's own handler
+ * calls immediately before invoking this one, so it is established as safe
+ * here. strlcpy into a fixed buffer keeps it allocation-free.
+ */
+static char s_wdt_task[CONFIG_FREERTOS_NUMBER_OF_CORES][CONFIG_FREERTOS_MAX_TASK_NAME_LEN];
+
 void esp_task_wdt_isr_user_handler(void)
 {
     s_wdt_events++;
+
+    for (int core = 0; core < CONFIG_FREERTOS_NUMBER_OF_CORES; core++) {
+        const TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(core);
+        const char *name = (t != NULL) ? pcTaskGetName(t) : NULL;
+
+        strlcpy(s_wdt_task[core], (name != NULL) ? name : "?",
+                sizeof(s_wdt_task[core]));
+    }
 }
 
 uint32_t espix_fault_wdt_count(void)
 {
     return s_wdt_events;
+}
+
+const char *espix_fault_wdt_task(int core)
+{
+    if (s_wdt_events == 0 ||
+        core < 0 || core >= CONFIG_FREERTOS_NUMBER_OF_CORES ||
+        s_wdt_task[core][0] == '\0') {
+        return NULL;
+    }
+    return s_wdt_task[core];
 }
 
 const char *espix_fault_reset_reason_str(void)

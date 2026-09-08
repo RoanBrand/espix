@@ -75,6 +75,17 @@ const char *espix_fault_reset_reason_str(void);
 uint32_t espix_fault_wdt_count(void);
 
 /*
+ * The task that was running on `core` when the watchdog last fired, or NULL if
+ * it never has.
+ *
+ * The distinction it exists for: a name beginning "app:" is a user program
+ * using the CPU it was given, which is not a fault. Any other name means espix
+ * held a core for five seconds, which is. Both cores are recorded because the
+ * ISR is not told which one starved.
+ */
+const char *espix_fault_wdt_task(int core);
+
+/*
  * Ask for `task` to be torn down from normal context. Safe to call from the
  * panic path (queue send only, no allocation). Currently unused — see the
  * header comment.

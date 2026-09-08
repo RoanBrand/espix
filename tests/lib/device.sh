@@ -846,6 +846,53 @@ dev_wdt_count() {
     _dev_parse_wdt "$(_dev_ask 'uptime')"
 }
 
+# Which task was holding a core, from the parenthesised tail of `uptime`:
+#
+#     up 5 min, last reset: power-on, 1 watchdog warning (app:testapp)
+#
+# Empty when the device reports no name, which older firmware does not.
+_dev_parse_wdt_task() {     # <uptime output>
+    printf '%s' "$1" | sed -n 's/.*watchdog warning[s]* (\([^)]*\)).*/\1/p'
+}
+
+# Is a watchdog trigger espix's fault?
+#
+# A task named "app:something" is a user program using the CPU it was given.
+# tests/suites/35-signals.sh runs `testapp sig spin` on purpose -- a compute loop
+# with no blocking call, which the suite asserts must work -- so a run that
+# failed on that would be failing on its own test design. Anything else means
+# espix held a core for five seconds, which is a real finding.
+#
+# Unknown counts as espix's: a name we cannot read is not a name we can excuse.
+# Both cores are reported, so this has to look at each name rather than the
+# string as a whole -- "app:testapp, IDLE1" and "IDLE0, app:testapp" are the same
+# finding, and a `case app:*` on the whole string only recognises the first.
+#
+# IDLE names are dropped before judging: a core sitting in IDLE is not what
+# starved anything, it is the other core's report.
+_dev_wdt_is_ours() {        # <task names, comma separated>
+    local rest="${1:-}" name found=0
+
+    [ -n "$rest" ] || return 0      # no name reported: assume ours
+
+    while [ -n "$rest" ]; do
+        name=${rest%%,*}
+        case "$rest" in *,*) rest=${rest#*,} ;; *) rest="" ;; esac
+        name=$(printf '%s' "$name" | sed 's/^ *//; s/ *$//')
+
+        case "$name" in
+            IDLE*|'') continue ;;   # the other core, not the culprit
+            app:*)    found=1 ;;    # a program using the CPU it was given
+            *)        return 0 ;;   # an espix task held a core: ours
+        esac
+    done
+
+    # Only apps named, or only IDLE. The former is not a fault; the latter is
+    # unexplained, and unexplained counts as ours.
+    [ "$found" = 1 ] && return 1
+    return 0
+}
+
 dev_health_begin() {
     local up
     up=$(_dev_ask 'uptime')
@@ -881,7 +928,7 @@ dev_health_begin() {
 # while the run is in progress; this is the backstop for anything that happened
 # between its last poll and the end.
 dev_health_check() {
-    local reason mins cores conns wdt up problems=""
+    local reason mins cores conns wdt wdt_task up problems=""
 
     up=$(_dev_ask 'uptime')
     reason=$(_dev_parse_reason "$up")
@@ -919,7 +966,14 @@ dev_health_check() {
     # thing that notices.
     wdt=$(_dev_parse_wdt "$up")
     if [ "${wdt:-0}" -gt "${DEV_HEALTH_WDT:-0}" ]; then
-        problems="$problems task-watchdog($(( wdt - DEV_HEALTH_WDT )))"
+        wdt_task=$(_dev_parse_wdt_task "$up")
+        if _dev_wdt_is_ours "$wdt_task"; then
+            problems="$problems task-watchdog($(( wdt - DEV_HEALTH_WDT )):${wdt_task:-unknown})"
+        else
+            # A user program using its CPU. run.sh still reports it;
+            # see _dev_wdt_is_ours.
+            :
+        fi
     fi
 
     # Connection tasks: told apart by persistence and by *growth*, not by count.
@@ -1011,7 +1065,16 @@ _dev_monitor_alert() {      # <rundir> <reason>
 # Poll until <rundir>/stop appears. Intended to be backgrounded.
 dev_monitor_run() {
     local dir="$1"
-    local up cores mins last=-1 i wdt wdt_last=-1
+    # Seeded from the run's baseline, not from this loop's first sample.
+    #
+    # It used to start at -1 with a `>= 0` guard, which silently swallowed the
+    # first poll -- so anything firing between dev_health_begin() taking the
+    # baseline and the monitor's first question was counted by the end-of-run
+    # check and never attributed to a suite. That window is several seconds
+    # wide, since the monitor opens its own session first while four workers
+    # open theirs, and it is exactly when a pile-up is most likely.
+    local up cores mins last=-1 i wdt wdt_task
+    local wdt_last="${DEV_HEALTH_WDT:-0}"
 
     if ! dev_session_start >/dev/null 2>&1; then
         printf 'monitor could not open a session\n' > "$dir/health.log"
@@ -1059,8 +1122,10 @@ dev_monitor_run() {
         # check catches anyway. What only the monitor can add is *which suites
         # were running at the time*, so that is what it writes down.
         wdt=$(_dev_parse_wdt "$up")
-        if [ "$wdt_last" -ge 0 ] && [ "${wdt:-0}" -gt "$wdt_last" ]; then
-            printf '%s|%d|%s\n' "$(date +%s)" "$(( wdt - wdt_last ))" \
+        if [ "${wdt:-0}" -gt "$wdt_last" ]; then
+            wdt_task=$(_dev_parse_wdt_task "$up")
+            printf '%s|%d|%s|%s\n' "$(date +%s)" "$(( wdt - wdt_last ))" \
+                   "${wdt_task:-unknown}" \
                    "$(_dev_monitor_running "$dir")" >> "$dir/watchdog.log"
         fi
         [ "${wdt:-0}" -ge 0 ] && wdt_last=$wdt

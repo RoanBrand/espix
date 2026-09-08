@@ -583,15 +583,24 @@ fi
 # what was running, and the .cur files are deleted with the run directory.
 if [ -s "$RUNDIR/watchdog.log" ]; then
     printf '\n%s\n' "$(_espix_red 'task watchdog fired during the run:')"
-    while IFS='|' read -r when n running; do
+    ours=0
+    while IFS='|' read -r when n task running; do
         [ -n "$when" ] || continue
-        printf '  %s  %s trigger(s) while running:%s\n' \
+        printf '  %s  %s trigger(s), task %s, while running:%s\n' \
                "$(date -r "$when" '+%H:%M:%S' 2>/dev/null || echo "$when")" \
-               "$n" "$running"
+               "$n" "${task:-unknown}" "$running"
+        case "${task:-}" in app:*) ;; *) ours=1 ;; esac
     done < "$RUNDIR/watchdog.log"
-    printf '  a core was held long enough to starve its IDLE task; nothing rebooted\n'
-    printf '  (CONFIG_ESP_TASK_WDT_PANIC is off), but IDLE is what frees deleted\n'
-    printf '  tasks, so this defers reclamation. See docs/GOTCHAS.md.\n'
+
+    if [ "$ours" = 1 ]; then
+        printf '  a core was held long enough to starve its IDLE task; nothing rebooted\n'
+        printf '  (CONFIG_ESP_TASK_WDT_PANIC is off), but IDLE is what frees the stacks\n'
+        printf '  of self-deleted tasks, so this defers reclamation. See docs/GOTCHAS.md.\n'
+    else
+        printf '  all of these name an app, i.e. a program using the CPU it was given --\n'
+        printf '  reported, not counted as a fault. 35-signals runs a compute loop on\n'
+        printf '  purpose. See _dev_wdt_is_ours in tests/lib/device.sh.\n'
+    fi
 fi
 
 if health=$(dev_health_check); then :; else

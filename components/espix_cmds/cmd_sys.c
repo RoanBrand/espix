@@ -112,9 +112,31 @@ static int cmd_uptime(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "%s, last reset: %s\n", buf,
                      espix_fault_reset_reason_str());
     } else {
-        espix_printf(s, "%s, last reset: %s, %u watchdog warning%s\n", buf,
+        /*
+         * Named, not just counted. "1 watchdog warning" is unactionable: an app
+         * burning CPU it was given and espix starving its own machine look
+         * identical, and only one of them is a bug.
+         *
+         * Both cores are shown when they differ, because the ISR cannot tell
+         * which one starved -- see espix_fault_wdt_task().
+         */
+        const char *c0 = espix_fault_wdt_task(0);
+        const char *c1 = (CONFIG_FREERTOS_NUMBER_OF_CORES > 1)
+                             ? espix_fault_wdt_task(1) : NULL;
+
+        espix_printf(s, "%s, last reset: %s, %u watchdog warning%s", buf,
                      espix_fault_reset_reason_str(), (unsigned)wdt,
                      (wdt == 1) ? "" : "s");
+
+        if (c0 != NULL && c1 != NULL && strcmp(c0, c1) != 0) {
+            espix_printf(s, " (%s, %s)\n", c0, c1);
+        } else if (c0 != NULL) {
+            espix_printf(s, " (%s)\n", c0);
+        } else if (c1 != NULL) {
+            espix_printf(s, " (%s)\n", c1);
+        } else {
+            espix_printf(s, "\n");
+        }
     }
     return 0;
 }
