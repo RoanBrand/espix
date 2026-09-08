@@ -11,9 +11,10 @@
 # whichever framed command happens to be in flight -- unassertable. Process
 # state is not.
 #
-# PARALLEL_SAFE=no -- backgrounds processes and signals them by pid.
+# RESOURCES: none -- every assertion here is scoped by pid, including the
+# dmesg ones, so another suite's processes are invisible to it.
 
-if ! dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
     return 0
 fi

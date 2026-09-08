@@ -15,7 +15,8 @@ The prompt is the delimiter, and it carries information: `esp:~$ ` versus
 privilege cannot masquerade as a passing test.
 
 Usage:
-    session.py --host H --user U --password P [--timeout N] < commands
+    session.py --host H --user U --password P [--timeout N]
+               [--login-timeout N] < commands
 Each input line is one command. Output is framed per command:
     <<<ESPIX-CMD n>>>
     ...output...
@@ -42,8 +43,15 @@ def strip_ansi(data):
 
 
 class Session:
-    def __init__(self, host, user, password, timeout=25):
+    def __init__(self, host, user, password, timeout=25, login_timeout=None):
         self.timeout = timeout
+        # Logging in and running a command deserve different patience. A login
+        # costs a key exchange plus PBKDF2 at 20 000 iterations and gets slower
+        # when several happen together -- measured at 4.0s alone and 8.7-11.7s
+        # for five at once -- while a command taking 25 seconds is a fault and
+        # should be reported as one. See the note on ESPIX_LOGIN_TIMEOUT in
+        # device.sh, including what this did *not* turn out to explain.
+        self.login_timeout = timeout if login_timeout is None else login_timeout
         self.buf = b""
         argv = [
             "ssh", "-tt",
@@ -72,9 +80,9 @@ class Session:
             os.execvpe("ssh", argv, env)
             os._exit(127)
 
-        self._expect(b"assword:")
+        self._expect(b"assword:", self.login_timeout)
         os.write(self.fd, password.encode() + b"\r")
-        self._wait_prompt()
+        self._wait_prompt(self.login_timeout)
         self.prompt = self._last_prompt()
 
     def _last_prompt(self):
@@ -106,16 +114,16 @@ class Session:
         self.buf += chunk
         return True
 
-    def _expect(self, needle):
-        deadline = time.time() + self.timeout
+    def _expect(self, needle, timeout=None):
+        deadline = time.time() + (self.timeout if timeout is None else timeout)
         while needle not in self.buf:
             if not self._read_some(deadline):
                 raise TimeoutError(
                     f"never saw {needle!r}; got: {self.buf[-400:]!r}")
         return True
 
-    def _wait_prompt(self):
-        deadline = time.time() + self.timeout
+    def _wait_prompt(self, timeout=None):
+        deadline = time.time() + (self.timeout if timeout is None else timeout)
         while True:
             tail = strip_ansi(self.buf).rstrip(b"\x00")
             # Trailing CR/LF before the prompt is normal; only the very end
@@ -197,10 +205,13 @@ def main():
     ap.add_argument("--user", required=True)
     ap.add_argument("--password", required=True)
     ap.add_argument("--timeout", type=int, default=25)
+    ap.add_argument("--login-timeout", type=int, default=None,
+                    help="patience for the login only; defaults to --timeout")
     args = ap.parse_args()
 
     try:
-        s = Session(args.host, args.user, args.password, args.timeout)
+        s = Session(args.host, args.user, args.password, args.timeout,
+                    args.login_timeout)
     except Exception as exc:                      # noqa: BLE001
         # Framed on stdout as well as on stderr. Nothing reads our stderr --
         # device.sh redirects it to a file it never opens and then deletes --

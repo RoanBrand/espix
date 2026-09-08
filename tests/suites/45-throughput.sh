@@ -10,9 +10,11 @@
 # from /dev/factory, so the suite can run as often as it likes without wearing
 # flash -- littlefs's cost is in its writes.
 #
-# PARALLEL_SAFE=no -- saturates the link.
+# RESOURCES: exclusive -- these are measurements. They run alone, after the
+# pool has drained and the device has settled, so the floors below mean the
+# same thing in a parallel run as in a serial one.
 
-if ! dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
     return 0
 fi

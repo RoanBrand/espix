@@ -5,7 +5,8 @@
 # unlocking the root account for the network. It is also the only interface
 # that survives the network being broken, which is when you need it most.
 #
-# PARALLEL_SAFE=no -- there is one serial port.
+# RESOURCES: console -- there is one serial port. Nothing else in the tree
+# wants it, so this still runs in the pool beside the SSH suites.
 
 if [ "$ESPIX_HAVE_SERIAL" != yes ]; then
     espix_skip "no serial port given (--port) or no pyserial"

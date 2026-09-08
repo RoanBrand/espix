@@ -1,12 +1,19 @@
 # Filesystem: the commands, the mode bits, and the refusals.
 #
-# PARALLEL_SAFE=no -- creates and removes files under /tmp with fixed names.
+# RESOURCES: none -- the paths it makes carry the worker number, so two of
+# these side by side cannot see each other's files.
 
-T=/tmp/espix-test-fs
+T=/tmp/espix-test-fs-$ESPIX_WORKER
+# The full name, not the stem: the two assertions below look at a listing of
+# /tmp, where another worker's espix-test-fs-2 is also sitting. Matching the
+# stem would let this suite see its neighbour's directory and call it its own
+# -- and worse, the "it is gone now" assertion would fail on a directory that
+# is none of its business.
+TNAME=espix-test-fs-$ESPIX_WORKER
 
 dev_run "rm -r $T" >/dev/null 2>&1
 dev_run "mkdir $T" >/dev/null
-assert_contains "mkdir creates a directory" "espix-test-fs" "$(dev_run 'ls -l /tmp')"
+assert_contains "mkdir creates a directory" "$TNAME" "$(dev_run 'ls -l /tmp')"
 
 dev_run "echo hello-espix > $T/a.txt" >/dev/null
 assert_eq "a file round-trips through the shell" "hello-espix" "$(dev_run "cat $T/a.txt")"
@@ -45,4 +52,4 @@ dev_run "cp $T/b.txt $T/c.txt" >/dev/null
 assert_eq "cp copies the contents" "hello-espix" "$(dev_run "cat $T/c.txt")"
 
 dev_run "rm -r $T" >/dev/null
-assert_not_contains "rm -r removes the tree" "espix-test-fs" "$(dev_run 'ls /tmp')"
+assert_not_contains "rm -r removes the tree" "$TNAME" "$(dev_run 'ls /tmp')"

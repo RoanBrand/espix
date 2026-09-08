@@ -1,6 +1,8 @@
 # Identity: who you are, what that lets you do, and what it does not.
 #
-# PARALLEL_SAFE=no -- sudo changes process credentials.
+# RESOURCES: none -- `sudo <cmd>` raises privilege for that one command and
+# nothing outlives it, so a second session running beside this one is
+# unaffected. It was marked unsafe on the assumption that it was not.
 
 assert_contains "id names the user"  "($ESPIX_USER)" "$(dev_run 'id')"
 assert_contains "groups lists a group" "$ESPIX_USER" "$(dev_run 'groups')"

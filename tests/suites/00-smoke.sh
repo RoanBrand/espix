@@ -1,6 +1,6 @@
 # Does the device work at all, and is it the build we think it is?
 #
-# PARALLEL_SAFE=yes -- read-only, touches no shared state.
+# RESOURCES: none -- read-only, touches no shared state.
 
 assert_eq "whoami is the login user" "$ESPIX_USER" "$(dev_run 'whoami')"
 assert_contains "id reports a uid and gid" "uid=" "$(dev_run 'id')"

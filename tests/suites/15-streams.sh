@@ -6,9 +6,9 @@
 # message vanished into a redirect and the loader was blamed for not naming a
 # symbol it had named perfectly. That specific failure is the first check here.
 #
-# PARALLEL_SAFE=no -- writes files under /tmp with fixed names.
+# RESOURCES: none -- its /tmp paths carry the worker number.
 
-T=/tmp/espix-streams
+T=/tmp/espix-streams-$ESPIX_WORKER
 dev_run "rm -r $T" >/dev/null 2>&1
 dev_run "mkdir $T" >/dev/null 2>&1
 
@@ -96,7 +96,7 @@ esac
 # diagnostics do.
 # ---------------------------------------------------------------------------
 
-if dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp"; then
+if dev_testapp_present; then
     APP="/home/$ESPIX_USER/testapp"
 
     both=$(dev_run "$APP both")

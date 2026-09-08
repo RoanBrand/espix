@@ -1,6 +1,6 @@
 # Interfaces and routing.
 #
-# PARALLEL_SAFE=yes -- read-only, touches no shared state.
+# RESOURCES: none -- read-only, touches no shared state.
 
 link_out=$(dev_run 'ip link')
 

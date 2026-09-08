@@ -40,13 +40,19 @@ espix_timeout() {
     # only way back, because an explicit `0<&0` on an async command is applied
     # *after* the /dev/null substitution and so re-duplicates /dev/null.
     # Braces round the exec, and they are not decoration: `exec` with no
-    # command makes its redirections *permanent*, so `exec 7<&0 2>/dev/null`
+    # command makes its redirections *permanent*, so `exec 19<&0 2>/dev/null`
     # silences the shell's stderr for good -- which swallowed ssh's own
     # diagnostics and broke the one assertion that checks a client's `2>&1`.
-    # Grouping scopes the 2>/dev/null to the group while fd 7 still lands on
+    # Grouping scopes the 2>/dev/null to the group while fd 19 still lands on
     # the shell.
+    # Descriptor 19, not 7. device.sh already owns 6 and 7 for the console
+    # FIFOs and 8 and 9 for the session, so `exec 7<&0` here would quietly take
+    # the console's write end away from it the first time a console suite
+    # reached for a deadline. Nothing does that today, which is exactly the kind
+    # of thing that stays true until it does not. bash 3.2 has no {var}<&0 to
+    # allocate one, so the number is picked by hand and written down.
     local have_stdin=""
-    if { exec 7<&0; } 2>/dev/null; then
+    if { exec 19<&0; } 2>/dev/null; then
         have_stdin=yes
     fi
 
@@ -54,13 +60,13 @@ espix_timeout() {
     # background jobs in the same shell report themselves.
     set -m
     if [ -n "$have_stdin" ]; then
-        "$@" <&7 &
+        "$@" <&19 &
     else
         "$@" &
     fi
     pid=$!
     set +m
-    [ -n "$have_stdin" ] && { exec 7<&-; } 2>/dev/null
+    [ -n "$have_stdin" ] && { exec 19<&-; } 2>/dev/null
     start=$SECONDS
 
     while kill -0 "$pid" 2>/dev/null; do

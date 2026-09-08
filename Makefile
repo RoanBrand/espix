@@ -13,6 +13,7 @@
 #   make apps             build apps/ and stage into fsroot/bin
 #   make test-app         build the test app into fsroot/home/esp
 #   make test             run the test suite       [SUITE=fs] [PORT=...]
+#                                                 [J=8] [SERIAL=1] [SEED=n]
 #   make stress           transport regression check, expects zero failures [N=30]
 #   make clean            fullclean, firmware and apps
 #
@@ -35,7 +36,7 @@ endif
 all: build
 
 help:
-	@sed -n '3,22p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,23p' Makefile | sed 's/^# \{0,1\}//'
 
 build:
 	$(IDF) build
@@ -70,6 +71,9 @@ test: test-app
 	@eval "$$(./tools/idf.sh --env)"; \
 	ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh \
 	    $(if $(SUITE),--suite $(SUITE),) \
+	    $(if $(J),-j $(J),) \
+	    $(if $(SEED),--seed $(SEED),) \
+	    $(if $(SERIAL),--serial,) \
 	    $$(p="$(PORT)"; [ -n "$$p" ] || p=$$(./tools/port.sh 2>/dev/null || true); \
 	       [ -n "$$p" ] && printf -- '--port %s' "$$p")
 
