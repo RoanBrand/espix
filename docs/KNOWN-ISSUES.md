@@ -89,11 +89,58 @@ belong to ESP-IDF rather than to espix see [UPSTREAM.md](UPSTREAM.md).
   the run that produced it used neither `2>&1` nor stdin, so that is a
   resemblance and not a diagnosis.
 
+  **It is reproducible now.** Running the test suite four suites at a time
+  (`tests/run.sh -j 4`, the default since the pool was added) panics the device
+  inside about seven minutes, with the same signature to the frame: faulting
+  task `sshd:conn`, `remove_free_block` -> `block_merge_next` -> `tlsf_free`
+  from `free(vfs_fds_triple)` at the end of `esp_vfs_select`, called from
+  `chan_poll_interrupt()`, on the **PSRAM** heap (`heap=0x3c110000`). What
+  changed is only the load: several sessions running processes at once, so the
+  50ms `select()` poll runs in several tasks rather than one.
+
+  Two workers are enough -- `-j 2` panicked in 208 seconds -- so this is not
+  about the session limit going from four to eight. It is about two sessions
+  doing anything at once, which the old serial harness never did.
+
+  And it is not one signature. Four runs produced four panics: this one, a
+  `CacheError` (exccause 0x47) on IDLE0, the `esp_linenoise` free below, and the
+  SHA abort that is now fixed. Different detectors, one likely cause -- memory
+  being corrupted somewhere else and noticed by whoever touches it next.
+
+  This is the entry to work on next, and it now has a handle: a reproducer that
+  takes minutes rather than a fault seen once. Two things to hold on to when
+  picking it up. The frame that asserts is the detector and not the culprit --
+  something else corrupted the heap earlier and this is merely the next free.
+  And the fault predates every part of the parallel work: this entry was written
+  before it, describing the same three frames.
+
   `CONFIG_HEAP_POISONING_COMPREHENSIVE` found nothing across four runs, and
   would not be expected to: it checks canaries around *allocations*, and a
   write through a stale task handle lands inside a live TCB. If it returns, the
   serial console with poisoning on is the fastest route — the console being the
   one channel that is not the thing under test.
+
+- **`esp_linenoise` frees a garbage pointer under load.** Seen once, on the
+  serial console, during a four-worker run: faulting task `main`, `free(0x15)`
+  inside `esp_linenoise_history_free()` from `espix_history_apply()` in
+  `console_read_line()`, tripping heap_caps_base.c's "free() target pointer is
+  outside heap areas".
+
+  0x15 is not a pointer, so the editor's history array held something that was
+  never allocated. Two candidates, neither confirmed: memory corruption from
+  elsewhere -- there is no MMU, and the entry above is loose in the same system
+  -- or `esp_linenoise_edit()`'s ENTER case, which does
+  `state->history_length--; free(config->history[state->history_length]);` with
+  no check that the length is above zero. espix's `espix_history_apply()`
+  rebuilds the editor's list on every prompt and adds a `""` placeholder that
+  `esp_linenoise_history_add()` then refuses as a duplicate, which is a way to
+  arrive at ENTER with a length of one that becomes zero -- but reaching an
+  actual underflow from there needs a read that skips the rebuild, and that path
+  has not been found.
+
+  The console is only reachable over the UART, so this needs somebody at the
+  serial line while the network is busy. Recorded rather than chased because it
+  has been seen once.
 
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
