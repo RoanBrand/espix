@@ -60,6 +60,57 @@ suppressed and the DNS option is documented as unavoidable. Worth re-testing if
 the DHCP server ever gains a real "offer nothing" value; `components/espix_net/usb_ncm.c`
 says so at the point where the suppression would go.
 
+### `esp_core_dump_image_check()` drives the SHA peripheral with no lock
+
+`espcoredump` checksums with the **ROM** SHA on every target but the original
+ESP32 (`components/espcoredump/src/core_dump_sha.c`):
+
+```c
+static void core_dump_sha256_start(core_dump_sha_ctx_t *sha_ctx)
+{
+    ets_sha_enable();                 /* resets the peripheral */
+    ets_sha_init(&sha_ctx->ctx, SHA2_256);
+}
+...
+static void core_dump_sha256_finish(core_dump_sha_ctx_t *sha_ctx)
+{
+    ets_sha_finish(&sha_ctx->ctx, sha_ctx->result);
+    ets_sha_disable();                /* turns it off */
+}
+```
+
+Those ROM calls take no lock. That is correct for the panic path they were
+written for, where nothing else is running -- but `esp_core_dump_image_check()`,
+`esp_core_dump_image_get()` and `esp_core_dump_get_summary()` are public APIs
+called from ordinary tasks, and they go through the same checksum.
+
+So a runtime call lands in the middle of another task's SHA. `ets_sha_enable()`
+resets the peripheral and `ets_sha_disable()` turns it off under the other
+operation, which then reads its digest state back as all zeroes -- and IDF's own
+fault-injection guard in `sha_hal_read_digest()`
+(`components/esp_hal_security/sha_hal.c:128`) calls `abort()` on precisely that.
+The device panics and reboots.
+
+Reproduced on an ESP32-S3 running four test suites at once: a health monitor
+asking `coredump` every ten seconds beside SSH logins, each of which is PBKDF2
+at 20 000 iterations of HMAC-SHA256. The core dump named it in one step -- one
+`sshd:conn` task in `sha_hal_read_digest()` under
+`psa_key_derivation_output_bytes()`, another `sshd:conn` sitting in
+`esp_core_dump_image_check()`.
+
+**Workaround.** espix takes `esp_crypto_sha_aes_lock_acquire()` -- the same lock
+`esp_sha_acquire_hardware()` uses -- around every espcoredump call that verifies
+an image; see `components/espix_fault/coredump.c`. Nothing inside those calls
+takes it again, the ROM SHA being lockless, so there is no re-entry to deadlock
+on.
+
+**The fix upstream** would be for espcoredump to take that lock itself when it
+is not on the panic path, or to use the mbedtls port at runtime and keep the ROM
+path for the crash handler. Note that any application calling
+`esp_core_dump_image_check()` from a task is exposed, not just this one: it needs
+no unusual configuration and no unusual hardware, only a second task using SHA
+at the wrong moment. TLS does, and so does anything hashing a password.
+
 ### The VFS has no `chmod`
 
 `esp_vfs_fs_ops_t` carries `truncate`, `ftruncate` and `utime` and nothing else
