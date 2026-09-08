@@ -151,6 +151,26 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   In the meantime it is rare and it is loud: the fault handler records it, and
   the test runner aborts the run and says which suites were in flight.
 
+- **A session occasionally dies under parallel load, and nothing explains it
+  yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
+  session partway through and the harness reported seven failures that were one
+  event — `session gone before: ps`, then everything downstream comparing
+  against the dead-session sentinel. The device was fine throughout: no reboot,
+  no core dump, and the very next run was 149 assertions green.
+
+  It is not new and it is not the panics. The same shape turned up early in the
+  parallel work, before any of the fixes: one login failure in nine rounds of
+  "open a session, then open four connections at once", which the login-timeout
+  change did **not** explain — a login measures 4.0s alone and 8.7–11.7s with
+  five at once, nowhere near the 25s budget it was blamed on.
+
+  What is known: the connection goes away rather than hanging, the device does
+  not notice anything, and it is rare enough that a rate needs tens of runs to
+  measure. What would settle it is the serial console open with `dmesg -n debug`
+  while a parallel run goes, so the device's own account of the disconnect is
+  captured — which is how the `Corrupted MAC` bug was eventually caught, and for
+  the same reason: never debug a transport through itself.
+
 - **The fault handler intercepts but does not recover.** A crash is recorded and
   reported in `dmesg` on the next boot, and then the system reboots.
   `espix_fault_request_reap()` exists with no callers.
