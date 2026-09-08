@@ -34,37 +34,36 @@ fi
 # KNOWN-ISSUES rather than worked around in the firmware. What this suite tests
 # is the shell over serial, and it cannot test that through a channel something
 # else is writing to.
-CONSOLE_LEVEL_SAVED=""
+# Quieted over SSH, not over the console, and it has to be that way round.
+#
+# The console cannot quiet its own log: setting the level takes a command, and
+# typing a command is the thing the log breaks. The first attempt did it from
+# the console and produced this --
+#
+#     root:/# dmesg -n w
+#     root:/# dmesg -n wa
+#     espix: sshchan: esp logged out
+#
+# -- the editor redrawing after every keystroke while klog lines landed between
+# the redraws, so console.py saw a prompt mid-command and framed the answer
+# wrong. Over SSH there is no such problem: `dmesg -n` is global, and sudo
+# reaches root from the `esp` account.
+CONSOLE_LEVEL_SAVED=$(dev_run 'sudo dmesg -n' |
+                      sed -n 's/.*console level: \([0-9]*\).*/\1/p')
+dev_run 'sudo dmesg -n warn' >/dev/null 2>&1
 
 console_restore() {
     case "${CONSOLE_LEVEL_SAVED:-}" in
-        ''|*[!0-9]*) dev_console_run 'dmesg -n info' >/dev/null 2>&1 ;;
-        *)           dev_console_run "dmesg -n $CONSOLE_LEVEL_SAVED" >/dev/null 2>&1 ;;
+        ''|*[!0-9]*) dev_run 'sudo dmesg -n info' >/dev/null 2>&1 ;;
+        *)           dev_run "sudo dmesg -n $CONSOLE_LEVEL_SAVED" >/dev/null 2>&1 ;;
     esac
 }
 
-# The first call has to be both the probe and the quieting, and it is one call
-# because it cannot be two.
-#
-# The probe must come first: it is the one call allowed to find a console that
-# is not there, and everything after it may assume one that is. But the log has
-# to be quiet *before* anything is parsed, or a klog line splits the answer. Put
-# the quieting ahead of the probe and you have an unguarded console call in
-# front of the guard -- a run spent twenty-five minutes waiting on exactly that.
-#
-# `dmesg -n` with no argument only reads, so it is a safe first thing to say,
-# and its answer doubles as the level to restore.
-if ! CONSOLE_LEVEL_SAVED=$(dev_console_run 'dmesg -n'); then
+# One probe decides whether the console is there, and it comes first among the
+# console calls -- everything after may assume a console that answers.
+if ! who=$(dev_console_run 'whoami'); then
     espix_skip "console did not answer -- see the message above for whether"
     espix_skip "something else is holding $ESPIX_PORT"
-    return 0
-fi
-CONSOLE_LEVEL_SAVED=$(printf '%s' "$CONSOLE_LEVEL_SAVED" |
-                      sed -n 's/.*console level: \([0-9]*\).*/\1/p')
-dev_console_run 'dmesg -n warn' >/dev/null 2>&1
-
-if ! who=$(dev_console_run 'whoami'); then
-    espix_skip "console stopped answering after the first command"
     console_restore
     return 0
 fi
