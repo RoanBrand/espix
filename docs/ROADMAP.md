@@ -535,11 +535,11 @@ things are as they are.
   permission story fall out of the file mode instead of needing one of its own.
 
   It would be espix's **first device driver of its own** -- `/dev/uart` is live
-  in this build but it is ESP-IDF's. Two things already in the way, both in
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md): `ls /dev` cannot list mount points, and a
-  device VFS with no `stat` cannot be listed by `ls -l`. So the driver would work
-  and be invisible, which makes this a good exercise and an unsatisfying one
-  until the mount table lands -- the first Filesystem item here.
+  in this build but it is ESP-IDF's. An espix `s_nodes[]` entry is now listed by
+  `ls /dev` and typed by `ls -l`, so a node for this would be visible as soon as
+  it is added; only ESP-IDF's own `/dev/uart` mount remains unlistable (see
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md)). The mode comes from the table, so
+  `chmod` on it is refused by design rather than being a way to change it.
 
   Related to **Per-app export tables**: handing every loaded app a radio is
   exactly the thing that item exists to stop, and a device node is how the

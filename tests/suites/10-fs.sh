@@ -53,3 +53,45 @@ assert_eq "cp copies the contents" "hello-espix" "$(dev_run "cat $T/c.txt")"
 
 dev_run "rm -r $T" >/dev/null
 assert_not_contains "rm -r removes the tree" "$TNAME" "$(dev_run 'ls /tmp')"
+
+# ---------------------------------------------------------------------------
+# /dev: a directory espix answers for itself.
+#
+# It is not on littlefs, its entries come from the device table, and nothing
+# under it is a name anyone may create or remove. An older image's /dev may
+# still hold files; none of them may show up here.
+# ---------------------------------------------------------------------------
+
+dev_out=$(dev_run 'ls /dev')
+assert_contains     "ls /dev lists the null device"    "null"    "$dev_out"
+assert_contains     "ls /dev lists the factory device" "factory" "$dev_out"
+assert_not_contains "ls /dev hides anything else"      "keep"    "$dev_out"
+# ESP-IDF's own UART VFS is a separate mount at a longer prefix; /dev lists
+# only what espix owns.
+assert_not_contains "ls /dev does not list the UART VFS" "uart" "$dev_out"
+
+assert_contains "/ is still a directory listing with dev in it" "dev" \
+    "$(dev_run 'ls /')"
+
+dev_l=$(dev_run 'ls -l /dev')
+assert_contains "null is a character device"  "c"           "$dev_l"
+assert_contains "null is world-writable"      "crw-rw-rw-"  "$dev_l"
+assert_contains "factory is read-only"        "-r--r--r--"  "$dev_l"
+
+assert_eq "cat /dev/null is empty" "" "$(dev_run 'cat /dev/null')"
+
+# A non-root shell must be able to redirect into the sink -- which is why the
+# permission check has to read the device's declared mode, not the rule's 0644.
+assert_status "an ordinary account may write /dev/null" 0 dev_status \
+    'echo swallowed > /dev/null'
+
+# Nothing in /dev is editable, in either direction.
+assert_status "touch /dev/x is refused"     1 dev_status 'touch /dev/x'
+assert_status "mkdir /dev/x is refused"     1 dev_status 'mkdir /dev/x'
+assert_status "rm /dev/null is refused"     1 dev_status 'rm /dev/null'
+assert_status "rm -r /dev is refused"       1 dev_status 'rm -r /dev'
+assert_status "chmod on a device is refused" 1 dev_status 'chmod 600 /dev/null'
+
+# And /dev is still there afterwards, in its own right.
+assert_contains "/dev survives the attempts" "null" "$(dev_run 'ls /dev')"
+

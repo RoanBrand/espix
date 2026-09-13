@@ -187,6 +187,20 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     if (dev != NULL) {
         return espix_dev_open(dev, flags);
     }
+    if (espix_dev_isdir(p)) {
+        errno = EISDIR;
+        return -1;
+    }
+    if (espix_dev_underdev(p)) {
+        /*
+         * The subtree is espix's and answers to the table alone, so a name
+         * that is not a node does not exist -- and no create can land on a
+         * synthetic directory. Both branches keep /dev out of littlefs
+         * entirely, which is what hides whatever an older image left there.
+         */
+        errno = (flags & O_CREAT) ? EROFS : ENOENT;
+        return -1;
+    }
 
     if (NO_LOWER(l->ops->open_p)) {
         return enosys();
@@ -360,6 +374,15 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
         espix_dev_stat(dev, st);
         return 0;
     }
+    if (espix_dev_isdir(p)) {
+        espix_dev_dir_stat(st);
+        return 0;
+    }
+    if (espix_dev_underdev(p)) {
+        /* A name in /dev that is not a node is not there -- never littlefs. */
+        errno = ENOENT;
+        return -1;
+    }
 
     if (NO_LOWER(l->dir->stat_p)) {
         return enosys();
@@ -377,6 +400,12 @@ static int vfs_unlink(void *ctx, const char *path)
     const lower_t *l = ctx;
 
     RESOLVE_OR_FAIL(path, -1);
+
+    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+        /* Nothing in /dev is a name espix will edit. */
+        errno = EROFS;
+        return -1;
+    }
 
     const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_UNLINK, 0);
     if (err != 0) {
@@ -398,6 +427,14 @@ static int vfs_rename(void *ctx, const char *src, const char *dst)
      * here would report a path outside the root as merely too long. */
     if (resolve(src, abs_src, sizeof(abs_src)) == NULL ||
         resolve(dst, abs_dst, sizeof(abs_dst)) == NULL) {
+        return -1;
+    }
+
+    /* A rename edits two names; either one landing in /dev is refused, in
+     * both directions, because nothing there is a littlefs name. */
+    if (espix_dev_isdir(abs_src) || espix_dev_underdev(abs_src) ||
+        espix_dev_isdir(abs_dst) || espix_dev_underdev(abs_dst)) {
+        errno = EROFS;
         return -1;
     }
 
@@ -425,6 +462,14 @@ static DIR *vfs_opendir(void *ctx, const char *name)
         errno = err;
         return NULL;
     }
+    if (espix_dev_isdir(p)) {
+        return espix_dev_opendir();
+    }
+    if (espix_dev_underdev(p)) {
+        /* Only /dev itself is a directory here. */
+        errno = ENOTDIR;
+        return NULL;
+    }
     if (NO_LOWER(l->dir->opendir_p)) {
         errno = ENOSYS;
         return NULL;
@@ -436,6 +481,9 @@ static struct dirent *vfs_readdir(void *ctx, DIR *pdir)
 {
     const lower_t *l = ctx;
 
+    if (espix_dev_dirp(pdir)) {
+        return espix_dev_readdir(pdir);
+    }
     if (NO_LOWER(l->dir->readdir_p)) {
         errno = ENOSYS;
         return NULL;
@@ -447,6 +495,10 @@ static int vfs_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
                          struct dirent **out)
 {
     const lower_t *l = ctx;
+
+    if (espix_dev_dirp(pdir)) {
+        return espix_dev_readdir_r(pdir, entry, out);
+    }
     return NO_LOWER(l->dir->readdir_r_p)
                ? enosys() : l->dir->readdir_r_p(l->ctx, pdir, entry, out);
 }
@@ -454,6 +506,10 @@ static int vfs_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
 static long vfs_telldir(void *ctx, DIR *pdir)
 {
     const lower_t *l = ctx;
+
+    if (espix_dev_dirp(pdir)) {
+        return espix_dev_telldir(pdir);
+    }
     return NO_LOWER(l->dir->telldir_p) ? enosys()
                                        : l->dir->telldir_p(l->ctx, pdir);
 }
@@ -462,6 +518,10 @@ static void vfs_seekdir(void *ctx, DIR *pdir, long offset)
 {
     const lower_t *l = ctx;
 
+    if (espix_dev_dirp(pdir)) {
+        espix_dev_seekdir(pdir, offset);
+        return;
+    }
     if (!NO_LOWER(l->dir->seekdir_p)) {
         l->dir->seekdir_p(l->ctx, pdir, offset);
     }
@@ -470,6 +530,10 @@ static void vfs_seekdir(void *ctx, DIR *pdir, long offset)
 static int vfs_closedir(void *ctx, DIR *pdir)
 {
     const lower_t *l = ctx;
+
+    if (espix_dev_dirp(pdir)) {
+        return espix_dev_closedir(pdir);
+    }
     return NO_LOWER(l->dir->closedir_p) ? enosys()
                                         : l->dir->closedir_p(l->ctx, pdir);
 }
@@ -479,6 +543,17 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
     const lower_t *l = ctx;
 
     RESOLVE_OR_FAIL(name, -1);
+
+    /*
+     * /dev itself is a real littlefs directory -- the mount point that keeps
+     * `ls /` listing it -- so mkdir("/dev") is let through. A name *inside* it
+     * is not: the device table owns that space and it holds no creatable
+     * entries.
+     */
+    if (espix_dev_underdev(p)) {
+        errno = EROFS;
+        return -1;
+    }
 
     const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_MKDIR, 0);
     if (err != 0) {
@@ -502,6 +577,12 @@ static int vfs_rmdir(void *ctx, const char *name)
 
     RESOLVE_OR_FAIL(name, -1);
 
+    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+        /* The mount point stays, and nothing inside it is a real directory. */
+        errno = EROFS;
+        return -1;
+    }
+
     const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_RMDIR, 0);
     if (err != 0) {
         errno = err;
@@ -515,6 +596,11 @@ static int vfs_truncate(void *ctx, const char *path, off_t length)
     const lower_t *l = ctx;
 
     RESOLVE_OR_FAIL(path, -1);
+
+    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+        errno = EROFS;
+        return -1;
+    }
 
     const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_TRUNCATE, 0);
     if (err != 0) {
@@ -543,6 +629,10 @@ static int vfs_utime(void *ctx, const char *path, const struct utimbuf *times)
     const lower_t *l = ctx;
     RESOLVE_OR_FAIL(path, -1);
 
+    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+        errno = EROFS;
+        return -1;
+    }
     return NO_LOWER(l->dir->utime_p) ? enosys()
                                      : l->dir->utime_p(l->ctx, p, times);
 }

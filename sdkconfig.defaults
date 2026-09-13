@@ -127,6 +127,12 @@ CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 # Console
 #
 CONFIG_VFS_SUPPORT_DIR=y
+# ESP-IDF registers its own nullfs VFS at "/dev/null" by default (nullfs.c,
+# CONFIG_VFS_INITIALIZE_DEV_NULL). That prefix is longer than espix's "", so
+# ESP-IDF routes /dev/null to it before espix sees the path, shadowing espix's
+# own /dev/null node and bypassing the permission check. espix owns the whole of
+# /dev, so IDF's copy must not be registered.
+CONFIG_VFS_INITIALIZE_DEV_NULL=n
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # Leave the compile-time maximum at INFO. Raising it to DEBUG does not just
 # allow debug output at runtime — espcoredump's macros gate on LOG_LOCAL_LEVEL

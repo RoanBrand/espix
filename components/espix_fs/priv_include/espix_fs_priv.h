@@ -106,6 +106,26 @@ const void *espix_dev_lookup(const char *abs_path);
 void        espix_dev_stat(const void *handle, struct stat *st);
 int         espix_dev_open(const void *handle, int flags);
 
+/*
+ * The virtual /dev directory. Its entries are the device table, and nothing
+ * in it reaches littlefs, so whatever an older image left there is invisible.
+ */
+bool        espix_dev_isdir(const char *abs_path);
+bool        espix_dev_underdev(const char *abs_path);
+bool        espix_dev_mode(const char *abs_path, mode_t *out);
+void        espix_dev_dir_stat(struct stat *st);
+
+DIR        *espix_dev_opendir(void);
+struct dirent *espix_dev_readdir(DIR *pdir);
+int         espix_dev_readdir_r(DIR *pdir, struct dirent *entry,
+                                struct dirent **out);
+long        espix_dev_telldir(DIR *pdir);
+void        espix_dev_seekdir(DIR *pdir, long offset);
+int         espix_dev_closedir(DIR *pdir);
+
+/* True for a DIR that espix_dev_opendir() handed out, so vfs.c can route. */
+bool        espix_dev_dirp(DIR *pdir);
+
 static inline bool espix_dev_fd(int fd)
 {
     return fd >= ESPIX_DEV_FD_BASE;

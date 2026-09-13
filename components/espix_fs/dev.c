@@ -28,10 +28,17 @@
  *
  * A slot rather than a bare device index because two readers of /dev/factory
  * need two file positions.
+ *
+ * /dev is also a *directory* here, not a littlefs one: vfs_opendir() hands back
+ * a synthetic DIR built on the table below, and vfs.c refuses every other
+ * operation under /dev. So the directory lists the nodes, and a file an older
+ * image happened to leave inside it is neither shown nor reachable.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -165,6 +172,167 @@ int espix_dev_open(const void *handle, int flags)
 
     errno = EMFILE;
     return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* The /dev directory                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * /dev is a directory espix answers for without it existing on littlefs.
+ * Paths inside it reach the device table and nothing else, so a file someone
+ * left in an older image's /dev is neither listed nor reachable -- which is
+ * also why no migration is needed to clean one up.
+ *
+ * The handle is what makes this fit ESP-IDF: esp_vfs_opendir() writes
+ * dd_vfs_idx into the DIR it is handed back, and every later call routes on
+ * that field, so the DIR must be the first member of whatever opendir()
+ * returns. A real static pool, rather than malloc, because /dev holds two
+ * fixed entries and a bounded pool cannot fragment the heap.
+ */
+#define ESPIX_DEV_DIR_MAX 4
+
+typedef struct {
+    DIR            dir;     /* first: esp_vfs_opendir() stamps dd_vfs_idx here */
+    struct dirent  ent;     /* readdir()'s answer, stable until the next call */
+    int            cursor;  /* next node to hand out, 0..DEV_COUNT */
+    bool           in_use;
+} dev_dir_t;
+
+static dev_dir_t s_dirs[ESPIX_DEV_DIR_MAX];
+
+bool espix_dev_isdir(const char *abs_path)
+{
+    return strcmp(abs_path, "/dev") == 0;
+}
+
+bool espix_dev_underdev(const char *abs_path)
+{
+    return strncmp(abs_path, "/dev/", 5) == 0;
+}
+
+/* Only the owner triad is meaningful here; the type char and perms come from
+ * the table, and the size is what ls shows (0 for a directory). */
+void espix_dev_dir_stat(struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode    = S_IFDIR | 0755;
+    st->st_nlink   = 2;
+    st->st_size    = 0;
+    st->st_blksize = 4096;
+}
+
+/*
+ * A device path's permission bits, for the mode rule. The table is the one
+ * place a device's mode is written down, so the permission check has to ask
+ * it -- otherwise mode_from_rule() would answer 0644 for /dev/null and a
+ * non-root shell could not redirect to it.
+ */
+bool espix_dev_mode(const char *abs_path, mode_t *out)
+{
+    const dev_node_t *n = espix_dev_lookup(abs_path);
+    if (n == NULL) {
+        return false;
+    }
+    *out = n->mode & ESPIX_MODE_BITS;
+    return true;
+}
+
+static dev_dir_t *dir_of(DIR *pdir)
+{
+    for (int i = 0; i < ESPIX_DEV_DIR_MAX; i++) {
+        if (s_dirs[i].in_use && (DIR *)&s_dirs[i] == pdir) {
+            return &s_dirs[i];
+        }
+    }
+    return NULL;
+}
+
+bool espix_dev_dirp(DIR *pdir)
+{
+    return pdir != NULL && dir_of(pdir) != NULL;
+}
+
+DIR *espix_dev_opendir(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_DEV_DIR_MAX; i++) {
+        if (!s_dirs[i].in_use) {
+            s_dirs[i].in_use = true;
+            s_dirs[i].cursor  = 0;
+            xSemaphoreGive(s_lock);
+            return (DIR *)&s_dirs[i];
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    errno = ENFILE;
+    return NULL;
+}
+
+int espix_dev_readdir_r(DIR *pdir, struct dirent *entry, struct dirent **out)
+{
+    dev_dir_t *d = dir_of(pdir);
+    if (d == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    if (d->cursor >= DEV_COUNT) {
+        *out = NULL;
+        return 0;
+    }
+
+    const dev_node_t *n    = &s_nodes[d->cursor++];
+    const char       *base = strrchr(n->path, '/') + 1;
+
+    memset(entry, 0, sizeof(*entry));
+    entry->d_type = (n->kind == DEV_NULL) ? DT_CHR : DT_REG;
+    strlcpy(entry->d_name, base, sizeof(entry->d_name));
+
+    *out = entry;
+    return 0;
+}
+
+struct dirent *espix_dev_readdir(DIR *pdir)
+{
+    dev_dir_t *d = dir_of(pdir);
+    if (d == NULL) {
+        errno = EBADF;
+        return NULL;
+    }
+
+    struct dirent *out = NULL;
+    if (espix_dev_readdir_r(pdir, &d->ent, &out) != 0) {
+        return NULL;
+    }
+    return out;
+}
+
+long espix_dev_telldir(DIR *pdir)
+{
+    dev_dir_t *d = dir_of(pdir);
+    return (d != NULL) ? d->cursor : -1;
+}
+
+void espix_dev_seekdir(DIR *pdir, long offset)
+{
+    dev_dir_t *d = dir_of(pdir);
+    if (d != NULL && offset >= 0 && offset <= DEV_COUNT) {
+        d->cursor = (int)offset;
+    }
+}
+
+int espix_dev_closedir(DIR *pdir)
+{
+    dev_dir_t *d = dir_of(pdir);
+    if (d == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+
+    d->in_use = false;
+    d->cursor = 0;
+    return 0;
 }
 
 static dev_slot_t *slot_of(int fd)

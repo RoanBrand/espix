@@ -333,19 +333,25 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `access` — there is no `stat` for `ls` to call, and `readdir` never merges
   mount points, so it does not appear in a listing of `/dev` either.
 
-  **`ls /dev` itself now works and is still empty**, for a second and separate
-  reason. `/dev` is a real directory since espix started creating it in the boot
-  skeleton, so the listing succeeds — but espix's own device nodes, `/dev/null`
-  and `/dev/factory`, live in a table consulted by `vfs_open()` and `vfs_stat()`
-  and are not wired into `readdir`. They work perfectly when named and are
-  invisible when listed. So there are two unrelated reasons something can be
-  missing from that directory: a mount point `readdir` will not merge, and a
-  device espix answers for without enumerating.
+  **`ls /dev` itself now lists espix's own nodes**, `/dev/null` and
+  `/dev/factory`. `/dev` is a real littlefs directory — the boot skeleton makes
+  it, and it is what keeps `ls /` showing `dev` — but espix answers the
+  directory itself and everything under it from the device table in `dev.c`:
+  `vfs_opendir("/dev")` returns a synthetic `DIR` (a small static pool), and
+  `vfs_readdir` yields the two nodes. Nothing inside reaches littlefs, so a file
+  left in an older image's `/dev` is neither listed nor reachable, and none of
+  `mkdir`/`unlink`/`rename`/`truncate`/`utime` under `/dev` will touch it.
 
-  **Unchanged by espix owning the root VFS**, so this is not a regression to go
-  looking for: LittleFS was the fallback before too and `/dev/uart` outranked it
-  identically. Both causes belong to ESP-IDF's driver and to what the rootfs
-  happens to contain.
+  Two consequences worth knowing. **`chmod`/`chown` on a device is refused**
+  (`operation not permitted`): a device's mode is declared in the table, not
+  stored, and there is no inode to carry a changed one. And a device's mode is
+  what the permission check reads — the table's `0666` for `/dev/null`, not the
+  rule's `0644` — so a non-root shell can redirect into the sink.
+
+  `/dev/uart` still does not appear, and that is deliberate: it is ESP-IDF's,
+  its prefix is longer than espix's so it never reaches this VFS, and it is the
+  serial console rather than a general device tree. The listing shows only what
+  espix owns.
 
 - **Only the root filesystem gets espix's permission check.** Anything
   registered at its own prefix is routed by ESP-IDF before espix sees it, so

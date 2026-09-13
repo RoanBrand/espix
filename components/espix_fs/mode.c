@@ -247,6 +247,17 @@ mode_t espix_fs_mode(const char *abs_path, const struct stat *st)
         st = &own;
     }
 
+    /*
+     * A device's mode is the table's, not the rule's. The rule would answer
+     * from the file's first bytes -- 0644 for /dev/null, which reads as empty
+     * -- and a non-root shell could then not redirect to a sink that is
+     * world-writable by design.
+     */
+    mode_t dev_mode;
+    if (espix_dev_mode(abs_path, &dev_mode)) {
+        return dev_mode;
+    }
+
     espix_fs_posix_attr_t attr;
     (void)attr_effective(abs_path, st, &attr);
     return (mode_t)(attr.mode & ESPIX_MODE_BITS);
@@ -301,6 +312,14 @@ esp_err_t espix_fs_chmod(const char *abs_path, mode_t mode)
     if (abs_path == NULL || (mode & ~(mode_t)ESPIX_MODE_BITS) != 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    /*
+     * A device's mode is declared by espix, not stored, and there is no inode
+     * to carry a changed one -- so this is refused rather than silently
+     * succeeding against nothing. `/dev` itself is fixed for the same reason.
+     */
+    if (espix_dev_lookup(abs_path) != NULL || espix_dev_isdir(abs_path)) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
     /* ENOENT is the root refusing, and has to stay distinguishable from the
      * ownership refusal: callers map it to errno, and a path outside the root
      * must read as absent rather than as an I/O failure. */
@@ -344,6 +363,10 @@ esp_err_t espix_fs_chown(const char *abs_path, uint16_t uid, uint16_t gid)
 
     if (abs_path == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* A device's owner is espix's, not a file's; see espix_fs_chmod(). */
+    if (espix_dev_lookup(abs_path) != NULL || espix_dev_isdir(abs_path)) {
+        return ESP_ERR_NOT_ALLOWED;
     }
     const int admin = espix_fs_admin_check(abs_path, uid != ESPIX_FS_KEEP_ID);
     if (admin == ENOENT) {

@@ -46,6 +46,34 @@ LittleFS mounted beneath it and holding no path of its own; the next section is
 why. The property described here is unchanged — one filesystem, at the real
 root — and the empty base path is still what delivers it.
 
+### `/dev` is a directory espix answers for itself
+
+`/dev/null` and `/dev/factory` are rows in a table in `espix_fs/dev.c`, not files
+on LittleFS. Because espix owns the root VFS, it can answer the `/dev` directory
+from that table as well: `vfs_opendir("/dev")` returns a synthetic `DIR` and
+`vfs_readdir` yields the nodes, while `vfs.c` intercepts `open`, `stat`,
+`mkdir`, `unlink`, `rename`, `truncate` and `utime` for anything under `/dev`.
+Nothing there reaches LittleFS, so a file an older image left inside `/dev` is
+neither listed nor reachable, and none of `mkdir`/`unlink`/`rename` will touch
+it — which is why no boot-time migration is needed to clean one up.
+
+`/dev` itself stays a real LittleFS directory, created by the boot skeleton, as
+the mount point that keeps `ls /` listing `dev`. Its contents are hidden behind
+the table.
+
+Two details make this fit ESP-IDF. `esp_vfs_opendir()` stamps `dd_vfs_idx` into
+the `DIR` it is handed back and later routes on that field, so the synthetic
+handle is a struct whose first member is a real `DIR` — a small static pool, not
+a `malloc` per call. And the mode the permission check reads is the table's, not
+the rule's: the rule would derive `0644` for `/dev/null` (it reads as empty) and
+a non-root shell could then not redirect into a sink that is `0666` by design.
+`chmod`/`chown` on a device are refused; there is no inode to store a mode on.
+
+ESP-IDF's own `/dev/null` VFS (`CONFIG_VFS_INITIALIZE_DEV_NULL`) is switched off
+for this reason: its prefix is longer than espix's `""`, so it would outrank the
+root and shadow espix's node.
+
+
 ### espix owns the root VFS, and that is where permissions belong
 
 Every file call in the system — from a shell command or from an app loaded off
