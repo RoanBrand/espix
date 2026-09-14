@@ -158,8 +158,9 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   leg of `45-throughput`, in the quiet phase, with the suite running alone. So
   concurrency across suites is not required to trigger it.
 
-- **Every sftp session leaks about 440 bytes of internal heap. Open, and
-  measured.** Roughly 9 TLSF blocks per session, and they never come back.
+- ~~**Every sftp session leaks about 440 bytes of internal heap.**~~ **Found and
+  fixed:** the sftp channel built a login environment and never freed it.
+  Roughly 9 TLSF blocks per session, and they never came back.
 
   Found because the per-suite heap attribution put `40-transfer` and
   `45-throughput` at `+2K / +45 blocks` twice running while every other suite sat
@@ -203,15 +204,37 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   the stdin queue, `exec_cmd` and the channel. None of the obvious paths holds
   anything.
 
-  **So the next step is instrumentation, not more reading.**
+  **Instrumentation found it in one run, after reading had failed.**
   `CONFIG_HEAP_TRACING_STANDALONE` with `heap_trace_start(HEAP_TRACE_LEAKS)`
-  around a single fetch would name the call site outright, the way the ABI
-  watchpoint named its writer. It costs internal RAM for the record buffer,
-  which is the scarce thing here, so it wants a Kconfig switch and a command to
-  start and stop it rather than being always on.
+  around the whole sftp channel, cleanup included, dumped nine unfreed
+  allocations totalling 336 bytes and named the allocator outright:
 
-  Cost in practice: a full test run does on the order of thirty transfers, so
-  ~13K per run, which is most of the per-run growth that started this hunt.
+  ```
+  ssh_channel_run          ssh_channel.c   <- the sftp branch
+    apply_account          ssh_channel.c:1583
+      espix_env_set_login_defaults  env.c:359
+        espix_env_set               env.c:111/117/134
+  ```
+
+  292 bytes for the table plus 4/5/10/5/5/5/5/5 for the names and values. With
+  TLSF's per-block overhead that is ~444 bytes, against the ~440 measured.
+
+  **The bug:** `finish_session()` frees the session's environment
+  (`espix_env_free()`), and the exec and shell paths both call it. The sftp
+  branch went straight to `out:` instead, so the environment `apply_account()`
+  had just built was never released -- and sftp never reads it in the first
+  place, since `base_dir()` works from `session->cwd`.
+
+  Fixed by freeing it on that branch. Not by calling `finish_session()`: that
+  also hangs up processes and sends the channel close, and the sftp path has no
+  processes and has already sent its own.
+
+  **After:** sixteen transfers, downloads and uploads, move the internal heap by
+  0 bytes and 0 blocks, against +72 blocks per eight before.
+
+  A residue remains in those two suites -- about +28 blocks each, down from +45
+  -- which is not scp: measured directly, downloads and uploads are now clean.
+  The suites also write files and run `sftp -b`, and that is where to look next.
 
 - **Something writes past the process table and silently disables half the ABI
   resolver. Open, and now watched for.** A `-j4` run failed 21 assertions across

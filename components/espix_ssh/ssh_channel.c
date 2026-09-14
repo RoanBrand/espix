@@ -1768,6 +1768,23 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         espix_sftp_run(c, &session);
         s_raw_chan = NULL;
 
+        /*
+         * The environment apply_account() built, which nothing here ever reads.
+         *
+         * Not finish_session(): that also hangs up processes and sends the
+         * close, and this branch has no processes and has just sent its own.
+         * What it shares is the one thing that leaks -- the session's env table
+         * is heap-allocated at login and the exec and shell paths free it
+         * through finish_session(), while this path went straight to `out`.
+         *
+         * It cost ~440 bytes and 9 blocks of internal heap per transfer, which
+         * a test run turns into ~13K. Measured, not guessed: plain ssh was
+         * clean, an sftp fetch of a file that does not exist leaked exactly as
+         * much as one that works, and heap tracing named
+         * espix_env_set_login_defaults() as the allocator.
+         */
+        espix_env_free(&session);
+
         send_exit_status(ch, 0);
         close_channel(ch);
         goto out;
