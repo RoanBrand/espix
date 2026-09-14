@@ -189,8 +189,16 @@ int espix_dev_open(const void *handle, int flags)
  * that field, so the DIR must be the first member of whatever opendir()
  * returns. A real static pool, rather than malloc, because /dev holds two
  * fixed entries and a bounded pool cannot fragment the heap.
+ *
+ * Sized to CONFIG_ESPIX_SSH_MAX_SESSIONS rather than to a guess at how many
+ * people list /dev at once. A handle lives only for the length of one `ls`, so
+ * four would almost always do -- but "almost always" here fails as ENFILE from
+ * opendir(), which reads as the device being out of something rather than as a
+ * pool being small, and the parallel test runner alone holds four sessions
+ * before anyone types anything. Eight slots is 8 * sizeof(dev_dir_t) of .bss to
+ * make the failure unreachable.
  */
-#define ESPIX_DEV_DIR_MAX 4
+#define ESPIX_DEV_DIR_MAX 8
 
 typedef struct {
     DIR            dir;     /* first: esp_vfs_opendir() stamps dd_vfs_idx here */
