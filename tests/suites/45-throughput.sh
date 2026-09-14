@@ -32,14 +32,37 @@ now_ms() { "$ESPIX_PYTHON" -c 'import time;print(int(time.time()*1000))'; }
 # A single transfer folds in the SSH handshake -- PBKDF2 at 20 000 iterations,
 # comfortably a second -- which at these rates is a large slice of the answer.
 # It is identical in both runs and cancels.
+# The smallest difference between the two transfers that can mean anything.
+#
+# Below this the differential is noise and the rate it produces is arithmetic,
+# not measurement. 1536KB at the 200 KB/s floor is 7.7 seconds, so even a
+# transfer ten times faster than anything this device has managed leaves 770ms
+# between the two -- a difference under 100ms means a transfer did not happen.
+RATE_MIN_DT_MS=100
+
+# Answers -1, never a number, when the measurement collapsed.
+#
+# It used to answer a number regardless, guarded only against dt <= 0, and a run
+# reported `scp upload: 307200 KB/s (floor 200)` -- 300 MB/s over WiFi, from the
+# 2MB upload finishing 5ms after the 512KB one. Both had failed: dev_push sends
+# its errors to /dev/null, so a broken upload path costs no time, collapses the
+# difference, and divides its way to an enormous rate that clears the floor.
+#
+# Which is the exact failure this suite exists to catch, passing. A check that
+# goes green because its measurement broke is worse than no check -- the same
+# lesson _dev_parse_uptime learned by inventing reboots out of a failed parse.
 rate_kbs() {   # <ms for small> <ms for big> <small KB> <big KB>
     local dt=$(( $2 - $1 ))
-    [ "$dt" -gt 0 ] || { echo 0; return; }
+    [ "$dt" -ge "$RATE_MIN_DT_MS" ] || { echo -1; return; }
     echo $(( ($4 - $3) * 1000 / dt ))
 }
 
 report() {     # <what> <rate> <floor>
-    if [ "$2" -ge "$3" ]; then
+    if [ "$2" -lt 0 ]; then
+        espix_fail "$1: the measurement collapsed" \
+                   "the two transfers finished within ${RATE_MIN_DT_MS}ms of each other" \
+                   "which means one of them did not transfer -- not that it was fast"
+    elif [ "$2" -ge "$3" ]; then
         espix_pass "$1: $2 KB/s (floor $3)"
     else
         espix_fail "$1: $2 KB/s is below the $3 KB/s floor" \

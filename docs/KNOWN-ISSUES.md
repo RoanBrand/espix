@@ -271,10 +271,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   against the dead-session sentinel. The device was fine throughout: no reboot,
   no core dump, and the very next run was 149 assertions green.
 
-  **Check the entry above first.** A gone client used to leave its foreground
-  command running with the session slot held, which is intermittent, load
-  dependent, leaves no crash, and looks from the harness exactly like a session
-  that died. Fixed 2026-09-08; if this does not recur, that was it.
+  **It recurred, so the teardown fix was not it.** The entry above — a gone
+  client leaving its foreground command running with the slot held — was fixed
+  2026-09-08, and this said "if this does not recur, that was it". On
+  2026-09-14 a `-j 4` run reproduced the signature exactly: `35-signals`, seven
+  failures, `session gone before: ps` first, and the suite green on its own
+  re-run seconds later (15 ok). Device healthy throughout — no reboot, no core
+  dump, 178 of 185 assertions passing around it.
+
+  So that hypothesis is closed off rather than left hanging. Whatever this is,
+  it survives the teardown fix.
 
   It is not new and it is not the panics. The same shape turned up early in the
   parallel work, before any of the fixes: one login failure in nine rounds of
