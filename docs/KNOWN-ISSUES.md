@@ -117,6 +117,40 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   entry's original diagnosis assumed the fallback. It may well have been right,
   but it was not read.
 
+- **The PSRAM heap's free list was found corrupt, once, and it is open.** A
+  `-j4` run rebooted mid-suite; the core dump says:
+
+  ```
+  Panic reason: assert failed: insert_free_block tlsf_control_functions.h:400
+                (current && "free list cannot have a null entry")
+  tcpip_thread → ip4_input → tcp_input → pbuf_free → free() → tlsf_free → abort
+  ```
+
+  `tcpip` is the **finder, not the culprit**. lwip freed an ordinary pbuf and
+  TLSF tripped over damage already done to `control` at the base of the PSRAM
+  heap. `pbuf_free` in the TCP/IP thread is simply the most frequent `free()` on
+  the box, so it gets there first — the same reason the entry below surfaced as
+  four panics in four unrelated places.
+
+  Reading the run that found it: 51 assertions failed, all but three of them
+  `<<<dead-session>>>`. That is **one** event, not 51 — the reboot killed four
+  worker sessions at the same instant. `reset-reason-changed('software'->'')`
+  and `coredump-unanswered` in the same report are empty answers from a device
+  that was still coming up, not findings.
+
+  What is ruled out, and it is the tempting one: this is *not* the PSRAM/DMA
+  cache-line spill. The entry below records that theory being tested and
+  disproved — taking the SSH buffers out of PSRAM entirely only changed which
+  heap the corruption landed on.
+
+  Hunting it since with `CONFIG_HEAP_POISONING_COMPREHENSIVE`: four full runs,
+  no catch. Note when you try: the poisoned build's per-allocation canaries cost
+  enough internal RAM that eight concurrent sessions drove `min free internal
+  since boot` to **0 K**, which fails assertions in ways that read as unrelated
+  bugs (`ESP_ERR_NO_MEM` spawning an app, a session dying with status 255).
+  `tests/run.sh` now prints that low-water mark every run so it cannot be missed
+  a second time.
+
 - ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
   double free in espix's own command history, and the whole shape of it is worth
   keeping, because almost nothing about the way it presented pointed at the
