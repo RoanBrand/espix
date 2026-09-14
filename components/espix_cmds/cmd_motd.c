@@ -182,7 +182,12 @@ static void fact_heap(char *out, size_t len, uint32_t caps)
     multi_heap_info_t info;
     heap_caps_get_info(&info, caps);
 
-    const size_t total = info.total_free_bytes + info.total_allocated_bytes;
+    /* The heap's real size, not used + free: the allocator's per-block header
+     * is counted in neither of those, so their sum shrinks as the number of
+     * live allocations grows and a banner reading "184K / 299K" invites the
+     * reader to wonder where the other 6K of chip went. See print_heap_line()
+     * in cmd_sys.c for the arithmetic. */
+    const size_t total = heap_caps_get_total_size(caps);
     if (total == 0) {
         out[0] = '\0';          /* capability absent on this board */
         return;

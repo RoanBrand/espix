@@ -173,23 +173,43 @@ static int cmd_reboot(espix_session_t *s, int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * The `total` column is the heap's actual size, not `used + free`, and the
+ * difference is not pedantry -- it caused a real misreading.
+ *
+ * `used + free` looks like a capacity and behaves like a counter. ESP-IDF
+ * subtracts the per-block allocator header from the allocated figure and counts
+ * it in neither column (multi_heap.c, multi_heap_get_info_impl):
+ *
+ *     overhead = allocated_blocks * tlsf_alloc_overhead();   // sizeof(size_t)
+ *     total_allocated_bytes = (pool_size - tlsf_size) - free_bytes - overhead;
+ *
+ * so `used + free` falls by four bytes for every live allocation. Watching it
+ * drift 301K -> 300K -> 299K -> 297K across four identical runs reads as a slow
+ * leak of the heap itself, when it is the block count rising and nothing being
+ * lost at all. heap_caps_get_total_size() is the fixed number for a given
+ * image, which is what a column headed "total" should say.
+ *
+ * The overhead is then worth printing rather than hiding, since it is the whole
+ * explanation for why the three columns no longer add up.
+ */
 static void print_heap_line(espix_session_t *s, const char *label, uint32_t caps)
 {
     multi_heap_info_t info;
     heap_caps_get_info(&info, caps);
 
-    if (info.total_free_bytes + info.total_allocated_bytes == 0) {
+    const size_t capacity = heap_caps_get_total_size(caps);
+    if (capacity == 0) {
         return;     /* capability not present on this chip/build */
     }
 
-    const size_t total = info.total_free_bytes + info.total_allocated_bytes;
-
-    espix_printf(s, "%-9s %9u %9u %9u %11u\n",
+    espix_printf(s, "%-9s %9u %9u %9u %11u %8u\n",
                  label,
-                 (unsigned)(total / 1024),
+                 (unsigned)(capacity / 1024),
                  (unsigned)(info.total_allocated_bytes / 1024),
                  (unsigned)(info.total_free_bytes / 1024),
-                 (unsigned)(info.largest_free_block / 1024));
+                 (unsigned)(info.largest_free_block / 1024),
+                 (unsigned)info.allocated_blocks);
 }
 
 static int cmd_free(espix_session_t *s, int argc, char **argv)
@@ -197,8 +217,8 @@ static int cmd_free(espix_session_t *s, int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    espix_printf(s, "%-9s %9s %9s %9s %11s\n",
-                 "", "total(K)", "used(K)", "free(K)", "largest(K)");
+    espix_printf(s, "%-9s %9s %9s %9s %11s %8s\n",
+                 "", "total(K)", "used(K)", "free(K)", "largest(K)", "blocks");
     print_heap_line(s, "internal", MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     print_heap_line(s, "psram",    MALLOC_CAP_SPIRAM);
     espix_printf(s, "min free internal since boot: %u K\n",
@@ -234,6 +254,29 @@ static int cmd_free(espix_session_t *s, int argc, char **argv)
     espix_printf(s, "flash mmap: %s; a write %s\n",
                  mapped ? "regions live" : "none live",
                  mapped ? "must disable the cache" : "leaves the cache on");
+
+    /*
+     * Whether this image checks the heap as it goes, for the same reason the
+     * line above is here: it changes what a clean run is worth, and there is
+     * nowhere else to ask.
+     *
+     * Poisoning is a debugging build setting, switched on to hunt a corruption
+     * and switched off again afterwards, and both halves of that are easy to
+     * lose track of. A run that finds nothing means something quite different
+     * depending on which way this reads, and the way to get that wrong is to
+     * assume rather than look -- this project has already spent a day on a
+     * board that was not running the tree in front of it, which is why
+     * `uname -a` carries a build id and tests/run.sh refuses to start on a
+     * mismatch. Same class of mistake, one line to close.
+     */
+#if CONFIG_HEAP_POISONING_COMPREHENSIVE
+    espix_printf(s, "heap poisoning: comprehensive (canaries and fill checked "
+                    "on every alloc and free)\n");
+#elif CONFIG_HEAP_POISONING_LIGHT
+    espix_printf(s, "heap poisoning: light (canaries checked on free)\n");
+#else
+    espix_printf(s, "heap poisoning: off\n");
+#endif
     return 0;
 }
 
