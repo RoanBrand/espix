@@ -277,9 +277,33 @@ FAILED_POOL=""
 
 # ------------------------------------------------------------ the phases ---
 
+# What one suite did to the internal heap, measured only where it means
+# something: this function is the single path for every phase that runs a suite
+# ALONE -- --serial, the failed-suite re-run, and the quiet phase -- so a delta
+# taken around the call has nobody else to share the blame with.
+#
+# The run already reported a low-water mark for the whole run, which says the
+# heap got tight and not which suite tightened it. A steady 4K per run went
+# unattributed for exactly that reason.
+#
+# Two `free` readings per suite, over the existing session rather than a fresh
+# login: at ~2.7s of PBKDF2 each, logging in twice per suite would put a minute
+# on every serial run for a diagnostic that is meant to be free.
+#
+# READ IT AS "what the heap did while this suite ran", not "what this suite
+# allocated". The monitor session, the harness's own queries and anything else
+# connected are inside the window too. First measurements: 30-proc reported
+# +4K/+31 blocks on the first run after a boot and exactly nothing on the next,
+# so a single reading is a warm-up cost as easily as a leak -- what makes it
+# evidence is the same suite doing it twice.
+_serial_heap_read() {
+    _dev_parse_free_used "$(_dev_ask 'free')"
+}
+
 run_serial_list() {     # <how> <name>...
     local how="$1"; shift
     local name outdir="$RUNDIR" rc serial_pid waited
+    local h0_used h0_blk h1_used h1_blk d_used d_blk
 
     [ "$how" = rerun ] && outdir="$RUNDIR/rerun"
     for name in "$@"; do
@@ -287,6 +311,10 @@ run_serial_list() {     # <how> <name>...
         if [ "$POOL_CAPTURE" = 1 ]; then
             printf '  %s ' "$(_espix_dim "-> $name")"
         fi
+
+        read -r h0_used h0_blk <<EOF
+$(_serial_heap_read)
+EOF
 
         # Deadlined, like everything in the pool.
         #
@@ -335,9 +363,33 @@ run_serial_list() {     # <how> <name>...
             continue
         fi
 
-        if [ "$POOL_CAPTURE" = 1 ] && [ -f "$outdir/res/$name.res" ]; then
-            read -r p f s secs rest < "$outdir/res/$name.res"
-            printf '%ss, %s ok, %s fail, %s skip\n' "$secs" "$p" "$f" "$s"
+        read -r h1_used h1_blk <<EOF
+$(_serial_heap_read)
+EOF
+
+        # Silent unless the heap actually moved, so a line here means something.
+        # Either reading being -1 means the device did not answer, which is not
+        # a measurement of zero and must not be printed as one.
+        d_used=0; d_blk=0
+        if [ "${h0_used:--1}" -ge 0 ] && [ "${h1_used:--1}" -ge 0 ]; then
+            d_used=$(( h1_used - h0_used ))
+            d_blk=$(( h1_blk - h0_blk ))
+        fi
+
+        if [ "$POOL_CAPTURE" = 1 ]; then
+            # Appended to the timing the grid already prints for this suite.
+            if [ -f "$outdir/res/$name.res" ]; then
+                read -r p f s secs rest < "$outdir/res/$name.res"
+                printf '%ss, %s ok, %s fail, %s skip' "$secs" "$p" "$f" "$s"
+            fi
+            if [ "$d_used" -ne 0 ] || [ "$d_blk" -ne 0 ]; then
+                printf ', heap %+dK %+d blocks' "$d_used" "$d_blk"
+            fi
+            printf '\n'
+        elif [ "$d_used" -ne 0 ] || [ "$d_blk" -ne 0 ]; then
+            # Serial prints suite output as it goes, so this needs its own line.
+            printf '  %s\n' \
+                "$(_espix_dim "$name: heap $(printf '%+dK %+d blocks' "$d_used" "$d_blk")")"
         fi
     done
 }

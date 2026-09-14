@@ -37,8 +37,25 @@ static const char *errno_name(int e)
     case EEXIST:  return "EEXIST";
     case ENOTDIR: return "ENOTDIR";
     case EINVAL:  return "EINVAL";
-    default:      return "?";
+    case ENOMEM:  return "ENOMEM";
+    default:      break;
     }
+
+    /*
+     * Anything else by number rather than "?".
+     *
+     * A run failed `chmod <path> ?` under load and that was the whole report:
+     * the suite established that chmod had failed and then declined to say why,
+     * on a test that only fails under load -- which is exactly the case where
+     * nobody can reproduce it afterwards to ask again.
+     *
+     * Static buffer, because the caller wants a string. This app is
+     * single-threaded and prints the result immediately, so the one buffer is
+     * enough; a second call before the first is printed would not be.
+     */
+    static char other[24];
+    snprintf(other, sizeof(other), "errno %d", e);
+    return other;
 }
 
 static int cmd_probe(int argc, char **argv)

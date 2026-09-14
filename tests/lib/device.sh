@@ -915,6 +915,26 @@ _dev_parse_free_min() {     # <free output>
     esac
 }
 
+# Internal heap "used" and block count, as one pair, from a `free` reading.
+#
+# Two numbers because they answer different questions about the same growth: a
+# run that adds 4K in one block and a run that adds 4K in forty are not the same
+# bug, and the block count is already sitting in the same row.
+#
+# "-1 -1" and never "0 0" on a failed parse, for the reason _dev_parse_free_min
+# spells out above -- a zero here reads as a real and dramatic finding, so a
+# parser that invents one on a bad line is worse than no parser.
+_dev_parse_free_used() {    # <free output> -> "<usedK> <blocks>"
+    local line used blocks
+    line=$(printf '%s' "$1" | sed -n 's/^internal  *//p' | head -1)
+    used=$(printf '%s' "$line" | awk '{print $2}')
+    blocks=$(printf '%s' "$line" | awk '{print $5}')
+    case "${used:-}${blocks:-}" in
+        ''|*[!0-9]*) printf '%s' "-1 -1" ;;
+        *)           printf '%s %s' "$used" "$blocks" ;;
+    esac
+}
+
 # Is a watchdog trigger espix's fault?
 #
 # WHY THIS DOES NOT FAIL A RUN, since restoring that is the obvious "fix".

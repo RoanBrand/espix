@@ -146,6 +146,14 @@ static int abi_chmod(const char *path, mode_t mode)
     case ESP_ERR_INVALID_ARG:
         errno = EINVAL;
         return -1;
+    case ESP_ERR_NOT_ALLOWED:
+        /* The refusal espix_fs_chmod() actually returns for a mode change the
+         * caller may not make. Without this it fell to EIO below, so an app
+         * could never tell "not allowed" from "the filesystem broke" -- and a
+         * suite that caught chmod failing under load reported it as EIO and
+         * left nothing to go on. */
+        errno = EACCES;
+        return -1;
     default:
         errno = EIO;
         return -1;
