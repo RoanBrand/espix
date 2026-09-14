@@ -707,6 +707,21 @@ if [ -s "$RUNDIR/heapmin" ]; then
     fi
 fi
 
+# What was still awaiting reclamation when the heap was last read.
+#
+# Every heap figure above -- the per-suite deltas and the low-water mark -- is
+# taken at a moment, and a task that has exited but whose stack IDLE has not
+# freed is holding memory that is on its way back. Without this line those two
+# cases read identically, which is how 12K of deferred reclamation was reported
+# as a leak in 55-sessions.
+_pending=$(dev_tasks_deleted 2>/dev/null || printf '%s' "-1")
+case "${_pending:-}" in ''|*[!0-9-]*) _pending=-1 ;; esac
+if [ "$_pending" -gt 0 ]; then
+    printf '\n%d task(s) had exited but were not yet reclaimed when this was read;\n' \
+           "$_pending"
+    printf 'their stacks are still counted as used. See docs/GOTCHAS.md on IDLE.\n'
+fi
+
 if [ "$health_ok" = no ]; then
     printf '\n%s %s\n' "$(_espix_red 'device health after the run:')" "$health"
     N_FAIL=$((N_FAIL + 1))

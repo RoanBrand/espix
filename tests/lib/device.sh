@@ -915,6 +915,38 @@ _dev_parse_free_min() {     # <free output>
     esac
 }
 
+# Tasks that have exited and whose stacks IDLE has not freed yet.
+#
+# Worth reporting beside any heap figure, because it is the difference between
+# "this memory is gone" and "this memory has not come back yet". ps lists these:
+# uxTaskGetSystemState() walks xTasksWaitingTermination as eDeleted, which
+# cmd_sys.c prints as 'D'. 55-sessions read that column as a live session once
+# and reported reclamation running late as a 12K leak.
+#
+# -1 and never 0 on a failed parse, for the reason _dev_parse_free_min gives
+# below: zero is the reassuring answer here, so inventing it on a bad read hides
+# exactly what this is for.
+_dev_parse_tasks_deleted() {    # <ps output>
+    local n
+    case "${1:-}" in
+        ''|"$DEV_DEAD") printf '%s' "-1"; return ;;
+    esac
+    # A ps listing has its header; anything without it is not one.
+    case "$1" in
+        *NAME*) ;;
+        *) printf '%s' "-1"; return ;;
+    esac
+    n=$(printf '%s' "$1" | awk '$3 == "D"' | grep -c .)
+    case "${n:-}" in
+        ''|*[!0-9]*) printf '%s' "-1" ;;
+        *)           printf '%s' "$n" ;;
+    esac
+}
+
+dev_tasks_deleted() {
+    _dev_parse_tasks_deleted "$(_dev_ask 'ps')"
+}
+
 # Internal heap "used" and block count, as one pair, from a `free` reading.
 #
 # Two numbers because they answer different questions about the same growth: a

@@ -30,7 +30,27 @@ if [ -z "${DEV_PROMPT:-}" ]; then
     return 0
 fi
 
-sess_count() { dev_run 'ps' | grep -c 'sshd:conn'; }
+# Live connection tasks. A deleted one is not a session.
+#
+# This was `grep -c 'sshd:conn'`, which counts every line whatever state it is
+# in -- and `ps` lists more than living tasks. uxTaskGetSystemState() walks
+# xTasksWaitingTermination alongside the ready, blocked and suspended lists and
+# reports those as eDeleted, which cmd_sys.c prints as 'D'. So a connection that
+# had already exited, and was only waiting for IDLE to free its stack, counted
+# as a live session: the release check read 4 where 3 was right and reported a
+# leak that was reclamation running late.
+#
+# Columns: $1 pid ('-' for a kernel task), $2 name, $3 state.
+sess_count() { dev_run 'ps' | awk '$2 == "sshd:conn" && $3 != "D"' | grep -c .; }
+
+# Connection tasks that have exited and not yet been reclaimed.
+#
+# Counted separately rather than folded into the above, because the two answer
+# different questions: sess_count() says whether the slot came back, this says
+# whether the *memory* has. IDLE frees the stacks of self-deleted tasks, so
+# starving it -- which eight concurrent PBKDF2 logins reliably do -- holds those
+# stacks after the sessions are gone. See docs/GOTCHAS.md.
+sess_pending() { dev_run 'ps' | awk '$2 == "sshd:conn" && $3 == "D"' | grep -c .; }
 
 # Is the session this suite counts through still there?
 #
@@ -212,11 +232,15 @@ sess_release
 # Wait for the count to come back rather than sleeping a guess at it.
 #
 # A fixed ten seconds was the guess, and it was wrong often enough to matter:
-# close_gracefully() drains each connection until its peer hangs up, bounded at
-# five seconds *each*, and eight of them closing together do not all finish
-# inside one bound. The assertion is that the slots come back, not that they
-# come back within some particular second, so it waits and then says how long
-# it took.
+# close_gracefully() drains each connection until its peer hangs up, bounded by
+# LINGER_DRAIN_MS (600ms) each, and eight of them closing together do not all
+# finish inside one bound. The assertion is that the slots come back, not that
+# they come back within some particular second, so it waits and says how long it
+# took.
+#
+# It waits for the reclamation too. The slot comes back when the task exits; the
+# *memory* comes back when IDLE frees its stack, and those are not the same
+# moment under the load this suite creates on purpose.
 released_after=0
 i=0
 while [ "$i" -lt 30 ]; do
@@ -226,7 +250,9 @@ while [ "$i" -lt 30 ]; do
     case "$back" in ''|*[!0-9]*) continue ;; esac
     if [ "$back" -le "$base" ]; then
         released_after=$i
-        break
+        pending=$(sess_pending)
+        case "$pending" in ''|*[!0-9]*) pending=0 ;; esac
+        [ "$pending" -eq 0 ] && break
     fi
 done
 
@@ -237,13 +263,22 @@ else
     espix_fail "closing them frees the slots" "expected: $base" "actual:   $back"
 fi
 
+pending=$(sess_pending)
+case "$pending" in ''|*[!0-9]*) pending=0 ;; esac
+
 free_after=$(sess_free_line)
 after_k=$(printf '%s' "$free_after" | awk '{print $3+0}')
 idle_k=$(printf '%s' "$free_idle" | awk '{print $3+0}')
 if [ "${after_k:-0}" -ge $(( ${idle_k:-0} - 8 )) ]; then
     espix_pass "and the memory with them (${idle_k}K -> ${after_k}K free)"
+elif [ "$pending" -gt 0 ]; then
+    # Deferred, not leaked, and the difference is the whole point: the stacks of
+    # $pending exited task(s) are still held because IDLE has not run. Reporting
+    # that as a leak sends the next reader hunting something that is not there.
+    espix_skip "and the memory with them: $(( idle_k - after_k ))K still held by $pending exited task(s) awaiting IDLE"
 else
     espix_fail "and the memory with them" \
                "was ${idle_k}K free before, ${after_k}K after" \
-               "$(( idle_k - after_k ))K did not come back"
+               "$(( idle_k - after_k ))K did not come back" \
+               "and nothing is awaiting reclamation, so it is not deferred"
 fi
