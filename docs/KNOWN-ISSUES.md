@@ -264,37 +264,55 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   connections not yet gone being counted as live. **A number measured on a
   broken system is not a baseline.**
 
-- **An ordinary account cannot write `/dev/null`, and it made a throughput
-  floor meaningless for as long as it has existed.** `scp` to it fails with
-  `dest open "/dev/null": Permission denied` as `esp`; the same write from root
-  on the console succeeds.
+- ~~**An ordinary account cannot write `/dev/null`.**~~ **Never true of any
+  committed build, and the way it got recorded is the part worth keeping.**
 
-  The node is espix's own, not IDF's: `vfs.c` routes it through
-  `espix_dev_lookup()` -> `espix_dev_open()` after the access check, IDF's null
-  VFS is registered nowhere, and the table gives it `S_IFCHR | 0666`. `vfs_stat`
-  answers for it too, so this is not the `O_CREAT` branch of
-  `espix_fs_access_check()` demanding write on `/dev` -- that branch is skipped
-  when the target exists. It is somewhere in `may()` ->
-  `espix_fs_owner()`/`permitted()` deciding a node with no owner record is not
-  writable by 1000. Root is unaffected because the check returns 0 for uid 0
-  before any of it.
+  What was seen was real: `scp` to `/dev/null` failed with `Permission denied`
+  as `esp` while the same write from root succeeded, and it made
+  `45-throughput`'s upload floor meaningless -- every upload failed, both
+  failures cost the same handshake, and the rate (a difference between a 512KB
+  and a 2MB transfer) was computed from noise. It read
+  `scp upload: 307200 KB/s (floor 200)` and passed.
 
-  (An empty `ls /dev` is *not* part of this. The virtual filesystem has no
-  directory listing yet by design; `null` and `factory` are names that open
-  directly.)
+  **The diagnosis was wrong twice, and both mistakes are the same mistake.**
 
-  **What it cost.** `tests/suites/45-throughput.sh` uploads to `/dev/null` to
-  avoid wearing flash, and discarded `dev_push`'s stderr. So every upload failed,
-  both failures cost the same handshake, and the rate -- a difference between a
-  512KB and a 2MB transfer -- was computed from noise. It read
-  `scp upload: 307200 KB/s (floor 200)` and passed. Other runs read 666, 556 and
-  922 KB/s, which look perfectly reasonable and are the same noise.
+  First: "the node is espix's own, not IDF's -- IDF's null VFS is registered
+  nowhere". It is registered, by ESP-IDF itself, under
+  `CONFIG_VFS_INITIALIZE_DEV_NULL` (default `y`) in `vfs/nullfs.c`. The grep
+  that produced "nowhere" was scoped to espix's tree and could not have found an
+  IDF-internal `ESP_SYSTEM_INIT_FN`. **A conclusion drawn from a gap the search
+  itself made.** Because IDF's prefix `/dev/null` is longer than espix's `""`,
+  it outranked espix's node and bypassed `espix_fs_access_check()` entirely --
+  which is why writes worked, for everyone, on every build that had it.
 
-  A suite whose header says it exists because "a process's stdin came to run at
-  5 KB/s without anyone noticing" would not have noticed this. The upload leg now
-  checks the destination accepts a write and skips with a reason when it does
-  not, and `rate_kbs()` refuses to answer when the two transfers finish within
-  100ms of each other.
+  Second: "other runs read 666, 556 and 922 KB/s ... the same noise". Those were
+  real measurements, taken before the condition existed.
+
+  **How the condition existed at all: `sdkconfig` is gitignored and carries
+  settings across branches.** A build of the `/dev` feature branch wrote
+  `CONFIG_VFS_INITIALIZE_DEV_NULL=n` into it. Checking out `main` and rebuilding
+  did not revert that -- `sdkconfig.defaults` only overrides a value still at its
+  Kconfig default -- so `main` was being built with the branch's config and
+  without the branch's fix. espix owned `/dev/null`, and `mode_from_rule()`
+  answered `0644` for a node the table declares `0666`. Exactly the broken
+  middle state that branch's commit message predicts.
+
+  So `build/` was not a build of the tree in front of it, which is the same
+  class of error the stale-firmware guard exists for -- and it was invisible
+  because the guard compares the *board* against `build/`, and both agreed.
+  `sdkconfig.defaults` now warns about it.
+
+  **Fixed for real** by the `/dev` work: espix owns the whole subtree, and
+  `espix_fs_mode()` answers from the device table, so the check, `stat()` and
+  `ls -l` agree on `0666`. `tests/suites/10-fs.sh` asserts an ordinary account
+  may write the sink, and `45-throughput`'s upload leg measures again
+  (616 KB/s, beside the 666/556/922 above).
+
+  **What survives, and earned its place.** `rate_kbs()` refuses to answer when
+  the two transfers finish within 100ms of each other, and the upload leg checks
+  the destination accepts a write before timing writes to it. A suite whose
+  header says it exists because "a process's stdin came to run at 5 KB/s without
+  anyone noticing" had reported 300 MB/s over WiFi and called it a pass.
 
 - **A session occasionally dies under parallel load, and nothing explains it
   yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
