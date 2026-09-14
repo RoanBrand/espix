@@ -245,6 +245,34 @@ under a minute, so a poller on a ten-second cadence can arrive after the evidenc
 is gone. espix counts in `espix_fault_wdt_count()` and reports it from `uptime`,
 which is the line anything monitoring the machine already reads.
 
+**What trips it in espix, and how that was established.** Not by arithmetic —
+two derivations from login cost were wrong before the question was answered from
+evidence. The watchdog ISR prints a backtrace to the **UART**, and with
+`tools/serlog.sh` capturing it, three of four triggers in one session decoded to
+the same stack:
+
+```
+pbkdf2_sha256 (espix_auth/auth.c) → hmac_half → psa_hash_finish
+  → esp_sha_hash_abort → free() → multi_heap_free
+```
+
+PBKDF2 runs 20 000 iterations with no blocking call, and each one allocates and
+frees internal DMA memory inside the PSA driver — see the next section, which
+already counts that at 40 000 heap operations per password check. Eight
+concurrent logins on two cores is enough to keep both above IDLE for five
+seconds. So the trigger is a real workload saturating the machine, which is
+exactly the case the watchdog cannot distinguish from a stall.
+
+Two limits worth carrying: the fourth trigger decoded to the **wifi** task in
+`pm_tbtt_process` → `esp_phy_enable`, the modem-sleep wake path, so not every
+trigger is PBKDF2. And the ISR prints CPU 0's backtrace, which is not
+necessarily the core that starved.
+
+The general lesson is about the capture, not the crypto: the backtrace exists
+only on the console. A watchdog trigger observed without `tools/serlog.sh`
+running gives you a task name and nothing else, which is where this question sat
+for two days.
+
 ### `psa_hash_clone()` allocates, and X25519 has a fast path you cannot reach
 
 Two crypto-performance traps on ESP-IDF, both found by measuring a slow SSH

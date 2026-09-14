@@ -117,6 +117,40 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   entry's original diagnosis assumed the fallback. It may well have been right,
   but it was not read.
 
+- **The PSRAM heap's free list was found corrupt, once, and it is open.** A
+  `-j4` run rebooted mid-suite; the core dump says:
+
+  ```
+  Panic reason: assert failed: insert_free_block tlsf_control_functions.h:400
+                (current && "free list cannot have a null entry")
+  tcpip_thread → ip4_input → tcp_input → pbuf_free → free() → tlsf_free → abort
+  ```
+
+  `tcpip` is the **finder, not the culprit**. lwip freed an ordinary pbuf and
+  TLSF tripped over damage already done to `control` at the base of the PSRAM
+  heap. `pbuf_free` in the TCP/IP thread is simply the most frequent `free()` on
+  the box, so it gets there first — the same reason the entry below surfaced as
+  four panics in four unrelated places.
+
+  Reading the run that found it: 51 assertions failed, all but three of them
+  `<<<dead-session>>>`. That is **one** event, not 51 — the reboot killed four
+  worker sessions at the same instant. `reset-reason-changed('software'->'')`
+  and `coredump-unanswered` in the same report are empty answers from a device
+  that was still coming up, not findings.
+
+  What is ruled out, and it is the tempting one: this is *not* the PSRAM/DMA
+  cache-line spill. The entry below records that theory being tested and
+  disproved — taking the SSH buffers out of PSRAM entirely only changed which
+  heap the corruption landed on.
+
+  Hunting it since with `CONFIG_HEAP_POISONING_COMPREHENSIVE`: four full runs,
+  no catch. Note when you try: the poisoned build's per-allocation canaries cost
+  enough internal RAM that eight concurrent sessions drove `min free internal
+  since boot` to **0 K**, which fails assertions in ways that read as unrelated
+  bugs (`ESP_ERR_NO_MEM` spawning an app, a session dying with status 255).
+  `tests/run.sh` now prints that low-water mark every run so it cannot be missed
+  a second time.
+
 - ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
   double free in espix's own command history, and the whole shape of it is worth
   keeping, because almost nothing about the way it presented pointed at the
@@ -230,6 +264,38 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   connections not yet gone being counted as live. **A number measured on a
   broken system is not a baseline.**
 
+- **An ordinary account cannot write `/dev/null`, and it made a throughput
+  floor meaningless for as long as it has existed.** `scp` to it fails with
+  `dest open "/dev/null": Permission denied` as `esp`; the same write from root
+  on the console succeeds.
+
+  The node is espix's own, not IDF's: `vfs.c` routes it through
+  `espix_dev_lookup()` -> `espix_dev_open()` after the access check, IDF's null
+  VFS is registered nowhere, and the table gives it `S_IFCHR | 0666`. `vfs_stat`
+  answers for it too, so this is not the `O_CREAT` branch of
+  `espix_fs_access_check()` demanding write on `/dev` -- that branch is skipped
+  when the target exists. It is somewhere in `may()` ->
+  `espix_fs_owner()`/`permitted()` deciding a node with no owner record is not
+  writable by 1000. Root is unaffected because the check returns 0 for uid 0
+  before any of it.
+
+  (An empty `ls /dev` is *not* part of this. The virtual filesystem has no
+  directory listing yet by design; `null` and `factory` are names that open
+  directly.)
+
+  **What it cost.** `tests/suites/45-throughput.sh` uploads to `/dev/null` to
+  avoid wearing flash, and discarded `dev_push`'s stderr. So every upload failed,
+  both failures cost the same handshake, and the rate -- a difference between a
+  512KB and a 2MB transfer -- was computed from noise. It read
+  `scp upload: 307200 KB/s (floor 200)` and passed. Other runs read 666, 556 and
+  922 KB/s, which look perfectly reasonable and are the same noise.
+
+  A suite whose header says it exists because "a process's stdin came to run at
+  5 KB/s without anyone noticing" would not have noticed this. The upload leg now
+  checks the destination accepts a write and skips with a reason when it does
+  not, and `rate_kbs()` refuses to answer when the two transfers finish within
+  100ms of each other.
+
 - **A session occasionally dies under parallel load, and nothing explains it
   yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
   session partway through and the harness reported seven failures that were one
@@ -237,10 +303,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   against the dead-session sentinel. The device was fine throughout: no reboot,
   no core dump, and the very next run was 149 assertions green.
 
-  **Check the entry above first.** A gone client used to leave its foreground
-  command running with the session slot held, which is intermittent, load
-  dependent, leaves no crash, and looks from the harness exactly like a session
-  that died. Fixed 2026-09-08; if this does not recur, that was it.
+  **It recurred, so the teardown fix was not it.** The entry above — a gone
+  client leaving its foreground command running with the slot held — was fixed
+  2026-09-08, and this said "if this does not recur, that was it". On
+  2026-09-14 a `-j 4` run reproduced the signature exactly: `35-signals`, seven
+  failures, `session gone before: ps` first, and the suite green on its own
+  re-run seconds later (15 ok). Device healthy throughout — no reboot, no core
+  dump, 178 of 185 assertions passing around it.
+
+  So that hypothesis is closed off rather than left hanging. Whatever this is,
+  it survives the teardown fix.
 
   It is not new and it is not the panics. The same shape turned up early in the
   parallel work, before any of the fixes: one login failure in nine rounds of
