@@ -85,6 +85,11 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
 
+#if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
+    /* After the last registration, so setup's own writes do not trip it. */
+    espix_proc_abi_watch_arm();
+#endif
+
     espix_klog(ESPIX_KLOG_INFO, TAG, "process table ready (%d slots)",
                ESPIX_PROC_MAX);
     return ESP_OK;

@@ -30,6 +30,16 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 
+# A dump carries task stacks only, not .bss or .data.
+#
+# CONFIG_ESP_COREDUMP_CAPTURE_DRAM=y would add them, and it does not fit: IDF
+# asks for at least 128KB of coredump partition and ours is 64KB
+# (partitions/esp32s3-16mb.csv). Growing it means moving `storage`, which means
+# reflashing the whole filesystem -- so this is a real decision, not an
+# oversight, and the consequence is that a dump cannot tell you the value of a
+# static. Reach for a watchpoint instead: it stops at the instruction, which is
+# better evidence than the wreckage afterwards.
+
 #
 # Heap corruption hunting — off, and here is the switch when it is needed.
 #

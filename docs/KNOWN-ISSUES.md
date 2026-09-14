@@ -158,6 +158,86 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   leg of `45-throughput`, in the quiet phase, with the suite running alone. So
   concurrency across suites is not required to trigger it.
 
+- **Something writes past the process table and silently disables half the ABI
+  resolver. Open, and now watched for.** A `-j4` run failed 21 assertions across
+  `15-streams`, `70-env` and `45-throughput`, every one of them:
+
+  ```
+  E (1583885) ELF: Can't find symbol getenv
+  espix: /home/esp/testapp: undefined symbol: getenv   [exit 126]
+  ```
+
+  They failed alone too, and the board stayed that way: 35 minutes later, with
+  no reboot, `tools/esp.sh '/home/esp/testapp env'` still reproduced it. That
+  made it the first corruption here that could be interrogated while it was
+  still happening, and the interrogation is the useful part of this entry.
+
+  **How it was narrowed, with no debugger.** `getenv` is served only by espix's
+  resolver in `abi_resolver.c` — the loader's default table deliberately does
+  not export it (`abi_env.c` explains why publishing newlib's would be
+  backwards). Two facts then separate the possibilities:
+
+  - `testapp` relocates `getpid` *before* `getenv`, and `getpid` is **also**
+    resolver-only. It resolved. So the resolver was installed and running.
+  - On the broken board `/bin/sigtest` ran, and anything needing `getenv` did
+    not. Registration order in `proc.c` is signal first, env second.
+
+  So the resolver was walking `s_tables[0]` and not `s_tables[1]`: either
+  `s_table_count` had gone from 2 to 1, or the second entry was cleared.
+
+  **And the map says how that is reachable:**
+
+  ```
+  3fca8fd0  00001ec0  B g_espix_procs    <- 12 slots x 656 bytes, ends at 3fcaae90
+  3fcaae90  00000004  b s_table_count
+  3fcaae94  00000020  b s_tables
+  ```
+
+  `s_table_count` is the first word after the process table. One word written
+  one past the end of `g_espix_procs` lands exactly on the counter that decides
+  how many ABI tables get searched. Nothing rewrites it afterwards, which is why
+  the damage is permanent and why it surfaces an hour later as a missing symbol
+  rather than as anything resembling its cause.
+
+  **This is a theory about the reach, not a finding about the writer.** Every
+  `g_espix_procs[i]` loop in `proc.c` is correctly bounded, so it is not a
+  visible off-by-one — a wild store, a bad `memcpy` size, or an overflow inside
+  the last slot (`cwd[]` and `root[]` are the `ESPIX_PATH_MAX` arrays in there)
+  all reach the same word.
+
+  **So it is watched rather than guessed at.** `CONFIG_ESPIX_PROC_ABI_WATCHPOINT`
+  (default y) arms one of the ESP32-S3's two hardware watchpoints on
+  `s_table_count` and one on `s_tables[1]`, on both cores — the registers are
+  per-CPU, and app tasks float between them. The next stray write panics at the
+  instruction that did it, and the backtrace names the writer.
+
+  Proven to fire before being trusted, which is what `crash abi` is for:
+
+  ```
+  Debug exception reason: Watchpoint 0 triggered
+  A8 : 0x3fcaae90                     <- &s_table_count
+  0x4202abd8: espix_proc_abi_watch_selftest at abi_resolver.c:151
+  0x420181b6: cmd_crash at cmd_run.c:494
+  ```
+
+  **What is deliberately not done yet.** The resolver could check its own state
+  and report "ABI tables damaged" instead of "Can't find symbol getenv". That is
+  worth having and it is the wrong order: a guard that makes the symptom
+  survivable also makes it quieter, and the writer is findable right now. It
+  goes in with the fix.
+
+  **A dump will not help you here, and that is a decision.**
+  `CONFIG_ESP_COREDUMP_CAPTURE_DRAM` would put `.bss` in the core dump, but IDF
+  asks for at least 128KB of coredump partition and ours is 64KB; growing it
+  moves `storage` and means reflashing the filesystem. See the note in
+  `sdkconfig.defaults`. The watchpoint stops at the instruction, which is better
+  evidence than the wreckage anyway.
+
+  Not claimed to be the same bug as the CacheError above, the `Corrupted MAC on
+  input` that killed a `top` session during the same run, or the 17K internal
+  heap low-water those runs reached. They may share a cause. Saying so before
+  measuring is the move that put a wrong verdict in this file twice.
+
 - **The PSRAM heap's free list was found corrupt, once, and it is open.** A
   `-j4` run rebooted mid-suite; the core dump says:
 

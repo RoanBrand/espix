@@ -28,6 +28,11 @@
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
 
+#if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
+#include "esp_cpu.h"
+#include "esp_ipc.h"
+#endif
+
 #define TAG "abi"
 
 /* Small and fixed: one entry per subsystem that publishes overrides, which is
@@ -100,3 +105,66 @@ void espix_proc_abi_resolver_register(void)
 {
     elf_set_symbol_resolver(espix_symbol_resolver);
 }
+
+#if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
+/*
+ * Watch this file's own table state for writes from anywhere else.
+ *
+ * It was found damaged on a running board: getenv() stopped resolving while
+ * getpid() -- published by the table registered one line earlier -- kept
+ * working, which is the signature of the resolver searching one table instead
+ * of two. Nothing here ever rewrites s_table_count after boot, so whatever did
+ * it was outside this file, and the board stayed broken until it was rebooted.
+ *
+ * s_table_count is the first word after g_espix_procs, so one word written past
+ * the end of the process table lands on it. That is the leading theory and not
+ * a finding: the watchpoint exists to name the writer rather than to confirm a
+ * guess, and it will catch a wild store from anywhere just as well.
+ *
+ * Armed after registration, so the legitimate setup writes do not trip it.
+ */
+static void abi_watch_arm_this_core(void *unused)
+{
+    (void)unused;
+
+    /* Both 4 bytes and naturally aligned, which the debug registers require.
+     * Not one wide watchpoint over the whole region: the nearest power-of-two
+     * window that would span it reaches back into g_espix_procs's last slot,
+     * and ordinary writes there would fire it continuously. */
+    esp_cpu_set_watchpoint(0, &s_table_count, sizeof(s_table_count),
+                           ESP_CPU_WATCHPOINT_STORE);
+    esp_cpu_set_watchpoint(1, &s_tables[1], sizeof(s_tables[1].syms),
+                           ESP_CPU_WATCHPOINT_STORE);
+}
+
+/*
+ * Trip the watchpoint on purpose, for `crash abi`.
+ *
+ * Stores the value that is already there, so the only thing it changes is that
+ * the watchpoint fires -- the ABI state is left correct either way. A guard
+ * nobody has watched fire is not known to work, and this one guards a
+ * corruption that took an afternoon to characterise; being able to ask it to
+ * prove itself is worth the dozen lines.
+ */
+void espix_proc_abi_watch_selftest(void)
+{
+    *(volatile size_t *)&s_table_count = s_table_count;
+}
+
+void espix_proc_abi_watch_arm(void)
+{
+    /* Watchpoint registers are per-CPU, so arming only on the core that runs
+     * init would miss everything the other core does -- which is half the
+     * system, and app tasks float between them. */
+    abi_watch_arm_this_core(NULL);
+
+#if !CONFIG_FREERTOS_UNICORE
+    const uint32_t other = (xPortGetCoreID() == 0) ? 1 : 0;
+    if (esp_ipc_call_blocking(other, abi_watch_arm_this_core, NULL) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "could not arm the ABI watchpoint on core %u",
+                   (unsigned)other);
+    }
+#endif
+}
+#endif /* CONFIG_ESPIX_PROC_ABI_WATCHPOINT */

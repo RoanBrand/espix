@@ -485,6 +485,17 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
 
 static int cmd_crash(espix_session_t *s, int argc, char **argv)
 {
+#if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
+    /* `crash abi` stores to the watched ABI table state instead, so the
+     * watchpoint can be seen firing rather than assumed to work. */
+    if (argc == 2 && strcmp(argv[1], "abi") == 0) {
+        espix_printf(s, "storing to the watched ABI state — expect a watchpoint\n");
+        espix_klog(ESPIX_KLOG_WARN, "crash", "deliberate watchpoint test");
+        espix_proc_abi_watch_selftest();
+        espix_printf(s, "no watchpoint fired — it is not armed\n");
+        return 1;
+    }
+#endif
     (void)argc;
     (void)argv;
 
@@ -512,7 +523,7 @@ static espix_cmd_t s_run_cmds[] = {
       .usage = "kill [-SIG|-l] <pid>..." },
     { .name = "crash", .fn = cmd_crash,
       .help = "fault on purpose, to test fault reporting",
-      .usage = "crash" },
+      .usage = "crash [abi]" },
 };
 
 void espix_cmds_register_run(void)

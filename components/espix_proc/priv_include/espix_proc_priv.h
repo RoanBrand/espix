@@ -265,6 +265,12 @@ typedef struct {
  * clash is reported. */
 void espix_abi_resolver_add(const abi_sym_t *syms, size_t count);
 void espix_proc_abi_resolver_register(void);
+
+#if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
+/* Arm the watchpoints on the resolver's table state, on both cores. Call once,
+ * after every espix_abi_resolver_add(). See the note in abi_resolver.c. */
+void espix_proc_abi_watch_arm(void);
+#endif
 void espix_proc_abi_env_register(void);
 
 void espix_proc_abi_signal_register(void);

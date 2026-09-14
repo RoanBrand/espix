@@ -268,6 +268,15 @@ espix_proc_state_t espix_proc_state_of(espix_pid_t pid);
 
 const char *espix_proc_state_str(espix_proc_state_t state);
 
+#if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
+/*
+ * Store to the watched ABI table state, to prove the watchpoint fires. Panics
+ * if it is working. Writes back the value already there, so nothing is damaged
+ * by asking. `crash abi` is the caller.
+ */
+void espix_proc_abi_watch_selftest(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
