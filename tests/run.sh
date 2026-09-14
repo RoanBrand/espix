@@ -572,6 +572,20 @@ if [ -n "${FAILED_POOL:-}" ]; then
     done
 fi
 
+# Ask the device how it is *before* printing any of it.
+#
+# This has to come first, and it did not: dev_health_check() is what writes
+# watchdog.total and heapmin, and the two blocks below read them. With the call
+# left where it read most naturally -- after the reporting -- the watchdog.total
+# fallback was dead code, so a trigger the monitor's ten-second poll straddled
+# printed nothing at all, which is the one case that fallback exists for.
+#
+# Only the fetch moves. The printed order is unchanged: watchdog, then heap,
+# then health.
+health=""
+health_ok=yes
+if health=$(dev_health_check); then :; else health_ok=no; fi
+
 # The watchdog, with the attribution only the monitor could supply.
 #
 # Reported, never fatal. The watchdog fires when a core was busy for five
@@ -612,7 +626,36 @@ elif [ -s "$RUNDIR/watchdog.total" ]; then
            "$n" "${task:-unknown}"
 fi
 
-if health=$(dev_health_check); then :; else
+# How close the internal heap came to nothing. Printed every run, not only a bad
+# one: the number is only useful as a trend, and a line that appears only when
+# something is already wrong cannot establish one.
+#
+# The device's figure is cumulative since boot, so it is reported against the
+# baseline dev_health_begin() took -- otherwise the first run to touch zero
+# turns the line red for every later run on that boot, and the run that actually
+# did it stops standing out.
+#
+# Reported, never fatal: the run is entitled to push the device hard. But when
+# it does read zero, the run's other failures are usually not what they look
+# like. An allocation that failed, a session that died mid-command and a memory
+# floor assertion each say "bug" alone, and "the heap hit the wall" together.
+if [ -s "$RUNDIR/heapmin" ]; then
+    read -r heap_min heap_base < "$RUNDIR/heapmin"
+    if [ "${heap_base:--1}" -ge 0 ] && [ "$heap_min" -lt "$heap_base" ]; then
+        if [ "$heap_min" -le 0 ]; then
+            printf '\n%s allocations were failing\n' \
+                   "$(_espix_red 'the internal heap reached zero during this run --')"
+        else
+            printf '\ninternal heap low-water mark: fell to %sK this run (was %sK)\n' \
+                   "$heap_min" "$heap_base"
+        fi
+    else
+        printf '\ninternal heap low-water mark: %sK, unchanged by this run\n' \
+               "$heap_min"
+    fi
+fi
+
+if [ "$health_ok" = no ]; then
     printf '\n%s %s\n' "$(_espix_red 'device health after the run:')" "$health"
     N_FAIL=$((N_FAIL + 1))
 fi

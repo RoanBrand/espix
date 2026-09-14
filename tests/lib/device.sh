@@ -740,6 +740,7 @@ DEV_HEALTH_REASON=""
 DEV_HEALTH_MINUTES=-1
 DEV_HEALTH_CONNS=1
 DEV_HEALTH_WDT=0
+DEV_HEALTH_HEAPMIN=-1
 
 # espix prints one of three shapes (espix_kernel/kernel.c):
 #   up N min          up H:MM          up N days, H:MM
@@ -883,6 +884,37 @@ _dev_parse_wdt_task() {     # <uptime output>
     printf '%s' "$1" | sed -n 's/.*watchdog warning[s]* (\([^)]*\)).*/\1/p'
 }
 
+# The internal heap's low-water mark, from `free`:
+#
+#     min free internal since boot: 0 K
+#
+# Cumulative since boot and never recovers, which is what makes two reads enough
+# where sampling would not be: a run that dipped to nothing for a tenth of a
+# second and recovered looks perfectly healthy in every other number, and this is
+# the only one that remembers. Taken at the start and the end, the pair says
+# whether *this* run is what pushed it down.
+#
+# It earned its place. A run under heap poisoning failed three assertions in ways
+# that read as three unrelated bugs -- an ESP_ERR_NO_MEM spawning an app, a
+# session dying mid-command with status 255, and 55-sessions' 20K floor -- and
+# all three were one fact: the internal heap had reached zero. Nothing in the
+# run's own output said so. Finding it meant going and asking the board by hand
+# afterwards, which only happens when somebody already suspects it.
+#
+# -1, never 0, when there is no answer. Zero is a real and alarming reading here,
+# so a failed parse that returned it would invent the very finding this exists to
+# report. That mistake has been made in this file before, in _dev_parse_uptime.
+_dev_parse_free_min() {     # <free output>
+    local n
+    n=$(printf '%s' "$1" |
+        sed -n 's/.*min free internal since boot: *\([0-9][0-9]*\) *K.*/\1/p' |
+        head -1)
+    case "${n:-}" in
+        ''|*[!0-9]*) printf '%s' "-1" ;;
+        *)           printf '%s' "$n" ;;
+    esac
+}
+
 # Is a watchdog trigger espix's fault?
 #
 # WHY THIS DOES NOT FAIL A RUN, since restoring that is the obvious "fix".
@@ -896,12 +928,31 @@ _dev_parse_wdt_task() {     # <uptime output>
 # just hands the core to the next one. There is no sprinkling of vTaskDelay that
 # makes IDLE run while there is real work queued.
 #
-# Two full runs produced two triggers, both naming sshd:conn, and no attempt to
-# derive the mechanism from login cost has survived contact: five concurrent
-# logins is not 6s on one core (there are two), and 55-sessions does not open
-# eight at once (SESS_BATCH is 4). What is known is the task name. That is worth
-# printing and not worth failing on -- and this project already wrote down why,
-# about the connection-count check a few functions below:
+# WHAT IT IS, now that the console has said so.
+#
+# Arithmetic never settled this -- two derivations from login cost were wrong
+# (five concurrent logins is not 6s on one core, there are two; and 55-sessions
+# opens SESS_BATCH=4 at a time, not eight). The answer came from the UART
+# backtrace the watchdog ISR prints, captured with tools/serlog.sh. Three of four
+# triggers in one session decoded to the same stack:
+#
+#     pbkdf2_sha256 (espix_auth/auth.c) -> hmac_half -> psa_hash_finish
+#       -> esp_sha_hash_abort -> free() -> multi_heap_free
+#
+# PBKDF2 runs 20 000 iterations with no blocking call, and IDF's PSA SHA driver
+# allocates and frees an internal DMA buffer inside psa_hash_clone()/abort() on
+# every one of them -- around 40 000 heap operations per login, with up to eight
+# logins in flight. So it is saturation by a real workload, exactly as the
+# paragraphs above reason, and now with the code named.
+#
+# Two limits on that, kept because they are easy to overstate. The fourth trigger
+# decoded to the *wifi* task in pm_tbtt_process -> esp_phy_enable, the modem-sleep
+# wake path, not PBKDF2 at all. And the ISR prints CPU 0's backtrace, which is not
+# necessarily the core that starved. Three of four is strong; it is not all four.
+#
+# None of which changes the verdict: worth printing, not worth failing on -- and
+# this project already wrote down why, about the connection-count check a few
+# functions below:
 #
 #     A check that fires on correct behaviour gets ignored, which costs more
 #     than the check is worth.
@@ -961,6 +1012,17 @@ dev_health_begin() {
     if [ "${DEV_HEALTH_WDT:-0}" -gt 0 ]; then
         printf '  %s %d watchdog warning(s) already recorded; counting from there\n' \
                "$(_espix_dim note:)" "$DEV_HEALTH_WDT"
+    fi
+
+    # The heap low-water mark is cumulative since boot and never recovers, so
+    # without a baseline the first run that touches zero makes every later run
+    # on that boot report zero too. That is the failure mode this file already
+    # names twice: a line that is always there stops being read, and the run
+    # where it *first* went red is the one that mattered.
+    DEV_HEALTH_HEAPMIN=$(_dev_parse_free_min "$(_dev_ask 'free')")
+    if [ "${DEV_HEALTH_HEAPMIN:--1}" -eq 0 ]; then
+        printf '  %s the internal heap has already been to zero on this boot\n' \
+               "$(_espix_dim note:)"
     fi
 
     # Whatever is already connected before the run starts is somebody else's,
@@ -1033,6 +1095,21 @@ dev_health_check() {
         printf 'watchdog %d %s\n' "$(( wdt - DEV_HEALTH_WDT ))" \
                "${wdt_task:-unknown}" > "${ESPIX_RUNDIR:-/tmp}/watchdog.total" \
                2>/dev/null || true
+    fi
+
+    # How close the internal heap came to nothing. Reported, never fatal, for
+    # the same reason as the watchdog: a run may legitimately push the device
+    # hard, and a check that goes red on that gets ignored. See
+    # _dev_parse_free_min() for what this costs to miss.
+    #
+    # Through the shared session, so it is one command and not a login.
+    local heap_min
+    heap_min=$(_dev_parse_free_min "$(_dev_ask 'free')")
+    if [ "${heap_min:--1}" -ge 0 ]; then
+        # Both numbers, so run.sh can say whether this run is what pushed it
+        # down or whether it was already there.
+        printf '%s %s\n' "$heap_min" "${DEV_HEALTH_HEAPMIN:--1}" \
+               > "${ESPIX_RUNDIR:-/tmp}/heapmin" 2>/dev/null || true
     fi
 
     # Connection tasks: told apart by persistence and by *growth*, not by count.
