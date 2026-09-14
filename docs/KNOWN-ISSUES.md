@@ -158,6 +158,61 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   leg of `45-throughput`, in the quiet phase, with the suite running alone. So
   concurrency across suites is not required to trigger it.
 
+- **Every sftp session leaks about 440 bytes of internal heap. Open, and
+  measured.** Roughly 9 TLSF blocks per session, and they never come back.
+
+  Found because the per-suite heap attribution put `40-transfer` and
+  `45-throughput` at `+2K / +45 blocks` twice running while every other suite sat
+  at ±1K with zero net blocks. Both are the file-moving suites, and OpenSSH 10.3
+  drives `scp` over SFTP.
+
+  **Measured on an idle board, outside the suite entirely** (`used K`, `blocks`):
+
+  ```
+  A idle baseline                    177  337
+  B after 6 scp downloads            180  392     +3K  +55
+  C after 150s idle                  180  392     unchanged -- it does not come back
+  ```
+
+  Then bisected, 8 operations at a time:
+
+  ```
+  plain ssh, tiny command            +0K   +0     clean
+  plain ssh, bulk output (dmesg)     +0K   +0     clean -- so not data volume
+  sftp fetch of a MISSING file       +3K  +72     leaks
+  sftp fetch that succeeds           +3K  +72     leaks the same
+  ```
+
+  So it is the sftp **session**, not the transfer: a fetch that opens no file at
+  all leaks identically to one that moves bytes. Thirty sessions during this
+  investigation took internal from 177K to 190K. PSRAM stayed flat at 98K, which
+  matters because `sftp_t` is the one big allocation and it is PSRAM-backed
+  (`CONFIG_ESPIX_SSH_SFTP_IN_PSRAM`) -- whatever leaks is internal and small.
+
+  **Ruled out by measurement, not by reading:** TIME_WAIT. IDF's lwIP is built
+  `MEM_LIBC_MALLOC`/`MEMP_MEM_MALLOC`, so PCBs come from the C heap, and
+  `CONFIG_LWIP_TCP_MSL=60000` holds a closed connection for ~120s -- which fits
+  "many small blocks, few bytes" so well that it was the working theory. Reading
+  C above is what killed it.
+
+  **Ruled out by reading:** `sftp.c` allocates in exactly two places and frees in
+  one, and its teardown closes every handle (`fclose`/`closedir`) before the
+  free; handles live in a fixed array inside `sftp_t`. The `subsystem` request
+  branch in `ssh_channel.c` allocates nothing, the sftp branch builds its
+  `espix_session_t` on the stack, and the shared `out:` path frees the locks,
+  the stdin queue, `exec_cmd` and the channel. None of the obvious paths holds
+  anything.
+
+  **So the next step is instrumentation, not more reading.**
+  `CONFIG_HEAP_TRACING_STANDALONE` with `heap_trace_start(HEAP_TRACE_LEAKS)`
+  around a single fetch would name the call site outright, the way the ABI
+  watchpoint named its writer. It costs internal RAM for the record buffer,
+  which is the scarce thing here, so it wants a Kconfig switch and a command to
+  start and stop it rather than being always on.
+
+  Cost in practice: a full test run does on the order of thirty transfers, so
+  ~13K per run, which is most of the per-run growth that started this hunt.
+
 - **Something writes past the process table and silently disables half the ABI
   resolver. Open, and now watched for.** A `-j4` run failed 21 assertions across
   `15-streams`, `70-env` and `45-throughput`, every one of them:
