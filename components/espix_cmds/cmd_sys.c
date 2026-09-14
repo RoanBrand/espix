@@ -613,8 +613,13 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
     heap_caps_get_info(&internal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     heap_caps_get_info(&psram, MALLOC_CAP_SPIRAM);
 
-    const size_t int_total = internal.total_free_bytes + internal.total_allocated_bytes;
-    const size_t psr_total = psram.total_free_bytes + psram.total_allocated_bytes;
+    /* The heaps' real sizes, for the reason print_heap_line() gives: used+free
+     * is not a capacity, it shrinks as the live block count rises, and `top`
+     * disagreeing with `free` about how much internal RAM the chip has is the
+     * kind of small contradiction that costs an hour to chase. */
+    const size_t int_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT);
+    const size_t psr_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
 
     espix_printf(s, "top - %s\n", uptime);
     espix_printf(s, "Mem:  internal %uK/%uK",
