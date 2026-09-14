@@ -59,6 +59,21 @@ CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 # an explicit setting and an existing `sdkconfig` wins. So turning it off means
 # editing `sdkconfig` too (or deleting it and letting this file regenerate it).
 # Check `build/config/sdkconfig.h` afterwards rather than assuming either way.
+#
+# The same asymmetry crosses *branches*, which is worse, because nothing about
+# the working tree shows it. `sdkconfig` is gitignored, so it is not switched
+# with the branch: build a branch that sets an option, check out another, and
+# every later build carries that option with no sign of it in `git status`.
+#
+# That cost half a day. A `/dev` feature branch set
+# CONFIG_VFS_INITIALIZE_DEV_NULL=n; `main` was then built with that config and
+# without the branch's matching code, which broke /dev/null for non-root users
+# and was recorded in KNOWN-ISSUES.md as a bug in espix. It was not.
+#
+# The stale-firmware guard does not catch this: it compares the board against
+# `build/`, and those two agree perfectly. What disagrees is `build/` and the
+# source. When a config-dependent result surprises you, check
+# `build/config/sdkconfig.h` against this file before believing it.
 
 #
 # ELF loader (espressif/elf_loader) — the centerpiece: load native apps
