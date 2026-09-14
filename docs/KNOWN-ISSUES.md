@@ -264,6 +264,38 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   connections not yet gone being counted as live. **A number measured on a
   broken system is not a baseline.**
 
+- **An ordinary account cannot write `/dev/null`, and it made a throughput
+  floor meaningless for as long as it has existed.** `scp` to it fails with
+  `dest open "/dev/null": Permission denied` as `esp`; the same write from root
+  on the console succeeds.
+
+  The node is espix's own, not IDF's: `vfs.c` routes it through
+  `espix_dev_lookup()` -> `espix_dev_open()` after the access check, IDF's null
+  VFS is registered nowhere, and the table gives it `S_IFCHR | 0666`. `vfs_stat`
+  answers for it too, so this is not the `O_CREAT` branch of
+  `espix_fs_access_check()` demanding write on `/dev` -- that branch is skipped
+  when the target exists. It is somewhere in `may()` ->
+  `espix_fs_owner()`/`permitted()` deciding a node with no owner record is not
+  writable by 1000. Root is unaffected because the check returns 0 for uid 0
+  before any of it.
+
+  (An empty `ls /dev` is *not* part of this. The virtual filesystem has no
+  directory listing yet by design; `null` and `factory` are names that open
+  directly.)
+
+  **What it cost.** `tests/suites/45-throughput.sh` uploads to `/dev/null` to
+  avoid wearing flash, and discarded `dev_push`'s stderr. So every upload failed,
+  both failures cost the same handshake, and the rate -- a difference between a
+  512KB and a 2MB transfer -- was computed from noise. It read
+  `scp upload: 307200 KB/s (floor 200)` and passed. Other runs read 666, 556 and
+  922 KB/s, which look perfectly reasonable and are the same noise.
+
+  A suite whose header says it exists because "a process's stdin came to run at
+  5 KB/s without anyone noticing" would not have noticed this. The upload leg now
+  checks the destination accepts a write and skips with a reason when it does
+  not, and `rate_kbs()` refuses to answer when the two transfers finish within
+  100ms of each other.
+
 - **A session occasionally dies under parallel load, and nothing explains it
   yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
   session partway through and the harness reported seven failures that were one

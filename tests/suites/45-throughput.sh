@@ -32,6 +32,7 @@ now_ms() { "$ESPIX_PYTHON" -c 'import time;print(int(time.time()*1000))'; }
 # A single transfer folds in the SSH handshake -- PBKDF2 at 20 000 iterations,
 # comfortably a second -- which at these rates is a large slice of the answer.
 # It is identical in both runs and cancels.
+
 # The smallest difference between the two transfers that can mean anything.
 #
 # Below this the differential is noise and the rate it produces is arithmetic,
@@ -74,9 +75,22 @@ report() {     # <what> <rate> <floor>
 # scp, both directions. /dev/null and /dev/factory keep littlefs out of it.
 # ---------------------------------------------------------------------------
 
-t0=$(now_ms); dev_push "$TMP/small" /dev/null >/dev/null 2>&1; t_us=$(( $(now_ms) - t0 ))
-t0=$(now_ms); dev_push "$TMP/big"   /dev/null >/dev/null 2>&1; t_ub=$(( $(now_ms) - t0 ))
-report "scp upload" "$(rate_kbs 0 $(( t_ub - t_us )) 0 $(( BIG_KB - SMALL_KB )))" 200
+# Whether the destination even accepts a write, before timing writes to it.
+#
+# It does not, for an ordinary account, and that is why this measurement was
+# reporting 307200 KB/s: every upload failed with "dest open /dev/null:
+# Permission denied", both failures cost the same handshake, and the difference
+# they were derived from was 5ms of noise. See docs/KNOWN-ISSUES.md.
+#
+# The error used to go to /dev/null on *this* side too, which is how a check
+# whose whole purpose is noticing a broken transfer path managed not to.
+if dev_push "$TMP/small" /dev/null >/dev/null 2>&1; then
+    t0=$(now_ms); dev_push "$TMP/small" /dev/null >/dev/null 2>&1; t_us=$(( $(now_ms) - t0 ))
+    t0=$(now_ms); dev_push "$TMP/big"   /dev/null >/dev/null 2>&1; t_ub=$(( $(now_ms) - t0 ))
+    report "scp upload" "$(rate_kbs 0 $(( t_ub - t_us )) 0 $(( BIG_KB - SMALL_KB )))" 200
+else
+    espix_skip "scp upload: /dev/null refuses a write from this account (KNOWN-ISSUES)"
+fi
 
 t0=$(now_ms); dev_pull /etc/hostname  "$TMP/tiny" >/dev/null 2>&1; t_dt=$(( $(now_ms) - t0 ))
 t0=$(now_ms); dev_pull /dev/factory   "$TMP/got"  >/dev/null 2>&1; t_db=$(( $(now_ms) - t0 ))

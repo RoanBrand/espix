@@ -51,13 +51,22 @@ fi
 dev_askpass_init
 trap 'dev_askpass_cleanup' EXIT
 
-out=$(dev_once "$*")
+# _dev_ssh rather than dev_once, because dev_once throws the exit status away
+# and the status is what separates the two cases below.
+out=$(_dev_ssh "$*" 2>&1); rc=$?
+out=$(printf '%s' "$out" | grep -v '^Warning: Permanently added' || true)
 
-# An empty answer is the shape a failed login takes, and it is the shape that
-# misled once already. Say so, and say how to tell the two cases apart.
-if [ -z "$out" ]; then
-    printf 'esp.sh: no answer from %s@%s for: %s\n' \
-           "$ESPIX_USER" "$ESPIX_HOST" "$*" >&2
+# ssh answers 255 for its own failures -- refused, timed out, not authenticated
+# -- and anything else is the remote command's own status. Only the first is a
+# problem with getting in.
+#
+# Keyed on that and not on empty output, which was the first version and was
+# wrong within the hour: `cat /dev/null` returns nothing and is entirely
+# correct, and the tool called it a failed login. A diagnostic that fires on
+# correct behaviour is the thing this file exists to complain about.
+if [ "$rc" -eq 255 ]; then
+    printf 'esp.sh: could not reach %s@%s (ssh exit 255): %s\n' \
+           "$ESPIX_USER" "$ESPIX_HOST" "${out:-no message}" >&2
     printf 'esp.sh: that is what a failed login looks like too. To tell a device\n' >&2
     printf 'esp.sh: problem from a client one, run the suite'"'"'s own login path:\n\n' >&2
     printf '    ./tests/run.sh --suite 00-smoke\n\n' >&2
@@ -65,4 +74,5 @@ if [ -z "$out" ]; then
     exit 1
 fi
 
-printf '%s\n' "$out"
+[ -n "$out" ] && printf '%s\n' "$out"
+exit "$rc"
