@@ -14,6 +14,8 @@
 #   make test-app         build the test app into fsroot/home/esp
 #   make test             run the test suite       [SUITE=fs] [PORT=...]
 #                                                 [J=8] [SERIAL=1] [SEED=n]
+#   make test-panic       same, with the UART captured to serial.log --
+#                         use when hunting a panic; console suites skip
 #   make stress           transport regression check, expects zero failures [N=30]
 #   make clean            fullclean, firmware and apps
 #
@@ -24,6 +26,8 @@ IDF   := ./tools/idf.sh
 
 # Serial port. Detected late (only when a target needs one) so that `make
 # build` works with no board attached.
+PANIC_LOG ?= serial.log
+
 ifeq ($(origin PORT), undefined)
   PORT_ARG = $$(./tools/port.sh)
 else
@@ -31,7 +35,7 @@ else
 endif
 
 .PHONY: all build flash fs flash-all monitor monitor-reset apps test-app \
-        test stress clean help
+        test test-panic stress clean help
 
 all: build
 
@@ -82,6 +86,35 @@ test: test-app
 # nothing after it when no board is attached, and run.sh then dies on an unbound
 # $2 -- which is a confusing way to be told "no serial port", and happens
 # routinely now that USB-NCM gives a reason to unplug the UART cable.
+
+# The suite with the serial console captured, for hunting a cache-error panic.
+#
+# A CacheError prints which of seven faults fired to the UART and nowhere else;
+# the core dump keeps exccause 71, which is the same for all seven. Catching
+# that line is the difference between naming the bug and assuming it.
+#
+# Deliberately NOT passing --port: macOS cu.* devices are not exclusive, so
+# serlog and the console suites would race and split the byte stream between
+# them, corrupting the capture this target exists to produce. run.sh sets
+# ESPIX_HAVE_SERIAL=no without a port and the console suites skip -- that is the
+# trade, and it is why this is a separate target rather than a flag on `test`.
+test-panic: test-app
+	@eval "$$(./tools/idf.sh --env)"; \
+	p="$(PORT)"; [ -n "$$p" ] || p=$$(./tools/port.sh 2>/dev/null || true); \
+	if [ -z "$$p" ]; then \
+	    echo "make: test-panic needs a serial port; none detected (set PORT=)" >&2; \
+	    exit 1; \
+	fi; \
+	./tools/serlog.sh "$$p" $(PANIC_LOG) || exit 1; \
+	trap './tools/serlog.sh stop $(PANIC_LOG) >/dev/null 2>&1' EXIT INT TERM; \
+	ESPIX_PYTHON="$$ESPIX_PYTHON" ESPIX_SERLOG=$(PANIC_LOG) ./tests/run.sh \
+	    $(if $(SUITE),--suite $(SUITE),) \
+	    $(if $(J),-j $(J),) \
+	    $(if $(SEED),--seed $(SEED),) \
+	    $(if $(SERIAL),--serial,); \
+	rc=$$?; \
+	echo "serial capture: $(PANIC_LOG)"; \
+	exit $$rc
 
 # Measures the known transport failure rate rather than gating on it -- see
 # tests/suites/90-stress.sh. Separate from `make test` on purpose: a check that

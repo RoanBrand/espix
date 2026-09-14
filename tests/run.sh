@@ -664,6 +664,40 @@ if [ -f "$RUNDIR/abort" ]; then
     N_FAIL=$((N_FAIL + 1))
 fi
 
+# Was anything reading this board's UART while the run happened?
+#
+# ESPIX_SERLOG names the log when `make test-panic` started one; a capture
+# started by hand leaves its own pidfile in the working directory. Either counts.
+_espix_serial_capture() {
+    local log="${ESPIX_SERLOG:-serial.log}" pid
+    [ -f "$log.pid" ] || return 1
+    pid=$(cat "$log.pid" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# A CacheError panic names which of seven distinct faults fired, and it prints
+# that to the UART and nowhere else -- the core dump keeps exccause 71, which is
+# identical for all seven. So a panic caught with nothing reading the port has
+# already lost the line that would identify it, and no amount of re-reading the
+# dump afterwards gets it back.
+#
+# This says so at the point it happened, because the alternative is what the
+# project has already done twice: diagnose a cache error by assuming the
+# fallback reason, and record the assumption as a finding.
+_espix_panic_seen=no
+grep -qi 'core dump' "$RUNDIR/abort" 2>/dev/null && _espix_panic_seen=yes
+case "${health:-}" in *coredump*|*panic*) _espix_panic_seen=yes ;; esac
+
+if [ "$_espix_panic_seen" = yes ] && ! _espix_serial_capture; then
+    printf '\n%s\n' "$(_espix_red 'the panic reason was not captured:')"
+    printf '  Which of the seven cache faults fired goes to the UART only, and nothing\n'
+    printf '  was reading the port during this run, so that line is gone. The dump keeps\n'
+    printf '  exccause 71, which every one of them shares.\n'
+    printf '  To catch the next one:  %s\n' "$(_espix_dim 'make test-panic')"
+    printf '  (console suites skip -- serlog has to be the only reader, because macOS\n'
+    printf '   cu.* devices are not exclusive and two readers split the bytes.)\n'
+fi
+
 if [ "$N_FAIL" -gt 0 ]; then
     [ -n "$SUITES_FAILED" ] && printf 'failed suites:%s\n' "$SUITES_FAILED"
     [ "$ESPIX_JOBS" != 1 ] && \

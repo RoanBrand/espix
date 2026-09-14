@@ -52,6 +52,17 @@ RATE_MIN_DT_MS=100
 # Which is the exact failure this suite exists to catch, passing. A check that
 # goes green because its measurement broke is worse than no check -- the same
 # lesson _dev_parse_uptime learned by inventing reboots out of a failed parse.
+#
+# The guard below catches the two transfers finishing too CLOSE. It cannot catch
+# the mirror image, which is the small leg failing fast: that stretches the
+# difference rather than collapsing it, and the rate inflates through the floor
+# instead of through the ceiling. A run reported `ssh stdin: 1575 KB/s` -- seven
+# times the honest figure -- from the 512K leg dying when the board panicked,
+# while the assertion on that same leg's byte count was failing two lines above.
+#
+# So no arithmetic here can tell a good measurement from a bad one. Each caller
+# has to establish that BOTH legs delivered what they were asked for, and skip
+# the rate rather than compute one when they did not.
 rate_kbs() {   # <ms for small> <ms for big> <small KB> <big KB>
     local dt=$(( $2 - $1 ))
     [ "$dt" -ge "$RATE_MIN_DT_MS" ] || { echo -1; return; }
@@ -85,18 +96,41 @@ report() {     # <what> <rate> <floor>
 # The error used to go to /dev/null on *this* side too, which is how a check
 # whose whole purpose is noticing a broken transfer path managed not to.
 if dev_push "$TMP/small" /dev/null >/dev/null 2>&1; then
-    t0=$(now_ms); dev_push "$TMP/small" /dev/null >/dev/null 2>&1; t_us=$(( $(now_ms) - t0 ))
-    t0=$(now_ms); dev_push "$TMP/big"   /dev/null >/dev/null 2>&1; t_ub=$(( $(now_ms) - t0 ))
-    report "scp upload" "$(rate_kbs 0 $(( t_ub - t_us )) 0 $(( BIG_KB - SMALL_KB )))" 200
+    t0=$(now_ms); dev_push "$TMP/small" /dev/null >/dev/null 2>&1; rc_us=$?; t_us=$(( $(now_ms) - t0 ))
+    t0=$(now_ms); dev_push "$TMP/big"   /dev/null >/dev/null 2>&1; rc_ub=$?; t_ub=$(( $(now_ms) - t0 ))
+
+    # scp's own exit status is the only evidence available here: the destination
+    # is /dev/null, so there is no byte count to compare against afterwards.
+    if [ "$rc_us" -eq 0 ] && [ "$rc_ub" -eq 0 ]; then
+        report "scp upload" "$(rate_kbs 0 $(( t_ub - t_us )) 0 $(( BIG_KB - SMALL_KB )))" 200
+    else
+        espix_skip "scp upload: not measured -- a transfer failed (small rc $rc_us, big rc $rc_ub)"
+    fi
 else
     espix_skip "scp upload: /dev/null refuses a write from this account (KNOWN-ISSUES)"
 fi
 
 t0=$(now_ms); dev_pull /etc/hostname  "$TMP/tiny" >/dev/null 2>&1; t_dt=$(( $(now_ms) - t0 ))
 t0=$(now_ms); dev_pull /dev/factory   "$TMP/got"  >/dev/null 2>&1; t_db=$(( $(now_ms) - t0 ))
-got=$(wc -c < "$TMP/got" 2>/dev/null || echo 0)
-assert_eq "the download arrived whole" "4194304" "$(printf '%s' "$got" | tr -d ' ')"
-report "scp download" "$(rate_kbs 0 $(( t_db - t_dt )) 0 4096)" 180
+tiny=$(wc -c < "$TMP/tiny" 2>/dev/null | tr -d ' ' || echo 0)
+got=$(wc -c < "$TMP/got"  2>/dev/null | tr -d ' ' || echo 0)
+
+# The reference leg is subtracted from the timed one, so a failure there is not
+# neutral -- it shortens what gets subtracted and inflates the result. Its size
+# is not asserted exactly because a hostname is allowed to change; that it
+# arrived at all is the part this measurement depends on.
+if [ "${tiny:-0}" -gt 0 ]; then
+    espix_pass "the reference fetch arrived"
+else
+    espix_fail "the reference fetch arrived" "/etc/hostname fetched 0 bytes"
+fi
+assert_eq "the download arrived whole" "4194304" "$got"
+
+if [ "${tiny:-0}" -gt 0 ] && [ "$got" = "4194304" ]; then
+    report "scp download" "$(rate_kbs 0 $(( t_db - t_dt )) 0 4096)" 180
+else
+    espix_skip "scp download: not measured -- a fetch did not arrive whole"
+fi
 
 # ---------------------------------------------------------------------------
 # A process's stdin -- the one path scp does not touch.
@@ -116,9 +150,20 @@ t0=$(now_ms); out_b=$(_ssh_in "$APP sink" < "$TMP/big"   2>/dev/null); t_sb=$(( 
 
 # The count first: a transfer that ended early is a failure, not a fast result,
 # and without this a truncated read reports as excellent throughput.
+#
+# Tested separately from the assertions rather than read back out of them:
+# assert_contains reports a result, it does not return one, and the rate below
+# must not be computed from a leg that did not deliver.
+small_ok=0; case "$out_s" in *"sink: $(( SMALL_KB * 1024 )) bytes"*) small_ok=1 ;; esac
+big_ok=0;   case "$out_b" in *"sink: $(( BIG_KB   * 1024 )) bytes"*) big_ok=1   ;; esac
+
 assert_contains "stdin delivered every byte (512K)"  "sink: $(( SMALL_KB * 1024 )) bytes" "$out_s"
 assert_contains "stdin delivered every byte (2048K)" "sink: $(( BIG_KB * 1024 )) bytes"   "$out_b"
 
-report "ssh stdin" "$(rate_kbs 0 $(( t_sb - t_ss )) 0 $(( BIG_KB - SMALL_KB )))" 100
+if [ "$small_ok" = 1 ] && [ "$big_ok" = 1 ]; then
+    report "ssh stdin" "$(rate_kbs 0 $(( t_sb - t_ss )) 0 $(( BIG_KB - SMALL_KB )))" 100
+else
+    espix_skip "ssh stdin: not measured -- the $([ "$small_ok" = 1 ] && echo 2048K || echo 512K) leg did not deliver its bytes"
+fi
 
 rm -rf "$TMP"
