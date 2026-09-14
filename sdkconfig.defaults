@@ -210,15 +210,27 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=2
 # (the NTB below), where ECM sends one frame per transfer.
 CONFIG_TINYUSB_NET_MODE_NCM=y
 
-# NTB buffers: how many aggregate blocks are in flight each way, and how large
-# each may be. Three of 3200 bytes each way is Espressif's own recommendation
-# for NCM and costs about 19KB.
+# NTB buffers: how many aggregate blocks are in flight each way, and how large.
+# A static array in TinyUSB (ncm_epbuf); DRAM_ATTR keeps it out of .bss, so the
+# size is paid twice -- internal RAM and flash.
 #
-# The count is what stops "tud_network_can_xmit: request blocked" under load: a
-# single buffer each way means the link stalls whenever the host has not yet
-# collected the last block. espix drops a frame it cannot hand to TinyUSB and
-# lets TCP retransmit, which is correct but slow if it happens often.
-CONFIG_TINYUSB_NCM_OUT_NTB_BUFFS_COUNT=3
+# The counts are deliberately asymmetric, and it took measuring to find out why.
+# Three runs of 45-throughput over usb0 at each setting, KB/s:
+#
+#                        upload          download
+#   OUT=3 IN=3      673 735 731      818 822 813     Espressif's default
+#   OUT=2 IN=2      671 668 679       46  46  46     and truncated at 2MB
+#   OUT=2 IN=3      673 737 743      839 785 847     kept
+#
+# So the receive buffer was spare and the transmit buffer is load-bearing.
+# OUT=2 saves 3200 bytes (19,216 -> 16,016) and costs nothing measurable.
+#
+# IN=2 is not a slowdown, it is a breakage: scp of a 4MB file delivered exactly
+# 2MB and stopped, at 46 KB/s, identically across three runs, with nothing in
+# dmesg -- no "Packet cannot be accepted on USB interface". Kconfig accepts 1-6,
+# so 2 is a legal value that silently loses data. See docs/UPSTREAM.md. Leave
+# IN at 3.
+CONFIG_TINYUSB_NCM_OUT_NTB_BUFFS_COUNT=2
 CONFIG_TINYUSB_NCM_IN_NTB_BUFFS_COUNT=3
 CONFIG_TINYUSB_NCM_OUT_NTB_BUFF_MAX_SIZE=3200
 CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200

@@ -431,6 +431,29 @@ changes — deliberately survivable, since it falls back to the old generic
 message. **Delete `missing_symbol_name()`, `missing_sym_visit()` and
 `ELF_MISSING_SYM_PREFIX` when this lands.**
 
+## `espressif/esp_tinyusb` (TinyUSB NCM)
+
+### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer
+
+`CONFIG_TINYUSB_NCM_IN_NTB_BUFFS_COUNT` accepts 1-6 and defaults to 3. At **2**,
+device-to-host bulk transfer breaks: `scp` of a 4 MB file from the device
+delivered exactly 2,097,152 bytes and stopped, at 46 KB/s against 818 KB/s at
+the default. Three runs, identical to the byte and the kilobyte.
+
+Nothing is logged. `esp_tinyusb`'s own warning for a refused send --
+`"Packet cannot be accepted on USB interface, dropping"` in `tinyusb_net.c` --
+never fires, so this is not the back-pressure path the Kconfig help describes
+when it says a low count causes `tud_network_can_xmit: request blocked`. It is
+also not the *other* direction: `OUT` at 2 with `IN` at 3 measures identically
+to the default, in both directions, which is the configuration espix now ships.
+
+Exactly half the file, at a count of 2, suggests the xmit ring's free-list
+accounting rather than throughput -- but that is inference, and the measurement
+is the part worth reporting.
+
+Not filed upstream yet. What a report needs first is the same test on a stock
+`esp_tinyusb` example rather than through espix's netif, to rule this side out.
+
 ## `joltwallet/littlefs`
 
 ### Nothing can reach LittleFS custom attributes
