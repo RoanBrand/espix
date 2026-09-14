@@ -63,10 +63,12 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   blocked one was harmless too. `tests/suites/15-streams.sh` pins both kill
   paths, and both were made to fail before they were made to pass.
 
-- ~~**A second unexplained fault, once, under sustained inbound traffic.**~~
-  **Explained and fixed.** Kept in full, because what it looked like the day
-  before it was understood is the useful part: the entry reasons its way to the
-  doorstep and stops.
+- **A second fault under sustained inbound traffic. Fixed once, and reopened
+  2026-09-14 — see the recurrence at the end of this entry.** Kept in full,
+  because what it looked like the day before it was understood is the useful
+  part: the entry reasons its way to the doorstep and stops. The fix it reasoned
+  its way to has now been outlived by the bug, so read the history knowing the
+  conclusion did not hold.
 
   What was recorded at the time: during a throughput run, `exccause 0x47`
   (CacheError) inside `Cache_WriteBack_Addr`, reached from `psa_mac_update` →
@@ -116,6 +118,45 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   errors — the specific one is printed to the UART and stored nowhere else. This
   entry's original diagnosis assumed the fallback. It may well have been right,
   but it was not read.
+
+  **Reopened 2026-09-14: it recurred on an image whose identity checks out.**
+  A `-j4` `make test` panicked and rebooted. This time the board and `build/`
+  agreed — device `96a6320-dirty+279248328` against the same describe and ELF
+  SHA in `build/espix.bin` — `run.sh`'s identity check passed, and `espcoredump`
+  decoded the dump rather than refusing it. So the escape that dismissed the
+  previous recurrence does not apply, and this is evidence about committed code.
+
+  ```
+  exccause 0x47 (CacheError)   excvaddr 0x0   pc Cache_WriteBack_Addr+65
+  sshd:conn
+    ssh_packet_read (ssh_transport.c:512)
+      psa_mac_update -> esp_hmac_update_transparent -> esp_sha256_update
+        -> esp_sha_dma_process (sha.c:289) -> esp_cache_msync(0x3c12f938, 1984)
+          -> cache_hal_writeback_addr -> Cache_WriteBack_Addr
+  ```
+
+  Identical to the original signature, including the buffer: `c=0x3c12f5c0` puts
+  the connection struct in the `0x3C…` external-memory window, so the SHA driver
+  takes its DMA path over PSRAM exactly as described above.
+
+  **What this costs the "fixed" verdict.** `CONFIG_SPIRAM_XIP_FROM_PSRAM=y` was
+  enabled in this build. The fix worked by removing the need to disable the
+  cache during a flash operation; the fault recurred anyway. Either something
+  still turns the cache off, or the cause was never *"cache disabled but cached
+  memory region accessed"* — which is the **fallback** reason this entry admits
+  it assumed and never read. The fix did make it much rarer, and that is not
+  nothing, but rarer is not the same as explained.
+
+  **And the identifying line was lost again.** Nothing was capturing the UART,
+  so which of the seven faults fired is unknown for this occurrence too. That is
+  now harder to repeat by accident: `make test-panic` runs the suite with
+  `tools/serlog.sh` holding the port, and `run.sh` says outright when a panic
+  went by with no capture running.
+
+  Context worth keeping for a reproduction: the panic landed inside
+  `run_program` → `chan_poll_interrupt` with `testapp sink` running — the stdin
+  leg of `45-throughput`, in the quiet phase, with the suite running alone. So
+  concurrency across suites is not required to trigger it.
 
 - **The PSRAM heap's free list was found corrupt, once, and it is open.** A
   `-j4` run rebooted mid-suite; the core dump says:
