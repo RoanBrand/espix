@@ -1186,12 +1186,20 @@ dev_health_check() {
     local base="${DEV_HEALTH_CONNS:-1}"
     [ "$base" -lt 1 ] && base=1
 
-    conns=$(_dev_ask 'ps' | grep -c 'sshd:conn')
+    # Live tasks only. `grep -c 'sshd:conn'` counted 'D' as well -- exited,
+    # waiting on IDLE to free the stack -- which is reclamation running late and
+    # not a held session. 55-sessions had the same bug and reported 12K of
+    # deferred cleanup as a leak. Columns: $2 name, $3 state.
+    conns=$(_dev_ask 'ps' | awk '$2 == "sshd:conn" && $3 != "D"' | grep -c .)
     if [ "$conns" -gt "$base" ]; then
         sleep 7
-        conns=$(_dev_ask 'ps' | grep -c 'sshd:conn')
+        conns=$(_dev_ask 'ps' | awk '$2 == "sshd:conn" && $3 != "D"' | grep -c .)
         if [ "$conns" -gt "$base" ]; then
-            problems="$problems sshd-conn-tasks-held=$conns(was $base at start)"
+            # The states come with it: a stranded task is worth chasing and a
+            # spectator's idle session is not, and the letters say which.
+            local states
+            states=$(_dev_ask 'ps' | awk '$2 == "sshd:conn" {printf "%s", $3}')
+            problems="$problems sshd-conn-tasks-held=$conns(was $base at start, states $states)"
         fi
     fi
 

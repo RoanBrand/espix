@@ -236,6 +236,59 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   -- which is not scp: measured directly, downloads and uploads are now clean.
   The suites also write files and run `sftp -b`, and that is where to look next.
 
+- **Killing a process under load strands the connection task that killed it.
+  Open, with backtraces.** Two distinct deadlocks, both from deleting a task
+  that holds a lock, and between them they are the `<<<dead-session>>>` cascade
+  that `15-streams` and `35-signals` have been producing under `-j4` for weeks.
+
+  A `make test` ended with `sshd-conn-tasks-held=4(was 2 at start)` and
+  `55-sessions` skipping for lack of free slots. Twenty-four minutes later, idle,
+  the board still held them -- states `R,B,B,B`, **none `D`**, so these are live
+  tasks that will not exit, not reclamation running late. Internal had gone from
+  166K to 203K and stayed. A deliberate `crash` captured all four:
+
+  ```
+  THREAD  5  cmd_top -> vTaskDelay                     <- a healthy session, the control
+  THREAD 11  prvDeleteTCB -> _reclaim_reent -> esp_cleanup_r
+               -> _fclose_r -> __retarget_lock_acquire_recursive   xTicksToWait = portMAX_DELAY
+  THREAD 13  esp_linenoise_edit_insert -> refresh_line -> ssh_edit_write
+               -> send_cooked (ssh_channel.c:396) -> xQueueTakeMutexRecursive
+                                                     xTicksToWait = portMAX_DELAY
+  ```
+
+  Thread 11 is the hazard `proc.c:520` already describes in full: `vTaskDelete()`
+  runs `_reclaim_reent()` **on the killer's task**, which fcloses the dead task's
+  streams, and `fclose` needs the very FILE lock the deleted task was holding.
+  Thread 13 is the same shape one level up -- the deleted task was inside a
+  channel write holding `ch->tx_lock`, and the next writer waits forever.
+
+  **Why only under load, which was the part that made it look mysterious.**
+  `kill_unwind()` sets `stop_requested`, aborts the target's delay and gives it
+  `KILL_UNWIND_MS` (250ms) to leave libc on its own; an app that does not is
+  deleted anyway. Under `-j4` the cores are saturated -- the watchdog fired in
+  this very run -- so the target may not be *scheduled at all* inside that
+  window. The grace is a probability, not a guarantee, and load is what shifts
+  it. `35-signals` then tests exactly this on purpose: "a process ignoring
+  SIGTERM is stopped anyway, after the grace".
+
+  **What is already right, and where it stops.** `finish_session()` takes
+  `tx_lock` with a bounded wait and says why: *"the process above may have died
+  inside a write still holding it -- espix_proc_kill() deletes the task outright
+  and cannot unwind what it held."* That reasoning was applied at exactly one of
+  the ten lock sites. The other eight `tx_lock`/`rx_lock` acquisitions in
+  `ssh_channel.c` use `portMAX_DELAY`.
+
+  **The fix is not one change.** Bounding those eight turns thread 13 from a
+  permanent strand into a failed write and a clean teardown, and it follows a
+  precedent already in the file. Thread 11 cannot be bounded that way -- the
+  wait is inside FreeRTOS's own `prvDeleteTCB`, reached from `vTaskDelete()` --
+  so it needs either a longer or load-aware unwind grace, or not force-deleting
+  a task that is inside stdio at all. Lengthening the grace lowers the odds and
+  closes nothing.
+
+  Not to be confused with the deferred-reclamation case above: that one shows
+  `D` tasks and clears itself, this one shows `B` and does not.
+
 - **Something writes past the process table and silently disables half the ABI
   resolver. Open, and now watched for.** A `-j4` run failed 21 assertions across
   `15-streams`, `70-env` and `45-throughput`, every one of them:
