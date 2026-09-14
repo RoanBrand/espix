@@ -170,6 +170,55 @@ static void ls_id_name(uint16_t id, bool is_group, char *out, size_t len)
     }
 }
 
+/*
+ * The four variable-width columns of a long listing, for one entry.
+ *
+ * One function because the listing is measured before it is printed and the
+ * two passes must agree exactly: a column measured from one rendering and
+ * filled from another is a misalignment waiting for the first entry where they
+ * differ.
+ *
+ * An unstatted entry answers "-" in all four rather than being special-cased at
+ * the call sites. It has no owner, size or date to report, and "-" is what the
+ * listing already showed for a directory's size.
+ */
+static void ls_cols(const ls_entry_t *e, bool human,
+                    char *owner, size_t owner_len,
+                    char *group, size_t group_len,
+                    char *size,  size_t size_len,
+                    char *when,  size_t when_len)
+{
+    if (!e->statted) {
+        strlcpy(owner, "-", owner_len);
+        strlcpy(group, "-", group_len);
+        strlcpy(size,  "-", size_len);
+        strlcpy(when,  "-", when_len);
+        return;
+    }
+
+    ls_id_name(e->uid, false, owner, owner_len);
+    ls_id_name(e->gid, true,  group, group_len);
+    ls_time(when, when_len, e->mtime);
+
+    /* A directory's size is whatever littlefs spends on the entry itself, which
+     * is not what anyone reading `ls -l` is asking about. */
+    if (e->is_dir) {
+        strlcpy(size, "-", size_len);
+    } else {
+        ls_size(size, size_len, e->size, human);
+    }
+}
+
+/* Grow a column to fit `text`. */
+static void ls_widen(int *width, const char *text)
+{
+    const int n = (int)strlen(text);
+
+    if (n > *width) {
+        *width = n;
+    }
+}
+
 /* Ceiling on entries held at once. Said out loud when reached rather than
  * dropped quietly -- `ps` silently losing its ninth process is already a
  * known issue and is not worth repeating here. */
@@ -269,16 +318,35 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    /* A plain file argument just describes itself. */
+    /* A plain file argument just describes itself.
+     *
+     * With owner and group, which this form used to leave out -- so `ls -l
+     * /etc/passwd` and `ls -l /etc` described the same file differently, and
+     * the one you reach for when you care about a single file was the one
+     * missing who owns it. Widths are the strings' own here: there is one row,
+     * so there is nothing to line it up against. */
     if (!S_ISDIR(st.st_mode)) {
         if (f.long_form) {
             char when[20];
             char perms[11];
             char size[16];
+            char owner[ESPIX_USER_MAX];
+            char group[ESPIX_USER_MAX];
+            uint16_t uid = 0;
+            uint16_t gid = 0;
+
+            espix_fs_owner(abs, &st, &uid, &gid);
+            ls_id_name(uid, false, owner, sizeof(owner));
+            ls_id_name(gid, true,  group, sizeof(group));
             ls_time(when, sizeof(when), st.st_mtime);
             ls_size(size, sizeof(size), st.st_size, f.human);
+            /* st.st_mode, not espix_fs_mode(): vfs_stat() has already folded
+             * the rule's permission bits in, and espix_fs_mode() answers the
+             * permissions alone -- passing it here would drop S_ISCHR and draw
+             * every device as an ordinary file. */
             espix_fs_mode_str(st.st_mode, false, perms, sizeof(perms));
-            espix_printf(s, "%s  %8s  %12s  %s\n", perms, size, when, abs);
+            espix_printf(s, "%s %s %s %s %s %s\n",
+                         perms, owner, group, size, when, abs);
         } else {
             espix_printf(s, "%s\n", abs);
         }
@@ -377,6 +445,49 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         }
     }
 
+    /*
+     * Column widths measured from the listing, then one pass to print it.
+     *
+     * They used to be fixed -- owner and group padded to ESPIX_USER_MAX
+     * whatever they held, size to 8 when the widest entry was two digits, and
+     * two spaces between several columns. On a directory of root-owned files
+     * that is a third of the line spent on padding, and it is worst exactly
+     * where there is least to say: a subdirectory prints "-" for both size and
+     * date, right-aligned in eight and twelve columns, so the eye has to cross
+     * a blank gap to reach the name.
+     *
+     * The old comment justified the fixed width as keeping columns aligned
+     * "whether an id resolves to a name or prints as a number". Measuring does
+     * that better -- it aligns on what is there rather than on what espix
+     * allows -- and it is what ls has always done.
+     *
+     * ls_cols() is called twice per entry, once to measure and once to print,
+     * rather than caching four strings per entry. The entry array is already
+     * the memory ceiling here (LS_ENTRIES_MAX), and formatting a size and a
+     * date twice is cheaper than carrying 50 bytes an entry to avoid it.
+     */
+    int w_owner = 1;
+    int w_group = 1;
+    int w_size  = 1;
+    int w_when  = 1;
+
+    if (f.long_form) {
+        for (size_t i = 0; i < count; i++) {
+            char owner[ESPIX_USER_MAX];
+            char group[ESPIX_USER_MAX];
+            char size[16];
+            char when[20];
+
+            ls_cols(&ents[i], f.human, owner, sizeof(owner), group,
+                    sizeof(group), size, sizeof(size), when, sizeof(when));
+
+            ls_widen(&w_owner, owner);
+            ls_widen(&w_group, group);
+            ls_widen(&w_size,  size);
+            ls_widen(&w_when,  when);
+        }
+    }
+
     for (size_t i = 0; i < count; i++) {
         const ls_entry_t *e = &ents[i];
 
@@ -384,35 +495,26 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
             espix_printf(s, "%s\n", e->name);
             continue;
         }
-        if (!e->statted) {
-            espix_printf(s, "?????????? %-8s %-8s %8s  %12s  %s\n",
-                         "-", "-", "-", "-", e->name);
-            continue;
-        }
 
-        char when[20];
-        char perms[11];
-        char size[16];
-
-        ls_time(when, sizeof(when), e->mtime);
-        espix_fs_mode_str(e->mode, e->is_dir, perms, sizeof(perms));
-
-        /* Left-aligned and padded to the widest name espix allows, so the
-         * columns line up whether an id resolves to a name or prints as a
-         * number. */
         char owner[ESPIX_USER_MAX];
         char group[ESPIX_USER_MAX];
-        ls_id_name(e->uid, false, owner, sizeof(owner));
-        ls_id_name(e->gid, true,  group, sizeof(group));
+        char size[16];
+        char when[20];
+        char perms[11];
 
-        if (e->is_dir) {
-            espix_printf(s, "%s  %-8s %-8s %8s  %12s  %s/\n",
-                         perms, owner, group, "-", when, e->name);
+        ls_cols(e, f.human, owner, sizeof(owner), group, sizeof(group),
+                size, sizeof(size), when, sizeof(when));
+
+        if (e->statted) {
+            espix_fs_mode_str(e->mode, e->is_dir, perms, sizeof(perms));
         } else {
-            ls_size(size, sizeof(size), e->size, f.human);
-            espix_printf(s, "%s  %-8s %-8s %8s  %12s  %s\n",
-                         perms, owner, group, size, when, e->name);
+            strlcpy(perms, "??????????", sizeof(perms));
         }
+
+        espix_printf(s, "%s %-*s %-*s %*s %*s %s%s\n",
+                     perms, w_owner, owner, w_group, group,
+                     w_size, size, w_when, when,
+                     e->name, (e->statted && e->is_dir) ? "/" : "");
     }
 
     for (size_t i = 0; i < count; i++) {
@@ -818,10 +920,38 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+#define DF_USAGE "usage: df [-h]\n"
+
+/*
+ * Flags parsed rather than ignored, which is the whole of the change here.
+ *
+ * This used to be `(void)argc; (void)argv;`, so `df -h` printed 1K blocks and
+ * exited 0 -- and so did `df -Z`. Silently accepting a flag you do not
+ * implement is worse than rejecting it: the caller reads the answer believing
+ * it is the answer to what they asked. ls_parse() above already had the right
+ * shape for this; the only difference is that df takes no operand.
+ */
 static int cmd_df(espix_session_t *s, int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    bool human = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' || argv[i][1] == '\0') {
+            /* There is one filesystem and df already names it. An operand is a
+             * misunderstanding worth correcting rather than ignoring. */
+            espix_eprintf(s, "df: %s: df reports the root filesystem and takes "
+                             "no operand\n" DF_USAGE, argv[i]);
+            return 1;
+        }
+        for (const char *c = argv[i] + 1; *c != '\0'; c++) {
+            switch (*c) {
+            case 'h': human = true; break;
+            default:
+                espix_eprintf(s, "df: unknown option '-%c'\n" DF_USAGE, *c);
+                return 1;
+            }
+        }
+    }
 
     espix_fs_info_t info;
     if (espix_fs_stat_root(&info) != ESP_OK) {
@@ -835,9 +965,28 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
                              ? (unsigned)((info.used_bytes * 100) / info.total_bytes)
                              : 0;
 
+    /* ls_size() rather than a second formatter: -h means the same thing in both
+     * commands, and two implementations of "1.5M" drift. */
+    char c_total[16];
+    char c_used[16];
+    char c_avail[16];
+
+    if (human) {
+        ls_size(c_total, sizeof(c_total), (off_t)info.total_bytes, true);
+        ls_size(c_used,  sizeof(c_used),  (off_t)info.used_bytes,  true);
+        ls_size(c_avail, sizeof(c_avail),
+                (off_t)(info.total_bytes - info.used_bytes), true);
+    } else {
+        snprintf(c_total, sizeof(c_total), "%u", total_k);
+        snprintf(c_used,  sizeof(c_used),  "%u", used_k);
+        snprintf(c_avail, sizeof(c_avail), "%u", total_k - used_k);
+    }
+
+    /* "Size" under -h, as GNU df does: the numbers are no longer 1K blocks and
+     * a header that says they are would be the same lie in a smaller place. */
     espix_printf(s, "%-12s %9s %9s %9s %5s %s\n",
-                 "Filesystem", "1K-blocks", "Used", "Available", "Use%",
-                 "Mounted on");
+                 "Filesystem", human ? "Size" : "1K-blocks", "Used",
+                 "Available", "Use%", "Mounted on");
     /*
      * Still "littlefs" on "/", and both halves are still true even though `/`
      * is served by espix's own VFS now: that layer holds no storage, it holds
@@ -848,8 +997,8 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
      * espix_fs_stat_root() resolves by partition label rather than by path, so
      * it never noticed the change.
      */
-    espix_printf(s, "%-12s %9u %9u %9u %4u%% %s\n",
-                 "littlefs", total_k, used_k, total_k - used_k, pct, "/");
+    espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
+                 "littlefs", c_total, c_used, c_avail, pct, "/");
     return 0;
 }
 
@@ -996,7 +1145,7 @@ static espix_cmd_t s_fs_cmds[] = {
     { .name = "chgrp", .fn = cmd_chown,
       .help = "change file group",               .usage = "chgrp <group> <path>..." },
     { .name = "df",    .fn = cmd_df,
-      .help = "report filesystem usage",         .usage = "df" },
+      .help = "report filesystem usage",         .usage = "df [-h]" },
 };
 
 void espix_cmds_register_fs(void)
