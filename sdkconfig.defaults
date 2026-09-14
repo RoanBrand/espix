@@ -31,6 +31,36 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 
 #
+# Heap corruption hunting — off, and here is the switch when it is needed.
+#
+# Uncomment to make every allocation carry head and tail canaries, checked on
+# free, with freed memory filled and verified on the next allocation. It catches
+# an overrun at the block that overran and a double free on the spot, instead of
+# leaving TLSF to trip over the damage minutes later in whatever task happens to
+# free next. docs/KNOWN-ISSUES.md has the open PSRAM corruption this exists for.
+#
+# CONFIG_HEAP_POISONING_COMPREHENSIVE=y
+#
+# Two things to know before switching it on. It costs speed — every alloc and
+# free memsets, so throughput drops and task watchdog warnings get commoner, and
+# neither is a regression. And it costs internal RAM: the per-block canaries were
+# enough to drive `min free internal since boot` to 0 K at eight concurrent
+# sessions, which fails assertions in ways that read as unrelated bugs.
+#
+# Put it here rather than in `sdkconfig`, which is gitignored and regenerated
+# from this file: an experiment kept only there is silently reverted by
+# `idf.py fullclean`, and a clean run from a quietly uninstrumented build is
+# worse than no run at all. `free` on the device reports which way it is set, so
+# a build can always be asked rather than assumed.
+#
+# Switching it off again is NOT symmetric, and this cost a build. Adding a line
+# here overrides `sdkconfig` when the value there is still at its Kconfig
+# default; *removing* the line does not, because by then `sdkconfig` holds it as
+# an explicit setting and an existing `sdkconfig` wins. So turning it off means
+# editing `sdkconfig` too (or deleting it and letting this file regenerate it).
+# Check `build/config/sdkconfig.h` afterwards rather than assuming either way.
+
+#
 # ELF loader (espressif/elf_loader) — the centerpiece: load native apps
 # cross-compiled on a PC off the filesystem at runtime.
 #

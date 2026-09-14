@@ -42,5 +42,11 @@ __pycache__/
 .continue/
 compile_commands.json
 
+# Serial captures. tools/serlog.sh writes these into the repo root by default,
+# and they reach tens of megabytes during a hunt -- one `git add -A` away from
+# being committed.
+*.log
+*.log.pid
+
 # NOTE: dependencies.lock IS committed, deliberately — it pins the exact
 # component versions so builds are reproducible.
