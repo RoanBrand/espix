@@ -580,6 +580,38 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
     }
 
     TaskHandle_t task = slot->info.task;
+
+    /* Never this task: suspending ourselves here wedges the caller instead of
+     * killing anything, and deleting ourselves abandons everything below.
+     * kill_unwind() already refuses the same case. */
+    if (task == xTaskGetCurrentTaskHandle()) {
+        task = NULL;
+    }
+
+    /*
+     * Suspended under the lock, deleted outside it, and the order is the whole
+     * correctness argument -- do not tidy the suspend out of here.
+     *
+     * A process has two possible deleters: itself, via vTaskDelete(NULL) at the
+     * end of proc_task(), and this function. Both used to be able to fire. The
+     * handle was copied here, the lock released, and only then deleted -- and in
+     * that window the process could finish and delete itself, leaving this to
+     * free a TCB that was already gone. Two deletes of one task corrupts the
+     * scheduler's lists, and what that looks like is IDLE taking an
+     * IllegalInstruction inside 0xa5a5a5a5 -- filled stack, no longer a stack --
+     * followed by an assert that it cannot select a task. `kill -9` on an app
+     * that was writing hard reproduced it on the first try, every try.
+     *
+     * The lock closes it because a process cannot reach its own vTaskDelete()
+     * without passing through espix_proc_finish(), which takes this same lock.
+     * So while it is held the process is in one of two decidable states: already
+     * finished, in which case its handle may be stale and the early return above
+     * has already left it alone; or not yet in finish(), in which case it has
+     * not self-deleted and cannot, once suspended, ever get there.
+     */
+    if (task != NULL) {
+        vTaskSuspend(task);
+    }
     slot->info.task = NULL;
 
     /* Copy the name while the lock still protects it: the slot can be recycled

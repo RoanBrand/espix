@@ -236,8 +236,8 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   -- which is not scp: measured directly, downloads and uploads are now clean.
   The suites also write files and run `sftp -b`, and that is where to look next.
 
-- **`kill -9` on a heavily-writing app panics the board. Open, and reproducible
-  on demand.** Two attempts, two panics, first iteration each time.
+- **`kill -9` on a heavily-writing app panics the board. Open; one race closed,
+  and it is NOT enough.** Two attempts, two panics, first iteration each time.
 
   Reproducer, which is the valuable part -- everything before this was
   intermittent and load-dependent:
@@ -274,6 +274,33 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   across `espix_proc_wait()` would stop the task being waited for from
   finishing. That reasoning is right for the wait and was carried one statement
   too far.
+
+  **A real race was found and closed, and the panic survived it.**
+  `proc_force_kill()` now suspends the target **under `g_espix_proc_lock`**
+  before releasing it and deleting. That is sound and worth keeping: a process
+  cannot reach its own `vTaskDelete(NULL)` without passing through
+  `espix_proc_finish()`, which takes the same lock, so holding it makes the two
+  deleters decidable -- already finished (leave the handle alone) or not yet in
+  finish (suspend it, and it can never get there).
+
+  It made the panic much rarer: nine consecutive kills with no panic, where the
+  old build panicked on the first every time. Then `35-signals --stress` failed
+  with `reset reason is now 'panic' (was 'power-on')`, same `panic_abort`
+  signature, faulting task `tcpip`. **So the double delete was a real defect and
+  was not the whole cause, or not the cause at all.** Nine clean runs are not
+  evidence of a fix when the thing being measured is probabilistic -- that is the
+  same mistake as reading one 30-proc heap delta and calling it a leak.
+
+  Still to look at: `espix_proc_release_resources()` and `espix_proc_finish()`
+  run on the *slot* after the delete, and the slot can be recycled by a new
+  process the moment `finish` wakes a waiter. And the backtrace for this
+  occurrence was never read -- `espcoredump` failed twice with "Invalid head of
+  packet", almost certainly because espix's own console shares that UART, so the
+  next attempt should capture the panic text live with `tools/serlog.sh` instead.
+
+  The reproducer now lives in `35-signals`, gated behind `--stress` because
+  killing a writing app still strands a connection task and would otherwise turn
+  the health check red on every run. Remove the gate when the strand is fixed.
 
   **This changes the fix for the entry below.** Handing `vTaskDelete` to the
   reaper, to keep the dead task's stdio cleanup off a connection task, would

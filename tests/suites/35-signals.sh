@@ -184,3 +184,50 @@ assert_contains "kill -l names SIGKILL" "KILL" "$sigs"
 
 assert_contains "kill rejects a pid that is not there" "no such process" \
     "$(dev_run 'kill 9999' 2>&1)"
+
+# ---------------------------------------------------------------------------
+# kill -9 on an app that is writing hard must not take the board down.
+#
+# This reproduced a panic on the first attempt, every attempt: an app has two
+# possible deleters -- itself at the end of proc_task(), and proc_force_kill()
+# -- and the killer used to copy the task handle, release the table lock, and
+# only then delete. In that window the app could finish and delete itself, so
+# the kill freed a TCB that was already gone. What two deletes of one task look
+# like is IDLE taking an IllegalInstruction inside filled stack memory, then an
+# assert that the scheduler cannot select a task.
+#
+# The reset *reason* rather than uptime-in-minutes, because this board reboots
+# and is answering again inside one minute -- which is how the panic went
+# unnoticed while the suite was busy reporting dead sessions instead.
+# ---------------------------------------------------------------------------
+
+# Opt-in, and not because it is slow.
+#
+# Killing a writing app still strands the connection task that killed it -- the
+# tx_lock half of this is open, see docs/KNOWN-ISSUES.md -- so running it by
+# default would leave one held session behind every time and turn the health
+# check red on every run, for a bug that is already written down. That is the
+# same reason 90-stress is opt-in.
+#
+# Remove this gate the moment the strand is fixed: the panic it guards against
+# is severe enough to want in the default run.
+if [ "${ESPIX_STRESS:-0}" != 1 ]; then
+    espix_skip "kill -9 on a writing app: needs --stress (it strands a session)"
+    return 0
+fi
+
+reason_before=$(_dev_parse_reason "$(dev_run 'uptime')")
+kill_pid=$(dev_run "$APP out 200000 40 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -z "$kill_pid" ]; then
+    espix_skip "kill -9 on a writing app: could not start one"
+else
+    dev_run "kill -9 $kill_pid" >/dev/null 2>&1
+    reason_after=$(_dev_parse_reason "$(dev_once 'uptime')")
+    case "$reason_after" in
+        '')      espix_fail "kill -9 on a writing app leaves the board up" \
+                            "the device did not answer afterwards at all" ;;
+        *panic*) espix_fail "kill -9 on a writing app leaves the board up" \
+                            "reset reason is now '$reason_after' (was '$reason_before')" ;;
+        *)       espix_pass "kill -9 on a writing app leaves the board up ($reason_after)" ;;
+    esac
+fi
