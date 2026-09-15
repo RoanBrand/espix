@@ -236,6 +236,53 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   -- which is not scp: measured directly, downloads and uploads are now clean.
   The suites also write files and run `sftp -b`, and that is where to look next.
 
+- **`kill -9` on a heavily-writing app panics the board. Open, and reproducible
+  on demand.** Two attempts, two panics, first iteration each time.
+
+  Reproducer, which is the valuable part -- everything before this was
+  intermittent and load-dependent:
+
+  ```
+  pid=$(dev_run "$APP out 200000 40 &" | sed -n 's/^\[\([0-9]*\)\].*/\1/p')
+  dev_run "kill -9 $pid"
+  ```
+
+  An app writing continuously, killed with no grace. The session dies, and the
+  board goes down with it:
+
+  ```
+  espix: fault in task 'IDLE1' (fault: IllegalInstruction)
+  assert failed: prvSelectHighestPriorityTaskSMP tasks.c:3642 (xTaskScheduled == 1)
+  Backtrace: ... 0x40381e1a:0xa5a5a5a5 |<-CORRUPTED
+  ```
+
+  `0xa5a5a5a5` is FreeRTOS's stack fill pattern, so IDLE1 is running through
+  memory that is not a stack any more. A scheduler that cannot select a task is
+  downstream of its task lists being corrupt, not a bug in the scheduler.
+
+  **The defect the code plainly has**, whether or not it is the whole story:
+  `proc_task()` ends in `vTaskDelete(NULL)` -- an app self-deletes when it
+  finishes ([exec.c:554](components/espix_proc/exec.c#L554)). And
+  `proc_force_kill()` takes the task handle under `g_espix_proc_lock`, **releases
+  the lock**, and only then calls `vTaskDelete(task)`
+  ([proc.c:593](components/espix_proc/proc.c#L593)). Between the give and the
+  delete the app can finish and delete itself, so the kill deletes a TCB that is
+  already freed. Two deletes of one task is exactly how the scheduler's lists
+  end up pointing at filled stack memory.
+
+  The lock is released deliberately -- the comment explains that holding it
+  across `espix_proc_wait()` would stop the task being waited for from
+  finishing. That reasoning is right for the wait and was carried one statement
+  too far.
+
+  **This changes the fix for the entry below.** Handing `vTaskDelete` to the
+  reaper, to keep the dead task's stdio cleanup off a connection task, would
+  make this window *wider*, not narrower: the handle would sit in a queue while
+  the task it names may already be gone. Whatever takes ownership of that handle
+  has to be handed something that stays valid -- the delete and the "this slot's
+  task is mine to delete" decision have to happen together, under the lock, or
+  the handle has to be made safe to hold.
+
 - **Killing a process under load strands the connection task that killed it.
   Open, with backtraces.** Two distinct deadlocks, both from deleting a task
   that holds a lock, and between them they are the `<<<dead-session>>>` cascade
