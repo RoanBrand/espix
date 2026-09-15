@@ -94,6 +94,25 @@
 #define RX_WAIT_MS 250
 
 /*
+ * The transmit lock, bounded.
+ *
+ * Every acquisition used to be portMAX_DELAY, and one of them is reachable with
+ * the lock held by a task that no longer exists: a process force-killed while
+ * writing dies inside send_stream() still holding it, and FreeRTOS will not let
+ * anyone but the owner give a mutex back. The next writer then waited forever,
+ * which is what stranded a connection task per kill and turned into the
+ * <<<dead-session>>> cascade.
+ *
+ * TX_DEAD_MS is deliberately far longer than any legitimate hold rather than
+ * merely longer than a quick one. A healthy writer can sit in write_all() for
+ * up to BLOCKED_WRITE_TIMEOUT_MS (15s) per packet against a stalled peer, so a
+ * tighter bound would abandon working-but-slow transfers. A dead holder is dead
+ * for good, so waiting longer costs nothing in the case this exists for.
+ */
+#define TX_WAIT_MS   250
+#define TX_DEAD_MS 30000
+
+/*
  * Fallback terminal size, and the floor under whatever a client asks for.
  *
  * A client may legitimately request a pty of 0x0 when it has no terminal of its
@@ -120,7 +139,17 @@ typedef struct {
     uint32_t    local_window;
     bool        want_shell;
     bool        want_sftp;
-    bool        closed;
+
+    /* Volatile because it is the channel's one cross-task exit condition: an
+     * app task sets it on a failed write, the connection task on a peer CLOSE,
+     * and chan_tx_take() spins on it. */
+    volatile bool closed;
+
+    /*
+     * tx_lock was held by a task that has been deleted, so nobody can ever give
+     * it back -- and nobody may even ask for it again. See chan_task_gone().
+     */
+    volatile bool tx_orphaned;
 
     /*
      * `ssh host <cmd>`: the command the client asked to run, on the heap
@@ -215,6 +244,98 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /*
+ * Take the transmit lock, or decide nobody is ever giving it back.
+ *
+ * The rule this implements: blocking forever is fine only where something is
+ * guaranteed to unblock it. Nothing guarantees that here -- a force-killed
+ * process dies holding this lock and FreeRTOS lets only the owner release a
+ * mutex -- so the wait is bounded and failing it closes the channel.
+ *
+ * Closing is the part that makes this a fix rather than a nicer hang. `closed`
+ * is the one condition every other waiter and both stream loops already test,
+ * so setting it releases the whole session: send_stream() leaves its loop,
+ * chan_stream_read() reports EOF, and the connection task reaches its teardown
+ * instead of parking in the line editor forever.
+ *
+ * Recursive, so a nested take by the task that already owns it returns
+ * immediately and this costs those callers nothing.
+ */
+static bool chan_tx_take(ssh_chan_t *ch)
+{
+    /*
+     * Checked before asking, never after, and this is the whole reason
+     * chan_task_gone() exists.
+     *
+     * xQueueSemaphoreTake() reaches into the recorded holder's TCB for priority
+     * inheritance -- xTaskPriorityInherit() on the way in (queue.c), and
+     * vTaskPriorityDisinheritAfterTimeout() on the way out of a timed wait. If
+     * that holder has been deleted its TCB is freed memory, so *asking* is the
+     * use-after-free; the timeout is not what makes it unsafe, it merely turns
+     * silent corruption into configASSERT(pxTCB->uxMutexesHeld) and a panic.
+     * Measured: bounding these waits made the board assert on the first kill,
+     * every time, where before it corrupted quietly and fell over later.
+     */
+    if (ch->tx_orphaned) {
+        return false;
+    }
+
+    for (unsigned waited = 0; waited < TX_DEAD_MS; waited += TX_WAIT_MS) {
+        if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(TX_WAIT_MS))
+            == pdTRUE) {
+            return true;
+        }
+        /* Somebody else gave up first, or the peer hung up. Either way there is
+         * nothing left worth writing. */
+        if (ch->closed) {
+            return false;
+        }
+    }
+
+    espix_klog(ESPIX_KLOG_WARN, TAG,
+               "transmit lock held for %ds, probably by a killed process; "
+               "abandoning the channel", TX_DEAD_MS / 1000);
+    ch->closed = true;
+    return false;
+}
+
+/*
+ * A process on this session has been force-deleted; write off what it held.
+ *
+ * Only the owner of a FreeRTOS mutex can give it back, so a task deleted inside
+ * send_stream() leaves tx_lock held for the life of the channel. Worse, the
+ * recorded holder is now a freed TCB and every subsequent take() walks it for
+ * priority inheritance -- so the lock is not merely unavailable, it is unsafe to
+ * ask for. This marks it, once, at the only moment the system actually knows.
+ *
+ * Checked against the dead task rather than assumed: most kills catch a process
+ * that holds nothing (asleep, computing, blocked on input), and those sessions
+ * are perfectly healthy afterwards. `kill -9` on a sleeping app must not cost
+ * the user their shell.
+ *
+ * xSemaphoreGetMutexHolder() only reads the stored handle -- it does not follow
+ * it -- so comparing pointers here is safe even though dereferencing would not
+ * be.
+ */
+static void chan_task_gone(espix_session_t *s, void *task)
+{
+    ssh_chan_t *ch = s->transport;
+
+    if (ch == NULL || ch->tx_lock == NULL || task == NULL) {
+        return;
+    }
+    if (xSemaphoreGetMutexHolder(ch->tx_lock) != (TaskHandle_t)task) {
+        return;
+    }
+
+    espix_klog(ESPIX_KLOG_WARN, TAG,
+               "a killed process still held the transmit lock; closing the "
+               "channel rather than waiting on a lock nobody can release");
+
+    ch->tx_orphaned = true;
+    ch->closed      = true;
+}
+
+/*
  * Block until the peer reopens its window, servicing the adjustment ourselves.
  * Only ever needed after a large burst of output.
  */
@@ -235,6 +356,25 @@ static esp_err_t wait_for_window(ssh_chan_t *ch)
             espix_klog(ESPIX_KLOG_WARN, TAG,
                        "window closed while the read side is busy; output lost");
             return ESP_ERR_TIMEOUT;
+        }
+
+        /*
+         * Only read when something has actually arrived.
+         *
+         * ssh_packet_read() -> read_exact() waits indefinitely when no byte of
+         * a packet has turned up, which is right for an idle session waiting on
+         * a keystroke and wrong here: this runs with tx_lock HELD, so a peer
+         * that goes quiet without reopening its window would park a writer on
+         * that lock forever and take every other writer with it. Bounding the
+         * wait costs a spin of the loop above, which is already capped.
+         */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(c->fd, &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = RX_WAIT_MS * 1000 };
+        if (select(c->fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            xSemaphoreGive(ch->rx_lock);
+            continue;
         }
 
         const esp_err_t err = ssh_packet_read(c);
@@ -280,7 +420,9 @@ static esp_err_t wait_for_window(ssh_chan_t *ch)
  */
 static esp_err_t send_packet(ssh_chan_t *ch, ssh_buf_t *b)
 {
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return ESP_FAIL;
+    }
     const esp_err_t err = ssh_packet_write(ch->conn, b);
     xSemaphoreGiveRecursive(ch->tx_lock);
 
@@ -311,7 +453,9 @@ static esp_err_t send_stream(ssh_chan_t *ch, const char *data, size_t len,
      * send. Control packets used to be filled outside it, which quietly
      * clobbered whatever was mid-flight.
      */
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return ESP_FAIL;
+    }
 
     esp_err_t err = ESP_OK;
 
@@ -393,7 +537,9 @@ static int send_cooked(ssh_chan_t *ch, const char *data, size_t len,
 
     /* One write stays one burst even though it is emitted line by line, so an
      * app's output and the shell's cannot end up interleaved mid-message. */
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return -1;
+    }
 
     for (size_t i = 0; i < len && result >= 0; i++) {
         if (data[i] != '\n') {
@@ -655,6 +801,22 @@ static int chan_write(espix_session_t *s, const char *data, size_t len)
 {
     ssh_chan_t *ch = s->transport;
 
+    /*
+     * A process that has been asked to stop starts no new write.
+     *
+     * Checked here rather than deeper because this is above the lock: a
+     * stopping app must not take tx_lock at all, or it can still be holding it
+     * when the grace runs out and force-kill deletes it -- which orphans the
+     * lock for the life of the channel. Combined with the check in write_all(),
+     * an app on its way out is neither inside lwIP nor holding anything.
+     *
+     * False for the connection task, which is not a process, so builtins and
+     * the line editor are unaffected.
+     */
+    if (espix_proc_stopping()) {
+        return -1;
+    }
+
     if (ch->raw_out) {
         return (send_data(ch, data, len) == ESP_OK) ? (int)len : -1;
     }
@@ -684,6 +846,11 @@ static int chan_write(espix_session_t *s, const char *data, size_t len)
 static int chan_write_err(espix_session_t *s, const char *data, size_t len)
 {
     ssh_chan_t *ch = s->transport;
+
+    /* As in chan_write(): a stopping process takes no lock. */
+    if (espix_proc_stopping()) {
+        return -1;
+    }
 
     if (ch->raw_out) {
         return (send_stream(ch, data, len, SSH_EXTENDED_DATA_STDERR) == ESP_OK)
@@ -909,7 +1076,9 @@ static void adjust_local_window(ssh_chan_t *ch, uint32_t consumed)
      *
      * Recursive, so send_packet() taking it again is free.
      */
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return;
+    }
 
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_WINDOW_ADJUST);
@@ -1338,7 +1507,9 @@ static esp_err_t reply_request(ssh_chan_t *ch, bool ok)
     ssh_buf_t b;
 
     /* Locked across the fill; see the note in adjust_local_window(). */
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return ESP_FAIL;
+    }
 
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, ok ? SSH_MSG_CHANNEL_SUCCESS : SSH_MSG_CHANNEL_FAILURE);
@@ -1486,7 +1657,9 @@ static esp_err_t send_exit_status(ssh_chan_t *ch, uint32_t status)
 {
     ssh_buf_t b;
 
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return ESP_FAIL;
+    }
 
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_REQUEST);
@@ -1506,7 +1679,9 @@ static void close_channel(ssh_chan_t *ch)
 {
     ssh_buf_t b;
 
-    xSemaphoreTakeRecursive(ch->tx_lock, portMAX_DELAY);
+    if (!chan_tx_take(ch)) {
+        return;
+    }
 
     ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
     ssh_put_u8(&b, SSH_MSG_CHANNEL_EOF);
@@ -1803,6 +1978,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .write     = chan_write,
             .write_err = chan_write_err,
             .poll_interrupt = chan_poll_interrupt,
+            .task_gone      = chan_task_gone,
             .transport = ch,
             /* Overwritten by apply_account(); nobody rather than 0 so that a
              * path which forgets to set it fails closed instead of open. */
@@ -1900,6 +2076,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .write     = chan_write,
             .write_err = chan_write_err,
         .poll_interrupt = chan_poll_interrupt,
+        .task_gone      = chan_task_gone,
         .transport = ch,
         /* Overwritten by apply_account(); nobody rather than 0 so that a
          * path which forgets to set it fails closed instead of open. */

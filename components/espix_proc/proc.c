@@ -13,6 +13,7 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
+#include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
 
 #define TAG "proc"
 
@@ -185,6 +186,10 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     free(slot->sig_handlers);
     slot->sig_handlers = NULL;
 
+    /* Nothing left to put back, and a finished slot must not hold a pointer
+     * into a reent that the next process to use this slot will not own. */
+    slot->reent = NULL;
+
     /*
      * Safe to delete only because the process is already gone by the time this
      * runs -- either it returned from main(), or vTaskDelete() took it. A task
@@ -213,9 +218,15 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     slot->info.state     = state;
     slot->info.exit_code = exit_code;
     slot->info.task      = NULL;
-    xSemaphoreGive(g_espix_proc_lock);
 
+    /*
+     * Under the lock, with the state it announces. Released first, as this used
+     * to be, a spawn can recycle this slot and clear its finished bit in the
+     * gap -- and the set then lands on a slot that already belongs to the next
+     * process, whose first espix_proc_wait() returns before it has started.
+     */
     xEventGroupSetBits(g_espix_proc_events, (EventBits_t)1 << index);
+    xSemaphoreGive(g_espix_proc_lock);
 }
 
 espix_proc_slot_t *espix_proc_find(espix_pid_t pid)
@@ -498,6 +509,13 @@ bool espix_sigcheck(void)
     return (espix_sigcheck_mask() & ESPIX_SIG_STOPPING) != 0;
 }
 
+bool espix_proc_stopping(void)
+{
+    const espix_proc_slot_t *slot = espix_proc_self();
+
+    return slot != NULL && slot->stop_requested;
+}
+
 /*
  * SIGKILL. Deleting another task on a system with no memory protection is a
  * blunt instrument: anything it held at the time -- a VFS mutex, a heap block,
@@ -579,6 +597,19 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /*
+     * A second kill of the same process -- or a kill racing the session hangup
+     * that lands on the same slot -- must not run the teardown below twice. The
+     * first killer clears info.task under this lock and then releases it before
+     * vTaskDelete(), so a live slot with no task is one already being killed.
+     * Two of them would free the ELF image while the first is still inside
+     * vTaskDelete(), with the victim possibly still executing it.
+     */
+    if (slot->info.task == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     TaskHandle_t task = slot->info.task;
 
     /* Never this task: suspending ourselves here wedges the caller instead of
@@ -609,23 +640,64 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
      * has already left it alone; or not yet in finish(), in which case it has
      * not self-deleted and cannot, once suspended, ever get there.
      */
+    bool detached = false;
     if (task != NULL) {
         vTaskSuspend(task);
+
+        /*
+         * And before deleting it, take espix's streams out of its reent.
+         *
+         * The delete runs the victim's newlib teardown -- on this task if the
+         * victim is not running, on IDLE if it is -- and that teardown fcloses
+         * the victim's stdout and stderr, which are funopen() streams over the
+         * session. Closing one writes into the SSH channel and takes tx_lock,
+         * which a process killed mid-write is still holding, so whichever task
+         * runs the teardown blocks forever. On this one that strands the
+         * session; on IDLE it takes the board down.
+         *
+         * Restoring the streams is what the process's own exit path does, and
+         * it is the only reason a clean exit was ever safe. See
+         * espix_proc_detach_streams().
+         */
+        detached = espix_proc_detach_streams(slot);
     }
     slot->info.task = NULL;
 
     /* Copy the name while the lock still protects it: the slot can be recycled
-     * the moment espix_proc_finish() below wakes whoever was waiting. */
+     * the moment espix_proc_finish() below wakes whoever was waiting. The
+     * session goes with it, for the same reason and for task_gone() below. */
     char name[ESPIX_PROC_NAME_MAX];
     strlcpy(name, slot->info.name, sizeof(name));
+    espix_session_t *const session = slot->info.session;
 
     xSemaphoreGive(g_espix_proc_lock);
 
     if (task != NULL) {
         vTaskDelete(task);
+
+        /*
+         * And tell the transport which task just died.
+         *
+         * A process deleted inside a write still holds its channel's transmit
+         * lock, and only a mutex's owner may give it back -- so that lock is
+         * orphaned for the life of the channel. It is not merely unavailable:
+         * FreeRTOS walks the recorded holder's TCB for priority inheritance on
+         * every subsequent take, and that TCB has just been freed. The
+         * transport checks whether this task was the holder and, if so, stops
+         * using the lock at all. Nothing else in the system knows both facts at
+         * the same moment.
+         */
+        if (session != NULL && session->task_gone != NULL) {
+            session->task_gone(session, (void *)task);
+        }
     }
 
-    espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s)", (int)pid, name);
+    /* Said out loud, and only once the lock is down. "stdio detached" means this
+     * kill went through the path that used to strand a session or panic the
+     * board -- worth seeing happen, rather than inferring it from an absence of
+     * panics. */
+    espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s)%s", (int)pid, name,
+               detached ? " [stdio detached]" : "");
 
     espix_proc_release_resources(slot);
     espix_proc_finish(slot, ESPIX_PROC_KILLED, -1);

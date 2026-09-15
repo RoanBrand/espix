@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/reent.h>      /* _REENT and the stdio a force-kill has to put back */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -385,6 +386,24 @@ static void proc_task(void *arg)
     FILE *const prev_stdout = stdout;
     FILE *const prev_stderr = stderr;
 
+    /*
+     * Publish this task's reent before anything replaces its streams.
+     *
+     * A force-kill has to be able to put the global streams back, because
+     * deleting a task runs prvDeleteTCB() -> _reclaim_reent(), which fcloses
+     * every stream in the dead task's reent that is not the global one. The
+     * streams assigned below are funopen() objects over the session, so closing
+     * one writes into the SSH channel. See espix_proc_detach_streams().
+     *
+     * Under the lock, and *before* the assignment below, so a killer sees one
+     * of two decidable states: slot->reent set, meaning this task may have
+     * espix's streams installed; or NULL, meaning it has not reached here and
+     * there is nothing of ours to close.
+     */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    slot->reent = _REENT;
+    xSemaphoreGive(g_espix_proc_lock);
+
     bool own_in = false, own_out = false, own_err = false;
 
     if (session != NULL && session->open_stream != NULL) {
@@ -552,6 +571,76 @@ done:
 
     espix_shell_set_current(NULL);
     vTaskDelete(NULL);
+}
+
+/*
+ * Take espix's streams out of a process's reent, so that deleting its task does
+ * not close them from somebody else's.
+ *
+ * This is the whole fix for a bug that has now been found three times, and the
+ * mechanism is FreeRTOS's, not espix's. Deleting a task eventually runs
+ * prvDeleteTCB(), whose configDEINIT_TLS_BLOCK step is _reclaim_reent() ->
+ * esp_cleanup_r(), and that fcloses each of the dead task's three std streams
+ * which differs from the global one. A process's stdout and stderr are
+ * funopen() objects over its session, so that fclose enters the SSH channel's
+ * send path -- and a process killed mid-write is still holding both the FILE's
+ * own lock and ch->tx_lock. The teardown therefore blocks forever.
+ *
+ * Which task it blocks decides how bad it is, and both have been seen:
+ *
+ *   the killer   vTaskDelete() runs prvDeleteTCB() on the caller when the
+ *                victim is not currently running (FreeRTOS-Kernel/tasks.c,
+ *                "If the task is currently running, call prvDeleteTCB from
+ *                outside of critical section"). The connection task that
+ *                killed it strands -- the <<<dead-session>>> cascade.
+ *
+ *   IDLE         a victim that *was* running goes to xTasksWaitingTermination
+ *                and IDLE runs prvDeleteTCB() instead. IDLE tasks are pinned
+ *                per core, and prvSelectHighestPriorityTaskSMP() is built on
+ *                "we eventually default to the IDLE tasks at priority 0".
+ *                Block IDLE1 and core 1 has nothing left to schedule, which
+ *                trips its configASSERT(xTaskScheduled == pdTRUE). That is the
+ *                board going down.
+ *
+ * The kernel cannot be told to skip the teardown, so espix removes what it
+ * would act on. Restoring the *global* streams rather than the ones this task
+ * happened to start with is deliberate: it makes esp_cleanup_r()'s comparison
+ * false by construction, whatever anyone does to the globals later.
+ *
+ * Not a new idea -- the process's own exit path does exactly this before it
+ * returns, which is the only reason a clean exit was ever safe. Only a
+ * force-kill skipped it.
+ *
+ * The streams are deliberately not closed: that is the very call that blocks,
+ * so a force-killed process leaks its FILE objects. A hard kill already leaks
+ * everything the app held; see docs/KNOWN-ISSUES.md.
+ *
+ * Returns whether espix's streams were actually installed, so the caller can
+ * say so once it has dropped the lock -- proof the dangerous path was reached
+ * and neutralised, rather than an absence of panics to infer from.
+ *
+ * Called with the process suspended and the table lock held, so nothing can be
+ * inside its reent while this rewrites it. Idempotent: it clears the pointer it
+ * used.
+ */
+bool espix_proc_detach_streams(espix_proc_slot_t *slot)
+{
+    if (slot == NULL || slot->reent == NULL) {
+        return false;
+    }
+
+    struct _reent *const r = slot->reent;
+
+    const bool had_ours = (_REENT_STDIN(r)  != _REENT_STDIN(_GLOBAL_REENT)) ||
+                          (_REENT_STDOUT(r) != _REENT_STDOUT(_GLOBAL_REENT)) ||
+                          (_REENT_STDERR(r) != _REENT_STDERR(_GLOBAL_REENT));
+
+    _REENT_STDIN(r)  = _REENT_STDIN(_GLOBAL_REENT);
+    _REENT_STDOUT(r) = _REENT_STDOUT(_GLOBAL_REENT);
+    _REENT_STDERR(r) = _REENT_STDERR(_GLOBAL_REENT);
+
+    slot->reent = NULL;
+    return had_ours;
 }
 
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,

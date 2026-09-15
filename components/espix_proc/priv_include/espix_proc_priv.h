@@ -2,6 +2,8 @@
  * shared between proc.c (table, wait, kill) and exec.c (loading and running). */
 #pragma once
 
+#include <stdio.h>      /* struct _reent, for the stdio a force-kill puts back */
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -169,6 +171,18 @@ typedef struct {
      * the FILE needs -- see the note in exec.c.
      */
     bool              foreground;
+
+    /*
+     * The task's own struct _reent, published by the process itself before it
+     * replaced any of its stdio.
+     *
+     * Kept so a force-kill can put the global streams back before deleting the
+     * task. Deleting a task runs prvDeleteTCB() -> _reclaim_reent(), which
+     * fcloses every stream in that reent which is not the global one -- and a
+     * process's stdout and stderr are funopen() objects over its session, so
+     * closing one writes into the SSH channel. See espix_proc_detach_streams().
+     */
+    struct _reent *reent;
 } espix_proc_slot_t;
 
 /* Bit for `sig`, or 0 if it is not a signal. Not sigaddset(): that macro is
@@ -224,6 +238,13 @@ void espix_proc_release_resources(espix_proc_slot_t *slot);
 /* Record a terminal state and wake anyone in espix_proc_wait(). */
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
                        int exit_code);
+
+/* Put the global stdio back into the process's reent, so that deleting its task
+ * does not close espix's streams from the killer's -- or from IDLE's, which
+ * takes the board down. Returns whether espix's streams were installed. Caller
+ * must hold the lock and must have suspended the task: see the note in
+ * espix_proc_detach_streams(). */
+bool espix_proc_detach_streams(espix_proc_slot_t *slot);
 
 /* Monotonic pid allocation; pids are never reused. Caller must hold the lock. */
 espix_pid_t espix_proc_next_pid(void);

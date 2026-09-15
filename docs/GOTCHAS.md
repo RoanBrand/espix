@@ -531,3 +531,34 @@ arrives under a page of core-dump tracing.
 One heading per gotcha, with what it broke and where the claim comes from. If it
 is only true on some parts, say which. If it was measured rather than
 documented, say that too.
+
+## `vTaskDelete(other)` runs the victim's teardown somewhere else
+
+Deleting another task does not tidy up "in the kernel". `prvDeleteTCB()` runs
+**on the caller** when the victim is not currently running, and on **IDLE** when
+it is (`FreeRTOS-Kernel/tasks.c`). Its `configDEINIT_TLS_BLOCK` step is
+`_reclaim_reent()` -> `esp_cleanup_r()`, which fcloses every std stream in the
+dead task's reent that differs from the global one. If those streams write to
+anything that can block -- espix's do, they are `funopen()` objects over the SSH
+channel -- then the *caller* blocks, or IDLE does, and a blocked IDLE takes the
+board down because the scheduler assumes it can always fall back to it.
+
+Three consequences worth knowing before deleting any task:
+
+- **Put the global streams back first** if the task replaced its stdio.
+  `espix_proc_detach_streams()` does this; a clean exit always did, which is why
+  only force-kill was ever unsafe.
+- **A mutex held at deletion is not just stuck, it is poison.** Only the owner
+  may give a FreeRTOS mutex back, and `xQueueSemaphoreTake()` reaches into the
+  recorded holder's TCB for priority inheritance -- freed memory. Bounding the
+  wait does not help; it only swaps silent corruption for
+  `vTaskPriorityDisinheritAfterTimeout` asserting. The answer is to never ask:
+  mark the lock orphaned and test that before taking it.
+- **A task blocked in lwIP leaves a dangling netconn.** It is waiting on
+  `conn->op_completed`; delete it and close the socket, and `tcpip` signals a
+  freed semaphore.
+
+The general form: FreeRTOS owns none of what a process holds -- newlib owns the
+FILEs, lwIP the netconn, espix the channel lock -- so `vTaskDelete()` is not a
+SIGKILL. Terminate cooperatively at the syscall boundary and keep the delete for
+a task that demonstrably holds nothing. See `espix_proc_stopping()`.

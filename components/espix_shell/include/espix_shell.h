@@ -197,6 +197,25 @@ struct espix_session {
     bool (*poll_interrupt)(espix_session_t *s);
 
     /*
+     * A process using this session was force-deleted, and here is its task.
+     *
+     * The transport is told so it can write off anything the dead task can
+     * never hand back. For SSH that is the channel's transmit lock: FreeRTOS
+     * lets only the owner release a mutex, so one held at deletion is orphaned
+     * for good -- and every later take() dereferences the freed TCB through
+     * priority inheritance, which is a use-after-free whether the wait is
+     * bounded or not. Knowing *which* task died is what lets the transport
+     * check whether it actually held the lock, rather than tearing down a
+     * perfectly good session every time something is killed.
+     *
+     * The handle is opaque here on purpose: this header is transport-agnostic
+     * and has no FreeRTOS in it. Called after vTaskDelete(), with no espix_proc
+     * lock held. NULL for a transport with nothing a process can hold -- the
+     * console has no such lock.
+     */
+    void (*task_gone)(espix_session_t *s, void *task);
+
+    /*
      * The terminal understands escape sequences. Set by the transport: the
      * console learns it from esp_linenoise_probe(), an SSH session always has a
      * pty in this build. Colour is emitted only when this is set.

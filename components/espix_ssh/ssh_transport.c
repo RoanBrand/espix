@@ -19,6 +19,7 @@
 #include "freertos/task.h"
 
 #include "espix_kernel.h"
+#include "espix_proc.h"   /* espix_proc_stopping(), so a writing app can be signalled */
 #include "ssh_priv.h"
 
 #define TAG "ssh"
@@ -340,6 +341,34 @@ static esp_err_t write_all(int fd, const void *src, size_t len)
                            (unsigned)sent, (unsigned)len);
                 return ESP_ERR_TIMEOUT;
             }
+            /*
+             * The delivery point a writing process never had.
+             *
+             * This loop is where an app blocks when the peer stops draining,
+             * and until now nothing here could be interrupted: `kill` set
+             * stop_requested and the app never looked, so the grace always
+             * expired and the task was deleted -- inside lwIP, holding the
+             * channel's transmit lock. Both of those leave dangling state, and
+             * between them they account for every panic this bug has produced.
+             *
+             * Giving up here unwinds the process back through its own stack
+             * instead, so it releases the lock and leaves lwIP cleanly. The
+             * packet is abandoned half-sent, which is why the caller closes the
+             * channel on a write failure -- but the connection was ending
+             * anyway, and a truncated stream is strictly better than a task
+             * deleted mid-syscall.
+             *
+             * espix_proc_stopping() rather than espix_sigcheck(): the latter
+             * runs handlers and can park on SIGSTOP, and neither is safe with a
+             * packet half-written and tx_lock held.
+             */
+            if (espix_proc_stopping()) {
+                espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                           "send interrupted %u bytes into %u; process stopping",
+                           (unsigned)sent, (unsigned)len);
+                return ESP_ERR_INVALID_STATE;
+            }
+
             vTaskDelay(1);
             continue;
         }

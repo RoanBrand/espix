@@ -172,6 +172,27 @@ esp_err_t espix_proc_request_stop(espix_pid_t pid);
 bool espix_sigcheck(void);
 
 /*
+ * Has this process been asked to stop? Reads the flag and nothing else.
+ *
+ * The difference from espix_sigcheck() is what it does NOT do: no handler
+ * dispatch, no parking on SIGSTOP. That makes it the only form safe to call
+ * from inside a transport write, where running an app's signal handler would
+ * re-enter the very send that is in progress, and parking would hold the
+ * channel's transmit lock for as long as the process stayed stopped.
+ *
+ * It exists so a writing process is interruptible at all. Everything else
+ * espix can be stopped inside -- sleep, pause, a read -- has a delivery point;
+ * the send path had none, so `kill` could not touch an app that was writing and
+ * force-deleting it was the only outcome. Deleting a task blocked in lwIP or
+ * holding a channel lock is what produced three separate panics; see
+ * docs/KNOWN-ISSUES.md.
+ *
+ * False for a task that is not a process, so the connection task's own writes
+ * and the key exchange are unaffected.
+ */
+bool espix_proc_stopping(void);
+
+/*
  * Hang up on `session`: SIGHUP to everything it owns, then force what is left,
  * as happens when a terminal goes away. The session's stdio dies with it, so
  * anything still holding it must not outlive it. Returns how many were ended.

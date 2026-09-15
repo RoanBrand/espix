@@ -201,21 +201,12 @@ assert_contains "kill rejects a pid that is not there" "no such process" \
 # unnoticed while the suite was busy reporting dead sessions instead.
 # ---------------------------------------------------------------------------
 
-# Opt-in, and not because it is slow.
-#
-# Killing a writing app still strands the connection task that killed it -- the
-# tx_lock half of this is open, see docs/KNOWN-ISSUES.md -- so running it by
-# default would leave one held session behind every time and turn the health
-# check red on every run, for a bug that is already written down. That is the
-# same reason 90-stress is opt-in.
-#
-# Remove this gate the moment the strand is fixed: the panic it guards against
-# is severe enough to want in the default run.
-if [ "${ESPIX_STRESS:-0}" != 1 ]; then
-    espix_skip "kill -9 on a writing app: needs --stress (it strands a session)"
-    return 0
-fi
-
+# Runs by default, and it did not always: killing a writing app used to strand
+# the connection task that killed it, so this left a held session behind every
+# time. Both halves are closed now -- the stdio detach keeps the newlib teardown
+# off the killer, and chan_tx_take() bounds the transmit lock -- so the session
+# is expected back, and the health check between suites is what notices if it is
+# not.
 reason_before=$(_dev_parse_reason "$(dev_run 'uptime')")
 kill_pid=$(dev_run "$APP out 200000 40 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 if [ -z "$kill_pid" ]; then

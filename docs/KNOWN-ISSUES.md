@@ -236,133 +236,87 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   -- which is not scp: measured directly, downloads and uploads are now clean.
   The suites also write files and run `sftp -b`, and that is where to look next.
 
-- **`kill -9` on a heavily-writing app panics the board. Open; one race closed,
-  and it is NOT enough.** Two attempts, two panics, first iteration each time.
+- **`kill -9` on a writing app took the board down, and stranded the session
+  that killed it. Both fixed.** Filed for months as two bugs; they were one, and
+  the difference was only which task ran the victim's teardown.
 
-  Reproducer, which is the valuable part -- everything before this was
-  intermittent and load-dependent:
+  Reproducer, which is still the valuable part:
 
   ```
   pid=$(dev_run "$APP out 200000 40 &" | sed -n 's/^\[\([0-9]*\)\].*/\1/p')
   dev_run "kill -9 $pid"
   ```
 
-  An app writing continuously, killed with no grace. The session dies, and the
-  board goes down with it:
+  **The mechanism, read out of the sources this build actually compiles.**
+  `vTaskDelete()` of a task that is not running calls `prvDeleteTCB()` **on the
+  caller**; if the victim *was* running it goes to `xTasksWaitingTermination` and
+  **IDLE** does it instead (`FreeRTOS-Kernel/tasks.c` — note it is that tree, not
+  `FreeRTOS-Kernel-SMP/`, which is a different kernel selected by
+  `CONFIG_FREERTOS_SMP` and is not what espix builds). Either way
+  `configDEINIT_TLS_BLOCK` runs `_reclaim_reent()` -> `esp_cleanup_r()`, which
+  fcloses each std stream that differs from the global one. A process's stdout is
+  a `funopen()` object over the SSH channel, so that fclose enters the send path
+  and blocks on a lock the dead task still holds.
 
-  ```
-  espix: fault in task 'IDLE1' (fault: IllegalInstruction)
-  assert failed: prvSelectHighestPriorityTaskSMP tasks.c:3642 (xTaskScheduled == 1)
-  Backtrace: ... 0x40381e1a:0xa5a5a5a5 |<-CORRUPTED
-  ```
+  On the killer that stranded the connection task. On IDLE it killed the board:
+  IDLE tasks are pinned per core and `prvSelectHighestPriorityTaskSMP()` assumes
+  it can always fall back to them, so blocking IDLE1 leaves core 1 with nothing
+  to schedule and trips `configASSERT(xTaskScheduled == pdTRUE)` at
+  `tasks.c:3642` — which is the reported assert, exactly. The faulting task
+  varied (`IDLE1`, `tcpip`) because an assert during a context switch is
+  attributed to whoever triggered the switch.
 
-  `0xa5a5a5a5` is FreeRTOS's stack fill pattern, so IDLE1 is running through
-  memory that is not a stack any more. A scheduler that cannot select a task is
-  downstream of its task lists being corrupt, not a bug in the scheduler.
+  **Three defects, found in order, each hidden behind the one before it.**
 
-  **The defect the code plainly has**, whether or not it is the whole story:
-  `proc_task()` ends in `vTaskDelete(NULL)` -- an app self-deletes when it
-  finishes ([exec.c:554](components/espix_proc/exec.c#L554)). And
-  `proc_force_kill()` takes the task handle under `g_espix_proc_lock`, **releases
-  the lock**, and only then calls `vTaskDelete(task)`
-  ([proc.c:593](components/espix_proc/proc.c#L593)). Between the give and the
-  delete the app can finish and delete itself, so the kill deletes a TCB that is
-  already freed. Two deletes of one task is exactly how the scheduler's lists
-  end up pointing at filled stack memory.
+  1. *The killer ran the victim's newlib teardown.* Fixed by
+     `espix_proc_detach_streams()`: put the global streams back into the victim's
+     reent, under the lock, before deleting. `esp_cleanup_r()` then finds nothing
+     of espix's to close. The kill log says `[stdio detached]` when this fires,
+     so the dangerous path is observed rather than inferred from an absence of
+     panics.
+  2. *`tx_lock` was orphaned.* Only a mutex's owner may release it, so a task
+     deleted mid-write held it forever. Worse, it is not merely unavailable:
+     `xQueueSemaphoreTake()` walks the recorded holder's TCB for priority
+     inheritance, and that TCB is freed — so **every** later take is a
+     use-after-free, bounded or not. Bounding the waits made this loud rather
+     than safe: it turned silent corruption into
+     `assert failed: vTaskPriorityDisinheritAfterTimeout tasks.c:5243`, on the
+     first kill, every time. Fixed by never asking: `chan_task_gone()` checks
+     whether the dead task was the holder and, if so, marks the lock orphaned;
+     `chan_tx_take()` tests that before it calls take at all.
+  3. *The victim was deleted inside lwIP.* Exposed only once the hang was gone —
+     the strand had been masking it. A task blocked in `send()` is waiting on
+     `conn->op_completed`; delete it, then close the socket, and the `tcpip`
+     thread signals a freed semaphore:
+     `assert failed: spinlock_acquire spinlock.h:142`, through
+     `lwip_netconn_do_writemore -> sys_sem_signal`. Pre-existing, and invisible
+     while the connection task was wedged.
 
-  The lock is released deliberately -- the comment explains that holding it
-  across `espix_proc_wait()` would stop the task being waited for from
-  finishing. That reasoning is right for the wait and was carried one statement
-  too far.
+  **The general rule this settles.** espix cannot have a true SIGKILL and should
+  not pretend to. Real Unix can delete a process because the kernel owns
+  everything it holds; here the FILE objects belong to newlib, the netconn to
+  lwIP and `tx_lock` to espix's own SSH layer, and FreeRTOS owns none of it. So
+  termination is cooperative at the syscall boundary, with `vTaskDelete()` as a
+  last resort for a task that demonstrably holds nothing.
 
-  **A real race was found and closed, and the panic survived it.**
-  `proc_force_kill()` now suspends the target **under `g_espix_proc_lock`**
-  before releasing it and deleting. That is sound and worth keeping: a process
-  cannot reach its own `vTaskDelete(NULL)` without passing through
-  `espix_proc_finish()`, which takes the same lock, so holding it makes the two
-  deleters decidable -- already finished (leave the handle alone) or not yet in
-  finish (suspend it, and it can never get there).
+  That is what `espix_proc_stopping()` is for: a stop check with no handler
+  dispatch and no SIGSTOP parking, safe to call inside a transport write.
+  `write_all()` tests it in its EAGAIN loop and `chan_write()` before taking the
+  lock, so a process on its way out is neither inside lwIP nor holding anything
+  when the grace expires. The send path was the only blocking point in espix with
+  no delivery point at all, which is why `kill` could never touch a writing app.
 
-  It made the panic much rarer: nine consecutive kills with no panic, where the
-  old build panicked on the first every time. Then `35-signals --stress` failed
-  with `reset reason is now 'panic' (was 'power-on')`, same `panic_abort`
-  signature, faulting task `tcpip`. **So the double delete was a real defect and
-  was not the whole cause, or not the cause at all.** Nine clean runs are not
-  evidence of a fix when the thing being measured is probabilistic -- that is the
-  same mistake as reading one 30-proc heap delta and calling it a leak.
+  **Measured after the fix:** 20 consecutive kills, no panic, and the killing
+  session survived all 20. `35-signals` 16/16 with the `--stress` gate removed,
+  `30-proc` 18/18, `15-streams` 34/34, `55-sessions` 9/9, health "all good" each
+  time. Throughput unchanged: scp download 662 KB/s and ssh stdin 243 KB/s,
+  against 674-720 and 236-237 recorded before.
 
-  Still to look at: `espix_proc_release_resources()` and `espix_proc_finish()`
-  run on the *slot* after the delete, and the slot can be recycled by a new
-  process the moment `finish` wakes a waiter. And the backtrace for this
-  occurrence was never read -- `espcoredump` failed twice with "Invalid head of
-  packet", almost certainly because espix's own console shares that UART, so the
-  next attempt should capture the panic text live with `tools/serlog.sh` instead.
-
-  The reproducer now lives in `35-signals`, gated behind `--stress` because
-  killing a writing app still strands a connection task and would otherwise turn
-  the health check red on every run. Remove the gate when the strand is fixed.
-
-  **This changes the fix for the entry below.** Handing `vTaskDelete` to the
-  reaper, to keep the dead task's stdio cleanup off a connection task, would
-  make this window *wider*, not narrower: the handle would sit in a queue while
-  the task it names may already be gone. Whatever takes ownership of that handle
-  has to be handed something that stays valid -- the delete and the "this slot's
-  task is mine to delete" decision have to happen together, under the lock, or
-  the handle has to be made safe to hold.
-
-- **Killing a process under load strands the connection task that killed it.
-  Open, with backtraces.** Two distinct deadlocks, both from deleting a task
-  that holds a lock, and between them they are the `<<<dead-session>>>` cascade
-  that `15-streams` and `35-signals` have been producing under `-j4` for weeks.
-
-  A `make test` ended with `sshd-conn-tasks-held=4(was 2 at start)` and
-  `55-sessions` skipping for lack of free slots. Twenty-four minutes later, idle,
-  the board still held them -- states `R,B,B,B`, **none `D`**, so these are live
-  tasks that will not exit, not reclamation running late. Internal had gone from
-  166K to 203K and stayed. A deliberate `crash` captured all four:
-
-  ```
-  THREAD  5  cmd_top -> vTaskDelay                     <- a healthy session, the control
-  THREAD 11  prvDeleteTCB -> _reclaim_reent -> esp_cleanup_r
-               -> _fclose_r -> __retarget_lock_acquire_recursive   xTicksToWait = portMAX_DELAY
-  THREAD 13  esp_linenoise_edit_insert -> refresh_line -> ssh_edit_write
-               -> send_cooked (ssh_channel.c:396) -> xQueueTakeMutexRecursive
-                                                     xTicksToWait = portMAX_DELAY
-  ```
-
-  Thread 11 is the hazard `proc.c:520` already describes in full: `vTaskDelete()`
-  runs `_reclaim_reent()` **on the killer's task**, which fcloses the dead task's
-  streams, and `fclose` needs the very FILE lock the deleted task was holding.
-  Thread 13 is the same shape one level up -- the deleted task was inside a
-  channel write holding `ch->tx_lock`, and the next writer waits forever.
-
-  **Why only under load, which was the part that made it look mysterious.**
-  `kill_unwind()` sets `stop_requested`, aborts the target's delay and gives it
-  `KILL_UNWIND_MS` (250ms) to leave libc on its own; an app that does not is
-  deleted anyway. Under `-j4` the cores are saturated -- the watchdog fired in
-  this very run -- so the target may not be *scheduled at all* inside that
-  window. The grace is a probability, not a guarantee, and load is what shifts
-  it. `35-signals` then tests exactly this on purpose: "a process ignoring
-  SIGTERM is stopped anyway, after the grace".
-
-  **What is already right, and where it stops.** `finish_session()` takes
-  `tx_lock` with a bounded wait and says why: *"the process above may have died
-  inside a write still holding it -- espix_proc_kill() deletes the task outright
-  and cannot unwind what it held."* That reasoning was applied at exactly one of
-  the ten lock sites. The other eight `tx_lock`/`rx_lock` acquisitions in
-  `ssh_channel.c` use `portMAX_DELAY`.
-
-  **The fix is not one change.** Bounding those eight turns thread 13 from a
-  permanent strand into a failed write and a clean teardown, and it follows a
-  precedent already in the file. Thread 11 cannot be bounded that way -- the
-  wait is inside FreeRTOS's own `prvDeleteTCB`, reached from `vTaskDelete()` --
-  so it needs either a longer or load-aware unwind grace, or not force-deleting
-  a task that is inside stdio at all. Lengthening the grace lowers the odds and
-  closes nothing.
-
-  Not to be confused with the deferred-reclamation case above: that one shows
-  `D` tasks and clears itself, this one shows `B` and does not.
-
+  **What is still open:** a force-killed process leaks its `funopen` streams,
+  because closing them is the very call that blocks. Measured at ~2.5K per kill
+  over 20. It is bounded and only a hard kill pays it; see the SIGKILL entry at
+  the top of this file. Closing it needs the app to unwind far enough to close
+  its own streams, which is a further step on the same road.
 - **Something writes past the process table and silently disables half the ABI
   resolver. Open, and now watched for.** A `-j4` run failed 21 assertions across
   `15-streams`, `70-env` and `45-throughput`, every one of them:
