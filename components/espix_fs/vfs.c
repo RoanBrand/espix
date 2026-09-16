@@ -114,11 +114,65 @@ static lower_t s_mounts[ESPIX_FS_MAX_MOUNTS];
 static portMUX_TYPE s_mount_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /*
- * fds and directory handles carry no path, so which mount they belong to has to
- * be remembered. esp_vfs stores a local fd in a uint8_t, so 256 bytes covers the
- * whole range; directories are few, and matched by pointer.
+ * The fds this VFS has handed out, and what each one belongs to.
+ *
+ * An fd carries no path, so which mount it belongs to has to be remembered --
+ * but the *number* cannot be the lower filesystem's own. FatFs and the littlefs
+ * port both count from zero, espix calls their ops directly rather than through
+ * esp_vfs, and IDF's own table, the console and the sockets are using those
+ * numbers too. Two files on two filesystems then share one entry: a rootfs close
+ * clears it, and the next read on the stick is answered EBADF. Measured, and
+ * written up in docs/KNOWN-ISSUES.md -- it cost the first two copies after every
+ * boot.
+ *
+ * So the number is IDF's: esp_vfs_register_fd_with_local_fd() picks an unused
+ * one, which is what keeps this table honest, keeps fds out of the range the
+ * sockets use, and keeps them inside `fd_set` for select(). The layer below is
+ * called with its own number, which is what the table is for. IDF frees the slot
+ * itself when the fd is closed, so there is nothing to unregister here.
+ *
+ * Indexed by fd, sized to the range below the device fds, which are handed out
+ * directly and never appear here.
  */
-static uint8_t s_fd_mount[256];    /* mount index + 1; 0 = not a mount of ours */
+typedef struct {
+    int     lower_fd;   /* the number the layer below knows it by, -1 = free */
+    uint8_t mount;      /* index into s_mounts, +1 */
+} fd_slot_t;
+
+static fd_slot_t s_fds[ESPIX_DEV_FD_BASE];
+
+/*
+ * Every slot starts free, and the sentinel is -1 rather than 0: a zeroed table
+ * would otherwise say every fd is live with mount index 0, which is one before
+ * the root. Done here rather than with an initialiser because C has no way to
+ * write a designated value for a whole array.
+ */
+static void fd_table_init(void)
+{
+    for (int i = 0; i < ESPIX_DEV_FD_BASE; i++) {
+        s_fds[i].lower_fd = -1;
+    }
+}
+
+/* The VFS id esp_vfs_register_fd() needs, from the registration at the bottom
+ * of this file. */
+static esp_vfs_id_t s_vfs_id = -1;
+
+static bool fd_slot_get(int fd, fd_slot_t *out)
+{
+    if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
+        return false;
+    }
+
+    bool ours = false;
+    portENTER_CRITICAL(&s_mount_lock);
+    if (s_fds[fd].lower_fd >= 0) {
+        *out = s_fds[fd];
+        ours = true;
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+    return ours;
+}
 #define ESPIX_FS_DIRS  8
 static struct {
     DIR    *dirp;
@@ -152,28 +206,62 @@ static const lower_t *mount_by_path(const char *abs_path)
     return best;
 }
 
-/* One byte, written on open and cleared on close, so no lock is needed. */
-static const lower_t *mount_by_fd(int fd)
+/* The layer below a fd espix handed out, or NULL when it is not one of ours --
+ * a device fd, a socket, or something already closed. */
+static const lower_t *mount_of_slot(const fd_slot_t *s)
 {
-    if (fd < 0 || fd > 255) {
-        return NULL;
-    }
-    const uint8_t m = s_fd_mount[fd];
-    return m == 0 ? NULL : &s_mounts[m - 1];
+    return &s_mounts[s->mount - 1];
 }
 
-static void fd_map_set(int fd, const lower_t *mount)
+/*
+ * IDF's fd for a file just opened below, or -1.
+ *
+ * The number comes from esp_vfs rather than from the filesystem, which is the
+ * whole point: it is unique against the console, the sockets and every other
+ * mount, so the entry it gets here cannot be someone else's. `local_fd` is left
+ * as IDF set it -- equal to the fd -- so this VFS's ops are called with the
+ * number it handed out, and the lower filesystem's own number travels in the
+ * table instead.
+ */
+static int fd_slot_alloc(int lower_fd, const lower_t *mount)
 {
-    if (fd >= 0 && fd <= 255) {
-        s_fd_mount[fd] = (uint8_t)((mount - s_mounts) + 1);
+    int fd = -1;
+
+    if (esp_vfs_register_fd_with_local_fd(s_vfs_id, -1, false, &fd) != ESP_OK) {
+        return -1;
     }
+
+    /* Above the device fds there is no entry to write, and esp_vfs would have to
+     * be handing out a number in a range the devices reserved. Refuse rather than
+     * index past the table; sockets and the console cannot reach this far in
+     * practice, and "cannot in practice" is not a reason to write out of bounds. */
+    if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
+        if (fd >= 0) {
+            (void)esp_vfs_unregister_fd(s_vfs_id, fd);
+        }
+        return -1;
+    }
+
+    portENTER_CRITICAL(&s_mount_lock);
+    s_fds[fd].lower_fd = lower_fd;
+    s_fds[fd].mount    = (uint8_t)((mount - s_mounts) + 1);
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    return fd;
 }
 
-static void fd_map_clear(int fd)
+/* IDF releases its own entry when the fd is closed, so this only forgets which
+ * layer the number belonged to. */
+static void fd_slot_free(int fd)
 {
-    if (fd >= 0 && fd <= 255) {
-        s_fd_mount[fd] = 0;
+    if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
+        return;
     }
+
+    portENTER_CRITICAL(&s_mount_lock);
+    s_fds[fd].lower_fd = -1;
+    s_fds[fd].mount    = 0;
+    portEXIT_CRITICAL(&s_mount_lock);
 }
 
 static const lower_t *mount_by_dir(DIR *pdir)
@@ -384,14 +472,31 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
         return -1;
     }
 
-    if (fd >= 0) {
-        fd_map_set(fd, l);
+    if (fd < 0) {
+        return fd;                      /* the layer below set errno */
     }
 
-    if (fd >= 0 && creating) {
+    /*
+     * And the caller never sees that number: it gets a fd from esp_vfs, which is
+     * unique against the console, the sockets and every other mount, and the
+     * filesystem's own number is remembered for the calls that follow. See the
+     * comment on s_fds for what happens without this.
+     */
+    const int packed = fd_slot_alloc(fd, l);
+    if (packed < 0) {
+        /* Out of fds rather than out of anything the caller can free: hand the
+         * lower one back instead of leaking it. */
+        if (!NO_LOWER(l->ops->close_p)) {
+            l->ops->close_p(l->ctx, fd);
+        }
+        errno = EMFILE;
+        return -1;
+    }
+
+    if (creating) {
         espix_fs_claim(p);
     }
-    return fd;
+    return packed;
 }
 
 static int vfs_close(void *ctx, int fd)
@@ -399,14 +504,17 @@ static int vfs_close(void *ctx, int fd)
     if (espix_dev_fd(fd)) {
         return espix_dev_close(fd);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    const int rc = NO_LOWER(l->ops->close_p) ? enosys()
-                                             : l->ops->close_p(l->ctx, fd);
-    /* Cleared either way: a failed close still leaves the fd not ours. */
-    fd_map_clear(fd);
+    const lower_t *l = mount_of_slot(&slot);
+
+    const int rc = NO_LOWER(l->ops->close_p)
+                       ? enosys() : l->ops->close_p(l->ctx, slot.lower_fd);
+    /* Forgotten either way: a failed close still leaves the fd not ours. esp_vfs
+     * releases its own entry around this call, so nothing is unregistered. */
+    fd_slot_free(fd);
     return rc;
 }
 
@@ -415,12 +523,13 @@ static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
     if (espix_dev_fd(fd)) {
         return espix_dev_read(fd, dst, size);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    return NO_LOWER(l->ops->read_p) ? enosys()
-                                    : l->ops->read_p(l->ctx, fd, dst, size);
+    const lower_t *l = mount_of_slot(&slot);
+    return NO_LOWER(l->ops->read_p)
+               ? enosys() : l->ops->read_p(l->ctx, slot.lower_fd, dst, size);
 }
 
 static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
@@ -428,12 +537,13 @@ static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
     if (espix_dev_fd(fd)) {
         return espix_dev_write(fd, data, size);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    return NO_LOWER(l->ops->write_p) ? enosys()
-                                     : l->ops->write_p(l->ctx, fd, data, size);
+    const lower_t *l = mount_of_slot(&slot);
+    return NO_LOWER(l->ops->write_p)
+               ? enosys() : l->ops->write_p(l->ctx, slot.lower_fd, data, size);
 }
 
 static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
@@ -441,12 +551,13 @@ static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
     if (espix_dev_fd(fd)) {
         return espix_dev_pread(fd, dst, size, off);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
+    const lower_t *l = mount_of_slot(&slot);
     return NO_LOWER(l->ops->pread_p)
-               ? enosys() : l->ops->pread_p(l->ctx, fd, dst, size, off);
+               ? enosys() : l->ops->pread_p(l->ctx, slot.lower_fd, dst, size, off);
 }
 
 static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
@@ -458,12 +569,14 @@ static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
         (void)off;
         return espix_dev_write(fd, src, size);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
+    const lower_t *l = mount_of_slot(&slot);
     return NO_LOWER(l->ops->pwrite_p)
-               ? enosys() : l->ops->pwrite_p(l->ctx, fd, src, size, off);
+               ? enosys()
+               : l->ops->pwrite_p(l->ctx, slot.lower_fd, src, size, off);
 }
 
 static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
@@ -471,12 +584,13 @@ static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
     if (espix_dev_fd(fd)) {
         return espix_dev_lseek(fd, size, mode);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    return NO_LOWER(l->ops->lseek_p) ? enosys()
-                                     : l->ops->lseek_p(l->ctx, fd, size, mode);
+    const lower_t *l = mount_of_slot(&slot);
+    return NO_LOWER(l->ops->lseek_p)
+               ? enosys() : l->ops->lseek_p(l->ctx, slot.lower_fd, size, mode);
 }
 
 static int vfs_fstat(void *ctx, int fd, struct stat *st)
@@ -484,12 +598,13 @@ static int vfs_fstat(void *ctx, int fd, struct stat *st)
     if (espix_dev_fd(fd)) {
         return espix_dev_fstat(fd, st);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    return NO_LOWER(l->ops->fstat_p) ? enosys()
-                                     : l->ops->fstat_p(l->ctx, fd, st);
+    const lower_t *l = mount_of_slot(&slot);
+    return NO_LOWER(l->ops->fstat_p)
+               ? enosys() : l->ops->fstat_p(l->ctx, slot.lower_fd, st);
 }
 
 static int vfs_fsync(void *ctx, int fd)
@@ -497,11 +612,13 @@ static int vfs_fsync(void *ctx, int fd)
     if (espix_dev_fd(fd)) {
         return espix_dev_fsync(fd);
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    return NO_LOWER(l->ops->fsync_p) ? enosys() : l->ops->fsync_p(l->ctx, fd);
+    const lower_t *l = mount_of_slot(&slot);
+    return NO_LOWER(l->ops->fsync_p)
+               ? enosys() : l->ops->fsync_p(l->ctx, slot.lower_fd);
 }
 
 static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
@@ -512,12 +629,13 @@ static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
         (void)cmd; (void)arg;
         return 0;
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
-    return NO_LOWER(l->ops->fcntl_p) ? enosys()
-                                     : l->ops->fcntl_p(l->ctx, fd, cmd, arg);
+    const lower_t *l = mount_of_slot(&slot);
+    return NO_LOWER(l->ops->fcntl_p)
+               ? enosys() : l->ops->fcntl_p(l->ctx, slot.lower_fd, cmd, arg);
 }
 
 /* ------------------------------------------------------------------ */
@@ -839,12 +957,13 @@ static int vfs_ftruncate(void *ctx, int fd, off_t length)
         errno = EINVAL;
         return -1;
     }
-    const lower_t *l = mount_by_fd(fd);
-    if (l == NULL) {
+    fd_slot_t slot;
+    if (!fd_slot_get(fd, &slot)) {
         return ebadf();
     }
+    const lower_t *l = mount_of_slot(&slot);
     return NO_LOWER(l->dir->ftruncate_p)
-               ? enosys() : l->dir->ftruncate_p(l->ctx, fd, length);
+               ? enosys() : l->dir->ftruncate_p(l->ctx, slot.lower_fd, length);
 }
 
 static int vfs_utime(void *ctx, const char *path, const struct utimbuf *times)
@@ -949,10 +1068,18 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
      * CONTEXT_PTR because the ops take the lower layer as their first argument.
      * The context is slot 0 and is used for nothing but identity: ops pick their
      * mount by path, fd or directory handle, this VFS serving every mount.
+     *
+     * *With_id* rather than the plain call, because the id it hands back is what
+     * esp_vfs_register_fd() needs when a file is opened: the fd a caller gets is
+     * allocated there, and that allocation is what keeps it from colliding with
+     * the console, the sockets and the other filesystems' own numbering.
      */
-    const esp_err_t err = esp_vfs_register_fs(
-        "", &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
-        &s_mounts[0]);
+    /* Before the VFS exists, so no fd can arrive before the table can answer. */
+    fd_table_init();
+
+    const esp_err_t err = esp_vfs_register_fs_with_id(
+        &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
+        &s_mounts[0], &s_vfs_id);
 
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot register the root VFS: %s",
@@ -1045,8 +1172,9 @@ esp_err_t espix_vfs_del_mount(const char *prefix)
      * stays until the caller closes up; pulling the volume out from under a
      * reader is the one outcome worse than a failed umount.
      */
-    for (int fd = 0; fd < 256; fd++) {
-        if (s_fd_mount[fd] == (uint8_t)((slot - s_mounts) + 1)) {
+    for (int fd = 0; fd < ESPIX_DEV_FD_BASE; fd++) {
+        if (s_fds[fd].lower_fd >= 0 &&
+            s_fds[fd].mount == (uint8_t)((slot - s_mounts) + 1)) {
             portEXIT_CRITICAL(&s_mount_lock);
             return ESP_ERR_INVALID_STATE;
         }
