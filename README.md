@@ -65,7 +65,7 @@ runs, and the legend is the same one the Unix surface uses:
 | Faults | Permissions enforced in espix's own VFS | **yes** | builtins, loaded apps and SFTP alike |
 | Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
 | Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
-| Display | A console on a panel | **planned** | MIPI DSI on the P4 and S31, SPI elsewhere |
+| Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **planned** | the desktop case, once there is a panel and a pointer |
 | Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
 | Services | Scheduled work: a `cron` | **planned** | the same missing supervisor, from the other end |
@@ -80,7 +80,7 @@ runs, and the legend is the same one the Unix surface uses:
 | USB | one OTG: host **or** device | two, so both at once | one OTG |
 | Radio | WiFi | none built in — companion chip needed | WiFi |
 | Wired | — | 100M Ethernet | Gigabit Ethernet |
-| Display | — | MIPI DSI, HDMI variants | weaker than the P4 |
+| Display | parallel RGB and i8080, through `LCD_CAM` | MIPI DSI, plus RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; no MIPI, and weaker than the P4 |
 | Runs today | **yes** | no | no |
 
 The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),
@@ -319,6 +319,14 @@ quite different things:
   boundary, not a `fork()`-shaped one. **Still to be confirmed against the P4
   Technical Reference Manual** rather than promised: what espix would get there
   is most likely fault isolation between tasks, not copy-on-write.
+
+**The display interfaces, read from `soc_caps.h` rather than from a datasheet.**
+`SOC_LCDCAM_I80_LCD_SUPPORTED` and `SOC_LCDCAM_RGB_LCD_SUPPORTED` are set
+for all three parts, so a parallel panel -- i8080 or RGB -- is drivable on any
+of them, through the same `LCD_CAM` peripheral the camera uses.
+`SOC_MIPI_DSI_SUPPORTED` is the P4's alone, and the S31 has `SOC_PARLIO_LCD_SUPPORTED`
+instead: that is the concrete form of "weaker/limited display output vs P4"
+above, and it is why the grid says what it says.
 
 ## A word on the SSH server
 
