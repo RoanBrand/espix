@@ -376,7 +376,17 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev)
     BYTE pdrv = 0xFF;
     esp_err_t err = ff_diskio_get_drive(&pdrv);
     if (err != ESP_OK) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: no free drive number", path);
+        /*
+         * Every FatFs volume is in use. That has to leave here as something
+         * other than what the diskio layer returned: ESP_ERR_NOT_FOUND is also
+         * what "this is not a FAT filesystem" means by the time a caller sees
+         * it, and blaming the filesystem for a volume limit is the kind of
+         * message that costs somebody an hour. IDF's own vfs_fat_bdl.c makes the
+         * same translation, to the same code.
+         */
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no free volume (FF_VOLUMES is %d)",
+                   path, FF_VOLUMES);
+        err = ESP_ERR_NO_MEM;
         goto fail_slot;
     }
     err = ff_diskio_register_bdl(pdrv, dev);

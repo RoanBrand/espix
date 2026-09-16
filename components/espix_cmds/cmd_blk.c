@@ -577,6 +577,12 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
             espix_eprintf(s, "mount: %s: already mounted\n", path);
         } else if (err == ESP_ERR_NOT_FOUND) {
             espix_eprintf(s, "mount: %s: not a FAT filesystem\n", devname);
+        } else if (err == ESP_ERR_NO_MEM) {
+            /* Two things answer with this one: FatFs has no free volume, or an
+             * allocation failed. fat.c logs which, on this console, so this says
+             * only what the command itself knows. */
+            espix_eprintf(s, "mount: %s: cannot mount (no free volume, or out "
+                             "of memory)\n", devname);
         } else {
             espix_eprintf(s, "mount: %s: %s\n", devname, esp_err_to_name(err));
         }

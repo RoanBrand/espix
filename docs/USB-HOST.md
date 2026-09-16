@@ -307,8 +307,8 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
-| `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,307,152 B | 69% |
-| ... and Stage 2 (mounting, FatFs) | 0x1461b0 — 1,336,752 B | 68% |
+| `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,306,128 B | 69% |
+| ... and Stage 2 (mounting, FatFs) | 0x146210 — 1,335,824 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
 
 Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus
@@ -443,6 +443,11 @@ records it.
   that is next.
 - **`df` still reports the rootfs.** Per-mount free space is one `f_getfree()`
   away and not yet wired to a command.
+- **Two volumes at a time.** `CONFIG_FATFS_VOLUME_COUNT` is 2, and that is what
+  FatFs sizes its drive table by — the mount table itself has room for three
+  beyond the root, so FatFs's number is the one that bites. One USB storage
+  device at a time is the tighter limit in practice; the knob is the answer if a
+  device ever arrives with three FAT partitions worth mounting at once.
 - **`/mnt` is in the boot skeleton** now, so a device whose image predates
   mounting still has somewhere to mount to.
 
