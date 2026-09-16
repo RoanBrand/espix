@@ -263,6 +263,9 @@ void espix_proc_abi_time_register(void);
  * all of it is unwrapped libc, because those calls already dispatch into
  * espix's own VFS. */
 void espix_proc_abi_fs_register(void);
+
+/* The app identity calls: getuid/geteuid, getgid/getegid. */
+void espix_proc_abi_ident_register(void);
 void espix_proc_abi_libc_register(void);
 
 /* Publish the POSIX signal surface, and interpose the blocking calls that have

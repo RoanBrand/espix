@@ -87,8 +87,19 @@ static int cmd_chmod(const char *path, const char *octal)
 
 /*
  * Ownership as an app sees it: stat() by path and fstat() by descriptor. The
- * expected uid has to come from the suite -- geteuid() is not in the app ABI.
+ * expected uid comes from the suite: this reports, it does not judge.
  */
+/*
+ * Who the app is, as the ABI answers it. The shell's `id` is the other side of
+ * the comparison a suite makes.
+ */
+static int cmd_id(void)
+{
+    printf("uid=%u gid=%u euid=%u egid=%u\n", (unsigned)getuid(),
+           (unsigned)getgid(), (unsigned)geteuid(), (unsigned)getegid());
+    return 0;
+}
+
 static int cmd_stat(const char *path)
 {
     struct stat st;
@@ -547,6 +558,7 @@ static void usage(void)
            "  argv [args...]      echo argc and each argument\n"
            "  probe <path>...     open each path, report ok or errno\n"
            "  stat <path>         stat and fstat, with the app own uid\n"
+           "  id                  uid, gid, euid and egid as the ABI answers them\n"
            "  chmod <path> <oct>  chmod, report ok or errno\n"
            "  cd <path>           chdir then getcwd\n"
            "  write <path> <text> create and write\n"
@@ -587,6 +599,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "chmod") == 0 && argc > 3) {
         return cmd_chmod(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "id") == 0) {
+        return cmd_id();
     }
     if (strcmp(cmd, "stat") == 0 && argc > 2) {
         return cmd_stat(argv[2]);

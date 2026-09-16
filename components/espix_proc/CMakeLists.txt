@@ -8,6 +8,7 @@ idf_component_register(
         "abi_resolver.c"
         "abi_fs.c"
         "abi_libc.c"
+        "abi_ident.c"
         "abi_signal.c"
         "abi_time.c"
     INCLUDE_DIRS

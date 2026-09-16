@@ -85,6 +85,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_env_register();
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
+    espix_proc_abi_ident_register();
 
 #if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
     /* After the last registration, so setup's own writes do not trip it. */
