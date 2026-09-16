@@ -109,6 +109,20 @@ bool espix_usb_present(void);
 size_t espix_usb_devlist(espix_usb_dev_t *out, size_t n);
 
 /*
+ * Called when a storage device appears and goes, once per disk.
+ *
+ * Exists so that something outside this component can give the device a name in
+ * the VFS without depending on the USB stack -- nothing in espix_fs knows about
+ * USB, and this is the only place that knows both. Fired from the USB task, with
+ * the device's row intact: published already on attach, not yet released on
+ * detach. Must not call back into espix_usb, because detach fires it under the
+ * device lock.
+ */
+typedef void (*espix_usb_dev_hook_fn)(const espix_usb_dev_t *dev, bool attached);
+
+void espix_usb_set_dev_hook(espix_usb_dev_hook_fn fn);
+
+/*
  * The block device under a storage device, so that it can be mounted.
  *
  * Borrowed, never owned: it belongs to the device's slot and is given back when

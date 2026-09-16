@@ -23,6 +23,9 @@ esp_err_t espix_usb_host_probe_addr(uint8_t addr);
 size_t    espix_usb_host_scan_pool(void);
 esp_blockdev_handle_t espix_usb_host_dev_blockdev(const char *name);
 
+/* Fires the hook espix_usb_set_dev_hook() installed; nothing when there is none. */
+void espix_usb_dev_hook_fire(const espix_usb_dev_t *dev, bool attached);
+
 #ifdef __cplusplus
 }
 #endif

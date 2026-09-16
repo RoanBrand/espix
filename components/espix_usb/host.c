@@ -1040,6 +1040,10 @@ static esp_err_t attach_device(uint8_t address)
                info.idVendor, info.idProduct, d->info.size,
                (unsigned)d->info.nparts, d->info.nparts == 1 ? "" : "s");
 
+    /* After publishing, so whatever the hook registers is usable the moment the
+     * attach is over -- and before the lock goes, so the row cannot change. */
+    espix_usb_dev_hook_fire(&d->info, true);
+
     xSemaphoreGive(s_attach_lock);
     return ESP_OK;
 }
@@ -1101,6 +1105,9 @@ static void on_disconnected(msc_host_device_handle_t device)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (size_t i = 0; i < ESPIX_USB_MAX_DEVS; i++) {
         if (s_devs[i].device == device) {
+            /* While the row is still whole: slot_release() clears it, and the
+             * hook is what takes the names back out of /dev. */
+            espix_usb_dev_hook_fire(&s_devs[i].info, false);
             slot_release(&s_devs[i], &gone, &bdl, name, sizeof(name));
             break;
         }

@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -57,12 +58,14 @@ static const char *TAG = "devfs";
 typedef enum {
     DEV_NULL,
     DEV_FACTORY,
+    DEV_BLOCK,
 } dev_kind_t;
 
 typedef struct {
     const char *path;
     dev_kind_t  kind;
     mode_t      mode;       /* type bits included */
+    uint64_t    size;       /* block nodes only; 0 elsewhere */
 } dev_node_t;
 
 /*
@@ -77,11 +80,53 @@ typedef struct {
  * wanting somewhere to read from.
  */
 static const dev_node_t s_nodes[] = {
-    { "/dev/null",    DEV_NULL,    S_IFCHR | 0666 },
-    { "/dev/factory", DEV_FACTORY, S_IFREG | 0444 },
+    { "/dev/null",    DEV_NULL,    S_IFCHR | 0666, 0 },
+    { "/dev/factory", DEV_FACTORY, S_IFREG | 0444, 0 },
 };
 
 #define DEV_COUNT ((int)(sizeof(s_nodes) / sizeof(s_nodes[0])))
+
+/*
+ * Block devices get nodes too, so that /dev/sda and /dev/sda1 exist the way they
+ * do everywhere else, and `mount` can take the name someone would type.
+ *
+ * Registered from outside -- espix_dev_register_block() -- because nothing in
+ * espix_fs knows what a USB device is, and this is the seam that keeps it that
+ * way: the component that knows both wires the two together.
+ *
+ * A fixed pool rather than malloc, for the reason the directory pool below is:
+ * a bounded array cannot fragment the heap and cannot fail to allocate. Twenty
+ * is what the USB component can have attached at once -- four disks, and four
+ * partitions each -- so the pool cannot be outgrown by a sequence of attaches.
+ *
+ * The node is embedded so the pointer lookup() hands out lives as long as the
+ * reservation, and `path` points into the entry's own buffer.
+ */
+#define ESPIX_DEV_BLOCK_MAX  20
+#define ESPIX_DEV_BLOCK_PATH 16        /* "/dev/sda1" and its NUL */
+
+typedef struct {
+    dev_node_t node;
+    char       own_path[ESPIX_DEV_BLOCK_PATH];
+    bool       used;
+} dev_blk_t;
+
+static dev_blk_t s_blocks[ESPIX_DEV_BLOCK_MAX];
+
+/* The block node at a position in the directory listing, or NULL. Positional and
+ * in pool order, so a listing is stable while nothing is plugged or unplugged. */
+static const dev_node_t *block_at(int nth)
+{
+    for (int i = 0; i < ESPIX_DEV_BLOCK_MAX; i++) {
+        if (!s_blocks[i].used) {
+            continue;
+        }
+        if (nth-- == 0) {
+            return &s_blocks[i].node;
+        }
+    }
+    return NULL;
+}
 
 typedef struct {
     const dev_node_t *node;     /* NULL when the slot is free */
@@ -102,6 +147,81 @@ void espix_dev_init(void)
     }
 }
 
+/*
+ * Give a block device a name in /dev, or take it away. `name` is the device name
+ * without the directory: "sda" for a disk, "sda1" for a partition.
+ *
+ * Called from the USB attach/detach hook, so this runs in the USB task, and the
+ * pool is locked because a session can be reading /dev meanwhile.
+ *
+ * Registering a name that already exists updates it rather than adding a second
+ * node: a re-attach of the same slot arrives with the same name, and the pool
+ * must not fill with duplicates.
+ */
+esp_err_t espix_dev_register_block(const char *name, uint64_t size)
+{
+    char path[ESPIX_DEV_BLOCK_PATH];
+
+    if (name == NULL || name[0] == '\0' ||
+        snprintf(path, sizeof(path), "/dev/%.*s", ESPIX_DEV_BLOCK_PATH - 7,
+                 name) >= (int)sizeof(path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    dev_blk_t *slot = NULL;
+    for (int i = 0; i < ESPIX_DEV_BLOCK_MAX; i++) {
+        if (!s_blocks[i].used) {
+            if (slot == NULL) {
+                slot = &s_blocks[i];
+            }
+            continue;
+        }
+        if (strcmp(s_blocks[i].own_path, path) == 0) {
+            s_blocks[i].node.size = size;
+            xSemaphoreGive(s_lock);
+            return ESP_OK;
+        }
+    }
+
+    if (slot != NULL) {
+        strlcpy(slot->own_path, path, sizeof(slot->own_path));
+        slot->node.path = slot->own_path;
+        slot->node.kind = DEV_BLOCK;
+        slot->node.mode = S_IFBLK | 0660;
+        slot->node.size = size;
+        slot->used      = true;
+    }
+    xSemaphoreGive(s_lock);
+
+    if (slot == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no room for %s in /dev", path);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void espix_dev_unregister_block(const char *name)
+{
+    char path[ESPIX_DEV_BLOCK_PATH];
+
+    if (name == NULL || name[0] == '\0' ||
+        snprintf(path, sizeof(path), "/dev/%.*s", ESPIX_DEV_BLOCK_PATH - 7,
+                 name) >= (int)sizeof(path)) {
+        return;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_DEV_BLOCK_MAX; i++) {
+        if (s_blocks[i].used && strcmp(s_blocks[i].own_path, path) == 0) {
+            s_blocks[i].used = false;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+}
+
 static const esp_partition_t *factory(void)
 {
     if (s_factory == NULL) {
@@ -117,6 +237,9 @@ static const esp_partition_t *factory(void)
 
 static off_t dev_size(const dev_node_t *n)
 {
+    if (n->kind == DEV_BLOCK) {
+        return (off_t)n->size;
+    }
     if (n->kind == DEV_FACTORY) {
         const esp_partition_t *p = factory();
         return (p != NULL) ? (off_t)p->size : 0;
@@ -131,7 +254,19 @@ const void *espix_dev_lookup(const char *abs_path)
             return &s_nodes[i];
         }
     }
-    return NULL;
+
+    /* Locked, because a block node can be registered or taken away by the USB
+     * task while this is walking the pool. */
+    const void *found = NULL;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_DEV_BLOCK_MAX; i++) {
+        if (s_blocks[i].used && strcmp(abs_path, s_blocks[i].own_path) == 0) {
+            found = &s_blocks[i].node;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return found;
 }
 
 void espix_dev_stat(const void *handle, struct stat *st)
@@ -148,6 +283,18 @@ void espix_dev_stat(const void *handle, struct stat *st)
 int espix_dev_open(const void *handle, int flags)
 {
     const dev_node_t *n = handle;
+
+    /*
+     * A block node is a name, not a stream. It exists so the device has the name
+     * every other system gives it, and so `mount` can take it; raw sector access
+     * is a feature of its own -- it would have to know which device it holds and
+     * refuse to hand out one that is mounted -- so opening one says so instead of
+     * pretending.
+     */
+    if (n->kind == DEV_BLOCK) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
 
     /* Read-only devices refuse a writable open outright, the way a read-only
      * filesystem does, rather than accepting it and failing every write. */
@@ -285,17 +432,36 @@ int espix_dev_readdir_r(DIR *pdir, struct dirent *entry, struct dirent **out)
         errno = EBADF;
         return -1;
     }
-    if (d->cursor >= DEV_COUNT) {
+    if (d->cursor >= DEV_COUNT + ESPIX_DEV_BLOCK_MAX) {
         *out = NULL;
         return 0;
     }
 
-    const dev_node_t *n    = &s_nodes[d->cursor++];
-    const char       *base = strrchr(n->path, '/') + 1;
+    /* Locked: the block half of the listing is the live pool, and the USB task
+     * changes it. The static half does not care. */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    const dev_node_t *n = (d->cursor < DEV_COUNT)
+                        ? &s_nodes[d->cursor]
+                        : block_at(d->cursor - DEV_COUNT);
+    if (n == NULL) {
+        xSemaphoreGive(s_lock);
+        *out = NULL;
+        return 0;
+    }
+    d->cursor++;
+
+    const char *base = strrchr(n->path, '/') + 1;
 
     memset(entry, 0, sizeof(*entry));
-    entry->d_type = (n->kind == DEV_NULL) ? DT_CHR : DT_REG;
+    switch (n->kind) {
+    case DEV_NULL:  entry->d_type = DT_CHR; break;
+    case DEV_BLOCK: entry->d_type = DT_BLK; break;
+    default:        entry->d_type = DT_REG; break;
+    }
     strlcpy(entry->d_name, base, sizeof(entry->d_name));
+
+    xSemaphoreGive(s_lock);
 
     *out = entry;
     return 0;
@@ -325,7 +491,7 @@ long espix_dev_telldir(DIR *pdir)
 void espix_dev_seekdir(DIR *pdir, long offset)
 {
     dev_dir_t *d = dir_of(pdir);
-    if (d != NULL && offset >= 0 && offset <= DEV_COUNT) {
+    if (d != NULL && offset >= 0 && offset <= DEV_COUNT + ESPIX_DEV_BLOCK_MAX) {
         d->cursor = (int)offset;
     }
 }

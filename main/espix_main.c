@@ -43,6 +43,39 @@
 
 #define TAG "espix"
 
+/*
+ * Give every attached storage device a name in /dev, and take the names away
+ * when it goes.
+ *
+ * This is the only place that knows both halves: espix_fs has no idea what USB
+ * is, espix_usb knows nothing about the VFS, and this file already depends on
+ * both. Doing it here is what keeps those two components independent of each
+ * other, which is the reason the hook exists at all.
+ *
+ * Per disk *and* per partition, the way every other system names them, and what
+ * makes `mount /dev/sda1 /mnt` work. A superfloppy has no partitions, so its
+ * disk node is the only one there is -- and mounting the disk itself is then the
+ * only way to reach the filesystem on it.
+ */
+static void usb_dev_nodes(const espix_usb_dev_t *dev, bool attached)
+{
+    if (attached) {
+        (void)espix_dev_register_block(dev->name, dev->size);
+        for (size_t i = 0; i < dev->nparts; i++) {
+            (void)espix_dev_register_block(dev->parts[i].name,
+                                           dev->parts[i].size);
+        }
+        return;
+    }
+
+    /* Detach hands the row over intact -- before it is released -- so the
+     * partitions are still there to be named. */
+    espix_dev_unregister_block(dev->name);
+    for (size_t i = 0; i < dev->nparts; i++) {
+        espix_dev_unregister_block(dev->parts[i].name);
+    }
+}
+
 void app_main(void)
 {
     espix_kernel_early_init();
@@ -80,6 +113,10 @@ void app_main(void)
     if (usb_err != ESP_OK) {
         ESP_LOGW(TAG, "usb host unavailable: %s", esp_err_to_name(usb_err));
     }
+
+    /* Installed whether or not the stack came up: an empty socket is the normal
+     * case, and a device-role build simply never hears anything. */
+    espix_usb_set_dev_hook(usb_dev_nodes);
 
 #if CONFIG_ESPIX_SSH_ENABLED
     /* Binds immediately and accepts asynchronously, so this does not wait for

@@ -97,6 +97,25 @@ esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
                                   uint64_t size, esp_blockdev_handle_t *out);
 
 /*
+ * Give a block device a name in /dev, or take it away: "sda" for a disk, "sda1"
+ * for a partition of one.
+ *
+ * These exist so a device has the name every other system gives it -- `ls /dev`
+ * lists them, `stat` reports the medium's size, `mount /dev/sda1` works -- and
+ * so a mount point can be found without knowing anything about the driver
+ * underneath. Opening one is refused: raw sector access would have to know which
+ * device it holds and whether it is mounted, so it is a feature of its own
+ * rather than something to fake here.
+ *
+ * Registered by whoever knows about both halves, since nothing in espix_fs knows
+ * what USB is and espix_usb knows nothing about the VFS. A name that already
+ * exists is updated rather than duplicated, and both calls are safe from any
+ * task: the pool is locked because a session can be listing /dev meanwhile.
+ */
+esp_err_t espix_dev_register_block(const char *name, uint64_t size);
+void espix_dev_unregister_block(const char *name);
+
+/*
  * Resolve `path` against `cwd` into `out` (absolute, no "." or ".." segments,
  * no trailing slash except for "/" itself). Used by every shell command that
  * takes a path, so relative paths behave the same everywhere.

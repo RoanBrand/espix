@@ -54,6 +54,26 @@ bool espix_usb_present(void)
 #endif
 }
 
+/*
+ * The storage-device hook, here rather than in host.c because both roles build
+ * this file and the setter has to exist either way -- a device-role board calls
+ * it and never hears anything, which is the correct behaviour and not a link
+ * error. host.c fires it.
+ */
+static espix_usb_dev_hook_fn s_dev_hook;
+
+void espix_usb_set_dev_hook(espix_usb_dev_hook_fn fn)
+{
+    s_dev_hook = fn;
+}
+
+void espix_usb_dev_hook_fire(const espix_usb_dev_t *dev, bool attached)
+{
+    if (s_dev_hook != NULL) {
+        s_dev_hook(dev, attached);
+    }
+}
+
 size_t espix_usb_devlist(espix_usb_dev_t *out, size_t n)
 {
 #if CONFIG_ESPIX_USB_ROLE_HOST

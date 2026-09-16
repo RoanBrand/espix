@@ -62,13 +62,25 @@ else
         assert_contains "blkid knows the same disk" "$disk:" "$blkid_out"
         assert_contains "blkid names the same type column" 'TYPE="disk"' "$blkid_out"
         assert_contains "blkid takes a device name" "$disk:" "$(dev_run "blkid $disk")"
+        assert_contains "blkid takes the /dev spelling" "$disk:" \
+                        "$(dev_run "blkid /dev/$disk")"
+
+        # The names live in /dev too, which is what makes `mount /dev/sda1` --
+        # and reading the name off `ls /dev` -- work at all.
+        assert_contains "the disk has a node in /dev" "$disk" "$(dev_run 'ls /dev')"
+        assert_status "a device that is not attached has no node" 1 \
+                      dev_status 'ls /dev/sdq'
 
         # A partition appears under its disk. The tree characters that draw it are
         # three bytes each, which is a formatting detail rather than something to
         # assert on here: the row's own TYPE column says what it is.
-        if printf '%s\n' "$lsblk_out" |
-                awk 'NR > 1 && $3 == "part" { found = 1 } END { exit !found }'; then
+        part=$(printf '%s\n' "$lsblk_out" |
+               awk 'NR > 1 && $3 == "part" { print $1; exit }')
+
+        if [ -n "$part" ]; then
             espix_pass "a partition is listed under its disk"
+            assert_contains "the partition has a node in /dev" "$part" \
+                            "$(dev_run 'ls /dev')"
         else
             espix_skip "no partitions on the attached device"
         fi

@@ -486,6 +486,27 @@ records it.
 - **`/mnt` is in the boot skeleton** now, so a device whose image predates
   mounting still has somewhere to mount to.
 
+### Devices have names in /dev
+
+`/dev/sda` and `/dev/sda1` exist, so a volume can be named the way every other
+system names it: `ls /dev` lists what is plugged in, `stat /dev/sda1` reports the
+medium's size, and `mount /dev/sda1 /mnt` takes the operand someone would actually
+type. `sda1` and `/dev/sda1` mean the same thing to `mount`, `umount` and `blkid`.
+
+They are names rather than streams. Opening one answers `EOPNOTSUPP` instead of
+handing back a file descriptor, because raw sector access would have to know
+which device it holds and refuse to open one that is mounted — a feature with
+decisions of its own, not something to fake meanwhile.
+
+Where the halves meet is worth knowing, since it is where the layering could have
+gone wrong: nothing in espix_fs knows what USB is and espix_usb knows nothing
+about the VFS, and both were left that way. `espix_usb_set_dev_hook()` fires on
+attach and detach with the device's row intact, and `main/espix_main.c` — which
+already depends on both — turns that into `espix_dev_register_block()` and
+`espix_dev_unregister_block()`. Registering a name that exists updates it rather
+than adding a second, and the node pool is fixed at twenty (four disks and four
+partitions each), so no sequence of attaches can fragment the heap or outgrow it.
+
 ## Roadmap, not now
 
 - **Unmount when the device is pulled.** The removal path in espix_usb frees the

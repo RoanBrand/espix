@@ -274,6 +274,25 @@ static bool dev_named(const espix_usb_dev_t *d, const char *name)
  * worse than saying what it is. Everything else follows blkid's KEY="value"
  * shape, and a key with no known value is left out rather than printed empty.
  */
+/*
+ * A device operand in the form the block layer names things: `sda1`, whether it
+ * was written that way or as `/dev/sda1`.
+ *
+ * Both spellings are in use everywhere else, and the /dev names are what a user
+ * sees in `ls /dev` -- which is where the name of a stick is looked up from in
+ * the first place. Accepting only one of them would mean remembering which, and
+ * the argument is already known to be a device rather than a path, so there is
+ * nothing to confuse it with.
+ */
+static const char *dev_operand(const char *arg, char *buf, size_t len)
+{
+    if (strncmp(arg, "/dev/", 5) == 0) {
+        strlcpy(buf, arg + 5, len);
+        return buf;
+    }
+    return arg;
+}
+
 static int cmd_blkid(espix_session_t *s, int argc, char **argv)
 {
     if (!espix_usb_host_built()) {
@@ -296,11 +315,14 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
     for (int a = 1; a < argc; a++) {
         bool found = false;
 
+        char devbuf[ESPIX_USB_NAME_MAX];
+        const char *want = dev_operand(argv[a], devbuf, sizeof(devbuf));
+
         for (size_t i = 0; i < n && !found; i++) {
-            found = dev_named(&devs[i], argv[a]);
+            found = dev_named(&devs[i], want);
         }
         if (!found) {
-            espix_eprintf(s, "blkid: %s: no such device\n", argv[a]);
+            espix_eprintf(s, "blkid: %s: no such device\n", want);
             status = 1;
         }
     }
@@ -313,11 +335,14 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
         bool part_wanted = (argc == 1);
 
         for (int a = 1; a < argc; a++) {
-            if (strcmp(argv[a], devs[i].name) == 0) {
+            char devbuf[ESPIX_USB_NAME_MAX];
+            const char *want = dev_operand(argv[a], devbuf, sizeof(devbuf));
+
+            if (strcmp(want, devs[i].name) == 0) {
                 disk_wanted = true;
             }
             for (size_t j = 0; j < devs[i].nparts; j++) {
-                if (strcmp(argv[a], devs[i].parts[j].name) == 0) {
+                if (strcmp(want, devs[i].parts[j].name) == 0) {
                     part_wanted = true;
                 }
             }
@@ -486,7 +511,8 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    const char *devname = argv[1];
+    char devbuf[ESPIX_USB_NAME_MAX];
+    const char *devname = dev_operand(argv[1], devbuf, sizeof(devbuf));
 
     /* Resolved against the session's cwd like every other path argument, then
      * required to exist -- see below. */
@@ -649,7 +675,8 @@ static int cmd_umount(espix_session_t *s, int argc, char **argv)
         rec = mount_by_path(abs);
     }
     if (rec == NULL) {
-        rec = mount_by_dev(argv[1]);
+        char devbuf[ESPIX_USB_NAME_MAX];
+        rec = mount_by_dev(dev_operand(argv[1], devbuf, sizeof(devbuf)));
     }
     if (rec == NULL) {
         espix_eprintf(s, "umount: %s: not mounted\n", argv[1]);
@@ -694,7 +721,7 @@ static espix_cmd_t s_blk_cmds[] = {
       /* The root-only rule belongs in the help: a user who is told why is not
        * left thinking the command is broken. */
       .help = "mount a FAT filesystem from a USB device (root only)",
-      .usage = "mount [device path]" },
+      .usage = "mount [device|/dev/device path]" },
     { .name = "umount", .fn = cmd_umount,
       .help = "unmount a mounted filesystem (root only)",
       .usage = "umount path" },
