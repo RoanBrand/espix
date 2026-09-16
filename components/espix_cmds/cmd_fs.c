@@ -97,9 +97,14 @@ static void ls_time(char *out, size_t len, time_t t)
  * shared helpers, because `lsblk` reports sizes too and two implementations of
  * "1.5M" drift.
  */
-static void ls_size(char *out, size_t len, off_t bytes, bool human)
+/*
+ * Sizes arrive here as uint64_t, not off_t: off_t is 32 bits on this target, and
+ * a 6GB volume formatted through one reports its low 32 bits -- 6.0G came out as
+ * 2.0G in `df -h` until this changed. Callers with an off_t convert implicitly.
+ */
+static void ls_size(char *out, size_t len, uint64_t bytes, bool human)
 {
-    espix_cmd_size(out, len, (uint64_t)(bytes < 0 ? 0 : bytes), human);
+    espix_cmd_size(out, len, bytes, human);
 }
 
 /*
@@ -1083,9 +1088,9 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
                               ? (unsigned)((used_b * 100) / total) : 0;
 
         if (human) {
-            ls_size(c_total, sizeof(c_total), (off_t)total,  true);
-            ls_size(c_used,  sizeof(c_used),  (off_t)used_b, true);
-            ls_size(c_avail, sizeof(c_avail), (off_t)free_b, true);
+            ls_size(c_total, sizeof(c_total), total,  true);
+            ls_size(c_used,  sizeof(c_used),  used_b, true);
+            ls_size(c_avail, sizeof(c_avail), free_b, true);
         } else {
             snprintf(c_total, sizeof(c_total), "%u", (unsigned)(total / 1024));
             snprintf(c_used,  sizeof(c_used),  "%u", (unsigned)(used_b / 1024));
