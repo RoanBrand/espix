@@ -148,6 +148,14 @@ in `lib/`, not left to memory.
   half an hour. And `func &` gives back a *subshell* pid, so signalling it
   leaves the `ssh` underneath alive holding a session slot until the device
   reboots. Background the binary, and `wait` a named pid.
+- **The UART and OTG sockets cannot both be occupied.** Flashing, the console and
+  `serlog` need the UART; anything about storage needs OTG. A flash therefore
+  means the stick is out and the board boots with nothing attached -- so a USB
+  test straight after flashing finds an empty `lsblk`, and 75-usb skips its
+  storage half rather than failing. A boot-time attach needs OTG in, which means
+  `sudo reboot` instead of a flash; a live attach needs only the plug. To run a
+  storage suite with the serial cable out, run it without `--port`: run.sh then
+  sets ESPIX_HAVE_SERIAL=no and the console suites skip.
 
 ## Speed, and parallelism
 
