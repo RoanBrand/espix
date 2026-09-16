@@ -509,11 +509,17 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
 
 ## Roadmap, not now
 
-- **Unmount when the device is pulled.** The removal path in espix_usb frees the
-  block device, so a mounted volume has to be closed *before* that: a hook the USB
-  side calls before tearing a device down, and a mount layer that answers it. It
-  is the one gap Stage 2 leaves, and
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem) has the shape of the fix.
+- ~~**Unmount when the device is pulled.**~~ **Done**, in three pieces: the
+  detach hook (`espix_usb_set_dev_hook()`), a mount that the hook marks dead, and
+  a sentinel `lower_t` whose empty ops tables turn every operation on that mount
+  into `ENOSYS` instead of a read through a released block device. `umount` skips
+  the volume sync for a dead mount, because `f_mount(NULL)` would write a dirty
+  volume back through the same freed device.
+  Measured: an idle pull auto-unmounts and the shell survives; a pull with a file
+  open keeps the mount marked, reads answer `ENOSYS`, `df` declines the row, and
+  `umount` succeeds once the handle is gone. **One case is not espix's to fix** —
+  a transfer already in flight when the device goes — and it is written up in
+  [UPSTREAM.md](UPSTREAM.md#a-device-pulled-mid-transfer-takes-the-heap-with-it).
 - **`df` per mount.** One `f_getfree()` behind an `espix_fs_stat_fat()`, and the
   point where `df` stops being a rootfs-only command.
 - **`READ CAPACITY(16)`,** so a drive larger than 2 TiB reports its real size
@@ -521,11 +527,12 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   not espix's, so it belongs to the list below as much as to here.
 - **A GPT reader**, once a disk turns up that needs one. The protective MBR is
   reported today rather than followed.
-- **A USB keyboard (HID).** Deferred, and cheap when it happens: the test needs
-  no display and no serial port — SSH in over WiFi, run a command that prints
-  decoded keystrokes, and type on the USB keyboard. That sidesteps the
-  can't-plug-both-sockets problem entirely, and at two channels it is also
-  comfortably inside the budget rather than competing with a disk.
+- **A USB keyboard (HID).** Deferred until there is a display, which is the
+  honest position: with no screen, a keyboard's only use would be a test that
+  prints what was typed, and nothing else in espix would consume the events. The
+  test itself is cheap when a display arrives — SSH in over WiFi, run a command
+  that prints decoded keystrokes, type on the keyboard — and it sidesteps the
+  can't-plug-both-sockets problem entirely.
 - **exFAT.** `FF_FS_EXFAT` is hardcoded `0` in IDF's `components/fatfs/src/ffconf.h`
   with no Kconfig to change it, so enabling it means patching a dependency — the
   `tools/patch-littlefs.py` precedent. Separately: exFAT is covered by Microsoft
@@ -537,12 +544,14 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
 - **lwext4** for ext2/3/4, and a much later `lwntfs`. Until then, `lsblk` naming
   them as recognised-but-unsupported is the honest position, and it is what this
   stage delivers.
-- **Whether VBUS needs board-side control.** Answered for one hub on one board —
-  a PD hub that powers the board *and* enumerates devices works, with the board
-  taking its power through the same socket the host controller uses. If a board
-  ever needs power switched to the port, `boards/*.conf` is the only place
-  per-board wiring can be expressed today and there is **no precedent in it**:
-  those files carry flash size, PSRAM mode and a partition table, nothing else.
+- **Whether VBUS needs board-side control: it does not, here.** Answered for one
+  hub on one board — a PD hub that powers the board *and* enumerates devices
+  works, with the board taking its power through the same socket the host
+  controller uses. Nothing is left to do in software: a port that is not switched
+  in hardware cannot be switched from code, so this is a wiring question for a
+  future board rather than a task. `boards/*.conf` would be the only place to
+  express it, and it has no precedent — those files carry flash size, PSRAM mode
+  and a partition table, nothing else.
 
 ## The knob
 

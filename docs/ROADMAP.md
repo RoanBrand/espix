@@ -159,6 +159,13 @@ things are as they are.
      that would let espix stop being "the default VFS that happens to be on top"
      and start being a layer with a defined place in the order.
 
+  **And a smaller patch worth considering: 32-bit `off_t`.** `/dev/sda4` lists as
+  `0` for 23 GiB, and no file over 4GB can be reported or seeked correctly. There
+  is no Kconfig for it (UPSTREAM.md has the detail), so it is a define on the
+  newlib headers, in the shape of the other two patches — with the difference that
+  it would touch every `struct stat` in the image. That is why it wants its own
+  decision rather than riding along with something else.
+
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
 

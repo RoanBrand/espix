@@ -671,7 +671,15 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   than 4 GB reports a truncated size — `/dev/sda4`, 23 GiB, lists as `0`,
   which is exactly its low 32 bits.
 
-- **Unplugging a mounted stick is a use-after-free.** Stage 2 mounts FAT from a
+- ~~**Unplugging a mounted stick is a use-after-free.**~~ **Fixed**, by the detach
+  hook, the dead-mount sentinel and the skipped volume sync (`ffc1029` onward,
+  plus three follow-ups the pull tests found). Measured: an idle pull
+  auto-unmounts and the shell survives; a pull with a file open leaves the mount
+  marked, reads answering `ENOSYS` and `df` declining the row; `umount` works once
+  the handle is gone. The one case espix cannot fix — a transfer already in flight
+  — is in UPSTREAM.md. The text below is kept as the shape of the problem.
+
+  Stage 2 mounts FAT from a
   USB device, and the block device it mounts is *borrowed* from `espix_usb`: the
   slot owns it, and when the device is unplugged the slot hands it back to the MSC
   driver and uninstalls the device. FatFs knows none of that, so a volume whose

@@ -220,6 +220,12 @@ ESPBAUD=115200 ./tools/idf.sh -p /dev/tty.usbserial-210 coredump-info -s /tmp/co
 `-s` keeps the bytes, so a failure to *decode* does not cost another read, and
 `coredump-info -c /tmp/core.bin` then needs no serial port at all.
 
+Better still, that is now one command: `make coredump` reads the whole partition
+at 115200 and decodes from the file (`tools/coredump.sh`), and
+`tools/port-holder.sh <port>` answers "who has this port" in one line — the check
+every tool makes before opening one, since two readers on a `cu.*` device split
+the byte stream between them.
+
 ### The task watchdog watches IDLE, and IDLE is not what you think
 
 `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1` subscribe the **idle tasks**, so

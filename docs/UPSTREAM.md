@@ -790,3 +790,24 @@ The same function reads in a loop:
 LittleFS itself synthesises `.` and `..`; the port discards them. Nothing above
 the VFS can see them, so `ls -a` shows dotfiles but not the directory entries,
 which is GNU `ls`'s `-A` rather than its `-a`.
+
+## ESP-IDF (newlib)
+
+### `off_t` is 32 bits, and no Kconfig changes it
+
+`st_size` is an `off_t`, and on this target `off_t` is a 32-bit `long`. Nothing
+in IDF 6.1 offers to widen it: there is no `CONFIG_LIBC_FS_*` for it, and the only
+size knob nearby — `sys/select.h`'s `FD_SETSIZE` — is about `select()`, not file
+sizes.
+
+Both symptoms were measured. `/dev/sda4`, a 23 GiB partition, lists as `0`, which
+is exactly its low 32 bits. And `df -h` printed a 6.0 GiB volume as `2.0G`, since
+2,133,860,352 is the low 32 bits of 6,428,827,648 — that one was espix's own bug,
+a cast through `off_t` in the shared size formatter, and is fixed; the first is the
+ceiling itself. No file over 4 GiB can be reported or seeked correctly, whatever
+espix does above it.
+
+A patch in the shape of the other two — a build-time define on the newlib headers
+— would fix it. It is also the one patch that would touch every `struct stat` in
+the image, so it wants a deliberate decision rather than riding along with
+something else. docs/ROADMAP.md is where that decision is written down.
