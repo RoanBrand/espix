@@ -994,8 +994,8 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
         if (argv[i][0] != '-' || argv[i][1] == '\0') {
             /* There is one filesystem and df already names it. An operand is a
              * misunderstanding worth correcting rather than ignoring. */
-            espix_eprintf(s, "df: %s: df reports the root filesystem and takes "
-                             "no operand\n" DF_USAGE, argv[i]);
+            espix_eprintf(s, "df: %s: df reports every mounted filesystem and "
+                             "takes no operand\n" DF_USAGE, argv[i]);
             return 1;
         }
         for (const char *c = argv[i] + 1; *c != '\0'; c++) {
@@ -1054,6 +1054,48 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
      */
     espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
                  "littlefs", c_total, c_used, c_avail, pct, "/");
+
+    /*
+     * Then a row per mounted volume, in the same shape.
+     *
+     * df was rootfs-only because nothing could ask a FAT volume how full it was.
+     * espix_fs_stat_fat() does now. A mount that cannot answer -- a non-FAT
+     * volume, or one whose device has been pulled -- is left out rather than
+     * printed as zero, because a row claiming no space at all is worse than no
+     * row. The first column is the filesystem *type*, as the rootfs row has
+     * always been: the layer espix adds holds no storage of its own.
+     */
+    for (size_t i = 0; ; i++) {
+        char path[ESPIX_PATH_MAX];
+
+        if (espix_fs_mount_at(i, path, sizeof(path)) != ESP_OK) {
+            break;
+        }
+
+        uint64_t total  = 0;
+        uint64_t free_b = 0;
+        if (espix_fs_stat_fat(path, &total, &free_b) != ESP_OK) {
+            continue;
+        }
+
+        const uint64_t used_b = (total > free_b) ? (total - free_b) : 0;
+        const unsigned pct_v  = (total > 0)
+                              ? (unsigned)((used_b * 100) / total) : 0;
+
+        if (human) {
+            ls_size(c_total, sizeof(c_total), (off_t)total,  true);
+            ls_size(c_used,  sizeof(c_used),  (off_t)used_b, true);
+            ls_size(c_avail, sizeof(c_avail), (off_t)free_b, true);
+        } else {
+            snprintf(c_total, sizeof(c_total), "%u", (unsigned)(total / 1024));
+            snprintf(c_used,  sizeof(c_used),  "%u", (unsigned)(used_b / 1024));
+            snprintf(c_avail, sizeof(c_avail), "%u", (unsigned)(free_b / 1024));
+        }
+
+        espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
+                     "vfat", c_total, c_used, c_avail, pct_v, path);
+    }
+
     return 0;
 }
 

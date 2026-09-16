@@ -298,6 +298,37 @@ bool espix_vfs_mount_dead(const char *path)
 }
 
 /*
+ * The nth mount, for a caller that walks them -- `df` printing a row per volume.
+ *
+ * Index 0 is the first *mount* rather than the root: the root is not a mount of
+ * anything, and its usage comes from espix_fs_stat_root().
+ */
+esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t    seen  = 0;
+    esp_err_t found = ESP_ERR_NOT_FOUND;
+
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (!s_mounts[i].used) {
+            continue;
+        }
+        if (seen++ == index) {
+            strlcpy(out, s_mounts[i].prefix, out_len);
+            found = ESP_OK;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    return found;
+}
+
+/*
  * A number for a file just opened below, out of espix's own range, or -1.
  *
  * Nothing is registered with IDF for it: the number travels as `local_fd`, IDF

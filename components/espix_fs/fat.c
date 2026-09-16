@@ -465,6 +465,53 @@ fail_slot:
     return err;
 }
 
+/*
+ * How much of a mounted FAT volume is left.
+ *
+ * The arithmetic is ESP-IDF's esp_vfs_fat_info()'s, and cannot be that function
+ * because it looks its mount up by base path -- which espix never registers, for
+ * the reason the file header gives. f_getfree() answers in clusters and the
+ * sector size lives in the FATFS it hands back.
+ *
+ * A volume whose device has been pulled answers with an error rather than
+ * numbers: its mount is marked dead (see vfs.c), and f_getfree on it would be a
+ * call into a file system holding a freed block device.
+ */
+esp_err_t espix_fs_stat_fat(const char *path, uint64_t *total,
+                            uint64_t *free_bytes)
+{
+    if (path == NULL || total == NULL || free_bytes == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    fat_mount_t *m = slot_find(path);
+    if (m == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    DWORD  free_clusters = 0;
+    FATFS *fs            = NULL;
+
+    const FRESULT fr = f_getfree(m->drive, &free_clusters, &fs);
+    if (fr != FR_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: free space: %s", path,
+                   fresult_name(fr));
+        return (fr == FR_NOT_READY) ? ESP_ERR_INVALID_STATE : ESP_FAIL;
+    }
+
+    WORD sector_size = FF_MIN_SS;
+#if FF_MAX_SS != FF_MIN_SS
+    sector_size = fs->ssize;
+#endif
+
+    const uint64_t cluster_bytes = (uint64_t)fs->csize * sector_size;
+
+    *total      = ((uint64_t)(fs->n_fatent - 2)) * cluster_bytes;
+    *free_bytes = ((uint64_t)free_clusters) * cluster_bytes;
+
+    return ESP_OK;
+}
+
 esp_err_t espix_fs_unmount_fat(const char *path)
 {
     if (path == NULL) {

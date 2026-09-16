@@ -95,6 +95,26 @@ esp_err_t espix_fs_unmount_fat(const char *path);
 esp_err_t espix_fs_mount_dead(const char *path);
 
 /*
+ * How much of a mounted FAT volume is left, in bytes.
+ *
+ * ESP_ERR_NOT_FOUND for a path that is not a mount of espix's, and an error for
+ * one whose device has been pulled -- a volume marked dead will not answer, since
+ * asking would mean reading through a block device espix_usb has released.
+ */
+esp_err_t espix_fs_stat_fat(const char *path, uint64_t *total,
+                            uint64_t *free_bytes);
+
+/*
+ * The nth mount, for a caller that walks them: `df` prints a row per volume.
+ * Index 0 is the first mount, not the root -- the root is not a mount of
+ * anything and its usage comes from espix_fs_stat_root().
+ *
+ * ESP_ERR_NOT_FOUND once the index is past the last one, which is how a caller
+ * knows it has finished.
+ */
+esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len);
+
+/*
  * A block device view over a partition of `parent`, for mounting `sda1` rather
  * than `sda`. Released with its own ops->release, which frees the view and
  * leaves the parent alone -- the parent belongs to whoever made it.
