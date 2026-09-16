@@ -409,16 +409,23 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
  * A superfloppy has no view: it mounts the disk's own block device, which
  * espix_usb owns and this file must never release.
  *
- * The records are not locked. Mounting is a root-only administrative action and
- * the mount table underneath is properly serialised, so the worst two concurrent
- * mounts can do is both pick the same free slot and leave one record behind —
- * which shows as `umount` saying `not mounted` for a mount that exists.
+ * The records are not locked. Mounting is rare and the mount table underneath is
+ * properly serialised, so the worst two concurrent mounts can do is both pick the
+ * same free slot and leave one record behind — which shows as `umount` saying
+ * `not mounted` for a mount that exists.
  */
 typedef struct {
     bool                  used;
     char                  dev[ESPIX_USB_NAME_MAX];
     char                  path[ESPIX_PATH_MAX];
     esp_blockdev_handle_t view;
+    /*
+     * The session that mounted it. A non-root mount is allowed where the mount
+     * point is already the caller's (see cmd_mount), and the volume then belongs
+     * to them -- which is also what makes them the one who may unmount it, the
+     * way Linux's `user` option does.
+     */
+    uint16_t              uid;
 } mount_rec_t;
 
 static mount_rec_t s_mounts[ESPIX_FS_MAX_MOUNTS];
@@ -506,10 +513,6 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         espix_eprintf(s, MOUNT_USAGE);
         return 1;
     }
-    if (s == NULL || s->uid != 0) {
-        espix_eprintf(s, "mount: only root can mount\n");
-        return 1;
-    }
 
     char devbuf[ESPIX_USB_NAME_MAX];
     const char *devname = dev_operand(argv[1], devbuf, sizeof(devbuf));
@@ -557,6 +560,24 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     }
     if (!S_ISDIR(st.st_mode)) {
         espix_eprintf(s, "mount: %s: not a directory\n", path);
+        return 1;
+    }
+
+    /*
+     * Root mounts anywhere; anyone else only where they already own the
+     * directory. That is Linux's `user` option in effect -- the fstab entry which
+     * grants it is, here, the mount point being theirs -- and it is what keeps a
+     * session from mounting over a path it has no business claiming.
+     *
+     * The volume then belongs to them without anything more being done about it:
+     * espix_fs_mount_fat() is handed the mounting session's uid and gid, and the
+     * mode rule answers from that. So a stick `esp` mounts reads and writes as
+     * `esp`, and a stick root mounts stays root's -- which is what `sudo mount`
+     * gets.
+     */
+    if (s == NULL || (s->uid != 0 && st.st_uid != s->uid)) {
+        espix_eprintf(s, "mount: %s: only its owner or root can mount here\n",
+                      path);
         return 1;
     }
 
@@ -635,6 +656,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     memset(rec, 0, sizeof(*rec));
     rec->used = true;
     rec->view = view;
+    rec->uid  = (s != NULL) ? s->uid : 0;
     snprintf(rec->dev, sizeof(rec->dev), "%s", devname);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
 
@@ -662,6 +684,11 @@ static int umount_one(espix_session_t *s, const char *arg)
     }
     if (rec == NULL) {
         espix_eprintf(s, "umount: %s: not mounted\n", arg);
+        return 1;
+    }
+
+    if (s == NULL || (s->uid != 0 && rec->uid != s->uid)) {
+        espix_eprintf(s, "umount: %s: mounted by another user\n", rec->path);
         return 1;
     }
 
@@ -710,11 +737,9 @@ static int cmd_umount(espix_session_t *s, int argc, char **argv)
         espix_eprintf(s, UMOUNT_USAGE);
         return 1;
     }
-    if (s == NULL || s->uid != 0) {
-        espix_eprintf(s, "umount: only root can unmount\n");
-        return 1;
-    }
 
+    /* Root and the mounter; checked per operand, in umount_one(), because one
+     * session can own one mount and not another. */
     int status = 0;
     for (int i = 1; i < argc; i++) {
         if (umount_one(s, argv[i]) != 0) {
@@ -786,10 +811,10 @@ static espix_cmd_t s_blk_cmds[] = {
     { .name = "mount", .fn = cmd_mount,
       /* The root-only rule belongs in the help: a user who is told why is not
        * left thinking the command is broken. */
-      .help = "mount a FAT filesystem from a USB device (root only)",
+      .help = "mount a FAT filesystem (root, or the mount point's owner)",
       .usage = "mount [device|/dev/device path]" },
     { .name = "umount", .fn = cmd_umount,
-      .help = "unmount a mounted filesystem (root only)",
+      .help = "unmount a mounted filesystem (its mounter, or root)",
       .usage = "umount path|device..." },
 };
 
