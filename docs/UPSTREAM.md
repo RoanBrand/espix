@@ -639,6 +639,46 @@ nothing.
 the errno the layer above reports. See
 [GOTCHAS.md](GOTCHAS.md#a-write-that-succeeded-has-not-been-written-yet).
 
+### A device pulled mid-transfer takes the heap with it
+
+`espix_usb` releases the block device on detach, which is what its design says it
+should do: the slot owns the handle and gives it back. The problem is *when*. An
+MSC transfer already in flight cannot be recalled, and it holds a pointer to that
+block device, so it finishes against freed memory — and a transfer whose buffer
+and length are no longer meaningful does not fail, it writes somewhere.
+
+Measured, pulling a second or two into `cp /dev/factory /mnt/sd1/…`:
+
+    pc 0x403840a2 <tlsf_free+614>
+    #0  remove_free_block (tlsf_control_functions.h:374)
+    #1  block_remove
+    #2  block_merge_next
+    #3  tlsf_free (tlsf.c:633)
+    #4  multi_heap_free_impl
+    #5  heap_caps_free
+    #10 espix_shell_session_run (session.c:607)   ← the console task, a bystander
+
+Heap corruption, caught by `free()` walking a list that had stopped making sense,
+in a task that had nothing to do with the stick. It is repeatable once seen: pull
+*while a write is in progress* and the board is gone. Pull when nothing is being
+written and everything above this works — including reads on the dead mount
+answering `ENOSYS` and `df` declining to report on it, both measured.
+
+**What would fix it, best first:**
+
+1. **A way to quiesce.** An `msc_host_*` call that stops new transfers and waits
+   for the in-flight one before the caller releases the handle. That is the ask,
+   and it is the only version that is correct rather than lucky.
+2. **Reference counting on the handle**, so a transfer finishing after the release
+   has nothing to write through.
+3. **What espix could do alone:** `on_disconnected()` could delay
+   `msc_host_uninstall_device()` instead of calling it immediately, on the theory
+   that a few hundred milliseconds outlasts any transfer. A guess dressed as a
+   fix, which is why it is third.
+
+Until one of those exists this belongs with the known ways to lose the board,
+which is where docs/KNOWN-ISSUES.md points from.
+
 ## `espressif/esp_tinyusb` (TinyUSB NCM)
 
 ### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer

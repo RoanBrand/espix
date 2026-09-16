@@ -1011,6 +1011,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## USB host
 
+- **Pulling a stick during a write can corrupt the heap.** Everything else about
+  a pull is handled, and measured: the mount is marked dead, reads answer
+  `ENOSYS`, `df` declines the row, an idle pull auto-unmounts, and `umount` works
+  afterwards. But a transfer already in flight when the device goes cannot be
+  recalled, and it completes against a block device `espix_usb` has released --
+  seen corrupting the heap and taking the board down from an unrelated task. It
+  needs the USB layer to quiesce before the release, which is not something espix
+  can reach, so it is written up in [UPSTREAM.md](UPSTREAM.md#a-device-pulled-mid-transfer-takes-the-heap-with-it)
+  rather than fixed here.
+
 - **Removing a device can panic inside the library's hub driver.** With an
   external hub on the port, unplugging a device — or the hub — can reach an
   assert at `ext_hub.c:508` in `device_release()`: the driver keeps a
