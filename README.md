@@ -22,18 +22,9 @@ it: [ROADMAP.md](docs/ROADMAP.md) for work espix might take on,
 differs from what a POSIX or FreeRTOS habit expects, and what may not be used
 together.
 
-## Status
+## Capabilities
 
-Early, but running on hardware. The tables below are what works and where it
-runs, and the legend is the same one the Unix surface uses:
-
-- **yes** — it works on the S3, the only part espix has actually been run on
-  (16MB flash, 8MB octal PSRAM, ESP-IDF v6.1). The other targets are
-  build-verified or planned, and say so below.
-- **partial** — it works, with a caveat named in the notes.
-- **planned** — designed for rather than built.
-
-### Capabilities
+<sub>Tested on ESP32-S3N16R8 with ESP-IDF v6.1</sub>
 
 | Category | | | |
 |---|---|---|---|
@@ -70,7 +61,7 @@ runs, and the legend is the same one the Unix surface uses:
 | Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
 | Services | Scheduled work: a `cron` | **planned** | the same missing supervisor, from the other end |
 
-### Targets
+## Targets
 
 | | **S3** — verified | **P4** — planned | **S31** — planned |
 |---|---|---|---|
@@ -291,7 +282,7 @@ kernel messages.
 ## Hardware Targets
 
 The chips, and what each one changes, are in the grid at
-[Status — Targets](#targets). What follows is the hardware detail those rows
+[Targets](#targets). What follows is the hardware detail those rows
 rest on.
 
 
