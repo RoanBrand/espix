@@ -11,10 +11,11 @@ sda    29G     disk        SanDisk Ultra
 └─sda1 29G     part vfat   MYSTICK
 ```
 
-**What this is not** is a filesystem. Nothing is mounted, and no path under a USB
-stick is reachable: `lsblk` names the filesystem and stops there. That is the
-first stage on purpose — see [Stage 2](#stage-2--mounting-and-why-it-is-not-done),
-where the quick version of mounting turns out to be worse than not having it.
+**What this is not** is a filesystem that mounts itself. Nothing is mounted until
+you say so, and no path under a USB stick is reachable before that: `lsblk` names
+the filesystem, and `mount sda1 /mnt` is the next command. See
+[Stage 2](#stage-2--mounting), including the one shape of mounting that would
+have been worse than not having it at all.
 
 The same socket is the one [USB-NETWORKING.md](USB-NETWORKING.md) uses to present
 `usb0`, and the two cannot both have it: which of them this build is, and what
@@ -94,6 +95,10 @@ prints that line alone, because the value is what was asked for) — and an oper
 that names nothing is refused rather than quietly printing less. **Neither prints
 anything at all when nothing is attached** — an empty table is an answer, and an
 empty header is noise.
+
+`mount` and `umount` take those same names — `mount sda1 /mnt` — and are described
+in [Stage 2](#stage-2--mounting), which is where the "nothing is mounted until you
+ask" part of this document is.
 
 ### What it reports, and what it cannot
 
@@ -201,8 +206,9 @@ therefore does not work; the host stack is a managed component like any other.
 | `espressif/esp_ext_part_tables` 0.5.0 | reads the partition table out of sector 0 |
 
 The MSC driver hands out an `esp_blockdev` handle per device (IDF 6.0.4 and
-later), and espix keeps it: that is the handle Stage 2 mounts from, and holding it
-does not tie up the driver's own.
+later), and espix keeps it: that is what Stage 2 mounts from —
+`espix_usb_dev_blockdev()` lends it — and holding it does not tie up the driver's
+own.
 
 **Both stacks are always downloaded; only one is linked.** The component manager
 resolves manifests before Kconfig exists, so it cannot see
@@ -270,18 +276,26 @@ that exists.
 3. **A stick in:** `dmesg` shows the device line within a second, and `lsblk` the
    disk. A partitioned stick gives `sda1` with its filesystem; a stick with no
    partition table gives the filesystem on the disk row instead (superfloppy).
-4. **Pull it out:** `dmesg` says `sda: removed`, `lsblk` no longer lists it, and
+4. **Mount it:** `mount sda1 /mnt` is silent on success, `mount` lists it as
+   `sda1 on /mnt type vfat`, `ls /mnt` shows the stick's files, and `cat` reads
+   one. `cat /mnt/photo.jpg > /tmp/copy` on a 30MB stick is the read path end to
+   end, and `umount /mnt` afterwards leaves `mount` printing nothing again.
+   Refusals worth seeing once each: `mount sda2 /mnt` where sda2 is exFAT says
+   `exfat/ntfs is not supported`; `umount /mnt` while a file is open says `busy`;
+   and **do not pull the stick while it is mounted** — that is the gap in
+   [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem), not a test.
+5. **Pull it out:** `dmesg` says `sda: removed`, `lsblk` no longer lists it, and
    the *name* is immediately reusable — a second device took `sda` again.
    `free` before and after is the check that the slot and its buffers went back.
-5. **A hub:** the hub and anything non-storage is enumerated and listed by
+6. **A hub:** the hub and anything non-storage is enumerated and listed by
    `lsusb`; one storage device attaches. A second storage device is refused for
    want of host channels (see above) — that is the part's limit, not a fault.
-6. **The suite agrees:** `make test SUITE=usb` runs `75-usb.sh`, which asserts the
+7. **The suite agrees:** `make test SUITE=usb` runs `75-usb.sh`, which asserts the
    role, the absence of `usb0`, and that both commands answer — and skips the
    enumeration half when nothing is plugged in. **`make test SUITE=net`** covers
    the other side: it now asserts that a build without USB-NCM really has no
    `usb0` rather than merely skipping the link checks.
-7. **In a device-role build**, `lsblk` and `blkid` still exist and explain
+8. **In a device-role build**, `lsblk` and `blkid` still exist and explain
    themselves: `lsblk: usb host was not built into this image
    (CONFIG_ESPIX_USB_ROLE_HOST)`. A command that vanished from a build would
    leave you comparing the device against this page and guessing.
@@ -294,7 +308,14 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
 | `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,307,152 B | 69% |
+| ... and Stage 2 (mounting, FatFs) | 0x1461b0 — 1,336,752 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
+
+Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus
+`fat.c`, the partition view and the two commands. The device-role figure above is
+from Stage 1 and has not been re-measured — its image grows too, because `mount`
+and `umount` exist in that build as well (they answer that the host was not built
+in) and that is what keeps FatFs linked there.
 
 So the host stack costs about **46KB of image** more than the TinyUSB NCM stack it
 replaces — and that number includes `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG`, which
@@ -320,53 +341,120 @@ figure rather than a specification, and it is dominated by diagnostics: the
 and `ESPIX_USB_VERBOSE=y` adds more. Re-take it with `free` on the build you care
 about, with the device attached and detached, before quoting it.
 
-## Stage 2 — mounting, and why it is not done
+## Stage 2 — mounting
 
-The quick version is `esp_vfs_fat_bdl_mount(handle, "/mnt", ...)`, and it is
-wrong twice over rather than merely inelegant:
+`mount sda1 /mnt` works, `ls` and `cat` reach it like any other directory, and
+`umount /mnt` gives the stick back. What follows is why it is built the way it
+is, and the two places the plan on file was wrong.
+
+### The volume is routed, not registered
+
+The quick version — `esp_vfs_fat_bdl_mount(handle, "/mnt", ...)` — is wrong twice
+over rather than merely inelegant, and both reasons were on file before any of
+this was written:
 
 - **It skips the permission check.** espix registers its VFS at IDF's *fallback*
   prefix `""`. Anything registered at `/mnt` is therefore routed by IDF *before*
 espix sees the path: no `resolve()`, no `espix_fs_root_permits()`, no cwd. A
-`confine`d process could read the whole stick. This is not a new discovery —
-`components/espix_fs/dev.c` says a second prefix is deliberately forbidden, and
-[KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem) already records it as a gap.
-- **`chmod` on a FAT file would write to the wrong partition.**
-  `components/espix_fs/mode.c` hardcodes `ESPIX_FS_ROOT_PARTITION` in
-  `attr_store()`: a FAT file whose mode is not the rule's default would store
-  littlefs attributes for a path that is not on littlefs.
+`confine`d process could read the whole stick.
+- **`chmod` on a FAT file would write to the wrong partition.** `mode.c`'s
+  `attr_store()` hardcodes `ESPIX_FS_ROOT_PARTITION`: a FAT path whose mode is
+  not the rule's default would have stored littlefs attributes for a path that is
+  not on littlefs.
 
-The design that avoids both is already written down in
-[ROADMAP.md](ROADMAP.md#filesystem): espix keeps a path-to-lower-ops table and
-routes internally, so every call still passes its own check. Three pieces are
-already shaped for it:
+So espix routes it itself, which is what [ROADMAP.md](ROADMAP.md#filesystem)
+planned: `components/espix_fs/vfs.c` holds a table of mounts, picks one by
+longest matching prefix, and reaches the filesystem below by a direct call to its
+ops. `/mnt/photo.jpg` passes through the same code and the same check as
+`/etc/passwd`.
 
-- `lower_t` in `components/espix_fs/vfs.c` is a struct *passed as VFS context*
-  specifically because a mount was expected; it becomes an array with a
-  longest-match prefix lookup.
-- `tools/patch-littlefs.py` is the precedent for a mount-without-registering
-  split, and FatFs needs the same treatment because
-  `esp_vfs_fat_*_mount()` registers.
-- The `/dev` overlay is a working example of espix owning a subtree by string
-  match inside its own VFS.
-- The mode *rule* (`mode.c`) is already the policy a filesystem with no stored
-  metadata needs — what Linux expresses as `-o uid=,gid=,fmask=` — which is
-  exactly what FAT wants.
+| piece | what it is |
+|---|---|
+| `lower_t s_mounts[ESPIX_FS_MAX_MOUNTS]` | the single `lower_t` that was always described as "an array when mounting lands" |
+| `espix_vfs_add_mount()` / `_del_mount()` | publish and remove a filesystem at a prefix; the root is slot 0 |
+| `stored_metadata` | false for FAT, which is what makes `chmod` answer EPERM instead of filing metadata against the wrong volume |
+| `components/espix_fs/fat.c` | the FAT driver: IDF's ops behind 24 shims that strip the mount prefix and hand IDF its own context back |
+| `tools/patch-fatfs.py` | gives IDF's FatFs a mount-without-registering split; see below |
 
-Known wrinkles, so they are not rediscovered: fds 240–255 are reserved for
-devices and IDF's `local_fd_t` is a `uint8_t`, so a mount index packed into the
-fd has to coexist with that; `/mnt` is not in the boot skeleton, so it has to be
-added the way `/dev` was; and **unmount does not exist as a concept** anywhere in
-espix, which removable media needs more than anything else does.
+### Two corrections to the plan
 
-Everything Stage 1 does is a prerequisite for that and none of it is wasted: the
-device table, the block-device handle and the partition list are what a mount
-would be given.
+**The fd packing ROADMAP.md expected is not needed.** With two filesystems below,
+the worry was that LittleFS's fd 3 and FAT's fd 3 would collide when they came
+back into espix's `read()`. They cannot: espix passes the lower filesystem's fd
+through unchanged, and IDF allocates those from one global table, so an fd
+identifies its filesystem by construction. What routing does need is the reverse
+question — which mount does this fd belong to? — and that is a 256-byte array
+indexed by fd, plus the same idea keyed by pointer for open `DIR` handles, which
+carry no fd at all. About as much code as the packing would have been, and
+ROADMAP.md is corrected.
+
+**`esp_vfs_fat_bdl_mount()` cannot be trimmed down; IDF's FatFs is patched.**
+Three obstacles, each of which rules out a cheaper option:
+
+- every public entry point that mounts a block device ends in
+  `esp_vfs_register_fs()`, so mounting through IDF *is* registering a prefix;
+- the ops tables (`s_vfs_fat`, `s_vfs_fat_dir`) are file-scope static, so the
+  driver cannot be reached directly either;
+- the context those ops need is built *inside* `esp_vfs_fat_register()`, whose
+  only other job is the registration, so the two cannot be separated from outside
+  the file.
+
+`tools/patch-fatfs.py` therefore adds `esp_vfs_fat_ctx_create()`,
+`esp_vfs_fat_ctx_free()` and `esp_vfs_fat_get_ops()`, and lifts the context
+construction out of `esp_vfs_fat_register()` rather than making a copy of it — one
+implementation with two callers, and nothing to drift.
+`tools/esp_vfs_fat-ctx.patch` is the same change as a patch ready to send, and
+[UPSTREAM.md](UPSTREAM.md) carries the request.
+
+fatfs is a **built-in** IDF component, and the registry publishes no
+`espressif/fatfs` that could override it (checked — it 404s), so unlike
+`joltwallet/littlefs` this patches the IDF installation itself. The change is
+additive — `esp_vfs_fat_register()` does exactly what it did — but the hook is
+written to fail loudly, because a patch in a tree espix does not own is precisely
+the kind of thing that goes missing quietly. The script checks the IDF version and
+every anchor, and CMake is told to re-configure when either patched file changes.
+Without that last part, a reinstalled IDF sails past the hook and fails as an
+undefined reference to `esp_vfs_fat_ctx_create()` pointing at espix instead of at
+the real cause — which is not hypothetical: it is what the first version of the
+hook did, and
+[GOTCHAS.md](GOTCHAS.md#a-configure-time-hook-is-not-a-build-time-guarantee)
+records it.
+
+### What mounting does, and does not do
+
+- **Nothing is formatted, ever.** `esp_vfs_fat_*_mount()` will `f_mkfs()` a volume
+  that does not look like FAT when asked to. A stick somebody plugged in to read
+  must never come back empty, so a failure to mount is reported as one, with the
+  `FRESULT` named: "not a FAT filesystem" and "drive not ready" are different
+  news.
+- **FAT only.** `mount sda1 /mnt` on an exFAT or NTFS volume answers
+  `exfat/ntfs is not supported` — the same words `lsblk` prints, for the same
+  reason.
+- **Root only**, as `mount(8)` is: it changes the namespace for every session.
+  `mount` with no arguments lists what is mounted and anyone may run that, as
+  anyone may read `/proc/mounts`.
+- **`umount` refuses while something is open on the mount.** It answers `busy` and
+  says why, rather than pulling a volume out from under a reader who is halfway
+  through a file.
+- **Unplugging a mounted stick is not handled yet.** The block device is borrowed
+  from espix_usb, which gives it back when the device goes, and a filesystem still
+  holding it would be reading memory that was freed. Unmount first —
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem) has the mechanism and the fix
+  that is next.
+- **`df` still reports the rootfs.** Per-mount free space is one `f_getfree()`
+  away and not yet wired to a command.
+- **`/mnt` is in the boot skeleton** now, so a device whose image predates
+  mounting still has somewhere to mount to.
 
 ## Roadmap, not now
 
-- **Mounting, which is Stage 2 above** — still the largest item, and still not
-  cheap.
+- **Unmount when the device is pulled.** The removal path in espix_usb frees the
+  block device, so a mounted volume has to be closed *before* that: a hook the USB
+  side calls before tearing a device down, and a mount layer that answers it. It
+  is the one gap Stage 2 leaves, and
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem) has the shape of the fix.
+- **`df` per mount.** One `f_getfree()` behind an `espix_fs_stat_fat()`, and the
+  point where `df` stops being a rootfs-only command.
 - **`READ CAPACITY(16)`,** so a drive larger than 2 TiB reports its real size
   instead of a plausible 2 TiB. It is the class driver's choice of SCSI command,
   not espix's, so it belongs to the list below as much as to here.

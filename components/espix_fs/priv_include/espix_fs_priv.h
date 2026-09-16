@@ -78,11 +78,38 @@ void espix_fs_claim(const char *abs_path);
 bool espix_fs_root_permits(const char *abs_path);
 
 /*
+ * A mount prefix's maximum length, including the NUL. Internal: callers pass
+ * mount points, they do not size anything with this.
+ */
+#define ESPIX_FS_PREFIX_MAX  32
+
+/*
  * Publish espix's VFS as the root, forwarding to the filesystem described by
  * `lower_ops` and `lower_ctx` (as returned by esp_littlefs_mount()).
  */
 esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
                                   void *lower_ctx);
+
+/*
+ * A second filesystem at `prefix` ("/mnt"), reached through espix's VFS so the
+ * permission check applies there too -- which is the whole reason it is a table
+ * in here rather than another esp_vfs registration. The caller owns the
+ * filesystem: this only routes to it.
+ *
+ * `stored_metadata` is false for one that keeps no owner or mode of its own
+ * (FAT), which is what makes chmod and chown refuse rather than write an
+ * attribute with nowhere to live.
+ *
+ * espix_vfs_del_mount() answers ESP_ERR_INVALID_STATE while a file or directory
+ * is still open on the mount: a lower filesystem's fd cannot be revoked, so the
+ * caller has to close up first.
+ */
+esp_err_t espix_vfs_add_mount(const char *prefix, const esp_vfs_fs_ops_t *ops,
+                              void *ctx, bool stored_metadata);
+esp_err_t espix_vfs_del_mount(const char *prefix);
+
+/* False on a mount whose filesystem carries no modes of its own. */
+bool espix_vfs_stores_metadata(const char *abs_path);
 
 
 /* ------------------------------------------------------------------ */

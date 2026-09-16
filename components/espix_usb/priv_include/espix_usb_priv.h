@@ -21,6 +21,7 @@ void   espix_usb_host_status_query(espix_usb_host_status_t *out);
 size_t espix_usb_host_device_list(espix_usb_desc_t *out, size_t n);
 esp_err_t espix_usb_host_probe_addr(uint8_t addr);
 size_t    espix_usb_host_scan_pool(void);
+esp_blockdev_handle_t espix_usb_host_dev_blockdev(const char *name);
 
 #ifdef __cplusplus
 }

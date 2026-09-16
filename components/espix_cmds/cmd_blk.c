@@ -1,28 +1,38 @@
 /*
- * Block devices: lsblk and blkid.
+ * Block devices: lsblk, blkid, mount and umount.
  *
- * These describe the storage the USB host found. Nothing mounts it yet -- a
- * filesystem needs a mount table espix does not have, and without one an
- * IDF-routed prefix skips the permission check entirely (the reason is spelled
- * out in docs/USB-HOST.md) -- so what these commands are for is knowing what is
- * attached: which device, how big, which filesystems are on it, and, for the
- * ones espix has no driver for, saying so rather than staying silent.
+ * The first two describe the storage the USB host found: which device, how big,
+ * which filesystems are on it, and, for the ones espix has no driver for, saying
+ * so rather than staying silent.
  *
- * Both exist in a build without the USB host, and explain themselves. A command
- * that vanishes when an option is off leaves the user comparing their device
- * against documentation and guessing.
+ * The other two mount and unmount those filesystems. Mounting goes through
+ * espix's own VFS -- the volume is *not* registered at a prefix, because that
+ * would route IDF directly to it with the permission check skipped (the reason
+ * is in components/espix_fs/dev.c) -- and the filesystem itself is FAT, driven
+ * out of espix_fs/fat.c. What this file owns is the part that needs to know
+ * about both: which device and partition a name refers to, the block device view
+ * over it, and the record that lets `umount` give that view back.
+ *
+ * All four commands exist in a build without the USB host, and explain
+ * themselves. A command that vanishes when an option is off leaves the user
+ * comparing their device against documentation and guessing.
  */
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "espix_cmds_priv.h"
+#include "espix_fs.h"
 #include "espix_shell.h"
 #include "espix_usb.h"
 
-#define LSBLK_USAGE "usage: lsblk [disk]\n"
-#define BLKID_USAGE "usage: blkid [device]...\n"
+#define LSBLK_USAGE  "usage: lsblk [disk]\n"
+#define BLKID_USAGE  "usage: blkid [device]...\n"
+#define MOUNT_USAGE  "usage: mount [device path]\n"
+#define UMOUNT_USAGE "usage: umount path\n"
 
 /*
  * Column widths. NAME and FSTYPE are measured per listing, the way `ls` measures
@@ -345,6 +355,308 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* Mounting                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * What is mounted where.
+ *
+ * espix_fs owns the mount table itself; this is the part only the command layer
+ * can know -- which device a mount came from, and the block device *view* this
+ * file created for a partition, which has to be given back when the mount goes.
+ * A superfloppy has no view: it mounts the disk's own block device, which
+ * espix_usb owns and this file must never release.
+ *
+ * The records are not locked. Mounting is a root-only administrative action and
+ * the mount table underneath is properly serialised, so the worst two concurrent
+ * mounts can do is both pick the same free slot and leave one record behind —
+ * which shows as `umount` saying `not mounted` for a mount that exists.
+ */
+typedef struct {
+    bool                  used;
+    char                  dev[ESPIX_USB_NAME_MAX];
+    char                  path[ESPIX_PATH_MAX];
+    esp_blockdev_handle_t view;
+} mount_rec_t;
+
+static mount_rec_t s_mounts[ESPIX_FS_MAX_MOUNTS];
+
+static mount_rec_t *mount_by_path(const char *path)
+{
+    for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (s_mounts[i].used && strcmp(s_mounts[i].path, path) == 0) {
+            return &s_mounts[i];
+        }
+    }
+    return NULL;
+}
+
+static mount_rec_t *mount_by_dev(const char *dev)
+{
+    for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (s_mounts[i].used && strcmp(s_mounts[i].dev, dev) == 0) {
+            return &s_mounts[i];
+        }
+    }
+    return NULL;
+}
+
+static mount_rec_t *mount_free_slot(void)
+{
+    for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (!s_mounts[i].used) {
+            return &s_mounts[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * The disk a name refers to, and the partition within it when the name is a
+ * partition's. `part` comes back NULL for a whole disk, which is the superfloppy
+ * case: the filesystem is on the disk itself, not on a partition of it.
+ */
+static bool blk_lookup(const espix_usb_dev_t *devs, size_t n, const char *name,
+                       const espix_usb_dev_t **disk,
+                       const espix_usb_part_t **part)
+{
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < devs[i].nparts; j++) {
+            if (strcmp(devs[i].parts[j].name, name) == 0) {
+                *disk = &devs[i];
+                *part = &devs[i].parts[j];
+                return true;
+            }
+        }
+        if (strcmp(devs[i].name, name) == 0) {
+            *disk = &devs[i];
+            *part = NULL;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * mount: put a FAT filesystem espix found on the port into the namespace.
+ *
+ * FAT and only FAT. The other names `lsblk` prints are there to say what a
+ * volume *is* -- an attempt to mount one says "not supported" rather than
+ * looking like a broken driver, which is the same reason the column exists.
+ */
+static int cmd_mount(espix_session_t *s, int argc, char **argv)
+{
+    if (!espix_usb_host_built()) {
+        return no_host(s, "mount");
+    }
+
+    /* No operands: what is mounted. Readable by anyone, as /proc/mounts is. */
+    if (argc == 1) {
+        for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
+            if (s_mounts[i].used) {
+                espix_printf(s, "%s on %s type vfat\n", s_mounts[i].dev,
+                             s_mounts[i].path);
+            }
+        }
+        return 0;
+    }
+    if (argc != 3) {
+        espix_eprintf(s, MOUNT_USAGE);
+        return 1;
+    }
+    if (s == NULL || s->uid != 0) {
+        espix_eprintf(s, "mount: only root can mount\n");
+        return 1;
+    }
+
+    const char *devname = argv[1];
+
+    /* Resolved against the session's cwd like every other path argument, then
+     * required to exist -- see below. */
+    char abs[ESPIX_PATH_MAX];
+    if (!espix_cmd_path(s, argv[2], abs, sizeof(abs))) {
+        return 1;
+    }
+    const char *path = abs;
+
+    espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
+    const size_t n = attached(s, "mount", devs);
+
+    const espix_usb_dev_t  *disk = NULL;
+    const espix_usb_part_t *part = NULL;
+
+    if (!blk_lookup(devs, n, devname, &disk, &part)) {
+        espix_eprintf(s, "mount: %s: no such device\n", devname);
+        return 1;
+    }
+
+    const char *fstype  = (part != NULL) ? part->fstype : disk->fstype;
+    const bool  foreign = (part != NULL) ? part->foreign : disk->foreign;
+
+    if (fstype[0] == '\0') {
+        espix_eprintf(s, "mount: %s: no filesystem espix can read\n", devname);
+        return 1;
+    }
+    if (foreign || strcmp(fstype, "vfat") != 0) {
+        espix_eprintf(s, "mount: %s: %s is not supported\n", devname, fstype);
+        return 1;
+    }
+
+    /*
+     * The mount point has to be there already. Making it would be a directory
+     * appearing out of nowhere, and hiding whatever stood there is the caller's
+     * business rather than something to do silently.
+     */
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        espix_eprintf(s, "mount: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        espix_eprintf(s, "mount: %s: not a directory\n", path);
+        return 1;
+    }
+
+    if (mount_by_path(path) != NULL) {
+        espix_eprintf(s, "mount: %s: already mounted\n", path);
+        return 1;
+    }
+    const mount_rec_t *other = mount_by_dev(devname);
+    if (other != NULL) {
+        /* Two FAT contexts over one disk would each cache the same sectors and
+         * both write them back, so this is refused rather than allowed to be
+         * confusing later. */
+        espix_eprintf(s, "mount: %s: already mounted on %s\n", devname,
+                      other->path);
+        return 1;
+    }
+
+    mount_rec_t *rec = mount_free_slot();
+    if (rec == NULL) {
+        espix_eprintf(s, "mount: no free mount slot\n");
+        return 1;
+    }
+
+    /*
+     * The device is named by its *disk*, and a partition becomes a view over
+     * that device using the offsets the partition table gave -- the same numbers
+     * `lsblk` prints. Nothing is copied, and nothing is read until the
+     * filesystem asks.
+     *
+     * espix's own view rather than IDF's esp_blockdev_generic_partition_get():
+     * that one takes its offsets as `size_t`, so a 30GB partition on a 32-bit
+     * target mounts as the low 32 bits of itself and fails later rather than
+     * here. part.c has the arithmetic.
+     */
+    esp_blockdev_handle_t disk_bdl = espix_usb_dev_blockdev(disk->name);
+    if (disk_bdl == NULL) {
+        espix_eprintf(s, "mount: %s: no block device (unplugged?)\n", disk->name);
+        return 1;
+    }
+
+    esp_blockdev_handle_t view = NULL;
+    esp_blockdev_handle_t dev  = disk_bdl;
+
+    if (part != NULL) {
+        const esp_err_t err = espix_fs_partition_view(
+            disk_bdl, part->start, part->size, &view);
+        if (err != ESP_OK) {
+            espix_eprintf(s, "mount: %s: cannot read the partition: %s\n",
+                          devname, esp_err_to_name(err));
+            return 1;
+        }
+        dev = view;
+    }
+
+    const esp_err_t err = espix_fs_mount_fat(path, dev);
+    if (err != ESP_OK) {
+        if (view != NULL) {
+            view->ops->release(view);
+        }
+        if (err == ESP_ERR_INVALID_STATE) {
+            espix_eprintf(s, "mount: %s: already mounted\n", path);
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            espix_eprintf(s, "mount: %s: not a FAT filesystem\n", devname);
+        } else {
+            espix_eprintf(s, "mount: %s: %s\n", devname, esp_err_to_name(err));
+        }
+        return 1;
+    }
+
+    memset(rec, 0, sizeof(*rec));
+    rec->used = true;
+    rec->view = view;
+    snprintf(rec->dev, sizeof(rec->dev), "%s", devname);
+    snprintf(rec->path, sizeof(rec->path), "%s", path);
+
+    /* Silent on success, like mount(8) without -v: a command that reports every
+     * routine thing is one whose output nobody reads. */
+    return 0;
+}
+
+/*
+ * umount: take it back out, and give back what was made for it.
+ *
+ * Refused while anything is open on the mount, by the layer that can tell --
+ * espix_fs answers ESP_ERR_INVALID_STATE rather than pulling a volume out from
+ * under a reader who is halfway through a file.
+ */
+static int cmd_umount(espix_session_t *s, int argc, char **argv)
+{
+    if (!espix_usb_host_built()) {
+        return no_host(s, "umount");
+    }
+    if (argc != 2) {
+        espix_eprintf(s, UMOUNT_USAGE);
+        return 1;
+    }
+    if (s == NULL || s->uid != 0) {
+        espix_eprintf(s, "umount: only root can unmount\n");
+        return 1;
+    }
+
+    /*
+     * A path -- resolved like every other command's path argument -- or a device
+     * name. umount(8) takes either and there is no reason to be stricter.
+     */
+    char abs[ESPIX_PATH_MAX];
+    mount_rec_t *rec = NULL;
+
+    if (espix_cmd_path(s, argv[1], abs, sizeof(abs))) {
+        rec = mount_by_path(abs);
+    }
+    if (rec == NULL) {
+        rec = mount_by_dev(argv[1]);
+    }
+    if (rec == NULL) {
+        espix_eprintf(s, "umount: %s: not mounted\n", argv[1]);
+        return 1;
+    }
+
+    const esp_err_t err = espix_fs_unmount_fat(rec->path);
+    if (err == ESP_ERR_INVALID_STATE) {
+        espix_eprintf(s, "umount: %s: busy -- a file is open on it\n", rec->path);
+        return 1;
+    }
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        espix_eprintf(s, "umount: %s: %s\n", rec->path, esp_err_to_name(err));
+        return 1;
+    }
+
+    /*
+     * The view was this file's to create and is this file's to release. The
+     * disk's own block device is not: that one belongs to espix_usb, and
+     * releasing it here would be a double free the moment the stick is pulled.
+     */
+    if (rec->view != NULL) {
+        rec->view->ops->release(rec->view);
+    }
+    memset(rec, 0, sizeof(*rec));
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_blk_cmds[] = {
     { .name = "lsblk", .fn = cmd_lsblk,
@@ -355,6 +667,14 @@ static espix_cmd_t s_blk_cmds[] = {
     { .name = "blkid", .fn = cmd_blkid,
       .help = "print a device's identity, filesystem and label",
       .usage = "blkid [device]..." },
+    { .name = "mount", .fn = cmd_mount,
+      /* The root-only rule belongs in the help: a user who is told why is not
+       * left thinking the command is broken. */
+      .help = "mount a FAT filesystem from a USB device (root only)",
+      .usage = "mount [device path]" },
+    { .name = "umount", .fn = cmd_umount,
+      .help = "unmount a mounted filesystem (root only)",
+      .usage = "umount path" },
 };
 
 void espix_cmds_register_blk(void)

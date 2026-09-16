@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 
+#include "esp_blockdev.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -43,6 +44,51 @@ esp_err_t espix_fs_mount_root(void);
 esp_err_t espix_fs_stat_root(espix_fs_info_t *out);
 
 bool espix_fs_is_mounted(void);
+
+/*
+ * Mount table shape: the root plus three, from components/espix_fs/vfs.c. A
+ * caller keeping its own per-mount records sizes them with this, so the two
+ * cannot drift apart.
+ */
+#define ESPIX_FS_MAX_MOUNTS 4
+
+/*
+ * Mount the FAT filesystem on `dev` at `path` -- the second filesystem in the
+ * namespace, and the first one that is not littlefs.
+ *
+ * Reached through espix's own VFS like the root, so a permission check applies
+ * there too; see components/espix_fs/fat.c and tools/patch-fatfs.py for what
+ * that costs. `path` is the *mount point*: the caller is expected to have made
+ * it, and its contents are hidden for as long as the mount lasts, exactly as on
+ * any Unix.
+ *
+ * The block device stays the caller's -- this never releases the handle, because
+ * a whole disk and a partition view over one are both mountable and only the
+ * caller knows which it made. Release it after espix_fs_unmount_fat().
+ *
+ * Never formats: a volume that does not mount is reported, not overwritten.
+ */
+esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev);
+
+/*
+ * Unmount it. ESP_ERR_INVALID_STATE while a file or directory is still open on
+ * the mount -- a lower filesystem's fd cannot be revoked, so the caller has to
+ * close up first.
+ */
+esp_err_t espix_fs_unmount_fat(const char *path);
+
+/*
+ * A block device view over a partition of `parent`, for mounting `sda1` rather
+ * than `sda`. Released with its own ops->release, which frees the view and
+ * leaves the parent alone -- the parent belongs to whoever made it.
+ *
+ * IDF's esp_blockdev_generic_partition_get() does the same thing with 32-bit
+ * offsets, which cannot express a partition larger than 4GB on an ESP32 target.
+ * Since that is one FAT32 volume on an ordinary stick, this is 64-bit; see
+ * part.c.
+ */
+esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
+                                  uint64_t size, esp_blockdev_handle_t *out);
 
 /*
  * Resolve `path` against `cwd` into `out` (absolute, no "." or ".." segments,

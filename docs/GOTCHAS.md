@@ -531,6 +531,31 @@ espcoredump's macros gate on `LOG_LOCAL_LEVEL` at compile time and write
 straight to `esp_rom_printf`, bypassing the runtime level — so every crash
 arrives under a page of core-dump tracing.
 
+### A configure-time hook is not a build-time guarantee
+
+`tools/patch-fatfs.py` runs from an `execute_process()` in the top-level
+`CMakeLists.txt`, which by default runs **when CMake configures**, not when the
+build runs. So a patched dependency can be reverted — a fresh IDF install, an
+upgrade, or `git checkout` — and the next `make build` will not re-apply it: CMake
+sees no reason to configure again, ninja compiles the reverted tree, and the
+failure arrives as an undefined reference pointing at *espix's* code rather than at
+the missing patch. That is not hypothetical here; it is exactly what the first
+version of the fatfs hook did.
+
+Telling CMake which files the hook owns is the fix, and it is one property:
+
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${IDF_PATH}/components/fatfs/vfs/vfs_fat.c"
+        "${IDF_PATH}/components/fatfs/vfs/vfs_fat_internal.h")
+
+A patch *script* has the same shape of problem in the other direction: it must be
+idempotent (this one checks for its own symbols and exits quietly when they are
+there) and it must fail loudly when the thing it patches has moved, because a
+patch that applies to the wrong version is worse than one that does not apply at
+all. The IDF version and every anchor are checked, and a mismatch stops the build
+with the reason.
+
+
 ## How to add to this
 
 One heading per gotcha, with what it broke and where the claim comes from. If it

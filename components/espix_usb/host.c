@@ -1176,6 +1176,32 @@ size_t espix_usb_host_devlist(espix_usb_dev_t *out, size_t n)
     return count;
 }
 
+/*
+ * The block device under a named storage device, for the one caller that mounts
+ * it. Borrowed and not owned: it belongs to the slot, and the slot gives it back
+ * when the device goes -- which is what docs/KNOWN-ISSUES.md has an entry about,
+ * because a mount that outlives the device is the case this does not solve.
+ */
+esp_blockdev_handle_t espix_usb_host_dev_blockdev(const char *name)
+{
+    esp_blockdev_handle_t bdl = NULL;
+
+    if (name == NULL || s_lock == NULL) {
+        return NULL;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t i = 0; i < ESPIX_USB_MAX_DEVS; i++) {
+        if (s_devs[i].info.in_use && strcmp(s_devs[i].info.name, name) == 0) {
+            bdl = s_devs[i].bdl;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    return bdl;
+}
+
 void espix_usb_host_status_query(espix_usb_host_status_t *out)
 {
     out->running = s_installed;

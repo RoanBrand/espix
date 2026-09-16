@@ -631,6 +631,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
+- **Unplugging a mounted stick is a use-after-free.** Stage 2 mounts FAT from a
+  USB device, and the block device it mounts is *borrowed* from `espix_usb`: the
+  slot owns it, and when the device is unplugged the slot hands it back to the MSC
+  driver and uninstalls the device. FatFs knows none of that, so a volume whose
+  device has gone reads through a freed block device and a freed device object.
+  The only safe move today is to unmount first — which the docs say, and which
+  nobody will remember at the moment they pull a stick out.
+
+  The fix is a removal hook: `espix_usb` calls it *before* tearing a device down,
+  and the mount layer unmounts. Two things make it more than a callback. The hook
+  runs on the USB task, so it must not block on a transfer that same task
+  delivers; and an unmount with a file still open cannot free the context under
+  the reader's fd. The shape that satisfies both is to mark the device gone — so
+  I/O fails instead of reading freed memory — and free the block device when the
+  last reference to it goes, rather than on the removal path.
+
+
 - **A directory's mode does not hide what is inside it.** Unix requires search
   (`x`) permission on every component of a path; espix checks the final
   component, plus the parent for anything that creates or removes a name. So

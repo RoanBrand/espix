@@ -54,6 +54,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "freertos/FreeRTOS.h"
+
 #include "esp_littlefs.h"
 #include "esp_vfs.h"
 #include "esp_vfs_ops.h"
@@ -67,17 +69,145 @@
 #define TAG "fs"
 
 /*
- * The layer below. A struct passed as the VFS context rather than file-scope
- * statics, because `mount` is on the roadmap and a second mount would otherwise
- * mean unpicking this.
+ * The layers below, one entry per mount.
+ *
+ * A struct passed as the VFS context rather than file-scope statics, because
+ * `mount` was on the roadmap and a second mount would otherwise mean unpicking
+ * this. That second mount has arrived, so the struct grew a prefix: entry 0 is
+ * the root (prefix ""), and a path goes to the longest prefix that claims it.
+ *
+ * The context handed to esp_vfs_register_fs() is entry 0 and says nothing about
+ * which mount a call belongs to, so each op picks its mount by path, by fd or by
+ * directory handle -- whichever the call carries.
  */
 typedef struct {
     const esp_vfs_fs_ops_t  *ops;
     const esp_vfs_dir_ops_t *dir;
     void                    *ctx;
+    char                     prefix[ESPIX_FS_PREFIX_MAX];
+    size_t                   len;
+    /*
+     * False when the filesystem keeps no ownership or mode of its own (FAT).
+     * espix's rule still answers for such a path -- there is nothing stored to
+     * read -- but a *write* has nowhere to go, so chmod and chown refuse rather
+     * than stamping an attribute into whichever filesystem can hold one.
+     */
+    bool                     stored_metadata;
+    bool                     used;
 } lower_t;
 
-static lower_t s_root;
+static lower_t s_mounts[ESPIX_FS_MAX_MOUNTS];
+
+/*
+ * Mounts are added and removed while other sessions are opening files, so the
+ * table is read and written under a spinlock. Every critical section below is a
+ * handful of instructions and none of them blocks.
+ */
+static portMUX_TYPE s_mount_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/*
+ * fds and directory handles carry no path, so which mount they belong to has to
+ * be remembered. esp_vfs stores a local fd in a uint8_t, so 256 bytes covers the
+ * whole range; directories are few, and matched by pointer.
+ */
+static uint8_t s_fd_mount[256];    /* mount index + 1; 0 = not a mount of ours */
+#define ESPIX_FS_DIRS  8
+static struct {
+    DIR    *dirp;
+    uint8_t mount;                 /* index + 1 */
+} s_dir_map[ESPIX_FS_DIRS];
+
+/*
+ * Longest prefix wins, and a prefix only claims a path it matches whole -- so
+ * "/mnt" does not take "/mntx". The root is the fallback rather than a candidate:
+ * it is what every path reaches when nothing longer matches.
+ */
+static const lower_t *mount_by_path(const char *abs_path)
+{
+    const lower_t *best = &s_mounts[0];
+    size_t         best_len = 0;
+    const size_t   path_len = strlen(abs_path);
+
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        const lower_t *m = &s_mounts[i];
+        if (!m->used || m->len <= best_len || m->len > path_len) {
+            continue;
+        }
+        if (strncmp(abs_path, m->prefix, m->len) == 0 &&
+            (abs_path[m->len] == '\0' || abs_path[m->len] == '/')) {
+            best = m;
+            best_len = m->len;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+    return best;
+}
+
+/* One byte, written on open and cleared on close, so no lock is needed. */
+static const lower_t *mount_by_fd(int fd)
+{
+    if (fd < 0 || fd > 255) {
+        return NULL;
+    }
+    const uint8_t m = s_fd_mount[fd];
+    return m == 0 ? NULL : &s_mounts[m - 1];
+}
+
+static void fd_map_set(int fd, const lower_t *mount)
+{
+    if (fd >= 0 && fd <= 255) {
+        s_fd_mount[fd] = (uint8_t)((mount - s_mounts) + 1);
+    }
+}
+
+static void fd_map_clear(int fd)
+{
+    if (fd >= 0 && fd <= 255) {
+        s_fd_mount[fd] = 0;
+    }
+}
+
+static const lower_t *mount_by_dir(DIR *pdir)
+{
+    const lower_t *l = NULL;
+
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 0; i < ESPIX_FS_DIRS; i++) {
+        if (s_dir_map[i].dirp == pdir && s_dir_map[i].mount != 0) {
+            l = &s_mounts[s_dir_map[i].mount - 1];
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+    return l;
+}
+
+static void dir_map_set(DIR *pdir, const lower_t *mount)
+{
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 0; i < ESPIX_FS_DIRS; i++) {
+        if (s_dir_map[i].dirp == pdir || s_dir_map[i].mount == 0) {
+            s_dir_map[i].dirp  = pdir;
+            s_dir_map[i].mount = (uint8_t)((mount - s_mounts) + 1);
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+}
+
+static void dir_map_clear(DIR *pdir)
+{
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 0; i < ESPIX_FS_DIRS; i++) {
+        if (s_dir_map[i].dirp == pdir) {
+            s_dir_map[i].dirp  = NULL;
+            s_dir_map[i].mount = 0;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+}
 
 /* Refuse rather than crash when the layer below does not implement something. */
 #define NO_LOWER(expr) ((expr) == NULL)
@@ -85,6 +215,13 @@ static lower_t s_root;
 static int enosys(void)
 {
     errno = ENOSYS;
+    return -1;
+}
+
+/* An fd this VFS never handed out: not a device, and not on any mount. */
+static int ebadf(void)
+{
+    errno = EBADF;
     return -1;
 }
 
@@ -169,7 +306,6 @@ static const char *resolve(const char *path, char *buf, size_t len)
 
 static int vfs_open(void *ctx, const char *path, int flags, int mode)
 {
-    const lower_t *l = ctx;
     RESOLVE_OR_FAIL(path, -1);
 
     const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_OPEN, flags);
@@ -202,6 +338,13 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
         return -1;
     }
 
+    /*
+     * Chosen after the two /dev branches above rather than before: /dev is
+     * answered without reaching a filesystem at all, so no mount is needed
+     * until this point.
+     */
+    const lower_t *l = mount_by_path(p);
+
     if (NO_LOWER(l->ops->open_p)) {
         return enosys();
     }
@@ -233,6 +376,10 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
         return -1;
     }
 
+    if (fd >= 0) {
+        fd_map_set(fd, l);
+    }
+
     if (fd >= 0 && creating) {
         espix_fs_claim(p);
     }
@@ -241,18 +388,28 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
 
 static int vfs_close(void *ctx, int fd)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_close(fd);
     }
-    return NO_LOWER(l->ops->close_p) ? enosys() : l->ops->close_p(l->ctx, fd);
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
+    }
+    const int rc = NO_LOWER(l->ops->close_p) ? enosys()
+                                             : l->ops->close_p(l->ctx, fd);
+    /* Cleared either way: a failed close still leaves the fd not ours. */
+    fd_map_clear(fd);
+    return rc;
 }
 
 static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_read(fd, dst, size);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->read_p) ? enosys()
                                     : l->ops->read_p(l->ctx, fd, dst, size);
@@ -260,9 +417,12 @@ static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
 
 static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_write(fd, data, size);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->write_p) ? enosys()
                                      : l->ops->write_p(l->ctx, fd, data, size);
@@ -270,9 +430,12 @@ static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
 
 static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_pread(fd, dst, size, off);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->pread_p)
                ? enosys() : l->ops->pread_p(l->ctx, fd, dst, size, off);
@@ -281,12 +444,15 @@ static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
 static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
                           off_t off)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         /* Only /dev/null accepts writes, and it discards them, so the offset
          * changes nothing. */
         (void)off;
         return espix_dev_write(fd, src, size);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->pwrite_p)
                ? enosys() : l->ops->pwrite_p(l->ctx, fd, src, size, off);
@@ -294,9 +460,12 @@ static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
 
 static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_lseek(fd, size, mode);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->lseek_p) ? enosys()
                                      : l->ops->lseek_p(l->ctx, fd, size, mode);
@@ -304,9 +473,12 @@ static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
 
 static int vfs_fstat(void *ctx, int fd, struct stat *st)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_fstat(fd, st);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->fstat_p) ? enosys()
                                      : l->ops->fstat_p(l->ctx, fd, st);
@@ -314,21 +486,27 @@ static int vfs_fstat(void *ctx, int fd, struct stat *st)
 
 static int vfs_fsync(void *ctx, int fd)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         return espix_dev_fsync(fd);
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->fsync_p) ? enosys() : l->ops->fsync_p(l->ctx, fd);
 }
 
 static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         /* Nothing here has flags worth reporting, and F_GETFL returning 0 is
          * more useful to a caller than ENOSYS. */
         (void)cmd; (void)arg;
         return 0;
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->ops->fcntl_p) ? enosys()
                                      : l->ops->fcntl_p(l->ctx, fd, cmd, arg);
@@ -365,8 +543,6 @@ static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
  */
 static int vfs_stat(void *ctx, const char *path, struct stat *st)
 {
-    const lower_t *l = ctx;
-
     RESOLVE_OR_FAIL(path, -1);
 
     const void *dev = espix_dev_lookup(p);
@@ -384,6 +560,8 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
         return -1;
     }
 
+    const lower_t *l = mount_by_path(p);
+
     if (NO_LOWER(l->dir->stat_p)) {
         return enosys();
     }
@@ -397,8 +575,6 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
 
 static int vfs_unlink(void *ctx, const char *path)
 {
-    const lower_t *l = ctx;
-
     RESOLVE_OR_FAIL(path, -1);
 
     if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
@@ -412,14 +588,13 @@ static int vfs_unlink(void *ctx, const char *path)
         errno = err;
         return -1;
     }
+    const lower_t *l = mount_by_path(p);
     return NO_LOWER(l->dir->unlink_p) ? enosys()
                                       : l->dir->unlink_p(l->ctx, p);
 }
 
 static int vfs_rename(void *ctx, const char *src, const char *dst)
 {
-    const lower_t *l = ctx;
-
     char abs_src[ESPIX_PATH_MAX];
     char abs_dst[ESPIX_PATH_MAX];
 
@@ -447,14 +622,23 @@ static int vfs_rename(void *ctx, const char *src, const char *dst)
         errno = err;
         return -1;
     }
+    /*
+     * One filesystem for both names: moving data between two mounts is not a
+     * rename, and EXDEV is what every Unix says about it rather than
+     * half-doing it.
+     */
+    const lower_t *l = mount_by_path(abs_src);
+    if (mount_by_path(abs_dst) != l) {
+        errno = EXDEV;
+        return -1;
+    }
+
     return NO_LOWER(l->dir->rename_p)
                ? enosys() : l->dir->rename_p(l->ctx, abs_src, abs_dst);
 }
 
 static DIR *vfs_opendir(void *ctx, const char *name)
 {
-    const lower_t *l = ctx;
-
     RESOLVE_OR_FAIL(name, NULL);
 
     const int err = espix_fs_access_check(p, ESPIX_FS_ACCESS_OPENDIR, 0);
@@ -470,19 +654,33 @@ static DIR *vfs_opendir(void *ctx, const char *name)
         errno = ENOTDIR;
         return NULL;
     }
+    const lower_t *l = mount_by_path(p);
+
     if (NO_LOWER(l->dir->opendir_p)) {
         errno = ENOSYS;
         return NULL;
     }
-    return l->dir->opendir_p(l->ctx, p);
+
+    /*
+     * readdir and closedir get this handle and no path, so the mount it came
+     * from is remembered here and looked up again on those calls.
+     */
+    DIR *pdir = l->dir->opendir_p(l->ctx, p);
+    if (pdir != NULL) {
+        dir_map_set(pdir, l);
+    }
+    return pdir;
 }
 
 static struct dirent *vfs_readdir(void *ctx, DIR *pdir)
 {
-    const lower_t *l = ctx;
-
     if (espix_dev_dirp(pdir)) {
         return espix_dev_readdir(pdir);
+    }
+    const lower_t *l = mount_by_dir(pdir);
+    if (l == NULL) {
+        errno = EBADF;
+        return NULL;
     }
     if (NO_LOWER(l->dir->readdir_p)) {
         errno = ENOSYS;
@@ -494,10 +692,12 @@ static struct dirent *vfs_readdir(void *ctx, DIR *pdir)
 static int vfs_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
                          struct dirent **out)
 {
-    const lower_t *l = ctx;
-
     if (espix_dev_dirp(pdir)) {
         return espix_dev_readdir_r(pdir, entry, out);
+    }
+    const lower_t *l = mount_by_dir(pdir);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->dir->readdir_r_p)
                ? enosys() : l->dir->readdir_r_p(l->ctx, pdir, entry, out);
@@ -505,10 +705,12 @@ static int vfs_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
 
 static long vfs_telldir(void *ctx, DIR *pdir)
 {
-    const lower_t *l = ctx;
-
     if (espix_dev_dirp(pdir)) {
         return espix_dev_telldir(pdir);
+    }
+    const lower_t *l = mount_by_dir(pdir);
+    if (l == NULL) {
+        return -1;
     }
     return NO_LOWER(l->dir->telldir_p) ? enosys()
                                        : l->dir->telldir_p(l->ctx, pdir);
@@ -516,32 +718,33 @@ static long vfs_telldir(void *ctx, DIR *pdir)
 
 static void vfs_seekdir(void *ctx, DIR *pdir, long offset)
 {
-    const lower_t *l = ctx;
-
     if (espix_dev_dirp(pdir)) {
         espix_dev_seekdir(pdir, offset);
         return;
     }
-    if (!NO_LOWER(l->dir->seekdir_p)) {
+    const lower_t *l = mount_by_dir(pdir);
+    if (l != NULL && !NO_LOWER(l->dir->seekdir_p)) {
         l->dir->seekdir_p(l->ctx, pdir, offset);
     }
 }
 
 static int vfs_closedir(void *ctx, DIR *pdir)
 {
-    const lower_t *l = ctx;
-
     if (espix_dev_dirp(pdir)) {
         return espix_dev_closedir(pdir);
     }
-    return NO_LOWER(l->dir->closedir_p) ? enosys()
-                                        : l->dir->closedir_p(l->ctx, pdir);
+    const lower_t *l = mount_by_dir(pdir);
+    if (l == NULL) {
+        return ebadf();
+    }
+    const int rc = NO_LOWER(l->dir->closedir_p) ? enosys()
+                                                : l->dir->closedir_p(l->ctx, pdir);
+    dir_map_clear(pdir);
+    return rc;
 }
 
 static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
 {
-    const lower_t *l = ctx;
-
     RESOLVE_OR_FAIL(name, -1);
 
     /*
@@ -560,6 +763,7 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
         errno = err;
         return -1;
     }
+    const lower_t *l = mount_by_path(p);
     if (NO_LOWER(l->dir->mkdir_p)) {
         return enosys();
     }
@@ -573,8 +777,6 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
 
 static int vfs_rmdir(void *ctx, const char *name)
 {
-    const lower_t *l = ctx;
-
     RESOLVE_OR_FAIL(name, -1);
 
     if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
@@ -588,13 +790,12 @@ static int vfs_rmdir(void *ctx, const char *name)
         errno = err;
         return -1;
     }
+    const lower_t *l = mount_by_path(p);
     return NO_LOWER(l->dir->rmdir_p) ? enosys() : l->dir->rmdir_p(l->ctx, p);
 }
 
 static int vfs_truncate(void *ctx, const char *path, off_t length)
 {
-    const lower_t *l = ctx;
-
     RESOLVE_OR_FAIL(path, -1);
 
     if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
@@ -607,18 +808,22 @@ static int vfs_truncate(void *ctx, const char *path, off_t length)
         errno = err;
         return -1;
     }
+    const lower_t *l = mount_by_path(p);
     return NO_LOWER(l->dir->truncate_p)
                ? enosys() : l->dir->truncate_p(l->ctx, p, length);
 }
 
 static int vfs_ftruncate(void *ctx, int fd, off_t length)
 {
-    const lower_t *l = ctx;
     if (espix_dev_fd(fd)) {
         /* /dev/null is already empty and /dev/factory is read-only. */
         (void)length;
         errno = EINVAL;
         return -1;
+    }
+    const lower_t *l = mount_by_fd(fd);
+    if (l == NULL) {
+        return ebadf();
     }
     return NO_LOWER(l->dir->ftruncate_p)
                ? enosys() : l->dir->ftruncate_p(l->ctx, fd, length);
@@ -626,13 +831,13 @@ static int vfs_ftruncate(void *ctx, int fd, off_t length)
 
 static int vfs_utime(void *ctx, const char *path, const struct utimbuf *times)
 {
-    const lower_t *l = ctx;
     RESOLVE_OR_FAIL(path, -1);
 
     if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
         errno = EROFS;
         return -1;
     }
+    const lower_t *l = mount_by_path(p);
     return NO_LOWER(l->dir->utime_p) ? enosys()
                                      : l->dir->utime_p(l->ctx, p, times);
 }
@@ -684,6 +889,12 @@ static const esp_vfs_fs_ops_t s_espix_vfs = {
     .dir      = &s_espix_vfs_dir,
 };
 
+/*
+ * Fill in slot 0. Kept separate from espix_vfs_add_mount() above it because the
+ * root is not a mount like the others: it has no prefix, it is the fallback
+ * every path reaches, and it is registered with esp_vfs rather than only with
+ * the table below.
+ */
 esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
                                   void *lower_ctx)
 {
@@ -696,9 +907,17 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
         return ESP_ERR_INVALID_ARG;
     }
 
-    s_root.ops = lower_ops;
-    s_root.dir = lower_ops->dir;
-    s_root.ctx = lower_ctx;
+    portENTER_CRITICAL(&s_mount_lock);
+    lower_t *root = &s_mounts[0];
+    root->ops      = lower_ops;
+    root->dir      = lower_ops->dir;
+    root->ctx      = lower_ctx;
+    root->prefix[0] = '\0';
+    root->len      = 0;
+    /* littlefs carries espix's own mode and owner attributes. */
+    root->stored_metadata = true;
+    root->used     = true;
+    portEXIT_CRITICAL(&s_mount_lock);
 
     /*
      * "" is the fallback: any path no longer prefix claims. That is what makes
@@ -708,14 +927,128 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
      *
      * STATIC because the tables above are `const` and outlive any call;
      * CONTEXT_PTR because the ops take the lower layer as their first argument.
+     * The context is slot 0 and is used for nothing but identity: ops pick their
+     * mount by path, fd or directory handle, this VFS serving every mount.
      */
     const esp_err_t err = esp_vfs_register_fs(
         "", &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
-        &s_root);
+        &s_mounts[0]);
 
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot register the root VFS: %s",
                    esp_err_to_name(err));
     }
     return err;
+}
+
+esp_err_t espix_vfs_add_mount(const char *prefix,
+                              const esp_vfs_fs_ops_t *ops, void *ctx,
+                              bool stored_metadata)
+{
+    if (ops == NULL || ctx == NULL || prefix == NULL || ops->dir == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * Absolute, at least one character, no trailing slash: a prefix is matched
+     * whole, so "/mnt/" would never match "/mnt" and would quietly mount
+     * nothing.
+     */
+    const size_t len = strlen(prefix);
+    if (len < 1 || len >= ESPIX_FS_PREFIX_MAX || prefix[0] != '/' ||
+        prefix[len - 1] == '/') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_mount_lock);
+
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (s_mounts[i].used && strcmp(s_mounts[i].prefix, prefix) == 0) {
+            portEXIT_CRITICAL(&s_mount_lock);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    lower_t *slot = NULL;
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (!s_mounts[i].used) {
+            slot = &s_mounts[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        portEXIT_CRITICAL(&s_mount_lock);
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no free mount: %s", prefix);
+        return ESP_ERR_NO_MEM;
+    }
+
+    slot->ops      = ops;
+    slot->dir      = ops->dir;
+    slot->ctx      = ctx;
+    strlcpy(slot->prefix, prefix, sizeof(slot->prefix));
+    slot->len      = len;
+    slot->stored_metadata = stored_metadata;
+    slot->used     = true;
+
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "mounted %s", prefix);
+    return ESP_OK;
+}
+
+esp_err_t espix_vfs_del_mount(const char *prefix)
+{
+    if (prefix == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_mount_lock);
+
+    lower_t *slot = NULL;
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (s_mounts[i].used && strcmp(s_mounts[i].prefix, prefix) == 0) {
+            slot = &s_mounts[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        portEXIT_CRITICAL(&s_mount_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * Refused while a file is still open on it. There is no way to revoke a
+     * lower filesystem's fd -- it belongs to a task somewhere -- so the mount
+     * stays until the caller closes up; pulling the volume out from under a
+     * reader is the one outcome worse than a failed umount.
+     */
+    for (int fd = 0; fd < 256; fd++) {
+        if (s_fd_mount[fd] == (uint8_t)((slot - s_mounts) + 1)) {
+            portEXIT_CRITICAL(&s_mount_lock);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    for (size_t i = 0; i < ESPIX_FS_DIRS; i++) {
+        if (s_dir_map[i].mount == (uint8_t)((slot - s_mounts) + 1)) {
+            portEXIT_CRITICAL(&s_mount_lock);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    slot->used = false;
+    slot->ops  = NULL;
+    slot->dir  = NULL;
+    slot->ctx  = NULL;
+    slot->len  = 0;
+    slot->prefix[0] = '\0';
+
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "unmounted %s", prefix);
+    return ESP_OK;
+}
+
+bool espix_vfs_stores_metadata(const char *abs_path)
+{
+    return mount_by_path(abs_path)->stored_metadata;
 }

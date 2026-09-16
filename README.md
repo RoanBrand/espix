@@ -35,11 +35,12 @@ console, so `scp` puts an app in `/bin` and you run it by name. Files survive a
 reboot and a firmware reflash.
 
 The USB-OTG port is a **host** by default: a stick plugged into it is enumerated,
-identified and its partition table read on its own, and `lsblk`/`blkid` report
-what is there — including the filesystems espix cannot drive and disks that have
-no partition table at all. It is not mounted — [USB-HOST](docs/USB-HOST.md) says
-why — and because host mode and USB-NCM are two uses of the one OTG peripheral, a
-default build has no `usb0`.
+identified and its partition table read on its own, `lsblk`/`blkid` report what is
+there — including the filesystems espix cannot drive and disks that have no
+partition table at all — and `mount sda1 /mnt` mounts a FAT volume into the
+namespace, through espix's own VFS rather than a prefix of IDF's. Because host
+mode and USB-NCM are two uses of the one OTG peripheral, a default build has no
+`usb0` — [USB-HOST](docs/USB-HOST.md).
 
 Fault interception is wired but only *reports* — see
 [Crash handling and isolation](#crash-handling-and-isolation). For the full
@@ -329,8 +330,9 @@ merely missing.
 | `ls -i`, inode numbers | **no** | esp_littlefs reports `d_ino = 0` for every entry, and LittleFS exposes no file id |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
-| `/proc`, `mount` / `umount` | **planned** | espix owns `/` but routes only `/`; a second mount needs its own routing table |
-| `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). Nothing is mounted, and **one storage device at a time** — [USB-HOST](docs/USB-HOST.md) |
+| `/proc` | **planned** | the one part of espix's own mount table still missing; a second mount now exists |
+| `mount`, `umount` | **yes** | `mount sda1 /mnt` puts a FAT32/FAT16 volume from a USB device into the namespace, reached through espix's own VFS so the permission check applies to it. Root only; nothing is ever formatted; unplug while mounted is a gap — [USB-HOST](docs/USB-HOST.md#stage-2--mounting) |
+| `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). **One storage device at a time** — [USB-HOST](docs/USB-HOST.md) |
 | Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
 | Read and write bits enforced | **yes** | in espix's root VFS, so builtins, loaded apps and SFTP are all checked the same way |
@@ -348,7 +350,7 @@ merely missing.
 | `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
 | USB-NCM | **yes** | device role only: `usb0`, plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](docs/USB-NETWORKING.md) |
-| USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. One storage device at a time, for want of host channels — [USB-HOST](docs/USB-HOST.md) |
+| USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `mount sda1 /mnt` mounts its FAT volume, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. One storage device at a time, for want of host channels — [USB-HOST](docs/USB-HOST.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Raw lwIP / `netconn` for the SSH transport | **planned** | BSD sockets today, deliberately: apps get the same API. Cut calls before changing API — one `send()` per packet instead of three was worth 1.7× |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |

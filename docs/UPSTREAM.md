@@ -226,6 +226,58 @@ Not an oversight anyone has missed — IDF's own test says so:
     // f_chmod support to be implemented in VFS)
     -- components/vfs/test_apps/main/test_vfs_access.c
 
+### FatFs cannot be mounted without registering a path
+
+`esp_vfs_fat_*_mount()` ends in `esp_vfs_register_fs()`, so an IDF FatFs mount is
+always *also* a prefix in the namespace. For a VFS that owns the namespace itself
+— which is where a permission check belongs, the same place Linux and NuttX put
+theirs — that is the whole problem: the prefix outranks the owner's fallback, and
+those paths reach the filesystem with no check applied.
+
+There is no way around it from outside the component. The ops tables
+(`s_vfs_fat`, `s_vfs_fat_dir`) are file-scope static, and the context they take is
+built *inside* `esp_vfs_fat_register()`, whose only other job is the registration,
+so the two cannot be separated by a caller either.
+
+The split is small, and this is what espix carries in
+`tools/esp_vfs_fat-ctx.patch`:
+
+- `fat_ctx_create()`, lifted out of `esp_vfs_fat_register()`, which now calls it —
+  one implementation with two callers rather than a copy that can drift;
+- `esp_vfs_fat_ctx_create()` / `esp_vfs_fat_ctx_free()`: build and free a context
+  that is registered nowhere;
+- `esp_vfs_fat_get_ops()`: hand out the tables.
+
+Paths handed to those ops are already relative to the mount point, exactly as
+`esp_vfs` would have made them. (The declarations went into
+`vfs/vfs_fat_internal.h` because `esp_vfs_fat.h` cannot name `esp_vfs_fs_ops_t`
+without making fatfs depend on `vfs` publicly — a decision upstream should make
+rather than inherit from a patch.)
+
+espix applies this with `tools/patch-fatfs.py` from the build, which is a worse
+arrangement than `managed_components/`: fatfs is a **built-in** component and the
+registry publishes no `espressif/fatfs` that could override it. See
+[USB-HOST.md](USB-HOST.md#stage-2--mounting) for the cost of carrying it.
+
+### A partition view cannot be larger than 4GB
+
+`esp_blockdev_generic_partition_get()` takes the partition's offset and size as
+`size_t`, and stores the offset as one:
+
+    esp_err_t esp_blockdev_generic_partition_get(esp_blockdev_handle_t parent,
+                                                 size_t start, size_t size,
+                                                 esp_blockdev_handle_t *out);
+    typedef struct { esp_blockdev_t dev; esp_blockdev_handle_t parent;
+                     size_t start_offset; } esp_blockdev_generic_partition_t;
+
+`size_t` is 32 bits on every ESP32 target, so a partition larger than 4GB — one
+FAT32 volume on an ordinary USB stick, which is the case that finds this — cannot
+be expressed. It does not fail, either: the size truncates, the volume mounts as
+the low 32 bits of itself, and the failure surfaces much later as a read past a
+boundary nobody asked for. espix carries `components/espix_fs/part.c`, the same
+implementation with `uint64_t` offsets — about eighty lines, and a pity to have
+twice.
+
 ### `chmod()` returns success and does nothing
 
 `esp_libc/src/realpath.c`:

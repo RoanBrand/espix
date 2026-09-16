@@ -159,6 +159,15 @@ static void owner_from_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
  */
 static esp_err_t attr_read(const char *abs_path, espix_fs_posix_attr_t *out)
 {
+    /*
+     * A mount whose filesystem keeps no modes of its own has nothing to read,
+     * and asking littlefs about a path that lives on another filesystem would be
+     * answering from the wrong volume. NOT_FOUND is what the rules already treat
+     * as "nothing stored", so the rule answers instead.
+     */
+    if (!espix_vfs_stores_metadata(abs_path)) {
+        return ESP_ERR_NOT_FOUND;
+    }
     return esp_littlefs_getattr(ESPIX_FS_ROOT_PARTITION, abs_path,
                                 ESPIX_FS_ATTR_POSIX, out, sizeof(*out), NULL);
 }
@@ -213,6 +222,19 @@ static bool attr_effective(const char *abs_path, const struct stat *st,
 static esp_err_t attr_store(const char *abs_path, const struct stat *st,
                             const espix_fs_posix_attr_t *attr)
 {
+    /*
+     * FAT has nowhere to keep a mode or an owner. Refused rather than written,
+     * because the only metadata store here is littlefs's: stamping it with a
+     * path from another filesystem would file the record against the wrong
+     * volume -- and "/mnt/photo.jpg" has no counterpart in the rootfs at all.
+     *
+     * Refused the way a device's mode is, so a caller gets EPERM out of chmod
+     * rather than a silent success against nothing.
+     */
+    if (!espix_vfs_stores_metadata(abs_path)) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
     espix_fs_posix_attr_t rule;
     attr_from_rule(abs_path, st, &rule);
 

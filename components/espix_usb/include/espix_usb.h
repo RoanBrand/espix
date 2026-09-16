@@ -1,12 +1,11 @@
 /*
  * USB host: the OTG port in host mode, and the storage devices found on it.
  *
- * Stage 1 is enumeration and nothing else. A device is found, identified, and
- * its partition table read, and then espix stops -- nothing here is mounted and
- * nothing is registered with the VFS. That is not caution for its own sake: a
- * filesystem mounted at its own prefix is routed by IDF before espix's
- * permission check ever sees a path (components/espix_fs/dev.c says why), so
- * mounting means a mount table, and a mount table is not this.
+ * Stage 1 was enumeration and nothing else. Stage 2 mounts: espix owns the
+ * namespace, so a mounted filesystem is reached through espix's own VFS rather
+ * than registered at a prefix, and this component's part in that is to lend the
+ * block device (see espix_usb_dev_blockdev()) -- the mount table and the FAT
+ * driver are in espix_fs, and docs/USB-HOST.md has the shape of it.
  *
  * The port has one role at a time, chosen at build time
  * (CONFIG_ESPIX_USB_ROLE in espix_net/Kconfig), so in a device-role build there
@@ -20,6 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "esp_blockdev.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -98,6 +98,21 @@ bool espix_usb_present(void);
  * and never more than n, so a caller with a stack array is safe.
  */
 size_t espix_usb_devlist(espix_usb_dev_t *out, size_t n);
+
+/*
+ * The block device under a storage device, so that it can be mounted.
+ *
+ * Borrowed, never owned: it belongs to the device's slot and is given back when
+ * the device goes. A mount that outlives its device is therefore not safe, and
+ * that is written down in docs/KNOWN-ISSUES.md rather than papered over here.
+ *
+ * Named by the *disk* -- "sda", not "sda1" -- because a partition is a view over
+ * the disk's block device rather than a device of its own; build one from the
+ * byte offsets in `espix_usb_dev_t.parts` with
+ * esp_blockdev_generic_partition_get(). NULL for a name that is not a storage
+ * device espix has, and in a device-role build.
+ */
+esp_blockdev_handle_t espix_usb_dev_blockdev(const char *name);
 
 /*
  * Everything the host library can see on the port, which is not the same set as

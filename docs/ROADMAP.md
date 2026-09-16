@@ -70,7 +70,9 @@ things are as they are.
 
 ## Filesystem
 
-- **`mount`, `umount` and `/proc`, with espix's own mount table.** espix owns
+- **`mount`, `umount` and `/proc`, with espix's own mount table.** *Done for FAT
+  on USB — see [USB-HOST.md](USB-HOST.md#stage-2--mounting); `/proc` is the rest
+  of it.* espix owns
   the root VFS but routes only the root: it holds one pointer to one filesystem.
   Anything else mounted — FAT on an SD card, a second LittleFS partition,
   `/proc` — would be registered with ESP-IDF's VFS at its own prefix and would
@@ -85,37 +87,48 @@ things are as they are.
   [UPSTREAM.md](UPSTREAM.md)). `/proc` is then espix's own ops rather than a
   filesystem at all, which is what makes it the cheap one to do first.
 
-  **The second filesystem now exists, and it is a USB stick.** Enumeration,
-  identification and the partition table are shipped — [USB-HOST.md](USB-HOST.md)
-  — including a held `esp_blockdev` handle per device, which is exactly what a
-  mount would be given. Nothing is mounted because of the two defects below,
-  which are not stylistic: a `confine`d process could read the whole stick, and
-  `chmod` on a FAT file would store littlefs attributes for the wrong partition
-  (`components/espix_fs/mode.c` hardcodes `ESPIX_FS_ROOT_PARTITION`).
+  **The second filesystem exists, and it mounts.** Enumeration, identification
+  and the partition table shipped first — [USB-HOST.md](USB-HOST.md) — and
+  `mount sda1 /mnt` now puts a FAT volume in the namespace with the permission
+  check still applying to it. Both defects that blocked it are closed: the
+  filesystem is reached through espix's table rather than registered at a prefix,
+  and a mount that stores no metadata of its own (FAT) has `chmod` answer EPERM
+  instead of filing littlefs attributes for a path that is not on littlefs.
 
   **"Routing internally" is smaller than it sounds**, and worth costing before
-  rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the
-  global fd table either way; what espix adds is a prefix lookup (an array and a
-  longest-match `strncmp`, ~30 lines) and one wrinkle — with two filesystems
-  below, LittleFS fd 3 and FAT fd 3 collide when they come back into espix's
-  `read()`, so the mount index gets packed into the fd espix returns and
-  unpacked on the way in. About ten lines and no second table. Call it eighty
-  lines, not a VFS.
+  rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the global
+  fd table either way; what espix adds is a prefix lookup (an array and a
+  longest-match `strncmp`) and one wrinkle — and the wrinkle was written down
+  wrong here. With two filesystems below, LittleFS fd 3 and FAT fd 3 *cannot*
+  collide: espix passes the lower filesystem's fd through unchanged and IDF
+  allocates those from one global table, so an fd identifies its filesystem by
+  construction. What routing needs is the reverse question, fd (or `DIR`) to
+  mount, which is a 256-byte array indexed by fd plus a few pointer slots for
+  directory handles — and that is what it turned out to be: `lower_t s_mounts[]`
+  in `vfs.c`, `espix_vfs_add_mount()`, and `components/espix_fs/fat.c` behind it.
 
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
 
   **Why not extend ESP-IDF's VFS instead?** It has no hook of any kind —
-  `esp_vfs.h` offers nothing to intercept with. Patching `$IDF_PATH` is a
-  non-starter: it is shared by every project on the machine, where
-  `managed_components/` is per-project and gitignored. The real alternative is
-  shadowing the `vfs` component with a patched copy in `components/vfs/`, which
-  a project component may do — and that is *architecturally the better answer*,
-  putting the check in `esp_vfs_open()` where Linux puts it and covering every
-  mount with no routing code in espix at all. It is not first choice only
-  because of what it costs: `vfs.c` and `vfs_calls.c` are ~58KB of core code
-  that the console, sockets and eventfd all depend on, to be re-merged on every
-  IDF upgrade. Worth revisiting if the eighty lines above turn out to be wrong.
+  `esp_vfs.h` offers nothing to intercept with. Patching `$IDF_PATH` for *this* is
+  a non-starter: it is shared by every project on the machine, where
+  `managed_components/` is per-project and gitignored — and a behavioural change
+  to core VFS code is not something to carry in a tree espix does not own. The
+  real alternative is shadowing the `vfs` component with a patched copy in
+  `components/vfs/`, which a project component may do — and that is
+  *architecturally the better answer*, putting the check in `esp_vfs_open()` where
+  Linux puts it and covering every mount with no routing code in espix at all. It
+  is not first choice only because of what it costs: `vfs.c` and `vfs_calls.c` are
+  ~58KB of core code that the console, sockets and eventfd all depend on, to be
+  re-merged on every IDF upgrade. Worth revisiting if those eighty lines turn out
+  to be wrong.
+
+  Stage 2 did patch `$IDF_PATH` — for `fatfs`, not `vfs`, and the distinction is
+  the whole reason it was acceptable: three *additive* functions and a refactor
+  whose absence is a link error on the first build, rather than a change to core
+  code whose absence would be a behavioural difference nobody would notice until
+  it mattered. See [UPSTREAM.md](UPSTREAM.md) — the request goes there either way.
 
 - ~~**A file surface for apps.**~~ Done. `abi_fs.c` publishes fopen, open,
   read, stat, opendir and the rest, and almost all of it is unwrapped libc

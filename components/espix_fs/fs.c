@@ -19,9 +19,11 @@
 #define TAG "fs"
 
 /* Created on first boot so a freshly-formatted filesystem still looks sane,
- * even without the baked fsroot image. */
+ * even without the baked fsroot image. /mnt is the conventional place to mount
+ * a removable filesystem, and having it there is what lets `mount sda1 /mnt`
+ * work on a device whose image predates mounting. */
 static const char *const k_skeleton[] = {
-    "/bin", "/dev", "/etc", "/home", "/tmp", "/var", "/var/log",
+    "/bin", "/dev", "/etc", "/home", "/mnt", "/tmp", "/var", "/var/log",
 };
 
 static bool s_mounted;

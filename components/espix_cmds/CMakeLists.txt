@@ -26,6 +26,7 @@ idf_component_register(
         espix_usb
         espix_auth
         espix_time
+        esp_blockdev
         lwip
         freertos
         esp_system

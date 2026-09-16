@@ -65,6 +65,16 @@ size_t espix_usb_devlist(espix_usb_dev_t *out, size_t n)
 #endif
 }
 
+esp_blockdev_handle_t espix_usb_dev_blockdev(const char *name)
+{
+#if CONFIG_ESPIX_USB_ROLE_HOST
+    return espix_usb_host_dev_blockdev(name);
+#else
+    (void)name;
+    return NULL;
+#endif
+}
+
 void espix_usb_host_status(espix_usb_host_status_t *out)
 {
     if (out == NULL) {

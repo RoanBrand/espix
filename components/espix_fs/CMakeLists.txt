@@ -5,14 +5,18 @@ idf_component_register(
         "vfs.c"
         "access.c"
         "dev.c"
+        "fat.c"
+        "part.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
         "priv_include"
     REQUIRES
         esp_common
+        esp_blockdev
     PRIV_REQUIRES
         esp_partition
+        fatfs
         espix_kernel
         espix_proc
         espix_shell

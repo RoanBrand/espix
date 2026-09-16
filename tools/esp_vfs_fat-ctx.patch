@@ -1,0 +1,157 @@
+diff --git a/components/fatfs/vfs/vfs_fat.c b/components/fatfs/vfs/vfs_fat.c
+index 4595f91c..3968b2fc 100644
+--- a/components/fatfs/vfs/vfs_fat.c
++++ b/components/fatfs/vfs/vfs_fat.c
+@@ -180,21 +180,26 @@ static const esp_vfs_fs_ops_t s_vfs_fat = {
+ #endif // CONFIG_VFS_SUPPORT_DIR
+ };
+ 
+-esp_err_t esp_vfs_fat_register(const esp_vfs_fat_conf_t* conf, FATFS** out_fs)
++/*
++ * espix: the ops tables themselves, so a caller can drive this driver without
++ * going through esp_vfs. The dir ops hang off s_vfs_fat.
++ */
++const esp_vfs_fs_ops_t* esp_vfs_fat_get_ops(void)
+ {
+-    size_t ctx = find_context_index_by_path(conf->base_path);
+-    if (ctx < FF_VOLUMES) {
+-        if (out_fs) {
+-            *out_fs = &s_fat_ctxs[ctx]->fs;
+-        }
+-        return ESP_ERR_INVALID_STATE;
+-    }
+-
+-    ctx = find_unused_context_index();
+-    if (ctx == FF_VOLUMES) {
+-        return ESP_ERR_NO_MEM;
+-    }
++    return &s_vfs_fat;
++}
+ 
++/*
++ * espix: everything esp_vfs_fat_register() does that is not registration.
++ *
++ * Lifted out of it rather than copied, so a context built for a caller that
++ * registers nothing is the same context: if this file's idea of one changes,
++ * both paths change together. The lock is left to the callers, because a
++ * registration that fails frees the context and must not close a lock it never
++ * initialised.
++ */
++static esp_err_t fat_ctx_create(const esp_vfs_fat_conf_t* conf, vfs_fat_ctx_t** out_ctx)
++{
+     size_t max_files = conf->max_files;
+     if (max_files < 1) {
+         max_files = 1;  // ff_memalloc(max_files * sizeof(bool)) below will fail if max_files == 0
+@@ -219,7 +224,81 @@ esp_err_t esp_vfs_fat_register(const esp_vfs_fat_conf_t* conf, FATFS** out_fs)
+     strlcpy(fat_ctx->fat_drive, conf->fat_drive, sizeof(fat_ctx->fat_drive) - 1);
+     strlcpy(fat_ctx->base_path, conf->base_path, sizeof(fat_ctx->base_path) - 1);
+ 
+-    esp_err_t err = esp_vfs_register_fs(conf->base_path, &s_vfs_fat, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC, fat_ctx);
++    *out_ctx = fat_ctx;
++    return ESP_OK;
++}
++
++/*
++ * espix: a context with no VFS entry. The caller drives esp_vfs_fat_get_ops()
++ * itself and frees this with esp_vfs_fat_ctx_free() when the volume is
++ * unmounted. base_path is bookkeeping only: nothing here strips it.
++ */
++esp_err_t esp_vfs_fat_ctx_create(const esp_vfs_fat_conf_t* conf, FATFS** out_fs, void** out_ctx)
++{
++    if (conf == NULL || out_fs == NULL || out_ctx == NULL) {
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    vfs_fat_ctx_t* fat_ctx = NULL;
++    esp_err_t err = fat_ctx_create(conf, &fat_ctx);
++    if (err != ESP_OK) {
++        return err;
++    }
++
++    _lock_init(&fat_ctx->lock);
++    *out_fs = &fat_ctx->fs;
++    *out_ctx = fat_ctx;
++    return ESP_OK;
++}
++
++/*
++ * espix: the reverse of esp_vfs_fat_ctx_create(), freeing what
++ * esp_vfs_fat_unregister_path() frees and nothing else. The volume is the
++ * caller's to unmount first -- f_mount(NULL, drv, 0) -- because only it knows
++ * the drive number.
++ */
++esp_err_t esp_vfs_fat_ctx_free(void* ctx)
++{
++    if (ctx == NULL) {
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    vfs_fat_ctx_t* fat_ctx = (vfs_fat_ctx_t*) ctx;
++    _lock_close(&fat_ctx->lock);
++#if !FF_FS_TINY && FF_USE_DYN_BUFFER
++    for (size_t i = 0; i < fat_ctx->max_files; ++i) {
++        if (fat_ctx->files[i].buf != NULL) {
++            ff_memfree(fat_ctx->files[i].buf);
++        }
++    }
++#endif
++    free(fat_ctx->flags);
++    free(fat_ctx);
++    return ESP_OK;
++}
++
++esp_err_t esp_vfs_fat_register(const esp_vfs_fat_conf_t* conf, FATFS** out_fs)
++{
++    size_t ctx = find_context_index_by_path(conf->base_path);
++    if (ctx < FF_VOLUMES) {
++        if (out_fs) {
++            *out_fs = &s_fat_ctxs[ctx]->fs;
++        }
++        return ESP_ERR_INVALID_STATE;
++    }
++
++    ctx = find_unused_context_index();
++    if (ctx == FF_VOLUMES) {
++        return ESP_ERR_NO_MEM;
++    }
++
++    vfs_fat_ctx_t* fat_ctx = NULL;
++    esp_err_t err = fat_ctx_create(conf, &fat_ctx);
++    if (err != ESP_OK) {
++        return err;
++    }
++
++    err = esp_vfs_register_fs(conf->base_path, &s_vfs_fat, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC, fat_ctx);
+     if (err != ESP_OK) {
+         free(fat_ctx->flags);
+         free(fat_ctx);
+diff --git a/components/fatfs/vfs/vfs_fat_internal.h b/components/fatfs/vfs/vfs_fat_internal.h
+index 03c36a3e..d5795ee4 100644
+--- a/components/fatfs/vfs/vfs_fat_internal.h
++++ b/components/fatfs/vfs/vfs_fat_internal.h
+@@ -14,6 +14,25 @@
+ #include "sdmmc_cmd.h"
+ #endif
+ #include <sys/param.h>
++#include "esp_vfs_ops.h"   // espix: esp_vfs_fs_ops_t, for esp_vfs_fat_get_ops()
++
++/*
++ * espix additions (see tools/patch-fatfs.py): mount a FAT filesystem without
++ * registering it at a base path, for a VFS that owns the namespace itself and
++ * reaches this driver through the ops below.
++ *
++ * Declared here rather than in esp_vfs_fat.h because that header would then name
++ * esp_vfs_fs_ops_t and have to depend on vfs publicly -- a bigger change than
++ * this one, and one upstream can make when it takes these.
++ *
++ * Paths handed to those ops must be relative to the mount point already, the way
++ * esp_vfs would have made them.
++ */
++esp_err_t esp_vfs_fat_ctx_create(const esp_vfs_fat_conf_t* conf, FATFS** out_fs,
++                                 void** out_ctx);
++esp_err_t esp_vfs_fat_ctx_free(void* ctx);
++const esp_vfs_fs_ops_t* esp_vfs_fat_get_ops(void);
++
+ #include <stddef.h>
+ 
+ typedef struct vfs_fat_spiflash_ctx_t {
