@@ -24,43 +24,56 @@ together.
 
 ## Status
 
-Early, but running on hardware. Verified on an ESP32-S3 (16MB flash, 8MB octal
-PSRAM) with ESP-IDF v6.1: LittleFS mounted as the real `/`, a
-transport-agnostic shell of 60 commands, a process table, and — the point of
-the exercise — an app cross-compiled on a PC, copied over as a file, and loaded
-and executed at runtime with argv and an exit status.
+Early, but running on hardware. The tables below are what works and where it
+runs, and the legend is the same one the Unix surface uses:
 
-WiFi comes up as `wlan0` and an SSH server serves the same shell as the serial
-console, so `scp` puts an app in `/bin` and you run it by name. Files survive a
-reboot and a firmware reflash.
+- **yes** — it works on the S3, the only part espix has actually been run on
+  (16MB flash, 8MB octal PSRAM, ESP-IDF v6.1). The other targets are
+  build-verified or planned, and say so below.
+- **partial** — it works, with a caveat named in the notes.
+- **planned** — designed for rather than built.
 
-The USB-OTG port is a **host** by default, so a default build has no `usb0`:
-host mode and USB-NCM are two uses of the one peripheral. What that carries is in
-[feature highlights](#feature-highlights) and [USB-HOST](docs/USB-HOST.md).
+### Capabilities
 
-Fault interception is wired but only *reports* — see
-[Crash handling and isolation](#crash-handling-and-isolation). For the Unix
-surface row by row, see [docs/POSIX.md](docs/POSIX.md).
+| Category | | | |
+|---|---|---|---|
+| Storage | LittleFS mounted as the real `/` | **yes** | survives reboot and a firmware reflash |
+| Storage | USB host: enumerate, identify, read the partition table | **yes** | `lsusb`, `lsblk`, `blkid`; four device slots, for a hub |
+| Storage | Mount a FAT volume into the namespace | **yes** | through espix's own VFS, so the permission check applies |
+| Storage | `/etc/fstab`, applied on attach | **yes** | device column takes a name, a wildcard, or `LABEL=`/`UUID=`/`PARTUUID=` |
+| Storage | `mount -o uid=,gid=` | **yes** | root hands a volume to a user without giving them root |
+| Storage | Volumes mounted at once | **partial** | two, bounded by `CONFIG_FATFS_VOLUME_COUNT` |
+| Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
+| Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` |
+| Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
+| Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
+| Shell | Serial console and SSH, same commands | **yes** | 60 commands |
+| Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
+| Shell | Line editing, history, TAB completion | **yes** | |
+| Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
+| Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
+| Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
+| Faults | Permissions enforced in espix's own VFS | **yes** | builtins, loaded apps and SFTP alike |
+| Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
+| Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
 
-## Feature highlights
+### Targets
 
-- **An ESP32-S3 runtime with 16MB flash and 8MB PSRAM**, LittleFS mounted as the
-  real `/`, surviving reboot and reflash.
-- **A shell on the serial console and over SSH**, with line editing, history and
-  TAB completion.
-- **The OTG port as a USB host**: a stick is enumerated, its partition table read,
-  its FAT volume mounted into the namespace, and `/etc/fstab` mounts by label,
-  UUID or PARTUUID.
-- **A native app ABI**: cross-compile on a PC, copy the ELF over, run it by name
-  with argv and an exit status — signals, the filesystem, the environment,
-  and its own uid and gid.
-- **Users, groups and permissions**: passwords, `chown`/`chmod`, supplementary
-  groups, `sudo`, and `confine` for an app with its own view of the filesystem.
-- **A process table**: `ps`, `top`, `kill`, signal handlers, and a per-process
-  working directory.
-- **WiFi with a real clock** (DHCP and NTP), and USB-NCM as the alternative wire.
+| | **S3** — verified | **P4** — planned | **S31** — planned |
+|---|---|---|---|
+| ISA | Xtensa | RISC-V | RISC-V |
+| MMU | none | address translation and RISC-V PMP | a real one — a Linux BSP exists |
+| Process isolation | guardrail only | fault isolation between tasks, to confirm | **planned**, `fork()`-shaped |
+| USB | one OTG: host **or** device | two, so both at once | one OTG |
+| Radio | WiFi | none built in — companion chip needed | WiFi |
+| Wired | — | 100M Ethernet | Gigabit Ethernet |
+| Display | — | MIPI DSI, HDMI variants | weaker than the P4 |
+| Runs today | **yes** | no | no |
 
-*The full Unix surface, row by row, with what is deliberate and what is **no** —
+The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),
+which is also where the one build option hardware decides today is explained.
+
+*The Unix surface, row by row, with what is deliberate and what is **no** —
 [docs/POSIX.md](docs/POSIX.md).*
 
 ## Getting started
@@ -264,11 +277,10 @@ kernel messages.
 
 ## Hardware Targets
 
-| Chip | Notes |
-|---|---|
-| **S3** | Most common / oldest of the three targets. Xtensa ISA, not RISC-V. No MMU available. |
-| **P4** | Best for "desktop"-style use — best display output (MIPI DSI, HDMI variant exists), Ethernet (100M). Weaker MMU than S31 (not enough for real Linux-style isolation). **No built-in WiFi/BT** — needs a companion chip (typically ESP32-C6) over SDIO/SPI for wireless. |
-| **S31** | Latest ESP32. CPU freq (320mhz) is lower than the P4, but has higher IPC efficiency. Has a real MMU. Gigabit Ethernet. Weaker/limited display output vs P4.  |
+The chips, and what each one changes, are in the grid at
+[Status — Targets](#targets). What follows is the hardware detail those rows
+rest on.
+
 
 Support priority and per-chip feature availability (isolation model,
 display, networking) still to be finalized as the design matures.

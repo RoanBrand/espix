@@ -41,7 +41,7 @@ merely missing.
 | Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`; `stat` reports the same mode and owner `ls -l` shows |
 | Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |
 | `fork()` / `exec()` | **no** on S3, **planned** on S31 | needs an MMU for copy-on-write; the S31 has one |
-| MMU-backed process isolation | **no** on S3, **planned** on S31 | see [Hardware Targets](#hardware-targets) and [Crash handling](#crash-handling-and-isolation) |
+| MMU-backed process isolation | **no** on S3, **planned** on S31 | see [hardware targets](../README.md#hardware-targets) and [crash handling](#crash-handling-and-isolation) |
 | setuid / setgid / sticky | **yes** | all three consulted; setuid is a guardrail on S3 and a boundary on S31 |
 
 ### Filesystem
