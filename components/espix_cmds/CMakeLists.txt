@@ -8,6 +8,8 @@ idf_component_register(
         "cmd_net.c"
         "cmd_motd.c"
         "cmd_time.c"
+        "cmd_blk.c"
+        "cmd_usbhost.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -21,6 +23,7 @@ idf_component_register(
         espix_shell
         espix_fault
         espix_net
+        espix_usb
         espix_auth
         espix_time
         lwip

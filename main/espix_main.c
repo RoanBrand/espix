@@ -18,8 +18,12 @@
  *                 /etc/wifi.conf. Returns immediately; association and DHCP
  *                 run on the event loop, so an absent or unreachable network
  *                 never delays the prompt.
- *   7. commands — need the registry, and the filesystem to act on.
- *   8. console  — takes over this task and does not return.
+ *   7. usb      — the OTG port as a host, when the role is host. Independent of
+ *                 everything above and, like networking, done as soon as the
+ *                 stack is up: an empty socket is the normal case, and devices
+ *                 appear on the USB task as they are plugged in.
+ *   8. commands — need the registry, and the filesystem to act on.
+ *   9. console  — takes over this task and does not return.
  */
 
 #include "esp_err.h"
@@ -35,6 +39,7 @@
 #include "espix_shell.h"
 #include "espix_ssh.h"
 #include "espix_time.h"
+#include "espix_usb.h"
 
 #define TAG "espix"
 
@@ -64,6 +69,16 @@ void app_main(void)
     const esp_err_t net_err = espix_net_init();
     if (net_err != ESP_OK) {
         ESP_LOGW(TAG, "networking unavailable: %s", esp_err_to_name(net_err));
+    }
+
+    /*
+     * The other use of the OTG port, and the reason the port has a role: only
+     * one of USB-NCM and USB host can have it. Also not fatal -- the board works
+     * with nothing in the socket, which is how it usually is.
+     */
+    const esp_err_t usb_err = espix_usb_init();
+    if (usb_err != ESP_OK) {
+        ESP_LOGW(TAG, "usb host unavailable: %s", esp_err_to_name(usb_err));
     }
 
 #if CONFIG_ESPIX_SSH_ENABLED

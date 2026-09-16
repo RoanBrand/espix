@@ -431,6 +431,59 @@ changes — deliberately survivable, since it falls back to the old generic
 message. **Delete `missing_symbol_name()`, `missing_sym_visit()` and
 `ELF_MISSING_SYM_PREFIX` when this lands.**
 
+## `espressif/usb` and `espressif/usb_host_msc` (the USB host stack)
+
+### A client's event callback must not wait on that client's own transfers
+
+The documented pattern for a class driver is to call `msc_host_install_device()`
+from the MSC event callback, and Espressif's own example does exactly that. It
+does not work. The callback is invoked from `usb_host_client_handle_events()`
+(`usb_host.c:1319`), and a client's transfer completions are delivered only from
+inside that same function: its endpoint list is serviced there
+(`_handle_pending_ep()`, `usb_host.c:1296`) and that is where
+`urb->transfer.callback()` runs (`usb_host.c:1136`). So an install started in the
+callback waits on a semaphore that only the call stack it is blocking can give.
+
+Nothing fails fast and nothing is logged. `msc_bulk_transfer()` waits the
+transfer's full `timeout_ms` — 5000 ms, set by the driver (`msc_host.c:703`) — and
+`msc_wait_for_ready_state()` retries `5000 / 100 = 50` times (`msc_host.c:297`,
+`:551`), each retry another SCSI command of three transfers. Measured on an
+ESP32-S3 with a Samsung PSSD T9: **ten minutes to fail**, no log line until it
+does, the `USB MSC` task blocked throughout, and therefore the *next* device never
+reported either. From outside it looks exactly like a driver that ignored the
+device — which is how espix spent a day on it.
+
+**Workaround:** do the work somewhere else. espix queues the address from the
+callback and a `usb:work` task performs the install; the same SSD then attaches in
+**1.0 s**. Everything else that blocks on transfers follows the same rule: espix's
+`usbscan` and `usbprobe` run from a session task and never from `usb:host`,
+because `usb:host` is the task that drives the library whose completions the
+install is waiting for — doing it there moves the deadlock rather than fixing it.
+
+### `msc_host_install_device()` asserts on a device with no bulk-only interface
+
+`extract_config_from_descriptor()` looks for the class-8 / subclass-6 /
+protocol-0x50 interface and then does `assert(ifc_desc)` (`msc_host.c:228`). A
+public API that aborts the board is a sharp edge: pointing a diagnostic at a hub
+resets the device instead of answering "not storage".
+
+**Workaround:** check the interface list first and never call the driver for a
+device that has none — `addr_msc_interface()` in `espix_usb/host.c` does, and
+`usbprobe` reports it in words. The driver could return
+`ESP_ERR_NOT_SUPPORTED` like the rest of its error paths do.
+
+### `USB_W_VALUE_DT_INTERFACE` used where `USB_B_DESCRIPTOR_TYPE_INTERFACE` is meant
+
+`next_interface_desc()` filters descriptor walks by `USB_W_VALUE_DT_INTERFACE`
+(`msc_host.c:108`) — the *wValue* encoding used in control requests, not the
+`bDescriptorType` field it is compared against. It works only because both
+constants happen to be `0x04` (`usb_types_ch9.h:45` and `:146`). Either changing
+would silently stop the class driver seeing any interface at all, with the symptom
+of the first entry above: a device that enumerates and is then ignored.
+
+**Workaround:** none needed today; named here so the coincidence is not
+rediscovered as a mystery.
+
 ## `espressif/esp_tinyusb` (TinyUSB NCM)
 
 ### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer

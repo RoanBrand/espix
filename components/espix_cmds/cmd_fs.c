@@ -93,39 +93,13 @@ static void ls_time(char *out, size_t len, time_t t)
 /*
  * The size column, plain or -h.
  *
- * coreutils rounds up, and drops to one decimal only below 10: 1412 bytes is
- * "1.4K" and 20796 is "21K", not "20.3K". Matching that exactly matters more
- * than being arithmetically neat, because the point of -h is that the number
- * looks like the one every other tool would have printed.
- *
- * Integer arithmetic throughout. The obvious version wants doubles and ceil(),
- * which drags in libm for a column of a listing.
+ * The formatting itself lives in espix_cmd_size(), beside every other command's
+ * shared helpers, because `lsblk` reports sizes too and two implementations of
+ * "1.5M" drift.
  */
 static void ls_size(char *out, size_t len, off_t bytes, bool human)
 {
-    if (!human || bytes < 1024) {
-        snprintf(out, len, "%ld", (long)bytes);
-        return;
-    }
-
-    static const char units[] = { 'K', 'M', 'G' };
-    uint64_t          div     = 1024;
-    int               u       = 0;
-
-    while ((uint64_t)bytes >= div * 1024 && u < 2) {
-        div *= 1024;
-        u++;
-    }
-
-    /* Tenths, rounded up -- never report less than the file holds. */
-    const uint64_t tenths = ((uint64_t)bytes * 10 + div - 1) / div;
-
-    if (tenths < 100) {
-        snprintf(out, len, "%u.%u%c", (unsigned)(tenths / 10),
-                 (unsigned)(tenths % 10), units[u]);
-    } else {
-        snprintf(out, len, "%u%c", (unsigned)((tenths + 9) / 10), units[u]);
-    }
+    espix_cmd_size(out, len, (uint64_t)(bytes < 0 ? 0 : bytes), human);
 }
 
 /*

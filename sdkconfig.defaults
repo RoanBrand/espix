@@ -211,6 +211,12 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=2
 #
 # USB-NCM (usb0)
 #
+# The role choice, in components/espix_net/Kconfig, decides whether any of this
+# is built at all: USB-NCM and USB host claim the same OTG peripheral, and the
+# S3 has one (SOC_USB_OTG_PERIPH_NUM is 1). These settings are inert in a
+# host-role build, which is the default -- TinyUSB is not linked and nothing here
+# is read.
+#
 # NCM rather than ECM or RNDIS. All three carry Ethernet over USB; NCM is the
 # modern one and the only one every current host takes without help -- Linux,
 # macOS and Windows 11 all bind it from their own in-box drivers. ECM has never
@@ -255,6 +261,29 @@ CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200
 # means supplying string descriptors at runtime rather than from Kconfig.
 CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="espix"
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"
+
+#
+# USB host
+#
+# Hub support defaults to **n** in the host stack, so without this line a hub is
+# a dead socket: the devices behind it never enumerate, and nothing in the log
+# says why the stick is not there. This one line is what makes the hub half of
+# the feature work. Multi-level hubs (a hub behind a hub) already default on.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
+# DEBUG has to be *compiled in* before a tag can be raised to it at runtime, and
+# the USB stack logs almost everything at DEBUG -- a successful enumeration
+# prints nothing at INFO at all. With this at IDF's default of INFO, "no output"
+# means nothing: the messages do not exist in the image. The runtime level stays
+# INFO, so nothing gets noisier unless a tag is raised (ESPIX_USB_VERBOSE, below).
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM is not set here, and cannot be: its
+# Kconfig says `depends on IDF_TARGET_ESP32P4 && SPIRAM`, because only the P4's
+# USB-DWC internal DMA can reach external RAM. On the S3 every USB buffer has to
+# be internal, which is why the reads in espix_usb/host.c ask for MALLOC_CAP_DMA
+# rather than taking the cheapest heap. On a P4 board this is the line to add,
+# and it is worth adding there: it moves the DMA buffers off the scarce heap.
 
 #
 # espix

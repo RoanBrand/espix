@@ -30,7 +30,15 @@ usb_out=$(dev_run 'usb status')
 
 case "$usb_out" in
     *"not built into this image"*)
-        espix_skip "usb-ncm is not in this build"
+        # This is a host-role build: the one OTG peripheral is driving storage
+        # instead of presenting usb0, so usb0 must genuinely be absent rather
+        # than merely unconfigured. The skip below records what is not being
+        # tested; these two assertions are what would notice the default
+        # changing back under the suite (docs/USB-HOST.md).
+        assert_not_contains "no usb0 in a build without USB-NCM" "usb0:" "$link_out"
+        assert_not_contains "the port is not reporting a failed host either" \
+                            "usb host is not running" "$(dev_run 'lsblk')"
+        espix_skip "usb-ncm is not in this build (the OTG port is the USB host)"
         ;;
     *)
         assert_contains "usb0 is listed whenever it is built in" "usb0:" "$link_out"

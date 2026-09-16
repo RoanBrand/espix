@@ -730,6 +730,35 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   devices, which have no mode to check; the problem is a second *filesystem*.
   See [ROADMAP.md](ROADMAP.md#filesystem) for what closing it costs.
 
+- **USB storage is enumerated but not mounted, and the second half is
+  deliberate.** `lsblk` and `blkid` name a stick, its partitions, its filesystems
+  and its labels, and no path under it exists: there is no `/mnt`, and
+  `cat /mnt/sda1/anything` cannot work. This is not unfinished work — it is the
+  reverse. The quick way to mount (registering FatFs at its own prefix) would
+  skip `espix_fs_access_check()` for every file on the stick, and `chmod` on a FAT
+  file would store littlefs attributes for a path that is not on littlefs
+  (`components/espix_fs/mode.c` hardcodes `ESPIX_FS_ROOT_PARTITION`). Both defects
+  are described in [USB-HOST.md](USB-HOST.md), with the design that avoids them in
+  [ROADMAP.md](ROADMAP.md#filesystem).
+
+- **One USB storage device at a time, and a hub spends channels before you get
+  there.** The S3's USB core has a fixed pool of host-controller channels: the
+  root port takes one, an open hub two more (its control pipe plus an interrupt
+  endpoint), and a bulk-only storage device three (control, bulk IN, bulk OUT).
+  A second storage device therefore finds nothing left and is refused with
+  `ESP_ERR_NOT_SUPPORTED`, while `lsusb` shows it enumerated, addressed and with a
+  perfectly good interface. **The first device to enumerate wins** — which reads
+  as a flaky port unless you know, and it means the second drive appears only
+  after the first is unplugged (the sweep claims it within a few seconds). A
+  keyboard costs far less than a disk, so "one disk at a time" is the practical
+  rule rather than "one device". See [USB-HOST.md](USB-HOST.md#hubs-and-more-than-one-device).
+
+- **A drive larger than 2 TiB reports as 2 TiB.** Not an error, no warning: the
+  MSC layer reads capacity with SCSI `READ CAPACITY(10)`, whose block count is 32
+  bits, so a 4 TB disk prints `2199023255040` bytes (`2³² × 512`) — a plausible
+  number that is wrong by half. `READ CAPACITY(16)` would fix it and the class
+  driver does not use it.
+
 - **Unmounting is two steps now, and `esp_vfs_littlefs_unregister()` is not one
   of them.** espix mounts through `esp_littlefs_mount()` and never registers
   LittleFS with the VFS, so the port's unregister has no registration to tear
@@ -901,6 +930,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   not leaving alone.
 
 ## Networking and time
+
+- **A default build has no `usb0`.** USB host and USB-NCM are two uses of the one
+  OTG peripheral, and the host role is the default — so a board flashed with the
+  standard image has lost the cable-reachable interface a previous image had.
+  `ip link` does not list `usb0`, and `usb status` says `usb-ncm was not built
+  into this image (CONFIG_ESPIX_USB_NCM_ENABLED)`, because the option's
+  dependency on the device role leaves it out of the build entirely rather than
+  setting it to `n`. The way back is `ESPIX_USB_ROLE_DEVICE`; the other half of
+  the trade, a hub blocking the UART socket, is in
+  [USB-HOST.md](USB-HOST.md).
 
 - **DHCP option 42 is implemented but has never been exercised.**
   `CONFIG_LWIP_DHCP_GET_NTP_SRV` is on and SNTP is configured to take a server

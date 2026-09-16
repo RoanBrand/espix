@@ -85,6 +85,14 @@ things are as they are.
   [UPSTREAM.md](UPSTREAM.md)). `/proc` is then espix's own ops rather than a
   filesystem at all, which is what makes it the cheap one to do first.
 
+  **The second filesystem now exists, and it is a USB stick.** Enumeration,
+  identification and the partition table are shipped — [USB-HOST.md](USB-HOST.md)
+  — including a held `esp_blockdev` handle per device, which is exactly what a
+  mount would be given. Nothing is mounted because of the two defects below,
+  which are not stylistic: a `confine`d process could read the whole stick, and
+  `chmod` on a FAT file would store littlefs attributes for the wrong partition
+  (`components/espix_fs/mode.c` hardcodes `ESPIX_FS_ROOT_PARTITION`).
+
   **"Routing internally" is smaller than it sounds**, and worth costing before
   rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the
   global fd table either way; what espix adds is a prefix lookup (an array and a
@@ -497,6 +505,45 @@ things are as they are.
   [partitions/esp32s3-16mb.csv](../partitions/esp32s3-16mb.csv); the 8MB table
   notes why the same shape does not fit there.
 
+- **USB host beyond storage.** Enumeration, identification, the partition table,
+  superfloppy volumes and hotplug are done and shipped — see
+  [USB-HOST.md](USB-HOST.md) — and what is left divides into things that are cheap
+  and things that need a decision. Two of the original open questions are now
+  answered: a PD hub does power the board *and* enumerate devices, and **two
+  storage devices do not fit** — the S3 has a fixed pool of host channels and a
+  hub plus one disk consumes almost all of them, so the second disk is refused
+  while the first works. A keyboard costs two channels where a disk costs three.
+
+  - **exFAT** is a patched dependency rather than a feature. `FF_FS_EXFAT` is
+    hardcoded `0` in IDF's `components/fatfs/src/ffconf.h` with no Kconfig to
+    change it, so it means carrying a patch the way
+    `tools/patch-littlefs.py` carries one. It is also the one item here with a
+    legal question attached: exFAT is covered by Microsoft patents, and FatFs's
+    author has said a licence may be needed for commercial use. **That has not
+    been verified against IDF or FatFs here** — no patent or licence text ships
+    with the bundled FatFs — so it is a "check the terms first" item, not a
+    "just enable it" item.
+  - **lwext4** for ext2/3/4, and a much later `lwntfs`, are new components with
+    the same shape as the filesystem work in [Filesystem](#filesystem). `lsblk`
+    already names both as recognised and unsupported, which is the honest
+    position until then.
+  - **GPT** wants a partition-table reader rather than a parser change: the
+    protective MBR is reported today rather than followed.
+  - **A USB keyboard** is the interesting one and needs no display and no serial
+    port to test: SSH in over WiFi, print decoded keystrokes, and type. That
+    sidesteps the hub-blocks-the-UART-socket problem entirely, which is the part
+    of this that costs real time.
+  - **Runtime role switching** (device ↔ host without a reflash) was rejected
+    rather than deferred: it needs both stacks linked, which gives up the whole
+    saving, and nothing has verified that the peripheral can be handed over
+    cleanly at runtime.
+  - **VBUS.** Whether a PD hub powers the board *and* enumerates devices is what
+    [USB-HOST.md](USB-HOST.md) is there to find out. If power to the port turns
+    out to need switching from the board, `boards/*.conf` is the only place
+    per-board wiring can be expressed today and there is **no precedent in it**:
+    those files carry flash size, PSRAM mode and a partition table, and nothing
+    else.
+
 ## Networking and time
 
 - **Routing and NAT: be the bridge people buy a Raspberry Pi for.** With WiFi on
@@ -675,6 +722,11 @@ other way round.
   beside UART and SSH, and the session layer was built transport-agnostic
   precisely so a third one could be added without touching the shell. The P4 is
   the target -- MIPI DSI, with an HDMI variant.
+
+  The keyboard half has somewhere to land now: USB host mode already enumerates
+  devices and identifies them ([USB-HOST.md](USB-HOST.md)), so what it needs is a
+  HID class driver beside the mass-storage one, not a second stack or a second
+  role.
 
 - **A minimal 2D desktop environment**: a filesystem browser, a JPEG viewer, an
   audio player for whatever formats decode cheaply, and video on the P4, which

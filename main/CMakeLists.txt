@@ -11,6 +11,7 @@ idf_component_register(
         espix_shell
         espix_cmds
         espix_net
+        espix_usb
         espix_auth
         espix_ssh
         espix_time
