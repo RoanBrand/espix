@@ -570,11 +570,14 @@ success for a copy whose real write failed — and on a filesystem that refuses
 writes, success for a file of zero bytes.
 
 Found here by doing exactly that: `cp` into a freshly mounted FAT volume checked
-`fwrite()` and ignored `fclose()`, and fifteen bytes arrived as an empty file with
-nothing said. The shell's `>` and `2>` had the same hole in `redirects_release()`.
-Both check now, and both name the errno — the layers underneath are another
-matter (see [UPSTREAM.md](UPSTREAM.md) on the discarded sense data), which is
-precisely why the reporting had to come first.
+`fwrite()` and ignored `fclose()`. The shell's `>` and `2>` had the same hole in
+`redirects_release()`. Both check now and both name the errno — and that is how
+the empty file turned out *not* to be this bug. Six of seven copies wrote their
+fifteen bytes; one arrived as an empty file, and the `fclose()` that would have
+reported a failure returned success. What is left is in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem), and
+[UPSTREAM.md](UPSTREAM.md) explains why the reporting had to come first: the
+layer below throws away the sense data that would have named the cause.
 
 ### A configure-time hook is not a build-time guarantee
 

@@ -631,6 +631,32 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
+- **A write into a mounted FAT volume is sometimes lost, silently.** Measured on
+  the four-partition Cruzer: seven `sudo cp /etc/hostname /mnt/sd1/<name>` runs,
+  each after a fresh mount, and one of them produced a 0-byte file with nothing
+  said -- `cat` prints nothing from it, so the data is gone rather than mis-sized.
+  Six produced the fifteen bytes asked for. Nothing distinguishes the failure:
+  not the filename, not whether the file already existed, not an intervening
+  read, and not the mount being new (five of the six successes also ran against a
+  mount made moments earlier).
+
+  The flush/close hole that was fixed in espix is *not* this. That fix makes a
+  *reported* failure visible, and this failure is not reported: `fclose()`
+  returned success with the file empty, which puts the loss below stdio -- in
+  FatFs's write path, or in the MSC layer under it, with success coming back up.
+
+  Two diagnostics say which. `CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y` makes IDF's
+  `vfs_fat_write`/`vfs_fat_close` print their `FRESULT`, which answers whether
+  FatFs knew; and `msc_scsi_bot.c` discards the SCSI sense data on a failed
+  transfer (`scsi_cmd_sense(device, NULL)`), so a patch in the shape of
+  `tools/patch-fatfs.py`, printing the sense key, would name a medium error, a
+  write-protect or a UNIT ATTENTION. UPSTREAM.md already records the discarded
+  sense data as the reason a write failure arrives as one anonymous error code;
+  this is the same gap seen from the one place where it costs data.
+
+  Until then the only honest advice is that a stick written from here is not
+  trustworthy without reading the file back.
+
 - **Unplugging a mounted stick is a use-after-free.** Stage 2 mounts FAT from a
   USB device, and the block device it mounts is *borrowed* from `espix_usb`: the
   slot owns it, and when the device is unplugged the slot hands it back to the MSC
