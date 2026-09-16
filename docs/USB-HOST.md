@@ -478,11 +478,20 @@ records it.
   that is next.
 - **`df` still reports the rootfs.** Per-mount free space is one `f_getfree()`
   away and not yet wired to a command.
-- **Two volumes at a time.** `CONFIG_FATFS_VOLUME_COUNT` is 2, and that is what
-  FatFs sizes its drive table by — the mount table itself has room for three
-  beyond the root, so FatFs's number is the one that bites. One USB storage
-  device at a time is the tighter limit in practice; the knob is the answer if a
-  device ever arrives with three FAT partitions worth mounting at once.
+- **Two volumes at a time, for now.** `CONFIG_FATFS_VOLUME_COUNT` is 2 — IDF's
+  default, range 1–10, which nothing in this tree chose — and the mount table
+  has room for three beyond the root, so FatFs's number is the one that bites. One
+  USB storage device at a time is the tighter limit in practice.
+
+  **Revisit once there is internal memory to spare**, because raising it is not
+  the "only costs while mounted" change it looks like.
+  `CONFIG_FATFS_SECTOR_4096=y` makes `FF_MIN_SS == FF_MAX_SS`, and FatFs then keeps
+  its sector window *inside* each `FATFS` instead of allocating it — so it is
+  **4KB of `.bss` per volume, resident from boot whether or not anything is ever
+  mounted**. Two more volumes is 8KB, out of the same internal RAM the SSH session
+  stacks come from. The mount table has to rise with it (`ESPIX_FS_MAX_MOUNTS` is
+  the root plus three), and the numbers to take are `idf.py size` for the `.bss`
+  delta and a `make test -j 4` low-water reading — not an estimate.
 - **`/mnt` is in the boot skeleton** now, so a device whose image predates
   mounting still has somewhere to mount to.
 
