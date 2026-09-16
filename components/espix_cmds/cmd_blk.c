@@ -917,6 +917,13 @@ void espix_blk_device_gone(const char *dev)
 #define FSTAB_PATH  "/etc/fstab"
 
 /*
+ * The device column is longer than a device name: "PARTUUID=" and eleven bytes
+ * of identity is 20, and reading that with the name's width truncated every
+ * identity to seven characters -- which no rule could ever match.
+ */
+#define FSTAB_FIELD_MAX 24
+
+/*
  * The file, when it has never been written.
  *
  * Created rather than shipped: the rootfs skeleton is built at boot, and the
@@ -1238,12 +1245,15 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
             *hash = '\0';
         }
 
-        char name[ESPIX_USB_NAME_MAX];
+        char field[FSTAB_FIELD_MAX];
         char point[ESPIX_PATH_MAX];
         char owner[ESPIX_USER_MAX];
         char flags[32] = "";
 
-        if (sscanf(line, "%7s %127s %31s %31s", name, point, owner, flags) < 3) {
+        /* The widths are the buffers' sizes minus one, and no more: an account
+         * name is 16 bytes in espix, which is exactly what a 17-byte buffer
+         * holds, and a wider conversion would write past it. */
+        if (sscanf(line, "%23s %127s %16s %31s", field, point, owner, flags) < 3) {
             continue;
         }
         if (strstr(flags, "noauto") != NULL) {
@@ -1267,7 +1277,7 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
          */
         fstab_hit_t hits[ESPIX_USB_MAX_DEVS * (1 + ESPIX_USB_MAX_PARTS)];
         size_t nhits = 0;
-        const bool identity = (fstab_ident_kind(name) != FSTAB_IDENT_NONE);
+        const bool identity = (fstab_ident_kind(field) != FSTAB_IDENT_NONE);
 
         for (size_t i = 0; i < n && nhits < sizeof(hits) / sizeof(hits[0]); i++) {
             if (strcmp(devs[i].name, dev) != 0) {
@@ -1276,14 +1286,14 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
 
             /* The disk itself first -- a superfloppy has no partitions -- and
              * then each partition. */
-            if (fstab_match(name, &devs[i], NULL)) {
+            if (fstab_match(field, &devs[i], NULL)) {
                 hits[nhits].disk = i;
                 hits[nhits].is_part = false;
                 nhits++;
             }
 
             for (size_t j = 0; j < devs[i].nparts; j++) {
-                if (!fstab_match(name, &devs[i], &devs[i].parts[j])) {
+                if (!fstab_match(field, &devs[i], &devs[i].parts[j])) {
                     continue;
                 }
                 hits[nhits].disk = i;
@@ -1296,7 +1306,7 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
         if (identity && nhits > 1) {
             espix_klog(ESPIX_KLOG_WARN, TAG,
                        "%s: %s matches %u volumes; mounting none",
-                       FSTAB_PATH, name, (unsigned)nhits);
+                       FSTAB_PATH, field, (unsigned)nhits);
             continue;
         }
 
