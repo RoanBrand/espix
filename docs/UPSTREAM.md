@@ -226,6 +226,58 @@ Not an oversight anyone has missed — IDF's own test says so:
     // f_chmod support to be implemented in VFS)
     -- components/vfs/test_apps/main/test_vfs_access.c
 
+### FatFs cannot be mounted without registering a path
+
+`esp_vfs_fat_*_mount()` ends in `esp_vfs_register_fs()`, so an IDF FatFs mount is
+always *also* a prefix in the namespace. For a VFS that owns the namespace itself
+— which is where a permission check belongs, the same place Linux and NuttX put
+theirs — that is the whole problem: the prefix outranks the owner's fallback, and
+those paths reach the filesystem with no check applied.
+
+There is no way around it from outside the component. The ops tables
+(`s_vfs_fat`, `s_vfs_fat_dir`) are file-scope static, and the context they take is
+built *inside* `esp_vfs_fat_register()`, whose only other job is the registration,
+so the two cannot be separated by a caller either.
+
+The split is small, and this is what espix carries in
+`tools/esp_vfs_fat-ctx.patch`:
+
+- `fat_ctx_create()`, lifted out of `esp_vfs_fat_register()`, which now calls it —
+  one implementation with two callers rather than a copy that can drift;
+- `esp_vfs_fat_ctx_create()` / `esp_vfs_fat_ctx_free()`: build and free a context
+  that is registered nowhere;
+- `esp_vfs_fat_get_ops()`: hand out the tables.
+
+Paths handed to those ops are already relative to the mount point, exactly as
+`esp_vfs` would have made them. (The declarations went into
+`vfs/vfs_fat_internal.h` because `esp_vfs_fat.h` cannot name `esp_vfs_fs_ops_t`
+without making fatfs depend on `vfs` publicly — a decision upstream should make
+rather than inherit from a patch.)
+
+espix applies this with `tools/patch-fatfs.py` from the build, which is a worse
+arrangement than `managed_components/`: fatfs is a **built-in** component and the
+registry publishes no `espressif/fatfs` that could override it. See
+[USB-HOST.md](USB-HOST.md#stage-2--mounting) for the cost of carrying it.
+
+### A partition view cannot be larger than 4GB
+
+`esp_blockdev_generic_partition_get()` takes the partition's offset and size as
+`size_t`, and stores the offset as one:
+
+    esp_err_t esp_blockdev_generic_partition_get(esp_blockdev_handle_t parent,
+                                                 size_t start, size_t size,
+                                                 esp_blockdev_handle_t *out);
+    typedef struct { esp_blockdev_t dev; esp_blockdev_handle_t parent;
+                     size_t start_offset; } esp_blockdev_generic_partition_t;
+
+`size_t` is 32 bits on every ESP32 target, so a partition larger than 4GB — one
+FAT32 volume on an ordinary USB stick, which is the case that finds this — cannot
+be expressed. It does not fail, either: the size truncates, the volume mounts as
+the low 32 bits of itself, and the failure surfaces much later as a read past a
+boundary nobody asked for. espix carries `components/espix_fs/part.c`, the same
+implementation with `uint64_t` offsets — about eighty lines, and a pity to have
+twice.
+
 ### `chmod()` returns success and does nothing
 
 `esp_libc/src/realpath.c`:
@@ -294,6 +346,44 @@ names, which is possible precisely because the namespace is unclaimed.
 Not a defect — worth recording only because its presence suggests a POSIX layer
 that is not there. Upstream never implemented signals either, so it is not a
 source to draw on.
+
+## `espressif/esp_ext_part_tables`
+
+### A `0x00` type byte ends the table, and on real media it does not
+
+`esp_mbr_parse()` stops at the first partition entry whose type byte is zero:
+
+    if (partition->type == 0x00) {
+        break; // No more partitions, exit the loop (MBR partition table cannot
+               // have holes in it)
+    }
+
+That is true of an *empty* entry and false of a typed one. A hybrid ISO image —
+the layout that `dd`-ing an Arch, CachyOS or Ubuntu installer onto a stick
+produces — uses `0x00` for its large filesystem entry, with a real LBA and sector
+count, so every entry after it is dropped. Measured on a CachyOS 202604
+installer: entry 1 is 2.8G of ISO 9660 typed `0x00`, entry 2 is 23M of EFI FAT
+typed `0xEF`. The library reports one partition and no partitions respectively —
+neither the ISO nor the FAT partition that is the only mountable thing on the
+stick. Nothing sets `ESP_EXT_PART_LIST_FLAG_LOSSY` either, so a caller cannot even
+tell that something was left out.
+
+The rule that would be right is "empty" in the sense the comment means it: no
+start *and* no size. A `0x00`-typed entry that names sectors is an unnameable type
+— worth inserting, or at the very least worth flagging.
+
+espix walks the four entries itself now and calls
+`esp_mbr_parse_default_supported_partition_types()` for the type table, which is
+the part of the parser that assumes nothing about the walk; see
+[USB-HOST.md](USB-HOST.md#what-it-reports-and-what-it-cannot).
+
+### `0xEF` is not in the type table
+
+The EFI System Partition — `0xEF`, "EFI (FAT-12/16/32)" to `fdisk` — is FAT, so
+FatFs can mount it, and every Arch, CachyOS and Windows installer writes one. It
+maps to `ESP_EXT_PART_TYPE_NONE`, so a caller that trusts the table cannot name
+it, let alone mount it. espix adds the mapping itself; it belongs beside `0x01`,
+`0x04`, `0x06` and `0x0E`.
 
 ## `espressif/esp_linenoise`
 
@@ -431,6 +521,164 @@ changes — deliberately survivable, since it falls back to the old generic
 message. **Delete `missing_symbol_name()`, `missing_sym_visit()` and
 `ELF_MISSING_SYM_PREFIX` when this lands.**
 
+## `espressif/usb` and `espressif/usb_host_msc` (the USB host stack)
+
+### A client's event callback must not wait on that client's own transfers
+
+The documented pattern for a class driver is to call `msc_host_install_device()`
+from the MSC event callback, and Espressif's own example does exactly that. It
+does not work. The callback is invoked from `usb_host_client_handle_events()`
+(`usb_host.c:1319`), and a client's transfer completions are delivered only from
+inside that same function: its endpoint list is serviced there
+(`_handle_pending_ep()`, `usb_host.c:1296`) and that is where
+`urb->transfer.callback()` runs (`usb_host.c:1136`). So an install started in the
+callback waits on a semaphore that only the call stack it is blocking can give.
+
+Nothing fails fast and nothing is logged. `msc_bulk_transfer()` waits the
+transfer's full `timeout_ms` — 5000 ms, set by the driver (`msc_host.c:703`) — and
+`msc_wait_for_ready_state()` retries `5000 / 100 = 50` times (`msc_host.c:297`,
+`:551`), each retry another SCSI command of three transfers. Measured on an
+ESP32-S3 with a Samsung PSSD T9: **ten minutes to fail**, no log line until it
+does, the `USB MSC` task blocked throughout, and therefore the *next* device never
+reported either. From outside it looks exactly like a driver that ignored the
+device — which is how espix spent a day on it.
+
+**Workaround:** do the work somewhere else. espix queues the address from the
+callback and a `usb:work` task performs the install; the same SSD then attaches in
+**1.0 s**. Everything else that blocks on transfers follows the same rule: espix's
+`usbscan` and `usbprobe` run from a session task and never from `usb:host`,
+because `usb:host` is the task that drives the library whose completions the
+install is waiting for — doing it there moves the deadlock rather than fixing it.
+
+### `msc_host_install_device()` asserts on a device with no bulk-only interface
+
+`extract_config_from_descriptor()` looks for the class-8 / subclass-6 /
+protocol-0x50 interface and then does `assert(ifc_desc)` (`msc_host.c:228`). A
+public API that aborts the board is a sharp edge: pointing a diagnostic at a hub
+resets the device instead of answering "not storage".
+
+**Workaround:** check the interface list first and never call the driver for a
+device that has none — `addr_msc_interface()` in `espix_usb/host.c` does, and
+`usbprobe` reports it in words. The driver could return
+`ESP_ERR_NOT_SUPPORTED` like the rest of its error paths do.
+
+### `USB_W_VALUE_DT_INTERFACE` used where `USB_B_DESCRIPTOR_TYPE_INTERFACE` is meant
+
+`next_interface_desc()` filters descriptor walks by `USB_W_VALUE_DT_INTERFACE`
+(`msc_host.c:108`) — the *wValue* encoding used in control requests, not the
+`bDescriptorType` field it is compared against. It works only because both
+constants happen to be `0x04` (`usb_types_ch9.h:45` and `:146`). Either changing
+would silently stop the class driver seeing any interface at all, with the symptom
+of the first entry above: a device that enumerates and is then ignored.
+
+**Workaround:** none needed today; named here so the coincidence is not
+rediscovered as a mystery.
+
+### The external-hub driver asserts when a device is released twice
+
+`device_release()` asserts that the device it is handed is actually on its way
+out (`ext_hub.c:508`):
+
+    static void device_release(ext_hub_dev_t *ext_hub_dev)
+    {
+        EXT_HUB_ENTER_CRITICAL();
+        assert(ext_hub_dev->dynamic.flags.waiting_release); // Sanity check
+        ext_hub_dev->dynamic.flags.waiting_release = 0;
+        ext_hub_dev->dynamic.flags.waiting_free = 1;
+
+On this board it arrives as, from the core dump:
+
+    Panic reason: assert failed: device_release ext_hub.c:508 (ext_hub_dev->dynamic.flags.waiting_release)
+    ext_hub_process ()            ext_hub.c:1535
+    hub_process ()                hub.c:1345
+    usb_host_lib_handle_events () usb_host.c:929
+
+`waiting_release` is the driver's "this device is being torn down" state. It is
+set in three places — `ext_hub.c:405`, the *device gone* path at `:1431`/`:1439`,
+and `:1469`, a loop over the pending and active hub lists — and cleared only at
+`:509`. The *device gone* path guards itself against re-entry (`:1420`); the loop
+at `:1469` sets the flag unconditionally and adds `DEV_ACTION_RELEASE` when the
+stage is idle, so a second release of the same device reaches the assert there.
+
+Seen once, on the first attach of a newly formatted stick with an external hub
+attached (`espressif/usb` 1.5.0, ESP-IDF v6.1, esp32s3). It is the *attach* path,
+not removal: a clean unplug and replug of the same stick did not reproduce it.
+The record said removal for a while, which is worth knowing before anyone goes
+looking for a teardown race. It is in the library's own event loop — a caller's
+only frame in the stack is the `usb_host_lib_handle_events()` call that drives it
+— so nothing in a caller can prevent it, and the cost is the whole board. Checking
+the flag where it is set, or tolerating a second release, would make this a log
+line instead.
+
+**Workaround:** none. Hubs cannot be turned off here — this board cannot power a
+device from the OTG socket, so the hub is how anything is plugged in at all.
+
+### A failed SCSI write discards its sense data
+
+`scsi_cmd_write10()` fetches the sense data when a write fails — and throws it
+away (`msc_scsi_bot.c:366`):
+
+    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, num_sectors * sector_size);
+    if (unlikely(ret != ESP_OK)) {
+        MSC_RETURN_ON_ERROR( scsi_cmd_sense(device, NULL));
+    }
+    return ret;
+
+`scsi_cmd_sense(device, NULL)` runs the REQUEST SENSE transfer and drops the
+response, so the one thing that says *why* — write-protected, a UNIT ATTENTION
+left over from partitioning the medium on another host, a medium error — reaches
+neither a caller nor a log. The BDL path adds nothing of its own either:
+`msc_bdl_write()` returns the error without logging anything, where the older
+`diskio_usb.c` path at least printed `scsi_cmd_write10 failed (%d)`.
+
+Those causes are indistinguishable without it, and a caller sees one error code
+for all of them. Passing the sense response out, or logging it, would cost
+nothing.
+
+**Workaround:** none — which is why a write failure here has to be diagnosed from
+the errno the layer above reports. See
+[GOTCHAS.md](GOTCHAS.md#a-write-that-succeeded-has-not-been-written-yet).
+
+### A device pulled mid-transfer takes the heap with it
+
+`espix_usb` releases the block device on detach, which is what its design says it
+should do: the slot owns the handle and gives it back. The problem is *when*. An
+MSC transfer already in flight cannot be recalled, and it holds a pointer to that
+block device, so it finishes against freed memory — and a transfer whose buffer
+and length are no longer meaningful does not fail, it writes somewhere.
+
+Measured, pulling a second or two into `cp /dev/factory /mnt/sd1/…`:
+
+    pc 0x403840a2 <tlsf_free+614>
+    #0  remove_free_block (tlsf_control_functions.h:374)
+    #1  block_remove
+    #2  block_merge_next
+    #3  tlsf_free (tlsf.c:633)
+    #4  multi_heap_free_impl
+    #5  heap_caps_free
+    #10 espix_shell_session_run (session.c:607)   ← the console task, a bystander
+
+Heap corruption, caught by `free()` walking a list that had stopped making sense,
+in a task that had nothing to do with the stick. It is repeatable once seen: pull
+*while a write is in progress* and the board is gone. Pull when nothing is being
+written and everything above this works — including reads on the dead mount
+answering `ENOSYS` and `df` declining to report on it, both measured.
+
+**What would fix it, best first:**
+
+1. **A way to quiesce.** An `msc_host_*` call that stops new transfers and waits
+   for the in-flight one before the caller releases the handle. That is the ask,
+   and it is the only version that is correct rather than lucky.
+2. **Reference counting on the handle**, so a transfer finishing after the release
+   has nothing to write through.
+3. **What espix could do alone:** `on_disconnected()` could delay
+   `msc_host_uninstall_device()` instead of calling it immediately, on the theory
+   that a few hundred milliseconds outlasts any transfer. A guess dressed as a
+   fix, which is why it is third.
+
+Until one of those exists this belongs with the known ways to lose the board,
+which is where docs/KNOWN-ISSUES.md points from.
+
 ## `espressif/esp_tinyusb` (TinyUSB NCM)
 
 ### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer
@@ -542,3 +790,24 @@ The same function reads in a loop:
 LittleFS itself synthesises `.` and `..`; the port discards them. Nothing above
 the VFS can see them, so `ls -a` shows dotfiles but not the directory entries,
 which is GNU `ls`'s `-A` rather than its `-a`.
+
+## ESP-IDF (newlib)
+
+### `off_t` is 32 bits, and no Kconfig changes it
+
+`st_size` is an `off_t`, and on this target `off_t` is a 32-bit `long`. Nothing
+in IDF 6.1 offers to widen it: there is no `CONFIG_LIBC_FS_*` for it, and the only
+size knob nearby — `sys/select.h`'s `FD_SETSIZE` — is about `select()`, not file
+sizes.
+
+Both symptoms were measured. `/dev/sda4`, a 23 GiB partition, lists as `0`, which
+is exactly its low 32 bits. And `df -h` printed a 6.0 GiB volume as `2.0G`, since
+2,133,860,352 is the low 32 bits of 6,428,827,648 — that one was espix's own bug,
+a cast through `off_t` in the shared size formatter, and is fixed; the first is the
+ceiling itself. No file over 4 GiB can be reported or seeked correctly, whatever
+espix does above it.
+
+A patch in the shape of the other two — a build-time define on the newlib headers
+— would fix it. It is also the one patch that would touch every `struct stat` in
+the image, so it wants a deliberate decision rather than riding along with
+something else. docs/ROADMAP.md is where that decision is written down.

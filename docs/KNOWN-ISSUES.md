@@ -631,6 +631,71 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
+- ~~**A write into a mounted FAT volume is lost for the first two copies after a
+  boot.**~~ **Fixed**, by the fd packing (`86bc6bd`) and by releasing the entry it
+  allocates (`c016e00`). The cause was the fd collision described below and not
+  the write path at all, which is why every check added to the write path stayed
+  silent: nothing was wrong with the write, it was aimed at the wrong file. Ten
+  sequential copies with `cp`'s read-back now pass on hardware. The reproduction
+  is kept below as the record of how it looked, since that is what the next
+  person will see if this class of bug returns.
+
+  Reproduced twice, on two builds, matching to the byte: after a reset,
+  `sudo mount /dev/sda1 /mnt/sd1` and then two `sudo cp /etc/hostname` runs.
+  The first answers `close failed: Bad file number` (`EBADF`) and leaves a
+  0-byte file; the second leaves a 0-byte file with every call — `fwrite`,
+  `fflush`, `fclose` — returning success. The third and every later copy writes
+  its fifteen bytes, until the next boot. Nothing else distinguishes them: not
+  the filename, not whether the file existed, not an intervening read.
+
+  It is an fd collision. espix calls FatFs's *inner* ops — the ones
+  `tools/patch-fatfs.py` exposes so that `esp_vfs` is bypassed and espix's
+  permission check is not — and those hand out FatFs's own
+  `fat_ctx->files[]` slots: 0, 1, 2, … Meanwhile IDF's global fd table and the
+  console are handing out those same numbers. So `s_fd_mount[2]` can be written
+  by a rootfs open and by a FAT open, and `vfs_close` can find nothing at all
+  for a fd that is ours: `mount_by_fd()` answers `NULL` and the close returns
+  `EBADF`, or — worse — the operation reaches the right mount and the transfer
+  for a file whose slot number was reused goes nowhere. That the failures stop
+  after two is what local fd slots being cycled looks like from outside.
+
+  The fix is to **pack the fds**: `open` returns a number from espix's own space,
+  every op maps it back to the lower fd, and the routing map is keyed on espix's
+  number rather than one it shares with the console and the rootfs. The 256-byte
+  array in `vfs.c` becomes a small table of open files, which also drops the
+  assumption that a fd fits in a byte — an assumption the comment there states
+  as fact today. Until then `cp` reads every copy back and reports one that did
+  not arrive, which is how this was caught.
+
+  Related, and separate: `off_t` is 32 bits here, so a device or file larger
+  than 4 GB reports a truncated size — `/dev/sda4`, 23 GiB, lists as `0`,
+  which is exactly its low 32 bits.
+
+- ~~**Unplugging a mounted stick is a use-after-free.**~~ **Fixed**, by the detach
+  hook, the dead-mount sentinel and the skipped volume sync (`ffc1029` onward,
+  plus three follow-ups the pull tests found). Measured: an idle pull
+  auto-unmounts and the shell survives; a pull with a file open leaves the mount
+  marked, reads answering `ENOSYS` and `df` declining the row; `umount` works once
+  the handle is gone. The one case espix cannot fix — a transfer already in flight
+  — is in UPSTREAM.md. The text below is kept as the shape of the problem.
+
+  Stage 2 mounts FAT from a
+  USB device, and the block device it mounts is *borrowed* from `espix_usb`: the
+  slot owns it, and when the device is unplugged the slot hands it back to the MSC
+  driver and uninstalls the device. FatFs knows none of that, so a volume whose
+  device has gone reads through a freed block device and a freed device object.
+  The only safe move today is to unmount first — which the docs say, and which
+  nobody will remember at the moment they pull a stick out.
+
+  The fix is a removal hook: `espix_usb` calls it *before* tearing a device down,
+  and the mount layer unmounts. Two things make it more than a callback. The hook
+  runs on the USB task, so it must not block on a transfer that same task
+  delivers; and an unmount with a file still open cannot free the context under
+  the reader's fd. The shape that satisfies both is to mark the device gone — so
+  I/O fails instead of reading freed memory — and free the block device when the
+  last reference to it goes, rather than on the removal path.
+
+
 - **A directory's mode does not hide what is inside it.** Unix requires search
   (`x`) permission on every component of a path; espix checks the final
   component, plus the parent for anything that creates or removes a name. So
@@ -729,6 +794,35 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `espix_fs_access_check()` uncalled for every file on it. Harmless for
   devices, which have no mode to check; the problem is a second *filesystem*.
   See [ROADMAP.md](ROADMAP.md#filesystem) for what closing it costs.
+
+- **USB storage is enumerated but not mounted, and the second half is
+  deliberate.** `lsblk` and `blkid` name a stick, its partitions, its filesystems
+  and its labels, and no path under it exists: there is no `/mnt`, and
+  `cat /mnt/sda1/anything` cannot work. This is not unfinished work — it is the
+  reverse. The quick way to mount (registering FatFs at its own prefix) would
+  skip `espix_fs_access_check()` for every file on the stick, and `chmod` on a FAT
+  file would store littlefs attributes for a path that is not on littlefs
+  (`components/espix_fs/mode.c` hardcodes `ESPIX_FS_ROOT_PARTITION`). Both defects
+  are described in [USB-HOST.md](USB-HOST.md), with the design that avoids them in
+  [ROADMAP.md](ROADMAP.md#filesystem).
+
+- **One USB storage device at a time, and a hub spends channels before you get
+  there.** The S3's USB core has a fixed pool of host-controller channels: the
+  root port takes one, an open hub two more (its control pipe plus an interrupt
+  endpoint), and a bulk-only storage device three (control, bulk IN, bulk OUT).
+  A second storage device therefore finds nothing left and is refused with
+  `ESP_ERR_NOT_SUPPORTED`, while `lsusb` shows it enumerated, addressed and with a
+  perfectly good interface. **The first device to enumerate wins** — which reads
+  as a flaky port unless you know, and it means the second drive appears only
+  after the first is unplugged (the sweep claims it within a few seconds). A
+  keyboard costs far less than a disk, so "one disk at a time" is the practical
+  rule rather than "one device". See [USB-HOST.md](USB-HOST.md#hubs-and-more-than-one-device).
+
+- **A drive larger than 2 TiB reports as 2 TiB.** Not an error, no warning: the
+  MSC layer reads capacity with SCSI `READ CAPACITY(10)`, whose block count is 32
+  bits, so a 4 TB disk prints `2199023255040` bytes (`2³² × 512`) — a plausible
+  number that is wrong by half. `READ CAPACITY(16)` would fix it and the class
+  driver does not use it.
 
 - **Unmounting is two steps now, and `esp_vfs_littlefs_unregister()` is not one
   of them.** espix mounts through `esp_littlefs_mount()` and never registers
@@ -902,6 +996,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Networking and time
 
+- **A default build has no `usb0`.** USB host and USB-NCM are two uses of the one
+  OTG peripheral, and the host role is the default — so a board flashed with the
+  standard image has lost the cable-reachable interface a previous image had.
+  `ip link` does not list `usb0`, and `usb status` says `usb-ncm was not built
+  into this image (CONFIG_ESPIX_USB_NCM_ENABLED)`, because the option's
+  dependency on the device role leaves it out of the build entirely rather than
+  setting it to `n`. The way back is `ESPIX_USB_ROLE_DEVICE`; the other half of
+  the trade, a hub blocking the UART socket, is in
+  [USB-HOST.md](USB-HOST.md).
+
 - **DHCP option 42 is implemented but has never been exercised.**
   `CONFIG_LWIP_DHCP_GET_NTP_SRV` is on and SNTP is configured to take a server
   from DHCP when `/etc/wifi.conf` does not name one, but the network it has been
@@ -912,3 +1016,33 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   boot with a working network, and indefinitely without one. A soft `reboot`
   keeps the time. See [ROADMAP.md](ROADMAP.md#networking-and-time) for what
   falls in that window and what a fix would cost.
+
+## USB host
+
+- **Pulling a stick during a write can corrupt the heap.** Everything else about
+  a pull is handled, and measured: the mount is marked dead, reads answer
+  `ENOSYS`, `df` declines the row, an idle pull auto-unmounts, and `umount` works
+  afterwards. But a transfer already in flight when the device goes cannot be
+  recalled, and it completes against a block device `espix_usb` has released --
+  seen corrupting the heap and taking the board down from an unrelated task. It
+  needs the USB layer to quiesce before the release, which is not something espix
+  can reach, so it is written up in [UPSTREAM.md](UPSTREAM.md#a-device-pulled-mid-transfer-takes-the-heap-with-it)
+  rather than fixed here.
+
+- **Removing a device can panic inside the library's hub driver.** With an
+  external hub on the port, unplugging a device — or the hub — can reach an
+  assert at `ext_hub.c:508` in `device_release()`: the driver keeps a
+  `waiting_release` flag per hub device, sets it in three places and clears it in
+  one, and a second release of the same device arrives with the flag already
+  clear. The fault is in the library's *own* event loop, so espix's only frame in
+  the stack is the `usb_host_lib_handle_events()` call that drives it, and the
+  board goes down: the recovery is the reboot that follows. Nothing is corrupted,
+  and no volume should be involved — unmount before pulling anything, as
+  everywhere else.
+
+  It is rare: seen once in a day of plugging and unplugging, on
+  `espressif/usb` 1.5.0. It is also the easiest panic here to diagnose, because
+  the assert names its own file and line: `dmesg` on the next boot prints it, and
+  `coredump` keeps it — in full, after the kernel log has rolled — with no serial
+  port involved. `idf.py coredump-info`, via `make coredump`, is for the backtrace
+  rather than for the reason. [UPSTREAM.md](UPSTREAM.md) carries the report.

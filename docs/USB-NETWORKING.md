@@ -55,6 +55,16 @@ The **P4** is the exception worth knowing: `SOC_USB_OTG_PERIPH_NUM` is 2 there,
 with one full-speed and one high-speed PHY. It is the only espix target that
 could be a USB host on one port and run USB-NCM on the other at the same time.
 
+**On every other target the two roles are exclusive, and espix now builds one of
+them.** `SOC_USB_OTG_PERIPH_NUM` is 1 on the S3 and the S31, and espix's default
+is the **host** role: the same peripheral drives a USB stick rather than
+presenting `usb0`, so a board flashed with the default image does not have `usb0`
+at all. Switching back is the `ESPIX_USB_ROLE` choice in
+`components/espix_net/Kconfig` — see [USB-HOST.md](USB-HOST.md), which also
+covers the half that gets people: on a devkit whose two sockets sit close
+together, a hub in the OTG socket can block the UART one, leaving SSH as the only
+console.
+
 **Plug in one at a time unless you know your board is happy with both.** They
 are two independent 5V supplies and two independent grounds, and joining them is
 an electrical question, not a software one:
@@ -350,8 +360,11 @@ comparable to WiFi at all, and this table would be worth measuring again.
 
 ## Building it out
 
-`CONFIG_ESPIX_USB_NCM_ENABLED` is on by default and can be turned off, which
-drops espix's driver and the whole TinyUSB stack from the image — about 51KB of
-flash. The `usb` command still exists in such a build and says the feature was
-not compiled in, rather than disappearing and leaving you comparing your device
+The choice that decides whether any of this exists is `ESPIX_USB_ROLE` in
+`components/espix_net/Kconfig`: **host** (the default) builds the host stack
+instead, and **device** builds what is described here. Turning USB-NCM off in a
+device-role build drops espix's driver and the whole TinyUSB stack from the
+image — about 51KB of flash. The `usb` command still exists in such a build and
+says the feature was not compiled in, rather than disappearing and leaving you
+comparing your device
 against this page.

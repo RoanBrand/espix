@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "espix_shell.h"
 
@@ -17,6 +18,8 @@ void espix_cmds_register_run(void);
 void espix_cmds_register_net(void);
 void espix_cmds_register_motd(void);
 void espix_cmds_register_time(void);
+void espix_cmds_register_blk(void);
+void espix_cmds_register_usbhost(void);
 
 /* Resolves a non-builtin command name to a program in /bin or by path. */
 void espix_cmds_register_exec_fallback(void);
@@ -30,6 +33,9 @@ void espix_cmds_print_greeting(espix_session_t *s);
  */
 bool espix_cmd_path(espix_session_t *s, const char *arg,
                     char *out, size_t out_len);
+
+/* A byte count as a size column: plain, or -h for "1.4K"/"21K"/"28.7G". */
+void espix_cmd_size(char *out, size_t len, uint64_t bytes, bool human);
 
 /* Register a NULL-terminated array of commands, logging any duplicates. */
 void espix_cmds_register_table(espix_cmd_t *table, size_t count);

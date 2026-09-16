@@ -93,39 +93,18 @@ static void ls_time(char *out, size_t len, time_t t)
 /*
  * The size column, plain or -h.
  *
- * coreutils rounds up, and drops to one decimal only below 10: 1412 bytes is
- * "1.4K" and 20796 is "21K", not "20.3K". Matching that exactly matters more
- * than being arithmetically neat, because the point of -h is that the number
- * looks like the one every other tool would have printed.
- *
- * Integer arithmetic throughout. The obvious version wants doubles and ceil(),
- * which drags in libm for a column of a listing.
+ * The formatting itself lives in espix_cmd_size(), beside every other command's
+ * shared helpers, because `lsblk` reports sizes too and two implementations of
+ * "1.5M" drift.
  */
-static void ls_size(char *out, size_t len, off_t bytes, bool human)
+/*
+ * Sizes arrive here as uint64_t, not off_t: off_t is 32 bits on this target, and
+ * a 6GB volume formatted through one reports its low 32 bits -- 6.0G came out as
+ * 2.0G in `df -h` until this changed. Callers with an off_t convert implicitly.
+ */
+static void ls_size(char *out, size_t len, uint64_t bytes, bool human)
 {
-    if (!human || bytes < 1024) {
-        snprintf(out, len, "%ld", (long)bytes);
-        return;
-    }
-
-    static const char units[] = { 'K', 'M', 'G' };
-    uint64_t          div     = 1024;
-    int               u       = 0;
-
-    while ((uint64_t)bytes >= div * 1024 && u < 2) {
-        div *= 1024;
-        u++;
-    }
-
-    /* Tenths, rounded up -- never report less than the file holds. */
-    const uint64_t tenths = ((uint64_t)bytes * 10 + div - 1) / div;
-
-    if (tenths < 100) {
-        snprintf(out, len, "%u.%u%c", (unsigned)(tenths / 10),
-                 (unsigned)(tenths % 10), units[u]);
-    } else {
-        snprintf(out, len, "%u%c", (unsigned)((tenths + 9) / 10), units[u]);
-    }
+    espix_cmd_size(out, len, bytes, human);
 }
 
 /*
@@ -255,9 +234,10 @@ typedef struct {
     bool human;
     bool by_time;
     bool reverse;
+    bool dir_itself;
 } ls_flags_t;
 
-#define LS_USAGE "usage: ls [-1ahltr] [path]\n"
+#define LS_USAGE "usage: ls [-1adhiltr] [path]\n"
 
 /*
  * Flags, bundled ("-lah") or separate, in any order. Anything that is not a
@@ -278,6 +258,8 @@ static bool ls_parse(espix_session_t *s, int argc, char **argv,
 
         for (const char *p = argv[i] + 1; *p != '\0'; p++) {
             switch (*p) {
+            /* The entry itself, not its contents: how a mount point is inspected. */
+            case 'd': f->dir_itself = true; break;
             case 'l': f->long_form = true; break;
             case 'a': f->all       = true; break;
             case 'h': f->human     = true; break;
@@ -318,14 +300,14 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    /* A plain file argument just describes itself.
+    /* A plain file argument, or any directory with -d, just describes itself.
      *
      * With owner and group, which this form used to leave out -- so `ls -l
      * /etc/passwd` and `ls -l /etc` described the same file differently, and
      * the one you reach for when you care about a single file was the one
      * missing who owns it. Widths are the strings' own here: there is one row,
      * so there is nothing to line it up against. */
-    if (!S_ISDIR(st.st_mode)) {
+    if (!S_ISDIR(st.st_mode) || f.dir_itself) {
         if (f.long_form) {
             char when[20];
             char perms[11];
@@ -591,6 +573,38 @@ static int cmd_mkdir(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+/* Empty directories only, which is what rmdir(2) does -- `rm -r` is the way to
+ * take a tree, and keeping the two apart is the point of having both. No -p:
+ * mkdir here has none either, and one flag in a pair is worse than none. */
+static int cmd_rmdir(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 2) {
+        espix_eprintf(s, "usage: rmdir <dir>...\n");
+        return 1;
+    }
+
+    int status = 0;
+
+    for (int i = 1; i < argc; i++) {
+        char abs[ESPIX_PATH_MAX];
+        if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
+            status = 1;
+            continue;
+        }
+        if (strcmp(abs, "/") == 0 || strcmp(abs, "/media") == 0) {
+            espix_eprintf(s, "rmdir: refusing to remove %s\n", abs);
+            status = 1;
+            continue;
+        }
+        if (rmdir(abs) != 0) {
+            espix_eprintf(s, "rmdir: %s: %s\n", abs, strerror(errno));
+            status = 1;
+        }
+    }
+
+    return status;
+}
+
 static int cmd_rm(espix_session_t *s, int argc, char **argv)
 {
     bool recursive = false;
@@ -635,6 +649,62 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+/*
+ * Read both files back and compare them, chunk for chunk.
+ *
+ * Not paranoia. A write into a mounted FAT volume has been measured arriving as
+ * an empty file -- once in seven copies -- with every layer reporting success,
+ * this command's fflush() and fclose() included: the transfer is lost somewhere
+ * under FatFs without an error coming back up (KNOWN-ISSUES.md has the numbers).
+ * Reading the copy back is therefore the only way to know it arrived.
+ *
+ * Buffers from the heap rather than the stack, because this runs on the SSH
+ * connection task and that stack is the one that overflowed once already. An
+ * allocation failure means "not verified", which is not the same as "wrong", so
+ * it is said out loud and does not fail the copy.
+ */
+static bool copy_arrived(espix_session_t *s, const char *src, const char *dst)
+{
+    FILE *a = fopen(src, "rb");
+    if (a == NULL) {
+        return false;
+    }
+    FILE *b = fopen(dst, "rb");
+    if (b == NULL) {
+        fclose(a);
+        return false;
+    }
+
+    char *ca = malloc(COPY_CHUNK);
+    char *cb = malloc(COPY_CHUNK);
+    if (ca == NULL || cb == NULL) {
+        free(ca);
+        free(cb);
+        fclose(a);
+        fclose(b);
+        espix_eprintf(s, "cp: %s: cannot verify (out of memory)\n", dst);
+        return true;
+    }
+
+    bool same = true;
+    while (same) {
+        const size_t na = fread(ca, 1, COPY_CHUNK, a);
+        const size_t nb = fread(cb, 1, COPY_CHUNK, b);
+
+        if (na != nb || (na > 0 && memcmp(ca, cb, na) != 0)) {
+            same = false;
+        } else if (na < COPY_CHUNK) {
+            break;                      /* both ended, at the same place */
+        }
+    }
+
+    free(ca);
+    free(cb);
+    fclose(a);
+    fclose(b);
+    return same;
+}
+
 static int cmd_cp(espix_session_t *s, int argc, char **argv)
 {
     if (argc != 3) {
@@ -668,14 +738,46 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
 
     while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0) {
         if (fwrite(chunk, 1, n, out) != n) {
-            espix_eprintf(s, "cp: %s: write failed\n", dst);
+            espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
             status = 1;
             break;
         }
     }
 
     fclose(in);
-    fclose(out);
+
+    /*
+     * The flush is where the bytes actually go: stdio buffers them, so on a
+     * mounted volume the real write happens here and not in fwrite(). Checking
+     * fwrite() alone therefore reports success for a copy that fails on close --
+     * which is how fifteen bytes became a 0-byte file with nothing said.
+     */
+    if (status == 0 && fflush(out) != 0) {
+        espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
+        status = 1;
+    }
+    /*
+     * Closed whatever happened; the failure is reported only when there is not
+     * one already. That `fclose` is not tidiness: it is the only thing that gives
+     * the destination's fd back, and short-circuiting it meant one failed copy
+     * left the volume answering "busy -- a file is open on it" for good -- which
+     * is exactly what a pull mid-copy produces, and how this was found.
+     */
+    if (fclose(out) != 0 && status == 0) {
+        espix_eprintf(s, "cp: %s: close failed: %s\n", dst, strerror(errno));
+        status = 1;
+    }
+
+    /*
+     * Then look at what arrived. Every layer above has now reported success, and
+     * a copy has been measured arriving as an empty file anyway -- so this is the
+     * check that would have caught it, rather than the operator noticing later.
+     */
+    if (status == 0 && !copy_arrived(s, src, dst)) {
+        espix_eprintf(s, "cp: %s: the copy did not arrive intact\n", dst);
+        status = 1;
+    }
+
     return status;
 }
 
@@ -939,8 +1041,8 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
         if (argv[i][0] != '-' || argv[i][1] == '\0') {
             /* There is one filesystem and df already names it. An operand is a
              * misunderstanding worth correcting rather than ignoring. */
-            espix_eprintf(s, "df: %s: df reports the root filesystem and takes "
-                             "no operand\n" DF_USAGE, argv[i]);
+            espix_eprintf(s, "df: %s: df reports every mounted filesystem and "
+                             "takes no operand\n" DF_USAGE, argv[i]);
             return 1;
         }
         for (const char *c = argv[i] + 1; *c != '\0'; c++) {
@@ -999,6 +1101,48 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
      */
     espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
                  "littlefs", c_total, c_used, c_avail, pct, "/");
+
+    /*
+     * Then a row per mounted volume, in the same shape.
+     *
+     * df was rootfs-only because nothing could ask a FAT volume how full it was.
+     * espix_fs_stat_fat() does now. A mount that cannot answer -- a non-FAT
+     * volume, or one whose device has been pulled -- is left out rather than
+     * printed as zero, because a row claiming no space at all is worse than no
+     * row. The first column is the filesystem *type*, as the rootfs row has
+     * always been: the layer espix adds holds no storage of its own.
+     */
+    for (size_t i = 0; ; i++) {
+        char path[ESPIX_PATH_MAX];
+
+        if (espix_fs_mount_at(i, path, sizeof(path)) != ESP_OK) {
+            break;
+        }
+
+        uint64_t total  = 0;
+        uint64_t free_b = 0;
+        if (espix_fs_stat_fat(path, &total, &free_b) != ESP_OK) {
+            continue;
+        }
+
+        const uint64_t used_b = (total > free_b) ? (total - free_b) : 0;
+        const unsigned pct_v  = (total > 0)
+                              ? (unsigned)((used_b * 100) / total) : 0;
+
+        if (human) {
+            ls_size(c_total, sizeof(c_total), total,  true);
+            ls_size(c_used,  sizeof(c_used),  used_b, true);
+            ls_size(c_avail, sizeof(c_avail), free_b, true);
+        } else {
+            snprintf(c_total, sizeof(c_total), "%u", (unsigned)(total / 1024));
+            snprintf(c_used,  sizeof(c_used),  "%u", (unsigned)(used_b / 1024));
+            snprintf(c_avail, sizeof(c_avail), "%u", (unsigned)(free_b / 1024));
+        }
+
+        espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
+                     "vfat", c_total, c_used, c_avail, pct_v, path);
+    }
+
     return 0;
 }
 
@@ -1125,11 +1269,13 @@ static espix_cmd_t s_fs_cmds[] = {
     { .name = "cd",    .fn = cmd_cd,
       .help = "change the working directory",    .usage = "cd [dir]" },
     { .name = "ls",    .fn = cmd_ls,
-      .help = "list directory contents",         .usage = "ls [-1ahltr] [path]" },
+      .help = "list directory contents",         .usage = "ls [-1adhiltr] [path]" },
     { .name = "cat",   .fn = cmd_cat,
       .help = "print files",                     .usage = "cat <file>..." },
     { .name = "mkdir", .fn = cmd_mkdir,
       .help = "create directories",              .usage = "mkdir <dir>..." },
+    { .name = "rmdir", .fn = cmd_rmdir,
+      .help = "remove empty directories",        .usage = "rmdir <dir>..." },
     { .name = "rm",    .fn = cmd_rm,
       .help = "remove files or directories",     .usage = "rm [-r] <path>..." },
     { .name = "cp",    .fn = cmd_cp,

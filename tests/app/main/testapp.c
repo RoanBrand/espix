@@ -16,6 +16,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -82,6 +83,47 @@ static int cmd_chmod(const char *path, const char *octal)
     }
     printf("chmod %s %s\n", path, errno_name(errno));
     return 1;
+}
+
+/*
+ * Ownership as an app sees it: stat() by path and fstat() by descriptor. The
+ * expected uid comes from the suite: this reports, it does not judge.
+ */
+/*
+ * Who the app is, as the ABI answers it. The shell's `id` is the other side of
+ * the comparison a suite makes.
+ */
+static int cmd_id(void)
+{
+    printf("uid=%u gid=%u euid=%u egid=%u\n", (unsigned)getuid(),
+           (unsigned)getgid(), (unsigned)geteuid(), (unsigned)getegid());
+    return 0;
+}
+
+static int cmd_stat(const char *path)
+{
+    struct stat st;
+
+    if (stat(path, &st) != 0) {
+        printf("stat %s %s\n", path, errno_name(errno));
+        return 1;
+    }
+
+    printf("stat %s uid=%u gid=%u\n", path, (unsigned)st.st_uid,
+           (unsigned)st.st_gid);
+
+    /* fstat() has no path to answer from, which is where the two part company. */
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        struct stat by_fd;
+        if (fstat(fd, &by_fd) == 0) {
+            printf("fstat %s uid=%u gid=%u\n", path, (unsigned)by_fd.st_uid,
+                   (unsigned)by_fd.st_gid);
+        }
+        close(fd);
+    }
+
+    return 0;
 }
 
 static int cmd_cd(const char *path)
@@ -515,6 +557,8 @@ static void usage(void)
            "  exit <n>            exit with status n\n"
            "  argv [args...]      echo argc and each argument\n"
            "  probe <path>...     open each path, report ok or errno\n"
+           "  stat <path>         stat and fstat, with the app own uid\n"
+           "  id                  uid, gid, euid and egid as the ABI answers them\n"
            "  chmod <path> <oct>  chmod, report ok or errno\n"
            "  cd <path>           chdir then getcwd\n"
            "  write <path> <text> create and write\n"
@@ -555,6 +599,12 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "chmod") == 0 && argc > 3) {
         return cmd_chmod(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "id") == 0) {
+        return cmd_id();
+    }
+    if (strcmp(cmd, "stat") == 0 && argc > 2) {
+        return cmd_stat(argv[2]);
     }
     if (strcmp(cmd, "cd") == 0 && argc > 2) {
         return cmd_cd(argv[2]);

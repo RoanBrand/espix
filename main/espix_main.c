@@ -18,8 +18,12 @@
  *                 /etc/wifi.conf. Returns immediately; association and DHCP
  *                 run on the event loop, so an absent or unreachable network
  *                 never delays the prompt.
- *   7. commands — need the registry, and the filesystem to act on.
- *   8. console  — takes over this task and does not return.
+ *   7. usb      — the OTG port as a host, when the role is host. Independent of
+ *                 everything above and, like networking, done as soon as the
+ *                 stack is up: an empty socket is the normal case, and devices
+ *                 appear on the USB task as they are plugged in.
+ *   8. commands — need the registry, and the filesystem to act on.
+ *   9. console  — takes over this task and does not return.
  */
 
 #include "esp_err.h"
@@ -35,8 +39,52 @@
 #include "espix_shell.h"
 #include "espix_ssh.h"
 #include "espix_time.h"
+#include "espix_usb.h"
 
 #define TAG "espix"
+
+/*
+ * Give every attached storage device a name in /dev, and take the names away
+ * when it goes.
+ *
+ * This is the only place that knows both halves: espix_fs has no idea what USB
+ * is, espix_usb knows nothing about the VFS, and this file already depends on
+ * both. Doing it here is what keeps those two components independent of each
+ * other, which is the reason the hook exists at all.
+ *
+ * Per disk *and* per partition, the way every other system names them, and what
+ * makes `mount /dev/sda1 /mnt` work. A superfloppy has no partitions, so its
+ * disk node is the only one there is -- and mounting the disk itself is then the
+ * only way to reach the filesystem on it.
+ */
+static void usb_dev_nodes(const espix_usb_dev_t *dev, bool attached)
+{
+    if (attached) {
+        (void)espix_dev_register_block(dev->name, dev->size);
+        for (size_t i = 0; i < dev->nparts; i++) {
+            (void)espix_dev_register_block(dev->parts[i].name,
+                                           dev->parts[i].size);
+        }
+
+        /* And whatever /etc/fstab says about it, if anything. */
+        espix_blk_device_added(dev->name);
+        return;
+    }
+
+    /*
+     * Before anything else: a mount of this device is about to have its block
+     * device released underneath it, so the filesystem has to be told first --
+     * this is the detach half of the use-after-free Stage 2 left open.
+     */
+    espix_blk_device_gone(dev->name);
+
+    /* Detach hands the row over intact -- before it is released -- so the
+     * partitions are still there to be named. */
+    espix_dev_unregister_block(dev->name);
+    for (size_t i = 0; i < dev->nparts; i++) {
+        espix_dev_unregister_block(dev->parts[i].name);
+    }
+}
 
 void app_main(void)
 {
@@ -65,6 +113,20 @@ void app_main(void)
     if (net_err != ESP_OK) {
         ESP_LOGW(TAG, "networking unavailable: %s", esp_err_to_name(net_err));
     }
+
+    /*
+     * The other use of the OTG port, and the reason the port has a role: only
+     * one of USB-NCM and USB host can have it. Also not fatal -- the board works
+     * with nothing in the socket, which is how it usually is.
+     */
+    const esp_err_t usb_err = espix_usb_init();
+    if (usb_err != ESP_OK) {
+        ESP_LOGW(TAG, "usb host unavailable: %s", esp_err_to_name(usb_err));
+    }
+
+    /* Installed whether or not the stack came up: an empty socket is the normal
+     * case, and a device-role build simply never hears anything. */
+    espix_usb_set_dev_hook(usb_dev_nodes);
 
 #if CONFIG_ESPIX_SSH_ENABLED
     /* Binds immediately and accepts asynchronously, so this does not wait for

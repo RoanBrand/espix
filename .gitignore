@@ -1,5 +1,9 @@
 # ESP-IDF build output
 build/
+# An out-of-tree build directory (`idf.py -B build-<something>`), which is how a
+# second configuration gets measured without disturbing the first -- a role, a
+# board, a target. Build output all the same, and it is thousands of files.
+build-*/
 sdkconfig
 sdkconfig.old
 managed_components/
@@ -50,3 +54,4 @@ compile_commands.json
 
 # NOTE: dependencies.lock IS committed, deliberately — it pins the exact
 # component versions so builds are reproducible.
+coredump.bin

@@ -3,6 +3,7 @@
  */
 
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -123,11 +124,19 @@ int espix_session_write(espix_session_t *s, const char *data, size_t len,
     return err ? session_err(s, data, len) : session_out(s, data, len);
 }
 
-/* What one command line's redirections resolved to. */
+/* What one command line's redirections resolved to. The names are kept so a
+ * failure to close can name the file: the close is where a buffered write is
+ * actually attempted, and a silent failure there loses data.
+ *
+ * Pointers into argv rather than copies, because this struct lives on the stack
+ * of every command -- and over SSH that stack is the connection task's budget.
+ * The strings outlive the command, and redirects_release() runs inside it. */
 typedef struct {
-    FILE *out;          /* `>` / `>>`, or NULL */
-    FILE *err;          /* `2>` / `2>>`, or NULL */
-    bool  err_to_out;   /* `2>&1` */
+    FILE *out;              /* `>` / `>>`, or NULL */
+    FILE *err;              /* `2>` / `2>>`, or NULL */
+    bool  err_to_out;       /* `2>&1` */
+    const char *out_name;   /* the target as typed, for a failed close */
+    const char *err_name;
 } redirects_t;
 
 /*
@@ -203,8 +212,15 @@ static int take_redirects(espix_session_t *s, int argc, char **argv,
 
         *slot = fopen(abs, append ? "ab" : "wb");
         if (*slot == NULL) {
-            espix_eprintf(s, "espix: %s: cannot open for writing\n", abs);
+            espix_eprintf(s, "espix: %s: cannot open for writing: %s\n", abs,
+                          strerror(errno));
             return -1;
+        }
+        /* Kept for redirects_release(): a failed close has to name the file. */
+        if (to_out) {
+            r->out_name = argv[i + 1];
+        } else {
+            r->err_name = argv[i + 1];
         }
 
         i++;                            /* the target */
@@ -234,11 +250,17 @@ static void redirects_release(espix_session_t *s, redirects_t *r)
         s->err_to_out   = false;
     }
     if (r->out != NULL) {
-        fclose(r->out);
+        if (fclose(r->out) != 0) {
+            espix_eprintf(s, "espix: %s: write failed: %s\n", r->out_name,
+                          strerror(errno));
+        }
         r->out = NULL;
     }
     if (r->err != NULL) {
-        fclose(r->err);
+        if (fclose(r->err) != 0) {
+            espix_eprintf(s, "espix: %s: write failed: %s\n", r->err_name,
+                          strerror(errno));
+        }
         r->err = NULL;
     }
 }

@@ -70,7 +70,9 @@ things are as they are.
 
 ## Filesystem
 
-- **`mount`, `umount` and `/proc`, with espix's own mount table.** espix owns
+- **`mount`, `umount` and `/proc`, with espix's own mount table.** *Done for FAT
+  on USB — see [USB-HOST.md](USB-HOST.md#stage-2--mounting); `/proc` is the rest
+  of it.* espix owns
   the root VFS but routes only the root: it holds one pointer to one filesystem.
   Anything else mounted — FAT on an SD card, a second LittleFS partition,
   `/proc` — would be registered with ESP-IDF's VFS at its own prefix and would
@@ -85,29 +87,136 @@ things are as they are.
   [UPSTREAM.md](UPSTREAM.md)). `/proc` is then espix's own ops rather than a
   filesystem at all, which is what makes it the cheap one to do first.
 
+  **The second filesystem exists, and it mounts.** Enumeration, identification
+  and the partition table shipped first — [USB-HOST.md](USB-HOST.md) — and
+  `mount sda1 /mnt` now puts a FAT volume in the namespace with the permission
+  check still applying to it. Both defects that blocked it are closed: the
+  filesystem is reached through espix's table rather than registered at a prefix,
+  and a mount that stores no metadata of its own (FAT) has `chmod` answer EPERM
+  instead of filing littlefs attributes for a path that is not on littlefs.
+
   **"Routing internally" is smaller than it sounds**, and worth costing before
-  rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the
-  global fd table either way; what espix adds is a prefix lookup (an array and a
-  longest-match `strncmp`, ~30 lines) and one wrinkle — with two filesystems
-  below, LittleFS fd 3 and FAT fd 3 collide when they come back into espix's
-  `read()`, so the mount index gets packed into the fd espix returns and
-  unpacked on the way in. About ten lines and no second table. Call it eighty
-  lines, not a VFS.
+  rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the global
+  fd table either way; what espix adds is a prefix lookup (an array and a
+  longest-match `strncmp`) and one wrinkle — and the wrinkle, written down wrong
+  here twice, is the fd. The earlier version of this paragraph said there was no
+  collision, because espix passes the lower filesystem's fd through unchanged
+  and IDF allocates from one global table. That is not what happens. The ops
+  espix calls are FatFs's *inner* ops — the ones `tools/patch-fatfs.py` exposes
+  precisely so that `esp_vfs` is bypassed — and those hand out FatFs's own
+  `fat_ctx->files[]` slots: 0, 1, 2, … While IDF's global table, and the
+  console, are handing out those same numbers. So a FAT file is fd 2 while the
+  console is fd 2, and anything keyed on the fd without knowing which filesystem
+  it came from is wrong.
+
+  Measured, and written up in [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem): the
+  first two writes after a boot fail — one `EBADF` on close, one silently — and
+  every write after that succeeds until the next boot.
+
+  So the fds need *packing*, which is what this paragraph twice talked itself out
+  of: a file opened below gets a number from espix's own space and every op maps
+  it back. That is the reverse map plus an offset, and `lower_t s_mounts[]` in
+  `vfs.c` has only the second half of it.
+
+  The options, and what each costs:
+
+  **A — formalise the seam.** One registration, espix's own fd keys, every
+  assumption written down with the IDF line it depends on, and tests that fail if
+  IDF changes one. Cheapest, keeps IDF's libc glue, sockets and `select()`
+  working unchanged, and it is what espix does now — see
+  `tests/suites/12-vfs.sh`, which asserts the five things that matter.
+
+  **B — one registered VFS per mount.** The IDF-native shape, and wrong here:
+  each mount publishes a second name for its filesystem, which is exactly what
+  the stacked design exists to avoid, and the permission check cannot move into
+  vendored filesystems, so it would be bypassable.
+
+  **C — own the syscalls.** espix implements the libc entry points itself and
+  keeps an fd table at whatever size it likes, with permissions at the single
+  entry point, `/dev` nodes with real semantics, and no prefix matching to be
+  surprised by. The obstacle is not files, it is **sockets**: lwIP's sockets live
+  in IDF's table and are the reason `select()` matters at all, so C needs a
+  mapping layer between espix's fds and IDF's socket fds before any file moves.
+  Worth doing when one of these is true rather than when the tidiness annoys the
+  most: device files that need real read/write semantics, sockets selectable in
+  the same set as open files, per-process bind mounts, or a second filesystem
+  type that must not be reachable by path.
+
+  **D — extend IDF.** Cheapest per unit of pain removed, and the ask to lead with
+  upstream, because two of the three are housekeeping rather than features:
+
+  1. **Document that `local_fd` is opaque and stored verbatim.** It already
+     behaves that way (`vfs.c:764`), and it is the only reason espix can hand out
+     keys of its own rather than borrowing the lower filesystem's numbers. One
+     sentence in the header turns an accident into a contract.
+  2. **Let a release work on non-permanent entries.** `esp_vfs_unregister_fd()`
+     refuses anything not registered permanent (`vfs.c:679`), so a driver that
+     allocates an entry per open and frees it after the close path has no way to
+     do both. That cost espix one leaked entry per open, and eventually a table
+     with no room left.
+  3. **A stacking registration.** A VFS that receives the untranslated path
+     *before* the prefix match and may forward to the next match — the one thing
+     that would let espix stop being "the default VFS that happens to be on top"
+     and start being a layer with a defined place in the order.
+
+  **And a smaller patch worth considering: 32-bit `off_t`.** `/dev/sda4` lists as
+  `0` for 23 GiB, and no file over 4GB can be reported or seeked correctly. There
+  is no Kconfig for it (UPSTREAM.md has the detail), so it is a define on the
+  newlib headers, in the shape of the other two patches — with the difference that
+  it would touch every `struct stat` in the image. That is why it wants its own
+  decision rather than riding along with something else.
+
+### The POSIX surface, and which layer would have to change
+
+espix presents a POSIX-shaped interface over filesystems that are not POSIX and a
+VFS that is not the kernel's, so some of what an app can call behaves differently
+or not at all. This is the list, with the honest answer for each: a fix and the
+layer it belongs to, or a choice and the reason.
+
+| surface | espix today | what would change it |
+|---|---|---|
+| `stat().st_uid`, `.st_gid` | the owner rule's answer, for a path | **done**: `vfs_stat()` fills both from `espix_fs_owner()` |
+| `fstat().st_uid`, `.st_gid` | still `0`, and marked in the code | the rule is path-based and a descriptor is not a path; the fix is to remember the path on the fd slot, or to leave it |
+| `stat().st_blksize`, `.st_blocks` | plausible constants | a real value, or leave and document |
+| `access()` on a path | not espix's to answer | implement in the VFS |
+| `link()`, `symlink()` | unsupported | the VFS, then the lower filesystems |
+| `select()` on a file | `ENOSYS` | a select in the VFS, or option C below |
+| `dup()`, `fcntl()` | partial | the VFS |
+| `mmap()`, `statvfs()`, `utime()` | partial or absent | the VFS, and the littlefs port's Kconfig for utime |
+| `/dev/<device>` opened as a file | `EOPNOTSUPP` (a name, not a stream) | raw block I/O as its own feature |
+| a volume whose device was pulled | `ENOSYS` from every operation | deliberate; `EIO` would need a refusing helper per op |
+| `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it |
+| an fd's number | espix's own (128–159), not the lower fs's | deliberate; an fd is opaque, so nothing should care |
+| `.` and `..` in a directory listing | absent; `..` still resolves in a path | the lower filesystem's doing; the VFS could synthesise them |
+
+Two things this table is for. It is where a `ESPIX_NOT_POSIX:` marker in the code
+points, so a reader can find out what to do rather than only what is wrong. And it
+is the checklist that decides option C: when the rows saying *the VFS* outnumber
+the rows saying *deliberate*, owning the syscalls stops being tidiness and starts
+being the shortest path.
 
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
 
   **Why not extend ESP-IDF's VFS instead?** It has no hook of any kind —
-  `esp_vfs.h` offers nothing to intercept with. Patching `$IDF_PATH` is a
-  non-starter: it is shared by every project on the machine, where
-  `managed_components/` is per-project and gitignored. The real alternative is
-  shadowing the `vfs` component with a patched copy in `components/vfs/`, which
-  a project component may do — and that is *architecturally the better answer*,
-  putting the check in `esp_vfs_open()` where Linux puts it and covering every
-  mount with no routing code in espix at all. It is not first choice only
-  because of what it costs: `vfs.c` and `vfs_calls.c` are ~58KB of core code
-  that the console, sockets and eventfd all depend on, to be re-merged on every
-  IDF upgrade. Worth revisiting if the eighty lines above turn out to be wrong.
+  `esp_vfs.h` offers nothing to intercept with. Patching `$IDF_PATH` for *this* is
+  a non-starter: it is shared by every project on the machine, where
+  `managed_components/` is per-project and gitignored — and a behavioural change
+  to core VFS code is not something to carry in a tree espix does not own. The
+  real alternative is shadowing the `vfs` component with a patched copy in
+  `components/vfs/`, which a project component may do — and that is
+  *architecturally the better answer*, putting the check in `esp_vfs_open()` where
+  Linux puts it and covering every mount with no routing code in espix at all. It
+  is not first choice only because of what it costs: `vfs.c` and `vfs_calls.c` are
+  ~58KB of core code that the console, sockets and eventfd all depend on, to be
+  re-merged on every IDF upgrade. Worth revisiting if those eighty lines turn out
+  to be wrong.
+
+  Stage 2 did patch `$IDF_PATH` — for `fatfs`, not `vfs`, and the distinction is
+  the whole reason it was acceptable: three *additive* functions and a refactor
+  whose absence is a link error on the first build, rather than a change to core
+  code whose absence would be a behavioural difference nobody would notice until
+  it mattered. See [UPSTREAM.md](UPSTREAM.md) — the request goes there either way.
 
 - ~~**A file surface for apps.**~~ Done. `abi_fs.c` publishes fopen, open,
   read, stat, opendir and the rest, and almost all of it is unwrapped libc
@@ -291,6 +400,18 @@ things are as they are.
   100–999, no home — which with `sudo -u` is the whole mechanism for running an
   app under its own identity. `passwd` no longer creates accounts, which is what
   fixed it handing every new one uid 1000.
+
+- **`SERIAL=` in /etc/fstab, for the device rather than a volume.** The USB device
+  serial is read already (`espix_usb_dev_t.serial`) and printed by `blkid`, so
+  reading it costs nothing. It is the one identifier that survives a whole-disk
+  `dd` clone, where `LABEL=`, `UUID=` and `PARTUUID=` all travel with the copy.
+
+  What is not done is the question underneath it, rather than the reading: **a
+  serial identifies a disk, and a rule mounts a volume.** `SERIAL=X` is
+  unambiguous only for a superfloppy, and any real rule has to say which partition
+  of that disk -- which means either a composite field (`SERIAL=X/1`) or a second
+  column. One is a new spelling to learn, the other a change to the file's shape,
+  and it is worth deciding deliberately rather than by precedence.
 
 ## Signals
 
@@ -497,6 +618,46 @@ things are as they are.
   [partitions/esp32s3-16mb.csv](../partitions/esp32s3-16mb.csv); the 8MB table
   notes why the same shape does not fit there.
 
+- **USB host beyond storage.** Enumeration, identification, the partition table,
+  superfloppy volumes and hotplug are done and shipped — see
+  [USB-HOST.md](USB-HOST.md) — and what is left divides into things that are cheap
+  and things that need a decision. Two of the original open questions are now
+  answered: a PD hub does power the board *and* enumerate devices, and **two
+  storage devices do not fit** — the S3 has a fixed pool of host channels and a
+  hub plus one disk consumes almost all of them, so the second disk is refused
+  while the first works. A keyboard costs two channels where a disk costs three.
+
+  - **exFAT** is a patched dependency rather than a feature. `FF_FS_EXFAT` is
+    hardcoded `0` in IDF's `components/fatfs/src/ffconf.h` with no Kconfig to
+    change it, so it means carrying a patch the way
+    `tools/patch-littlefs.py` carries one. It is also the one item here with a
+    legal question attached: exFAT is covered by Microsoft patents, and FatFs's
+    author has said a licence may be needed for commercial use. **That has not
+    been verified against IDF or FatFs here** — no patent or licence text ships
+    with the bundled FatFs — so it is a "check the terms first" item, not a
+    "just enable it" item.
+  - **lwext4** for ext2/3/4, and a much later `lwntfs`, are new components with
+    the same shape as the filesystem work in [Filesystem](#filesystem). `lsblk`
+    already names both as recognised and unsupported, which is the honest
+    position until then — and names ext2/3/4 specifically, from the superblock,
+    on a partition (`0x83`) and on a whole-device volume alike.
+  - **GPT** wants a partition-table reader rather than a parser change: the
+    protective MBR is reported today rather than followed.
+  - **A USB keyboard** is the interesting one and needs no display and no serial
+    port to test: SSH in over WiFi, print decoded keystrokes, and type. That
+    sidesteps the hub-blocks-the-UART-socket problem entirely, which is the part
+    of this that costs real time.
+  - **Runtime role switching** (device ↔ host without a reflash) was rejected
+    rather than deferred: it needs both stacks linked, which gives up the whole
+    saving, and nothing has verified that the peripheral can be handed over
+    cleanly at runtime.
+  - **VBUS.** Whether a PD hub powers the board *and* enumerates devices is what
+    [USB-HOST.md](USB-HOST.md) is there to find out. If power to the port turns
+    out to need switching from the board, `boards/*.conf` is the only place
+    per-board wiring can be expressed today and there is **no precedent in it**:
+    those files carry flash size, PSRAM mode and a partition table, and nothing
+    else.
+
 ## Networking and time
 
 - **Routing and NAT: be the bridge people buy a Raspberry Pi for.** With WiFi on
@@ -675,6 +836,11 @@ other way round.
   beside UART and SSH, and the session layer was built transport-agnostic
   precisely so a third one could be added without touching the shell. The P4 is
   the target -- MIPI DSI, with an HDMI variant.
+
+  The keyboard half has somewhere to land now: USB host mode already enumerates
+  devices and identifies them ([USB-HOST.md](USB-HOST.md)), so what it needs is a
+  HID class driver beside the mass-storage one, not a second stack or a second
+  role.
 
 - **A minimal 2D desktop environment**: a filesystem browser, a JPEG viewer, an
   audio player for whatever formats decode cheaply, and video on the P4, which

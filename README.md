@@ -26,13 +26,21 @@ together.
 
 Early, but running on hardware. Verified on an ESP32-S3 (16MB flash, 8MB octal
 PSRAM) with ESP-IDF v6.1: LittleFS mounted as the real `/`, a
-transport-agnostic shell with 37 commands, a process table, and — the point of
+transport-agnostic shell with 57 commands, a process table, and — the point of
 the exercise — an app cross-compiled on a PC, copied over as a file, and loaded
 and executed at runtime with argv and an exit status.
 
 WiFi comes up as `wlan0` and an SSH server serves the same shell as the serial
 console, so `scp` puts an app in `/bin` and you run it by name. Files survive a
 reboot and a firmware reflash.
+
+The USB-OTG port is a **host** by default: a stick plugged into it is enumerated,
+identified and its partition table read on its own, `lsblk`/`blkid` report what is
+there — including the filesystems espix cannot drive and disks that have no
+partition table at all — and `mount sda1 /mnt` mounts a FAT volume into the
+namespace, through espix's own VFS rather than a prefix of IDF's. Because host
+mode and USB-NCM are two uses of the one OTG peripheral, a default build has no
+`usb0` — [USB-HOST](docs/USB-HOST.md).
 
 Fault interception is wired but only *reports* — see
 [Crash handling and isolation](#crash-handling-and-isolation). For the full
@@ -249,6 +257,13 @@ kernel messages.
 Support priority and per-chip feature availability (isolation model,
 display, networking) still to be finalized as the design matures.
 
+One hardware fact decides a build option today: **`SOC_USB_OTG_PERIPH_NUM` is 1
+on the S3 and the S31, and 2 only on the P4.** The OTG peripheral is either a
+device (USB-NCM, `usb0`) or a host (USB storage), so espix asks which in
+`ESPIX_USB_ROLE` and defaults to **host**. The P4 could do both at once, but
+builds one role like the others until a board file can say which socket reaches
+which controller — [USB-HOST](docs/USB-HOST.md).
+
 What the MMU rows in the matrix below rest on, since "has an MMU" covers two
 quite different things:
 
@@ -315,7 +330,9 @@ merely missing.
 | `ls -i`, inode numbers | **no** | esp_littlefs reports `d_ino = 0` for every entry, and LittleFS exposes no file id |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
-| `/proc`, `mount` / `umount` | **planned** | espix owns `/` but routes only `/`; a second mount needs its own routing table |
+| `/proc` | **planned** | the one part of espix's own mount table still missing; a second mount now exists |
+| `mount`, `umount` | **yes** | `mount sda1 /mnt` puts a FAT32/FAT16 volume from a USB device into the namespace, reached through espix's own VFS so the permission check applies to it. Root only; nothing is ever formatted; unplug while mounted is a gap — [USB-HOST](docs/USB-HOST.md#stage-2--mounting) |
+| `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). **One storage device at a time** — [USB-HOST](docs/USB-HOST.md) |
 | Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
 | Read and write bits enforced | **yes** | in espix's root VFS, so builtins, loaded apps and SFTP are all checked the same way |
@@ -332,7 +349,8 @@ merely missing.
 | SSH server | **yes** | password auth — [read this first](#a-word-on-the-ssh-server) |
 | `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
-| USB-NCM | **yes** | `usb0`: plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](docs/USB-NETWORKING.md) |
+| USB-NCM | **yes** | device role only: `usb0`, plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](docs/USB-NETWORKING.md) |
+| USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `mount sda1 /mnt` mounts its FAT volume, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. One storage device at a time, for want of host channels — [USB-HOST](docs/USB-HOST.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Raw lwIP / `netconn` for the SSH transport | **planned** | BSD sockets today, deliberately: apps get the same API. Cut calls before changing API — one `send()` per packet instead of three was worth 1.7× |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |

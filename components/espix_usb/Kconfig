@@ -1,0 +1,28 @@
+menu "espix usb"
+
+    config ESPIX_USB_VERBOSE
+        bool "Verbose USB host logging"
+        depends on ESPIX_USB_ROLE_HOST
+        default n
+        help
+            Raise the USB stack's own log tags to DEBUG, so `dmesg` shows what
+            the host library and the class drivers think is happening: port
+            changes, what was enumerated and at what speed, and why a device was
+            not claimed by any driver.
+
+            This is the switch to reach for when a device does not appear. The
+            stack logs everything useful at DEBUG and almost nothing at INFO, so
+            with this off a working enumeration and an empty socket look
+            identical -- which is exactly the question it exists to answer.
+
+            Two halves, and both are needed. CONFIG_LOG_MAXIMUM_LEVEL (DEBUG, in
+            sdkconfig.defaults) decides whether the messages exist in the image
+            at all; this option raises the tags that are noisy enough to be worth
+            leaving off by default.
+
+            Costs nothing when off, and when on it costs log volume: the kernel
+            log ring holds 96 lines (ESPIX_KLOG_LINES) and this will fill it.
+            Nothing else in the system is raised -- WiFi, lwip and the app loader
+            keep their own levels.
+
+endmenu

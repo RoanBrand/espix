@@ -81,11 +81,6 @@ if [ "$ACTION" != start ]; then
 fi
 PIDFILE="$LOG.pid"
 
-port_holder() {
-    command -v lsof >/dev/null 2>&1 || return 1
-    lsof "$1" 2>/dev/null | awk 'NR>1 {print $1" (pid "$2")"; exit}'
-}
-
 case "$ACTION" in
 stop)
     if [ ! -f "$PIDFILE" ]; then
@@ -124,14 +119,22 @@ if [ -z "$PORT" ]; then
     [ -n "$PORT" ] || { echo "serlog: no serial port found; pass one" >&2; exit 2; }
 fi
 
-# Refuse rather than race. See note 2 above.
-holder=$(port_holder "$PORT")
-if [ -n "$holder" ]; then
-    echo "serlog: $PORT is already held by $holder" >&2
-    echo "serlog: two readers split the byte stream; stop that one first" >&2
+# Refuse rather than race. See note 2 above. tools/port-holder.sh asks the
+# exclusive tty.* node for the same UART and names the holders, which is stronger
+# than an lsof of the cu.* device: that only sees processes which opened it by
+# that name, and a probe of the tty node sees every opener of the UART.
+#
+# Its status is three-way -- 0 free, 1 held, 2 no such port -- and the two
+# failures want different advice, so they are kept apart rather than lumped into
+# "not free" with the wrong sentence.
+holder_rc=0
+"$here/port-holder.sh" "$PORT" || holder_rc=$?
+if [ "$holder_rc" = 1 ]; then
+    echo "serlog: $PORT is already held (above); two readers split the byte stream" >&2
     echo "serlog:   tools/serlog.sh stop [logfile]   if it is a previous capture" >&2
     exit 3
 fi
+[ "$holder_rc" = 0 ] || { echo "serlog: $PORT cannot be opened (above)" >&2; exit 2; }
 
 # The IDF virtualenv has pyserial; the system python usually does not.
 if [ -x "$here/idf.sh" ]; then

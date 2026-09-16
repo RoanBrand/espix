@@ -35,7 +35,7 @@ menu "espix SSH"
 
             The cost is internal RAM, and only while a connection is actually
             open: nothing here is preallocated. With the PSRAM options below on,
-            which is the default, a connection costs 10344 bytes of internal
+            which is the default, a connection costs 12392 bytes of internal
             RAM -- its task stack, which can never live in PSRAM, and the
             channel receive buffer. Everything else, 14760 bytes of packet
             buffers and key-exchange state plus about 15KB more while a transfer
@@ -63,10 +63,22 @@ menu "espix SSH"
         int "Connection task stack (bytes)"
         depends on ESPIX_SSH_ENABLED
         range 4096 16384
-        default 8192
+        default 10240
         help
             The protocol logic is shallow, but the shell session runs on this
-            stack, and commands run on it too.
+            stack, and commands run on it too. So does `sudo`, which re-enters
+            the shell in the same task and pays the parsing frames twice.
+
+            8192 was not enough: `sudo mount sda1 /mnt/sd1` tripped the stack
+            canary at 7680 bytes used, 508 free, and the core dump named this
+            task. A command's stack cost is part of its contract, and `ps` is
+            where to read it -- its STACK column is FreeRTOS's high-water mark,
+            the smallest free figure the task has ever reached.
+
+            Raising this raises the per-connection internal cost in the note
+            above by the same amount: 10344 becomes 12392, so eight open
+            connections want about 16K more than the figures there were
+            measured with.
 
     config ESPIX_SSH_SFTP_IN_PSRAM
         bool "Allocate SFTP transfer buffers from PSRAM when available"
@@ -88,7 +100,7 @@ menu "espix SSH"
         help
             Moves the 14760 bytes of packet buffers, cipher state and stored
             key-exchange material per connection out of internal RAM, which is
-            what limits how many sessions fit. A connection then costs 10344
+            what limits how many sessions fit. A connection then costs 12392
             bytes of internal RAM: its task stack, which can never leave
             internal RAM, and the channel receive buffer.
 

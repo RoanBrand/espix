@@ -29,6 +29,11 @@ combination and timing, and nothing in the prototype hints at them.
 | A big task stack, in PSRAM | `xTaskCreate()` will never do it. `xTaskCreateStatic()` will, with `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` — and then that task **may not touch WiFi or Bluetooth**, because it may not call ROM code. | `freertos/Kconfig:585` |
 | An ISR that survives a flash write | `ESP_INTR_FLAG_IRAM` is not a promise the framework keeps for you. Every function it calls and every constant it reads must also be in IRAM/DRAM; one flash-resident callee turns a flash operation into a crash. | `esp_intr_alloc.h:42` |
 | A lazily created mutex | `xSemaphoreCreateMutex()` allocates, so it cannot be called from a critical section — and the obvious `if (lock == NULL) create();` is itself the race it is meant to prevent. `xSemaphoreCreateMutexStatic()` with static storage, inside a critical section, is the version that works. | espix `espix_shell/history.c`, which learned this the hard way |
+| USB host *and* USB-NCM on one board | `SOC_USB_OTG_PERIPH_NUM` is **1** on the S3 and the S31, and 2 only on the P4. The one peripheral is either a host or a device, so it is a build-time choice, not a runtime one — espix asks in `ESPIX_USB_ROLE`. | `soc/esp32s3/include/soc/soc_caps.h:338`, `soc/esp32p4/.../soc_caps.h:438`; espix [USB-HOST.md](USB-HOST.md) |
+| Any device behind a hub | Nothing enumerates until `CONFIG_USB_HOST_HUBS_SUPPORTED=y` — it **defaults to `n`** — and the symptom is silence: the hub's port lights up if it has lights, the log says nothing, and the devices behind it may as well not be plugged in. `CONFIG_USB_HOST_HUB_MULTI_LEVEL` does default to `y`, which makes the trap look handled. | `usb/Kconfig:137` (esp `espressif/usb` 1.5.0) |
+| A USB host transfer buffer in PSRAM | It has to be internal RAM on the S3: the USB-DWC DMA engine cannot reach external memory there, so `MALLOC_CAP_DMA` is the requirement and not the optimisation. The option that lifts it, `CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM`, is `depends on IDF_TARGET_ESP32P4 && SPIRAM` and does not exist on this target. | `usb/Kconfig:227` |
+| Doing USB work *inside* a host-library client callback | The callback runs inside `usb_host_client_handle_events()`, and that function is the only thing that delivers that client's transfer completions (`usb_host.c:1136`, `:1296`). Anything that waits for a transfer from there waits for the loop it is blocking: `msc_host_install_device()` takes 5 s per transfer × 50 retries — ten minutes per device, no log line, driver task blocked, and every later device invisible. | `msc_host.c:297`, `:551`, `:703`; espix [UPSTREAM.md](UPSTREAM.md) |
+| A hub *and* two storage devices | Every pipe is a host-controller channel: the root port 1, an open hub 2 (control + interrupt), a bulk-only device 3 (control + two bulk). `hcd_pipe_alloc()` returns `ESP_ERR_NOT_SUPPORTED` when the pool is empty — with the HCD logging `No more HCD channels available` — so the second drive is refused while the first works, and the *first* one to enumerate wins. One storage device at a time on the S3. | `hcd_dwc.c:2119`; espix [USB-HOST.md](USB-HOST.md) |
 
 ## Cache and DMA
 
@@ -202,6 +207,24 @@ panics (`elf_add_wdt_panic_details`), so after a reboot all seven look identical
 reproducing, or the reproduction is wasted: `tools/serlog.sh`, and run the suite
 without `--port` so nothing competes for the device (macOS lets two readers open
 the same `cu.*` and simply splits the bytes between them).
+
+The same non-exclusivity bites a *flash read*: esptool drives the stub through
+that driver, and a core-dump read through `cu.*` can fail at the last block with
+`Corrupt data, expected 0x1000 bytes but received 0x9d`. Use the `tty.*` node,
+which can only be held by one process, and slow it down while you are there:
+
+```
+ESPBAUD=115200 ./tools/idf.sh -p /dev/tty.usbserial-210 coredump-info -s /tmp/core.bin
+```
+
+`-s` keeps the bytes, so a failure to *decode* does not cost another read, and
+`coredump-info -c /tmp/core.bin` then needs no serial port at all.
+
+Better still, that is now one command: `make coredump` reads the whole partition
+at 115200 and decodes from the file (`tools/coredump.sh`), and
+`tools/port-holder.sh <port>` answers "who has this port" in one line — the check
+every tool makes before opening one, since two readers on a `cu.*` device split
+the byte stream between them.
 
 ### The task watchdog watches IDLE, and IDLE is not what you think
 
@@ -500,6 +523,53 @@ from a task. It resets the SHA peripheral under whatever else is using it. The
 general lesson: a `ets_`/ROM entry point is not a locked API, wherever you find
 one being called at runtime.
 
+### Every SSH command runs on the connection task's stack
+
+`sshd:conn` is created with `CONFIG_ESPIX_SSH_TASK_STACK`, and the shell session
+runs on that stack — so a command's frames and the task's are the same budget.
+`sudo` makes it worse: it re-enters the shell inside the same task, paying the
+line-parsing frames twice.
+
+The console does not have this problem. `main` carries the interactive session
+with 8700 bytes, while the same shell over SSH lives in whatever the Kconfig
+says — which was 8192, and a `sudo mount` overflowed it: 7680 bytes used, 508
+free, caught by the stack canary and reported by the core dump as a stack
+overflow in `sshd:conn`.
+
+That makes the stack cost of a command part of its contract, and `ps` the place
+to read it: the STACK column is `usStackHighWaterMark`, the smallest free figure
+the task has ever reached and not a current reading. A command that leaves a few
+hundred bytes there will overflow on a slightly different path.
+
+### The VFS fd table is sized by the socket count, and three other things it will not tell you
+
+Four IDF behaviours that cost espix a bug each, all in the space where a stacking
+VFS meets `esp_vfs`:
+
+- **`MAX_FDS` is `FD_SETSIZE` is `MEMP_NUM_NETCONN` is
+  `CONFIG_LWIP_MAX_SOCKETS`** (`esp_vfs.h:42`, `lwipopts.h:124`,
+  `lwip/sockets.h:478`). The fd table is as wide as the socket budget, so every
+  open file competes with every socket. A build with 20 sockets has twenty fds in
+  total — stdio, sockets and files together.
+- **A VFS registered without a path receives no paths at all.** It is stored with
+  `path_prefix_len = LEN_PATH_PREFIX_IGNORED` (`vfs.c:431`), and
+  `get_vfs_for_path()` skips those entries by name (`vfs.c:840`). Registering one
+  that way is how espix stopped receiving `mkdir`: the rootfs mounted, and then
+  not one directory could be created in it, which reads as a filesystem failure
+  rather than a registration one.
+- **`esp_vfs_unregister_fd()` only frees entries registered `permanent = true`**
+  (`vfs.c:679`). A driver that allocates an entry per open must ask for permanent
+  or nothing can ever free it — one table entry lost per open, and a table full
+  after a boot's worth of them.
+- **`local_fd` is opaque and stored verbatim** (`vfs.c:764`), and IDF hands it
+  back on every call. It does *not* have to be a number IDF allocated, which is
+  what lets a driver with several filesystems behind it hand out keys of its own
+  instead of borrowing the lower filesystem's numbering.
+
+Worth knowing on top of those: a path-based open costs **two** entries for one
+file — IDF's own, for the number the driver returned (`vfs_calls.c:56`), and
+whatever the driver allocated itself — and IDF's close releases only its own.
+
 ## Build and configuration
 
 ### `sdkconfig` wins, and it is usually not in version control
@@ -526,7 +596,79 @@ espcoredump's macros gate on `LOG_LOCAL_LEVEL` at compile time and write
 straight to `esp_rom_printf`, bypassing the runtime level — so every crash
 arrives under a page of core-dump tracing.
 
+### A write that "succeeded" has not been written yet
+
+`fwrite()` returns the length it was handed as soon as the bytes are in stdio's
+buffer; the file is touched when that buffer fills or the stream is closed. A
+program that checks `fwrite()` and not `fflush()`/`fclose()` therefore reports
+success for a copy whose real write failed — and on a filesystem that refuses
+writes, success for a file of zero bytes.
+
+Found here by doing exactly that: `cp` into a freshly mounted FAT volume checked
+`fwrite()` and ignored `fclose()`. The shell's `>` and `2>` had the same hole in
+`redirects_release()`. Both check now and both name the errno — and that is how
+the empty file turned out *not* to be this bug. Six of seven copies wrote their
+fifteen bytes; one arrived as an empty file, and the `fclose()` that would have
+reported a failure returned success. What is left is in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem), and
+[UPSTREAM.md](UPSTREAM.md) explains why the reporting had to come first: the
+layer below throws away the sense data that would have named the cause.
+
+### A configure-time hook is not a build-time guarantee
+
+`tools/patch-fatfs.py` runs from an `execute_process()` in the top-level
+`CMakeLists.txt`, which by default runs **when CMake configures**, not when the
+build runs. So a patched dependency can be reverted — a fresh IDF install, an
+upgrade, or `git checkout` — and the next `make build` will not re-apply it: CMake
+sees no reason to configure again, ninja compiles the reverted tree, and the
+failure arrives as an undefined reference pointing at *espix's* code rather than at
+the missing patch. That is not hypothetical here; it is exactly what the first
+version of the fatfs hook did.
+
+Telling CMake which files the hook owns is the fix, and it is one property:
+
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${IDF_PATH}/components/fatfs/vfs/vfs_fat.c"
+        "${IDF_PATH}/components/fatfs/vfs/vfs_fat_internal.h")
+
+A patch *script* has the same shape of problem in the other direction: it must be
+idempotent (this one checks for its own symbols and exits quietly when they are
+there) and it must fail loudly when the thing it patches has moved, because a
+patch that applies to the wrong version is worse than one that does not apply at
+all. The IDF version and every anchor are checked, and a mismatch stops the build
+with the reason.
+
+
 ## How to add to this
+
+### Deviations get a marker, not just prose
+
+espix looks like POSIX from the outside and is not, in places, and the cost of
+finding that out one trap at a time is a debugging session. The live example is `fstat()`: `stat()` answers the owner from the ownership rule,
+and `fstat()` still reports `st_uid` and `st_gid` as 0 -- so a program that opens a
+file and asks who owns it is told root.
+
+So a place that looks POSIX-shaped and is not gets a marker at the code site:
+
+```c
+/* ESPIX_NOT_POSIX: st_uid and st_gid are always 0; ownership comes from
+ * espix_fs_owner(). See the POSIX surface table in docs/ROADMAP.md. */
+```
+
+`ESPIX_NOT_POSIX:` is spelled for `grep -rn`, the way `RESOURCES:` is in the test
+suites, because the point is to be able to ask the question:
+
+```
+grep -rn ESPIX_NOT_POSIX components/
+```
+
+and get the whole list rather than the parts anyone happened to remember. It is
+for **API-shaped** deviations — a function, a type, a field somebody will assume
+means what POSIX means — not for a command's choice of column heading.
+
+The prose stays here, saying what bites and how to recognise it; ROADMAP's table
+says what to do about it and which layer would have to change. Both are needed:
+one is how you stop being confused, the other is how it gets fixed.
 
 One heading per gotcha, with what it broke and where the claim comes from. If it
 is only true on some parts, say which. If it was measured rather than
@@ -562,3 +704,59 @@ The general form: FreeRTOS owns none of what a process holds -- newlib owns the
 FILEs, lwIP the netconn, espix the channel lock -- so `vTaskDelete()` is not a
 SIGKILL. Terminate cooperatively at the syscall boundary and keep the delete for
 a task that demonstrably holds nothing. See `espix_proc_stopping()`.
+
+## The USB work task has a stack budget, and filesystem work runs on it
+
+`usb:work` is created with `WORK_TASK_STACK` in components/espix_usb/host.c, and
+it is where the attach hook fires -- deliberately, because the library's own task
+cannot block on transfers that only it can deliver. Whatever the hook does runs
+on that stack.
+
+`blk`'s `/etc/fstab` applier mounts volumes from that hook, and FatFs is deep.
+Measured with `ps`, reading the task's high-water mark:
+
+| what the attach ran | peak use |
+| --- | --- |
+| the install alone, before /etc/fstab existed | ~740 bytes |
+| the applier reading fstab and creating the file | ~3228 bytes |
+| the same, with a mount in the path | ~4268 bytes |
+| the same, matching an identity in /etc/fstab | ~4540 bytes |
+
+At 4096 the middle row was already fatal once the device array sat on the stack.
+The panic said `***ERROR*** A stack overflow in task usb:work has been detected.`
+and the board reboot-looped for as long as a stick was attached, because the
+attach that overflows happens again on every boot -- and the UART that would have
+said so is the one cable that is usually somewhere else. The array is `static`
+now (attaches are serialised by the host's attach lock, so one buffer is enough)
+and the stack is 6144.
+
+The rule: **anything added to the attach hook is spending `usb:work`'s stack.**
+If it is deeper than a mount, give it a task of its own rather than a larger
+number here.
+
+## The boot path's stack is full, and `main` has 8192 bytes
+
+A change that added one call to `vfs_open()` -- an `espix_fs_owner()` to capture a
+file's owner for `fstat()` -- put the board in a boot loop:
+
+    ***ERROR*** A stack overflow in task main has been detected.
+
+At boot `main` mounts the rootfs, runs `espix_auth_init()` and opens files, and the
+permission check inside every one of those opens already computes the owner it asks
+for. Looking it up again drags `espix_fs_owner()` -> `stat()` -> the layer below on
+top of a chain that was already deep, and there was nothing left.
+
+The figures are recorded as they are, because they do not yet add up: `main` is
+8192 bytes (`CONFIG_ESP_MAIN_TASK_STACK_SIZE`) and `ps` reports about 5500 free
+after a clean boot -- some 2.7 KB used at rest, against a chain of roughly a
+kilobyte that overflowed it. Whatever the rest of it is, the rule the incident does
+support is the one above: **a call added anywhere the boot sequence reaches is a
+stack decision**, and the value wanted is often already sitting in a frame above
+you. `access_check()` had the owner in `may()` and threw it away; handing it out
+costs no frames at all.
+
+Two diagnostics worth keeping. `tools/serlog.sh` caught it -- the panic goes to the
+UART and nowhere else. And the backtrace on the first panic named IDF's core-dump
+writer rather than the overflow, because the dump itself faulted and re-entered; in
+a boot loop, read the *first* fault, and treat the frames below `|<-CORRUPTED` as
+gone rather than as the answer.

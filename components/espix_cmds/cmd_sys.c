@@ -1146,6 +1146,25 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
                         "           decoding them yields the wrong functions.\n");
     }
 
+    /*
+     * The panic that put the dump there, as espix recorded it while it was
+     * happening: task, kind, and the message. The message is the diagnosis on its
+     * own -- an assert's file and line -- and needs neither the matching ELF nor
+     * the serial port that decoding the dump needs. `dmesg` reports this too, but
+     * only until the ring rolls over it.
+     */
+    const espix_fault_record_t *rec = espix_fault_last();
+    if (rec != NULL) {
+        espix_printf(s, "  panic:          %s in task '%s', core %d\n",
+                     espix_fault_exception_str(rec->exception), rec->task,
+                     rec->core);
+        if (rec->details[0] != '\0') {
+            espix_printf(s, "  reason:         %s\n", rec->details);
+        } else if (rec->reason[0] != '\0') {
+            espix_printf(s, "  reason:         %s\n", rec->reason);
+        }
+    }
+
     /* The registers and stacks are all in there, but decoding them needs the
      * matching ELF, which lives on the host. */
     espix_printf(s, "  full backtrace: idf.py -p <port> coredump-info\n");

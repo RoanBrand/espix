@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 
+#include "esp_blockdev.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -43,6 +44,107 @@ esp_err_t espix_fs_mount_root(void);
 esp_err_t espix_fs_stat_root(espix_fs_info_t *out);
 
 bool espix_fs_is_mounted(void);
+
+/*
+ * Mount table shape: the root plus three, from components/espix_fs/vfs.c. A
+ * caller keeping its own per-mount records sizes them with this, so the two
+ * cannot drift apart.
+ */
+#define ESPIX_FS_MAX_MOUNTS 4
+
+/*
+ * Mount the FAT filesystem on `dev` at `path` -- the second filesystem in the
+ * namespace, and the first one that is not littlefs.
+ *
+ * Reached through espix's own VFS like the root, so a permission check applies
+ * there too; see components/espix_fs/fat.c and tools/patch-fatfs.py for what
+ * that costs. `path` is the *mount point*: the caller is expected to have made
+ * it, and its contents are hidden for as long as the mount lasts, exactly as on
+ * any Unix.
+ *
+ * The block device stays the caller's -- this never releases the handle, because
+ * a whole disk and a partition view over one are both mountable and only the
+ * caller knows which it made. Release it after espix_fs_unmount_fat().
+ *
+ * `owner_uid` and `owner_gid` own everything the volume holds, because FAT keeps
+ * no ownership of its own: the uid= and gid= Linux gives a removable volume, so
+ * the person who plugged the stick in can write to it. They are the mounting
+ * session's ids, told to this rather than looked up.
+ *
+ * Never formats: a volume that does not mount is reported, not overwritten.
+ */
+esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
+                             uint16_t owner_uid, uint16_t owner_gid);
+
+/*
+ * Unmount it. ESP_ERR_INVALID_STATE while a file or directory is still open on
+ * the mount -- a lower filesystem's fd cannot be revoked, so the caller has to
+ * close up first.
+ */
+esp_err_t espix_fs_unmount_fat(const char *path);
+
+/*
+ * The device a mount came from has been unplugged.
+ *
+ * The mount is *marked*, not removed: it keeps claiming its paths so they do not
+ * quietly start resolving inside the rootfs, and every operation on it fails
+ * instead of reaching a filesystem whose block device espix_usb has already
+ * released. Unmount it afterwards to give the rest back -- espix_fs_unmount_fat()
+ * knows not to sync a volume whose device is gone.
+ */
+esp_err_t espix_fs_mount_dead(const char *path);
+
+/*
+ * How much of a mounted FAT volume is left, in bytes.
+ *
+ * ESP_ERR_NOT_FOUND for a path that is not a mount of espix's, and an error for
+ * one whose device has been pulled -- a volume marked dead will not answer, since
+ * asking would mean reading through a block device espix_usb has released.
+ */
+esp_err_t espix_fs_stat_fat(const char *path, uint64_t *total,
+                            uint64_t *free_bytes);
+
+/*
+ * The nth mount, for a caller that walks them: `df` prints a row per volume.
+ * Index 0 is the first mount, not the root -- the root is not a mount of
+ * anything and its usage comes from espix_fs_stat_root().
+ *
+ * ESP_ERR_NOT_FOUND once the index is past the last one, which is how a caller
+ * knows it has finished.
+ */
+esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len);
+
+/*
+ * A block device view over a partition of `parent`, for mounting `sda1` rather
+ * than `sda`. Released with its own ops->release, which frees the view and
+ * leaves the parent alone -- the parent belongs to whoever made it.
+ *
+ * IDF's esp_blockdev_generic_partition_get() does the same thing with 32-bit
+ * offsets, which cannot express a partition larger than 4GB on an ESP32 target.
+ * Since that is one FAT32 volume on an ordinary stick, this is 64-bit; see
+ * part.c.
+ */
+esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
+                                  uint64_t size, esp_blockdev_handle_t *out);
+
+/*
+ * Give a block device a name in /dev, or take it away: "sda" for a disk, "sda1"
+ * for a partition of one.
+ *
+ * These exist so a device has the name every other system gives it -- `ls /dev`
+ * lists them, `stat` reports the medium's size, `mount /dev/sda1` works -- and
+ * so a mount point can be found without knowing anything about the driver
+ * underneath. Opening one is refused: raw sector access would have to know which
+ * device it holds and whether it is mounted, so it is a feature of its own
+ * rather than something to fake here.
+ *
+ * Registered by whoever knows about both halves, since nothing in espix_fs knows
+ * what USB is and espix_usb knows nothing about the VFS. A name that already
+ * exists is updated rather than duplicated, and both calls are safe from any
+ * task: the pool is locked because a session can be listing /dev meanwhile.
+ */
+esp_err_t espix_dev_register_block(const char *name, uint64_t size);
+void espix_dev_unregister_block(const char *name);
 
 /*
  * Resolve `path` against `cwd` into `out` (absolute, no "." or ".." segments,

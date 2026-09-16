@@ -1,9 +1,48 @@
 menu "espix networking"
 
+    choice ESPIX_USB_ROLE
+        prompt "What the USB-OTG port is"
+        depends on SOC_USB_OTG_SUPPORTED
+        default ESPIX_USB_ROLE_HOST
+        help
+            A board with one general-purpose USB controller cannot be both a
+            device and a host: the OTG peripheral is a singleton, and
+            SOC_USB_OTG_PERIPH_NUM above says how many this chip has. espix picks
+            one role at build time rather than pretending otherwise, because the
+            two stacks do not coexist in the link either.
+
+            The P4 is the only espix target with two (SOC_USB_OTG_PERIPH_NUM is
+            2 there), and this choice still applies to it: the wiring of one
+            board's two sockets is not something software can discover.
+
+    config ESPIX_USB_ROLE_HOST
+        bool "host -- espix drives attached devices"
+        help
+            The OTG port powers and enumerates devices plugged into it: storage
+            first (`lsblk`, `blkid`), a keyboard later. This is the default
+            because a machine that calls itself a server should have a host
+            port.
+
+            Two consequences worth knowing before flashing it. usb0 disappears
+            from the image, so a board that was reachable over the cable is not
+            any more -- WiFi and SSH are the way in. And on a devkit whose two
+            sockets sit close together, a hub in the OTG socket can block the
+            UART socket, which leaves SSH as the only console; unplugging the
+            hub is the recovery, not a reflash.
+
+    config ESPIX_USB_ROLE_DEVICE
+        bool "device -- USB-NCM ethernet (usb0)"
+        help
+            Presents the board to a computer as a USB Ethernet adapter. See
+            `espix networking` below for the mode and address options; they are
+            unchanged, they simply only apply to this role.
+
+    endchoice
+
     config ESPIX_USB_NCM_ENABLED
         bool "USB-NCM (Ethernet over the USB-OTG port)"
         default y
-        depends on SOC_USB_OTG_SUPPORTED
+        depends on ESPIX_USB_ROLE_DEVICE
         help
             Presents the board to a computer as a USB Ethernet adapter, so it
             is reachable over the cable with no WiFi, no access point and no

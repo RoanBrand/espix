@@ -89,6 +89,23 @@ command -v scp >/dev/null 2>&1 || fatal "no scp"
 # them is right; failing the whole run because one interpreter is thin is not.
 ESPIX_HAVE_SERIAL=no
 if [ -n "$ESPIX_PORT" ]; then
+    # Refuse a port somebody else already has, because --port makes this run a
+    # *second* reader. macOS lets two processes share a cu.* device and they
+    # split the byte stream between them, so both captures come out with holes --
+    # and that is not hypothetical: a suite run made itself the second reader of
+    # the capture that was hunting its panic, which cost the panic's reason for
+    # the rest of the session. tools/serlog.sh has always refused in the other
+    # direction; this is the direction that actually happened.
+    #
+    # Three-way status from the helper -- 0 free, 1 held, 2 no such port -- kept
+    # apart here too, because "held" and "missing" want different advice.
+    holder_rc=0
+    "$ESPIX_ROOT/tools/port-holder.sh" "$ESPIX_PORT" || holder_rc=$?
+    if [ "$holder_rc" = 1 ]; then
+        fatal "$ESPIX_PORT is already held, above; run without --port to leave the console alone, or stop the reader first"
+    fi
+    [ "$holder_rc" = 0 ] || fatal "$ESPIX_PORT cannot be opened, above"
+
     if "$ESPIX_PYTHON" -c 'import serial' 2>/dev/null; then
         ESPIX_HAVE_SERIAL=yes
     else

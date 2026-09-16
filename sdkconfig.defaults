@@ -140,9 +140,27 @@ CONFIG_LWIP_LOCAL_HOSTNAME="espix"
 # would be an accept() that returns EMFILE rather than anything naming sockets.
 #
 # This is also FD_SETSIZE, which is why select() in the console and the SSH
-# server keep working as it rises, and why espix's device fds sit at 240-255
-# (see espix_fs/dev.c) -- far above anything lwIP will hand out.
-CONFIG_LWIP_MAX_SOCKETS=20
+# server keep working as it rises. It is also the whole VFS fd table: IDF's
+# vfs.h says `#define MAX_FDS FD_SETSIZE`, so this number is how many fds exist,
+# period -- stdio, sockets and every open file together.
+#
+# Which is why it is 40 now rather than 20. espix's file fds used to be the
+# filesystems' own numbers, so they never touched this table and 20 was purely a
+# socket budget; they are registered fds now (see the comment on s_fds in
+# espix_fs/vfs.c), because two filesystems both counting from zero cannot share
+# one fd space. A path-based open on that route costs two entries -- IDF's, and
+# the one espix allocates -- so 40 is headroom rather than a tight fit: eight
+# SSH sessions' sockets plus a couple of dozen open files at once.
+#
+# The exhaustion that prompted the raise was *not* the number, though. espix's
+# entry was registered non-permanent, and esp_vfs_unregister_fd() refuses
+# anything that is not permanent (vfs.c:679), so it was never released: a boot's
+# worth of opens filled the table and every open after that answered ENFILE.
+# See fd_slot_alloc()/fd_slot_free() in espix_fs/vfs.c.
+#
+# espix's device fds sit at 240-255 (see espix_fs/dev.c), far above anything
+# this table hands out, and are never registered here.
+CONFIG_LWIP_MAX_SOCKETS=40
 
 #
 # Execute from PSRAM instead of flash.
@@ -211,6 +229,12 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=2
 #
 # USB-NCM (usb0)
 #
+# The role choice, in components/espix_net/Kconfig, decides whether any of this
+# is built at all: USB-NCM and USB host claim the same OTG peripheral, and the
+# S3 has one (SOC_USB_OTG_PERIPH_NUM is 1). These settings are inert in a
+# host-role build, which is the default -- TinyUSB is not linked and nothing here
+# is read.
+#
 # NCM rather than ECM or RNDIS. All three carry Ethernet over USB; NCM is the
 # modern one and the only one every current host takes without help -- Linux,
 # macOS and Windows 11 all bind it from their own in-box drivers. ECM has never
@@ -257,6 +281,29 @@ CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="espix"
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"
 
 #
+# USB host
+#
+# Hub support defaults to **n** in the host stack, so without this line a hub is
+# a dead socket: the devices behind it never enumerate, and nothing in the log
+# says why the stick is not there. This one line is what makes the hub half of
+# the feature work. Multi-level hubs (a hub behind a hub) already default on.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
+# DEBUG has to be *compiled in* before a tag can be raised to it at runtime, and
+# the USB stack logs almost everything at DEBUG -- a successful enumeration
+# prints nothing at INFO at all. With this at IDF's default of INFO, "no output"
+# means nothing: the messages do not exist in the image. The runtime level stays
+# INFO, so nothing gets noisier unless a tag is raised (ESPIX_USB_VERBOSE, below).
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM is not set here, and cannot be: its
+# Kconfig says `depends on IDF_TARGET_ESP32P4 && SPIRAM`, because only the P4's
+# USB-DWC internal DMA can reach external RAM. On the S3 every USB buffer has to
+# be internal, which is why the reads in espix_usb/host.c ask for MALLOC_CAP_DMA
+# rather than taking the cheapest heap. On a P4 board this is the line to add,
+# and it is worth adding there: it moves the DMA buffers off the scarce heap.
+
+#
 # espix
 #
 # The Kconfig default is 8 as well; repeating it here is what makes a fresh
@@ -264,6 +311,11 @@ CONFIG_TINYUSB_DESC_PRODUCT_STRING="espix USB Ethernet"
 # would otherwise keep whatever it already had. Neither of these overrides an
 # sdkconfig that already names the option -- delete it, or edit it by hand.
 CONFIG_ESPIX_SSH_MAX_SESSIONS=8
+
+# 8192 was too small: a command runs on this task's stack, `sudo` re-enters the
+# shell on it, and a `sudo mount` tripped the canary at 7680 bytes used, 508
+# free. 10240 leaves room for a command that reaches into a mounted filesystem.
+CONFIG_ESPIX_SSH_TASK_STACK=10240
 
 # Precomputation for base-point scalar multiplication, which is what ECDSA does
 # for k*G -- and signing the exchange hash with the nistp256 host key is the
