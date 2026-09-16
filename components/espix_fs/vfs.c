@@ -733,6 +733,12 @@ static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
                ? enosys() : l->ops->lseek_p(l->ctx, slot.lower_fd, size, mode);
 }
 
+/*
+ * ESPIX_NOT_POSIX: st_uid and st_gid come back 0 from an fstat(), where vfs_stat()
+ * now answers from the ownership rule. The rule is path-based and a descriptor is
+ * not a path, so this cannot ask it -- the fix would be to remember the path on the
+ * fd slot. Nothing reads these fields yet; docs/ROADMAP.md's surface table has it.
+ */
 static int vfs_fstat(void *ctx, int fd, struct stat *st)
 {
     if (espix_dev_fd(fd)) {
@@ -845,6 +851,23 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
          */
         st->st_mode = (st->st_mode & ~(mode_t)ESPIX_MODE_BITS) |
                       (espix_fs_mode(p, st) & ESPIX_MODE_BITS);
+
+        /*
+         * And the owner, from the same rule the mode came from. Nothing ever
+         * filled these two fields, so every file in espix reported uid 0 -- while
+         * `ls -l` reported the real owner, because it asks espix_fs_owner(). Two
+         * different sources for one fact, and nothing said so: a caller reading
+         * ownership POSIX-style was told root, and an app that chowned something
+         * to the uid it read would have chowned it to root.
+         *
+         * A device node is not this path: espix_dev_stat() above leaves them at 0,
+         * which is right, because a device is the kernel's.
+         */
+        uint16_t uid = 0;
+        uint16_t gid = 0;
+        espix_fs_owner(p, st, &uid, &gid);
+        st->st_uid = uid;
+        st->st_gid = gid;
     }
     return rc;
 }
