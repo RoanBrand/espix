@@ -733,3 +733,30 @@ and the stack is 6144.
 The rule: **anything added to the attach hook is spending `usb:work`'s stack.**
 If it is deeper than a mount, give it a task of its own rather than a larger
 number here.
+
+## The boot path's stack is full, and `main` has 8192 bytes
+
+A change that added one call to `vfs_open()` -- an `espix_fs_owner()` to capture a
+file's owner for `fstat()` -- put the board in a boot loop:
+
+    ***ERROR*** A stack overflow in task main has been detected.
+
+At boot `main` mounts the rootfs, runs `espix_auth_init()` and opens files, and the
+permission check inside every one of those opens already computes the owner it asks
+for. Looking it up again drags `espix_fs_owner()` -> `stat()` -> the layer below on
+top of a chain that was already deep, and there was nothing left.
+
+The figures are recorded as they are, because they do not yet add up: `main` is
+8192 bytes (`CONFIG_ESP_MAIN_TASK_STACK_SIZE`) and `ps` reports about 5500 free
+after a clean boot -- some 2.7 KB used at rest, against a chain of roughly a
+kilobyte that overflowed it. Whatever the rest of it is, the rule the incident does
+support is the one above: **a call added anywhere the boot sequence reaches is a
+stack decision**, and the value wanted is often already sitting in a frame above
+you. `access_check()` had the owner in `may()` and threw it away; handing it out
+costs no frames at all.
+
+Two diagnostics worth keeping. `tools/serlog.sh` caught it -- the panic goes to the
+UART and nowhere else. And the backtrace on the first panic named IDF's core-dump
+writer rather than the overflow, because the dump itself faulted and re-entered; in
+a boot loop, read the *first* fault, and treat the frames below `|<-CORRUPTED` as
+gone rather than as the answer.
