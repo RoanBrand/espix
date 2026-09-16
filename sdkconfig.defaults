@@ -140,9 +140,27 @@ CONFIG_LWIP_LOCAL_HOSTNAME="espix"
 # would be an accept() that returns EMFILE rather than anything naming sockets.
 #
 # This is also FD_SETSIZE, which is why select() in the console and the SSH
-# server keep working as it rises, and why espix's device fds sit at 240-255
-# (see espix_fs/dev.c) -- far above anything lwIP will hand out.
-CONFIG_LWIP_MAX_SOCKETS=20
+# server keep working as it rises. It is also the whole VFS fd table: IDF's
+# vfs.h says `#define MAX_FDS FD_SETSIZE`, so this number is how many fds exist,
+# period -- stdio, sockets and every open file together.
+#
+# Which is why it is 40 now rather than 20. espix's file fds used to be the
+# filesystems' own numbers, so they never touched this table and 20 was purely a
+# socket budget; they are registered fds now (see the comment on s_fds in
+# espix_fs/vfs.c), because two filesystems both counting from zero cannot share
+# one fd space. A path-based open on that route costs two entries -- IDF's, and
+# the one espix allocates -- so 40 is headroom rather than a tight fit: eight
+# SSH sessions' sockets plus a couple of dozen open files at once.
+#
+# The exhaustion that prompted the raise was *not* the number, though. espix's
+# entry was registered non-permanent, and esp_vfs_unregister_fd() refuses
+# anything that is not permanent (vfs.c:679), so it was never released: a boot's
+# worth of opens filled the table and every open after that answered ENFILE.
+# See fd_slot_alloc()/fd_slot_free() in espix_fs/vfs.c.
+#
+# espix's device fds sit at 240-255 (see espix_fs/dev.c), far above anything
+# this table hands out, and are never registered here.
+CONFIG_LWIP_MAX_SOCKETS=40
 
 #
 # Execute from PSRAM instead of flash.

@@ -222,12 +222,19 @@ static const lower_t *mount_of_slot(const fd_slot_t *s)
  * as IDF set it -- equal to the fd -- so this VFS's ops are called with the
  * number it handed out, and the lower filesystem's own number travels in the
  * table instead.
+ *
+ * *Permanent*, and that is not a detail. IDF's own close frees its entry for the
+ * caller's fd, but espix's entry -- this one -- is only ever freed by
+ * esp_vfs_unregister_fd(), and that call refuses anything not registered
+ * permanent (vfs.c:679). Registered non-permanent it was simply never released:
+ * one table entry lost per open, so a boot's worth of opens filled a table only
+ * as wide as CONFIG_LWIP_MAX_SOCKETS and every open after that answered ENFILE.
  */
 static int fd_slot_alloc(int lower_fd, const lower_t *mount)
 {
     int fd = -1;
 
-    if (esp_vfs_register_fd_with_local_fd(s_vfs_id, -1, false, &fd) != ESP_OK) {
+    if (esp_vfs_register_fd_with_local_fd(s_vfs_id, -1, true, &fd) != ESP_OK) {
         return -1;
     }
 
@@ -250,8 +257,17 @@ static int fd_slot_alloc(int lower_fd, const lower_t *mount)
     return fd;
 }
 
-/* IDF releases its own entry when the fd is closed, so this only forgets which
- * layer the number belonged to. */
+/*
+ * Release the fd espix allocated for the file.
+ *
+ * Two entries exist per file and both have to go. IDF's path-based open
+ * registers its own for the number this VFS returned (vfs_calls.c:56) and its
+ * close unregisters that one -- but *this* one is espix's, taken in
+ * fd_slot_alloc(), and nothing else in the system knows about it. Not freeing it
+ * leaked a table entry per open: with the table only as wide as
+ * CONFIG_LWIP_MAX_SOCKETS, a boot's worth of opens filled it, and every open
+ * after that answered ENFILE or EMFILE.
+ */
 static void fd_slot_free(int fd)
 {
     if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
@@ -262,6 +278,8 @@ static void fd_slot_free(int fd)
     s_fds[fd].lower_fd = -1;
     s_fds[fd].mount    = 0;
     portEXIT_CRITICAL(&s_mount_lock);
+
+    (void)esp_vfs_unregister_fd(s_vfs_id, fd);
 }
 
 static const lower_t *mount_by_dir(DIR *pdir)
@@ -1068,22 +1086,46 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
      * CONTEXT_PTR because the ops take the lower layer as their first argument.
      * The context is slot 0 and is used for nothing but identity: ops pick their
      * mount by path, fd or directory handle, this VFS serving every mount.
-     *
-     * *With_id* rather than the plain call, because the id it hands back is what
-     * esp_vfs_register_fd() needs when a file is opened: the fd a caller gets is
-     * allocated there, and that allocation is what keeps it from colliding with
-     * the console, the sockets and the other filesystems' own numbering.
      */
-    /* Before the VFS exists, so no fd can arrive before the table can answer. */
+    /* Before either registration, so no fd can arrive before the table can
+     * answer. */
     fd_table_init();
 
-    const esp_err_t err = esp_vfs_register_fs_with_id(
-        &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
-        &s_mounts[0], &s_vfs_id);
+    const esp_err_t err = esp_vfs_register_fs(
+        "", &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
+        &s_mounts[0]);
 
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot register the root VFS: %s",
                    esp_err_to_name(err));
+        return err;
+    }
+
+    /*
+     * And a second registration with no path at all, whose only job is to hand
+     * out fds.
+     *
+     * It cannot be the only one. A pathless VFS is stored with
+     * `path_prefix_len = LEN_PATH_PREFIX_IGNORED` and get_vfs_for_path() skips
+     * exactly those (vfs.c:840), so everything would arrive as "no such file or
+     * directory" -- which is what happened when this was tried: the rootfs
+     * mounted and then could not be made a single directory in. It is also why
+     * the fds a caller gets must be registered here rather than picked: a
+     * registered fd is found by its table entry, and its entry is what routes a
+     * read back to these ops.
+     *
+     * Same ops and same context as the first: the context is identity and
+     * nothing more, and only one of the two registrations is ever reached by
+     * path.
+     */
+    const esp_err_t fd_err = esp_vfs_register_fs_with_id(
+        &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
+        &s_mounts[0], &s_vfs_id);
+
+    if (fd_err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "cannot register the fd VFS: %s (files will not open)",
+                   esp_err_to_name(fd_err));
     }
     return err;
 }
