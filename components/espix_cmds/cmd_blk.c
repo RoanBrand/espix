@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #include "espix_auth.h"
@@ -931,7 +932,11 @@ static const char FSTAB_TEMPLATE[] =
     "#\n"
     "#   <device>       <mount point>   <owner>   [flags]\n"
     "#\n"
-    "# device       what lsblk prints: sda1, or sd*1 for partition 1 of any disk\n"
+    "# device       sda1, or sd*1 for partition 1 of any disk, or an identity:\n"
+    "#              LABEL=BIGFAT, UUID=3E4A-1C7B, PARTUUID=5f8b1c2a-01 -- blkid\n"
+    "#              prints all three. An identity has to match exactly one volume;\n"
+    "#              two carrying the same one mounts neither. A name cannot\n"
+    "#              promise that: sda is the slot a device happened to be given.\n"
     "# mount point  a template; %s becomes the device name\n"
     "# owner        an account name, a uid, or - for root\n"
     "# flags        noauto, to leave the device alone until somebody mounts it\n"
@@ -967,6 +972,65 @@ static bool fstab_glob(const char *pat, const char *name)
         name++;
     }
     return *name == '\0';
+}
+
+/*
+ * What the device column holds: a name, a wildcard, or an identity.
+ *
+ * An identity is what a name cannot be. The letter in sda is the slot the device
+ * was given when it was attached -- host.c builds it as "sd%c", 'a' + i -- so it
+ * says nothing about which stick this is: with two on a hub, or after one is
+ * unplugged and another takes the freed letter, the name moves. A label, a
+ * volume serial and an MBR partition identity travel on the medium, so a rule
+ * using one mounts the volume it means rather than whichever arrived first.
+ */
+typedef enum {
+    FSTAB_IDENT_NONE,
+    FSTAB_IDENT_LABEL,
+    FSTAB_IDENT_UUID,
+    FSTAB_IDENT_PARTUUID,
+} fstab_ident_t;
+
+static fstab_ident_t fstab_ident_kind(const char *field)
+{
+    if (strncmp(field, "LABEL=", 6) == 0) {
+        return FSTAB_IDENT_LABEL;
+    }
+    if (strncmp(field, "UUID=", 5) == 0) {
+        return FSTAB_IDENT_UUID;
+    }
+    if (strncmp(field, "PARTUUID=", 9) == 0) {
+        return FSTAB_IDENT_PARTUUID;
+    }
+    return FSTAB_IDENT_NONE;
+}
+
+/*
+ * Whether this volume answers to the device column.
+ *
+ * Case is not significant: FAT stores labels upper case, and blkid prints a vfat
+ * UUID upper case and a PARTUUID lower, so a value pasted out of either should
+ * not have to be re-cased to match.
+ */
+static bool fstab_match(const char *field, const espix_usb_dev_t *disk,
+                        const espix_usb_part_t *part)
+{
+    const char *name  = (part != NULL) ? part->name : disk->name;
+    const char *label = (part != NULL) ? part->label : disk->label;
+    const char *uuid  = (part != NULL) ? part->uuid : disk->uuid;
+    const char *puuid = (part != NULL) ? part->partuuid : "";
+
+    switch (fstab_ident_kind(field)) {
+    case FSTAB_IDENT_LABEL:
+        return label[0] != 0 && strcasecmp(field + 6, label) == 0;
+    case FSTAB_IDENT_UUID:
+        return uuid[0] != 0 && strcasecmp(field + 5, uuid) == 0;
+    case FSTAB_IDENT_PARTUUID:
+        return puuid[0] != 0 && strcasecmp(field + 9, puuid) == 0;
+    case FSTAB_IDENT_NONE:
+    default:
+        return fstab_glob(field, name);
+    }
 }
 
 /* `uid`/`gid` from an owner field: an account name, a number, or `-` for root. */
@@ -1144,6 +1208,13 @@ static void fstab_mount(const espix_usb_dev_t *disk,
                rec->dev, path);
 }
 
+/* One matched volume: a partition, or the disk itself when it has no table. */
+typedef struct {
+    size_t disk;
+    size_t part;
+    bool   is_part;
+} fstab_hit_t;
+
 /* Every line that matches this device, or the template if the file is absent. */
 static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
 {
@@ -1187,32 +1258,57 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
             continue;
         }
 
-        for (size_t i = 0; i < n; i++) {
+        /*
+         * Every match is collected before any of them is mounted, because an
+         * identity has to be unambiguous: two volumes carrying one label is
+         * exactly the case where mounting the first would mount the wrong one.
+         * So an identity that matches more than one volume mounts none of them
+         * and says so. A wildcard keeps its old meaning of matching several.
+         */
+        fstab_hit_t hits[ESPIX_USB_MAX_DEVS * (1 + ESPIX_USB_MAX_PARTS)];
+        size_t nhits = 0;
+        const bool identity = (fstab_ident_kind(name) != FSTAB_IDENT_NONE);
+
+        for (size_t i = 0; i < n && nhits < sizeof(hits) / sizeof(hits[0]); i++) {
             if (strcmp(devs[i].name, dev) != 0) {
                 continue;           /* a different disk */
             }
 
             /* The disk itself first -- a superfloppy has no partitions -- and
              * then each partition. */
-            if (fstab_glob(name, devs[i].name)) {
-                char path[ESPIX_PATH_MAX];
-                fstab_path(path, sizeof(path), point, devs[i].name);
-                if (path[0] != '\0') {
-                    fstab_mount(&devs[i], NULL, path, uid, gid,
-                                 strstr(point, "%s") != NULL);
-                }
+            if (fstab_match(name, &devs[i], NULL)) {
+                hits[nhits].disk = i;
+                hits[nhits].is_part = false;
+                nhits++;
             }
 
             for (size_t j = 0; j < devs[i].nparts; j++) {
-                if (!fstab_glob(name, devs[i].parts[j].name)) {
+                if (!fstab_match(name, &devs[i], &devs[i].parts[j])) {
                     continue;
                 }
-                char path[ESPIX_PATH_MAX];
-                fstab_path(path, sizeof(path), point, devs[i].parts[j].name);
-                if (path[0] != '\0') {
-                    fstab_mount(&devs[i], &devs[i].parts[j], path,
-                                 uid, gid, strstr(point, "%s") != NULL);
-                }
+                hits[nhits].disk = i;
+                hits[nhits].part = j;
+                hits[nhits].is_part = true;
+                nhits++;
+            }
+        }
+
+        if (identity && nhits > 1) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: %s matches %u volumes; mounting none",
+                       FSTAB_PATH, name, (unsigned)nhits);
+            continue;
+        }
+
+        for (size_t h = 0; h < nhits; h++) {
+            const espix_usb_dev_t *d = &devs[hits[h].disk];
+            const espix_usb_part_t *p = hits[h].is_part ? &d->parts[hits[h].part]
+                                                       : NULL;
+            char path[ESPIX_PATH_MAX];
+
+            fstab_path(path, sizeof(path), point, p != NULL ? p->name : d->name);
+            if (path[0] != 0) {
+                fstab_mount(d, p, path, uid, gid, strstr(point, "%s") != NULL);
             }
         }
     }

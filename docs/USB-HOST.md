@@ -596,7 +596,33 @@ looks for it.
     owner        an account name, a uid, or - for root
     flags        noauto
 
-Applied when a device is attached and unmounted when it goes. `*` is the whole
+Applied when a device is attached and unmounted when it goes. The device column is a name, a
+wildcard, or an identity.
+
+An identity is what a name cannot be. The letter in `sda` is the slot the device
+was given when it was attached -- `host.c` builds it as `"sd%c", 'a' + i` -- so
+with two sticks on a hub, or after one is unplugged and another takes the freed
+letter, the name moves and the rule follows the wrong stick. Formatting the path
+from `%s` makes that worse rather than better: the path stays and the volume
+under it changes.
+
+    LABEL=BIGFAT            the volume's label
+    UUID=3E4A-1C7B          the FAT volume serial, at 0x43 in the boot sector
+    PARTUUID=5f8b1c2a-01    the MBR disk signature and the entry number
+
+`blkid` prints all three, so a value is read off the device rather than guessed.
+Matching ignores case: FAT stores labels upper case, and blkid prints a vfat
+UUID upper case and a PARTUUID lower. An identity must match exactly one volume
+-- two carrying the same one mounts neither and says so in the log, which is the
+whole point of preferring an identity to a name -- while a wildcard keeps its
+old meaning of matching several. A volume with no label, a disk whose signature
+is zero, and anything on a GPT table (espix reads no GPT) have no identity to
+match on, and say nothing rather than something ambiguous.
+
+For a policy that must not move either, pair an identity with a literal point:
+
+    UUID=3E4A-1C7B   /media/backup   esp
+ `*` is the whole
 pattern language -- enough for "partition N of any disk", and small enough to
 check by reading. `noauto` leaves an entry alone until somebody mounts it.
 
