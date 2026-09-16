@@ -570,6 +570,38 @@ static int cmd_mkdir(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+/* Empty directories only, which is what rmdir(2) does -- `rm -r` is the way to
+ * take a tree, and keeping the two apart is the point of having both. No -p:
+ * mkdir here has none either, and one flag in a pair is worse than none. */
+static int cmd_rmdir(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 2) {
+        espix_eprintf(s, "usage: rmdir <dir>...\n");
+        return 1;
+    }
+
+    int status = 0;
+
+    for (int i = 1; i < argc; i++) {
+        char abs[ESPIX_PATH_MAX];
+        if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
+            status = 1;
+            continue;
+        }
+        if (strcmp(abs, "/") == 0 || strcmp(abs, "/media") == 0) {
+            espix_eprintf(s, "rmdir: refusing to remove %s\n", abs);
+            status = 1;
+            continue;
+        }
+        if (rmdir(abs) != 0) {
+            espix_eprintf(s, "rmdir: %s: %s\n", abs, strerror(errno));
+            status = 1;
+        }
+    }
+
+    return status;
+}
+
 static int cmd_rm(espix_session_t *s, int argc, char **argv)
 {
     bool recursive = false;
@@ -1239,6 +1271,8 @@ static espix_cmd_t s_fs_cmds[] = {
       .help = "print files",                     .usage = "cat <file>..." },
     { .name = "mkdir", .fn = cmd_mkdir,
       .help = "create directories",              .usage = "mkdir <dir>..." },
+    { .name = "rmdir", .fn = cmd_rmdir,
+      .help = "remove empty directories",        .usage = "rmdir <dir>..." },
     { .name = "rm",    .fn = cmd_rm,
       .help = "remove files or directories",     .usage = "rm [-r] <path>..." },
     { .name = "cp",    .fn = cmd_cp,
