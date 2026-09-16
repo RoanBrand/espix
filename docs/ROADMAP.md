@@ -118,6 +118,47 @@ things are as they are.
   it back. That is the reverse map plus an offset, and `lower_t s_mounts[]` in
   `vfs.c` has only the second half of it.
 
+  The options, and what each costs:
+
+  **A — formalise the seam.** One registration, espix's own fd keys, every
+  assumption written down with the IDF line it depends on, and tests that fail if
+  IDF changes one. Cheapest, keeps IDF's libc glue, sockets and `select()`
+  working unchanged, and it is what espix does now — see
+  `tests/suites/12-vfs.sh`, which asserts the five things that matter.
+
+  **B — one registered VFS per mount.** The IDF-native shape, and wrong here:
+  each mount publishes a second name for its filesystem, which is exactly what
+  the stacked design exists to avoid, and the permission check cannot move into
+  vendored filesystems, so it would be bypassable.
+
+  **C — own the syscalls.** espix implements the libc entry points itself and
+  keeps an fd table at whatever size it likes, with permissions at the single
+  entry point, `/dev` nodes with real semantics, and no prefix matching to be
+  surprised by. The obstacle is not files, it is **sockets**: lwIP's sockets live
+  in IDF's table and are the reason `select()` matters at all, so C needs a
+  mapping layer between espix's fds and IDF's socket fds before any file moves.
+  Worth doing when one of these is true rather than when the tidiness annoys the
+  most: device files that need real read/write semantics, sockets selectable in
+  the same set as open files, per-process bind mounts, or a second filesystem
+  type that must not be reachable by path.
+
+  **D — extend IDF.** Cheapest per unit of pain removed, and the ask to lead with
+  upstream, because two of the three are housekeeping rather than features:
+
+  1. **Document that `local_fd` is opaque and stored verbatim.** It already
+     behaves that way (`vfs.c:764`), and it is the only reason espix can hand out
+     keys of its own rather than borrowing the lower filesystem's numbers. One
+     sentence in the header turns an accident into a contract.
+  2. **Let a release work on non-permanent entries.** `esp_vfs_unregister_fd()`
+     refuses anything not registered permanent (`vfs.c:679`), so a driver that
+     allocates an entry per open and frees it after the close path has no way to
+     do both. That cost espix one leaked entry per open, and eventually a table
+     with no room left.
+  3. **A stacking registration.** A VFS that receives the untranslated path
+     *before* the prefix match and may forward to the next match — the one thing
+     that would let espix stop being "the default VFS that happens to be on top"
+     and start being a layer with a defined place in the order.
+
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
 

@@ -631,8 +631,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
-- **A write into a mounted FAT volume is lost for the first two copies after a
-  boot.** Reproduced twice, on two builds, matching to the byte: after a reset,
+- ~~**A write into a mounted FAT volume is lost for the first two copies after a
+  boot.**~~ **Fixed**, by the fd packing (`86bc6bd`) and by releasing the entry it
+  allocates (`c016e00`). The cause was the fd collision described below and not
+  the write path at all, which is why every check added to the write path stayed
+  silent: nothing was wrong with the write, it was aimed at the wrong file. Ten
+  sequential copies with `cp`'s read-back now pass on hardware. The reproduction
+  is kept below as the record of how it looked, since that is what the next
+  person will see if this class of bug returns.
+
+  Reproduced twice, on two builds, matching to the byte: after a reset,
   `sudo mount /dev/sda1 /mnt/sd1` and then two `sudo cp /etc/hostname` runs.
   The first answers `close failed: Bad file number` (`EBADF`) and leaves a
   0-byte file; the second leaves a 0-byte file with every call — `fwrite`,

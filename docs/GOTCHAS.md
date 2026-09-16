@@ -535,6 +535,35 @@ to read it: the STACK column is `usStackHighWaterMark`, the smallest free figure
 the task has ever reached and not a current reading. A command that leaves a few
 hundred bytes there will overflow on a slightly different path.
 
+### The VFS fd table is sized by the socket count, and three other things it will not tell you
+
+Four IDF behaviours that cost espix a bug each, all in the space where a stacking
+VFS meets `esp_vfs`:
+
+- **`MAX_FDS` is `FD_SETSIZE` is `MEMP_NUM_NETCONN` is
+  `CONFIG_LWIP_MAX_SOCKETS`** (`esp_vfs.h:42`, `lwipopts.h:124`,
+  `lwip/sockets.h:478`). The fd table is as wide as the socket budget, so every
+  open file competes with every socket. A build with 20 sockets has twenty fds in
+  total — stdio, sockets and files together.
+- **A VFS registered without a path receives no paths at all.** It is stored with
+  `path_prefix_len = LEN_PATH_PREFIX_IGNORED` (`vfs.c:431`), and
+  `get_vfs_for_path()` skips those entries by name (`vfs.c:840`). Registering one
+  that way is how espix stopped receiving `mkdir`: the rootfs mounted, and then
+  not one directory could be created in it, which reads as a filesystem failure
+  rather than a registration one.
+- **`esp_vfs_unregister_fd()` only frees entries registered `permanent = true`**
+  (`vfs.c:679`). A driver that allocates an entry per open must ask for permanent
+  or nothing can ever free it — one table entry lost per open, and a table full
+  after a boot's worth of them.
+- **`local_fd` is opaque and stored verbatim** (`vfs.c:764`), and IDF hands it
+  back on every call. It does *not* have to be a number IDF allocated, which is
+  what lets a driver with several filesystems behind it hand out keys of its own
+  instead of borrowing the lower filesystem's numbering.
+
+Worth knowing on top of those: a path-based open costs **two** entries for one
+file — IDF's own, for the number the driver returned (`vfs_calls.c:56`), and
+whatever the driver allocated itself — and IDF's close releases only its own.
+
 ## Build and configuration
 
 ### `sdkconfig` wins, and it is usually not in version control
