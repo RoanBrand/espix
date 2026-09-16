@@ -568,7 +568,17 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
 
     const int rc = l->dir->stat_p(l->ctx, p, st);
     if (rc == 0) {
-        st->st_mode |= espix_fs_mode(p, st) & ESPIX_MODE_BITS;
+        /*
+         * Replaced, not or-ed. The filesystem below reports the type -- S_IFDIR,
+         * S_IFREG -- and espix decides the permissions, which is the split Linux
+         * draws between its VFS and the filesystems under it. FatFs fills in 0777
+         * of its own, so or-ing espix's bits into them left every file on a
+         * mounted stick world-writable and executable, while the access check
+         * computed 0644 from the very same rule: what stat() reported and what
+         * espix enforced disagreed.
+         */
+        st->st_mode = (st->st_mode & ~(mode_t)ESPIX_MODE_BITS) |
+                      (espix_fs_mode(p, st) & ESPIX_MODE_BITS);
     }
     return rc;
 }

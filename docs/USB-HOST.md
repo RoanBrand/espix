@@ -449,6 +449,15 @@ records it.
   `exfat/ntfs is not supported` — the same words `lsblk` prints, for the same
   reason, and likewise `ext2/3/4 is not supported` and `iso9660 is not supported`
   for the volumes `lsblk` can now name precisely.
+- **FAT has no modes to show.** FatFs reports `0777` for everything it stats, so the
+  VFS *replaces* those bits with espix's own — the same rule a file on the rootfs
+  gets — and keeps the type bits from the filesystem below. A mounted stick
+  therefore reads `-rw-r--r--`/`drwxr-xr-x`, `chmod` refuses because there is
+  nowhere to store a change, and what `stat()` reports is what the access check
+  enforces. Or-ing the two together instead — which is what this did until a
+  second filesystem made the difference visible — left every file on a stick
+  world-writable and executable in the listing while the check said 0644, so a
+  binary that the loader would refuse looked runnable.
 - **Root only**, as `mount(8)` is: it changes the namespace for every session.
   `mount` with no arguments lists what is mounted and anyone may run that, as
   anyone may read `/proc/mounts`.
