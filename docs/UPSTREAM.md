@@ -347,6 +347,44 @@ Not a defect — worth recording only because its presence suggests a POSIX laye
 that is not there. Upstream never implemented signals either, so it is not a
 source to draw on.
 
+## `espressif/esp_ext_part_tables`
+
+### A `0x00` type byte ends the table, and on real media it does not
+
+`esp_mbr_parse()` stops at the first partition entry whose type byte is zero:
+
+    if (partition->type == 0x00) {
+        break; // No more partitions, exit the loop (MBR partition table cannot
+               // have holes in it)
+    }
+
+That is true of an *empty* entry and false of a typed one. A hybrid ISO image —
+the layout that `dd`-ing an Arch, CachyOS or Ubuntu installer onto a stick
+produces — uses `0x00` for its large filesystem entry, with a real LBA and sector
+count, so every entry after it is dropped. Measured on a CachyOS 202604
+installer: entry 1 is 2.8G of ISO 9660 typed `0x00`, entry 2 is 23M of EFI FAT
+typed `0xEF`. The library reports one partition and no partitions respectively —
+neither the ISO nor the FAT partition that is the only mountable thing on the
+stick. Nothing sets `ESP_EXT_PART_LIST_FLAG_LOSSY` either, so a caller cannot even
+tell that something was left out.
+
+The rule that would be right is "empty" in the sense the comment means it: no
+start *and* no size. A `0x00`-typed entry that names sectors is an unnameable type
+— worth inserting, or at the very least worth flagging.
+
+espix walks the four entries itself now and calls
+`esp_mbr_parse_default_supported_partition_types()` for the type table, which is
+the part of the parser that assumes nothing about the walk; see
+[USB-HOST.md](USB-HOST.md#what-it-reports-and-what-it-cannot).
+
+### `0xEF` is not in the type table
+
+The EFI System Partition — `0xEF`, "EFI (FAT-12/16/32)" to `fdisk` — is FAT, so
+FatFs can mount it, and every Arch, CachyOS and Windows installer writes one. It
+maps to `ESP_EXT_PART_TYPE_NONE`, so a caller that trusts the table cannot name
+it, let alone mount it. espix adds the mapping itself; it belongs beside `0x01`,
+`0x04`, `0x06` and `0x0E`.
+
 ## `espressif/esp_linenoise`
 
 ### ENTER decrements the history length without checking it

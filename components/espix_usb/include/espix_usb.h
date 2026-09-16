@@ -65,11 +65,12 @@ typedef struct {
     uint64_t size;                              /* bytes */
     bool     table_read;                        /* sector 0 was read and parsed */
     /*
-     * True when the table held entries espix cannot represent -- an extended
-     * partition (0x05/0x0F), or a type the parser does not know -- so the rows
-     * beside it are not the whole table. The library flags both as a lossy parse.
-     * espix passes no filter of its own, so this can only be the medium's doing,
-     * never something espix chose to leave out.
+     * True when the table held entries espix could not show: a type byte nothing
+     * here can name, or an entry pointing outside the device. The rows beside it
+     * are then not the whole table, and `lsblk` says so beneath them.
+     *
+     * Nothing espix chose to leave out sets this -- the walk reports every entry
+     * it can find -- so a set flag is always something about the medium.
      */
     bool     table_skipped;
     /*

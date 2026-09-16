@@ -35,6 +35,7 @@
 #include "usb/usb_host.h"
 
 #include "esp_mbr.h"
+#include "esp_mbr_utils.h"
 
 #include "espix_kernel.h"
 #include "espix_usb.h"
@@ -69,6 +70,41 @@
 #define FAT_LABEL_FAT16   0x2B
 
 #define MBR_SIGNATURE_OFFSET 510
+
+/*
+ * One MBR partition entry: 16 bytes, four of them starting at 446. Only the LBA
+ * fields are read -- the CHS fields beside them carry the same information in a
+ * form this cannot use, and they are the half that was already obsolete when the
+ * format was written.
+ */
+#define MBR_ENTRIES        4
+#define MBR_ENTRY_OFFSET   446
+#define MBR_ENTRY_SIZE     16
+#define MBR_ENTRY_TYPE     4        /* byte 4 of the entry: the type code */
+#define MBR_ENTRY_LBA      8        /* four bytes, little-endian, from byte 8 */
+#define MBR_ENTRY_SECTORS  12
+
+/*
+ * The EFI System Partition. FAT, so espix can mount it, and absent from the
+ * library's type table, so without a line of espix's own it is a type nothing
+ * can name.
+ */
+#define MBR_TYPE_EFI_FAT   0xEF
+
+/*
+ * An ISO 9660 volume's primary descriptor, which is where that filesystem keeps
+ * its name: logical sector 16 of the ISO's own 2048-byte sectors, so 32768 bytes
+ * in, with the type code at byte 0, "CD001" at 1, and the 32-byte volume
+ * identifier at 40. All of it inside the first 512 bytes of the block, so one
+ * read answers both the question and the label.
+ */
+#define ISO_PVD_OFFSET     32768
+#define ISO_MAGIC_OFFSET   1
+#define ISO_LABEL_OFFSET   40
+#define ISO_LABEL_LEN      32
+
+/* BS_VolLab: 11 space-padded bytes, the same shape as an ISO's identifier. */
+#define FAT_LABEL_LEN      11
 
 typedef struct {
     bool                     in_use;
@@ -320,11 +356,43 @@ static const char *fstype_name(uint8_t type, bool *foreign)
     }
 }
 
-static bool is_fat_type(uint8_t type)
+/* A four-byte little-endian field of an MBR partition entry. */
+static uint32_t entry_u32(const uint8_t *entry, size_t at)
 {
-    return type == ESP_EXT_PART_TYPE_FAT12 ||
-           type == ESP_EXT_PART_TYPE_FAT16 ||
-           type == ESP_EXT_PART_TYPE_FAT32;
+    return (uint32_t)entry[at] | ((uint32_t)entry[at + 1] << 8) |
+           ((uint32_t)entry[at + 2] << 16) | ((uint32_t)entry[at + 3] << 24);
+}
+
+/*
+ * The name for a partition entry's *type byte*: the library's table first, then
+ * espix's own additions. "" means nothing here can name it, which is not the same
+ * as a type that means "no filesystem": the walk keeps the row either way and
+ * counts it, so `lsblk` can say that the listing is not the whole table.
+ */
+static const char *partition_type_name(uint8_t raw, bool *foreign)
+{
+    uint8_t parsed = ESP_EXT_PART_TYPE_NONE;
+
+    /*
+     * The type table stays the library's rather than a copy here, so a code it
+     * learns upstream arrives without an edit; the names espix prints are espix's
+     * either way.
+     */
+    (void)esp_mbr_parse_default_supported_partition_types(raw, &parsed);
+    if (parsed != ESP_EXT_PART_TYPE_NONE) {
+        return fstype_name(parsed, foreign);
+    }
+
+    /*
+     * 0xEF is the EFI System Partition -- "EFI (FAT-12/16/32)" to fdisk, and what
+     * every Arch, CachyOS and Windows installer writes. It is FAT, so espix can
+     * mount it, and the library has no code for it: without this line the only
+     * mountable partition on an installer stick is the one espix cannot name.
+     */
+    if (raw == MBR_TYPE_EFI_FAT) {
+        return "vfat";
+    }
+    return "";
 }
 
 static bool has_mbr_signature(const uint8_t *sector)
@@ -357,26 +425,69 @@ static size_t fat_label_offset(const uint8_t *sector)
  * Bytes are copied as they stand: a label written in a non-ASCII code page is not
  * transcoded, because nothing here knows which page that was.
  */
+/*
+ * A fixed-width, space-padded label, trimmed and NUL-terminated. Left empty when
+ * it is all spaces or the formatter's own idea of unnamed -- FAT's "NO NAME",
+ * which an ISO would be unlikely to use but would mean the same thing.
+ */
+static void label_copy(const char *src, size_t src_len, char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+
+    size_t n = src_len;
+    while (n > 0 && src[n - 1] == ' ') {
+        n--;
+    }
+    if (n == 0 || (n == 7 && memcmp(src, "NO NAME", 7) == 0)) {
+        return;
+    }
+
+    const size_t len = (n < out_len - 1) ? n : out_len - 1;
+    memcpy(out, src, len);
+    out[len] = '\0';
+}
+
 static void fat_label(const uint8_t *sector, char *out, size_t out_len)
 {
     const size_t off = fat_label_offset(sector);
 
-    if (out_len == 0 || off == 0) {
-        return;
+    if (off == 0) {
+        return;     /* not a FAT boot sector, so it has no FAT label */
     }
+    label_copy((const char *)sector + off, FAT_LABEL_LEN, out, out_len);
+}
 
-    const uint8_t *label = sector + off;
-    size_t n = 11;
-    while (n > 0 && label[n - 1] == ' ') {
-        n--;
+/*
+ * An ISO 9660 primary volume descriptor, in the block given: byte 0 is the type
+ * code (1 = primary), bytes 1-5 the magic "CD001", and the volume identifier at
+ * 40 -- the volume's own name for itself, which is what makes an installer
+ * recognisable ("COS_202604") rather than a 2.8G mystery.
+ */
+static bool iso_descriptor(const uint8_t *block, char *out_label, size_t out_len)
+{
+    if (block[0] != 1 || memcmp(block + ISO_MAGIC_OFFSET, "CD001", 5) != 0) {
+        return false;
     }
-    if (n == 0 || (n == 7 && memcmp(label, "NO NAME", 7) == 0)) {
-        return;     /* the formatter's own idea of an unnamed volume */
-    }
+    label_copy((const char *)block + ISO_LABEL_OFFSET, ISO_LABEL_LEN,
+               out_label, out_len);
+    return true;
+}
 
-    const size_t len = (n < out_len - 1) ? n : out_len - 1;
-    memcpy(out, label, len);
-    out[len] = '\0';
+/*
+ * The same, from a block the caller has not read. 32768 is a multiple of every
+ * sector size a block device here reports -- 512, 1024, 2048, 4096 -- so the
+ * read is aligned wherever it is asked for, which is not true of the offset the
+ * ext probe uses.
+ */
+static bool iso_descriptor_read(usb_dev_t *d, size_t unit, uint64_t offset,
+                                uint8_t *buf, char *out_label, size_t out_len)
+{
+    if (d->bdl->ops->read(d->bdl, buf, unit, offset, unit) != ESP_OK) {
+        return false;
+    }
+    return iso_descriptor(buf, out_label, out_len);
 }
 
 /*
@@ -386,57 +497,93 @@ static void fat_label(const uint8_t *sector, char *out, size_t out_len)
  * offset 56 of it -- bytes 1080 and 1081, little-endian 53 EF. Where those bytes
  * actually are depends on the sector size, and that is the whole subtlety:
  *
- *   - 512 or 1024 byte sectors: they are in the *second* 1024-byte block, so the
- *     caller's buffer has to be refilled from offset 1024. That address is a
- *     multiple of both, so the read is aligned, which is what a block device
- *     requires.
+ *   - 512 or 1024 byte sectors: they are in the *second* block, so the caller's
+ *     buffer has to be refilled from offset 1024. That address is a multiple of
+ *     both, so the read is aligned, which is what a block device requires.
  *   - 2048 or 4096: they are already inside the block the caller read, and a read
  *     at 1024 would be *unaligned* -- the same trap that makes the library's own
  *     esp_ext_part_list_bdl_read() unusable on a 4K-sector disk.
  *
- * `buf` is clobbered in the first case. Nothing that matters is left in it: the
- * caller has already decided this is not FAT, and every signature it checks for
- * lives in the first 512 bytes anyway.
+ * `buf` is clobbered in the first case, which is why block_fstype() checks every
+ * signature that lives in the first 512 bytes -- FAT, exFAT, NTFS and the ISO
+ * descriptor -- before calling this.
  */
 static bool ext_region_is_ext(usb_dev_t *d, uint64_t base, size_t unit,
                               uint8_t *buf)
 {
-    const size_t magic = 1024 + 56;
+    /* Where an ext volume keeps its superblock, and the two fields of it that say
+     * so: s_magic (0xEF53) and s_log_block_size, which is the block size as a
+     * power of two and cannot exceed 6 -- 64 KiB -- on any ext ever built. */
+    const size_t super     = 1024;
+    const size_t magic     = 56;
+    const size_t block_log = 24;
 
-    if (unit >= magic + 2) {
-        return buf[magic] == 0x53 && buf[magic + 1] == 0xEF;
-    }
+    const bool in_this_block = unit >= super + block_log + 4;
 
-    if (d->bdl->ops->read(d->bdl, buf, unit, base + 1024, unit) != ESP_OK) {
+    if (!in_this_block &&
+        d->bdl->ops->read(d->bdl, buf, unit, base + super, unit) != ESP_OK) {
         return false;
     }
-    return buf[magic - 1024] == 0x53 && buf[magic - 1024 + 1] == 0xEF;
+
+    /* Either the superblock is in the block we were given, or the read above
+     * replaced it with the block it starts in. */
+    const uint8_t *sb = in_this_block ? buf + super : buf;
+
+    if (sb[magic] != 0x53 || sb[magic + 1] != 0xEF) {
+        return false;
+    }
+
+    /*
+     * The magic alone is two bytes, and two bytes turn up in data that is not ext
+     * once in 65536. The block size beside it has to be a power of two no larger
+     * than 64 KiB, which is the check libblkid makes too; that is the difference
+     * between naming somebody's volume and guessing at it.
+     */
+    const uint32_t log2_block = (uint32_t)sb[block_log] |
+                                ((uint32_t)sb[block_log + 1] << 8) |
+                                ((uint32_t)sb[block_log + 2] << 16) |
+                                ((uint32_t)sb[block_log + 3] << 24);
+    return log2_block <= 6;
 }
 
 /*
- * What a filesystem covering a whole device calls itself, or "". The case with
- * no partition table at all, where sector 0 is the filesystem's own boot sector
- * rather than an MBR -- a "superfloppy", which is how appliance-formatted sticks
- * arrive. FAT is read here; exFAT, NTFS and ext are named because naming what
- * cannot be read is the point of the whole report.
+ * What filesystem the block given belongs to, or "" for one nothing here can
+ * name. Called for a whole device whose sector 0 is a filesystem's own boot
+ * sector rather than an MBR -- a "superfloppy", which is how appliance-formatted
+ * sticks arrive -- and for each partition of a device that has a table, because a
+ * type byte is a hint and this is the evidence.
  *
- * `sector` is the buffer sector 0 was read into, and may be refilled: see
- * ext_region_is_ext(), which runs last for exactly that reason.
+ * FAT is read, label and all; exFAT, NTFS, ext and ISO 9660 are named, because
+ * naming what cannot be read is the point of the whole report.
+ *
+ * `block` holds the region's first block and may be refilled: the ext probe reads
+ * a second block on sector sizes that cannot hold its superblock, so every check
+ * that needs only the first bytes -- including the ISO's -- runs before it.
  */
-static const char *whole_device_fstype(usb_dev_t *d, uint8_t *sector,
-                                       size_t unit, bool *foreign)
+static const char *block_fstype(usb_dev_t *d, uint64_t base, uint8_t *block,
+                                size_t unit, bool *foreign)
 {
-    if (fat_label_offset(sector) != 0) {
+    if (fat_label_offset(block) != 0) {
         return "vfat";
     }
     /* The OEM-name field doubles as the signature for both of these. */
-    if (memcmp(sector + 3, "EXFAT   ", 8) == 0) {
+    if (memcmp(block + 3, "EXFAT   ", 8) == 0) {
         *foreign = true;
         return "exfat";
     }
-    if (memcmp(sector + 3, "NTFS    ", 8) == 0) {
+    if (memcmp(block + 3, "NTFS    ", 8) == 0) {
         *foreign = true;
         return "ntfs";
+    }
+    /*
+     * An ISO's descriptor is at 32768, not here -- except in the case that found
+     * this: a hybrid image's partition begins exactly at its own descriptor, which
+     * is the 2.8G entry of an Arch or CachyOS installer whose type byte is 0x00
+     * and whose content is the only thing that names it.
+     */
+    if (iso_descriptor(block, NULL, 0)) {
+        *foreign = true;
+        return "iso9660";
     }
     /*
      * ext2/3/4, and the reason a Linux-prepared stick used to read as a bare
@@ -446,7 +593,7 @@ static const char *whole_device_fstype(usb_dev_t *d, uint8_t *sector,
      * -- the feature flags do -- and "ext4" would be a guess. Last, because this
      * is the check that may refill the buffer.
      */
-    if (ext_region_is_ext(d, 0, unit, sector)) {
+    if (ext_region_is_ext(d, base, unit, block)) {
         *foreign = true;
         return "ext2/3/4";
     }
@@ -504,90 +651,140 @@ static void read_partition_table(usb_dev_t *d)
          * appliance-formatted sticks arrive and how most of them used to ship.
          * The filesystem belongs to the disk row rather than to a partition,
          * which is where `lsblk` puts it too. FAT is readable here (label and
-         * all); exFAT and NTFS are only named, because naming what cannot be read
-         * is the point of this report.
+         * all); exFAT, NTFS, ext and ISO 9660 are only named, because naming what
+         * cannot be read is the point of this report.
          */
         bool foreign = false;
-        const char *type = whole_device_fstype(d, sector, unit, &foreign);
+        const char *type = block_fstype(d, 0, sector, unit, &foreign);
+
+        /*
+         * A pure ISO -- written to a stick with no partition table at all -- keeps
+         * nothing in sector 0, because its descriptor is 32768 bytes in, where the
+         * ISO's logical sector 16 lives. One read, and only when nothing above
+         * recognised the sector.
+         */
+        if (type[0] == '\0' &&
+            iso_descriptor_read(d, unit, ISO_PVD_OFFSET, sector,
+                                d->info.label, sizeof(d->info.label))) {
+            type = "iso9660";
+            foreign = true;
+        }
 
         if (type[0] != '\0') {
             copy_str(d->info.fstype, sizeof(d->info.fstype), type);
             d->info.foreign = foreign;
-            fat_label(sector, d->info.label, sizeof(d->info.label));
+            if (strcmp(type, "vfat") == 0) {
+                fat_label(sector, d->info.label, sizeof(d->info.label));
+            }
         }
         free(sector);
         return;
     }
 
     /*
-     * Parsed from the buffer rather than through esp_ext_part_list_bdl_read(),
-     * which reads a fixed 512 bytes and so cannot work on a 4K-sector disk.
+     * Walked here rather than through esp_mbr_parse(), because of one rule that
+     * matters on real media: the library ends the table at a 0x00 *type byte*. A
+     * hybrid ISO image -- an Arch or CachyOS installer, whose first entry is typed
+     * 0x00 with a real start and size -- then loses every entry after it,
+     * including the FAT EFI partition that is the only thing on such a stick espix
+     * can mount. Measured on a CachyOS 202604 installer: 2.8G of ISO 9660 typed
+     * 0x00, then 23M of EFI FAT typed 0xEF, and espix showed neither. A table ends
+     * when an entry is *empty* -- no start and no size -- which is a different
+     * thing entirely.
+     *
+     * The type table is still the library's: see partition_type_name().
      */
-    {
-        /* The medium's own sector size, so an LBA in the table scales to the byte
-         * address the block device expects. */
-        esp_mbr_parse_extra_args_t args = {
-            .sector_size = (esp_ext_part_sector_size_t)unit,
-        };
-        esp_ext_part_list_t list = { 0 };
+    for (size_t i = 0; i < MBR_ENTRIES && d->info.nparts < ESPIX_USB_MAX_PARTS; i++) {
+        const uint8_t *entry = sector + MBR_ENTRY_OFFSET + i * MBR_ENTRY_SIZE;
+        const uint8_t  raw = entry[MBR_ENTRY_TYPE];
+        const uint32_t lba_start = entry_u32(entry, MBR_ENTRY_LBA);
+        const uint32_t lba_sectors = entry_u32(entry, MBR_ENTRY_SECTORS);
 
-        if (esp_mbr_parse(sector, &list, &args) == ESP_OK) {
-            for (esp_ext_part_list_item_t *it = esp_ext_part_list_item_head(&list);
-                 it != NULL && d->info.nparts < ESPIX_USB_MAX_PARTS;
-                 it = esp_ext_part_list_item_next(it)) {
-                espix_usb_part_t *p = &d->info.parts[d->info.nparts];
-                const uint8_t type = it->info.type;
-                const bool fat = is_fat_type(type);
-
-                /*
-                 * "sda1", built by hand. The disk name is three characters
-                 * because slot_claim() made it, and an MBR holds four entries, so
-                 * the whole name is five bytes. Written out rather than
-                 * formatted: snprintf("%s%u") into an 8-byte buffer is exactly
-                 * what -Wformat-truncation exists to flag, and it is right to.
-                 */
-                if (d->info.nparts < 9) {
-                    p->name[0] = d->info.name[0];
-                    p->name[1] = d->info.name[1];
-                    p->name[2] = d->info.name[2];
-                    p->name[3] = (char)('1' + (int)d->info.nparts);
-                    p->name[4] = '\0';
-                }
-                p->start = it->info.address;
-                p->size = it->info.size;
-                copy_str(p->fstype, sizeof(p->fstype),
-                         fstype_name(type, &p->foreign));
-
-                if (fat && d->bdl->ops->read(d->bdl, sector, unit, p->start,
-                                             unit) == ESP_OK) {
-                    fat_label(sector, p->label, sizeof(p->label));
-                }
-
-                /*
-                 * One MBR byte covers ext and every other Linux filesystem, so
-                 * the superblock is read to say which one: "ext2/3/4" is worth
-                 * stating where "linux" is all the byte knows. Only for a
-                 * partition big enough to hold a superblock at all.
-                 */
-                if (type == ESP_EXT_PART_TYPE_LINUX_ANY && p->size > 2048 &&
-                    d->bdl->ops->read(d->bdl, sector, unit, p->start,
-                                      unit) == ESP_OK &&
-                    ext_region_is_ext(d, p->start, unit, sector)) {
-                    copy_str(p->fstype, sizeof(p->fstype), "ext2/3/4");
-                }
-                d->info.nparts++;
-            }
-
-            /*
-             * The parser flags a lossy parse when it skipped an entry: an extended
-             * partition, or a type it does not know. Nothing here passes a filter,
-             * so this can only be the medium's own doing.
-             */
-            if (list.flags & ESP_EXT_PART_LIST_FLAG_LOSSY) {
-                d->info.table_skipped = true;
-            }
-            esp_ext_part_list_deinit(&list);
+        if (lba_start == 0 && lba_sectors == 0) {
+            break;              /* empty: the table ends here */
         }
+
+        /*
+         * Scaled by the medium's own sector size, the convention the library used
+         * and the one espix documents. The MBR specification says these counts are
+         * in 512-byte units; on every device this has seen the two agree, and
+         * assuming 512 on a 4K-sector device would be wrong in a way nothing here
+         * could observe.
+         */
+        const uint64_t start = (uint64_t)lba_start * unit;
+        const uint64_t size  = (uint64_t)lba_sectors * unit;
+
+        /*
+         * Every number here is data off somebody's stick, so it is checked before
+         * it is used: an entry that falls outside the device is not shown, and is
+         * counted so the listing can say so.
+         */
+        if (size == 0 ||
+            (d->info.size > 0 &&
+             (start >= d->info.size || size > d->info.size - start))) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: entry %u is not inside the device", d->info.name,
+                       (unsigned)(i + 1));
+            d->info.table_skipped = true;
+            continue;
+        }
+
+        espix_usb_part_t *p = &d->info.parts[d->info.nparts];
+
+        /*
+         * "sda1", built by hand. The disk name is three characters because
+         * slot_claim() made it, and an MBR holds four entries, so the whole name
+         * is five bytes. Written out rather than formatted: snprintf("%s%u") into
+         * an 8-byte buffer is exactly what -Wformat-truncation exists to flag, and
+         * it is right to.
+         */
+        if (d->info.nparts < 9) {
+            p->name[0] = d->info.name[0];
+            p->name[1] = d->info.name[1];
+            p->name[2] = d->info.name[2];
+            p->name[3] = (char)('1' + (int)d->info.nparts);
+            p->name[4] = '\0';
+        }
+        p->start   = start;
+        p->size    = size;
+        p->foreign = false;
+        copy_str(p->fstype, sizeof(p->fstype),
+                 partition_type_name(raw, &p->foreign));
+
+        /*
+         * Then the partition's own first block, once, which is the evidence the
+         * type byte can only hint at: a FAT boot sector (also how a 0x00-typed
+         * entry gets a name at all), an ISO's volume descriptor, or ext's
+         * superblock. Where the content is recognised it wins over the byte, since
+         * a partition table being slightly wrong is not something to believe.
+         */
+        if (d->bdl->ops->read(d->bdl, sector, unit, start, unit) == ESP_OK) {
+            bool foreign = false;
+            const char *content = block_fstype(d, start, sector, unit, &foreign);
+
+            if (content[0] != '\0') {
+                copy_str(p->fstype, sizeof(p->fstype), content);
+                p->foreign = foreign;
+
+                if (strcmp(content, "vfat") == 0) {
+                    fat_label(sector, p->label, sizeof(p->label));
+                } else if (strcmp(content, "iso9660") == 0) {
+                    /* Recognised by block_fstype() a moment ago; this fills the
+                     * label out of the same block. */
+                    (void)iso_descriptor(sector, p->label, sizeof(p->label));
+                }
+            }
+        }
+
+        /*
+         * A row is a row even when nothing can name it: its size is real and worth
+         * seeing. It is counted rather than hidden, so `lsblk` can admit that the
+         * listing is not the whole table.
+         */
+        if (p->fstype[0] == '\0') {
+            d->info.table_skipped = true;
+        }
+        d->info.nparts++;
     }
 
     free(sector);

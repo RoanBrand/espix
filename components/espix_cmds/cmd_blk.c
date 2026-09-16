@@ -224,8 +224,8 @@ static int cmd_lsblk(espix_session_t *s, int argc, char **argv)
          * what this exists to stop.
          */
         if (devs[i].table_skipped) {
-            espix_printf(s, "%s: entries not shown (extended or unrecognised "
-                            "partition types)\n", devs[i].name);
+            espix_printf(s, "%s: entries not shown (an unnameable type, or an "
+                            "entry outside the device)\n", devs[i].name);
         }
     }
 

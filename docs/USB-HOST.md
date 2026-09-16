@@ -114,32 +114,39 @@ still arrive (the case that produced this code: a SanDisk Cruzer Blade prepared
 by an appliance, which read as a bare unpartitioned disk until sector 0 was
 examined). Sector 0 is then the filesystem's own boot sector: a FAT one gives
 `vfat` on the disk row plus its volume label, and exFAT or NTFS boot sectors are
-named and marked unsupported. An **ext2/3/4** volume is recognised by its superblock at offset 1024 — the one signature that is not in sector 0 at all, which is why a Linux-prepared stick like that Blade read as a bare disk with an empty `FSTYPE` until that offset was read. Anything else stays a bare disk.
+named and marked unsupported. Two filesystems keep nothing in sector 0 at all and are found by a read further in: **ext2/3/4**, whose superblock is at 1024, and **ISO 9660**, whose primary descriptor is at 32768 — which is why a Linux-prepared stick or an installer image read as a bare disk with an empty `FSTYPE` until those offsets were read. A stick that is empty, or holds something nothing here recognises, stays a bare disk, and nothing is missing from that answer: Linux's own `blkid` reports nothing for such a stick either.
 - **Filesystems espix has no driver for are named, not hidden.** The partition
 table says `exfat/ntfs` (one MBR code covers both, so it is as specific as sector
-0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, or `gpt`, each marked `(unsupported)`. That is the whole reason
+0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, `iso9660` when its descriptor does, or `gpt`, each marked `(unsupported)`. `0xEF` — "EFI (FAT-12/16/32)" to `fdisk`, and what every Arch, CachyOS and Windows installer writes — is **`vfat`**, and mountable: it is FAT, and the library has no code for it, so espix adds that one itself. That is the whole reason
 the command exists before mounting does: silence would read as an empty disk.
 
   `vfat`, `littlefs` and `raw` are *not* marked, and the marker is about the type
   rather than this build: FatFs is in the ESP-IDF image either way, and what is
   missing is the mount plumbing, not the driver.
-- **Labels come from the FAT boot sector.** An MBR has nowhere to put a volume
+- **Labels come from the filesystem's own first sector.** An MBR has nowhere to put a volume
   label, so the 11 space-padded bytes at `0x2B` (FAT12/16) or `0x47` (FAT32) are
   read from the partition's first sector, using the filesystem-type string the
   formatter wrote to decide which. A volume still called `NO NAME` reports none.
   Bytes are copied as they stand — a label in a non-ASCII code page is not
-  transcoded, because nothing here knows which page that was.
-- **Entries the parser cannot represent are reported, not hidden.** An extended
-  partition (`0x05`/`0x0F`) or an unknown type byte is skipped by the table
-  parser, so the rows beside it are not the whole table. `lsblk` says so below
-  them — `sda: entries not shown (extended or unrecognised partition types)` —
-  and `blkid` puts `SKIPPED="1"` on the disk line for a script. What it cannot do
-  is follow the chain: the logical partitions *inside* an extended partition are
-  never read, so a stick with five partitions shows its primaries and the note.
-
-  An empty entry is a different thing and a worse one: the parser stops there
-  ("an MBR cannot have holes in it"), so anything after a gap is invisible and
-  nothing flags it. Trailing empty entries are just the end of the table.
+  transcoded, because nothing here knows which page that was. An ISO's 32-byte volume identifier is read the same way, from its descriptor — which is the block a hybrid image's partition begins with.
+- **The partition table is walked by espix, not by the library.** The library
+  ends the table at a `0x00` *type byte*; a hybrid ISO image — an Arch or CachyOS
+  installer, whose first entry is typed `0x00` with a real start and size — then
+  loses every entry after it, including the FAT EFI partition that is the only
+  thing on such a stick espix can mount. Measured on a CachyOS 202604 installer:
+  2.8G of ISO 9660 typed `0x00`, then 23M of EFI FAT typed `0xEF`, and espix
+  showed neither. So the walk is espix's, and the table ends when an entry is
+  *empty* — no start and no size — which is a different thing. The type table is
+  still the library's, with the additions above; [UPSTREAM.md](UPSTREAM.md)
+  carries the report.
+- **Entries it still cannot show are counted, not hidden.** A type byte nothing
+  here can name, or an entry pointing outside the device, leaves a row that is
+  real but nameless: the row is printed anyway, and `lsblk` says so beneath the
+  table — `sda: entries not shown (an unnameable type, or an entry outside the
+  device)` — with `blkid` putting `SKIPPED="1"` on the disk line for a script.
+  What it does not do is follow a chain: the logical partitions *inside* an
+  extended partition (`0x05`/`0x0F`) are not read, so a stick with five
+  partitions shows its primaries and the note.
 - **Four device slots.** `sda`…`sdd`; a fifth device is refused with a log line
   rather than silently displacing one. A name stays with a device for as long as
   it is plugged in.
@@ -213,7 +220,7 @@ therefore does not work; the host stack is a managed component like any other.
 |---|---|
 | `espressif/usb` 1.5.0 | the host library: enumeration, transfers, and the hub driver |
 | `espressif/usb_host_msc` 1.3.0 | the class driver for mass storage: bulk-only transport and SCSI |
-| `espressif/esp_ext_part_tables` 0.5.0 | reads the partition table out of sector 0 |
+| `espressif/esp_ext_part_tables` 0.5.0 | the partition type table — its codes, and the names espix prints for them. The MBR walk itself is espix's, because of the `0x00` rule below |
 
 The MSC driver hands out an `esp_blockdev` handle per device (IDF 6.0.4 and
 later), and espix keeps it: that is what Stage 2 mounts from —
@@ -291,7 +298,8 @@ that exists.
    one. `cat /mnt/photo.jpg > /tmp/copy` on a 30MB stick is the read path end to
    end, and `umount /mnt` afterwards leaves `mount` printing nothing again.
    Refusals worth seeing once each: `mount sda2 /mnt` where sda2 is exFAT says
-   `exfat/ntfs is not supported`; `umount /mnt` while a file is open says `busy`;
+   `exfat/ntfs is not supported`, an installer stick's ISO partition says
+   `iso9660 is not supported`; `umount /mnt` while a file is open says `busy`;
    and **do not pull the stick while it is mounted** — that is the gap in
    [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem), not a test.
 5. **Pull it out:** `dmesg` says `sda: removed`, `lsblk` no longer lists it, and
@@ -318,7 +326,7 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
 | `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,306,128 B | 69% |
-| ... and Stage 2 (mounting, FatFs) | 0x1463d0 — 1,336,272 B | 68% |
+| ... and Stage 2 (mounting, FatFs) | 0x1460b0 — 1,335,472 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
 
 Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus
@@ -439,8 +447,8 @@ records it.
   news.
 - **FAT only.** `mount sda1 /mnt` on an exFAT or NTFS volume answers
   `exfat/ntfs is not supported` — the same words `lsblk` prints, for the same
-  reason, and likewise `ext2/3/4 is not supported` for a Linux volume that
-  `lsblk` can now name precisely.
+  reason, and likewise `ext2/3/4 is not supported` and `iso9660 is not supported`
+  for the volumes `lsblk` can now name precisely.
 - **Root only**, as `mount(8)` is: it changes the namespace for every session.
   `mount` with no arguments lists what is mounted and anyone may run that, as
   anyone may read `/proc/mounts`.
