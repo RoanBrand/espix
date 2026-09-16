@@ -139,7 +139,13 @@ static SemaphoreHandle_t s_attach_lock;
  * install, where the driver's event loop is free to deliver the completions.
  */
 #define WORK_QUEUE_LEN  8
-#define WORK_TASK_STACK 4096
+/*
+ * 6KB, not the 4KB this started at: the attach hook now mounts /etc/fstab
+ * volumes here, FatFs alone wants about 2KB, and the device array the applier
+ * copies is another couple of KB. The old size overflowed -- a panic on every
+ * attach, which with a stick left in means a boot loop.
+ */
+#define WORK_TASK_STACK 6144
 #define WORK_TASK_PRIO  3           /* below usb:host(4) and USB MSC(5) */
 
 /* How often the worker sweeps the pool when nothing has been queued. Devices are

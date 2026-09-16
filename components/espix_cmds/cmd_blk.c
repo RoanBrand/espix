@@ -1174,9 +1174,9 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
 /*
  * A storage device has appeared. Runs on the USB work task -- the context the
  * attach hook fires in, chosen so that transfers complete while a device is
- * installed -- so filesystem calls are safe here. That task's stack is the
- * budget to watch, not a guarantee: it is 3.5KB, and mounting is the deepest
- * thing ever asked to run on it.
+ * installed -- so filesystem calls are safe here, and its stack is sized for
+ * this: WORK_TASK_STACK in host.c accounts for a FatFs mount on top of
+ * everything the install itself needs.
  */
 void espix_blk_device_added(const char *dev)
 {
@@ -1184,7 +1184,14 @@ void espix_blk_device_added(const char *dev)
         return;
     }
 
-    espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
+    /*
+     * Static, not automatic: this array is a couple of KB and this function runs
+     * on the USB work task, whose stack cannot hold it -- it overflowed when this
+     * was a local. Attaches are serialised by the host's attach lock, so one
+     * buffer is enough.
+     */
+    static espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
+
     const size_t n = espix_usb_devlist(devs, ESPIX_USB_MAX_DEVS);
 
     fstab_apply(devs, n, dev);
