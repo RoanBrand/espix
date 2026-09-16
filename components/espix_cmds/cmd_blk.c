@@ -32,7 +32,7 @@
 #define LSBLK_USAGE  "usage: lsblk [disk]\n"
 #define BLKID_USAGE  "usage: blkid [device]...\n"
 #define MOUNT_USAGE  "usage: mount [device path]\n"
-#define UMOUNT_USAGE "usage: umount path\n"
+#define UMOUNT_USAGE "usage: umount path|device...\n"
 
 /*
  * Column widths. NAME and FSTYPE are measured per listing, the way `ls` measures
@@ -643,27 +643,9 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
-/*
- * umount: take it back out, and give back what was made for it.
- *
- * Refused while anything is open on the mount, by the layer that can tell --
- * espix_fs answers ESP_ERR_INVALID_STATE rather than pulling a volume out from
- * under a reader who is halfway through a file.
- */
-static int cmd_umount(espix_session_t *s, int argc, char **argv)
+/* One operand: a mount point, or a device name. Returns 0 when it went. */
+static int umount_one(espix_session_t *s, const char *arg)
 {
-    if (!espix_usb_host_built()) {
-        return no_host(s, "umount");
-    }
-    if (argc != 2) {
-        espix_eprintf(s, UMOUNT_USAGE);
-        return 1;
-    }
-    if (s == NULL || s->uid != 0) {
-        espix_eprintf(s, "umount: only root can unmount\n");
-        return 1;
-    }
-
     /*
      * A path -- resolved like every other command's path argument -- or a device
      * name. umount(8) takes either and there is no reason to be stricter.
@@ -671,15 +653,15 @@ static int cmd_umount(espix_session_t *s, int argc, char **argv)
     char abs[ESPIX_PATH_MAX];
     mount_rec_t *rec = NULL;
 
-    if (espix_cmd_path(s, argv[1], abs, sizeof(abs))) {
+    if (espix_cmd_path(s, arg, abs, sizeof(abs))) {
         rec = mount_by_path(abs);
     }
     if (rec == NULL) {
         char devbuf[ESPIX_USB_NAME_MAX];
-        rec = mount_by_dev(dev_operand(argv[1], devbuf, sizeof(devbuf)));
+        rec = mount_by_dev(dev_operand(arg, devbuf, sizeof(devbuf)));
     }
     if (rec == NULL) {
-        espix_eprintf(s, "umount: %s: not mounted\n", argv[1]);
+        espix_eprintf(s, "umount: %s: not mounted\n", arg);
         return 1;
     }
 
@@ -706,6 +688,42 @@ static int cmd_umount(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * umount: take it back out, and give back what was made for it.
+ *
+ * Several operands, as umount(8) takes: `umount /mnt/a /mnt/b` is how a script
+ * tidies up, and stopping at the first failure would leave the rest mounted with
+ * nothing said about them. Every operand is attempted, and the exit status is 1
+ * if any of them failed -- a single "not mounted" among three good ones is worth
+ * knowing about rather than swallowing.
+ *
+ * Refused while anything is open on the mount, by the layer that can tell --
+ * espix_fs answers ESP_ERR_INVALID_STATE rather than pulling a volume out from
+ * under a reader who is halfway through a file.
+ */
+static int cmd_umount(espix_session_t *s, int argc, char **argv)
+{
+    if (!espix_usb_host_built()) {
+        return no_host(s, "umount");
+    }
+    if (argc < 2) {
+        espix_eprintf(s, UMOUNT_USAGE);
+        return 1;
+    }
+    if (s == NULL || s->uid != 0) {
+        espix_eprintf(s, "umount: only root can unmount\n");
+        return 1;
+    }
+
+    int status = 0;
+    for (int i = 1; i < argc; i++) {
+        if (umount_one(s, argv[i]) != 0) {
+            status = 1;
+        }
+    }
+    return status;
+}
+
 /* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_blk_cmds[] = {
@@ -724,7 +742,7 @@ static espix_cmd_t s_blk_cmds[] = {
       .usage = "mount [device|/dev/device path]" },
     { .name = "umount", .fn = cmd_umount,
       .help = "unmount a mounted filesystem (root only)",
-      .usage = "umount path" },
+      .usage = "umount path|device..." },
 };
 
 void espix_cmds_register_blk(void)
