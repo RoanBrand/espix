@@ -43,19 +43,32 @@ runs, and the legend is the same one the Unix surface uses:
 | Storage | `/etc/fstab`, applied on attach | **yes** | device column takes a name, a wildcard, or `LABEL=`/`UUID=`/`PARTUUID=` |
 | Storage | `mount -o uid=,gid=` | **yes** | root hands a volume to a user without giving them root |
 | Storage | Volumes mounted at once | **partial** | two, bounded by `CONFIG_FATFS_VOLUME_COUNT` |
+| Storage | exFAT and ext4 volumes | **planned** | named and identified by `lsblk` today; nothing mounts them |
+| Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
+| Storage | Serve the stick over the network | **planned** | NFS or SMB, the NAS case |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
 | Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` |
 | Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
+| Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |
+| Programs | USB keyboard and mouse | **planned** | a console you type on, on the host port |
 | Shell | Serial console and SSH, same commands | **yes** | 60 commands |
 | Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
 | Shell | Line editing, history, TAB completion | **yes** | |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
+| Networking | Ethernet | **planned** | the P4 and the S31 have it; the S3 has no wired peripheral |
+| Networking | IP routing, NAT and bridging | **planned** | `route` exists; forwarding and NAT do not — a router built from an ESP32 |
+| Networking | DHCP server and DNS for the LAN | **planned** | an app-side resolver already exists to build on |
+| Networking | A VPN endpoint | **planned** | WireGuard-shaped, for the router case |
 | Faults | Permissions enforced in espix's own VFS | **yes** | builtins, loaded apps and SFTP alike |
 | Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
 | Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
+| Display | A console on a panel | **planned** | MIPI DSI on the P4 and S31, SPI elsewhere |
+| Display | A window system | **planned** | the desktop case, once there is a panel and a pointer |
+| Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
+| Services | Scheduled work: a `cron` | **planned** | the same missing supervisor, from the other end |
 
 ### Targets
 
