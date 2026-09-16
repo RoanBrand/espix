@@ -558,17 +558,24 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         return 0;
     }
     /*
-     * `-o uid=<id>[,gid=<id>]` first, as every other espix command takes its
-     * options before the operands. Root only: a session mounting at a directory
-     * of its own gets itself as the owner with no option at all, and an option
-     * that could name someone else would let a session hand its volume to an id
-     * it cannot then use -- or quietly take a volume away from itself.
+     * `-o uid=<id>[,gid=<id>]`, anywhere among the arguments rather than only
+     * first: GNU mount accepts it after the operands because getopt permutes,
+     * and `mount sda1 /mnt -o uid=esp` is what fingers type. The first cut here
+     * took it in position one only, which made the feature unusable in the
+     * spelling anyone would reach for -- found by running exactly that.
+     *
+     * Root only: a session mounting at a directory of its own gets itself as the
+     * owner with no option at all, and an option that could name someone else
+     * would let a session hand away a volume it cannot then use.
      */
     uint16_t owner_uid = (s != NULL) ? s->uid : 0;
     uint16_t owner_gid = (s != NULL) ? s->gid : 0;
 
-    if (argc >= 2 && strcmp(argv[1], "-o") == 0) {
-        if (argc < 3) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") != 0) {
+            continue;
+        }
+        if (i + 1 >= argc) {
             espix_eprintf(s, MOUNT_USAGE);
             return 1;
         }
@@ -576,11 +583,16 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
             espix_eprintf(s, "mount: -o is root's to use\n");
             return 1;
         }
-        if (!parse_owner(s, argv[2], &owner_uid, &owner_gid)) {
+        if (!parse_owner(s, argv[i + 1], &owner_uid, &owner_gid)) {
             return 1;
         }
-        argv += 2;
+
+        /* Drop the pair, keeping everything else in order. */
+        for (int j = i; j + 2 <= argc; j++) {
+            argv[j] = argv[j + 2];
+        }
         argc -= 2;
+        break;
     }
 
     if (argc != 3) {
