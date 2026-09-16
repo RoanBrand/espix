@@ -576,8 +576,12 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
      * gets.
      */
     if (s == NULL || (s->uid != 0 && st.st_uid != s->uid)) {
-        espix_eprintf(s, "mount: %s: only its owner or root can mount here\n",
-                      path);
+        /* Both numbers in the message on purpose: `ls -l` reports this directory
+         * as the caller's, so if this refuses, one of the two readings is not
+         * what it looks like -- and saying which is cheaper than another guess. */
+        espix_eprintf(s, "mount: %s: only its owner or root can mount here "
+                         "(directory uid %u, session uid %u)\n",
+                      path, (unsigned)st.st_uid, (unsigned)(s ? s->uid : 0));
         return 1;
     }
 
