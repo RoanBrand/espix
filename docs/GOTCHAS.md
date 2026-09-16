@@ -208,6 +208,18 @@ reproducing, or the reproduction is wasted: `tools/serlog.sh`, and run the suite
 without `--port` so nothing competes for the device (macOS lets two readers open
 the same `cu.*` and simply splits the bytes between them).
 
+The same non-exclusivity bites a *flash read*: esptool drives the stub through
+that driver, and a core-dump read through `cu.*` can fail at the last block with
+`Corrupt data, expected 0x1000 bytes but received 0x9d`. Use the `tty.*` node,
+which can only be held by one process, and slow it down while you are there:
+
+```
+ESPBAUD=115200 ./tools/idf.sh -p /dev/tty.usbserial-210 coredump-info -s /tmp/core.bin
+```
+
+`-s` keeps the bytes, so a failure to *decode* does not cost another read, and
+`coredump-info -c /tmp/core.bin` then needs no serial port at all.
+
 ### The task watchdog watches IDLE, and IDLE is not what you think
 
 `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1` subscribe the **idle tasks**, so
@@ -504,6 +516,24 @@ for; wrong for `esp_core_dump_image_check()`, which is a public API callable
 from a task. It resets the SHA peripheral under whatever else is using it. The
 general lesson: a `ets_`/ROM entry point is not a locked API, wherever you find
 one being called at runtime.
+
+### Every SSH command runs on the connection task's stack
+
+`sshd:conn` is created with `CONFIG_ESPIX_SSH_TASK_STACK`, and the shell session
+runs on that stack — so a command's frames and the task's are the same budget.
+`sudo` makes it worse: it re-enters the shell inside the same task, paying the
+line-parsing frames twice.
+
+The console does not have this problem. `main` carries the interactive session
+with 8700 bytes, while the same shell over SSH lives in whatever the Kconfig
+says — which was 8192, and a `sudo mount` overflowed it: 7680 bytes used, 508
+free, caught by the stack canary and reported by the core dump as a stack
+overflow in `sshd:conn`.
+
+That makes the stack cost of a command part of its contract, and `ps` the place
+to read it: the STACK column is `usStackHighWaterMark`, the smallest free figure
+the task has ever reached and not a current reading. A command that leaves a few
+hundred bytes there will overflow on a slightly different path.
 
 ## Build and configuration
 

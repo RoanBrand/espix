@@ -600,8 +600,11 @@ and `:1469`, a loop over the pending and active hub lists — and cleared only a
 at `:1469` sets the flag unconditionally and adds `DEV_ACTION_RELEASE` when the
 stage is idle, so a second release of the same device reaches the assert there.
 
-Seen once, on a device removal with an external hub attached (`espressif/usb`
-1.5.0, ESP-IDF v6.1, esp32s3). It is in the library's own event loop — a caller's
+Seen once, on the first attach of a newly formatted stick with an external hub
+attached (`espressif/usb` 1.5.0, ESP-IDF v6.1, esp32s3). It is the *attach* path,
+not removal: a clean unplug and replug of the same stick did not reproduce it.
+The record said removal for a while, which is worth knowing before anyone goes
+looking for a teardown race. It is in the library's own event loop — a caller's
 only frame in the stack is the `usb_host_lib_handle_events()` call that drives it
 — so nothing in a caller can prevent it, and the cost is the whole board. Checking
 the flag where it is set, or tolerating a second release, would make this a log

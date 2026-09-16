@@ -294,6 +294,11 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 # sdkconfig that already names the option -- delete it, or edit it by hand.
 CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 
+# 8192 was too small: a command runs on this task's stack, `sudo` re-enters the
+# shell on it, and a `sudo mount` tripped the canary at 7680 bytes used, 508
+# free. 10240 leaves room for a command that reaches into a mounted filesystem.
+CONFIG_ESPIX_SSH_TASK_STACK=10240
+
 # Precomputation for base-point scalar multiplication, which is what ECDSA does
 # for k*G -- and signing the exchange hash with the nistp256 host key is the
 # largest single cost in an SSH key exchange here. The ESP32-S3 has no ECC
