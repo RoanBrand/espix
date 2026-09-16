@@ -36,6 +36,8 @@ extern "C" {
 #define ESPIX_USB_NAME_MAX   8       /* "sda1" */
 #define ESPIX_USB_FSTYPE_MAX 12      /* "exfat/ntfs" */
 #define ESPIX_USB_LABEL_MAX  24      /* Volume labels are 11 bytes on disk */
+#define ESPIX_USB_UUID_MAX   10      /* "3E4A-1C7B", the FAT volume serial */
+#define ESPIX_USB_PARTUUID_MAX 12    /* "5f8b1c2a-03", signature and entry */
 #define ESPIX_USB_STR_MAX    64      /* Device strings, converted to UTF-8 */
 
 /*
@@ -48,6 +50,18 @@ typedef struct {
     char     name[ESPIX_USB_NAME_MAX];          /* "sda1" */
     char     fstype[ESPIX_USB_FSTYPE_MAX];      /* "" when nothing is recognised */
     char     label[ESPIX_USB_LABEL_MAX];        /* "" when the volume has none */
+    /*
+     * The FAT volume serial, written the way blkid writes it so that a value
+     * read off the device can be typed into /etc/fstab unchanged. Empty for
+     * anything but vfat, and for a volume whose serial is zero.
+     */
+    char     uuid[ESPIX_USB_UUID_MAX];
+    /*
+     * The MBR disk signature and this entry's number, Linux's PARTUUID for a DOS
+     * table. Empty when the disk's signature is zero -- a partition tool may leave
+     * it so, and inventing one would give every such disk the same identity.
+     */
+    char     partuuid[ESPIX_USB_PARTUUID_MAX];
     uint64_t start;                             /* byte offset in the disk */
     uint64_t size;                              /* bytes */
     bool     foreign;   /* recognised, but no driver here will ever open it */
@@ -81,6 +95,8 @@ typedef struct {
      */
     char     fstype[ESPIX_USB_FSTYPE_MAX];      /* "" when the disk has a table */
     char     label[ESPIX_USB_LABEL_MAX];        /* its volume label, if any */
+    char     uuid[ESPIX_USB_UUID_MAX];          /* a superfloppy's own serial */
+    uint32_t disk_id;                           /* MBR signature; 0 = none */
     bool     foreign;                           /* recognised, no driver for it */
     size_t   nparts;
     espix_usb_part_t parts[ESPIX_USB_MAX_PARTS];

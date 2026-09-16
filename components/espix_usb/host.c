@@ -401,6 +401,10 @@ static const char *partition_type_name(uint8_t raw, bool *foreign)
     return "";
 }
 
+/* The FAT boot sector's volume serial, and the MBR's own identifier. */
+#define FAT_SERIAL_OFFSET   0x43
+#define MBR_DISK_ID_OFFSET  0x1B8
+
 static bool has_mbr_signature(const uint8_t *sector)
 {
     return sector[MBR_SIGNATURE_OFFSET] == 0x55 &&
@@ -463,6 +467,45 @@ static void fat_label(const uint8_t *sector, char *out, size_t out_len)
         return;     /* not a FAT boot sector, so it has no FAT label */
     }
     label_copy((const char *)sector + off, FAT_LABEL_LEN, out, out_len);
+}
+
+/* The FAT boot sector's volume serial, four bytes at 0x43, in the same buffer the
+ * label above comes out of. Printed the way blkid prints a vfat UUID -- upper
+ * case, four and four -- because the point of reading it is to put it in a file
+ * that somebody compares against blkid's output. */
+static void fat_serial(const uint8_t *sector, char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0 || fat_label_offset(sector) == 0) {
+        return;     /* not a FAT boot sector, so it has no serial */
+    }
+
+    const uint32_t serial = (uint32_t)sector[FAT_SERIAL_OFFSET] |
+                            ((uint32_t)sector[FAT_SERIAL_OFFSET + 1] << 8) |
+                            ((uint32_t)sector[FAT_SERIAL_OFFSET + 2] << 16) |
+                            ((uint32_t)sector[FAT_SERIAL_OFFSET + 3] << 24);
+
+    if (serial == 0) {
+        return;     /* nothing to identify; a zero would match every other zero */
+    }
+
+    snprintf(out, out_len, "%04X-%04X", (unsigned)(serial >> 16),
+             (unsigned)(serial & 0xFFFFu));
+}
+
+/*
+ * Linux's PARTUUID for an MBR table: the disk signature, a dash, and the entry
+ * number -- both as they appear in blkid, so the value is portable between the
+ * two. The entry number is the MBR slot and not the row in this listing: a stick
+ * whose second entry cannot be read still calls sda3 slot three.
+ */
+static void partuuid_format(char *out, size_t out_len, uint32_t disk_id,
+                            unsigned entry)
+{
+    if (out == NULL || out_len == 0 || disk_id == 0) {
+        return;
+    }
+
+    snprintf(out, out_len, "%08x-%02u", (unsigned)disk_id, entry);
 }
 
 /*
@@ -681,6 +724,7 @@ static void read_partition_table(usb_dev_t *d)
             d->info.foreign = foreign;
             if (strcmp(type, "vfat") == 0) {
                 fat_label(sector, d->info.label, sizeof(d->info.label));
+                fat_serial(sector, d->info.uuid, sizeof(d->info.uuid));
             }
         }
         free(sector);
@@ -708,6 +752,14 @@ static void read_partition_table(usb_dev_t *d)
      */
     uint8_t table[MBR_ENTRIES * MBR_ENTRY_SIZE];
     memcpy(table, sector + MBR_ENTRY_OFFSET, sizeof(table));
+
+    /* The table's own identity, for PARTUUID: the four bytes at 0x1B8. Left zero
+     * when they are zero, so a disk nothing has signed has no PARTUUID rather
+     * than one shared with every other unsigned disk. */
+    d->info.disk_id = (uint32_t)sector[MBR_DISK_ID_OFFSET] |
+                      ((uint32_t)sector[MBR_DISK_ID_OFFSET + 1] << 8) |
+                      ((uint32_t)sector[MBR_DISK_ID_OFFSET + 2] << 16) |
+                      ((uint32_t)sector[MBR_DISK_ID_OFFSET + 3] << 24);
 
     for (size_t i = 0; i < MBR_ENTRIES && d->info.nparts < ESPIX_USB_MAX_PARTS; i++) {
         const uint8_t *entry = table + i * MBR_ENTRY_SIZE;
@@ -763,6 +815,8 @@ static void read_partition_table(usb_dev_t *d)
         p->name[4] = '\0';
         p->start   = start;
         p->size    = size;
+        partuuid_format(p->partuuid, sizeof(p->partuuid), d->info.disk_id,
+                        (unsigned)(i + 1));
         p->foreign = false;
         copy_str(p->fstype, sizeof(p->fstype),
                  partition_type_name(raw, &p->foreign));
@@ -784,6 +838,7 @@ static void read_partition_table(usb_dev_t *d)
 
                 if (strcmp(content, "vfat") == 0) {
                     fat_label(sector, p->label, sizeof(p->label));
+                    fat_serial(sector, p->uuid, sizeof(p->uuid));
                 } else if (strcmp(content, "iso9660") == 0) {
                     /* Recognised by block_fstype() a moment ago; this fills the
                      * label out of the same block. */

@@ -366,6 +366,15 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
             kv(s, "MANUFACTURER", devs[i].manufacturer);
             kv(s, "SERIAL", devs[i].serial);
             kv(s, "LABEL", devs[i].label);
+            kv(s, "UUID", devs[i].uuid);
+            /* PTUUID is the table's own identifier, which is the left half of a
+             * PARTUUID: printed so a rule's value is read rather than guessed. */
+            if (devs[i].disk_id != 0) {
+                char ptuuid[16];
+                snprintf(ptuuid, sizeof(ptuuid), "%08x",
+                         (unsigned)devs[i].disk_id);
+                kv(s, "PTUUID", ptuuid);
+            }
             kv_hex(s, "VID", devs[i].id_vendor);
             kv_hex(s, "PID", devs[i].id_product);
             kv_num(s, "SIZE", devs[i].size);
@@ -392,6 +401,8 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
             espix_printf(s, "%s: TYPE=\"%s\"", p->name,
                          p->fstype[0] != '\0' ? p->fstype : "unknown");
             kv(s, "LABEL", p->label);
+            kv(s, "UUID", p->uuid);
+            kv(s, "PARTUUID", p->partuuid);
             kv_num(s, "START", p->start);
             kv_num(s, "SIZE", p->size);
             espix_printf(s, "\n");
@@ -1242,7 +1253,7 @@ static espix_cmd_t s_blk_cmds[] = {
       .help = "list block devices and their filesystems (MBR only, no GPT)",
       .usage = "lsblk [disk]" },
     { .name = "blkid", .fn = cmd_blkid,
-      .help = "print a device's identity, filesystem and label",
+      .help = "print a device's identity, filesystem, label and uuid",
       .usage = "blkid [device]..." },
     { .name = "mount", .fn = cmd_mount,
       /* The root-only rule belongs in the help: a user who is told why is not
