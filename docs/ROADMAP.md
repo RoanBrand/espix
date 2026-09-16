@@ -539,7 +539,8 @@ things are as they are.
   - **lwext4** for ext2/3/4, and a much later `lwntfs`, are new components with
     the same shape as the filesystem work in [Filesystem](#filesystem). `lsblk`
     already names both as recognised and unsupported, which is the honest
-    position until then.
+    position until then — and names ext2/3/4 specifically, from the superblock,
+    on a partition (`0x83`) and on a whole-device volume alike.
   - **GPT** wants a partition-table reader rather than a parser change: the
     protective MBR is reported today rather than followed.
   - **A USB keyboard** is the interesting one and needs no display and no serial

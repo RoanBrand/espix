@@ -89,7 +89,7 @@ sda1: TYPE="vfat" LABEL="MYSTICK" START="1048576" SIZE="30719950848"
 
 Two deliberate differences from Linux's `blkid`: `TYPE` on a whole-disk line
 reads `disk`, because there is no filesystem to name there; and keys with no
-known value are left out rather than printed empty. Both commands take names as
+known value are left out rather than printed empty. One key is a flag rather than a value: `SKIPPED="1"` says the partition table held entries espix could not represent, so the partition lines beside it are not the whole story. Both commands take names as
 operands — `lsblk` a disk (`sda`), `blkid` a disk or a partition (`sda1`, which
 prints that line alone, because the value is what was asked for) — and an operand
 that names nothing is refused rather than quietly printing less. **Neither prints
@@ -114,11 +114,10 @@ still arrive (the case that produced this code: a SanDisk Cruzer Blade prepared
 by an appliance, which read as a bare unpartitioned disk until sector 0 was
 examined). Sector 0 is then the filesystem's own boot sector: a FAT one gives
 `vfat` on the disk row plus its volume label, and exFAT or NTFS boot sectors are
-named and marked unsupported. Anything else stays a bare disk.
+named and marked unsupported. An **ext2/3/4** volume is recognised by its superblock at offset 1024 — the one signature that is not in sector 0 at all, which is why a Linux-prepared stick like that Blade read as a bare disk with an empty `FSTYPE` until that offset was read. Anything else stays a bare disk.
 - **Filesystems espix has no driver for are named, not hidden.** The partition
 table says `exfat/ntfs` (one MBR code covers both, so it is as specific as sector
-0 gets), `linux` (`0x83` is "Linux any" — this is not "ext4", because sector 0
-does not say), or `gpt`, each marked `(unsupported)`. That is the whole reason
+0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, or `gpt`, each marked `(unsupported)`. That is the whole reason
 the command exists before mounting does: silence would read as an empty disk.
 
   `vfat`, `littlefs` and `raw` are *not* marked, and the marker is about the type
@@ -130,6 +129,17 @@ the command exists before mounting does: silence would read as an empty disk.
   formatter wrote to decide which. A volume still called `NO NAME` reports none.
   Bytes are copied as they stand — a label in a non-ASCII code page is not
   transcoded, because nothing here knows which page that was.
+- **Entries the parser cannot represent are reported, not hidden.** An extended
+  partition (`0x05`/`0x0F`) or an unknown type byte is skipped by the table
+  parser, so the rows beside it are not the whole table. `lsblk` says so below
+  them — `sda: entries not shown (extended or unrecognised partition types)` —
+  and `blkid` puts `SKIPPED="1"` on the disk line for a script. What it cannot do
+  is follow the chain: the logical partitions *inside* an extended partition are
+  never read, so a stick with five partitions shows its primaries and the note.
+
+  An empty entry is a different thing and a worse one: the parser stops there
+  ("an MBR cannot have holes in it"), so anything after a gap is invisible and
+  nothing flags it. Trailing empty entries are just the end of the table.
 - **Four device slots.** `sda`…`sdd`; a fifth device is refused with a log line
   rather than silently displacing one. A name stays with a device for as long as
   it is plugged in.
@@ -308,7 +318,7 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
 | `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,306,128 B | 69% |
-| ... and Stage 2 (mounting, FatFs) | 0x146210 — 1,335,824 B | 68% |
+| ... and Stage 2 (mounting, FatFs) | 0x1463d0 — 1,336,272 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
 
 Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus
@@ -429,7 +439,8 @@ records it.
   news.
 - **FAT only.** `mount sda1 /mnt` on an exFAT or NTFS volume answers
   `exfat/ntfs is not supported` — the same words `lsblk` prints, for the same
-  reason.
+  reason, and likewise `ext2/3/4 is not supported` for a Linux volume that
+  `lsblk` can now name precisely.
 - **Root only**, as `mount(8)` is: it changes the namespace for every session.
   `mount` with no arguments lists what is mounted and anyone may run that, as
   anyone may read `/proc/mounts`.

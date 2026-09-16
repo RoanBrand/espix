@@ -65,6 +65,14 @@ typedef struct {
     uint64_t size;                              /* bytes */
     bool     table_read;                        /* sector 0 was read and parsed */
     /*
+     * True when the table held entries espix cannot represent -- an extended
+     * partition (0x05/0x0F), or a type the parser does not know -- so the rows
+     * beside it are not the whole table. The library flags both as a lossy parse.
+     * espix passes no filter of its own, so this can only be the medium's doing,
+     * never something espix chose to leave out.
+     */
+    bool     table_skipped;
+    /*
      * The disk's own filesystem, when it has one: a device with no partition
      * table whose sector 0 is a filesystem's boot sector -- a "superfloppy". Then
      * the filesystem belongs to this row rather than to a partition, and

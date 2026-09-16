@@ -216,6 +216,17 @@ static int cmd_lsblk(espix_session_t *s, int argc, char **argv)
                 (j + 1 == devs[i].nparts) ? "\u2514\u2500" : "\u251c\u2500",
                 p->name, part_size, "part", fstype, p->label);
         }
+
+        /*
+         * A note rather than a column: it describes the whole table, not the row
+         * above it, and the listing has no room for a flag that is false almost
+         * always. The alternative -- printing fewer rows and saying nothing -- is
+         * what this exists to stop.
+         */
+        if (devs[i].table_skipped) {
+            espix_printf(s, "%s: entries not shown (extended or unrecognised "
+                            "partition types)\n", devs[i].name);
+        }
     }
 
     return 0;
@@ -328,6 +339,12 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
             kv_hex(s, "VID", devs[i].id_vendor);
             kv_hex(s, "PID", devs[i].id_product);
             kv_num(s, "SIZE", devs[i].size);
+            /* A flag rather than a value, so not through kv(): this says the
+             * partition list beside it is not the whole table, which a script
+             * reading only sda1..sda4 would otherwise never learn. */
+            if (devs[i].table_skipped) {
+                espix_printf(s, " SKIPPED=\"1\"");
+            }
             espix_printf(s, "\n");
         }
 

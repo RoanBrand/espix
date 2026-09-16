@@ -380,13 +380,51 @@ static void fat_label(const uint8_t *sector, char *out, size_t out_len)
 }
 
 /*
+ * Does the ext2/3/4 superblock sit in this region?
+ *
+ * The superblock begins 1024 bytes into the volume and its `s_magic` is 0xEF53 at
+ * offset 56 of it -- bytes 1080 and 1081, little-endian 53 EF. Where those bytes
+ * actually are depends on the sector size, and that is the whole subtlety:
+ *
+ *   - 512 or 1024 byte sectors: they are in the *second* 1024-byte block, so the
+ *     caller's buffer has to be refilled from offset 1024. That address is a
+ *     multiple of both, so the read is aligned, which is what a block device
+ *     requires.
+ *   - 2048 or 4096: they are already inside the block the caller read, and a read
+ *     at 1024 would be *unaligned* -- the same trap that makes the library's own
+ *     esp_ext_part_list_bdl_read() unusable on a 4K-sector disk.
+ *
+ * `buf` is clobbered in the first case. Nothing that matters is left in it: the
+ * caller has already decided this is not FAT, and every signature it checks for
+ * lives in the first 512 bytes anyway.
+ */
+static bool ext_region_is_ext(usb_dev_t *d, uint64_t base, size_t unit,
+                              uint8_t *buf)
+{
+    const size_t magic = 1024 + 56;
+
+    if (unit >= magic + 2) {
+        return buf[magic] == 0x53 && buf[magic + 1] == 0xEF;
+    }
+
+    if (d->bdl->ops->read(d->bdl, buf, unit, base + 1024, unit) != ESP_OK) {
+        return false;
+    }
+    return buf[magic - 1024] == 0x53 && buf[magic - 1024 + 1] == 0xEF;
+}
+
+/*
  * What a filesystem covering a whole device calls itself, or "". The case with
  * no partition table at all, where sector 0 is the filesystem's own boot sector
  * rather than an MBR -- a "superfloppy", which is how appliance-formatted sticks
- * arrive. FAT is read here; exFAT and NTFS are named because naming what cannot
- * be read is the point of the whole report.
+ * arrive. FAT is read here; exFAT, NTFS and ext are named because naming what
+ * cannot be read is the point of the whole report.
+ *
+ * `sector` is the buffer sector 0 was read into, and may be refilled: see
+ * ext_region_is_ext(), which runs last for exactly that reason.
  */
-static const char *whole_device_fstype(const uint8_t *sector, bool *foreign)
+static const char *whole_device_fstype(usb_dev_t *d, uint8_t *sector,
+                                       size_t unit, bool *foreign)
 {
     if (fat_label_offset(sector) != 0) {
         return "vfat";
@@ -399,6 +437,18 @@ static const char *whole_device_fstype(const uint8_t *sector, bool *foreign)
     if (memcmp(sector + 3, "NTFS    ", 8) == 0) {
         *foreign = true;
         return "ntfs";
+    }
+    /*
+     * ext2/3/4, and the reason a Linux-prepared stick used to read as a bare
+     * disk: ext keeps its superblock at 1024, so a whole-device ext volume has
+     * nothing at all in sector 0 for any of the checks above to find. Named
+     * without claiming a version, because s_magic does not distinguish 2, 3 and 4
+     * -- the feature flags do -- and "ext4" would be a guess. Last, because this
+     * is the check that may refill the buffer.
+     */
+    if (ext_region_is_ext(d, 0, unit, sector)) {
+        *foreign = true;
+        return "ext2/3/4";
     }
     return "";
 }
@@ -458,7 +508,7 @@ static void read_partition_table(usb_dev_t *d)
          * is the point of this report.
          */
         bool foreign = false;
-        const char *type = whole_device_fstype(sector, &foreign);
+        const char *type = whole_device_fstype(d, sector, unit, &foreign);
 
         if (type[0] != '\0') {
             copy_str(d->info.fstype, sizeof(d->info.fstype), type);
@@ -512,7 +562,29 @@ static void read_partition_table(usb_dev_t *d)
                                              unit) == ESP_OK) {
                     fat_label(sector, p->label, sizeof(p->label));
                 }
+
+                /*
+                 * One MBR byte covers ext and every other Linux filesystem, so
+                 * the superblock is read to say which one: "ext2/3/4" is worth
+                 * stating where "linux" is all the byte knows. Only for a
+                 * partition big enough to hold a superblock at all.
+                 */
+                if (type == ESP_EXT_PART_TYPE_LINUX_ANY && p->size > 2048 &&
+                    d->bdl->ops->read(d->bdl, sector, unit, p->start,
+                                      unit) == ESP_OK &&
+                    ext_region_is_ext(d, p->start, unit, sector)) {
+                    copy_str(p->fstype, sizeof(p->fstype), "ext2/3/4");
+                }
                 d->info.nparts++;
+            }
+
+            /*
+             * The parser flags a lossy parse when it skipped an entry: an extended
+             * partition, or a type it does not know. Nothing here passes a filter,
+             * so this can only be the medium's own doing.
+             */
+            if (list.flags & ESP_EXT_PART_LIST_FLAG_LOSSY) {
+                d->info.table_skipped = true;
             }
             esp_ext_part_list_deinit(&list);
         }
