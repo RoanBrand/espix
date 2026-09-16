@@ -120,11 +120,26 @@ typedef struct {
 static lower_t s_mounts[ESPIX_FS_MAX_MOUNTS];
 
 /*
- * What a path under a pulled volume reaches. Not a struct full of refusing
- * functions: NULL ops, because every caller already handles a layer that cannot
- * do something. See `dead` above.
+ * What a path under a pulled volume reaches.
+ *
+ * The tables are empty rather than absent, and that distinction is the whole
+ * thing: every op in this file is written `l->ops->open_p` / `l->dir->opendir_p`,
+ * and NO_LOWER() tests the function pointer -- so a NULL table is dereferenced
+ * before anything can decide there is nothing to call. That is a crash, and it is
+ * what running the open-file pull test showed: `cat` on a mount kept dead died
+ * here, where the prediction had been a quiet refusal.
+ *
+ * The mount is kept and marked (`dead`) rather than removed, so paths under it
+ * keep existing instead of falling through to the rootfs.
  */
-static const lower_t s_dead = { .dead = true };
+static const esp_vfs_fs_ops_t  s_dead_ops;
+static const esp_vfs_dir_ops_t s_dead_dir;
+
+static const lower_t s_dead = {
+    .ops  = &s_dead_ops,
+    .dir  = &s_dead_dir,
+    .dead = true,
+};
 
 /*
  * Mounts are added and removed while other sessions are opening files, so the
