@@ -631,31 +631,37 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
-- **A write into a mounted FAT volume is sometimes lost, silently.** Measured on
-  the four-partition Cruzer: seven `sudo cp /etc/hostname /mnt/sd1/<name>` runs,
-  each after a fresh mount, and one of them produced a 0-byte file with nothing
-  said -- `cat` prints nothing from it, so the data is gone rather than mis-sized.
-  Six produced the fifteen bytes asked for. Nothing distinguishes the failure:
-  not the filename, not whether the file already existed, not an intervening
-  read, and not the mount being new (five of the six successes also ran against a
-  mount made moments earlier).
+- **A write into a mounted FAT volume is lost for the first two copies after a
+  boot.** Reproduced twice, on two builds, matching to the byte: after a reset,
+  `sudo mount /dev/sda1 /mnt/sd1` and then two `sudo cp /etc/hostname` runs.
+  The first answers `close failed: Bad file number` (`EBADF`) and leaves a
+  0-byte file; the second leaves a 0-byte file with every call — `fwrite`,
+  `fflush`, `fclose` — returning success. The third and every later copy writes
+  its fifteen bytes, until the next boot. Nothing else distinguishes them: not
+  the filename, not whether the file existed, not an intervening read.
 
-  The flush/close hole that was fixed in espix is *not* this. That fix makes a
-  *reported* failure visible, and this failure is not reported: `fclose()`
-  returned success with the file empty, which puts the loss below stdio -- in
-  FatFs's write path, or in the MSC layer under it, with success coming back up.
+  It is an fd collision. espix calls FatFs's *inner* ops — the ones
+  `tools/patch-fatfs.py` exposes so that `esp_vfs` is bypassed and espix's
+  permission check is not — and those hand out FatFs's own
+  `fat_ctx->files[]` slots: 0, 1, 2, … Meanwhile IDF's global fd table and the
+  console are handing out those same numbers. So `s_fd_mount[2]` can be written
+  by a rootfs open and by a FAT open, and `vfs_close` can find nothing at all
+  for a fd that is ours: `mount_by_fd()` answers `NULL` and the close returns
+  `EBADF`, or — worse — the operation reaches the right mount and the transfer
+  for a file whose slot number was reused goes nowhere. That the failures stop
+  after two is what local fd slots being cycled looks like from outside.
 
-  Two diagnostics say which. `CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y` makes IDF's
-  `vfs_fat_write`/`vfs_fat_close` print their `FRESULT`, which answers whether
-  FatFs knew; and `msc_scsi_bot.c` discards the SCSI sense data on a failed
-  transfer (`scsi_cmd_sense(device, NULL)`), so a patch in the shape of
-  `tools/patch-fatfs.py`, printing the sense key, would name a medium error, a
-  write-protect or a UNIT ATTENTION. UPSTREAM.md already records the discarded
-  sense data as the reason a write failure arrives as one anonymous error code;
-  this is the same gap seen from the one place where it costs data.
+  The fix is to **pack the fds**: `open` returns a number from espix's own space,
+  every op maps it back to the lower fd, and the routing map is keyed on espix's
+  number rather than one it shares with the console and the rootfs. The 256-byte
+  array in `vfs.c` becomes a small table of open files, which also drops the
+  assumption that a fd fits in a byte — an assumption the comment there states
+  as fact today. Until then `cp` reads every copy back and reports one that did
+  not arrive, which is how this was caught.
 
-  Until then the only honest advice is that a stick written from here is not
-  trustworthy without reading the file back.
+  Related, and separate: `off_t` is 32 bits here, so a device or file larger
+  than 4 GB reports a truncated size — `/dev/sda4`, 23 GiB, lists as `0`,
+  which is exactly its low 32 bits.
 
 - **Unplugging a mounted stick is a use-after-free.** Stage 2 mounts FAT from a
   USB device, and the block device it mounts is *borrowed* from `espix_usb`: the

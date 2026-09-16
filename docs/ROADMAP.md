@@ -98,14 +98,25 @@ things are as they are.
   **"Routing internally" is smaller than it sounds**, and worth costing before
   rejecting it as reinventing the VFS. ESP-IDF keeps the libc glue and the global
   fd table either way; what espix adds is a prefix lookup (an array and a
-  longest-match `strncmp`) and one wrinkle — and the wrinkle was written down
-  wrong here. With two filesystems below, LittleFS fd 3 and FAT fd 3 *cannot*
-  collide: espix passes the lower filesystem's fd through unchanged and IDF
-  allocates those from one global table, so an fd identifies its filesystem by
-  construction. What routing needs is the reverse question, fd (or `DIR`) to
-  mount, which is a 256-byte array indexed by fd plus a few pointer slots for
-  directory handles — and that is what it turned out to be: `lower_t s_mounts[]`
-  in `vfs.c`, `espix_vfs_add_mount()`, and `components/espix_fs/fat.c` behind it.
+  longest-match `strncmp`) and one wrinkle — and the wrinkle, written down wrong
+  here twice, is the fd. The earlier version of this paragraph said there was no
+  collision, because espix passes the lower filesystem's fd through unchanged
+  and IDF allocates from one global table. That is not what happens. The ops
+  espix calls are FatFs's *inner* ops — the ones `tools/patch-fatfs.py` exposes
+  precisely so that `esp_vfs` is bypassed — and those hand out FatFs's own
+  `fat_ctx->files[]` slots: 0, 1, 2, … While IDF's global table, and the
+  console, are handing out those same numbers. So a FAT file is fd 2 while the
+  console is fd 2, and anything keyed on the fd without knowing which filesystem
+  it came from is wrong.
+
+  Measured, and written up in [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem): the
+  first two writes after a boot fail — one `EBADF` on close, one silently — and
+  every write after that succeeds until the next boot.
+
+  So the fds need *packing*, which is what this paragraph twice talked itself out
+  of: a file opened below gets a number from espix's own space and every op maps
+  it back. That is the reverse map plus an offset, and `lower_t s_mounts[]` in
+  `vfs.c` has only the second half of it.
 
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
