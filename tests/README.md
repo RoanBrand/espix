@@ -63,6 +63,35 @@ machine. Note the shape of that carefully: `10-fs.sh` asserts against a listing
 of `/tmp`, where a *neighbour's* `espix-test-fs-2` is also sitting, so it matches
 the full name and not the stem.
 
+### Skipping, and the difference between "skipped" and "passed"
+
+A suite that cannot test its subject must **skip, with the reason**, and the
+reason has to name what is missing. Never pass on an empty result: an empty
+`lsblk` is a legitimate answer from a device with nothing plugged in, so a suite
+that asserts against it passes for the wrong reason.
+
+```sh
+if [ -z "$lsblk_out" ]; then
+    espix_skip "nothing attached; plug a stick into the OTG socket"
+else
+    …
+fi
+```
+
+The conditions worth skipping on, and who owns each:
+
+| condition | how to tell | example |
+|---|---|---|
+| no mass storage | `lsblk` prints nothing, or says the host role was not built in | `75-usb.sh` |
+| no serial console | `ESPIX_HAVE_SERIAL=no` — the runner sets it when `--port` was not given, or when the interpreter has no pyserial | `50-console.sh` |
+| needs root | `mount` and `umount` are root-only and the harness runs as `$ESPIX_USER` | `12-vfs.sh` |
+| the board cannot do it at all | the role is device rather than host, or the filesystem is one espix will not mount | `75-usb.sh`, `12-vfs.sh` |
+
+A skip is not a failure, and the summary counts the two separately: a run of all
+skips is the runner saying the *board* could not answer, not that the code is
+fine. That distinction is the whole reason to skip rather than to pass quietly —
+and it is why a green run means something only when the skips were expected.
+
 ### Which helper to reach for
 
 - **`dev_run`** for nearly everything. It uses the session the runner already

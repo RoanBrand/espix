@@ -74,8 +74,12 @@ else
         # A partition appears under its disk. The tree characters that draw it are
         # three bytes each, which is a formatting detail rather than something to
         # assert on here: the row's own TYPE column says what it is.
+        # A partition's name in column 1 carries the tree glyph ("├─sda1"), and
+        # /dev lists the bare name, so the glyph has to go before comparing. The
+        # suite failed against a working device until it did.
         part=$(printf '%s\n' "$lsblk_out" |
-               awk 'NR > 1 && $3 == "part" { print $1; exit }')
+               awk 'NR > 1 && $3 == "part" { print $1; exit }' |
+               sed 's/^[^[:alnum:]]*//')
 
         if [ -n "$part" ]; then
             espix_pass "a partition is listed under its disk"
