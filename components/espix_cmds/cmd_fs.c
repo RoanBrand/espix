@@ -609,6 +609,62 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+/*
+ * Read both files back and compare them, chunk for chunk.
+ *
+ * Not paranoia. A write into a mounted FAT volume has been measured arriving as
+ * an empty file -- once in seven copies -- with every layer reporting success,
+ * this command's fflush() and fclose() included: the transfer is lost somewhere
+ * under FatFs without an error coming back up (KNOWN-ISSUES.md has the numbers).
+ * Reading the copy back is therefore the only way to know it arrived.
+ *
+ * Buffers from the heap rather than the stack, because this runs on the SSH
+ * connection task and that stack is the one that overflowed once already. An
+ * allocation failure means "not verified", which is not the same as "wrong", so
+ * it is said out loud and does not fail the copy.
+ */
+static bool copy_arrived(espix_session_t *s, const char *src, const char *dst)
+{
+    FILE *a = fopen(src, "rb");
+    if (a == NULL) {
+        return false;
+    }
+    FILE *b = fopen(dst, "rb");
+    if (b == NULL) {
+        fclose(a);
+        return false;
+    }
+
+    char *ca = malloc(COPY_CHUNK);
+    char *cb = malloc(COPY_CHUNK);
+    if (ca == NULL || cb == NULL) {
+        free(ca);
+        free(cb);
+        fclose(a);
+        fclose(b);
+        espix_eprintf(s, "cp: %s: cannot verify (out of memory)\n", dst);
+        return true;
+    }
+
+    bool same = true;
+    while (same) {
+        const size_t na = fread(ca, 1, COPY_CHUNK, a);
+        const size_t nb = fread(cb, 1, COPY_CHUNK, b);
+
+        if (na != nb || (na > 0 && memcmp(ca, cb, na) != 0)) {
+            same = false;
+        } else if (na < COPY_CHUNK) {
+            break;                      /* both ended, at the same place */
+        }
+    }
+
+    free(ca);
+    free(cb);
+    fclose(a);
+    fclose(b);
+    return same;
+}
+
 static int cmd_cp(espix_session_t *s, int argc, char **argv)
 {
     if (argc != 3) {
@@ -660,10 +716,21 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
         espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
         status = 1;
     }
-    if (fclose(out) != 0 && status == 0) {
+    if (status == 0 && fclose(out) != 0) {
         espix_eprintf(s, "cp: %s: close failed: %s\n", dst, strerror(errno));
         status = 1;
     }
+
+    /*
+     * Then look at what arrived. Every layer above has now reported success, and
+     * a copy has been measured arriving as an empty file anyway -- so this is the
+     * check that would have caught it, rather than the operator noticing later.
+     */
+    if (status == 0 && !copy_arrived(s, src, dst)) {
+        espix_eprintf(s, "cp: %s: the copy did not arrive intact\n", dst);
+        status = 1;
+    }
+
     return status;
 }
 

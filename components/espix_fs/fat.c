@@ -235,7 +235,20 @@ static ssize_t fat_read(void *ctx, int fd, void *dst, size_t size)
 static ssize_t fat_write(void *ctx, int fd, const void *data, size_t size)
 {
     fat_mount_t *m = ctx;
-    return m->ops->write_p(m->fat_ctx, fd, data, size);
+    const ssize_t n = m->ops->write_p(m->fat_ctx, fd, data, size);
+
+    /*
+     * A short write is reported as a count rather than a failure, all the way up
+     * from FatFs, and a caller that ignores the count loses the rest of the
+     * buffer without a word. That is one of the ways a copy arrives empty with
+     * nothing said, so it gets a line of its own instead of the benefit of the
+     * doubt.
+     */
+    if (n >= 0 && (size_t)n != size) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "short write: %d of %u bytes",
+                   (int)n, (unsigned)size);
+    }
+    return n;
 }
 
 static ssize_t fat_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
