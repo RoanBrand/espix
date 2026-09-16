@@ -119,27 +119,35 @@ static portMUX_TYPE s_mount_lock = portMUX_INITIALIZER_UNLOCKED;
  * An fd carries no path, so which mount it belongs to has to be remembered --
  * but the *number* cannot be the lower filesystem's own. FatFs and the littlefs
  * port both count from zero, espix calls their ops directly rather than through
- * esp_vfs, and IDF's own table, the console and the sockets are using those
- * numbers too. Two files on two filesystems then share one entry: a rootfs close
- * clears it, and the next read on the stick is answered EBADF. Measured, and
- * written up in docs/KNOWN-ISSUES.md -- it cost the first two copies after every
- * boot.
+ * esp_vfs, and two files on two filesystems would then share one entry: a close
+ * of one clears it and the next read of the other is answered EBADF. Measured,
+ * and written up in docs/KNOWN-ISSUES.md.
  *
- * So the number is IDF's: esp_vfs_register_fd_with_local_fd() picks an unused
- * one, which is what keeps this table honest, keeps fds out of the range the
- * sockets use, and keeps them inside `fd_set` for select(). The layer below is
- * called with its own number, which is what the table is for. IDF frees the slot
- * itself when the fd is closed, so there is nothing to unregister here.
+ * So espix hands out numbers of its own, and they travel as `local_fd`: IDF
+ * stores whatever the driver returns in that field verbatim (vfs.c:764) and
+ * gives it back on every call. Nothing has to be registered for it, which is the
+ * point -- IDF's path-based open makes its own entry for the caller's fd and its
+ * close releases that one, so one entry per open is the whole cost.
  *
- * Indexed by fd, sized to the range below the device fds, which are handed out
- * directly and never appear here.
+ * Registering a second one was a bug in both directions. An entry per open that
+ * nothing freed, because esp_vfs_unregister_fd() refuses entries that are not
+ * permanent (vfs.c:679); and, to free it, an unregister call from inside this
+ * VFS's close -- which runs under whatever locks the caller holds. lwIP holds a
+ * spinlock when it closes a socket, and taking a mutex from there asserts. Both
+ * symptoms are in docs/GOTCHAS.md.
+ *
+ * The range sits below the device fds, which are handed out directly and never
+ * appear here.
  */
+#define ESPIX_FS_FD_BASE 128
+#define ESPIX_FS_FD_MAX  32
+
 typedef struct {
     int     lower_fd;   /* the number the layer below knows it by, -1 = free */
     uint8_t mount;      /* index into s_mounts, +1 */
 } fd_slot_t;
 
-static fd_slot_t s_fds[ESPIX_DEV_FD_BASE];
+static fd_slot_t s_fds[ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX];
 
 /*
  * Every slot starts free, and the sentinel is -1 rather than 0: a zeroed table
@@ -149,18 +157,21 @@ static fd_slot_t s_fds[ESPIX_DEV_FD_BASE];
  */
 static void fd_table_init(void)
 {
-    for (int i = 0; i < ESPIX_DEV_FD_BASE; i++) {
+    for (size_t i = 0; i < sizeof(s_fds) / sizeof(s_fds[0]); i++) {
         s_fds[i].lower_fd = -1;
     }
 }
 
-/* The VFS id esp_vfs_register_fd() needs, from the registration at the bottom
- * of this file. */
-static esp_vfs_id_t s_vfs_id = -1;
+/* True for a number this VFS handed out. Device fds are above the range and
+ * never reach the table. */
+static bool fd_ours(int fd)
+{
+    return fd >= ESPIX_FS_FD_BASE && fd < ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX;
+}
 
 static bool fd_slot_get(int fd, fd_slot_t *out)
 {
-    if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
+    if (!fd_ours(fd)) {
         return false;
     }
 
@@ -214,63 +225,41 @@ static const lower_t *mount_of_slot(const fd_slot_t *s)
 }
 
 /*
- * IDF's fd for a file just opened below, or -1.
+ * A number for a file just opened below, out of espix's own range, or -1.
  *
- * The number comes from esp_vfs rather than from the filesystem, which is the
- * whole point: it is unique against the console, the sockets and every other
- * mount, so the entry it gets here cannot be someone else's. `local_fd` is left
- * as IDF set it -- equal to the fd -- so this VFS's ops are called with the
- * number it handed out, and the lower filesystem's own number travels in the
- * table instead.
- *
- * *Permanent*, and that is not a detail. IDF's own close frees its entry for the
- * caller's fd, but espix's entry -- this one -- is only ever freed by
- * esp_vfs_unregister_fd(), and that call refuses anything not registered
- * permanent (vfs.c:679). Registered non-permanent it was simply never released:
- * one table entry lost per open, so a boot's worth of opens filled a table only
- * as wide as CONFIG_LWIP_MAX_SOCKETS and every open after that answered ENFILE.
+ * Nothing is registered with IDF for it: the number travels as `local_fd`, IDF
+ * stores that verbatim and hands it back on every op, and IDF's path-based open
+ * makes the one table entry the caller's fd needs. See the comment on s_fds.
  */
 static int fd_slot_alloc(int lower_fd, const lower_t *mount)
 {
     int fd = -1;
 
-    if (esp_vfs_register_fd_with_local_fd(s_vfs_id, -1, true, &fd) != ESP_OK) {
-        return -1;
-    }
-
-    /* Above the device fds there is no entry to write, and esp_vfs would have to
-     * be handing out a number in a range the devices reserved. Refuse rather than
-     * index past the table; sockets and the console cannot reach this far in
-     * practice, and "cannot in practice" is not a reason to write out of bounds. */
-    if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
-        if (fd >= 0) {
-            (void)esp_vfs_unregister_fd(s_vfs_id, fd);
-        }
-        return -1;
-    }
-
     portENTER_CRITICAL(&s_mount_lock);
-    s_fds[fd].lower_fd = lower_fd;
-    s_fds[fd].mount    = (uint8_t)((mount - s_mounts) + 1);
+    for (int i = ESPIX_FS_FD_BASE; i < ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX; i++) {
+        if (s_fds[i].lower_fd < 0) {
+            s_fds[i].lower_fd = lower_fd;
+            s_fds[i].mount    = (uint8_t)((mount - s_mounts) + 1);
+            fd = i;
+            break;
+        }
+    }
     portEXIT_CRITICAL(&s_mount_lock);
 
     return fd;
 }
 
 /*
- * Release the fd espix allocated for the file.
- *
- * Two entries exist per file and both have to go. IDF's path-based open
- * registers its own for the number this VFS returned (vfs_calls.c:56) and its
- * close unregisters that one -- but *this* one is espix's, taken in
- * fd_slot_alloc(), and nothing else in the system knows about it. Not freeing it
- * leaked a table entry per open: with the table only as wide as
- * CONFIG_LWIP_MAX_SOCKETS, a boot's worth of opens filled it, and every open
- * after that answered ENFILE or EMFILE.
+ * Forget which layer the number belonged to. IDF releases its own entry around
+ * the call, and there is deliberately nothing else to do here: this runs inside
+ * a VFS op, under whatever locks the caller already holds, and taking a lock
+ * from there is what the unregister call that used to live here got wrong --
+ * lwIP holds a spinlock while it closes a socket, and a mutex taken from under
+ * it asserts.
  */
 static void fd_slot_free(int fd)
 {
-    if (fd < 0 || fd >= ESPIX_DEV_FD_BASE) {
+    if (!fd_ours(fd)) {
         return;
     }
 
@@ -278,8 +267,6 @@ static void fd_slot_free(int fd)
     s_fds[fd].lower_fd = -1;
     s_fds[fd].mount    = 0;
     portEXIT_CRITICAL(&s_mount_lock);
-
-    (void)esp_vfs_unregister_fd(s_vfs_id, fd);
 }
 
 static const lower_t *mount_by_dir(DIR *pdir)
@@ -495,15 +482,15 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     }
 
     /*
-     * And the caller never sees that number: it gets a fd from esp_vfs, which is
-     * unique against the console, the sockets and every other mount, and the
-     * filesystem's own number is remembered for the calls that follow. See the
-     * comment on s_fds for what happens without this.
+     * The caller never sees the filesystem's number. It gets one of espix's own,
+     * which travels to IDF as the file's `local_fd` -- stored verbatim there and
+     * handed back on every call -- so that two filesystems both counting from
+     * zero cannot share an entry. See the comment on s_fds.
      */
-    const int packed = fd_slot_alloc(fd, l);
-    if (packed < 0) {
-        /* Out of fds rather than out of anything the caller can free: hand the
-         * lower one back instead of leaking it. */
+    const int key = fd_slot_alloc(fd, l);
+    if (key < 0) {
+        /* Out of keys rather than out of anything the caller can free: hand the
+         * lower fd back instead of leaking it. */
         if (!NO_LOWER(l->ops->close_p)) {
             l->ops->close_p(l->ctx, fd);
         }
@@ -514,7 +501,7 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     if (creating) {
         espix_fs_claim(p);
     }
-    return packed;
+    return key;
 }
 
 static int vfs_close(void *ctx, int fd)
@@ -1102,31 +1089,13 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
     }
 
     /*
-     * And a second registration with no path at all, whose only job is to hand
-     * out fds.
-     *
-     * It cannot be the only one. A pathless VFS is stored with
-     * `path_prefix_len = LEN_PATH_PREFIX_IGNORED` and get_vfs_for_path() skips
-     * exactly those (vfs.c:840), so everything would arrive as "no such file or
-     * directory" -- which is what happened when this was tried: the rootfs
-     * mounted and then could not be made a single directory in. It is also why
-     * the fds a caller gets must be registered here rather than picked: a
-     * registered fd is found by its table entry, and its entry is what routes a
-     * read back to these ops.
-     *
-     * Same ops and same context as the first: the context is identity and
-     * nothing more, and only one of the two registrations is ever reached by
-     * path.
+     * One registration, and only one. A second, path-less one used to live here
+     * so that esp_vfs_register_fd() had a VFS to attach file fds to. File fds do
+     * not need it -- the numbers espix hands out travel as `local_fd` instead,
+     * which IDF stores verbatim (vfs.c:764) -- and a path-less VFS is skipped by
+     * get_vfs_for_path() entirely (vfs.c:840), so it was a second thing to get
+     * wrong and no help at all. See the comment on s_fds.
      */
-    const esp_err_t fd_err = esp_vfs_register_fs_with_id(
-        &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
-        &s_mounts[0], &s_vfs_id);
-
-    if (fd_err != ESP_OK) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG,
-                   "cannot register the fd VFS: %s (files will not open)",
-                   esp_err_to_name(fd_err));
-    }
     return err;
 }
 

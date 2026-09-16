@@ -71,7 +71,7 @@ dev_run "rm /home/$ESPIX_USER/vfs-loop-1.txt /home/$ESPIX_USER/vfs-loop-2.txt \
 #    so that a filesystem is reachable only where it is mounted; the IDF patches
 #    in tools/ are what keeps it that way, and a plausible prefix resolving is how
 #    that would break.
-assert_contains "a lower filesystem has no name of its own" "No such file" \
+assert_contains "a lower filesystem has no name of its own" "no such file" \
                 "$(dev_run 'ls /sd1 2>&1')"
 
 # 4. The one deliberate permission bypass stays where it is documented. Its
