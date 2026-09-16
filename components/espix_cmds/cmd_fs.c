@@ -234,9 +234,10 @@ typedef struct {
     bool human;
     bool by_time;
     bool reverse;
+    bool dir_itself;
 } ls_flags_t;
 
-#define LS_USAGE "usage: ls [-1ahltr] [path]\n"
+#define LS_USAGE "usage: ls [-1adhiltr] [path]\n"
 
 /*
  * Flags, bundled ("-lah") or separate, in any order. Anything that is not a
@@ -257,6 +258,8 @@ static bool ls_parse(espix_session_t *s, int argc, char **argv,
 
         for (const char *p = argv[i] + 1; *p != '\0'; p++) {
             switch (*p) {
+            /* The entry itself, not its contents: how a mount point is inspected. */
+            case 'd': f->dir_itself = true; break;
             case 'l': f->long_form = true; break;
             case 'a': f->all       = true; break;
             case 'h': f->human     = true; break;
@@ -297,14 +300,14 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    /* A plain file argument just describes itself.
+    /* A plain file argument, or any directory with -d, just describes itself.
      *
      * With owner and group, which this form used to leave out -- so `ls -l
      * /etc/passwd` and `ls -l /etc` described the same file differently, and
      * the one you reach for when you care about a single file was the one
      * missing who owns it. Widths are the strings' own here: there is one row,
      * so there is nothing to line it up against. */
-    if (!S_ISDIR(st.st_mode)) {
+    if (!S_ISDIR(st.st_mode) || f.dir_itself) {
         if (f.long_form) {
             char when[20];
             char perms[11];
@@ -1266,7 +1269,7 @@ static espix_cmd_t s_fs_cmds[] = {
     { .name = "cd",    .fn = cmd_cd,
       .help = "change the working directory",    .usage = "cd [dir]" },
     { .name = "ls",    .fn = cmd_ls,
-      .help = "list directory contents",         .usage = "ls [-1ahltr] [path]" },
+      .help = "list directory contents",         .usage = "ls [-1adhiltr] [path]" },
     { .name = "cat",   .fn = cmd_cat,
       .help = "print files",                     .usage = "cat <file>..." },
     { .name = "mkdir", .fn = cmd_mkdir,
