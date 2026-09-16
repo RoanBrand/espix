@@ -489,6 +489,17 @@ esp_err_t espix_fs_stat_fat(const char *path, uint64_t *total,
         return ESP_ERR_NOT_FOUND;
     }
 
+    /*
+     * A volume whose device has gone is not asked, even though its slot is still
+     * here: after a pull while a file was open, the unmount is refused, the mount
+     * stays -- marked dead, refusing everything -- and f_getfree() on it would
+     * read through a block device espix_usb has already released. The comment
+     * above promises an error for a pulled volume; this is what makes it true.
+     */
+    if (espix_vfs_mount_dead(path)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     DWORD  free_clusters = 0;
     FATFS *fs            = NULL;
 
