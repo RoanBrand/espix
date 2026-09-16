@@ -185,12 +185,6 @@ static portMUX_TYPE s_mount_lock = portMUX_INITIALIZER_UNLOCKED;
 typedef struct {
     int     lower_fd;   /* the number the layer below knows it by, -1 = free */
     uint8_t mount;      /* index into s_mounts, +1 */
-    /*
-     * The owner, captured while the path was still in hand: fstat() has only a
-     * descriptor, and the ownership rule is path-based.
-     */
-    uint16_t uid;
-    uint16_t gid;
 } fd_slot_t;
 
 static fd_slot_t s_fds[ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX];
@@ -361,8 +355,7 @@ esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len)
  * stores that verbatim and hands it back on every op, and IDF's path-based open
  * makes the one table entry the caller's fd needs. See the comment on s_fds.
  */
-static int fd_slot_alloc(int lower_fd, const lower_t *mount, uint16_t uid,
-                         uint16_t gid)
+static int fd_slot_alloc(int lower_fd, const lower_t *mount)
 {
     /*
      * Only a mount that lives in the array has an index. A dead one is answered
@@ -382,8 +375,6 @@ static int fd_slot_alloc(int lower_fd, const lower_t *mount, uint16_t uid,
         if (s_fds[i].lower_fd < 0) {
             s_fds[i].lower_fd = lower_fd;
             s_fds[i].mount    = (uint8_t)((mount - s_mounts) + 1);
-            s_fds[i].uid      = uid;
-            s_fds[i].gid      = gid;
             fd = i;
             break;
         }
@@ -631,17 +622,7 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
      * handed back on every call -- so that two filesystems both counting from
      * zero cannot share an entry. See the comment on s_fds.
      */
-    /*
-     * The owner, asked for here because this is the last place that has the path.
-     * access_check() computed it a few lines up for the permission decision and had
-     * nowhere to put it, so it is looked up again -- one path lookup per open, which
-     * is the price of the two ways of asking one question agreeing.
-     */
-    uint16_t owner_uid = 0;
-    uint16_t owner_gid = 0;
-    espix_fs_owner(p, NULL, &owner_uid, &owner_gid);
-
-    const int key = fd_slot_alloc(fd, l, owner_uid, owner_gid);
+    const int key = fd_slot_alloc(fd, l);
     if (key < 0) {
         /* Out of keys rather than out of anything the caller can free: hand the
          * lower fd back instead of leaking it. */
@@ -753,9 +734,10 @@ static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
 }
 
 /*
- * The owner comes from the slot, not from the layer below: the layer below has no
- * idea who owns anything, and the rule that does is path-based while a descriptor
- * is not a path. The slot carries what open() captured.
+ * ESPIX_NOT_POSIX: st_uid and st_gid come back 0 from an fstat(), where vfs_stat()
+ * now answers from the ownership rule. The rule is path-based and a descriptor is
+ * not a path, so this cannot ask it -- the fix would be to remember the path on the
+ * fd slot. Nothing reads these fields yet; docs/ROADMAP.md's surface table has it.
  */
 static int vfs_fstat(void *ctx, int fd, struct stat *st)
 {
@@ -767,14 +749,8 @@ static int vfs_fstat(void *ctx, int fd, struct stat *st)
         return ebadf();
     }
     const lower_t *l = mount_of_slot(&slot);
-    const int rc = NO_LOWER(l->ops->fstat_p)
-                       ? enosys() : l->ops->fstat_p(l->ctx, slot.lower_fd, st);
-
-    if (rc == 0) {
-        st->st_uid = slot.uid;
-        st->st_gid = slot.gid;
-    }
-    return rc;
+    return NO_LOWER(l->ops->fstat_p)
+               ? enosys() : l->ops->fstat_p(l->ctx, slot.lower_fd, st);
 }
 
 static int vfs_fsync(void *ctx, int fd)

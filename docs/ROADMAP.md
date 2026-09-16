@@ -176,7 +176,7 @@ layer it belongs to, or a choice and the reason.
 | surface | espix today | what would change it |
 |---|---|---|
 | `stat().st_uid`, `.st_gid` | the owner rule's answer, for a path | **done**: `vfs_stat()` fills both from `espix_fs_owner()` |
-| `fstat().st_uid`, `.st_gid` | the rule answer, captured at open | **done**: the fd slot carries the owner, since a descriptor has no path |
+| `fstat().st_uid`, `.st_gid` | still `0`, and marked in the code | the rule is path-based and a descriptor is not a path; the fix is to remember the path on the fd slot, or to leave it |
 | `stat().st_blksize`, `.st_blocks` | plausible constants | a real value, or leave and document |
 | `access()` on a path | not espix's to answer | implement in the VFS |
 | `link()`, `symlink()` | unsupported | the VFS, then the lower filesystems |
