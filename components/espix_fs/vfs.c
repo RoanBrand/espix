@@ -337,6 +337,17 @@ esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len)
  */
 static int fd_slot_alloc(int lower_fd, const lower_t *mount)
 {
+    /*
+     * Only a mount that lives in the array has an index. A dead one is answered
+     * by the sentinel, which is a different object, so `mount - s_mounts` on it
+     * is meaningless -- and the nonsense index stored here would come back out of
+     * mount_of_slot() as a wild pointer. That is a crash, not a wrong answer, so
+     * it is refused before the arithmetic rather than after.
+     */
+    if (mount->dead) {
+        return -1;
+    }
+
     int fd = -1;
 
     portENTER_CRITICAL(&s_mount_lock);
@@ -1306,6 +1317,13 @@ esp_err_t espix_vfs_del_mount(const char *prefix)
     slot->dir  = NULL;
     slot->ctx  = NULL;
     slot->len  = 0;
+    /*
+     * And `dead`, which is the one that matters here. A slot is reused by the
+     * next mount, so a flag left set from the volume that used to be in it makes
+     * a *fresh* mount answer with the sentinel: every open on it fails, and the
+     * packing does arithmetic on a pointer that is not in this array.
+     */
+    slot->dead = false;
     slot->prefix[0] = '\0';
 
     portEXIT_CRITICAL(&s_mount_lock);
