@@ -68,6 +68,13 @@ static void usb_dev_nodes(const espix_usb_dev_t *dev, bool attached)
         return;
     }
 
+    /*
+     * Before anything else: a mount of this device is about to have its block
+     * device released underneath it, so the filesystem has to be told first --
+     * this is the detach half of the use-after-free Stage 2 left open.
+     */
+    espix_blk_device_gone(dev->name);
+
     /* Detach hands the row over intact -- before it is released -- so the
      * partitions are still there to be named. */
     espix_dev_unregister_block(dev->name);

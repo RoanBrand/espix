@@ -102,9 +102,29 @@ typedef struct {
      */
     uint16_t                 owner_uid;
     uint16_t                 owner_gid;
+    /*
+     * True once the device this mount came from has been unplugged.
+     *
+     * The block device belongs to espix_usb, which releases it on detach, so
+     * from that moment on the filesystem below is holding a freed pointer and
+     * any call into it is a use-after-free. A dead mount stays in the table --
+     * its paths must keep *existing* rather than falling through to the rootfs --
+     * but every lookup returns s_dead instead, whose ops are all NULL, and the
+     * NO_LOWER() checks that were already there answer ENOSYS.
+     *
+     * Cheap on purpose: nothing in the op path had to change to become safe.
+     */
+    bool                     dead;
 } lower_t;
 
 static lower_t s_mounts[ESPIX_FS_MAX_MOUNTS];
+
+/*
+ * What a path under a pulled volume reaches. Not a struct full of refusing
+ * functions: NULL ops, because every caller already handles a layer that cannot
+ * do something. See `dead` above.
+ */
+static const lower_t s_dead = { .dead = true };
 
 /*
  * Mounts are added and removed while other sessions are opening files, so the
@@ -214,14 +234,67 @@ static const lower_t *mount_by_path(const char *abs_path)
         }
     }
     portEXIT_CRITICAL(&s_mount_lock);
-    return best;
+
+    /* A dead mount still claims its paths -- see `dead` -- but answers with the
+     * sentinel, so nothing below it is called. */
+    return best->dead ? &s_dead : best;
 }
 
-/* The layer below a fd espix handed out, or NULL when it is not one of ours --
- * a device fd, a socket, or something already closed. */
+/* The layer below a fd espix handed out. The sentinel when the device has gone,
+ * which is what makes every op refuse without touching it. */
 static const lower_t *mount_of_slot(const fd_slot_t *s)
 {
-    return &s_mounts[s->mount - 1];
+    const lower_t *l = &s_mounts[s->mount - 1];
+    return l->dead ? &s_dead : l;
+}
+
+/*
+ * The device behind a mount has gone. Called from the USB side's detach hook,
+ * through the command layer, which is where the name-to-path association lives.
+ *
+ * Marked, not removed: the mount has to keep claiming its paths, so they do not
+ * quietly start resolving inside the rootfs, and a file somebody still holds has
+ * to fail rather than read freed memory. Tearing it down is
+ * espix_fs_unmount_fat()'s job, which skips the volume sync for a dead mount --
+ * that sync is the write which would go through the freed block device.
+ */
+esp_err_t espix_fs_mount_dead(const char *path)
+{
+    if (path == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (s_mounts[i].used && strcmp(s_mounts[i].prefix, path) == 0) {
+            s_mounts[i].dead = true;
+            portEXIT_CRITICAL(&s_mount_lock);
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: the device was removed; it answers no more", path);
+            return ESP_OK;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    return ESP_ERR_NOT_FOUND;
+}
+
+/* Whether a mount has been marked dead, for fat.c's unmount to ask before it
+ * syncs a volume whose device is gone. */
+bool espix_vfs_mount_dead(const char *path)
+{
+    bool dead = false;
+
+    portENTER_CRITICAL(&s_mount_lock);
+    for (size_t i = 1; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        if (s_mounts[i].used && strcmp(s_mounts[i].prefix, path) == 0) {
+            dead = s_mounts[i].dead;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    return dead;
 }
 
 /*

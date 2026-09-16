@@ -127,6 +127,11 @@ bool espix_vfs_stores_metadata(const char *abs_path);
  */
 bool espix_vfs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid);
 
+/* True once espix_fs_mount_dead() has marked a mount's device gone. fat.c asks
+ * before syncing a volume on unmount, which is the write that would otherwise go
+ * through a released block device. */
+bool espix_vfs_mount_dead(const char *path);
+
 
 /* ------------------------------------------------------------------ */
 /* Device nodes -- see dev.c                                           */

@@ -486,12 +486,25 @@ esp_err_t espix_fs_unmount_fat(const char *path)
         return err;
     }
 
-    const FRESULT fr = f_mount(NULL, m->drive, 0);
-    if (fr != FR_OK) {
-        /* Reported, not retried: the mount is gone from espix's table already,
-         * and putting it back would leave a volume nothing routes to. */
-        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: unmounting the volume: %s",
-                   path, fresult_name(fr));
+    /*
+     * A dead mount is not synced. Its device was pulled out from under it, so
+     * f_mount(NULL) would write a dirty volume back through a block device the
+     * USB stack has already released -- the use-after-free this path exists to
+     * avoid. The FatFs volume slot is left as it is; the diskio and the ctx
+     * below are still espix's to free, and neither touches a device.
+     */
+    if (espix_vfs_mount_dead(path)) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: not syncing a volume whose device is gone", path);
+    } else {
+        const FRESULT fr = f_mount(NULL, m->drive, 0);
+        if (fr != FR_OK) {
+            /* Reported, not retried: the mount is gone from espix's table
+             * already, and putting it back would leave a volume nothing routes
+             * to. */
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: unmounting the volume: %s",
+                       path, fresult_name(fr));
+        }
     }
 
     ff_diskio_unregister(m->pdrv);

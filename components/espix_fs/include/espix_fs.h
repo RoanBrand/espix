@@ -84,6 +84,17 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
 esp_err_t espix_fs_unmount_fat(const char *path);
 
 /*
+ * The device a mount came from has been unplugged.
+ *
+ * The mount is *marked*, not removed: it keeps claiming its paths so they do not
+ * quietly start resolving inside the rootfs, and every operation on it fails
+ * instead of reaching a filesystem whose block device espix_usb has already
+ * released. Unmount it afterwards to give the rest back -- espix_fs_unmount_fat()
+ * knows not to sync a volume whose device is gone.
+ */
+esp_err_t espix_fs_mount_dead(const char *path);
+
+/*
  * A block device view over a partition of `parent`, for mounting `sda1` rather
  * than `sda`. Released with its own ops->release, which frees the view and
  * leaves the parent alone -- the parent belongs to whoever made it.

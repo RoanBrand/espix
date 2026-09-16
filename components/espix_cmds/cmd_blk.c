@@ -726,6 +726,54 @@ static int cmd_umount(espix_session_t *s, int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * The device a mount came from has gone.
+ *
+ * Called from espix_usb's detach hook, *before* the USB stack gives the block
+ * device back -- that order is the whole point, and it is why this exists rather
+ * than being left to an umount command: nothing else notices a stick leaving.
+ *
+ * Marked dead first, so anything still holding a file fails instead of reading
+ * memory the USB stack is about to free, and then unmounted so the mount point is
+ * free again. The unmount refuses while a file is open, and that refusal is fine:
+ * the mount stays, marked, refusing everything until its reader is finished.
+ */
+void espix_blk_device_gone(const char *dev)
+{
+    if (dev == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
+        mount_rec_t *rec = &s_mounts[i];
+
+        /*
+         * Prefix, not equality: the hook names the *disk* -- "sda" -- while a
+         * record holds whatever was mounted, which is usually a partition of it
+         * ("sda1"). One letter plus digits means a disk name can never be a
+         * prefix of another disk's, so this cannot match the wrong volume.
+         */
+        if (!rec->used || strncmp(rec->dev, dev, strlen(dev)) != 0) {
+            continue;
+        }
+
+        char path[ESPIX_PATH_MAX];
+        strlcpy(path, rec->path, sizeof(path));
+
+        (void)espix_fs_mount_dead(path);
+
+        /* Silent on purpose: no session is behind this, and the klog line the
+         * mark writes is the record of it. */
+        if (espix_fs_unmount_fat(path) == ESP_OK) {
+            if (rec->view != NULL) {
+                rec->view->ops->release(rec->view);
+                rec->view = NULL;
+            }
+            memset(rec, 0, sizeof(*rec));
+        }
+    }
+}
+
 static espix_cmd_t s_blk_cmds[] = {
     { .name = "lsblk", .fn = cmd_lsblk,
       /* The MBR limitation belongs where someone will read it, which is the
