@@ -380,6 +380,14 @@ question put to it over SSH the whole time.
 
 ## The test app
 
+**Three commands, three jobs.** `make test-app` builds the app; `make test` does
+that and then syncs it to `/home/<user>/testapp`; `tests/run.sh` *only* syncs, so
+run directly it will happily use whatever app is already on the device. After
+changing the test app, either go through `make test` or run `make test-app`
+first. A suite that fails with `command not found`, or with the app printing its
+usage, means the device is holding the old binary rather than that the app is
+missing -- which read as a broken app twice in one evening.
+
 `tests/app/` is its own IDF project, so `tools/build-apps.sh` — which globs
 `apps/*/` — leaves it alone and it never lands in a normal rootfs image. `make
 test-app` builds it and stages it to `fsroot/home/esp/testapp`, the same path
