@@ -327,6 +327,8 @@ of them, through the same `LCD_CAM` peripheral the camera uses.
 `SOC_MIPI_DSI_SUPPORTED` is the P4's alone, and the S31 has `SOC_PARLIO_LCD_SUPPORTED`
 instead: that is the concrete form of "weaker/limited display output vs P4"
 above, and it is why the grid says what it says.
+`SOC_LCDCAM_CAM_SUPPORTED` is set for all three as well, so the same peripheral
+takes a camera on any of them.
 
 ## A word on the SSH server
 
