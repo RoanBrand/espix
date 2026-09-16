@@ -10,6 +10,7 @@
 #   make flash-all        both, in the order a first boot needs
 #   make monitor          attach, without resetting the board
 #   make monitor-reset    attach, resetting first (to catch boot output)
+#   make coredump         decode the core dump left by the last panic
 #   make apps             build apps/ and stage into fsroot/bin
 #   make test-app         build the test app into fsroot/home/esp
 #   make test             run the test suite       [SUITE=fs] [PORT=...]
@@ -34,13 +35,13 @@ else
   PORT_ARG = $(PORT)
 endif
 
-.PHONY: all build flash fs flash-all monitor monitor-reset apps test-app \
-        test test-panic stress clean help
+.PHONY: all build flash fs flash-all monitor monitor-reset coredump apps \
+        test-app test test-panic stress clean help
 
 all: build
 
 help:
-	@sed -n '3,23p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,24p' Makefile | sed 's/^# \{0,1\}//'
 
 build:
 	$(IDF) build
@@ -61,6 +62,16 @@ monitor:
 
 monitor-reset:
 	$(IDF) -p $(PORT_ARG) monitor
+
+# The core dump the last panic left in flash, decoded against build/espix.elf.
+#
+# Needs the serial port, because reading flash is what the port is for -- and
+# that is exactly the problem when the OTG socket is in use, since this board's
+# two USB-C sockets cannot both be occupied. `dmesg` and `coredump` on the device
+# carry the faulting task and the reason without any of this; come here when the
+# backtrace itself is what is wanted.
+coredump:
+	$(IDF) -p $(PORT_ARG) coredump-info
 
 apps:
 	./tools/build-apps.sh

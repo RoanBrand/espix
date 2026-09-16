@@ -326,7 +326,7 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
 | `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,306,128 B | 69% |
-| ... and Stage 2 (mounting, FatFs) | 0x1460d0 — 1,335,504 B | 68% |
+| ... and Stage 2 (mounting, FatFs) | 0x1461b0 — 1,335,728 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
 
 Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus

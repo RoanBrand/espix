@@ -574,6 +574,42 @@ of the first entry above: a device that enumerates and is then ignored.
 **Workaround:** none needed today; named here so the coincidence is not
 rediscovered as a mystery.
 
+### The external-hub driver asserts when a device is released twice
+
+`device_release()` asserts that the device it is handed is actually on its way
+out (`ext_hub.c:508`):
+
+    static void device_release(ext_hub_dev_t *ext_hub_dev)
+    {
+        EXT_HUB_ENTER_CRITICAL();
+        assert(ext_hub_dev->dynamic.flags.waiting_release); // Sanity check
+        ext_hub_dev->dynamic.flags.waiting_release = 0;
+        ext_hub_dev->dynamic.flags.waiting_free = 1;
+
+On this board it arrives as, from the core dump:
+
+    Panic reason: assert failed: device_release ext_hub.c:508 (ext_hub_dev->dynamic.flags.waiting_release)
+    ext_hub_process ()            ext_hub.c:1535
+    hub_process ()                hub.c:1345
+    usb_host_lib_handle_events () usb_host.c:929
+
+`waiting_release` is the driver's "this device is being torn down" state. It is
+set in three places — `ext_hub.c:405`, the *device gone* path at `:1431`/`:1439`,
+and `:1469`, a loop over the pending and active hub lists — and cleared only at
+`:509`. The *device gone* path guards itself against re-entry (`:1420`); the loop
+at `:1469` sets the flag unconditionally and adds `DEV_ACTION_RELEASE` when the
+stage is idle, so a second release of the same device reaches the assert there.
+
+Seen once, on a device removal with an external hub attached (`espressif/usb`
+1.5.0, ESP-IDF v6.1, esp32s3). It is in the library's own event loop — a caller's
+only frame in the stack is the `usb_host_lib_handle_events()` call that drives it
+— so nothing in a caller can prevent it, and the cost is the whole board. Checking
+the flag where it is set, or tolerating a second release, would make this a log
+line instead.
+
+**Workaround:** none. Hubs cannot be turned off here — this board cannot power a
+device from the OTG socket, so the hub is how anything is plugged in at all.
+
 ## `espressif/esp_tinyusb` (TinyUSB NCM)
 
 ### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer

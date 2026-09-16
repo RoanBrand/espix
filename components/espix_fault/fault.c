@@ -26,7 +26,13 @@
 
 #define TAG "fault"
 
-#define FAULT_MAGIC 0x58465045u    /* 'XFPE' */
+/*
+ * 'XFPE' in the first version; bumped because the record grew a `details` field,
+ * and a record left by an older firmware must be ignored rather than read as
+ * this one. A noinit record is whatever was there before, so the magic is the
+ * only thing standing between a reader and somebody else's memory.
+ */
+#define FAULT_MAGIC 0x58465046u
 
 #if CONFIG_ESP_PANIC_HANDLER_IRAM
 #error "espix_fault reads task names and the process table from the panic path, \
@@ -59,7 +65,7 @@ static void copy_str(char *dst, size_t dst_len, const char *src)
     dst[i] = '\0';
 }
 
-static const char *exception_str(int exception)
+const char *espix_fault_exception_str(int exception)
 {
     switch (exception) {
     case PANIC_EXCEPTION_DEBUG: return "debug";
@@ -89,6 +95,27 @@ void __wrap_esp_panic_handler(void *info)
         s_record.uptime_us = esp_timer_get_time();
         copy_str(s_record.reason, sizeof(s_record.reason), pi->reason);
 
+        /*
+         * The message, which for an abort lives somewhere else entirely.
+         *
+         * panic_abort() sets g_panic_abort_details and then executes an illegal
+         * instruction, and the override that turns reason and description into
+         * the abort's text happens *inside* esp_panic_handler() -- the function
+         * this wrapper replaces. So at this point the info still describes the
+         * fault that the abort caused: exception is FAULT and reason reads
+         * "IllegalInstruction", which is exactly the diagnosis that sent somebody
+         * to the UART for a coredump. The global is set before the fault and is
+         * the only thing that knows an assert produced this, so it is checked
+         * directly rather than through pi->exception.
+         */
+        if (g_panic_abort_details != NULL) {
+            copy_str(s_record.details, sizeof(s_record.details),
+                     g_panic_abort_details);
+        } else {
+            copy_str(s_record.details, sizeof(s_record.details),
+                     pi->description);
+        }
+
         /* xTaskGetCurrentTaskHandleForCore() takes no lock (see the comment in
          * freertos_tasks_c_additions.h), so it is safe here — a lock would risk
          * deadlocking against whatever the dying task was holding. */
@@ -108,7 +135,7 @@ void __wrap_esp_panic_handler(void *info)
         panic_print_str("\r\nespix: fault in task '");
         panic_print_str(s_record.task);
         panic_print_str("' (");
-        panic_print_str(exception_str(s_record.exception));
+        panic_print_str(espix_fault_exception_str(s_record.exception));
         panic_print_str(": ");
         panic_print_str(s_record.reason[0] ? s_record.reason : "?");
         panic_print_str(") — recorded for next boot\r\n");
@@ -238,10 +265,15 @@ esp_err_t espix_fault_init(void)
 
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "previous boot: %s in task '%s' at 0x%08x (%s), core %d",
-                   exception_str(s_last.exception),
+                   espix_fault_exception_str(s_last.exception),
                    s_last.task,
                    (unsigned)s_last.addr,
-                   s_last.reason[0] ? s_last.reason : "?",
+                   /* The message when there is one -- for an abort, `reason` is
+                    * NULL and the assert text is the whole diagnosis. The klog
+                    * line caps at ESPIX_KLOG_LINE_MAX, so this may be cut short
+                    * here; `coredump` prints the record in full. */
+                   s_last.reason[0] ? s_last.reason
+                                    : (s_last.details[0] ? s_last.details : "?"),
                    s_last.core);
 
         if (s_last.pid != ESPIX_PID_NONE) {

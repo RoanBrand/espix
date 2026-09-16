@@ -34,12 +34,24 @@ extern "C" {
 #define ESPIX_FAULT_TASK_NAME_MAX 16
 #define ESPIX_FAULT_REASON_MAX    32
 
+/*
+ * The abort message itself: "assert failed: device_release ext_hub.c:508 (...)".
+ *
+ * Separate from `reason`, because ESP-IDF keeps them separate and for an abort
+ * `reason` is NULL -- the text lives in g_panic_abort_details. Without it a panic
+ * of that kind records only "abort", which is a diagnosis that needs the UART to
+ * finish, on a board whose two USB-C sockets cannot both be occupied. 128 bytes
+ * holds the longest assert seen here with room to spare.
+ */
+#define ESPIX_FAULT_DETAILS_MAX   128
+
 typedef struct {
     uint32_t magic;
     int      core;
     int      exception;                             /* panic_exception_t */
     uintptr_t addr;                                 /* faulting instruction */
     char     reason[ESPIX_FAULT_REASON_MAX];
+    char     details[ESPIX_FAULT_DETAILS_MAX];
     char     task[ESPIX_FAULT_TASK_NAME_MAX];
     espix_pid_t pid;                                /* ESPIX_PID_NONE if not an espix process */
     int64_t  uptime_us;                             /* uptime at the fault */
@@ -60,6 +72,11 @@ const espix_fault_record_t *espix_fault_last(void);
 
 /* Reset reason as a short string, for `dmesg` / `uname`. */
 const char *espix_fault_reset_reason_str(void);
+
+/* "abort", "task-wdt", "int-wdt", "fault", "debug" — the panic's kind, for a
+ * reader: the record keeps the enum, and one of these names is what makes it
+ * legible in `dmesg` and in `coredump`. */
+const char *espix_fault_exception_str(int exception);
 
 /*
  * How many times the task watchdog has triggered since boot.

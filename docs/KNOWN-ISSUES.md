@@ -968,3 +968,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   boot with a working network, and indefinitely without one. A soft `reboot`
   keeps the time. See [ROADMAP.md](ROADMAP.md#networking-and-time) for what
   falls in that window and what a fix would cost.
+
+## USB host
+
+- **Removing a device can panic inside the library's hub driver.** With an
+  external hub on the port, unplugging a device — or the hub — can reach an
+  assert at `ext_hub.c:508` in `device_release()`: the driver keeps a
+  `waiting_release` flag per hub device, sets it in three places and clears it in
+  one, and a second release of the same device arrives with the flag already
+  clear. The fault is in the library's *own* event loop, so espix's only frame in
+  the stack is the `usb_host_lib_handle_events()` call that drives it, and the
+  board goes down: the recovery is the reboot that follows. Nothing is corrupted,
+  and no volume should be involved — unmount before pulling anything, as
+  everywhere else.
+
+  It is rare: seen once in a day of plugging and unplugging, on
+  `espressif/usb` 1.5.0. It is also the easiest panic here to diagnose, because
+  the assert names its own file and line: `dmesg` on the next boot prints it, and
+  `coredump` keeps it — in full, after the kernel log has rolled — with no serial
+  port involved. `idf.py coredump-info`, via `make coredump`, is for the backtrace
+  rather than for the reason. [UPSTREAM.md](UPSTREAM.md) carries the report.
