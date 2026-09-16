@@ -569,19 +569,24 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
      * grants it is, here, the mount point being theirs -- and it is what keeps a
      * session from mounting over a path it has no business claiming.
      *
-     * The volume then belongs to them without anything more being done about it:
+     * Ownership comes from espix_fs_owner(), not from st.st_uid: espix does not
+     * fill that field at all (nothing in the tree assigns it), because a stat is
+     * what the filesystem below says and ownership is espix's own rule. sftp,
+     * exec and the access checker all ask the same way, so this does too.
+     *
+     * The volume then belongs to them without anything else being done about it:
      * espix_fs_mount_fat() is handed the mounting session's uid and gid, and the
      * mode rule answers from that. So a stick `esp` mounts reads and writes as
-     * `esp`, and a stick root mounts stays root's -- which is what `sudo mount`
+     * `esp`, and a stick root mounts stays root's, which is what `sudo mount`
      * gets.
      */
-    if (s == NULL || (s->uid != 0 && st.st_uid != s->uid)) {
-        /* Both numbers in the message on purpose: `ls -l` reports this directory
-         * as the caller's, so if this refuses, one of the two readings is not
-         * what it looks like -- and saying which is cheaper than another guess. */
+    uint16_t dir_uid = 0;
+    espix_fs_owner(path, NULL, &dir_uid, NULL);
+
+    if (s == NULL || (s->uid != 0 && dir_uid != s->uid)) {
         espix_eprintf(s, "mount: %s: only its owner or root can mount here "
                          "(directory uid %u, session uid %u)\n",
-                      path, (unsigned)st.st_uid, (unsigned)(s ? s->uid : 0));
+                      path, (unsigned)dir_uid, (unsigned)(s ? s->uid : 0));
         return 1;
     }
 
