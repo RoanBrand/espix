@@ -96,3 +96,31 @@ fi
 #    have. Run by hand: mount a FAT volume, then interleave reads and copies on
 #    it and on the rootfs, and check that every one of them succeeds.
 espix_skip "the cross-mount fd check needs root to mount; see the note above"
+
+# 6. What an app is told about ownership. stat() answers from the ownership rule
+#    and fstat() does not, so an app that opens a file and asks who owns it is
+#    given a different answer than one that stats the path -- which the roadmap's
+#    surface table lists as two rows. The app prints its own uid between them,
+#    which is the comparison that matters and needs no uid known in advance: a
+#    filesystem telling an app that a file it owns belongs to root is the bug.
+if ! dev_testapp_present; then
+    espix_skip "test app not built -- run 'make test-app'"
+else
+    app="/home/$ESPIX_USER/testapp"
+    probe="/home/$ESPIX_USER/stat-probe.txt"
+    dev_run "$app write $probe owner" >/dev/null 2>&1
+
+    out=$(dev_run "$app stat $probe")
+    stat_line=$(printf '%s\n' "$out" | sed -n '/^stat /p')
+    assert_contains "an app can stat a file it owns" "uid=" "$out"
+
+    # The contract, and the bug the surface table records: a filesystem telling an
+    # app that a file it owns belongs to root. No uid is assumed -- only that it is
+    # not 0, which is what being told root means.
+    assert_not_contains "stat() does not report root for a file the app owns" \
+                        "uid=0" "$stat_line"
+
+    # fstat() is reported and not asserted: the table lists its st_uid as still 0,
+    # and asserting that would lock in a behaviour the fix is undecided about.
+    printf '%s\n' "$out" | sed -n 's/^fstat /testapp fstat /p'
+fi
