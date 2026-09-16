@@ -641,6 +641,36 @@ with the reason.
 
 ## How to add to this
 
+### Deviations get a marker, not just prose
+
+espix looks like POSIX from the outside and is not, in places, and the cost of
+finding that out one trap at a time is a debugging session. `struct stat`'s
+`st_uid` being permanently 0 is the example: `ls -l` reported a directory as its
+owner's, a caller read `stat()` and was told root, and neither was lying — they
+use different sources, and nothing said so.
+
+So a place that looks POSIX-shaped and is not gets a marker at the code site:
+
+```c
+/* ESPIX_NOT_POSIX: st_uid and st_gid are always 0; ownership comes from
+ * espix_fs_owner(). See the POSIX surface table in docs/ROADMAP.md. */
+```
+
+`ESPIX_NOT_POSIX:` is spelled for `grep -rn`, the way `RESOURCES:` is in the test
+suites, because the point is to be able to ask the question:
+
+```
+grep -rn ESPIX_NOT_POSIX components/
+```
+
+and get the whole list rather than the parts anyone happened to remember. It is
+for **API-shaped** deviations — a function, a type, a field somebody will assume
+means what POSIX means — not for a command's choice of column heading.
+
+The prose stays here, saying what bites and how to recognise it; ROADMAP's table
+says what to do about it and which layer would have to change. Both are needed:
+one is how you stop being confused, the other is how it gets fixed.
+
 One heading per gotcha, with what it broke and where the claim comes from. If it
 is only true on some parts, say which. If it was measured rather than
 documented, say that too.

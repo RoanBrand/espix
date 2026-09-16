@@ -290,6 +290,9 @@ int espix_dev_open(const void *handle, int flags)
      * is a feature of its own -- it would have to know which device it holds and
      * refuse to hand out one that is mounted -- so opening one says so instead of
      * pretending.
+     *
+     * ESPIX_NOT_POSIX: on Linux opening a block device gives a readable stream.
+     * Here it is EOPNOTSUPP. See the POSIX surface table in docs/ROADMAP.md.
      */
     if (n->kind == DEV_BLOCK) {
         errno = EOPNOTSUPP;

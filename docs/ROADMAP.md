@@ -166,6 +166,33 @@ things are as they are.
   it would touch every `struct stat` in the image. That is why it wants its own
   decision rather than riding along with something else.
 
+### The POSIX surface, and which layer would have to change
+
+espix presents a POSIX-shaped interface over filesystems that are not POSIX and a
+VFS that is not the kernel's, so some of what an app can call behaves differently
+or not at all. This is the list, with the honest answer for each: a fix and the
+layer it belongs to, or a choice and the reason.
+
+| surface | espix today | what would change it |
+|---|---|---|
+| `stat().st_uid`, `.st_gid` | always `0` — nothing fills them | fill from the owner rule in the stat path; **next commit**, since nothing reads them today |
+| `stat().st_blksize`, `.st_blocks` | plausible constants | a real value, or leave and document |
+| `access()` on a path | not espix's to answer | implement in the VFS |
+| `link()`, `symlink()` | unsupported | the VFS, then the lower filesystems |
+| `select()` on a file | `ENOSYS` | a select in the VFS, or option C below |
+| `dup()`, `fcntl()` | partial | the VFS |
+| `mmap()`, `statvfs()`, `utime()` | partial or absent | the VFS, and the littlefs port's Kconfig for utime |
+| `/dev/<device>` opened as a file | `EOPNOTSUPP` (a name, not a stream) | raw block I/O as its own feature |
+| a volume whose device was pulled | `ENOSYS` from every operation | deliberate; `EIO` would need a refusing helper per op |
+| `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it |
+| an fd's number | espix's own (128–159), not the lower fs's | deliberate; an fd is opaque, so nothing should care |
+
+Two things this table is for. It is where a `ESPIX_NOT_POSIX:` marker in the code
+points, so a reader can find out what to do rather than only what is wrong. And it
+is the checklist that decides option C: when the rows saying *the VFS* outnumber
+the rows saying *deliberate*, owning the syscalls stops being tidiness and starts
+being the shortest path.
+
   Note this is a *precondition* for uniform permissions, not a nice-to-have
   beside them: see [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem).
 

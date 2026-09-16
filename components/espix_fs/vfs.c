@@ -131,6 +131,11 @@ static lower_t s_mounts[ESPIX_FS_MAX_MOUNTS];
  *
  * The mount is kept and marked (`dead`) rather than removed, so paths under it
  * keep existing instead of falling through to the rootfs.
+ *
+ * ESPIX_NOT_POSIX: a volume whose device has been unplugged answers ENOSYS for
+ * every operation instead of EIO, because the sentinel's ops are NULL and that is
+ * what a NULL op means here. Documented rather than changed; the POSIX surface
+ * table in docs/ROADMAP.md has it.
  */
 static const esp_vfs_fs_ops_t  s_dead_ops;
 static const esp_vfs_dir_ops_t s_dead_dir;
