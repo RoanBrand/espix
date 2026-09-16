@@ -187,6 +187,7 @@ layer it belongs to, or a choice and the reason.
 | a volume whose device was pulled | `ENOSYS` from every operation | deliberate; `EIO` would need a refusing helper per op |
 | `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it |
 | an fd's number | espix's own (128–159), not the lower fs's | deliberate; an fd is opaque, so nothing should care |
+| `.` and `..` in a directory listing | absent; `..` still resolves in a path | the lower filesystem's doing; the VFS could synthesise them |
 
 Two things this table is for. It is where a `ESPIX_NOT_POSIX:` marker in the code
 points, so a reader can find out what to do rather than only what is wrong. And it
@@ -399,6 +400,18 @@ being the shortest path.
   100–999, no home — which with `sudo -u` is the whole mechanism for running an
   app under its own identity. `passwd` no longer creates accounts, which is what
   fixed it handing every new one uid 1000.
+
+- **`SERIAL=` in /etc/fstab, for the device rather than a volume.** The USB device
+  serial is read already (`espix_usb_dev_t.serial`) and printed by `blkid`, so
+  reading it costs nothing. It is the one identifier that survives a whole-disk
+  `dd` clone, where `LABEL=`, `UUID=` and `PARTUUID=` all travel with the copy.
+
+  What is not done is the question underneath it, rather than the reading: **a
+  serial identifies a disk, and a rule mounts a volume.** `SERIAL=X` is
+  unambiguous only for a superfloppy, and any real rule has to say which partition
+  of that disk -- which means either a composite field (`SERIAL=X/1`) or a second
+  column. One is a new spelling to learn, the other a change to the file's shape,
+  and it is worth deciding deliberately rather than by precedence.
 
 ## Signals
 

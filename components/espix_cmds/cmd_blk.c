@@ -916,41 +916,25 @@ void espix_blk_device_gone(const char *dev)
 
 #define FSTAB_PATH  "/etc/fstab"
 
-/*
- * The device column is longer than a device name: "PARTUUID=" and eleven bytes
- * of identity is 20, and reading that with the name's width truncated every
- * identity to seven characters -- which no rule could ever match.
- */
+/* The device column is wider than a name: "PARTUUID=" and eleven bytes of identity is 20. */
 #define FSTAB_FIELD_MAX 24
 
 /*
- * The file, when it has never been written.
- *
- * Created rather than shipped: the rootfs skeleton is built at boot, and the
- * comment *is* the documentation -- whoever opens this should not need a manual
- * to find out that the columns are not Linux's.
- *
- * Nothing is enabled in it. CONFIG_FATFS_VOLUME_COUNT is 2, and a wildcard on a
- * four-partition stick would ask for three volumes, so a default policy would be
- * a default failure. Uncommenting a line is the opt-in.
+ * The file, when it has never been written. Everything in it is commented out:
+ * uncommenting a line is the opt-in, and CONFIG_FATFS_VOLUME_COUNT is 2, so a
+ * policy enabled by default would be a default failure.
  */
 static const char FSTAB_TEMPLATE[] =
-    "# espix fstab -- not Linux's. Three fields, doing the jobs theirs do.\n"
+    "# espix fstab -- not Linux's.\n"
     "#\n"
     "#   <device>       <mount point>   <owner>   [flags]\n"
     "#\n"
-    "# device       sda1, or sd*1 for partition 1 of any disk, or an identity:\n"
-    "#              LABEL=BIGFAT, UUID=3E4A-1C7B, PARTUUID=5f8b1c2a-01 -- blkid\n"
-    "#              prints all three. An identity has to match exactly one volume;\n"
-    "#              two carrying the same one mounts neither. A name cannot\n"
-    "#              promise that: sda is the slot a device happened to be given.\n"
-    "# mount point  a template; %s becomes the device name\n"
+    "# device       sda1, sd*1, or an identity blkid prints: LABEL=, UUID=, PARTUUID=\n"
+    "# mount point  %s becomes the device name\n"
     "# owner        an account name, a uid, or - for root\n"
-    "# flags        noauto, to leave the device alone until somebody mounts it\n"
+    "# flags        noauto\n"
     "#\n"
-    "# Mounting happens when a device is attached and unmounting when it is\n"
-    "# removed. A volume belongs to the owner named here, so the example below\n"
-    "# gives `esp` a stick it can read and write without sudo.\n"
+    "# An identity must match exactly one volume.\n"
     "#\n"
     "#   sd*1   /media/%s   esp\n"
     "#   sda4   /srv/backup -        noauto\n";
@@ -981,16 +965,7 @@ static bool fstab_glob(const char *pat, const char *name)
     return *name == '\0';
 }
 
-/*
- * What the device column holds: a name, a wildcard, or an identity.
- *
- * An identity is what a name cannot be. The letter in sda is the slot the device
- * was given when it was attached -- host.c builds it as "sd%c", 'a' + i -- so it
- * says nothing about which stick this is: with two on a hub, or after one is
- * unplugged and another takes the freed letter, the name moves. A label, a
- * volume serial and an MBR partition identity travel on the medium, so a rule
- * using one mounts the volume it means rather than whichever arrived first.
- */
+/* What the device column holds: a name, a wildcard, or a blkid identity. See docs/USB-HOST.md. */
 typedef enum {
     FSTAB_IDENT_NONE,
     FSTAB_IDENT_LABEL,
@@ -1012,13 +987,7 @@ static fstab_ident_t fstab_ident_kind(const char *field)
     return FSTAB_IDENT_NONE;
 }
 
-/*
- * Whether this volume answers to the device column.
- *
- * Case is not significant: FAT stores labels upper case, and blkid prints a vfat
- * UUID upper case and a PARTUUID lower, so a value pasted out of either should
- * not have to be re-cased to match.
- */
+/* Whether this volume answers to the device column. Case is not significant. */
 static bool fstab_match(const char *field, const espix_usb_dev_t *disk,
                         const espix_usb_part_t *part)
 {
@@ -1096,14 +1065,7 @@ static void fstab_path(char *out, size_t len, const char *tmpl, const char *name
     memcpy(out + head + mid, at + 2, tail + 1);
 }
 
-/*
- * Make every component of `path` that is not there yet.
- *
- * Only used for a point built from the template: `/media/%s` cannot exist before
- * the device that names it does, and one hand-made directory per device name is
- * not a policy. A point written out literally is left alone -- a typo there
- * should be an error, which is what Linux does with a missing mount point.
- */
+/* Make every component of a templated mount point that is missing; a literal point is left alone. */
 static bool fstab_mkdirs(const char *path)
 {
     char buf[ESPIX_PATH_MAX];
@@ -1268,13 +1230,7 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
             continue;
         }
 
-        /*
-         * Every match is collected before any of them is mounted, because an
-         * identity has to be unambiguous: two volumes carrying one label is
-         * exactly the case where mounting the first would mount the wrong one.
-         * So an identity that matches more than one volume mounts none of them
-         * and says so. A wildcard keeps its old meaning of matching several.
-         */
+        /* Matches are collected first: an identity matching several volumes mounts none and logs why. */
         fstab_hit_t hits[ESPIX_USB_MAX_DEVS * (1 + ESPIX_USB_MAX_PARTS)];
         size_t nhits = 0;
         const bool identity = (fstab_ident_kind(field) != FSTAB_IDENT_NONE);
@@ -1326,13 +1282,7 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
     fclose(f);
 }
 
-/*
- * A storage device has appeared. Runs on the USB work task -- the context the
- * attach hook fires in, chosen so that transfers complete while a device is
- * installed -- so filesystem calls are safe here, and its stack is sized for
- * this: WORK_TASK_STACK in host.c accounts for a FatFs mount on top of
- * everything the install itself needs.
- */
+/* A storage device has appeared: apply /etc/fstab. Runs on the USB work task. */
 void espix_blk_device_added(const char *dev)
 {
     if (dev == NULL) {

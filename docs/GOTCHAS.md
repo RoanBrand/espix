@@ -644,10 +644,9 @@ with the reason.
 ### Deviations get a marker, not just prose
 
 espix looks like POSIX from the outside and is not, in places, and the cost of
-finding that out one trap at a time is a debugging session. `struct stat`'s
-`st_uid` being permanently 0 is the example: `ls -l` reported a directory as its
-owner's, a caller read `stat()` and was told root, and neither was lying — they
-use different sources, and nothing said so.
+finding that out one trap at a time is a debugging session. The live example is `fstat()`: `stat()` answers the owner from the ownership rule,
+and `fstat()` still reports `st_uid` and `st_gid` as 0 -- so a program that opens a
+file and asks who owns it is told root.
 
 So a place that looks POSIX-shaped and is not gets a marker at the code site:
 

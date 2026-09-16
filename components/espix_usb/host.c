@@ -469,10 +469,7 @@ static void fat_label(const uint8_t *sector, char *out, size_t out_len)
     label_copy((const char *)sector + off, FAT_LABEL_LEN, out, out_len);
 }
 
-/* The FAT boot sector's volume serial, four bytes at 0x43, in the same buffer the
- * label above comes out of. Printed the way blkid prints a vfat UUID -- upper
- * case, four and four -- because the point of reading it is to put it in a file
- * that somebody compares against blkid's output. */
+/* The FAT boot sector's volume serial, at 0x43 in the block the label comes from. */
 static void fat_serial(const uint8_t *sector, char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0 || fat_label_offset(sector) == 0) {
@@ -492,12 +489,7 @@ static void fat_serial(const uint8_t *sector, char *out, size_t out_len)
              (unsigned)(serial & 0xFFFFu));
 }
 
-/*
- * Linux's PARTUUID for an MBR table: the disk signature, a dash, and the entry
- * number -- both as they appear in blkid, so the value is portable between the
- * two. The entry number is the MBR slot and not the row in this listing: a stick
- * whose second entry cannot be read still calls sda3 slot three.
- */
+/* Linux's PARTUUID: the disk signature, a dash, and the entry number. */
 static void partuuid_format(char *out, size_t out_len, uint32_t disk_id,
                             unsigned entry)
 {
@@ -753,9 +745,7 @@ static void read_partition_table(usb_dev_t *d)
     uint8_t table[MBR_ENTRIES * MBR_ENTRY_SIZE];
     memcpy(table, sector + MBR_ENTRY_OFFSET, sizeof(table));
 
-    /* The table's own identity, for PARTUUID: the four bytes at 0x1B8. Left zero
-     * when they are zero, so a disk nothing has signed has no PARTUUID rather
-     * than one shared with every other unsigned disk. */
+    /* PARTUUID's other half: the table's identity at 0x1B8, left zero when it is zero. */
     d->info.disk_id = (uint32_t)sector[MBR_DISK_ID_OFFSET] |
                       ((uint32_t)sector[MBR_DISK_ID_OFFSET + 1] << 8) |
                       ((uint32_t)sector[MBR_DISK_ID_OFFSET + 2] << 16) |
