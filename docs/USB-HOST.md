@@ -56,7 +56,7 @@ is what it prints. The columns:
 
 | column | what it is |
 |---|---|
-| `NAME` | `sda`, `sdb`… in slot order, with `sda1`… for the partitions in the MBR |
+| `NAME` | `sda`, `sdb`… in slot order, with `sda1`… for the partitions in the MBR. The number is the *entry's*, so a skipped one leaves a gap exactly as `fdisk` does |
 | `SIZE` | the size the device reports |
 | `TYPE` | `disk` or `part` |
 | `FSTYPE` | what is on it — a partition's filesystem, or on a disk line the filesystem the disk *itself* carries (a superfloppy); empty when there is neither, and `unreadable` when sector 0 could not be read |
@@ -326,7 +326,7 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
 | `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,306,128 B | 69% |
-| ... and Stage 2 (mounting, FatFs) | 0x1460b0 — 1,335,472 B | 68% |
+| ... and Stage 2 (mounting, FatFs) | 0x1460d0 — 1,335,504 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
 
 Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus

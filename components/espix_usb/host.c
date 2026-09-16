@@ -694,8 +694,17 @@ static void read_partition_table(usb_dev_t *d)
      *
      * The type table is still the library's: see partition_type_name().
      */
+    /*
+     * Copied out of the MBR before the walk, because the per-partition probes
+     * below read into `sector`: the table has to outlive the walk's own use of
+     * that buffer, and reading an entry out of a block that has since been
+     * refilled is how a partition goes missing.
+     */
+    uint8_t table[MBR_ENTRIES * MBR_ENTRY_SIZE];
+    memcpy(table, sector + MBR_ENTRY_OFFSET, sizeof(table));
+
     for (size_t i = 0; i < MBR_ENTRIES && d->info.nparts < ESPIX_USB_MAX_PARTS; i++) {
-        const uint8_t *entry = sector + MBR_ENTRY_OFFSET + i * MBR_ENTRY_SIZE;
+        const uint8_t *entry = table + i * MBR_ENTRY_SIZE;
         const uint8_t  raw = entry[MBR_ENTRY_TYPE];
         const uint32_t lba_start = entry_u32(entry, MBR_ENTRY_LBA);
         const uint32_t lba_sectors = entry_u32(entry, MBR_ENTRY_SECTORS);
@@ -732,19 +741,20 @@ static void read_partition_table(usb_dev_t *d)
         espix_usb_part_t *p = &d->info.parts[d->info.nparts];
 
         /*
-         * "sda1", built by hand. The disk name is three characters because
-         * slot_claim() made it, and an MBR holds four entries, so the whole name
-         * is five bytes. Written out rather than formatted: snprintf("%s%u") into
-         * an 8-byte buffer is exactly what -Wformat-truncation exists to flag, and
-         * it is right to.
+         * "sda1", built by hand, and numbered by the *entry* rather than by the
+         * row: a stick whose second entry cannot be read shows sda1 and sda3, as
+         * fdisk does, instead of quietly renumbering itself and disagreeing with
+         * the tool on the other end of the cable. Five bytes plus the NUL -- the
+         * disk name is always three characters because slot_claim() made it -- and
+         * written out rather than formatted, because snprintf("%s%u") into an
+         * 8-byte buffer is exactly what -Wformat-truncation exists to flag, and it
+         * is right to.
          */
-        if (d->info.nparts < 9) {
-            p->name[0] = d->info.name[0];
-            p->name[1] = d->info.name[1];
-            p->name[2] = d->info.name[2];
-            p->name[3] = (char)('1' + (int)d->info.nparts);
-            p->name[4] = '\0';
-        }
+        p->name[0] = d->info.name[0];
+        p->name[1] = d->info.name[1];
+        p->name[2] = d->info.name[2];
+        p->name[3] = (char)('1' + (int)i);
+        p->name[4] = '\0';
         p->start   = start;
         p->size    = size;
         p->foreign = false;
