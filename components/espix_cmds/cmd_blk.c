@@ -31,7 +31,8 @@
 
 #define LSBLK_USAGE  "usage: lsblk [disk]\n"
 #define BLKID_USAGE  "usage: blkid [device]...\n"
-#define MOUNT_USAGE  "usage: mount [device path]\n"
+#define MOUNT_USAGE \
+    "usage: mount [-o uid=<id>[,gid=<id>]] [device|/dev/device path]\n"
 #define UMOUNT_USAGE "usage: umount path|device...\n"
 
 /*
@@ -493,6 +494,53 @@ static bool blk_lookup(const espix_usb_dev_t *devs, size_t n, const char *name,
  * volume *is* -- an attempt to mount one says "not supported" rather than
  * looking like a broken driver, which is the same reason the column exists.
  */
+/*
+ * `uid=<id>[,gid=<id>]`, the value `mount -o` takes.
+ *
+ * Numeric only. espix has no passwd lookup -- getpwnam is not implemented, and
+ * the names a user would rather type live in /etc/passwd, which espix_auth reads
+ * for itself -- so `id` prints the number to use. Names arrive with the fstab
+ * parser, which has to resolve them anyway and can share cmd_fs.c's resolver.
+ */
+static bool parse_owner(espix_session_t *s, const char *arg,
+                        uint16_t *uid, uint16_t *gid)
+{
+    char buf[64];
+
+    if (strlcpy(buf, arg, sizeof(buf)) >= sizeof(buf)) {
+        espix_eprintf(s, "mount: -o: too long\n");
+        return false;
+    }
+
+    for (char *tok = strtok(buf, ","); tok != NULL; tok = strtok(NULL, ",")) {
+        uint16_t   *out   = NULL;
+        const char *value = NULL;
+
+        if (strncmp(tok, "uid=", 4) == 0) {
+            out   = uid;
+            value = tok + 4;
+        } else if (strncmp(tok, "gid=", 4) == 0) {
+            out   = gid;
+            value = tok + 4;
+        } else {
+            espix_eprintf(s, "mount: -o %s: only uid= and gid= are understood\n",
+                          tok);
+            return false;
+        }
+
+        char *end = NULL;
+        const unsigned long n = strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || n > UINT16_MAX) {
+            espix_eprintf(s, "mount: -o %s: not an id (a number, 0..65535)\n",
+                          tok);
+            return false;
+        }
+        *out = (uint16_t)n;
+    }
+
+    return true;
+}
+
 static int cmd_mount(espix_session_t *s, int argc, char **argv)
 {
     if (!espix_usb_host_built()) {
@@ -509,6 +557,32 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         }
         return 0;
     }
+    /*
+     * `-o uid=<id>[,gid=<id>]` first, as every other espix command takes its
+     * options before the operands. Root only: a session mounting at a directory
+     * of its own gets itself as the owner with no option at all, and an option
+     * that could name someone else would let a session hand its volume to an id
+     * it cannot then use -- or quietly take a volume away from itself.
+     */
+    uint16_t owner_uid = (s != NULL) ? s->uid : 0;
+    uint16_t owner_gid = (s != NULL) ? s->gid : 0;
+
+    if (argc >= 2 && strcmp(argv[1], "-o") == 0) {
+        if (argc < 3) {
+            espix_eprintf(s, MOUNT_USAGE);
+            return 1;
+        }
+        if (s == NULL || s->uid != 0) {
+            espix_eprintf(s, "mount: -o is root's to use\n");
+            return 1;
+        }
+        if (!parse_owner(s, argv[2], &owner_uid, &owner_gid)) {
+            return 1;
+        }
+        argv += 2;
+        argc -= 2;
+    }
+
     if (argc != 3) {
         espix_eprintf(s, MOUNT_USAGE);
         return 1;
@@ -641,7 +715,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         dev = view;
     }
 
-    const esp_err_t err = espix_fs_mount_fat(path, dev, s->uid, s->gid);
+    const esp_err_t err = espix_fs_mount_fat(path, dev, owner_uid, owner_gid);
     if (err != ESP_OK) {
         if (view != NULL) {
             view->ops->release(view);
@@ -821,7 +895,7 @@ static espix_cmd_t s_blk_cmds[] = {
       /* The root-only rule belongs in the help: a user who is told why is not
        * left thinking the command is broken. */
       .help = "mount a FAT filesystem (root, or the mount point's owner)",
-      .usage = "mount [device|/dev/device path]" },
+      .usage = "mount [-o uid=<id>[,gid=<id>]] [device|/dev/device path]" },
     { .name = "umount", .fn = cmd_umount,
       .help = "unmount a mounted filesystem (its mounter, or root)",
       .usage = "umount path|device..." },
