@@ -721,7 +721,14 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
         espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
         status = 1;
     }
-    if (status == 0 && fclose(out) != 0) {
+    /*
+     * Closed whatever happened; the failure is reported only when there is not
+     * one already. That `fclose` is not tidiness: it is the only thing that gives
+     * the destination's fd back, and short-circuiting it meant one failed copy
+     * left the volume answering "busy -- a file is open on it" for good -- which
+     * is exactly what a pull mid-copy produces, and how this was found.
+     */
+    if (fclose(out) != 0 && status == 0) {
         espix_eprintf(s, "cp: %s: close failed: %s\n", dst, strerror(errno));
         status = 1;
     }
