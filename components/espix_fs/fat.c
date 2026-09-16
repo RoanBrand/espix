@@ -354,7 +354,8 @@ static const esp_vfs_fs_ops_t s_fat_ops = {
 /* Public                                                              */
 /* ------------------------------------------------------------------ */
 
-esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev)
+esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
+                             uint16_t owner_uid, uint16_t owner_gid)
 {
     if (path == NULL || dev == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -431,7 +432,7 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev)
     m->ops = esp_vfs_fat_get_ops();
 
     /* Published last: until this returns, no path can reach the mount. */
-    err = espix_vfs_add_mount(path, &s_fat_ops, m, false);
+    err = espix_vfs_add_mount(path, &s_fat_ops, m, false, owner_uid, owner_gid);
     if (err != ESP_OK) {
         f_mount(NULL, m->drive, 0);
         goto fail_ctx;

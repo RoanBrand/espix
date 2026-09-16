@@ -105,11 +105,27 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
  * caller has to close up first.
  */
 esp_err_t espix_vfs_add_mount(const char *prefix, const esp_vfs_fs_ops_t *ops,
-                              void *ctx, bool stored_metadata);
+                              void *ctx, bool stored_metadata,
+                              uint16_t owner_uid, uint16_t owner_gid);
 esp_err_t espix_vfs_del_mount(const char *prefix);
 
 /* False on a mount whose filesystem carries no modes of its own. */
 bool espix_vfs_stores_metadata(const char *abs_path);
+
+/*
+ * A mount whose owner the rule decides: the root, and any filesystem that
+ * carries ownership itself. The same value as ESPIX_FS_KEEP_ID because it means
+ * the same thing -- leave this to something else.
+ */
+#define ESPIX_FS_OWNER_RULE ((uint16_t)0xFFFF)
+
+/*
+ * The owner of the mount a path belongs to, when that mount keeps no ownership
+ * of its own -- the uid and gid of whoever mounted it, which is the shape Linux
+ * gives a removable volume with uid= and gid=. False means the rule answers, as
+ * it does for the rootfs and everything under it.
+ */
+bool espix_vfs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid);
 
 
 /* ------------------------------------------------------------------ */

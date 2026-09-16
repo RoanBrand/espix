@@ -585,7 +585,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         dev = view;
     }
 
-    const esp_err_t err = espix_fs_mount_fat(path, dev);
+    const esp_err_t err = espix_fs_mount_fat(path, dev, s->uid, s->gid);
     if (err != ESP_OK) {
         if (view != NULL) {
             view->ops->release(view);

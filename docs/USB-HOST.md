@@ -326,7 +326,7 @@ esp32s3, with the shipped defaults (`ESPIX_USB_VERBOSE=n`):
 | build | `espix.bin` | free in a 4MB app partition |
 |---|---|---|
 | `ESPIX_USB_ROLE_HOST` (default) | 0x13ee10 — 1,306,128 B | 69% |
-| ... and Stage 2 (mounting, FatFs) | 0x1461b0 — 1,335,728 B | 68% |
+| ... and Stage 2 (mounting, FatFs) | 0x146310 — 1,336,080 B | 68% |
 | `ESPIX_USB_ROLE_DEVICE` | 0x1339f0 — 1,260,016 B | 70% |
 
 Stage 2 costs about **29KB**: FatFs itself (`ff.c` and its Unicode tables) plus
@@ -458,6 +458,13 @@ records it.
   second filesystem made the difference visible — left every file on a stick
   world-writable and executable in the listing while the check said 0644, so a
   binary that the loader would refuse looked runnable.
+- **A mounted volume belongs to whoever mounted it.** FAT stores no ownership, so
+  the mount carries the mounting session's `uid` and `gid` — the `uid=`/`gid=`
+  Linux gives a removable volume, so that the person who plugged the stick in can
+  write to it rather than finding everything root's. `sudo mount` therefore gives
+  a root-owned volume, exactly as a root mount does on Linux; `esp` writing a
+  stick it plugged in itself wants espix to grow a non-root way to mount, which it
+  does not have yet.
 - **Root only**, as `mount(8)` is: it changes the namespace for every session.
   `mount` with no arguments lists what is mounted and anyone may run that, as
   anyone may read `/proc/mounts`.

@@ -94,6 +94,14 @@ typedef struct {
      */
     bool                     stored_metadata;
     bool                     used;
+    /*
+     * Who owns what a metadata-less mount holds -- the uid and gid of whoever
+     * mounted it, the shape Linux gives a removable volume with uid= and gid=.
+     * ESPIX_FS_OWNER_RULE for the root and for anything that carries ownership of
+     * its own: those keep answering from the rule, as they always have.
+     */
+    uint16_t                 owner_uid;
+    uint16_t                 owner_gid;
 } lower_t;
 
 static lower_t s_mounts[ESPIX_FS_MAX_MOUNTS];
@@ -926,6 +934,8 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
     root->len      = 0;
     /* littlefs carries espix's own mode and owner attributes. */
     root->stored_metadata = true;
+    root->owner_uid = ESPIX_FS_OWNER_RULE;
+    root->owner_gid = ESPIX_FS_OWNER_RULE;
     root->used     = true;
     portEXIT_CRITICAL(&s_mount_lock);
 
@@ -953,7 +963,8 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
 
 esp_err_t espix_vfs_add_mount(const char *prefix,
                               const esp_vfs_fs_ops_t *ops, void *ctx,
-                              bool stored_metadata)
+                              bool stored_metadata,
+                              uint16_t owner_uid, uint16_t owner_gid)
 {
     if (ops == NULL || ctx == NULL || prefix == NULL || ops->dir == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -998,6 +1009,8 @@ esp_err_t espix_vfs_add_mount(const char *prefix,
     strlcpy(slot->prefix, prefix, sizeof(slot->prefix));
     slot->len      = len;
     slot->stored_metadata = stored_metadata;
+    slot->owner_uid = owner_uid;
+    slot->owner_gid = owner_gid;
     slot->used     = true;
 
     portEXIT_CRITICAL(&s_mount_lock);
@@ -1061,4 +1074,22 @@ esp_err_t espix_vfs_del_mount(const char *prefix)
 bool espix_vfs_stores_metadata(const char *abs_path)
 {
     return mount_by_path(abs_path)->stored_metadata;
+}
+
+bool espix_vfs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid)
+{
+    const lower_t *l = mount_by_path(abs_path);
+
+    /* The sentinel means the rule answers -- the rootfs, and anything that keeps
+     * ownership in the filesystem itself. */
+    if (l == NULL || l->owner_uid == ESPIX_FS_OWNER_RULE) {
+        return false;
+    }
+    if (uid != NULL) {
+        *uid = l->owner_uid;
+    }
+    if (gid != NULL) {
+        *gid = l->owner_gid;
+    }
+    return true;
 }

@@ -610,6 +610,32 @@ line instead.
 **Workaround:** none. Hubs cannot be turned off here — this board cannot power a
 device from the OTG socket, so the hub is how anything is plugged in at all.
 
+### A failed SCSI write discards its sense data
+
+`scsi_cmd_write10()` fetches the sense data when a write fails — and throws it
+away (`msc_scsi_bot.c:366`):
+
+    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, num_sectors * sector_size);
+    if (unlikely(ret != ESP_OK)) {
+        MSC_RETURN_ON_ERROR( scsi_cmd_sense(device, NULL));
+    }
+    return ret;
+
+`scsi_cmd_sense(device, NULL)` runs the REQUEST SENSE transfer and drops the
+response, so the one thing that says *why* — write-protected, a UNIT ATTENTION
+left over from partitioning the medium on another host, a medium error — reaches
+neither a caller nor a log. The BDL path adds nothing of its own either:
+`msc_bdl_write()` returns the error without logging anything, where the older
+`diskio_usb.c` path at least printed `scsi_cmd_write10 failed (%d)`.
+
+Those causes are indistinguishable without it, and a caller sees one error code
+for all of them. Passing the sense response out, or logging it, would cost
+nothing.
+
+**Workaround:** none — which is why a write failure here has to be diagnosed from
+the errno the layer above reports. See
+[GOTCHAS.md](GOTCHAS.md#a-write-that-succeeded-has-not-been-written-yet).
+
 ## `espressif/esp_tinyusb` (TinyUSB NCM)
 
 ### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer

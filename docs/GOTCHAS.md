@@ -531,6 +531,21 @@ espcoredump's macros gate on `LOG_LOCAL_LEVEL` at compile time and write
 straight to `esp_rom_printf`, bypassing the runtime level — so every crash
 arrives under a page of core-dump tracing.
 
+### A write that "succeeded" has not been written yet
+
+`fwrite()` returns the length it was handed as soon as the bytes are in stdio's
+buffer; the file is touched when that buffer fills or the stream is closed. A
+program that checks `fwrite()` and not `fflush()`/`fclose()` therefore reports
+success for a copy whose real write failed — and on a filesystem that refuses
+writes, success for a file of zero bytes.
+
+Found here by doing exactly that: `cp` into a freshly mounted FAT volume checked
+`fwrite()` and ignored `fclose()`, and fifteen bytes arrived as an empty file with
+nothing said. The shell's `>` and `2>` had the same hole in `redirects_release()`.
+Both check now, and both name the errno — the layers underneath are another
+matter (see [UPSTREAM.md](UPSTREAM.md) on the discarded sense data), which is
+precisely why the reporting had to come first.
+
 ### A configure-time hook is not a build-time guarantee
 
 `tools/patch-fatfs.py` runs from an `execute_process()` in the top-level

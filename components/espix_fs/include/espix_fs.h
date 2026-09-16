@@ -66,9 +66,15 @@ bool espix_fs_is_mounted(void);
  * a whole disk and a partition view over one are both mountable and only the
  * caller knows which it made. Release it after espix_fs_unmount_fat().
  *
+ * `owner_uid` and `owner_gid` own everything the volume holds, because FAT keeps
+ * no ownership of its own: the uid= and gid= Linux gives a removable volume, so
+ * the person who plugged the stick in can write to it. They are the mounting
+ * session's ids, told to this rather than looked up.
+ *
  * Never formats: a volume that does not mount is reported, not overwritten.
  */
-esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev);
+esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
+                             uint16_t owner_uid, uint16_t owner_gid);
 
 /*
  * Unmount it. ESP_ERR_INVALID_STATE while a file or directory is still open on

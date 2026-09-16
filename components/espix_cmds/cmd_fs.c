@@ -642,14 +642,28 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
 
     while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0) {
         if (fwrite(chunk, 1, n, out) != n) {
-            espix_eprintf(s, "cp: %s: write failed\n", dst);
+            espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
             status = 1;
             break;
         }
     }
 
     fclose(in);
-    fclose(out);
+
+    /*
+     * The flush is where the bytes actually go: stdio buffers them, so on a
+     * mounted volume the real write happens here and not in fwrite(). Checking
+     * fwrite() alone therefore reports success for a copy that fails on close --
+     * which is how fifteen bytes became a 0-byte file with nothing said.
+     */
+    if (status == 0 && fflush(out) != 0) {
+        espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
+        status = 1;
+    }
+    if (fclose(out) != 0 && status == 0) {
+        espix_eprintf(s, "cp: %s: close failed: %s\n", dst, strerror(errno));
+        status = 1;
+    }
     return status;
 }
 

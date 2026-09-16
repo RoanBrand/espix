@@ -140,6 +140,16 @@ void espix_fs_set_owner_rule(espix_fs_owner_rule_t rule)
  */
 static void owner_from_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
 {
+    /*
+     * A mount that keeps no ownership of its own answers with whoever mounted it:
+     * the uid= and gid= Linux gives a removable volume, so that the person who
+     * plugged the stick in can write to it. Everything else -- the rootfs and the
+     * directories espix owns inside it -- falls through to the rule.
+     */
+    if (espix_vfs_mount_owner(abs_path, uid, gid)) {
+        return;
+    }
+
     *uid = 0;
     *gid = 0;
 
