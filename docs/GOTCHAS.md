@@ -721,6 +721,7 @@ Measured with `ps`, reading the task's high-water mark:
 | the install alone, before /etc/fstab existed | ~740 bytes |
 | the applier reading fstab and creating the file | ~3228 bytes |
 | the same, with a mount in the path | ~4268 bytes |
+| the same, matching an identity in /etc/fstab | ~4540 bytes |
 
 At 4096 the middle row was already fatal once the device array sat on the stack.
 The panic said `***ERROR*** A stack overflow in task usb:work has been detected.`

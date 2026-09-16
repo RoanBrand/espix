@@ -641,3 +641,10 @@ opt-in.
 Verified on hardware with `sd*1   /media/%s   esp`: the attach mounted `sda1` as
 `esp`, an unprivileged session created a file on it and unmounted it, and
 `mount` showed the volume for exactly as long as it was there.
+
+And with an identity, which is the reason for the column being wider than a name:
+`UUID=B321-90F7   /media/big   esp` mounted the BIGFAT volume at that literal
+path, while `/media/sda1` -- where the same stick used to appear when the rule
+named a letter -- stayed empty. The log said `blk: /etc/fstab: mounted sda1 at
+/media/big`, a write as `esp` landed on the volume, and `usb:work` peaked at 4540
+bytes of its 6144 bytes doing it.
