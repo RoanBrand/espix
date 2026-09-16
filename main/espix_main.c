@@ -65,6 +65,9 @@ static void usb_dev_nodes(const espix_usb_dev_t *dev, bool attached)
             (void)espix_dev_register_block(dev->parts[i].name,
                                            dev->parts[i].size);
         }
+
+        /* And whatever /etc/fstab says about it, if anything. */
+        espix_blk_device_added(dev->name);
         return;
     }
 

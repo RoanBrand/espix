@@ -21,13 +21,17 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
+#include "espix_auth.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
 #include "espix_shell.h"
 #include "espix_usb.h"
+
+#define TAG "blk"
 
 #define LSBLK_USAGE  "usage: lsblk [disk]\n"
 #define BLKID_USAGE  "usage: blkid [device]...\n"
@@ -892,6 +896,298 @@ void espix_blk_device_gone(const char *dev)
             memset(rec, 0, sizeof(*rec));
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* /etc/fstab                                                          */
+/* ------------------------------------------------------------------ */
+
+#define FSTAB_PATH  "/etc/fstab"
+
+/*
+ * The file, when it has never been written.
+ *
+ * Created rather than shipped: the rootfs skeleton is built at boot, and the
+ * comment *is* the documentation -- whoever opens this should not need a manual
+ * to find out that the columns are not Linux's.
+ *
+ * Nothing is enabled in it. CONFIG_FATFS_VOLUME_COUNT is 2, and a wildcard on a
+ * four-partition stick would ask for three volumes, so a default policy would be
+ * a default failure. Uncommenting a line is the opt-in.
+ */
+static const char FSTAB_TEMPLATE[] =
+    "# espix fstab -- not Linux's. Three fields, doing the jobs theirs do.\n"
+    "#\n"
+    "#   <device>       <mount point>   <owner>   [flags]\n"
+    "#\n"
+    "# device       what lsblk prints: sda1, or sd*1 for partition 1 of any disk\n"
+    "# mount point  a template; %s becomes the device name\n"
+    "# owner        an account name, a uid, or - for root\n"
+    "# flags        noauto, to leave the device alone until somebody mounts it\n"
+    "#\n"
+    "# Mounting happens when a device is attached and unmounting when it is\n"
+    "# removed. A volume belongs to the owner named here, so the example below\n"
+    "# gives `esp` a stick it can read and write without sudo.\n"
+    "#\n"
+    "#   sd*1   /media/%s   esp\n"
+    "#   sda4   /srv/backup -        noauto\n";
+
+/* `*` matches any run of characters, and that is the whole pattern language:
+ * enough for "partition N of any disk", and small enough to check by reading. */
+static bool fstab_glob(const char *pat, const char *name)
+{
+    while (*pat != '\0') {
+        if (*pat == '*') {
+            pat++;
+            if (*pat == '\0') {
+                return true;
+            }
+            for (const char *p = name; *p != '\0'; p++) {
+                if (fstab_glob(pat, p)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (*name == '\0' || *pat != *name) {
+            return false;
+        }
+        pat++;
+        name++;
+    }
+    return *name == '\0';
+}
+
+/* `uid`/`gid` from an owner field: an account name, a number, or `-` for root. */
+static bool fstab_owner(const char *word, uint16_t *uid, uint16_t *gid)
+{
+    if (strcmp(word, "-") == 0) {
+        *uid = 0;
+        *gid = 0;
+        return true;
+    }
+
+    char *end = NULL;
+    const unsigned long n = strtoul(word, &end, 10);
+    if (end != word && *end == '\0') {
+        if (n > UINT16_MAX) {
+            return false;
+        }
+        *uid = (uint16_t)n;
+        *gid = (uint16_t)n;
+        return true;
+    }
+
+    espix_user_t u;
+    if (espix_auth_lookup(word, &u) != ESP_OK) {
+        return false;
+    }
+    *uid = u.uid;
+    *gid = u.gid;
+    return true;
+}
+
+/* The mount point, with `%s` replaced by the device name when it has one. A
+ * point without `%s` is used as written, which is how a policy names one
+ * particular stick. Replaced by hand rather than through printf: a format string
+ * read out of a file is a class of bug worth not having, root's file or not. */
+static void fstab_path(char *out, size_t len, const char *tmpl, const char *name)
+{
+    const char *at = strstr(tmpl, "%s");
+
+    if (at == NULL) {
+        strlcpy(out, tmpl, len);
+        return;
+    }
+
+    const size_t head = (size_t)(at - tmpl);
+    const size_t mid  = strlen(name);
+    const size_t tail = strlen(at + 2);
+
+    if (head + mid + tail + 1 > len) {
+        out[0] = '\0';
+        return;
+    }
+
+    memcpy(out, tmpl, head);
+    memcpy(out + head, name, mid);
+    memcpy(out + head + mid, at + 2, tail + 1);
+}
+
+/*
+ * Mount one volume where fstab says, as the owner it names.
+ *
+ * Quiet about failure: this runs with nobody watching, and a log line is the
+ * only thing anybody can do about it at that moment.
+ */
+static void fstab_mount(const espix_usb_dev_t *disk,
+                        const espix_usb_part_t *part,
+                        const char *path, uint16_t uid, uint16_t gid)
+{
+    const char *fstype  = (part != NULL) ? part->fstype : disk->fstype;
+    const bool  foreign = (part != NULL) ? part->foreign : disk->foreign;
+
+    if (fstype[0] == '\0' || foreign || strcmp(fstype, "vfat") != 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: %s is not one to mount", path,
+                   fstype[0] != '\0' ? fstype : "unrecognised");
+        return;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: no such directory; not mounting there", path);
+        return;
+    }
+    if (mount_by_path(path) != NULL) {
+        return;                     /* already mounted; nothing to add */
+    }
+
+    esp_blockdev_handle_t disk_bdl = espix_usb_dev_blockdev(disk->name);
+    if (disk_bdl == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no block device", disk->name);
+        return;
+    }
+
+    esp_blockdev_handle_t view = NULL;
+    esp_blockdev_handle_t dev  = disk_bdl;
+
+    if (part != NULL &&
+        espix_fs_partition_view(disk_bdl, part->start, part->size,
+                                &view) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot read the partition",
+                   path);
+        return;
+    }
+    if (view != NULL) {
+        dev = view;
+    }
+
+    const esp_err_t err = espix_fs_mount_fat(path, dev, uid, gid);
+    if (err != ESP_OK) {
+        if (view != NULL) {
+            view->ops->release(view);
+        }
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot mount: %s", path,
+                   esp_err_to_name(err));
+        return;
+    }
+
+    mount_rec_t *rec = mount_free_slot();
+    if (rec == NULL) {
+        (void)espix_fs_unmount_fat(path);
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no free mount slot", path);
+        return;
+    }
+
+    memset(rec, 0, sizeof(*rec));
+    rec->used = true;
+    rec->view = view;
+    snprintf(rec->dev, sizeof(rec->dev), "%s",
+             (part != NULL) ? part->name : disk->name);
+    snprintf(rec->path, sizeof(rec->path), "%s", path);
+    /*
+     * `uid` is the *owner*, not a mounter, because there is no session here --
+     * and that is also who may unmount it, which is what an fstab `user` entry
+     * means on Linux.
+     */
+    rec->uid = uid;
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: mounted %s at %s", FSTAB_PATH,
+               rec->dev, path);
+}
+
+/* Every line that matches this device, or the template if the file is absent. */
+static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
+{
+    FILE *f = fopen(FSTAB_PATH, "r");
+    if (f == NULL) {
+        FILE *t = fopen(FSTAB_PATH, "w");
+        if (t != NULL) {
+            fputs(FSTAB_TEMPLATE, t);
+            fclose(t);
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "%s: written, with the examples commented out",
+                       FSTAB_PATH);
+        }
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *hash = strchr(line, '#');
+        if (hash != NULL) {
+            *hash = '\0';
+        }
+
+        char name[ESPIX_USB_NAME_MAX];
+        char point[ESPIX_PATH_MAX];
+        char owner[ESPIX_USER_MAX];
+        char flags[32] = "";
+
+        if (sscanf(line, "%7s %127s %31s %31s", name, point, owner, flags) < 3) {
+            continue;
+        }
+        if (strstr(flags, "noauto") != NULL) {
+            continue;
+        }
+
+        uint16_t uid = 0;
+        uint16_t gid = 0;
+        if (!fstab_owner(owner, &uid, &gid)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no such account: %s",
+                       FSTAB_PATH, owner);
+            continue;
+        }
+
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(devs[i].name, dev) != 0) {
+                continue;           /* a different disk */
+            }
+
+            /* The disk itself first -- a superfloppy has no partitions -- and
+             * then each partition. */
+            if (fstab_glob(name, devs[i].name)) {
+                char path[ESPIX_PATH_MAX];
+                fstab_path(path, sizeof(path), point, devs[i].name);
+                if (path[0] != '\0') {
+                    fstab_mount(&devs[i], NULL, path, uid, gid);
+                }
+            }
+
+            for (size_t j = 0; j < devs[i].nparts; j++) {
+                if (!fstab_glob(name, devs[i].parts[j].name)) {
+                    continue;
+                }
+                char path[ESPIX_PATH_MAX];
+                fstab_path(path, sizeof(path), point, devs[i].parts[j].name);
+                if (path[0] != '\0') {
+                    fstab_mount(&devs[i], &devs[i].parts[j], path, uid, gid);
+                }
+            }
+        }
+    }
+
+    fclose(f);
+}
+
+/*
+ * A storage device has appeared. Runs on the USB work task -- the context the
+ * attach hook fires in, chosen so that transfers complete while a device is
+ * installed -- so filesystem calls are safe here. That task's stack is the
+ * budget to watch, not a guarantee: it is 3.5KB, and mounting is the deepest
+ * thing ever asked to run on it.
+ */
+void espix_blk_device_added(const char *dev)
+{
+    if (dev == NULL) {
+        return;
+    }
+
+    espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
+    const size_t n = espix_usb_devlist(devs, ESPIX_USB_MAX_DEVS);
+
+    fstab_apply(devs, n, dev);
 }
 
 static espix_cmd_t s_blk_cmds[] = {

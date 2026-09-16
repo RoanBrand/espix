@@ -27,6 +27,15 @@ void espix_cmds_register_all(void);
  */
 void espix_blk_device_gone(const char *dev);
 
+/*
+ * A storage device has appeared: apply /etc/fstab to it.
+ *
+ * Created here, in the file's own comments, on first use -- and created with
+ * everything commented out, because the volume count is 2 and a wildcard on a
+ * four-partition stick would ask for more than that.
+ */
+void espix_blk_device_added(const char *dev);
+
 #ifdef __cplusplus
 }
 #endif
