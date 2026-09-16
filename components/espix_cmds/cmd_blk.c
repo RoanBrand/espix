@@ -1015,6 +1015,37 @@ static void fstab_path(char *out, size_t len, const char *tmpl, const char *name
 }
 
 /*
+ * Make every component of `path` that is not there yet.
+ *
+ * Only used for a point built from the template: `/media/%s` cannot exist before
+ * the device that names it does, and one hand-made directory per device name is
+ * not a policy. A point written out literally is left alone -- a typo there
+ * should be an error, which is what Linux does with a missing mount point.
+ */
+static bool fstab_mkdirs(const char *path)
+{
+    char buf[ESPIX_PATH_MAX];
+
+    if (path[0] != '/' || strlen(path) >= sizeof(buf)) {
+        return false;
+    }
+    strlcpy(buf, path, sizeof(buf));
+
+    for (char *p = buf + 1; *p != '\0'; p++) {
+        if (*p != '/') {
+            continue;
+        }
+        *p = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+            return false;
+        }
+        *p = '/';
+    }
+
+    return mkdir(buf, 0755) == 0 || errno == EEXIST;
+}
+
+/*
  * Mount one volume where fstab says, as the owner it names.
  *
  * Quiet about failure: this runs with nobody watching, and a log line is the
@@ -1022,7 +1053,8 @@ static void fstab_path(char *out, size_t len, const char *tmpl, const char *name
  */
 static void fstab_mount(const espix_usb_dev_t *disk,
                         const espix_usb_part_t *part,
-                        const char *path, uint16_t uid, uint16_t gid)
+                        const char *path, uint16_t uid, uint16_t gid,
+                        bool templated)
 {
     const char *fstype  = (part != NULL) ? part->fstype : disk->fstype;
     const bool  foreign = (part != NULL) ? part->foreign : disk->foreign;
@@ -1034,7 +1066,11 @@ static void fstab_mount(const espix_usb_dev_t *disk,
     }
 
     struct stat st;
-    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    const bool absent = (stat(path, &st) != 0);
+
+    if (absent && templated && fstab_mkdirs(path)) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: created the mount point", path);
+    } else if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "%s: no such directory; not mounting there", path);
         return;
@@ -1151,7 +1187,8 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
                 char path[ESPIX_PATH_MAX];
                 fstab_path(path, sizeof(path), point, devs[i].name);
                 if (path[0] != '\0') {
-                    fstab_mount(&devs[i], NULL, path, uid, gid);
+                    fstab_mount(&devs[i], NULL, path, uid, gid,
+                                 strstr(point, "%s") != NULL);
                 }
             }
 
@@ -1162,7 +1199,8 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
                 char path[ESPIX_PATH_MAX];
                 fstab_path(path, sizeof(path), point, devs[i].parts[j].name);
                 if (path[0] != '\0') {
-                    fstab_mount(&devs[i], &devs[i].parts[j], path, uid, gid);
+                    fstab_mount(&devs[i], &devs[i].parts[j], path,
+                                 uid, gid, strstr(point, "%s") != NULL);
                 }
             }
         }

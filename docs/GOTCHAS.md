@@ -705,3 +705,31 @@ The general form: FreeRTOS owns none of what a process holds -- newlib owns the
 FILEs, lwIP the netconn, espix the channel lock -- so `vTaskDelete()` is not a
 SIGKILL. Terminate cooperatively at the syscall boundary and keep the delete for
 a task that demonstrably holds nothing. See `espix_proc_stopping()`.
+
+## The USB work task has a stack budget, and filesystem work runs on it
+
+`usb:work` is created with `WORK_TASK_STACK` in components/espix_usb/host.c, and
+it is where the attach hook fires -- deliberately, because the library's own task
+cannot block on transfers that only it can deliver. Whatever the hook does runs
+on that stack.
+
+`blk`'s `/etc/fstab` applier mounts volumes from that hook, and FatFs is deep.
+Measured with `ps`, reading the task's high-water mark:
+
+| what the attach ran | peak use |
+| --- | --- |
+| the install alone, before /etc/fstab existed | ~740 bytes |
+| the applier reading fstab and creating the file | ~3228 bytes |
+| the same, with a mount in the path | ~4268 bytes |
+
+At 4096 the middle row was already fatal once the device array sat on the stack.
+The panic said `***ERROR*** A stack overflow in task usb:work has been detected.`
+and the board reboot-looped for as long as a stick was attached, because the
+attach that overflows happens again on every boot -- and the UART that would have
+said so is the one cable that is usually somewhere else. The array is `static`
+now (attaches are serialised by the host's attach lock, so one buffer is enough)
+and the stack is 6144.
+
+The rule: **anything added to the attach hook is spending `usb:work`'s stack.**
+If it is deeper than a mount, give it a task of its own rather than a larger
+number here.

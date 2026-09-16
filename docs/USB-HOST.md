@@ -581,3 +581,37 @@ cure is to delete it (or edit it) and rebuild —
 [GOTCHAS.md](GOTCHAS.md) has the details — and the check is
 `CONFIG_USB_HOST_HUBS_SUPPORTED` appearing in the generated `sdkconfig`, not
 in `sdkconfig.defaults`.
+
+## /etc/fstab
+
+Mounting can be policy rather than a command. `/etc/fstab` is espix's own file,
+not Linux's -- three fields doing the jobs theirs do, and the file documents
+itself: it is created with every example commented out the first time an attach
+looks for it.
+
+    <device>       <mount point>   <owner>   [flags]
+
+    device       what lsblk prints: sda1, or sd*1 for partition 1 of any disk
+    mount point  a template; %s becomes the device name
+    owner        an account name, a uid, or - for root
+    flags        noauto
+
+Applied when a device is attached and unmounted when it goes. `*` is the whole
+pattern language -- enough for "partition N of any disk", and small enough to
+check by reading. `noauto` leaves an entry alone until somebody mounts it.
+
+A mount point built from the template is created if it is missing, parents
+included: `/media/%s` cannot exist before the device that names it does. One
+written out literally is not created, and a missing one is an error, as on
+Linux.
+
+The owner named becomes the volume's owner, which is also who may unmount it --
+an fstab `user` entry, arrived at because nobody is logged in at attach time.
+
+Nothing is enabled by default: CONFIG_FATFS_VOLUME_COUNT is 2, and a wildcard on
+a four-partition stick would ask for three volumes. Uncommenting a line is the
+opt-in.
+
+Verified on hardware with `sd*1   /media/%s   esp`: the attach mounted `sda1` as
+`esp`, an unprivileged session created a file on it and unmounted it, and
+`mount` showed the volume for exactly as long as it was there.
