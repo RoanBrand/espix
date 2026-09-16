@@ -70,8 +70,12 @@ monitor-reset:
 # two USB-C sockets cannot both be occupied. `dmesg` and `coredump` on the device
 # carry the faulting task and the reason without any of this; come here when the
 # backtrace itself is what is wanted.
+#
+# tools/coredump.sh, not `idf.py coredump-info`: that reads the dump's exact
+# length (unaligned, which esptool 5.4 chokes on) at 460800 (where this link
+# drops bytes), and decodes while it reads, so one failure loses both halves.
 coredump:
-	$(IDF) -p $(PORT_ARG) coredump-info
+	PORT="$(PORT_ARG)" ./tools/coredump.sh $(CORE)
 
 apps:
 	./tools/build-apps.sh

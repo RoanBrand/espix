@@ -54,3 +54,4 @@ compile_commands.json
 
 # NOTE: dependencies.lock IS committed, deliberately — it pins the exact
 # component versions so builds are reproducible.
+coredump.bin
