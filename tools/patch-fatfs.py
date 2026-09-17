@@ -349,7 +349,18 @@ DISKIO_BDL_HEADER_NEW = '''
  * pass it straight through to the esp_blockdev ops, which already take uint64_t
  * byte addresses as far down as msc_bdl_read()'s READ(16). Left at DWORD these
  * wrap around and read or write the wrong sector, with no error anywhere.
+ *
+ * ESPIX_BDL_PROBE is how many of the first single-sector reads after a mount get
+ * read a second time and compared -- see the note in tools/patch-fatfs.py. The
+ * fault it looks for is on the first accesses after a mount, so the window is
+ * small on purpose: past it a working system pays nothing.
+ *
+ * The comparison buffer is sized to the sector FatFs uses for a USB disk rather
+ * than to FF_MAX_SS, which is 4096 here: that would cost 4KB of .bss to look at
+ * 512-byte sectors. A device with larger sectors is simply not probed.
  */
+#define ESPIX_BDL_PROBE 200
+#define ESPIX_BDL_PROBE_SS 512
 '''
 MARK_DISKIO_BDL_HEADER = "espix 64-bit sector patch"
 
@@ -414,6 +425,80 @@ DISKIO_BDL_EDITS = [
         "    }\n",
         "espix: the address, not just the failure",
         "diskio_bdl.c read diagnostic",
+    ),
+    # A second read of the same range, compared against the first.
+    #
+    # This is the measurement the T9 fault needs: a listing fails with FR_INT_ERR
+    # while *no* read fails, so the transfer succeeds and the bytes are wrong.
+    # Whether a second read of the same LBA agrees decides the mechanism, and the
+    # three candidates need three different fixes: a stale buffer (the same wrong
+    # bytes every time), a short transfer (the tail of the buffer never written),
+    # or the drive answering wrongly (a mismatch that moves around).
+    #
+    # Only for single-sector reads, and only for the first few after a mount,
+    # which is where the fault lives -- so a working system pays two integer
+    # compares and a counter.
+    (
+        "    ESP_LOGV(TAG, \"read - pdrv=%u, sector=%lu, count=%u, sec_size=%u\",\n"
+        "             (unsigned)pdrv, (unsigned long)sector, (unsigned)count, (unsigned)sec_size);\n",
+        "    ESP_LOGV(TAG, \"read - pdrv=%u, sector=%lu, count=%u, sec_size=%u\",\n"
+        "             (unsigned)pdrv, (unsigned long)sector, (unsigned)count, (unsigned)sec_size);\n"
+        "\n"
+        "    /* espix: probe the first reads after a mount -- see tools/patch-fatfs.py. */\n"
+        "    static BYTE   s_probe[ESPIX_BDL_PROBE_SS];\n"
+        "    static size_t s_probe_left = ESPIX_BDL_PROBE;\n"
+        "    const bool    probing = (s_probe_left > 0 && count == 1 &&\n"
+        "                             sec_size <= sizeof(s_probe));\n"
+        "    if (probing) {\n"
+        "        s_probe_left--;\n"
+        "    }\n",
+        "espix: probe the first reads after a mount",
+        "double-read probe",
+    ),
+    # The comparison itself, once the first read has come back clean.
+    (
+        "    esp_err_t err = drv->handle->ops->read(drv->handle, buff, count * sec_size,\n"
+        "                                           (uint64_t)sector * sec_size, count * sec_size);\n"
+        "    if (unlikely(err != ESP_OK)) {\n"
+        "        /* espix: the address, not just the failure -- see the note in\n"
+        "         * tools/patch-fatfs.py. Addr is absolute on the device this view\n"
+        "         * was made from, so it compares directly with the disk's size. */\n"
+        "        ESP_LOGE(TAG, \"BDL read failed (0x%x) at addr %llu, %u sector(s) of %u\",\n"
+        "                 err, (unsigned long long)((uint64_t)sector * sec_size),\n"
+        "                 (unsigned)count, (unsigned)sec_size);\n"
+        "        return RES_ERROR;\n"
+        "    }\n"
+        "    return RES_OK;\n"
+        "}\n",
+        "    esp_err_t err = drv->handle->ops->read(drv->handle, buff, count * sec_size,\n"
+        "                                           (uint64_t)sector * sec_size, count * sec_size);\n"
+        "    if (unlikely(err != ESP_OK)) {\n"
+        "        /* espix: the address, not just the failure -- see the note in\n"
+        "         * tools/patch-fatfs.py. Addr is absolute on the device this view\n"
+        "         * was made from, so it compares directly with the disk's size. */\n"
+        "        ESP_LOGE(TAG, \"BDL read failed (0x%x) at addr %llu, %u sector(s) of %u\",\n"
+        "                 err, (unsigned long long)((uint64_t)sector * sec_size),\n"
+        "                 (unsigned)count, (unsigned)sec_size);\n"
+        "        return RES_ERROR;\n"
+        "    }\n"
+        "    if (probing && drv->handle->ops->read(drv->handle, s_probe, count * sec_size,\n"
+        "                                          (uint64_t)sector * sec_size,\n"
+        "                                          count * sec_size) == ESP_OK) {\n"
+        "        /* Reported, never corrected: FatFs keeps the first copy, which is\n"
+        "         * what the fault is about -- \"fixing\" it here would hide it. */\n"
+        "        if (memcmp(s_probe, buff, count * sec_size) != 0) {\n"
+        "            unsigned d = 0;\n"
+        "            while (d < count * sec_size && s_probe[d] == buff[d]) d++;\n"
+        "            ESP_LOGE(TAG, \"BDL read at addr %llu differed on a second read \"\n"
+        "                     \"(offset %u, first buffer has %u there)\",\n"
+        "                     (unsigned long long)((uint64_t)sector * sec_size),\n"
+        "                     (unsigned)d, (unsigned)(d < count * sec_size ? buff[d] : 0));\n"
+        "        }\n"
+        "    }\n"
+        "    return RES_OK;\n"
+        "}\n",
+        "differed on a second read",
+        "probe compare",
     ),
 ]
 

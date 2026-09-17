@@ -1070,46 +1070,50 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   port involved. `idf.py coredump-info`, via `make coredump`, is for the backtrace
   rather than for the reason. [UPSTREAM.md](UPSTREAM.md) carries the report.
 
-- **A read on the 3.1TB T9 sometimes returns data FatFs cannot parse.** Measured,
-  and traced to the layer that can be named: the read **succeeds** and the bytes
-  are wrong. Nothing fails at the block device -- `diskio_bdl.c` logs every failed
-  read and never logged one -- and FatFs refuses the result itself, with
-  `FR_INT_ERR` (`fresult=2`), which on exFAT is usually the entry-set checksum at
-  `ff.c:2190`. IDF maps both `FR_INT_ERR` and `FR_DISK_ERR` to `EIO`, so at the
-  surface it is an indistinguishable "I/O error"; the FRESULT is what separates
-  "a read failed" from "a read lied".
+- **A read on the 3.1TB T9 returns different bytes when it is repeated.** This is
+  measured, not inferred, and it is the root of everything the listing symptoms
+  looked like.
 
-  It shows up as a truncated directory listing, sometimes badly -- one run in six
-  listed 2 of `Games/`'s 9 entries, and the missing ones are back on the next
-  call. **Nothing is lost:** the entries are on the medium, and every "missing"
-  entry reappeared on a re-list. `ls` reports it
-  ([UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)),
-  so it is visible rather than silent, which is the whole difference between a
-  short listing and apparent data loss.
+  A probe read the first 200 single-sector accesses after each mount a second
+  time and compared the two buffers. On a failing mount, six of them disagreed --
+  the same address, read twice, giving different bytes. **No read failed:** the
+  block device reported success every time, which is why `diskio_bdl.c`'s own
+  "read failed" log stayed empty and why this looked like a filesystem fault for
+  so long. FatFs is what notices, via exFAT's entry-set checksum (`ff.c:2190`),
+  and reports `FR_INT_ERR` (`fresult=2`, measured) -- which IDF maps to `EIO`,
+  the same errno as a genuine `FR_DISK_ERR`, so the surface cannot tell "a read
+  failed" from "a read lied".
 
-  How often depends on the directory and on whether the mount is cold, measured
-  mounted read-only:
+  Where it happens: at the **start of the partition**, in the first accesses after
+  a mount. The differing addresses clustered in the partition's first ~22 KB
+  (16,777,728 through 16,799,744 -- the partition begins at 16,777,216), and the
+  same probe caught one read at **426 GiB**, an address a directory listing has no
+  business touching. That one is most likely a *consequence*: FatFs followed a
+  cluster number it had read wrongly.
 
-  | what was listed | failures |
-  |---|---|
-  | the root, warm mount | 0 in 115 |
-  | the root, read-write mount | 0 in 60 |
-  | the root, first listing after a fresh mount | 8 in 25 |
-  | `Games/`, warm mount | 2 in 6 |
+  So the shape is: a cold read comes back wrong, FatFs caches it and builds on
+  it, and the damage surfaces later as a short listing or a parse error. Which
+  also explains why a broken listing does **not** always show a mismatch -- if the
+  two reads agree on the same wrong bytes, or the bad read was a multi-sector one
+  the probe skips, the corruption is real and undetected by it.
 
-  So it is not only a cold-start effect, and not a read-write one: a rw mount was
-  measured clean over 60 listings. Longer directories seem to fare worse, which
-  fits a per-sector probability.
+  Rate, mounted read-only: 0 in 115 listings of the root when warm, 0 in 60 on a
+  read-write mount, 8 in 25 when the root was listed for the first time after
+  mounting, 2 in 6 on `Games/` warm.
 
-  What it is *not*: a failed read, a 32-bit address problem (the entries that go
-  missing are in a directory near the start of a 3.1TB volume), or anything in
-  espix's own code. It is the same signature as the GPT-array quirk this drive
-  already showed -- the same LBA giving different bytes on two reads -- which
-  makes it very likely one read-corruption bug seen from two filesystems.
+  **Nothing is lost.** Every entry that went missing reappeared on a re-list; the
+  bytes are on the medium and the read is simply not reliable the first time.
+  `ls` reports it ([UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)),
+  so a short listing is visible rather than silent.
 
-  Unresolved, and the next measurement is a comparison of the bytes read from
-  one LBA on a cold access against the same LBA warm: that would say whether the
-  buffer is stale, the transfer is short, or the drive itself is answering
-  wrongly. Until then: **mount this drive read-only.** A read that goes wrong is
-  recoverable -- the retry succeeds -- where a write that goes wrong puts the bad
-  copy back, and FatFs caches what it reads.
+  It is below espix: nothing in espix's stack fails, and the addresses are around
+  16 MB, far under the 2TiB mark, so it is not the 64-bit widening either. It has
+  the same shape as the GPT-array quirk this drive already showed -- one LBA, two
+  answers -- and is very likely the same bug. **Mount this drive read-only**: a
+  read that goes wrong is recovered by the retry, where a write that goes wrong
+  puts the bad copy back, and FatFs caches what it reads.
+
+  Next, if it is ever chased: whether a retry *inside* the read path fixes it
+  (which would be a workaround worth having) and whether another USB device or
+  cable reproduces it (which would say whether it is this drive). Both are cheap;
+  neither has been done.
