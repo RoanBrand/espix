@@ -964,6 +964,17 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
         }
 
         /*
+         * The probe above refilled `buf`, so the entry-array sector that was in
+         * it is gone: forget which one it was, or the next entry of a
+         * four-entries-per-sector array gets read out of a partition's boot
+         * sector. The same trap the MBR walk copies its table out of the way to
+         * avoid, met from the other side — and it hid two of the three
+         * partitions on the first real GPT disk this ran against, silently,
+         * because a boot sector's zeroes look exactly like unused entries.
+         */
+        loaded = UINT64_MAX;
+
+        /*
          * A partition holding no filesystem is not one espix failed to name: a
          * Microsoft reserved entry holds none by definition, and an empty EFI
          * partition is an ordinary thing to find on a disk prepared by Windows.
