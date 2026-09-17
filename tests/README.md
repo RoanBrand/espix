@@ -83,6 +83,7 @@ The conditions worth skipping on, and who owns each:
 | condition | how to tell | example |
 |---|---|---|
 | no mass storage | `lsblk` prints nothing, or says the host role was not built in | `75-usb.sh` |
+| a partition with no `PARTUUID` to match on | `blkid <name>` has no `PARTUUID=` field: a GPT entry whose GUID is zero, or an MBR whose signature is zero | `75-usb.sh` |
 | no serial console | `ESPIX_HAVE_SERIAL=no` — the runner sets it when `--port` was not given, or when the interpreter has no pyserial | `50-console.sh` |
 | needs root | `mount` and `umount` are root-only and the harness runs as `$ESPIX_USER` | `12-vfs.sh` |
 | the board cannot do it at all | the role is device rather than host, or the filesystem is one espix will not mount | `75-usb.sh`, `12-vfs.sh` |

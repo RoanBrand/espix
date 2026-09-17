@@ -541,6 +541,17 @@ to read it: the STACK column is `usStackHighWaterMark`, the smallest free figure
 the task has ever reached and not a current reading. A command that leaves a few
 hundred bytes there will overflow on a slightly different path.
 
+The device table is the current example of that, and a measured one: `lsblk`,
+`blkid` and `mount` each build a four-device table on this stack — everything
+`espix_usb_devlist()` can return — so a byte added to `espix_usb_part_t` costs
+sixteen of them here. Widening a partition's `PARTUUID` from an MBR's twelve
+characters to a GPT GUID's thirty-six took that struct from 88 bytes to 112 and
+`espix_usb_dev_t` from 672 to 768: 384 bytes more stack in each of those three
+commands, and 768 more bytes of `.bss` for the two static copies (`s_devs` in
+`host.c`, and `devs` in `cmd_blk.c`, which is static because the USB work task's
+stack could not hold it). `ps` before and after is how that was checked, and how
+the next field added to that struct should be.
+
 ### The VFS fd table is sized by the socket count, and three other things it will not tell you
 
 Four IDF behaviours that cost espix a bug each, all in the space where a stacking

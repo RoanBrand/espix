@@ -32,12 +32,25 @@ extern "C" {
  * slot order so a device keeps its name for as long as it stays plugged in.
  */
 #define ESPIX_USB_MAX_DEVS   4
-#define ESPIX_USB_MAX_PARTS  4       /* what an MBR holds; no GPT yet */
+#define ESPIX_USB_MAX_PARTS  4       /* what an MBR holds, and a GPT entry array
+                                      * has more: a disk with more partitions
+                                      * than this lists the first four and sets
+                                      * table_skipped. Four is what the 4TB SSD
+                                      * that prompted the GPT reader needs --
+                                      * Microsoft reserved, one data volume, one
+                                      * BitLocker -- so the ceiling costs
+                                      * nothing today. */
 #define ESPIX_USB_NAME_MAX   8       /* "sda1" */
 #define ESPIX_USB_FSTYPE_MAX 12      /* "exfat/ntfs" */
 #define ESPIX_USB_LABEL_MAX  24      /* Volume labels are 11 bytes on disk */
 #define ESPIX_USB_UUID_MAX   10      /* "3E4A-1C7B", the FAT volume serial */
-#define ESPIX_USB_PARTUUID_MAX 12    /* "5f8b1c2a-03", signature and entry */
+/*
+ * "5f8b1c2a-03" is an MBR's PARTUUID -- the disk signature and the entry
+ * number, eleven characters. A GPT partition's is the entry's own GUID, 36
+ * characters, and one buffer holds either: the field says which table the disk
+ * had, and a caller never sees both spellings at once.
+ */
+#define ESPIX_USB_PARTUUID_MAX 37
 #define ESPIX_USB_STR_MAX    64      /* Device strings, converted to UTF-8 */
 
 /*
@@ -57,9 +70,11 @@ typedef struct {
      */
     char     uuid[ESPIX_USB_UUID_MAX];
     /*
-     * The MBR disk signature and this entry's number, Linux's PARTUUID for a DOS
-     * table. Empty when the disk's signature is zero -- a partition tool may leave
-     * it so, and inventing one would give every such disk the same identity.
+     * The table's identity for this entry: Linux's PARTUUID. An MBR's is the
+     * disk signature and the entry number, a GPT partition's is the entry's own
+     * GUID, and either is a value `blkid` prints and `/etc/fstab` accepts.
+     * Empty when the table carries no identity for it -- a zero MBR signature,
+     * or a zero GUID.
      */
     char     partuuid[ESPIX_USB_PARTUUID_MAX];
     uint64_t start;                             /* byte offset in the disk */

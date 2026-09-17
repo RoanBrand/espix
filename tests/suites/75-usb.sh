@@ -85,6 +85,26 @@ else
             espix_pass "a partition is listed under its disk"
             assert_contains "the partition has a node in /dev" "$part" \
                             "$(dev_run 'ls /dev')"
+
+            # A partition's PARTUUID has one of two shapes: an MBR's disk
+            # signature and entry number, or a GPT entry's 36-character GUID.
+            # Worth asserting wherever a partition is listed, because this is the
+            # value a /etc/fstab rule takes, and a malformed one is a rule that
+            # can never match -- on a disk that otherwise looks entirely fine.
+            puuid=$(dev_run "blkid $part" |
+                    sed -n 's/.*PARTUUID="\([^"]*\)".*/\1/p')
+
+            if [ -z "$puuid" ]; then
+                espix_skip "the partition's table carries no PARTUUID"
+            elif printf '%s' "$puuid" | grep -qE '^[0-9a-f]{8}-[0-9]{2}$'; then
+                espix_pass "the partition's PARTUUID is an MBR signature and entry"
+            elif printf '%s' "$puuid" |
+                 grep -qE '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'; then
+                espix_pass "the partition's PARTUUID is a GPT entry GUID"
+            else
+                espix_fail "the partition's PARTUUID is neither spelling" \
+                           "actual: $puuid"
+            fi
         else
             espix_skip "no partitions on the attached device"
         fi

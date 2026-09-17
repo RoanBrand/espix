@@ -2,7 +2,8 @@
  * The host role: install the stack, watch for mass-storage devices, and keep a
  * table of what is attached.
  *
- * Stage 1 reads sector 0 and stops there. The partition table is what makes
+ * Stage 1 reads the partition table and stops there: sector 0 for an MBR, and
+ * for a GPT disk the entry array at LBA 1. The partition table is what makes
  * `lsblk` worth having, and reading it is not a mount: no filesystem driver is
  * consulted, nothing is registered with the VFS, and a stick espix cannot drive
  * is described just as carefully as one it can. A mount is a different piece of
@@ -83,6 +84,39 @@
 #define MBR_ENTRY_TYPE     4        /* byte 4 of the entry: the type code */
 #define MBR_ENTRY_LBA      8        /* four bytes, little-endian, from byte 8 */
 #define MBR_ENTRY_SECTORS  12
+
+/*
+ * A GPT header, from the UEFI specification -- the same layout and the same
+ * offsets FatFs parses in ff.c (its GPTH_* and GPTE_* constants, under
+ * FF_LBA64). Only what the walk needs: where the entry array is, how many
+ * entries it holds, and how big each one is.
+ *
+ * The signature is the test for which kind of table a disk has: eight bytes at
+ * a fixed offset, read from LBA 1. Sector 0 cannot answer it, because a GPT
+ * disk's protective MBR is a real MBR entry typed 0xEE that covers the whole
+ * disk.
+ */
+#define GPT_HEADER_LBA      1
+#define GPT_SIGNATURE       "EFI PART"
+#define GPT_HDR_PT_LBA      72      /* QWORD: the entry array's first LBA */
+#define GPT_HDR_PT_COUNT    80      /* DWORD: entries the array holds */
+#define GPT_HDR_ENTRY_SIZE  84      /* DWORD: bytes per entry */
+
+#define GPT_ENTRY_SIZE      128     /* the size every table this has met uses */
+#define GPT_ENTRY_TYPE_GUID 0       /* 16 bytes: what the partition is for */
+#define GPT_ENTRY_UUID      16      /* 16 bytes: this entry's own identity */
+#define GPT_ENTRY_FIRST_LBA 32
+#define GPT_ENTRY_LAST_LBA  40
+
+/*
+ * The ceiling FatFs enforces on its own GPT reader, and the size of the
+ * reference layout in the specification: 128 entries of 128 bytes. A header
+ * claiming more is not one to walk.
+ */
+#define GPT_ENTRIES_MAX     128
+
+/* A GUID written the way Linux writes one: 36 characters and a terminator. */
+#define GUID_STR_LEN        36
 
 /*
  * The EFI System Partition. FAT, so espix can mount it, and absent from the
@@ -362,11 +396,21 @@ static const char *fstype_name(uint8_t type, bool *foreign)
     }
 }
 
-/* A four-byte little-endian field of an MBR partition entry. */
+/*
+ * A four-byte little-endian field: an MBR entry's LBA or sector count, or a
+ * field of a GPT header.
+ */
 static uint32_t entry_u32(const uint8_t *entry, size_t at)
 {
     return (uint32_t)entry[at] | ((uint32_t)entry[at + 1] << 8) |
            ((uint32_t)entry[at + 2] << 16) | ((uint32_t)entry[at + 3] << 24);
+}
+
+/* An eight-byte one, which is how a GPT counts LBAs. */
+static uint64_t entry_u64(const uint8_t *entry, size_t at)
+{
+    return (uint64_t)entry_u32(entry, at) |
+           ((uint64_t)entry_u32(entry, at + 4) << 32);
 }
 
 /*
@@ -399,6 +443,91 @@ static const char *partition_type_name(uint8_t raw, bool *foreign)
         return "vfat";
     }
     return "";
+}
+
+/*
+ * The GPT type GUIDs worth naming, in the byte order they are stored in on disk
+ * -- the first three fields little-endian, so a GUID is not one memcmp away from
+ * its spelling. Microsoft basic data is byte for byte FatFs's own GUID_MS_Basic
+ * (ff.c), which makes it a second opinion rather than a transcription; the
+ * others are the discoverable-partition GUIDs from the UEFI specification, and
+ * what confirms them is a real GPT disk naming its rows.
+ *
+ * Deliberately short, and the division of labour is the point: a GUID says what
+ * the partition is *for*, not what is on it. "Microsoft basic data" covers every
+ * FAT, exFAT, NTFS and BitLocker volume Windows ever wrote, so it names the row
+ * and the partition's own boot sector still has the last word -- the same split
+ * the MBR walk makes between its type byte and its content probe.
+ */
+static const uint8_t GPT_GUID_ESP[16] =
+    {0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B};
+static const uint8_t GPT_GUID_MS_BASIC[16] =
+    {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+static const uint8_t GPT_GUID_MS_RESERVED[16] =
+    {0x16,0xE3,0xC9,0xE3,0x5C,0x0B,0xB8,0x4D,0x81,0x7D,0xF9,0x2D,0xF0,0x02,0x15,0xAE};
+static const uint8_t GPT_GUID_LINUX_FS[16] =
+    {0xAF,0x3D,0xC6,0x0F,0x83,0x84,0x72,0x47,0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4};
+
+/*
+ * The name for a GPT type GUID, the counterpart of partition_type_name(). ""
+ * means nothing here knows it, which leaves the boot sector to answer alone --
+ * and there is no "unknown GUID" string, because a GUID nothing recognises is
+ * information about espix, not about the disk.
+ */
+static const char *gpt_type_name(const uint8_t *guid, bool *foreign)
+{
+    if (memcmp(guid, GPT_GUID_ESP, sizeof(GPT_GUID_ESP)) == 0) {
+        return "vfat";      /* FAT, and the one GPT type espix can mount */
+    }
+    if (memcmp(guid, GPT_GUID_MS_BASIC, sizeof(GPT_GUID_MS_BASIC)) == 0) {
+        return "msdata";
+    }
+    if (memcmp(guid, GPT_GUID_MS_RESERVED, sizeof(GPT_GUID_MS_RESERVED)) == 0) {
+        return "msreserved";
+    }
+    if (memcmp(guid, GPT_GUID_LINUX_FS, sizeof(GPT_GUID_LINUX_FS)) == 0) {
+        *foreign = true;
+        return "linux";
+    }
+    return "";
+}
+
+/*
+ * A GUID spelled the way Linux spells one, so that a PARTUUID read off espix can
+ * be typed into /etc/fstab, and the value `blkid` on the other end of the cable
+ * prints is the value espix prints. Linux's own spelling is the GUID's fields as
+ * written -- first three little-endian -- so the bytes are reordered here rather
+ * than rewritten.
+ *
+ * A GUID of all zeros is no identity at all: empty, because a row of zeros would
+ * match every other row of zeros. The same rule the MBR side applies to a zero
+ * disk signature, for the same reason.
+ */
+static void guid_format(char *dst, size_t dst_len, const uint8_t *raw)
+{
+    /* 36 characters and a terminator. Stated rather than derived, because the
+     * guard is also what lets the compiler see the snprintf cannot truncate. */
+    if (dst == NULL || dst_len < GUID_STR_LEN + 1) {
+        if (dst != NULL && dst_len > 0) {
+            dst[0] = '\0';
+        }
+        return;
+    }
+
+    uint8_t seen = 0;
+    for (size_t i = 0; i < 16; i++) {
+        seen |= raw[i];
+    }
+    if (seen == 0) {
+        dst[0] = '\0';
+        return;
+    }
+
+    snprintf(dst, dst_len,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             raw[3], raw[2], raw[1], raw[0], raw[5], raw[4], raw[7], raw[6],
+             raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
+             raw[15]);
 }
 
 /* The FAT boot sector's volume serial, and the MBR's own identifier. */
@@ -642,7 +771,218 @@ static const char *block_fstype(usb_dev_t *d, uint64_t base, uint8_t *block,
 }
 
 /*
- * Sector 0, then one more read per FAT partition for its label.
+ * A partition's name: the disk's, then the entry's number. Numbered by the
+ * *entry* rather than by the row, so a table with a gap keeps its numbering and
+ * espix agrees with `lsblk`, `fdisk` and `blkid` on the other side of the cable
+ * instead of quietly renumbering itself.
+ *
+ * Written out rather than formatted: snprintf("%s%u") into an eight-byte buffer
+ * is what -Wformat-truncation exists to flag, and it is right to. Three digits
+ * is all an index needs -- an MBR holds four entries and a GPT array 128.
+ */
+static void part_name(char *dst, size_t dst_len, const char *disk, uint32_t entry)
+{
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+
+    size_t n = 0;
+    while (n < 3 && n + 1 < dst_len && disk[n] != '\0') {
+        dst[n] = disk[n];
+        n++;
+    }
+
+    char digits[3];
+    size_t nd = 0;
+    while (entry > 0 && nd < sizeof(digits)) {
+        digits[nd++] = (char)('0' + (int)(entry % 10));
+        entry /= 10;
+    }
+    while (nd > 0 && n + 1 < dst_len) {
+        dst[n++] = digits[--nd];
+    }
+    dst[n] = '\0';
+}
+
+/*
+ * A GPT disk, whose partition table is at LBA 1 rather than in sector 0.
+ *
+ * This is the case that turned up as a 3.6TB Samsung T9: three partitions and a
+ * 3.1TB exFAT volume among them, arriving behind a *protective* MBR, so the walk
+ * below found one entry typed 0xEE covering the whole disk and described a 4TB
+ * drive as a single unreadable partition. The protective entry is honest about
+ * sector 0 and useless as a description of the disk.
+ *
+ * The test is the GPT header's own signature, not the 0xEE entry: an installer
+ * image that carries both tables is a GPT disk with a hybrid MBR, and following
+ * its protective entry would be just as wrong there. By the time this is called,
+ * sector 0 has an MBR signature, so the disk has one table or the other.
+ *
+ * The entry array is up to 16K and is walked a sector at a time in the caller's
+ * buffer. An array holds 128 entries; a disk with two or three partitions that
+ * matter is the ordinary case, and allocating the whole array to read them would
+ * be 16K of heap for nothing. That is also why an entry's GUIDs are read out
+ * before the partition probe refills the buffer they came in.
+ *
+ * Returns true when the disk is a GPT disk and has been handled here -- including
+ * when its header was refused, because the MBR walk has nothing better to say
+ * about a disk whose real table is the one this just rejected.
+ */
+static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
+{
+    if (unit < GPT_ENTRY_SIZE) {
+        return false;       /* an entry would straddle sectors */
+    }
+
+    if (d->bdl->ops->read(d->bdl, buf, unit, (uint64_t)GPT_HEADER_LBA * unit,
+                          unit) != ESP_OK) {
+        return false;
+    }
+    if (memcmp(buf, GPT_SIGNATURE, sizeof(GPT_SIGNATURE) - 1) != 0) {
+        return false;
+    }
+
+    const uint64_t table_lba  = entry_u64(buf, GPT_HDR_PT_LBA);
+    const uint32_t entries    = entry_u32(buf, GPT_HDR_PT_COUNT);
+    const uint32_t entry_size = entry_u32(buf, GPT_HDR_ENTRY_SIZE);
+
+    /*
+     * The two rules FatFs applies to a GPT header before reading its table, and
+     * for the same reasons: an entry size other than 128 bytes would run past the
+     * entry it describes, and an array longer than the specification's 128 is a
+     * header to refuse rather than to walk off the end of.
+     */
+    if (entry_size != GPT_ENTRY_SIZE || entries == 0 || entries > GPT_ENTRIES_MAX) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: a GPT table this cannot walk (%u entries of %u bytes)",
+                   d->info.name, (unsigned)entries, (unsigned)entry_size);
+        d->info.table_skipped = true;
+        return true;
+    }
+
+    uint64_t loaded = UINT64_MAX;       /* which entry-array sector is in `buf` */
+
+    for (uint32_t i = 0; i < entries; i++) {
+        const uint64_t offset = (uint64_t)i * entry_size;
+        const uint64_t lba    = table_lba + offset / unit;
+        const size_t   at     = (size_t)(offset % unit);
+
+        if (lba != loaded) {
+            if (d->bdl->ops->read(d->bdl, buf, unit, lba * unit, unit) != ESP_OK) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "%s: cannot read the GPT entry array", d->info.name);
+                d->info.table_skipped = true;
+                break;
+            }
+            loaded = lba;
+        }
+
+        const uint8_t *entry = buf + at;
+
+        /*
+         * A slot with no type GUID is one the table never used, which is most of
+         * a 128-entry array. The table ends when the entries do, not when a zero
+         * appears -- the same distinction the MBR walk makes between an empty
+         * entry and a 0x00 type byte, and for the same reason: a table can carry
+         * a zeroed field inside an entry that is in use.
+         */
+        bool used = false;
+        for (size_t b = 0; b < 16 && !used; b++) {
+            used = entry[GPT_ENTRY_TYPE_GUID + b] != 0;
+        }
+        if (!used) {
+            continue;
+        }
+
+        const uint64_t first = entry_u64(entry, GPT_ENTRY_FIRST_LBA);
+        const uint64_t last  = entry_u64(entry, GPT_ENTRY_LAST_LBA);
+
+        /* LBAs read off somebody's disk, checked before they are multiplied, so
+         * a nonsense pair cannot wrap into a plausible-looking row. */
+        if (last < first) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: GPT entry %u ends before it starts",
+                       d->info.name, (unsigned)(i + 1));
+            d->info.table_skipped = true;
+            continue;
+        }
+
+        const uint64_t start = first * unit;
+        const uint64_t size  = (last - first + 1) * unit;
+
+        if (d->info.size > 0 &&
+            (start >= d->info.size || size > d->info.size - start)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: GPT entry %u is not inside the device",
+                       d->info.name, (unsigned)(i + 1));
+            d->info.table_skipped = true;
+            continue;
+        }
+
+        /*
+         * Four slots is espix's ceiling, not the table's. A disk with more
+         * partitions than that lists the first four and is counted as incomplete,
+         * because a script reading sda1..sda4 would otherwise never learn that
+         * there was an sda5.
+         */
+        if (d->info.nparts >= ESPIX_USB_MAX_PARTS) {
+            d->info.table_skipped = true;
+            continue;
+        }
+
+        espix_usb_part_t *p = &d->info.parts[d->info.nparts];
+
+        part_name(p->name, sizeof(p->name), d->info.name, i + 1);
+        p->start   = start;
+        p->size    = size;
+        p->foreign = false;
+        guid_format(p->partuuid, sizeof(p->partuuid), entry + GPT_ENTRY_UUID);
+        copy_str(p->fstype, sizeof(p->fstype), gpt_type_name(entry, &p->foreign));
+
+        /*
+         * Then the partition's own first block, exactly as the MBR walk reads it
+         * and for the same reason: the type GUID says what the partition is meant
+         * for and the boot sector says what is on it, and where the two disagree
+         * the content is what to believe. Both GUIDs are already out of the entry
+         * by here, because this read refills the buffer they came in.
+         */
+        if (d->bdl->ops->read(d->bdl, buf, unit, start, unit) == ESP_OK) {
+            bool foreign = false;
+            const char *content = block_fstype(d, start, buf, unit, &foreign);
+
+            if (content[0] != '\0') {
+                copy_str(p->fstype, sizeof(p->fstype), content);
+                p->foreign = foreign;
+
+                if (strcmp(content, "vfat") == 0) {
+                    fat_label(buf, p->label, sizeof(p->label));
+                    fat_serial(buf, p->uuid, sizeof(p->uuid));
+                } else if (strcmp(content, "iso9660") == 0) {
+                    (void)iso_descriptor(buf, p->label, sizeof(p->label));
+                }
+            }
+        }
+
+        /*
+         * A partition holding no filesystem is not one espix failed to name: a
+         * Microsoft reserved entry holds none by definition, and an empty EFI
+         * partition is an ordinary thing to find on a disk prepared by Windows.
+         * It takes a type GUID nothing knows *and* content nothing recognises to
+         * leave the column empty, and that is a fact about the disk worth
+         * admitting to.
+         */
+        if (p->fstype[0] == '\0') {
+            d->info.table_skipped = true;
+        }
+        d->info.nparts++;
+    }
+
+    return true;
+}
+
+/*
+ * Sector 0 -- or, on a GPT disk, LBA 1 and the entry array behind it -- then one
+ * more read per partition for its own first block and its label.
  *
  * The read goes through the block device, whose geometry asks for whole sectors
  * at aligned addresses, and the buffer ends up on the USB wire unchanged -- so it
@@ -751,6 +1091,23 @@ static void read_partition_table(usb_dev_t *d)
                       ((uint32_t)sector[MBR_DISK_ID_OFFSET + 2] << 16) |
                       ((uint32_t)sector[MBR_DISK_ID_OFFSET + 3] << 24);
 
+    /*
+     * A GPT disk, and *after* the two reads above rather than before them: a GPT
+     * disk arrives with an MBR signature, because its protective MBR is a real
+     * entry typed 0xEE covering the whole disk, so the walk below would report a
+     * single unreadable partition and stop. But gpt_read() reads LBA 1 into
+     * `sector`, so sector 0 has to be taken out of that buffer first -- and the
+     * order is the whole reason this sits down here rather than beside the
+     * signature check.
+     *
+     * The test is the GPT header rather than the 0xEE entry, because a hybrid
+     * installer image carries both tables and the GPT one is the real one.
+     */
+    if (gpt_read(d, sector, unit)) {
+        free(sector);
+        return;
+    }
+
     for (size_t i = 0; i < MBR_ENTRIES && d->info.nparts < ESPIX_USB_MAX_PARTS; i++) {
         const uint8_t *entry = table + i * MBR_ENTRY_SIZE;
         const uint8_t  raw = entry[MBR_ENTRY_TYPE];
@@ -788,21 +1145,8 @@ static void read_partition_table(usb_dev_t *d)
 
         espix_usb_part_t *p = &d->info.parts[d->info.nparts];
 
-        /*
-         * "sda1", built by hand, and numbered by the *entry* rather than by the
-         * row: a stick whose second entry cannot be read shows sda1 and sda3, as
-         * fdisk does, instead of quietly renumbering itself and disagreeing with
-         * the tool on the other end of the cable. Five bytes plus the NUL -- the
-         * disk name is always three characters because slot_claim() made it -- and
-         * written out rather than formatted, because snprintf("%s%u") into an
-         * 8-byte buffer is exactly what -Wformat-truncation exists to flag, and it
-         * is right to.
-         */
-        p->name[0] = d->info.name[0];
-        p->name[1] = d->info.name[1];
-        p->name[2] = d->info.name[2];
-        p->name[3] = (char)('1' + (int)i);
-        p->name[4] = '\0';
+        /* "sda1", numbered by the entry rather than by the row: see part_name(). */
+        part_name(p->name, sizeof(p->name), d->info.name, (uint32_t)(i + 1));
         p->start   = start;
         p->size    = size;
         partuuid_format(p->partuuid, sizeof(p->partuuid), d->info.disk_id,

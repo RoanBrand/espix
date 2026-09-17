@@ -29,7 +29,7 @@ together.
 | Category | | | |
 |---|---|---|---|
 | Storage | LittleFS mounted as the real `/` | **yes** | survives reboot and a firmware reflash |
-| Storage | USB host: enumerate, identify, read the partition table | **yes** | `lsusb`, `lsblk`, `blkid`; four device slots, for a hub |
+| Storage | USB host: enumerate, identify, read the partition table (MBR and GPT) | **yes** | `lsusb`, `lsblk`, `blkid`; four device slots, for a hub |
 | Storage | Mount a FAT volume into the namespace | **yes** | through espix's own VFS, so the permission check applies |
 | Storage | `/etc/fstab`, applied on attach | **yes** | device column takes a name, a wildcard, or `LABEL=`/`UUID=`/`PARTUUID=` |
 | Storage | `mount -o uid=,gid=` | **yes** | root hands a volume to a user without giving them root |

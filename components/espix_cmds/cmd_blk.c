@@ -1306,7 +1306,7 @@ static espix_cmd_t s_blk_cmds[] = {
     { .name = "lsblk", .fn = cmd_lsblk,
       /* The MBR limitation belongs where someone will read it, which is the
        * command's own help rather than a document they have not opened. */
-      .help = "list block devices and their filesystems (MBR only, no GPT)",
+      .help = "list block devices and their filesystems (MBR and GPT)",
       .usage = "lsblk [disk]" },
     { .name = "blkid", .fn = cmd_blkid,
       .help = "print a device's identity, filesystem, label and uuid",

@@ -56,7 +56,7 @@ is what it prints. The columns:
 
 | column | what it is |
 |---|---|
-| `NAME` | `sda`, `sdb`… in slot order, with `sda1`… for the partitions in the MBR. The number is the *entry's*, so a skipped one leaves a gap exactly as `fdisk` does |
+| `NAME` | `sda`, `sdb`… in slot order, with `sda1`… for the partitions in the table, MBR or GPT. The number is the *entry's*, so a skipped one leaves a gap exactly as `fdisk` does |
 | `SIZE` | the size the device reports |
 | `TYPE` | `disk` or `part` |
 | `FSTYPE` | what is on it — a partition's filesystem, or on a disk line the filesystem the disk *itself* carries (a superfloppy); empty when there is neither, and `unreadable` when sector 0 could not be read |
@@ -102,12 +102,24 @@ ask" part of this document is.
 
 ### What it reports, and what it cannot
 
-`lsblk`'s own help line carries the headline limitation — `help lsblk` says
-"(MBR only, no GPT)" — because that is where someone will read it. The detail:
+`lsblk` reads either kind of partition table, MBR or GPT. The detail:
 
-- **MBR only, no GPT.** Sector 0 is read and its partition table parsed. A GPT
-disk shows as its *protective MBR* entry — a partition of type `gpt`, marked
-unsupported — which is the honest answer from sector 0 alone.
+- **Both tables.** Sector 0 is read and its partition table parsed; if LBA 1
+carries a GPT header — `"EFI PART"` at the top of it — the GPT entry array is
+walked instead. That signature is the test rather than the protective MBR's
+`0xEE` entry, because a hybrid installer image carries both tables and the GPT
+one is the real one. An entry's *type GUID* names the row — `msdata`,
+`msreserved`, `linux`, or `vfat` for the EFI System Partition, which is FAT and
+mountable — and then the partition's own boot sector has the last word, exactly
+as it does over an MBR type byte. A partition's `PARTUUID` is its GPT entry GUID,
+spelled the way Linux spells one, so the value `blkid` prints on the other end of
+the cable is the value espix prints. Four rows are still the ceiling: a GPT
+array holds 128 entries, and a disk with more than four partitions says so
+(`entries not shown`, `SKIPPED="1"`) rather than listing four as if that were
+all of them. It costs 1,440 bytes of code and 336 bytes of read-only data, and 768
+bytes of static RAM: a GPT `PARTUUID` is 36 characters where an MBR's is eleven,
+which takes `espix_usb_part_t` from 88 bytes to 112, and the two static
+four-device tables pay that sixteen times over.
 - **A disk with no partition table is read as a superfloppy.** One volume covering
 the whole device, no table at all — how most sticks used to ship and how some
 still arrive (the case that produced this code: a SanDisk Cruzer Blade prepared
@@ -117,7 +129,7 @@ examined). Sector 0 is then the filesystem's own boot sector: a FAT one gives
 named and marked unsupported. Two filesystems keep nothing in sector 0 at all and are found by a read further in: **ext2/3/4**, whose superblock is at 1024, and **ISO 9660**, whose primary descriptor is at 32768 — which is why a Linux-prepared stick or an installer image read as a bare disk with an empty `FSTYPE` until those offsets were read. A stick that is empty, or holds something nothing here recognises, stays a bare disk, and nothing is missing from that answer: Linux's own `blkid` reports nothing for such a stick either.
 - **Filesystems espix has no driver for are named, not hidden.** The partition
 table says `exfat/ntfs` (one MBR code covers both, so it is as specific as sector
-0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, `iso9660` when its descriptor does, or `gpt`, each marked `(unsupported)`. `0xEF` — "EFI (FAT-12/16/32)" to `fdisk`, and what every Arch, CachyOS and Windows installer writes — is **`vfat`**, and mountable: it is FAT, and the library has no code for it, so espix adds that one itself. That is the whole reason
+0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, `iso9660` when its descriptor does, or `gpt` for a protective MBR whose GPT header could not be read, each marked `(unsupported)`. On a GPT disk the same happens through the entry's type GUID (`msdata`, `msreserved`, `linux`), with the partition's own boot sector overriding it wherever it can. `0xEF` — "EFI (FAT-12/16/32)" to `fdisk`, and what every Arch, CachyOS and Windows installer writes — is **`vfat`**, and mountable: it is FAT, and the library has no code for it, so espix adds that one itself. That is the whole reason
 the command exists before mounting does: silence would read as an empty disk.
 
   `vfat`, `littlefs` and `raw` are *not* marked, and the marker is about the type
@@ -534,8 +546,11 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
 - **`READ CAPACITY(16)`,** so a drive larger than 2 TiB reports its real size
   instead of a plausible 2 TiB. It is the class driver's choice of SCSI command,
   not espix's, so it belongs to the list below as much as to here.
-- **A GPT reader**, once a disk turns up that needs one. The protective MBR is
-  reported today rather than followed.
+- **The rest of GPT.** The table is read, every partition listed, and each one's
+  PARTUUID printed. An entry's 36-byte UTF-16 *name* is not — Windows writes
+  "Basic data partition" into all of them, and `lsblk` has no column for it —
+  and neither is the disk's own GPT GUID, which Linux reports as the table's
+  PTUUID.
 - **A USB keyboard (HID).** Deferred until there is a display, which is the
   honest position: with no screen, a keyboard's only use would be a test that
   prints what was typed, and nothing else in espix would consume the events. The
@@ -543,8 +558,15 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   that prints decoded keystrokes, type on the keyboard — and it sidesteps the
   can't-plug-both-sockets problem entirely.
 - **exFAT.** `FF_FS_EXFAT` is hardcoded `0` in IDF's `components/fatfs/src/ffconf.h`
-  with no Kconfig to change it, so enabling it means patching a dependency — the
-  `tools/patch-littlefs.py` precedent. Separately: exFAT is covered by Microsoft
+  with no Kconfig to change it, so enabling it means patching a dependency at
+  configure time — `tools/patch-fatfs.py`, the `tools/patch-littlefs.py`
+  precedent, behind `CONFIG_ESPIX_FS_EXFAT` (default `n`; +5,644 bytes of ROM, no
+  static RAM). The driver builds as of that patch; mounting an exFAT volume
+  through the VFS is **not** wired, so a mount's cost is unmeasured. A volume
+  larger than 2TiB also needs `FF_LBA64` — hardcoded `0` in the same file, and
+  only meaningful alongside exFAT, which is why it is one patch and one option:
+  the 3.1TB exFAT volume on the 4TB SSD that prompted the GPT reader cannot be
+  addressed at all with 32-bit LBAs. Separately: exFAT is covered by Microsoft
   patents and FatFs's author has historically noted that a licence may be needed
   for commercial use. **That claim was not verified against IDF or FatFs here — no
   patent or licence text ships with the bundled FatFs — so check Microsoft's own
@@ -609,6 +631,8 @@ under it changes.
     LABEL=BIGFAT            the volume's label
     UUID=3E4A-1C7B          the FAT volume serial, at 0x43 in the boot sector
     PARTUUID=5f8b1c2a-01    the MBR disk signature and the entry number
+    PARTUUID=707cf9a1-11d6-4095-94c7-2880e6f359db
+                            a GPT partition's own GUID, 36 characters
 
 `blkid` prints all three, so a value is read off the device rather than guessed.
 Matching ignores case: FAT stores labels upper case, and blkid prints a vfat
@@ -616,8 +640,8 @@ UUID upper case and a PARTUUID lower. An identity must match exactly one volume
 -- two carrying the same one mounts neither and says so in the log, which is the
 whole point of preferring an identity to a name -- while a wildcard keeps its
 old meaning of matching several. A volume with no label, a disk whose signature
-is zero, and anything on a GPT table (espix reads no GPT) have no identity to
-match on, and say nothing rather than something ambiguous.
+is zero, and a GPT entry whose own GUID is zero have no identity to match on, and
+say nothing rather than something ambiguous.
 
 For a policy that must not move either, pair an identity with a literal point:
 

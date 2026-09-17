@@ -630,7 +630,10 @@ being the shortest path.
   - **exFAT** is a patched dependency rather than a feature. `FF_FS_EXFAT` is
     hardcoded `0` in IDF's `components/fatfs/src/ffconf.h` with no Kconfig to
     change it, so it means carrying a patch the way
-    `tools/patch-littlefs.py` carries one. It is also the one item here with a
+    `tools/patch-littlefs.py` carries one — which is now done:
+    `tools/patch-fatfs.py` behind `CONFIG_ESPIX_FS_EXFAT` (default `n`; +5,644
+    bytes of ROM, no static RAM), with the mount side still to wire. `FF_LBA64`
+    rides the same option, since only an exFAT volume gets past 2TiB. It is also the one item here with a
     legal question attached: exFAT is covered by Microsoft patents, and FatFs's
     author has said a licence may be needed for commercial use. **That has not
     been verified against IDF or FatFs here** — no patent or licence text ships
@@ -641,8 +644,11 @@ being the shortest path.
     already names both as recognised and unsupported, which is the honest
     position until then — and names ext2/3/4 specifically, from the superblock,
     on a partition (`0x83`) and on a whole-device volume alike.
-  - **GPT** wants a partition-table reader rather than a parser change: the
-    protective MBR is reported today rather than followed.
+  - **GPT** is done, and arrived exactly as the line above predicted: a reader
+    rather than a parser change, in `host.c` beside the MBR walk. What asked for
+    it was a 4TB Samsung T9 — three partitions behind a protective MBR, one
+    unreadable row before. What is left of it is small: an entry's UTF-16
+    partition name, and the disk's own GUID, neither of which is printed today.
   - **A USB keyboard** is the interesting one and needs no display and no serial
     port to test: SSH in over WiFi, print decoded keystrokes, and type. That
     sidesteps the hub-blocks-the-UART-socket problem entirely, which is the part
