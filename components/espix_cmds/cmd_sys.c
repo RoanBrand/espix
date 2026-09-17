@@ -1105,6 +1105,103 @@ static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * IDF's levels, indexed by their own enum, so the index *is* the level.
+ *
+ * Separate from k_level_names above because the two numberings are unrelated:
+ * espix_klog's is ERROR=0..DEBUG=3 and IDF's is NONE=0..VERBOSE=5 -- so
+ * `dmesg -n 2` and `log <tag> 2` mean different things, and sharing one table
+ * would make that a trap rather than a fact.
+ */
+static const char *const k_esp_level_names[] = {
+    "none", "err", "warn", "info", "debug", "verbose"
+};
+
+static bool esp_level_from_arg(const char *arg, esp_log_level_t *out)
+{
+    for (size_t i = 0; i < sizeof(k_esp_level_names) / sizeof(k_esp_level_names[0]); i++) {
+        if (strcmp(arg, k_esp_level_names[i]) == 0) {
+            *out = (esp_log_level_t)i;
+            return true;
+        }
+    }
+
+    if (arg[0] >= '0' && arg[0] <= '5' && arg[1] == '\0') {
+        *out = (esp_log_level_t)(arg[0] - '0');
+        return true;
+    }
+    return false;
+}
+
+/*
+ * log <tag> [level] -- a component's log level, at runtime.
+ *
+ * This is IDF's esp_log_level_set()/esp_log_level_get(), which is what every
+ * ESP-IDF application reaches for to turn one subsystem's chatter on without
+ * rebuilding. It is worth having here for a specific reason: much of what
+ * espix's own code cannot see is logged by IDF at DEBUG -- a FatFs FRESULT, a
+ * USB transfer's failure -- so without this the only way to read those numbers
+ * is to edit a component's source and change its log level. `dmesg` looks like
+ * it should do this and does not: it reads espix's ring and sets which of
+ * *espix's* lines reach the console.
+ *
+ * `*` is every tag, as IDF defines it. Not enumerable -- IDF keeps its tag table
+ * private and offers no way to walk it -- so this reports one tag at a time
+ * rather than listing.
+ *
+ * Root only to set, readable by anyone: the same split `dmesg -n` draws, and for
+ * the same reason. One session raising a noisy tag's level fills the ring and
+ * the console for everyone on the device.
+ */
+static int cmd_log(espix_session_t *s, int argc, char **argv)
+{
+    if (argc == 1) {
+        espix_printf(s, "usage: log <tag> [level]\n"
+                        "       levels: %s, %s, %s, %s, %s, %s  (or 0-5)\n"
+                        "       '*' is every tag -- IDF's own wildcard\n",
+                     k_esp_level_names[0], k_esp_level_names[1],
+                     k_esp_level_names[2], k_esp_level_names[3],
+                     k_esp_level_names[4], k_esp_level_names[5]);
+        /*
+         * Said here rather than only in the docs, because asking for "verbose"
+         * and seeing nothing happen looks like a broken command. IDF compiles
+         * out whatever is above CONFIG_LOG_MAXIMUM_LEVEL, and ESP_LOGV is a
+         * no-op when the ceiling is DEBUG -- which it is in this build.
+         */
+#if CONFIG_LOG_MAXIMUM_LEVEL < 5
+        espix_printf(s, "note: this build compiles up to %s; "
+                        "'verbose' will show nothing\n",
+                     k_esp_level_names[CONFIG_LOG_MAXIMUM_LEVEL]);
+#endif
+        return 0;
+    }
+
+    const char *tag = argv[1];
+
+    if (argc == 2) {
+        const esp_log_level_t cur = esp_log_level_get(tag);
+        espix_printf(s, "%s: %s\n", tag,
+                     (cur <= ESP_LOG_VERBOSE) ? k_esp_level_names[cur]
+                                              : "unknown");
+        return 0;
+    }
+
+    esp_log_level_t level;
+    if (!esp_level_from_arg(argv[2], &level)) {
+        espix_eprintf(s, "log: bad level '%s'; want 0-5 or none/err/warn/"
+                         "info/debug/verbose\n", argv[2]);
+        return 1;
+    }
+    if (s != NULL && s->uid != 0) {
+        espix_eprintf(s, "log: only root may change a log level\n");
+        return 1;
+    }
+
+    esp_log_level_set(tag, level);
+    espix_printf(s, "%s: %s\n", tag, k_esp_level_names[level]);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 
 static int cmd_coredump(espix_session_t *s, int argc, char **argv)
@@ -1723,6 +1820,9 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "dmesg",  .fn = cmd_dmesg,
       .help = "print the kernel log",
       .usage = "dmesg [-T] [-n <level>]" },
+    { .name = "log",    .fn = cmd_log,
+      .help = "show or set a component's log level",
+      .usage = "log <tag> [level]" },
     { .name = "coredump", .fn = cmd_coredump,
       .help = "show or erase the stored core dump",
       .usage = "coredump [erase]" },

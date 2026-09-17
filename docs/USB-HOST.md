@@ -717,6 +717,21 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
 | `ESPIX_USB_VERBOSE` | raises exactly the USB tags (`USBH`, `ENUM`, `EXT_HUB`, `EXT_PORT`, `HUB`, `HCD DWC`, `USB HOST`, `USB_MSC`) to DEBUG at boot. **The switch to reach for when a device does not appear** — with it off, a working enumeration and an empty socket look identical. Costs log volume: the ring holds `ESPIX_KLOG_LINES` (96) lines and this fills it |
 | `ESPIX_USB_NCM_ENABLED` | unchanged, now `depends on ESPIX_USB_ROLE_DEVICE` |
 
+And one that is not a config at all, because it does at runtime what
+`ESPIX_USB_VERBOSE` does at boot, and for the tags that option does not name:
+
+| command | what it does |
+|---|---|
+| `log <tag> <level>` | IDF's `esp_log_level_set()`, so a component's log level can be raised without rebuilding — `log USB_MSC debug`, or `log "*" debug` for every tag. Root only to set; `log <tag>` reports one. This matters because the number worth having is often logged by IDF at DEBUG, and until this existed the only way to read one was to edit the component and change its level. `dmesg` looks like it should do this and does not: it reads espix's ring and decides which of *espix's* lines reach the console (`dmesg -n`) |
+
+The two numberings differ, and the commands do not pretend otherwise. espix's
+levels run `err/warn/info/debug` as 0-3 (`dmesg -n`), IDF's run
+`none/err/warn/info/debug/verbose` as 0-5 (`log`). So `dmesg -n 1` is espix's
+`warn` where `log <tag> 1` is IDF's `err`: two different things wearing the same
+digit. Prefer the words. `verbose` is also compiled out in this build
+(`CONFIG_LOG_MAXIMUM_LEVEL` is `DEBUG`), and `log` with no arguments says so
+rather than leaving a silent no-op.
+
 One trap, because it has cost espix a build before: **an existing `sdkconfig`
 wins over `sdkconfig.defaults` and over Kconfig defaults**, silently. Changing
 the default, or adding a line to `sdkconfig.defaults`, can be correct in every

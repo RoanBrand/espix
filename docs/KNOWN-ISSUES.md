@@ -933,6 +933,29 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   prompt is never left buried — but the messages themselves are not going to
   stop appearing. Do not "fix" this by routing klog through the current session.
 
+- **An IDF component's line arrives as two ring entries, and the second one's
+  level is guessed wrong.** espix captures `ESP_LOGx` output by installing a
+  `esp_log_set_vprintf()` hook (`klog.c`), because most of what espix cannot see
+  is logged by IDF rather than by espix — a FatFs `FRESULT`, a USB transfer's
+  failure. IDF's formatter reaches that hook more than once per message, so one
+  `ESP_LOGW` becomes two lines in `dmesg`: the header, and then the text.
+
+      [     2.400] W W (2400) wifi:
+      [     2.400] I Password length matches WPA2 standards, authmode threshold changes from OPEN to WPA2
+
+  The first line is espix's own level letter followed by IDF's, which reads as a
+  duplicated `W W (2400) wifi:`; the second has no prefix at all, so
+  `level_from_esp_log()` falls back to the first character of the text and lands
+  on `I` — the message above is a *warning*. Neither is repaired: joining the two
+  needs the hook to hold the header across two calls, and it is called from every
+  task, so that is shared state on the logging path.
+
+  Cosmetic, and it does not lose the message — which is the point of capturing
+  IDF at all. Worth knowing before reading a level off an IDF line: trust the
+  header's letter, not the body's. The same test that reads IDF lines should
+  read them through `log <tag> debug`, which is what raises a tag's level at
+  runtime.
+
 ## SSH
 
 - **Only a *process* reads stdin, not a builtin.** `ssh host 'testapp cat'
