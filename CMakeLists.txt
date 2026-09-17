@@ -58,6 +58,22 @@ if(NOT espix_fatfs_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-fatfs.py failed; see the message above")
 endif()
 
+# Add READ CAPACITY(16), READ(16) and WRITE(16) to espressif/usb_host_msc,
+# which speaks only the (10) commands and their 32-bit LBAs -- unreadable past
+# 2TiB, and READ CAPACITY(10) itself saturates there rather than reporting the
+# real size. Found on a real 3.6TB Samsung T9, which read back as exactly
+# 2,199,023,255,040 bytes. See docs/USB-HOST.md and tools/patch-msc.py.
+#
+# After project(), same reasoning as the littlefs hook above: the component
+# manager has to have downloaded the tree first.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-msc.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_msc_patch_result)
+if(NOT espix_msc_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-msc.py failed; see the message above")
+endif()
+
 # Build fsroot/ into a LittleFS image for the "storage" partition. This is how
 # the initial rootfs (and, until SCP exists, cross-compiled apps) get onto the
 # device: `idf.py storage-flash`.

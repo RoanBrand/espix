@@ -1560,7 +1560,19 @@ static esp_err_t attach_device(uint8_t address)
         d->device = device;
         d->bdl = bdl;
         d->info.sector_size = info.sector_size;
-        d->info.size = (uint64_t)info.sector_count * info.sector_size;
+        /*
+         * Not (uint64_t)info.sector_count * info.sector_size: sector_count is
+         * a uint32_t in msc_host_device_info_t (public API, so left alone by
+         * tools/patch-msc.py), and stays 32-bit even on a disk that answered
+         * READ CAPACITY(16). The blockdev's own geometry is the patched
+         * 64-bit figure -- disk_size in msc_bdl.c, fed from block_count_64 --
+         * so it is read from there instead. Without this, the disk row itself
+         * would show the true size (msc_host_get_device_info() still returns
+         * the truncated one, but nothing here reads it for this) while every
+         * partition past 2TiB failed the "is this inside the device" bounds
+         * check in the MBR and GPT walks below and vanished silently.
+         */
+        d->info.size = bdl->geometry.disk_size;
         d->info.id_vendor = info.idVendor;
         d->info.id_product = info.idProduct;
         wstr_to_utf8(info.iManufacturer, d->info.manufacturer,
