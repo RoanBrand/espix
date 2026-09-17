@@ -299,6 +299,7 @@ DISKIO_SECT_BLOCK = "\n".join([
 
 DISKIO_BDL_HEADER_OLD = '#include "esp_compiler.h"\n'
 
+
 # insert_before() would put this block ahead of the anchor, and the anchor line
 # is repeated inside it -- so the next run would find the anchor's own copy
 # first, mistake the insertion for the anchor, and insert a second block. The
@@ -348,6 +349,35 @@ DISKIO_BDL_EDITS = [
         "        DISKIO_SECT end_sector = *((DISKIO_SECT *)buff + 1);\n",
         "DISKIO_SECT start_sector = *((DISKIO_SECT *)buff)",
         "diskio_bdl.c trim",
+    ),
+    # A failed read is named with the byte address it was for. This is a
+    # diagnostic, and it earns its place: a sector read that fails on the 3.1TB
+    # T9 about one run in ten appears at the filesystem as an indistinguishable
+    # `errno`, and where that address falls -- above the 2TiB mark, so the
+    # widened 64-bit path, or below it, alongside the unexplained GPT-array
+    # quirk the same drive already showed -- is the measurement that says which
+    # layer to look at. Only a *failure* logs, so a working read costs one
+    # compare.
+    (
+        "    esp_err_t err = drv->handle->ops->read(drv->handle, buff, count * sec_size,\n"
+        "                                           (uint64_t)sector * sec_size, count * sec_size);\n"
+        "    if (unlikely(err != ESP_OK)) {\n"
+        "        ESP_LOGE(TAG, \"BDL read failed (0x%x)\", err);\n"
+        "        return RES_ERROR;\n"
+        "    }\n",
+        "    esp_err_t err = drv->handle->ops->read(drv->handle, buff, count * sec_size,\n"
+        "                                           (uint64_t)sector * sec_size, count * sec_size);\n"
+        "    if (unlikely(err != ESP_OK)) {\n"
+        "        /* espix: the address, not just the failure -- see the note in\n"
+        "         * tools/patch-fatfs.py. Addr is absolute on the device this view\n"
+        "         * was made from, so it compares directly with the disk's size. */\n"
+        "        ESP_LOGE(TAG, \"BDL read failed (0x%x) at addr %llu, %u sector(s) of %u\",\n"
+        "                 err, (unsigned long long)((uint64_t)sector * sec_size),\n"
+        "                 (unsigned)count, (unsigned)sec_size);\n"
+        "        return RES_ERROR;\n"
+        "    }\n",
+        "espix: the address, not just the failure",
+        "diskio_bdl.c read diagnostic",
     ),
 ]
 
