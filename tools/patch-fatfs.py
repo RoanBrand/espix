@@ -148,7 +148,7 @@ FFCONF_LABEL_BLOCK = chr(10).join([
     "#define CONFIG_FATFS_USE_LABEL" + (chr(9) * 1) + "0",
     "#endif",
 ]) + chr(10)
-MARK_FFCONF_LABEL = "CONFIG_ESPIX_FS_EXFAT reaches FF_USE_LABEL in C"
+MARK_FFCONF_LABEL = " * what compiles that block."
 
 MARK_FFCONF = "CONFIG_ESPIX_FS_EXFAT"
 
