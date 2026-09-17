@@ -207,6 +207,42 @@ FFCONF_LABEL_BLOCK = chr(10).join([
 ]) + chr(10)
 MARK_FFCONF_LABEL = " * what compiles that block."
 
+# The readdir failure, at ERROR level.
+#
+# IDF logs this FRESULT at DEBUG (vfs_fat.c:1155), and nothing turns DEBUG on
+# for that tag in an espix build -- so the one number that separates the two
+# possible causes never reaches the ring. It matters because IDF maps *both* to
+# EIO (vfs_fat.c:420-421):
+#
+#   FR_DISK_ERR  a read or write failed -- diskio_bdl.c would have logged it too
+#   FR_INT_ERR   a read succeeded and returned data FatFs could not parse, which
+#                on exFAT is usually the entry-set checksum (ff.c:2190)
+#
+# The offset is added for the same reason: it says how far into the directory the
+# walk had got, which is where a bad sector would sit.
+VFS_READDIR_OLD = "\n".join([
+    "    FRESULT res = f_readdir(&fat_dir->ffdir, &fat_dir->filinfo);",
+    "    if (res != FR_OK) {",
+    "        *out_dirent = NULL;",
+    '        ESP_LOGD(TAG, "%s: fresult=%d", __func__, res);',
+    "        return fresult_to_errno(res);",
+    "    }",
+])
+VFS_READDIR_NEW = "\n".join([
+    "    FRESULT res = f_readdir(&fat_dir->ffdir, &fat_dir->filinfo);",
+    "    if (res != FR_OK) {",
+    "        *out_dirent = NULL;",
+    "        /* espix: error level, and the offset -- see tools/patch-fatfs.py.",
+    "         * FR_DISK_ERR and FR_INT_ERR both reach errno as EIO, so the number",
+    "         * is the only thing that says whether a read failed or one returned",
+    "         * data FatFs could not parse. */",
+    '        ESP_LOGE(TAG, "%s: fresult=%d at entry offset %lu", __func__, res,',
+    "                 (unsigned long)fat_dir->offset);",
+    "        return fresult_to_errno(res);",
+    "    }",
+])
+MARK_VFS_READDIR = "espix: error level, and the offset"
+
 MARK_FFCONF = "CONFIG_ESPIX_FS_EXFAT"
 
 # FF_LBA64 is a second hardcoded 0 in the same file, and exFAT does not work
@@ -711,6 +747,9 @@ def main() -> int:
                                    MARK_C_OPS, str(source.name) + " get_ops")
         source_new = replace_once(source_new, C_REGISTER_OLD, C_REGISTER_NEW,
                                   MARK_C_HELPER, str(source.name) + " register")
+        source_new = replace_once(source_new, VFS_READDIR_OLD, VFS_READDIR_NEW,
+                                  MARK_VFS_READDIR,
+                                  str(source.name) + " readdir diagnostic")
 
         ffconf_new = replace_once(ffconf_text, FFCONF_OLD, FFCONF_NEW,
                                   MARK_FFCONF, str(ffconf.name) + " exFAT")

@@ -248,6 +248,7 @@ esp_err_t espix_fs_rm_rf(const char *abs_path)
     }
 
     esp_err_t err = ESP_OK;
+    int       why = 0;
     struct dirent *ent;
 
     while ((ent = readdir(dir)) != NULL) {
@@ -266,6 +267,13 @@ esp_err_t espix_fs_rm_rf(const char *abs_path)
          * ESPIX_PATH_MAX, so this cannot run away. */
         err = espix_fs_rm_rf(child);
         if (err != ESP_OK) {
+            /*
+             * Held across the unwind, and restored below. errno is what carries
+             * the *reason* -- a read-only volume answers EROFS, not ESP_FAIL --
+             * and it would otherwise be lost to closedir() on the way out, which
+             * is how a refusal came to be reported as a bare "ESP_FAIL".
+             */
+            why = errno;
             break;
         }
     }
@@ -273,6 +281,7 @@ esp_err_t espix_fs_rm_rf(const char *abs_path)
     closedir(dir);
 
     if (err != ESP_OK) {
+        errno = why;
         return err;
     }
     return (rmdir(abs_path) == 0) ? ESP_OK : ESP_FAIL;

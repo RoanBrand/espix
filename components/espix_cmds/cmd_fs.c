@@ -673,9 +673,19 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
         }
 
         if (recursive) {
+            /*
+             * errno first. espix_fs_rm_rf() reports that it failed; errno is
+             * what says *why*, and why is the whole answer here -- a read-only
+             * volume answers EROFS on the unlink, and "Read-only file system"
+             * is useful where esp_err_to_name()'s "ESP_FAIL" is not. Cleared
+             * first so a stale value cannot be read as this call's reason.
+             */
+            errno = 0;
             const esp_err_t err = espix_fs_rm_rf(abs);
             if (err != ESP_OK) {
-                espix_eprintf(s, "rm: %s: %s\n", abs, esp_err_to_name(err));
+                espix_eprintf(s, "rm: %s: %s\n", abs,
+                              (errno != 0) ? strerror(errno)
+                                           : esp_err_to_name(err));
                 status = 1;
             }
         } else if (unlink(abs) != 0) {

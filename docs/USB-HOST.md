@@ -616,40 +616,36 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   under a different, apparently unsafe, access pattern. Not done this
   session because it is real work for a symptom that costs nothing today —
   `SKIPPED="1"` already says the listing may be incomplete, honestly.
-- **A directory read on the same disk fails intermittently, and this is the
-  same drive.** Listing one directory on the T9 in a loop — mounted read-only,
-  so nothing else is touching it — fails roughly one run in ten, on the read
-  that would advance to the *next* directory sector. It lands in one of two
-  places, and the two look nothing alike:
+- **A read on the same disk sometimes returns data FatFs cannot parse, and this
+  is the drive the GPT quirk above was found on.** Directory listings on the T9
+  come back truncated, sometimes badly -- one run in six listed 2 of `Games/`'s
+  9 entries -- and the missing entries are back on the next call. Nothing is
+  lost; what is wrong is the read.
 
-  - while advancing: the walk ends early and the listing is short. Seen as
-    `13 entries` for a directory that holds 19, with no error reported anywhere,
-    which is how it was mistaken for missing files.
-  - on the read past the last entry: every entry is listed and the failure comes
-    after them — `stopped after 19 entries: I/O error` — which is a complete
-    listing with a read error attached.
+  It is *not* a failed read, which is the part worth knowing. `diskio_bdl.c`
+  logs every failed block-device read, and the log is empty: the transfer
+  succeeds and the bytes are wrong. FatFs catches that itself with `FR_INT_ERR`
+  (`fresult=2`) -- on exFAT almost always the entry-set checksum at `ff.c:2190`
+  -- and IDF maps `FR_INT_ERR` and `FR_DISK_ERR` alike to `EIO`, so the surface
+  says only "I/O error". The FRESULT is what separates "a read failed" from "a
+  read lied", which is why `tools/patch-fatfs.py` now logs it at error level,
+  with the directory offset it happened at, and logs the address of any failed
+  block-device read beside it.
 
-  Both are now *reported*: `ls` used to swallow the `errno` IDF hands out of a
-  failed `readdir`, so neither was visible. See
-  [UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)
-  for why `NULL` cannot be told from end-of-directory, and
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md) for the standing entry.
+  Measured on a read-only mount: 0 in 115 listings of the root when warm, 0 in
+  60 on a read-write mount, 8 in 25 when the root was listed for the *first*
+  time after mounting, and 2 in 6 on `Games/` warm. So it is neither a cold-start
+  effect alone nor a read-write one -- but it is per-access, so a longer
+  directory sees it sooner.
 
-  Nothing is lost either way — the entries are on the medium and the read is
-  retried on the next call — but **mount this drive read-only** until it is
-  understood. A read that goes wrong is recoverable; a write that goes wrong puts
-  the bad copy back, and FatFs caches what it reads. `-o ro` makes that refusal
-  real rather than advisory: it rides on the block device, so FatFs answers
-  `FR_WRITE_PROTECTED` before the disk is touched.
+  This is very likely the *same* bug as the GPT-array entry above: the same
+  disk, the same "one LBA, two answers" shape, once caught by a partition-table
+  checksum and once by an exFAT one. That would make it one read-corruption bug
+  seen from two filesystems rather than two bugs. **Mount this drive read-only
+  until it is understood** -- a read that goes wrong is recovered by the retry,
+  where a write that goes wrong puts the bad copy back, and FatFs caches what it
+  reads. [KNOWN-ISSUES.md](KNOWN-ISSUES.md) has the standing entry.
 
-  This is plausibly the *same* fault as the GPT-array entry above — the same
-  disk, the same "the same LBA gives a different answer moments later" shape,
-  once seen in the partition table and once in a directory. That would make it
-  one bug at the read level rather than two in two filesystems, which is the real
-  reason to document it here: the layer is a guess, not a finding. The
-  measurement that would settle it is logging the failing LBA in the diskio
-  layer — above the 2TiB mark it is the widened 64-bit path; below it, it is
-  the older quirk.
 - **A USB keyboard (HID).** Deferred until there is a display, which is the
   honest position: with no screen, a keyboard's only use would be a test that
   prints what was typed, and nothing else in espix would consume the events. The

@@ -1047,30 +1047,46 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   port involved. `idf.py coredump-info`, via `make coredump`, is for the backtrace
   rather than for the reason. [UPSTREAM.md](UPSTREAM.md) carries the report.
 
-- **A directory read on the 3.1TB T9 fails intermittently.** Measured on the
-  Samsung T9, mounted read-only, listing the same directory in a loop: roughly
-  one run in ten fails a read of the *next* directory sector. It is the drive or
-  the read path, not the filesystem — the bytes on the medium are fine, and the
-  listing that follows is complete.
+- **A read on the 3.1TB T9 sometimes returns data FatFs cannot parse.** Measured,
+  and traced to the layer that can be named: the read **succeeds** and the bytes
+  are wrong. Nothing fails at the block device -- `diskio_bdl.c` logs every failed
+  read and never logged one -- and FatFs refuses the result itself, with
+  `FR_INT_ERR` (`fresult=2`), which on exFAT is usually the entry-set checksum at
+  `ff.c:2190`. IDF maps both `FR_INT_ERR` and `FR_DISK_ERR` to `EIO`, so at the
+  surface it is an indistinguishable "I/O error"; the FRESULT is what separates
+  "a read failed" from "a read lied".
 
-  What it looks like depends on where it lands, and that is why it was mistaken
-  for data loss the first time:
+  It shows up as a truncated directory listing, sometimes badly -- one run in six
+  listed 2 of `Games/`'s 9 entries, and the missing ones are back on the next
+  call. **Nothing is lost:** the entries are on the medium, and every "missing"
+  entry reappeared on a re-list. `ls` reports it
+  ([UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)),
+  so it is visible rather than silent, which is the whole difference between a
+  short listing and apparent data loss.
 
-  - failing while *advancing* through the directory: the walk ends early and the
-    listing is genuinely short. Seen as `13 entries` for a directory holding 19,
-    with no error anywhere, before `ls` learned to report one.
-  - failing on the read that looks *past* the last entry: every entry is listed
-    and the failure is reported after them — `stopped after 19 entries: I/O
-    error` — which is a complete listing with a read error attached.
+  How often depends on the directory and on whether the mount is cold, measured
+  mounted read-only:
 
-  `ls` reports it now ([UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)),
-  so this is visible rather than silent, and it costs nothing: the entries are
-  there and the read is retried next time.
+  | what was listed | failures |
+  |---|---|
+  | the root, warm mount | 0 in 115 |
+  | the root, read-write mount | 0 in 60 |
+  | the root, first listing after a fresh mount | 8 in 25 |
+  | `Games/`, warm mount | 2 in 6 |
 
-  Unresolved. The first question is the failing LBA — whether it is past the 2TiB
-  mark, which would point at the widened 64-bit path, or below it, which would
-  put it with the unexplained GPT-era quirk this drive already showed (the same
-  LBA returning different bytes on two reads moments apart). Logging the LBA in
-  the diskio layer is the one measurement that would separate the two, and it has
-  not been done yet. Until then: **mount the T9 read-only.** A read that goes
-  wrong is recoverable; a write that goes wrong puts the bad copy back.
+  So it is not only a cold-start effect, and not a read-write one: a rw mount was
+  measured clean over 60 listings. Longer directories seem to fare worse, which
+  fits a per-sector probability.
+
+  What it is *not*: a failed read, a 32-bit address problem (the entries that go
+  missing are in a directory near the start of a 3.1TB volume), or anything in
+  espix's own code. It is the same signature as the GPT-array quirk this drive
+  already showed -- the same LBA giving different bytes on two reads -- which
+  makes it very likely one read-corruption bug seen from two filesystems.
+
+  Unresolved, and the next measurement is a comparison of the bytes read from
+  one LBA on a cold access against the same LBA warm: that would say whether the
+  buffer is stale, the transfer is short, or the drive itself is answering
+  wrongly. Until then: **mount this drive read-only.** A read that goes wrong is
+  recoverable -- the retry succeeds -- where a write that goes wrong puts the bad
+  copy back, and FatFs caches what it reads.
