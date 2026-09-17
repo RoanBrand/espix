@@ -1075,7 +1075,10 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   looked like.
 
   A probe read the first 200 single-sector accesses after each mount a second
-  time and compared the two buffers. On a failing mount, six of them disagreed --
+  time and compared the two buffers. It was removed once it had answered -- 512
+  bytes of `.bss` and a doubled read for the first accesses of every mount is a
+  lot to carry for a question that is settled -- so this is a measurement that
+  was made, not one that can be repeated by running something today. On a failing mount, six of them disagreed --
   the same address, read twice, giving different bytes. **No read failed:** the
   block device reported success every time, which is why `diskio_bdl.c`'s own
   "read failed" log stayed empty and why this looked like a filesystem fault for

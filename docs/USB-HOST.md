@@ -619,7 +619,9 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
 - **A repeated read of the same address on the T9 returns different bytes, and
   this is the drive the GPT quirk above was found on.** Measured with a probe
   that read the first 200 single-sector accesses after a mount a second time and
-  compared them: six disagreed on a failing mount. No read failed -- the block
+  compared them: six disagreed on a failing mount. The probe has since been
+  removed, having answered its question; the measurement stands, but nothing in
+  the tree reproduces it now. No read failed -- the block
   device answered success every time -- so `diskio_bdl.c`'s failed-read log
   stayed empty and this spent a while looking like a filesystem fault.
 
