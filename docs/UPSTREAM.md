@@ -807,10 +807,36 @@ a cast through `off_t` in the shared size formatter, and is fixed; the first is 
 ceiling itself. No file over 4 GiB can be reported or seeked correctly, whatever
 espix does above it.
 
+**The same 32-bit narrowing, twice more.** Reaching a 3.1 TB volume found the
+other two places a size passed through a type narrower than the value:
+
+- `df`'s plain `1K-blocks` column formatted each figure through `unsigned`, so a
+  3.1 TB volume — 3,371,628,178 1K-blocks — both wrapped and could subtract into
+  a negative that printed as a huge number. It is `%llu` on a `uint64_t` now, and
+  the available figure is derived in 64-bit rather than from two truncated ones.
+- `df -h`'s rootfs row still cast through `off_t` before calling the formatter,
+  which is the 6.0G/2.0G bug surviving in the one row the earlier fix did not
+  cover: the volume rows beneath it passed a `uint64_t` and were right.
+
+The rule that keeps it fixed: `espix_cmd_size()` takes a `uint64_t` and every
+caller hands it one. A size carried in a 32-bit type anywhere between the driver
+and the formatter is the bug, and it is silent.
+
+There is a fourth, which reaching T also exposed and which was **not** the 32-bit
+ceiling: the formatter's unit table stopped at `G`. A 3.1 TB volume printed as
+`3214G` in `df`, `lsblk` and `ls` alike, because all three share that one
+function. Two rounding faults came out with it — the tenths were rounded *up*
+rather than to the nearest, and the whole unit was rounded a second time, so
+3.638 TiB printed as `4T` before it printed as `3.7T`. Corrected against
+coreutils: round the tenths to nearest, truncate the unit, so `3.6T`.
+
 A patch in the shape of the other two — a build-time define on the newlib headers
-— would fix it. It is also the one patch that would touch every `struct stat` in
-the image, so it wants a deliberate decision rather than riding along with
-something else. docs/ROADMAP.md is where that decision is written down.
+— would fix the ceiling. It is also the one patch that would touch every `struct
+stat` in the image, so it wants a deliberate decision rather than riding along
+with something else. docs/ROADMAP.md is where that decision is written down.
+Until then the four-byte-`off_t` cases above are the ones to watch for, and
+`st_size` — so `ls -l`'s own size column — is the remaining one that is still
+truncated: a file over 4 GiB still lists as its low 32 bits.
 
 ## `FF_USE_LABEL` is a bare symbol, and exFAT is what compiles the line using it
 
@@ -826,3 +852,101 @@ Enabling exFAT compiles that block, and the build fails with
 espix's patch adds a `#ifndef CONFIG_FATFS_USE_LABEL` fallback ahead of the
 define; `tools/patch-fatfs.py` carries the same note. Upstream, the fix is
 either a `default y` on the option or that guard.
+
+## A failed `readdir` and the end of a directory are the same NULL
+
+FatFs reports a directory read failure honestly. `dir_read` propagates the
+`FR_DISK_ERR` out of `move_window(fs, dp->sect)` (`ff.c:2349-2350`), and IDF
+carries it all the way:
+
+- `vfs_fat_readdir_r` sets `*out_dirent = NULL` and returns the errno
+  (`vfs_fat.c:1153-1157`);
+- `vfs_fat_readdir` sets `errno` and returns `NULL` (`vfs_fat.c:1131-1134`).
+
+The POSIX `readdir` contract is what loses it: `NULL` means end-of-directory,
+and a caller that does not read `errno` cannot tell the two apart. espix's `ls`
+did not — its loop was `while ((ent = readdir(dir)) != NULL)` and the file held
+no `errno` reference at all — so a walk that failed part-way printed a short
+listing and a count of what it had managed to read. On a 3.1TB exFAT volume that
+read `13 entries` for a directory holding 19, which is not a truncated listing
+to anyone reading it: it is a directory that holds 13 things.
+
+**espix's workaround:** clear `errno` immediately before *every* `readdir` --
+after all other work in the iteration, with nothing between the reset and the
+call. Two placements that look right do not work, and both were tried on
+hardware rather than reasoned about:
+
+- clearing it once outside the loop. Anything before the first `readdir` can set
+  it, and `opendir` does.
+- clearing it after the `NULL` check. The per-entry `stat()` below sets `errno`
+  in the ordinary course of a *successful* listing -- a lookup that misses a probe
+  and then answers from the rule leaves `ENOENT` behind -- so by the next
+  iteration's end-of-directory the reset has long been overwritten. Measured:
+  `ls -l /` reported `stopped after 8 entries: No data` on a walk that had not
+  failed at all.
+
+`ENOSYS` is excluded from the report, because that is what a lower filesystem
+with no `readdir` at all answers (see `vfs_readdir`) and it is a build fact rather
+than a read failure.
+
+Upstream, there is no fix at this level — `readdir` cannot distinguish the two
+and never will. What a POSIX implementation can do is what espix does, and what
+every other `ls` does: consult `errno`. The trap worth knowing is that the
+consultation has to be immediate.
+
+This is worth knowing beyond espix. It hit here because a directory walk over
+USB can fail a sector read, and FatFs is honest about it; any `readdir` loop that
+ignores `errno` will silently under-report the same way.
+
+Two halves of the same feature were widened separately, and only one of them
+reaches the driver.
+
+FatFs's side is right. `ff.h:74` makes `LBA_t` a `QWORD` when `FF_LBA64` is set,
+`ff_disk_read()`/`ff_disk_write()` are declared with it (`diskio.c:95,99`, via
+`#define disk_read ff_disk_read` at `ffconf.h:403`), and every sector FatFs
+computes internally is 64-bit.
+
+The dispatch under it is not. `diskio_impl.h` declares the registered drivers'
+function pointers with a 32-bit sector:
+
+    typedef struct {
+        DSTATUS (*init) (unsigned char pdrv);
+        DSTATUS (*status) (unsigned char pdrv);
+        DRESULT (*read) (unsigned char pdrv, unsigned char* buff, uint32_t sector, UINT count);
+        DRESULT (*write)(unsigned char pdrv, const unsigned char* buff, uint32_t sector, UINT count);
+        DRESULT (*ioctl)(unsigned char pdrv, unsigned char cmd, void* buff);
+    } ff_diskio_impl_t;
+
+`ff_disk_read()` then calls `s_impls[pdrv]->read(pdrv, buff, sector, count)`,
+where `sector` is the 64-bit `LBA_t` it was handed. The conversion to the
+pointer's `uint32_t` parameter happens at the call site, implicitly, and the
+compiler says nothing. Sector `0x100000000` becomes `0`: the read succeeds, from
+somewhere else on the medium entirely.
+
+So `FF_LBA64` widens FatFs's arithmetic and nothing else. A volume larger than
+2^32 sectors — 2TiB at a 512-byte sector, which is the size that motivates exFAT
+in the first place — mounts, reads at low LBAs, and silently returns wrong data
+above the boundary. It is the same class of failure as the `size_t` partition
+offset in `esp_blockdev_generic_partition_get()` above, one layer further down.
+
+`FF_LBA64` also cannot be enabled alone: `ff.h:81` fails the build with
+`#error exFAT needs to be enabled when enable 64-bit LBA`, so every route to this
+goes through `FF_FS_EXFAT`.
+
+**espix's workaround.** `tools/patch-fatfs.py` gives the struct a
+`DISKIO_SECT`, which is `LBA_t` when `FF_LBA64` is set and `DWORD` when it is
+not, and declares every backend that assigns into it with the same type. The
+mismatch becomes a build error instead of a wrong read, which is how the other
+three backends surfaced rather than being guessed at. `diskio_bdl.c` also widens
+its `GET_SECTOR_COUNT` buffer write, since `ff.c:5954` passes an `LBA_t*` there
+and a 32-bit store left the upper half uninitialised.
+
+Deliberately *not* widened: `diskio_sdmmc.c`, `diskio_wl.c` and
+`diskio_rawflash.c` still narrow to 32 bits at `sdmmc_read_sectors()`,
+`wl_read()` and `esp_partition_read()`. Those APIs take 32-bit sector numbers
+themselves, so widening the parameter would only move the truncation one call
+further in; espix registers none of them.
+
+Upstream, the fix is to declare the struct's sector parameter as `LBA_t` — and,
+with it, to widen every backend's error of omission into the build error espix's
+patch makes it.

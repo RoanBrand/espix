@@ -10,15 +10,39 @@ menu "espix filesystem"
             that line to follow this symbol, so it is a build choice rather
             than an edit to the IDF tree.
 
-            The cost, measured on the S3 build with idf.py size:
+            It also turns on FF_LBA64, which is not optional for the volumes
+            exFAT is wanted for: ff.c refuses any volume whose last LBA does not
+            fit in 32 bits, which at a 512-byte sector is 2TiB. Without it an
+            exFAT partition larger than that mounts as FR_NO_FILESYSTEM.
 
-              total image   1344060 -> 1349704   +5644 bytes
-              .bss            58760 -> 58760     no change
-              .data           26503 -> 26503     no change
+            Two more 32-bit fields had to widen with it, both in the IDF tree
+            and both silent when left alone: the diskio read/write function
+            pointers in diskio_impl.h, and the sector parameters and ioctl
+            buffers in diskio_bdl.c. See tools/patch-fatfs.py.
 
-            Nothing shows in .bss because a FATFS work area is allocated
-            rather than static, so the RAM cost sits on the heap at mount.
-            What an exFAT mount costs there is not measured yet: that needs a
-            medium to mount.
+            With it on, `mount` accepts a volume lsblk names exfat and lsblk
+            stops marking that type unsupported -- the driver is there, so the
+            marker would be a lie.
+
+            The cost, measured on the S3 build with idf.py size -- this option n
+            against the same tree with it y, so the delta is the whole feature
+            rather than one patch of it:
+
+              total image   1347280 -> 1354252    +6972 bytes
+              .bss            59528 -> 59528      no change
+              .data           26503 -> 26503      no change
+
+            The earlier figure for FF_FS_EXFAT alone was +5644; the rest is
+            FF_LBA64. Nothing shows in .bss because a FATFS work area is
+            allocated rather than static, so the RAM cost sits on the heap at
+            mount. Expect a 3TB volume to allocate a few KB more there and to
+            spend a moment reading its allocation bitmap the first time free
+            space is asked for.
+
+            Licensing: exFAT is covered by Microsoft patents, and FatFs's author
+            has historically noted that a licence may be needed for commercial
+            use. No patent or licence text ships with IDF's FatFs, and that claim
+            has not been verified here -- check the terms before shipping this on
+            by default.
 
 endmenu

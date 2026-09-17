@@ -26,6 +26,8 @@
 #include <strings.h>
 #include <sys/stat.h>
 
+#include "sdkconfig.h"
+
 #include "espix_auth.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
@@ -37,7 +39,7 @@
 #define LSBLK_USAGE  "usage: lsblk [disk]\n"
 #define BLKID_USAGE  "usage: blkid [device]...\n"
 #define MOUNT_USAGE \
-    "usage: mount [-o uid=<id>[,gid=<id>]] [device|/dev/device path]\n"
+    "usage: mount [-o uid=<id>[,gid=<id>][,ro|rw]] [device|/dev/device path]\n"
 #define UMOUNT_USAGE "usage: umount path|device...\n"
 
 /*
@@ -45,7 +47,8 @@
  * its columns: a stick with one FAT partition should not be laid out for a disk
  * full of Linux partitions, and a table whose widths change halfway down is
  * unreadable. SIZE and TYPE are fixed because the formatter's widest output
- * bounds them -- "20480G" is six characters and "part" is four.
+ * bounds them -- "1024T" and its one-decimal form are the ceiling now that the
+ * unit table reaches T, and "part" is four.
  */
 #define LSBLK_SIZE_W   7
 #define LSBLK_TYPE_W   4
@@ -435,6 +438,13 @@ typedef struct {
     bool                  used;
     char                  dev[ESPIX_USB_NAME_MAX];
     char                  path[ESPIX_PATH_MAX];
+    /*
+     * What lsblk called it, kept rather than re-derived: the type is decided once
+     * when a volume is identified (see block_fstype() in espix_usb/host.c) and
+     * asking the disk again from here would be a second read to arrive at the
+     * same answer. `df` is what reads it.
+     */
+    char                  fstype[ESPIX_USB_FSTYPE_MAX];
     esp_blockdev_handle_t view;
     /*
      * The session that mounted it. A non-root mount is allowed where the mount
@@ -443,6 +453,13 @@ typedef struct {
      * way Linux's `user` option does.
      */
     uint16_t              uid;
+    /*
+     * Mounted read-only. Carried on the *view* rather than here: this flag is
+     * only for what `mount` prints, since the enforcement is the block device's
+     * (see espix_fs_partition_view()). A mount record that said "ro" while the
+     * volume below accepted writes would be worse than saying nothing.
+     */
+    bool                  readonly;
 } mount_rec_t;
 
 static mount_rec_t s_mounts[ESPIX_FS_MAX_MOUNTS];
@@ -478,6 +495,45 @@ static mount_rec_t *mount_free_slot(void)
 }
 
 /*
+ * What `df` needs to know about a mount that espix_fs's own table does not hold.
+ *
+ * `df` walks espix_fs_mount_at(), which yields mount points and nothing else, so
+ * these are how a row finds out where its volume came from and what it is.
+ * Public within the component rather than reached for directly, because
+ * s_mounts is this file's: an accessor keeps the one rule that matters -- a
+ * record is only read while it is `used` -- in the file that maintains it.
+ */
+bool espix_blk_mount_source(const char *path, char *out, size_t out_len)
+{
+    const mount_rec_t *rec = mount_by_path(path);
+
+    if (rec == NULL || out == NULL || out_len == 0) {
+        return false;
+    }
+
+    /*
+     * "/dev/sda2", which is what this volume is called everywhere else: dev.c
+     * registers exactly that node for it, and `mount`/`umount` already accept
+     * the spelling. GNU df prints the source in this column for the same
+     * reason, so a value read off espix can be typed back into a command.
+     */
+    if (snprintf(out, out_len, "/dev/%s", rec->dev) >= (int)out_len) {
+        return false;
+    }
+    return true;
+}
+
+bool espix_blk_mount_type(const char *path, char *out, size_t out_len)
+{
+    const mount_rec_t *rec = mount_by_path(path);
+
+    if (rec == NULL || rec->fstype[0] == '\0' || out == NULL || out_len == 0) {
+        return false;
+    }
+    return strlcpy(out, rec->fstype, out_len) < out_len;
+}
+
+/*
  * The disk a name refers to, and the partition within it when the name is a
  * partition's. `part` comes back NULL for a whole disk, which is the superfloppy
  * case: the filesystem is on the disk itself, not on a partition of it.
@@ -504,12 +560,29 @@ static bool blk_lookup(const espix_usb_dev_t *devs, size_t n, const char *name,
 }
 
 /*
- * mount: put a FAT filesystem espix found on the port into the namespace.
+ * Whether espix has a driver for what lsblk named.
  *
- * FAT and only FAT. The other names `lsblk` prints are there to say what a
- * volume *is* -- an attempt to mount one says "not supported" rather than
- * looking like a broken driver, which is the same reason the column exists.
+ * One answer for both callers -- the command and the fstab applier -- so the
+ * two cannot disagree about what may be mounted. `foreign` already means "not
+ * one espix will ever open" and is decided where the type is named (see
+ * block_fstype() in espix_usb/host.c), so what is left here is the one type
+ * that is mountable only when it was built in.
  */
+static bool mountable(bool foreign, const char *fstype)
+{
+    if (foreign || fstype[0] == '\0') {
+        return false;
+    }
+    if (strcmp(fstype, "vfat") == 0) {
+        return true;
+    }
+#if CONFIG_ESPIX_FS_EXFAT
+    return strcmp(fstype, "exfat") == 0;
+#else
+    return false;       /* no exFAT driver in this build */
+#endif
+}
+
 /*
  * `uid=<id>[,gid=<id>]`, the value `mount -o` takes.
  *
@@ -518,8 +591,8 @@ static bool blk_lookup(const espix_usb_dev_t *devs, size_t n, const char *name,
  * for itself -- so `id` prints the number to use. Names arrive with the fstab
  * parser, which has to resolve them anyway and can share cmd_fs.c's resolver.
  */
-static bool parse_owner(espix_session_t *s, const char *arg,
-                        uint16_t *uid, uint16_t *gid)
+static bool parse_mount_opts(espix_session_t *s, const char *arg,
+                             uint16_t *uid, uint16_t *gid, bool *readonly)
 {
     char buf[64];
 
@@ -529,6 +602,20 @@ static bool parse_owner(espix_session_t *s, const char *arg,
     }
 
     for (char *tok = strtok(buf, ","); tok != NULL; tok = strtok(NULL, ",")) {
+        /*
+         * `ro` and `rw` first, because they carry no value: a token that is one
+         * of these must not fall through to the uid= parser and be reported as a
+         * malformed id.
+         */
+        if (strcmp(tok, "ro") == 0) {
+            *readonly = true;
+            continue;
+        }
+        if (strcmp(tok, "rw") == 0) {
+            *readonly = false;
+            continue;
+        }
+
         uint16_t   *out   = NULL;
         const char *value = NULL;
 
@@ -539,8 +626,8 @@ static bool parse_owner(espix_session_t *s, const char *arg,
             out   = gid;
             value = tok + 4;
         } else {
-            espix_eprintf(s, "mount: -o %s: only uid= and gid= are understood\n",
-                          tok);
+            espix_eprintf(s, "mount: -o %s: only uid=, gid=, ro and rw are "
+                             "understood\n", tok);
             return false;
         }
 
@@ -557,6 +644,13 @@ static bool parse_owner(espix_session_t *s, const char *arg,
     return true;
 }
 
+/*
+ * mount: put a filesystem espix found on the port into the namespace.
+ *
+ * FAT and exFAT, and nothing else. The other names `lsblk` prints are there to
+ * say what a volume *is* -- an attempt to mount one says "not supported" rather
+ * than looking like a broken driver, which is the same reason the column exists.
+ */
 static int cmd_mount(espix_session_t *s, int argc, char **argv)
 {
     if (!espix_usb_host_built()) {
@@ -567,8 +661,14 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     if (argc == 1) {
         for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
             if (s_mounts[i].used) {
-                espix_printf(s, "%s on %s type vfat\n", s_mounts[i].dev,
-                             s_mounts[i].path);
+                /* One name for both: espix mounts through one driver, and what
+                 * it can mount is FAT and exFAT. Which of the two is the
+                 * volume's own business, not the mount's. `ro` appears only when
+                 * it is set, as `mount(8)` prints things that are not the
+                 * default. */
+                espix_printf(s, "%s on %s type fat%s\n", s_mounts[i].dev,
+                             s_mounts[i].path,
+                             s_mounts[i].readonly ? " (ro)" : "");
             }
         }
         return 0;
@@ -586,6 +686,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
      */
     uint16_t owner_uid = (s != NULL) ? s->uid : 0;
     uint16_t owner_gid = (s != NULL) ? s->gid : 0;
+    bool     readonly  = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") != 0) {
@@ -599,7 +700,8 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
             espix_eprintf(s, "mount: -o is root's to use\n");
             return 1;
         }
-        if (!parse_owner(s, argv[i + 1], &owner_uid, &owner_gid)) {
+        if (!parse_mount_opts(s, argv[i + 1], &owner_uid, &owner_gid,
+                              &readonly)) {
             return 1;
         }
 
@@ -645,7 +747,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         espix_eprintf(s, "mount: %s: no filesystem espix can read\n", devname);
         return 1;
     }
-    if (foreign || strcmp(fstype, "vfat") != 0) {
+    if (!mountable(foreign, fstype)) {
         espix_eprintf(s, "mount: %s: %s is not supported\n", devname, fstype);
         return 1;
     }
@@ -732,9 +834,21 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     esp_blockdev_handle_t view = NULL;
     esp_blockdev_handle_t dev  = disk_bdl;
 
-    if (part != NULL) {
-        const esp_err_t err = espix_fs_partition_view(
-            disk_bdl, part->start, part->size, &view);
+    /*
+     * A view whenever a partition needs slicing *or* the mount is read-only.
+     *
+     * The second half is the point: the disk handle is cached and shared by
+     * espix_usb, so the read-only flag cannot go on it -- it would outlive this
+     * mount and make the next one read-only too. A view over the whole disk
+     * (start 0, and the disk's own size) is espix's own handle to mark, and it
+     * is released with the mount like any partition's.
+     */
+    if (part != NULL || readonly) {
+        const uint64_t start = (part != NULL) ? part->start : 0;
+        const uint64_t size  = (part != NULL) ? part->size
+                                              : disk_bdl->geometry.disk_size;
+        const esp_err_t err = espix_fs_partition_view(disk_bdl, start, size,
+                                                      readonly, &view);
         if (err != ESP_OK) {
             espix_eprintf(s, "mount: %s: cannot read the partition: %s\n",
                           devname, esp_err_to_name(err));
@@ -768,6 +882,8 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     rec->used = true;
     rec->view = view;
     rec->uid  = (s != NULL) ? s->uid : 0;
+    rec->readonly = readonly;
+    snprintf(rec->fstype, sizeof(rec->fstype), "%s", fstype);
     snprintf(rec->dev, sizeof(rec->dev), "%s", devname);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
 
@@ -932,12 +1048,13 @@ static const char FSTAB_TEMPLATE[] =
     "# device       sda1, sd*1, or an identity blkid prints: LABEL=, UUID=, PARTUUID=\n"
     "# mount point  %s becomes the device name\n"
     "# owner        an account name, a uid, or - for root\n"
-    "# flags        noauto\n"
+    "# flags        noauto, ro\n"
     "#\n"
     "# An identity must match exactly one volume.\n"
     "#\n"
     "#   sd*1   /media/%s   esp\n"
-    "#   sda4   /srv/backup -        noauto\n";
+    "#   sda4   /srv/backup -        noauto\n"
+    "#   sda2   /media/%s   -        ro\n";
 
 /* `*` matches any run of characters, and that is the whole pattern language:
  * enough for "partition N of any disk", and small enough to check by reading. */
@@ -1097,13 +1214,13 @@ static bool fstab_mkdirs(const char *path)
  */
 static void fstab_mount(const espix_usb_dev_t *disk,
                         const espix_usb_part_t *part,
-                        const char *path, uint16_t uid, uint16_t gid,
+                        const char *path, uint16_t uid, uint16_t gid, bool ro,
                         bool templated)
 {
     const char *fstype  = (part != NULL) ? part->fstype : disk->fstype;
     const bool  foreign = (part != NULL) ? part->foreign : disk->foreign;
 
-    if (fstype[0] == '\0' || foreign || strcmp(fstype, "vfat") != 0) {
+    if (!mountable(foreign, fstype)) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: %s is not one to mount", path,
                    fstype[0] != '\0' ? fstype : "unrecognised");
         return;
@@ -1132,14 +1249,17 @@ static void fstab_mount(const espix_usb_dev_t *disk,
     esp_blockdev_handle_t view = NULL;
     esp_blockdev_handle_t dev  = disk_bdl;
 
-    if (part != NULL &&
-        espix_fs_partition_view(disk_bdl, part->start, part->size,
-                                &view) != ESP_OK) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot read the partition",
-                   path);
-        return;
-    }
-    if (view != NULL) {
+    /* The same rule as cmd_mount: a view for a partition, and for a read-only
+     * mount on a whole disk, so the flag lands on a handle espix owns. */
+    if (part != NULL || ro) {
+        const uint64_t start = (part != NULL) ? part->start : 0;
+        const uint64_t size  = (part != NULL) ? part->size
+                                              : disk_bdl->geometry.disk_size;
+        if (espix_fs_partition_view(disk_bdl, start, size, ro, &view) != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot read the partition",
+                       path);
+            return;
+        }
         dev = view;
     }
 
@@ -1166,6 +1286,8 @@ static void fstab_mount(const espix_usb_dev_t *disk,
     snprintf(rec->dev, sizeof(rec->dev), "%s",
              (part != NULL) ? part->name : disk->name);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
+    snprintf(rec->fstype, sizeof(rec->fstype), "%s", fstype);
+    rec->readonly = ro;
     /*
      * `uid` is the *owner*, not a mounter, because there is no session here --
      * and that is also who may unmount it, which is what an fstab `user` entry
@@ -1221,6 +1343,10 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
         if (strstr(flags, "noauto") != NULL) {
             continue;
         }
+        /* `ro` is passed down to the mount, not acted on here: the enforcement
+         * is the block device's, and this only decides what the mount is made
+         * read-only *as*. */
+        const bool ro = (strstr(flags, "ro") != NULL);
 
         uint16_t uid = 0;
         uint16_t gid = 0;
@@ -1274,7 +1400,8 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
 
             fstab_path(path, sizeof(path), point, p != NULL ? p->name : d->name);
             if (path[0] != 0) {
-                fstab_mount(d, p, path, uid, gid, strstr(point, "%s") != NULL);
+                fstab_mount(d, p, path, uid, gid, ro,
+                            strstr(point, "%s") != NULL);
             }
         }
     }

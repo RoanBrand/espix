@@ -108,5 +108,83 @@ else
         else
             espix_skip "no partitions on the attached device"
         fi
+
+        # --------------------------------------------------------- read-only ---
+        #
+        # `mount -o ro` is enforced by the block device, not by espix: the view
+        # is marked read-only, IDF's diskio status callback answers STA_PROTECT
+        # for it, and FatFs then refuses a write with FR_WRITE_PROTECTED
+        # (ff.c:3508) before it reaches the disk at all. That is the property
+        # worth asserting, because a mount that *said* ro while the volume below
+        # still accepted writes would be worse than one that said nothing.
+        #
+        # Only mounts something nothing else is using: this suite runs alone, and
+        # an example mount point is created and removed around it.
+        if [ -n "$part" ]; then
+            ros=/tmp/espix-ro-test
+
+            if ! dev_run "mkdir -p $ros" >/dev/null 2>&1; then
+                espix_skip "could not make a mount point for the read-only check"
+            elif dev_status "sudo mount -o ro /dev/$part $ros" ; then
+                espix_pass "a volume mounts read-only"
+
+                assert_contains "mount names it read-only" "(ro)" "$(dev_run 'mount')"
+
+                # The write must be refused. `touch` is the cheapest write there
+                # is: it creates a directory entry, so it fails for a read-only
+                # volume whatever the file's contents would have been.
+                assert_status "and refuses a write through it" 1 \
+                    dev_status "touch $ros/ro-probe"
+
+                # The read side must still work -- enforcing this by breaking
+                # reads would pass the assertion above for the wrong reason.
+                assert_status "while still reading" 0 dev_status "ls -l $ros"
+
+                dev_run "sudo umount $ros" >/dev/null 2>&1
+                assert_not_contains "and unmounts cleanly" "$ros" "$(dev_run 'mount')"
+            else
+                espix_skip "could not mount /dev/$part read-only to check it"
+            fi
+
+            dev_run "rmdir $ros" >/dev/null 2>&1
+        fi
+
+        # ------------------------------------------------------------ sizes ---
+        #
+        # The disk row's SIZE is the same value blkid reports in bytes, run
+        # through espix_cmd_size() -- the formatter every command shares. Its
+        # unit table stopped at 'G' for a while, so a 3.1TB partition read
+        # "3214G" here, in `df -h`, and in `ls` alike.
+        #
+        # Only a device at or past 1TB can show this, so a small stick is skipped
+        # rather than asserted against: a stick that prints "29G" is right, and a
+        # test that demanded "T" of it would be asserting the wrong thing about a
+        # working device. T9 owners get the assertion; everyone else gets a skip
+        # that says why.
+        #
+        # PRODUCT is what tells the disk's line from a partition's: blkid prints
+        # it only for the disk, and a partition's SIZE is part of the disk's.
+        disk_size=$(printf '%s\n' "$lsblk_out" |
+                    awk -v d="$disk" '$1 == d { print $2; exit }')
+        # One line, so it survives being run through `sh -c` on the device:
+        # sub() drops everything but SIZE, which PRODUCT pins to the disk's line
+        # rather than a partition's.
+        blkid_bytes=$(dev_run "blkid $disk" |
+                      awk '/PRODUCT=/ { sub(/.*SIZE="/, ""); sub(/".*/, ""); print; exit }')
+
+        if [ -z "$blkid_bytes" ]; then
+            espix_skip "the disk reports no byte size, so its unit cannot be checked"
+        elif [ "$blkid_bytes" -lt 1000000000000 ]; then
+            espix_skip "disk is under 1TB, so the terabyte unit cannot be exercised"
+        else
+            # 1TB is at least "1.0T", and the rounding that makes 3.638 TiB read
+            # "3.6T" rather than "3.7T" happens here too -- so a wrong one shows
+            # up as a T value a whole unit too high.
+            case "$disk_size" in
+                *T) espix_pass "a disk past 1TB is sized in terabytes ($disk_size)" ;;
+                *)  espix_fail "a disk past 1TB should be sized in terabytes" \
+                               "lsblk SIZE: $disk_size (blkid: ${blkid_bytes} bytes)" ;;
+            esac
+        fi
     fi
 fi

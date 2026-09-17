@@ -367,10 +367,13 @@ static void str_desc_to_utf8(const usb_str_desc_t *desc, char *dst, size_t dst_l
  * The MBR type code, named the way a mount would have to name it. One name for
  * the three FAT types, as Linux does: the driver is the same one.
  *
- * `foreign` marks the types this recognises but no driver here will ever open --
- * exFAT/NTFS, Linux, and the protective MBR of a GPT disk. Naming those is most
- * of the reason `lsblk` exists before mounting does; a column that stays blank
- * for them reads as an empty disk.
+ * `foreign` marks the types this recognises but no driver here will open:
+ * NTFS, Linux, and the protective MBR of a GPT disk. exFAT joins that list only
+ * when CONFIG_ESPIX_FS_EXFAT is off -- with the driver built in it is a type
+ * espix can open, and saying otherwise would have `mount` refuse a volume the
+ * image is capable of reading. Naming those is most of the reason `lsblk` exists
+ * before mounting does; a column that stays blank for them reads as an empty
+ * disk.
  */
 static const char *fstype_name(uint8_t type, bool *foreign)
 {
@@ -796,7 +799,15 @@ static const char *block_fstype(usb_dev_t *d, uint64_t base, uint8_t *block,
     }
     /* The OEM-name field doubles as the signature for both of these. */
     if (memcmp(block + 3, "EXFAT   ", 8) == 0) {
+        /*
+         * Foreign only when there is no driver to open it: "no driver in this
+         * build" is a fact about espix, "unsupported" is a fact about the type,
+         * and lsblk's marker is the second one. With the option on, the mount
+         * that follows is expected to work.
+         */
+#if !CONFIG_ESPIX_FS_EXFAT
         *foreign = true;
+#endif
         return "exfat";
     }
     if (memcmp(block + 3, "NTFS    ", 8) == 0) {

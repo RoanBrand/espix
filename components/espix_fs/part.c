@@ -137,7 +137,8 @@ static const esp_blockdev_ops_t s_part_ops = {
 };
 
 esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
-                                  uint64_t size, esp_blockdev_handle_t *out)
+                                  uint64_t size, bool readonly,
+                                  esp_blockdev_handle_t *out)
 {
     if (parent == NULL || parent->ops == NULL || out == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -169,6 +170,21 @@ esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
     v->dev.geometry    = parent->geometry;
     v->dev.device_flags = parent->device_flags;
     v->dev.geometry.disk_size = size;
+    /*
+     * The caller's answer, never the parent's: a view is the only place espix
+     * can carry "this mount is read-only" without touching a handle it does not
+     * own. The USB disk handle is cached and shared, so setting the flag there
+     * would make every later mount of the same disk read-only too.
+     *
+     * FatFs reads it through ff_diskio_register_bdl(), whose status callback
+     * answers STA_PROTECT for a read-only device; f_open then refuses a write
+     * with FR_WRITE_PROTECTED (ff.c:3508) instead of attempting one and failing
+     * at the disk. part_write() refuses as well, so the guarantee holds even for
+     * a caller that reaches the block device directly.
+     */
+    if (readonly) {
+        v->dev.device_flags.read_only = true;
+    }
 
     *out = &v->dev;
     return ESP_OK;

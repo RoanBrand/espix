@@ -317,6 +317,12 @@ CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 # free. 10240 leaves room for a command that reaches into a mounted filesystem.
 CONFIG_ESPIX_SSH_TASK_STACK=10240
 
+# exFAT, for the 3.1TB exFAT partition a Samsung T9 carries. This is the one
+# option here that is off for a reason other than a preference -- see
+# components/espix_fs/Kconfig for what it patches in IDF and the licensing note
+# that goes with it -- so a build that wants it says so explicitly.
+CONFIG_ESPIX_FS_EXFAT=y
+
 # Precomputation for base-point scalar multiplication, which is what ECDSA does
 # for k*G -- and signing the exchange hash with the nistp256 host key is the
 # largest single cost in an SSH key exchange here. The ESP32-S3 has no ECC

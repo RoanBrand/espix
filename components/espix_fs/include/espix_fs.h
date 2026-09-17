@@ -123,9 +123,17 @@ esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len);
  * offsets, which cannot express a partition larger than 4GB on an ESP32 target.
  * Since that is one FAT32 volume on an ordinary stick, this is 64-bit; see
  * part.c.
+ *
+ * `readonly` marks the *view*, not the parent: this is how a read-only mount is
+ * carried, because the only handle espix owns here is the view. The USB disk
+ * handle is cached and shared, so a flag set on it would outlive the mount and
+ * make every later mount of the same disk read-only as well. A view over the
+ * whole disk is equally valid for that reason -- start 0, size the disk -- when
+ * the caller wants the flag and nothing to slice.
  */
 esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
-                                  uint64_t size, esp_blockdev_handle_t *out);
+                                  uint64_t size, bool readonly,
+                                  esp_blockdev_handle_t *out);
 
 /*
  * Give a block device a name in /dev, or take it away: "sda" for a disk, "sda1"

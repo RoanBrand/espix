@@ -627,13 +627,18 @@ being the shortest path.
   hub plus one disk consumes almost all of them, so the second disk is refused
   while the first works. A keyboard costs two channels where a disk costs three.
 
-  - **exFAT** is a patched dependency rather than a feature. `FF_FS_EXFAT` is
-    hardcoded `0` in IDF's `components/fatfs/src/ffconf.h` with no Kconfig to
-    change it, so it means carrying a patch the way
-    `tools/patch-littlefs.py` carries one — which is now done:
-    `tools/patch-fatfs.py` behind `CONFIG_ESPIX_FS_EXFAT` (default `n`; +5,644
-    bytes of ROM, no static RAM), with the mount side still to wire. `FF_LBA64`
-    rides the same option, since only an exFAT volume gets past 2TiB. It is also the one item here with a
+  - **exFAT** is a patched dependency rather than a feature, and it is done.
+    `FF_FS_EXFAT` is hardcoded `0` in IDF's `components/fatfs/src/ffconf.h` with
+    no Kconfig to change it, so it means carrying a patch the way
+    `tools/patch-littlefs.py` carries one — `tools/patch-fatfs.py` behind
+    `CONFIG_ESPIX_FS_EXFAT` (default `n`). Three more edits came with it, and
+    none was optional: `FF_LBA64` (hardcoded `0` beside it, and without it
+    `ff.c` refuses any volume past 2TiB — which is the whole point), the
+    `uint32_t` sector in `ff_diskio_impl_t` (a silent truncation of every LBA
+    FatFs passes above 2^32, now `DISKIO_SECT` so the mismatch is a build error),
+    and `diskio_bdl.c` with it. Measured at +6,972 bytes of ROM and no static
+    RAM; see [USB-HOST.md](USB-HOST.md#roadmap-not-now) for what each edit does
+    and what is deliberately left alone. It is also the one item here with a
     legal question attached: exFAT is covered by Microsoft patents, and FatFs's
     author has said a licence may be needed for commercial use. **That has not
     been verified against IDF or FatFs here** — no patent or licence text ships
@@ -643,7 +648,8 @@ being the shortest path.
     the same shape as the filesystem work in [Filesystem](#filesystem). `lsblk`
     already names both as recognised and unsupported, which is the honest
     position until then — and names ext2/3/4 specifically, from the superblock,
-    on a partition (`0x83`) and on a whole-device volume alike.
+    on a partition (`0x83`) and on a whole-device volume alike. NTFS stays in
+    that column even with the exFAT option on: FatFs reads exFAT, not NTFS.
   - **GPT** is done, and arrived exactly as the line above predicted: a reader
     rather than a parser change, in `host.c` beside the MBR walk. What asked for
     it was a 4TB Samsung T9 — three partitions behind a protective MBR, one

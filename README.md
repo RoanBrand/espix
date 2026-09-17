@@ -33,8 +33,9 @@ together.
 | Storage | Mount a FAT volume into the namespace | **yes** | through espix's own VFS, so the permission check applies |
 | Storage | `/etc/fstab`, applied on attach | **yes** | device column takes a name, a wildcard, or `LABEL=`/`UUID=`/`PARTUUID=` |
 | Storage | `mount -o uid=,gid=` | **yes** | root hands a volume to a user without giving them root |
+| Storage | `mount -o ro` | **yes** | refused by FatFs at the block device, not by policy; `/etc/fstab` takes `ro` too |
 | Storage | Volumes mounted at once | **partial** | two, bounded by `CONFIG_FATFS_VOLUME_COUNT` |
-| Storage | exFAT volumes | **partial** | the driver can be built in (`ESPIX_FS_EXFAT`, +5.6KB ROM, no static RAM); detection and mounting are not wired yet |
+| Storage | exFAT volumes | **yes** | with `ESPIX_FS_EXFAT` (off by default, +7.0KB ROM, no static RAM); past 2TiB needs the same option, which carries `FF_LBA64` and the 64-bit diskio fix with it |
 | Storage | ext4 volumes | **planned** | named and identified by `lsblk` today; no driver in IDF |
 | Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
 | Storage | Serve the stick over the network | **planned** | NFS or SMB, the NAS case |

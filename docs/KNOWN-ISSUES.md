@@ -1046,3 +1046,31 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `coredump` keeps it — in full, after the kernel log has rolled — with no serial
   port involved. `idf.py coredump-info`, via `make coredump`, is for the backtrace
   rather than for the reason. [UPSTREAM.md](UPSTREAM.md) carries the report.
+
+- **A directory read on the 3.1TB T9 fails intermittently.** Measured on the
+  Samsung T9, mounted read-only, listing the same directory in a loop: roughly
+  one run in ten fails a read of the *next* directory sector. It is the drive or
+  the read path, not the filesystem — the bytes on the medium are fine, and the
+  listing that follows is complete.
+
+  What it looks like depends on where it lands, and that is why it was mistaken
+  for data loss the first time:
+
+  - failing while *advancing* through the directory: the walk ends early and the
+    listing is genuinely short. Seen as `13 entries` for a directory holding 19,
+    with no error anywhere, before `ls` learned to report one.
+  - failing on the read that looks *past* the last entry: every entry is listed
+    and the failure is reported after them — `stopped after 19 entries: I/O
+    error` — which is a complete listing with a read error attached.
+
+  `ls` reports it now ([UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)),
+  so this is visible rather than silent, and it costs nothing: the entries are
+  there and the read is retried next time.
+
+  Unresolved. The first question is the failing LBA — whether it is past the 2TiB
+  mark, which would point at the widened 64-bit path, or below it, which would
+  put it with the unexplained GPT-era quirk this drive already showed (the same
+  LBA returning different bytes on two reads moments apart). Logging the LBA in
+  the diskio layer is the one measurement that would separate the two, and it has
+  not been done yet. Until then: **mount the T9 read-only.** A read that goes
+  wrong is recoverable; a write that goes wrong puts the bad copy back.

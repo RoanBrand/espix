@@ -353,6 +353,7 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
     size_t               count     = 0;
     size_t               cap       = 0;
     bool                 truncated = false;
+    int                  read_errno = 0;
     const struct dirent *ent;
 
     /*
@@ -360,8 +361,35 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
      * readdir skips them itself, in a loop that reads until it gets what it
      * calls "a real object name". The guard this code used to carry could never
      * fire. It is also why -a cannot show them -- see KNOWN-ISSUES.md.
+     *
+     * `errno` has to be cleared immediately before every readdir, because
+     * readdir answers NULL both for "no more entries" and for an error and
+     * leaves errno alone in the first case. Only a value written by the readdir
+     * that just returned NULL means anything.
+     *
+     * This is not hypothetical: a directory walk over USB fails with FR_DISK_ERR
+     * when a sector cannot be read (dir_read -> move_window, ff.c:2349), and IDF
+     * passes that out as errno (vfs_fat.c:1131). Without this the listing stopped
+     * early and said "13 entries", which reads as a directory that holds 13
+     * things rather than as a listing that was cut off.
      */
-    while ((ent = readdir(dir)) != NULL) {
+    while (1) {
+        /*
+         * Last thing before readdir, with nothing after it that can fail. The
+         * per-entry stat() further down sets errno in the ordinary course of a
+         * *successful* listing -- a lookup that misses a probe and then answers
+         * from the rule leaves ENOENT behind -- so a reset placed any earlier is
+         * overwritten by the next iteration's own work. Measured, not reasoned:
+         * with the reset after the NULL check instead, `ls -l /` reported
+         * "stopped after 8 entries: No data" on a walk that had not failed.
+         */
+        errno = 0;
+        ent = readdir(dir);
+        if (ent == NULL) {
+            read_errno = errno;
+            break;
+        }
+
         if (!f.all && ent->d_name[0] == '.') {
             continue;
         }
@@ -504,7 +532,17 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
     }
     free(ents);
 
-    if (truncated) {
+    if (read_errno != 0) {
+        /* ENOSYS is what a lower filesystem with no readdir at all answers (see
+         * vfs_readdir), which is a build fact rather than a read failure -- the
+         * directory is still complete as far as anything can tell. Anything else
+         * came from the read itself, and the count below is then a count of what
+         * *could* be read rather than of what is there. */
+        if (read_errno != ENOSYS) {
+            espix_eprintf(s, "ls: %s: stopped after %u entries: %s\n",
+                          abs, (unsigned)count, strerror(read_errno));
+        }
+    } else if (truncated) {
         espix_eprintf(s, "ls: stopped at %u entries\n", (unsigned)count);
     }
     if (f.long_form) {
@@ -1068,16 +1106,22 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
                              : 0;
 
     /* ls_size() rather than a second formatter: -h means the same thing in both
-     * commands, and two implementations of "1.5M" drift. */
-    char c_total[16];
-    char c_used[16];
-    char c_avail[16];
+     * commands, and two implementations of "1.5M" drift. Twenty-four rather than
+     * sixteen bytes because the plain column is a 64-bit count: a 3.1TB volume is
+     * 3,371,628,178 1K-blocks, ten digits before the terminator. */
+    char c_total[24];
+    char c_used[24];
+    char c_avail[24];
 
     if (human) {
-        ls_size(c_total, sizeof(c_total), (off_t)info.total_bytes, true);
-        ls_size(c_used,  sizeof(c_used),  (off_t)info.used_bytes,  true);
+        /* uint64_t all the way to the formatter: espix_cmd_size() takes one, and
+         * an off_t on the way there is 32 bits on this target -- which is how a
+         * 6GB volume once printed as 2.0G. The volume rows below never had the
+         * cast; this row did. */
+        ls_size(c_total, sizeof(c_total), info.total_bytes, true);
+        ls_size(c_used,  sizeof(c_used),  info.used_bytes,  true);
         ls_size(c_avail, sizeof(c_avail),
-                (off_t)(info.total_bytes - info.used_bytes), true);
+                info.total_bytes - info.used_bytes, true);
     } else {
         snprintf(c_total, sizeof(c_total), "%u", total_k);
         snprintf(c_used,  sizeof(c_used),  "%u", used_k);
@@ -1086,7 +1130,7 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
 
     /* "Size" under -h, as GNU df does: the numbers are no longer 1K blocks and
      * a header that says they are would be the same lie in a smaller place. */
-    espix_printf(s, "%-12s %9s %9s %9s %5s %s\n",
+    espix_printf(s, "%-16s %11s %11s %11s %5s %s\n",
                  "Filesystem", human ? "Size" : "1K-blocks", "Used",
                  "Available", "Use%", "Mounted on");
     /*
@@ -1099,7 +1143,7 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
      * espix_fs_stat_root() resolves by partition label rather than by path, so
      * it never noticed the change.
      */
-    espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
+    espix_printf(s, "%-16s %11s %11s %11s %4u%% %s\n",
                  "littlefs", c_total, c_used, c_avail, pct, "/");
 
     /*
@@ -1109,8 +1153,9 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
      * espix_fs_stat_fat() does now. A mount that cannot answer -- a non-FAT
      * volume, or one whose device has been pulled -- is left out rather than
      * printed as zero, because a row claiming no space at all is worse than no
-     * row. The first column is the filesystem *type*, as the rootfs row has
-     * always been: the layer espix adds holds no storage of its own.
+     * row. The first column is the *source*, as GNU df has it, and its type is
+     * kept beside it in the mount record (espix_blk_mount_type()) for when a -T
+     * wants it.
      */
     for (size_t i = 0; ; i++) {
         char path[ESPIX_PATH_MAX];
@@ -1134,13 +1179,31 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
             ls_size(c_used,  sizeof(c_used),  used_b, true);
             ls_size(c_avail, sizeof(c_avail), free_b, true);
         } else {
-            snprintf(c_total, sizeof(c_total), "%u", (unsigned)(total / 1024));
-            snprintf(c_used,  sizeof(c_used),  "%u", (unsigned)(used_b / 1024));
-            snprintf(c_avail, sizeof(c_avail), "%u", (unsigned)(free_b / 1024));
+            /* 64-bit, and the available figure is derived in 64-bit rather than
+             * from two truncated ones: 1K-blocks of a 3.1TB volume is over 2^32,
+             * so the old 32-bit columns both wrapped and could subtract into a
+             * negative that printed as a huge number. */
+            snprintf(c_total, sizeof(c_total), "%llu",
+                     (unsigned long long)(total / 1024));
+            snprintf(c_used,  sizeof(c_used),  "%llu",
+                     (unsigned long long)(used_b / 1024));
+            snprintf(c_avail, sizeof(c_avail), "%llu",
+                     (unsigned long long)(free_b / 1024));
         }
 
-        espix_printf(s, "%-12s %9s %9s %9s %4u%% %s\n",
-                     "vfat", c_total, c_used, c_avail, pct_v, path);
+        /*
+         * The source, not the type: GNU df's first column, and the name that can
+         * be typed back into `mount` or `umount`. A mount with no record here is
+         * one df should not have found, so it says so rather than printing a
+         * volume as if it came from nowhere.
+         */
+        char source[ESPIX_PATH_MAX];
+        if (!espix_blk_mount_source(path, source, sizeof(source))) {
+            snprintf(source, sizeof(source), "-");
+        }
+
+        espix_printf(s, "%-16s %11s %11s %11s %4u%% %s\n",
+                     source, c_total, c_used, c_avail, pct_v, path);
     }
 
     return 0;

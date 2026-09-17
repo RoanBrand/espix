@@ -55,6 +55,30 @@ tools/esp_vfs_fat-ctx.patch is the same change as a git patch, ready to send
 upstream. When it lands, delete this script, that patch, and the
 execute_process() hook in CMakeLists.txt.
 
+exFAT, and the 64-bit LBAs it needs
+-----------------------------------
+The rest of what this patches is the exFAT feature, and every edit is gated on
+CONFIG_ESPIX_FS_EXFAT so that with the option off each file is byte for byte what
+shipped:
+
+  * ffconf.h's FF_FS_EXFAT is hardcoded 0 with no Kconfig for it, so the line is
+    patched to follow the espix symbol instead.
+  * FF_LBA64 is hardcoded 0 beside it and is not optional: ff.c:3545 refuses any
+    volume whose last LBA does not fit in 32 bits, which at a 512-byte sector is
+    2TiB -- smaller than the partition exFAT is wanted for.
+  * ffconf.h's bare FF_USE_LABEL reaches C rather than #if in a block that only
+    exFAT compiles, so the symbol it names needs a fallback. See docs/UPSTREAM.md.
+  * diskio_impl.h's read/write function pointers take uint32_t, and ff_disk_read()
+    hands them an LBA_t. That truncation is implicit at the call site and silent
+    -- sector 0x100000000 reads somewhere else on the medium -- so the struct's
+    sector type is DISKIO_SECT (LBA_t under FF_LBA64, DWORD without it) and every
+    backend that assigns into the struct is declared with the same, which turns
+    the mismatch into a build error.
+  * diskio_bdl.c and the three backends beside it widen with it. diskio_bdl.c is
+    the one espix registers, so its sector parameters and GET_SECTOR_COUNT buffer
+    go all the way to 64 bits; the others narrow at sdmmc_read_sectors(), wl_read()
+    and esp_partition_read(), which take 32 bits themselves.
+
 Failure policy
 --------------
 Loud, never silent. An IDF version this was not written against, or an anchor
@@ -106,6 +130,39 @@ def insert_before(text: str, anchor: str, addition: str, marker: str,
     return text.replace(anchor, addition + anchor, 1)
 
 
+def insert_after(text: str, anchor: str, addition: str, marker: str,
+                 label: str) -> str:
+    """For an anchor whose line the inserted block itself contains.
+
+    insert_before() writes `addition + anchor`, so if `addition` ends with the
+    anchor's own text the two are indistinguishable on the next run -- the
+    marker is in the text either way, so it reports "already patched" having
+    already inserted the block twice. Writing after the anchor instead leaves
+    the anchor unique.
+    """
+    if marker in text:
+        return text
+    if anchor not in text:
+        raise AnchorMissing(f"{label}: anchor not found")
+    return text.replace(anchor, anchor + addition, 1)
+
+
+def sub_once(text: str, pattern: "re.Pattern", new: str, marker: str,
+             label: str) -> str:
+    """replace_once() for a line whose alignment is not known in advance.
+
+    A single wrong tab count makes a literal match into a silent no-op, so for
+    these the shape of the line is matched instead.
+    """
+    if marker in text:
+        return text
+    matches = pattern.findall(text)
+    if len(matches) != 1:
+        raise AnchorMissing(f"{label}: expected exactly one match, found "
+                            f"{len(matches)}")
+    return pattern.sub(lambda _: new, text, count=1)
+
+
 def replace_once(text: str, old: str, new: str, marker: str,
                  label: str) -> str:
     if marker in text:
@@ -151,6 +208,203 @@ FFCONF_LABEL_BLOCK = chr(10).join([
 MARK_FFCONF_LABEL = " * what compiles that block."
 
 MARK_FFCONF = "CONFIG_ESPIX_FS_EXFAT"
+
+# FF_LBA64 is a second hardcoded 0 in the same file, and exFAT does not work
+# without it above 2TiB: ff.c refuses a volume whose last LBA does not fit in 32
+# bits (ff.c:3545, FR_NO_FILESYSTEM), which is every exFAT volume large enough to
+# want exFAT. It follows the same symbol as FF_FS_EXFAT -- ffconf.h itself
+# documents the dependency ("To enable 64-bit LBA, also exFAT needs to be
+# enabled") -- so one option turns both on.
+#
+# One line, matched on its shape rather than its alignment: the value column of
+# this file is tabs whose count differs per option (FF_FS_EXFAT uses two, some
+# use one), and hardcoding the wrong count is a silent no-op. The pattern is
+# anchored to end-of-line so it cannot catch FF_LBA64's neighbours.
+FFCONF_LBA64_RE = re.compile(r"^#define FF_LBA64[ \t]+0[ \t]*$", re.MULTILINE)
+FFCONF_LBA64_NEW = chr(10).join([
+    "/*",
+    " * espix: the same #ifdef shape as FF_FS_EXFAT below, and for the same",
+    " * reason. An exFAT volume past 2TiB cannot be addressed with 32-bit LBAs",
+    " * at all -- ff.c:3545 rejects it outright.",
+    " */",
+    "#ifdef CONFIG_ESPIX_FS_EXFAT",
+    "#define FF_LBA64" + (chr(9) * 2) + "1",
+    "#else",
+    "#define FF_LBA64" + (chr(9) * 2) + "0",
+    "#endif",
+])
+MARK_FFCONF_LBA64 = "CONFIG_ESPIX_FS_EXFAT" + chr(10) + "#define FF_LBA64"
+
+# The last 32-bit field left in FatFs's read path, and the one FF_LBA64 alone
+# does not reach. ff.c computes 64-bit LBAs and hands them to ff_disk_read(),
+# which dispatches through ff_diskio_impl_t -- whose function pointers take
+# uint32_t. The truncation is implicit, at the call site, and silent: sector
+# 0x100000000 becomes 0 and reads somewhere else on the medium entirely.
+#
+# Guarded on FF_LBA64 so that with the option off this is a no-op, byte for
+# byte: LBA_t is a DWORD then, and every backend's DWORD signature still
+# matches. With it on, only diskio_bdl.c has to widen too -- it is the one
+# backend espix registers, and the esp_blockdev ops under it already take
+# uint64_t byte addresses.
+#
+# diskio_sdmmc.c, diskio_wl.c and diskio_rawflash.c keep their 32-bit
+# signatures: it is only diskio_bdl.c that espix ever registers, and widening
+# them would mean chasing 32-bit APIs (wl_read, sdmmc_read_sectors,
+# esp_partition_read) that cannot take a 64-bit LBA anyway.
+DISKIO_IMPL_OLD = "\n".join([
+    "    DRESULT (*read) (unsigned char pdrv, unsigned char* buff, uint32_t sector, UINT count);  /*!< sector read function */",
+    "    DRESULT (*write) (unsigned char pdrv, const unsigned char* buff, uint32_t sector, UINT count);   /*!< sector write function */",
+])
+DISKIO_IMPL_NEW = "\n".join([
+    "    DRESULT (*read) (unsigned char pdrv, unsigned char* buff, DISKIO_SECT sector, UINT count);  /*!< sector read function */",
+    "    DRESULT (*write) (unsigned char pdrv, const unsigned char* buff, DISKIO_SECT sector, UINT count);   /*!< sector write function */",
+])
+# Its own marker, distinct from the macro block's -- one shared marker would make
+# the second edit look like a repeat of the first, which is the silence the
+# markers exist to prevent.
+MARK_DISKIO_IMPL = "buff, DISKIO_SECT sector, UINT count"
+MARK_DISKIO_SECT = "espix: the sector type the interface is written with"
+
+# The line the DISKIO_SECT block is inserted after, in diskio_impl.h. Chosen
+# because the block's own text does not contain it, so the marker can be unique
+# to the block.
+DISKIO_SECT_ANCHOR = "#define FF_DRV_NOT_USED 0xFF\n"
+
+# One definition of that type for every backend, because all five assign into the
+# struct above and -Wincompatible-pointer-types refuses a mismatch. It is only
+# diskio_bdl.c that espix registers, but the other four are compiled into the
+# same component and have to agree with the struct all the same.
+#
+# A backend whose underlying API takes 32 bits -- sdmmc_read_sectors(),
+# wl_read(), esp_partition_read() -- still hands DISKIO_SECT to it and narrows
+# there. That is that API's limit and is unchanged from before; what this fixes
+# is the interface FatFs itself calls through.
+DISKIO_SECT_BLOCK = "\n".join([
+    "/*",
+    " * espix: the sector type the interface is written with. FF_LBA64 widens",
+    " * LBA_t to a QWORD while these signatures were written for a DWORD, and a",
+    " * driver declared with the narrower one does not fail to build by itself --",
+    " * the mismatch only shows in the struct above, and only then if the compiler",
+    " * is asked to look. FatFs passes a 64-bit LBA through that field, so the",
+    " * narrow type truncates it silently: sector 0x100000000 reads somewhere else",
+    " * on the medium entirely.",
+    " */",
+    "#if FF_LBA64",
+    "#define DISKIO_SECT LBA_t",
+    "#else",
+    "#define DISKIO_SECT DWORD",
+    "#endif",
+    "",
+])
+
+DISKIO_BDL_HEADER_OLD = '#include "esp_compiler.h"\n'
+
+# insert_before() would put this block ahead of the anchor, and the anchor line
+# is repeated inside it -- so the next run would find the anchor's own copy
+# first, mistake the insertion for the anchor, and insert a second block. The
+# marker test cannot help: the same line is inside the block either way. So this
+# one inserts *after* the anchor, where the following line is `static const char
+# *TAG` and nothing repeats.
+DISKIO_BDL_HEADER_NEW = '''
+/*
+ * espix 64-bit sector patch. The sector type is DISKIO_SECT, from
+ * diskio_impl.h: FF_LBA64 widens LBA_t to a QWORD and the three functions below
+ * pass it straight through to the esp_blockdev ops, which already take uint64_t
+ * byte addresses as far down as msc_bdl_read()'s READ(16). Left at DWORD these
+ * wrap around and read or write the wrong sector, with no error anywhere.
+ */
+'''
+MARK_DISKIO_BDL_HEADER = "espix 64-bit sector patch"
+
+DISKIO_BDL_EDITS = [
+    # (old, new, marker, label)
+    (
+        "static DRESULT ff_bdl_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)\n",
+        "static DRESULT ff_bdl_read(BYTE pdrv, BYTE *buff, DISKIO_SECT sector, UINT count)\n",
+        "ff_bdl_read(BYTE pdrv, BYTE *buff, DISKIO_SECT",
+        "diskio_bdl.c read",
+    ),
+    (
+        "static DRESULT ff_bdl_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)\n",
+        "static DRESULT ff_bdl_write(BYTE pdrv, const BYTE *buff, DISKIO_SECT sector, UINT count)\n",
+        "ff_bdl_write(BYTE pdrv, const BYTE *buff, DISKIO_SECT",
+        "diskio_bdl.c write",
+    ),
+    # The ioctl buffer is `LBA_t sz_drv` at ff.c:5954, so a 32-bit write here
+    # leaves half of it uninitialised.
+    (
+        "        *((DWORD *)buff) = (DWORD)(drv->handle->geometry.disk_size / drv->fs_sector_size);\n",
+        "        *((DISKIO_SECT *)buff) = (DISKIO_SECT)(drv->handle->geometry.disk_size / drv->fs_sector_size);\n",
+        "*((DISKIO_SECT *)buff) = (DISKIO_SECT)(drv->handle->geometry.disk_size",
+        "diskio_bdl.c sector count",
+    ),
+    # The CTRL_TRIM reads, named in full so the marker cannot match anything but
+    # these two lines (a bare "DWORD start_sector" would also hit
+    # diskio_sdmmc.c's, which is deliberately left alone).
+    (
+        "        DWORD start_sector = *((DWORD *)buff);\n"
+        "        DWORD end_sector = *((DWORD *)buff + 1);\n",
+        "        DISKIO_SECT start_sector = *((DISKIO_SECT *)buff);\n"
+        "        DISKIO_SECT end_sector = *((DISKIO_SECT *)buff + 1);\n",
+        "DISKIO_SECT start_sector = *((DISKIO_SECT *)buff)",
+        "diskio_bdl.c trim",
+    ),
+]
+
+# The other three backends compiled into this component. All of them assign into
+# ff_diskio_impl_t, so all of them have to be declared with DISKIO_SECT for it to
+# compile -- but only their read/write signatures and the GET_SECTOR_COUNT buffer
+# are touched: the sector argument still narrows at sdmmc_read_sectors(),
+# wl_read() and esp_partition_read(), which is those APIs' own limit.
+#
+# Diskio sdmmc's CTRL_TRIM deliberately keeps its DWORD reads: they feed
+# ff_sdmmc_trim(), which calls sdmmc_erase_sectors(card, size_t, size_t, ...),
+# so widening them would only turn a truncation into a narrowing that
+# -Wconversion would like a word about.
+DISKIO_OTHERS = [
+    (
+        "diskio_sdmmc.c",
+        [
+            ("static DRESULT ff_sdmmc_read (BYTE pdrv, BYTE* buff, DWORD sector, UINT count)",
+             "static DRESULT ff_sdmmc_read (BYTE pdrv, BYTE* buff, DISKIO_SECT sector, UINT count)",
+             "ff_sdmmc_read (BYTE pdrv, BYTE* buff, DISKIO_SECT", "read"),
+            ("static DRESULT ff_sdmmc_write (BYTE pdrv, const BYTE* buff, DWORD sector, UINT count)",
+             "static DRESULT ff_sdmmc_write (BYTE pdrv, const BYTE* buff, DISKIO_SECT sector, UINT count)",
+             "ff_sdmmc_write (BYTE pdrv, const BYTE* buff, DISKIO_SECT", "write"),
+            ("            *((DWORD*) buff) = card->csd.capacity;",
+             "            *((DISKIO_SECT*) buff) = card->csd.capacity;",
+             "*((DISKIO_SECT*) buff) = card->csd.capacity", "sector count"),
+        ],
+    ),
+    (
+        "diskio_wl.c",
+        [
+            ("static DRESULT ff_wl_read (BYTE pdrv, BYTE *buff, DWORD sector, UINT count)",
+             "static DRESULT ff_wl_read (BYTE pdrv, BYTE *buff, DISKIO_SECT sector, UINT count)",
+             "ff_wl_read (BYTE pdrv, BYTE *buff, DISKIO_SECT", "read"),
+            ("static DRESULT ff_wl_write (BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)",
+             "static DRESULT ff_wl_write (BYTE pdrv, const BYTE *buff, DISKIO_SECT sector, UINT count)",
+             "ff_wl_write (BYTE pdrv, const BYTE *buff, DISKIO_SECT", "write"),
+            ("        *((DWORD *) buff) = wl_size(wl_handle) / wl_sector_size(wl_handle);",
+             "        *((DISKIO_SECT *) buff) = wl_size(wl_handle) / wl_sector_size(wl_handle);",
+             "*((DISKIO_SECT *) buff) = wl_size(wl_handle)", "sector count"),
+        ],
+    ),
+    (
+        "diskio_rawflash.c",
+        [
+            ("static DRESULT ff_raw_read (BYTE pdrv, BYTE *buff, DWORD sector, UINT count)",
+             "static DRESULT ff_raw_read (BYTE pdrv, BYTE *buff, DISKIO_SECT sector, UINT count)",
+             "ff_raw_read (BYTE pdrv, BYTE *buff, DISKIO_SECT", "read"),
+            ("static DRESULT ff_raw_write (BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)",
+             "static DRESULT ff_raw_write (BYTE pdrv, const BYTE *buff, DISKIO_SECT sector, UINT count)",
+             "ff_raw_write (BYTE pdrv, const BYTE *buff, DISKIO_SECT", "write"),
+            ("            *((DWORD *) buff) = s_sectors_count[pdrv];",
+             "            *((DISKIO_SECT *) buff) = s_sectors_count[pdrv];",
+             "*((DISKIO_SECT *) buff) = s_sectors_count[pdrv]", "sector count"),
+        ],
+    ),
+]
 
 HEADER_INCLUDE_ANCHOR = '#include <stddef.h>\n'
 HEADER_INCLUDE_BLOCK = '''#include "esp_vfs_ops.h"   // espix: esp_vfs_fs_ops_t, for esp_vfs_fat_get_ops()
@@ -398,6 +652,14 @@ def main() -> int:
     header = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat_internal.h"
     source = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat.c"
     ffconf = idf_path / "components" / "fatfs" / "src" / "ffconf.h"
+    diskio_i = idf_path / "components" / "fatfs" / "diskio" / "diskio_impl.h"
+    diskio_bdl = idf_path / "components" / "fatfs" / "diskio" / "diskio_bdl.c"
+    diskio_others = {}
+    diskio_others_new = {}
+    diskio_others_old = {}
+    for fname, edits in DISKIO_OTHERS:
+        path = idf_path / "components" / "fatfs" / "diskio" / fname
+        diskio_others[path] = edits
 
     try:
         version = idf_version(idf_path)
@@ -408,6 +670,8 @@ def main() -> int:
         header_text = header.read_text()
         source_text = source.read_text()
         ffconf_text = ffconf.read_text()
+        diskio_i_text = diskio_i.read_text()
+        diskio_bdl_text = diskio_bdl.read_text()
 
         header_new = insert_before(header_text, HEADER_INCLUDE_ANCHOR,
                                    HEADER_INCLUDE_BLOCK, MARK_H_CTX,
@@ -420,9 +684,35 @@ def main() -> int:
 
         ffconf_new = replace_once(ffconf_text, FFCONF_OLD, FFCONF_NEW,
                                   MARK_FFCONF, str(ffconf.name) + " exFAT")
+        ffconf_new = sub_once(ffconf_new, FFCONF_LBA64_RE, FFCONF_LBA64_NEW,
+                              MARK_FFCONF_LBA64, str(ffconf.name) + " LBA64")
         ffconf_new = insert_before(ffconf_new, "#define FF_USE_LABEL",
                                    FFCONF_LABEL_BLOCK, MARK_FFCONF_LABEL,
                                    str(ffconf.name) + " label symbol")
+
+        diskio_i_new = insert_after(diskio_i_text, DISKIO_SECT_ANCHOR,
+                                    DISKIO_SECT_BLOCK, MARK_DISKIO_SECT,
+                                    str(diskio_i.name) + " DISKIO_SECT")
+        diskio_i_new = replace_once(diskio_i_new, DISKIO_IMPL_OLD,
+                                    DISKIO_IMPL_NEW, MARK_DISKIO_IMPL,
+                                    str(diskio_i.name) + " 64-bit sector")
+
+        diskio_bdl_new = insert_after(diskio_bdl_text, DISKIO_BDL_HEADER_OLD,
+                                      DISKIO_BDL_HEADER_NEW,
+                                      MARK_DISKIO_BDL_HEADER,
+                                      str(diskio_bdl.name) + " 64-bit sector")
+        for old, new, marker, label in DISKIO_BDL_EDITS:
+            diskio_bdl_new = replace_once(diskio_bdl_new, old, new, marker,
+                                          str(diskio_bdl.name) + " " + label)
+
+        for file, edits in diskio_others.items():
+            old_text = file.read_text()
+            text = old_text
+            for old, new, marker, label in edits:
+                text = replace_once(text, old, new, marker,
+                                    str(file.name) + " " + label)
+            diskio_others_new[file] = text
+            diskio_others_old[file] = old_text
 
     except AnchorMissing as exc:
         print(f"patch-fatfs.py: {exc}", file=sys.stderr)
@@ -433,15 +723,17 @@ def main() -> int:
         return 1
 
     changed = []
-    if header_new != header_text:
-        header.write_text(header_new)
-        changed.append(header)
-    if source_new != source_text:
-        source.write_text(source_new)
-        changed.append(source)
-    if ffconf_new != ffconf_text:
-        ffconf.write_text(ffconf_new)
-        changed.append(ffconf)
+    to_write = [(header, header_text, header_new),
+                (source, source_text, source_new),
+                (ffconf, ffconf_text, ffconf_new),
+                (diskio_i, diskio_i_text, diskio_i_new),
+                (diskio_bdl, diskio_bdl_text, diskio_bdl_new)]
+    to_write += [(path, diskio_others_old[path], diskio_others_new[path])
+                 for path in diskio_others_new]
+    for path, old, new in to_write:
+        if new != old:
+            path.write_text(new)
+            changed.append(path)
 
     if changed:
         print("patch-fatfs.py: patched " + ", ".join(str(p) for p in changed))

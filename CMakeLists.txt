@@ -41,14 +41,25 @@ endif()
 # to send upstream, and this hook goes when it lands.
 #
 # The script runs on every *configure*, and CMake is told to re-configure when
-# either patched file changes — which is what a reinstall or an upgrade does to
+# any patched file changes — which is what a reinstall or an upgrade does to
 # them, and what `git checkout` does in the IDF tree. Without that, a reverted
 # IDF would sail past the hook and fail as an undefined reference to
 # esp_vfs_fat_ctx_create() pointing at espix rather than at the real cause: that
 # is not a hypothetical, it is what the first version of this hook did.
+#
+# Every file the script writes is listed, not just the first two: ffconf.h and
+# the two diskio files carry the exFAT and 64-bit work, and leaving them out
+# would let a `git checkout` of those revert the patch with nothing to notice --
+# the same failure, wearing a different coat.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${IDF_PATH}/components/fatfs/vfs/vfs_fat.c"
-    "${IDF_PATH}/components/fatfs/vfs/vfs_fat_internal.h")
+    "${IDF_PATH}/components/fatfs/vfs/vfs_fat_internal.h"
+    "${IDF_PATH}/components/fatfs/src/ffconf.h"
+    "${IDF_PATH}/components/fatfs/diskio/diskio_impl.h"
+    "${IDF_PATH}/components/fatfs/diskio/diskio_bdl.c"
+    "${IDF_PATH}/components/fatfs/diskio/diskio_sdmmc.c"
+    "${IDF_PATH}/components/fatfs/diskio/diskio_wl.c"
+    "${IDF_PATH}/components/fatfs/diskio/diskio_rawflash.c")
 execute_process(
     COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-fatfs.py"
             --idf-path "${IDF_PATH}"

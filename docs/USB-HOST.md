@@ -493,6 +493,16 @@ records it.
 - **Root only**, as `mount(8)` is: it changes the namespace for every session.
   `mount` with no arguments lists what is mounted and anyone may run that, as
   anyone may read `/proc/mounts`.
+- **`-o ro` mounts read-only, and the refusal is real.** The flag goes on the
+  block-device *view* espix owns, not on the disk handle — that handle is cached
+  and shared by espix_usb, so a flag set there would outlive the mount and make
+  the next mount of the same disk read-only too. IDF's diskio status callback
+  then answers `STA_PROTECT` for it and FatFs refuses a write with
+  `FR_WRITE_PROTECTED` (`ff.c:3508`) before the disk is touched at all, rather
+  than writing and failing at the driver. That matters for a device under
+  investigation: a read that goes wrong is recoverable, a *write* that goes
+  wrong puts the bad copy back. `/etc/fstab` takes `ro` in its flags column, and
+  `mount` prints `(ro)` so a listing says which it is.
 - **`umount` refuses while something is open on the mount.** It answers `busy` and
   says why, rather than pulling a volume out from under a reader who is halfway
   through a file.
@@ -606,27 +616,88 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   under a different, apparently unsafe, access pattern. Not done this
   session because it is real work for a symptom that costs nothing today —
   `SKIPPED="1"` already says the listing may be incomplete, honestly.
+- **A directory read on the same disk fails intermittently, and this is the
+  same drive.** Listing one directory on the T9 in a loop — mounted read-only,
+  so nothing else is touching it — fails roughly one run in ten, on the read
+  that would advance to the *next* directory sector. It lands in one of two
+  places, and the two look nothing alike:
+
+  - while advancing: the walk ends early and the listing is short. Seen as
+    `13 entries` for a directory that holds 19, with no error reported anywhere,
+    which is how it was mistaken for missing files.
+  - on the read past the last entry: every entry is listed and the failure comes
+    after them — `stopped after 19 entries: I/O error` — which is a complete
+    listing with a read error attached.
+
+  Both are now *reported*: `ls` used to swallow the `errno` IDF hands out of a
+  failed `readdir`, so neither was visible. See
+  [UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)
+  for why `NULL` cannot be told from end-of-directory, and
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md) for the standing entry.
+
+  Nothing is lost either way — the entries are on the medium and the read is
+  retried on the next call — but **mount this drive read-only** until it is
+  understood. A read that goes wrong is recoverable; a write that goes wrong puts
+  the bad copy back, and FatFs caches what it reads. `-o ro` makes that refusal
+  real rather than advisory: it rides on the block device, so FatFs answers
+  `FR_WRITE_PROTECTED` before the disk is touched.
+
+  This is plausibly the *same* fault as the GPT-array entry above — the same
+  disk, the same "the same LBA gives a different answer moments later" shape,
+  once seen in the partition table and once in a directory. That would make it
+  one bug at the read level rather than two in two filesystems, which is the real
+  reason to document it here: the layer is a guess, not a finding. The
+  measurement that would settle it is logging the failing LBA in the diskio
+  layer — above the 2TiB mark it is the widened 64-bit path; below it, it is
+  the older quirk.
 - **A USB keyboard (HID).** Deferred until there is a display, which is the
   honest position: with no screen, a keyboard's only use would be a test that
   prints what was typed, and nothing else in espix would consume the events. The
   test itself is cheap when a display arrives — SSH in over WiFi, run a command
   that prints decoded keystrokes, type on the keyboard — and it sidesteps the
   can't-plug-both-sockets problem entirely.
-- **exFAT.** `FF_FS_EXFAT` is hardcoded `0` in IDF's `components/fatfs/src/ffconf.h`
-  with no Kconfig to change it, so enabling it means patching a dependency at
-  configure time — `tools/patch-fatfs.py`, the `tools/patch-littlefs.py`
-  precedent, behind `CONFIG_ESPIX_FS_EXFAT` (default `n`; +5,644 bytes of ROM, no
-  static RAM). The driver builds as of that patch; mounting an exFAT volume
-  through the VFS is **not** wired, so a mount's cost is unmeasured. A volume
-  larger than 2TiB also needs `FF_LBA64` — hardcoded `0` in the same file, and
-  only meaningful alongside exFAT, which is why it is one patch and one option:
-  the 3.1TB exFAT volume on the 4TB SSD that prompted the GPT reader cannot be
-  addressed at all with 32-bit LBAs. Separately: exFAT is covered by Microsoft
-  patents and FatFs's author has historically noted that a licence may be needed
-  for commercial use. **That claim was not verified against IDF or FatFs here — no
-  patent or licence text ships with the bundled FatFs — so check Microsoft's own
-  terms before shipping it on by default.** `lsblk` and `blkid` name exFAT and
-  NTFS today, whole-device or partition, which is the honest half.
+- **exFAT.** Done, and it took four edits in `tools/patch-fatfs.py` rather than
+  one, because `FF_FS_EXFAT` alone mounts nothing on the volume that wants it.
+
+  `FF_FS_EXFAT` is hardcoded `0` in IDF's `components/fatfs/src/ffconf.h` with no
+  Kconfig to change it, so enabling it means patching a dependency at configure
+  time — the `tools/patch-littlefs.py` precedent, behind `CONFIG_ESPIX_FS_EXFAT`
+  (default `n`). `FF_LBA64` is hardcoded `0` in the same file and is **not
+  optional**: `ff.c:3545` refuses any volume whose last LBA does not fit in 32
+  bits — 2TiB at a 512-byte sector — which is smaller than the 3.1TB partition
+  that prompted the GPT reader, so `f_mount` would answer `FR_NO_FILESYSTEM` with
+  exFAT alone.
+
+  Then the truncation underneath, which neither flag reaches: `ff.c` computes
+  64-bit LBAs and hands them to `ff_disk_read()`, which dispatches through
+  `ff_diskio_impl_t` — a struct whose read and write function pointers take
+  `uint32_t`. The narrowing is implicit at the call site and silent: sector
+  `0x100000000` becomes `0` and reads somewhere else on the medium entirely. The
+  struct's sector type is `DISKIO_SECT` now, and every backend that assigns into
+  it is declared with the same, so the mismatch is a build error rather than a
+  wrong read. `diskio_bdl.c`'s sector parameters and `GET_SECTOR_COUNT` buffer
+  widen with them — that ioctl's buffer is an `LBA_t`, so a 32-bit write left
+  half of it uninitialised.
+
+  What is deliberately *not* widened: `diskio_sdmmc.c`, `diskio_wl.c` and
+  `diskio_rawflash.c` pass `DISKIO_SECT` into `sdmmc_read_sectors()`, `wl_read()`
+  and `esp_partition_read()`, which take 32 bits. That is those APIs' limit and
+  is unchanged; only the interface FatFs itself calls through was fixed.
+
+  Measured: +6,972 bytes of ROM for the whole feature (`FF_FS_EXFAT` alone was
+  +5,644), no static RAM — a `FATFS` work area is allocated, so an exFAT mount's
+  RAM sits on the heap.
+
+  With it on, `mount` accepts a volume `lsblk` names `exfat`, and `lsblk` stops
+  marking that type unsupported, because the marker would otherwise be a lie
+  about a driver that is present.
+
+  Separately: exFAT is covered by Microsoft patents and FatFs's author has
+  historically noted that a licence may be needed for commercial use. **That
+  claim was not verified against IDF or FatFs here — no patent or licence text
+  ships with the bundled FatFs — so check Microsoft's own terms before shipping
+  it on by default.** NTFS is still named and still unsupported: FatFs has no
+  NTFS, and `lsblk`/`blkid` naming it is the honest half.
 - **lwext4** for ext2/3/4, and a much later `lwntfs`. Until then, `lsblk` naming
   them as recognised-but-unsupported is the honest position, and it is what this
   stage delivers.

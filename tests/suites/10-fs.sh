@@ -95,3 +95,50 @@ assert_status "chmod on a device is refused" 1 dev_status 'chmod 600 /dev/null'
 # And /dev is still there afterwards, in its own right.
 assert_contains "/dev survives the attempts" "null" "$(dev_run 'ls /dev')"
 
+# --------------------------------------------------------------- sizes ---
+#
+# `df` is the only place a size is visible without a USB device attached, so it
+# is where the formatter can be checked on a board with nothing plugged in.
+#
+# The unit table reaches 'T' because it stopped at 'G' for a while and printed a
+# 3.1TB volume as "3214G" -- the same value `lsblk` and `ls` report through the
+# same function, so one command covers all of them. A rootfs is far too small to
+# reach T here; what this asserts is the shape below it, which is what a wrong
+# bound breaks first.
+df_h=$(dev_run 'df -h')
+assert_contains "df -h renames the size column" "Size"        "$df_h"
+assert_not_contains "df -h does not claim 1K blocks" "1K-blocks" "$df_h"
+assert_contains "df -h names the root filesystem" "littlefs"    "$df_h"
+
+# A rootfs is 12M, so no assertion here can reach the unit that was missing --
+# the T boundary is where the bug was, and the numbers either side of it are not
+# reachable from a board with a small volume on it. What this pair does cover is
+# that the command still runs and lays its table out with the new widths; the
+# boundary values are checked against a real 3.1TB disk by the USB suite, and
+# against the formatter directly wherever espix_cmd_size() is compiled for a host.
+#
+# The plain column is a 64-bit count -- 1K-blocks of a 3.1TB volume is over 2^32,
+# and it used to be formatted through an `unsigned`.
+df_plain=$(dev_run 'df')
+assert_contains "df names the block column" "1K-blocks" "$df_plain"
+assert_contains "df still names the root filesystem" "littlefs" "$df_plain"
+
+# ------------------------------------------------------- silent truncation ---
+#
+# readdir answers NULL for "no more entries" *and* for an I/O error, and only
+# sets errno for the second. Until this was fixed `ls` never looked, so a walk
+# that failed part-way printed a short listing and a count -- on a 3.1TB exFAT
+# volume it once said "13 entries" for a directory holding 19, which reads as a
+# directory that holds 13 things.
+#
+# The failing half of that is asserted against the real volume by 75-usb.sh.
+# What is asserted here is the half that guards the fix: errno is cleared before
+# every readdir, and a stale value read after a *successful* walk would make an
+# ordinary listing claim a failure. A clean directory must stay quiet.
+ls_ok=$(dev_run 'ls -l /')
+assert_not_contains "a clean listing reports no read error" "stopped after" "$ls_ok"
+assert_not_contains "a clean listing reports no I/O error"  "Input/output error" "$ls_ok"
+assert_contains     "and still prints its count"            "entries" "$ls_ok"
+assert_not_contains "the synthetic /dev listing is quiet too" "stopped after" \
+    "$(dev_run 'ls -l /dev')"
+
