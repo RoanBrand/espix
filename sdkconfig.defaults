@@ -323,6 +323,13 @@ CONFIG_ESPIX_SSH_TASK_STACK=10240
 # that goes with it -- so a build that wants it says so explicitly.
 CONFIG_ESPIX_FS_EXFAT=y
 
+# ext2/3/4, via the vendored esp_lwext4 component. The feature set has to be
+# ext4 for a real Linux volume — an ext4 filesystem carries the `extents`
+# incompatible feature, so the ext3 set would not accept it. Everything else the
+# component needs (the MIT extents implementation, journaling, the internal-SRAM
+# allocator) is already its default.
+CONFIG_LWEXT4_FEATURE_SET_EXT4=y
+
 # Precomputation for base-point scalar multiplication, which is what ECDSA does
 # for k*G -- and signing the exchange hash with the nistp256 host key is the
 # largest single cost in an SSH key exchange here. The ESP32-S3 has no ECC

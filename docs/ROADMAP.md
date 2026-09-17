@@ -471,12 +471,31 @@ otherwise have been a surprise:
 **What espix would write:** `components/espix_fs/ext.c`, a shim over `ext4_*` in
 the shape of `fat.c` (~400-600 lines); the mount wiring (`mountable()`, the mount
 record, fstab, `ESPIX_FS_EXT4`, and dropping `foreign` from the `ext2/3/4` row);
-a superblock reader for `blkid`'s label and UUID, which today is FAT-only; and a
-free-space call for `df`, which today is `espix_fs_stat_fat()` by name. The
-genuinely new piece is an **fd table**: FatFs's glue handed espix a file table
-and an `int` fd, where lwext4 has neither because the caller owns the
-`ext4_file` — so espix allocates, bounds and recycles handles itself, inside
-`esp_vfs`'s `uint8_t` `local_fd_t` that `dev.c` already documents.
+a superblock reader for `blkid`'s label and UUID, which today is FAT-only; and
+plumbing `df` onto lwext4's own `ext4_mount_point_stats()`, since that call
+already exists and only espix's FAT-named surface is missing. The genuinely new
+piece is an **fd table**: FatFs's glue handed espix a file table and an `int` fd,
+where lwext4 has neither because the caller owns the `ext4_file` — so espix
+allocates, bounds and recycles handles itself, inside `esp_vfs`'s `uint8_t`
+`local_fd_t` that `dev.c` already documents.
+
+Two things are easier than they looked, now that the headers have been read
+rather than guessed at:
+
+- **Read-only mounting is native.** `ext4_mount(dev_name, mount_point, bool
+  read_only)` takes it as an argument, so none of the exFAT work is needed here:
+  no view to mark read-only, no riding `STA_PROTECT` through the status callback.
+- **`ext4_fseek()` takes an `int64_t` offset**, so seeking past 4 GiB is
+  something the filesystem can already do. The ceiling is espix's `off_t` alone,
+  which makes the fix for it purely a matter of espix's own types.
+
+**The component builds against IDF 6.1 unmodified** — verified, not assumed: the
+vendored tree, its `ExternalProject`, the generated `ext4_config.h` and the
+`esp_blockdev` adapter all compile and link as they ship, with no source edits.
+Everything it needs (`esp_blockdev`, `esp_blockdev_util`, `sdmmc`) exists in 6.1.
+The image size is unchanged at that point because nothing references lwext4 yet
+and `--gc-sections` drops all of it, so **the real size cost is still unmeasured**
+and needs the shim to exist before it can be.
 
 **What it would find espix is missing** — the second reason to do it, after the
 filesystem itself, because these are model questions rather than additions:
@@ -492,8 +511,9 @@ filesystem itself, because these are model questions rather than additions:
   for.
 - **Symlinks** want `symlink()`/`readlink()` plus resolution in the VFS. There is
   no symlink handling anywhere in the tree today.
-- **`statfs`/`statvfs`**, replacing a FAT-named free-space call with a generic
-  surface.
+- **`statfs`/`statvfs`** as a *generic* surface. The capability is already in
+  lwext4 (`ext4_mount_point_stats()`); what espix lacks is a filesystem-agnostic
+  place to ask, since `df` reaches for `espix_fs_stat_fat()` by name.
 - **The 32-bit `off_t` stops being theoretical.** ext4 volumes hold files over
   4 GiB as a matter of course and `st_size` truncates, so this is the documented
   ceiling arriving as a practical blocker and forcing that decision —
