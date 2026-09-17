@@ -648,7 +648,14 @@ being the shortest path.
     rather than a parser change, in `host.c` beside the MBR walk. What asked for
     it was a 4TB Samsung T9 — three partitions behind a protective MBR, one
     unreadable row before. What is left of it is small: an entry's UTF-16
-    partition name, and the disk's own GUID, neither of which is printed today.
+    partition name, and the disk's own GUID, neither of which is printed
+    today — plus one real oddity, not yet chased down: reading the same
+    entry-array LBA twice in one `gpt_read()` call, once inside a clean
+    whole-array checksum sweep and once during the interleaved entry walk,
+    gets two different answers on the T9, moments apart. All three
+    partitions still list correctly either way, so it costs nothing today;
+    see [USB-HOST.md](USB-HOST.md#roadmap-not-now) for what was checked and
+    what the fix would be.
   - **A USB keyboard** is the interesting one and needs no display and no serial
     port to test: SSH in over WiFi, print decoded keystrokes, and type. That
     sidesteps the hub-blocks-the-UART-socket problem entirely, which is the part

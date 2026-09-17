@@ -771,3 +771,29 @@ UART and nowhere else. And the backtrace on the first panic named IDF's core-dum
 writer rather than the overflow, because the dump itself faulted and re-entered; in
 a boot loop, read the *first* fault, and treat the frames below `|<-CORRUPTED` as
 gone rather than as the answer.
+
+## `esp_rom_crc32_le()` is a raw chain step, not a drop-in CRC-32
+
+Its own header (`esp_rom_crc.h`) documents the general recipe -- pre-invert the
+seed once, thread the running value between calls with no inversion in between,
+invert once at the end, then XOR by the target algorithm's `xorout` -- but it is
+easy to reach for `crc = 0xFFFFFFFF; ...; return ~crc;` from memory, the shape
+every zlib-style CRC-32 snippet uses, and get it wrong for *this* function. Wrote
+exactly that once, validating a GPT entry array's checksum against real hardware,
+and it rejected a table that was genuinely valid: the seed and the final `~` were
+each individually the standard convention, applied to a function that already
+expects one of them folded into a different place.
+
+For GPT's specific checksum -- the ordinary CRC-32 (`init=0xFFFFFFFF`,
+`xorout=0xFFFFFFFF`, the pair FatFs's own byte-at-a-time `crc32()` in `ff.c`
+implements) -- the pre-invert of the seed and the final invert-then-xorout cancel
+exactly: `~(0xFFFFFFFF)` is `0`, and `(~crc) ^ 0xFFFFFFFF` is `crc` unchanged. So
+the seed is `0`, chained calls pass the running value straight through, and the
+raw result is compared with no inversion anywhere -- confirmed against a real
+call site already in the IDF tree, `esp_rom_crc32_le(0, buf, len)` in
+`bootloader_support/src/bootloader_utility_tee.c`, used exactly that way with no
+final `~`. The general lesson: read the multi-chunk recipe in the header comment
+for the *specific* algorithm being reproduced before assuming the usual shape
+applies, because this function's contract is one layer more abstract than a
+typical CRC-32 helper and the abstraction is exactly where a memorised shortcut
+goes wrong.

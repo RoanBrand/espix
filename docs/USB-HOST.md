@@ -129,7 +129,20 @@ examined). Sector 0 is then the filesystem's own boot sector: a FAT one gives
 named and marked unsupported. Two filesystems keep nothing in sector 0 at all and are found by a read further in: **ext2/3/4**, whose superblock is at 1024, and **ISO 9660**, whose primary descriptor is at 32768 — which is why a Linux-prepared stick or an installer image read as a bare disk with an empty `FSTYPE` until those offsets were read. A stick that is empty, or holds something nothing here recognises, stays a bare disk, and nothing is missing from that answer: Linux's own `blkid` reports nothing for such a stick either.
 - **Filesystems espix has no driver for are named, not hidden.** The partition
 table says `exfat/ntfs` (one MBR code covers both, so it is as specific as sector
-0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, `iso9660` when its descriptor does, or `gpt` for a protective MBR whose GPT header could not be read, each marked `(unsupported)`. On a GPT disk the same happens through the entry's type GUID (`msdata`, `msreserved`, `linux`), with the partition's own boot sector overriding it wherever it can. `0xEF` — "EFI (FAT-12/16/32)" to `fdisk`, and what every Arch, CachyOS and Windows installer writes — is **`vfat`**, and mountable: it is FAT, and the library has no code for it, so espix adds that one itself. That is the whole reason
+0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, `iso9660` when its descriptor does, `bitlocker` when its boot sector carries BitLocker's own GUID, or `gpt` for a protective MBR whose GPT header could not be read, each marked `(unsupported)`. On a GPT disk the same happens through the entry's type GUID (`msdata`, `msreserved`, `linux`), with the partition's own boot sector overriding it wherever it can.
+
+  `bitlocker` is checked *before* the FAT probe below, and has to be: "BitLocker
+  To Go" — what `manage-bde` writes for a password-protected removable drive —
+  is a lookalike FAT32 boot sector on purpose, so that an OS with no BitLocker
+  support reads it as an ordinary formatted volume rather than refusing it.
+  Microsoft's own layout (documented in libyal's libbde) keeps the real FAT32
+  fields intact — volume label, `"FAT32   "` — and only past the boot code does
+  a fixed 16-byte GUID replace what would otherwise be more of it, at one of two
+  offsets depending on whether the drive is fixed or removable. Found on a real
+  disk: a BitLocker-encrypted 512G partition on the Samsung T9 read as `vfat`
+  until the GUID check existed.
+
+  `0xEF` — "EFI (FAT-12/16/32)" to `fdisk`, and what every Arch, CachyOS and Windows installer writes — is **`vfat`**, and mountable: it is FAT, and the library has no code for it, so espix adds that one itself. That is the whole reason
 the command exists before mounting does: silence would read as an empty disk.
 
   `vfat`, `littlefs` and `raw` are *not* marked, and the marker is about the type
@@ -543,14 +556,56 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   [UPSTREAM.md](UPSTREAM.md#a-device-pulled-mid-transfer-takes-the-heap-with-it).
 - **`df` per mount.** One `f_getfree()` behind an `espix_fs_stat_fat()`, and the
   point where `df` stops being a rootfs-only command.
-- **`READ CAPACITY(16)`,** so a drive larger than 2 TiB reports its real size
-  instead of a plausible 2 TiB. It is the class driver's choice of SCSI command,
-  not espix's, so it belongs to the list below as much as to here.
+- **`READ CAPACITY(16)`, and `READ(16)`/`WRITE(16)` behind it — done.** A 3.6TB
+  Samsung T9 reported exactly 2,199,023,255,040 bytes: `0xFFFFFFFF` blocks of
+  512, `READ CAPACITY(10)`'s 32-bit field clamping rather than the disk's real
+  size, per SBC-2 the signal to retry with the 64-bit command. `tools/patch-msc.py`
+  adds `scsi_cmd_read_capacity_16`/`scsi_cmd_read16`/`scsi_cmd_write16` to
+  `espressif/usb_host_msc` (`0x9E`/`0x88`/`0x8A`), tried only when `(10)`
+  saturates — a device that answers `(10)` cleanly costs nothing extra, and one
+  that has no `(16)` at all still gets its `(10)` answer rather than failing
+  outright. `espix_usb_dev_t.size` reads the blockdev's own 64-bit
+  `geometry.disk_size` rather than the public `sector_count` field (which stays
+  32-bit; it is public API and the patch leaves it alone), because a partition
+  past 2 TiB would otherwise fail every "is this inside the device" bounds
+  check in the MBR and GPT walks and vanish without a word. Cost: +772 bytes of
+  code, +64 of read-only data, no static RAM.
 - **The rest of GPT.** The table is read, every partition listed, and each one's
   PARTUUID printed. An entry's 36-byte UTF-16 *name* is not — Windows writes
   "Basic data partition" into all of them, and `lsblk` has no column for it —
   and neither is the disk's own GPT GUID, which Linux reports as the table's
   PTUUID.
+- **`bitlocker`**, named via the fixed GUID Windows writes past the boot code
+  of a lookalike FAT32 sector (`libbde`'s `bde_identifier`, at a fixed offset
+  that differs by whether the volume is on fixed or removable media) — found
+  because a real BitLocker-To-Go partition on the T9 read as `vfat` until the
+  GUID check existed, exactly the same class of "trust the content over the
+  label" case the ISO-in-a-0x00-entry one already was, just with Microsoft
+  choosing the lookalike deliberately rather than an installer doing it by
+  accident.
+- **A real disk's GPT array reads differently on two separate reads of the
+  same LBA, moments apart.** Not a parser bug: the entry-array checksum
+  (`GPTH_PtBcc`, which FatFs's own formatter writes but its reader never
+  checks — see `gpt_entries_crc_ok()`) passes clean when the array is read in
+  one uninterrupted sweep, and a byte-for-byte independent read of the same
+  sector off the same physical disk from a Mac (`/dev/rdisk4`, read-only)
+  confirms it: all zero, exactly where a valid, unused GPT entry should be.
+  But the *entry walk*, which interleaves array-sector reads with per-partition
+  boot-sector probes and reads that same sector again a few calls later,
+  gets something else back from it on every run tried so far — four
+  warnings (`GPT entry 125 is not inside the device`, etc.) that a
+  clean-sweep read of the identical bytes never reproduces. All three real
+  partitions are still listed correctly regardless, so this is cosmetic
+  today, and it is real: something in the alternating small-read pattern
+  this walk uses gets a stale or wrong answer from the same offset a
+  dedicated sweep does not. The fix that would remove it without more
+  investigation: merge the checksum sweep and the entry walk into one pass —
+  stash the handful of used entries (bounded by `ESPIX_USB_MAX_PARTS`, so a
+  small fixed buffer) as the single sweep finds them, and build partition
+  rows from that stash afterward rather than reading the array a second time
+  under a different, apparently unsafe, access pattern. Not done this
+  session because it is real work for a symptom that costs nothing today —
+  `SKIPPED="1"` already says the listing may be incomplete, honestly.
 - **A USB keyboard (HID).** Deferred until there is a display, which is the
   honest position: with no screen, a keyboard's only use would be a test that
   prints what was typed, and nothing else in espix would consume the events. The

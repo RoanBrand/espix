@@ -32,6 +32,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 #include "usb/msc_host.h"
 #include "usb/usb_host.h"
 
@@ -101,6 +102,7 @@
 #define GPT_HDR_PT_LBA      72      /* QWORD: the entry array's first LBA */
 #define GPT_HDR_PT_COUNT    80      /* DWORD: entries the array holds */
 #define GPT_HDR_ENTRY_SIZE  84      /* DWORD: bytes per entry */
+#define GPT_HDR_PT_BCC      88      /* DWORD: CRC32 of the whole entry array */
 
 #define GPT_ENTRY_SIZE      128     /* the size every table this has met uses */
 #define GPT_ENTRY_TYPE_GUID 0       /* 16 bytes: what the partition is for */
@@ -861,6 +863,72 @@ static void part_name(char *dst, size_t dst_len, const char *disk, uint32_t entr
 }
 
 /*
+ * Validates the entry array against the header's own checksum (GPTH_PtBcc),
+ * a whole-array CRC32 the UEFI specification defines for exactly this
+ * purpose. FatFs checks the *header's* own checksum before trusting it
+ * (test_gpt_header, ff.c) but never reads this one back, even though its own
+ * formatter writes it -- so this is stricter than FatFs, not merely matching
+ * it.
+ *
+ * Written because of a real 3.6TB Samsung T9: the walk below produced four
+ * entries that failed its per-entry sanity checks, on a disk whose same four
+ * LBAs read back as nothing but zeros under a direct, independent read from
+ * a different host. What produced those four entries in espix's own read was
+ * not pinned down -- the BOT status wrapper's dataResidue field already
+ * catches a genuine short SCSI transfer before it would ever reach here, and
+ * every offset this walk computed checked out exactly against the real
+ * header's own fields once decoded by hand. Whichever it was, a checksum
+ * that does not match the one the table carries for itself is reason enough
+ * not to build a single row from it -- which also closes a case the walk's
+ * own per-entry checks cannot: a padding-region entry that happens to pass
+ * every one of them by coincidence would otherwise become a phantom
+ * partition with no warning at all.
+ *
+ * A read failure here is reported by the caller exactly as a read failure
+ * during the walk is; this only decides whether the walk should trust what
+ * it is about to read, not whether the read itself succeeded.
+ */
+static bool gpt_entries_crc_ok(usb_dev_t *d, uint8_t *buf, size_t unit,
+                               uint64_t table_lba, uint32_t entries,
+                               uint32_t entry_size, uint32_t stored_crc)
+{
+    /*
+     * esp_rom_crc.h documents its own chaining recipe: pre-invert the seed
+     * once, thread the running value between calls with no per-chunk
+     * inversion, invert once at the end, then XOR by the named algorithm's
+     * xorout. GPT's checksum is the ordinary CRC-32 (init=0xFFFFFFFF,
+     * xorout=0xFFFFFFFF -- the same one FatFs's own byte-at-a-time crc32()
+     * implements in ff.c, poly 0xEDB88320 reflected), and for that specific
+     * pair the pre-invert of the seed and the final invert-then-xorout
+     * cancel exactly: ~(0xFFFFFFFF) is 0, and (~crc) ^ 0xFFFFFFFF is crc
+     * unchanged. So the seed starts at 0 and the raw running value is
+     * compared directly -- no inversion anywhere in this function.
+     *
+     * Got this wrong the first time by starting at 0xFFFFFFFF and inverting
+     * at the end, which is the recipe for a *different* pair of
+     * (init, xorout) values, not this one -- and it rejected a real GPT
+     * table's genuinely valid entry array on the first attempt.
+     */
+    const uint64_t total_bytes = (uint64_t)entries * entry_size;
+    const uint64_t sectors = (total_bytes + unit - 1) / unit;
+    uint32_t crc = 0;
+    uint64_t done = 0;
+
+    for (uint64_t s = 0; s < sectors; s++) {
+        if (d->bdl->ops->read(d->bdl, buf, unit, (table_lba + s) * unit,
+                              unit) != ESP_OK) {
+            return false;
+        }
+        const uint64_t remaining = total_bytes - done;
+        const size_t   take      = remaining < unit ? (size_t)remaining : unit;
+        crc = esp_rom_crc32_le(crc, buf, take);
+        done += take;
+    }
+
+    return crc == stored_crc;
+}
+
+/*
  * A GPT disk, whose partition table is at LBA 1 rather than in sector 0.
  *
  * This is the case that turned up as a 3.6TB Samsung T9: three partitions and a
@@ -880,9 +948,14 @@ static void part_name(char *dst, size_t dst_len, const char *disk, uint32_t entr
  * be 16K of heap for nothing. That is also why an entry's GUIDs are read out
  * before the partition probe refills the buffer they came in.
  *
+ * The array is checked against the header's own checksum before any of that --
+ * see gpt_entries_crc_ok() -- so a table that fails it is never walked at all,
+ * rather than producing rows this cannot otherwise tell apart from real ones.
+ *
  * Returns true when the disk is a GPT disk and has been handled here -- including
- * when its header was refused, because the MBR walk has nothing better to say
- * about a disk whose real table is the one this just rejected.
+ * when its header, or its entry array's checksum, was refused, because the MBR
+ * walk has nothing better to say about a disk whose real table is the one this
+ * just rejected.
  */
 static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
 {
@@ -901,6 +974,7 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
     const uint64_t table_lba  = entry_u64(buf, GPT_HDR_PT_LBA);
     const uint32_t entries    = entry_u32(buf, GPT_HDR_PT_COUNT);
     const uint32_t entry_size = entry_u32(buf, GPT_HDR_ENTRY_SIZE);
+    const uint32_t entries_crc = entry_u32(buf, GPT_HDR_PT_BCC);
 
     /*
      * The two rules FatFs applies to a GPT header before reading its table, and
@@ -912,6 +986,23 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "%s: a GPT table this cannot walk (%u entries of %u bytes)",
                    d->info.name, (unsigned)entries, (unsigned)entry_size);
+        d->info.table_skipped = true;
+        return true;
+    }
+
+    /*
+     * A whole-array read, purely to add its bytes into a running CRC32 --
+     * `buf` is not kept past this, and the walk below reads every sector of
+     * the array again as it goes. Reading it twice costs nothing worth
+     * avoiding (16K at most, and only once per attach) next to what a wrong
+     * table would cost: a phantom partition, or a real one silently missing.
+     * See gpt_entries_crc_ok().
+     */
+    if (!gpt_entries_crc_ok(d, buf, unit, table_lba, entries, entry_size,
+                           entries_crc)) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: GPT entry array checksum does not match the header; "
+                   "not walked", d->info.name);
         d->info.table_skipped = true;
         return true;
     }
