@@ -278,6 +278,33 @@ boundary nobody asked for. espix carries `components/espix_fs/part.c`, the same
 implementation with `uint64_t` offsets — about eighty lines, and a pity to have
 twice.
 
+**The same truncation, one file over, in the SDMMC block device.**
+`components/sdmmc/sdmmc_blockdev.c` (v6.0.2) narrows the address the same way,
+before converting it to sectors:
+
+    size_t start_sector_num = (size_t) addr / sector_size;
+    size_t last_byte_addr   = (size_t) (addr + data_len - 1);
+
+Media past 4GB therefore wraps modulo 4GB, silently — the operation targets a
+valid sector and returns success — and **reads are affected as well as writes**,
+so data above the boundary comes from the wrong place without an error anywhere.
+
+espix is not on that path: the SDMMC block device is for SD cards, and espix's
+storage is USB MSC, where `msc_bdl_read()`/`msc_bdl_write()` are `uint64_t`
+throughout and pick `READ(16)` above `UINT32_MAX` (see `tools/patch-msc.py`).
+The point of recording it is the audit, not the fix: this is the **third**
+instance of the family after `esp_blockdev_generic_partition_get()` above, and
+the rule it establishes is that no byte address in a lower block-device layer is
+safe to assume 64-bit without reading it.
+
+Reported upstream as [esp-idf#18875](https://github.com/espressif/esp-idf/issues/18875)
+(IDFGH-18017), fixed on main and **not** backported to the v6.0 release line, so
+a v6.0-based project has to check its exact revision rather than the issue's
+state. The measurement is from a third-party port's own write-up —
+`doc/CAVEATS.md` in `huming2207/esp_lwext4` — which pinned the alias exactly: an
+inode bitmap for block group 227 landing on block group 3's block bitmap, at
+which point the allocator had marked that group's own metadata as free.
+
 ### `chmod()` returns success and does nothing
 
 `esp_libc/src/realpath.c`:

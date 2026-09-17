@@ -413,6 +413,106 @@ being the shortest path.
   column. One is a new spelling to learn, the other a change to the file's shape,
   and it is worth deciding deliberately rather than by precedence.
 
+### ext2/3/4, via a port rather than a library
+
+The plan, costed — not started. What asked for it: `lsblk` already names
+`ext2/3/4`, from the superblock, on a partition (`0x83`) and on a whole-device
+volume alike, and a Linux-formatted stick is the one common volume that stays
+unreadable.
+
+**Use `huming2207/esp_lwext4`, not `gkostka/lwext4` directly.** The port is what
+lwext4-on-ESP-IDF needs and what espix would otherwise write: a *generated*
+`ext4_config.h` (upstream's own seam — `#if !CONFIG_USE_DEFAULT_CFG` → a
+`generated/` header, so **nothing upstream is edited**), an adapter over
+`esp_blockdev`, Kconfig-to-macro mapping, and a malloc layer with internal-SRAM /
+PSRAM / prefer-PSRAM modes, which suits this tree's IRAM-first rule.
+`espix_fs_partition_view()` already returns an `esp_blockdev_handle_t`, so the
+block device is a direct fit rather than an adaptation.
+
+**Not the component manager.** Neither repo has an `idf_component.yml`, and
+esp_lwext4 keeps lwext4 as a git submodule with no branch pin — a `git:`
+dependency would resolve to a component with an empty `lwext4/`. Its own demo
+consumes it as a submodule at `components/esp_lwext4`, which is the integration
+to copy. So: **vendor it and pin the revision**, the way `EXPECTED_IDF` pins the
+IDF the patch scripts are written against.
+
+**It also settles the licence**, which is the reason to prefer it to raw lwext4.
+lwext4 is GPLv2 with exactly two GPL files (`ext4_xattr.c`, `ext4_extents.c`);
+the port's default build compiles an **MIT** extents implementation and an xattr
+stub instead, keeping both out and the firmware BSD-3/MIT. Selecting upstream
+extents instead makes the binary GPL-2.0 — a fork in the road, and a bigger
+decision than exFAT's patent question. Worth knowing that the MIT extent code is
+the port's own "experimental" replacement, though he has verified depth-2 extent
+trees against `e2fsck` and `debugfs`.
+
+**Three things his `doc/CAVEATS.md` settles in advance**, each of which would
+otherwise have been a surprise:
+
+- **ESP-IDF's SDMMC block device truncates byte addresses to `size_t`**, wrapping
+  media over 4GB silently and on reads as well as writes. Not espix's path —
+  storage here is USB MSC, which is `uint64_t` throughout — but it is the third
+  instance of that family in this tree, so it is written up in
+  [UPSTREAM.md](UPSTREAM.md#a-partition-view-cannot-be-larger-than-4gb). His own
+  instruction is the useful part: *"other lower BDL implementations must be
+  audited separately"*, which is exactly what `part.c` already is.
+- **Mutation requires journaling.** Allocation, tree splitting and extent removal
+  return `ENOTSUP` unless journaling is compiled in *and* the mounted filesystem
+  has an active transaction.
+- **The pinned lwext4 core has an unfixed error-propagation bug**:
+  `ext4_fwrite()` assigns the result of `ext4_fs_put_inode_ref()` to `r` at its
+  `Finish` label, **overwriting an earlier allocation error** before it chooses
+  between abort and commit. Passing `e2fsck` is therefore not evidence that an
+  injected I/O failure rolls back safely — and that matters here more than
+  anywhere, because the T9 this tree was developed against
+  ([KNOWN-ISSUES.md](KNOWN-ISSUES.md)) returns wrong bytes on a repeated read.
+  **A library with an unverified error path writing to that drive is the
+  combination to avoid**, which is why the first milestone is read-only.
+
+**What espix would write:** `components/espix_fs/ext.c`, a shim over `ext4_*` in
+the shape of `fat.c` (~400-600 lines); the mount wiring (`mountable()`, the mount
+record, fstab, `ESPIX_FS_EXT4`, and dropping `foreign` from the `ext2/3/4` row);
+a superblock reader for `blkid`'s label and UUID, which today is FAT-only; and a
+free-space call for `df`, which today is `espix_fs_stat_fat()` by name. The
+genuinely new piece is an **fd table**: FatFs's glue handed espix a file table
+and an `int` fd, where lwext4 has neither because the caller owns the
+`ext4_file` — so espix allocates, bounds and recycles handles itself, inside
+`esp_vfs`'s `uint8_t` `local_fd_t` that `dev.c` already documents.
+
+**What it would find espix is missing** — the second reason to do it, after the
+filesystem itself, because these are model questions rather than additions:
+
+- **Real ownership and modes.** ext4 keeps uid/gid/mode in the inode. espix's
+  model is a rule plus a side attribute (`mode.c`) for filesystems that keep
+  none, so `espix_fs_owner()`, `chmod` and `chown` must either defer to the
+  filesystem or deliberately override it. That is a decision touching `access.c`,
+  `mode.c` and `abi_fs.c`, and it should be taken *before* the shim.
+- **Inode numbers exist**, so `ls -i` becomes possible — littlefs cannot, and
+  [UPSTREAM.md](UPSTREAM.md) has the reason under *`readdir()` reports no inode*.
+- **Hardlinks** (lwext4 supports them) want a `link()` espix has no counterpart
+  for.
+- **Symlinks** want `symlink()`/`readlink()` plus resolution in the VFS. There is
+  no symlink handling anywhere in the tree today.
+- **`statfs`/`statvfs`**, replacing a FAT-named free-space call with a generic
+  surface.
+- **The 32-bit `off_t` stops being theoretical.** ext4 volumes hold files over
+  4 GiB as a matter of course and `st_size` truncates, so this is the documented
+  ceiling arriving as a practical blocker and forcing that decision —
+  [UPSTREAM.md](UPSTREAM.md#off_t-is-32-bits-and-no-kconfig-changes-it).
+
+**Effort.** Read-only, as with exFAT: the shim and fd table are the bulk at
+roughly 1-2 days, wiring and `blkid`/`df` another, against a vendored dependency
+whose build is already solved. **Call it 3-5 focused days to a read-only mount,
+plus hardware testing.** Writes are a separate decision afterwards, gated on the
+error-propagation question above and on the ownership model. A follow-on that
+fits the port's own list — its *accidental power-failure* test is unchecked — is
+worth contributing upstream rather than carrying, on the same reasoning that
+`tools/patch-*.py` exists to be deleted.
+
+Two smaller things to watch: the port's `ExternalProject` uses `BUILD_ALWAYS
+TRUE`, so lwext4 recompiles every build, and its component `REQUIRES ... sdmmc`
+because it ships an SDMMC adapter, where espix is USB MSC. Neither is a blocker;
+both are the sort of thing that is cheaper to know now.
+
 ## Signals
 
 - **Delivery during `select()` and `read()`.** The sleep family and `pause()`
@@ -650,6 +750,10 @@ being the shortest path.
     position until then — and names ext2/3/4 specifically, from the superblock,
     on a partition (`0x83`) and on a whole-device volume alike. NTFS stays in
     that column even with the exFAT option on: FatFs reads exFAT, not NTFS.
+    **ext2/3/4 is now planned and costed** rather than named: a third-party
+    ESP-IDF port of lwext4 instead of the library itself, vendored and pinned,
+    read-only first, and with a licence fork to decide — see
+    [ext2/3/4, via a port rather than a library](#ext234-via-a-port-rather-than-a-library).
   - **GPT** is done, and arrived exactly as the line above predicted: a reader
     rather than a parser change, in `host.c` beside the MBR walk. What asked for
     it was a 4TB Samsung T9 — three partitions behind a protective MBR, one

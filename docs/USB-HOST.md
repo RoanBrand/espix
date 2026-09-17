@@ -697,7 +697,11 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   NTFS, and `lsblk`/`blkid` naming it is the honest half.
 - **lwext4** for ext2/3/4, and a much later `lwntfs`. Until then, `lsblk` naming
   them as recognised-but-unsupported is the honest position, and it is what this
-  stage delivers.
+  stage delivers. ext2/3/4 is now planned rather than merely named — a
+  third-party ESP-IDF port, vendored and pinned, read-only first — and
+  [ROADMAP.md](ROADMAP.md#ext234-via-a-port-rather-than-a-library) carries the
+  cost, the licence fork and the three things that would otherwise surface as
+  surprises.
 - **Whether VBUS needs board-side control: it does not, here.** Answered for one
   hub on one board — a PD hub that powers the board *and* enumerates devices
   works, with the board taking its power through the same socket the host
