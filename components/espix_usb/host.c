@@ -730,9 +730,65 @@ static bool ext_region_is_ext(usb_dev_t *d, uint64_t base, size_t unit,
  * a second block on sector sizes that cannot hold its superblock, so every check
  * that needs only the first bytes -- including the ISO's -- runs before it.
  */
+/*
+ * BitLocker's own identifier, a fixed 16-byte GUID libbde's bde_volume.h names
+ * bde_identifier -- used by the "Windows 7" (fixed-disk) and "To Go"
+ * (removable-media) volume layouts alike, at a different fixed offset in
+ * each. bde_identifier_used_disk_space_only, a Windows 8+ mode that only
+ * encrypts the space actually in use, is a second, equally fixed GUID at the
+ * same two offsets and is checked for too, since there is no way to tell in
+ * advance which mode formatted a given drive.
+ *
+ * The offsets are the sum of every field ahead of `identifier` in each struct
+ * (boot_entry_point through bootcode): 160 for windows_7, 424 for to_go. Both
+ * fit inside the 512-byte sector already in hand, so no extra read is needed.
+ */
+#define BITLOCKER_ID_OFFSET_FIXED     160
+#define BITLOCKER_ID_OFFSET_REMOVABLE 424
+#define BITLOCKER_ID_LEN              16
+
+static const uint8_t BITLOCKER_GUID[BITLOCKER_ID_LEN] = {
+    0x3b, 0xd6, 0x67, 0x49, 0x29, 0x2e, 0xd8, 0x4a,
+    0x83, 0x99, 0xf6, 0xa3, 0x39, 0xe3, 0xd0, 0x01,
+};
+static const uint8_t BITLOCKER_GUID_USED_SPACE_ONLY[BITLOCKER_ID_LEN] = {
+    0x3b, 0x4d, 0xa8, 0x92, 0x80, 0xdd, 0x0e, 0x4d,
+    0x9e, 0x4e, 0xb1, 0xe3, 0x28, 0x4e, 0xae, 0xd8,
+};
+
+static bool bitlocker_identifier(const uint8_t *block)
+{
+    return memcmp(block + BITLOCKER_ID_OFFSET_FIXED, BITLOCKER_GUID,
+                  BITLOCKER_ID_LEN) == 0 ||
+           memcmp(block + BITLOCKER_ID_OFFSET_FIXED, BITLOCKER_GUID_USED_SPACE_ONLY,
+                  BITLOCKER_ID_LEN) == 0 ||
+           memcmp(block + BITLOCKER_ID_OFFSET_REMOVABLE, BITLOCKER_GUID,
+                  BITLOCKER_ID_LEN) == 0 ||
+           memcmp(block + BITLOCKER_ID_OFFSET_REMOVABLE, BITLOCKER_GUID_USED_SPACE_ONLY,
+                  BITLOCKER_ID_LEN) == 0;
+}
+
 static const char *block_fstype(usb_dev_t *d, uint64_t base, uint8_t *block,
                                 size_t unit, bool *foreign)
 {
+    /*
+     * Checked before the FAT probe below, deliberately: "BitLocker To Go" --
+     * what `manage-bde` writes on a password-protected removable drive --
+     * is a lookalike FAT32 boot sector on purpose. Microsoft's own format
+     * (libbde's bde_volume.h, which this was checked against) keeps the real
+     * FAT32 layout intact -- volume label at 0x2B/0x47, "FAT32   " at 0x52,
+     * both exactly where fat_label_offset() looks -- so that a BitLocker-
+     * unaware OS reads it as a formatted FAT32 volume rather than refusing
+     * it outright. Only past the boot code, at a fixed offset that differs
+     * between the fixed-disk and removable-media layouts, does a 16-byte GUID
+     * replace what would otherwise be more boot code. That GUID is the only
+     * honest way to tell the two apart, and this is the case that found it: a
+     * BitLocker-encrypted 512G partition on a real disk read as `vfat`.
+     */
+    if (bitlocker_identifier(block)) {
+        *foreign = true;
+        return "bitlocker";
+    }
     if (fat_label_offset(block) != 0) {
         return "vfat";
     }
