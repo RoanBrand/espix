@@ -116,6 +116,42 @@ def replace_once(text: str, old: str, new: str, marker: str,
     return text.replace(old, new, 1)
 
 
+# exFAT is off in ESP-IDF and there is no Kconfig for it: ffconf.h hard-codes
+# it to 0, unlike the options around it which read CONFIG_FATFS_*. So the line
+# is patched to follow an espix symbol instead, which makes the feature a
+# build choice. Another project building against this IDF sees no
+# CONFIG_ESPIX_FS_EXFAT at all, and an unknown identifier in #if is 0 -- so it
+# gets today's behaviour.
+FFCONF_OLD = "#define FF_FS_EXFAT" + (chr(9) * 2) + "0"
+FFCONF_NEW = chr(10).join([
+    "/*",
+    " * espix: an #ifdef, not a bare symbol: sdkconfig.h defines only what is",
+    " * set to y, so CONFIG_ESPIX_FS_EXFAT is an undeclared identifier when the",
+    " * option is off -- and ffconf.h values reach C code, not only #if.",
+    " */",
+    "#ifdef CONFIG_ESPIX_FS_EXFAT",
+    "#define FF_FS_EXFAT" + (chr(9) * 2) + "1",
+    "#else",
+    "#define FF_FS_EXFAT" + (chr(9) * 2) + "0",
+    "#endif",
+])
+
+FFCONF_LABEL_BLOCK = chr(10).join([
+    "/*",
+    " * espix: sdkconfig.h defines only what is set to y, so a bare",
+    " * CONFIG_FATFS_USE_LABEL is an undeclared identifier when the option is n.",
+    " * That is normally harmless because ff.c only uses FF_USE_LABEL inside",
+    " * #if -- but the block at ff.c:2357 tests it in C, and enabling exFAT is",
+    " * what compiles that block. Reported upstream; see docs/UPSTREAM.md.",
+    " */",
+    "#ifndef CONFIG_FATFS_USE_LABEL",
+    "#define CONFIG_FATFS_USE_LABEL" + (chr(9) * 1) + "0",
+    "#endif",
+]) + chr(10)
+MARK_FFCONF_LABEL = "CONFIG_ESPIX_FS_EXFAT reaches FF_USE_LABEL in C"
+
+MARK_FFCONF = "CONFIG_ESPIX_FS_EXFAT"
+
 HEADER_INCLUDE_ANCHOR = '#include <stddef.h>\n'
 HEADER_INCLUDE_BLOCK = '''#include "esp_vfs_ops.h"   // espix: esp_vfs_fs_ops_t, for esp_vfs_fat_get_ops()
 
@@ -361,6 +397,7 @@ def main() -> int:
 
     header = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat_internal.h"
     source = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat.c"
+    ffconf = idf_path / "components" / "fatfs" / "src" / "ffconf.h"
 
     try:
         version = idf_version(idf_path)
@@ -370,6 +407,7 @@ def main() -> int:
 
         header_text = header.read_text()
         source_text = source.read_text()
+        ffconf_text = ffconf.read_text()
 
         header_new = insert_before(header_text, HEADER_INCLUDE_ANCHOR,
                                    HEADER_INCLUDE_BLOCK, MARK_H_CTX,
@@ -379,6 +417,12 @@ def main() -> int:
                                    MARK_C_OPS, str(source.name) + " get_ops")
         source_new = replace_once(source_new, C_REGISTER_OLD, C_REGISTER_NEW,
                                   MARK_C_HELPER, str(source.name) + " register")
+
+        ffconf_new = replace_once(ffconf_text, FFCONF_OLD, FFCONF_NEW,
+                                  MARK_FFCONF, str(ffconf.name) + " exFAT")
+        ffconf_new = insert_before(ffconf_new, "#define FF_USE_LABEL",
+                                   FFCONF_LABEL_BLOCK, MARK_FFCONF_LABEL,
+                                   str(ffconf.name) + " label symbol")
 
     except AnchorMissing as exc:
         print(f"patch-fatfs.py: {exc}", file=sys.stderr)
@@ -395,6 +439,9 @@ def main() -> int:
     if source_new != source_text:
         source.write_text(source_new)
         changed.append(source)
+    if ffconf_new != ffconf_text:
+        ffconf.write_text(ffconf_new)
+        changed.append(ffconf)
 
     if changed:
         print("patch-fatfs.py: patched " + ", ".join(str(p) for p in changed))

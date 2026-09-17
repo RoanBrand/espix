@@ -811,3 +811,18 @@ A patch in the shape of the other two — a build-time define on the newlib head
 — would fix it. It is also the one patch that would touch every `struct stat` in
 the image, so it wants a deliberate decision rather than riding along with
 something else. docs/ROADMAP.md is where that decision is written down.
+
+## `FF_USE_LABEL` is a bare symbol, and exFAT is what compiles the line using it
+
+`ffconf.h` writes `#define FF_USE_LABEL CONFIG_FATFS_USE_LABEL`, and ESP-IDF's
+generated `sdkconfig.h` defines only the symbols set to `y` -- so with
+`CONFIG_FATFS_USE_LABEL=n` that value is an undeclared identifier. Harmless
+until something evaluates it in *C* rather than in `#if`: `ff.c:2357` has
+`if (FF_USE_LABEL && vol)`, inside a block guarded by
+`#if FF_FS_MINIMIZE <= 1 || FF_FS_RPATH >= 2 || FF_USE_LABEL || FF_FS_EXFAT`.
+Enabling exFAT compiles that block, and the build fails with
+`'CONFIG_FATFS_USE_LABEL' undeclared (first use in this function)`.
+
+espix's patch adds a `#ifndef CONFIG_FATFS_USE_LABEL` fallback ahead of the
+define; `tools/patch-fatfs.py` carries the same note. Upstream, the fix is
+either a `default y` on the option or that guard.
