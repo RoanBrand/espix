@@ -34,9 +34,9 @@ together.
 | Storage | `/etc/fstab`, applied on attach | **yes** | device column takes a name, a wildcard, or `LABEL=`/`UUID=`/`PARTUUID=` |
 | Storage | `mount -o uid=,gid=` | **yes** | root hands a volume to a user without giving them root |
 | Storage | `mount -o ro` | **yes** | refused by FatFs at the block device, not by policy; `/etc/fstab` takes `ro` too |
-| Storage | Volumes mounted at once | **partial** | two, bounded by `CONFIG_FATFS_VOLUME_COUNT` |
-| Storage | exFAT volumes | **yes** | with `ESPIX_FS_EXFAT` (off by default, +7.0KB ROM, no static RAM); past 2TiB needs the same option, which carries `FF_LBA64` and the 64-bit diskio fix with it |
-| Storage | ext4 volumes | **yes** | read-only, via lwext4; the core needs `tools/lwext4-csum-seed.patch` for any volume e2fsprogs 1.47+ makes |
+| Storage | Volumes mounted at once | **partial** | two FAT or exFAT volumes (`CONFIG_FATFS_VOLUME_COUNT`), two ext (`EXT_MAX_MOUNTS`), plus the rootfs |
+| Storage | exFAT volumes | **yes** | on by default (`ESPIX_FS_EXFAT`, +7.0KB ROM, no static RAM); `FF_LBA64` and the 64-bit diskio fix come with it, so a volume past 2TiB is readable too |
+| Storage | ext2/3/4 volumes | **yes** | read-only, via lwext4 — a driver of espix's own, with two mount slots; the core needs `tools/lwext4-csum-seed.patch` for any volume e2fsprogs 1.47 or later makes |
 | Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
 | Storage | Serve the stick over the network | **planned** | NFS or SMB, the NAS case |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
@@ -46,7 +46,7 @@ together.
 | Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |
 | Programs | USB keyboard and mouse | **planned** | a console you type on, on the host port |
 | Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
-| Shell | Serial console and SSH, same commands | **yes** | 60 commands |
+| Shell | Serial console and SSH, same commands | **yes** | 61 commands |
 | Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
 | Shell | Line editing, history, TAB completion | **yes** | |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
@@ -270,17 +270,19 @@ transfer is checked against the same permissions a shell login would face — th
 two doors agree — and a client starts in its own home directory. Permissions a
 client sends are applied, except setuid, setgid and sticky, which are masked off
 rather than refused so that one bit cannot fail an entire `scp -p`. File size is
-not a limit: a write is streamed to the file as it arrives rather than
-reassembled in memory.
+not a limit, because a write is streamed to the file as it arrives rather than
+reassembled in memory — though a transfer *offset* past 4 GiB is refused, stdio's
+seek being 32 bits, which is a property of the C library espix links against rather
+than of the filesystem. See [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 
 Downloads run at about 355KB/s over 2.4GHz WiFi. Uploads are much slower, and
 bounded by LittleFS erasing a block per write rather than by the network — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the measurements and for where
 the per-connection buffers live.
 
-Two connections may be open at once, so a transfer can run while you are logged
-in. The serial console stays independent, and `dmesg` is how a remote user reads
-kernel messages.
+Eight connections may be open at once (`ESPIX_SSH_MAX_SESSIONS`), so a transfer
+can run while you are logged in. The serial console stays independent, and `dmesg`
+is how a remote user reads kernel messages.
 
 ## Hardware Targets
 
@@ -299,7 +301,7 @@ device (USB-NCM, `usb0`) or a host (USB storage), so espix asks which in
 builds one role like the others until a board file can say which socket reaches
 which controller — [USB-HOST](docs/USB-HOST.md).
 
-What the MMU rows in the matrix below rest on, since "has an MMU" covers two
+What the MMU rows in the matrix above rest on, since "has an MMU" covers two
 quite different things:
 
 - **The S31 has the kind that matters.** Espressif shipped a developer preview
@@ -484,19 +486,36 @@ MIT — see [LICENSE](LICENSE).
 
 Any code directly incorporated from other MIT-licensed projects (e.g. Esp32OS)
 retains its original license notice; see individual file headers / a `NOTICE.md`
-once added. None is incorporated today — `espressif/elf_loader`,
-`espressif/esp_linenoise` and `joltwallet/littlefs` are fetched at build time by
-the IDF component manager rather than vendored into this tree.
+once added. Nothing is incorporated today: everything espix depends on is fetched
+at build time by the IDF component manager rather than vendored into this tree.
 
-`joltwallet/littlefs` is the one exception to "fetched and left alone": the
-build adds two things to the downloaded copy — a public custom-attribute API,
-because espix keeps a file's mode in a LittleFS user attribute and the port
-exposes no way to reach one, and a mount-only entry point, because espix
-registers the root VFS itself and needs the filesystem mounted without a name
-of its own. Nothing is copied into this tree — see
-[tools/patch-littlefs.py](tools/patch-littlefs.py) and
-[docs/UPSTREAM.md](docs/UPSTREAM.md) — and the patch is written to be sent
-upstream, at which point it goes away.
+**Five build-time patches, each written to be sent upstream** —
+[tools/README.md](tools/README.md) has the detail, and
+[docs/UPSTREAM.md](docs/UPSTREAM.md) the half that belongs to ESP-IDF rather than
+to espix:
+
+- `joltwallet/littlefs` gains a public custom-attribute API, because espix keeps a
+  file's mode in a LittleFS user attribute and the port exposes no way to reach
+  one, and a mount entry point, because espix registers the root VFS itself and
+  needs the filesystem mounted without a name of its own.
+- `fatfs`, which is built into IDF, gains the same kind of entry point — mount
+  without registering a base path — for the same reason.
+- `usb_host_msc` gains `READ CAPACITY(16)`, `READ(16)` and `WRITE(16)`, without
+  which a disk past 2TiB is unreadable and its real size never reported.
+- The `lwext4` core gains the metadata checksum seed, without which it refuses
+  every ext4 volume e2fsprogs 1.47 or later makes.
+- `esp_libc`, plus one declaration in the toolchain's own `reent.h`, hold
+  `_lseek_r` at the 32-bit ABI the prebuilt C library calls it with, so that
+  `off_t` can be 64 bits.
+
+Everything espix depends on is fetched by the IDF component manager at the
+versions in `dependencies.lock` — `espressif/elf_loader`,
+`espressif/esp_linenoise`, `joltwallet/littlefs`, `espressif/esp_tinyusb`,
+`espressif/usb`, `espressif/usb_host_msc`, `espressif/esp_ext_part_tables`, and
+`esp_lwext4` as a git dependency that carries the lwext4 core as its own submodule.
+The patches are applied to the downloaded copies on every configure, so a
+reinstall or an upgrade restores them, and an anchor that has moved stops the build
+by name rather than producing an image that is quietly missing something.
 
 ## Acknowledgements
 

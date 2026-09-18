@@ -411,7 +411,7 @@ DEV_SSH_MAX_RETRIES=4
 #
 # espix_timeout is handed the ssh *binary*, through env, and never a shell
 # function: `"$@" &` on a function gives back a subshell pid, and killing that
-# leaves ssh alive holding one of espix's four connection slots. run.sh's
+# leaves ssh alive holding one of espix's connection slots. run.sh's
 # preflight did exactly that, and the orphans accumulate until the device
 # answers nobody. See the note in portable.sh.
 _dev_ssh_once() {
