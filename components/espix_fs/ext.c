@@ -23,10 +23,11 @@
  *
  * Read-only, first. ext4_mount() takes read_only as an argument and every
  * mutating op below refuses, so the two agree by construction rather than by
- * discipline. Writes come later: the vendored lwext4 core has a known
- * error-propagation defect on the write path (components/esp_lwext4/doc/
- * CAVEATS.md, and docs/ROADMAP.md), and a volume mounted here may be somebody's
- * only copy of something.
+ * discipline. Writes come later, and in two stages -- volumes without extents
+ * first, extents once the error path has been tested -- because the vendored
+ * lwext4 core has a known error-propagation defect on the write path
+ * (components/esp_lwext4/doc/CAVEATS.md), and a volume mounted here may be
+ * somebody's only copy of something. docs/ROADMAP.md has the plan and the gate.
  *
  * Locking is one recursive mutex for every mount, because lwext4's own lock
  * hooks (struct ext4_lock) take no context argument -- so a per-mount lock

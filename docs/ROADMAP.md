@@ -455,8 +455,10 @@ and no IRAM at all** — the number that matters most, since IRAM is already at 
 whole 16KB. Three limits are real and written up in
 [KNOWN-ISSUES.md](KNOWN-ISSUES.md): a listing cannot tell its end from a failure,
 a pulled device leaves lwext4's mount point behind, and a read-only mount is owned
-by whoever mounted it rather than by its inodes. Writes are the next milestone,
-gated on the error-propagation question and the ownership model below.
+by whoever mounted it rather than by its inodes. Writes are the next milestone, and
+they are **staged below** — volumes without extents first, extents once the error
+path has been tested — because what gates them is a one-line patch and an ownership
+decision rather than a pile of missing code.
 
 **The one thing that had to be fixed in lwext4 was upstream's, and now is.** A
 volume made by e2fsprogs 1.47 or later enables `metadata_csum_seed`, which sets an
@@ -598,14 +600,101 @@ filesystem itself, because these are model questions rather than additions:
   explicit ABI surfaced, the cost, and the one thing it does not fix — SFTP's
   transfer path, which is in [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
+**Writes, staged, and why in that order.** Two milestones, because the risky half
+is separable from the useful half — and the useful half needs nothing experimental.
+
+*Milestone 1: volumes without the extent feature* — ext2, ext3, or ext4 made with
+`-O ^extent`. Their files use indirect blocks, so the entire write path is
+**upstream lwext4**, the code with years of use behind it, and the only thing
+carried is the one-line `ext4_fwrite` fix below. In the order a mount takes them:
+
+- the BDL adapter configured writable: `read_only = false`,
+  `sync_after_write = true`, and `lower_device_supports_rewrite = true` — true of
+  USB MSC, and the port warns against setting it for raw erase-before-write flash.
+- `ext4_mount(..., read_only = false)` and then **`ext4_journal_start()`**, which is
+  also where journal recovery happens. Verified rather than assumed: `ext4_mount()`
+  does *not* start it, so a mount that forgets this has every mutation answered
+  `ENOTSUP` — fail-closed, which is the right direction to find it in.
+- the ops, each already registered and returning `EROFS` today: `ext4_fwrite` (with
+  `ext4_fseek` behind `pwrite`), `ext4_dir_mk`, `ext4_dir_rm`, `ext4_fremove`,
+  `ext4_frename`, `ext4_ftruncate`.
+- `ext_open` stops refusing `O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC` and passes the
+  flags to `ext4_fopen2`, which already takes them. What mode a *created* file gets
+  is worth checking rather than assuming: the create path takes no mode argument.
+- `ext_fsync` becomes real — `ext4_cache_flush()` then the adapter's sync — instead
+  of returning 0, and `close` commits a dirty handle.
+- `ext4_journal_stop()` before `ext4_umount()` on the way out, while the dead-device
+  branch keeps skipping all of it: a pulled device must not be written to.
+
+`utime` keeps refusing even then. This revision of lwext4 has no public entry point
+for setting times — grepped, not assumed — so an ext volume will report the right
+mtime and not accept one.
+
+The gate that makes milestone 1 safe is a **volume** question, not a type one.
+`type_always_read_only()` in `cmd_blk.c` currently answers for every ext type,
+because the driver could only mount read-only; once it can write, the answer has to
+come from the superblock — `incompat & EXT4_FINCOM_EXTENTS`, in the word the type
+probe already reads. A volume with extents mounts read-only and says why; one
+without is writable, and `mount -o rw` / `ro` already parse. The **default stays
+read-only**, for the reason `ext.c` opens with: a volume mounted here may be
+somebody's only copy of something.
+
+*Milestone 2: extents* — where ext4 volumes made by anything current land. The
+port's own list applies in full: mutation requires an active journal transaction
+(which is milestone 1's work, done first), an unwritten extent returns `ENOTSUP` on
+a create/write lookup, and *"these checks do not qualify the implementation for
+arbitrary power loss, injected I/O failure, hostile-image fuzzing, or all
+Linux-created extent layouts."*
+
+**The error-propagation gate is a patch, not a blocker.** The defect is present in
+the pinned core, at `lwext4/src/ext4.c:178`:
+
+    Finish:
+        r = ext4_fs_put_inode_ref(&ref);   /* clobbers the data/allocation error */
+        if (r != EOK) ... abort, or commit, on the wrong value
+
+One line and one variable: the abort/commit decision has to see the error that
+actually happened. espix already carries five patches with the same discipline —
+applied by a script on every configure, written to be sent upstream — so this is the
+sixth, and it belongs upstream rather than here.
+
+What a patch cannot settle is the rest of that sentence: passing `e2fsck` is not
+evidence that an injected write failure rolls back. That is testable *here* in a way
+it was not for the port's author, because espix owns the BDL wrapper: an adapter
+that fails the Nth write on demand exercises the abort path directly, and the host
+closes the same loop the port used —
+
+    write on the device → umount → attach the stick to a PC → e2fsck -f -n
+
+which is also the only way to check a journal replay after a pulled device. Both
+need the stick attached, so they are tests for an OTG run rather than the wireless
+suite.
+
+**The ownership model has to be settled first, and it is the bigger item.**
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) states it: `stat` already answers from the inode
+while the access check, `chmod` and `chown` go through espix's rule, so `ls -l` and
+the permission check disagree about the same file. Writes make that untenable
+rather than merely untidy — a filesystem that can store an owner and a mode should
+be asked for them — so the shape is `stored_metadata = true` for ext, with the rule
+reading from the inode where one exists. That touches `access.c`, `mode.c` and
+`abi_fs.c`, and it is a decision rather than a task, which is why it comes before
+the code.
+
+One consequence to write down as well: the stdio seek limit now reaches *writes*.
+`cp` truncates and streams, so copying in is unaffected, but the append path seeks —
+so appending past 4 GiB is the same 32-bit limit as an SFTP transfer, and has the
+same fix, moving those paths onto descriptors.
+
 **Effort.** Done, for the read-only milestone. The shim and the fd table were the
 bulk of it, `df` was plumbing onto `ext4_mount_point_stats()` rather than new
 capability, and the vendored build was already solved — what the estimate is
-still owed is the hardware testing. Writes are a separate decision afterwards,
-gated on the error-propagation question above and on the ownership model. A
-follow-on that fits the port's own list — its *accidental power-failure* test is
-unchecked — is worth contributing upstream rather than carrying, on the same
-reasoning that `tools/patch-*.py` exists to be deleted.
+still owed is the hardware testing. Writes are staged above rather than estimated
+here, and for a reason: the driver work is the same shape as what the read-only
+milestone already built, while what actually gates the first one is the ownership
+decision and a one-line patch rather than missing code. A follow-on that fits the
+port's own list — its *accidental power-failure* test is unchecked — is worth
+contributing upstream rather than carrying, on the same reasoning that
+`tools/patch-*.py` exists to be deleted.
 
 Two smaller things to watch: the port's `ExternalProject` uses `BUILD_ALWAYS
 TRUE`, so lwext4 recompiles every build, and its component `REQUIRES ... sdmmc`
