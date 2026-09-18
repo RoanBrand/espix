@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
 """
-Teach the vendored lwext4 core to honour the metadata checksum seed.
+Teach the vendored lwext4 core the two things it needs that upstream lacks.
 
-A volume made by e2fsprogs 1.47 or later sets INCOMPAT_CSUM_SEED (0x2000),
-because mke2fs now enables metadata_csum_seed by default, and every metadata
-checksum on such a volume is seeded from the superblock's s_checksum_seed
-instead of from the filesystem UUID. The core seeds from the UUID in eight
-places, so it refuses the volume at mount -- correctly, since the feature is not
-implemented. The effect is that no ext4 volume a current Linux creates can be
-read at all. See docs/KNOWN-ISSUES.md.
+The changes are patch files, applied to the *core* -- the lwext4 submodule the
+component carries, not the port around it. Applying patch files rather than doing
+the same surgery in Python, as the other scripts here do, is deliberate and is
+where this file differs from them: between them the changes are ten files and eight
+functions plus a two-line fix, so a second copy in Python would be one more thing
+to keep in step, and this way the applied change and the artefact that goes
+upstream are the same bytes.
 
-The change is tools/lwext4-csum-seed.patch, applied to the *core* -- the lwext4
-submodule the component carries, not the port around it. Applying the patch file
-rather than doing the same surgery in Python, as the other two scripts here do,
-is deliberate and is the one place this file differs from them: the change is
-ten files and eight functions, so a second copy of it in Python would be one
-more thing to keep in step, and this way the applied change and the artefact
-that goes upstream are the same bytes.
+**lwext4-csum-seed.patch** is why an ext4 volume made by a current Linux could not
+be read at all. A volume made by e2fsprogs 1.47 or later sets INCOMPAT_CSUM_SEED
+(0x2000), because mke2fs now enables metadata_csum_seed by default, and every
+metadata checksum on such a volume is seeded from the superblock's
+s_checksum_seed instead of from the filesystem UUID. The core seeded from the UUID
+in eight places, so it refused the volume at mount -- correctly, since the feature
+was not implemented. See docs/KNOWN-ISSUES.md.
+
+**lwext4-fwrite-error.patch** is the one that matters before anything writes to an
+ext volume. `ext4_fwrite()` assigns the result of `ext4_fs_put_inode_ref()` to `r`
+at its `Finish` label, discarding the error that sent it there -- so a failed block
+write can commit its transaction instead of aborting, and the caller is told the
+operation succeeded. That is why the write milestone is read-only until this
+lands, and why it is fixed here rather than worked around: see docs/ROADMAP.md.
 
 Idempotent, and it has to be: CMake runs this on every configure because the
-component manager re-downloads the component whenever it re-resolves, which
-takes the patch with it.
+component manager re-downloads the component whenever it re-resolves, which takes
+the patches with it.
 
-**Temporary by construction.** When this goes upstream -- it belongs to
-gkostka/lwext4, and the port would pick it up by bumping its submodule -- delete
-this file, tools/lwext4-csum-seed.patch and the execute_process() block in the
-top-level CMakeLists.txt.
+**Temporary by construction.** Both belong to gkostka/lwext4, and the port would
+pick them up by bumping its submodule. When they land, delete this file, the two
+patch files and the execute_process() block in the top-level CMakeLists.txt.
 """
 
 import re
@@ -39,11 +45,21 @@ from pathlib import Path
 # or, worse, apply to the wrong lines.
 EXPECTED_REVISION = "d774c178f0211d62d3f0d49e9164aa655573ecfe"
 COMPONENT = "esp_lwext4"
-PATCH = "lwext4-csum-seed.patch"
 
-# In the core, and the whole of the change: the helper every checksum site now
-# asks for the seed from. Its presence is what "already patched" means.
-MARKER = "ext4_sb_csum_seed"
+# (patch file, file in the core, a string that only exists once it is applied).
+#
+# A marker per patch, rather than one test for all of them, and patch(1)'s exit
+# status is not trusted for "already applied": asked to reverse a patch that is not
+# in the tree, patch *asks* rather than failing -- "Unreversed (or previously
+# applied) patch detected! Ignore -R?" -- and answers itself with the default, so it
+# returns success in both cases. A marker cannot be fooled that way.
+PATCHES = [
+    # INCOMPAT_CSUM_SEED, without which no current ext4 volume mounts.
+    ("lwext4-csum-seed.patch", "include/ext4_super.h", "ext4_sb_csum_seed"),
+    # A failed write must abort its transaction, not commit over the failure.
+    ("lwext4-fwrite-error.patch", "src/ext4.c",
+     "const int released = ext4_fs_put_inode_ref(&ref);"),
+]
 
 
 def die(msg):
@@ -69,6 +85,36 @@ def check_revision(root):
         )
 
 
+def patch_command(core, name, *flags):
+    """A patch invocation, with the patch file named rather than piped in.
+
+    `--batch` because a build must never wait for an answer: patch asks about
+    anything ambiguous, and its default answer is not always the one a build wants.
+    """
+    return ["patch", "-p1", "-d", str(core), "--batch", *flags, "-i",
+            str(Path(__file__).resolve().parent / name)]
+
+
+def apply(core, name):
+    # Dry run first. A tree that is half-patched -- an apply interrupted, or a hand
+    # edit -- is reported rather than made worse, and the way out is named.
+    check = subprocess.run(patch_command(core, name, "--dry-run"),
+                           capture_output=True, text=True)
+    if check.returncode != 0:
+        die(
+            f"{name} does not apply to this tree:\n{check.stdout}{check.stderr}"
+            f"  Delete managed_components/{COMPONENT} and reconfigure: the manager"
+            f" fetches\n  a clean copy, and this runs again on the way back up."
+        )
+
+    done = subprocess.run(patch_command(core, name, "--forward"),
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        die(f"{name} failed:\n{done.stdout}{done.stderr}")
+
+    print(f"patch-lwext4: applied {name} to the lwext4 core")
+
+
 def main():
     root = Path(__file__).resolve().parent.parent
     comp = root / "managed_components" / COMPONENT
@@ -81,44 +127,24 @@ def main():
     check_revision(root)
 
     core = comp / "lwext4"
-    header = core / "include" / "ext4_super.h"
 
-    if not header.is_file():
+    if not (core / "src" / "ext4.c").is_file():
         die(
-            f"{core} has no include/ext4_super.h, so the lwext4 submodule did "
-            f"not\n  come with the component. The component manager fetches "
+            f"{core} has no src/ext4.c, so the lwext4 submodule did not\n"
+            f"  come with the component. The component manager fetches "
             f"submodules, so a\n  core that is missing means this tree was "
             f"assembled some other way."
         )
 
-    if MARKER in header.read_text(encoding="utf-8"):
-        return 0  # already patched; configure runs every build
+    for name, where, marker in PATCHES:
+        target = core / where
+        if not target.is_file():
+            die(f"{core} has no {where}; the core is not the tree this expects.")
 
-    patch = Path(__file__).resolve().parent / PATCH
-    if not patch.is_file():
-        die(f"{patch} is missing; it is the change this applies.")
+        if marker in target.read_text(encoding="utf-8"):
+            continue  # configure runs every build, so this has to be a no-op
+        apply(core, name)
 
-    # Dry run first. A tree that is half-patched -- an apply interrupted, or a
-    # hand edit -- is reported rather than made worse, and the way out is named.
-    args = ["patch", "-p1", "-d", str(core), "--forward", "-i", str(patch)]
-    check = subprocess.run(args + ["--dry-run"], capture_output=True, text=True)
-    if check.returncode != 0:
-        die(
-            f"the patch does not apply to this tree:\n"
-            f"{check.stdout}{check.stderr}"
-            f"  Delete managed_components/{COMPONENT} and reconfigure: the "
-            f"manager fetches\n  a clean copy, and this runs again on the way "
-            f"back up."
-        )
-
-    applied = subprocess.run(args, capture_output=True, text=True)
-    if applied.returncode != 0:
-        die(f"patch failed:\n{applied.stdout}{applied.stderr}")
-
-    print(
-        f"patch-lwext4: taught the lwext4 core to honour the metadata checksum "
-        f"seed (in managed_components/{COMPONENT}/lwext4)"
-    )
     return 0
 
 

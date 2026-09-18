@@ -646,9 +646,10 @@ carried is the one-line `ext4_fwrite` fix below. In the order a mount takes them
 - `ext4_journal_stop()` before `ext4_umount()` on the way out, while the dead-device
   branch keeps skipping all of it: a pulled device must not be written to.
 
-`utime` keeps refusing even then. This revision of lwext4 has no public entry point
-for setting times — grepped, not assumed — so an ext volume will report the right
-mtime and not accept one.
+`utime`, `chmod` and `chown` are not blocked on lwext4: `ext4_mtime_set()`,
+`ext4_mode_set()` and `ext4_owner_set()` each take a path, so the three calls that
+refuse on an ext mount today have an implementation waiting for a writable mount
+rather than an API to be added.
 
 The gate that makes milestone 1 safe is a **volume** question, not a type one.
 `type_always_read_only()` in `cmd_blk.c` currently answers for every ext type,

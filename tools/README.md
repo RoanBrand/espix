@@ -51,15 +51,26 @@ delete both files and the `execute_process()` block in the top-level
 
 ## patch-lwext4.py
 
-Teaches the lwext4 core to honour the metadata checksum seed, which is what a
-volume made by e2fsprogs 1.47 or later needs. `mke2fs` enables
-`metadata_csum_seed` by default now, so every metadata checksum on such a volume
-is seeded from the superblock rather than from the filesystem UUID — and the
-core, seeding from the UUID in eight places, refused the volume at mount. Correctly
-enough, since the feature was not implemented; the effect was that espix could not
-read any ext4 volume a current Linux creates. See
-[../docs/KNOWN-ISSUES.md](../docs/KNOWN-ISSUES.md) and
-[../docs/ROADMAP.md](../docs/ROADMAP.md).
+Teaches the lwext4 core the two things it needs that upstream lacks — both in the
+*core*, which the component carries as a submodule, rather than in the port around
+it.
+
+`lwext4-csum-seed.patch` is the metadata checksum seed, which is what a volume made
+by e2fsprogs 1.47 or later needs. `mke2fs` enables `metadata_csum_seed` by default
+now, so every metadata checksum on such a volume is seeded from the superblock
+rather than from the filesystem UUID — and the core, seeding from the UUID in eight
+places, refused the volume at mount. Correctly enough, since the feature was not
+implemented; the effect was that espix could not read any ext4 volume a current
+Linux creates. See [../docs/KNOWN-ISSUES.md](../docs/KNOWN-ISSUES.md).
+
+`lwext4-fwrite-error.patch` is the one that matters before anything writes to an
+ext volume. `ext4_fwrite()` overwrites the error that sent it to its `Finish` label
+with the result of releasing the inode reference, so a failed block write can
+*commit* its transaction instead of aborting — and the caller is told the operation
+succeeded. See [../docs/ROADMAP.md](../docs/ROADMAP.md), which is where the write
+milestone is staged, and
+[../components/espix_fs/ext.c](../components/espix_fs/ext.c) for why that milestone
+is read-only until this lands.
 
 The firmware build runs it from a CMake hook, after `project()` because that is
 when the download happens. It is idempotent, and it fails the build with a clear
@@ -70,17 +81,17 @@ left half-patched.
 ./tools/patch-lwext4.py        # applied automatically; safe to run by hand
 ```
 
-Unlike the other patch scripts here it *applies* `lwext4-csum-seed.patch` rather
-than repeating the change in Python, and that is deliberate: the change is ten
-files and eight functions, so a second copy of it in this directory would be one
-more thing to keep in step. This way the patch that gets applied and the patch
-that goes upstream are the same bytes.
+Unlike the other patch scripts here it *applies* patch files rather than repeating
+the change in Python, and that is deliberate: between them the changes are ten
+files, eight functions and a two-line fix, so a second copy in this directory would
+be one more thing to keep in step. This way the patch that gets applied and the
+patch that goes upstream are the same bytes.
 
-**Temporary by construction.** `lwext4-csum-seed.patch` is the change as a plain
-diff, ready to send to `gkostka/lwext4` — the core, not the port around it. The
-port would pick it up by bumping its submodule. When it lands, delete this script,
-the patch and the `execute_process()` block in the top-level `CMakeLists.txt`, and
-update the pin in `main/idf_component.yml`.
+**Temporary by construction.** Both are plain diffs, ready to send to
+`gkostka/lwext4` — the core, not the port around it. The port would pick them up by
+bumping its submodule. When they land, delete this script, the two patches and the
+`execute_process()` block in the top-level `CMakeLists.txt`, and update the pin in
+`main/idf_component.yml`.
 
 ## patch-libc-offt.py
 

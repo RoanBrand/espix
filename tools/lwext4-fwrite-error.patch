@@ -1,0 +1,64 @@
+Report a failed write instead of committing over it
+
+`ext4_fwrite()` assigns the result of `ext4_fs_put_inode_ref()` to `r` at its
+`Finish` label, which is reached by the successful path and by every `goto
+Finish` alike. An error stored in `r` -- a failed block write, a failed
+allocation -- is therefore overwritten before the code below chooses between
+`ext4_trans_abort()` and `ext4_trans_stop()`:
+
+    Finish:
+        r = ext4_fs_put_inode_ref(&ref);      /* clobbers the error */
+        if (r != EOK) ... abort, or commit, on the wrong value
+
+So a write that failed can commit its transaction, and the caller is told the
+release succeeded rather than that the write did not. On a filesystem this is the
+worst kind of defect: the failure is invisible at the point it happens and the
+on-disk result depends on which error arrived last.
+
+The fix keeps the first error and still reports a failure to release:
+
+    Finish:
+        {
+            const int released = ext4_fs_put_inode_ref(&ref);
+
+            if (r == EOK)
+                r = released;
+        }
+
+which is what the neighbouring functions do in effect -- `ext4_mode_get()` and
+its siblings assign the release result on the success path and `goto Finish`
+around it on the error path, so they cannot lose an earlier error.
+
+Two notes for a maintainer:
+
+- Passing `e2fsck` is not evidence that this is fixed or that anything else on
+  this path is correct. The failure needs an *injected* one: a block device that
+  fails writes on demand, which is how the caller here tests it.
+- If upstream has fixed this since, take their version. This is written against
+  the revision the component pins, where the clobber is still present.
+
+--- a/src/ext4.c
++++ b/src/ext4.c
+@@ -2006,7 +2006,21 @@
+ 	}
+ 
+ Finish:
+-	r = ext4_fs_put_inode_ref(&ref);
++	/*
++	 * Releasing the reference must not stand in for the error that got us
++	 * here: the abort-or-commit decision below is made on r, and this call
++	 * used to overwrite it. A failed write could therefore commit instead of
++	 * aborting -- and the caller was told the operation succeeded.
++	 *
++	 * The release result is kept when nothing else went wrong, so a failure
++	 * on that path is still reported.
++	 */
++	{
++		const int released = ext4_fs_put_inode_ref(&ref);
++
++		if (r == EOK)
++			r = released;
++	}
+ 
+ 	if (r != EOK)
+ 		ext4_trans_abort(file->mp);
