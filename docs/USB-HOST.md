@@ -433,7 +433,7 @@ ops. `/mnt/photo.jpg` passes through the same code and the same check as
 |---|---|
 | `lower_t s_mounts[ESPIX_FS_MAX_MOUNTS]` | the single `lower_t` that was always described as "an array when mounting lands" |
 | `espix_vfs_add_mount()` / `_del_mount()` | publish and remove a filesystem at a prefix; the root is slot 0 |
-| `stored_metadata` | false for FAT, which is what makes `chmod` answer EPERM instead of filing metadata against the wrong volume |
+| `espix_fs_meta_t` | where a mount's modes and owners come from: `LOWER` for ext, which reads its inodes, `ESPIX` for littlefs (a user attribute), `NONE` for FAT — whoever mounted it, then the rule |
 | `components/espix_fs/fat.c` | the FAT driver: IDF's ops behind 24 shims that strip the mount prefix and hand IDF its own context back |
 | `tools/patch-fatfs.py` | gives IDF's FatFs a mount-without-registering split; see below |
 

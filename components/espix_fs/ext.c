@@ -1121,14 +1121,17 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
     }
 
     /*
-     * stored_metadata false, so espix treats this like FAT: the mounter owns
-     * everything, and chmod and chown refuse instead of writing an attribute
-     * with nowhere to live. Not the final answer for ext, whose inodes carry
-     * real modes and owners, but the vendored lwext4 has xattr compiled out, so
-     * espix has nowhere to put its own attributes yet, and a read-only mount
-     * could not be chmod'd anyway. Written up in docs/ROADMAP.md.
+     * ESPIX_FS_META_LOWER: an ext inode is the source of truth for a mode and an
+     * owner, so espix adds nothing to them and the permission check reads what the
+     * file says. That is what Unix does, and it is what makes `ls -l` and the
+     * check agree by construction rather than by coincidence.
+     *
+     * chmod and chown still refuse, and for a different reason than FAT's: ext has
+     * somewhere to put them, but writing an inode needs a writable mount. See
+     * docs/ROADMAP.md for what that milestone takes.
      */
-    err = espix_vfs_add_mount(path, &s_ext_ops, m, false, owner_uid, owner_gid);
+    err = espix_vfs_add_mount(path, &s_ext_ops, m, ESPIX_FS_META_LOWER,
+                              owner_uid, owner_gid);
     if (err != ESP_OK) {
         ext4_umount(m->mp);
         goto fail_dev;

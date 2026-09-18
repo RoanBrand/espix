@@ -1,7 +1,8 @@
 # Filesystem: the commands, the mode bits, and the refusals.
 #
-# RESOURCES: none -- the paths it makes carry the worker number, so two of
-# these side by side cannot see each other's files.
+# RESOURCES: none for the paths it makes -- they carry the worker number, so two of
+# these side by side cannot see each other's files. The ext section at the end needs
+# a volume attached and root to mount it, and skips loudly when neither is there.
 
 T=/tmp/espix-test-fs-$ESPIX_WORKER
 # The full name, not the stem: the two assertions below look at a listing of
@@ -141,4 +142,50 @@ assert_not_contains "a clean listing reports no I/O error"  "Input/output error"
 assert_contains     "and still prints its count"            "entries" "$ls_ok"
 assert_not_contains "the synthetic /dev listing is quiet too" "stopped after" \
     "$(dev_run 'ls -l /dev')"
+
+# ------------------------------------------------- ext: the inodes are the rules ---
+#
+# ext keeps modes and owners in its inodes, so espix reads them rather than its own
+# rule: a volume's permissions are the volume's, which is how Linux treats a
+# filesystem that carries its own. `lost+found` is what makes that decisive without
+# creating anything on the volume -- mke2fs always makes it 0700 and root-owned,
+# where the rule would have said 0755 for a directory and given it to the mount's
+# owner.
+#
+# Needs an ext volume attached and root to mount it, so it skips loudly otherwise
+# rather than passing against nothing.
+ext_part=$(dev_run 'lsblk' | awk 'NR > 1 && $3 == "part" && $4 ~ /^ext/ { print $1; exit }')
+if [ -z "$ext_part" ]; then
+    espix_skip "no ext volume attached -- needs the stick on the OTG port"
+else
+    ext_mnt=/mnt/espix-ext-$ESPIX_WORKER
+    dev_run "sudo mkdir -p $ext_mnt" >/dev/null 2>&1
+
+    # Mounted with the options a metadata-less volume needs, deliberately: one that
+    # keeps its own must ignore them, and that is half the point.
+    mount_out=$(dev_run "sudo mount -o uid=1000,gid=1000 $ext_part $ext_mnt 2>&1")
+    if [ -n "$mount_out" ]; then
+        espix_skip "could not mount $ext_part: $mount_out"
+    else
+        listing=$(dev_run "ls -l $ext_mnt 2>&1")
+
+        assert_contains "an ext volume's modes come from its inodes, not the rule" \
+                        "drwx------" "$listing"
+        assert_contains "and its owner is the inode's, not whoever mounted it" \
+                        "root root" "$listing"
+
+        # 0700 root, so the rule's 0755 for a directory would have let this through.
+        opened=$(dev_run "ls $ext_mnt/lost+found 2>&1")
+        assert_contains "a directory the volume keeps private is refused to esp" \
+                        "cannot open" "$opened"
+
+        # Changing one needs a writable mount, which is the next milestone rather
+        # than this one -- so this is a refusal by status, not by message.
+        assert_status "chmod on an ext volume refuses, having nowhere to write yet" \
+                      1 dev_status "chmod $ext_mnt/lost+found 0755"
+
+        dev_run "sudo umount $ext_mnt" >/dev/null 2>&1
+        dev_run "sudo rmdir $ext_mnt" >/dev/null 2>&1
+    fi
+fi
 

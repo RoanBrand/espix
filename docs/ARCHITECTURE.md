@@ -187,21 +187,15 @@ a **precedence** rather than a per-filesystem policy:
 
 | asked | who answers |
 |---|---|
-| the **filesystem**, where it keeps metadata for this path | littlefs: a user attribute. ext: the inode, once the note below is settled. FatFs is asked nothing, because it has nothing |
+| the **filesystem**, where it keeps metadata for this path | littlefs: a user attribute. ext: the inode — and it wins, so a `uid=` mount option is ignored there, as it is for ext4 on Linux. FatFs is asked nothing, because it has nothing |
 | the **mount**, where the filesystem keeps none | `mount -o uid=,gid=` — whoever mounted the volume is its owner. Linux's vfat driver takes the same options for the same reason |
 | the **rule**, for anything still unanswered | below |
 
 Enforcement is not in that table. It is one check in espix's VFS, above every
 mount, so a filesystem cannot opt out of being checked by declining to answer —
 and what it can do instead, by answering, is make the check right. That is the
-whole reason for asking the filesystem first.
-
-One place does not match the table yet, and it is the reason the table is worth
-writing down: an ext mount registers `stored_metadata = false`, so its `stat`
-answers from the inode while the permission check uses the rule underneath. Both are
-half right, which is the worst kind of wrong — `ls -l` and the check disagree about
-the same file. It is the split [KNOWN-ISSUES.md](KNOWN-ISSUES.md) records, and the
-decision [ROADMAP.md](ROADMAP.md) carries before ext can be written to.
+whole reason for asking the filesystem first, and it is what `espix_fs_meta_t`
+records per mount: `LOWER`, `ESPIX`, or `NONE`.
 
 **How littlefs answers, which is the tier-1 case today.** It stores no permission
 bits, but it does carry *user attributes* — small blobs in an entry's metadata,
@@ -276,11 +270,11 @@ Two things are deliberately outside it, and neither is laziness:
   [KNOWN-ISSUES.md](KNOWN-ISSUES.md) records what that costs to do properly.
 - **A mount whose filesystem keeps no metadata is checked against the mount's owner
   and the rule, not against the file.** That is the honest answer when there is
-  nothing to read, and it is why `chmod` refuses there rather than writing somewhere
-  the check would not look. ext is the case where this is *wrong* rather than merely
-  coarse — its inodes have an owner and its `stat` reports it, while the check
-  consults the rule — and [ROADMAP.md](ROADMAP.md) carries it as a decision to make
-  before writes.
+  nothing to read — FatFs stores neither a mode nor an owner — and it is why `chmod`
+  refuses there rather than writing somewhere the check would not look. Where a
+  filesystem *does* keep them the file is asked instead, so what a volume says about
+  itself is what espix enforces: `-o uid=`/`gid=` are for the volumes that have
+  nothing to say, which is the division Linux draws too.
 
 Two identities exist — `root` on the console, `esp` over SSH — and all nine bits are
 stored and shown. `chmod` refuses the combinations espix does not act on, rather

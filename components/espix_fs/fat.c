@@ -444,8 +444,10 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
 
     m->ops = esp_vfs_fat_get_ops();
 
-    /* Published last: until this returns, no path can reach the mount. */
-    err = espix_vfs_add_mount(path, &s_fat_ops, m, false, owner_uid, owner_gid);
+    /* Published last: until this returns, no path can reach the mount. FatFs
+     * keeps no modes or owners, so what it holds is owned by whoever mounted it. */
+    err = espix_vfs_add_mount(path, &s_fat_ops, m, ESPIX_FS_META_NONE,
+                              owner_uid, owner_gid);
     if (err != ESP_OK) {
         f_mount(NULL, m->drive, 0);
         goto fail_ctx;

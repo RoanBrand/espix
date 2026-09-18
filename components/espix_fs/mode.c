@@ -170,12 +170,13 @@ static void owner_from_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
 static esp_err_t attr_read(const char *abs_path, espix_fs_posix_attr_t *out)
 {
     /*
-     * A mount whose filesystem keeps no modes of its own has nothing to read,
-     * and asking littlefs about a path that lives on another filesystem would be
-     * answering from the wrong volume. NOT_FOUND is what the rules already treat
-     * as "nothing stored", so the rule answers instead.
+     * Only the rootfs has espix's store on it. Anywhere else there is nothing to
+     * read -- and asking littlefs about a path that lives on another filesystem
+     * would be answering from the wrong volume. NOT_FOUND is what the rules already
+     * treat as "nothing stored", which is what sends a caller to the mount's owner
+     * and then to the rule.
      */
-    if (!espix_vfs_stores_metadata(abs_path)) {
+    if (espix_vfs_metadata(abs_path) != ESPIX_FS_META_ESPIX) {
         return ESP_ERR_NOT_FOUND;
     }
     return esp_littlefs_getattr(ESPIX_FS_ROOT_PARTITION, abs_path,
@@ -198,8 +199,15 @@ static void attr_from_rule(const char *abs_path, const struct stat *st,
 }
 
 /*
- * What a path's mode and owner actually are: the stored attribute if there is
- * one, the rules otherwise.
+ * What a path's mode and owner actually are: the filesystem's own where it keeps
+ * them, the stored attribute if there is one, the rule otherwise.
+ *
+ * The first of those is the whole precedence in three lines, and it is why `ls -l`
+ * and the permission check cannot disagree: for a filesystem that carries its own
+ * permissions -- ext, whose inodes have them -- the values the lower stat just
+ * returned *are* the answer, and neither an attribute espix stores nor the rule has
+ * any business overriding them. It saves work as well: the rule would have opened
+ * every one of those files to decide whether it looks executable.
  *
  * Going through here rather than reading the attribute directly is what keeps
  * chmod and chown from destroying each other. The attribute is one record of
@@ -210,6 +218,13 @@ static void attr_from_rule(const char *abs_path, const struct stat *st,
 static bool attr_effective(const char *abs_path, const struct stat *st,
                            espix_fs_posix_attr_t *out)
 {
+    if (espix_vfs_metadata(abs_path) == ESPIX_FS_META_LOWER && st != NULL) {
+        out->mode = (uint16_t)(st->st_mode & ESPIX_MODE_BITS);
+        out->uid  = (uint16_t)st->st_uid;
+        out->gid  = (uint16_t)st->st_gid;
+        return true;
+    }
+
     if (attr_read(abs_path, out) == ESP_OK) {
         return true;
     }
@@ -233,15 +248,18 @@ static esp_err_t attr_store(const char *abs_path, const struct stat *st,
                             const espix_fs_posix_attr_t *attr)
 {
     /*
-     * FAT has nowhere to keep a mode or an owner. Refused rather than written,
-     * because the only metadata store here is littlefs's: stamping it with a
-     * path from another filesystem would file the record against the wrong
-     * volume -- and "/mnt/photo.jpg" has no counterpart in the rootfs at all.
+     * Only the rootfs can be changed this way, because it is the only filesystem
+     * espix has a store on. One that keeps its own metadata (ext) would take an
+     * inode write instead -- which is the writable-mount milestone, not this one
+     * -- and one that keeps none (FAT) has nowhere to put it: stamping an
+     * attribute with a path from another filesystem would file the record against
+     * the wrong volume, and "/mnt/photo.jpg" has no counterpart in the rootfs at
+     * all.
      *
      * Refused the way a device's mode is, so a caller gets EPERM out of chmod
      * rather than a silent success against nothing.
      */
-    if (!espix_vfs_stores_metadata(abs_path)) {
+    if (espix_vfs_metadata(abs_path) != ESPIX_FS_META_ESPIX) {
         return ESP_ERR_NOT_ALLOWED;
     }
 

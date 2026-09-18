@@ -769,21 +769,25 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `hexdump` while chasing this, and all it can report on a device node is
   `EOPNOTSUPP`.
 
-- **A read-only ext mount is owned by whoever mounted it, not by its inodes.**
-  `stat` answers with the real uid, gid and mode from the inode, because that is
-  what `ext4_raw_inode_fill()` returns — but the access check, and `chmod` and
-  `chown`, go through espix's own ownership rule, and the mount is registered
-  with `stored_metadata` false, exactly as a FAT volume is. So `ls -l` shows one
-  owner and the permission check believes another, and `chmod` refuses.
+- ~~**A read-only ext mount is owned by whoever mounted it, not by its inodes.**~~
+  **Fixed.** The precedence is now the filesystem first: an ext mount registers as
+  `ESPIX_FS_META_LOWER`, so what its inodes say is what the permission check
+  enforces, and `-o uid=`/`gid=` are ignored there the way Linux ignores them for
+  ext4. A volume's permissions are its own: `ls -l` and the check read the same
+  source, which is what makes them agree by construction.
 
-  Two causes, and either alone would be enough. lwext4 is built with xattr off
-  (the MIT extents and xattr-stub build that keeps the firmware non-GPL), so
-  espix's own mode and owner attributes have nowhere to live on an ext volume;
-  and a read-only mount could not be `chmod`'d even if they did. The real fix is
-  not in `ext.c` — it is for the ownership rule to read ownership out of the
-  inode where a filesystem has it, which is the design question
-  [ROADMAP.md](ROADMAP.md) records. Until then `stored_metadata false` is the
-  honest answer, since it is the one that cannot mislead a permission check.
+  Two consequences worth knowing, and both follow from that rather than from a
+  defect. A stick made on a PC carries whatever uid that PC's user had — usually
+  1000, which is what `esp` is here — so a file owned by some other account is that
+  account's to read, and only root (the console, or `sudo`) sees everything on the
+  volume. And `chmod` and `chown` refuse on an ext mount: ext has somewhere to put a
+  mode, but writing an inode needs a writable mount, which is the milestone after
+  this one in [ROADMAP.md](ROADMAP.md).
+
+  The uid model is 16 bits throughout (`espix_fs_posix_attr_t`) where an ext inode
+  carries 32, so an owner above 65535 is attributed to its low 16 bits. Nothing in
+  espix has an account up there and a removable volume is unlikely to, but it is a
+  truncation rather than a refusal, which is worth knowing before it matters.
 
 
 - **A directory's mode does not hide what is inside it.** Unix requires search

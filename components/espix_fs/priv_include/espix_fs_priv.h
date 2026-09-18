@@ -91,26 +91,45 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
                                   void *lower_ctx);
 
 /*
+ * Where a mount's modes and owners come from. One precedence, applied in this
+ * order, and the reason there is only one:
+ *
+ *   LOWER   the filesystem keeps them -- ext, in its inodes. What its own stat
+ *           returns is the answer, and nothing above it may override that: a
+ *           volume carrying its own permissions is the one case where espix has
+ *           nothing to add.
+ *   ESPIX   espix keeps them for a filesystem that keeps none -- littlefs, in a
+ *           user attribute. Stored, so a write has somewhere to go and chmod and
+ *           chown work.
+ *   NONE    neither, so the mount answers for what it holds: the uid and gid of
+ *           whoever mounted it, and the rule for anything still unanswered (FAT).
+ */
+typedef enum {
+    ESPIX_FS_META_NONE = 0,
+    ESPIX_FS_META_ESPIX,
+    ESPIX_FS_META_LOWER,
+} espix_fs_meta_t;
+
+/*
  * A second filesystem at `prefix` ("/mnt"), reached through espix's VFS so the
  * permission check applies there too -- which is the whole reason it is a table
  * in here rather than another esp_vfs registration. The caller owns the
  * filesystem: this only routes to it.
  *
- * `stored_metadata` is false for one that keeps no owner or mode of its own
- * (FAT), which is what makes chmod and chown refuse rather than write an
- * attribute with nowhere to live.
+ * `metadata` says where that filesystem's modes and owners come from, which is
+ * what decides whether chmod and chown have anywhere to write.
  *
  * espix_vfs_del_mount() answers ESP_ERR_INVALID_STATE while a file or directory
  * is still open on the mount: a lower filesystem's fd cannot be revoked, so the
  * caller has to close up first.
  */
 esp_err_t espix_vfs_add_mount(const char *prefix, const esp_vfs_fs_ops_t *ops,
-                              void *ctx, bool stored_metadata,
+                              void *ctx, espix_fs_meta_t metadata,
                               uint16_t owner_uid, uint16_t owner_gid);
 esp_err_t espix_vfs_del_mount(const char *prefix);
 
-/* False on a mount whose filesystem carries no modes of its own. */
-bool espix_vfs_stores_metadata(const char *abs_path);
+/* Where this path's modes and owners come from. See espix_fs_meta_t. */
+espix_fs_meta_t espix_vfs_metadata(const char *abs_path);
 
 /*
  * A mount whose owner the rule decides: the root, and any filesystem that

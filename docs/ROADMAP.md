@@ -592,14 +592,15 @@ image, and nothing in IRAM.
 filesystem itself, because these are model questions rather than additions:
 
 - **Real ownership and modes.** ext4 keeps uid/gid/mode in the inode. espix's
-  model is a rule plus a side attribute (`mode.c`) for filesystems that keep
-  none, so `espix_fs_owner()`, `chmod` and `chown` must either defer to the
-  filesystem or deliberately override it. That is a decision touching `access.c`,
-  `mode.c` and `abi_fs.c`, and it was **not** taken before the shim: the
-  read-only mount registers with `stored_metadata` false, so it behaves as a FAT
-  volume does and the decision is still open. Deliberate — a read-only mount
-  cannot be `chmod`'d, and `false` is the answer that cannot mislead a permission
-  check — but deferred rather than made, and it has to be made before writes.
+  model is a rule plus a side attribute (`mode.c`) for filesystems that keep none,
+  so `espix_fs_owner()`, `chmod` and `chown` have to answer *who is asked first* —
+  and **that is settled rather than open**: the filesystem is asked, then the mount,
+  then the rule, which `espix_fs_meta_t` records per mount and
+  [ARCHITECTURE.md](ARCHITECTURE.md#modes-and-owners-the-filesystem-first-then-the-mount-then-a-rule)
+  writes up. An ext volume enforces its own permissions, `-o uid=`/`gid=` are
+  ignored for it as they are on Linux, and `stat`, the check and `ls -l` read one
+  source. What is left is the *writing* half, because a read-only mount cannot be
+  `chmod`'d however it keeps metadata: that is milestone 1 of the writes plan above.
 - **Inode numbers exist**, so `ls -i` becomes possible — littlefs cannot, and
   [UPSTREAM.md](UPSTREAM.md) has the reason under *`readdir()` reports no inode*.
 - **Hardlinks** (lwext4 supports them) want a `link()` espix has no counterpart
@@ -689,15 +690,14 @@ which is also the only way to check a journal replay after a pulled device. Both
 need the stick attached, so they are tests for an OTG run rather than the wireless
 suite.
 
-**The ownership model has to be settled first, and it is the bigger item.**
-[KNOWN-ISSUES.md](KNOWN-ISSUES.md) states it: `stat` already answers from the inode
-while the access check, `chmod` and `chown` go through espix's rule, so `ls -l` and
-the permission check disagree about the same file. Writes make that untenable
-rather than merely untidy — a filesystem that can store an owner and a mode should
-be asked for them — so the shape is `stored_metadata = true` for ext, with the rule
-reading from the inode where one exists. That touches `access.c`, `mode.c` and
-`abi_fs.c`, and it is a decision rather than a task, which is why it comes before
-the code.
+**The ownership half of this is done, and it was the smaller half of the work.**
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) recorded that an ext mount was owned by whoever
+mounted it while its `stat` reported the inode's values; the precedence now asks the
+filesystem first (`ESPIX_FS_META_LOWER`), so an ext volume's own modes and owners are
+what the check enforces, `-o uid=`/`gid=` are ignored for it as they are on Linux,
+and `stat`, the check and `ls -l` read one source. What is left is the *writing*
+half: `chmod` and `chown` refuse on ext because changing an inode needs a writable
+mount, which is milestone 1 above rather than a design question.
 
 One consequence to write down as well: the stdio seek limit now reaches *writes*.
 `cp` truncates and streams, so copying in is unaffected, but the append path seeks —

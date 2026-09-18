@@ -86,13 +86,8 @@ typedef struct {
     void                    *ctx;
     char                     prefix[ESPIX_FS_PREFIX_MAX];
     size_t                   len;
-    /*
-     * False when the filesystem keeps no ownership or mode of its own (FAT).
-     * espix's rule still answers for such a path -- there is nothing stored to
-     * read -- but a *write* has nowhere to go, so chmod and chown refuse rather
-     * than stamping an attribute into whichever filesystem can hold one.
-     */
-    bool                     stored_metadata;
+    /* Where this mount's modes and owners come from. See espix_fs_meta_t. */
+    espix_fs_meta_t          metadata;
     bool                     used;
     /*
      * Who owns what a metadata-less mount holds -- the uid and gid of whoever
@@ -1215,7 +1210,7 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
     root->prefix[0] = '\0';
     root->len      = 0;
     /* littlefs carries espix's own mode and owner attributes. */
-    root->stored_metadata = true;
+    root->metadata = ESPIX_FS_META_ESPIX;
     root->owner_uid = ESPIX_FS_OWNER_RULE;
     root->owner_gid = ESPIX_FS_OWNER_RULE;
     root->used     = true;
@@ -1259,7 +1254,7 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
 
 esp_err_t espix_vfs_add_mount(const char *prefix,
                               const esp_vfs_fs_ops_t *ops, void *ctx,
-                              bool stored_metadata,
+                              espix_fs_meta_t metadata,
                               uint16_t owner_uid, uint16_t owner_gid)
 {
     if (ops == NULL || ctx == NULL || prefix == NULL || ops->dir == NULL) {
@@ -1304,7 +1299,7 @@ esp_err_t espix_vfs_add_mount(const char *prefix,
     slot->ctx      = ctx;
     strlcpy(slot->prefix, prefix, sizeof(slot->prefix));
     slot->len      = len;
-    slot->stored_metadata = stored_metadata;
+    slot->metadata = metadata;
     slot->owner_uid = owner_uid;
     slot->owner_gid = owner_gid;
     slot->used     = true;
@@ -1375,9 +1370,11 @@ esp_err_t espix_vfs_del_mount(const char *prefix)
     return ESP_OK;
 }
 
-bool espix_vfs_stores_metadata(const char *abs_path)
+espix_fs_meta_t espix_vfs_metadata(const char *abs_path)
 {
-    return mount_by_path(abs_path)->stored_metadata;
+    const lower_t *l = mount_by_path(abs_path);
+
+    return (l == NULL) ? ESPIX_FS_META_NONE : l->metadata;
 }
 
 bool espix_vfs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid)
