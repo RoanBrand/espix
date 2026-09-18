@@ -55,9 +55,9 @@ merely missing.
 | Per-session working directory | **yes** | your `cd` is not someone else's |
 | File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
 | `/proc` | **planned** | the one part of espix's own mount table still missing; a second mount now exists |
-| `mount`, `umount` | **yes** | `mount sda1 /mnt` puts a FAT32/FAT16 volume from a USB device into the namespace, reached through espix's own VFS so the permission check applies to it. Root only; nothing is ever formatted; unplug while mounted is a gap; `mount -o uid=,gid=` hands the volume to a user without root, and `-o ro` mounts it read-only — [USB-HOST](docs/USB-HOST.md#stage-2--mounting) |
-| `/etc/fstab` | **yes** | applied on attach and undone on removal: the device column takes a name, a wildcard, or an identity from `blkid` (`LABEL=`, `UUID=`, `PARTUUID=`), and the owner named becomes the volume's owner — [USB-HOST](docs/USB-HOST.md) |
-| `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). **Four device slots**, which is what a hub needs; two FAT volumes at once — [USB-HOST](docs/USB-HOST.md) |
+| `mount`, `umount` | **yes** | `mount sda1 /mnt` puts a FAT32/FAT16 volume from a USB device into the namespace, reached through espix's own VFS so the permission check applies to it. Root only; nothing is ever formatted; unplug while mounted is a gap; `mount -o uid=,gid=` hands the volume to a user without root, and `-o ro` mounts it read-only — [USB-HOST](USB-HOST.md#stage-2--mounting) |
+| `/etc/fstab` | **yes** | applied on attach and undone on removal: the device column takes a name, a wildcard, or an identity from `blkid` (`LABEL=`, `UUID=`, `PARTUUID=`), and the owner named becomes the volume's owner — [USB-HOST](USB-HOST.md) |
+| `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). **Four device slots**, which is what a hub needs; two FAT volumes at once — [USB-HOST](USB-HOST.md) |
 | Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
 | Read and write bits enforced | **yes** | in espix's root VFS, so builtins, loaded apps and SFTP are all checked the same way |
@@ -74,8 +74,8 @@ merely missing.
 | SSH server | **yes** | password auth — [read this first](#a-word-on-the-ssh-server) |
 | `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
 | Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
-| USB-NCM | **yes** | device role only: `usb0`, plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](docs/USB-NETWORKING.md) |
-| USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `mount sda1 /mnt` mounts its FAT volume, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. Four device slots, for a hub; two FAT volumes at once, bounded by `CONFIG_FATFS_VOLUME_COUNT` — [USB-HOST](docs/USB-HOST.md) |
+| USB-NCM | **yes** | device role only: `usb0`, plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](USB-NETWORKING.md) |
+| USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `mount sda1 /mnt` mounts its FAT volume, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. Four device slots, for a hub; two FAT volumes at once, bounded by `CONFIG_FATFS_VOLUME_COUNT` — [USB-HOST](USB-HOST.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
 | Raw lwIP / `netconn` for the SSH transport | **planned** | BSD sockets today, deliberately: apps get the same API. Cut calls before changing API — one `send()` per packet instead of three was worth 1.7× |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
