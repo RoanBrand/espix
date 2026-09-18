@@ -1122,13 +1122,20 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `doc/CAVEATS.md` asks for -- that a failed operation on this path is not safely
   rolled back -- produced by an experiment meant to test something else.
 
-- **`chmod` and `chown` refuse on an ext mount, even a writable one.** The
-  filesystem keeps modes and owners in its inodes and espix reads them — the
-  permission check enforces the volume's own, as it should — but there is no path
-  from `chmod` to an inode write: the mount record carries no setter for it, so
-  mode.c declines for every filesystem that is not the rootfs. `ext4_mode_set()`
-  and `ext4_owner_set()` exist and are the missing half; see
-  [ROADMAP.md](ROADMAP.md).
+- ~~**`chmod` and `chown` refuse on an ext mount, even a writable one.**~~
+  **Fixed.** The mount record carries a setter now (`espix_fs_meta_ops_t`), which a
+  filesystem that keeps its own metadata hands to the VFS at mount, and mode.c
+  asks it before falling back to espix's attribute store or refusing. ext writes
+  its inodes through `ext4_mode_set()` and `ext4_owner_set()`, so on a writable
+  volume both work: `chmod 0755` gives `-rwxr-xr-x`, and a changed group lands in
+  the inode. Everything else is unchanged — the rootfs still uses the store, and
+  FatFs still has nothing to write and says so.
+
+  One wart worth knowing: a refusal carries only that it was refused. The
+  `esp_err` the VFS hands back cannot carry an errno, so `chmod` on a
+  *read-only* ext mount answers "operation not permitted" where "read-only
+  filesystem" is the useful thing to say. The status is right; the message is
+  not.
 
 ## SSH
 

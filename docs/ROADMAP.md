@@ -656,9 +656,11 @@ stick would otherwise be world-writable.
 Partition Manager, extents and all: `mount -o rw` gives a writable mount; a copied
 file arrives at `0644` rather than lwext4's `0666`; `mkdir` gives `0755`; `mv`,
 `rm`, `rmdir` and a rewrite through `O_TRUNC` (3 KB down to 15 bytes) all work; the
-data survives a clean unmount and a read-only remount; and `chmod` refuses with
-`EPERM`, which is [KNOWN-ISSUES.md](KNOWN-ISSUES.md) recording a gap rather than a
-wish. 10-fs, 12-vfs and 75-usb are green with the stick attached.
+data survives a clean unmount and a read-only remount. `chmod` and `chown` write
+the inode through a setter the mount hands the VFS (`espix_fs_meta_ops_t`), so
+`chmod 0755` gives `-rwxr-xr-x` and a changed group lands; a read-only mount
+refuses, and the rootfs's own path is untouched. 10-fs, 12-vfs and 75-usb are
+green with the stick attached.
 
 Still unexercised, and worth saying rather than assuming: `ext_truncate()` and
 `ext_ftruncate()` -- the path- and descriptor-shaped truncates, which the shell's

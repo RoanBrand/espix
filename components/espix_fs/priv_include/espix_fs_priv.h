@@ -111,13 +111,31 @@ typedef enum {
 } espix_fs_meta_t;
 
 /*
+ * How a mounted filesystem is asked to change a mode and an owner, for one that
+ * keeps them itself -- ext, whose inodes carry both. NULL for everything else:
+ * FAT keeps neither, and the rootfs keeps espix's own attributes, which mode.c
+ * writes directly.
+ *
+ * Both fields are always passed, not only the one the caller changed: whatever
+ * they did not change has already been filled in from what the filesystem
+ * reported, so an implementation may set both without clobbering either.
+ * Returns 0, or -1 with errno set, like a VFS op.
+ */
+typedef struct {
+    int  (*setattr)(void *ctx, const char *abs_path, mode_t mode,
+                    uint16_t uid, uint16_t gid);
+    void  *ctx;
+} espix_fs_meta_ops_t;
+
+/*
  * A second filesystem at `prefix` ("/mnt"), reached through espix's VFS so the
  * permission check applies there too -- which is the whole reason it is a table
  * in here rather than another esp_vfs registration. The caller owns the
  * filesystem: this only routes to it.
  *
  * `metadata` says where that filesystem's modes and owners come from, which is
- * what decides whether chmod and chown have anywhere to write.
+ * what decides whether chmod and chown have anywhere to write, and `meta` is how
+ * to write them there -- NULL for a filesystem that has no such thing.
  *
  * espix_vfs_del_mount() answers ESP_ERR_INVALID_STATE while a file or directory
  * is still open on the mount: a lower filesystem's fd cannot be revoked, so the
@@ -125,11 +143,15 @@ typedef enum {
  */
 esp_err_t espix_vfs_add_mount(const char *prefix, const esp_vfs_fs_ops_t *ops,
                               void *ctx, espix_fs_meta_t metadata,
+                              const espix_fs_meta_ops_t *meta,
                               uint16_t owner_uid, uint16_t owner_gid);
 esp_err_t espix_vfs_del_mount(const char *prefix);
 
 /* Where this path's modes and owners come from. See espix_fs_meta_t. */
 espix_fs_meta_t espix_vfs_metadata(const char *abs_path);
+
+/* How to change them, or NULL where the filesystem has no such thing. */
+const espix_fs_meta_ops_t *espix_vfs_meta_ops(const char *abs_path);
 
 /*
  * A mount whose owner the rule decides: the root, and any filesystem that

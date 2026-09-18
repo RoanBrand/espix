@@ -248,15 +248,26 @@ static esp_err_t attr_store(const char *abs_path, const struct stat *st,
                             const espix_fs_posix_attr_t *attr)
 {
     /*
-     * Only the rootfs can be changed this way, because it is the only filesystem
-     * espix has a store on. One that keeps its own metadata (ext) would take an
-     * inode write instead -- through ext4_mode_set() and ext4_owner_set(), which
-     * exist, but which nothing here calls yet: this needs a seam from this file to
-     * the mounted filesystem, and the mount record has no such pair of callbacks.
-     * See docs/ROADMAP.md. And one that keeps none (FAT) has nowhere to put it:
-     * stamping an attribute with a path from another filesystem would file the
-     * record against the wrong volume, and "/mnt/photo.jpg" has no counterpart in
-     * the rootfs at all.
+     * A filesystem that keeps its own metadata is asked to change it -- the other
+     * half of the precedence attr_effective() reads, and the reason chmod works on
+     * a writable ext volume. ext writes its inodes through ext4_mode_set() and
+     * ext4_owner_set() and keeps no copy of its own, so nothing below is consulted
+     * and the two answers cannot drift apart.
+     */
+    const espix_fs_meta_ops_t *ops = espix_vfs_meta_ops(abs_path);
+
+    if (ops != NULL && ops->setattr != NULL) {
+        return (ops->setattr(ops->ctx, abs_path, attr->mode, attr->uid,
+                             attr->gid) == 0)
+                   ? ESP_OK : ESP_ERR_NOT_ALLOWED;
+    }
+
+    /*
+     * Otherwise only the rootfs can be changed this way, because it is the only
+     * filesystem espix has a store on. One that keeps none (FAT) has nowhere to
+     * put it: stamping an attribute with a path from another filesystem would file
+     * the record against the wrong volume, and "/mnt/photo.jpg" has no counterpart
+     * in the rootfs at all.
      *
      * Refused the way a device's mode is, so a caller gets EPERM out of chmod
      * rather than a silent success against nothing.

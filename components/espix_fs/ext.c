@@ -88,6 +88,9 @@ typedef struct {
      * the work of finding that out.
      */
     bool               read_only;
+    /* How espix asks this mount to change a mode or an owner: an inode write,
+     * because that is where ext keeps them. Handed to the VFS at mount. */
+    espix_fs_meta_ops_t meta;
     lwext4_port_bdl_t *adapter;
     char               dev[16];                   /* registered device name */
     char               mp[16];                    /* lwext4 mount point */
@@ -1198,6 +1201,51 @@ static int ext_utime(void *ctx, const char *path, const struct utimbuf *times)
     return 0;
 }
 
+/*
+ * chmod and chown, for espix's VFS. Both go to the inode, which is where ext keeps
+ * them, and both are set on every call: mode.c fills in whichever the caller did not
+ * change from what the inode reported, so writing both is writing back what was
+ * already there for the one that did not change.
+ *
+ * A read-only mount refuses here rather than inside lwext4, for the same reason the
+ * other mutating ops do.
+ */
+static int ext_setattr(void *ctx, const char *abs_path, mode_t mode,
+                       uint16_t uid, uint16_t gid)
+{
+    ext_mount_t *m = (ext_mount_t *)ctx;
+    ext_route_t  r;
+
+    const int err = ext_resolve(abs_path, &r);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    if (m != r.m) {
+        /* The VFS asks the mount a path belongs to; a mismatch would mean it asked
+         * the wrong one, and writing through it would write the wrong volume. */
+        errno = EXDEV;
+        return -1;
+    }
+    if (m->read_only) {
+        return refusero();
+    }
+
+    ext_lock();
+    int rc = ext4_mode_set(r.path, (uint32_t)(mode & ESPIX_MODE_BITS));
+
+    if (rc == EOK) {
+        rc = ext4_owner_set(r.path, (uint32_t)uid, (uint32_t)gid);
+    }
+    ext_unlock();
+
+    if (rc != EOK) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* The VFS ops                                                         */
 /* ------------------------------------------------------------------ */
@@ -1656,7 +1704,10 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
      * somewhere to put them, but writing an inode needs a writable mount. See
      * docs/ROADMAP.md for what that milestone takes.
      */
-    err = espix_vfs_add_mount(path, &s_ext_ops, m, ESPIX_FS_META_LOWER,
+    m->meta.setattr = ext_setattr;
+    m->meta.ctx     = m;
+
+    err = espix_vfs_add_mount(path, &s_ext_ops, m, ESPIX_FS_META_LOWER, &m->meta,
                               owner_uid, owner_gid);
     if (err != ESP_OK) {
         if (!read_only) {

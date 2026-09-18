@@ -88,6 +88,8 @@ typedef struct {
     size_t                   len;
     /* Where this mount's modes and owners come from. See espix_fs_meta_t. */
     espix_fs_meta_t          metadata;
+    /* How to change them there, or NULL. See espix_fs_meta_ops_t. */
+    const espix_fs_meta_ops_t *meta;
     bool                     used;
     /*
      * Who owns what a metadata-less mount holds -- the uid and gid of whoever
@@ -1255,6 +1257,7 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
 esp_err_t espix_vfs_add_mount(const char *prefix,
                               const esp_vfs_fs_ops_t *ops, void *ctx,
                               espix_fs_meta_t metadata,
+                              const espix_fs_meta_ops_t *meta,
                               uint16_t owner_uid, uint16_t owner_gid)
 {
     if (ops == NULL || ctx == NULL || prefix == NULL || ops->dir == NULL) {
@@ -1300,6 +1303,7 @@ esp_err_t espix_vfs_add_mount(const char *prefix,
     strlcpy(slot->prefix, prefix, sizeof(slot->prefix));
     slot->len      = len;
     slot->metadata = metadata;
+    slot->meta     = meta;
     slot->owner_uid = owner_uid;
     slot->owner_gid = owner_gid;
     slot->used     = true;
@@ -1375,6 +1379,13 @@ espix_fs_meta_t espix_vfs_metadata(const char *abs_path)
     const lower_t *l = mount_by_path(abs_path);
 
     return (l == NULL) ? ESPIX_FS_META_NONE : l->metadata;
+}
+
+const espix_fs_meta_ops_t *espix_vfs_meta_ops(const char *abs_path)
+{
+    const lower_t *l = mount_by_path(abs_path);
+
+    return (l == NULL) ? NULL : l->meta;
 }
 
 bool espix_vfs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid)
