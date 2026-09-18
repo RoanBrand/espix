@@ -177,27 +177,51 @@ cleared before that call returns: the connection task lives on afterwards, and a
 pointer left behind to a caller's stack frame is the use-after-free that used to
 reboot the board from the exec path.
 
-### File modes are a rule plus an attribute on the file
+### Modes and owners: the filesystem first, then the mount, then a rule
 
-LittleFS stores no permission bits: `esp_littlefs`'s `stat()` fills in `S_IFREG`
-or `S_IFDIR` and stops. But it does carry *user attributes* -- small blobs in an
-entry's metadata, which `SPEC.md` describes as meant for exactly this and which
-the port already uses to hold mtime. That is where a mode belongs, and it is
-what the README always said this would use.
+Two of the three filesystems espix mounts keep no permission bits at all:
+`esp_littlefs`'s `stat()` fills in `S_IFREG` or `S_IFDIR` and stops, and a FatFs
+volume keeps nothing unless a mount option says so. espix wants modes and owners
+everywhere, because they are what its permission check is made of, so the answer is
+a **precedence** rather than a per-filesystem policy:
 
-Reaching them needs the `lfs_t *` the port keeps private, so espix patches in a
-public accessor; the finding and the patch are in [UPSTREAM.md](UPSTREAM.md).
+| asked | who answers |
+|---|---|
+| the **filesystem**, where it keeps metadata for this path | littlefs: a user attribute. ext: the inode, once the note below is settled. FatFs is asked nothing, because it has nothing |
+| the **mount**, where the filesystem keeps none | `mount -o uid=,gid=` — whoever mounted the volume is its owner. Linux's vfat driver takes the same options for the same reason |
+| the **rule**, for anything still unanswered | below |
 
-The mode is then split in two.
+Enforcement is not in that table. It is one check in espix's VFS, above every
+mount, so a filesystem cannot opt out of being checked by declining to answer —
+and what it can do instead, by answering, is make the check right. That is the
+whole reason for asking the filesystem first.
 
-A **rule** supplies the default: directories are `0755`, a file whose first four
-bytes are the ELF magic is `0755`, everything else is `0644`. Nothing is stored
-for any of that, and it is not an optimisation -- the image builder writes no
-attributes at all, so every file in a freshly flashed rootfs arrives without
-one, and without the rule nothing in `/bin` would be executable after a
-`storage-flash`. Two more things fall out of it: a flash write happens when you
-run `chmod` and at no other time, on a filesystem that pays a block erase per
-write; and a device nobody has chmod'd has no mode state to be wrong.
+One place does not match the table yet, and it is the reason the table is worth
+writing down: an ext mount registers `stored_metadata = false`, so its `stat`
+answers from the inode while the permission check uses the rule underneath. Both are
+half right, which is the worst kind of wrong — `ls -l` and the check disagree about
+the same file. It is the split [KNOWN-ISSUES.md](KNOWN-ISSUES.md) records, and the
+decision [ROADMAP.md](ROADMAP.md) carries before ext can be written to.
+
+**How littlefs answers, which is the tier-1 case today.** It stores no permission
+bits, but it does carry *user attributes* — small blobs in an entry's metadata,
+which `SPEC.md` describes as meant for exactly this and which the port already uses
+to hold mtime. That is where a mode belongs, and it is what the README always said
+this would use. Reaching them needs the `lfs_t *` the port keeps private, so espix
+patches in a public accessor; the finding and the patch are in
+[UPSTREAM.md](UPSTREAM.md).
+
+The answer is then split in two.
+
+The **rule** is the third tier, for a path nothing above it has answered for:
+directories are `0755` (`/tmp` is `01777`), a file whose first four bytes are the
+ELF magic is `0755`, everything else is `0644`. Nothing is stored for any of that,
+and it is not an optimisation -- the image builder writes no attributes at all, so
+every file in a freshly flashed rootfs arrives without one, and without the rule
+nothing in `/bin` would be executable after a `storage-flash`. Two more things fall
+out of it: a flash write happens when you run `chmod` and at no other time, on a
+filesystem that pays a block erase per write; and a device nobody has chmod'd has no
+mode state to be wrong.
 
 The **attribute** then records only what someone changed. `LFS_ERR_NOATTR` means
 "use the rule", which is also what a portable littlefs implementation is
@@ -212,15 +236,15 @@ as long as there was no owner model, which cost four bytes a file and saved
 rewriting every stored mode once there was one — and that is exactly how it
 played out: ownership landed without touching a single file already on disk.
 
-Ownership follows the same two-part shape as the mode. A file with no stored
-attribute belongs to the account whose home directory contains it, longest home
-winning, and to root otherwise; root's home is `/`, so the rootfs is root's and
-`/home/esp` is esp's with nothing written to flash to say so. `chown` stores the
-attribute only when it disagrees with that rule, and removes it when it agrees
-again. Because the mode and the owner share one record, both are read through
-one path that fills the fields nobody is changing from the rules — otherwise a
-`chmod` would write a blank owner and quietly hand a file in `/home/esp` to
-root.
+Ownership follows the same three tiers, and the rule is the interesting one: a path
+with no stored attribute and no mount owner belongs to the account whose home
+directory contains it, longest home winning, and to root otherwise; root's home is
+`/`, so the rootfs is root's and `/home/esp` is esp's with nothing written to flash
+to say so. `chown` stores the attribute only when it disagrees with that rule, and
+removes it when it agrees again. Because the mode and the owner share one record,
+both are read through one path that fills the fields nobody is changing from the
+rules — otherwise a `chmod` would write a blank owner and quietly hand a file in
+`/home/esp` to root.
 
 What this shape avoids is bookkeeping. An earlier version kept the deviations in
 `/etc/modes` keyed by path, which meant every rename and every delete had to be
@@ -229,27 +253,43 @@ could not see would have lost the mode. LittleFS moves an attribute with the
 entry and drops it with the file, so all of that code is gone and the cases it
 was covering cannot arise.
 
-### Only the execute bit is enforced, and that is not laziness
+### What the permission check covers, and what it does not
 
-Nine bits are stored and shown; one is consulted. The asymmetry is about where
-espix sits in the call path, not about how much work each would be.
+The check is one function in espix's VFS — `espix_fs_access_check()` — called on
+open (with the open's flags), `opendir`, `unlink`, both sides of a rename, `mkdir`,
+`rmdir` and `truncate`. It runs above the mount rather than inside each driver, so
+the same rules hold for the shell, for a loaded app and for SFTP: the last of those
+used to reach the filesystem as espix itself and skip every check, because it runs
+on the SSH connection task, which is neither a process nor a session.
 
-espix owns execution. `run` and the shell's fallback both go through
-`espix_proc_spawn_elf()`, so "may this run" is a question there is somewhere to
-ask.
+That the seam exists at all is the point of espix owning the root VFS. Before it,
+an app opened a file through libc and the VFS reached the filesystem without
+passing espix — enforcing in `cat` alone would have been a boundary you step around
+with `run`.
 
-Reading and writing had no such place until espix took the root VFS — an app
-opened a file through libc and the VFS reached the filesystem without passing
-espix, and enforcing in `cat` alone would have been a boundary you step around
-with `run`. That seam now exists (see above); what is still missing is an
-*owner* on a file to compare a mode against, so the check is wired and
-permissive.
+Two things are deliberately outside it, and neither is laziness:
 
-Two identities exist — `root` on the console, `esp` over SSH — so it is not that
-there is nobody to distinguish between. What is missing is an *owner* on the
-file, which is also why `chown` does not exist and why `chmod` refuses setuid,
-setgid and sticky rather than storing bits that name a privilege transition
-nothing performs. [ROADMAP.md](ROADMAP.md) carries what adding one would buy.
+- **Search permission is checked on the final component, and on the parent for
+  anything that creates or removes a name — not on every intermediate directory.**
+  Unix requires `x` on each component of a path, which means walking and stat-ing
+  the whole path from inside the check.
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md) records what that costs to do properly.
+- **A mount whose filesystem keeps no metadata is checked against the mount's owner
+  and the rule, not against the file.** That is the honest answer when there is
+  nothing to read, and it is why `chmod` refuses there rather than writing somewhere
+  the check would not look. ext is the case where this is *wrong* rather than merely
+  coarse — its inodes have an owner and its `stat` reports it, while the check
+  consults the rule — and [ROADMAP.md](ROADMAP.md) carries it as a decision to make
+  before writes.
+
+Two identities exist — `root` on the console, `esp` over SSH — and all nine bits are
+stored and shown. `chmod` refuses the combinations espix does not act on, rather
+than storing bits that mean nothing: setuid or setgid on a *directory*, and sticky
+on a *file*. The rest are consulted: setuid and setgid are honoured at exec,
+granting the binary's ids, and sticky is what lets a shared directory accept writes
+without accepting deletions — which is what makes a `1777` `/tmp` possible. On the
+S3 setuid is a guardrail rather than a boundary, there being no MMU to enforce one;
+it is implemented because the S31 has.
 
 ### espix does not use `esp_console_run()`
 

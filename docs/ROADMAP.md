@@ -186,7 +186,7 @@ layer it belongs to, or a choice and the reason.
 | `utime()` | **done**, and asserted from an app | espix's VFS fills `utime_p` and the lower port's Kconfig has it on; `mmap`/`statvfs` above are the rest of that row |
 | `/dev/<device>` opened as a file | `EOPNOTSUPP` (a name, not a stream) | raw block I/O as its own feature |
 | a volume whose device was pulled | `ENOSYS` from every operation | deliberate; `EIO` would need a refusing helper per op |
-| `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it |
+| `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it. `-o fmode=`/`dmode=` would *declare* a mode rather than store one — the item below |
 | an fd's number | espix's own (128–159), not the lower fs's | deliberate; an fd is opaque, so nothing should care |
 | `.` and `..` in a directory listing | absent; `..` still resolves in a path | the lower filesystem's doing; the VFS could synthesise them |
 
@@ -276,6 +276,25 @@ being the shortest path.
   match the port. What remains: search permission is checked on the final path
   component and on the parent for anything that creates or removes a name, not
   on every intermediate directory; see [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+- **Mode-shaped mount options, the other half of what the rule does.**
+  `mount -o uid=,gid=` already answers *who owns this volume* for a filesystem that
+  keeps no owner of its own, which is what Linux's vfat driver takes `uid=`, `gid=`
+  and `umask=` for. espix has the first two and none of the mode ones, so on a FAT
+  or exFAT volume there is no way to say "what is here is executable": the rule
+  gives `0644` to anything that is not an ELF, `chmod` is refused because there is
+  nowhere to store it, and a shell script on a stick therefore cannot be run at all.
+  `-o fmode=` and `-o dmode=` — with `umask=` being the same thing written the other
+  way round — is a *declaration* rather than a store, and it slots in as tier 2 of
+  the precedence in
+  [ARCHITECTURE.md](ARCHITECTURE.md#modes-and-owners-the-filesystem-first-then-the-mount-then-a-rule):
+  below a stored attribute, above the rule, which is where a mount's answer belongs.
+
+  Small and self-contained — option parsing plus fields on the mount record, and the
+  mode path already consults the mount for its owner. Worth doing *with* the ext
+  ownership decision rather than before it, because both are answering one question,
+  *who is asked for metadata, and in what order*, and doing them together is one
+  change to `mode.c` instead of two.
 
 - ~~**A way up to root that is not the serial console.**~~ Done, as `sudo`:
   `/etc/sudoers` lists the accounts that may run a command as uid 0, seeded with
