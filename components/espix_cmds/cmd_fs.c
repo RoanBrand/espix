@@ -1386,11 +1386,16 @@ static espix_cmd_t s_fs_cmds[] = {
     { .name = "rmdir", .fn = cmd_rmdir,
       .help = "remove empty directories",        .usage = "rmdir <dir>..." },
     { .name = "rm",    .fn = cmd_rm,
-      .help = "remove files or directories",     .usage = "rm [-r] <path>..." },
+      .help = "remove files or directories",     .usage = "rm [-r] <path>...",
+      /* Traversal, and the filesystem underneath: 4096 is the same figure the
+       * other commands that reach into a filesystem ask for. */
+      .stack = 4096 },
     { .name = "cp",    .fn = cmd_cp,
-      .help = "copy a file",                     .usage = "cp <src> <dst>" },
+      .help = "copy a file",                     .usage = "cp <src> <dst>",
+      .stack = 4096 },
     { .name = "mv",    .fn = cmd_mv,
-      .help = "move or rename a file",           .usage = "mv <src> <dst>" },
+      .help = "move or rename a file",           .usage = "mv <src> <dst>",
+      .stack = 4096 },
     { .name = "touch", .fn = cmd_touch,
       .help = "create empty files",              .usage = "touch <file>..." },
     { .name = "chmod", .fn = cmd_chmod,
@@ -1400,7 +1405,9 @@ static espix_cmd_t s_fs_cmds[] = {
     { .name = "chgrp", .fn = cmd_chown,
       .help = "change file group",               .usage = "chgrp <group> <path>..." },
     { .name = "df",    .fn = cmd_df,
-      .help = "report filesystem usage",         .usage = "df [-h]" },
+      .help = "report filesystem usage",         .usage = "df [-h]",
+      /* statvfs reaches into the filesystem: lwext4's, for an ext mount. */
+      .stack = 4096 },
 };
 
 void espix_cmds_register_fs(void)

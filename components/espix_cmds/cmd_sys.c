@@ -1855,7 +1855,10 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "groups [user]" },
     { .name = "sudo",   .fn = cmd_sudo,
       .help = "run a command as root, or as another user",
-      .usage = "sudo [-u <user>] <command> [args...]" },
+      .usage = "sudo [-u <user>] <command> [args...]",
+      /* Re-enters the dispatcher, so the command it runs gets a stack of its
+       * own instead of two frames sharing the session's. */
+      .stack = 4096 },
     { .name = "echo",   .fn = cmd_echo,
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,

@@ -10,10 +10,13 @@
 #include "freertos/task.h"
 
 #include "esp_console.h"
+#include "esp_log.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+
+#define TAG "shell"
 
 espix_session_t *espix_shell_current(void)
 {
@@ -400,6 +403,77 @@ static int take_assignments(espix_session_t *s, int argc, char **argv,
     return taken;
 }
 
+/*
+ * A command that declared a stack of its own runs on a task created for it.
+ *
+ * The context is a stack local in the spawner, which waits for the task before
+ * returning -- so it outlives the task by construction, and so does the argv it
+ * points at, which lives in espix_shell_exec()'s scratch buffer. Nothing else
+ * touches that buffer until this returns.
+ */
+typedef struct {
+    espix_session_t *s;
+    espix_cmd_fn     fn;
+    int              argc;
+    char           **argv;
+    uint32_t         stack;
+    int              status;
+    TaskHandle_t     caller;        /* notified when the command is done */
+} cmd_task_ctx_t;
+
+static void cmd_task(void *arg)
+{
+    cmd_task_ctx_t *c = arg;
+
+    c->status = c->fn(c->s, c->argc, c->argv);
+
+    /*
+     * Reported before the task exits, because afterwards nothing can ask it: a
+     * deleted task takes its high-water mark with it, and this figure is where
+     * the size in the command table should come from. `used` is what the command
+     * actually needed, which is the number worth writing down.
+     */
+    const uint32_t free_min = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGD(TAG, "cmd: %s: %u of %u bytes used", c->argv[0],
+             (unsigned)(c->stack - free_min), (unsigned)c->stack);
+
+    xTaskNotifyGive(c->caller);
+    vTaskDelete(NULL);
+}
+
+static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
+                           int argc, char **argv)
+{
+    cmd_task_ctx_t ctx = {
+        .s      = s,
+        .fn     = cmd->fn,
+        .argc   = argc,
+        .argv   = argv,
+        .stack  = cmd->stack,
+        .status = 1,
+        .caller = xTaskGetCurrentTaskHandle(),
+    };
+
+    /* Named for the command, so `ps` says what is running. FreeRTOS truncates
+     * the name at configTASK_NAME_LEN. */
+    char name[24];
+    snprintf(name, sizeof(name), "cmd:%s", cmd->name);
+
+    /* Anything already pending is somebody else's, and would let this return
+     * before the command has run. */
+    ulTaskNotifyTake(pdTRUE, 0);
+
+    /* The session's priority, so a command behaves the same either way. */
+    if (xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
+                    NULL) != pdPASS) {
+        espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
+        return 1;
+    }
+
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return ctx.status;
+}
+
 int espix_shell_exec(espix_session_t *s, const char *line)
 {
     if (line == NULL) {
@@ -490,8 +564,17 @@ int espix_shell_exec(espix_session_t *s, const char *line)
 
     /* Not a builtin: let it be resolved as a program, the way a shell falls
      * through to PATH. */
-    const int status = (cmd != NULL) ? cmd->fn(s, argc, av)
-                                     : s_exec_fallback(s, argc, av);
+    int status;
+
+    if (cmd == NULL) {
+        status = s_exec_fallback(s, argc, av);
+    } else if (cmd->stack == 0) {
+        /* Declared to fit on the session's own task, which is sized for the
+         * protocol plus exactly the commands that declare zero. */
+        status = cmd->fn(s, argc, av);
+    } else {
+        status = run_on_own_task(s, cmd, argc, av);
+    }
 
     /*
      * Reported here, inside the redirection, rather than by the caller.

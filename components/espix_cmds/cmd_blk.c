@@ -1514,10 +1514,15 @@ static espix_cmd_t s_blk_cmds[] = {
       /* The root-only rule belongs in the help: a user who is told why is not
        * left thinking the command is broken. */
       .help = "mount a FAT filesystem (root, or the mount point's owner)",
-      .usage = "mount [-o uid=<id>[,gid=<id>]] [device|/dev/device path]" },
+      .usage = "mount [-o uid=<id>[,gid=<id>]] [device|/dev/device path]",
+      /* lwext4's mount is the deepest thing a command does: 9556 bytes of a
+       * 10240-byte session stack before it tripped the canary, and the ext4
+       * path is deeper than the FAT one that measured it. */
+      .stack = 12288 },
     { .name = "umount", .fn = cmd_umount,
       .help = "unmount a mounted filesystem (its mounter, or root)",
-      .usage = "umount path|device..." },
+      .usage = "umount path|device...",
+      .stack = 12288 },
 };
 
 void espix_cmds_register_blk(void)

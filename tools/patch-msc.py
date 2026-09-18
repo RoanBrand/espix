@@ -358,7 +358,12 @@ BDL_READ_ANCHOR = (
     "    return scsi_cmd_read10(dev, dst, (uint32_t)lba, (uint32_t)num_blocks, block_size);"
 )
 
-BDL_READ_ADDITION = (
+# The whole of msc_bdl_read()'s body after the geometry, assembled from three
+# pieces: the bounce for an unaligned destination (and the read itself), the
+# optional probe, and the copy out to the caller. Three pieces because the probe
+# has to sit between the read and that copy, and a replacement is one string.
+
+BDL_READ_PREFIX = (
     "    const uint64_t lba = src_addr / block_size;\n"
     "    const uint64_t num_blocks = len / block_size;\n"
     "    if (num_blocks > UINT32_MAX) {\n"
@@ -400,7 +405,9 @@ BDL_READ_ADDITION = (
     "    } else {\n"
     "        err = scsi_cmd_read10(dev, target, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
     "    }\n"
-    "\n"
+)
+
+BDL_READ_SUFFIX = (
     "    if (target != dst) {\n"
     "        if (err == ESP_OK) {\n"
     "            memcpy(dst, target, len);\n"
@@ -412,14 +419,59 @@ BDL_READ_ADDITION = (
 
 MARK_BDL_READ = "scsi_cmd_read16(dev, target"
 
-# The bounce needs two headers the component does not already pull in: the cache
-# caps for the allocation, and memcpy. string.h first, matching the file's own
-# ordering of system before project headers.
+# The probe, when the project asks for one. It answers what nothing above this
+# layer can: whether the device returned *different bytes* for the same LBA (the
+# medium lied) or the transfer failed (the read failed). Both arrive at a
+# filesystem as one errno, and a listing that stopped early looks exactly like a
+# short directory -- which is what the 3.1TB T9 was misread as for months.
+#
+# Off by default and bounded by a count, because it reads every verified transfer
+# twice and a 12 Mbps link makes that expensive. It compares the DMA'd buffer,
+# not the caller's copy of it.
+BDL_READ_VERIFY = (
+    "#if CONFIG_ESPIX_USB_VERIFY_READS > 0\n"
+    "    static unsigned verified;\n"
+    "    if (err == ESP_OK && verified < CONFIG_ESPIX_USB_VERIFY_READS) {\n"
+    "        uint8_t *scratch = heap_caps_malloc(len, MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);\n"
+    "        verified++;\n"
+    "        if (scratch != NULL) {\n"
+    "            esp_err_t again = (lba > UINT32_MAX)\n"
+    "                ? scsi_cmd_read16(dev, scratch, lba, (uint32_t)num_blocks, block_size)\n"
+    "                : scsi_cmd_read10(dev, scratch, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
+    "            if (again != ESP_OK) {\n"
+    "                ESP_LOGE(\"espix_msc\", \"verify: reread of %llu failed (0x%x)\",\n"
+    "                         (unsigned long long)lba, again);\n"
+    "            } else if (memcmp(target, scratch, len) != 0) {\n"
+    "                size_t at = 0;\n"
+    "                while (at < len && target[at] == scratch[at]) {\n"
+    "                    at++;\n"
+    "                }\n"
+    "                ESP_LOGE(\"espix_msc\",\n"
+    "                         \"verify: %llu differs at byte %u of %u (%02x vs %02x)\",\n"
+    "                         (unsigned long long)lba, (unsigned)at, (unsigned)len,\n"
+    "                         target[at], scratch[at]);\n"
+    "            }\n"
+    "            heap_caps_free(scratch);\n"
+    "        }\n"
+    "    }\n"
+    "#endif\n"
+    "\n"
+)
+
+BDL_READ_ADDITION = BDL_READ_PREFIX + BDL_READ_VERIFY + BDL_READ_SUFFIX
+
+# The bounce and the probe need headers the component does not already pull in:
+# the cache caps and memcpy, plus sdkconfig for the probe's count and esp_log to
+# report a mismatch. string.h first, matching the file's ordering of system before
+# project headers.
 MSC_INCLUDES_ANCHOR = "#include \"msc_scsi_bot.h\"\n"
 MSC_INCLUDES_ADDITION = (
     "#include <string.h>\n"
     "\n"
+    "#include \"sdkconfig.h\"\n"
+    "\n"
     "#include \"esp_heap_caps.h\"\n"
+    "#include \"esp_log.h\"\n"
 )
 MARK_MSC_INCLUDES = "#include \"esp_heap_caps.h\""
 

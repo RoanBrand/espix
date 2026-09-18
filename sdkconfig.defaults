@@ -315,7 +315,7 @@ CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 # 8192 was too small: a command runs on this task's stack, `sudo` re-enters the
 # shell on it, and a `sudo mount` tripped the canary at 7680 bytes used, 508
 # free. 10240 leaves room for a command that reaches into a mounted filesystem.
-CONFIG_ESPIX_SSH_TASK_STACK=10240
+CONFIG_ESPIX_SSH_TASK_STACK=6144
 
 # exFAT, for the 3.1TB exFAT partition a Samsung T9 carries. This is the one
 # option here that is off for a reason other than a preference -- see

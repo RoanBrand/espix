@@ -266,6 +266,26 @@ typedef struct espix_cmd {
     const char      *help;                 /* one-line summary, for `help` */
     const char      *usage;                /* e.g. "rm [-r] <path>..." */
     espix_cmd_fn     fn;
+
+    /*
+     * The task stack this command needs, in bytes, or 0 to run on the session's
+     * own task.
+     *
+     * A command's stack cost is part of its contract. The session task is sized
+     * for the protocol plus the commands that declare 0 here, and anything that
+     * declares a size runs on a task of its own -- sized for it, freed when it
+     * exits, and never charged to every open connection. `sudo` declares one
+     * because it re-enters the dispatcher, so the command it runs gets a stack
+     * of its own instead of paying for two frames on one.
+     *
+     * A command that declares too little is caught by the stack canary, which is
+     * how `mount` was caught using 9556 bytes of a 10240-byte session stack.
+     * `ps` reports a running task's high-water mark, and the dispatcher logs the
+     * same figure when a spawned command finishes, so the numbers here are
+     * measured rather than believed.
+     */
+    uint32_t         stack;
+
     struct espix_cmd *next;                /* registry-owned; do not set */
 } espix_cmd_t;
 

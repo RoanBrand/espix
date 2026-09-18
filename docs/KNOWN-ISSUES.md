@@ -1393,8 +1393,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   espix's own probe buffers, `__attribute__((aligned(64)))` on the one that lives
   on the stack, cache-aligned `ff_memalloc()` for FatFs
   (`tools/patch-fatfs.py`), and a bounce buffer in `msc_bdl_read()` for anyone
-  else (`tools/patch-msc.py`). The probe described above is no longer needed: the
-  test is a directory listing that was truncated.
+  else (`tools/patch-msc.py`).
+
+  **That did not fix it, and the measurement was right where I was wrong.** With
+  the alignment change in place the counts were identical -- 73, then 239 twice --
+  so the corruption is *inside* the read, and an invalidate of a completed IN
+  transfer is safe for the region's own bytes (the DMA has already written RAM;
+  the invalidate makes the CPU read it). What an unaligned sync damages is the
+  *neighbouring* lines, not the data. The alignment work is still correct, and
+  stays, but it was not this.
+
+  What the docs had already measured was the answer, and I explained it away: a
+  read that is repeated returns **different bytes**, which is a *device*
+  signature. A cache returns the same wrong bytes. So the probe is back --
+  `CONFIG_ESPIX_USB_VERIFY_READS` in `components/espix_usb/Kconfig`, bounded and
+  off by default, logging the address and the first differing byte -- because the
+  next question is whether the device or the transfer differs, and only a probe
+  can say.
 
   The GPT-array quirk this drive also showed was the same bug, not a separate one,
   and `lsblk`'s "entries not shown" was reporting it accurately -- entries 125-128

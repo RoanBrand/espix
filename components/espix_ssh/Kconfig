@@ -63,22 +63,35 @@ menu "espix SSH"
         int "Connection task stack (bytes)"
         depends on ESPIX_SSH_ENABLED
         range 4096 16384
-        default 10240
+        default 6144
         help
-            The protocol logic is shallow, but the shell session runs on this
-            stack, and commands run on it too. So does `sudo`, which re-enters
-            the shell in the same task and pays the parsing frames twice.
+            The protocol logic is shallow, but the handshake is not: x25519,
+            ECDSA and PBKDF2 run here, and a live session measured 4056 bytes
+            used -- handshake, prompt and a command together.
 
-            8192 was not enough: `sudo mount sda1 /mnt/sd1` tripped the stack
-            canary at 7680 bytes used, 508 free, and the core dump named this
-            task. A command's stack cost is part of its contract, and `ps` is
-            where to read it -- its STACK column is FreeRTOS's high-water mark,
-            the smallest free figure the task has ever reached.
+            Commands do not run here unless they say they can. `espix_cmd_t` has
+            a `stack` field, and a command that declares a size runs on a task of
+            its own: sized for it, freed when it exits, never charged to every
+            open connection. The shell used to run on this stack, which cost
+            10240 per connection and was still not enough for lwext4's mount --
+            `sudo mount -o ro sda3 /media/s3` tripped the canary and the core
+            dump named this task. It had already happened once before, at 8192,
+            on `sudo mount sda1 /mnt/sd1`.
+
+            So this number is the protocol plus the commands that run inline, and
+            the deep ones pay for themselves. Raising it is still the wrong fix
+            for a command that needs more: declare the size in the command table,
+            where it costs one command's stack instead of every session's.
+
+            Sizing is measured, not guessed. `ps` shows a running task's
+            high-water mark, and the dispatcher logs the same figure for a
+            spawned command as it finishes -- `dmesg` is where to read what a
+            command actually used.
 
             Raising this raises the per-connection internal cost in the note
             above by the same amount: 10344 becomes 12392, so eight open
-            connections want about 16K more than the figures there were
-            measured with.
+            connections want about 16K more than the figures there were measured
+            with.
 
     config ESPIX_SSH_SFTP_IN_PSRAM
         bool "Allocate SFTP transfer buffers from PSRAM when available"
