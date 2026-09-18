@@ -1084,20 +1084,33 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 ## Writing to an ext volume
 
 - **What a failed write did before `tools/lwext4-fwrite-error.patch`.** Observed
-  on hardware rather than argued. With the vendored core's `ext4_fwrite()`
-  error clobber in place, a fault injected into the block device -- writes from
-  the twelfth onward refused -- left `cp` of a **15-byte** file reporting
-  `write failed: I/O error`, and the file on the volume was **4096 bytes**:
-  the right fifteen bytes followed by a block of garbage. The data writes were
-  refused and the metadata was committed anyway, which is exactly the failure
-  the patch prevents -- the abort decision had been made on the result of
-  releasing the inode reference rather than on the error that got there first.
+  on hardware rather than argued. With the vendored core's `ext4_fwrite()` error
+  clobber in place, a fault injected into the block device -- writes from the
+  twelfth onward refused -- had `cp` of a **15-byte** file report `write failed:
+  I/O error` while the volume listed the file as **4096 bytes**, the right fifteen
+  bytes followed by a block of garbage. The data writes were refused and the
+  metadata went to the journal anyway, which is what the patch prevents: the
+  abort decision had been made on the result of releasing the inode reference
+  rather than on the error that got there first.
 
-  Worth knowing for anyone repeating it: a fault that *persists* masks the
-  clobber, because the release fails as well and that error reaches the abort
-  decision on its own. The caller is then told, while the volume is still left
-  inconsistent. Seeing the silent variant needs exactly one failed write, which
-  is what `CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER` now does.
+  **It was not durable damage, and that is worth as much as the finding.**
+  Mounting the volume again replayed the journal, the phantom file was gone, and
+  the volume was consistent -- the transaction had never been committed, so the
+  replay discarded it. What the clobber cost, on that fault shape, was a corrupt
+  file visible to whoever looked at the volume before it was next mounted.
+
+  Two things to know before repeating it. A fault that *persists* masks the
+  clobber: the release fails too, and that error reaches the abort decision on its
+  own, so the caller is told even though the metadata went to the journal. And the
+  count is per mount, so it has to clear whatever journal recovery spends -- about
+  160 writes on a volume left unclean by the previous run -- or the one refusal
+  lands in the recovery instead of the file operation, and nothing is tested.
+
+  A third thing that fell out of trying it: a write refused *during* recovery did
+  not stop recovery, and the mount completed with the volume consistent. Whether
+  that is recovery being resilient or an error path that does not check itself is
+  exactly what `doc/CAVEATS.md` says has not been established, and it is on the
+  list of things this harness exists to answer.
 
 
 - **Writes on an ext4 volume go through the port's experimental extent
