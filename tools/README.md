@@ -114,9 +114,28 @@ beyond it. See [../docs/KNOWN-ISSUES.md](../docs/KNOWN-ISSUES.md).
 Three files, one of them outside IDF: the definition, the weak declaration that has
 to agree with it, and — the one to know about — the toolchain's own `reent.h`, which
 declares `_lseek_r` in terms of `_off_t` and so follows the widened type by
-construction. Pinning that declaration to `int` is correct for every project, with
-or without a widened `off_t`, which is why it is worth touching a file outside the
-IDF tree at all; the hook finds it by asking the compiler for its sysroot.
+construction. The hook finds it by asking the compiler for its sysroot.
+
+**That third file is outside IDF on purpose, and it is the only patch here that
+is.** The others touch `$IDF_PATH` or `managed_components/` — input the build
+already treats as fetched. `include/reent.h` belongs to the *compiler toolchain*,
+shared by every project on the machine that uses it, so this is the one patch that
+changes something espix does not own.
+
+It is kept because both cannot be had: `_off_t` is what `off_t` widens, and that
+declaration is written in terms of it, so it had to move for a 32-bit `_lseek_r` to
+compile against a 64-bit `off_t`. And what it now says is *more* correct than what
+was there: it declares the ABI the library was actually built with, which is what
+its own compiled callers use.
+
+**The cost, accepted knowingly.** For a project that never widens `off_t`, the
+declared type becomes `int` where it was `long`: the same width and an identical
+ABI, but a different declared type, which a pedantic build on another project could
+notice.
+
+**Undoing it.** Restore the line from `TOOLCHAIN` in the script, then delete that
+dict, the `--toolchain-root` argument and its `CMAKE_CONFIGURE_DEPENDS` entry. The
+`off_t` widening goes with it, for the reason above.
 
 ```bash
 ./tools/patch-libc-offt.py --idf-path "$IDF_PATH"    # or IDF_PATH=... with no argument

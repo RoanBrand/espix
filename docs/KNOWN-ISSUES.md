@@ -1367,3 +1367,19 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   (which would be a workaround worth having) and whether another USB device or
   cable reproduces it (which would say whether it is this drive). Both are cheap;
   neither has been done.
+
+## Building espix
+
+- **Building espix changes one line of your toolchain's headers.** `off_t` and
+  `_off_t` are the same type, so widening `off_t` — which is what lets a file over
+  4 GiB be reported and seeked, see [UPSTREAM.md](UPSTREAM.md) — necessarily widens
+  `_off_t`, and the toolchain's own `reent.h` declares `_lseek_r` in terms of it.
+  `tools/patch-libc-offt.py` therefore pins that declaration to its 32-bit width on
+  every configure, in the *toolchain installation* rather than in the IDF tree: the
+  one patch here that touches something espix does not own.
+
+  It matters because that toolchain is shared. Another project built with it on the
+  same machine gets the same declaration — `int` where it was `long`, the same width
+  and an identical ABI, but a different declared type. That is deliberate rather than
+  accidental, and [tools/README.md](../tools/README.md) says why, what the cost is,
+  and how to undo it if you would rather not.

@@ -950,8 +950,13 @@ real 32-bit function that calls the 64-bit `esp_vfs_lseek` — in both the weak
 declaration and the definition — and pins the matching declaration in the
 toolchain's own `reent.h`, which is written in terms of `_off_t`, the very type
 being widened, and so follows it by construction. That last file is outside IDF,
-which is why the hook asks the compiler for its sysroot; pinning it to `int` is
-correct for any project, widened `off_t` or not. `lseek()`, `pread()` and `pwrite()`
+which is why the hook asks the compiler for its sysroot. Pinning it to `int` is
+correct for any project, widened `off_t` or not — it declares the ABI the library
+was built with, which is what its own compiled callers use — and the cost is a
+shared toolchain: another project built with it gets `int` where it had `long`, the
+same width and ABI and a different declared type.
+[tools/README.md](../tools/README.md) records that as a deliberate deviation, with
+how to undo it. `lseek()`, `pread()` and `pwrite()`
 are untouched and stay 64-bit, which is where a file over 4 GiB is actually reached.
 `tools/esp_libc-lseek-abi.patch` is the IDF half ready to send, and the better fix
 upstream is a **Kconfig knob for 64-bit `off_t`**, which would make the width
