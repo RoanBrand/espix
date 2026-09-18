@@ -122,6 +122,27 @@ that was implicit while `off_t` was 32 bits, and stopped being implicit when a
 project widened the type. The better fix upstream is a Kconfig knob for 64-bit
 `off_t`, which would make the width explicit; there is none today.
 
+## check-abi.py
+
+Fails the build if a symbol an app resolves a layer below is not in the image.
+espix's own tables are the allowlist, but two tables inside `elf_loader` answer for
+62 standard names *first* — and each entry there is what anchors its function into
+the image, so those names are present unless something takes them away: the
+`CONFIG_ELF_LOADER_LIBC_SYMBOLS` / `_ESPIDF_SYMBOLS` options switched off, or a
+newer `elf_loader` that dropped a name. Either way an app finds out as
+`undefined symbol`, at load, on a device.
+
+The build runs it after the link — a `POST_BUILD` step rather than a
+configure-time hook like the patch scripts above, because there is no ELF to read
+until then. It costs the image nothing, which is the whole reason it is not a
+`_Static_assert`: naming a function to prove it exists is what pulls it in. That
+argument, and the list it guards, are in
+[`components/espix_proc/abi_libc.c`](../components/espix_proc/abi_libc.c).
+
+```bash
+python3 tools/check-abi.py --elf build/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm
+```
+
 ## Deploying an app
 
 Build it on the host, copy it over, run it by name:

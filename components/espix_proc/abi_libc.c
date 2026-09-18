@@ -33,6 +33,55 @@
  * that could be misused in a way printf() does not already allow. A symbol that
  * cannot pass that test does not belong here.
  *
+ * And a name only belongs here if the call reaches espix -- or reaches nothing.
+ * libc's open(), stat() and read() are published unwrapped *because* they
+ * dispatch into espix's own VFS and so meet the permission check on the way in;
+ * chdir, getcwd and chmod are espix's own under libc's names because IDF's are
+ * stubs; sleep and usleep are overridden so a signal can cut them short. A call
+ * that would reach *below* espix -- a lower filesystem, a device, a ROM routine
+ * with its own policy -- gets overridden to route through espix or is left out
+ * with the reason written down. An app's fopen() used to reach the filesystem
+ * without passing espix at all, which is the bug this rule exists to prevent.
+ *
+ * What is answered a layer below, and needs no entry here
+ * ------------------------------------------------------
+ * elf_loader's own table (esp_elf_symbol.c) is searched *before* this one, so
+ * these are already reachable and listing them again is dead weight -- which
+ * three entries were, until tools/check-abi.py started comparing the names below
+ * with the names here. Grouped as that file groups them, and only the names an
+ * app of espix's kind reaches for:
+ *
+ *   string.h  strerror, memcpy, memset, strlen, strcmp, strchr, strrchr,
+ *             strcspn, strncat, strtod, strtol
+ *   stdio.h   printf, fprintf, vfprintf, puts, putchar, fputc, fputs, fwrite
+ *   stdlib.h  malloc, calloc, realloc, free
+ *   unistd.h  close, exit, sleep, usleep
+ *   time.h    clock_gettime, strftime
+ *   setjmp.h  setjmp, longjmp
+ *   getopt.h  getopt_long and its four variables
+ *   libc      __errno, __getreent and the ctype table -- `_ctype_` under newlib,
+ *             its picolibc equivalent under picolibc. These are newlib's own ABI
+ *             rather than a C API, and an app built against either libc needs
+ *             the matching set.
+ *   pthread.h pthread_create, join, detach, exit and two attribute calls, which
+ *             an app that wants a second thread uses. espix does not own these:
+ *             a thread created through them is a FreeRTOS task, not a process,
+ *             so it has no espix identity and no signal delivery. Worth knowing
+ *             before anything promises a thread the isolation an app gets.
+ *
+ * sleep and usleep are the exception that proves the rule: espix does override
+ * them, and it has to go through the resolver to do it, because a table cannot
+ * shadow a name the loader's own is searched first for. See abi_signal.c.
+ *
+ * None of this can be a _Static_assert. `sizeof(&f)` proves the *declaration*
+ * exists and costs nothing, but what matters is whether the *definition* is in
+ * the image, and naming it to prove that is exactly what pulls it in -- the cost
+ * the assertion was meant to avoid. So the check runs at the other end:
+ * tools/check-abi.py reads the linked ELF and fails the build if a name
+ * elf_loader promises is not in it, and compares the two name lists so that an
+ * entry here which something below already answers for is caught before it is
+ * flashed rather than discovered when an app gets the wrong implementation.
+ *
  * Found by writing an app: it wanted setvbuf and would not load, then snprintf
  * and still would not load, each time with "relocation failed" naming no
  * symbol. See docs/UPSTREAM.md.

@@ -158,3 +158,38 @@ else
     assert_contains "the errno an app reads is the one espix set, named" \
                     "abi errno=ENOENT strerror=No such file or directory" "$abi_out"
 fi
+
+# 8. The permission check reaches an app, not only the shell. Section 1 proves it
+#    for a builtin -- cp into /etc is refused. An app is the other half: it calls
+#    the same VFS through its own descriptors, and an app's fopen() reaching the
+#    filesystem without passing espix at all is a bug this project has had once.
+if ! dev_testapp_present; then
+    espix_skip "test app not built -- run 'make test-app'"
+else
+    app="/home/$ESPIX_USER/testapp"
+
+    # /etc belongs to root, and the app runs as the suite's ordinary account.
+    denied=$(dev_run "$app write /etc/espix-abi-probe denied")
+    assert_not_contains "an app cannot create a file under /etc" "ok" "$denied"
+
+    # Nor on a file it does not own.
+    chmod_out=$(dev_run "$app chmod /etc/hostname 0777")
+    assert_not_contains "an app cannot chmod a file it does not own" "ok" "$chmod_out"
+fi
+
+# 9. No app-visible name reaches a lower filesystem. Every entry in the ABI is
+#    either libc that arrives in espix's VFS on the way in, espix's own
+#    implementation, or pure computation over the caller's memory -- so a
+#    lower-level call in one of these files (lfs_*, ff_*, ext4_*,
+#    esp_littlefs_*, esp_vfs_fat_*) means a published name that skips the
+#    permission check. Same grep-and-fail shape as the bypass check in 4.
+abi_files=$(ls "$ESPIX_ROOT"/components/espix_proc/abi_*.c \
+               "$ESPIX_ROOT"/components/espix_proc/abi_*.cpp \
+               "$ESPIX_ROOT"/components/espix_net/abi.c 2>/dev/null)
+lower_hits=$(grep -En '\b(lfs_|ff_|ext4_|esp_littlefs_|esp_vfs_fat_)' $abi_files 2>/dev/null || true)
+if [ -z "$lower_hits" ]; then
+    espix_pass "no app-visible name reaches a lower filesystem directly"
+else
+    espix_fail "no app-visible name reaches a lower filesystem directly" \
+               "$(printf '%s' "$lower_hits" | tr '\n' ' ')"
+fi

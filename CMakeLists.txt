@@ -191,3 +191,23 @@ if(ESPIX_BUILD_APPS)
     # The image is packaged from fsroot/, so staging has to have happened first.
     add_dependencies(littlefs_storage_bin espix_apps)
 endif()
+
+# A symbol an app resolves a layer below is usable only if its definition is in
+# the image -- and naming it to *prove* that is what pulls it in and grows the
+# kernel, so the check runs the other way round, on the linked ELF, where it costs
+# the image nothing. It catches elf_loader's symbol tables being switched off, or
+# a newer elf_loader dropping a name; an app finds either as "undefined symbol",
+# at load time, on a device.
+#
+# See tools/check-abi.py, and the list it guards in components/espix_proc/abi_libc.c.
+#
+# After the link, so this is POST_BUILD rather than configure-time like the patch
+# hooks above: there is no ELF to read until then.
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME}.elf POST_BUILD
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check-abi.py"
+            --elf "$<TARGET_FILE:${CMAKE_PROJECT_NAME}.elf>"
+            --nm "${CMAKE_NM}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Checking the layer-below symbols are in the image"
+    VERBATIM)
+

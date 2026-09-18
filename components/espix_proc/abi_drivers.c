@@ -109,11 +109,13 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     /* Monotonic time, which is how Arduino's millis()/micros() are built. */
     ESP_ELFSYM_EXPORT(esp_timer_get_time),
 
-    /* Heap and libc the loader's own table happens not to cover. */
+    /*
+     * Heap and libc the loader's own table happens not to cover. memset, strtol
+     * and ets_printf used to be listed here and are answered a layer below, so
+     * they were unreachable -- tools/check-abi.py compares the two name lists at
+     * build time now rather than leaving that to be noticed.
+     */
     ESP_ELFSYM_EXPORT(heap_caps_calloc),
-    ESP_ELFSYM_EXPORT(memset),
-    ESP_ELFSYM_EXPORT(strtol),
-    ESP_ELFSYM_EXPORT(ets_printf),
     ESP_ELFSYM_EXPORT(__udivdi3),
     ESP_ELFSYM_EXPORT(vsnprintf),
 
