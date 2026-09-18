@@ -1401,7 +1401,7 @@ static void log_why_not_mounted(esp_blockdev_handle_t dev, const char *path)
     }
 }
 
-#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0
+#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE > 0
 /*
  * A block device that refuses the Nth write, for the one question nothing else
  * can answer: what lwext4 does when the medium says no.
@@ -1413,12 +1413,13 @@ static void log_why_not_mounted(esp_blockdev_handle_t dev, const char *path)
  * underneath, so every operation forwards except write, which counts and then
  * refuses.
  *
- * Built only when CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER is set; zero, the
+ * Built only when CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE is set; zero, the
  * default, compiles none of this.
  */
 typedef struct {
     esp_blockdev_handle_t real;
     unsigned              writes;
+    bool                  fired;
 } ext_fail_bd_t;
 
 static ext_fail_bd_t          s_fail_ctx;
@@ -1445,13 +1446,14 @@ static esp_err_t fail_write(esp_blockdev_handle_t h, const uint8_t *src,
     espix_klog(ESPIX_KLOG_INFO, TAG, "fail-inject: write %u of %u bytes",
                f->writes, (unsigned)len);
 
-    /* Exactly one write, not every write from here on. A fault that persists
-     * trips the inode-reference release at the end of ext4_fwrite() as well, and
-     * that error reaches the abort decision whatever happened to the data write
-     * before it -- so the defect this exists to expose hides behind a different
-     * failure. One write leaves the release succeeding, which is the case where
-     * the original error is the only thing that can be lost. */
-    if (f->writes == (unsigned)CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER) {
+    /* The first write at or above the address, and once. Above it is file data
+     * on a volume laid out like the one this was written against; below it is
+     * metadata, and a failed metadata write is one lwext4 reissues, which proves
+     * nothing. Failing one data write leaves the release succeeding, which is the
+     * case where the original error is the only thing that can be lost. */
+    if (!f->fired && f->writes >= 1 &&
+        dst_addr >= (uint64_t)CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE) {
+        f->fired = true;
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "fail-inject: refusing write %u (%u bytes at %llu)",
                    f->writes, (unsigned)len, (unsigned long long)dst_addr);
@@ -1511,6 +1513,7 @@ static const esp_blockdev_ops_t s_fail_ops = {
 static void fail_bd_arm(void)
 {
     s_fail_ctx.writes = 0;
+    s_fail_ctx.fired  = false;
 }
 
 /* The device the adapter is given: the real one, or the shim in front of it. */
@@ -1518,6 +1521,7 @@ static esp_blockdev_handle_t fail_bd(esp_blockdev_handle_t dev)
 {
     s_fail_ctx.real   = dev;
     s_fail_ctx.writes = 0;
+    s_fail_ctx.fired  = false;
 
     s_fail_dev.ctx          = &s_fail_ctx;
     s_fail_dev.device_flags = dev->device_flags;
@@ -1525,13 +1529,13 @@ static esp_blockdev_handle_t fail_bd(esp_blockdev_handle_t dev)
     s_fail_dev.ops          = &s_fail_ops;
 
     espix_klog(ESPIX_KLOG_WARN, TAG,
-               "fail-inject: armed, write %d after the mount will be refused "
-               "(CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER)",
-               CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER);
+               "fail-inject: armed, the first write at or above %lld will be "
+               "refused (CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE)",
+               (long long)CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE);
 
     return &s_fail_dev;
 }
-#endif /* CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0 */
+#endif /* CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE > 0 */
 
 /*
  * The mount itself, done here rather than by the vendored component: its
@@ -1631,7 +1635,7 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
         .lower_device_supports_rewrite = true,
     };
 
-#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0
+#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE > 0
     const esp_blockdev_handle_t lower = fail_bd(dev);
 #else
     const esp_blockdev_handle_t lower = dev;
@@ -1743,7 +1747,7 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
         goto fail_dev;
     }
 
-#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0
+#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE > 0
     /* From here, and not from the start of the mount. See fail_bd_arm(). */
     fail_bd_arm();
 #endif

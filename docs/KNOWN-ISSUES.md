@@ -1101,10 +1101,22 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
   Two things to know before repeating it. A fault that *persists* masks the
   clobber: the release fails too, and that error reaches the abort decision on its
-  own, so the caller is told even though the metadata went to the journal. And the
-  count is per mount, so it has to clear whatever journal recovery spends -- about
-  160 writes on a volume left unclean by the previous run -- or the one refusal
-  lands in the recovery instead of the file operation, and nothing is tested.
+  own, so the caller is told even though the metadata went to the journal.
+
+  **And the injection cannot isolate the call it is aimed at, which is why three
+  attempts produced three different failure modes instead of a comparison.** The
+  journal is a *file*: its blocks are allocated in the data region like any other
+  data, so neither a count of writes nor an address threshold separates a journal
+  write from the file-data write the test wants. Measured: an armed address above
+  2 GiB was first hit by write 5, inside `ext4_journal_start()`, at 0x88000000 --
+  a journal block, not the copy's data. Every attempt lands in the journal, and
+  lwext4 either reissues those writes or, with espix's fail-closed mount, refuses
+  to mount writable at all.
+
+  To isolate it the fault has to be *inside* `ext4_fwrite()`: a test-only patch of
+  the vendored core that fails one block write at that call and nowhere else. A
+  patch rather than a knob, because the layer underneath genuinely cannot tell the
+  two apart.
 
   A third thing that fell out of trying it: a write refused *during* recovery did
   not stop recovery, and the mount completed with the volume consistent. Whether

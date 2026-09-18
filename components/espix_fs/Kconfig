@@ -100,17 +100,24 @@ menu "espix filesystem"
 
 endmenu
 
-    config ESPIX_FS_EXT4_FAIL_WRITE_AFTER
-        int "Fail the Nth block write, for testing the error path (0 = off)"
+    config ESPIX_FS_EXT4_FAIL_WRITE_ABOVE
+        int "Refuse the first block write at or above this address (0 = off)"
         depends on ESPIX_FS_EXT4
         default 0
         help
-            Injects an I/O failure into the block device under a mounted ext
-            volume: the Nth write the adapter makes is refused, which is what a
-            medium that has stopped answering looks like.
+            Injects one I/O failure into the block device under a mounted ext
+            volume: the first write at or above this byte address is refused,
+            once, which is what a medium that has stopped answering looks like.
 
             It exists because the question it answers -- whether lwext4 aborts
             its transaction and reports the failure, or commits over it -- cannot
             be asked any other way, and because a passing e2fsck is not evidence
-            about it. Zero, the default, is no injection at all.
+            about it.
+
+            An address rather than a count of writes, because a count cannot
+            distinguish a failed metadata write from a failed file data write --
+            and lwext4 simply reissues the former, so a test aimed at a count
+            proves nothing. On a volume laid out like the one this was written
+            against, metadata sits low (0x400, 0x1000) and data high (0x8800...),
+            so 0x80000000 aims at a data write. Zero, the default, is off.
 
