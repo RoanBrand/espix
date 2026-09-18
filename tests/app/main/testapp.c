@@ -734,6 +734,48 @@ static int cmd_abi(const char *path)
     return 0;
 }
 
+/*
+ * Both truncates, because they are different calls: truncate(2) takes a path and
+ * goes through the VFS's own op, and ftruncate(2) takes the open handle's. Nothing
+ * in the suite reached either -- cp truncates by opening with O_TRUNC, which is the
+ * open path -- so this is the only thing that calls them.
+ *
+ * The second length is half the first, so a listing says which one landed.
+ */
+static int cmd_truncate(const char *path, const char *len_s)
+{
+    const long long len = strtoll(len_s, NULL, 10);
+
+    if (len <= 0) {
+        printf("truncate: length > 0\n");
+        return 2;
+    }
+
+    if (truncate(path, (off_t)len) != 0) {
+        printf("truncate %s %lld %s\n", path, len, errno_name(errno));
+        return 1;
+    }
+    printf("truncate %s %lld ok\n", path, len);
+
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        printf("ftruncate %s open %s\n", path, errno_name(errno));
+        return 1;
+    }
+
+    const long long half = len / 2;
+
+    if (ftruncate(fd, (off_t)half) != 0) {
+        printf("ftruncate %s %lld %s\n", path, half, errno_name(errno));
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    printf("ftruncate %s %lld ok\n", path, half);
+
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -758,7 +800,8 @@ static void usage(void)
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
-           "  abi <path>          call the published ABI by name, on a readable file\n");
+           "  abi <path>          call the published ABI by name, on a readable file\n"
+           "  truncate <path> <n> truncate(2) then ftruncate(2), to n and n/2\n");
 }
 
 int main(int argc, char **argv)
@@ -833,6 +876,9 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {
         return cmd_abi(argv[2]);
+    }
+    if (strcmp(cmd, "truncate") == 0 && argc > 3) {
+        return cmd_truncate(argv[2], argv[3]);
     }
 
     printf("testapp: unknown command '%s'\n", cmd);

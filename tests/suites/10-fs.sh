@@ -184,6 +184,28 @@ else
         assert_status "chmod on an ext volume refuses, having nowhere to write yet" \
                       1 dev_status "chmod $ext_mnt/lost+found 0755"
 
+        # Both truncates, which nothing else in the suite calls: cp reaches
+        # truncation by opening with O_TRUNC, which is the open path. The file is
+        # root's, so it is made writable first -- and that exercises chmod's success
+        # path on a writable volume while it is there.
+        if ! dev_testapp_present; then
+            espix_skip "test app not built -- run 'make test-app'"
+        else
+            app=/home/$ESPIX_USER/testapp
+            dev_run "sudo cp /bin/hello $ext_mnt/trunc.txt" >/dev/null 2>&1
+            dev_run "sudo chmod 0666 $ext_mnt/trunc.txt" >/dev/null 2>&1
+
+            trunc_out=$(dev_run "$app truncate $ext_mnt/trunc.txt 2000 2>&1")
+            assert_contains "truncate() reaches an ext inode" \
+                            "truncate $ext_mnt/trunc.txt 2000 ok" "$trunc_out"
+            assert_contains "and ftruncate() takes it to half" \
+                            "ftruncate $ext_mnt/trunc.txt 1000 ok" "$trunc_out"
+            assert_contains "the inode reports what they left" "1000" \
+                            "$(dev_run "ls -l $ext_mnt/trunc.txt")"
+
+            dev_run "sudo rm $ext_mnt/trunc.txt" >/dev/null 2>&1
+        fi
+
         dev_run "sudo umount $ext_mnt" >/dev/null 2>&1
         dev_run "sudo rmdir $ext_mnt" >/dev/null 2>&1
     fi

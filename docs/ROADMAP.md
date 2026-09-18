@@ -662,12 +662,13 @@ the inode through a setter the mount hands the VFS (`espix_fs_meta_ops_t`), so
 refuses, and the rootfs's own path is untouched. 10-fs, 12-vfs and 75-usb are
 green with the stick attached.
 
-Still unexercised, and worth saying rather than assuming: `ext_truncate()` and
-`ext_ftruncate()` -- the path- and descriptor-shaped truncates, which the shell's
-`cp` reaches through `O_TRUNC` at open rather than through either -- and the
-failure path below, where a count of five lands inside the journal's own writes
-rather than in `ext4_fwrite()`. Hitting it needs a higher count and, for the A/B
-that would prove the fix, the unfixed core built alongside.
+`ext_truncate()` and `ext_ftruncate()` were the last two ops with nothing calling
+them, `cp` reaching truncation through `O_TRUNC` at open; the testapp's new
+`truncate` command calls both in turn, and 10-fs asserts that the inode ends up
+at the length each one named. What is still unexercised is the failure path: the
+injection's count lands in the journal's own writes rather than in
+`ext4_fwrite()`, and the A/B that would prove the patch needs the unfixed core
+built alongside it.
 
 `utime`, `chmod` and `chown` are not blocked on lwext4: `ext4_mtime_set()`,
 `ext4_mode_set()` and `ext4_owner_set()` each take a path, so the three calls that

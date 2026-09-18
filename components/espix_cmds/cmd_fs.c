@@ -1066,9 +1066,18 @@ static int cmd_chmod(espix_session_t *s, int argc, char **argv)
             continue;
         }
 
+        /*
+         * errno first, as rm does: espix_fs_chmod() reports that it failed, and
+         * errno is what says why. A read-only ext volume answers EROFS there, and
+         * "Read-only file system" is the answer where fs_err()'s "operation not
+         * permitted" reads as a permission problem. Cleared first so a stale value
+         * cannot be read as this call's reason.
+         */
+        errno = 0;
         const esp_err_t rc = espix_fs_chmod(abs, mode);
         if (rc != ESP_OK) {
-            espix_eprintf(s, "chmod: %s: %s\n", abs, fs_err(rc));
+            espix_eprintf(s, "chmod: %s: %s\n", abs,
+                          (errno != 0) ? strerror(errno) : fs_err(rc));
             status = 1;
         }
     }
@@ -1350,9 +1359,12 @@ static int cmd_chown(espix_session_t *s, int argc, char **argv)
             continue;
         }
 
+        /* errno first, and on stderr: see the note in cmd_chmod(). */
+        errno = 0;
         const esp_err_t rc = espix_fs_chown(abs, uid, gid);
         if (rc != ESP_OK) {
-            espix_printf(s, "%s: %s: %s\n", argv[0], abs, fs_err(rc));
+            espix_eprintf(s, "%s: %s: %s\n", argv[0], abs,
+                          (errno != 0) ? strerror(errno) : fs_err(rc));
             status = 1;
         }
     }

@@ -257,9 +257,16 @@ static esp_err_t attr_store(const char *abs_path, const struct stat *st,
     const espix_fs_meta_ops_t *ops = espix_vfs_meta_ops(abs_path);
 
     if (ops != NULL && ops->setattr != NULL) {
-        return (ops->setattr(ops->ctx, abs_path, attr->mode, attr->uid,
-                             attr->gid) == 0)
-                   ? ESP_OK : ESP_ERR_NOT_ALLOWED;
+        /* Cleared so the setter's errno is the only thing a caller can read as
+         * the reason. A read-only mount answers EROFS there, and the esp_err
+         * this returns cannot carry that. */
+        errno = 0;
+
+        if (ops->setattr(ops->ctx, abs_path, attr->mode, attr->uid,
+                         attr->gid) != 0) {
+            return ESP_ERR_NOT_ALLOWED;
+        }
+        return ESP_OK;
     }
 
     /*
@@ -273,6 +280,9 @@ static esp_err_t attr_store(const char *abs_path, const struct stat *st,
      * rather than a silent success against nothing.
      */
     if (espix_vfs_metadata(abs_path) != ESPIX_FS_META_ESPIX) {
+        /* This refusal has no errno of its own, and a stale one would be read as
+         * the reason -- so it names itself. */
+        errno = EPERM;
         return ESP_ERR_NOT_ALLOWED;
     }
 

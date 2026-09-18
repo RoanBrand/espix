@@ -1176,11 +1176,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   the inode. Everything else is unchanged — the rootfs still uses the store, and
   FatFs still has nothing to write and says so.
 
-  One wart worth knowing: a refusal carries only that it was refused. The
-  `esp_err` the VFS hands back cannot carry an errno, so `chmod` on a
-  *read-only* ext mount answers "operation not permitted" where "read-only
-  filesystem" is the useful thing to say. The status is right; the message is
-  not.
+  The message is right as well. `esp_err` cannot carry an errno, so these
+  commands read errno first and fall back on `esp_err_to_name()` -- the idiom
+  `rm` already used, for the same reason -- `chmod` and `chown` clear it before
+  the call, and mode.c names `EPERM` where a refusal has no errno of its own.
+  A read-only ext mount therefore says "Read-only file system", and a FatFs one
+  says what EPERM says. (`chown` was also printing its errors to stdout, where
+  a redirection would have swallowed them; that is stderr now, like `chmod`.)
 
 ## SSH
 
