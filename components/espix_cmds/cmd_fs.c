@@ -326,8 +326,13 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
             /* st.st_mode, not espix_fs_mode(): vfs_stat() has already folded
              * the rule's permission bits in, and espix_fs_mode() answers the
              * permissions alone -- passing it here would drop S_ISCHR and draw
-             * every device as an ordinary file. */
-            espix_fs_mode_str(st.st_mode, false, perms, sizeof(perms));
+             * every device as an ordinary file.
+             *
+             * S_ISDIR rather than false: the type character is the caller's to
+             * say, because a listing already knows it and should not pay a stat
+             * for it -- but this path *has* the stat, and passing false drew every
+             * directory as an ordinary file. `ls -ld /tmp` said `-rwxrwxrwt`. */
+            espix_fs_mode_str(st.st_mode, S_ISDIR(st.st_mode), perms, sizeof(perms));
             espix_printf(s, "%s %s %s %s %s %s\n",
                          perms, owner, group, size, when, abs);
         } else {
