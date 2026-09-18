@@ -1112,6 +1112,21 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   exactly what `doc/CAVEATS.md` says has not been established, and it is on the
   list of things this harness exists to answer.
 
+  **What the comparison did not establish, so nobody repeats the effort.** The
+  fixed core was never made to fail *visibly*: with one write refused inside a
+  3 KB copy, the copy completed, the file was exactly the right size, and nothing
+  was reported to the caller -- plausibly because the refused write was a journal
+  block lwext4 reissued, which is not a failed operation. So a single refused
+  *block* is not a sharp enough instrument for this; what it needs is a failure
+  aimed at the write that matters, or a host `e2fsck` to look at the metadata
+  afterwards, which is the port's own method and needs a Linux box.
+
+  The harness is otherwise fitted for it: `fail_bd_arm()` restarts the count as
+  the mount returns, so the number means "the Nth write of whatever the mount is
+  used for next" rather than of the mount and its recovery together -- which is
+  how an earlier attempt put its one refusal inside a journal replay (about 160
+  writes on a volume the previous run left unclean) and tested nothing.
+
 
 - **Writes on an ext4 volume go through the port's experimental extent
   implementation.** An ext4 volume's files are extent-mapped, so allocating a

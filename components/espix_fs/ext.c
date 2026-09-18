@@ -1500,6 +1500,19 @@ static const esp_blockdev_ops_t s_fail_ops = {
     .release = fail_release,
 };
 
+/*
+ * Start counting again, called once the mount is up. Without this the counter
+ * covers the whole mount -- the superblock, the journal start, and on an unclean
+ * volume a journal replay that can spend a hundred and fifty writes -- so a count
+ * chosen to land inside a file operation lands in the mount instead, and the test
+ * proves nothing. Armed here, "write N" means the Nth write of whatever the mount
+ * is used for next, which is the thing being tested.
+ */
+static void fail_bd_arm(void)
+{
+    s_fail_ctx.writes = 0;
+}
+
 /* The device the adapter is given: the real one, or the shim in front of it. */
 static esp_blockdev_handle_t fail_bd(esp_blockdev_handle_t dev)
 {
@@ -1512,7 +1525,8 @@ static esp_blockdev_handle_t fail_bd(esp_blockdev_handle_t dev)
     s_fail_dev.ops          = &s_fail_ops;
 
     espix_klog(ESPIX_KLOG_WARN, TAG,
-               "fail-inject: write %d will be refused (CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER)",
+               "fail-inject: armed, write %d after the mount will be refused "
+               "(CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER)",
                CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER);
 
     return &s_fail_dev;
@@ -1728,6 +1742,11 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
         ext4_umount(m->mp);
         goto fail_dev;
     }
+
+#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0
+    /* From here, and not from the start of the mount. See fail_bd_arm(). */
+    fail_bd_arm();
+#endif
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "mounted %s at %s (%u-byte blocks)",
                m->dev, path, (unsigned)bs);
