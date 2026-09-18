@@ -1083,6 +1083,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Writing to an ext volume
 
+- **What a failed write did before `tools/lwext4-fwrite-error.patch`.** Observed
+  on hardware rather than argued. With the vendored core's `ext4_fwrite()`
+  error clobber in place, a fault injected into the block device -- writes from
+  the twelfth onward refused -- left `cp` of a **15-byte** file reporting
+  `write failed: I/O error`, and the file on the volume was **4096 bytes**:
+  the right fifteen bytes followed by a block of garbage. The data writes were
+  refused and the metadata was committed anyway, which is exactly the failure
+  the patch prevents -- the abort decision had been made on the result of
+  releasing the inode reference rather than on the error that got there first.
+
+  Worth knowing for anyone repeating it: a fault that *persists* masks the
+  clobber, because the release fails as well and that error reaches the abort
+  decision on its own. The caller is then told, while the volume is still left
+  inconsistent. Seeing the silent variant needs exactly one failed write, which
+  is what `CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER` now does.
+
+
 - **Writes on an ext4 volume go through the port's experimental extent
   implementation.** An ext4 volume's files are extent-mapped, so allocating a
   block means mutating an extent tree, and the implementation espix compiles is the

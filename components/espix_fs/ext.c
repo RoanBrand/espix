@@ -1439,7 +1439,19 @@ static esp_err_t fail_write(esp_blockdev_handle_t h, const uint8_t *src,
 
     f->writes++;
 
-    if (f->writes >= (unsigned)CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER) {
+    /* Every write, numbered, so a count that lands somewhere unexpected can be
+     * read off the log instead of guessed at again. Only in a build that asked
+     * for the injection. */
+    espix_klog(ESPIX_KLOG_INFO, TAG, "fail-inject: write %u of %u bytes",
+               f->writes, (unsigned)len);
+
+    /* Exactly one write, not every write from here on. A fault that persists
+     * trips the inode-reference release at the end of ext4_fwrite() as well, and
+     * that error reaches the abort decision whatever happened to the data write
+     * before it -- so the defect this exists to expose hides behind a different
+     * failure. One write leaves the release succeeding, which is the case where
+     * the original error is the only thing that can be lost. */
+    if (f->writes == (unsigned)CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER) {
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "fail-inject: refusing write %u (%u bytes at %llu)",
                    f->writes, (unsigned)len, (unsigned long long)dst_addr);
