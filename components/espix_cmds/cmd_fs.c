@@ -17,6 +17,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_usb.h"
 
 #define COPY_CHUNK 512
 
@@ -1159,13 +1160,14 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
     /*
      * Then a row per mounted volume, in the same shape.
      *
-     * df was rootfs-only because nothing could ask a FAT volume how full it was.
-     * espix_fs_stat_fat() does now. A mount that cannot answer -- a non-FAT
-     * volume, or one whose device has been pulled -- is left out rather than
+     * df was rootfs-only because nothing could ask a mounted volume how full it
+     * was. Both drivers answer now: espix_fs_stat_fat() for FAT and exFAT,
+     * espix_fs_stat_ext() for ext. A mount that cannot answer -- one whose device
+     * has been pulled, or a type with no driver -- is left out rather than
      * printed as zero, because a row claiming no space at all is worse than no
      * row. The first column is the *source*, as GNU df has it, and its type is
-     * kept beside it in the mount record (espix_blk_mount_type()) for when a -T
-     * wants it.
+     * kept beside it in the mount record (espix_blk_mount_type()); that is also
+     * what says which of the two to ask.
      */
     for (size_t i = 0; ; i++) {
         char path[ESPIX_PATH_MAX];
@@ -1174,9 +1176,26 @@ static int cmd_df(espix_session_t *s, int argc, char **argv)
             break;
         }
 
-        uint64_t total  = 0;
-        uint64_t free_b = 0;
-        if (espix_fs_stat_fat(path, &total, &free_b) != ESP_OK) {
+        /* The record's type, not the path: by now the path is a mounted volume
+         * and only the record says what is under it. */
+        char type[16];
+        if (!espix_blk_mount_type(path, type, sizeof(type))) {
+            continue;
+        }
+
+        uint64_t  total  = 0;
+        uint64_t  free_b = 0;
+        esp_err_t serr;
+
+#if CONFIG_ESPIX_FS_EXT4
+        if (espix_usb_fstype_is_ext(type)) {
+            serr = espix_fs_stat_ext(path, &total, &free_b);
+        } else
+#endif
+        {
+            serr = espix_fs_stat_fat(path, &total, &free_b);
+        }
+        if (serr != ESP_OK) {
             continue;
         }
 

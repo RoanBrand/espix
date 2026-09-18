@@ -43,7 +43,10 @@ extern "C" {
 #define ESPIX_USB_NAME_MAX   8       /* "sda1" */
 #define ESPIX_USB_FSTYPE_MAX 12      /* "exfat/ntfs" */
 #define ESPIX_USB_LABEL_MAX  24      /* Volume labels are 11 bytes on disk */
-#define ESPIX_USB_UUID_MAX   10      /* "3E4A-1C7B", the FAT volume serial */
+/* A FAT or exFAT volume serial is "3E4A-1C7B", nine characters; an ext volume's
+ * UUID is 36, which is what sets this. The field is whichever the filesystem has,
+ * and an ext one used to be dropped rather than truncated. */
+#define ESPIX_USB_UUID_MAX   37
 /*
  * "5f8b1c2a-03" is an MBR's PARTUUID -- the disk signature and the entry
  * number, eleven characters. A GPT partition's is the entry's own GUID, 36
@@ -167,6 +170,21 @@ void espix_usb_set_dev_hook(espix_usb_dev_hook_fn fn);
  * device espix has, and in a device-role build.
  */
 esp_blockdev_handle_t espix_usb_dev_blockdev(const char *name);
+
+/*
+ * Is this filesystem type one of the ext names -- ext2, ext3 or ext4?
+ *
+ * The names are minted here, in host.c, out of the superblock's feature words, and
+ * consumed by the three places that route on a type: the mount path, the read-only
+ * marker in the mount table, and `df`'s choice of which driver to ask. One
+ * predicate rather than a comparison at each, because a comparison that drifts
+ * from what this names would send an ext volume to the FAT driver -- which fails as
+ * "not a FAT filesystem", pointing at the volume rather than at the drift.
+ *
+ * Accepts the range spelling too, which is the fallback when the feature words are
+ * out of reach.
+ */
+bool espix_usb_fstype_is_ext(const char *fstype);
 
 /*
  * Everything the host library can see on the port, which is not the same set as

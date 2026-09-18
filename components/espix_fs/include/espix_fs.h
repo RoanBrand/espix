@@ -104,6 +104,39 @@ esp_err_t espix_fs_mount_dead(const char *path);
 esp_err_t espix_fs_stat_fat(const char *path, uint64_t *total,
                             uint64_t *free_bytes);
 
+#if CONFIG_ESPIX_FS_EXT4
+/*
+ * Mount the ext2/3/4 filesystem on `dev` at `path`, read-only.
+ *
+ * Same contract as espix_fs_mount_fat() above -- reached through espix's VFS, the
+ * block device stays the caller's, never formats -- with two differences that
+ * matter to a caller.
+ *
+ * It is read-only, always, and every operation that would write refuses with
+ * EROFS rather than failing some other way. ext4_mount() takes read_only as an
+ * argument, so the mount and the driver cannot disagree about it.
+ *
+ * `owner_uid` and `owner_gid` are used the way FAT's are, not the way ext's
+ * inodes would have it: the mounter owns everything, because espix's own mode
+ * and owner attributes have nowhere to live on an ext volume yet and a read-only
+ * mount could not be chmod'd anyway. `ls -l` still shows the inodes' real uid,
+ * gid and mode, which is what stat answers. The inconsistency between the two is
+ * deliberate and temporary; see docs/ROADMAP.md.
+ */
+esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
+                             uint16_t owner_uid, uint16_t owner_gid);
+
+/* Unmount it, and the same ESP_ERR_INVALID_STATE while something is still open
+ * on it. A mount whose device has been pulled and whose operations are still
+ * refused leaves lwext4's side standing; see docs/KNOWN-ISSUES.md. */
+esp_err_t espix_fs_unmount_ext(const char *path);
+
+/* How much of a mounted ext volume is left, in bytes. ext4_mount_point_stats()
+ * answers it, so unlike the FAT side there is no arithmetic here to get wrong. */
+esp_err_t espix_fs_stat_ext(const char *path, uint64_t *total,
+                            uint64_t *free_bytes);
+#endif
+
 /*
  * The nth mount, for a caller that walks them: `df` prints a row per volume.
  * Index 0 is the first mount, not the root -- the root is not a mount of

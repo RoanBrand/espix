@@ -85,6 +85,26 @@ if(NOT espix_msc_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-msc.py failed; see the message above")
 endif()
 
+# Teach the lwext4 core the component manager downloads to honour the metadata
+# checksum seed, without which it refuses any ext4 volume made by e2fsprogs 1.47
+# or later -- which is every volume a current Linux creates. See
+# docs/KNOWN-ISSUES.md and tools/lwext4-csum-seed.patch.
+#
+# After project(), same reasoning as the two hooks above: the download happens
+# when the component manager runs, which is inside project(). The patch lands in
+# the core rather than in the port, because that is where the checksum seeding
+# is -- the component carries it as a submodule, so this is the submodule's tree.
+#
+# Temporary by construction: tools/lwext4-csum-seed.patch is the same change
+# ready to send to gkostka/lwext4, and this hook goes when it lands.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-lwext4.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_lwext4_patch_result)
+if(NOT espix_lwext4_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-lwext4.py failed; see the message above")
+endif()
+
 # Build fsroot/ into a LittleFS image for the "storage" partition. This is how
 # the initial rootfs (and, until SCP exists, cross-compiled apps) get onto the
 # device: `idf.py storage-flash`.

@@ -45,4 +45,57 @@ menu "espix filesystem"
             has not been verified here -- check the terms before shipping this on
             by default.
 
+    config ESPIX_FS_EXT4
+        bool "ext2/3/4 support (read-only)"
+        default n
+        help
+            Mounts ext2, ext3 and ext4 as the third filesystem, after littlefs
+            and FAT/exFAT. The library is lwext4, vendored as the esp_lwext4
+            component in components/esp_lwext4, and its driver is espix's own --
+            components/espix_fs/ext.c, in the shape of fat.c -- so a mount made
+            here goes through espix's VFS and its permission check rather than
+            being reachable around it.
+
+            Read-only. ext4_mount() takes read_only as an argument and every
+            mutating operation refuses with EROFS, so the two agree by
+            construction. Writes need the vendored lwext4's write-path defect
+            dealt with first; see docs/ROADMAP.md.
+
+            One thing this gets that the FAT driver cannot: stat with a real
+            inode behind it. Mode, owner and timestamps come from the inode
+            rather than from a mount-wide uid=/gid= rule, and df is lwext4's own
+            count rather than arithmetic over a FAT. The exception is size, which
+            is truncated at 4 GiB like everything else while off_t is 32 bits --
+            see docs/UPSTREAM.md.
+
+            With it on, lsblk stops marking ext2/ext3/ext4 unsupported and `mount`
+            accepts it, on the same rule as exFAT: the driver is there, so the
+            marker would be a lie.
+
+            The cost, measured the way the exFAT option above was -- this option
+            n against the same tree with it y, so the delta is the whole feature:
+
+              total image   1355960 -> 1475820    +119860 bytes
+              .text          968970 -> 1083550    +114580
+              .rodata        259956 ->  265220      +5264
+              .bss            59576 ->   70008     +10432
+              .data           26519 ->   26535        +16
+              DIRAM .text     83839 ->   83839          0
+
+            The last line is the one that matters most: no IRAM, which is the
+            first thing to run out here and is already at its whole 16KB. Nothing
+            lwext4 needs is time-critical enough to be placed there, and its
+            block cache is a heap allocation rather than a static array.
+
+            The .bss is the largest of the rest and is mostly espix's own handle
+            table -- eight open files or directories at once, each holding an
+            ext4_dir of 320 bytes and a struct dirent of 260 even when it is a
+            file. A union would cut about 1.4KB of it back, and has not been done
+            yet.
+
+            lwext4 carries the extents and journal code either way, because
+            CONFIG_LWEXT4_FEATURE_SET_EXT4 is what a Linux volume needs -- an
+            ext4 filesystem has the extents feature and the ext2 or ext3 set
+            would refuse it.
+
 endmenu

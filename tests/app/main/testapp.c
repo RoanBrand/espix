@@ -172,6 +172,75 @@ static int cmd_read(const char *path)
 }
 
 /*
+ * Bytes at an offset, hex and ASCII.
+ *
+ * A file, not a device: espix refuses to open a block node from userland on
+ * purpose (see the note on espix_dev_open in dev.c), so `hexdump /dev/sda3`
+ * answers EOPNOTSUPP and always will. It was written hoping to read an ext4
+ * superblock that way, and could not -- worth knowing before trying again. The
+ * driver that *can* read one logs it itself; see log_why_not_mounted() in
+ * components/espix_fs/ext.c.
+ *
+ * open/lseek/read rather than stdio, because lseek is what makes an offset
+ * possible at all -- and it is also the call under test when a driver's reads
+ * are in doubt, so exercising it here is not incidental.
+ */
+static int cmd_hexdump(const char *path, const char *off_s, const char *len_s)
+{
+    const long off = strtol(off_s, NULL, 0);
+    const long len = strtol(len_s, NULL, 0);
+
+    if (off < 0 || len <= 0 || len > 4096) {
+        printf("hexdump: offset >= 0, length 1..4096\n");
+        return 2;
+    }
+
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("hexdump %s %s\n", path, errno_name(errno));
+        return 1;
+    }
+
+    if (lseek(fd, off, SEEK_SET) != off) {
+        printf("hexdump lseek %s\n", errno_name(errno));
+        close(fd);
+        return 1;
+    }
+
+    static unsigned char buf[4096];
+    const ssize_t got = read(fd, buf, (size_t)len);
+    close(fd);
+
+    if (got < 0) {
+        printf("hexdump read %s\n", errno_name(errno));
+        return 1;
+    }
+
+    for (ssize_t i = 0; i < got; i += 16) {
+        printf("%08lx  ", (unsigned long)(off + i));
+        for (int j = 0; j < 16; j++) {
+            if (i + j < got) {
+                printf("%02x ", buf[i + j]);
+            } else {
+                printf("   ");
+            }
+            if (j == 7) {
+                printf(" ");
+            }
+        }
+        printf(" |");
+        for (int j = 0; j < 16 && i + j < got; j++) {
+            const unsigned char c = buf[i + j];
+            printf("%c", (c >= 32 && c < 127) ? c : '.');
+        }
+        printf("|\n");
+    }
+
+    printf("hexdump %s %ld bytes at %ld\n", path, (long)got, off);
+    return 0;
+}
+
+/*
  * n lines of output, on demand.
  *
  * This is the handle on the `Corrupted MAC` failure in docs/KNOWN-ISSUES.md:
@@ -563,6 +632,8 @@ static void usage(void)
            "  cd <path>           chdir then getcwd\n"
            "  write <path> <text> create and write\n"
            "  read <path>         read the first line back\n"
+           "  hexdump <path> <off> <len>\n"
+           "                      hex and ascii at an offset, for superblocks\n"
            "  out <n> [width]     print n lines, each padded to width bytes\n"
            "  outbuf <n>          the same lines, 4KB-buffered (few packets)\n"
            "  both                one line to stdout, one to stderr\n"
@@ -614,6 +685,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "read") == 0 && argc > 2) {
         return cmd_read(argv[2]);
+    }
+    if (strcmp(cmd, "hexdump") == 0 && argc > 4) {
+        return cmd_hexdump(argv[2], argv[3], argv[4]);
     }
     if (strcmp(cmd, "outbuf") == 0 && argc > 2) {
         return cmd_outbuf(argv[2]);

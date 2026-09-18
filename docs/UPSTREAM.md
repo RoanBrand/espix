@@ -818,6 +818,62 @@ LittleFS itself synthesises `.` and `..`; the port discards them. Nothing above
 the VFS can see them, so `ls -a` shows dotfiles but not the directory entries,
 which is GNU `ls`'s `-A` rather than its `-a`.
 
+## `gkostka/lwext4` (the ext2/3/4 core, through `huming2207/esp_lwext4`)
+
+### No volume made by e2fsprogs 1.47 or later can be mounted
+
+`mke2fs` enables `metadata_csum_seed` by default these days, which sets
+`EXT4_FEATURE_INCOMPAT_CSUM_SEED` (`0x2000`) in the superblock. On such a volume
+every metadata checksum is seeded from the superblock's `s_checksum_seed` rather
+than from the filesystem UUID — and the core seeded from the UUID, inline, in
+eight places: `ext4_balloc.c`, `ext4_dir.c`, `ext4_dir_idx.c`, `ext4_extent.c`,
+`ext4_fs.c`, `ext4_ialloc.c` and `ext4_xattr.c`, with `ext4_types.h` calling the
+bit `BG_USE_META_CSUM`, which is not what it means.
+
+`ext4_fs_check_features()` then finds an incompatible bit outside
+`CONFIG_SUPPORTED_FINCOM` and answers `ENOTSUP`, so the mount fails with no hint
+as to which bit or why. The refusal is correct — the feature is not implemented —
+but the effect is that **no ext4 volume a current Linux creates can be read at
+all**, which is a large gap for a filesystem espix advertises on the strength of
+reading Linux-formatted sticks.
+
+The seed is not something that only matters when writing, which is what makes
+tolerating the bit useless rather than merely risky: verification runs on *reads*.
+`ext4_balloc_verify_bitmap_csum()` checks the block and inode bitmaps as they are
+read, `ext4_dir_csum_verify()` checks every directory block, the htree code checks
+its nodes, and the extent tree's tail carries its own checksum. All of them
+compare against what the filesystem stored, so a wrong seed fails the first bitmap
+and reads as a broken device rather than an unsupported filesystem.
+
+**How it was found**, since the code alone could not say: the mount answered
+`ENOTSUP` and nothing else, and espix's userland cannot read a device to go looking
+— dev.c refuses to open a block node on purpose. The driver now reads the
+superblock on that failure and logs its fields, its feature words and whether the
+checksum it computes matches the one stored: `log_why_not_mounted()` in
+`components/espix_fs/ext.c`. That turned "cannot mount" into `incompat 000022c2,
+unsupported 00002000` in one line. Everything else in it was fine — `compat
+0000103c`, `ro_compat 0000046b`, magic `0xEF53`, block size 4096, and the
+superblock checksum matched exactly, which is also what ruled out a bad read.
+
+**How espix carries it.** `tools/lwext4-csum-seed.patch` is the change as a plain
+diff: one helper, `ext4_sb_csum_seed()`, returning `s_checksum_seed` when the
+feature is set and `crc32c(~0, uuid, 16)` otherwise — which is exactly the
+kernel's `s_csum_seed` — with the eight sites asking for it and the bit joining
+the supported set. `tools/patch-lwext4.py` applies it to the copy the component
+manager fetches, from a CMake hook beside the other patch scripts.
+
+Two details worth having if this is ever redone by hand. The core's
+`struct ext4_sblock` sits inside a `#pragma pack(push, 1)` and mirrors the disk
+layout, so `s_checksum_seed` is at 0x270 and was named by taking two words out of
+the padding in front of `checksum`, which leaves the struct 1024 bytes. And
+`ext4_bg_crc16()` is deliberately untouched: that is the legacy `GDT_CSUM` path,
+and the kernel seeds it from the UUID as well.
+
+**Upstream** it belongs to `gkostka/lwext4`; the port would pick it up by bumping
+its submodule. When it lands, delete `tools/patch-lwext4.py`,
+`tools/lwext4-csum-seed.patch` and the `execute_process()` block in the top-level
+`CMakeLists.txt`, and update the pin in `main/idf_component.yml`.
+
 ## ESP-IDF (newlib)
 
 ### `off_t` is 32 bits, and no Kconfig changes it

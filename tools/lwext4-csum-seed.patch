@@ -1,0 +1,287 @@
+Honour the metadata checksum seed (INCOMPAT_CSUM_SEED)
+
+A volume made by e2fsprogs 1.47 or later sets EXT4_FEATURE_INCOMPAT_CSUM_SEED,
+because mke2fs now enables metadata_csum_seed by default. On such a volume every
+metadata checksum is seeded from the superblock's s_checksum_seed rather than
+from the filesystem UUID -- and every checksum here was seeded from the UUID
+directly, in ext4_balloc.c, ext4_dir.c, ext4_dir_idx.c, ext4_extent.c,
+ext4_fs.c and ext4_ialloc.c.
+
+So the volume is refused at mount, and correctly so: ext4_fs_check_features()
+finds an incompatible bit outside CONFIG_SUPPORTED_FINCOM and answers ENOTSUP.
+The effect is that no ext4 volume a current Linux creates can be read at all,
+which is how this was found -- a 7 GiB mkfs.ext4 partition, straight from KDE
+Partition Manager, reported "incompat 000022c2, unsupported 00002000" and
+nothing else.
+
+The fix is the one the kernel makes: keep the seed in one place, s_csum_seed,
+which is s_checksum_seed when the feature is set and crc32c(~0, uuid, 16)
+otherwise. The eight sites that computed the second inline now ask for it, and
+the bit joins the supported set -- seven in files any build compiles, and
+ext4_xattr.c's so that the change is whole rather than conditional on a build
+option.
+
+Two notes for a maintainer:
+
+- ext4_types.h gains a named checksum_seed at its on-disk offset, 0x270, taken
+  out of the padding in front of checksum so the struct stays 1024 bytes. The
+  same file's EXT4_FINCOM_BG_USE_META_CSUM is renamed EXT4_FINCOM_CSUM_SEED:
+  0x2000 in the incompatible field is CSUM_SEED, and "use crc32c for bg" is not
+  what it means.
+
+- ext4_bg_crc16() is deliberately left alone. That is the legacy GDT_CSUM path,
+  and the kernel seeds it from the UUID as well.
+
+Tested read-only, which is the direction it was needed in, on a stock mkfs.ext4
+volume: mounting it, listing it, reading a file, and asking for free space.
+Those reads are themselves the proof the seed is right, since
+ext4_balloc_verify_bitmap_csum(), ext4_dir_csum_verify() and the extent tail
+check all verify against what the filesystem stored rather than against anything
+this patch computes twice.
+
+--- a/include/ext4_super.h
++++ b/include/ext4_super.h
+@@ -50,6 +50,27 @@ extern "C" {
+ #include <ext4_types.h>
+ #include <ext4_misc.h>
+ 
++/**@brief   The seed this filesystem's metadata checksums start from.
++ *
++ * ESPIX addition. ext4 seeds a metadata checksum with either a value derived
++ * from the filesystem UUID or -- when the incompatible CSUM_SEED feature is set
++ * -- a value stored in the superblock, and e2fsprogs 1.47 and later set that
++ * feature by default. So without this a volume made by any current Linux cannot
++ * be read: the store-side and verify-side functions in ext4_balloc.c,
++ * ext4_dir.c, ext4_dir_idx.c, ext4_extent.c, ext4_fs.c and ext4_ialloc.c all
++ * seeded from the UUID inline, and every verification of a bitmap, directory
++ * block or extent tree then failed against a checksum computed from the other
++ * seed.
++ *
++ * Upstream refuses the feature instead of honouring it. That refusal is
++ * honest -- it is what "incompatible" means -- but it also means upstream reads
++ * only old volumes, so this file carries the difference deliberately. Remove it
++ * if the change goes upstream; see docs/KNOWN-ISSUES.md.
++ *
++ * @param   s superblock descriptor
++ * @return  the seed, as crc32c already folded it */
++uint32_t ext4_sb_csum_seed(struct ext4_sblock *s);
++
+ /**@brief   Blocks count get stored in superblock.
+  * @param   s superblock descriptor
+  * @return  count of blocks*/
+--- a/include/ext4_types.h
++++ b/include/ext4_types.h
+@@ -174,7 +174,16 @@ struct ext4_sblock {
+ 	uint8_t  encrypt_algos[4];	/* Encryption algorithms in use  */
+ 	uint8_t  encrypt_pw_salt[16];	/* Salt used for string2key algorithm */
+ 	uint32_t lpf_ino;		/* Location of the lost+found inode */
+-	uint32_t padding[100];	/* Padding to the end of the block */
++	/*
++	 * ESPIX: these two are named rather than left inside the padding below,
++	 * because ext4_sb_csum_seed() needs the second one. Both sit at their
++	 * on-disk offsets -- 0x26C and 0x270 -- and the padding is shortened by
++	 * the two words they take, so checksum stays at 0x3FC and the struct stays
++	 * 1024 bytes.
++	 */
++	uint32_t prj_quota_inum;	/* Inode for tracking project quota */
++	uint32_t checksum_seed;		/* Seed for metadata checksums */
++	uint32_t padding[98];	/* Padding to the end of the block */
+ 	uint32_t checksum;		/* crc32c(superblock) */
+ };
+ 
+@@ -246,10 +255,18 @@ struct ext4_sblock {
+ #define EXT4_FINCOM_FLEX_BG 0x0200
+ #define EXT4_FINCOM_EA_INODE 0x0400	 /* EA in inode */
+ #define EXT4_FINCOM_DIRDATA 0x1000	  /* data in dirent */
+-#define EXT4_FINCOM_BG_USE_META_CSUM 0x2000 /* use crc32c for bg */
+ #define EXT4_FINCOM_LARGEDIR 0x4000	 /* >2GB or 3-lvl htree */
+ #define EXT4_FINCOM_INLINE_DATA 0x8000      /* data in inode */
+ 
++/*
++ * ESPIX: renamed from EXT4_FINCOM_BG_USE_META_CSUM, which is what upstream
++ * lwext4 calls this bit and is not what it means. 0x2000 in the incompatible
++ * field is EXT4_FEATURE_INCOMPAT_CSUM_SEED: the filesystem's metadata checksums
++ * are seeded from the superblock's s_checksum_seed rather than from the UUID.
++ * See ext4_sb_csum_seed() in ext4_super.c and docs/KNOWN-ISSUES.md.
++ */
++#define EXT4_FINCOM_CSUM_SEED 0x2000
++
+ /*
+  * EXT2 supported feature set
+  */
+@@ -278,10 +295,18 @@ struct ext4_sblock {
+  */
+ #define EXT4_SUPPORTED_FCOM (EXT4_FCOM_DIR_INDEX)
+ 
++/*
++ * ESPIX: EXT4_FINCOM_CSUM_SEED is added to what this build supports. Upstream
++ * refuses it, and the refusal is honest -- its checksum code seeded from the
++ * UUID everywhere. Supporting it is one helper and the call sites that used the
++ * UUID directly; ext4_sb_csum_seed() has the reasoning, and without this espix
++ * cannot read any ext4 volume made by e2fsprogs 1.47 or later, which is every
++ * volume a current Linux produces.
++ */
+ #define EXT4_SUPPORTED_FINCOM                              \
+ 	(EXT4_FINCOM_FILETYPE | EXT4_FINCOM_META_BG |      \
+ 	 EXT4_FINCOM_EXTENTS | EXT4_FINCOM_FLEX_BG |       \
+-	 EXT4_FINCOM_64BIT)
++	 EXT4_FINCOM_CSUM_SEED | EXT4_FINCOM_64BIT)
+ 
+ #define EXT4_SUPPORTED_FRO_COM                             \
+ 	(EXT4_FRO_COM_SPARSE_SUPER |                       \
+--- a/src/ext4_balloc.c
++++ b/src/ext4_balloc.c
+@@ -91,9 +91,8 @@ static uint32_t ext4_balloc_bitmap_csum(struct ext4_sblock *sb,
+ 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
+ 		uint32_t blocks_per_group = ext4_get32(sb, blocks_per_group);
+ 
+-		/* First calculate crc32 checksum against fs uuid */
+-		checksum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid,
+-				sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		checksum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum against block_group_desc */
+ 		checksum = ext4_crc32c(checksum, bitmap, blocks_per_group / 8);
+ 	}
+--- a/src/ext4_dir.c
++++ b/src/ext4_dir.c
+@@ -49,6 +49,7 @@
+ #include <ext4_dir.h>
+ #include <ext4_dir_idx.h>
+ #include <ext4_crc32.h>
++#include <ext4_super.h>
+ #include <ext4_inode.h>
+ #include <ext4_fs.h>
+ 
+@@ -85,8 +86,8 @@ static uint32_t ext4_dir_csum(struct ext4_inode_ref *inode_ref,
+ 	uint32_t ino_index = to_le32(inode_ref->index);
+ 	uint32_t ino_gen = to_le32(ext4_inode_get_generation(inode_ref->inode));
+ 
+-	/* First calculate crc32 checksum against fs uuid */
+-	csum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
++	/* First fold in the filesystem checksum seed */
++	csum = ext4_sb_csum_seed(sb);
+ 	/* Then calculate crc32 checksum against inode number
+ 	 * and inode generation */
+ 	csum = ext4_crc32c(csum, &ino_index, sizeof(ino_index));
+--- a/src/ext4_dir_idx.c
++++ b/src/ext4_dir_idx.c
+@@ -226,8 +226,8 @@ static uint32_t ext4_dir_dx_checksum(struct ext4_inode_ref *inode_ref, void *de,
+ 		sz = count_offset + (count * sizeof(struct ext4_dir_idx_tail));
+ 		orig_cum = t->checksum;
+ 		t->checksum = 0;
+-		/* First calculate crc32 checksum against fs uuid */
+-		csum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		csum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum against inode number
+ 		 * and inode generation */
+ 		csum = ext4_crc32c(csum, &ino_index, sizeof(ino_index));
+--- a/src/ext4_extent.c
++++ b/src/ext4_extent.c
+@@ -661,9 +661,8 @@ static uint32_t ext4_ext_block_csum(struct ext4_inode_ref *inode_ref,
+ 		uint32_t ino_index = to_le32(inode_ref->index);
+ 		uint32_t ino_gen =
+ 		    to_le32(ext4_inode_get_generation(inode_ref->inode));
+-		/* First calculate crc32 checksum against fs uuid */
+-		checksum =
+-		    ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		checksum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum against inode number
+ 		 * and inode generation */
+ 		checksum = ext4_crc32c(checksum, &ino_index, sizeof(ino_index));
+--- a/src/ext4_fs.c
++++ b/src/ext4_fs.c
+@@ -160,7 +160,7 @@ static void ext4_fs_debug_features_inc(uint32_t features_incompatible)
+ 		ext4_dbg(DEBUG_FS, DBG_NONE "ea_inode\n");
+ 	if (features_incompatible & EXT4_FINCOM_DIRDATA)
+ 		ext4_dbg(DEBUG_FS, DBG_NONE "dirdata\n");
+-	if (features_incompatible & EXT4_FINCOM_BG_USE_META_CSUM)
++	if (features_incompatible & EXT4_FINCOM_CSUM_SEED)
+ 		ext4_dbg(DEBUG_FS, DBG_NONE "meta_csum\n");
+ 	if (features_incompatible & EXT4_FINCOM_LARGEDIR)
+ 		ext4_dbg(DEBUG_FS, DBG_NONE "largedir\n");
+@@ -506,9 +506,8 @@ static uint16_t ext4_fs_bg_checksum(struct ext4_sblock *sb, uint32_t bgid,
+ 		orig_checksum = bg->checksum;
+ 		bg->checksum = 0;
+ 
+-		/* First calculate crc32 checksum against fs uuid */
+-		checksum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid,
+-				sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		checksum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum against bgid */
+ 		checksum = ext4_crc32c(checksum, &le32_bgid, sizeof(bgid));
+ 		/* Finally calculate crc32 checksum against block_group_desc */
+@@ -668,9 +667,8 @@ static uint32_t ext4_fs_inode_checksum(struct ext4_inode_ref *inode_ref)
+ 		orig_checksum = ext4_inode_get_csum(sb, inode_ref->inode);
+ 		ext4_inode_set_csum(sb, inode_ref->inode, 0);
+ 
+-		/* First calculate crc32 checksum against fs uuid */
+-		checksum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid,
+-				       sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		checksum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum against inode number
+ 		 * and inode generation */
+ 		checksum = ext4_crc32c(checksum, &ino_index, sizeof(ino_index));
+--- a/src/ext4_ialloc.c
++++ b/src/ext4_ialloc.c
+@@ -99,8 +99,8 @@ static uint32_t ext4_ialloc_bitmap_csum(struct ext4_sblock *sb,	void *bitmap)
+ 		uint32_t inodes_per_group =
+ 			ext4_get32(sb, inodes_per_group);
+ 
+-		/* First calculate crc32 checksum against fs uuid */
+-		csum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		csum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum against inode bitmap */
+ 		csum = ext4_crc32c(csum, bitmap, (inodes_per_group + 7) / 8);
+ 	}
+--- a/src/ext4_super.c
++++ b/src/ext4_super.c
+@@ -85,6 +85,29 @@ uint32_t ext4_inodes_in_group_cnt(struct ext4_sblock *s, uint32_t bgid)
+ 	return (total_inodes - ((block_group_count - 1) * inodes_per_group));
+ }
+ 
++/*
++ * ESPIX addition; the reasoning and the upstream difference are documented on
++ * the declaration in ext4_super.h.
++ *
++ * The kernel computes this once at mount and keeps it as s_csum_seed:
++ *
++ *	if (ext4_has_feature_csum_seed(sbi))
++ *		sbi->s_csum_seed = le32_to_cpu(es->s_checksum_seed);
++ *	else
++ *		sbi->s_csum_seed = ext4_chksum(sbi, ~0, es->s_uuid,
++ *					       sizeof(es->s_uuid));
++ *
++ * which is exactly this, so the checksum helpers seed the same way the
++ * filesystem was written without each of them carrying the branch.
++ */
++uint32_t ext4_sb_csum_seed(struct ext4_sblock *s)
++{
++	if (ext4_sb_feature_incom(s, EXT4_FINCOM_CSUM_SEED))
++		return ext4_get32(s, checksum_seed);
++
++	return ext4_crc32c(EXT4_CRC32_INIT, s->uuid, sizeof(s->uuid));
++}
++
+ #if CONFIG_META_CSUM_ENABLE
+ static uint32_t ext4_sb_csum(struct ext4_sblock *s)
+ {
+--- a/src/ext4_xattr.c
++++ b/src/ext4_xattr.c
+@@ -188,9 +188,8 @@ static uint32_t ext4_xattr_block_checksum(struct ext4_inode_ref *inode_ref,
+ 		/* Preparation: temporarily set bg checksum to 0 */
+ 		orig_checksum = header->h_checksum;
+ 		header->h_checksum = 0;
+-		/* First calculate crc32 checksum against fs uuid */
+-		checksum =
+-		    ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
++		/* First fold in the filesystem checksum seed */
++		checksum = ext4_sb_csum_seed(sb);
+ 		/* Then calculate crc32 checksum block number */
+ 		checksum =
+ 		    ext4_crc32c(checksum, &le64_blocknr, sizeof(le64_blocknr));

@@ -125,11 +125,29 @@ the whole device, no table at all — how most sticks used to ship and how some
 still arrive (the case that produced this code: a SanDisk Cruzer Blade prepared
 by an appliance, which read as a bare unpartitioned disk until sector 0 was
 examined). Sector 0 is then the filesystem's own boot sector: a FAT one gives
-`vfat` on the disk row plus its volume label, and exFAT or NTFS boot sectors are
-named and marked unsupported. Two filesystems keep nothing in sector 0 at all and are found by a read further in: **ext2/3/4**, whose superblock is at 1024, and **ISO 9660**, whose primary descriptor is at 32768 — which is why a Linux-prepared stick or an installer image read as a bare disk with an empty `FSTYPE` until those offsets were read. A stick that is empty, or holds something nothing here recognises, stays a bare disk, and nothing is missing from that answer: Linux's own `blkid` reports nothing for such a stick either.
+`vfat` on the disk row plus its volume label and serial, and exFAT gives `exfat`
+plus its serial, and its label too — that one is a directory entry rather than a
+boot-sector field, so it is read by following the boot sector's own geometry to the
+root directory. An NTFS boot sector is named and marked unsupported with no label,
+because NTFS keeps that in its `$Volume` metadata file rather than in sector 0;
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) records it rather than leaving it looking like a
+volume with no label. Two filesystems keep nothing in sector 0 at all and are found
+by a read further in: **ext**, whose superblock is at 1024 and carries the volume
+label and UUID alongside the magic, and **ISO 9660**, whose primary descriptor is
+at 32768 — which is why a Linux-prepared stick or an installer image read as a bare
+disk with an empty `FSTYPE` until those offsets were read. A stick that is empty,
+or holds something nothing here recognises, stays a bare disk, and nothing is
+missing from that answer: Linux's own `blkid` reports nothing for such a stick
+either.
 - **Filesystems espix has no driver for are named, not hidden.** The partition
 table says `exfat/ntfs` (one MBR code covers both, so it is as specific as sector
-0 gets), `linux` (`0x83` is "Linux any"), `ext2/3/4` when that partition's own superblock says so, `iso9660` when its descriptor does, `bitlocker` when its boot sector carries BitLocker's own GUID, or `gpt` for a protective MBR whose GPT header could not be read, each marked `(unsupported)`. On a GPT disk the same happens through the entry's type GUID (`msdata`, `msreserved`, `linux`), with the partition's own boot sector overriding it wherever it can.
+0 gets), `linux` (`0x83` is "Linux any"), `ext4` — or `ext2` or `ext3`, whichever
+that partition's superblock feature words say, since ext stores no version — when
+its own superblock says so, `iso9660` when its descriptor does, `bitlocker` when
+its boot sector carries BitLocker's own GUID, or `gpt` for a protective MBR whose
+GPT header could not be read, each marked `(unsupported)`. On a GPT disk the same
+happens through the entry's type GUID (`msdata`, `msreserved`, `linux`), with the
+partition's own boot sector overriding it wherever it can.
 
   `bitlocker` is checked *before* the FAT probe below, and has to be: "BitLocker
   To Go" — what `manage-bde` writes for a password-protected removable drive —
@@ -472,8 +490,8 @@ records it.
   news.
 - **FAT only.** `mount sda1 /mnt` on an exFAT or NTFS volume answers
   `exfat/ntfs is not supported` — the same words `lsblk` prints, for the same
-  reason, and likewise `ext2/3/4 is not supported` and `iso9660 is not supported`
-  for the volumes `lsblk` can now name precisely.
+  reason, and likewise `ext4 is not supported` -- the version as `lsblk` named it
+  -- and `iso9660 is not supported` for the volumes `lsblk` can now name precisely.
 - **FAT has no modes to show.** FatFs reports `0777` for everything it stats, so the
   VFS *replaces* those bits with espix's own — the same rule a file on the rootfs
   gets — and keeps the type bits from the filesystem below. A mounted stick

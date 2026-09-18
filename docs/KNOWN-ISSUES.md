@@ -696,6 +696,92 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   last reference to it goes, rather than on the removal path.
 
 
+- **An ext listing cannot tell its end from a failure.** lwext4's
+  `ext4_dir_entry_next()` returns `NULL` for both — `ext4.c:3180`, where the same
+  `return de` covers `next_off == EXT4_DIR_ENTRY_OFFSET_TERM` and every failing
+  `goto Finish` — and there is no error to read afterwards. So `ls` on a
+  directory whose listing fails part-way prints a short listing rather than an
+  error, and a truncated directory looks exactly like a small one.
+
+  FAT does not have this: FatFs's `f_readdir` returns a `FRESULT`. The fix
+  belongs in the vendored lwext4 rather than in `ext.c` — that function needs an
+  out-parameter or an `errno` — and a patch there is one to re-verify against
+  `e2fsck`-checked images, so it is not done yet. `ext.c` records the same thing
+  where the call is made.
+
+- **An ext mount whose device is pulled leaves lwext4's mount point behind.**
+  The same shape as the FAT dead-mount entry above, and a bigger loss, because
+  everything that would give lwext4's side back touches the device:
+  `ext4_umount()` writes the superblock back and flushes the block cache, and
+  `lwext4_port_bdl_destroy()` syncs the lower BDL. On a pulled device both would
+  run through a block device `espix_usb` has already released, so both are
+  skipped and only espix's own slot is returned.
+
+  `CONFIG_EXT4_MOUNTPOINTS_COUNT` and `CONFIG_EXT4_BLOCKDEVS_COUNT` are both 2,
+  so a pull with a file open costs one of two ext mounts, plus the adapter's
+  buffer, until the board next boots. FatFs loses a volume slot the same way and
+  has more of them to spare. Closing it means each of those two calls needing a
+  variant that frees without flushing — which is a change to the vendored port,
+  and would still leave the superblock un-written-back at the point where it
+  cannot be written back anyway.
+
+- ~~**A modern ext4 volume will not mount at all.**~~ **Fixed**, by teaching the
+  vendored lwext4 to honour the metadata checksum seed. e2fsprogs 1.47 and later
+  turn on `metadata_csum_seed` by default, which sets `INCOMPAT_CSUM_SEED`
+  (`0x2000`) in the superblock, and lwext4 refused that bit — two incompatible
+  bits in the way, `0x2000` and nothing else, and the volume was otherwise
+  readable (`64bit`, extents, flex_bg and filetype are all supported).
+
+  The refusal was right on its own terms, which is why the fix had to be to
+  honour the feature rather than tolerate the bit: on such a volume every
+  metadata checksum is seeded from the superblock's `s_checksum_seed` instead of
+  from the filesystem UUID, while lwext4's verification code always seeded from
+  the UUID — `ext4_balloc_bitmap_csum()` and its siblings in `ext4_dir.c`,
+  `ext4_dir_idx.c`, `ext4_extent.c` and `ext4_ialloc.c`. Tolerating it would have
+  produced a mount that failed the first bitmap, directory or extent read, which
+  is worse than a refusal because it looks like a broken device.
+
+  So the seed is now read from the superblock when the feature is set, which is
+  what the kernel's `s_csum_seed` is: one helper and eight call sites. It is not a
+  fork — `tools/patch-lwext4.py` applies `tools/lwext4-csum-seed.patch` to the copy
+  the component manager fetches, so the change is one reviewable file that
+  upstream can take as it stands.
+
+  Verified on the 29G Sandisk, against a volume KDE Partition Manager made with
+  stock `mkfs.ext4`: `mount`, `ls -l` (which verifies directory-block checksums),
+  `cat` (extent-tree checksums), `df`, `EROFS` from a write as root, and
+  `umount`. A wrong seed could only ever have produced read failures and never
+  wrong contents, because the mount is read-only and lwext4 never writes a
+  checksum on that path — which is why this was worth doing rather than
+  reformatting the volume.
+
+  Found by the diagnostic it left behind: `mount` answered only `ENOTSUP`, so the
+  driver now reads the superblock on that failure and logs its fields, its
+  feature words and whether the checksum it computes matches the stored one
+  (`log_why_not_mounted()` in `components/espix_fs/ext.c`). That turned "cannot
+  mount" into "incompat 000022c2, unsupported 00002000" in one line. It is also
+  the only tool for the job: `/dev/sda3` cannot be read from userland at all,
+  because dev.c refuses to open a block node on purpose — the test app grew a
+  `hexdump` while chasing this, and all it can report on a device node is
+  `EOPNOTSUPP`.
+
+- **A read-only ext mount is owned by whoever mounted it, not by its inodes.**
+  `stat` answers with the real uid, gid and mode from the inode, because that is
+  what `ext4_raw_inode_fill()` returns — but the access check, and `chmod` and
+  `chown`, go through espix's own ownership rule, and the mount is registered
+  with `stored_metadata` false, exactly as a FAT volume is. So `ls -l` shows one
+  owner and the permission check believes another, and `chmod` refuses.
+
+  Two causes, and either alone would be enough. lwext4 is built with xattr off
+  (the MIT extents and xattr-stub build that keeps the firmware non-GPL), so
+  espix's own mode and owner attributes have nowhere to live on an ext volume;
+  and a read-only mount could not be `chmod`'d even if they did. The real fix is
+  not in `ext.c` — it is for the ownership rule to read ownership out of the
+  inode where a filesystem has it, which is the design question
+  [ROADMAP.md](ROADMAP.md) records. Until then `stored_metadata false` is the
+  honest answer, since it is the one that cannot mislead a permission check.
+
+
 - **A directory's mode does not hide what is inside it.** Unix requires search
   (`x`) permission on every component of a path; espix checks the final
   component, plus the parent for anything that creates or removes a name. So
@@ -899,6 +985,37 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
   Exit statuses *are* right: 127 when the file cannot be read, 126 when it is
   there and will not run, and the app's own status otherwise.
+
+- ~~**An exFAT volume's label is not read.**~~ **Implemented**, by following the boot
+  sector's own geometry to the root directory and reading the Volume Label entry
+  (type `0x83`) there — exFAT keeps its label in a directory entry rather than in
+  sector 0, which is why it is not a field read the way FAT's is.
+
+  One sector of the root directory is scanned, which is where a formatter writes
+  that entry; a label further in, or a geometry that does not add up, gives no label
+  rather than a guess. Every field is checked before it is used and the result is
+  checked for control characters, because both mistakes this reader has already made
+  produced plausible-looking values: offset `0x60` of the boot sector taken for a
+  label field is `FirstClusterOfRootDirectory`, so a volume printed a control
+  character as its name, and the serial read from `0x40` is `PartitionOffset`, so it
+  printed the partition's start LBA as the volume's serial. The serial is at `0x64`.
+
+  The third mistake was the most instructive, because every number in it was right.
+  What the boot sector holds is relative to the *volume*, and the block device being
+  read is the *disk*, so the address needed the partition's start added to it;
+  without that the read landed two megabytes into the disk — inside the FAT
+  partition before it — and found no label there. `base` was a parameter the
+  function never used, which `-Wno-unused-parameter` is content to leave alone.
+
+  The geometry is logged at DEBUG for exactly that reason: `log usb debug`, then
+  `dmesg` on the next enumeration, prints the sector size, transfer unit, heap
+  offset, root cluster and computed address. Note that enumeration happens when the
+  drive is plugged in, not when `lsblk` runs — `lsblk` reads the cached table — so
+  the line is only in the ring for a while after a plug-in.
+
+  An NTFS label is still unread, and unreachable the same way it always was: NTFS
+  keeps it in its `$Volume` metadata file, not in sector 0, so `lsblk` leaves that
+  column empty where Linux fills it.
 
 ## Shell and console
 

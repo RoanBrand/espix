@@ -395,8 +395,17 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
             const espix_usb_part_t *p = &devs[i].parts[j];
             bool named = false;
 
+            /*
+             * Through dev_operand(), not argv[a] directly. `blkid /dev/sda1` has
+             * to select that partition, and comparing the raw argument against a
+             * name like "sda1" selected nothing at all -- no line, no error, exit
+             * 0, because the validation pass above had normalised the operand and
+             * accepted it. The disk branch below normalises for the same reason.
+             */
             for (int a = 1; a < argc; a++) {
-                named = named || strcmp(argv[a], p->name) == 0;
+                char devbuf[ESPIX_USB_NAME_MAX];
+                const char *want = dev_operand(argv[a], devbuf, sizeof(devbuf));
+                named = named || strcmp(want, p->name) == 0;
             }
             if (argc > 1 && !named) {
                 continue;
@@ -577,9 +586,61 @@ static bool mountable(bool foreign, const char *fstype)
         return true;
     }
 #if CONFIG_ESPIX_FS_EXFAT
-    return strcmp(fstype, "exfat") == 0;
+    if (strcmp(fstype, "exfat") == 0) {
+        return true;
+    }
+#endif
+#if CONFIG_ESPIX_FS_EXT4
+    return espix_usb_fstype_is_ext(fstype);
 #else
-    return false;       /* no exFAT driver in this build */
+    return false;       /* no driver for this type in this build */
+#endif
+}
+
+/*
+ * Who mounts a type, and who unmounts it.
+ *
+ * The pair to mountable() above: that one decides whether a type may be mounted
+ * at all, these decide which driver does it, and all three read the same names
+ * side by side so they cannot drift apart. Unmounting has to be told the type
+ * rather than the path, because by then the path is a mounted volume and only
+ * the record says which driver is under it.
+ */
+static esp_err_t mount_by_type(const char *fstype, const char *path,
+                               esp_blockdev_handle_t dev,
+                               uint16_t uid, uint16_t gid)
+{
+#if CONFIG_ESPIX_FS_EXT4
+    if (espix_usb_fstype_is_ext(fstype)) {
+        return espix_fs_mount_ext(path, dev, uid, gid);
+    }
+#endif
+    return espix_fs_mount_fat(path, dev, uid, gid);
+}
+
+static esp_err_t unmount_by_type(const char *fstype, const char *path)
+{
+#if CONFIG_ESPIX_FS_EXT4
+    if (espix_usb_fstype_is_ext(fstype)) {
+        return espix_fs_unmount_ext(path);
+    }
+#endif
+    return espix_fs_unmount_fat(path);
+}
+
+/*
+ * The one type espix mounts read-only whatever the options say: ext, whose
+ * driver only knows how to mount read-only (components/espix_fs/ext.c). The
+ * mount record has to be told, or the table prints a writable ext volume and
+ * `mount` is the only place that would ever say so.
+ */
+static bool type_always_read_only(const char *fstype)
+{
+#if CONFIG_ESPIX_FS_EXT4
+    return espix_usb_fstype_is_ext(fstype);
+#else
+    (void)fstype;
+    return false;
 #endif
 }
 
@@ -661,13 +722,26 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     if (argc == 1) {
         for (size_t i = 0; i < ESPIX_FS_MAX_MOUNTS; i++) {
             if (s_mounts[i].used) {
-                /* One name for both: espix mounts through one driver, and what
-                 * it can mount is FAT and exFAT. Which of the two is the
-                 * volume's own business, not the mount's. `ro` appears only when
-                 * it is set, as `mount(8)` prints things that are not the
-                 * default. */
-                espix_printf(s, "%s on %s type fat%s\n", s_mounts[i].dev,
+                /*
+                 * The type it was mounted as, with the two FAT spellings folded
+                 * into one name. That fold predates ext and is deliberate: vfat
+                 * and exFAT go through the same driver, and which of the two a
+                 * volume is, is the volume's business rather than the mount's.
+                 *
+                 * Everything else prints what it is. There are three families
+                 * now, so the hardcoded "fat" this used to print would name an
+                 * ext volume wrongly -- which is the one thing a mount table must
+                 * not do.
+                 *
+                 * `ro` appears only when it is set, as `mount(8)` prints things
+                 * that are not the default.
+                 */
+                const bool fat = strcmp(s_mounts[i].fstype, "vfat") == 0 ||
+                                 strcmp(s_mounts[i].fstype, "exfat") == 0;
+
+                espix_printf(s, "%s on %s type %s%s\n", s_mounts[i].dev,
                              s_mounts[i].path,
+                             fat ? "fat" : s_mounts[i].fstype,
                              s_mounts[i].readonly ? " (ro)" : "");
             }
         }
@@ -857,7 +931,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         dev = view;
     }
 
-    const esp_err_t err = espix_fs_mount_fat(path, dev, owner_uid, owner_gid);
+    const esp_err_t err = mount_by_type(fstype, path, dev, owner_uid, owner_gid);
     if (err != ESP_OK) {
         if (view != NULL) {
             view->ops->release(view);
@@ -865,7 +939,16 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         if (err == ESP_ERR_INVALID_STATE) {
             espix_eprintf(s, "mount: %s: already mounted\n", path);
         } else if (err == ESP_ERR_NOT_FOUND) {
-            espix_eprintf(s, "mount: %s: not a FAT filesystem\n", devname);
+            /* "not a FAT filesystem" is what a FAT mount used to say, and still
+             * does; the ext driver names the type it looked for -- ext2, ext3 or
+             * ext4, whichever the superblock's features said -- because that is
+             * what lsblk reported and what the caller will recognise. */
+            if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "exfat") == 0) {
+                espix_eprintf(s, "mount: %s: not a FAT filesystem\n", devname);
+            } else {
+                espix_eprintf(s, "mount: %s: not an %s filesystem\n",
+                              devname, fstype);
+            }
         } else if (err == ESP_ERR_NO_MEM) {
             /* Two things answer with this one: FatFs has no free volume, or an
              * allocation failed. fat.c logs which, on this console, so this says
@@ -882,7 +965,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     rec->used = true;
     rec->view = view;
     rec->uid  = (s != NULL) ? s->uid : 0;
-    rec->readonly = readonly;
+    rec->readonly = readonly || type_always_read_only(fstype);
     snprintf(rec->fstype, sizeof(rec->fstype), "%s", fstype);
     snprintf(rec->dev, sizeof(rec->dev), "%s", devname);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
@@ -919,7 +1002,7 @@ static int umount_one(espix_session_t *s, const char *arg)
         return 1;
     }
 
-    const esp_err_t err = espix_fs_unmount_fat(rec->path);
+    const esp_err_t err = unmount_by_type(rec->fstype, rec->path);
     if (err == ESP_ERR_INVALID_STATE) {
         espix_eprintf(s, "umount: %s: busy -- a file is open on it\n", rec->path);
         return 1;
@@ -1016,7 +1099,7 @@ void espix_blk_device_gone(const char *dev)
 
         /* Silent on purpose: no session is behind this, and the klog line the
          * mark writes is the record of it. */
-        if (espix_fs_unmount_fat(path) == ESP_OK) {
+        if (unmount_by_type(rec->fstype, path) == ESP_OK) {
             if (rec->view != NULL) {
                 rec->view->ops->release(rec->view);
                 rec->view = NULL;
@@ -1263,7 +1346,7 @@ static void fstab_mount(const espix_usb_dev_t *disk,
         dev = view;
     }
 
-    const esp_err_t err = espix_fs_mount_fat(path, dev, uid, gid);
+    const esp_err_t err = mount_by_type(fstype, path, dev, uid, gid);
     if (err != ESP_OK) {
         if (view != NULL) {
             view->ops->release(view);
@@ -1275,7 +1358,7 @@ static void fstab_mount(const espix_usb_dev_t *disk,
 
     mount_rec_t *rec = mount_free_slot();
     if (rec == NULL) {
-        (void)espix_fs_unmount_fat(path);
+        (void)unmount_by_type(fstype, path);
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no free mount slot", path);
         return;
     }
@@ -1287,7 +1370,7 @@ static void fstab_mount(const espix_usb_dev_t *disk,
              (part != NULL) ? part->name : disk->name);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
     snprintf(rec->fstype, sizeof(rec->fstype), "%s", fstype);
-    rec->readonly = ro;
+    rec->readonly = ro || type_always_read_only(fstype);
     /*
      * `uid` is the *owner*, not a mounter, because there is no session here --
      * and that is also who may unmount it, which is what an fstab `user` entry

@@ -415,10 +415,32 @@ being the shortest path.
 
 ### ext2/3/4, via a port rather than a library
 
-The plan, costed — not started. What asked for it: `lsblk` already names
-`ext2/3/4`, from the superblock, on a partition (`0x83`) and on a whole-device
-volume alike, and a Linux-formatted stick is the one common volume that stays
-unreadable.
+**The read-only milestone is built.** `components/espix_fs/ext.c` mounts ext2,
+ext3 and ext4 through espix's VFS with `ESPIX_FS_EXT4` on: `mount`, `umount`,
+`df` and the whole path-based shell reach it with no changes of their own, and
+`lsblk` no longer marks the type unsupported. Measured cost, this option `n`
+against the same tree with it `y`: **+119,860 bytes of image, +10,432 of `.bss`,
+and no IRAM at all** — the number that matters most, since IRAM is already at its
+whole 16KB. Three limits are real and written up in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md): a listing cannot tell its end from a failure,
+a pulled device leaves lwext4's mount point behind, and a read-only mount is owned
+by whoever mounted it rather than by its inodes. Writes are the next milestone,
+gated on the error-propagation question and the ownership model below.
+
+**The one thing that had to be fixed in lwext4 was upstream's, and now is.** A
+volume made by e2fsprogs 1.47 or later enables `metadata_csum_seed`, which sets an
+incompatible bit that lwext4 refused — correctly, since it seeded every metadata
+checksum from the UUID while such a volume's are seeded from the superblock. The
+copy the manager fetches now honours the seed instead: one helper and eight call
+sites, applied by `tools/patch-lwext4.py` from `tools/lwext4-csum-seed.patch` —
+the same change, ready to send to `gkostka/lwext4`, which is where it belongs.
+Verified against a stock `mkfs.ext4` volume; [KNOWN-ISSUES.md](KNOWN-ISSUES.md)
+has the measurements.
+
+What asked for it: `lsblk` already named ext from the superblock, on a partition
+(`0x83`) and on a whole-device volume alike — and it now names the version, `ext4`
+or `ext2`/`ext3` by the feature words — while a Linux-formatted stick was the one
+common volume that stayed unreadable.
 
 **Use `huming2207/esp_lwext4`, not `gkostka/lwext4` directly.** The port is what
 lwext4-on-ESP-IDF needs and what espix would otherwise write: a *generated*
@@ -429,12 +451,29 @@ PSRAM / prefer-PSRAM modes, which suits this tree's IRAM-first rule.
 `espix_fs_partition_view()` already returns an `esp_blockdev_handle_t`, so the
 block device is a direct fit rather than an adaptation.
 
-**Not the component manager.** Neither repo has an `idf_component.yml`, and
-esp_lwext4 keeps lwext4 as a git submodule with no branch pin — a `git:`
-dependency would resolve to a component with an empty `lwext4/`. Its own demo
-consumes it as a submodule at `components/esp_lwext4`, which is the integration
-to copy. So: **vendor it and pin the revision**, the way `EXPECTED_IDF` pins the
-IDF the patch scripts are written against.
+**A git dependency, not a vendored copy.** esp_lwext4 publishes no
+`idf_component.yml`, so it cannot come from the registry — but that does not mean
+it has to be committed. `main/idf_component.yml` names it by repository and
+revision, the manager resolves it into the same gitignored `managed_components/`
+as every other dependency, and `dependencies.lock` pins the resolved SHA and a
+content hash.
+
+What stood here before was that a `git:` dependency would resolve to a component
+with an empty `lwext4/`, because the core is a submodule. That is wrong for the
+manager IDF 6.1 ships (3.1.2): its git source passes `with_submodules=True`
+unconditionally, and a component with no manifest gets no gitignore filtering at
+all, so the copy is the whole tree. Measured rather than assumed — the fetched
+`lwext4/` holds 91 files, and `diff -r` against upstream says the port and the
+core are byte-identical to the revisions pinned.
+
+Two small things the copy does that are worth knowing. The submodule's `.git`
+gitlink comes along, dangling and harmless — and it is why espix's patch is plain
+text rather than `git apply`. And upstream's `test_apps/` does **not**, because
+everything in it lives under `build_smoke/` and the manager's default excludes
+drop `**/build_*/**/*` as a build artefact.
+
+So **no vendored tree and no submodule of our own**: one manifest entry, one
+patch script, and the row in `dependencies.lock` that comes with them.
 
 **It also settles the licence**, which is the reason to prefer it to raw lwext4.
 lwext4 is GPLv2 with exactly two GPL files (`ext4_xattr.c`, `ext4_extents.c`);
@@ -468,16 +507,17 @@ otherwise have been a surprise:
   **A library with an unverified error path writing to that drive is the
   combination to avoid**, which is why the first milestone is read-only.
 
-**What espix would write:** `components/espix_fs/ext.c`, a shim over `ext4_*` in
-the shape of `fat.c` (~400-600 lines); the mount wiring (`mountable()`, the mount
-record, fstab, `ESPIX_FS_EXT4`, and dropping `foreign` from the `ext2/3/4` row);
-a superblock reader for `blkid`'s label and UUID, which today is FAT-only; and
-plumbing `df` onto lwext4's own `ext4_mount_point_stats()`, since that call
-already exists and only espix's FAT-named surface is missing. The genuinely new
-piece is an **fd table**: FatFs's glue handed espix a file table and an `int` fd,
-where lwext4 has neither because the caller owns the `ext4_file` — so espix
-allocates, bounds and recycles handles itself, inside `esp_vfs`'s `uint8_t`
-`local_fd_t` that `dev.c` already documents.
+**What it took:** `components/espix_fs/ext.c`, a shim over `ext4_*` in the shape
+of `fat.c`; the mount wiring (`mountable()`, `mount_by_type()`, the mount record,
+fstab, `ESPIX_FS_EXT4`, and dropping `foreign` from the ext row); and `df`
+onto lwext4's own `ext4_mount_point_stats()`, which was plumbing rather than new
+capability. The genuinely new piece was an **fd table**: FatFs's glue handed espix
+a file table and an `int` fd, where lwext4 has neither because the caller owns the
+`ext4_file` — so espix allocates, bounds and recycles handles itself. Still
+outstanding: a superblock reader for `blkid`'s label and UUID — FAT-only until
+this, so an ext volume reported neither, and now both come out of the superblock
+the type probe already reads. exFAT's label is read too, by following its own
+geometry to the root directory, where exFAT keeps it.
 
 Two things are easier than they looked, now that the headers have been read
 rather than guessed at:
@@ -493,9 +533,8 @@ rather than guessed at:
 vendored tree, its `ExternalProject`, the generated `ext4_config.h` and the
 `esp_blockdev` adapter all compile and link as they ship, with no source edits.
 Everything it needs (`esp_blockdev`, `esp_blockdev_util`, `sdmmc`) exists in 6.1.
-The image size is unchanged at that point because nothing references lwext4 yet
-and `--gc-sections` drops all of it, so **the real size cost is still unmeasured**
-and needs the shim to exist before it can be.
+The size cost is the measurement in the opening paragraph: +119,860 bytes of
+image, and nothing in IRAM.
 
 **What it would find espix is missing** — the second reason to do it, after the
 filesystem itself, because these are model questions rather than additions:
@@ -504,7 +543,11 @@ filesystem itself, because these are model questions rather than additions:
   model is a rule plus a side attribute (`mode.c`) for filesystems that keep
   none, so `espix_fs_owner()`, `chmod` and `chown` must either defer to the
   filesystem or deliberately override it. That is a decision touching `access.c`,
-  `mode.c` and `abi_fs.c`, and it should be taken *before* the shim.
+  `mode.c` and `abi_fs.c`, and it was **not** taken before the shim: the
+  read-only mount registers with `stored_metadata` false, so it behaves as a FAT
+  volume does and the decision is still open. Deliberate — a read-only mount
+  cannot be `chmod`'d, and `false` is the answer that cannot mislead a permission
+  check — but deferred rather than made, and it has to be made before writes.
 - **Inode numbers exist**, so `ls -i` becomes possible — littlefs cannot, and
   [UPSTREAM.md](UPSTREAM.md) has the reason under *`readdir()` reports no inode*.
 - **Hardlinks** (lwext4 supports them) want a `link()` espix has no counterpart
@@ -519,14 +562,14 @@ filesystem itself, because these are model questions rather than additions:
   ceiling arriving as a practical blocker and forcing that decision —
   [UPSTREAM.md](UPSTREAM.md#off_t-is-32-bits-and-no-kconfig-changes-it).
 
-**Effort.** Read-only, as with exFAT: the shim and fd table are the bulk at
-roughly 1-2 days, wiring and `blkid`/`df` another, against a vendored dependency
-whose build is already solved. **Call it 3-5 focused days to a read-only mount,
-plus hardware testing.** Writes are a separate decision afterwards, gated on the
-error-propagation question above and on the ownership model. A follow-on that
-fits the port's own list — its *accidental power-failure* test is unchecked — is
-worth contributing upstream rather than carrying, on the same reasoning that
-`tools/patch-*.py` exists to be deleted.
+**Effort.** Done, for the read-only milestone. The shim and the fd table were the
+bulk of it, `df` was plumbing onto `ext4_mount_point_stats()` rather than new
+capability, and the vendored build was already solved — what the estimate is
+still owed is the hardware testing. Writes are a separate decision afterwards,
+gated on the error-propagation question above and on the ownership model. A
+follow-on that fits the port's own list — its *accidental power-failure* test is
+unchecked — is worth contributing upstream rather than carrying, on the same
+reasoning that `tools/patch-*.py` exists to be deleted.
 
 Two smaller things to watch: the port's `ExternalProject` uses `BUILD_ALWAYS
 TRUE`, so lwext4 recompiles every build, and its component `REQUIRES ... sdmmc`
@@ -563,6 +606,22 @@ both are the sort of thing that is cheaper to know now.
   that the neighbouring assumption already broke once: OpenSSH 10.3's KEXINIT
   outgrew a fixed buffer and every connection was refused with a message
   claiming no common algorithm. Algorithm lists are not a stable surface.
+- **A session's memory — the ceiling that is arriving.** The sessions suite fills
+  the connection limit and now finds the internal heap at or near zero: allocations
+  fail, a session is dropped rather than refused, and the suite reports that
+  instead of a limit. Not new — the low-water mark has been falling for a while,
+  and the ext4 driver's 10 KB of `.bss` is only the latest bite (the figures are in
+  `ESPIX_FS_EXT4`'s Kconfig help) — but it is now below the suite's own floor of
+  20 KB free at eight connections.
+
+  Which memory matters, because the fix differs. This is **internal DRAM**, not
+  IRAM: IRAM is instruction memory and is already at its whole 16 KB, while what a
+  session costs is stack and buffers from the internal heap — the figure `ps`
+  reports. So the work is per-session: what a connection's task really needs, what
+  is sized for a worst case that never happens, and what could live in PSRAM
+  instead, with the usual exception for anything DMA touches or that sits on a
+  latency-sensitive path. `CONFIG_ESPIX_SSH_MAX_SESSIONS` is the other lever, and a
+  blunt one.
 
 ## Shell and console
 

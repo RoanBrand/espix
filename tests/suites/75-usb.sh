@@ -86,6 +86,15 @@ else
             assert_contains "the partition has a node in /dev" "$part" \
                             "$(dev_run 'ls /dev')"
 
+            # A partition operand takes the /dev spelling too, which is how an
+            # fstab rule writes it. This is a partition rather than the disk above,
+            # and it used to fail: blkid normalised the operand while validating it
+            # and then compared the raw argument while selecting the row, so
+            # `blkid /dev/sda1` printed nothing at all and exited 0 -- no line, no
+            # error. The disk-only assertion above could not see that.
+            assert_contains "blkid takes the /dev spelling for a partition" \
+                            "$part:" "$(dev_run "blkid /dev/$part")"
+
             # A partition's PARTUUID has one of two shapes: an MBR's disk
             # signature and entry number, or a GPT entry's 36-character GUID.
             # Worth asserting wherever a partition is listed, because this is the
@@ -107,6 +116,26 @@ else
             fi
         else
             espix_skip "no partitions on the attached device"
+        fi
+
+        # An ext partition is named by its version rather than as a range. The name
+        # comes from the superblock's feature words (host.c's ext_region_fstype),
+        # because ext stores no version: ext4 arrived with extents, 64-bit and
+        # flex_bg, and a journal is what ext3 added over ext2.
+        #
+        # Asserted on the shape rather than on "ext4", because the volume here is
+        # whatever was plugged in -- an ext2 stick saying ext2 is right, and a test
+        # that demanded ext4 would fail on a working device.
+        extname=$(printf '%s\n' "$lsblk_out" | awk '$4 ~ /^ext/ { print $4; exit }')
+
+        if [ -z "$extname" ]; then
+            espix_skip "no ext partition attached; the version naming is not exercised"
+        elif printf '%s' "$extname" | grep -qE '^ext[234]$'; then
+            espix_pass "an ext partition is named by its version ($extname)"
+        else
+            espix_fail "an ext partition is named by its version" \
+                       "actual: $extname" \
+                       "the feature words should give ext2, ext3 or ext4"
         fi
 
         # --------------------------------------------------------- read-only ---

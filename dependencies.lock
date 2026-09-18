@@ -1,4 +1,12 @@
 dependencies:
+  esp_lwext4:
+    component_hash: fe65e8eb039144df8c6833e1e0952b6538b3d374bf6df165460bab76a80b9cce
+    dependencies: []
+    source:
+      git: https://github.com/huming2207/esp_lwext4.git
+      path: .
+      type: git
+    version: d774c178f0211d62d3f0d49e9164aa655573ecfe
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -140,6 +148,7 @@ dependencies:
       type: service
     version: 1.22.3
 direct_dependencies:
+- esp_lwext4
 - espressif/elf_loader
 - espressif/esp_ext_part_tables
 - espressif/esp_linenoise
@@ -148,6 +157,6 @@ direct_dependencies:
 - espressif/usb_host_msc
 - idf
 - joltwallet/littlefs
-manifest_hash: a029b0e9df62b82fef3e9ce54a638a7652389859ef6cf424d1cd93542d6067b6
+manifest_hash: 0cb1ff894e8f9e727590ab2bddbc033445cedd2c59c4e6e4aa76bc7a732189af
 target: esp32s3
 version: 3.0.0

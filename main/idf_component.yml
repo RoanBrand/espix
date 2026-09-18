@@ -58,7 +58,24 @@ dependencies:
   espressif/usb_host_msc: "^1.3.0"
 
   # Reads the partition table out of a disk's sector 0. Worth having before
-  # anything can mount: it names the filesystems espix *cannot* drive -- exFAT,
-  # NTFS, ext4 -- so `lsblk` can say "ext4, unsupported" where the honest
+  # anything can mount: it names the filesystems espix *cannot* drive -- ntfs,
+  # iso9660 -- so `lsblk` can say "ntfs, unsupported" where the honest
   # alternative is silence.
   espressif/esp_ext_part_tables: "^0.5.0"
+
+  # ext2/3/4, the third filesystem. Not in the registry, so a git dependency
+  # pinned by revision rather than by version number -- the same guarantee
+  # dependencies.lock gives the others, just stated here because there is no
+  # registry entry to lock.
+  #
+  # The repository carries the lwext4 core as a git submodule, and the component
+  # manager fetches submodules along with the repo, so this one line brings both
+  # halves: the port's adapters and the core they sit on. The core this revision
+  # pins is 58bcf89a.
+  #
+  # espix patches the core on top of it -- the metadata checksum seed, without
+  # which no ext4 volume a current Linux made can be read. See tools/README.md,
+  # and delete that patch when it goes upstream.
+  esp_lwext4:
+    git: https://github.com/huming2207/esp_lwext4.git
+    version: "d774c178f0211d62d3f0d49e9164aa655573ecfe"

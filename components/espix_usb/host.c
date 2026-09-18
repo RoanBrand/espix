@@ -623,6 +623,249 @@ static void fat_serial(const uint8_t *sector, char *out, size_t out_len)
              (unsigned)(serial & 0xFFFFu));
 }
 
+/*
+ * exFAT's volume serial, out of its main boot sector -- the same 512 bytes the FAT
+ * reader above uses, at a different offset.
+ *
+ * It is at 0x64. It is *not* at 0x40, which is the volume's partition offset: an
+ * earlier version of this read that, and printed the partition's start LBA as the
+ * serial -- 00C0-0000 for a partition starting at 12,582,912 sectors, which is the
+ * kind of wrong that looks like a working value.
+ *
+ * There is deliberately no label read from here: exFAT keeps its volume label in a
+ * Volume Label directory entry (type 0x83) in the root directory, not in the boot
+ * sector. Reading 0x60 as a label field instead gave the low byte of
+ * FirstClusterOfRootDirectory, which printed as a control character. exfat_label()
+ * below follows the geometry to the root directory and reads it properly.
+ */
+#define EXFAT_SERIAL_OFFSET 0x64
+
+static void exfat_serial(const uint8_t *sector, char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+
+    const uint32_t serial = entry_u32(sector, EXFAT_SERIAL_OFFSET);
+    if (serial == 0) {
+        return;     /* nothing to identify; a zero would match every other zero */
+    }
+
+    snprintf(out, out_len, "%04X-%04X", (unsigned)(serial >> 16),
+             (unsigned)(serial & 0xFFFFu));
+}
+
+/*
+ * exFAT's volume label, which is a directory entry in the root directory rather
+ * than a field of the boot sector, so this follows the boot sector's own geometry
+ * to find it.
+ *
+ * The entry is 32 bytes: the type (0x83), a character count, then 11 UTF-16 code
+ * units. A formatter writes it as the first entry of the root directory, so one
+ * sector of that directory holds it -- which is what is read. A label that is
+ * further in than that, or a geometry that does not add up, gives no label rather
+ * than a guess.
+ *
+ * Every field is checked before it is used, and so is the result. That is not
+ * belt-and-braces: this file has already printed a partition offset as a serial
+ * and a cluster number as a name, and both looked like working values. A character
+ * count over 11, or a label with a control character in it, is a misread geometry
+ * rather than a label.
+ *
+ * The offsets around the serial are the ones this file already reads, and that the
+ * serial at 0x64 came out right against a real volume is what anchors the rest:
+ * FirstClusterOfRootDirectory at 0x60, the heap at 0x58, and the two shift counts
+ * at 0x6C and 0x6D.
+ */
+static void exfat_label(usb_dev_t *d, uint64_t base, size_t unit,
+                        const uint8_t *boot, char *out, size_t out_len)
+{
+    const size_t fat_off_at   = 0x50;       /* u32, in sectors */
+    const size_t heap_off_at  = 0x58;       /* u32, in sectors */
+    const size_t root_clu_at  = 0x60;       /* u32 */
+    const size_t bps_shift_at = 0x6C;       /* u8 */
+    const size_t spc_shift_at = 0x6D;       /* u8 */
+
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+
+    const uint32_t fat_off   = entry_u32(boot, fat_off_at);
+    const uint32_t heap_off  = entry_u32(boot, heap_off_at);
+    const uint32_t root_clu  = entry_u32(boot, root_clu_at);
+    const unsigned bps_shift = boot[bps_shift_at];
+    const unsigned spc_shift = boot[spc_shift_at];
+
+    /* 512 bytes to 4 KiB of sector, clusters bounded by the 32-bit cluster count,
+     * the FAT after the boot region, the heap after the FAT, and a root directory
+     * in the heap -- which is cluster 2 or later. */
+    if (bps_shift < 9 || bps_shift > 12 || spc_shift > 25 - bps_shift ||
+        fat_off < 24 || heap_off <= fat_off || root_clu < 2) {
+        return;
+    }
+
+    const uint64_t sector_bytes = 1ull << bps_shift;
+    const uint64_t cluster_secs = 1ull << spc_shift;
+
+    /* Cluster 2 is the first in the heap, which is why the root directory's cluster
+     * number has two taken off it. */
+    const uint64_t dir_at = ((uint64_t)heap_off +
+                             ((uint64_t)root_clu - 2) * cluster_secs) * sector_bytes;
+
+    /*
+     * Read a whole transfer unit from an address that is a multiple of one, which
+     * is the rule a block device imposes -- the one that made a 256-byte read fail
+     * silently earlier. The volume's sector size and the transfer unit need not
+     * agree: a 512-byte exFAT sector read through a 4096-byte unit lies inside the
+     * unit block that contains it, so that block is read and the scan begins at the
+     * sector's offset within it.
+     *
+     * `base` is added here and not above, because everything in the boot sector is
+     * relative to the *volume* while the block device is the *disk*: without it the
+     * read lands wherever that offset falls on the disk, which is somebody else's
+     * filesystem. That is what this did first, and it is why the geometry is logged
+     * -- the numbers were all right and the address was not.
+     */
+    const uint64_t block_at = base + (dir_at & ~((uint64_t)unit - 1));
+    const size_t   first    = (size_t)(dir_at - (dir_at & ~((uint64_t)unit - 1)));
+
+    espix_klog(ESPIX_KLOG_DEBUG, TAG,
+               "%s: exfat sector %llu, unit %u, heap %lu, root cluster %lu, "
+               "dir at %llu+%llu",
+               d->info.name, (unsigned long long)sector_bytes, (unsigned)unit,
+               (unsigned long)heap_off, (unsigned long)root_clu,
+               (unsigned long long)base, (unsigned long long)dir_at);
+
+    uint8_t *block = malloc(unit);
+    if (block == NULL) {
+        return;
+    }
+
+    if (d->bdl->ops->read(d->bdl, block, unit, block_at, unit) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "%s: exfat root directory unreadable",
+                   d->info.name);
+        free(block);
+        return;
+    }
+
+    for (size_t at = first; at + 32 <= unit; at += 32) {
+        if (block[at] == 0x00) {
+            break;      /* end of the directory */
+        }
+        if (block[at] != 0x83) {
+            continue;   /* not the Volume Label entry */
+        }
+
+        const unsigned chars = block[at + 1];
+        if (chars == 0 || chars > 11) {
+            break;      /* a count that cannot be a label */
+        }
+
+        uint16_t units[11];
+        for (unsigned i = 0; i < 11; i++) {
+            units[i] = (uint16_t)(block[at + 2 + 2 * i] |
+                                  ((uint16_t)block[at + 2 + 2 * i + 1] << 8));
+        }
+        utf16_to_utf8(units, chars, out, out_len);
+
+        for (size_t i = 0; out[i] != '\0'; i++) {
+            const unsigned char c = (unsigned char)out[i];
+            if (c < 0x20 || c == 0x7F) {
+                out[0] = '\0';      /* misread geometry, not a label */
+                break;
+            }
+        }
+        free(block);
+        return;
+    }
+
+    espix_klog(ESPIX_KLOG_DEBUG, TAG,
+               "%s: no exfat volume label entry in the first %u bytes of the "
+               "root directory",
+               d->info.name, (unsigned)unit);
+    free(block);
+}
+
+/*
+ * An ext volume's label and UUID, out of the superblock at 1024.
+ *
+ * `block` is the caller's first block and `unit` its size, because where the
+ * superblock is depends on the sector size: on a 512 or 1024 byte unit it starts
+ * the *second* block and has to be read, while on a larger unit it is inside the
+ * block already in hand. Getting that wrong is not a wrong answer but a failed
+ * read -- a block device wants a whole transfer unit at an address that is a
+ * multiple of one -- which is how the first version of this silently produced
+ * nothing: it asked for 256 bytes, which is neither.
+ *
+ * Both fields are inside the first 136 bytes of the superblock, so one unit is
+ * always enough. The UUID is 16 bytes printed in the usual 8-4-4-4-12 grouping,
+ * the form `lsblk` and `blkid` use; a zeroed one is no identity rather than 16
+ * zeroes.
+ */
+static void ext_identity(usb_dev_t *d, uint64_t base, size_t unit,
+                         const uint8_t *block, char *out_label, size_t label_len,
+                         char *out_uuid, size_t uuid_len)
+{
+    const size_t super    = 1024;
+    const size_t uuid_at  = 0x68;       /* s_uuid, 16 bytes */
+    const size_t label_at = 0x78;       /* s_volume_name, 16 bytes */
+    const size_t need     = label_at + 16;
+    uint8_t      local[1024];
+    const uint8_t *sb;
+
+    if (unit <= super && super % unit == 0) {
+        /* 512 or 1024: the superblock begins its own block, and 1024 is a multiple
+         * of the unit, so reading it is aligned. */
+        if (d->bdl->ops->read(d->bdl, local, unit, base + super,
+                              unit) != ESP_OK) {
+            return;
+        }
+        sb = local;
+    } else if (unit >= super + need) {
+        /* 2048 or more: it is inside the block the caller read. */
+        sb = block + super;
+    } else {
+        return;     /* neither case, which no block device's geometry is */
+    }
+
+    if (out_label != NULL && label_len > 0) {
+        /* A NUL-padded fixed-width field, so it ends at the first NUL, and trailing
+         * spaces go too. All NULs is what mkfs.ext4 writes for a volume with no
+         * label, which is the usual case. */
+        size_t n = 0;
+        while (n < 16 && sb[label_at + n] != '\0') {
+            n++;
+        }
+        while (n > 0 && sb[label_at + n - 1] == ' ') {
+            n--;
+        }
+        if (n > 0 && n < label_len) {
+            memcpy(out_label, sb + label_at, n);
+            out_label[n] = '\0';
+        }
+    }
+
+    if (out_uuid == NULL || uuid_len < 37) {
+        return;
+    }
+
+    const uint8_t *u = sb + uuid_at;
+    bool zero = true;
+
+    for (size_t i = 0; i < 16; i++) {
+        zero = zero && u[i] == 0;
+    }
+    if (zero) {
+        return;
+    }
+
+    snprintf(out_uuid, uuid_len,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+}
+
 /* Linux's PARTUUID: the disk signature, a dash, and the entry number. */
 static void partuuid_format(char *out, size_t out_len, uint32_t disk_id,
                             unsigned entry)
@@ -666,7 +909,7 @@ static bool iso_descriptor_read(usb_dev_t *d, size_t unit, uint64_t offset,
 }
 
 /*
- * Does the ext2/3/4 superblock sit in this region?
+ * Is the superblock at 1024 an ext2, ext3 or ext4 one, and which of the three?
  *
  * The superblock begins 1024 bytes into the volume and its `s_magic` is 0xEF53 at
  * offset 56 of it -- bytes 1080 and 1081, little-endian 53 EF. Where those bytes
@@ -681,23 +924,39 @@ static bool iso_descriptor_read(usb_dev_t *d, size_t unit, uint64_t offset,
  *
  * `buf` is clobbered in the first case, which is why block_fstype() checks every
  * signature that lives in the first 512 bytes -- FAT, exFAT, NTFS and the ISO
- * descriptor -- before calling this.
+ * descriptor -- before calling this. Everything below reads out of the same
+ * buffer, so nothing sorts a version before the read that finds it.
+ *
+ * Returns the name, or NULL when this is not an ext superblock at all.
  */
-static bool ext_region_is_ext(usb_dev_t *d, uint64_t base, size_t unit,
-                              uint8_t *buf)
+/*
+ * The bits that name a version, from the superblock's two feature words: what ext3
+ * added over ext2, and the three incompatible features ext4 arrived with. Same
+ * numbered bits in every ext implementation.
+ */
+#define EXT4_COMPAT_HAS_JOURNAL 0x0004
+#define EXT4_INCOMPAT_EXTENTS   0x0040
+#define EXT4_INCOMPAT_64BIT     0x0080
+#define EXT4_INCOMPAT_FLEX_BG   0x0200
+
+static const char *ext_region_fstype(usb_dev_t *d, uint64_t base, size_t unit,
+                                     uint8_t *buf)
 {
-    /* Where an ext volume keeps its superblock, and the two fields of it that say
-     * so: s_magic (0xEF53) and s_log_block_size, which is the block size as a
-     * power of two and cannot exceed 6 -- 64 KiB -- on any ext ever built. */
-    const size_t super     = 1024;
-    const size_t magic     = 56;
-    const size_t block_log = 24;
+    /* Where an ext volume keeps its superblock, and the fields of it that say what
+     * it is: s_magic (0xEF53), s_log_block_size -- the block size as a power of two,
+     * which cannot exceed 6, 64 KiB, on any ext ever built -- and the feature words
+     * that name the version. */
+    const size_t super      = 1024;
+    const size_t magic      = 56;
+    const size_t block_log  = 24;
+    const size_t feats      = 0x5C;     /* s_feature_compat, then incompat */
+    const size_t feats_all  = feats + 8;
 
     const bool in_this_block = unit >= super + block_log + 4;
 
     if (!in_this_block &&
         d->bdl->ops->read(d->bdl, buf, unit, base + super, unit) != ESP_OK) {
-        return false;
+        return NULL;
     }
 
     /* Either the superblock is in the block we were given, or the read above
@@ -705,7 +964,7 @@ static bool ext_region_is_ext(usb_dev_t *d, uint64_t base, size_t unit,
     const uint8_t *sb = in_this_block ? buf + super : buf;
 
     if (sb[magic] != 0x53 || sb[magic + 1] != 0xEF) {
-        return false;
+        return NULL;
     }
 
     /*
@@ -714,11 +973,39 @@ static bool ext_region_is_ext(usb_dev_t *d, uint64_t base, size_t unit,
      * than 64 KiB, which is the check libblkid makes too; that is the difference
      * between naming somebody's volume and guessing at it.
      */
-    const uint32_t log2_block = (uint32_t)sb[block_log] |
-                                ((uint32_t)sb[block_log + 1] << 8) |
-                                ((uint32_t)sb[block_log + 2] << 16) |
-                                ((uint32_t)sb[block_log + 3] << 24);
-    return log2_block <= 6;
+    const uint32_t log2_block = entry_u32(sb, block_log);
+    if (log2_block > 6) {
+        return NULL;
+    }
+
+    /*
+     * There is no version field: s_magic and the layout are the same in all three,
+     * and what separates them is which features they carry. So the version is read
+     * out of the feature words, which is what every ext tool does as well --
+     * lwext4's own feature-set split lists extents, 64-bit and flex_bg as the ext4
+     * set, and a journal is what ext3 added over ext2.
+     *
+     * A volume built with a subset (`mkfs.ext4 -O ^extent`) therefore reads as the
+     * lower version. That is the honest reading of what is on disk rather than a
+     * guess: those are the features it has.
+     */
+    const size_t have = in_this_block ? unit - super : unit;
+    if (have < feats_all) {
+        /* Not enough of the superblock to reach the feature words, which only a
+         * transfer unit under 512 bytes can cause -- no block device espix speaks
+         * to reports one. The volume is ext; which one cannot be said, so it is not
+         * claimed. */
+        return "ext2/3/4";
+    }
+
+    const uint32_t compat   = entry_u32(sb, feats);
+    const uint32_t incompat = entry_u32(sb, feats + 4);
+
+    if (incompat & (EXT4_INCOMPAT_EXTENTS | EXT4_INCOMPAT_64BIT |
+                    EXT4_INCOMPAT_FLEX_BG)) {
+        return "ext4";
+    }
+    return (compat & EXT4_COMPAT_HAS_JOURNAL) ? "ext3" : "ext2";
 }
 
 /*
@@ -827,16 +1114,34 @@ static const char *block_fstype(usb_dev_t *d, uint64_t base, uint8_t *block,
     /*
      * ext2/3/4, and the reason a Linux-prepared stick used to read as a bare
      * disk: ext keeps its superblock at 1024, so a whole-device ext volume has
-     * nothing at all in sector 0 for any of the checks above to find. Named
-     * without claiming a version, because s_magic does not distinguish 2, 3 and 4
-     * -- the feature flags do -- and "ext4" would be a guess. Last, because this
+     * nothing at all in sector 0 for any of the checks above to find. Named by its
+     * features rather than as a range: s_magic does not distinguish 2, 3 and 4 but
+     * the feature flags do, and ext_region_fstype() reads them. Last, because this
      * is the check that may refill the buffer.
      */
-    if (ext_region_is_ext(d, base, unit, block)) {
+    const char *ext = ext_region_fstype(d, base, unit, block);
+    if (ext != NULL) {
+#if CONFIG_ESPIX_FS_EXT4
+        /* The driver is there, so the marker would be a lie -- the same rule the
+         * exFAT type follows. */
+        *foreign = false;
+#else
         *foreign = true;
-        return "ext2/3/4";
+#endif
+        return ext;
     }
     return "";
+}
+
+/*
+ * The ext names this file mints, as one question. Declared in espix_usb.h because
+ * the callers are in espix_cmds, and a comparison written there that drifted from
+ * what is named here would send an ext volume to the FAT driver.
+ */
+bool espix_usb_fstype_is_ext(const char *fstype)
+{
+    return strcmp(fstype, "ext2") == 0 || strcmp(fstype, "ext3") == 0 ||
+           strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext2/3/4") == 0;
 }
 
 /*
@@ -1115,8 +1420,16 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
                 if (strcmp(content, "vfat") == 0) {
                     fat_label(buf, p->label, sizeof(p->label));
                     fat_serial(buf, p->uuid, sizeof(p->uuid));
+                } else if (strcmp(content, "exfat") == 0) {
+                    /* The serial is in this block; the label is not, and takes a
+                     * read of its own. See exfat_label(). */
+                    exfat_serial(buf, p->uuid, sizeof(p->uuid));
+                    exfat_label(d, start, unit, buf, p->label, sizeof(p->label));
                 } else if (strcmp(content, "iso9660") == 0) {
                     (void)iso_descriptor(buf, p->label, sizeof(p->label));
+                } else if (espix_usb_fstype_is_ext(content)) {
+                    ext_identity(d, start, unit, buf, p->label, sizeof(p->label),
+                                 p->uuid, sizeof(p->uuid));
                 }
             }
         }
@@ -1226,6 +1539,16 @@ static void read_partition_table(usb_dev_t *d)
             if (strcmp(type, "vfat") == 0) {
                 fat_label(sector, d->info.label, sizeof(d->info.label));
                 fat_serial(sector, d->info.uuid, sizeof(d->info.uuid));
+            } else if (strcmp(type, "exfat") == 0) {
+                exfat_serial(sector, d->info.uuid, sizeof(d->info.uuid));
+                exfat_label(d, 0, unit, sector, d->info.label,
+                            sizeof(d->info.label));
+            } else if (espix_usb_fstype_is_ext(type)) {
+                /* A whole-device ext volume starts at zero, so its superblock is
+                 * 1024 bytes in. */
+                ext_identity(d, 0, unit, sector, d->info.label,
+                             sizeof(d->info.label), d->info.uuid,
+                             sizeof(d->info.uuid));
             }
         }
         free(sector);
@@ -1342,10 +1665,17 @@ static void read_partition_table(usb_dev_t *d)
                 if (strcmp(content, "vfat") == 0) {
                     fat_label(sector, p->label, sizeof(p->label));
                     fat_serial(sector, p->uuid, sizeof(p->uuid));
+                } else if (strcmp(content, "exfat") == 0) {
+                    exfat_serial(sector, p->uuid, sizeof(p->uuid));
+                    exfat_label(d, start, unit, sector, p->label,
+                                sizeof(p->label));
                 } else if (strcmp(content, "iso9660") == 0) {
                     /* Recognised by block_fstype() a moment ago; this fills the
                      * label out of the same block. */
                     (void)iso_descriptor(sector, p->label, sizeof(p->label));
+                } else if (espix_usb_fstype_is_ext(content)) {
+                    ext_identity(d, start, unit, sector, p->label,
+                                 sizeof(p->label), p->uuid, sizeof(p->uuid));
                 }
             }
         }

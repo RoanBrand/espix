@@ -49,6 +49,39 @@ a plain diff, ready to send to joltwallet/esp_littlefs. When it is upstreamed,
 delete both files and the `execute_process()` block in the top-level
 `CMakeLists.txt`, and bump the version in `main/idf_component.yml`.
 
+## patch-lwext4.py
+
+Teaches the lwext4 core to honour the metadata checksum seed, which is what a
+volume made by e2fsprogs 1.47 or later needs. `mke2fs` enables
+`metadata_csum_seed` by default now, so every metadata checksum on such a volume
+is seeded from the superblock rather than from the filesystem UUID — and the
+core, seeding from the UUID in eight places, refused the volume at mount. Correctly
+enough, since the feature was not implemented; the effect was that espix could not
+read any ext4 volume a current Linux creates. See
+[../docs/KNOWN-ISSUES.md](../docs/KNOWN-ISSUES.md) and
+[../docs/ROADMAP.md](../docs/ROADMAP.md).
+
+The firmware build runs it from a CMake hook, after `project()` because that is
+when the download happens. It is idempotent, and it fails the build with a clear
+message rather than skipping if the pinned revision moves or the tree has been
+left half-patched.
+
+```bash
+./tools/patch-lwext4.py        # applied automatically; safe to run by hand
+```
+
+Unlike the other patch scripts here it *applies* `lwext4-csum-seed.patch` rather
+than repeating the change in Python, and that is deliberate: the change is ten
+files and eight functions, so a second copy of it in this directory would be one
+more thing to keep in step. This way the patch that gets applied and the patch
+that goes upstream are the same bytes.
+
+**Temporary by construction.** `lwext4-csum-seed.patch` is the change as a plain
+diff, ready to send to `gkostka/lwext4` — the core, not the port around it. The
+port would pick it up by bumping its submodule. When it lands, delete this script,
+the patch and the `execute_process()` block in the top-level `CMakeLists.txt`, and
+update the pin in `main/idf_component.yml`.
+
 ## Deploying an app
 
 Build it on the host, copy it over, run it by name:
