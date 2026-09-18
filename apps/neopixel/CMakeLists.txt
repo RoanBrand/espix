@@ -14,6 +14,11 @@ cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(neopixel)
 
+# off_t is 64 bits in the firmware, and struct stat is passed across the loader's
+# ABI -- so the app has to agree. See cmake/offt64.h.
+set(ESPIX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${ESPIX_ROOT}/cmake/offt64.cmake")
+
 # arduino-esp32 compiles its whole bundled library set, and some of it trips
 # IDF 6.1 headers with -Werror=missing-field-initializers. Not our code and not
 # our bug; downgrade it rather than patch a managed component.

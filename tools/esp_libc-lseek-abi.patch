@@ -1,0 +1,83 @@
+Declare _lseek_r at the width the libc was built with
+
+_lseek_r is called by the prebuilt newlib libc -- stdio.o carries the seek logic
+that fseek() and fseeko() end up in -- and by the ROM's libc stub table. Both were
+built when off_t was a 32-bit long, and both still pass 32 bits. The declaration
+and the definition here were written in terms of off_t, which is right while off_t
+is 32 bits and wrong as soon as a project widens it: the callers would pass 32 bits
+where 64 are read, and every fseek() would land somewhere else.
+
+That is not hypothetical. With off_t widened to 64 bits, a 12 KB SFTP upload fails
+with "seek failed", because the write path seeks to the end of the file before
+each chunk and lands past it.
+
+So _lseek_r keeps the width it has always had -- a 32-bit boundary, widening
+inside it -- and stops being an alias for esp_vfs_lseek, whose signature follows
+off_t and should. lseek(), pread() and pwrite() are untouched and stay 64-bit,
+which is where a file over 4 GiB is actually reached. stdio's own seeking stays
+limited to 4 GiB; that is a property of the libc this is linked against, not of
+this change.
+
+Two notes for a maintainer:
+
+- The declaration in reent_syscalls.c has to agree with the definition here: it is
+the weak fallback for builds without the VFS, so a mismatch is a compile error in
+those builds only.
+
+- A project that widens off_t also has to pin the declaration in the toolchain's
+reent.h, which says "extern _off_t _lseek_r (struct _reent *, int, _off_t, int)"
+and follows the type by construction. That file is not in this repository; it is
+correct for every project as it stands, and pinning it to int is harmless to one
+that never widens anything. The better fix on this side is a Kconfig knob for
+64-bit off_t, which would make the width explicit instead of implied -- there is
+none today.
+
+diff --git a/components/esp_libc/src/reent_syscalls.c b/components/esp_libc/src/reent_syscalls.c
+index 66cd4a4f..b00fa178 100644
+--- a/components/esp_libc/src/reent_syscalls.c
++++ b/components/esp_libc/src/reent_syscalls.c
+@@ -40,7 +40,7 @@ int _open_r(struct _reent *r, const char * path, int flags, int mode)
+ __attribute__((weak, alias("syscall_not_implemented")));
+ int _close_r(struct _reent *r, int fd)
+ __attribute__((weak, alias("syscall_not_implemented")));
+-off_t _lseek_r(struct _reent *r, int fd, off_t size, int mode)
++int _lseek_r(struct _reent *r, int fd, int offset, int whence)
+ __attribute__((weak, alias("syscall_not_implemented")));
+ int _fcntl_r(struct _reent *r, int fd, int cmd, int arg)
+ __attribute__((weak, alias("syscall_not_implemented")));
+diff --git a/components/vfs/vfs_calls.c b/components/vfs/vfs_calls.c
+index a8c46954..763f64c5 100644
+--- a/components/vfs/vfs_calls.c
++++ b/components/vfs/vfs_calls.c
+@@ -934,8 +934,29 @@ ssize_t pread(int fd, void *dst, size_t size, off_t offset)
+     __attribute__((alias("esp_vfs_pread")));
+ ssize_t pwrite(int fd, const void *src, size_t size, off_t offset)
+     __attribute__((alias("esp_vfs_pwrite")));
+-off_t _lseek_r(struct _reent *r, int fd, off_t size, int mode)
+-    __attribute__((alias("esp_vfs_lseek")));
++/*
++ * A 32-bit ABI, deliberately, and not an alias for esp_vfs_lseek.
++ *
++ * _lseek_r is called by the prebuilt newlib libc -- stdio.o carries the seek
++ * logic fseek() and fseeko() end up in -- which was compiled when off_t was a
++ * 32-bit long, and by the ROM's libc stub table, which declares an int offset for
++ * the same reason. A project may widen off_t; if this followed the type, those
++ * callers would pass 32 bits where 64 are read and every fseek() would land
++ * somewhere else. So the boundary keeps its width, the widening happens here, and
++ * espix's own lseek()/pread()/pwrite() are 64-bit and unaffected.
++ */
++int _lseek_r(struct _reent *r, int fd, int offset, int whence)
++{
++    const off_t at = esp_vfs_lseek(r, fd, (off_t)offset, whence);
++
++    /* Round-trip rather than a limit constant: it is the same question, and it
++     * needs no header. */
++    if (at != (off_t)(int)at) {
++        errno = EOVERFLOW;
++        return -1;
++    }
++    return (int)at;
++}
+ int _fcntl_r(struct _reent *r, int fd, int cmd, int arg)
+     __attribute__((alias("esp_vfs_fcntl_r")));
+ int _fstat_r(struct _reent *r, int fd, struct stat *st)

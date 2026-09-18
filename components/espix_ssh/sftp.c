@@ -291,7 +291,10 @@ static void put_attrs(ssh_buf_t *b, const struct stat *st, mode_t mode)
 {
     ssh_put_u32(b, SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_PERMISSIONS |
                    SSH_FILEXFER_ATTR_ACMODTIME);
-    ssh_put_u32(b, 0);                          /* size, high word */
+    /* SFTP v3's size is 64 bits, written as two words, and off_t is 64 bits here
+     * now -- so the high word is real. It was hardcoded 0 while off_t was 32 bits,
+     * which is why a file over 4 GiB reported a size of its low half. */
+    ssh_put_u32(b, (uint32_t)((uint64_t)st->st_size >> 32));
     ssh_put_u32(b, (uint32_t)st->st_size);
     ssh_put_u32(b, (S_ISDIR(st->st_mode) ? S_IFDIR : S_IFREG) |
                    (mode & ESPIX_MODE_BITS));
@@ -600,8 +603,10 @@ static esp_err_t do_readdir(sftp_t *s, uint32_t id, ssh_buf_t *in)
     id_name(gid, true,  group, sizeof(group));
 
     char longname[sizeof(de->d_name) + 96];
-    snprintf(longname, sizeof(longname), "%s 1 %s %s %8u %s %s",
-             perms, owner, group, (unsigned)st.st_size, when, de->d_name);
+    /* The size column is 64-bit, as the client's own parser will be. */
+    snprintf(longname, sizeof(longname), "%s 1 %s %s %8llu %s %s",
+             perms, owner, group, (unsigned long long)st.st_size, when,
+             de->d_name);
 
     ssh_buf_t b;
     ssh_buf_init(&b, s->out, sizeof(s->out));
@@ -622,12 +627,31 @@ static esp_err_t do_read(sftp_t *s, uint32_t id, ssh_buf_t *in)
         return send_status(s, id, SSH_FX_FAILURE, "bad handle");
     }
 
-    ssh_get_u32(in);                            /* offset, high word */
+    const uint32_t off_hi = ssh_get_u32(in);
     const uint32_t offset = ssh_get_u32(in);
     uint32_t       want   = ssh_get_u32(in);
 
     if (in->bad) {
         return send_status(s, id, SSH_FX_FAILURE, "malformed read");
+    }
+
+    /*
+     * The transfer path is stdio, and stdio's seek is 32 bits: fseek() takes a
+     * long, and fseeko() is in the prebuilt libc, compiled when off_t was 32 bits
+     * -- so calling it with a 64-bit off_t would hand it half a value. Seeking the
+     * descriptor instead is not a fix either: the FILE's buffer would be left
+     * holding the old position, and the next fread would return the wrong bytes
+     * without an error.
+     *
+     * So an offset past 4 GiB is refused rather than served from a truncated one.
+     * That is what used to happen, silently, and it would be worse now that
+     * everything else reports the real size. The fix is to move these handlers off
+     * FILE* and onto the descriptors, where espix's own 64-bit lseek applies.
+     * docs/KNOWN-ISSUES.md has it.
+     */
+    if (off_hi != 0) {
+        return send_status(s, id, SSH_FX_FAILURE,
+                           "offset beyond 4 GiB (transfer path is 32-bit)");
     }
     if (want > SFTP_READ_MAX) {
         want = SFTP_READ_MAX;
@@ -684,7 +708,7 @@ static size_t write_begin(sftp_t *s, uint8_t *pkt, size_t avail, size_t plen)
     const uint32_t id = ssh_get_u32(&in);
     sftp_handle_t *h  = handle_get(s, &in);
 
-    ssh_get_u32(&in);                           /* offset, high word */
+    const uint32_t off_hi = ssh_get_u32(&in);
     const uint32_t offset = ssh_get_u32(&in);
     const uint32_t len    = ssh_get_u32(&in);
 
@@ -707,6 +731,10 @@ static size_t write_begin(sftp_t *s, uint8_t *pkt, size_t avail, size_t plen)
         s->w_error = "inconsistent write length";
     } else if (h == NULL || h->file == NULL) {
         s->w_error = "bad handle";
+    } else if (off_hi != 0) {
+        /* Refused rather than truncated, for the reason the read handler gives:
+         * the transfer path's seek is stdio's, and stdio's is 32 bits. */
+        s->w_error = "offset beyond 4 GiB (transfer path is 32-bit)";
     } else if (fseek(h->file, (long)offset, SEEK_SET) != 0) {
         s->w_error = "seek failed";
     } else {

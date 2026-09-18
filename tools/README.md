@@ -82,6 +82,46 @@ port would pick it up by bumping its submodule. When it lands, delete this scrip
 the patch and the `execute_process()` block in the top-level `CMakeLists.txt`, and
 update the pin in `main/idf_component.yml`.
 
+## patch-libc-offt.py
+
+Keeps `_lseek_r`'s 32-bit ABI, now that `off_t` is 64 bits. `cmake/offt64.h` widens
+`off_t` for the whole firmware — that is what lets a file over 4 GiB be reported and
+seeked — and `_lseek_r` is an alias for `esp_vfs_lseek`, so it follows the type. Its
+callers do not, and cannot: newlib's prebuilt `stdio.o` carries the seek logic
+`fseek()` ends up in and was compiled when `off_t` was 32 bits, and the ROM's libc
+stub table declares an int offset for the same reason. Followed the type, the
+boundary reads 64 bits where those callers wrote 32, and every `fseek()` lands
+somewhere else — measured, as a 12 KB SFTP upload failing with `seek failed`.
+
+So `_lseek_r` keeps the width it has always had and widens inside, on its way to the
+64-bit `esp_vfs_lseek`. espix's own `lseek()`, `pread()` and `pwrite()` are 64-bit
+and unaffected, which is where a file over 4 GiB is actually reached. stdio's
+seeking stays limited to 4 GiB — a property of the libc espix links against rather
+than a choice, and the reason its SFTP transfer path has to move off `FILE*` to go
+beyond it. See [../docs/KNOWN-ISSUES.md](../docs/KNOWN-ISSUES.md).
+
+Three files, one of them outside IDF: the definition, the weak declaration that has
+to agree with it, and — the one to know about — the toolchain's own `reent.h`, which
+declares `_lseek_r` in terms of `_off_t` and so follows the widened type by
+construction. Pinning that declaration to `int` is correct for every project, with
+or without a widened `off_t`, which is why it is worth touching a file outside the
+IDF tree at all; the hook finds it by asking the compiler for its sysroot.
+
+```bash
+./tools/patch-libc-offt.py --idf-path "$IDF_PATH"    # or IDF_PATH=... with no argument
+```
+
+**Temporary by construction.** `esp_libc-lseek-abi.patch` is the IDF half of the
+change as a plain diff, ready to send to espressif/esp-idf. When it lands, delete
+both files and the `execute_process()` block in the top-level `CMakeLists.txt`. The
+toolchain's `reent.h` is a separate matter with no upstream to send it to from here
+— the patch file's closing note is addressed to whoever reads it next.
+
+Unlike the other patch scripts this one is not about a *bug*: it is about an ABI
+that was implicit while `off_t` was 32 bits, and stopped being implicit when a
+project widened the type. The better fix upstream is a Kconfig knob for 64-bit
+`off_t`, which would make the width explicit; there is none today.
+
 ## Deploying an app
 
 Build it on the host, copy it over, run it by name:

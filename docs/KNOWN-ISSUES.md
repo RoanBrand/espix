@@ -667,9 +667,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   as fact today. Until then `cp` reads every copy back and reports one that did
   not arrive, which is how this was caught.
 
-  Related, and separate: `off_t` is 32 bits here, so a device or file larger
+  Related, and separate: ~~`off_t` is 32 bits here, so a device or file larger
   than 4 GB reports a truncated size — `/dev/sda4`, 23 GiB, lists as `0`,
-  which is exactly its low 32 bits.
+  which is exactly its low 32 bits.~~ **Fixed** — `off_t` is 64 bits now, from
+  `cmake/offt64.h`, with `_lseek_r` held at its old width where the prebuilt libc
+  and the ROM call into it; [UPSTREAM.md](UPSTREAM.md) has the mechanism, the
+  declarations that surfaced, and what it cost. SFTP's *transfer* path is the one
+  thing it did not fix: see the note under **SSH**.
 
 - ~~**Unplugging a mounted stick is a use-after-free.**~~ **Fixed**, by the detach
   hook, the dead-mount sentinel and the skipped volume sync (`ffc1029` onward,
@@ -1074,6 +1078,27 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   runtime.
 
 ## SSH
+
+- **SFTP transfers cannot reach past 4 GiB, and say so.** The read and write
+  handlers seek with `fseek()`, which takes a `long`; `off_t` is 64 bits now, so
+  the client's 64-bit offset is truncated on the way in. The 64-bit sibling
+  `fseeko()` is not a way out either, because it lives in the **prebuilt** libc,
+  which was compiled when `off_t` was 32 bits — calling it with the widened type
+  would hand it half a value. And seeking the descriptor under the `FILE` is worse
+  than either: stdio's buffer would still hold the old position, so the next
+  `fread` would return the wrong bytes *without* an error.
+
+  So an offset whose high word is non-zero is refused with
+  `offset beyond 4 GiB (transfer path is 32-bit)` rather than served from a
+  truncated one. That is what used to happen, silently, and it would be a worse
+  bug now that everything else reports the real size.
+
+  The fix is to move those two handlers off `FILE *` and onto the descriptors,
+  where espix's own 64-bit `lseek`/`pread`/`pwrite` apply — `sftp.c` keeps a
+  `FILE *` per handle, so it is the handle and the streaming loop that change,
+  not the protocol. Everything that does not transfer works today over SFTP: a
+  file over 4 GiB reports its real size in `stat` and in the long listing, because
+  those read the same widened `struct stat`.
 
 - **Only a *process* reads stdin, not a builtin.** `ssh host 'testapp cat'
   < file` works: a loaded app gets a real `stdin` over the channel, and

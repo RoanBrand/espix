@@ -7,6 +7,15 @@ cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(espix)
 
+# Make off_t 64 bits, for every translation unit in the firmware. Before the
+# patch hooks below only in the sense of order in this file; what matters is that
+# it is after project(), because that is when IDF's build properties exist.
+#
+# An ABI decision rather than a preference, so it is on for every app as well --
+# see cmake/offt64.cmake, which each app's CMakeLists.txt includes too.
+set(ESPIX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/offt64.cmake")
+
 # Give joltwallet/littlefs a public custom-attribute API, which is where espix
 # keeps a file's mode. The port uses LittleFS user attributes itself (mtime) but
 # exposes neither them nor the `lfs_t *` they need, and ESP-IDF's VFS has no
@@ -67,6 +76,42 @@ execute_process(
     RESULT_VARIABLE espix_fatfs_patch_result)
 if(NOT espix_fatfs_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-fatfs.py failed; see the message above")
+endif()
+
+# Keep _lseek_r's 32-bit ABI, now that off_t is 64 bits. It is an alias for
+# esp_vfs_lseek and so follows the type, but its callers are prebuilt and do not:
+# newlib's stdio.o carries the seek logic fseek() ends up in and was compiled with
+# a 32-bit off_t, and the ROM's libc stub table declares an int offset for the same
+# reason. Without this, `fseek` seeks somewhere else -- measured, as an SFTP upload
+# failing with "seek failed" -- so the boundary keeps its width and the widening
+# happens inside it. espix's own lseek()/pread()/pwrite() stay 64-bit.
+#
+# Three files, the third outside IDF: the declaration in the toolchain's reent.h is
+# written in terms of _off_t, which is the type being widened, so it has to be
+# pinned to the width the libc was built with -- for the same reason as the
+# definition, and harmlessly for a project that never widens anything.
+#
+# See tools/patch-libc-offt.py and docs/UPSTREAM.md.
+#
+# Re-configure when any patched file changes, as for fatfs above: a reinstall or
+# a `git checkout` in the IDF tree reverts them, and reverting one without noticing
+# is a build that fails for a reason that points at espix.
+execute_process(
+    COMMAND "${CMAKE_C_COMPILER}" -print-sysroot
+    OUTPUT_VARIABLE espix_toolchain_sysroot
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${IDF_PATH}/components/vfs/vfs_calls.c"
+    "${IDF_PATH}/components/esp_libc/src/reent_syscalls.c"
+    "${espix_toolchain_sysroot}/include/reent.h")
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-libc-offt.py"
+            --idf-path "${IDF_PATH}"
+            --toolchain-root "${espix_toolchain_sysroot}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_libc_offt_patch_result)
+if(NOT espix_libc_offt_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-libc-offt.py failed; see the message above")
 endif()
 
 # Add READ CAPACITY(16), READ(16) and WRITE(16) to espressif/usb_host_msc,

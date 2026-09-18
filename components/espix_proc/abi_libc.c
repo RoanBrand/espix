@@ -75,11 +75,20 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(memmove),
     ESP_ELFSYM_EXPORT(memcmp),
 
-    /* stdlib.h -- strtol and strtod were published, strtoul was not. */
+    /* stdlib.h -- strtol and strtod were published, strtoul was not.
+     *
+     * The 64-bit pair goes with the widened off_t: an app that seeks or reads
+     * past 4 GiB has to parse the number first, and strtol cannot hold it. This
+     * table is also what pulls them out of newlib -- nothing else in the
+     * firmware converts 64-bit text, so without these two the linker has no
+     * reason to keep them and an app calling either fails to *load*, with the
+     * failure naming a symbol rather than the gap that let it happen. */
     ESP_ELFSYM_EXPORT(atoi),
     ESP_ELFSYM_EXPORT(abs),
     ESP_ELFSYM_EXPORT(qsort),
     ESP_ELFSYM_EXPORT(strtoul),
+    ESP_ELFSYM_EXPORT(strtoll),
+    ESP_ELFSYM_EXPORT(strtoull),
 
     ESP_ELFSYM_END
 };

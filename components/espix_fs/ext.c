@@ -302,12 +302,10 @@ static int ext_resolve(const char *path, ext_route_t *r)
  * public API has no fstat and no stat, and the alternative -- open, size, close
  * -- would be three operations and a handle for a question about a path.
  *
- * st_size is 32-bit because off_t is (docs/UPSTREAM.md). A file over 4 GiB is
- * therefore reported truncated: deliberately, and identically to what IDF's
- * FatFs glue does for exFAT, so the two drivers behave the same here rather than
- * each being wrong in its own way. Reading such a file still works, because
- * nothing below this line uses the reported size; what does not work is random
- * access to it. Widening off_t fixes both.
+ * st_size is the inode's own size, and off_t is 64 bits (cmake/offt64.h), so a
+ * file over 4 GiB reports its real size. It did not while off_t was a 32-bit
+ * `long`: the filesystem could express the size and the type could not, which is
+ * why `ls -l` showed the low half of it.
  */
 static int stat_locked(const char *path, struct stat *st)
 {

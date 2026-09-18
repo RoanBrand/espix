@@ -557,10 +557,15 @@ filesystem itself, because these are model questions rather than additions:
 - **`statfs`/`statvfs`** as a *generic* surface. The capability is already in
   lwext4 (`ext4_mount_point_stats()`); what espix lacks is a filesystem-agnostic
   place to ask, since `df` reaches for `espix_fs_stat_fat()` by name.
-- **The 32-bit `off_t` stops being theoretical.** ext4 volumes hold files over
-  4 GiB as a matter of course and `st_size` truncates, so this is the documented
-  ceiling arriving as a practical blocker and forcing that decision —
-  [UPSTREAM.md](UPSTREAM.md#off_t-is-32-bits-and-no-kconfig-changes-it).
+- ~~**The 32-bit `off_t` stops being theoretical.**~~ **Done.** ext4 volumes hold
+  files over 4 GiB as a matter of course and `st_size` truncated, so the documented
+  ceiling arrived as a practical blocker — and it was fixed where it belonged,
+  in the type: `cmake/offt64.h`, a force-include, so the type itself is never
+  patched, and the apps get it too because `struct stat` is an ABI between them and
+  the kernel. [UPSTREAM.md](UPSTREAM.md#off_t-is-32-bits-and-no-kconfig-changes-it)
+  has the mechanism, the `_lseek_r` declarations that turning `off_t` into an
+  explicit ABI surfaced, the cost, and the one thing it does not fix — SFTP's
+  transfer path, which is in [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 **Effort.** Done, for the read-only milestone. The shim and the fd table were the
 bulk of it, `df` was plumbing onto `ext4_mount_point_stats()` rather than new

@@ -18,6 +18,22 @@
 
 #define TAG "fs"
 
+/*
+ * off_t is 64 bits here, and that is not a default -- cmake/offt64.h makes it so,
+ * with a force-include, because the toolchain's is a 32-bit long and nothing in
+ * IDF offers to widen it (docs/UPSTREAM.md). A file larger than 4 GiB could not be
+ * reported or seeked while that was true, whatever the driver could do.
+ *
+ * Asserted rather than assumed, and here rather than in a test: a toolchain bump
+ * that renames a guard, or a build that loses the include, would revert every
+ * struct stat in the image in silence, and the symptom -- a 5 GiB file listing as
+ * its low 32 bits -- looks like a filesystem bug. This turns it into a compile
+ * error naming the file that explains it.
+ */
+_Static_assert(sizeof(off_t) == 8, "off_t is not 64 bits: see cmake/offt64.h");
+_Static_assert(sizeof(((struct stat *)0)->st_size) == 8,
+               "struct stat's size regressed to 32 bits");
+
 /* Created on first boot so a freshly-formatted filesystem still looks sane,
  * even without the baked fsroot image. /mnt is the conventional place to mount
  * a removable filesystem, and having it there is what lets `mount sda1 /mnt`

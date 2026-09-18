@@ -187,8 +187,10 @@ static int cmd_read(const char *path)
  */
 static int cmd_hexdump(const char *path, const char *off_s, const char *len_s)
 {
-    const long off = strtol(off_s, NULL, 0);
-    const long len = strtol(len_s, NULL, 0);
+    /* strtoll, not strtol: off_t is 64 bits now, and an offset past 4 GiB is
+     * exactly what this tool gets pointed at. */
+    const long long off = strtoll(off_s, NULL, 0);
+    const long long len = strtoll(len_s, NULL, 0);
 
     if (off < 0 || len <= 0 || len > 4096) {
         printf("hexdump: offset >= 0, length 1..4096\n");
@@ -217,7 +219,7 @@ static int cmd_hexdump(const char *path, const char *off_s, const char *len_s)
     }
 
     for (ssize_t i = 0; i < got; i += 16) {
-        printf("%08lx  ", (unsigned long)(off + i));
+        printf("%08llx  ", (unsigned long long)(off + i));
         for (int j = 0; j < 16; j++) {
             if (i + j < got) {
                 printf("%02x ", buf[i + j]);
@@ -236,7 +238,7 @@ static int cmd_hexdump(const char *path, const char *off_s, const char *len_s)
         printf("|\n");
     }
 
-    printf("hexdump %s %ld bytes at %ld\n", path, (long)got, off);
+    printf("hexdump %s %lld bytes at %lld\n", path, (long long)got, off);
     return 0;
 }
 

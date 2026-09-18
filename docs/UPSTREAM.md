@@ -913,13 +913,80 @@ rather than to the nearest, and the whole unit was rounded a second time, so
 3.638 TiB printed as `4T` before it printed as `3.7T`. Corrected against
 coreutils: round the tenths to nearest, truncate the unit, so `3.6T`.
 
-A patch in the shape of the other two — a build-time define on the newlib headers
-— would fix the ceiling. It is also the one patch that would touch every `struct
-stat` in the image, so it wants a deliberate decision rather than riding along
-with something else. docs/ROADMAP.md is where that decision is written down.
-Until then the four-byte-`off_t` cases above are the ones to watch for, and
-`st_size` — so `ls -l`'s own size column — is the remaining one that is still
-truncated: a file over 4 GiB still lists as its low 32 bits.
+**Fixed**, and not the way this section predicted. It said a patch in the shape of
+the other two — a build-time define on the newlib headers — which would have meant
+editing the toolchain, and so changing `off_t` for every project on the machine.
+The toolchain's own header leaves a door open instead:
+
+    sys/_types.h:45   #ifndef __machine_off_t_defined
+                      typedef long _off_t;
+                      #endif
+    sys/_types.h:102  typedef _off_t __off_t;
+    sys/types.h:155   typedef __off_t off_t;
+
+So `cmake/offt64.h` is a force-include that defines the guard and the type, and
+`cmake/offt64.cmake` applies it to every translation unit in the firmware and in
+every app — nothing is patched, so nothing drifts, and a toolchain bump that
+renames the guard fails the `_Static_assert` in `components/espix_fs/fs.c` rather
+than quietly reverting every `struct stat` in the image. C and C++ only, not
+`COMPILE_OPTIONS`: the blanket property reaches the assembler, which reads a
+force-included header as instructions.
+
+**It is an ABI, and the compiler found the one place that mattered.** `struct stat`
+changes size, so the apps must be built with it too — they are, from the same cmake
+include — and the one real boundary is `_lseek_r`. IDF defines it as an alias for
+`esp_vfs_lseek`, so it followed the type; its callers were built when `off_t` was
+32 bits and still pass 32. Two of them, and neither is source espix can rebuild:
+
+- newlib's **prebuilt** `stdio.o`, which carries the seek logic `fseek()` ends up in
+  — measured, as a 12 KB SFTP upload failing with `seek failed`, because the write
+  path seeks to the end of the file before each chunk and landed past it;
+- the **ROM's** libc stub table, which `newlib_init.c` installs it into and which
+  declares an int offset, because that is the ABI the ROM's callers were built to.
+
+The type system cannot express the truth here, so the boundary keeps the width it
+has always had and widens inside. `tools/patch-libc-offt.py` turns `_lseek_r` into a
+real 32-bit function that calls the 64-bit `esp_vfs_lseek` — in both the weak
+declaration and the definition — and pins the matching declaration in the
+toolchain's own `reent.h`, which is written in terms of `_off_t`, the very type
+being widened, and so follows it by construction. That last file is outside IDF,
+which is why the hook asks the compiler for its sysroot; pinning it to `int` is
+correct for any project, widened `off_t` or not. `lseek()`, `pread()` and `pwrite()`
+are untouched and stay 64-bit, which is where a file over 4 GiB is actually reached.
+`tools/esp_libc-lseek-abi.patch` is the IDF half ready to send, and the better fix
+upstream is a **Kconfig knob for 64-bit `off_t`**, which would make the width
+explicit rather than implied — there is no such option today.
+
+**One knock-on, in the app ABI.** `tests/app`'s hexdump parses its offset with
+`strtoll` now that an offset past 4 GiB is something it gets pointed at, so
+`components/espix_proc/abi_libc.c` had to publish it. An app resolves undefined
+symbols against espix's export tables and not against libc, and that table is also
+what pulls a function out of newlib in the first place: nothing else in the firmware
+converts 64-bit text, so the linker had no reason to keep `strtoll` and the app
+failed to *load*. The suite found it the way it was meant to — an app that would not
+load, naming the symbol — which is the argument for a hand-written table rather than
+a generated one, stated in that file's header.
+
+**What this fixes, and what it does not.** Every filesystem whose driver can
+express a large file now reports and seeks it correctly: FatFs has `FF_LBA64` and
+`vfs_fat`'s cast was the only narrowing, lwext4 seeks with `int64_t` and reports
+`uint64_t`, and `stat` of a large *device* node is right too — `/dev/sda4`, 23 GiB,
+was the measured symptom and no longer lists as `0`.
+
+What it does *not* fix is espix's own transfer path, and that one is in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) rather than here: SFTP's read and write
+handlers seek with `fseek()`, which takes a `long`, and whose 64-bit sibling
+`fseeko()` is in the *prebuilt* libc — compiled when `off_t` was 32 bits, so
+calling it with the widened type would hand it half a value. Seeking the
+descriptor instead would leave the `FILE`'s buffer holding the old position. So an
+SFTP offset past 4 GiB is refused rather than served from a truncated one, and
+fixing it properly means moving those handlers off `FILE *` and onto the
+descriptors, where espix's own 64-bit `lseek` applies.
+
+The cost, measured on the S3 with `idf.py size`, this change against the same tree
+without it: **image +3648 bytes, `.bss` +1568, and no IRAM** — the type is wider in
+`struct stat`, in a few locals and in the app ABI, and nothing about it is
+time-critical enough to be placed in `.iram1`.
 
 ## `FF_USE_LABEL` is a bare symbol, and exFAT is what compiles the line using it
 
