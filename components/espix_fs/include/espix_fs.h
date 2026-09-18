@@ -106,24 +106,28 @@ esp_err_t espix_fs_stat_fat(const char *path, uint64_t *total,
 
 #if CONFIG_ESPIX_FS_EXT4
 /*
- * Mount the ext2/3/4 filesystem on `dev` at `path`, read-only.
+ * Mount the ext2/3/4 filesystem on `dev` at `path`.
  *
  * Same contract as espix_fs_mount_fat() above -- reached through espix's VFS, the
  * block device stays the caller's, never formats -- with two differences that
  * matter to a caller.
  *
- * It is read-only, always, and every operation that would write refuses with
- * EROFS rather than failing some other way. ext4_mount() takes read_only as an
- * argument, so the mount and the driver cannot disagree about it.
+ * `read_only` is what lwext4 mounts with, and the driver refuses every mutating
+ * operation with EROFS on its own, so the mount and the refusals cannot disagree.
+ * A writable mount is the caller's decision rather than a default: an ext volume is
+ * usually somebody's own data, and writes to one go through the port's experimental
+ * extent implementation (components/esp_lwext4/doc/CAVEATS.md). A writable mount
+ * also needs the volume to have a journal -- lwext4's, started here -- and answers
+ * ESP_ERR_NOT_SUPPORTED when it does not, rather than quietly mounting read-only.
  *
- * `owner_uid` and `owner_gid` are used the way FAT's are, not the way ext's
- * inodes would have it: the mounter owns everything, because espix's own mode
- * and owner attributes have nowhere to live on an ext volume yet and a read-only
- * mount could not be chmod'd anyway. `ls -l` still shows the inodes' real uid,
- * gid and mode, which is what stat answers. The inconsistency between the two is
- * deliberate and temporary; see docs/ROADMAP.md.
+ * `owner_uid` and `owner_gid` are consulted only where a filesystem keeps no
+ * ownership of its own, which ext does: its inodes carry a uid, a gid and a mode,
+ * and those are what stat answers and what the permission check enforces. The mount
+ * options are therefore ignored here, as they are for ext4 on Linux. chmod and
+ * chown refuse until the mount is writable, because changing an inode needs one.
  */
 esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
+                             bool read_only,
                              uint16_t owner_uid, uint16_t owner_gid);
 
 /* Unmount it, and the same ESP_ERR_INVALID_STATE while something is still open

@@ -250,11 +250,13 @@ static esp_err_t attr_store(const char *abs_path, const struct stat *st,
     /*
      * Only the rootfs can be changed this way, because it is the only filesystem
      * espix has a store on. One that keeps its own metadata (ext) would take an
-     * inode write instead -- which is the writable-mount milestone, not this one
-     * -- and one that keeps none (FAT) has nowhere to put it: stamping an
-     * attribute with a path from another filesystem would file the record against
-     * the wrong volume, and "/mnt/photo.jpg" has no counterpart in the rootfs at
-     * all.
+     * inode write instead -- through ext4_mode_set() and ext4_owner_set(), which
+     * exist, but which nothing here calls yet: this needs a seam from this file to
+     * the mounted filesystem, and the mount record has no such pair of callbacks.
+     * See docs/ROADMAP.md. And one that keeps none (FAT) has nowhere to put it:
+     * stamping an attribute with a path from another filesystem would file the
+     * record against the wrong volume, and "/mnt/photo.jpg" has no counterpart in
+     * the rootfs at all.
      *
      * Refused the way a device's mode is, so a caller gets EPERM out of chmod
      * rather than a silent success against nothing.

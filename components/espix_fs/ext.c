@@ -21,13 +21,16 @@
  *     owns the ext4_file, so s_handles below is espix's own -- the genuinely new
  *     piece compared to fat.c, and why open/close are more than a passthrough.
  *
- * Read-only, first. ext4_mount() takes read_only as an argument and every
- * mutating op below refuses, so the two agree by construction rather than by
- * discipline. Writes come later, and in two stages -- volumes without extents
- * first, extents once the error path has been tested -- because the vendored
- * lwext4 core has a known error-propagation defect on the write path
- * (components/esp_lwext4/doc/CAVEATS.md), and a volume mounted here may be
- * somebody's only copy of something. docs/ROADMAP.md has the plan and the gate.
+ * Read-only unless the caller asks otherwise, and the default is deliberate: an
+ * ext volume mounted here is usually somebody's only copy of something, and the
+ * writes go through the port's experimental extent implementation
+ * (components/esp_lwext4/doc/CAVEATS.md). ext4_mount() takes read_only as an
+ * argument, every mutating op below consults the same flag, and the adapter is
+ * built read-only or writable to match -- so the three agree by construction
+ * rather than by discipline. A writable mount additionally needs a journal, which
+ * espix starts (lwext4's ext4_mount() does not) and which is also where journal
+ * recovery happens; a volume without one is refused rather than quietly mounted
+ * read-only. docs/ROADMAP.md has the caveats this rests on.
  *
  * Locking is one recursive mutex for every mount, because lwext4's own lock
  * hooks (struct ext4_lock) take no context argument -- so a per-mount lock
@@ -77,26 +80,41 @@
 #define EXT_MAX_MOUNTS 2
 
 typedef struct {
-    bool          used;
-    bool          is_dir;
-    ext4_file     file;
-    ext4_dir      dir;
-    /* Read once at open; the mount cannot change under it. See ext_fstat(). */
-    struct stat   st;
-    /* What readdir() hands back, owned by the handle so it outlives the call. */
-    struct dirent cur;
-    /* Entry count, for telldir/seekdir. lwext4 offers no position to hand out. */
-    long          offset;
-} ext_handle_t;
-
-typedef struct {
     bool               used;
+    /*
+     * What the mount was asked for. Kept per mount so the mutating ops can answer
+     * EROFS themselves: a write to a read-only mount is a wrong request rather
+     * than a filesystem that failed, and refusing it here keeps lwext4 from doing
+     * the work of finding that out.
+     */
+    bool               read_only;
     lwext4_port_bdl_t *adapter;
     char               dev[16];                   /* registered device name */
     char               mp[16];                    /* lwext4 mount point */
     char               prefix[ESPIX_FS_PREFIX_MAX];
     size_t             len;
 } ext_mount_t;
+
+typedef struct {
+    bool          used;
+    bool          is_dir;
+    /*
+     * The mount this was opened on, for its read-only flag and for the path
+     * ext4_cache_flush() wants. A mount cannot be released while a handle is open
+     * on it -- espix_fs_unmount_ext() refuses that -- so this cannot dangle.
+     */
+    ext_mount_t  *m;
+    /* The path as lwext4 spells it, for the calls that take one. */
+    char          path[192];
+    ext4_file     file;
+    ext4_dir      dir;
+    /* Read once at open. See ext_fstat(). */
+    struct stat   st;
+    /* What readdir() hands back, owned by the handle so it outlives the call. */
+    struct dirent cur;
+    /* Entry count, for telldir/seekdir. lwext4 offers no position to hand out. */
+    long          offset;
+} ext_handle_t;
 
 static ext_mount_t  s_mounts[EXT_MAX_MOUNTS];
 static ext_handle_t s_handles[EXT_MAX_HANDLES];
@@ -358,17 +376,6 @@ static int refusero(void)
 static int ext_open(void *ctx, const char *path, int flags, int mode)
 {
     (void)ctx;
-    (void)mode;
-
-    /*
-     * Refused here rather than by lwext4, which would answer the same way: the
-     * mount is read-only, so a request to write is a wrong request, not a
-     * filesystem that failed. Doing it first also keeps a handle from being
-     * taken for an open that was never going to succeed.
-     */
-    if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0) {
-        return refusero();
-    }
 
     ext_route_t r;
     const int   err = ext_resolve(path, &r);
@@ -377,18 +384,75 @@ static int ext_open(void *ctx, const char *path, int flags, int mode)
         return -1;
     }
 
+    /*
+     * A write on a read-only mount is refused here rather than by lwext4, which
+     * would answer the same way: the request is wrong, not the filesystem. Doing
+     * it first also keeps a handle from being taken for an open that was never
+     * going to succeed.
+     */
+    const bool mutates = ((flags & O_ACCMODE) != O_RDONLY) ||
+                         ((flags & (O_CREAT | O_TRUNC)) != 0);
+    if (mutates && r.m->read_only) {
+        return refusero();
+    }
+
     ext_handle_t *h = handle_alloc(false);
     if (h == NULL) {
         errno = EMFILE;
         return -1;
     }
+    h->m = r.m;
+    snprintf(h->path, sizeof(h->path), "%s", r.path);
+
+    /*
+     * The caller's flags, masked to the ones ext4_fopen2() takes -- access mode,
+     * create, exclusive, truncate, append. The same bits, so this is a
+     * translation rather than a mapping; espix's VFS passes its own flags
+     * through, and they can carry more than these.
+     */
+    const int wanted = flags & (O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND);
+
+    /*
+     * Whether the file is already there, asked *before* the open rather than after
+     * it: after the open it exists either way, and that difference is what says
+     * whether the caller's mode should be applied. Asked after, the answer is
+     * always yes and the mode is never set -- which is how the first version of
+     * this left every new file at 0666.
+     */
+    bool existed = false;
+
+    if ((flags & O_CREAT) != 0) {
+        uint32_t ignored = 0;
+
+        ext_lock();
+        existed = (ext4_mode_get(r.path, &ignored) == EOK);
+        ext_unlock();
+    }
 
     ext_lock();
-    const int r2 = ext4_fopen2(&h->file, r.path, O_RDONLY);
+    const int r2 = ext4_fopen2(&h->file, r.path, wanted);
+
+    /*
+     * A create gets the caller's mode through the usual 022 -- espix has no umask
+     * setting yet (see the mount options in docs/ROADMAP.md), and the alternative
+     * is worse than a hardcoded one: lwext4's create leaves the new inode at 0666,
+     * so every file written to a stick would be world-writable.
+     */
+    int r3 = r2;
+
+    if (r2 == EOK && (flags & O_CREAT) != 0 && !existed) {
+        r3 = ext4_mode_set(r.path, (uint32_t)(mode & 0777 & ~022));
+    }
+
     /* Read now rather than at fstat(): the inode is already to hand, and an
      * fstat that could fail is one more way for close to be reached by a path
      * that has no error to report. */
-    const int r3 = (r2 == EOK) ? stat_locked(r.path, &h->st) : r2;
+    if (r3 == EOK) {
+        r3 = stat_locked(r.path, &h->st);
+    }
+    if (r3 != EOK && r2 == EOK) {
+        ext4_fclose(&h->file);
+    }
     ext_unlock();
 
     if (r3 != EOK) {
@@ -547,32 +611,132 @@ static int ext_fstat(void *ctx, int fd, struct stat *st)
         return -1;
     }
 
-    /* From the inode the open already read, not by another lookup: it cannot
-     * have changed, because nothing can write this mount. */
-    *st = h->st;
+    /*
+     * Read the inode now rather than answering from the snapshot the open took: a
+     * writable mount means the size and the times can have changed since, and a
+     * cached answer that outlives a write is worse than the cost of one lookup.
+     */
+    ext_lock();
+    const int rc = stat_locked(h->path, st);
+    ext_unlock();
+
+    if (rc != EOK) {
+        errno = rc;
+        return -1;
+    }
+    h->st = *st;
     return 0;
 }
 
 static ssize_t ext_write(void *ctx, int fd, const void *data, size_t size)
 {
-    (void)ctx; (void)fd; (void)data; (void)size;
-    return refusero();
+    (void)ctx;
+
+    ext_handle_t *h = handle_of(fd);
+    if (h == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    if (h->is_dir) {
+        errno = EISDIR;
+        return -1;
+    }
+    if (h->m->read_only) {
+        return refusero();
+    }
+
+    size_t    wcnt = 0;
+    ext_lock();
+    const int err = ext4_fwrite(&h->file, data, size, &wcnt);
+    ext_unlock();
+
+    if (err != EOK) {
+        errno = err;
+        return -1;
+    }
+    /* A short count is an answer, not a failure: lwext4 stops where it can no
+     * longer write and reports what it did, the way write(2) does. */
+    return (ssize_t)wcnt;
 }
 
+/*
+ * Write at an offset without moving the file position -- the mirror of ext_pread,
+ * and for the same reason: lwext4 has no call for it. Save, seek, write, restore,
+ * under one lock hold so another writer cannot observe the position in between.
+ */
 static ssize_t ext_pwrite(void *ctx, int fd, const void *src, size_t size, off_t off)
 {
-    (void)ctx; (void)fd; (void)src; (void)size; (void)off;
-    return refusero();
+    (void)ctx;
+
+    ext_handle_t *h = handle_of(fd);
+    if (h == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    if (h->is_dir) {
+        errno = EISDIR;
+        return -1;
+    }
+    if (off < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (h->m->read_only) {
+        return refusero();
+    }
+
+    size_t  wcnt = 0;
+    ssize_t out  = -1;
+
+    ext_lock();
+    const uint64_t saved = ext4_ftell(&h->file);
+
+    if (ext4_fseek(&h->file, (int64_t)off, SEEK_SET) != EOK) {
+        errno = EINVAL;
+    } else {
+        const int err = ext4_fwrite(&h->file, src, size, &wcnt);
+        if (err != EOK) {
+            errno = err;
+        } else {
+            out = (ssize_t)wcnt;
+        }
+    }
+
+    /* Restored even on failure: the position is the caller's. */
+    ext4_fseek(&h->file, (int64_t)saved, SEEK_SET);
+    ext_unlock();
+
+    return out;
 }
 
-/* Nothing is buffered that could need writing out; lwext4's block cache is the
- * cache's business and flushes on its own. Asked only to check the fd. */
+/*
+ * Put what was written on the medium, on demand.
+ *
+ * lwext4 keeps a block cache, so a write is not durable when write() returns. The
+ * adapter is configured with sync_after_write, which means each write is already
+ * handed to the device rather than sitting in the adapter as well; what is left is
+ * the cache above it, which ext4_cache_flush() writes out and which the port names
+ * as the explicit durability checkpoint. A read-only mount has nothing to flush.
+ */
 static int ext_fsync(void *ctx, int fd)
 {
     (void)ctx;
 
-    if (handle_of(fd) == NULL) {
+    ext_handle_t *h = handle_of(fd);
+    if (h == NULL) {
         errno = EBADF;
+        return -1;
+    }
+    if (h->m->read_only) {
+        return 0;
+    }
+
+    ext_lock();
+    const int err = ext4_cache_flush(h->m->mp);
+    ext_unlock();
+
+    if (err != EOK) {
+        errno = err;
         return -1;
     }
     return 0;
@@ -788,50 +952,250 @@ static void ext_seekdir(void *ctx, DIR *pdir, long offset)
     ext_unlock();
 }
 
-/* The rest of the namespace, which a read-only mount refuses. EROFS and not
- * ENOSYS: the operation is understood and the mount is the reason, which is what
- * a caller needs to tell apart and what leaving the op NULL would lose. */
+/* The rest of the namespace. On a read-only mount each of these answers EROFS
+ * and not ENOSYS: the operation is understood and the mount is the reason, which
+ * is what a caller needs to tell apart and what leaving the op NULL would lose. */
 
 static int ext_mkdir(void *ctx, const char *name, mode_t mode)
 {
-    (void)ctx; (void)name; (void)mode;
-    return refusero();
+    (void)ctx;
+
+    ext_route_t r;
+    const int   err = ext_resolve(name, &r);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    if (r.m->read_only) {
+        return refusero();
+    }
+
+    ext_lock();
+    const int rc = ext4_dir_mk(r.path);
+
+    /* lwext4's mkdir takes no mode, and an inode with no permission bits is a
+     * directory nobody can enter -- the same reason ext_open() sets a mode after
+     * creating a file. */
+    const int mrc = (rc == EOK)
+                        ? ext4_mode_set(r.path, (uint32_t)(mode & 0777 & ~022))
+                        : rc;
+    ext_unlock();
+
+    if (mrc != EOK) {
+        errno = mrc;
+        return -1;
+    }
+    return 0;
 }
 
 static int ext_rmdir(void *ctx, const char *name)
 {
-    (void)ctx; (void)name;
-    return refusero();
+    (void)ctx;
+
+    ext_route_t r;
+    const int   err = ext_resolve(name, &r);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    if (r.m->read_only) {
+        return refusero();
+    }
+
+    ext_lock();
+    const int rc = ext4_dir_rm(r.path);
+    ext_unlock();
+
+    if (rc != EOK) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
 }
 
 static int ext_unlink(void *ctx, const char *path)
 {
-    (void)ctx; (void)path;
-    return refusero();
+    (void)ctx;
+
+    ext_route_t r;
+    const int   err = ext_resolve(path, &r);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    if (r.m->read_only) {
+        return refusero();
+    }
+
+    ext_lock();
+    const int rc = ext4_fremove(r.path);
+    ext_unlock();
+
+    if (rc != EOK) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
 }
 
 static int ext_rename(void *ctx, const char *src, const char *dst)
 {
-    (void)ctx; (void)src; (void)dst;
-    return refusero();
+    (void)ctx;
+
+    ext_route_t a;
+    ext_route_t b;
+
+    const int err = ext_resolve(src, &a);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    const int err2 = ext_resolve(dst, &b);
+    if (err2 != 0) {
+        errno = err2;
+        return -1;
+    }
+
+    /* lwext4 has no rename across mounts, and a caller who asked for one wants
+     * EXDEV: that is the answer POSIX names for it, and it is the one mv(1)
+     * falls back from by copying. */
+    if (a.m != b.m) {
+        errno = EXDEV;
+        return -1;
+    }
+    if (a.m->read_only) {
+        return refusero();
+    }
+
+    ext_lock();
+    const int rc = ext4_frename(a.path, b.path);
+    ext_unlock();
+
+    if (rc != EOK) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
 }
 
 static int ext_truncate(void *ctx, const char *path, off_t length)
 {
-    (void)ctx; (void)path; (void)length;
-    return refusero();
+    (void)ctx;
+
+    if (length < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ext_route_t r;
+    const int   err = ext_resolve(path, &r);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    if (r.m->read_only) {
+        return refusero();
+    }
+
+    /*
+     * Through a handle, because ext4_ftruncate() takes a file rather than a path
+     * and lwext4 offers no path-shaped equivalent. Opened read-write on purpose:
+     * a read-only handle is a request lwext4 refuses, and finding that out would
+     * cost the same open anyway.
+     */
+    ext4_file f;
+    int       rc;
+
+    ext_lock();
+    rc = ext4_fopen2(&f, r.path, O_RDWR);
+    if (rc == EOK) {
+        rc = ext4_ftruncate(&f, (uint64_t)length);
+
+        const int crc = ext4_fclose(&f);
+        if (rc == EOK) {
+            rc = crc;
+        }
+    }
+    ext_unlock();
+
+    if (rc != EOK) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
 }
 
 static int ext_ftruncate(void *ctx, int fd, off_t length)
 {
-    (void)ctx; (void)fd; (void)length;
-    return refusero();
+    (void)ctx;
+
+    ext_handle_t *h = handle_of(fd);
+    if (h == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    if (h->is_dir) {
+        errno = EISDIR;
+        return -1;
+    }
+    if (length < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (h->m->read_only) {
+        return refusero();
+    }
+
+    ext_lock();
+    const int rc = ext4_ftruncate(&h->file, (uint64_t)length);
+
+    /* The snapshot the handle keeps is now wrong; stat_locked() is the way back. */
+    const int src = (rc == EOK) ? stat_locked(h->path, &h->st) : rc;
+    ext_unlock();
+
+    if (src != EOK) {
+        errno = src;
+        return -1;
+    }
+    return 0;
 }
 
 static int ext_utime(void *ctx, const char *path, const struct utimbuf *times)
 {
-    (void)ctx; (void)path; (void)times;
-    return refusero();
+    (void)ctx;
+
+    if (times == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ext_route_t r;
+    const int   err = ext_resolve(path, &r);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    if (r.m->read_only) {
+        return refusero();
+    }
+
+    /*
+     * lwext4 sets the three times through separate calls, each taking a path.
+     * utime(2) names two of them, and the third -- the inode change time -- is not
+     * the caller's to set, so it is left to the filesystem.
+     */
+    ext_lock();
+    const int rc = ext4_atime_set(r.path, (uint32_t)times->actime);
+    const int mrc = (rc == EOK)
+                        ? ext4_mtime_set(r.path, (uint32_t)times->modtime)
+                        : rc;
+    ext_unlock();
+
+    if (mrc != EOK) {
+        errno = mrc;
+        return -1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -989,6 +1353,112 @@ static void log_why_not_mounted(esp_blockdev_handle_t dev, const char *path)
     }
 }
 
+#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0
+/*
+ * A block device that refuses the Nth write, for the one question nothing else
+ * can answer: what lwext4 does when the medium says no.
+ *
+ * It lives here rather than in a test harness because espix owns this layer -- the
+ * adapter is built around the esp_blockdev the caller passed in -- and because the
+ * port's own caveats say that a passing e2fsck is not evidence that an injected
+ * failure rolls back. The handle below is espix's own and its ctx is the device
+ * underneath, so every operation forwards except write, which counts and then
+ * refuses.
+ *
+ * Built only when CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER is set; zero, the
+ * default, compiles none of this.
+ */
+typedef struct {
+    esp_blockdev_handle_t real;
+    unsigned              writes;
+} ext_fail_bd_t;
+
+static ext_fail_bd_t          s_fail_ctx;
+static struct esp_blockdev    s_fail_dev;
+
+static esp_err_t fail_read(esp_blockdev_handle_t h, uint8_t *dst,
+                           size_t dst_size, uint64_t src, size_t len)
+{
+    ext_fail_bd_t *f = (ext_fail_bd_t *)h->ctx;
+
+    return f->real->ops->read(f->real, dst, dst_size, src, len);
+}
+
+static esp_err_t fail_write(esp_blockdev_handle_t h, const uint8_t *src,
+                            uint64_t dst_addr, size_t len)
+{
+    ext_fail_bd_t *f = (ext_fail_bd_t *)h->ctx;
+
+    f->writes++;
+
+    if (f->writes >= (unsigned)CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "fail-inject: refusing write %u (%u bytes at %llu)",
+                   f->writes, (unsigned)len, (unsigned long long)dst_addr);
+        return ESP_FAIL;
+    }
+    return f->real->ops->write(f->real, src, dst_addr, len);
+}
+
+static esp_err_t fail_erase(esp_blockdev_handle_t h, uint64_t start, size_t len)
+{
+    ext_fail_bd_t *f = (ext_fail_bd_t *)h->ctx;
+
+    return f->real->ops->erase(f->real, start, len);
+}
+
+static esp_err_t fail_sync(esp_blockdev_handle_t h)
+{
+    ext_fail_bd_t *f = (ext_fail_bd_t *)h->ctx;
+
+    return f->real->ops->sync(f->real);
+}
+
+static esp_err_t fail_ioctl(esp_blockdev_handle_t h, const uint8_t cmd, void *args)
+{
+    ext_fail_bd_t *f = (ext_fail_bd_t *)h->ctx;
+
+    return f->real->ops->ioctl(f->real, cmd, args);
+}
+
+static esp_err_t fail_release(esp_blockdev_handle_t h)
+{
+    ext_fail_bd_t *f = (ext_fail_bd_t *)h->ctx;
+
+    /* The real handle is the caller's to release, not this shim's -- espix owns
+     * it either way, and releasing it twice is worse than not releasing it. */
+    (void)f;
+    return ESP_OK;
+}
+
+static const esp_blockdev_ops_t s_fail_ops = {
+    .read    = fail_read,
+    .write   = fail_write,
+    .erase   = fail_erase,
+    .sync    = fail_sync,
+    .ioctl   = fail_ioctl,
+    .release = fail_release,
+};
+
+/* The device the adapter is given: the real one, or the shim in front of it. */
+static esp_blockdev_handle_t fail_bd(esp_blockdev_handle_t dev)
+{
+    s_fail_ctx.real   = dev;
+    s_fail_ctx.writes = 0;
+
+    s_fail_dev.ctx          = &s_fail_ctx;
+    s_fail_dev.device_flags = dev->device_flags;
+    s_fail_dev.geometry     = dev->geometry;
+    s_fail_dev.ops          = &s_fail_ops;
+
+    espix_klog(ESPIX_KLOG_WARN, TAG,
+               "fail-inject: write %d will be refused (CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER)",
+               CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER);
+
+    return &s_fail_dev;
+}
+#endif /* CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0 */
+
 /*
  * The mount itself, done here rather than by the vendored component: its
  * adapter registers a mount with IDF's VFS, which is what this file exists to
@@ -999,6 +1469,7 @@ static void log_why_not_mounted(esp_blockdev_handle_t dev, const char *path)
  * everything else has succeeded, so no path can reach a mount that is not ready.
  */
 esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
+                             bool read_only,
                              uint16_t owner_uid, uint16_t owner_gid)
 {
     if (path == NULL || dev == NULL) {
@@ -1073,8 +1544,12 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
          * correctness-first first version; the adapter's own default is the
          * same, spelled out because zero and one are not obviously the same. */
         .transfer_buffer_blocks = 1,
-        .read_only        = true,
-        .sync_after_write = false,
+        .read_only        = read_only,
+        /* Conservative, and it costs: every write is handed to the device rather
+         * than left in the adapter. The port says to disable it only when the lower
+         * device already provides the ordering lwext4's journal needs, which USB
+         * MSC does not. */
+        .sync_after_write = !read_only,
         /* An attestation about the device, not about intent: everything espix
          * mounts is a real filesystem on real media rather than raw
          * erase-before-write flash. Not asked of a read-only adapter, but true,
@@ -1082,7 +1557,13 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
         .lower_device_supports_rewrite = true,
     };
 
-    err = lwext4_port_bdl_create(dev, &cfg, &m->adapter);
+#if CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_AFTER > 0
+    const esp_blockdev_handle_t lower = fail_bd(dev);
+#else
+    const esp_blockdev_handle_t lower = dev;
+#endif
+
+    err = lwext4_port_bdl_create(lower, &cfg, &m->adapter);
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: cannot adapt the device: %s",
                    path, esp_err_to_name(err));
@@ -1097,12 +1578,14 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
         goto fail_adapter;
     }
 
-    /* read_only, which is the argument lwext4 mounts with -- so the mount and
-     * the ops that refuse writes agree by construction rather than by
-     * discipline. A volume that is not ext answers EINVAL or ENOENT here, and
-     * that is reported as "not found" rather than as a failure, because "this is
-     * not an ext filesystem" is the useful thing to say. */
-    rc = ext4_mount(m->dev, m->mp, true);
+    /* read_only as the caller asked for it, and the same flag the ops consult
+     * before touching anything -- so the mount and the refusals agree by
+     * construction rather than by discipline. A volume that is not ext answers
+     * EINVAL or ENOENT here, and that is reported as "not found" rather than as a
+     * failure, because "this is not an ext filesystem" is the useful thing to
+     * say. */
+    rc = ext4_mount(m->dev, m->mp, read_only);
+    m->read_only = read_only;
     if (rc != EOK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: cannot mount %s: %d",
                    path, m->mp, rc);
@@ -1121,6 +1604,49 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
     }
 
     /*
+     * A writable mount needs the journal running, and starting it is espix's job:
+     * lwext4's ext4_mount() does not, and every mutation is answered ENOTSUP until
+     * something does -- fail-closed, which is the right direction to find this out
+     * in. It is also where journal recovery happens, so a volume pulled mid-write
+     * is put right here rather than at the first write after it.
+     *
+     * A volume with no journal cannot be written through this port at all. That is
+     * reported as "cannot write" rather than mounted read-only behind the caller's
+     * back: they asked for writes, and the honest answer is that this volume cannot
+     * take them.
+     */
+    if (!read_only) {
+        const int jrc = ext4_journal_start(m->mp);
+
+        if (jrc != EOK) {
+            espix_klog(ESPIX_KLOG_ERROR, TAG,
+                       "%s: no journal (%d), so it cannot be written -- mount it "
+                       "read-only, or give the volume one",
+                       path, jrc);
+            err = ESP_ERR_NOT_SUPPORTED;
+            goto fail_mount;
+        }
+
+        /*
+         * Said out loud, once, because this is the one place espix's own code ends
+         * up in the path of an ordinary write: an ext4 volume's extent tree is
+         * handled by the port's experimental implementation, and its caveats are
+         * real (components/esp_lwext4/doc/CAVEATS.md). Refusing to write at all is
+         * the other half of that choice, and a mount that never asks for rw never
+         * reaches any of it.
+         */
+        struct ext4_sblock *sb = NULL;
+
+        if (ext4_get_sblock(m->mp, &sb) == EOK && sb != NULL &&
+            (sb->features_incompatible & EXT4_FINCOM_EXTENTS) != 0) {
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "%s: writable, and its extent tree is handled by the "
+                       "experimental port -- see esp_lwext4/doc/CAVEATS.md",
+                       path);
+        }
+    }
+
+    /*
      * ESPIX_FS_META_LOWER: an ext inode is the source of truth for a mode and an
      * owner, so espix adds nothing to them and the permission check reads what the
      * file says. That is what Unix does, and it is what makes `ls -l` and the
@@ -1133,6 +1659,9 @@ esp_err_t espix_fs_mount_ext(const char *path, esp_blockdev_handle_t dev,
     err = espix_vfs_add_mount(path, &s_ext_ops, m, ESPIX_FS_META_LOWER,
                               owner_uid, owner_gid);
     if (err != ESP_OK) {
+        if (!read_only) {
+            (void)ext4_journal_stop(m->mp);
+        }
         ext4_umount(m->mp);
         goto fail_dev;
     }

@@ -608,13 +608,17 @@ static bool mountable(bool foreign, const char *fstype)
  */
 static esp_err_t mount_by_type(const char *fstype, const char *path,
                                esp_blockdev_handle_t dev,
-                               uint16_t uid, uint16_t gid)
+                               uint16_t uid, uint16_t gid, bool readonly)
 {
 #if CONFIG_ESPIX_FS_EXT4
     if (espix_usb_fstype_is_ext(fstype)) {
-        return espix_fs_mount_ext(path, dev, uid, gid);
+        /* The flag goes to the driver, which mounts with it and refuses writes on
+         * its own. FatFs is not told: its read-onlyness is the partition view the
+         * caller built above, which is a stronger answer than a policy flag. */
+        return espix_fs_mount_ext(path, dev, readonly, uid, gid);
     }
 #endif
+    (void)readonly;
     return espix_fs_mount_fat(path, dev, uid, gid);
 }
 
@@ -626,22 +630,6 @@ static esp_err_t unmount_by_type(const char *fstype, const char *path)
     }
 #endif
     return espix_fs_unmount_fat(path);
-}
-
-/*
- * The one type espix mounts read-only whatever the options say: ext, whose
- * driver only knows how to mount read-only (components/espix_fs/ext.c). The
- * mount record has to be told, or the table prints a writable ext volume and
- * `mount` is the only place that would ever say so.
- */
-static bool type_always_read_only(const char *fstype)
-{
-#if CONFIG_ESPIX_FS_EXT4
-    return espix_usb_fstype_is_ext(fstype);
-#else
-    (void)fstype;
-    return false;
-#endif
 }
 
 /*
@@ -931,7 +919,8 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         dev = view;
     }
 
-    const esp_err_t err = mount_by_type(fstype, path, dev, owner_uid, owner_gid);
+    const esp_err_t err = mount_by_type(fstype, path, dev, owner_uid, owner_gid,
+                                        readonly);
     if (err != ESP_OK) {
         if (view != NULL) {
             view->ops->release(view);
@@ -965,7 +954,7 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     rec->used = true;
     rec->view = view;
     rec->uid  = (s != NULL) ? s->uid : 0;
-    rec->readonly = readonly || type_always_read_only(fstype);
+    rec->readonly = readonly;
     snprintf(rec->fstype, sizeof(rec->fstype), "%s", fstype);
     snprintf(rec->dev, sizeof(rec->dev), "%s", devname);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
@@ -1346,7 +1335,7 @@ static void fstab_mount(const espix_usb_dev_t *disk,
         dev = view;
     }
 
-    const esp_err_t err = mount_by_type(fstype, path, dev, uid, gid);
+    const esp_err_t err = mount_by_type(fstype, path, dev, uid, gid, ro);
     if (err != ESP_OK) {
         if (view != NULL) {
             view->ops->release(view);
@@ -1370,7 +1359,7 @@ static void fstab_mount(const espix_usb_dev_t *disk,
              (part != NULL) ? part->name : disk->name);
     snprintf(rec->path, sizeof(rec->path), "%s", path);
     snprintf(rec->fstype, sizeof(rec->fstype), "%s", fstype);
-    rec->readonly = ro || type_always_read_only(fstype);
+    rec->readonly = ro;
     /*
      * `uid` is the *owner*, not a mounter, because there is no session here --
      * and that is also who may unmount it, which is what an fstab `user` entry

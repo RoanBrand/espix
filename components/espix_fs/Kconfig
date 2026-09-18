@@ -99,3 +99,18 @@ menu "espix filesystem"
             would refuse it.
 
 endmenu
+
+    config ESPIX_FS_EXT4_FAIL_WRITE_AFTER
+        int "Fail the Nth block write, for testing the error path (0 = off)"
+        depends on ESPIX_FS_EXT4
+        default 0
+        help
+            Injects an I/O failure into the block device under a mounted ext
+            volume: the Nth write the adapter makes is refused, which is what a
+            medium that has stopped answering looks like.
+
+            It exists because the question it answers -- whether lwext4 aborts
+            its transaction and reports the failure, or commits over it -- cannot
+            be asked any other way, and because a passing e2fsck is not evidence
+            about it. Zero, the default, is no injection at all.
+

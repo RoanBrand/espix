@@ -1081,6 +1081,35 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   read them through `log <tag> debug`, which is what raises a tag's level at
   runtime.
 
+## Writing to an ext volume
+
+- **Writes on an ext4 volume go through the port's experimental extent
+  implementation.** An ext4 volume's files are extent-mapped, so allocating a
+  block means mutating an extent tree, and the implementation espix compiles is the
+  port's own (`components/esp_lwext4/port/lwext4_extent.c`; its
+  `doc/CAVEATS.md` is the whole story). What that means in practice, and all of it
+  is deliberate rather than discovered: a writable mount **needs a journal**, and a
+  volume without one is refused rather than quietly mounted read-only — mutating a
+  tree changes several metadata blocks at once and lwext4 will not do it without a
+  transaction; an **unwritten extent** returns `ENOTSUP` when written into, because
+  the port does not create or convert them (`fallocate()` and some copy tools make
+  them, so a file prepared that way on Linux is readable and not writable in that
+  region); and every write costs a **transaction**, so writes are slow in a way
+  that is lwext4's design rather than the port's overhead.
+
+  Read-only remains the default. A volume is somebody's own data far more often
+  than a stick is, which is why this is opt-in per mount (`mount -o rw`, or `rw` in
+  `/etc/fstab`) and why the mount says so in `dmesg` when the extent tree is in
+  play.
+
+- **`chmod` and `chown` refuse on an ext mount, even a writable one.** The
+  filesystem keeps modes and owners in its inodes and espix reads them — the
+  permission check enforces the volume's own, as it should — but there is no path
+  from `chmod` to an inode write: the mount record carries no setter for it, so
+  mode.c declines for every filesystem that is not the rootfs. `ext4_mode_set()`
+  and `ext4_owner_set()` exist and are the missing half; see
+  [ROADMAP.md](ROADMAP.md).
+
 ## SSH
 
 - **SFTP transfers cannot reach past 4 GiB, and say so.** The read and write

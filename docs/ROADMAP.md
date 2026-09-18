@@ -623,10 +623,16 @@ filesystem itself, because these are model questions rather than additions:
 **Writes, staged, and why in that order.** Two milestones, because the risky half
 is separable from the useful half — and the useful half needs nothing experimental.
 
-*Milestone 1: volumes without the extent feature* — ext2, ext3, or ext4 made with
-`-O ^extent`. Their files use indirect blocks, so the entire write path is
-**upstream lwext4**, the code with years of use behind it, and the only thing
-carried is the one-line `ext4_fwrite` fix below. In the order a mount takes them:
+*Milestone 1: the driver, which is built.* `mount -o rw` gives a writable ext
+volume: the adapter is configured writable, `ext4_mount()` is told, and **the journal
+is started by espix** (`ext4_mount()` does not do it, and every mutation answers
+`ENOTSUP` until something does — fail-closed, which is the right direction to find
+that out in). A volume with no journal is refused rather than mounted read-only
+behind the caller's back. The ops are `ext4_fwrite` (with `ext4_fseek` behind
+`pwrite`), `ext4_dir_mk`, `ext4_dir_rm`, `ext4_fremove`, `ext4_frename`,
+`ext4_ftruncate`, `ext4_atime_set`/`ext4_mtime_set`, and the create path sets a
+mode, because lwext4's create leaves a new inode at 0666 — every file written to a
+stick would otherwise be world-writable.
 
 - the BDL adapter configured writable: `read_only = false`,
   `sync_after_write = true`, and `lower_device_supports_rewrite = true` — true of
@@ -645,6 +651,13 @@ carried is the one-line `ext4_fwrite` fix below. In the order a mount takes them
   of returning 0, and `close` commits a dirty handle.
 - `ext4_journal_stop()` before `ext4_umount()` on the way out, while the dead-device
   branch keeps skipping all of it: a pulled device must not be written to.
+
+**Built, and verified as far as the hardening above allows.** On a real ext4 volume
+(a 7 GiB partition made by KDE Partition Manager, extents and all): mounted `-o rw`,
+a file copied in and read back, and the volume re-read after unmounting. Create,
+write and read are what has been exercised; `mkdir`, `unlink`, `rename`, `truncate`
+and `chmod`'s refusal compile and are not yet run on hardware, which is the next
+thing to do rather than something to assume.
 
 `utime`, `chmod` and `chown` are not blocked on lwext4: `ext4_mtime_set()`,
 `ext4_mode_set()` and `ext4_owner_set()` each take a path, so the three calls that
