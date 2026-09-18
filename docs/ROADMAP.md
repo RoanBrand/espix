@@ -652,12 +652,20 @@ stick would otherwise be world-writable.
 - `ext4_journal_stop()` before `ext4_umount()` on the way out, while the dead-device
   branch keeps skipping all of it: a pulled device must not be written to.
 
-**Built, and verified as far as the hardening above allows.** On a real ext4 volume
-(a 7 GiB partition made by KDE Partition Manager, extents and all): mounted `-o rw`,
-a file copied in and read back, and the volume re-read after unmounting. Create,
-write and read are what has been exercised; `mkdir`, `unlink`, `rename`, `truncate`
-and `chmod`'s refusal compile and are not yet run on hardware, which is the next
-thing to do rather than something to assume.
+**Built and exercised on a real volume.** A 7 GiB ext4 partition made by KDE
+Partition Manager, extents and all: `mount -o rw` gives a writable mount; a copied
+file arrives at `0644` rather than lwext4's `0666`; `mkdir` gives `0755`; `mv`,
+`rm`, `rmdir` and a rewrite through `O_TRUNC` (3 KB down to 15 bytes) all work; the
+data survives a clean unmount and a read-only remount; and `chmod` refuses with
+`EPERM`, which is [KNOWN-ISSUES.md](KNOWN-ISSUES.md) recording a gap rather than a
+wish. 10-fs, 12-vfs and 75-usb are green with the stick attached.
+
+Still unexercised, and worth saying rather than assuming: `ext_truncate()` and
+`ext_ftruncate()` -- the path- and descriptor-shaped truncates, which the shell's
+`cp` reaches through `O_TRUNC` at open rather than through either -- and the
+failure path below, where a count of five lands inside the journal's own writes
+rather than in `ext4_fwrite()`. Hitting it needs a higher count and, for the A/B
+that would prove the fix, the unfixed core built alongside.
 
 `utime`, `chmod` and `chown` are not blocked on lwext4: `ext4_mtime_set()`,
 `ext4_mode_set()` and `ext4_owner_set()` each take a path, so the three calls that

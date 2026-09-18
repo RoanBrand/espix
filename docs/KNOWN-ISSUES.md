@@ -1102,6 +1102,26 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `/etc/fstab`) and why the mount says so in `dmesg` when the extent tree is in
   play.
 
+- **Pulling a writable ext volume costs whatever is in its journal.** Unmounting
+  is not the formality here that it nearly is for FAT: a writable mount holds an
+  open journal transaction, and the volume is only put right when the next mount
+  replays it. Pull the device while it is writable and the replay happens next time
+  instead -- fine until it is not, and then not obviously fine at all.
+
+  Observed, in exactly that order. A file was created and read back on a writable
+  mount (15 bytes, mode 0644); the board was then power-cycled with the volume still
+  mounted, because the cable was swapped rather than the volume unmounted; and the
+  next mount ran with a fault injected into its block device, so the replay began
+  and failed partway. The file came back with its directory entry intact and its
+  inode reading size 0, mode 000 -- the entry had been written, the inode's own
+  fields had not, because they were still inside the transaction that never
+  finished. The volume's pre-existing files were untouched, and a mount that can
+  replay normally does.
+
+  So `umount` before pulling. This is also, accidentally, the evidence the port's
+  `doc/CAVEATS.md` asks for -- that a failed operation on this path is not safely
+  rolled back -- produced by an experiment meant to test something else.
+
 - **`chmod` and `chown` refuse on an ext mount, even a writable one.** The
   filesystem keeps modes and owners in its inodes and espix reads them — the
   permission check enforces the volume's own, as it should — but there is no path
