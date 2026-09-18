@@ -54,6 +54,35 @@ completely unrelated task, minutes later.
 And the line size is a **query**, not a constant: `esp_cache_get_line_size_by_addr()`.
 On the S3 it is configurable at 16, 32 or 64 bytes; espix builds at 32. Code
 that hard-codes 64 is accidentally safe until someone changes the option.
+### A block-device read's buffer is the caller's, and the cache is invalidated over all of it
+
+The rule above is not only about buffers you allocate *for* DMA. The USB host
+invalidates the cache over the transfer buffer when a read completes --
+`hcd_dwc.c`'s `cache_sync_data_buffer()`, which hands the caller's own buffer to
+`esp_cache_msync()`. IDF's comment there says it accepts UNALIGNED data anyway,
+"for cases where the class drivers force overwrite the allocated data buffers",
+and `msc_bdl_read()` passes its caller's `dst` straight through. So every caller
+of a block-device read hands a DMA target to the cache API whether it meant to or
+not, and *both* the head and the tail of an unaligned region can come back wrong.
+
+`MALLOC_CAP_DMA` alone is not enough: it is 8-byte alignment, and so is
+`malloc()`. FatFs's sector window came from `malloc()` and espix's own probe
+buffers were `MALLOC_CAP_DMA`, so the first and last cache lines of every read
+into them were corrupted -- silently, with the transfer reporting success, and
+only while the cache still held other bytes for those lines, which is the first
+accesses after a mount. On the 3.1TB T9 that truncated a 452-entry directory at
+240 entries and put nonsense in the last four GPT entries of a 128-entry array:
+the end of the read is where it shows. See
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host) for the whole account.
+
+Three ways out, and espix uses all three: allocate with
+`MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED`; align a stack buffer with
+`__attribute__((aligned(64)))` (over-aligning is free, and the cache line is a
+build option); and for callers whose buffer is not yours -- which includes a
+*user's* own `read()` buffer -- bounce through an aligned buffer in the block
+device layer. `tools/patch-msc.py` does the last of those.
+
+
 
 ### Using PSRAM for crypto buffers silently opts you into all of that
 

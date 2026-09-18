@@ -243,6 +243,60 @@ VFS_READDIR_NEW = "\n".join([
 ])
 MARK_VFS_READDIR = "espix: error level, and the offset"
 
+# FR_INT_ERR and FR_DISK_ERR share an errno, and they do not mean the same thing.
+#
+#   FR_DISK_ERR  a read or write failed
+#   FR_INT_ERR   a read succeeded and returned data FatFs could not parse -- on
+#                exFAT, usually the entry-set checksum at ff.c:2190
+#
+# IDF maps both to EIO (vfs_fat.c:420-421), so nothing above it can tell "a read
+# failed" from "a read lied", and a truncated directory looks exactly like a
+# small one. EBADMSG is the errno for "the data is malformed": an app, or a
+# person reading `ls`, learns that the medium answered and the answer did not
+# make sense, which is a different problem with a different next step.
+FRESULT_ERRNO_OLD = "        case FR_INT_ERR:        return EIO;"
+FRESULT_ERRNO_NEW = chr(10).join([
+    "        /* espix: EBADMSG, not EIO -- see the note in tools/patch-fatfs.py.",
+    "         * FR_DISK_ERR is the failed read; this is one that succeeded and",
+    "         * returned data FatFs could not parse. */",
+    "        case FR_INT_ERR:        return EBADMSG;",
+])
+MARK_FRESULT_ERRNO = "case FR_INT_ERR:        return EBADMSG;"
+
+# ff_memalloc(), which every FatFs allocation comes from: the filesystem object,
+# the LFN buffer, a file's own buffer, and -- the one that matters -- fs->win, the
+# sector window every read lands in (ff.c:3517).
+#
+# A read DMAs into fs->win, and the USB host invalidates the cache over the
+# transfer buffer when the transfer completes. esp_cache_msync() may only be given
+# a region whose address *and* size both meet the cache alignment -- "cache memory
+# synchronization to an unaligned address region may silently corrupt the memory"
+# -- and malloc() gives 8-byte alignment. So the first and last cache lines of
+# every sector read were corrupted, silently, with the transfer reporting success.
+# That is what truncated a 452-entry directory at 240 entries, and what put
+# nonsense in the last four GPT entries of the same drive: the corruption is
+# always at the end of a read, and only while the cache still holds other bytes
+# for those lines, which is the first accesses after a mount.
+#
+# 64 rather than the 32 this build's cache line is: the line size is a build
+# option (GOTCHAS.md) and this is a compile-time constant, and over-aligning is
+# free. MALLOC_CAP_DMA as well as MALLOC_CAP_8BIT because these buffers are DMA
+# targets, and saying so is cheaper than rediscovering it.
+FFSYSTEM_INCLUDE_OLD = "#include <stdlib.h>\t\t/* with POSIX API */"
+FFSYSTEM_INCLUDE_NEW = chr(10).join([
+    "#include <stdlib.h>\t\t/* with POSIX API */",
+    '#include "esp_heap_caps.h"',
+])
+FFSYSTEM_ALLOC_OLD = "\treturn malloc((size_t)msize);\t/* Allocate a new memory block */"
+FFSYSTEM_ALLOC_NEW = chr(10).join([
+    "\t/* espix: cache-aligned -- this is what fs->win comes from, and a read",
+    "\t * DMAs into it. See the note in tools/patch-fatfs.py. */",
+    "\treturn heap_caps_aligned_alloc(64, (size_t)msize,",
+    "\t                               MALLOC_CAP_8BIT | MALLOC_CAP_DMA);",
+])
+MARK_FFSYSTEM = "espix: cache-aligned -- this is what fs->win"
+MARK_FFSYSTEM_INCLUDE = '#include "esp_heap_caps.h"'
+
 MARK_FFCONF = "CONFIG_ESPIX_FS_EXFAT"
 
 # FF_LBA64 is a second hardcoded 0 in the same file, and exFAT does not work
@@ -718,6 +772,7 @@ def main() -> int:
     header = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat_internal.h"
     source = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat.c"
     ffconf = idf_path / "components" / "fatfs" / "src" / "ffconf.h"
+    ffsystem = idf_path / "components" / "fatfs" / "src" / "ffsystem.c"
     diskio_i = idf_path / "components" / "fatfs" / "diskio" / "diskio_impl.h"
     diskio_bdl = idf_path / "components" / "fatfs" / "diskio" / "diskio_bdl.c"
     diskio_others = {}
@@ -736,6 +791,7 @@ def main() -> int:
         header_text = header.read_text()
         source_text = source.read_text()
         ffconf_text = ffconf.read_text()
+        ffsystem_text = ffsystem.read_text()
         diskio_i_text = diskio_i.read_text()
         diskio_bdl_text = diskio_bdl.read_text()
 
@@ -750,6 +806,9 @@ def main() -> int:
         source_new = replace_once(source_new, VFS_READDIR_OLD, VFS_READDIR_NEW,
                                   MARK_VFS_READDIR,
                                   str(source.name) + " readdir diagnostic")
+        source_new = replace_once(source_new, FRESULT_ERRNO_OLD,
+                                  FRESULT_ERRNO_NEW, MARK_FRESULT_ERRNO,
+                                  str(source.name) + " FR_INT_ERR errno")
 
         ffconf_new = replace_once(ffconf_text, FFCONF_OLD, FFCONF_NEW,
                                   MARK_FFCONF, str(ffconf.name) + " exFAT")
@@ -758,6 +817,14 @@ def main() -> int:
         ffconf_new = insert_before(ffconf_new, "#define FF_USE_LABEL",
                                    FFCONF_LABEL_BLOCK, MARK_FFCONF_LABEL,
                                    str(ffconf.name) + " label symbol")
+
+        ffsystem_new = replace_once(ffsystem_text, FFSYSTEM_INCLUDE_OLD,
+                                    FFSYSTEM_INCLUDE_NEW,
+                                    MARK_FFSYSTEM_INCLUDE,
+                                    str(ffsystem.name) + " heap caps")
+        ffsystem_new = replace_once(ffsystem_new, FFSYSTEM_ALLOC_OLD,
+                                    FFSYSTEM_ALLOC_NEW, MARK_FFSYSTEM,
+                                    str(ffsystem.name) + " cache-aligned")
 
         diskio_i_new = insert_after(diskio_i_text, DISKIO_SECT_ANCHOR,
                                     DISKIO_SECT_BLOCK, MARK_DISKIO_SECT,
@@ -795,6 +862,7 @@ def main() -> int:
     to_write = [(header, header_text, header_new),
                 (source, source_text, source_new),
                 (ffconf, ffconf_text, ffconf_new),
+                (ffsystem, ffsystem_text, ffsystem_new),
                 (diskio_i, diskio_i_text, diskio_i_new),
                 (diskio_bdl, diskio_bdl_text, diskio_bdl_new)]
     to_write += [(path, diskio_others_old[path], diskio_others_new[path])

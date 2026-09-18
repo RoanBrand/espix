@@ -706,6 +706,38 @@ answering `ENOSYS` and `df` declining to report on it, both measured.
 Until one of those exists this belongs with the known ways to lose the board,
 which is where docs/KNOWN-ISSUES.md points from.
 
+### A read's transfer buffer is cache-synchronized with no alignment requirement
+
+`hcd_dwc.c`'s `cache_sync_data_buffer()` invalidates the cache over
+`urb->transfer.data_buffer` when an IN transfer completes, and its own comment
+says it "accept[s] UNALIGNED data, for cases where the class drivers force
+overwrite the allocated data buffers". The cache API's contract is that the
+region's address *and* size must both meet the alignment, and that synchronizing
+an unaligned region "may silently corrupt the memory" -- so accepting the buffer
+means accepting the corruption, and the failure is invisible: the transfer
+completes successfully and the caller reads wrong bytes from the head and tail
+cache lines.
+
+`msc_bdl_read()` is where it bites hardest, because it passes its *caller's*
+`dst` straight to `scsi_cmd_read10/16()`. Every caller is therefore required to
+pass a cache-aligned buffer, and nothing says so: FatFs's sector window comes
+from `malloc()` (`ffsystem.c`'s `ff_memalloc()`), and a filesystem reading into a
+user's buffer is the user's buffer to align. On espix this corrupted the first and
+last cache lines of every sector read, which truncated a 452-entry exFAT directory
+at 240 entries and put nonsense in the last four GPT entries of the drive --
+always at the end of a read, and only while the cache held other bytes for those
+lines, so it looked like a drive that answers the same read twice with different
+bytes.
+
+What would fix it upstream: reject an unaligned transfer buffer with an error
+rather than accepting it -- a hard failure is a far better outcome than silent
+corruption, and this would have been found in an afternoon -- or bounce inside the
+driver. espix does the second in `msc_bdl_read()` through `tools/patch-msc.py`,
+and aligns its own buffers, so this is a report rather than a blocker. The
+write path is not affected: an OUT transfer syncs once, before the transfer, with
+`ESP_CACHE_MSYNC_FLAG_UNALIGNED`.
+
+
 ## `espressif/esp_tinyusb` (TinyUSB NCM)
 
 ### `CFG_TUD_NCM_IN_NTB_N = 2` silently truncates a transfer

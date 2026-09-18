@@ -365,14 +365,63 @@ BDL_READ_ADDITION = (
     "        return ESP_ERR_INVALID_SIZE;\n"
     "    }\n"
     "\n"
-    "    msc_device_t *dev = (msc_device_t *)h->ctx;\n"
-    "    if (lba > UINT32_MAX) {\n"
-    "        return scsi_cmd_read16(dev, dst, lba, (uint32_t)num_blocks, block_size);\n"
+    "    /*\n"
+    "     * The transfer DMAs into dst, and the USB host invalidates the cache\n"
+    "     * over it when the transfer completes -- hcd_dwc.c's\n"
+    "     * cache_sync_data_buffer(), which hands the caller's own buffer to\n"
+    "     * esp_cache_msync(). That call may only be given a region whose address\n"
+    "     * *and* size both meet the cache alignment: \"cache memory\n"
+    "     * synchronization to an unaligned address region may silently corrupt\n"
+    "     * the memory\" (GOTCHAS.md quotes it in full). IDF's own comment there\n"
+    "     * says it accepts UNALIGNED data regardless, \"for cases where the class\n"
+    "     * drivers force overwrite the allocated data buffers\".\n"
+    "     *\n"
+    "     * The callers here include FatFs's sector window and a user's own\n"
+    "     * read() buffer, so this cannot be pushed onto them. An unaligned\n"
+    "     * destination therefore gets a bounce buffer. 64 rather than the 32 this\n"
+    "     * build's cache line is: the line size is a build option and this is a\n"
+    "     * compile-time constant, and over-aligning is free.\n"
+    "     *\n"
+    "     * The write path does not need this: an OUT transfer syncs once, before\n"
+    "     * the transfer, and passes ESP_CACHE_MSYNC_FLAG_UNALIGNED.\n"
+    "     */\n"
+    "    uint8_t *target = dst;\n"
+    "    if (((uintptr_t)dst % 64) != 0) {\n"
+    "        target = heap_caps_malloc(len, MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);\n"
+    "        if (target == NULL) {\n"
+    "            return ESP_ERR_NO_MEM;\n"
+    "        }\n"
     "    }\n"
-    "    return scsi_cmd_read10(dev, dst, (uint32_t)lba, (uint32_t)num_blocks, block_size);"
+    "\n"
+    "    msc_device_t *dev = (msc_device_t *)h->ctx;\n"
+    "    esp_err_t err;\n"
+    "    if (lba > UINT32_MAX) {\n"
+    "        err = scsi_cmd_read16(dev, target, lba, (uint32_t)num_blocks, block_size);\n"
+    "    } else {\n"
+    "        err = scsi_cmd_read10(dev, target, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
+    "    }\n"
+    "\n"
+    "    if (target != dst) {\n"
+    "        if (err == ESP_OK) {\n"
+    "            memcpy(dst, target, len);\n"
+    "        }\n"
+    "        heap_caps_free(target);\n"
+    "    }\n"
+    "    return err;"
 )
 
-MARK_BDL_READ = "scsi_cmd_read16(dev, dst"
+MARK_BDL_READ = "scsi_cmd_read16(dev, target"
+
+# The bounce needs two headers the component does not already pull in: the cache
+# caps for the allocation, and memcpy. string.h first, matching the file's own
+# ordering of system before project headers.
+MSC_INCLUDES_ANCHOR = "#include \"msc_scsi_bot.h\"\n"
+MSC_INCLUDES_ADDITION = (
+    "#include <string.h>\n"
+    "\n"
+    "#include \"esp_heap_caps.h\"\n"
+)
+MARK_MSC_INCLUDES = "#include \"esp_heap_caps.h\""
 
 BDL_WRITE_ANCHOR = (
     "    const uint64_t lba = dst_addr / block_size;\n"
@@ -483,6 +532,8 @@ def main():
                      MARK_INSTALL_CAPACITY, replacement=CAPACITY_ADDITION),
         insert_after(bdl, BDL_ANCHOR, "", "bdl geometry",
                      MARK_BDL_SIZE, replacement=BDL_ADDITION),
+        insert_after(bdl, MSC_INCLUDES_ANCHOR, MSC_INCLUDES_ADDITION,
+                     "bdl includes", MARK_MSC_INCLUDES),
         insert_after(bdl, BDL_READ_ANCHOR, "", "bdl read",
                      MARK_BDL_READ, replacement=BDL_READ_ADDITION),
         insert_after(bdl, BDL_WRITE_ANCHOR, "", "bdl write",

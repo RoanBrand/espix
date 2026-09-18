@@ -535,6 +535,29 @@ static void guid_format(char *dst, size_t dst_len, const uint8_t *raw)
              raw[15]);
 }
 
+/*
+ * A buffer for a read out of the block device.
+ *
+ * The USB host invalidates the cache over the transfer buffer when a read
+ * completes -- hcd_dwc.c's cache_sync_data_buffer() passes the caller's own
+ * buffer to esp_cache_msync() -- and the cache API's rule is that the region's
+ * address *and* size must both meet the alignment, because synchronizing an
+ * unaligned region "may silently corrupt the memory" (GOTCHAS.md quotes it in
+ * full). IDF's comment there says it accepts UNALIGNED data anyway, "for cases
+ * where the class drivers force overwrite the allocated data buffers".
+ *
+ * So a plain MALLOC_CAP_DMA allocation -- 8-byte alignment -- has the first and
+ * last cache lines of every read into it corrupted, while the transfer reports
+ * success. It is also transient: those lines hold bytes belonging to whatever
+ * the allocator put next, so the damage shows only while the cache still holds
+ * them, which is the first accesses after a mount. That is what made the 3.1TB
+ * T9 look like a drive that answers the same read twice with different bytes.
+ */
+static void *read_buffer(size_t len)
+{
+    return heap_caps_malloc(len, MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
+}
+
 /* The FAT boot sector's volume serial, and the MBR's own identifier. */
 #define FAT_SERIAL_OFFSET   0x43
 #define MBR_DISK_ID_OFFSET  0x1B8
@@ -736,7 +759,7 @@ static void exfat_label(usb_dev_t *d, uint64_t base, size_t unit,
                (unsigned long)heap_off, (unsigned long)root_clu,
                (unsigned long long)base, (unsigned long long)dir_at);
 
-    uint8_t *block = malloc(unit);
+    uint8_t *block = read_buffer(unit);
     if (block == NULL) {
         return;
     }
@@ -810,7 +833,11 @@ static void ext_identity(usb_dev_t *d, uint64_t base, size_t unit,
     const size_t uuid_at  = 0x68;       /* s_uuid, 16 bytes */
     const size_t label_at = 0x78;       /* s_volume_name, 16 bytes */
     const size_t need     = label_at + 16;
-    uint8_t      local[1024];
+    /* On the stack, and aligned for the same reason read_buffer() exists: this
+     * is a DMA target. 64 rather than the 32 this build's cache line is, because
+     * the line size is a build option and an attribute is fixed at compile time;
+     * over-aligning is free. */
+    uint8_t      local[1024] __attribute__((aligned(64)));
     const uint8_t *sb;
 
     if (unit <= super && super % unit == 0) {
@@ -1490,7 +1517,7 @@ static void read_partition_table(usb_dev_t *d)
         return;
     }
 
-    uint8_t *sector = heap_caps_malloc(unit, MALLOC_CAP_DMA);
+    uint8_t *sector = read_buffer(unit);
     if (sector == NULL) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no memory for sector 0",
                    d->info.name);

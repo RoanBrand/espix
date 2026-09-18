@@ -1370,17 +1370,37 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `ls` reports it ([UPSTREAM.md](UPSTREAM.md#a-failed-readdir-and-the-end-of-a-directory-are-the-same-null)),
   so a short listing is visible rather than silent.
 
-  It is below espix: nothing in espix's stack fails, and the addresses are around
-  16 MB, far under the 2TiB mark, so it is not the 64-bit widening either. It has
-  the same shape as the GPT-array quirk this drive already showed -- one LBA, two
-  answers -- and is very likely the same bug. **Mount this drive read-only**: a
-  read that goes wrong is recovered by the retry, where a write that goes wrong
-  puts the bad copy back, and FatFs caches what it reads.
+  **Resolved, and the earlier conclusion here was wrong.** This was written up as
+  "below espix" on the strength of "nothing in espix's stack fails" -- which the
+  paragraph above disproves, because the whole point is that no read *fails*. The
+  cause was espix's own, and it is the first entry under *Cache and DMA* in
+  [GOTCHAS.md](GOTCHAS.md) applied to a buffer nobody thought of as a DMA buffer:
 
-  Next, if it is ever chased: whether a retry *inside* the read path fixes it
-  (which would be a workaround worth having) and whether another USB device or
-  cable reproduces it (which would say whether it is this drive). Both are cheap;
-  neither has been done.
+  the USB host invalidates the cache over the *transfer buffer* when a read
+  completes (`hcd_dwc.c`'s `cache_sync_data_buffer()`, which passes the caller's
+  buffer to `esp_cache_msync()`), and that call may only be given a region whose
+  address *and* size meet the cache alignment. `MALLOC_CAP_DMA` alone is 8-byte
+  alignment and `malloc()` is 8, so FatFs's sector window and espix's own probe
+  buffers were unaligned, and the first and last cache lines of every read into
+  them were corrupted. It is transient because those lines hold bytes belonging to
+  whatever the allocator put next, so the damage shows only while the cache still
+  holds them -- the first accesses after a mount, which is exactly where the
+  differing addresses clustered. `msc_bdl_read()` passes its caller's `dst`
+  straight to the SCSI layer, so FatFs, lwext4, espix's probes and a *user's own
+  `read()` buffer* are all DMA targets.
+
+  Fixed in three places, one per kind of caller: `MALLOC_CAP_CACHE_ALIGNED` on
+  espix's own probe buffers, `__attribute__((aligned(64)))` on the one that lives
+  on the stack, cache-aligned `ff_memalloc()` for FatFs
+  (`tools/patch-fatfs.py`), and a bounce buffer in `msc_bdl_read()` for anyone
+  else (`tools/patch-msc.py`). The probe described above is no longer needed: the
+  test is a directory listing that was truncated.
+
+  The GPT-array quirk this drive also showed was the same bug, not a separate one,
+  and `lsblk`'s "entries not shown" was reporting it accurately -- entries 125-128
+  really did come back as nonsense, because they are the *end* of the array, and
+  the end of a read is where the corruption was. **Mounting this drive read-only**
+  remains good advice for other reasons, but it was never the fix for this.
 
 ## Building espix
 
