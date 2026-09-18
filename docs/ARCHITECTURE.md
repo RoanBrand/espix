@@ -446,6 +446,16 @@ relocatable ELF whose every libc call is an undefined symbol — `readelf
 `signal` all `UND`. That is what makes interception total, and it is worth
 knowing before assuming a `--wrap` is needed somewhere: it is not.
 
+The same fact is why every name has to be *chosen*: there is no pass-through from
+the image's own symbols, so an app can call only what a table says it can, and each
+entry needs a reason. The four answers — publish it because the call reaches espix,
+override it because the implementation lies or has to be a delivery point, leave it
+out because espix cannot answer it truthfully, or let a runtime carry it — are the
+table in
+[ROADMAP.md](ROADMAP.md#the-app-abi-what-an-app-may-name-and-who-answers-for-it).
+The statement is in `components/espix_proc/abi_libc.c`, and both halves of it are
+checked on every build by `tools/check-abi.py`.
+
 ### The ELF loader needs memory protection disabled
 
 `CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n` (and `ESP_SYSTEM_PMP_IDRAM_SPLIT=n` on

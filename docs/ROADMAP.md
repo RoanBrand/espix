@@ -182,7 +182,8 @@ layer it belongs to, or a choice and the reason.
 | `link()`, `symlink()` | unsupported | the VFS, then the lower filesystems |
 | `select()` on a file | `ENOSYS` | a select in the VFS, or option C below |
 | `dup()`, `fcntl()` | partial | the VFS |
-| `mmap()`, `statvfs()`, `utime()` | partial or absent | the VFS, and the littlefs port's Kconfig for utime |
+| `mmap()`, `statvfs()` | absent | the VFS |
+| `utime()` | **done**, and asserted from an app | espix's VFS fills `utime_p` and the lower port's Kconfig has it on; `mmap`/`statvfs` above are the rest of that row |
 | `/dev/<device>` opened as a file | `EOPNOTSUPP` (a name, not a stream) | raw block I/O as its own feature |
 | a volume whose device was pulled | `ENOSYS` from every operation | deliberate; `EIO` would need a refusing helper per op |
 | `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it |
@@ -412,6 +413,36 @@ being the shortest path.
   of that disk -- which means either a composite field (`SERIAL=X/1`) or a second
   column. One is a new spelling to learn, the other a change to the file's shape,
   and it is worth deciding deliberately rather than by precedence.
+
+### The app ABI: what an app may name, and who answers for it
+
+An app resolves its undefined symbols at load time against tables built into the
+firmware, so a name is reachable only if somebody typed it into one. There is no
+directory of the image's own symbols and no pass-through: a function the firmware
+calls a thousand times an hour is invisible to an app until it is listed. That is
+what makes these tables the sandbox on a chip with no MMU — an app shares the
+address space and can call only what it can name — and it makes every entry a
+decision with a reason rather than a convenience.
+
+| an entry is | when | what it is for |
+|---|---|---|
+| **published** | the call reaches espix — its VFS, its fd table, its signal delivery — or reaches nothing but the caller's memory | libc's `open()`, `stat()` and `read()`, which arrive in espix's VFS on the way in, so the permission check is not something they can skip |
+| **overridden** | the libc or IDF implementation lies, bypasses espix, or has to become a delivery point | `chdir`, `getcwd` and `chmod` under libc's names because IDF's are stubs; `sleep` and `usleep` so a signal can cut them short |
+| **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `isatty`, `dup`, `dup2`, `atexit`, `perror` — each with the reason written beside the table it is absent from |
+| **carried elsewhere** | the surface is large, or belongs to a runtime rather than to the kernel | an app's own libraries, or a loadable module: see the Arduino item under **Further out** |
+
+The layering matters as much as the list. elf_loader's own tables answer for 62
+standard names *before* espix's are consulted, so those need no entry — and where
+an entry does duplicate one, it resolves anyway and is dead weight that reads as a
+promise. Both cases are reported on every link now rather than left to be
+discovered, which is what caught `memset`, `strtol` and `ets_printf` sitting
+unreachable in a driver table. A table cannot shadow what is answered below it;
+that is what the resolver is for, and it runs first.
+
+`components/espix_proc/abi_libc.c` carries the full statement, the list of what is
+answered below, and why none of this can be a `_Static_assert`; `tools/check-abi.py`
+enforces it; `tests/suites/12-vfs.sh` calls the published names from an app, and
+checks that an app is refused what the shell is refused.
 
 ### ext2/3/4, via a port rather than a library
 
@@ -1056,6 +1087,59 @@ other way round.
   keeping that boundary honest. The gap between here and there is mostly a
   graphics stack and a windowing model, neither of which espix has any business
   inventing.
+
+- **Arduino sketches and ESP-IDF examples, as apps.** Both platforms have an
+  audience espix does not, and neither needs a new execution model to serve them:
+  an app is a cross-compiled ELF, so a sketch can simply *be* one. There is a
+  working experiment — `apps/neopixel`, a 112-line sketch beside a shim
+  (`main/espix_sketch.{h,cpp}` and `ctors.ld`) that supplies the `main()` espix
+  calls, runs the global constructors the loader does not, makes Arduino's
+  `delay()` a cancellation point through `--wrap`, and runs a named `teardown()`
+  when a signal or Ctrl-C stops the app. Arduino is a dependency of *that app* and
+  not of espix: the firmware stays Arduino-free, and that boundary is the thing to
+  keep.
+
+  **The cost worth attacking is that every sketch carries its own copy of the
+  runtime.** `elf_loader` ships a dynamic-module API — `dlmod_relocate`,
+  `dlmod_insert`, `dlmod_getaddr`, `dlmod_listname` — which espix uses none of, and
+  `dlmod_getaddr()` is already the last step of the symbol lookup. So a module
+  loaded once is resolvable by every app, with no kernel change at all: that is the
+  "Arduino as a runtime environment" idea, already underneath. The gate is memory
+  rather than API. The loader relocates a module into RAM exactly as it does an
+  app, so a shared runtime would pin its resident size for the system's lifetime,
+  where today it is paid per run and freed at exit. That has to be measured on a
+  real sketch before anything is built on it — neopixel's ELF is 20 KB, most of it
+  the Arduino core — and if it does not pay, the per-app copy is what already
+  works.
+
+  **How an app says it wants a runtime should not be a guess.** espix has no
+  business sniffing a binary for `setup`/`loop`, or a name for `.ino`: the same
+  mechanism has to serve IDF apps and plain POSIX ones, and a heuristic would be
+  wrong in exactly the cases that matter. Two honest mechanisms, and they compose:
+  *declare* it, the way an ELF declares its dependencies, so the loader loads the
+  runtime before the app; or *reference* it, and let the miss trigger the load —
+  the resolver hook already takes a symbol name and returns an address, so
+  on-demand is a few lines inside something espix owns. Either way
+  `Serial.println()` stops being `printf` with a comment explaining why, and
+  becomes a global object the runtime provides, writing to the app's stdout, with
+  `available()`/`read()` reading its stdin.
+
+  **The Arduino IDE is a packaging job, and a pleasant one.** A board package is
+  `boards.txt` plus `platform.txt`, and the upload step may be any tool — so
+  "flash" becomes build, `scp` the ELF into `/bin`, add a unit, restart. That is
+  the deployment espix already has, and the unit is the init and service manager
+  item under **Processes**, which is what makes a deployed sketch outlive the login
+  that started it. Two things to settle first: whether the sketch is built by the
+  Arduino toolchain or by espix's, and how a target address is entered at all,
+  the IDE's upload port being a serial idea.
+
+  **ESP-IDF examples are a smaller audience and a larger surface**, and the reason
+  is worth stating plainly: Arduino is a self-contained C++ core with one library
+  pattern, while an IDF example assumes `app_main`, FreeRTOS tasks, NVS and
+  stateful drivers. A symbol table can satisfy a stateless call and nothing else —
+  `esp_timer` and `gpio` already are — so the honest staging is POSIX-shaped IDF
+  calls first, which the ABI work above makes cheap, and the IDF application model
+  not at all until something actually needs it.
 
 These arrived with the project and predate almost everything in this file; they
 are recorded here rather than in a separate note so there is one place to look.

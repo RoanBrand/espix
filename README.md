@@ -45,6 +45,7 @@ together.
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
 | Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |
 | Programs | USB keyboard and mouse | **planned** | a console you type on, on the host port |
+| Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
 | Shell | Serial console and SSH, same commands | **yes** | 60 commands |
 | Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
 | Shell | Line editing, history, TAB completion | **yes** | |
