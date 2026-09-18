@@ -52,6 +52,20 @@ static esp_elf_symbol_table_t s_time_syms[] = {
     ESP_ELFSYM_EXPORT(difftime),
 
     /*
+     * The string forms, which are localtime() plus formatting and pure
+     * computation over that -- asctime() writes into a static buffer, so the _r
+     * pair is the one an app should prefer, as above.
+     *
+     * clock() is absent deliberately: it reads CPU time through _times_r, which
+     * IDF leaves unimplemented, so publishing it would hand an app -1 and no
+     * explanation. clock_gettime() is the one that works and is already there.
+     */
+    ESP_ELFSYM_EXPORT(ctime),
+    ESP_ELFSYM_EXPORT(ctime_r),
+    ESP_ELFSYM_EXPORT(asctime),
+    ESP_ELFSYM_EXPORT(asctime_r),
+
+    /*
      * tzset() so an app can pick up a TZ it set for itself. espix has already
      * called this at boot with the contents of /etc/timezone, so an app that
      * simply wants local time need not.

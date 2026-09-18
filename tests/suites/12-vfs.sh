@@ -124,3 +124,37 @@ else
     # and asserting that would lock in a behaviour the fix is undecided about.
     printf '%s\n' "$out" | sed -n 's/^fstat /testapp fstat /p'
 fi
+
+# 7. The published ABI, called rather than merely listed. Two ways for it to be
+#    wrong, and they look the same from outside: a symbol missing from espix's
+#    tables stops the app loading at all, while one published over an IDF stub
+#    loads and then answers ENOSYS. abi_libc.c, abi_fs.c and abi_time.c each say
+#    which names are deliberately absent and why -- isatty, dup, dup2, atexit,
+#    perror, access, lstat, clock -- and this is the half of that claim that can be
+#    run. perror is the one that was published first and removed after this ran.
+if ! dev_testapp_present; then
+    espix_skip "test app not built -- run 'make test-app'"
+else
+    app="/home/$ESPIX_USER/testapp"
+    probe="/home/$ESPIX_USER/stat-probe.txt"
+    dev_run "$app write $probe owner" >/dev/null 2>&1
+
+    # stderr as well: perror is part of what is being checked.
+    abi_out=$(dev_run "$app abi $probe 2>&1")
+
+    assert_contains "the ABI answers for the string calls an app expects" \
+                    "abi strtok=one,two,three strspn=3 pbrk=- memchr=y strnlen=4,5" \
+                    "$abi_out"
+    assert_contains "and for the stdlib it expects" \
+                    "abi strndup=trunc atol=42 atoll=99 labs=7 llabs=7" "$abi_out"
+    assert_contains "and for parsing, searching and a seeded rand" \
+                    "abi sscanf=12,34 bsearch=30 rand=repeatable" "$abi_out"
+    assert_contains "and for the time conversions, off a fixed instant" \
+                    "abi asctime=Thu Jan  1 00:00:00 1970 ctime=ok" "$abi_out"
+    assert_contains "fgetc, ungetc and fdopen share one descriptor" \
+                    "ungetc=ok fdopen=ok" "$abi_out"
+    assert_contains "utime reaches the filesystem rather than a stub" \
+                    "abi utime=ok" "$abi_out"
+    assert_contains "the errno an app reads is the one espix set, named" \
+                    "abi errno=ENOENT strerror=No such file or directory" "$abi_out"
+fi

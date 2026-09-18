@@ -23,7 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 /* errno by name where a test would otherwise be asserting on a number, and the
  * distinction between "not there" and "not allowed" is the whole point of
@@ -622,6 +624,116 @@ static int cmd_env(int argc, char **argv)
     return 2;
 }
 
+static int cmp_int(const void *a, const void *b)
+{
+    return *(const int *)a - *(const int *)b;
+}
+
+/*
+ * The published ABI, called by name.
+ *
+ * Two failures look identical from outside and are not: a symbol missing from
+ * the tables stops an app loading at all, and one published over a stub loads
+ * and then answers ENOSYS. This calls what the tables claim and prints the
+ * answers, so a suite can tell the second from the first -- which is the case
+ * the notes on isatty() and access() are about.
+ *
+ * Nothing here reads stdin. getchar() and getc() are published, but with no
+ * stdin on the channel they block, and fgetc() on a file is the same libc path;
+ * so they are exercised through the file below rather than left untested or
+ * hanging.
+ */
+static int cmd_abi(const char *path)
+{
+    char buf[] = "one:two:three";
+    char *save = NULL;
+    const char *t1 = strtok_r(buf, ":", &save);
+    const char *t2 = strtok_r(NULL, ":", &save);
+    const char *t3 = strtok_r(NULL, ":", &save);
+
+    printf("abi strtok=%s,%s,%s strspn=%u pbrk=%c memchr=%c strnlen=%u,%u\n",
+           t1 ? t1 : "(null)", t2 ? t2 : "(null)", t3 ? t3 : "(null)",
+           (unsigned)strspn("...abc", "."), *strpbrk("abc-def", "-"),
+           *(const char *)memchr("xyz", 'y', 3), (unsigned)strnlen("abcde", 4),
+           (unsigned)strnlen("abcde", 6));
+
+    char *dup = strndup("truncated", 5);
+    printf("abi strndup=%s atol=%ld atoll=%lld labs=%ld llabs=%lld\n",
+           dup ? dup : "(null)", atol("42"), atoll("99"), labs(-7), llabs(-7));
+    free(dup);
+
+    static const int keys[] = { 10, 20, 30, 40 };
+    const int want = 30;
+    const int *found = bsearch(&want, keys, 4, sizeof(keys[0]), cmp_int);
+
+    int i1 = 0, i2 = 0;
+    sscanf("12 34", "%d %d", &i1, &i2);
+
+    /* Determinism as a property rather than a value: the sequence rand()
+     * produces for a seed is the implementation's business, that it repeats for
+     * the same seed is not. */
+    srand(1);
+    const int r1 = rand();
+    srand(1);
+    const int r2 = rand();
+    printf("abi sscanf=%d,%d bsearch=%d rand=%s\n", i1, i2, found ? *found : -1,
+           (r1 == r2) ? "repeatable" : "not-repeatable");
+
+    /* A fixed instant through gmtime, so the text does not depend on the
+     * device's timezone -- the whole point of asserting on it. */
+    const time_t t0 = 0;
+    const struct tm *g = gmtime(&t0);
+    char asc[32] = "(null)";
+    if (g != NULL && asctime_r(g, asc) != NULL) {
+        asc[strcspn(asc, "\n")] = '\0';
+    }
+    char ctbuf[32];
+    printf("abi asctime=%s ctime=%s\n", asc,
+           (ctime_r(&t0, ctbuf) != NULL) ? "ok" : "null");
+
+    /*
+     * errno across the boundary, and strerror to name it. A failed fopen is how
+     * an app normally gets here, so this is the property the other commands lean
+     * on: the errno an app reads after a syscall is the one espix's layer set.
+     *
+     * Not perror(), which was published and then measured to write nothing: it
+     * sends its line to the firmware's own stderr stream rather than the channel
+     * the app is writing to. See the note in abi_libc.c.
+     */
+    FILE *missing = fopen("/nonexistent-abi-probe", "r");
+    printf("abi errno=%s strerror=%s\n", errno_name(errno), strerror(errno));
+    if (missing != NULL) {
+        fclose(missing);
+    }
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        printf("abi fs=%s\n", errno_name(errno));
+        return 1;
+    }
+    const int fd = fileno(f);
+    const int ch = fgetc(f);
+    ungetc(ch, f);
+    const int again = fgetc(f);
+
+    /* The same descriptor through the other door. One close, not two: fdopen
+     * does not take a copy of it. */
+    FILE *by_fd = fdopen(fd, "r");
+    printf("abi fs=ok fd=%d fgetc=%c ungetc=%s fdopen=%s\n", fd,
+           (ch == EOF) ? '?' : (char)ch, (again == ch) ? "ok" : "differs",
+           (by_fd != NULL) ? "ok" : "null");
+    if (by_fd != NULL) {
+        fclose(by_fd);
+    } else {
+        fclose(f);
+    }
+
+    const struct utimbuf when = { .actime = t0 + 1000, .modtime = t0 + 1000 };
+    printf("abi utime=%s\n", (utime(path, &when) == 0) ? "ok" : errno_name(errno));
+
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -645,7 +757,8 @@ static void usage(void)
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
-           "  env unset <NAME>    unsetenv, then read it back\n");
+           "  env unset <NAME>    unsetenv, then read it back\n"
+           "  abi <path>          call the published ABI by name, on a readable file\n");
 }
 
 int main(int argc, char **argv)
@@ -716,6 +829,10 @@ int main(int argc, char **argv)
         sleep((unsigned)strtol(argv[2], NULL, 10));
         printf("slept %s\n", argv[2]);
         return 0;
+    }
+
+    if (strcmp(cmd, "abi") == 0 && argc > 2) {
+        return cmd_abi(argv[2]);
     }
 
     printf("testapp: unknown command '%s'\n", cmd);

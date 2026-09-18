@@ -34,6 +34,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include "esp_elf.h"
 
@@ -209,6 +210,12 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
     ESP_ELFSYM_EXPORT(feof),
     ESP_ELFSYM_EXPORT(ferror),
     ESP_ELFSYM_EXPORT(remove),
+    /* The bridge between the two halves of POSIX I/O. Both matter here because
+     * espix's *descriptors* are the ones with the full interface -- open, read,
+     * write, lseek are 64-bit and the FILE * family is not -- so an app that
+     * needs the descriptor under a stdio stream can get at it. */
+    ESP_ELFSYM_EXPORT(fileno),
+    ESP_ELFSYM_EXPORT(fdopen),
 
     /*
      * POSIX file calls. Unwrapped: each of these enters espix's VFS, which
@@ -228,6 +235,16 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
     ESP_ELFSYM_EXPORT(truncate),
     ESP_ELFSYM_EXPORT(ftruncate),
     ESP_ELFSYM_EXPORT(fsync),
+    /*
+     * utime() is here because espix implements it: IDF routes it through
+     * esp_vfs_t's utime_p, which vfs.c fills in, so an app setting a file's
+     * times sets them on the filesystem rather than into a stub.
+     *
+     * lstat() is deliberately absent. IDF has no lstat at all, so an app would
+     * load and then be answered by libc's ENOSYS fallback, and with no symlinks
+     * in espix there is nothing for it to report differently from stat().
+     */
+    ESP_ELFSYM_EXPORT(utime),
 
     /*
      * `stat` reports the real mode, so an app sees exactly the bits `ls -l`

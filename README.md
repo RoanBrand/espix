@@ -36,11 +36,11 @@ together.
 | Storage | `mount -o ro` | **yes** | refused by FatFs at the block device, not by policy; `/etc/fstab` takes `ro` too |
 | Storage | Volumes mounted at once | **partial** | two, bounded by `CONFIG_FATFS_VOLUME_COUNT` |
 | Storage | exFAT volumes | **yes** | with `ESPIX_FS_EXFAT` (off by default, +7.0KB ROM, no static RAM); past 2TiB needs the same option, which carries `FF_LBA64` and the 64-bit diskio fix with it |
-| Storage | ext4 volumes | **planned** | named and identified by `lsblk` today; no driver in IDF |
+| Storage | ext4 volumes | **yes** | read-only, via lwext4; the core needs `tools/lwext4-csum-seed.patch` for any volume e2fsprogs 1.47+ makes |
 | Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
 | Storage | Serve the stick over the network | **planned** | NFS or SMB, the NAS case |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
-| Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` |
+| Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` — an allowlist in `components/espix_proc/abi_*.c`, so a name espix does not publish stops an app loading rather than loading and answering ENOSYS |
 | Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
 | Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |

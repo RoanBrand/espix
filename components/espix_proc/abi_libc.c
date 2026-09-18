@@ -62,7 +62,17 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(sprintf),
     ESP_ELFSYM_EXPORT(vprintf),
     ESP_ELFSYM_EXPORT(setvbuf),
+    ESP_ELFSYM_EXPORT(setbuf),
     ESP_ELFSYM_EXPORT(fflush),
+    ESP_ELFSYM_EXPORT(clearerr),
+    /* Input, and parsing what was read. `fgetc` and `getc` are the same call
+     * under two names and both are listed because both are what code says; the
+     * plain pair reads espix's stdin, which the SSH channel gives an app. */
+    ESP_ELFSYM_EXPORT(fgetc),
+    ESP_ELFSYM_EXPORT(getc),
+    ESP_ELFSYM_EXPORT(getchar),
+    ESP_ELFSYM_EXPORT(ungetc),
+    ESP_ELFSYM_EXPORT(sscanf),
 
     /* string.h -- strcmp, strlen, strchr, strrchr, strncat, memset and memcpy
      * were published and their obvious neighbours were not. */
@@ -72,8 +82,20 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(strcat),
     ESP_ELFSYM_EXPORT(strstr),
     ESP_ELFSYM_EXPORT(strdup),
+    ESP_ELFSYM_EXPORT(strnlen),
+    ESP_ELFSYM_EXPORT(strndup),
     ESP_ELFSYM_EXPORT(memmove),
     ESP_ELFSYM_EXPORT(memcmp),
+    ESP_ELFSYM_EXPORT(memchr),
+    /* Splitting and scanning. `strtok_r` is what an app should prefer, and
+     * `strtok` is what it usually calls -- the same pairing as the time table's
+     * localtime forms. `strspn`/`strpbrk` are the pair that strtok is written
+     * out of, and the two an app reaches for when it wants the split without the
+     * hidden state. */
+    ESP_ELFSYM_EXPORT(strspn),
+    ESP_ELFSYM_EXPORT(strpbrk),
+    ESP_ELFSYM_EXPORT(strtok),
+    ESP_ELFSYM_EXPORT(strtok_r),
 
     /* stdlib.h -- strtol and strtod were published, strtoul was not.
      *
@@ -84,11 +106,38 @@ static const struct esp_elfsym s_libc_syms[] = {
      * reason to keep them and an app calling either fails to *load*, with the
      * failure naming a symbol rather than the gap that let it happen. */
     ESP_ELFSYM_EXPORT(atoi),
+    ESP_ELFSYM_EXPORT(atol),
+    ESP_ELFSYM_EXPORT(atoll),
     ESP_ELFSYM_EXPORT(abs),
+    ESP_ELFSYM_EXPORT(labs),
+    ESP_ELFSYM_EXPORT(llabs),
     ESP_ELFSYM_EXPORT(qsort),
+    /* qsort's other half, and the two that need no explanation. `abort` is
+     * already reachable -- `__assert_func` is published and calls it -- so
+     * listing it adds the name, not the ability. */
+    ESP_ELFSYM_EXPORT(bsearch),
+    ESP_ELFSYM_EXPORT(rand),
+    ESP_ELFSYM_EXPORT(srand),
+    ESP_ELFSYM_EXPORT(abort),
     ESP_ELFSYM_EXPORT(strtoul),
     ESP_ELFSYM_EXPORT(strtoll),
     ESP_ELFSYM_EXPORT(strtoull),
+
+    /*
+     * Deliberately not here, and worth saying where the next person will look:
+     * isatty() and dup()/dup2() are unimplemented in IDF -- isatty is an alias
+     * for syscall_not_implemented -- and atexit() has nothing that runs a dying
+     * app's handlers. Each would load and then answer ENOSYS or silently do
+     * nothing, which is the case abi_fs.c's note on access() argues against.
+     *
+     * perror() was published here and then measured: it writes to the firmware's
+     * own stderr stream, not the channel the app is writing to, so the line never
+     * arrives. Removed on that evidence rather than kept for the name's sake --
+     * strerror() is the part an app needs, and the loader already publishes it.
+     *
+     * ctype.h needs nothing: newlib implements it as macros over `_ctype_`, and
+     * the loader publishes that table.
+     */
 
     ESP_ELFSYM_END
 };
