@@ -110,7 +110,19 @@ static int cmd_lsusb(espix_session_t *s, int argc, char **argv)
                      (st.devices - st.enumerated) == 1 ? "" : "s");
     }
 
-    espix_usb_desc_t devs[ESPIX_USB_LSUSB_MAX];
+    /*
+     * On the heap, not the stack. espix_usb_desc_t is about 280 bytes and there
+     * are eight of them, so the array alone is ~2.2 KB -- more than the session
+     * task has to spare, and it is charged whether or not a single device is
+     * attached. That is how `lsusb` on an empty port tripped the canary. Big
+     * buffers belong on the heap, the same rule cmd_fs.c follows.
+     */
+    espix_usb_desc_t *devs = calloc(ESPIX_USB_LSUSB_MAX, sizeof(*devs));
+    if (devs == NULL) {
+        espix_eprintf(s, "lsusb: out of memory\n");
+        return 1;
+    }
+
     const size_t n = espix_usb_host_devices(devs, ESPIX_USB_LSUSB_MAX);
 
     for (size_t i = 0; i < n; i++) {
@@ -144,6 +156,7 @@ static int cmd_lsusb(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "(nothing on the port)\n");
     }
 
+    free(devs);
     return 0;
 }
 
