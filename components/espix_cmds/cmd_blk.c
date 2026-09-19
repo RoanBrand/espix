@@ -331,7 +331,18 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
         }
     }
 
-    espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
+    /*
+     * On the heap, not the stack: the table is four espix_usb_dev_t, about
+     * 3.5 KB, and a command task is sized for its frames rather than for a
+     * buffer whose size is known. lsblk already does this; the same array on the
+     * stack is most of what kept this command's task at 10240.
+     */
+    espix_usb_dev_t *devs = heap_caps_malloc(sizeof(espix_usb_dev_t) * ESPIX_USB_MAX_DEVS,
+                                             MALLOC_CAP_8BIT);
+    if (devs == NULL) {
+        espix_eprintf(s, "blkid: no memory for the device table\n");
+        return 1;
+    }
     const size_t n = attached(s, "blkid", devs);
     int status = 0;
 
@@ -438,6 +449,7 @@ static int cmd_blkid(espix_session_t *s, int argc, char **argv)
         }
     }
 
+    free(devs);
     return status;
 }
 
@@ -716,6 +728,10 @@ static bool parse_mount_opts(espix_session_t *s, const char *arg,
  * say what a volume *is* -- an attempt to mount one says "not supported" rather
  * than looking like a broken driver, which is the same reason the column exists.
  */
+static int mount_over(espix_session_t *s, int argc, char **argv,
+                      uint16_t owner_uid, uint16_t owner_gid, bool readonly,
+                      espix_usb_dev_t *devs);
+
 static int cmd_mount(espix_session_t *s, int argc, char **argv)
 {
     if (!espix_usb_host_built()) {
@@ -796,6 +812,28 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
+    /*
+     * The device table goes on the heap, as lsblk's does -- four espix_usb_dev_t
+     * is about 3.5 KB -- and the body that uses it moves into mount_over() so
+     * there is exactly one place to free it, rather than a free before each of
+     * this command's many error returns.
+     */
+    espix_usb_dev_t *devs = heap_caps_malloc(sizeof(espix_usb_dev_t) * ESPIX_USB_MAX_DEVS,
+                                             MALLOC_CAP_8BIT);
+    if (devs == NULL) {
+        espix_eprintf(s, "mount: no memory for the device table\n");
+        return 1;
+    }
+
+    const int rc = mount_over(s, argc, argv, owner_uid, owner_gid, readonly, devs);
+    free(devs);
+    return rc;
+}
+
+static int mount_over(espix_session_t *s, int argc, char **argv,
+                      uint16_t owner_uid, uint16_t owner_gid, bool readonly,
+                      espix_usb_dev_t *devs)
+{
     char devbuf[ESPIX_USB_NAME_MAX];
     const char *devname = dev_operand(argv[1], devbuf, sizeof(devbuf));
 
@@ -807,7 +845,6 @@ static int cmd_mount(espix_session_t *s, int argc, char **argv)
     }
     const char *path = abs;
 
-    espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
     const size_t n = attached(s, "mount", devs);
 
     const espix_usb_dev_t  *disk = NULL;
