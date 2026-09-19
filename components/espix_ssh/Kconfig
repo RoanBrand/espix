@@ -63,11 +63,17 @@ menu "espix SSH"
         int "Connection task stack (bytes)"
         depends on ESPIX_SSH_ENABLED
         range 4096 16384
-        default 6144
+        default 8192
         help
             The protocol logic is shallow, but the handshake is not: x25519,
             ECDSA and PBKDF2 run here, and a live session measured 4056 bytes
-            used -- handshake, prompt and a command together.
+            used for handshake, prompt and a simple command together.
+
+            That is not the whole budget, because commands with no declared stack
+            run here too, and one with real work overruns it: `lsusb` tripped
+            the canary at 6368 bytes used on the 6144-byte stack this defaulted
+            to. 8192 leaves it room. A command that needs more than this still
+            declares its own size; see below.
 
             Commands do not run here unless they say they can. `espix_cmd_t` has
             a `stack` field, and a command that declares a size runs on a task of
@@ -89,9 +95,9 @@ menu "espix SSH"
             command actually used.
 
             Raising this raises the per-connection internal cost in the note
-            above by the same amount: 10344 becomes 12392, so eight open
-            connections want about 16K more than the figures there were measured
-            with.
+            above by the same amount, so eight open connections want about eight
+            times the increase more than the figures there were measured with.
+            tests/suites/55-sessions.sh re-measures it on the device.
 
     config ESPIX_SSH_SFTP_IN_PSRAM
         bool "Allocate SFTP transfer buffers from PSRAM when available"
