@@ -1205,6 +1205,64 @@ static void part_name(char *dst, size_t dst_len, const char *disk, uint32_t entr
     dst[n] = '\0';
 }
 
+
+/*
+ * The first sixteen bytes of a directory entry, for a warning that otherwise
+ * cannot tell its readers apart. An entry of zeros means the buffer was never
+ * written; one holding another entry's GUIDs means it holds stale content from
+ * an earlier read; anything else means the transfer itself went wrong. The T9
+ * was guessed at without this, and guessed wrong twice.
+ */
+static const char *entry_hex(const uint8_t *e, char *out, size_t len)
+{
+    size_t n = 0;
+
+    for (size_t b = 0; b < 16 && n + 3 < len; b++) {
+        n += (size_t)snprintf(out + n, len - n, "%02x", e[b]);
+    }
+    return out;
+}
+
+/*
+ * Reads a sector twice and reports when the two disagree.
+ *
+ * The GPT array is the one place where both answers are already known: the
+ * checksum sweep over these same sectors passes, so each of those reads holds
+ * the real content, and the walk's own read of the same sector produced random
+ * type GUIDs. Comparing them side by side turns that into either a reproducible
+ * fault or a fault that happens between a read and its use -- and either is
+ * worth more than the next guess.
+ */
+static bool gpt_read_sector(usb_dev_t *d, uint8_t *buf, size_t unit, uint64_t lba)
+{
+    if (d->bdl->ops->read(d->bdl, buf, unit, lba * unit, unit) != ESP_OK) {
+        return false;
+    }
+
+    uint8_t *again = read_buffer(unit);
+    if (again == NULL) {
+        return true;        /* no room to check; the read itself succeeded */
+    }
+
+    if (d->bdl->ops->read(d->bdl, again, unit, lba * unit, unit) == ESP_OK &&
+        memcmp(buf, again, unit) != 0) {
+        size_t first = 0;
+        while (first < unit && buf[first] == again[first]) {
+            first++;
+        }
+        char a[40];
+        char b[40];
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "%s: LBA %llu read twice differs first at byte %u: %s vs %s",
+                   d->info.name, (unsigned long long)lba, (unsigned)first,
+                   entry_hex(buf + first, a, sizeof(a)),
+                   entry_hex(again + first, b, sizeof(b)));
+    }
+
+    free(again);
+    return true;
+}
+
 /*
  * Validates the entry array against the header's own checksum (GPTH_PtBcc),
  * a whole-array CRC32 the UEFI specification defines for exactly this
@@ -1258,8 +1316,7 @@ static bool gpt_entries_crc_ok(usb_dev_t *d, uint8_t *buf, size_t unit,
     uint64_t done = 0;
 
     for (uint64_t s = 0; s < sectors; s++) {
-        if (d->bdl->ops->read(d->bdl, buf, unit, (table_lba + s) * unit,
-                              unit) != ESP_OK) {
+        if (!gpt_read_sector(d, buf, unit, table_lba + s)) {
             return false;
         }
         const uint64_t remaining = total_bytes - done;
@@ -1270,6 +1327,8 @@ static bool gpt_entries_crc_ok(usb_dev_t *d, uint8_t *buf, size_t unit,
 
     return crc == stored_crc;
 }
+
+
 
 /*
  * A GPT disk, whose partition table is at LBA 1 rather than in sector 0.
@@ -1358,7 +1417,7 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
         const size_t   at     = (size_t)(offset % unit);
 
         if (lba != loaded) {
-            if (d->bdl->ops->read(d->bdl, buf, unit, lba * unit, unit) != ESP_OK) {
+            if (!gpt_read_sector(d, buf, unit, lba)) {
                 espix_klog(ESPIX_KLOG_WARN, TAG,
                            "%s: cannot read the GPT entry array", d->info.name);
                 d->info.table_skipped = true;
@@ -1390,9 +1449,11 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
         /* LBAs read off somebody's disk, checked before they are multiplied, so
          * a nonsense pair cannot wrap into a plausible-looking row. */
         if (last < first) {
+            char hex[40];
             espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "%s: GPT entry %u ends before it starts",
-                       d->info.name, (unsigned)(i + 1));
+                       "%s: GPT entry %u ends before it starts (type %s)",
+                       d->info.name, (unsigned)(i + 1),
+                       entry_hex(entry, hex, sizeof(hex)));
             d->info.table_skipped = true;
             continue;
         }
@@ -1402,9 +1463,11 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
 
         if (d->info.size > 0 &&
             (start >= d->info.size || size > d->info.size - start)) {
+            char hex[40];
             espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "%s: GPT entry %u is not inside the device",
-                       d->info.name, (unsigned)(i + 1));
+                       "%s: GPT entry %u is not inside the device (type %s)",
+                       d->info.name, (unsigned)(i + 1),
+                       entry_hex(entry, hex, sizeof(hex)));
             d->info.table_skipped = true;
             continue;
         }
