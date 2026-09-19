@@ -706,36 +706,39 @@ answering `ENOSYS` and `df` declining to report on it, both measured.
 Until one of those exists this belongs with the known ways to lose the board,
 which is where docs/KNOWN-ISSUES.md points from.
 
-### A read's transfer buffer is cache-synchronized with no alignment requirement
+### `cache_sync_data_buffer()` accepts an unaligned region, but the buffer is the class driver's own
 
-`hcd_dwc.c`'s `cache_sync_data_buffer()` invalidates the cache over
-`urb->transfer.data_buffer` when an IN transfer completes, and its own comment
-says it "accept[s] UNALIGNED data, for cases where the class drivers force
-overwrite the allocated data buffers". The cache API's contract is that the
-region's address *and* size must both meet the alignment, and that synchronizing
-an unaligned region "may silently corrupt the memory" -- so accepting the buffer
-means accepting the corruption, and the failure is invisible: the transfer
-completes successfully and the caller reads wrong bytes from the head and tail
-cache lines.
+This was reported here as a live corruption on the ESP32-S3. **It was wrong, and
+the correction matters more than the report did.**
 
-`msc_bdl_read()` is where it bites hardest, because it passes its *caller's*
-`dst` straight to `scsi_cmd_read10/16()`. Every caller is therefore required to
-pass a cache-aligned buffer, and nothing says so: FatFs's sector window comes
-from `malloc()` (`ffsystem.c`'s `ff_memalloc()`), and a filesystem reading into a
-user's buffer is the user's buffer to align. On espix this corrupted the first and
-last cache lines of every sector read, which truncated a 452-entry exFAT directory
-at 240 entries and put nonsense in the last four GPT entries of the drive --
-always at the end of a read, and only while the cache held other bytes for those
-lines, so it looked like a drive that answers the same read twice with different
-bytes.
+The sync layer **does not exist on the S3**. `hcd_dwc.c` gates
+`cache_sync_data_buffer()` — and the descriptor- and frame-list syncs beside it —
+on `SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE`, which is defined for the ESP32-P4 and
+**not** the S3, so the `CACHE_SYNC_*` macros are stubbed out and no
+`esp_cache_msync()` executes. Even if they were compiled, `esp_cache_msync()` on
+an internal S3 address returns `ESP_ERR_NOT_SUPPORTED`; only the PSRAM window is
+cached.
 
-What would fix it upstream: reject an unaligned transfer buffer with an error
-rather than accepting it -- a hard failure is a far better outcome than silent
-corruption, and this would have been found in an afternoon -- or bounce inside the
-driver. espix does the second in `msc_bdl_read()` through `tools/patch-msc.py`,
-and aligns its own buffers, so this is a report rather than a blocker. The
-write path is not affected: an OUT transfer syncs once, before the transfer, with
-`ESP_CACHE_MSYNC_FLAG_UNALIGNED`.
+And the region is **not the caller's buffer, on any target**. The function syncs
+`urb->transfer.data_buffer` — the URB the class driver allocated through
+`usb_host_transfer_alloc()`, which is `MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED`
+and size-rounded. `msc_bulk_transfer()` DMAs into that URB and `memcpy()`s to the
+caller, so `msc_bdl_read()`'s `dst` is a copy destination and never a DMA target.
+The alignment of FatFs's sector window, an lwext4 buffer or a user's own
+`read()` buffer is therefore immaterial.
+
+What remains worth reporting upstream, and is **P4-only** (nothing fires on the
+S3 because the code is not compiled): on the OUT enqueue path
+`cache_sync_data_buffer()` passes `ESP_CACHE_MSYNC_FLAG_UNALIGNED` to a
+writeback whose buffer is in fact aligned. That needlessly bypasses the alignment
+check, and an unaligned writeback is exactly what the memory-synchronization
+documentation warns "may silently corrupt the memory". The M2C invalidate on
+dequeue does not pass `UNALIGNED` and so does require alignment — the class
+driver's buffer satisfies it, so it holds today. Either way the fix is to keep
+the call sites aligned, and to reject an unaligned sync rather than perform one.
+
+The read corruption this was blamed for is the T9's own; see
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host).
 
 
 ## `espressif/esp_tinyusb` (TinyUSB NCM)

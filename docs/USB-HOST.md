@@ -611,59 +611,56 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   label" case the ISO-in-a-0x00-entry one already was, just with Microsoft
   choosing the lookalike deliberately rather than an installer doing it by
   accident.
-- **A real disk's GPT array reads differently on two separate reads of the
-  same LBA, moments apart.** Not a parser bug: the entry-array checksum
+- **A real disk's GPT array can read wrong on one pass and right on another.**
+  This was the first place the T9's fault showed. The entry-array checksum
   (`GPTH_PtBcc`, which FatFs's own formatter writes but its reader never
-  checks — see `gpt_entries_crc_ok()`) passes clean when the array is read in
-  one uninterrupted sweep, and a byte-for-byte independent read of the same
-  sector off the same physical disk from a Mac (`/dev/rdisk4`, read-only)
-  confirms it: all zero, exactly where a valid, unused GPT entry should be.
-  But the *entry walk*, which interleaves array-sector reads with per-partition
-  boot-sector probes and reads that same sector again a few calls later,
-  gets something else back from it on every run tried so far — four
-  warnings (`GPT entry 125 is not inside the device`, etc.) that a
-  clean-sweep read of the identical bytes never reproduces. All three real
-  partitions are still listed correctly regardless, so this is cosmetic
-  today, and it is real: something in the alternating small-read pattern
-  this walk uses gets a stale or wrong answer from the same offset a
-  dedicated sweep does not. The fix that would remove it without more
-  investigation: merge the checksum sweep and the entry walk into one pass —
-  stash the handful of used entries (bounded by `ESPIX_USB_MAX_PARTS`, so a
-  small fixed buffer) as the single sweep finds them, and build partition
-  rows from that stash afterward rather than reading the array a second time
-  under a different, apparently unsafe, access pattern. Not done this
-  session because it is real work for a symptom that costs nothing today —
-  `SKIPPED="1"` already says the listing may be incomplete, honestly.
-- **A repeated read of the same address on the T9 returns different bytes, and
-  this is the drive the GPT quirk above was found on.** Measured with a probe
-  that read the first 200 single-sector accesses after a mount a second time and
-  compared them: six disagreed on a failing mount. The probe has since been
-  removed, having answered its question; the measurement stands, but nothing in
-  the tree reproduces it now. No read failed -- the block
-  device answered success every time -- so `diskio_bdl.c`'s failed-read log
-  stayed empty and this spent a while looking like a filesystem fault.
+  checks — see `gpt_entries_crc_ok()`) passed clean when the array was read in
+  one sweep, while the *entry walk*, which interleaves array-sector reads with
+  per-partition boot-sector probes, got nonsense back from the same sectors.
 
-  FatFs is what notices, through exFAT's entry-set checksum, and answers
-  `FR_INT_ERR` (`fresult=2`) -- which IDF maps to the same `EIO` as a genuine
-  `FR_DISK_ERR`, so the surface cannot tell "a read failed" from "a read lied".
-  `tools/patch-fatfs.py` logs the FRESULT at error level now, which is what
-  separated them, and the FRESULT is worth knowing about because those two need
-  different work.
+  It is understood and handled now. `gpt_read_sector()` reads a GPT sector
+  twice and, when the two disagree, re-reads until two consecutive reads agree,
+  and uses the agreed bytes — so a bad first read no longer rejects the whole
+  table. The header's own CRC32 is checked, and the entry LBAs are bounded
+  against the device *before* they are multiplied, so a wrapped pair cannot pass
+  as a phantom partition at 0. `lsblk` no longer reports `entries not shown` on
+  this drive. Everything below is the same fault, seen through exFAT instead of
+  GPT.
+- **The T9 returns wrong bytes while reporting success — and it is the
+  device.** Measured and characterised: roughly one block read in sixteen comes
+  back wrong, the wrong value is stable for a given LBA across boots, and an
+  *immediate* reread of the same sector usually returns the correct bytes. A
+  later read of the same sector can differ again, which is why a directory
+  listing stops at a different entry each time (8, 13 and 38 of a ~451-entry
+  directory on three attempts).
 
-  It clusters at the **start of the partition**, in the first accesses after a
-  mount -- the differing addresses sat in the partition's first ~22 KB, and the
-  same probe caught one read at 426 GiB, which a directory listing has no reason
-  to make and which is most likely FatFs following a cluster number it read
-  wrongly. So a cold read comes back wrong, FatFs caches it and builds on it, and
-  the damage surfaces later as a short listing.
+  It is **not** the ESP32-S3 cache, which is what it was blamed on for a while.
+  The host's cache-sync layer is not even compiled on this chip
+  (`SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE` is ESP32-P4 only), the BOT class driver
+  DMAs into its own internal URB and `memcpy()`s to the caller, and a cache
+  returns the *same* wrong bytes every time, not one read in sixteen. The
+  alignment work that once ran through this tree changed nothing, which is what
+  finally said so. See [GOTCHAS.md](GOTCHAS.md), which had it backwards.
 
-  Nothing is lost: every missing entry reappeared on a re-list. `ls` reports the
-  failure rather than printing a short listing silently, which is the difference
-  between a listing that was cut off and apparent data loss. **Mount this drive
-  read-only** -- a read that goes wrong is recovered by the retry, where a write
-  that goes wrong puts the bad copy back, and FatFs caches what it reads.
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md) has the standing entry and the measured
-  rates.
+  What espix does about it: the GPT array is guarded by its checksum and by
+  `gpt_read_sector()`'s verify-and-repair, so `lsblk` is reliable on this drive.
+  The exFAT directory scan is **not fixed and is parked**. FatFs catches the bad
+  data through exFAT's entry-set checksum and answers `FR_INT_ERR` — now mapped
+  to `EBADMSG` rather than the `EIO` a genuine read failure gets, so the surface
+  can tell "a read lied" from "a read failed", and `tools/patch-fatfs.py` logs
+  the FRESULT at error level. But the block-device verify cannot repair it: an
+  immediate reread returns the same wrong bytes, and a per-sector reread was
+  tried and agreed too. The candidate fix is a **checksum-aware retry at the
+  directory layer** — on `FR_INT_ERR`, close and re-open the directory and scan
+  again — which is free in the working case because it only runs once a read has
+  already failed. [KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host) has the standing
+  entry and the measured rates.
+
+  A low-power SanDisk Cruzer with the same directory shapes lists **completely**
+  on FAT and exFAT from this same board and stack, which is what points at the
+  drive (or its power) rather than espix's exFAT code. The T9 is a bus-powered
+  SSD behind a hub; a direct connection (no hub) has not been tried, and would
+  separate power from the drive's own firmware.
 
 - **A USB keyboard (HID).** Deferred until there is a display, which is the
   honest position: with no screen, a keyboard's only use would be a test that

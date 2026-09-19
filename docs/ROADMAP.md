@@ -555,9 +555,10 @@ otherwise have been a surprise:
   between abort and commit. Passing `e2fsck` is therefore not evidence that an
   injected I/O failure rolls back safely — and that matters here more than
   anywhere, because the T9 this tree was developed against
-  ([KNOWN-ISSUES.md](KNOWN-ISSUES.md)) returns wrong bytes on a repeated read.
-  **A library with an unverified error path writing to that drive is the
-  combination to avoid**, which is why the first milestone is read-only.
+  ([KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host)) returns wrong bytes
+  intermittently while reporting success. **A library with an unverified error
+  path writing to that drive is the combination to avoid**, which is why the
+  first milestone is read-only.
 
 **What it took:** `components/espix_fs/ext.c`, a shim over `ext4_*` in the shape
 of `fat.c`; the mount wiring (`mountable()`, `mount_by_type()`, the mount record,

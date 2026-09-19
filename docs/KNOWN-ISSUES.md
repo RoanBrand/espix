@@ -707,7 +707,18 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   directory whose listing fails part-way prints a short listing rather than an
   error, and a truncated directory looks exactly like a small one.
 
-  FAT does not have this: FatFs's `f_readdir` returns a `FRESULT`. The fix
+  **Measured, 2026-09-19.** On a SanDisk Cruzer whose ext4 volume `e2fsck`s clean
+  and whose `n250` directory a Linux host lists as **300** entries (E001–E300),
+  espix lists **226**, consistently, with the missing E-numbers scattered through
+  the range (001, 007, 010, … 299, 300) — the directory's on-disk order is not
+  name order, so an early stop drops an arbitrary subset rather than a tail. The
+  FAT32 and exFAT volumes of the same stick, with the same directory shapes, list
+  all 300. So this is not the drive and not the USB stack; it is lwext4's
+  directory traversal. Cross-referencing a listing against a known-good host is
+  the only way to see it today.
+
+  FAT does not have this: FatFs's `f_readdir` returns a `FRESULT`, and the FatFs
+  readdir diagnostic reports a truncated listing rather than hiding it. The fix
   belongs in the vendored lwext4 rather than in `ext.c` — that function needs an
   out-parameter or an `errno` — and a patch there is one to re-verify against
   `e2fsck`-checked images, so it is not done yet. `ext.c` records the same thing
@@ -1392,26 +1403,43 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   have changed anything, which is exactly what the identical counts before and
   after said.
 
-  So the signature the docs had measured was the answer all along: a read that is
-  repeated returns **different bytes**, and the wrong value is stable for a given
-  LBA. A cache returns the *same* wrong bytes; this is a device that lies. The GPT
-  array makes it precise: reading one sector five times in a row, one read in
-  roughly sixteen is wrong while the other four agree, and the bad one is a fixed
-  value per LBA across reboots. The device is a Samsung PSSD T9 behind a hub.
+  So the signature the docs had measured was the answer all along: the read is
+  unreliable, and a cache returns the *same* wrong bytes every time where this
+  does not. The GPT array makes it precise: reading one sector five times in a
+  row, one read in roughly sixteen is wrong while the other four agree, and the
+  bad value is fixed per LBA across reboots. An *immediate* reread of a bad read
+  usually comes back correct -- which lets the GPT allow "two consecutive reads
+  agree" repair it -- but not always, and an exFAT directory scan whose reads
+  happen to agree on the bad bytes for the moment is not repaired by it. The
+  device is a Samsung PSSD T9 behind a hub. A low-power SanDisk Cruzer lists the
+  same directory shapes **completely** on FAT and exFAT from this same board and
+  stack, which is what points at the T9 (or its power) rather than espix's exFAT
+  code; the T9 direct on the OTG port (no hub) has not been tried.
 
-  The host-side defense is therefore not alignment but **provenance and retry**:
+  Fixed, and verified on the drive:
 
   - `gpt_read_sector()` reads a GPT sector, reads it again, and on disagreement
     re-reads until two consecutive reads agree, replacing the buffer with the
-    agreed bytes; a run that never agrees fails the read. A bad first read no
-    longer rejects the whole table (`components/espix_usb/host.c`).
-  - The optional block-device probe (`CONFIG_ESPIX_USB_VERIFY_READS`) does the
-    same for every read it covers, and **fails** a read that never agrees rather
-    than majority-voting: a device that returns the same wrong bytes every time
-    wins a majority vote and the lie is returned as success.
+    agreed bytes; a run that never agrees fails the read. With the header CRC and
+    the bounded entry LBAs beside it, `lsblk` no longer reports `entries not
+    shown` on the T9.
   - A short transfer no longer skips the CSW. `bot_execute_command()` consumes it
     and the block layer re-issues the whole SCSI command, so one short read does
     not desync every later command (`tools/patch-msc.py`).
+  - The optional block-device probe (`CONFIG_ESPIX_USB_VERIFY_READS`) now
+    **fails** a read that never agrees rather than majority-voting it; a majority
+    is exactly what a device returning the same wrong bytes every time would win.
+
+  Parked -- with the leading idea for a future session. The exFAT directory scan:
+  on the T9 a ~451-entry directory stops at a different entry each time (measured
+  at 8, 13 and 38), because the wrong bytes vary over time while the block-device
+  verify's reread lands inside the same brief wrong window. The fix to try is a
+  **checksum-aware retry at the directory layer**: on `FR_INT_ERR` (exFAT's
+  entry-set checksum, surfaced as `EBADMSG`), close and re-open the directory and
+  scan again. It runs only after a read has already failed, so a healthy drive
+  pays nothing. The plumbing is the work -- FatFs caches the bad sector in its
+  window, so the retry has to restart the scan rather than re-call `readdir()` at
+  the same position, and it wants to sit where the FRESULT is still visible.
 
   `lsblk`'s "entries not shown" was reporting this accurately: entries that are
   really unused came back as nonsense and the entry-array checksum refused the
