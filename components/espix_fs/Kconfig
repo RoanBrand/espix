@@ -46,7 +46,7 @@ menu "espix filesystem"
             by default.
 
     config ESPIX_FS_EXT4
-        bool "ext2/3/4 support (read-only)"
+        bool "ext2/3/4 support (read-only by default)"
         default n
         help
             Mounts ext2, ext3 and ext4 as the third filesystem, after littlefs
@@ -56,10 +56,13 @@ menu "espix filesystem"
             here goes through espix's VFS and its permission check rather than
             being reachable around it.
 
-            Read-only. ext4_mount() takes read_only as an argument and every
-            mutating operation refuses with EROFS, so the two agree by
-            construction. Writes need the vendored lwext4's write-path defect
-            dealt with first; see docs/ROADMAP.md.
+            Read-only by default. ext4_mount() takes read_only as an argument
+            and every mutating operation refuses with EROFS, so the two agree by
+            construction. `mount -o rw` mounts a volume with a journal writable;
+            a volume without one is refused rather than mounted writable. Writes
+            go through the port's experimental extent implementation, and
+            CONFIG_ESPIX_FS_EXT4_FAIL_WRITE_ABOVE injects a failure into it for
+            testing. See docs/KNOWN-ISSUES.md and docs/ROADMAP.md.
 
             One thing this gets that the FAT driver cannot: stat with a real
             inode behind it. Mode, owner and timestamps come from the inode

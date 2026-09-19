@@ -437,6 +437,9 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
     const FRESULT fr = f_mount(m->fs, m->drive, 1);
     if (fr != FR_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: %s", path, fresult_name(fr));
+        /* A failed mount can still have registered the volume with FatFs; drop
+         * it, or the drive slot stays taken until the next registration. */
+        f_mount(NULL, m->drive, 0);
         err = (fr == FR_NO_FILESYSTEM || fr == FR_NO_FILE)
                   ? ESP_ERR_NOT_FOUND : ESP_FAIL;
         goto fail_ctx;

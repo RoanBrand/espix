@@ -386,6 +386,9 @@ BDL_READ_PREFIX = (
     "     * that upstream served, by turning a failed allocation into NO_MEM. See\n"
     "     * docs/GOTCHAS.md.\n"
     "     */\n"
+    "    if (s_bdl_lock != NULL) {\n"
+    "        xSemaphoreTake(s_bdl_lock, portMAX_DELAY);\n"
+    "    }\n"
     "    uint8_t *target = dst;\n"
     "\n"
     "    msc_device_t *dev = (msc_device_t *)h->ctx;\n"
@@ -414,10 +417,62 @@ BDL_READ_PREFIX = (
 )
 
 BDL_READ_SUFFIX = (
+    "    if (s_bdl_lock != NULL) {\n"
+    "        xSemaphoreGive(s_bdl_lock);\n"
+    "    }\n"
     "    return err;"
 )
 
 MARK_BDL_READ = "scsi_cmd_read16(dev, target"
+
+# The serialization lock, and where it is made.
+#
+# The MSC driver keeps one URB and one transfer semaphore per device and is not
+# reentrant; espix reaches it from FatFs, lwext4 and raw /dev reads, whose own
+# locks do not exclude each other, so two partitions of one stick (or a raw read
+# and a mount) could share the URB and corrupt one another. One lock for the
+# block device layer is enough while the S3 supports one bulk-only device at a
+# time, and it is taken in the caller's task -- never in the USB transfer
+# callback, which only gives the semaphore msc_bulk_transfer() waits on.
+BDL_LOCK_ANCHOR = "static esp_err_t msc_bdl_read(esp_blockdev_handle_t h, uint8_t *dst, size_t dst_size,\n"
+BDL_LOCK_ADDITION = (
+    "/*\n"
+    " * One lock for the whole block device layer.\n"
+    " *\n"
+    " * The MSC driver keeps one URB and one transfer semaphore per device, and is\n"
+    " * not reentrant. espix reaches it from more than one place -- FatFs through its\n"
+    " * own volume lock, lwext4 through a global one, a raw /dev read through the\n"
+    " * device lock -- and those do not exclude each other, so two partitions of one\n"
+    " * stick, or a raw read and a mount, could share the URB and corrupt each other.\n"
+    " *\n"
+    " * A single lock is enough while the S3 supports one bulk-only device at a time\n"
+    " * (docs/GOTCHAS.md). It is taken in the caller's task and never in the USB\n"
+    " * transfer callback: msc_bulk_transfer() waits on a semaphore that the callback\n"
+    " * gives, and the callback does no locking of its own.\n"
+    " */\n"
+    "static SemaphoreHandle_t s_bdl_lock;\n"
+    "\n"
+    "static esp_err_t msc_bdl_read(esp_blockdev_handle_t h, uint8_t *dst, size_t dst_size,\n"
+)
+MARK_BDL_LOCK = "one URB and one transfer semaphore per device"
+
+BDL_FACTORY_ANCHOR = (
+    "    msc_device_t *dev = (msc_device_t *)device;\n"
+    "    *out_handle = ESP_BLOCKDEV_HANDLE_INVALID;\n"
+    "    esp_blockdev_t *h = calloc(1, sizeof(esp_blockdev_t));\n"
+)
+BDL_FACTORY_ADDITION = (
+    "    msc_device_t *dev = (msc_device_t *)device;\n"
+    "    *out_handle = ESP_BLOCKDEV_HANDLE_INVALID;\n"
+    "    if (s_bdl_lock == NULL) {\n"
+    "        s_bdl_lock = xSemaphoreCreateMutex();\n"
+    "        if (s_bdl_lock == NULL) {\n"
+    "            return ESP_ERR_NO_MEM;\n"
+    "        }\n"
+    "    }\n"
+    "    esp_blockdev_t *h = calloc(1, sizeof(esp_blockdev_t));\n"
+)
+MARK_BDL_FACTORY = "s_bdl_lock = xSemaphoreCreateMutex();"
 
 # The probe, when the project asks for one. It answers what nothing above this
 # layer can: whether the device returned wrong bytes while reporting success. A
@@ -496,6 +551,9 @@ BDL_READ_ADDITION = BDL_READ_PREFIX + BDL_READ_VERIFY + BDL_READ_SUFFIX
 MSC_INCLUDES_ANCHOR = "#include \"msc_scsi_bot.h\"\n"
 MSC_INCLUDES_ADDITION = (
     "#include <string.h>\n"
+    "\n"
+    "#include \"freertos/FreeRTOS.h\"\n"
+    "#include \"freertos/semphr.h\"\n"
     "\n"
     "#include \"sdkconfig.h\"\n"
     "\n"
@@ -640,10 +698,19 @@ BDL_WRITE_ADDITION = (
     "    }\n"
     "\n"
     "    msc_device_t *dev = (msc_device_t *)h->ctx;\n"
-    "    if (lba > UINT32_MAX) {\n"
-    "        return scsi_cmd_write16(dev, src, lba, (uint32_t)num_blocks, block_size);\n"
+    "    if (s_bdl_lock != NULL) {\n"
+    "        xSemaphoreTake(s_bdl_lock, portMAX_DELAY);\n"
     "    }\n"
-    "    return scsi_cmd_write10(dev, src, (uint32_t)lba, (uint32_t)num_blocks, block_size);"
+    "    esp_err_t err;\n"
+    "    if (lba > UINT32_MAX) {\n"
+    "        err = scsi_cmd_write16(dev, src, lba, (uint32_t)num_blocks, block_size);\n"
+    "    } else {\n"
+    "        err = scsi_cmd_write10(dev, src, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
+    "    }\n"
+    "    if (s_bdl_lock != NULL) {\n"
+    "        xSemaphoreGive(s_bdl_lock);\n"
+    "    }\n"
+    "    return err;"
 )
 
 MARK_BDL_WRITE = "scsi_cmd_write16(dev, src"
@@ -827,6 +894,10 @@ def main():
                      "bdl includes", MARK_MSC_INCLUDES),
         insert_after(bdl, BDL_READ_ANCHOR, "", "bdl read",
                      MARK_BDL_READ, replacement=BDL_READ_ADDITION),
+        insert_after(bdl, BDL_LOCK_ANCHOR, "", "bdl lock",
+                     MARK_BDL_LOCK, replacement=BDL_LOCK_ADDITION),
+        insert_after(bdl, BDL_FACTORY_ANCHOR, "", "bdl factory lock",
+                     MARK_BDL_FACTORY, replacement=BDL_FACTORY_ADDITION),
         insert_after(bdl, BDL_WRITE_ANCHOR, "", "bdl write",
                      MARK_BDL_WRITE, replacement=BDL_WRITE_ADDITION),
         insert_after(source, BOT_ANCHOR, "", "bot status",

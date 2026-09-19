@@ -207,6 +207,14 @@ typedef struct {
 static attach_backoff_t s_backoff[ESPIX_USB_LSUSB_MAX];
 
 static QueueHandle_t s_work;
+/*
+ * Removals, queued rather than performed. The MSC disconnect callback runs
+ * inside the host library's own event loop, and the work below blocks -- it
+ * takes s_attach_lock, which an attach holds across every SCSI transfer, and
+ * calls into the class driver. Doing it there waits for the loop that would
+ * deliver those transfers, so the callback only queues the handle.
+ */
+static QueueHandle_t s_gone;
 
 /*
  * Serialises every open/close pair on the monitor client.
@@ -1674,7 +1682,10 @@ static void read_partition_table(usb_dev_t *d)
     }
 
     const size_t unit = d->bdl->geometry.read_size;
-    if (unit == 0 || unit > SECTOR_MAX) {
+    /* The boot-sector stencils read as far as offset 510, so a transfer unit
+     * smaller than a sector would read past the buffer; MSC will not report one,
+     * but the check costs nothing. */
+    if (unit < 512 || unit > SECTOR_MAX) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: refusing a %u byte sector size",
                    d->info.name, (unsigned)unit);
         return;
@@ -2144,6 +2155,8 @@ static esp_err_t attach_device(uint8_t address)
     return ESP_OK;
 }
 
+static void detach_device(msc_host_device_handle_t device);
+
 static void on_connected(uint8_t address)
 {
     /*
@@ -2162,6 +2175,17 @@ static void work_task(void *arg)
 
     for (;;) {
         uint8_t address = 0;
+
+        /*
+         * A removal first, without waiting: it is cheap, it takes the same lock
+         * an attach does, and doing it here -- rather than in the callback that
+         * queued it -- is what keeps the host library's event loop free.
+         */
+        msc_host_device_handle_t gone = NULL;
+        if (s_gone != NULL && xQueueReceive(s_gone, &gone, 0) == pdTRUE) {
+            detach_device(gone);
+            continue;
+        }
 
         if (xQueueReceive(s_work, &address, SCAN_PERIOD_TICKS) == pdTRUE) {
             /* The driver's event loop is free here, so its transfers complete
@@ -2190,7 +2214,7 @@ static void work_task(void *arg)
  * same way. Our block device handle is released first: it does not own the
  * device, and once the device is uninstalled there is nothing left to read.
  */
-static void on_disconnected(msc_host_device_handle_t device)
+static void detach_device(msc_host_device_handle_t device)
 {
     msc_host_device_handle_t gone = NULL;
     esp_blockdev_handle_t bdl = NULL;
@@ -2234,6 +2258,24 @@ static void on_disconnected(msc_host_device_handle_t device)
     }
 
     xSemaphoreGive(s_attach_lock);
+}
+
+/*
+ * The disconnect callback, and nothing else: queue the handle and return.
+ *
+ * It must not block. This runs inside usb_host_client_handle_events(), which is
+ * the only thing that delivers the class driver's transfer completions, and
+ * detach_device() waits on s_attach_lock -- which an attach holds for the whole
+ * of an install, across every SCSI transfer. Blocking here would stall the loop
+ * those transfers need, so a pull during an attach used to wait out the
+ * transfers' five-second timeouts instead of finishing.
+ */
+static void on_disconnected(msc_host_device_handle_t device)
+{
+    if (s_gone == NULL || xQueueSend(s_gone, &device, 0) != pdTRUE) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "no room to queue a removal; it is released on the next sweep");
+    }
 }
 
 static void on_msc_event(const msc_host_event_t *event, void *arg)
@@ -2484,6 +2526,12 @@ esp_err_t espix_usb_host_init(void)
      */
     s_work = xQueueCreate(WORK_QUEUE_LEN, sizeof(uint8_t));
     if (s_work == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_gone = xQueueCreate(WORK_QUEUE_LEN, sizeof(msc_host_device_handle_t));
+    if (s_gone == NULL) {
+        vQueueDelete(s_work);
+        s_work = NULL;
         return ESP_ERR_NO_MEM;
     }
     if (xTaskCreate(work_task, "usb:work", WORK_TASK_STACK, NULL, WORK_TASK_PRIO,
