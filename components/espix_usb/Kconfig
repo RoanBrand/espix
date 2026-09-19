@@ -31,23 +31,27 @@ menu "espix usb"
         default 0
         range 0 100000
         help
-            Read each transfer's blocks a second time into a scratch buffer and
-            compare, logging the first byte that differs and the address it was
-            for. 0 disables it.
+            Verify the first N block reads after boot: each is read a second
+            time and compared, and a read whose verification disagrees is
+            re-read until two consecutive reads agree (or failed after four
+            tries). 0 disables it.
 
             This exists because a device can return wrong data and report success,
             and nothing above the block device can tell. The filesystems do notice
             -- FatFs reports FR_INT_ERR from exFAT's entry-set checksum, lwext4
             logs a failed directory checksum -- but neither says whether the
             medium lied or the read failed, and a listing that stopped early looks
-            exactly like a short directory. A probe like this is what separated
-            the two on the 3.1TB T9.
+            exactly like a short directory.
+
+            A majority vote is deliberately NOT used: a device that returns the
+            same wrong bytes to every read wins the vote and the lie is returned
+            as success. Two reads that agree is the strongest claim available
+            without a checksum on the medium.
 
             It costs a second read of every verified transfer, so it is bounded
             and off by default: on a 12 Mbps link that is expensive, and a mount's
             first accesses are where the damage was measured (the first 200). Set
-            it to cover that, reboot, read `dmesg`, and turn it off again.
-
-            See docs/KNOWN-ISSUES.md.
+            it to cover that, reboot, read `dmesg`, and turn it off again. See
+            docs/KNOWN-ISSUES.md.
 
 endmenu

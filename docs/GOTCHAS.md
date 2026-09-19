@@ -54,33 +54,42 @@ completely unrelated task, minutes later.
 And the line size is a **query**, not a constant: `esp_cache_get_line_size_by_addr()`.
 On the S3 it is configurable at 16, 32 or 64 bytes; espix builds at 32. Code
 that hard-codes 64 is accidentally safe until someone changes the option.
-### A block-device read's buffer is the caller's, and the cache is invalidated over all of it
 
-The rule above is not only about buffers you allocate *for* DMA. The USB host
-invalidates the cache over the transfer buffer when a read completes --
-`hcd_dwc.c`'s `cache_sync_data_buffer()`, which hands the caller's own buffer to
-`esp_cache_msync()`. IDF's comment there says it accepts UNALIGNED data anyway,
-"for cases where the class drivers force overwrite the allocated data buffers",
-and `msc_bdl_read()` passes its caller's `dst` straight through. So every caller
-of a block-device read hands a DMA target to the cache API whether it meant to or
-not, and *both* the head and the tail of an unaligned region can come back wrong.
+### A block-device read's buffer is not a DMA target on the ESP32-S3
 
-`MALLOC_CAP_DMA` alone is not enough: it is 8-byte alignment, and so is
-`malloc()`. FatFs's sector window came from `malloc()` and espix's own probe
-buffers were `MALLOC_CAP_DMA`, so the first and last cache lines of every read
-into them were corrupted -- silently, with the transfer reporting success, and
-only while the cache still held other bytes for those lines, which is the first
-accesses after a mount. On the 3.1TB T9 that truncated a 452-entry directory at
-240 entries and put nonsense in the last four GPT entries of a 128-entry array:
-the end of the read is where it shows. See
-[KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host) for the whole account.
+The rule above is about buffers a cache sync actually touches. On this S3 it
+touches none: the USB host's whole cache layer sits inside
+`#if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE`, that macro is defined for the P4 and
+**not** the S3, and `hcd_dwc.c` stubs its five `CACHE_SYNC_*` macros to nothing.
+Even if the layer were compiled, `esp_cache_msync()` on an internal S3 address
+returns `ESP_ERR_NOT_SUPPORTED` -- only the PSRAM window is cached.
 
-Three ways out, and espix uses all three: allocate with
-`MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED`; align a stack buffer with
-`__attribute__((aligned(64)))` (over-aligning is free, and the cache line is a
-build option); and for callers whose buffer is not yours -- which includes a
-*user's* own `read()` buffer -- bounce through an aligned buffer in the block
-device layer. `tools/patch-msc.py` does the last of those.
+And the buffer it would sync is not the caller's. The BOT class driver DMAs into
+its own URB -- `msc_bulk_transfer()`'s `xfer->data_buffer`, allocated
+`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL` -- and `memcpy()`s to the caller, so a
+block-device destination (FatFs's window, an ext buffer, a user's own `read()`
+buffer) is a CPU copy and never a DMA target. The cache API's documented rule
+still holds for the URB; the caller's buffer is simply not part of it.
+
+`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL` is the guarantee that matters: it keeps
+the URB in internal RAM, which is the only memory the S3's USB-DWC engine can
+address (the option to DMA into PSRAM is P4-only). `MALLOC_CAP_CACHE_ALIGNED`
+asks `esp_cache_get_alignment()`, which for internal memory returns the
+internal-memory line size -- and that is 0 on the S3, so on internal RAM the flag
+is inert. The alignment work that once ran through this tree -- `read_buffer()`,
+the 64-aligned stack buffer in `ext_identity()`, the cache-aligned
+`ff_memalloc()`, and the block layer's bounce buffer -- could not have fixed a
+read fault on this chip. The bounce has been removed (a failed allocation was
+one `NO_MEM` away from failing a read upstream served); the rest is kept because
+it is free and would matter on a part whose internal memory is cached.
+
+**The read corruption this was blamed for was real, and it is the device's.** On
+a 3.1TB Samsung T9, roughly one block read in sixteen returns wrong bytes while
+reporting success, an immediate reread of the same LBA usually comes back
+correct, and the wrong value is stable for a given LBA across boots. A cache
+returns the *same* wrong bytes consistently; this does not. The alignment change
+left the fault counts identical, which is what finally said so. See
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host).
 
 
 

@@ -359,9 +359,9 @@ BDL_READ_ANCHOR = (
 )
 
 # The whole of msc_bdl_read()'s body after the geometry, assembled from three
-# pieces: the bounce for an unaligned destination (and the read itself), the
-# optional probe, and the copy out to the caller. Three pieces because the probe
-# has to sit between the read and that copy, and a replacement is one string.
+# pieces: the read itself (and the short-transfer re-issue), the optional probe,
+# and the return. The probe sits between the read and the return, and the whole
+# replacement is one string.
 
 BDL_READ_PREFIX = (
     "    const uint64_t lba = src_addr / block_size;\n"
@@ -371,91 +371,120 @@ BDL_READ_PREFIX = (
     "    }\n"
     "\n"
     "    /*\n"
-    "     * The transfer DMAs into dst, and the USB host invalidates the cache\n"
-    "     * over it when the transfer completes -- hcd_dwc.c's\n"
-    "     * cache_sync_data_buffer(), which hands the caller's own buffer to\n"
-    "     * esp_cache_msync(). That call may only be given a region whose address\n"
-    "     * *and* size both meet the cache alignment: \"cache memory\n"
-    "     * synchronization to an unaligned address region may silently corrupt\n"
-    "     * the memory\" (GOTCHAS.md quotes it in full). IDF's own comment there\n"
-    "     * says it accepts UNALIGNED data regardless, \"for cases where the class\n"
-    "     * drivers force overwrite the allocated data buffers\".\n"
+    "     * The caller's buffer is not a DMA target and needs no particular alignment.\n"
     "     *\n"
-    "     * The callers here include FatFs's sector window and a user's own\n"
-    "     * read() buffer, so this cannot be pushed onto them. An unaligned\n"
-    "     * destination therefore gets a bounce buffer. 64 rather than the 32 this\n"
-    "     * build's cache line is: the line size is a build option and this is a\n"
-    "     * compile-time constant, and over-aligning is free.\n"
+    "     * The BOT class driver DMAs into its own URB -- msc_bulk_transfer()'s\n"
+    "     * xfer->data_buffer, allocated MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL -- and\n"
+    "     * memcpy()s to the caller. The USB host's cache sync, where it exists at\n"
+    "     * all, is over that URB buffer and never over dst. On the ESP32-S3 the sync\n"
+    "     * layer is not even compiled (SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE is\n"
+    "     * ESP32-P4 only), and esp_cache_msync() cannot act on internal S3 RAM.\n"
     "     *\n"
-    "     * The write path does not need this: an OUT transfer syncs once, before\n"
-    "     * the transfer, and passes ESP_CACHE_MSYNC_FLAG_UNALIGNED.\n"
+    "     * This used to bounce an unaligned dst through a fresh allocation, on a\n"
+    "     * reading of the host that had the DMA landing in the caller's buffer. It\n"
+    "     * could not help -- dst was never DMA'd -- and it could fail a large read\n"
+    "     * that upstream served, by turning a failed allocation into NO_MEM. See\n"
+    "     * docs/GOTCHAS.md.\n"
     "     */\n"
     "    uint8_t *target = dst;\n"
-    "    if (((uintptr_t)dst % 64) != 0) {\n"
-    "        target = heap_caps_malloc(len, MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);\n"
-    "        if (target == NULL) {\n"
-    "            return ESP_ERR_NO_MEM;\n"
-    "        }\n"
-    "    }\n"
     "\n"
     "    msc_device_t *dev = (msc_device_t *)h->ctx;\n"
-    "    esp_err_t err;\n"
-    "    if (lba > UINT32_MAX) {\n"
-    "        err = scsi_cmd_read16(dev, target, lba, (uint32_t)num_blocks, block_size);\n"
-    "    } else {\n"
-    "        err = scsi_cmd_read10(dev, target, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
+    "    esp_err_t err = ESP_FAIL;\n"
+    "\n"
+    "    /*\n"
+    "     * espix: a short transfer is re-issued as a whole command, never retried in\n"
+    "     * the bulk stage. msc_bulk_transfer reports a short IN transfer as\n"
+    "     * ESP_ERR_INVALID_SIZE, and bot_execute_command has by then read the CSW, so\n"
+    "     * a fresh CBW/data/CSW starts in phase. Three attempts is enough for a\n"
+    "     * transmitted packet going missing, and not so many that a device which\n"
+    "     * always short-packetises takes five seconds a time to say so.\n"
+    "     */\n"
+    "    for (int attempt = 0; attempt < 3; attempt++) {\n"
+    "        if (lba > UINT32_MAX) {\n"
+    "            err = scsi_cmd_read16(dev, target, lba, (uint32_t)num_blocks, block_size);\n"
+    "        } else {\n"
+    "            err = scsi_cmd_read10(dev, target, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
+    "        }\n"
+    "        if (err != ESP_ERR_INVALID_SIZE) {\n"
+    "            break;\n"
+    "        }\n"
+    "        ESP_LOGW(\"espix_msc\", \"read %llu short; re-issuing (%d/3)\",\n"
+    "                 (unsigned long long)lba, attempt + 1);\n"
     "    }\n"
 )
 
 BDL_READ_SUFFIX = (
-    "    if (target != dst) {\n"
-    "        if (err == ESP_OK) {\n"
-    "            memcpy(dst, target, len);\n"
-    "        }\n"
-    "        heap_caps_free(target);\n"
-    "    }\n"
     "    return err;"
 )
 
 MARK_BDL_READ = "scsi_cmd_read16(dev, target"
 
 # The probe, when the project asks for one. It answers what nothing above this
-# layer can: whether the device returned *different bytes* for the same LBA (the
-# medium lied) or the transfer failed (the read failed). Both arrive at a
-# filesystem as one errno, and a listing that stopped early looks exactly like a
-# short directory -- which is what the 3.1TB T9 was misread as for months.
+# layer can: whether the device returned wrong bytes while reporting success. A
+# reread that agrees is accepted; a reread that differs is repeated until two
+# consecutive reads agree, and a read that never agrees fails rather than being
+# guessed at. A majority vote was tried and is wrong -- a device that returns
+# the same wrong bytes every time wins the majority.
 #
-# Off by default and bounded by a count, because it reads every verified transfer
-# twice and a 12 Mbps link makes that expensive. It compares the DMA'd buffer,
-# not the caller's copy of it.
+# Off by default and bounded by a count, because it multiplies the reads of every
+# transfer it covers.
 BDL_READ_VERIFY = (
     "#if CONFIG_ESPIX_USB_VERIFY_READS > 0\n"
+    "    /*\n"
+    "     * espix: verify the read, and fail it rather than trust a single answer.\n"
+    "     *\n"
+    "     * A device that returns wrong bytes while reporting success is what this\n"
+    "     * exists for. A reread that agrees is accepted; a reread that differs is\n"
+    "     * repeated until two consecutive reads agree, after which the read fails\n"
+    "     * with ESP_ERR_INVALID_CRC. Taking a majority vote was tried and is wrong:\n"
+    "     * a device that returns the same wrong bytes to every read wins the\n"
+    "     * majority and the wrong value is returned as success.\n"
+    "     *\n"
+    "     * Bounded by ESPIX_USB_VERIFY_READS, because it multiplies the reads of\n"
+    "     * every block it covers.\n"
+    "     */\n"
     "    static unsigned verified;\n"
     "    if (err == ESP_OK && verified < CONFIG_ESPIX_USB_VERIFY_READS) {\n"
     "        uint8_t *scratch = heap_caps_malloc(len, MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);\n"
+    "        uint8_t *prev    = heap_caps_malloc(len, MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);\n"
     "        verified++;\n"
-    "        if (scratch != NULL) {\n"
-    "            esp_err_t again = (lba > UINT32_MAX)\n"
-    "                ? scsi_cmd_read16(dev, scratch, lba, (uint32_t)num_blocks, block_size)\n"
-    "                : scsi_cmd_read10(dev, scratch, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
-    "            if (again != ESP_OK) {\n"
-    "                ESP_LOGE(\"espix_msc\", \"verify: reread of %llu failed (0x%x)\",\n"
-    "                         (unsigned long long)lba, again);\n"
-    "            } else if (memcmp(target, scratch, len) != 0) {\n"
-    "                size_t at = 0;\n"
-    "                while (at < len && target[at] == scratch[at]) {\n"
-    "                    at++;\n"
+    "        if (scratch != NULL && prev != NULL) {\n"
+    "            memcpy(prev, target, len);\n"
+    "            int attempt;\n"
+    "            for (attempt = 0; attempt < 4; attempt++) {\n"
+    "                esp_err_t again = (lba > UINT32_MAX)\n"
+    "                    ? scsi_cmd_read16(dev, scratch, lba, (uint32_t)num_blocks, block_size)\n"
+    "                    : scsi_cmd_read10(dev, scratch, (uint32_t)lba, (uint32_t)num_blocks, block_size);\n"
+    "                if (again != ESP_OK) {\n"
+    "                    ESP_LOGE(\"espix_msc\", \"verify: reread of %llu failed (0x%x)\",\n"
+    "                             (unsigned long long)lba, again);\n"
+    "                    err = again;\n"
+    "                    break;\n"
     "                }\n"
-    "                ESP_LOGE(\"espix_msc\",\n"
-    "                         \"verify: %llu differs at byte %u of %u (%02x vs %02x)\",\n"
-    "                         (unsigned long long)lba, (unsigned)at, (unsigned)len,\n"
-    "                         target[at], scratch[at]);\n"
+    "                if (memcmp(prev, scratch, len) == 0) {\n"
+    "                    /* Two reads agree. Adopt that value -- it differs from the\n"
+    "                     * original only when the original was the odd one out. */\n"
+    "                    memcpy(target, prev, len);\n"
+    "                    break;\n"
+    "                }\n"
+    "                uint8_t *swap = prev;\n"
+    "                prev = scratch;\n"
+    "                scratch = swap;\n"
     "            }\n"
+    "            if (attempt == 4) {\n"
+    "                ESP_LOGE(\"espix_msc\", \"verify: %llu: no two reads agreed\",\n"
+    "                         (unsigned long long)lba);\n"
+    "                err = ESP_ERR_INVALID_CRC;\n"
+    "            }\n"
+    "        }\n"
+    "        if (scratch != NULL) {\n"
     "            heap_caps_free(scratch);\n"
+    "        }\n"
+    "        if (prev != NULL) {\n"
+    "            heap_caps_free(prev);\n"
     "        }\n"
     "    }\n"
     "#endif\n"
-    "\n"
 )
 
 BDL_READ_ADDITION = BDL_READ_PREFIX + BDL_READ_VERIFY + BDL_READ_SUFFIX
@@ -488,10 +517,11 @@ MSC_INCLUDES_ADDITION = (
 # reads the same directory in full, the Cruzer is unaffected, and the count varies
 # per listing because the short transfer lands somewhere different each time.
 #
-# espix retries rather than failing, because a short read is recoverable and the
-# device is what got it wrong. With the retries exhausted it returns an error
-# instead of a half-filled buffer: a caller can act on a failure, and cannot act
-# on silently stale bytes.
+# espix fails the transfer rather than returning a half-filled buffer, and does
+# not retry it here: a short transfer means the device ended the data stage, so
+# re-submitting the same URB reads the CSW as data and desyncs BOT. Recovery
+# belongs one layer up, where the whole CBW/data/CSW sequence can start over --
+# the block device layer re-issues the SCSI command instead.
 MSC_SHORT_ANCHOR = (
     "    MSC_RETURN_ON_ERROR( usb_host_transfer_submit(xfer) );\n"
     "    const usb_transfer_status_t status = wait_for_transfer_done(xfer);\n"
@@ -518,51 +548,77 @@ MSC_SHORT_ANCHOR = (
 
 MSC_SHORT_ADDITION = (
     "    /*\n"
-    "     * espix: a transfer that returned fewer bytes than were asked for leaves\n"
-    "     * the tail of the caller's buffer holding the previous transfer's data,\n"
-    "     * and reporting that as ESP_OK hides it from everything above -- see the\n"
-    "     * note in tools/patch-msc.py. Retried, because a short read is\n"
-    "     * recoverable, and failed rather than half-filled when it persists.\n"
+    "     * espix: a short IN transfer must not be reported as success.\n"
+    "     *\n"
+    "     * Upstream copies actual_num_bytes and returns ESP_OK, so a transfer that\n"
+    "     * returned fewer bytes than were asked for leaves the tail of the caller's\n"
+    "     * buffer holding the previous transfer's data, and block device, filesystem\n"
+    "     * and listing all see success on a half-filled sector.\n"
+    "     *\n"
+    "     * Nor is it retried here. A short transfer means the device ended the data\n"
+    "     * stage; re-submitting the same URB would read the CSW as data and desync\n"
+    "     * the BOT sequence -- which is what the first version of this did. The\n"
+    "     * failure is reported instead, and the SCSI command is re-issued whole by\n"
+    "     * the block device layer, where the CBW/data/CSW sequence starts over.\n"
     "     */\n"
-    "    for (int attempt = 0; ; attempt++) {\n"
-    "        MSC_RETURN_ON_ERROR( usb_host_transfer_submit(xfer) );\n"
-    "        const usb_transfer_status_t status = wait_for_transfer_done(xfer);\n"
-    "        switch (status) {\n"
-    "        case USB_TRANSFER_STATUS_COMPLETED:\n"
-    "            if (ep == MSC_EP_IN && xfer->actual_num_bytes > size) {\n"
-    "                ret = ESP_ERR_INVALID_SIZE;\n"
-    "            } else if (ep == MSC_EP_IN && xfer->actual_num_bytes < size) {\n"
-    "                /* Three attempts: enough for a transmitted packet going\n"
-    "                 * missing, and not so many that a device which always\n"
-    "                 * short-packets takes five seconds a time to say so. */\n"
-    "                if (attempt < 2) {\n"
-    "                    continue;\n"
-    "                }\n"
-    "                ESP_LOGE(\"msc_host\",\n"
-    "                         \"short read: %u of %u bytes after %d attempts\",\n"
-    "                         (unsigned)xfer->actual_num_bytes, (unsigned)size,\n"
-    "                         attempt + 1);\n"
-    "                ret = ESP_ERR_INVALID_SIZE;\n"
-    "            } else {\n"
-    "                if (ep == MSC_EP_IN) {\n"
-    "                    memcpy(data, xfer->data_buffer, xfer->actual_num_bytes);\n"
-    "                }\n"
-    "                ret = ESP_OK;\n"
+    "    MSC_RETURN_ON_ERROR( usb_host_transfer_submit(xfer) );\n"
+    "    const usb_transfer_status_t status = wait_for_transfer_done(xfer);\n"
+    "    switch (status) {\n"
+    "    case USB_TRANSFER_STATUS_COMPLETED:\n"
+    "        if (ep == MSC_EP_IN && xfer->actual_num_bytes != size) {\n"
+    "            ESP_LOGE(\"msc_host\", \"short read: %u of %u bytes\",\n"
+    "                     (unsigned)xfer->actual_num_bytes, (unsigned)size);\n"
+    "            ret = ESP_ERR_INVALID_SIZE;\n"
+    "        } else {\n"
+    "            if (ep == MSC_EP_IN) {\n"
+    "                memcpy(data, xfer->data_buffer, xfer->actual_num_bytes);\n"
     "            }\n"
-    "            break;\n"
-    "        case USB_TRANSFER_STATUS_STALL:\n"
-    "            ret = ESP_ERR_MSC_STALL; break;\n"
-    "        default:\n"
-    "            ret = ESP_ERR_MSC_INTERNAL; break;\n"
+    "            ret = ESP_OK;\n"
     "        }\n"
     "        break;\n"
+    "    case USB_TRANSFER_STATUS_STALL:\n"
+    "        ret = ESP_ERR_MSC_STALL; break;\n"
+    "    default:\n"
+    "        ret = ESP_ERR_MSC_INTERNAL; break;\n"
     "    }\n"
     "\n"
     "    return ret;\n"
     "}"
 )
 
-MARK_MSC_SHORT = "espix: a transfer that returned fewer bytes"
+MARK_MSC_SHORT = "espix: a short IN transfer"
+
+# The URB is grown once, from the 64 bytes msc_host_install_device() allocates to
+# whatever the largest transfer needs. Upstream frees the old URB and commits the
+# new allocation straight into device->xfer, so an allocation failure leaves that
+# pointer dangling and the next transfer is a use-after-free. This allocates the
+# replacement first and only then frees the old one.
+MSC_REALLOC_ANCHOR = (
+    "    if (xfer->data_buffer_size < transfer_size) {\n"
+    "        // The allocated buffer is not large enough -> realloc\n"
+    "        MSC_RETURN_ON_ERROR( usb_host_transfer_free(xfer) );\n"
+    "        MSC_RETURN_ON_ERROR( usb_host_transfer_alloc(transfer_size, 0, &device->xfer) );\n"
+    "        xfer = device->xfer;\n"
+    "    }\n"
+)
+
+MSC_REALLOC_ADDITION = (
+    "    if (xfer->data_buffer_size < transfer_size) {\n"
+    "        /*\n"
+    "         * espix: allocate the bigger buffer before freeing the old one. The\n"
+    "         * upstream order frees first and commits the result of the second call\n"
+    "         * directly into device->xfer, so a failed allocation leaves it pointing\n"
+    "         * at freed memory and the next transfer is a use-after-free.\n"
+    "         */\n"
+    "        usb_transfer_t *bigger = NULL;\n"
+    "        MSC_RETURN_ON_ERROR( usb_host_transfer_alloc(transfer_size, 0, &bigger) );\n"
+    "        usb_host_transfer_free(xfer);\n"
+    "        device->xfer = bigger;\n"
+    "        xfer = bigger;\n"
+    "    }\n"
+)
+
+MARK_MSC_REALLOC = "espix: allocate the bigger buffer before freeing"
 MARK_MSC_INCLUDES = "#include \"esp_heap_caps.h\""
 
 BDL_WRITE_ANCHOR = (
@@ -591,6 +647,95 @@ BDL_WRITE_ADDITION = (
 )
 
 MARK_BDL_WRITE = "scsi_cmd_write16(dev, src"
+
+# The data stage's failure must not skip the status transport.
+#
+# bot_execute_command() returns through MSC_RETURN_ON_ERROR the moment the data
+# transfer fails, so the CSW is never read. The device is still holding it, and
+# the next CBW is answered with that stale CSW -- one short transfer desyncs
+# every command after it. BOT 5.3.3 also requires a stalled data endpoint to be
+# cleared before the CSW can be read. The data error is recorded, the CSW is
+# consumed, and only then is the data error returned; the block device layer
+# re-issues the whole command on the strength of it.
+BOT_ANCHOR = (
+    "    // 2. Optional data transport\n"
+    "    if (data) {\n"
+    "        MSC_RETURN_ON_ERROR( msc_bulk_transfer(device, (uint8_t *)data, size, ep) );\n"
+    "    }\n"
+    "\n"
+    "    // 3. Status transport\n"
+    "    esp_err_t err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);\n"
+    "\n"
+    "    // 3.1 Error recovery\n"
+    "    if (err == ESP_ERR_MSC_STALL) {\n"
+    "        // In case of the status transport failure, we can try reading the status again after clearing feature\n"
+    "        ESP_RETURN_ON_ERROR( clear_feature(device, device->config.bulk_in_ep), TAG, \"Clear feature failed\" );\n"
+    "        err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);\n"
+    "        if (ESP_OK != err) {\n"
+    "            // In case the repeated status transport failed we do reset recovery\n"
+    "            // We don't check the error code here, the command has already failed.\n"
+    "            msc_host_reset_recovery(device);\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    MSC_RETURN_ON_ERROR(err);\n"
+    "\n"
+    "    return check_csw(&csw, cbw->tag);\n"
+    "}\n"
+)
+
+BOT_ADDITION = (
+    "    // 2. Optional data transport\n"
+    "    /*\n"
+    "     * espix: the data stage's failure is recorded, not returned, so that the\n"
+    "     * status transport below still runs. Returning here would leave the CSW\n"
+    "     * unread, and the device would still be waiting to send it when the next\n"
+    "     * CBW arrives -- a BOT desync that outlives the one failed command. A\n"
+    "     * halted data endpoint is cleared first, as BOT 5.3.3 requires: the CSW\n"
+    "     * cannot be read past a stalled data stage.\n"
+    "     */\n"
+    "    esp_err_t data_err = ESP_OK;\n"
+    "    if (data) {\n"
+    "        data_err = msc_bulk_transfer(device, (uint8_t *)data, size, ep);\n"
+    "        if (data_err == ESP_ERR_MSC_STALL) {\n"
+    "            ESP_RETURN_ON_ERROR( clear_feature(device, (ep == MSC_EP_IN)\n"
+    "                                                   ? device->config.bulk_in_ep\n"
+    "                                                   : device->config.bulk_out_ep),\n"
+    "                                 TAG, \"Clear feature failed\" );\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    // 3. Status transport\n"
+    "    esp_err_t err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);\n"
+    "\n"
+    "    // 3.1 Error recovery\n"
+    "    if (err == ESP_ERR_MSC_STALL) {\n"
+    "        // In case of the status transport failure, we can try reading the status again after clearing feature\n"
+    "        ESP_RETURN_ON_ERROR( clear_feature(device, device->config.bulk_in_ep), TAG, \"Clear feature failed\" );\n"
+    "        err = msc_bulk_transfer(device, (uint8_t *)&csw, sizeof(msc_csw_t), MSC_EP_IN);\n"
+    "        if (ESP_OK != err) {\n"
+    "            // In case the repeated status transport failed we do reset recovery\n"
+    "            // We don't check the error code here, the command has already failed.\n"
+    "            msc_host_reset_recovery(device);\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    MSC_RETURN_ON_ERROR(err);\n"
+    "\n"
+    "    /*\n"
+    "     * espix: the CSW has been consumed, so BOT is back in phase even though the\n"
+    "     * data stage failed; report that failure rather than the CSW's own verdict,\n"
+    "     * which is what tells the layer above to re-issue the whole command.\n"
+    "     */\n"
+    "    if (data_err != ESP_OK) {\n"
+    "        return data_err;\n"
+    "    }\n"
+    "\n"
+    "    return check_csw(&csw, cbw->tag);\n"
+    "}\n"
+)
+
+MARK_BOT = "espix: the data stage's failure is recorded"
 
 
 def die(msg):
@@ -674,6 +819,8 @@ def main():
                      MARK_INSTALL_CAPACITY, replacement=CAPACITY_ADDITION),
         insert_after(host, MSC_SHORT_ANCHOR, "", "short read",
                      MARK_MSC_SHORT, replacement=MSC_SHORT_ADDITION),
+        insert_after(host, MSC_REALLOC_ANCHOR, "", "urb realloc",
+                     MARK_MSC_REALLOC, replacement=MSC_REALLOC_ADDITION),
         insert_after(bdl, BDL_ANCHOR, "", "bdl geometry",
                      MARK_BDL_SIZE, replacement=BDL_ADDITION),
         insert_after(bdl, MSC_INCLUDES_ANCHOR, MSC_INCLUDES_ADDITION,
@@ -682,6 +829,8 @@ def main():
                      MARK_BDL_READ, replacement=BDL_READ_ADDITION),
         insert_after(bdl, BDL_WRITE_ANCHOR, "", "bdl write",
                      MARK_BDL_WRITE, replacement=BDL_WRITE_ADDITION),
+        insert_after(source, BOT_ANCHOR, "", "bot status",
+                     MARK_BOT, replacement=BOT_ADDITION),
     ]
 
     if any(done):

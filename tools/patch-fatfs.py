@@ -263,39 +263,15 @@ FRESULT_ERRNO_NEW = chr(10).join([
 ])
 MARK_FRESULT_ERRNO = "case FR_INT_ERR:        return EBADMSG;"
 
-# ff_memalloc(), which every FatFs allocation comes from: the filesystem object,
-# the LFN buffer, a file's own buffer, and -- the one that matters -- fs->win, the
-# sector window every read lands in (ff.c:3517).
+# Note what is deliberately *not* patched here: ff_memalloc().
 #
-# A read DMAs into fs->win, and the USB host invalidates the cache over the
-# transfer buffer when the transfer completes. esp_cache_msync() may only be given
-# a region whose address *and* size both meet the cache alignment -- "cache memory
-# synchronization to an unaligned address region may silently corrupt the memory"
-# -- and malloc() gives 8-byte alignment. So the first and last cache lines of
-# every sector read were corrupted, silently, with the transfer reporting success.
-# That is what truncated a 452-entry directory at 240 entries, and what put
-# nonsense in the last four GPT entries of the same drive: the corruption is
-# always at the end of a read, and only while the cache still holds other bytes
-# for those lines, which is the first accesses after a mount.
-#
-# 64 rather than the 32 this build's cache line is: the line size is a build
-# option (GOTCHAS.md) and this is a compile-time constant, and over-aligning is
-# free. MALLOC_CAP_DMA as well as MALLOC_CAP_8BIT because these buffers are DMA
-# targets, and saying so is cheaper than rediscovering it.
-FFSYSTEM_INCLUDE_OLD = "#include <stdlib.h>\t\t/* with POSIX API */"
-FFSYSTEM_INCLUDE_NEW = chr(10).join([
-    "#include <stdlib.h>\t\t/* with POSIX API */",
-    '#include "esp_heap_caps.h"',
-])
-FFSYSTEM_ALLOC_OLD = "\treturn malloc((size_t)msize);\t/* Allocate a new memory block */"
-FFSYSTEM_ALLOC_NEW = chr(10).join([
-    "\t/* espix: cache-aligned -- this is what fs->win comes from, and a read",
-    "\t * DMAs into it. See the note in tools/patch-fatfs.py. */",
-    "\treturn heap_caps_aligned_alloc(64, (size_t)msize,",
-    "\t                               MALLOC_CAP_8BIT | MALLOC_CAP_DMA);",
-])
-MARK_FFSYSTEM = "espix: cache-aligned -- this is what fs->win"
-MARK_FFSYSTEM_INCLUDE = '#include "esp_heap_caps.h"'
+# It is where FatFs's sector window and file buffers come from, and it is
+# tempting to force them into internal, cache-aligned memory. It would do
+# nothing. The file an earlier version patched, src/ffsystem.c, is not compiled
+# on any target -- the build uses port/freertos/ffsystem.c -- and the class
+# driver copies through its own URB anyway, so a caller's buffer is never a DMA
+# target. The port allocator already takes cache alignment from
+# CONFIG_FATFS_ALLOC_PREFER_ALIGNED_WORK_BUFFERS. See docs/GOTCHAS.md.
 
 MARK_FFCONF = "CONFIG_ESPIX_FS_EXFAT"
 
@@ -772,7 +748,6 @@ def main() -> int:
     header = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat_internal.h"
     source = idf_path / "components" / "fatfs" / "vfs" / "vfs_fat.c"
     ffconf = idf_path / "components" / "fatfs" / "src" / "ffconf.h"
-    ffsystem = idf_path / "components" / "fatfs" / "src" / "ffsystem.c"
     diskio_i = idf_path / "components" / "fatfs" / "diskio" / "diskio_impl.h"
     diskio_bdl = idf_path / "components" / "fatfs" / "diskio" / "diskio_bdl.c"
     diskio_others = {}
@@ -791,7 +766,6 @@ def main() -> int:
         header_text = header.read_text()
         source_text = source.read_text()
         ffconf_text = ffconf.read_text()
-        ffsystem_text = ffsystem.read_text()
         diskio_i_text = diskio_i.read_text()
         diskio_bdl_text = diskio_bdl.read_text()
 
@@ -818,13 +792,6 @@ def main() -> int:
                                    FFCONF_LABEL_BLOCK, MARK_FFCONF_LABEL,
                                    str(ffconf.name) + " label symbol")
 
-        ffsystem_new = replace_once(ffsystem_text, FFSYSTEM_INCLUDE_OLD,
-                                    FFSYSTEM_INCLUDE_NEW,
-                                    MARK_FFSYSTEM_INCLUDE,
-                                    str(ffsystem.name) + " heap caps")
-        ffsystem_new = replace_once(ffsystem_new, FFSYSTEM_ALLOC_OLD,
-                                    FFSYSTEM_ALLOC_NEW, MARK_FFSYSTEM,
-                                    str(ffsystem.name) + " cache-aligned")
 
         diskio_i_new = insert_after(diskio_i_text, DISKIO_SECT_ANCHOR,
                                     DISKIO_SECT_BLOCK, MARK_DISKIO_SECT,
@@ -862,7 +829,6 @@ def main() -> int:
     to_write = [(header, header_text, header_new),
                 (source, source_text, source_new),
                 (ffconf, ffconf_text, ffconf_new),
-                (ffsystem, ffsystem_text, ffsystem_new),
                 (diskio_i, diskio_i_text, diskio_i_new),
                 (diskio_bdl, diskio_bdl_text, diskio_bdl_new)]
     to_write += [(path, diskio_others_old[path], diskio_others_new[path])

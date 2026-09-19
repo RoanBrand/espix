@@ -103,6 +103,9 @@
 #define GPT_HDR_PT_COUNT    80      /* DWORD: entries the array holds */
 #define GPT_HDR_ENTRY_SIZE  84      /* DWORD: bytes per entry */
 #define GPT_HDR_PT_BCC      88      /* DWORD: CRC32 of the whole entry array */
+#define GPT_HDR_SIZE        12      /* DWORD: the header's own length in bytes */
+#define GPT_HDR_BCC         16      /* DWORD: CRC32 of the header, over this zeroed */
+#define GPT_HDR_MIN         92      /* the header length the specification defines */
 
 #define GPT_ENTRY_SIZE      128     /* the size every table this has met uses */
 #define GPT_ENTRY_TYPE_GUID 0       /* 16 bytes: what the partition is for */
@@ -538,20 +541,17 @@ static void guid_format(char *dst, size_t dst_len, const uint8_t *raw)
 /*
  * A buffer for a read out of the block device.
  *
- * The USB host invalidates the cache over the transfer buffer when a read
- * completes -- hcd_dwc.c's cache_sync_data_buffer() passes the caller's own
- * buffer to esp_cache_msync() -- and the cache API's rule is that the region's
- * address *and* size must both meet the alignment, because synchronizing an
- * unaligned region "may silently corrupt the memory" (GOTCHAS.md quotes it in
- * full). IDF's comment there says it accepts UNALIGNED data anyway, "for cases
- * where the class drivers force overwrite the allocated data buffers".
+ * MALLOC_CAP_DMA keeps it in internal RAM, which is the only memory the
+ * ESP32-S3's USB-DWC engine can address -- it cannot reach PSRAM on this part,
+ * and that guarantee is the one that matters.
  *
- * So a plain MALLOC_CAP_DMA allocation -- 8-byte alignment -- has the first and
- * last cache lines of every read into it corrupted, while the transfer reports
- * success. It is also transient: those lines hold bytes belonging to whatever
- * the allocator put next, so the damage shows only while the cache still holds
- * them, which is the first accesses after a mount. That is what made the 3.1TB
- * T9 look like a drive that answers the same read twice with different bytes.
+ * The cache alignment does nothing here, and neither did the alignment story it
+ * came from. The USB host's cache-sync layer is compiled out on this chip
+ * (SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE is ESP32-P4 only), the DMA lands in the
+ * class driver's own URB buffer rather than in this one, and esp_cache_msync()
+ * cannot act on internal S3 RAM in any case. It stays because it is free and
+ * would matter on a part whose internal memory is cached. See docs/GOTCHAS.md,
+ * which had this backwards.
  */
 static void *read_buffer(size_t len)
 {
@@ -833,10 +833,11 @@ static void ext_identity(usb_dev_t *d, uint64_t base, size_t unit,
     const size_t uuid_at  = 0x68;       /* s_uuid, 16 bytes */
     const size_t label_at = 0x78;       /* s_volume_name, 16 bytes */
     const size_t need     = label_at + 16;
-    /* On the stack, and aligned for the same reason read_buffer() exists: this
-     * is a DMA target. 64 rather than the 32 this build's cache line is, because
-     * the line size is a build option and an attribute is fixed at compile time;
-     * over-aligning is free. */
+    /* On the stack, over-aligned for the same reason read_buffer() is kept
+     * aligned: it is free and correct on a part whose internal memory is cached.
+     * It is not required on the ESP32-S3 -- the DMA lands in the class driver's
+     * URB buffer, not here, and the host's cache sync is compiled out. See
+     * read_buffer() and docs/GOTCHAS.md. */
     uint8_t      local[1024] __attribute__((aligned(64)));
     const uint8_t *sb;
 
@@ -1224,14 +1225,20 @@ static const char *entry_hex(const uint8_t *e, char *out, size_t len)
 }
 
 /*
- * Reads a sector twice and reports when the two disagree.
+ * Reads a GPT sector, verified and repaired rather than merely reported.
  *
- * The GPT array is the one place where both answers are already known: the
- * checksum sweep over these same sectors passes, so each of those reads holds
- * the real content, and the walk's own read of the same sector produced random
- * type GUIDs. Comparing them side by side turns that into either a reproducible
- * fault or a fault that happens between a read and its use -- and either is
- * worth more than the next guess.
+ * The GPT array is where a wrong sector becomes a missing partition or a
+ * phantom one, and the only reason to trust a single read of it is a second
+ * that agrees. A disagreeing pair is re-read (up to four tries) until two
+ * consecutive reads agree, and the agreed bytes replace what is in buf. A run
+ * that never agrees fails the read, and the caller reports it exactly as it
+ * would any other read failure.
+ *
+ * This used to read twice and only log the difference, so a bad first read was
+ * still walked and its checksum still counted. The device this was found on --
+ * a Samsung T9 -- returns wrong bytes on roughly one read in sixteen while
+ * reporting success, and an immediate reread of the same LBA usually comes back
+ * correct, so a pair that agrees is the repair.
  */
 static bool gpt_read_sector(usb_dev_t *d, uint8_t *buf, size_t unit, uint64_t lba)
 {
@@ -1239,28 +1246,43 @@ static bool gpt_read_sector(usb_dev_t *d, uint8_t *buf, size_t unit, uint64_t lb
         return false;
     }
 
-    uint8_t *again = read_buffer(unit);
-    if (again == NULL) {
-        return true;        /* no room to check; the read itself succeeded */
+    uint8_t *prev = read_buffer(unit);
+    uint8_t *next = read_buffer(unit);
+    if (prev == NULL || next == NULL) {
+        free(prev);
+        free(next);
+        return true;        /* no room to check; the plain read succeeded */
     }
+    memcpy(prev, buf, unit);
 
-    if (d->bdl->ops->read(d->bdl, again, unit, lba * unit, unit) == ESP_OK &&
-        memcmp(buf, again, unit) != 0) {
-        size_t first = 0;
-        while (first < unit && buf[first] == again[first]) {
-            first++;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (d->bdl->ops->read(d->bdl, next, unit, lba * unit, unit) != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: LBA %llu reread failed",
+                       d->info.name, (unsigned long long)lba);
+            free(prev);
+            free(next);
+            return false;
         }
-        char a[40];
-        char b[40];
-        espix_klog(ESPIX_KLOG_ERROR, TAG,
-                   "%s: LBA %llu read twice differs first at byte %u: %s vs %s",
-                   d->info.name, (unsigned long long)lba, (unsigned)first,
-                   entry_hex(buf + first, a, sizeof(a)),
-                   entry_hex(again + first, b, sizeof(b)));
+        if (memcmp(prev, next, unit) == 0) {
+            memcpy(buf, prev, unit);
+            free(prev);
+            free(next);
+            return true;
+        }
+        uint8_t *swap = prev;
+        prev = next;
+        next = swap;
     }
 
-    free(again);
-    return true;
+    char a[40];
+    char b[40];
+    espix_klog(ESPIX_KLOG_ERROR, TAG,
+               "%s: LBA %llu: no two reads agreed (%s vs %s)",
+               d->info.name, (unsigned long long)lba,
+               entry_hex(prev, a, sizeof(a)), entry_hex(next, b, sizeof(b)));
+    free(prev);
+    free(next);
+    return false;
 }
 
 /*
@@ -1365,12 +1387,44 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
         return false;       /* an entry would straddle sectors */
     }
 
-    if (d->bdl->ops->read(d->bdl, buf, unit, (uint64_t)GPT_HEADER_LBA * unit,
-                          unit) != ESP_OK) {
+    if (!gpt_read_sector(d, buf, unit, GPT_HEADER_LBA)) {
         return false;
     }
     if (memcmp(buf, GPT_SIGNATURE, sizeof(GPT_SIGNATURE) - 1) != 0) {
         return false;
+    }
+
+    /*
+     * The header's own CRC32 -- the check FatFs's test_gpt_header() makes before
+     * it trusts a GPT at all. It covers the header's own length with the CRC
+     * field taken as zero, and it is what makes the array CRC below meaningful:
+     * that one is checked against a number this header carries, so a corrupt
+     * header could point the array anywhere and then vouch for it. The header
+     * read is verified like every other GPT sector, so a transient bad read is
+     * retried rather than rejected.
+     */
+    const uint32_t hdr_size = entry_u32(buf, GPT_HDR_SIZE);
+    if (hdr_size < GPT_HDR_MIN || hdr_size > unit) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: GPT header length %u is not usable", d->info.name,
+                   (unsigned)hdr_size);
+        d->info.table_skipped = true;
+        return true;
+    }
+    {
+        const uint32_t stored = entry_u32(buf, GPT_HDR_BCC);
+        uint8_t saved[4];
+        memcpy(saved, buf + GPT_HDR_BCC, sizeof(saved));
+        memset(buf + GPT_HDR_BCC, 0, sizeof(saved));
+        const uint32_t crc = esp_rom_crc32_le(0, buf, hdr_size);
+        memcpy(buf + GPT_HDR_BCC, saved, sizeof(saved));
+        if (crc != stored) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: GPT header checksum does not match; not walked",
+                       d->info.name);
+            d->info.table_skipped = true;
+            return true;
+        }
     }
 
     const uint64_t table_lba  = entry_u64(buf, GPT_HDR_PT_LBA);
@@ -1390,6 +1444,23 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
                    d->info.name, (unsigned)entries, (unsigned)entry_size);
         d->info.table_skipped = true;
         return true;
+    }
+
+    /*
+     * The array's own location is bounded against the device before it is
+     * multiplied. A header naming an array at LBA 0 or 1, or past the end of the
+     * disk, is not one to read: gpt_read_sector() would be sent outside the
+     * device, and table_lba * unit could wrap.
+     */
+    if (d->info.size > 0) {
+        const uint64_t sectors = d->info.size / unit;
+        if (table_lba < 2 || table_lba >= sectors) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: GPT entry array at LBA %llu is outside the device",
+                       d->info.name, (unsigned long long)table_lba);
+            d->info.table_skipped = true;
+            return true;
+        }
     }
 
     /*
@@ -1452,6 +1523,35 @@ static bool gpt_read(usb_dev_t *d, uint8_t *buf, size_t unit)
             char hex[40];
             espix_klog(ESPIX_KLOG_WARN, TAG,
                        "%s: GPT entry %u ends before it starts (type %s)",
+                       d->info.name, (unsigned)(i + 1),
+                       entry_hex(entry, hex, sizeof(hex)));
+            d->info.table_skipped = true;
+            continue;
+        }
+
+        /*
+         * Both LBAs are bounded against the device before the multiply. The
+         * check on the products below only catches a pair that has not already
+         * wrapped: first * unit wraps for an LBA near 2^64, and last - first + 1
+         * wraps for an entry spanning the whole address space. Either would
+         * leave a small, in-range row that looks entirely real.
+         */
+        if (d->info.size > 0) {
+            const uint64_t sectors = d->info.size / unit;
+            if (first >= sectors || last >= sectors) {
+                char hex[40];
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "%s: GPT entry %u is not inside the device (type %s)",
+                           d->info.name, (unsigned)(i + 1),
+                           entry_hex(entry, hex, sizeof(hex)));
+                d->info.table_skipped = true;
+                continue;
+            }
+        }
+        if (last - first > (UINT64_MAX / unit) - 1) {
+            char hex[40];
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: GPT entry %u is longer than the address space (type %s)",
                        d->info.name, (unsigned)(i + 1),
                        entry_hex(entry, hex, sizeof(hex)));
             d->info.table_skipped = true;
