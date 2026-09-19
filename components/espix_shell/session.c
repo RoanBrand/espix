@@ -86,16 +86,19 @@ int espix_puts(espix_session_t *s, const char *str)
 static int session_vprintf(espix_session_t *s, bool is_err,
                            const char *fmt, va_list ap)
 {
-    char buf[ESPIX_LINE_MAX];
+    /* The session's own buffer, not this frame's -- see the field's note. A NULL
+     * session, which is a command with no terminal attached, keeps the local. */
+    char  local[ESPIX_LINE_MAX];
+    char *buf = (s != NULL) ? s->printf_buf : local;
 
-    const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    const int n = vsnprintf(buf, ESPIX_LINE_MAX, fmt, ap);
     if (n < 0) {
         return n;
     }
 
     /* Truncation is reported as-written rather than retried on the heap: no
      * espix command legitimately emits a single line this long. */
-    const size_t len = ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
+    const size_t len = ((size_t)n < ESPIX_LINE_MAX) ? (size_t)n : ESPIX_LINE_MAX - 1;
 
     return is_err ? session_err(s, buf, len) : session_out(s, buf, len);
 }

@@ -28,6 +28,8 @@
 
 #include "sdkconfig.h"
 
+#include "esp_heap_caps.h"
+
 #include "espix_auth.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
@@ -151,7 +153,18 @@ static int cmd_lsblk(espix_session_t *s, int argc, char **argv)
         want = argv[i];
     }
 
-    espix_usb_dev_t devs[ESPIX_USB_MAX_DEVS];
+    /*
+     * On the heap, not the stack: four of these are about 2.6KB, and none of it
+     * scales with what the listing prints -- it is the device table, which has a
+     * fixed ceiling. A command task is sized for its own frames and for the
+     * buffers it declares; a structure this size is not a frame.
+     */
+    espix_usb_dev_t *devs = heap_caps_malloc(sizeof(espix_usb_dev_t) * ESPIX_USB_MAX_DEVS,
+                                             MALLOC_CAP_8BIT);
+    if (devs == NULL) {
+        espix_eprintf(s, "lsblk: no memory for the device table\n");
+        return 1;
+    }
     const size_t n = attached(s, "lsblk", devs);
 
     /*
@@ -184,10 +197,12 @@ static int cmd_lsblk(espix_session_t *s, int argc, char **argv)
     if (matched == 0) {
         if (want != NULL) {
             espix_eprintf(s, "lsblk: %s: no such device\n", want);
+            free(devs);
             return 1;
         }
         /* Nothing attached is an answer, not a failure: lsblk prints nothing for
          * it, and so does this. */
+        free(devs);
         return 0;
     }
 
@@ -238,6 +253,7 @@ static int cmd_lsblk(espix_session_t *s, int argc, char **argv)
         }
     }
 
+    free(devs);
     return 0;
 }
 
@@ -1505,9 +1521,17 @@ static espix_cmd_t s_blk_cmds[] = {
     { .name = "lsblk", .fn = cmd_lsblk,
       /* The MBR limitation belongs where someone will read it, which is the
        * command's own help rather than a document they have not opened. */
+      /* Its device table is on the heap, so this is its own frames only. 4096
+       * leaves room to spare; the canary is what says if it ever stops being
+       * true. */
+      .stack = 4096,
       .help = "list block devices and their filesystems (MBR and GPT)",
       .usage = "lsblk [disk]" },
     { .name = "blkid", .fn = cmd_blkid,
+      /* Still on its own stack: cmd_blkid() has the same device table as a local
+       * array, and until that moves to the heap it needs the size `lsblk` used to
+       * need. */
+      .stack = 10240,
       .help = "print a device's identity, filesystem, label and uuid",
       .usage = "blkid [device]..." },
     { .name = "mount", .fn = cmd_mount,

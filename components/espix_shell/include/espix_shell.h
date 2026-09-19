@@ -253,6 +253,19 @@ struct espix_session {
      * pair documents.
      */
     bool        err_to_out;
+
+    /*
+     * Where espix_printf() formats, rather than on the stack of whoever called
+     * it. 256 bytes is not much, but it is on *every* command's stack, and a
+     * command task is sized for its own frames -- a line buffer it does not own
+     * should not be part of that sizing. One per session, because two sessions
+     * can print at once and each needs its own.
+     *
+     * Within a session it is not reentrant, which is fine: a command runs to
+     * completion before the next begins, and one that waits for another -- `sudo`
+     * -- is on its own stack by then.
+     */
+    char        printf_buf[ESPIX_LINE_MAX];
 };
 
 /*
