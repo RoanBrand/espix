@@ -473,6 +473,96 @@ MSC_INCLUDES_ADDITION = (
     "#include \"esp_heap_caps.h\"\n"
     "#include \"esp_log.h\"\n"
 )
+# A short IN transfer is not an error in IDF's MSC driver, and it should be.
+#
+# msc_bulk_transfer() checks `actual_num_bytes > size` -- a transfer that returned
+# *more* than was asked for -- and then memcpy()s `actual_num_bytes` to the
+# caller. So a transfer that returned *fewer* copies only that many bytes, leaves
+# the rest of the caller's buffer holding whatever was there before, and returns
+# ESP_OK. Block device, filesystem and listing all see success, and the tail is
+# the previous transfer's data.
+#
+# On the 3.1TB T9 that showed as a directory listing stopping early with
+# FR_INT_ERR -- exFAT's entry-set checksum -- with a couple of entries named "?"
+# among the real ones. A partly-filled directory block, not a wrong one. Linux
+# reads the same directory in full, the Cruzer is unaffected, and the count varies
+# per listing because the short transfer lands somewhere different each time.
+#
+# espix retries rather than failing, because a short read is recoverable and the
+# device is what got it wrong. With the retries exhausted it returns an error
+# instead of a half-filled buffer: a caller can act on a failure, and cannot act
+# on silently stale bytes.
+MSC_SHORT_ANCHOR = (
+    "    MSC_RETURN_ON_ERROR( usb_host_transfer_submit(xfer) );\n"
+    "    const usb_transfer_status_t status = wait_for_transfer_done(xfer);\n"
+    "    switch (status) {\n"
+    "    case USB_TRANSFER_STATUS_COMPLETED:\n"
+    "        if (ep == MSC_EP_IN) {\n"
+    "            if (xfer->actual_num_bytes > size) {\n"
+    "                ret = ESP_ERR_INVALID_SIZE;\n"
+    "            } else {\n"
+    "                memcpy(data, xfer->data_buffer, xfer->actual_num_bytes);\n"
+    "                ret = ESP_OK;\n"
+    "            }\n"
+    "        }\n"
+    "        break;\n"
+    "    case USB_TRANSFER_STATUS_STALL:\n"
+    "        ret = ESP_ERR_MSC_STALL; break;\n"
+    "    default:\n"
+    "        ret = ESP_ERR_MSC_INTERNAL; break;\n"
+    "    }\n"
+    "\n"
+    "    return ret;\n"
+    "}"
+)
+
+MSC_SHORT_ADDITION = (
+    "    /*\n"
+    "     * espix: a transfer that returned fewer bytes than were asked for leaves\n"
+    "     * the tail of the caller's buffer holding the previous transfer's data,\n"
+    "     * and reporting that as ESP_OK hides it from everything above -- see the\n"
+    "     * note in tools/patch-msc.py. Retried, because a short read is\n"
+    "     * recoverable, and failed rather than half-filled when it persists.\n"
+    "     */\n"
+    "    for (int attempt = 0; ; attempt++) {\n"
+    "        MSC_RETURN_ON_ERROR( usb_host_transfer_submit(xfer) );\n"
+    "        const usb_transfer_status_t status = wait_for_transfer_done(xfer);\n"
+    "        switch (status) {\n"
+    "        case USB_TRANSFER_STATUS_COMPLETED:\n"
+    "            if (ep == MSC_EP_IN && xfer->actual_num_bytes > size) {\n"
+    "                ret = ESP_ERR_INVALID_SIZE;\n"
+    "            } else if (ep == MSC_EP_IN && xfer->actual_num_bytes < size) {\n"
+    "                /* Three attempts: enough for a transmitted packet going\n"
+    "                 * missing, and not so many that a device which always\n"
+    "                 * short-packets takes five seconds a time to say so. */\n"
+    "                if (attempt < 2) {\n"
+    "                    continue;\n"
+    "                }\n"
+    "                ESP_LOGE(\"msc_host\",\n"
+    "                         \"short read: %u of %u bytes after %d attempts\",\n"
+    "                         (unsigned)xfer->actual_num_bytes, (unsigned)size,\n"
+    "                         attempt + 1);\n"
+    "                ret = ESP_ERR_INVALID_SIZE;\n"
+    "            } else {\n"
+    "                if (ep == MSC_EP_IN) {\n"
+    "                    memcpy(data, xfer->data_buffer, xfer->actual_num_bytes);\n"
+    "                }\n"
+    "                ret = ESP_OK;\n"
+    "            }\n"
+    "            break;\n"
+    "        case USB_TRANSFER_STATUS_STALL:\n"
+    "            ret = ESP_ERR_MSC_STALL; break;\n"
+    "        default:\n"
+    "            ret = ESP_ERR_MSC_INTERNAL; break;\n"
+    "        }\n"
+    "        break;\n"
+    "    }\n"
+    "\n"
+    "    return ret;\n"
+    "}"
+)
+
+MARK_MSC_SHORT = "espix: a transfer that returned fewer bytes"
 MARK_MSC_INCLUDES = "#include \"esp_heap_caps.h\""
 
 BDL_WRITE_ANCHOR = (
@@ -582,6 +672,8 @@ def main():
                      MARK_INSTALL_LOCALS, replacement=INSTALL_ADDITION),
         insert_after(host, CAPACITY_ANCHOR, "", "install capacity",
                      MARK_INSTALL_CAPACITY, replacement=CAPACITY_ADDITION),
+        insert_after(host, MSC_SHORT_ANCHOR, "", "short read",
+                     MARK_MSC_SHORT, replacement=MSC_SHORT_ADDITION),
         insert_after(bdl, BDL_ANCHOR, "", "bdl geometry",
                      MARK_BDL_SIZE, replacement=BDL_ADDITION),
         insert_after(bdl, MSC_INCLUDES_ANCHOR, MSC_INCLUDES_ADDITION,
