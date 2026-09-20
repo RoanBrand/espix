@@ -146,6 +146,7 @@ void           ssh_skip(ssh_buf_t *b, size_t len);
 #define SSH_MAC_KEY_LEN   32    /* hmac-sha2-256 */
 #define SSH_MAC_LEN       32
 #define SSH_HASH_LEN      32    /* sha256 */
+#define SSH_HASH_BLOCK    64    /* sha256 block, and so the HMAC pad length */
 #define SSH_X25519_LEN    32
 #define SSH_P256_POINT    65    /* 0x04 || X || Y */
 
@@ -177,7 +178,20 @@ typedef struct {
     bool                  active;
     psa_cipher_operation_t cipher;   /* CTR is a stream: one long operation */
     mbedtls_svc_key_id_t  cipher_key;
-    mbedtls_svc_key_id_t  mac_key;
+
+    /*
+     * HMAC-SHA256's key schedule, prepared once when the key is installed: the
+     * SHA-256 state after absorbing the ipad and opad blocks.
+     *
+     * The schedule is fixed for the life of the key, but psa_mac_*() rebuilds it
+     * on every operation -- two SHA setups, each a heap allocation and a
+     * peripheral reset, plus a PSA key-slot lookup. Measured on the packet path
+     * that was ~300us of setup before a byte was hashed. Holding the two states
+     * makes each MAC two hashes fed to the peripheral directly, with no
+     * allocation and no key slot.
+     */
+    uint8_t               mac_inner[SSH_HASH_LEN];
+    uint8_t               mac_outer[SSH_HASH_LEN];
 } ssh_dir_t;
 
 typedef struct {
@@ -234,6 +248,13 @@ typedef struct {
     uint8_t  tx_frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8]
         __attribute__((aligned(SSH_DMA_ALIGN)));
 } ssh_conn_t;
+
+/*
+ * Prepare HMAC-SHA256's ipad/opad states from a raw key, once per key. The key
+ * must not exceed the hash block; the only caller passes SSH_MAC_KEY_LEN.
+ */
+void ssh_mac_prepare(const uint8_t *key, size_t key_len,
+                     uint8_t inner[SSH_HASH_LEN], uint8_t outer[SSH_HASH_LEN]);
 
 esp_err_t ssh_transport_banner(ssh_conn_t *c);
 esp_err_t ssh_packet_read(ssh_conn_t *c);

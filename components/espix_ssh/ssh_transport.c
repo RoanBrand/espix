@@ -15,6 +15,8 @@
 #include <sys/socket.h>
 
 #include "esp_timer.h"
+#include "mbedtls/platform_util.h"   /* mbedtls_platform_zeroize */
+#include "sha/sha_core.h"            /* the HMAC key schedule, prepared below */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -471,6 +473,240 @@ static size_t aligned_len(const ssh_dir_t *d, size_t packet_len)
     return d->active ? packet_len : 4 + packet_len;
 }
 
+/* ------------------------------------------------------------------ */
+/* HMAC-SHA256 over the peripheral                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * HMAC's key schedule is two SHA-256 states, and it is fixed for the life of
+ * the key. psa_mac_*() rebuilds it on every operation -- two SHA setups, each a
+ * heap allocation and a peripheral reset, plus a PSA key-slot lookup -- which on
+ * a per-packet path was measured at ~300us of setup before a byte was hashed.
+ * The states are prepared once instead (ssh_mac_prepare) and each packet is
+ * hashed directly, with no allocation and no key slot.
+ *
+ * These are the SHA engine's own building blocks rather than a hash API: the
+ * caller holds the hardware, and the message length is tracked here because the
+ * final block's bit count is not something the engine keeps for us.
+ */
+typedef struct {
+    uint8_t  buf[SSH_HASH_BLOCK];   /* a partial block waiting for more */
+    size_t   len;                   /* bytes in buf */
+    uint64_t total;                 /* whole message, for the length field */
+} sha_stream_t;
+
+static void sha_stream_start(sha_stream_t *s)
+{
+    s->len = 0;
+    /*
+     * The prepared state has already absorbed one block -- the ipad or the
+     * opad -- so the length the final block carries counts from there.
+     * Starting at zero instead produces a perfectly well-formed MAC that no
+     * peer agrees with, which is how this was found.
+     */
+    s->total = SSH_HASH_BLOCK;
+}
+
+/*
+ * data may be in PSRAM and unaligned: esp_sha_block() presents a block to the
+ * engine from the CPU, so neither matters and no cache synchronization is
+ * involved, unlike the DMA path the PSA driver takes.
+ */
+static void sha_stream_update(sha_stream_t *s, const void *data, size_t n)
+{
+    const uint8_t *p = (const uint8_t *)data;
+
+    if (n == 0) {
+        return;
+    }
+    s->total += n;
+
+    if (s->len != 0) {
+        const size_t fill = SSH_HASH_BLOCK - s->len;
+        if (n < fill) {
+            memcpy(s->buf + s->len, p, n);
+            s->len += n;
+            return;
+        }
+        memcpy(s->buf + s->len, p, fill);
+        esp_sha_block(SHA2_256, s->buf, false);
+        p += fill;
+        n -= fill;
+        s->len = 0;
+    }
+
+    while (n >= SSH_HASH_BLOCK) {
+        esp_sha_block(SHA2_256, p, false);
+        p += SSH_HASH_BLOCK;
+        n -= SSH_HASH_BLOCK;
+    }
+
+    if (n != 0) {
+        memcpy(s->buf, p, n);
+        s->len = n;
+    }
+}
+
+static void sha_stream_finish(sha_stream_t *s, uint8_t out[SSH_HASH_LEN])
+{
+    const uint64_t bits = s->total * 8;
+
+    s->buf[s->len++] = 0x80;
+    if (s->len > 56) {
+        memset(s->buf + s->len, 0, SSH_HASH_BLOCK - s->len);
+        esp_sha_block(SHA2_256, s->buf, false);
+        s->len = 0;
+    }
+    memset(s->buf + s->len, 0, 56 - s->len);
+    for (unsigned i = 0; i < 8; i++) {
+        s->buf[SSH_HASH_BLOCK - 1 - i] = (uint8_t)(bits >> (8 * i));
+    }
+    esp_sha_block(SHA2_256, s->buf, false);
+    esp_sha_read_digest_state(SHA2_256, out);
+}
+
+static void mac_selftest(const uint8_t *key, size_t key_len,
+                         const uint8_t *inner, const uint8_t *outer);
+
+void ssh_mac_prepare(const uint8_t *key, size_t key_len,
+                     uint8_t inner[SSH_HASH_LEN], uint8_t outer[SSH_HASH_LEN])
+{
+    uint8_t ipad[SSH_HASH_BLOCK];
+    uint8_t opad[SSH_HASH_BLOCK];
+
+    memset(ipad, 0x36, sizeof(ipad));
+    memset(opad, 0x5c, sizeof(opad));
+    for (size_t i = 0; i < key_len && i < SSH_HASH_BLOCK; i++) {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+
+    esp_sha_acquire_hardware();
+    esp_sha_set_mode(SHA2_256);
+    /* start=true reloads the IV, so the second block does not disturb the first
+     * before its state has been read out. */
+    esp_sha_block(SHA2_256, ipad, true);
+    esp_sha_read_digest_state(SHA2_256, inner);
+    esp_sha_block(SHA2_256, opad, true);
+    esp_sha_read_digest_state(SHA2_256, outer);
+    esp_sha_release_hardware();
+
+    mbedtls_platform_zeroize(ipad, sizeof(ipad));
+    mbedtls_platform_zeroize(opad, sizeof(opad));
+
+    /* Once per boot, on the first key: see mac_selftest(). */
+    static bool tested;
+    if (!tested) {
+        tested = true;
+        mac_selftest(key, key_len, inner, outer);
+    }
+}
+
+/*
+ * A known-answer test, because this is hand-driven HMAC and "every login still
+ * works" would also be true of an implementation that is consistently wrong.
+ * The comparison is against PSA, which reaches the same hardware by another
+ * route, and the check runs through the code the packets do -- prepare the
+ * states, hash in two halves -- rather than beside it.
+ *
+ * It has already earned its place: a final block whose length field forgot the
+ * already-absorbed pad block produced a well-formed MAC that no peer agreed
+ * with, and every login was refused.
+ */
+static void mac_selftest(const uint8_t *key, size_t key_len,
+                         const uint8_t *inner, const uint8_t *outer)
+{
+    static const uint8_t msg[] = "espix hmac selftest";
+    uint8_t      inner_digest[SSH_HASH_LEN];
+    uint8_t      mine[SSH_MAC_LEN], theirs[SSH_MAC_LEN];
+    sha_stream_t s;
+    size_t       n = 0;
+
+    esp_sha_acquire_hardware();
+    esp_sha_set_mode(SHA2_256);
+    esp_sha_write_digest_state(SHA2_256, (void *)inner);
+    sha_stream_start(&s);
+    sha_stream_update(&s, msg, sizeof(msg) - 1);
+    sha_stream_finish(&s, inner_digest);
+    esp_sha_write_digest_state(SHA2_256, (void *)outer);
+    sha_stream_start(&s);
+    sha_stream_update(&s, inner_digest, sizeof(inner_digest));
+    sha_stream_finish(&s, mine);
+    esp_sha_release_hardware();
+
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
+    mbedtls_svc_key_id_t k = MBEDTLS_SVC_KEY_ID_INIT;
+    if (psa_import_key(&attr, key, key_len, &k) != PSA_SUCCESS ||
+        psa_mac_compute(k, PSA_ALG_HMAC(PSA_ALG_SHA_256), msg, sizeof(msg) - 1,
+                        theirs, sizeof(theirs), &n) != PSA_SUCCESS) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "HMAC self-test could not run");
+        return;
+    }
+    psa_destroy_key(k);
+
+    if (memcmp(mine, theirs, SSH_MAC_LEN) != 0) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "HMAC self-test FAILED -- the packet MAC is wrong");
+        return;
+    }
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "HMAC self-test ok");
+}
+
+/*
+ * HMAC-SHA256 over up to three parts, using the schedule prepared for d. Parts
+ * rather than one assembled buffer because the receive path's sequence and
+ * header are not contiguous with the ciphertext, and copying a whole packet to
+ * make them so is most of what this exists to avoid. Takes and releases the
+ * hardware, so it must not be called while it is held.
+ */
+static void mac_parts(const ssh_dir_t *d,
+                      const void *a, size_t alen,
+                      const void *b, size_t blen,
+                      const void *c, size_t clen,
+                      uint8_t mac[SSH_MAC_LEN])
+{
+    uint8_t      inner[SSH_HASH_LEN];
+    uint8_t      inner_state[SSH_HASH_LEN];
+    uint8_t      outer_state[SSH_HASH_LEN];
+    sha_stream_t s;
+
+    /* The prepared states live in the connection struct, which is in PSRAM;
+     * the digest-register transfers want internal RAM. */
+    memcpy(inner_state, d->mac_inner, sizeof(inner_state));
+    memcpy(outer_state, d->mac_outer, sizeof(outer_state));
+
+    esp_sha_acquire_hardware();
+    esp_sha_set_mode(SHA2_256);
+
+    esp_sha_write_digest_state(SHA2_256, inner_state);
+    sha_stream_start(&s);
+    sha_stream_update(&s, a, alen);
+    sha_stream_update(&s, b, blen);
+    sha_stream_update(&s, c, clen);
+    sha_stream_finish(&s, inner);
+
+    esp_sha_write_digest_state(SHA2_256, outer_state);
+    sha_stream_start(&s);
+    sha_stream_update(&s, inner, sizeof(inner));
+    sha_stream_finish(&s, mac);
+
+    esp_sha_release_hardware();
+    mbedtls_platform_zeroize(inner, sizeof(inner));
+}
+
+/* Length-independent compare, so a peer cannot time its way to a forgery. */
+static bool mac_equal(const uint8_t *a, const uint8_t *b, size_t len)
+{
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; i++) {
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
 esp_err_t ssh_packet_read(ssh_conn_t *c)
 {
     uint8_t header[4];
@@ -527,25 +763,11 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
          * Streaming the MAC needs no shared buffer at all, so there is nothing
          * left to race over.
          */
-        psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
-        psa_status_t        st = psa_mac_verify_setup(
-            &op, c->rx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+        uint8_t expected[SSH_MAC_LEN];
+        mac_parts(&c->rx, seq, sizeof(seq), header, sizeof(header),
+                  c->in_buf, packet_len, expected);
 
-        if (st == PSA_SUCCESS) {
-            st = psa_mac_update(&op, seq, sizeof(seq));
-        }
-        if (st == PSA_SUCCESS) {
-            st = psa_mac_update(&op, header, 4);
-        }
-        if (st == PSA_SUCCESS) {
-            st = psa_mac_update(&op, c->in_buf, packet_len);
-        }
-        if (st == PSA_SUCCESS) {
-            st = psa_mac_verify_finish(&op, mac, sizeof(mac));
-        }
-        psa_mac_abort(&op);         /* no-op once finish() has terminated it */
-
-        if (st != PSA_SUCCESS) {
+        if (!mac_equal(expected, mac, sizeof(mac))) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "MAC mismatch on packet %u",
                        (unsigned)c->seq_in);
             return ESP_ERR_INVALID_MAC;
@@ -685,13 +907,8 @@ esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b)
      * from offset 4 onwards is the packet exactly as it is sent. The framing
      * check above reserved this room.
      */
-    size_t mac_len = 0;
-    if (psa_mac_compute(c->tx.mac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
-                        c->tx_frame, 8 + packet_len,
-                        c->tx_frame + 8 + packet_len, SSH_MAC_LEN,
-                        &mac_len) != PSA_SUCCESS || mac_len != SSH_MAC_LEN) {
-        return ESP_FAIL;
-    }
+    mac_parts(&c->tx, c->tx_frame, 8 + packet_len, NULL, 0, NULL, 0,
+              c->tx_frame + 8 + packet_len);
 
     /*
      * One send, not three. Each is a mailbox round-trip and a context switch

@@ -186,12 +186,12 @@ static esp_err_t install_dir(ssh_dir_t *d, const uint8_t *iv,
                    &d->cipher_key) != ESP_OK) {
         return ESP_FAIL;
     }
-    if (import_sym(mkey, SSH_MAC_KEY_LEN, PSA_KEY_TYPE_HMAC,
-                   PSA_ALG_HMAC(PSA_ALG_SHA_256),
-                   PSA_KEY_USAGE_SIGN_MESSAGE | PSA_KEY_USAGE_VERIFY_MESSAGE,
-                   &d->mac_key) != ESP_OK) {
-        return ESP_FAIL;
-    }
+    /*
+     * The MAC key is not imported into PSA. HMAC is computed from the two
+     * prepared states in ssh_transport.c, which needs the raw key and no key
+     * slot -- see the note in ssh_dir_t.
+     */
+    ssh_mac_prepare(mkey, SSH_MAC_KEY_LEN, d->mac_inner, d->mac_outer);
 
     /*
      * CTR is a stream cipher, so one operation runs for the life of the
@@ -456,10 +456,8 @@ void ssh_kex_release_keys(ssh_conn_t *c)
 
         psa_cipher_abort(&d->cipher);
         psa_destroy_key(d->cipher_key);
-        psa_destroy_key(d->mac_key);
 
         d->cipher_key = MBEDTLS_SVC_KEY_ID_INIT;
-        d->mac_key    = MBEDTLS_SVC_KEY_ID_INIT;
         d->active     = false;
     }
 }
