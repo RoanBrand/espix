@@ -1565,10 +1565,10 @@ static espix_cmd_t s_blk_cmds[] = {
       .help = "list block devices and their filesystems (MBR and GPT)",
       .usage = "lsblk [disk]" },
     { .name = "blkid", .fn = cmd_blkid,
-      /* Still on its own stack: cmd_blkid() has the same device table as a local
-       * array, and until that moves to the heap it needs the size `lsblk` used to
-       * need. */
-      .stack = 10240,
+      /* The device table is on the heap now, so this covers the command's own
+       * frames only: 2204 bytes measured with a stick attached, and 4096 leaves
+       * room to spare. The canary is what says if that ever stops being true. */
+      .stack = 4096,
       .help = "print a device's identity, filesystem, label and uuid",
       .usage = "blkid [device]..." },
     { .name = "mount", .fn = cmd_mount,
@@ -1576,14 +1576,20 @@ static espix_cmd_t s_blk_cmds[] = {
        * left thinking the command is broken. */
       .help = "mount a FAT filesystem (root, or the mount point's owner)",
       .usage = "mount [-o uid=<id>[,gid=<id>]] [device|/dev/device path]",
-      /* lwext4's mount is the deepest thing a command does: 9556 bytes of a
-       * 10240-byte session stack before it tripped the canary, and the ext4
-       * path is deeper than the FAT one that measured it. */
-      .stack = 12288 },
+      /* The device table is on the heap, so this is the command's own frames
+       * plus lwext4's, which is the deepest path a command reaches. Measured
+       * 2768 bytes mounting ext4 read-only and 3024 read-write; 6144 is double
+       * that, for a filesystem whose mount call tree is deeper still.
+       *
+       * The old 12288 came from a 9556-byte reading taken while commands ran
+       * inline on the session task, so it counted the shell's own frames too. */
+      .stack = 6144 },
     { .name = "umount", .fn = cmd_umount,
       .help = "unmount a mounted filesystem (its mounter, or root)",
       .usage = "umount path|device...",
-      .stack = 12288 },
+      /* Symmetric with mount but shallower: lwext4_umount measured 2524 bytes
+       * read-only and 2704 read-write, and 4096 still leaves a clear margin. */
+      .stack = 4096 },
 };
 
 void espix_cmds_register_blk(void)
