@@ -428,7 +428,23 @@ static void cmd_task(void *arg)
 {
     cmd_task_ctx_t *c = arg;
 
+    /*
+     * The session this command belongs to. Thread-local storage does not
+     * cross xTaskCreate, and everything that answers "who is asking" reads
+     * it: the filesystem permission check, the ownership rule,
+     * espix_shell_current() itself. Without this a command with a stack of
+     * its own was taken for espix itself -- permission checks were skipped,
+     * and a directory it created outside a home was left owned by root, so
+     * the user who made it could not write into it. `mkdir /tmp/x` then
+     * `echo hi > /tmp/x/f` was "Permission denied".
+     */
+    espix_shell_set_current(c->s);
+
     c->status = c->fn(c->s, c->argc, c->argv);
+
+    /* The task is about to be deleted; do not leave the pointer on a task
+     * that FreeRTOS may reuse. */
+    espix_shell_set_current(NULL);
 
     /*
      * Reported before the task exits, because afterwards nothing can ask it: a
