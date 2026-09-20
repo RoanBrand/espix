@@ -1245,6 +1245,50 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## SSH
 
+- ~~**A connection whose peer vanishes keeps its session slot until the command
+  ends, which can be minutes.**~~ **Fixed** (`f2463cf`), by TCP keepalive with
+  short timers on every accepted connection: `SO_KEEPALIVE` plus
+  `TCP_KEEPIDLE` 10s / `TCP_KEEPINTVL` 5s / `TCP_KEEPCNT` 3 in `ssh_server.c`.
+
+  Found by chasing `tests/suites/55-sessions.sh`, which failed about one run in
+  ten: "closing them frees the slots" and "and the memory with them" together,
+  with `device health after the run` reporting two `sshd:conn` tasks held in
+  states `R` and `B`. The suite is not at fault -- 30 seconds is generous.
+
+  What the holding task was doing, from probes on the device: running
+  `top -b -n 200` **to the last frame**. `cmd_top` polls `poll_interrupt()`
+  every 50ms, so a peer it could detect would have stopped it within a frame.
+  It never did, and the pump's read-failure -- the one place a close becomes
+  `ch->closed` -- never fired either. A zero-length `recv(MSG_PEEK|MSG_DONTWAIT)`
+  added to `chan_poll_interrupt()` to look past `select()` also never fired:
+  there was nothing to see. The peer had gone; the socket never said so.
+
+  The client side is not at fault either. At the moment of failure the host had
+  no leftover `ssh` processes for the eight sessions, so every client had exited
+  and every socket had been closed. The FIN simply was not arriving, and a
+  connection with no FIN looks exactly like an idle one -- which is why the two
+  existing timeouts did not cover it. `SO_RCVTIMEO` turns a silent socket into
+  "nothing right now", and idle is legitimate for hours. `SO_SNDTIMEO` gives
+  `write_all()` a stall clock, but a half-open connection still *accepts* bytes,
+  so progress keeps resetting that clock.
+
+  Two things were ruled out along the way and are worth keeping: `TX_DEAD_MS` is
+  exactly 30000, so a task parked on the transmit lock would have warned, and it
+  never did; and `read_exact()` handles `recv() == 0` correctly, so it is not
+  swallowing EOF.
+
+  Keepalive is the mechanism for exactly this, and `LWIP_TCP_KEEPALIVE` is
+  already on in IDF's `lwipopts.h`, so the timers can be shortened from their
+  two-hour default. Ten seconds of silence, a probe every five, three of them: a
+  dead peer is reaped in about twenty-five seconds, and one that is merely quiet
+  is probed and left alone. `TCP_KEEPCNT` is the load-bearing option -- without
+  it lwIP probes forever and the session is never given up.
+
+  Forty consecutive `55-sessions` runs passed after the change, against roughly
+  two failures in the twenty-four before it. The reproduction is cheap if this
+  returns: run the suite in a loop and watch `ps` at the failure -- the held
+  tasks' states and stack sizes are the fingerprint.
+
 - **SFTP transfers cannot reach past 4 GiB, and say so.** The read and write
   handlers seek with `fseek()`, which takes a `long`; `off_t` is 64 bits now, so
   the client's 64-bit offset is truncated on the way in. The 64-bit sibling
