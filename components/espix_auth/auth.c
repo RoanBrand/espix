@@ -27,6 +27,15 @@
 #include "mbedtls/platform_util.h"   /* mbedtls_platform_zeroize */
 #include "psa/crypto.h"
 
+/*
+ * The SHA peripheral's own API, from the mbedtls component's port. The public
+ * PSA and Mbed TLS calls reach the same hardware but pay a driver setup --
+ * including a heap allocation and a peripheral reset -- on every hash, which
+ * for PBKDF2's 40000 tiny hashes a login is the whole cost. See the note above
+ * pbkdf2_sha256().
+ */
+#include "sha/sha_core.h"
+
 #include "espix_auth.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -46,18 +55,13 @@
 #define SALT_LEN        16
 #define HASH_LEN        32
 /*
- * MEASURED 2026-09-08: 2030 ms, not the ~100ms this comment used to claim.
+ * 20000 iterations is 40000 HMACs -- two per iteration, inner and outer -- and
+ * that is the number the login actually pays for, so it is the one the number
+ * below has to be read against.
  *
- * That is ~101us per iteration. An HMAC-SHA256 over a 32-byte input is a
- * handful of 64-byte compressions and the S3's hardware accelerator does a
- * block in low single-digit microseconds, so the overwhelming majority of that
- * is *not* hashing -- it is per-iteration overhead. The task watchdog caught it
- * in the act: esp_sha_hash_setup() calls heap_caps_malloc() on every HMAC, so
- * this is twenty thousand malloc/free pairs per login.
- *
- * Which is why the number below has not been reduced. Cutting iterations would
- * shorten the login by weakening password hashing, to work around an allocator
- * problem that costs nothing to fix properly. See docs/ROADMAP.md.
+ * It has not been reduced and should not be: cutting it would shorten the login
+ * by weakening password hashing. What the per-iteration overhead used to be is
+ * the story told above pbkdf2_sha256(), and it is no longer paid.
  */
 #define PBKDF2_ITERS    20000
 
@@ -163,73 +167,84 @@ static bool from_hex(const char *in, uint8_t *out, size_t out_len)
 /* ------------------------------------------------------------------ */
 
 /*
- * PBKDF2-HMAC-SHA256, driven here rather than by psa_key_derivation_*().
+ * PBKDF2-HMAC-SHA256 over the SHA peripheral directly.
  *
- * WHY, because reaching past a working public API wants justifying. Measured on
- * an S3 at 240MHz, 20000 iterations through PSA cost **2030 ms** -- 101us an
- * iteration, for what should be two SHA-256 compressions. The reason is in
- * psa_crypto.c, psa_key_derivation_pbkdf2_generate_block():
+ * WHY NOT PSA. Measured on an S3 at 240MHz, 20000 iterations (40000 HMACs, two
+ * per iteration) cost 1207 ms through psa_hash_clone(). Almost none of that is
+ * hashing. Per HMAC the PSA path pays:
  *
- *     for (i = 1; i < pbkdf2->input_cost; i++) {
- *         status = psa_driver_wrapper_mac_compute(attributes,
- *                                                 pbkdf2->password, ...
+ *   - psa_hash_clone() -> esp_sha_hash_clone(), which is
+ *     heap_caps_malloc(sizeof(esp_sha256_context), MALLOC_CAP_DMA|INTERNAL)
+ *     plus a memset and a memcpy, undone by psa_hash_finish()'s abort. That is
+ *     40000 malloc/free pairs a login, not the "no per-iteration allocation"
+ *     an earlier version of this comment claimed.
+ *   - esp_sha_acquire_hardware(), which takes the SHA/AES lock *and* calls
+ *     esp_crypto_sha_enable_periph_clk(true) -- and that function resets the
+ *     peripheral on every enable. So the SHA block is reset 40000 times a login
+ *     to hash 40000 blocks.
  *
- * It calls the *one-shot* MAC on every iteration, handing it the raw password
- * each time -- so each iteration re-derives the HMAC key schedule from scratch:
- * hash the key, build the 64-byte ipad and opad blocks, absorb both. That is
- * roughly four compressions where two are useful, plus a full driver setup and
- * teardown (which, on the hardware SHA path, includes a heap_caps_malloc --
- * twenty thousand malloc/free pairs per login).
+ * WHAT THIS DOES INSTEAD. Absorb ipad and opad once, keep the two resulting
+ * SHA-256 states in 32-byte arrays, and per HMAC do only
+ * esp_sha_write_digest_state() -> esp_sha_block() -> esp_sha_read_digest_state()
+ * (SOC_SHA_SUPPORT_RESUME is what makes the middle of a hash resumable). No
+ * allocation, no key schedule, no peripheral reset per hash.
  *
- * It is not the hashing: a build with CONFIG_MBEDTLS_HARDWARE_SHA off measured
- * 1936 ms, *faster* than the accelerated one. Accelerating a minority of the
- * work cannot help. Reported in docs/UPSTREAM.md.
+ * The hardware is still shared: SHA shares a lock with AES, and with the crypto
+ * DMA, so it must not be held for the ~1s the whole derivation takes or WiFi's
+ * AES work would stall behind it. It is therefore taken and released once per
+ * PBKDF2_BATCH iterations -- a few hundred microseconds at a time, and a few
+ * hundred acquisitions a login instead of 40000.
  *
- * WHAT THIS DOES INSTEAD is the textbook shape PSA skips: absorb ipad and opad
- * once, then psa_hash_clone() those states per iteration. Two compressions an
- * iteration, no key schedule, no per-iteration allocation. Same construction,
- * same output -- pbkdf2_selftest() checks that against a published vector at
- * init, and every /etc/passwd record still verifies because the algorithm is
- * unchanged.
+ * This is the shape SHA needs; the construction is untouched. Same output --
+ * pbkdf2_selftest() checks the result against an RFC 7914 vector at init, so a
+ * mistake here is caught at boot rather than as a login that will not work.
  *
- * mbedtls_pkcs5_pbkdf2_hmac_ext() is the obvious answer, and was measured
- * rather than assumed -- the first version of this comment claimed it was
- * unavailable, and that was wrong. "private" in Mbed TLS 4.x means *unstable
- * API*, not unreachable: MBEDTLS_PKCS5_C is on, the symbol is exported from
- * libmbedcrypto.a, and drivers/builtin/include is already on this component's
- * include path. It links and it produces byte-identical output.
- *
- * It is simply slower here: 1675 ms against 1116 ms for the code below, same
- * board, same inputs. It reaches the same hardware SHA driver through the MD
- * layer and pays that driver's per-hash setup on all 40000 hashes; cloning a
- * prepared state does not. So the public API wins on this target -- a happier
- * answer than it had any right to be, and the reason there is no private
- * dependency here.
+ * The public APIs were measured and are slower on this target, which is why
+ * this reaches for the peripheral. mbedtls_pkcs5_pbkdf2_hmac_ext() reaches the
+ * same hardware through the MD layer and pays that driver's setup on all 40000
+ * hashes (1675 ms); psa_key_derivation_*() re-derives the key schedule every
+ * iteration (2030 ms). The one-shot esp_sha_hash_compute() is allocation-free
+ * (its context is on the stack) but must re-absorb ipad or opad for every
+ * hash, doubling the blocks for no reason. Reported in docs/UPSTREAM.md.
  */
 
-#define HMAC_BLOCK 64       /* SHA-256's input block, so the pad length */
+#define SHA_BLOCK 64        /* SHA-256's block, and the HMAC pad length */
 
-/* One clone of a prepared state, absorbing `in` and emitting `out`. The clone
- * is what makes this cheap; `src` keeps its post-pad state for the next call. */
-static psa_status_t hmac_half(const psa_hash_operation_t *src,
-                              const uint8_t *in, size_t in_len,
-                              uint8_t *out)
+/* Iterations between releasing the SHA/AES lock. Long enough that the lock is
+ * not what the loop costs, short enough that AES work waiting behind it is not
+ * made to wait for a login. */
+#define PBKDF2_BATCH 64
+
+/*
+ * The final block of a message whose first SHA_BLOCK bytes are already in
+ * `state`: `tail`, then the 0x80, zero fill, and the 64-bit big-endian bit
+ * count. Both hashes here absorb exactly one block before the tail -- the ipad
+ * or opad -- so the count is (SHA_BLOCK + tail_len) * 8.
+ */
+static void final_block(uint8_t block[SHA_BLOCK],
+                        const uint8_t *tail, size_t tail_len)
 {
-    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-    size_t               got = 0;
+    memset(block, 0, SHA_BLOCK);
+    memcpy(block, tail, tail_len);
+    block[tail_len] = 0x80;
 
-    psa_status_t st = psa_hash_clone(src, &op);
-    if (st == PSA_SUCCESS) {
-        st = psa_hash_update(&op, in, in_len);
+    const uint64_t bits = (uint64_t)(SHA_BLOCK + tail_len) * 8;
+    for (unsigned i = 0; i < 8; i++) {
+        block[SHA_BLOCK - 1 - i] = (uint8_t)(bits >> (8 * i));
     }
-    if (st == PSA_SUCCESS) {
-        st = psa_hash_finish(&op, out, HASH_LEN, &got);
-    }
-    if (st != PSA_SUCCESS || got != HASH_LEN) {
-        psa_hash_abort(&op);
-        return (st == PSA_SUCCESS) ? PSA_ERROR_CORRUPTION_DETECTED : st;
-    }
-    return PSA_SUCCESS;
+}
+
+/*
+ * One SHA-256 over `block`, resumed from the prepared `state` and written to
+ * `out`. `state` is only read, which is what lets one prepared state serve
+ * every iteration. The hardware must already be held.
+ */
+static void sha_resume(uint8_t state[HASH_LEN],
+                       const uint8_t block[SHA_BLOCK], uint8_t out[HASH_LEN])
+{
+    esp_sha_write_digest_state(SHA2_256, state);
+    esp_sha_block(SHA2_256, block, false);
+    esp_sha_read_digest_state(SHA2_256, out);
 }
 
 /*
@@ -244,85 +259,103 @@ static esp_err_t pbkdf2_sha256(const char *password,
     if (out_len != HASH_LEN || iters == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* S || INT_BE32(1) must fit the final block beside the 0x80 and the length
+     * field, or U_1 would need a second block. SALT_LEN is 16, so this guards
+     * against a future caller rather than a case that occurs. */
+    if (salt_len + sizeof(uint32_t) > SHA_BLOCK - 9) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    uint8_t pad[HMAC_BLOCK];
-    uint8_t key[HASH_LEN];
+    uint8_t        ipad[SHA_BLOCK];
+    uint8_t        opad[SHA_BLOCK];
+    uint8_t        key[HASH_LEN];
     const uint8_t *k     = (const uint8_t *)password;
     size_t         k_len = strlen(password);
 
-    psa_hash_operation_t inner = PSA_HASH_OPERATION_INIT;
-    psa_hash_operation_t outer = PSA_HASH_OPERATION_INIT;
-    esp_err_t            ret   = ESP_FAIL;
-    psa_status_t         st;
-
     /* RFC 2104: a key longer than the block is replaced by its own digest. */
-    if (k_len > HMAC_BLOCK) {
+    if (k_len > SHA_BLOCK) {
         size_t got = 0;
         if (psa_hash_compute(PSA_ALG_SHA_256, k, k_len, key, sizeof(key),
                              &got) != PSA_SUCCESS || got != HASH_LEN) {
-            goto out;
+            return ESP_FAIL;
         }
         k     = key;
         k_len = HASH_LEN;
     }
 
-    /* The two prepared states. Everything after this is clones of them. */
-    memset(pad, 0x36, sizeof(pad));
-    for (size_t i = 0; i < k_len; i++) { pad[i] = (uint8_t)(pad[i] ^ k[i]); }
-    if ((st = psa_hash_setup(&inner, PSA_ALG_SHA_256)) != PSA_SUCCESS ||
-        (st = psa_hash_update(&inner, pad, sizeof(pad))) != PSA_SUCCESS) {
-        goto out;
+    memset(ipad, 0x36, sizeof(ipad));
+    memset(opad, 0x5c, sizeof(opad));
+    for (size_t i = 0; i < k_len; i++) {
+        ipad[i] = (uint8_t)(ipad[i] ^ k[i]);
+        opad[i] = (uint8_t)(opad[i] ^ k[i]);
     }
 
-    memset(pad, 0x5c, sizeof(pad));
-    for (size_t i = 0; i < k_len; i++) { pad[i] = (uint8_t)(pad[i] ^ k[i]); }
-    if ((st = psa_hash_setup(&outer, PSA_ALG_SHA_256)) != PSA_SUCCESS ||
-        (st = psa_hash_update(&outer, pad, sizeof(pad))) != PSA_SUCCESS) {
-        goto out;
-    }
+    uint8_t       inner_state[HASH_LEN];
+    uint8_t       outer_state[HASH_LEN];
+    uint8_t       block[SHA_BLOCK];
+    uint8_t       u[HASH_LEN];
+    uint8_t       acc[HASH_LEN];
+    uint8_t       tail[SHA_BLOCK];
+    const uint8_t counter[4] = { 0, 0, 0, 1 };
+
+    /* One hold covers both prepared states and U_1. */
+    esp_sha_acquire_hardware();
+    esp_sha_set_mode(SHA2_256);
+
+    /* Absorb each pad once; what is read back is the state a hash resumed from
+     * it would start with. start=true reloads the IV, so the second block does
+     * not disturb the first. */
+    esp_sha_block(SHA2_256, ipad, true);
+    esp_sha_read_digest_state(SHA2_256, inner_state);
+    esp_sha_block(SHA2_256, opad, true);
+    esp_sha_read_digest_state(SHA2_256, outer_state);
 
     /* U_1 = PRF(P, S || INT_BE32(1)) */
-    uint8_t u[HASH_LEN];
-    uint8_t acc[HASH_LEN];
-    {
-        psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-        const uint8_t        counter[4] = { 0, 0, 0, 1 };
-        size_t               got = 0;
-
-        st = psa_hash_clone(&inner, &op);
-        if (st == PSA_SUCCESS) { st = psa_hash_update(&op, salt, salt_len); }
-        if (st == PSA_SUCCESS) { st = psa_hash_update(&op, counter, 4); }
-        if (st == PSA_SUCCESS) { st = psa_hash_finish(&op, u, HASH_LEN, &got); }
-        if (st != PSA_SUCCESS || got != HASH_LEN) {
-            psa_hash_abort(&op);
-            goto out;
-        }
-        if (hmac_half(&outer, u, HASH_LEN, u) != PSA_SUCCESS) {
-            goto out;
-        }
-    }
+    memcpy(tail, salt, salt_len);
+    memcpy(tail + salt_len, counter, sizeof(counter));
+    final_block(block, tail, salt_len + sizeof(counter));
+    sha_resume(inner_state, block, u);
+    final_block(block, u, HASH_LEN);
+    sha_resume(outer_state, block, u);
     memcpy(acc, u, HASH_LEN);
 
+    esp_sha_release_hardware();
+
     /* U_i = PRF(P, U_{i-1}); T_1 = U_1 ^ U_2 ^ ... ^ U_c */
-    for (uint32_t i = 1; i < iters; i++) {
-        if (hmac_half(&inner, u, HASH_LEN, u) != PSA_SUCCESS ||
-            hmac_half(&outer, u, HASH_LEN, u) != PSA_SUCCESS) {
-            goto out;
+    uint32_t i = 1;
+    while (i < iters) {
+        uint32_t n = iters - i;
+        if (n > PBKDF2_BATCH) {
+            n = PBKDF2_BATCH;
         }
-        for (size_t b = 0; b < HASH_LEN; b++) { acc[b] ^= u[b]; }
+
+        esp_sha_acquire_hardware();
+        esp_sha_set_mode(SHA2_256);
+        for (uint32_t j = 0; j < n; j++, i++) {
+            final_block(block, u, HASH_LEN);
+            sha_resume(inner_state, block, u);
+            final_block(block, u, HASH_LEN);
+            sha_resume(outer_state, block, u);
+            for (size_t b = 0; b < HASH_LEN; b++) {
+                acc[b] = (uint8_t)(acc[b] ^ u[b]);
+            }
+        }
+        esp_sha_release_hardware();
     }
 
     memcpy(out, acc, HASH_LEN);
-    ret = ESP_OK;
 
-out:
-    psa_hash_abort(&inner);
-    psa_hash_abort(&outer);
-    /* Neither the pads nor the intermediate U values may outlive this call:
-     * both are derived from the password. */
-    mbedtls_platform_zeroize(pad, sizeof(pad));
+    /* Neither the pads nor the intermediates may outlive this call: all are
+     * derived from the password. */
+    mbedtls_platform_zeroize(ipad, sizeof(ipad));
+    mbedtls_platform_zeroize(opad, sizeof(opad));
     mbedtls_platform_zeroize(key, sizeof(key));
-    return ret;
+    mbedtls_platform_zeroize(inner_state, sizeof(inner_state));
+    mbedtls_platform_zeroize(outer_state, sizeof(outer_state));
+    mbedtls_platform_zeroize(u, sizeof(u));
+    mbedtls_platform_zeroize(acc, sizeof(acc));
+    mbedtls_platform_zeroize(tail, sizeof(tail));
+    return ESP_OK;
 }
 
 static esp_err_t derive(const char *password, const uint8_t *salt,
@@ -332,29 +365,47 @@ static esp_err_t derive(const char *password, const uint8_t *salt,
 }
 
 /*
- * A known-answer test, because this is hand-driven HMAC and "every login still
+ * Known-answer tests, because this is hand-driven HMAC and "every login still
  * works" would also be true of an implementation that is consistently wrong.
  *
  * RFC 7914 section 11, the first PBKDF2-HMAC-SHA256 vector: P="passwd",
  * S="salt", c=1, dkLen=64. Only the first 32 bytes are checked, which is
- * exactly T_1 -- the one block this produces. One iteration, so it costs
- * nothing at boot.
+ * exactly T_1 -- the one block this produces.
+ *
+ * The second is the same inputs at c=200, an independently computed vector
+ * rather than a published one, and it is here for a different reason: 200
+ * crosses PBKDF2_BATCH three times, so releasing and re-taking the hardware in
+ * the middle of a derivation is exercised at boot rather than by a login that
+ * silently stops working. It costs a few hundred hashes.
  */
 static void pbkdf2_selftest(void)
 {
-    static const uint8_t want[HASH_LEN] = {
+    static const uint8_t want1[HASH_LEN] = {
         0x55, 0xac, 0x04, 0x6e, 0x56, 0xe3, 0x08, 0x9f,
         0xec, 0x16, 0x91, 0xc2, 0x25, 0x44, 0xb6, 0x05,
         0xf9, 0x41, 0x85, 0x21, 0x6d, 0xde, 0x04, 0x65,
         0xe6, 0x8b, 0x9d, 0x57, 0xc2, 0x0d, 0xac, 0xbc,
     };
+    static const uint8_t want200[HASH_LEN] = {
+        0x0f, 0x40, 0x9e, 0xb1, 0xaa, 0x5a, 0xd2, 0x60,
+        0x03, 0x3e, 0x44, 0x16, 0xbd, 0xdf, 0xa6, 0xa5,
+        0x23, 0x43, 0xb8, 0x83, 0x94, 0x2c, 0x88, 0xec,
+        0xcd, 0x24, 0x4e, 0x2d, 0x39, 0x12, 0x4b, 0xa1,
+    };
     uint8_t got[HASH_LEN];
 
     if (pbkdf2_sha256("passwd", (const uint8_t *)"salt", 4, 1,
                       got, sizeof(got)) != ESP_OK ||
-        memcmp(got, want, sizeof(want)) != 0) {
+        memcmp(got, want1, sizeof(want1)) != 0) {
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "PBKDF2 self-test FAILED -- passwords cannot be trusted");
+        return;
+    }
+    if (pbkdf2_sha256("passwd", (const uint8_t *)"salt", 4, 200,
+                      got, sizeof(got)) != ESP_OK ||
+        memcmp(got, want200, sizeof(want200)) != 0) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "PBKDF2 batch self-test FAILED -- passwords cannot be trusted");
         return;
     }
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "PBKDF2 self-test ok");

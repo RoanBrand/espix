@@ -1109,9 +1109,10 @@ both are the sort of thing that is cheaper to know now.
   point's behaviour and not the station's sleep schedule.
 
   So the 100-300ms beacon penalty reasoned about below is real in principle and
-  absent on this link. The login is slow for an entirely different reason:
-  **PBKDF2 costs 2030 ms of pure CPU**, against the "~100ms" its own comment
-  claims. See the auth entry.
+  absent on this link. The login was slow for an entirely different reason:
+  **PBKDF2 cost 2030 ms of pure CPU**, against the "~100ms" its own comment
+  claimed. That is now 223 ms, after `auth.c` stopped going through PSA — see
+  the auth entry.
 
   Kept open rather than closed, because "no benefit here" is not "no benefit" --
   a different access point with a longer DTIM could still show it. But it is no

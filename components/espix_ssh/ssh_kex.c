@@ -243,12 +243,13 @@ esp_err_t ssh_kex_run(ssh_conn_t *c)
 
     mbedtls_svc_key_id_t eph = MBEDTLS_SVC_KEY_ID_INIT;
     /*
-     * Phase timings, DEBUG. The handshake spends ~1040ms here and the S3 has no
-     * ECC accelerator (no SOC_ECC_SUPPORTED), so all of X25519 and the P-256
-     * signature are software with only the MPI peripheral assisting. Which of
-     * them dominates decides whether MBEDTLS_ECP_FIXED_POINT_OPTIM -- off in
-     * this build, and precisely the optimisation for base-point multiplication
-     * -- is worth its memory.
+     * Phase timings, DEBUG. The key exchange spends ~600ms of CPU here and the
+     * S3 has no ECC accelerator (no SOC_ECC_SUPPORTED), so all of X25519 and
+     * the P-256 signature are software with only the MPI peripheral assisting.
+     * MBEDTLS_ECP_FIXED_POINT_OPTIM -- the optimisation for base-point
+     * multiplication -- is on in this build and has already taken a nistp256
+     * signature from 593ms to 319ms, so the question that used to be posed here
+     * is answered; what remains is X25519, which it cannot help.
      */
     const int64_t t_kex0 = esp_timer_get_time();
     int64_t       t_mark = t_kex0;

@@ -150,6 +150,7 @@ PBKDF2-HMAC-SHA256 for a 32-byte key, all four producing identical output:
 | via `mbedtls_pkcs5_pbkdf2_hmac_ext()`, hardware SHA | **1675 ms** |
 | driving `psa_hash_clone()` directly, hardware SHA | **1116 ms** |
 | driving `mbedtls_sha256_*` directly, software, no allocation | **919 ms** |
+| driving the SHA peripheral itself, hardware, lock batched | **223 ms** |
 
 Row two is the tell. Turning the SHA accelerator *off* made it slightly faster,
 which is only possible if the hashing is a minority of the work — accelerating a
@@ -167,12 +168,21 @@ same hardware driver through the MD layer and pays that per-hash setup on all
 used carefully — which says the cost is in the driver's per-operation overhead,
 not in any one caller.
 
-espix works around it in `components/espix_auth/auth.c`: absorb
-ipad and opad once, then `psa_hash_clone()` those states per iteration. Same construction and
-byte-identical output — checked three ways: against RFC 7914 §11's first vector
-at init, against `mbedtls_pkcs5_pbkdf2_hmac_ext()` directly, and by every
-existing `/etc/passwd` record still verifying — for 45% less time and no extra
-memory. It is ~90 lines of hand-driven HMAC that nobody should have to write.
+espix works around it in `components/espix_auth/auth.c`, and the last row of the
+table is the workaround: absorb ipad and opad once, keep the two resulting
+SHA-256 states in memory, and resume the peripheral from them per hash —
+`esp_sha_write_digest_state()` → `esp_sha_block()` → `esp_sha_read_digest_state()`,
+from `sha/sha_core.h`. No allocation, no key schedule, and no driver setup per
+hash. Same construction and byte-identical output — checked against RFC 7914
+§11's first vector at init, against an independently computed 200-iteration
+vector that crosses the lock-release boundary, and by every existing
+`/etc/passwd` record still verifying.
+
+The hardware is shared — SHA and AES take one lock and share one clock gate, and
+enabling that clock resets the peripheral — so it is acquired and released once
+per 64 iterations rather than held for the whole derivation. That is a few
+hundred microseconds at a time and a few hundred acquisitions a login instead of
+40 000, and it keeps WiFi's AES work from queueing behind a one-second hash.
 
 Worth fixing upstream because the API shape already supports it:
 `psa_mac_sign_setup()`/`update()`/`sign_finish()` exist, and the loop could hold
@@ -199,18 +209,19 @@ DMA-capable RAM is the binding constraint — espix fits eight SSH sessions in
 expensive twice over: the time, and the fragmentation of forty thousand
 transient allocations per password check.
 
-**The last row of the table is what to take from this.** Bypassing PSA entirely
-and cloning a raw `mbedtls_sha256_context` — no allocator, no dispatch, no
-hardware lock — reached only 919 ms, against 1116 ms through PSA. So the
-allocation is worth about 200 ms of the total and the remaining ~900 ms is the
-software compression itself, at roughly 23 microseconds per 64-byte block.
+**The last two rows are what to take from this.** Bypassing PSA for a raw
+`mbedtls_sha256_context` — no allocator, no dispatch, no hardware lock — reached
+919 ms, so the allocation is worth about 200 ms and the rest was software
+compression at ~23 microseconds per 64-byte block. But that path is *software*:
+`mbedtls_sha256_*` on this build does not reach the accelerator at all.
+Driving the peripheral itself does, and lands at **223 ms**, or 5.6 microseconds
+per hash — one block each in the loop, so that figure is close to the
+accelerator's floor plus the state load and store.
 
-Which is the real indictment: the SHA accelerator does a block in low
-single-digit microseconds, so a driver whose per-operation overhead did not
-swamp it would put this whole derivation near **100 ms**. The hardware is there
-and unreachable at this granularity. espix kept the PSA version — 1.2x is not
-worth a dependency on a private header — so this stays a report rather than a
-workaround.
+So the hardware was never unreachable at this granularity; PSA's per-operation
+setup was simply larger than the operation it wrapped. That is the indictment,
+and it is correct. Both defects are still worth reporting, because a caller can
+see neither from the API — but neither is on espix's critical path now.
 
 ### The VFS has no `chmod`
 

@@ -317,12 +317,15 @@ pbkdf2_sha256 (espix_auth/auth.c) → hmac_half → psa_hash_finish
   → esp_sha_hash_abort → free() → multi_heap_free
 ```
 
-PBKDF2 runs 20 000 iterations with no blocking call, and each one allocates and
-frees internal DMA memory inside the PSA driver — see the next section, which
-already counts that at 40 000 heap operations per password check. Eight
-concurrent logins on two cores is enough to keep both above IDLE for five
-seconds. So the trigger is a real workload saturating the machine, which is
-exactly the case the watchdog cannot distinguish from a stall.
+PBKDF2 ran 20 000 iterations with no blocking call, and each allocated and freed
+internal DMA memory inside the PSA driver — 40 000 heap operations per password
+check. Eight concurrent logins on two cores was enough to keep both above IDLE
+for five seconds. So the trigger was a real workload saturating the machine,
+which is exactly the case the watchdog cannot distinguish from a stall.
+
+That stack is gone: `auth.c` now drives the SHA peripheral directly and
+allocates nothing per iteration (the crypto section below has the numbers). This
+is kept as the worked example of reading a trigger, not as a live hazard.
 
 Two limits worth carrying: the fourth trigger decoded to the **wifi** task in
 `pm_tbtt_process` → `esp_phy_enable`, the modem-sleep wake path, so not every
@@ -354,6 +357,12 @@ Also worth knowing what is *not* the fix: turning `CONFIG_MBEDTLS_HARDWARE_SHA`
 off measured slightly **faster** (1936 ms vs 2030 ms on the same workload),
 because the per-operation overhead swamps what the accelerator saves. An
 accelerator only helps if you can reach it at the right granularity.
+
+What is the fix, where the loop is yours: skip PSA and resume the peripheral
+from a state you keep yourself. espix's PBKDF2 went from 1116 ms through
+`psa_hash_clone()` to **223 ms** doing that, with no allocation at all. The
+driver's behaviour above is unchanged — it is a trap for PSA users, and worth
+recognising rather than rediscovering.
 
 **X25519 runs through mbedtls's generic ECP path**, at roughly 140 ms per
 scalar multiplication on a 240 MHz S3 — and the S3 has no ECC accelerator at all
