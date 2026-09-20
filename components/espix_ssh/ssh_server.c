@@ -563,6 +563,36 @@ static void accept_task(void *arg)
          */
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
 
+        /*
+         * Keepalive, with short timers rather than the two-hour default.
+         *
+         * The two timeouts above cover a peer that stops mid-packet and one
+         * that stops draining. Neither covers a peer that simply *vanishes*
+         * without its FIN reaching us: the socket still looks healthy, so a
+         * read times out as "nothing right now" -- and idle is a legitimate
+         * state that may last hours -- while a write keeps succeeding into a
+         * connection nothing is reading any more.
+         *
+         * 55-sessions reproduces exactly that. A killed client's connection
+         * held its session slot while a foreground \`top\` ran to the last of its
+         * frames; neither a read nor a select ever reported the close, and the
+         * probe that tried a zero-length peek saw nothing to see.
+         *
+         * LWIP_TCP_KEEPALIVE is on in this build, so the timers take effect:
+         * ten seconds of silence, then a probe every five, three of them. A
+         * dead peer is reaped in about twenty-five, and one that is merely
+         * quiet is probed and left alone. TCP_KEEPCNT is the load-bearing one
+         * -- without it lwIP probes forever and the session is never given up.
+         */
+        int keepalive = 1;
+        int keep_idle = 10;
+        int keep_intvl = 5;
+        int keep_cnt = 3;
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+
         if (!sessions_take()) {
             /*
              * Refusing cleanly beats letting a connection half-work. The limit
