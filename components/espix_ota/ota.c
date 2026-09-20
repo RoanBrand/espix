@@ -558,9 +558,7 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
         if (status != 200) {
             if (err != NULL) {
                 if (status == 404) {
-                    snprintf(err, err_len,
-                             "no manifest at %s (HTTP 404); does that release "
-                             "publish espix-ota.json?", url);
+                    snprintf(err, err_len, "no manifest found (HTTP 404)");
                 } else {
                     snprintf(err, err_len,
                              "%s: the server answered HTTP %d", url, status);

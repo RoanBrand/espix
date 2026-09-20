@@ -129,6 +129,68 @@ layout is in the field" note in the CSV still applies in spirit: changing the
 slot size *later* does move `storage`, and at that point `/` is lost. Choosing
 the slot size now is what avoids that second reflash.
 
+### When the image outgrows the slot
+
+The image is 1.69 MiB of a 1.9375 MiB slot, so there is room. The day it does
+not fit, the layout has to change -- and that is the one operation IDF's OTA
+cannot do. `esp_ota_*` writes inside a partition whose offset and size are
+fixed; nothing in IDF resizes a partition or rewrites the partition table. A
+layout change is a flash operation, whoever performs it.
+
+What can be preserved:
+
+* **Only `storage` really has to move.** Growing two adjacent slots by X needs
+  X of free space in front of them, and everything after shifts by X. `nvs`,
+  `otadata`, `phy_init` and `coredump` can move freely -- they are
+  regenerated. `storage` holds `/`, and a littlefs superblock names its
+  own block count and begins at the partition's first block, so move the
+  partition and the old filesystem is no longer at offset zero and will not
+  mount. littlefs has no online resize: shrinking or moving it means copying the
+  files out, formatting, and copying back.
+* **If only non-storage partitions move, `/` survives.** The 2 MiB-slot
+  variant above is exactly that: shrink `nvs` from 0x6000 to 0x4000, start
+  `ota_0` at 0x10000, and `storage` stays at 0x420000 with everything on it
+  intact. A cable reflash of the table and the app is enough.
+* **Once `storage` must shrink or move, the files come out first.** A USB disk
+  is the natural home -- espix already mounts one, and `cp -a / /mnt/sda1/` is
+  the whole backup. Or PSRAM, for the image rather than the rootfs: 6.7 MiB free
+  holds a 2 MiB app comfortably, and 12 MiB of rootfs not at all.
+
+Ways to do it, cheapest first:
+
+1. **Buy the headroom now.** `/` is about 21% used. Spending another half a
+   megabyte or so of it on bigger slots costs one reflash today and removes the
+   problem for a long time. If the image is expected to grow, this is far and
+   away the cheapest answer, and the only one that avoids a field migration.
+2. **A non-storage table change** -- shrink `nvs`, move `otadata`: a cable
+   reflash, with `/` intact. That covers the next step, about 2 MiB slots.
+3. **A migration build, delivered by OTA.** A build that still fits the old slots
+   can carry the new layout and perform it: back `/` up, write the new images
+   at their new offsets with raw flash writes, write the new partition table at
+   0x8000 last, reboot, format the new `storage`, restore. OTA is only the
+   delivery here -- the repartition is still raw flash work, and losing power
+   before the table switch leaves a board that needs a cable. The usual
+   hardening applies: the table goes last, and a valid image stays at the offset
+   the old table points to for as long as possible.
+4. **A recovery partition.** A small app in its own partition, valid in both
+   layouts, whose only job is maintenance: reformat the rootfs, write a table.
+   That is the safe home for step 3's dangerous part, and what to build if field
+   migrations become routine. `factory` + `ota_0` + `ota_1` is the
+   IDF-sanctioned shape, at the cost of a third copy of the app.
+
+Two notes on the workaround of downloading into `/` and overwriting both
+slots. Fetching is not the hard part -- PSRAM holds the image and a USB disk
+holds anything -- so landing it on the rootfs buys nothing and costs space. And
+overwriting both slots does not help either: the slots' `offsets` are what
+change, not the space between them, and after the table switch a slot only counts
+if an image sits where the new table says. The rootfs is the real casualty, and
+it is a data question, not a slot question.
+
+The board is always recoverable with a cable: `make flash-all` writes the
+bootloader, the table, the app and a fresh rootfs. That is not a fallback to be
+embarrassed about -- it is the honest answer to a layout change, and the design
+goal is to need it as rarely as possible.
+
 ### 8MB boards
 
 `/` cannot be preserved on 8MB with two useful slots: keeping `storage` at
