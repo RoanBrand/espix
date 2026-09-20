@@ -160,17 +160,8 @@ esp_err_t ssh_hostkey_sign(const uint8_t *hash, size_t hash_len,
         return ESP_FAIL;
     }
 
-    /*
-     * Self-check before it goes on the wire. Note what this can and cannot
-     * catch: it uses the same convention as the signing call, so it verified
-     * happily while that convention was wrong. It rules out a broken key or a
-     * malformed PSA call, not a disagreement with the peer.
-     */
-    if (psa_verify_message(s_key, PSA_ALG_ECDSA(PSA_ALG_SHA_256), hash,
-                           hash_len, raw, raw_len) != PSA_SUCCESS) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "our own signature does not verify");
-        return ESP_FAIL;
-    }
+    /* No self-check here. It tests a property of the key, and the key is fixed
+     * when it is loaded, so it runs once there -- hostkey_self_check(). */
 
     /* Inner blob: mpint r, mpint s. Then wrapped as a string inside the outer
      * (key-type, signature) pair — RFC 5656 §3.1.2. */
@@ -338,6 +329,57 @@ static esp_err_t load_key(void)
     return ESP_OK;
 }
 
+/*
+ * Sign and verify a fixed message, once, when the key is loaded.
+ *
+ * This is the check that used to run on every connection. It belongs here
+ * because the value it tests cannot change between logins: the key is fixed
+ * when it is loaded, and ECDSA is deterministic in this build
+ * (CONFIG_MBEDTLS_ECDSA_DETERMINISTIC), so the signature over a given message
+ * is a pure function of the key. Verifying per login recomputed an answer that
+ * was already known, at the cost of a second scalar multiplication -- and the
+ * larger part of what the "ecdsa sign" timer showed: 258 ms of its 318 ms,
+ * against 60 ms for the signature itself.
+ *
+ * What it can and cannot catch is unchanged. It uses the same convention as the
+ * signing call, so it would have passed happily while that convention was
+ * wrong; it rules out a broken key or a malformed PSA call, not a disagreement
+ * with the peer. A key that fails here is refused at startup rather than
+ * accepted and then failing every login.
+ *
+ * The probe is the SHA-256 of the empty string: a constant with an independent
+ * definition, so it cannot be edited by accident and quietly sign something
+ * else.
+ */
+static esp_err_t hostkey_self_check(void)
+{
+    static const uint8_t probe[P256_SCALAR] = {
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+    uint8_t sig[64];
+    size_t  sig_len = 0;
+
+    if (psa_sign_message(s_key, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                         probe, sizeof(probe),
+                         sig, sizeof(sig), &sig_len) != PSA_SUCCESS ||
+        sig_len != sizeof(sig)) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "cannot sign a test message with the host key");
+        return ESP_FAIL;
+    }
+    if (psa_verify_message(s_key, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                           probe, sizeof(probe),
+                           sig, sig_len) != PSA_SUCCESS) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "our own signature does not verify");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t ssh_hostkey_init(void)
 {
     if (s_have_key) {
@@ -350,6 +392,9 @@ esp_err_t ssh_hostkey_init(void)
     }
 
     if (load_key() == ESP_OK) {
+        if (hostkey_self_check() != ESP_OK) {
+            return ESP_FAIL;
+        }
         compute_fingerprint();
         espix_klog(ESPIX_KLOG_INFO, TAG, "host key %s", s_fingerprint);
         return ESP_OK;
@@ -375,6 +420,9 @@ esp_err_t ssh_hostkey_init(void)
                    "host key not persisted; it will change on reboot");
     }
 
+    if (hostkey_self_check() != ESP_OK) {
+        return ESP_FAIL;
+    }
     compute_fingerprint();
     espix_klog(ESPIX_KLOG_WARN, TAG, "generated host key %s", s_fingerprint);
     return ESP_OK;

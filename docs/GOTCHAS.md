@@ -368,9 +368,17 @@ recognising rather than rediscovering.
 scalar multiplication on a 240 MHz S3 — and the S3 has no ECC accelerator at all
 (`SOC_ECC_SUPPORTED` is absent; `MBEDTLS_HARDWARE_MPI` assists the big-integer
 arithmetic and that is the extent of it). `CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM`
-helps only base-point multiplication — ECDSA's k·G, where it took a nistp256
-signature from 593 ms to 319 ms — and does nothing for the variable-point half
-of a key agreement.
+helps only base-point multiplication — ECDSA's k·G, where it took the signing
+half of a nistp256 signature from ~335 ms to ~60 ms — and does nothing for the
+variable-point half of a key agreement.
+
+Verification is the expensive half: two variable-point multiplications against
+signing's one fixed-base one. espix signed *and then verified its own signature*
+on every connection, a nistp256 "ecdsa sign" phase of **318 ms** made of ~60 ms
+of signature and ~258 ms of check. The key is fixed when it is loaded and ECDSA
+is deterministic in this build, so that check could only ever produce the same
+answer; it now runs once in `ssh_hostkey_init()` instead, and the phase reads
+**60 ms**. Kex CPU fell from 601 ms to 345 ms.
 
 mbedtls ships **Everest**, a much faster formally-verified Curve25519, and it is
 already compiled into an IDF build (`libeverest.a` is in `build/`). But
