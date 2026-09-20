@@ -8,6 +8,21 @@
 CONFIG_PARTITION_TABLE_CUSTOM=y
 
 #
+# Application rollback. With two OTA slots the bootloader can revert to the
+# previous image when a freshly-written one does not confirm itself on its first
+# boot -- one attempt, no retry counter. espix confirms from app_main once the
+# console is up; see docs/OTA.md.
+#
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+#
+# A/B firmware updates: the `upgrade` command. On by default for 16MB because
+# that table has ota_0/ota_1; the 8MB factory table has no second slot, so the
+# Kconfig default turns it off there. See docs/OTA.md.
+#
+CONFIG_ESPIX_OTA_ENABLED=y
+
+#
 # FreeRTOS — needed for `ps` / `top` style introspection.
 #
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y

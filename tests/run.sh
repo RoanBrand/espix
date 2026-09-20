@@ -207,38 +207,38 @@ fi
 # decode. Every address resolved against the wrong ELF, and the only reason that
 # was caught is that espcoredump compares SHAs and refused.
 #
-# The git describe lives at offset 0x30 of the app description, which is 0x20
-# into the image -- so it is readable from build/espix.bin with dd, no toolchain
-# and no second build. The device reports the same string in `uname -a`.
-# Both halves of the identity, assembled the same way espix_build_id() does:
-# the git describe from esp_app_desc_t.version at 0x30, and the first
-# CONFIG_APP_RETRIEVE_LEN_ELF_SHA (9) hex characters of app_elf_sha256 at 0xB0.
-#
-# The SHA is the half that does the work. `-dirty` is the same string for every
-# modified tree, so a rebuild-without-flash at the same commit would compare
-# equal on the describe alone -- and that is the case this exists to catch.
+# The build identity is the first CONFIG_APP_RETRIEVE_LEN_ELF_SHA (9) hex
+# characters of app_elf_sha256 in the app description -- 0xB0 into the image, so
+# it is readable from build/espix.bin with dd, no toolchain and no second build.
+# It is a content hash, and that is the point: `-dirty` is the same string for
+# every modified tree, so a rebuild-without-flash at the same commit could
+# compare equal on the describe alone. The SHA cannot collide that way, and
+# espix_build_id() reports exactly this string as `uname -v`.
 _local_build_id() {
-    local bin="$ESPIX_ROOT/build/espix.bin" ver sha
+    local bin="$ESPIX_ROOT/build/espix.bin" sha
     [ -f "$bin" ] || return 1
-    ver=$(dd if="$bin" bs=1 skip=48  count=32 2>/dev/null | LC_ALL=C tr -d '\000')
     sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null | od -An -tx1 -v |
           tr -d ' \n' | cut -c1-9)
-    [ -n "$ver" ] && [ -n "$sha" ] || return 1
-    printf '%s+%s' "$ver" "$sha"
+    [ -n "$sha" ] || return 1
+    printf '%s' "$sha"
 }
 
 # Over the preflight session when there is one, and over its own connection when
 # there is not -- the check is worth a login on the rare path where the
 # persistent session could not be opened, because that path is already degraded
 # and is the last place to also be running the wrong image blind.
+#
+# `uname -v` is the Linux place for exactly this question ("which build of this
+# kernel"), and it is asked for on its own rather than parsed out of `uname -a`,
+# so the format of -a stays free to change.
 _device_build_id() {
     local out
     if [ -n "${DEV_SESSION_PID:-}" ]; then
-        out=$(dev_run 'uname -a')
+        out=$(dev_run 'uname -v')
     else
-        out=$(dev_once 'uname -a')
+        out=$(dev_once 'uname -v')
     fi
-    printf '%s' "$out" | sed -n 's/^espix [^ ]* (\([^)]*\)).*/\1/p'
+    printf '%s' "$out" | sed -n 's/^#\([0-9a-f]\{9\}\)$/\1/p'
 }
 
 # Absent is not mismatched, and neither is unknown. A clean checkout has no

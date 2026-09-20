@@ -17,25 +17,16 @@
 extern "C" {
 #endif
 
-#define ESPIX_VERSION_MAJOR 0
-#define ESPIX_VERSION_MINOR 3
-#define ESPIX_VERSION_PATCH 0
-
 /*
- * The same three numbers as a string literal.
+ * The version, generated from version.txt at the repository root by this
+ * component's CMakeLists. version.txt is also what ESP-IDF reads for
+ * PROJECT_VER, so the string in the SSH banner and the string in the app
+ * descriptor (what OTA tooling sees) come from one source and cannot drift.
  *
- * espix_version() below is the way to ask at runtime, and what most callers
- * want. This exists for the places that have to paste the version *inside* a
- * wider constant at compile time -- the SSH identification banner is one, and
- * it previously carried its own hand-written copy that a version bump would
- * have left stale.
+ * ESPIX_VERSION_STR, ESPIX_VERSION_MAJOR/MINOR/PATCH, ESPIX_BUILD_IS_RELEASE
+ * and ESPIX_GIT_DESCRIBE all arrive from there.
  */
-#define ESPIX_STR_(x) #x
-#define ESPIX_STR(x)  ESPIX_STR_(x)
-
-#define ESPIX_VERSION_STR   ESPIX_STR(ESPIX_VERSION_MAJOR) "." \
-                            ESPIX_STR(ESPIX_VERSION_MINOR) "." \
-                            ESPIX_STR(ESPIX_VERSION_PATCH)
+#include "espix_version.h"
 
 /* Longest absolute path espix will handle. Kept small deliberately: paths get
  * embedded in per-session and per-process structs. */
@@ -111,25 +102,43 @@ void     espix_kernel_boot_hold(void);
 void     espix_kernel_boot_release(void);
 unsigned espix_kernel_boot_pending(void);
 
-const char *espix_version(void);        /* e.g. "0.2.0" */
+const char *espix_version(void);        /* "0.3.0", from version.txt */
 const char *espix_target(void);         /* "esp32s3" */
 const char *espix_chip_model(void);     /* "ESP32-S3" */
 int64_t espix_uptime_us(void);
 
 /*
- * Which build is running, as git describes it: "2ebf416-dirty", or "unknown" if
- * the image carries no description. Not the same question as espix_version(),
- * and the difference matters -- this is the only thing that can tell you the
- * board is not running the tree in front of you. tests/run.sh compares it
- * against build/espix.bin and refuses to start when they differ.
+ * Whether this build is the tagged, unmodified release. The greeting mentions
+ * the build id only when it is not, which is why it has to ask.
+ */
+bool espix_build_is_release(void);
+
+/*
+ * The node name, which is what `uname -n` reports. Linux keeps this in the
+ * kernel and so does espix: espix_net owns the source of truth (/etc/hostname)
+ * and pushes it here, rather than the kernel reaching into networking.
+ */
+#define ESPIX_NODENAME_MAX 33   /* 32 + NUL, matching ESPIX_HOSTNAME_MAX */
+const char *espix_nodename(void);
+void        espix_kernel_set_nodename(const char *name);
+
+/*
+ * Which build is running: the first nine hex digits of the image's ELF SHA-256.
+ * A content identity rather than a version, and the only thing that can tell you
+ * the board is not running the tree in front of you -- `make test` builds and
+ * runs without flashing, so hours can go into an image from a tree that no
+ * longer exists. tests/run.sh compares this against build/espix.bin and refuses
+ * to start when they differ.
  */
 const char *espix_build_id(void);
 
 /*
- * Fill `buf` with a uname-style string. `all` selects the long form
- * (kernel + version + chip + revision + cores + IDF version).
+ * Fill `buf` with a uname-style string, like uname(1). `flags` is the set of
+ * option letters in effect without the dash: "a" is the long form, an empty
+ * string is the default (`-s`), and letters combine ("snrvm") the way the real
+ * command accepts them.
  */
-size_t espix_uname(char *buf, size_t len, bool all);
+size_t espix_uname(char *buf, size_t len, const char *flags);
 
 /* Human-readable uptime, e.g. "up 2 days, 3:14" or "up 41 min". */
 size_t espix_uptime_str(char *buf, size_t len);

@@ -20,6 +20,7 @@ void espix_cmds_register_motd(void);
 void espix_cmds_register_time(void);
 void espix_cmds_register_blk(void);
 void espix_cmds_register_usbhost(void);
+void espix_cmds_register_ota(void);
 
 /* Resolves a non-builtin command name to a program in /bin or by path. */
 void espix_cmds_register_exec_fallback(void);

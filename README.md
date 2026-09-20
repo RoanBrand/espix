@@ -133,6 +133,31 @@ idf.py -p /dev/ttyUSB0 storage-flash    # WARNING: replaces the whole rootfs
 Keeping them separate is deliberate: reflashing firmware should not destroy what
 is on the device.
 
+#### Over the network, without the cable
+
+The 16MB image has two application slots, so a running espix can write a new
+kernel into the spare one and the bootloader switches to it on the next reboot.
+If the new image does not confirm itself on its first boot, the previous one is
+restored automatically.
+
+From the device:
+
+    upgrade --slots          # which slots exist, their state, and which is running
+    upgrade --check          # is there a newer release? (exit 1 means yes)
+    sudo upgrade             # check, ask, then install
+    sudo upgrade -y          # ...without asking
+    sudo upgrade --file /mnt/sda1/espix.bin   # install from a file
+    sudo upgrade <url>       # install from a URL
+
+From the development machine, with no cable at all:
+
+    make flash-ota           # build, copy the image over SSH, install it
+    tools/esp.sh reboot      # then start it
+
+The update source is `ota.url` in `/etc/espix.conf`, defaulting to espix's GitHub
+release page. A release publishes `espix.bin` and `espix-ota.json`, the latter
+written by `tools/ota-manifest.sh`. See [docs/OTA.md](docs/OTA.md).
+
 **After changing ESP-IDF versions, clean twice.** `idf.py fullclean` covers the
 firmware, but each project under `apps/` is a *separate* IDF project with its
 own `build/` and `sdkconfig`, and they are not reached by it:

@@ -24,6 +24,8 @@ espix_proc       process table, ELF exec
     ↑
 espix_fault      panic interception, reaper skeleton
     ↑
+espix_ota        A/B updates: slots, the passive-slot write, the manifest
+    ↑
 espix_cmds       the actual commands
     ↑
   main           app_main = the init sequence, nothing else

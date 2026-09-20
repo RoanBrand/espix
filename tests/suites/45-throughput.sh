@@ -83,7 +83,7 @@ report() {     # <what> <rate> <floor>
 }
 
 # ---------------------------------------------------------------------------
-# scp, both directions. /dev/null and /dev/factory keep littlefs out of it.
+# scp, both directions. /dev/null and the firmware node keep littlefs out of it.
 # ---------------------------------------------------------------------------
 
 # Whether the destination even accepts a write, before timing writes to it.
@@ -111,7 +111,16 @@ else
 fi
 
 t0=$(now_ms); dev_pull /etc/hostname  "$TMP/tiny" >/dev/null 2>&1; t_dt=$(( $(now_ms) - t0 ))
-t0=$(now_ms); dev_pull /dev/factory   "$TMP/got"  >/dev/null 2>&1; t_db=$(( $(now_ms) - t0 ))
+# A firmware-sized read that never touches littlefs. Which node exists depends
+# on the table: the A/B build has ota0 (and no factory), the factory-only build
+# has factory. Take whichever this image exposes -- and take its size from the
+# device, because the slot is 4 MiB on the factory table and 0x1F0000 on the A/B
+# one, so a hardcoded expectation would pin this test to a single layout.
+fwdev=/dev/ota0
+dev_run 'ls /dev/ota0' >/dev/null 2>&1 || fwdev=/dev/factory
+fwsize=$(dev_run "ls -l $fwdev" 2>/dev/null |
+             awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) { print $i; exit } }')
+t0=$(now_ms); dev_pull "$fwdev" "$TMP/got" >/dev/null 2>&1; t_db=$(( $(now_ms) - t0 ))
 tiny=$(wc -c < "$TMP/tiny" 2>/dev/null | tr -d ' ' || echo 0)
 got=$(wc -c < "$TMP/got"  2>/dev/null | tr -d ' ' || echo 0)
 
@@ -124,10 +133,10 @@ if [ "${tiny:-0}" -gt 0 ]; then
 else
     espix_fail "the reference fetch arrived" "/etc/hostname fetched 0 bytes"
 fi
-assert_eq "the download arrived whole" "4194304" "$got"
+assert_eq "the download arrived whole" "$fwsize" "$got"
 
-if [ "${tiny:-0}" -gt 0 ] && [ "$got" = "4194304" ]; then
-    report "scp download" "$(rate_kbs 0 $(( t_db - t_dt )) 0 4096)" 180
+if [ "${tiny:-0}" -gt 0 ] && [ -n "$fwsize" ] && [ "$got" = "$fwsize" ]; then
+    report "scp download" "$(rate_kbs 0 $(( t_db - t_dt )) 0 $(( fwsize / 1024 )))" 180
 else
     espix_skip "scp download: not measured -- a fetch did not arrive whole"
 fi

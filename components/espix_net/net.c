@@ -283,6 +283,9 @@ static void load_hostname(void)
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "hostname %s", s_hostname);
+
+    /* The kernel keeps the node name for `uname -n`; networking owns it. */
+    espix_kernel_set_nodename(s_hostname);
 }
 
 esp_err_t espix_net_set_hostname(const char *name, bool persist)
@@ -292,6 +295,7 @@ esp_err_t espix_net_set_hostname(const char *name, bool persist)
     }
 
     strlcpy(s_hostname, name, sizeof(s_hostname));
+    espix_kernel_set_nodename(s_hostname);
 
     /* Every interface, for the reason in espix_net_register_if(). */
     for (size_t i = 0; i < s_if_count; i++) {

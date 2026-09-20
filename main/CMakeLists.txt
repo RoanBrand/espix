@@ -15,4 +15,5 @@ idf_component_register(
         espix_auth
         espix_ssh
         espix_time
+        espix_ota
 )

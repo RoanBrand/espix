@@ -57,6 +57,12 @@ fs:
 flash-all:
 	$(IDF) -p $(PORT_ARG) flash storage-flash
 
+# Push the firmware over the network instead of the UART cable: install it into
+# the board's passive slot over SSH and reboot into it. Needs the board already
+# on the network and its SSH reachable. See tools/flash-ota.sh.
+flash-ota: build
+	./tools/flash-ota.sh
+
 monitor:
 	$(IDF) -p $(PORT_ARG) monitor --no-reset
 

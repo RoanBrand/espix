@@ -1541,3 +1541,31 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   and an identical ABI, but a different declared type. That is deliberate rather than
   accidental, and [tools/README.md](../tools/README.md) says why, what the cost is,
   and how to undo it if you would rather not.
+
+## Updates
+
+- **`/dev/factory` does not exist on the A/B table.** The 16MB layout has no
+  `factory` partition, so the node is gone and `/dev/ota0` and `/dev/ota1` take its
+  place -- both always present, the passive one included. Anything reading
+  `/dev/factory` to pull the running image, `45-throughput.sh` included, has to take
+  whichever node the image actually exposes. Which slot is *running* is
+  `upgrade --slots`, not the directory listing.
+
+- **A command with its own task cannot read stdin.** `run_on_own_task()` spawns
+  the command and waits on it, and the connection task is the only reader of the
+  SSH wire -- so nothing drains the channel, a read blocks forever, and the
+  session ends dead with otadata mid-write. Foreground *apps* read stdin fine
+  because the connection task pumps while they run. This is why `upgrade
+  --stdin` does not exist and `make flash-ota` copies the image to `/tmp` and
+  installs it with `--file`.
+
+- **The update cache is root's to write.** The background check records what it
+  found in `/var/lib/espix/update`, and `/var` is root-owned, so `upgrade --check`
+  run by an ordinary account reports the answer without updating the cache --
+  `sudo upgrade --check` updates it. The greeting reads that cache and never the
+  network, so it only ever mentions an update a check has already recorded.
+
+- **A same-version rebuild counts as an update.** Newer semver, or the same
+  semver with a different build id, is offered; an older one never is. That is
+  what a rolling pre-1.0 project wants and would be surprising for a frozen one
+  -- see the note in [OTA.md](OTA.md).

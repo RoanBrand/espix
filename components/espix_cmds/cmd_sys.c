@@ -76,10 +76,33 @@ static int cmd_help(espix_session_t *s, int argc, char **argv)
 
 static int cmd_uname(espix_session_t *s, int argc, char **argv)
 {
-    const bool all = (argc > 1 && strcmp(argv[1], "-a") == 0);
+    /*
+     * uname(1) takes combined single-letter options (uname -sr), so the dash is
+     * only the first character. Only the fields this platform has are accepted;
+     * anything else is an error, as it is on the real command, rather than a
+     * silently ignored letter.
+     */
+    char flags[8] = {0};
+    size_t n = 0;
 
-    char buf[128];
-    espix_uname(buf, sizeof(buf), all);
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' || argv[i][1] == '\0') {
+            espix_eprintf(s, "uname: unexpected argument: %s\n", argv[i]);
+            return 1;
+        }
+        for (const char *p = argv[i] + 1; *p != '\0'; p++) {
+            if (strchr("asnrvm", *p) == NULL) {
+                espix_eprintf(s, "uname: invalid option -- '%c'\n", *p);
+                return 1;
+            }
+            if (n + 1 < sizeof(flags)) {
+                flags[n++] = *p;
+            }
+        }
+    }
+
+    char buf[160];
+    espix_uname(buf, sizeof(buf), flags);
     espix_printf(s, "%s\n", buf);
     return 0;
 }

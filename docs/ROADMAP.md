@@ -960,12 +960,12 @@ both are the sort of thing that is cheaper to know now.
   developer runs, plus one line from `make flash` when the detected chip and the
   configured strategy disagree, is the shape that works.
 
-- **OTA slots.** The partition table is `factory`-only. Two 4MB OTA slots plus
-  `otadata` would cost ~4MB of the 11.9MB rootfs but allow kernel updates over
-  the network. Changing this later means reflashing everything, so it is worth
-  deciding before the layout is in the field. A commented-out variant is in
-  [partitions/esp32s3-16mb.csv](../partitions/esp32s3-16mb.csv); the 8MB table
-  notes why the same shape does not fit there.
+- **OTA slots.** *Done.* The 16MB table has two application slots (`ota_0` and
+  `ota_1`, 0x1F0000 each) and an `otadata` partition; `nvs`, `coredump` and
+  `storage` stay at the offsets they have always had, so adopting the table does
+  not reformat the rootfs. The 8MB tables keep a single `factory` partition and
+  leave OTA off by default. Rollback is enabled, `upgrade` installs into the
+  passive slot, and `make flash-ota` does it over SSH. See [OTA.md](OTA.md).
 
 - **USB host beyond storage.** Enumeration, identification, the partition table,
   superfloppy volumes and hotplug are done and shipped — see

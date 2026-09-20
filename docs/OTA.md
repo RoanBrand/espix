@@ -1,0 +1,727 @@
+# espix OTA: A/B firmware updates over the network
+
+**Status: design. Nothing described here is built yet.** This document exists to
+settle the decisions that are expensive to change later -- the partition layout
+most of all -- and to record what was verified against ESP-IDF v6.1 rather than
+assumed.
+
+The goal is the Ubuntu/pi A/B experience applied to espix: two application
+slots, an update written to the passive one, the bootloader switching to it, and
+an automatic rollback if it does not come up. Plus the part that makes it
+pleasant to use: `upgrade` on the device, an update repository it can point at,
+and a login that mentions an available update without going near the network.
+
+## 1. Space: do we have enough?
+
+The question as asked. The answer is not just "yes" -- the A/B layout is very
+nearly free.
+
+Current 16MB image, from `build/espix.bin`:
+
+| | |
+|---|---|
+| `espix.bin` | 1,486,608 B = **1.42 MiB** |
+| `factory` partition | 4 MiB (2.8x the image -- heavily over-provisioned) |
+| `storage` (littlefs `/`) | 11.875 MiB |
+
+**The "41%" is headroom over the *image*, not the size of a slot.** Today's
+`factory` is 4 MiB but the image is 1.42 MiB, so 2.58 MiB of it is simply unused.
+A 2 MiB slot holds the same 1.42 MiB image and still leaves 596 KiB spare -- that
+spare is the "41% room to grow before the image stops fitting". Two 2 MiB slots
+occupy the *same 4 MiB* the single over-provisioned `factory` already occupied,
+which is why the rootfs barely moves. Nothing is being cut down to 2 MiB; the
+current partition is just far larger than the thing in it.
+
+| layout | rootfs | slot headroom over the image |
+|---|---|---|
+| 16MB today (`factory`, no OTA) | 11.8750 MiB | 2.58 MiB, unused, one slot |
+| **16MB A/B, `1.9375 MiB` slots, `/` untouched** | **11.8750 MiB** | 532 KiB (**+36.7%**) |
+| 16MB A/B, 2 MiB slots, `/` moved | 11.8125 MiB | 596 KiB (+41%) |
+| 16MB A/B, 2.5 MiB slots, `/` moved | 10.8125 MiB | 1.08 MiB (+76%) |
+| 8MB today (`factory`) | 4.8750 MiB | -- |
+| 8MB A/B, 1.75 MiB slots, `/` moved | 4.3125 MiB | 348 KiB (+23%) |
+| 8MB A/B, 2 MiB slots, `/` moved | 3.8125 MiB | 596 KiB (+41%) |
+| 8MB A/B, `1.46875 MiB` slots, `/` untouched | 4.8750 MiB | 53 KiB (+3.6%, too tight) |
+
+Both 16MB rows end at the last flash byte and leave a working second slot. The
+difference between them is whether the rootfs moves, and the recommended row is
+the one that does not.
+
+The commented-out variant already sitting in `partitions/esp32s3-16mb.csv` uses
+4 MiB slots and costs 4 MiB of rootfs (11.9 -> 7.8 MiB) -- paying for a slot size
+2.8x the image for nothing.
+
+### Proposed 16MB table -- and `/` keeps everything on it
+
+The recommended layout holds `storage`, `coredump` and `nvs` at **the exact
+offset and size they have today**, so `/` does not have to be reflashed or
+reformatted:
+
+```
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+ota_0,      app,  ota_0,    0x20000,   0x1F0000,
+ota_1,      app,  ota_1,    0x210000,  0x1F0000,
+coredump,   data, coredump, 0x410000,  0x10000,
+storage,    data, littlefs, 0x420000,  0xBE0000,
+```
+
+Against today: `nvs` is byte-for-byte where it was, `coredump` is where it was,
+and `storage` is at 0x420000 with the same 0xBE0000 size -- littlefs mounts the
+existing filesystem untouched, which was **verified on hardware** by flashing this
+table over the old one and finding the same files and the same used space. What
+changes is that `otadata` appears at 0xf000, `phy_init` moves from 0xf000 to
+0x11000 (regenerable PHY calibration data, nothing is lost), and the old single
+4 MiB `factory` region becomes two 0x1F0000 slots.
+
+**Why 0x1F0000 and not 0x1F8000.** The binding constraint is not the image size
+but the partition table: an *application partition offset* must be 0x10000
+aligned. With `ota_0` at 0x20000 the next slot can only start on a 64 KiB
+boundary, so a slot size that is not a multiple of 0x10000 leaves `ota_1`
+misaligned -- 0x1F8000 puts it at 0x218000 and the generator rejects the table
+outright ("Offset 0x218000 is not aligned to 0x10000"). A full 2 MiB slot would
+put `ota_1` at 0x220000 and end the slots at 0x420000, which is exactly where
+`storage` starts, leaving nowhere for `coredump` without moving the rootfs. The
+answer is 0x1F0000 slots plus the 64 KiB of slack between 0x400000 and 0x410000.
+Only the *size* may be merely 4 KiB aligned; the 0x10000 size rule belongs to
+Secure Boot v1, which espix does not use.
+
+An exact 2 MiB slot is still possible by starting `ota_0` at 0x10000 instead of
+0x20000, but that needs `nvs` shrunk from 0x6000 to 0x4000 to fit `otadata` below
+0x10000, and `nvs` holds live WiFi state. Not worth 64 KiB per slot.
+
+### What the gap actually costs
+
+| layout | unused bytes before the rootfs | capacity in one slot | per-slot headroom |
+|---|---|---|---|
+| today (`factory`) | 36 KiB (bootloader + partition table) | 4 MiB | -- |
+| recommended, 0x1F0000 slots | 148 KiB | 1.9375 MiB | 532 KiB (+36.7%) |
+| exact 2 MiB (shrink `nvs`) | 36 KiB | 2 MiB | 596 KiB |
+
+Two gaps make up the 148 KiB: the 56 KiB between 0x12000 and 0x20000, where
+`ota_0` has to start because `nvs` + `otadata` + `phy_init` end at 0x12000; and
+the 64 KiB between 0x400000 and 0x410000, which the 64 KiB offset alignment of
+`ota_1` leaves behind. Together that is 0.9% of the flash, and the exact-2 MiB
+alternative buys it back only by shrinking `nvs`, which holds live WiFi state.
+The old `factory` layout had no gap because nothing had to sit between `nvs` and
+the app.
+
+### What `otadata` is for
+
+`otadata` (type `data`, subtype `ota`, 0x2000) is the OTA data partition, and it
+is not optional: **without it there is no A/B at all.** It holds two
+sector-sized copies of an entry per slot -- `{ota_seq, ota_state, crc}` -- written
+alternately with a counter, so losing power mid-write cannot corrupt the choice.
+The bootloader reads `ota_seq` to decide which slot to boot
+(`boot_index = (ota_seq - 1) % app_count`), and `ota_state` carries the rollback
+state (`NEW`, `PENDING_VERIFY`, `VALID`, `INVALID`, `ABORTED`). With otadata
+all-0xFF the bootloader boots `factory` if there is one, otherwise `ota_0` --
+which is why a freshly UART-flashed board still boots with no OTA history. It is
+8 KiB of flash and there is nothing to tune.
+
+### The migration cost
+
+On 16MB, none -- the rootfs stays put as described above, so the change is a
+partition-table reflash and an app reflash, not a wipe. The "decide before this
+layout is in the field" note in the CSV still applies in spirit: changing the
+slot size *later* does move `storage`, and at that point `/` is lost. Choosing
+the slot size now is what avoids that second reflash.
+
+### 8MB boards
+
+`/` cannot be preserved on 8MB with two useful slots: keeping `storage` at
+0x320000 leaves only 0x2F0000 for both, i.e. 1.46875 MiB each and 3.6% headroom
+against a 1.42 MiB image. On 8MB this is a genuine trade, not a free one.
+
+* **Default: no OTA,`factory` only.** The 8MB table stays exactly as it is. This
+  is what a build does unless someone asks otherwise (see the build options in
+  section 4). The 8MB variants are build-verified only and have never run on
+  hardware, so this is also the low-risk answer.
+* **Opt-in: A/B with a smaller rootfs.** A separate 8MB-with-OTA table -- two
+  1.75 MiB slots (0x1C0000) and `storage` 0x3B0000/0x450000 (4.3125 MiB) -- keeps
+  23% slot headroom for 0.5625 MiB of rootfs.
+
+One slot plus OTA is not a thing, and rollback is not why. OTA needs a *passive*
+slot to write while the active one runs; the partition the running image is
+executing from cannot be rewritten in place. Two slots are the hard requirement.
+Rollback then costs no flash on top of them -- it is state bits inside otadata --
+so turning rollback off would save nothing at all.
+
+## 2. What ESP-IDF actually provides -- and a correction
+
+The plan in the request assumed "IDF has a standard protocol to listen on a
+port, so firmware can be pushed remotely instead of over UART". **That protocol
+does not exist.** Verified in the v6.1 tree:
+
+* `examples/system/ota/native_ota_example` is **not a server**. It is an
+  HTTP(S) client that *pulls* an image from a host-run web server; the only
+  ports in it (8002, 8070) are host-side test scaffolding in
+  `pytest_native_ota.py`.
+* There is **no `espota.py`** anywhere in ESP-IDF. (That tool is Arduino's, a
+  different project.)
+* `idf.py` has **no `ota` or `ota-flash`**. Its only OTA commands are
+  `erase-otadata` and `read-otadata`, both **serial**.
+* `components/app_update/otatool.py` is **serial-only**, a wrapper over
+  esptool; there is no network path.
+* IDF ships **no host tool that pushes firmware over TCP** to a device-side
+  server.
+
+What IDF does provide, and what we should use:
+
+* `esp_https_ota` -- a complete HTTPS pull-and-flash client with redirect
+  following (301/302/303/307/308; an HTTPS origin may not redirect down to
+  HTTP), CA-bundle support, chunked responses, and progress callbacks.
+* `app_update` -- `esp_ota_begin/write/end/set_boot_partition`, the passive-slot
+  selection, and the rollback state machine.
+* The bootloader -- slot selection and the rollback-on-unconfirmed-boot.
+
+So the dev-iteration goal ("no more swapping the hub and the UART cable") is
+still met, just by a different route than a listening port: **the device pulls
+from a server the developer already has running.** That is what `make ota` will
+do, and it needs no new on-device attack surface.
+
+### The remote-push path we already have for free: SSH
+
+For pushing a locally built image there is a second, arguably better route that
+needs no HTTP server and no new listener at all: the SSH session is already an
+authenticated, encrypted channel that espix owns. `make flash-ota` copies the
+image to the board and installs it:
+
+    scp build/espix.bin esp@espix:/tmp/espix.bin
+    ssh esp@espix 'sudo upgrade --file /tmp/espix.bin'
+
+or, with the image already on a USB disk:
+
+    upgrade --file /mnt/sda1/espix.bin
+
+**Streaming it in on stdin does not work, and the reason is worth recording.**
+The obvious form -- `cat build/espix.bin | ssh esp@espix 'sudo upgrade --stdin'` --
+stalls: a command that declares a stack of its own runs on a new task while the
+connection task waits on it (`session.c`, `run_on_own_task`), and the connection
+task is the only reader of the wire. Nothing drains the channel, so the reader
+waits forever and the session dies with otadata left mid-write. A foreground
+*app* gets away with reading stdin because the connection task pumps while it
+runs; a builtin on its own task does not. Making `--stdin` work means teaching
+`run_on_own_task` to pump, which is a transport change rather than an OTA one.
+The scp form costs 1.7 MB of `/tmp` -- cleared at boot anyway -- and works today.
+
+An unauthenticated OTA listener on a LAN port would be the single most dangerous
+piece of code in the system; not building one is a feature.
+
+### Not planned: an ArduinoOTA-style push listener
+
+The other project's convenience came from ArduinoOTA -- the IDE finds the board
+and pushes firmware with no cable -- and it is tempting to hand-roll the same
+small protocol (UDP discovery, a TCP transfer with an MD5 password challenge) so
+PlatformIO's `espota.py` would work with no Arduino dependency. It is
+deliberately **not planned**:
+
+* An unauthenticated listener that rewrites firmware is the single most dangerous
+  thing in the system, and a password-challenged one is still a second
+  authentication system to build and maintain.
+* SSH already does exactly this job, authenticated and encrypted, the Unix way: a
+  firmware push is `ssh`, not a bespoke protocol. Adding a listener when the
+  secure path already exists is surface for its own sake.
+
+Recorded so it is a decision rather than an oversight. The protocol is small, so
+if it is ever wanted it can be added behind a build option that defaults off.
+
+### The device-pull path
+
+    upgrade                 # check the manifest, prompt y/N
+    sudo upgrade -y         # check, then install without asking
+    upgrade --check         # report only; exit 0 if current, 1 if newer
+
+The manifest is one small HTTPS GET; the image is fetched only if the version
+is newer. Default source: espix's own GitHub releases.
+
+## 3. Version identity, and how to compare
+
+espix carries **two** version notions today, and they are not the same:
+
+* `espix_version()` (`components/espix_kernel/include/espix_kernel.h`) is the
+  hand-maintained `0.3.0` -- a promise about behaviour.
+* `esp_app_desc_t.version` -- what OTA tooling sees, and what `build/espix.bin`
+  carries at offset 0x30 -- is `CONFIG_APP_PROJECT_VER`, the git describe
+  (`2376160`). `espix_build_id()` composes it with the ELF SHA prefix for the
+  flash-identity guard.
+
+So a manifest saying `0.4.0` has nothing to compare against: the device's own
+descriptor says `2376160`. The two options, more plainly than before:
+
+1. **Keep both notions, and put both in the manifest.** `version` (semver) is
+   compared against the running `ESPIX_VERSION_STR`; `build` (the git describe)
+   is compared against the app descriptor of the *downloaded* image, to prove the
+   bytes are the ones the manifest named. No plumbing changes -- but two version
+   fields that can disagree, and OTA tooling (`idf.py image-info`, `esptool`,
+   anything else) still sees a commit hash where it expects a version.
+2. **Unify: make the release version *the* version.** `esp_app_desc_t.version`
+   becomes the semver, which is what every OTA tool and the bootloader expect.
+   The build identity stays the ELF SHA.
+
+**Recommendation: unify, now.** It is smaller than it looks -- the macros are
+used in exactly three places (`espix_kernel.h`, `kernel.c`, and the SSH version
+banner) -- and doing it after the manifest format is fixed means re-releasing
+with a changed format. Concretely:
+
+* Add `version.txt` at the project root. IDF already gives it top priority for
+  `PROJECT_VER`, so the app descriptor in `build/espix.bin` carries the semver
+  with no other change.
+* `PROJECT_VER` is passed as a compile definition *only* to `esp_app_desc.c`, so
+  the SSH banner needs a small generated header (`configure_file()` in the top
+  CMakeLists from `${PROJECT_VER}`). `ESPIX_VERSION_MAJOR/MINOR/PATCH` go away
+  and `ESPIX_VERSION_STR` comes from that header: one source of truth, not two.
+* `espix_build_id()` becomes `<version>+<elfsha9>` -- the same shape as today, so
+  `tests/run.sh`'s `dd` extraction from offsets 0x30 and 0xB0 keeps working
+  unchanged. The git describe drops out of the *identity* but can stay for display
+  via a generated `ESPIX_GIT_DESCRIBE`; the SHA is what actually catches "rebuilt
+  without flashing", so the guard loses no power.
+* One release check: git tag `vX.Y.Z` must equal `version.txt`.
+
+**Done, and verified on hardware.** `version.txt` exists; the header is generated
+from it by `components/espix_kernel/CMakeLists.txt`; the app descriptor and the
+SSH banner both read `0.3.0`. `espix_build_id()` is now the nine-hex content
+hash, so the device reports:
+
+    $ uname -a
+    espix esp32s3-cb5d74 0.3.0 #bfbb8cd6b ESP32-S3 rev0.2 2-core ESP-IDF v6.1-dirty
+    $ uname -r
+    0.3.0
+    $ uname -v
+    #bfbb8cd6b
+
+Linux's field order, one hash, and motd shows `espix 0.3.0` for a release build
+or `espix 0.3.0+bfbb8cd` for a development one. `uname` takes the real option
+letters (`-s -n -r -v -m -a`, combinable like `uname -sn`). `tests/run.sh`
+compares `uname -v` against the ELF SHA read out of `build/espix.bin`, and
+00-smoke is 15/15.
+
+### Deciding whether there is an update
+
+With both sides speaking the same language, the rule is:
+
+* manifest `version` newer than the device's -> update;
+* same `version`, different `build` -> update (a rebuilt or rolling release);
+* older `version` -> never, unless explicitly forced;
+* same `version` and same `build` -> up to date.
+
+The second rule is the one to be deliberate about, and it is a good default for a
+pre-1.0 project that rebuilds `main` often: a new build at the same version is
+picked up, and once installed the device's own `build` matches, so it is not
+offered again. The failure mode is the stable case -- if a published release
+asset is ever rebuilt in place at the same version, every device on that version
+is offered an update once. That is fine now and should be revisited when releases
+freeze; a `channel=stable|dev` setting could gate it.
+
+`build` should be the **ELF SHA-256**, the identity `espix_build_id()` already
+uses, because it is content-addressed and comparable on both sides. The
+manifest's `sha256` (of the `.bin`) is a third, independent check.
+
+## 4. The device side
+
+### A new component: `espix_ota`
+
+Follows the existing graph: depends on `espix_kernel`, `espix_net`,
+`espix_time`, `espix_fs`; `espix_cmds` owns the command and calls into it, the
+way `cmd_motd` and `cmd_net` already do. Nothing else gains an OTA dependency,
+so the graph stays acyclic.
+
+Public surface, roughly:
+
+* `espix_ota_init()` -- read config, mark the running image valid (see section 6),
+  start the periodic checker.
+* `espix_ota_check(bool force, ...)` -- fetch and parse the manifest, compare.
+* `espix_ota_install(..., progress)` -- download and write the passive slot.
+* `espix_ota_known_update(char *ver, ...)` -- the cached answer, for motd.
+  Touches no network.
+* `espix_ota_running_slot(char *buf, ...)` -- `ota_0`/`ota_1`, for `uname`/motd.
+
+### Build options
+
+Two options, each defaulted so a plain build is right:
+
+* `CONFIG_ESPIX_OTA_ENABLED` -- default `y` for 16MB flash, `n` otherwise
+  (`default y if ESPTOOLPY_FLASHSIZE_16MB`). Off, the command is not registered,
+  no check runs, and nothing pulls in `esp_https_ota`.
+* `CONFIG_ESPIX_OTA_URL` -- the default manifest URL, baked in as this repo's
+  GitHub `releases/latest/download/espix-ota.json`. Runtime `/etc/espix.conf`
+  (`ota.url=`) overrides it, and `ota.auto_check=off` disables the periodic check
+  while leaving `upgrade` usable.
+
+**The option gates code, not layout.** The 16MB table carries `ota_0`/`ota_1`
+whether or not the option is set, so a build with OTA compiled out still flashes
+to `ota_0` and boots normally, and enabling the option later needs no
+repartitioning. There is no second 16MB table to keep in sync; the 8MB table
+stays `factory`-only, as it is today.
+
+The one mismatch worth catching is an OTA-enabled build paired with a table that
+has no slots (an 8MB board on the factory table). The top-level CMake can parse
+the selected CSV and fail the build with a clear message, rather than letting it
+appear later as `esp_ota_get_next_update_partition()` returning NULL.
+
+### Memory: handle the failure, and say what was needed
+
+Internal RAM is the binding constraint (section 6 has the measurements), but the
+policy is not a gate that refuses before trying -- it is to handle each failure
+where it happens, cleanly, and to report numbers worth acting on:
+
+* Every allocation on the path is checked, and a NULL is handled at the point it
+  occurs rather than surfacing later as a crash. No failure touches the running
+  image.
+* The error carries both figures, because "no memory" alone is not actionable:
+  `out of memory: internal free 18 KiB, largest block 12 KiB; a TLS handshake
+  needs about 40 KiB -- close a session and retry`.
+* Everything that does not have to be internal goes to PSRAM. The pool is the
+  other way round from the numbers people expect -- about **6.7 MiB free in
+  PSRAM against ~107 KiB internal** -- so the OTA download buffer
+  (`buffer_caps = MALLOC_CAP_SPIRAM`), the manifest, our own buffers and the OTA
+  task's stack (the `...WithCaps` task API) all come from PSRAM. IDF's docs
+  suggest internal memory for the download buffer when there is room, for
+  throughput -- it should be the first thing moved back if internal ever stops
+  being tight.
+* What genuinely cannot move is the mbedTLS context and its in/out buffers
+  (`MBEDTLS_INTERNAL_MEM_ALLOC`), and that is the `40 KiB` that can fail. If it
+  proves painful, `CONFIG_MBEDTLS_DYNAMIC_BUFFER` cuts the peak from roughly
+  42 KiB to 22 KiB at some throughput cost -- a documented lever, not a guess.
+* One install at a time.
+
+### Config and state
+
+Config follows the house pattern -- a text file read with `espix_fs_conf_get()`,
+the same way `/etc/wifi.conf` and `/etc/usb.conf` work, and hand-editable with
+the expected effect:
+
+```
+# /etc/espix.conf
+ota.url=https://github.com/RoanBrand/espix/releases/latest/download/espix-ota.json
+ota.auto_check=on
+```
+
+Machine state -- when we last checked, and what we found -- is a separate
+question. Recommendation: **a small world-readable file under `/var/lib/espix/`**
+rather than NVS. espix's whole personality is inspectable text on a filesystem;
+a user can `cat` why motd mentioned an update, and NVS stays reserved for
+ESP-IDF's own WiFi/PHY use. The alternative, an NVS namespace, is more atomic
+and does not touch littlefs -- a legitimate choice, and worth settling before
+the code lands.
+
+### The manifest
+
+Attached to every release as a constant-named asset, alongside the image:
+
+```
+{
+  "name": "espix",
+  "version": "0.4.0",
+  "build": "a1b2c3d",
+  "chip": "esp32s3",
+  "min_version": "0.3.0",
+  "url": "https://github.com/RoanBrand/espix/releases/download/v0.4.0/espix.bin"
+}
+```
+
+Constant asset names (`espix.bin`, `espix-ota.json`) are what make
+`releases/latest/download/<asset>` resolve without the GitHub API. Checked
+against live repositories rather than assumed:
+
+* **Two redirects, not one.** `latest/download/<asset>` answers 302 to
+  `releases/download/<tag>/<asset>`, which answers 302 to
+  `release-assets.githubusercontent.com/...` with a signed, time-limited query
+  string (about an hour). `esp_https_ota` follows redirects by default and
+  refuses an HTTPS-to-HTTP downgrade, so this works -- but a client that did not
+  follow redirects, or that retried a stale signed URL much later, would fail.
+* **No API call**, which is the point: the unauthenticated limit it avoids is
+  **60 requests/hour/IP** (`x-ratelimit-limit: 60`). GitHub does publish SHA-256
+  digests for release assets now, but reading them means the API, so the
+  practical integrity path is to bake the digest into the manifest.
+* **Limits**: up to 1000 assets per release, each file under **2 GiB**, with no
+  documented total-size or bandwidth cap. A 1.4 MiB image is nowhere near any of
+  it.
+* **TLS**: `github.com` chains to USERTrust ECC / Sectigo; the asset host serves
+  GitHub's wildcard certificate (SAN covers `*.githubusercontent.com`), which on
+  today's chain runs through Let's Encrypt's *Generation Y* hierarchy --
+  `ISRG Root YR`, served cross-signed by `ISRG Root X1`. `ISRG Root X1` and
+  USERTrust ECC are both in `cacrt_all.pem`, which
+  `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL` builds from, so the device
+  validates today with no pinned certificate. **`ISRG Root YR` itself is not in
+  the bundle**; the chain only builds because the cross-signed root is served.
+  If GitHub ever stops sending it, the bundle must be updated or the asset host
+  pinned -- worth knowing before it surfaces as a mystery "Failed to verify
+  certificate".
+* GitHub still serves HTTP/1.1, which is all `esp_http_client` speaks. One
+  esp_https_ota quirk on this path: partial downloads do not work with chunked
+  transfer encoding, so the simple non-partial download is the one to use.
+
+The manifest is still worth having over reading the image header directly: one
+small GET yields the version, the URL and the release notes, whereas a header
+probe means opening a full TLS connection and starting an OTA just to answer
+"is there anything new?".
+
+Integrity comes from three independent checks: the transport (TLS to
+github.com), the image's own appended SHA-256 that `esp_ota_end` verifies, and
+a comparison of the downloaded image's app descriptor against the manifest's
+`build`.
+
+### `/dev/factory` has to be repointed
+
+`components/espix_fs/dev.c` exposes the app partition as a readable `/dev/factory`
+node, and it looks up **`ESP_PARTITION_SUBTYPE_APP_FACTORY` specifically**. With
+the A/B table there is no factory partition, so it returns NULL, logs "no factory
+partition to expose", and every read fails with `EIO`. That is not theoretical:
+`tests/suites/45-throughput.sh` pulls `/dev/factory` to measure scp download
+throughput, and the docs use `cp /dev/factory /mnt/sd1/` to pull the running image
+off the board.
+
+Settled design:
+
+* **`/dev/ota0` and `/dev/ota1`** name the two slots, and both are always present
+  when those partitions exist -- including the passive one, so the previous image
+  can be read. `ota0` rather than `ota_0`: IDF labels the partitions
+  `ota_0`/`ota_1`, but `/dev` reads better in the `sda1` style and the mapping is
+  one line.
+* **`/dev/factory` is present only when a `factory` partition exists.** With the
+  16MB A/B table there is none, so the node is absent rather than broken; an 8MB
+  `factory`-only board keeps it exactly as today. That is the honest reading of
+  the name -- it is the factory partition, not "the running image" -- and it
+  removes the `EIO` failure without giving the node a second meaning.
+* **Which slot is running is answered by `upgrade --slots`**, not by the `/dev`
+  listing. That is also where each slot's otadata state belongs
+  (`NEW`/`PENDING_VERIFY`/`VALID`/`INVALID`/`ABORTED`), the offsets and sizes, and
+  which one a new update would be written to -- information a device node cannot
+  carry.
+* `45-throughput.sh` pulls whichever of `/dev/ota0` or `/dev/factory` exists, and
+  sizes the transfer from the bytes it actually received rather than a hardcoded
+  4 MiB.
+
+### motd, without a login-time network call
+
+The request was explicit and correct: **no synchronous check at login.** motd
+and the greeting read only the cached state. When a check has previously found
+something newer, the greeting gains a line such as:
+
+    Update   espix 0.4.0 is available; run 'upgrade'
+
+and nothing at all when there is none. `espix_ota_known_update()` is a memory
+read.
+
+### The periodic check
+
+A low-priority task, deliberately undemanding:
+
+* only when there is a default route **and** `espix_time_is_synced()`;
+* at most once per 24h, plus a few minutes of jitter after boot so a fleet does
+  not stampede; back off after a failure rather than retrying hard;
+* never while an install is running;
+* records the outcome for motd and moves on.
+
+(The clock is not actually required for the TLS handshake in this
+configuration -- `CONFIG_MBEDTLS_HAVE_TIME_DATE` is off, so certificate
+validity dates are not checked -- but requiring it is the right policy: it keeps
+the door open to turning date validation on, and a check that runs at the epoch
+is reporting on a world that no longer exists.)
+
+## 5. Rollback, and when espix counts as "good"
+
+### What piboot actually does
+
+Worth stating precisely, because it is the model this feature is copied from and
+it is not quite "two fixed slots". Ubuntu's Pi A/B lives in `/boot/firmware` as
+folders: `current/` (always present), `new/` (the untested one), and optionally
+`old/` (the previous known-good, deleted to reclaim space). State is a per-folder
+`state` file reading `good`, `unknown`, `trying` or `bad`:
+
+* flashing writes `new/` and sets `new/state=unknown`, never touching `current/`;
+* the next boot a service flips it to `trying` and reboots into the Pi's
+  "tryboot" mode, whose selector is a clear-on-read register -- so any failure
+  falls back to `current/`;
+* a later service, `piboot-try-validate`, runs at `multi-user.target` and -- by
+  default -- calls a validation script that just runs `true`, then marks `new/`
+  `good` and swaps the names;
+* failures are caught by a hardware watchdog plus `panic=10`, and a fallback
+  writes `bad`.
+
+Two things carry over. First, the "did the boot succeed" decision belongs to
+userspace, late in boot, not to the bootloader -- espix's equivalent is the
+point in `app_main` where the console is up. Second, the attempt is ephemeral by
+construction: one try, then either commit or fall back. That is very close to
+IDF's `PENDING_VERIFY`, which also gives exactly one attempt -- piboot simply
+names the intermediate states and keeps the previous image around more
+explicitly.
+
+### What IDF gives us
+
+Enabling `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (currently off) changes the
+semantics in a way that must be designed for, not discovered:
+
+* On success, `esp_ota_set_boot_partition()` marks the new slot
+  `ESP_OTA_IMG_NEW`.
+* On the next boot the bootloader sets it to `PENDING_VERIFY` and boots it.
+* If the new image does not *confirm itself* before the next reset, the next
+  boot turns `PENDING_VERIFY` into `ABORTED`, which is not selectable -- so the
+  previous image boots. **One boot attempt, no retry counter.** A panic in early
+  init therefore rolls back for free.
+* A running image in `PENDING_VERIFY` **cannot begin another OTA**;
+  `esp_ota_begin` returns `ESP_ERR_OTA_ROLLBACK_INVALID_STATE` until it is
+  valid.
+
+So espix must call `esp_ota_mark_app_valid_cancel_rollback()` at a defined
+point. Too early and a broken-but-not-crashing image is blessed; too late and a
+user cannot re-`upgrade` during the first boot.
+
+Recommendation: **after `app_main`'s init completes and the console is up** --
+i.e. the system reached the point where a human can ask it anything. That is the
+espix analogue of piboot's "userspace says the boot succeeded". It is
+deliberately *not* conditioned on a login, which would break a headless boot.
+A short grace delay could be added if early-boot flakiness shows up in practice.
+
+One interaction to check on hardware: `espix_fault` intercepts panics and
+stores a core dump. A panic on the first boot of a new image must still lead to
+a reset (and thus a rollback) rather than to a wedged board.
+
+## 6. Costs and hazards measured, not guessed
+
+**Internal RAM is the real constraint, and it is manageable.** Measured on the
+board over SSH:
+
+| | internal heap free |
+|---|---|
+| idle, one session | 107 K |
+| six held sessions | 52 K |
+| min since boot | 38 K |
+
+Each session costs roughly 11 K. A TLS handshake needs about 35--40 K with the
+current mbedTLS settings (`IN_CONTENT_LEN=16384`, `OUT=4096`,
+`MBEDTLS_INTERNAL_MEM_ALLOC=y`; IDF's own measured figure is ~42 K for a
+validating HTTPS request, ~22 K with dynamic buffers). With one or two sessions
+that fits comfortably; at five-plus it does not. Therefore `upgrade` must
+**check free internal heap before starting and refuse with a clear message**
+rather than half-download and fail obscurely. The OTA download buffer itself can
+live in PSRAM (`esp_https_ota_config_t.buffer_caps`), which helps but does not
+remove the TLS requirement.
+
+**ROM is cheaper than expected.** The ELF already links `esp_ota_ops.c.obj`
+wholesale -- `esp_ota_begin/write/end/set_boot_partition/get_state_partition`
+are all in the image, pulled in by the flash coredump -- and
+`mbedtls_ssl_handshake_client_step`, x509 parsing and the full CA bundle are
+already linked via wpa_supplicant's `esp_eap_client.c`. So HTTPS OTA adds only
+`esp_https_ota` + `esp_http_client` + `esp-tls` + our code: tens of KB, not
+the ~100 KB an HTTPS stack usually costs from scratch. To be measured properly
+once there is a build.
+
+**Flash writes freeze the world, and this board cannot avoid it.** `esp_ota_write`
+disables the cache while programming: tasks running from flash are suspended,
+only IRAM-safe interrupts run. The usual mitigation is
+`CONFIG_SPI_FLASH_AUTO_SUSPEND`, but this board's flash (Boya, `0x68`) does not
+support suspend -- already documented in `docs/ROADMAP.md`. So installs will
+cause brief, repeated system stalls, and the SSH connection carrying the command
+will hiccup. Use `esp_ota_begin(..., OTA_WITH_SEQUENTIAL_WRITES, ...)` so erases
+are interleaved in small chunks rather than one long bulk erase, and document
+the behaviour. `ESP_TASK_WDT` is 5 s with panic off; watch it during the first
+install.
+
+**The flash-identity guard will fire on a release-pulled board.**
+`tests/run.sh` refuses to run when the running build id is not
+`build/espix.bin`. For the local push paths that guard stays exactly right --
+the board runs the bytes you just built. For a release pulled from GitHub it
+fires correctly and needs a deliberate, explicit bypass, not a silent one.
+
+## 7. What OTA does not cover
+
+**Only the application is updated. `/` is not.** Two slots replace the kernel
+plus espix's own components; the littlefs rootfs, `/bin`, `/etc`, NVS and the
+core dump partition are untouched. A release that only changes code in
+`components/` ships cleanly this way; a release that adds or changes files under
+`/bin` or `/etc` will not. That is worth stating plainly now, because the
+Ubuntu analogy the feature is modelled on *does* cover the whole system, and the
+difference will surprise someone eventually. A future "rootfs image" slot, or
+shipping a tarball the release also updates, is where that would go.
+
+## 8. Security posture
+
+* OTA writes to a partition: **root only**, which is the existing `sudo` model.
+* HTTPS with the CA bundle for the network paths;
+  `CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP` stays **off** in release builds. A dev build
+  can enable it to pull from a laptop, and that is the only thing it is for.
+* No on-device listener at all. The dev push is over SSH, which is already
+  authenticated; section 2 records why the ArduinoOTA-style variant is not
+  planned.
+* TLS authenticates the *server*; the image hash authenticates the *bytes*.
+  Neither proves the release was built by someone trustworthy, and note that
+  IDF does **not** enforce any "this version is newer" rule -- the application
+  compares versions itself, which is the whole reason for the manifest. Secure
+  Boot v2 and signed images are the real answer and are a separate decision;
+  `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT` together with
+  `CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT` is the cheap half -- signed
+  images without the full secure-boot eFuse commitment -- and is worth
+  considering in the same breath as the rest of this.
+
+## 9. Milestones
+
+Sequenced so each step is useful on its own and the risky parts are proven
+early.
+
+1. **Unify the version.** `version.txt`, the generated header,
+   `espix_build_id()` in its new shape, `tests/run.sh` still green. Small, and
+   everything after it depends on the identity being one thing.
+2. **Partition table + rollback + local install.** *Done and verified on
+   hardware.* The new 16MB table (rootfs untouched), rollback enabled,
+   `upgrade --slots` and `upgrade --file`, `mark_app_valid` from `app_main`.
+   Installing the image into `ota_1`, rebooting into it and watching the state
+   go `NEW` -> confirmed `VALID` is the whole path minus the transport.
+3. **Dev push loop.** *Done, with one substitution.* `esp_https_ota` and
+   `esp_http_client` are in, `upgrade <url>` fetches over TLS (verified against
+   GitHub, including a clean refusal of a body that is not an app image), and
+   `make flash-ota` installs over SSH. The `--stdin` form was dropped for the
+   reason in section 2. This is the milestone that removes the UART cable from
+   day-to-day work.
+4. **Manifest + GitHub + check/install UX.** *Done.* `/etc/espix.conf`
+   (`ota.url`, re-read every time so editing it takes effect at once), the
+   manifest parser, `upgrade` / `-y` / `--check`, `min_version`, the free-heap
+   reporting, progress and reboot handling, and `tools/ota-manifest.sh`, which
+   writes the manifest a release publishes (its `build` is the same content hash
+   the device reports as `uname -v`, read from the descriptor so the two cannot
+   disagree). Verified over HTTPS: a manifest advertising `0.3.1` reports an
+   update and exits 1, one matching the running version and build reports up to
+   date and exits 0. A positive install straight from the repo needs a published
+   release -- or an HTTP dev server plus `CONFIG_ESPIX_OTA_ALLOW_HTTP`, which is
+   off by default and was used for the local checks.
+5. **Notification.** *Done and verified.* A low-priority task checks five
+   minutes after boot and then at most once a day, only with a default route and
+   a set clock, recording the verdict in `/var/lib/espix/update` (a plain text
+   file -- `cat` it to see why the greeting says what it says). The greeting reads
+   that cache and never the network: with a cached `0.3.1` it shows
+   `Updates   espix 0.3.1; run 'upgrade'`, and with no cache it shows nothing.
+6. **Documentation and cleanup.** README "Updating later", `KNOWN-ISSUES.md`,
+   `ROADMAP.md`, and the removal of the `TAB completes, UP/DOWN walks history`
+   line from the greeting, which no modern system says.
+
+## 10. Open decisions
+
+Decided in this document: the 16MB slot size (0x1F0000, so the rootfs does not
+move), the 8MB default (OTA off, `factory`-only), one table per board regardless
+of the option, the device-pull model, SSH rather than a push listener, and
+unifying the version rather than carrying two.
+
+Still open:
+
+1. **Update state: a file under `/var/lib/espix/`, or NVS?** (section 4)
+2. **Signed images / Secure Boot now, or after OTA works?**
+3. **Rootfs updates: explicitly out of scope for v1?** (section 7)
+
+## Sources
+
+Claims here that did not come from the ESP-IDF checkout or a measurement on the
+board:
+
+* Ubuntu piboot A/B:
+  https://ubuntu.com/hardware/docs/boards/explanations/piboot-ab/
+* GitHub `/releases/latest/download/<asset>`:
+  https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases
+* GitHub API rate limits (60/hour/IP unauthenticated):
+  https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
+* Release asset limits (1000 assets, 2 GiB per file):
+  https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases
+* ESP-IDF OTA, and partition tables:
+  https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/ota.html

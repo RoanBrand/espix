@@ -1,0 +1,20 @@
+/*
+ * Generated from version.txt by components/espix_kernel/CMakeLists.txt.
+ *
+ * Do not edit, and do not commit: it is written into the build directory. The
+ * single source is version.txt at the repository root, which ESP-IDF itself
+ * reads for PROJECT_VER -- so the string in the SSH banner and the string in the
+ * app descriptor (what OTA tooling sees) cannot disagree.
+ */
+#pragma once
+
+#define ESPIX_VERSION_MAJOR @ESPIX_VERSION_MAJOR@
+#define ESPIX_VERSION_MINOR @ESPIX_VERSION_MINOR@
+#define ESPIX_VERSION_PATCH @ESPIX_VERSION_PATCH@
+#define ESPIX_VERSION_STR   "@espix_version@"
+
+/* 1 when git says this is the tagged commit with a clean tree. */
+#define ESPIX_BUILD_IS_RELEASE @ESPIX_BUILD_IS_RELEASE@
+
+/* "v0.3.0-4-g2ebf416-dirty" and the like, for a boot-time mention. */
+#define ESPIX_GIT_DESCRIBE  "@espix_git_describe@"

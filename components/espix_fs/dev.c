@@ -57,7 +57,7 @@ static const char *TAG = "devfs";
 
 typedef enum {
     DEV_NULL,
-    DEV_FACTORY,
+    DEV_APP,        /* an application partition: /dev/factory, /dev/ota0, ... */
     DEV_BLOCK,
 } dev_kind_t;
 
@@ -66,10 +66,16 @@ typedef struct {
     dev_kind_t  kind;
     mode_t      mode;       /* type bits included */
     uint64_t    size;       /* block nodes only; 0 elsewhere */
+    uint8_t     subtype;    /* DEV_APP only: which app partition */
 } dev_node_t;
 
 /*
- * /dev/factory is world-readable because it holds firmware code and no secrets.
+ * Application partitions are world-readable because they hold firmware code and
+ * no secrets. A node exists only while its partition does: the 16MB A/B table has
+ * no `factory`, so /dev/factory is absent there rather than present and broken;
+ * both OTA slots are listed, the passive one included, so the previous image can
+ * be read. Which slot is *running* is a question for `upgrade --slots`, not for a
+ * directory listing -- a device node cannot carry that.
  *
  * The `storage` partition is deliberately absent. Its raw image contains
  * /etc/ssh/host_ecdsa_key and /etc/wifi.conf, which are protected by file
@@ -80,8 +86,10 @@ typedef struct {
  * wanting somewhere to read from.
  */
 static const dev_node_t s_nodes[] = {
-    { "/dev/null",    DEV_NULL,    S_IFCHR | 0666, 0 },
-    { "/dev/factory", DEV_FACTORY, S_IFREG | 0444, 0 },
+    { "/dev/null",    DEV_NULL, S_IFCHR | 0666, 0, 0 },
+    { "/dev/factory", DEV_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_FACTORY },
+    { "/dev/ota0",    DEV_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_OTA_0 },
+    { "/dev/ota1",    DEV_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_OTA_1 },
 };
 
 #define DEV_COUNT ((int)(sizeof(s_nodes) / sizeof(s_nodes[0])))
@@ -136,9 +144,11 @@ typedef struct {
 static dev_slot_t        s_slots[ESPIX_DEV_FD_COUNT];
 static SemaphoreHandle_t s_lock;
 
-/* The app partition, found once. NULL until the first open of /dev/factory,
- * and NULL for ever on a build without one. */
-static const esp_partition_t *s_factory;
+/* One cached partition pointer per app node, with a flag for "looked it up
+ * already", so a slot this image genuinely does not have is not re-searched on
+ * every read. Indexed by the node's position in s_nodes. */
+static const esp_partition_t *s_app[DEV_COUNT];
+static bool                    s_app_found[DEV_COUNT];
 
 void espix_dev_init(void)
 {
@@ -222,17 +232,21 @@ void espix_dev_unregister_block(const char *name)
     xSemaphoreGive(s_lock);
 }
 
-static const esp_partition_t *factory(void)
+/* The partition behind an app node, or NULL when this image has no such slot.
+ * The answer cannot change at runtime, so it is cached once. */
+static const esp_partition_t *app_of(const dev_node_t *n)
 {
-    if (s_factory == NULL) {
-        s_factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
-                                             ESP_PARTITION_SUBTYPE_APP_FACTORY,
-                                             NULL);
-        if (s_factory == NULL) {
-            espix_klog(ESPIX_KLOG_WARN, TAG, "no factory partition to expose");
-        }
+    const int i = (int)(n - s_nodes);
+    if (i < 0 || i >= DEV_COUNT || n->kind != DEV_APP) {
+        return NULL;
     }
-    return s_factory;
+    if (!s_app_found[i]) {
+        s_app[i] = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                            (esp_partition_subtype_t)n->subtype,
+                                            NULL);
+        s_app_found[i] = true;
+    }
+    return s_app[i];
 }
 
 static off_t dev_size(const dev_node_t *n)
@@ -240,8 +254,8 @@ static off_t dev_size(const dev_node_t *n)
     if (n->kind == DEV_BLOCK) {
         return (off_t)n->size;
     }
-    if (n->kind == DEV_FACTORY) {
-        const esp_partition_t *p = factory();
+    if (n->kind == DEV_APP) {
+        const esp_partition_t *p = app_of(n);
         return (p != NULL) ? (off_t)p->size : 0;
     }
     return 0;
@@ -251,6 +265,10 @@ const void *espix_dev_lookup(const char *abs_path)
 {
     for (int i = 0; i < DEV_COUNT; i++) {
         if (strcmp(abs_path, s_nodes[i].path) == 0) {
+            /* A node for a partition this image does not have does not exist. */
+            if (s_nodes[i].kind == DEV_APP && app_of(&s_nodes[i]) == NULL) {
+                return NULL;
+            }
             return &s_nodes[i];
         }
     }
@@ -301,7 +319,7 @@ int espix_dev_open(const void *handle, int flags)
 
     /* Read-only devices refuse a writable open outright, the way a read-only
      * filesystem does, rather than accepting it and failing every write. */
-    if (n->kind == DEV_FACTORY) {
+    if (n->kind == DEV_APP) {
         const int acc = flags & O_ACCMODE;
         if (acc == O_WRONLY || acc == O_RDWR) {
             errno = EROFS;
@@ -444,6 +462,12 @@ int espix_dev_readdir_r(DIR *pdir, struct dirent *entry, struct dirent **out)
      * changes it. The static half does not care. */
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
+    /* A node for a partition this image does not have is not listed. */
+    while (d->cursor < DEV_COUNT && s_nodes[d->cursor].kind == DEV_APP &&
+           app_of(&s_nodes[d->cursor]) == NULL) {
+        d->cursor++;
+    }
+
     const dev_node_t *n = (d->cursor < DEV_COUNT)
                         ? &s_nodes[d->cursor]
                         : block_at(d->cursor - DEV_COUNT);
@@ -547,7 +571,7 @@ static ssize_t dev_read_at(const dev_node_t *n, void *dst, size_t size,
         return 0;                       /* always end of input */
     }
 
-    const esp_partition_t *p = factory();
+    const esp_partition_t *p = app_of(n);
     if (p == NULL) {
         errno = EIO;
         return -1;

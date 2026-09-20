@@ -3,26 +3,24 @@
 # Layout fills the flash exactly; last byte is 0xFFFFFF (ends at 0x1000000).
 # The partition table itself lives at 0x8000 (CONFIG_PARTITION_TABLE_OFFSET).
 #
+# Two application slots, so the kernel can be updated over the network: the
+# running slot keeps running while the other is written, and the bootloader
+# switches to it once the write is verified. nvs, coredump and storage are at the
+# offsets they have always had, so adopting this table does NOT reformat the
+# rootfs -- the over-allocated single 'factory' slot simply becomes two.
+#
+# Both slots are 0x1F0000. The constraint that sets that number is not the image
+# but the partition table: an *application partition offset* must be 0x10000
+# aligned, so with ota_0 at 0x20000 the next slot can only start on a 64KB
+# boundary. 0x1F8000 (the largest size that would still end exactly at 0x410000)
+# puts ota_1 at 0x218000, which the generator rejects. The 64KB between 0x400000
+# and 0x410000 is the slack that alignment costs; see docs/OTA.md.
+#
 # Name,     Type, SubType,  Offset,    Size,      Flags
 nvs,        data, nvs,      0x9000,    0x6000,
-phy_init,   data, phy,      0xf000,    0x1000,
-factory,    app,  factory,  0x10000,   0x400000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+ota_0,      app,  ota_0,    0x20000,   0x1F0000,
+ota_1,      app,  ota_1,    0x210000,  0x1F0000,
 coredump,   data, coredump, 0x410000,  0x10000,
 storage,    data, littlefs, 0x420000,  0xBE0000,
-
-# ---------------------------------------------------------------------------
-# OTA variant — NOT enabled. See "Deferred decisions" in the design notes.
-#
-# Two OTA slots make it possible to update the espix kernel over the network
-# without a serial cable, at the cost of ~4MB of rootfs (11.9MB -> 7.8MB).
-# Switching later means reflashing the whole device, so decide before this
-# layout is in the field.
-#
-# Name,     Type, SubType,  Offset,    Size,      Flags
-# nvs,      data, nvs,      0x9000,    0x6000,
-# otadata,  data, ota,      0xf000,    0x2000,
-# phy_init, data, phy,      0x11000,   0x1000,
-# ota_0,    app,  ota_0,    0x20000,   0x400000,
-# ota_1,    app,  ota_1,    0x420000,  0x400000,
-# coredump, data, coredump, 0x820000,  0x10000,
-# storage,  data, littlefs, 0x830000,  0x7D0000,

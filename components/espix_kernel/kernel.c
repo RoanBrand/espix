@@ -26,51 +26,59 @@ const char *espix_version(void)
 }
 
 /*
- * Which build this is, as opposed to which release: the git describe that
- * CONFIG_APP_PROJECT_VER carries, `2ebf416-dirty` and the like.
+ * Which build is running: the first nine hex digits of the image's ELF SHA-256.
  *
- * Separate from espix_version() because the two answer different questions and
- * conflating them is what made this necessary. `espix 0.3.0` is a promise about
- * behaviour; this is the identity of the bytes actually running, and only the
- * second one can tell you the board is not running what you just compiled.
+ * A content identity rather than a version. `espix 0.3.0` is a promise about
+ * behaviour; this is the identity of the bytes actually running, and only it can
+ * tell you the board is not running what you just compiled -- which matters
+ * because `make test` builds and runs without flashing, so hours can be spent
+ * against an image from a tree that no longer exists. tests/run.sh compares this
+ * against build/espix.bin and refuses to start when they differ.
  *
- * That is not hypothetical. `make test` builds the test app and runs the suite;
- * it does not flash. A board can therefore be tested for hours against an image
- * from an uncommitted tree that no longer exists, and nothing in espix's output
- * would have contradicted you -- which is exactly what happened, and cost a
- * debugging session spent explaining a panic in code nobody could check out.
- * tests/run.sh now refuses to start when this disagrees with build/espix.bin.
+ * Nine digits, not the full sixty-four: that is what tests/run.sh reads out of
+ * the image and what `uname -v` prints, and it is the same prefix espcoredump
+ * already uses to decide whether a stored dump belongs to the running image.
  */
 const char *espix_build_id(void)
 {
-    static char id[48];
+    static char id[16];
 
     if (id[0] != '\0') {
         return id;
     }
 
-    const esp_app_desc_t *desc = esp_app_get_description();
-    const char *ver = (desc != NULL && desc->version[0] != '\0')
-                          ? desc->version : "unknown";
-
-    /*
-     * Two halves, because neither is sufficient on its own.
-     *
-     * The git describe is what a person recognises, and it is what makes the
-     * mismatch message mean something at a glance. But it says `-dirty` for
-     * *any* modified tree, so two different working trees at the same commit
-     * produce the same string -- and "I rebuilt without flashing" is precisely
-     * the case that must not slip through.
-     *
-     * So it carries the ELF SHA prefix too, which is a content hash and cannot
-     * collide that way. It is the same identity espcoredump uses to decide
-     * whether a stored dump belongs to the running image, and espix already
-     * compares it for that in espix_fault/coredump.c -- so this is the
-     * established answer to "are these the same bytes", not a second one.
-     */
     const char *sha = esp_app_get_elf_sha256_str();
-    snprintf(id, sizeof(id), "%s+%s", ver, (sha != NULL) ? sha : "?");
+    if (sha == NULL || sha[0] == '\0') {
+        return "unknown";
+    }
+
+    snprintf(id, sizeof(id), "%.9s", sha);
     return id;
+}
+
+bool espix_build_is_release(void)
+{
+    return ESPIX_BUILD_IS_RELEASE;
+}
+
+/*
+ * The node name, as Linux keeps it in the kernel rather than in any one
+ * subsystem. espix_net owns where it comes from and pushes it here; the kernel
+ * only remembers it, for `uname -n`.
+ */
+static char s_nodename[ESPIX_NODENAME_MAX];
+
+const char *espix_nodename(void)
+{
+    return (s_nodename[0] != '\0') ? s_nodename : espix_target();
+}
+
+void espix_kernel_set_nodename(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return;
+    }
+    strlcpy(s_nodename, name, sizeof(s_nodename));
 }
 
 const char *espix_target(void)
@@ -106,34 +114,69 @@ const char *espix_chip_model(void)
     return chip_model_name(chip.model);
 }
 
-size_t espix_uname(char *buf, size_t len, bool all)
+static void field(char *buf, size_t len, size_t *used, const char *text)
+{
+    if (*used >= len) {
+        return;
+    }
+    const int n = snprintf(buf + *used, len - *used,
+                           (*used != 0) ? " %s" : "%s", text);
+    if (n > 0) {
+        *used += (size_t)n;
+    }
+}
+
+/*
+ * uname(1). The field order is Linux's -- system, node, release, version,
+ * machine -- and the split between release and version is the one that matters
+ * here: `uname -r` is the version a person quotes, `uname -v` is which build of
+ * it is running, and a shell prompt only ever asks for the first.
+ */
+size_t espix_uname(char *buf, size_t len, const char *flags)
 {
     if (buf == NULL || len == 0) {
         return 0;
     }
+    if (flags == NULL) {
+        flags = "";
+    }
 
-    if (!all) {
+    if (flags[0] == '\0') {
         return (size_t)snprintf(buf, len, "espix");
     }
+
+    const bool all = (strchr(flags, 'a') != NULL);
+    size_t used = 0;
 
     esp_chip_info_t chip;
     esp_chip_info(&chip);
 
-    /*
-     * The build id sits where Linux puts its own -- `uname -a` there reads
-     * `Linux host 6.1.0 #1 SMP PREEMPT_DYNAMIC ... x86_64`, and the `#1 SMP...`
-     * field is precisely "which build of this kernel is running". Same job, so
-     * same place, rather than a command of its own that nobody would think to
-     * run at the moment it matters.
-     */
-    return (size_t)snprintf(buf, len,
-                            "espix %s (%s) %s rev%d.%d %d-core IDF %s",
-                            s_version,
-                            espix_build_id(),
-                            chip_model_name(chip.model),
-                            chip.revision / 100, chip.revision % 100,
-                            chip.cores,
-                            esp_get_idf_version());
+    if (all || strchr(flags, 's') != NULL) {
+        field(buf, len, &used, "espix");
+    }
+    if (all || strchr(flags, 'n') != NULL) {
+        field(buf, len, &used, espix_nodename());
+    }
+    if (all || strchr(flags, 'r') != NULL) {
+        field(buf, len, &used, espix_version());
+    }
+    if (all || strchr(flags, 'v') != NULL) {
+        char version[16];
+        snprintf(version, sizeof(version), "#%s", espix_build_id());
+        field(buf, len, &used, version);
+    }
+    if (all || strchr(flags, 'm') != NULL) {
+        field(buf, len, &used, espix_chip_model());
+    }
+    if (all) {
+        char extra[64];
+        snprintf(extra, sizeof(extra), "rev%d.%d %d-core ESP-IDF %s",
+                 chip.revision / 100, chip.revision % 100,
+                 chip.cores, esp_get_idf_version());
+        field(buf, len, &used, extra);
+    }
+
+    return used;
 }
 
 size_t espix_uptime_str(char *buf, size_t len)

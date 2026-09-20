@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "ota.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        espix_fs
+        espix_net
+        espix_time
+        app_update
+        esp_partition
+        esp_https_ota
+        esp_http_client
+        mbedtls
+        esp_app_format
+        heap
+        freertos
+        log
+)

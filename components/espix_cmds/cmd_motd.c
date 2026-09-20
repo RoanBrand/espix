@@ -22,6 +22,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
+#include "espix_ota.h"
 
 /*
  * The logo is two marks in one column: the wordmark, and the antenna beneath
@@ -269,7 +270,17 @@ void espix_cmds_print_greeting(espix_session_t *s)
     rule[i] = '\0';
     row(&ctx, rule);
 
-    snprintf(value, sizeof(value), "espix %s", espix_version());
+    /*
+     * The release alone, the way a shell prompt reports a kernel -- and the
+     * build id only when this is not the released build, which is when it
+     * answers "am I running what was published?" rather than being noise.
+     */
+    if (espix_build_is_release()) {
+        snprintf(value, sizeof(value), "espix %s", espix_version());
+    } else {
+        snprintf(value, sizeof(value), "espix %s+%.7s",
+                 espix_version(), espix_build_id());
+    }
     row_fact(&ctx, "OS", value);
 
     fact_host(value, sizeof(value));
@@ -299,6 +310,17 @@ void espix_cmds_print_greeting(espix_session_t *s)
     fact_network(value, sizeof(value));
     row_fact(&ctx, "Network", value);
 
+    /*
+     * An update the background check already found. Read from the cached state,
+     * never from the network: a login must not wait on a fetch, which is exactly
+     * why the check runs on its own and this only reports what it left behind.
+     */
+    char update[16];
+    if (espix_ota_enabled() && espix_ota_known_update(update, sizeof(update))) {
+        snprintf(value, sizeof(value), "espix %s; run 'upgrade'", update);
+        row_fact(&ctx, "Updates", value);
+    }
+
     /* Any logo lines not yet consumed still have to be drawn. */
     while (ctx.line < LOGO_LINES) {
         row(&ctx, NULL);
@@ -317,8 +339,7 @@ void espix_cmds_print_greeting(espix_session_t *s)
                      ansi ? ANSI_RESET : "");
     }
 
-    espix_printf(s, "Type 'help' for the command list. "
-                    "TAB completes, UP/DOWN walks history.\n\n");
+    espix_printf(s, "Type 'help' for the command list.\n\n");
 }
 
 static int cmd_motd(espix_session_t *s, int argc, char **argv)

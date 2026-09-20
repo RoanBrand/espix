@@ -35,6 +35,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
+#include "espix_ota.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
 #include "espix_ssh.h"
@@ -98,6 +99,10 @@ void app_main(void)
      * the shipped default password is still in place. */
     ESP_ERROR_CHECK(espix_auth_init());
 
+    /* Reads the OTA configuration and reports which slot is running. Never
+     * fatal: a board with one slot simply has nowhere to write an update. */
+    ESP_ERROR_CHECK(espix_ota_init());
+
     /*
      * Must precede networking: this registers the IP_EVENT handler that starts
      * the SNTP client, and the address it waits for is about to arrive. Not
@@ -137,6 +142,14 @@ void app_main(void)
 #endif
 
     espix_cmds_register_all();
+
+    /*
+     * Everything above is up, so this image is worth keeping: if the bootloader
+     * is holding it as pending-verify, say so now rather than let the next reset
+     * roll it back. A no-op on a normal boot. See the rollback note in
+     * docs/OTA.md.
+     */
+    espix_ota_confirm_boot();
 
     const esp_err_t err = espix_console_session_start();
     if (err != ESP_OK) {

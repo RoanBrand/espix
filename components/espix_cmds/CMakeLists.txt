@@ -10,6 +10,7 @@ idf_component_register(
         "cmd_time.c"
         "cmd_blk.c"
         "cmd_usbhost.c"
+        "cmd_ota.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -26,6 +27,8 @@ idf_component_register(
         espix_usb
         espix_auth
         espix_time
+        espix_ota
+        app_update
         esp_blockdev
         lwip
         freertos
