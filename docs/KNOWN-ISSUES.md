@@ -631,6 +631,35 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
+- **A directory made outside every user's home is owned by root, so its own
+  creator cannot write into it.** The rootfs keeps no ownership of its own and
+  derives it from the location instead -- the account whose home contains a
+  path, longest home winning, root for everything else -- so `mkdir /tmp/d1`
+  records root, and the very next thing the same user does inside it is
+  refused:
+
+  ```
+  $ whoami
+  esp
+  $ mkdir /tmp/d1
+  $ echo hi > /tmp/d1/f
+  espix: /tmp/d1/f: cannot open for writing: Permission denied
+  $ echo hi > /tmp/f9          # no directory in the way
+  $ cat /tmp/f9
+  hi
+  ```
+
+  A file created by the same user is fine -- `open()` records the caller -- so
+  it is `mkdir` alone that hands the directory to root. The visible cost is
+  that `/tmp` is advertised as sticky and world-writable and is not usable the
+  way /tmp is expected to be, and `tests/suites/15-streams.sh` fails fifteen
+  assertions because it does `mkdir $T` and then `> $T/app-out`. It is not the
+  transport: the same suite passes every assertion that goes over the wire.
+
+  Either a directory should belong to whoever created it, with only *files*
+  falling back to the location rule, or `/tmp` wants naming in the rule as
+  recursively user-owned. Which of those is a policy question, not a typo.
+
 - ~~**A write into a mounted FAT volume is lost for the first two copies after a
   boot.**~~ **Fixed**, by the fd packing (`86bc6bd`) and by releasing the entry it
   allocates (`c016e00`). The cause was the fd collision described below and not
