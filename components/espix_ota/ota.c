@@ -69,6 +69,18 @@ void espix_ota_running_slot(char *buf, size_t len)
     strlcpy(buf, short_name(run->subtype, run->label), len);
 }
 
+/* Nine hex digits of a descriptor's app_elf_sha256 -- the same prefix
+ * espix_build_id() reports for the running image. */
+static void sha_prefix(const esp_app_desc_t *d, char *out, size_t len)
+{
+    snprintf(out, len, "%02x%02x%02x%02x%02x",
+             d->app_elf_sha256[0], d->app_elf_sha256[1], d->app_elf_sha256[2],
+             d->app_elf_sha256[3], d->app_elf_sha256[4]);
+    if (strlen(out) > 9) {
+        out[9] = 0;
+    }
+}
+
 size_t espix_ota_slots(espix_ota_slot_t *out, size_t n)
 {
     if (out == NULL || n == 0) {
@@ -94,6 +106,15 @@ size_t espix_ota_slots(espix_ota_slot_t *out, size_t n)
 
         esp_ota_img_states_t st;
         slot->state = (esp_ota_get_state_partition(p, &st) == ESP_OK) ? (int)st : -1;
+
+        /* What image is in this slot, running or not: the descriptor is part of
+         * the image, so the passive slot can be read without booting it. An
+         * erased slot simply has none. */
+        esp_app_desc_t desc;
+        if (esp_ota_get_partition_description(p, &desc) == ESP_OK) {
+            strlcpy(slot->version, desc.version, sizeof(slot->version));
+            sha_prefix(&desc, slot->build, sizeof(slot->build));
+        }
         count++;
     }
     if (it != NULL) {
@@ -536,7 +557,14 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
         const int status = esp_http_client_get_status_code(c);
         if (status != 200) {
             if (err != NULL) {
-                snprintf(err, err_len, "%s: HTTP %d", url, status);
+                if (status == 404) {
+                    snprintf(err, err_len,
+                             "no manifest at %s (HTTP 404); does that release "
+                             "publish espix-ota.json?", url);
+                } else {
+                    snprintf(err, err_len,
+                             "%s: the server answered HTTP %d", url, status);
+                }
             }
             e = ESP_ERR_NOT_FOUND;
         } else {
@@ -551,7 +579,12 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
             buf[n] = '\0';
         }
     } else if (err != NULL) {
-        snprintf(err, err_len, "%s: %s", url, esp_err_to_name(e));
+        /* The common ones by name: esp_err_to_name() alone says
+         * ESP_ERR_HTTP_CONNECT, which is not a sentence. */
+        const char *why = (e == ESP_ERR_TIMEOUT)       ? "timed out"
+                        : (e == ESP_ERR_HTTP_CONNECT)  ? "could not connect"
+                        : esp_err_to_name(e);
+        snprintf(err, err_len, "cannot reach %s: %s", url, why);
     }
 
     esp_http_client_close(c);

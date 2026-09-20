@@ -148,9 +148,6 @@ size_t espix_uname(char *buf, size_t len, const char *flags)
     const bool all = (strchr(flags, 'a') != NULL);
     size_t used = 0;
 
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
-
     if (all || strchr(flags, 's') != NULL) {
         field(buf, len, &used, "espix");
     }
@@ -161,19 +158,33 @@ size_t espix_uname(char *buf, size_t len, const char *flags)
         field(buf, len, &used, espix_version());
     }
     if (all || strchr(flags, 'v') != NULL) {
+        /*
+         * The build field, where Linux puts "#1 SMP PREEMPT ...". A released
+         * build has no content identity to report and says so plainly; a
+         * development build carries the content hash, which is what "am I
+         * running what I think I am" needs. motd applies the same rule.
+         */
         char version[16];
-        snprintf(version, sizeof(version), "#%s", espix_build_id());
+        if (espix_build_is_release()) {
+            snprintf(version, sizeof(version), "#1");
+        } else {
+            snprintf(version, sizeof(version), "#%s", espix_build_id());
+        }
         field(buf, len, &used, version);
     }
     if (all || strchr(flags, 'm') != NULL) {
         field(buf, len, &used, espix_chip_model());
     }
     if (all) {
-        char extra[64];
-        snprintf(extra, sizeof(extra), "rev%d.%d %d-core ESP-IDF %s",
-                 chip.revision / 100, chip.revision % 100,
-                 chip.cores, esp_get_idf_version());
-        field(buf, len, &used, extra);
+        /*
+         * The SDK is this platform's "operating system", the last field Linux
+         * prints. Chip revision and core count are real facts but neither
+         * belongs here -- ps, motd and the boot log say them where somebody is
+         * actually looking.
+         */
+        char os[48];
+        snprintf(os, sizeof(os), "ESP-IDF %s", esp_get_idf_version());
+        field(buf, len, &used, os);
     }
 
     return used;

@@ -27,6 +27,8 @@ typedef struct {
     char     name[ESPIX_OTA_NAME_MAX];  /* "ota0", "ota1", "factory", ... */
     uint32_t offset;
     uint32_t size;
+    char     version[32];               /* from that slot's descriptor, "" if none */
+    char     build[12];                 /* its 9-hex ELF SHA, "" if none */
     int      state;                     /* esp_ota_img_states_t, or -1 if unknown */
     bool     active;                    /* the image is running from here */
     bool     next;                      /* the next update would be written here */

@@ -286,11 +286,17 @@ SSH banner both read `0.3.0`. `espix_build_id()` is now the nine-hex content
 hash, so the device reports:
 
     $ uname -a
-    espix esp32s3-cb5d74 0.3.0 #bfbb8cd6b ESP32-S3 rev0.2 2-core ESP-IDF v6.1-dirty
+    espix esp32s3-cb5d74 0.3.0 #acad9bd8d ESP32-S3 ESP-IDF v6.1-dirty
     $ uname -r
     0.3.0
     $ uname -v
-    #bfbb8cd6b
+    #acad9bd8d
+
+`uname -a` is sysname, node, release, build, machine, then the SDK -- `rev0.2`
+and `2-core` were dropped because Linux reports neither there. A release
+build shows `#1` in the build field where a development build shows the content
+hash, the same rule motd follows, so an official espix carries no hash at all in
+its identity strings.
 
 Linux's field order, one hash, and motd shows `espix 0.3.0` for a release build
 or `espix 0.3.0+bfbb8cd` for a development one. `uname` takes the real option

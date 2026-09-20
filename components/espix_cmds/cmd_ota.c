@@ -12,6 +12,7 @@
 #include "esp_ota_ops.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_net.h"
 #include "espix_ota.h"
 
 static const char *state_name(int state)
@@ -37,8 +38,8 @@ static int show_slots(espix_session_t *s)
         return 1;
     }
 
-    espix_printf(s, "%-8s %-10s %-10s %-14s %s\n",
-                 "SLOT", "OFFSET", "SIZE", "STATE", "BOOT");
+    espix_printf(s, "%-8s %-10s %-10s %-14s %-8s %-10s %s\n",
+                 "SLOT", "OFFSET", "SIZE", "STATE", "VERSION", "BUILD", "BOOT");
     for (size_t i = 0; i < n; i++) {
         const espix_ota_slot_t *t = &slots[i];
         char boot[20] = "";
@@ -50,9 +51,12 @@ static int show_slots(espix_session_t *s)
             strlcat(boot, t->active ? " + next" : "next", sizeof(boot));
         }
 
-        espix_printf(s, "%-8s 0x%06x   0x%06x   %-14s %s\n",
+        espix_printf(s, "%-8s 0x%06x   0x%06x   %-14s %-8s %-10s %s\n",
                      t->name, (unsigned)t->offset, (unsigned)t->size,
-                     state_name(t->state), boot);
+                     state_name(t->state),
+                     (t->version[0] != 0) ? t->version : "-",
+                     (t->build[0] != 0) ? t->build : "-",
+                     boot);
     }
     return 0;
 }
@@ -95,6 +99,15 @@ static int run_manifest(espix_session_t *s, bool check_only, bool assume_yes)
     char err[160];
 
     espix_printf(s, "upgrade: checking %s\n", src);
+
+    /* Say why before trying, rather than after a long timeout: with no default
+     * route there is nothing to reach and the reason is knowable here. */
+    char ifname[ESPIX_IF_NAME_MAX];
+    uint32_t gw;
+    if (!espix_net_default_route(ifname, sizeof(ifname), &gw)) {
+        espix_eprintf(s, "upgrade: no route to the network\n");
+        return 1;
+    }
 
     espix_ota_manifest_t m;
     const esp_err_t e = espix_ota_check(src, &m, err, sizeof(err));
