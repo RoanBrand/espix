@@ -631,12 +631,17 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Filesystem
 
-- **A directory made outside every user's home is owned by root, so its own
-  creator cannot write into it.** The rootfs keeps no ownership of its own and
-  derives it from the location instead -- the account whose home contains a
-  path, longest home winning, root for everything else -- so `mkdir /tmp/d1`
-  records root, and the very next thing the same user does inside it is
-  refused:
+- ~~**A directory made outside every user's home is owned by root, so its own
+  creator cannot write into it.**~~ **Fixed** (`d1e761e`), by giving a command's
+  own task its session. `run_on_own_task()` spawns a task for any command with a
+  non-zero stack and never set the session thread-local, so every reader of "who
+  is asking" saw no session and took the caller for espix itself: the permission
+  check returned early without checking, and `espix_fs_claim()` did not stamp an
+  owner, leaving the location rule to answer root. Two symptoms, one cause.
+
+  The directory was the visible one. `mkdir /tmp/d1` recorded root -- the rule
+  answers root for anything not inside a home -- and the next thing the same
+  user did inside it was refused:
 
   ```
   $ whoami
@@ -649,16 +654,18 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   hi
   ```
 
-  A file created by the same user is fine -- `open()` records the caller -- so
-  it is `mkdir` alone that hands the directory to root. The visible cost is
-  that `/tmp` is advertised as sticky and world-writable and is not usable the
-  way /tmp is expected to be, and `tests/suites/15-streams.sh` fails fifteen
-  assertions because it does `mkdir $T` and then `> $T/app-out`. It is not the
-  transport: the same suite passes every assertion that goes over the wire.
+  The file case worked because the shell sets a redirect up on the *session*
+  task, whose thread-local is set, while `mkdir`, `touch` and the rest run on a
+  task of their own -- not because `open()` recorded the caller, which was the
+  reading that made this look like a rule about directories.
 
-  Either a directory should belong to whoever created it, with only *files*
-  falling back to the location rule, or `/tmp` wants naming in the rule as
-  recursively user-owned. Which of those is a policy question, not a typo.
+  The other symptom was quieter and worse: any command with a stack of its own
+  was exempt from the permission check entirely. That is why it is not merely an
+  ownership rule to be argued about.
+
+  `tests/suites/15-streams.sh` failed fifteen assertions on the directory half
+  (`mkdir $T`, then `> $T/app-out`) and passes 34/34 after; 00-smoke, 10-fs,
+  12-vfs, 20-users, 30-proc and 40-transfer pass too.
 
 - ~~**A write into a mounted FAT volume is lost for the first two copies after a
   boot.**~~ **Fixed**, by the fd packing (`86bc6bd`) and by releasing the entry it
