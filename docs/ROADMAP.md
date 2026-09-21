@@ -250,7 +250,7 @@ being the shortest path.
   winning, and root otherwise. Since root's home is `/`, that makes the rootfs
   root's and `/home/esp` esp's with nothing written to flash to say so -- which
   is what keeps a freshly imaged device free of attribute data and what makes a
-  storage-flash come back correct.
+  rootfs flash come back correct.
 
   What is left of the case for `/etc/shadow`: very little. The file is 0600
   root, and every reader goes through espix_auth, which raises privilege for its

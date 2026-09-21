@@ -1700,7 +1700,7 @@ static void close_channel(ssh_chan_t *ch)
  * Start where a login would: the account's home directory.
  *
  * Falls back to / when the directory is not actually there. A rootfs can be
- * replaced wholesale by storage-flash or edited on the device, and refusing to
+ * replaced wholesale by a rootfs flash or edited on the device, and refusing to
  * open a shell because a directory went missing would be a poor trade.
  */
 static void apply_account(espix_session_t *session, const char *user)
@@ -2095,7 +2095,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * and nothing has read until now.
      *
      * Falls back to / when the directory is not actually there. A rootfs can be
-     * replaced wholesale by storage-flash or edited on the device, and refusing
+     * replaced wholesale by a rootfs flash or edited on the device, and refusing
      * to open a shell because a directory went missing would be a poor trade.
      */
     session.login = true;

@@ -214,7 +214,7 @@ directories are `0755` (`/tmp` is `01777`), a file whose first four bytes are th
 ELF magic is `0755`, everything else is `0644`. Nothing is stored for any of that,
 and it is not an optimisation -- the image builder writes no attributes at all, so
 every file in a freshly flashed rootfs arrives without one, and without the rule
-nothing in `/bin` would be executable after a `storage-flash`. Two more things fall
+nothing in `/bin` would be executable after a rootfs flash. Two more things fall
 out of it: a flash write happens when you run `chmod` and at no other time, on a
 filesystem that pays a block erase per write; and a device nobody has chmod'd has no
 mode state to be wrong.
@@ -514,9 +514,11 @@ firmware — was written against.
 
 ### The rootfs image is not flashed by `idf.py flash`
 
-`littlefs_create_partition_image(storage fsroot)` without `FLASH_IN_PROJECT`.
-With it, every firmware flash would rewrite the filesystem and destroy anything
-created on the device. Flashing the rootfs is an explicit `idf.py storage-flash`.
+It is built by `tools/make-fs-image.sh` and written by `make flash-fs`, never
+by a firmware flash -- otherwise every flash would rewrite the filesystem and
+destroy anything created on the device. The image is sized to its contents and
+grown to the whole partition by the kernel's `grow_on_mount` on its first
+mount, so even that write stays small.
 
 ### Upload throughput is bounded by flash erases, not by the network
 
@@ -529,7 +531,7 @@ Demonstrated on demand rather than inferred, on one board in one position:
 | storage partition | upload KB/s | download KB/s | when |
 |---|---|---|---|
 | used | 78.3 | 356.0 | before XIP |
-| freshly erased (`storage-flash`) | 195.5 | 354.0 | before XIP |
+| freshly erased (`make flash-fs`) | 195.5 | 354.0 | before XIP |
 | used again, after writing 12MB | 78.2 | 357.9 | before XIP |
 | **used** | **121, 124** | **173, 179** | **after XIP, -54 dBm** |
 
@@ -584,7 +586,7 @@ free blocks is not one of them**, and `esp_littlefs.h` does not expose the call
 in any case. So there is no TRIM, no defragment, and no way to buy back the
 erase-on-next-write cost.
 
-The only thing that re-erases the partition is `idf.py storage-flash`, which
+The only thing that re-erases the partition is `make flash-fs`, which
 destroys the filesystem — which is why the middle row of that table is a
 laboratory condition and not a maintenance procedure.
 

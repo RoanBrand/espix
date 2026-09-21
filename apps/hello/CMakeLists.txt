@@ -9,7 +9,7 @@
 #   idf.py elf
 #
 # Then copy build/hello.app.elf to ../../fsroot/bin/hello and run
-# `idf.py storage-flash` in the firmware project, or push it over the wire once
+# `make flash-fs` in the firmware project, or push it over the wire once
 # SCP exists.
 cmake_minimum_required(VERSION 3.22)
 

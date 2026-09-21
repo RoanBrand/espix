@@ -95,7 +95,7 @@ compile.
 ```bash
 . $IDF_PATH/export.sh
 idf.py set-target esp32s3                              # see Hardware Targets
-idf.py -p /dev/ttyUSB0 flash storage-flash monitor     # macOS: /dev/cu.usbserial-*
+idf.py -p /dev/ttyUSB0 flash monitor                   # firmware; rootfs: make flash-fs
 ```
 
 Or through the Makefile, which finds the SDK and the serial port itself and
@@ -112,10 +112,11 @@ make release        # tag, build and publish a GitHub release
 
 **Those write different things.** `make flash` writes the firmware -- the
 bootloader, the partition table, the kernel (`ota_0`) and the loader (`ota_1`)
--- and leaves the filesystem alone. `make flash-fs` (or `storage-flash`) writes
-the rootfs image, which holds the apps built out of `apps/` and nothing else. espix creates the rest for itself on first boot — the
-directory skeleton, `/etc/passwd`, `/etc/group`, `/etc/sudoers`, `/etc/hostname`,
-your home directory and the SSH host key — so skipping `storage-flash` costs you
+-- and leaves the filesystem alone. `make flash-fs` writes the rootfs: the apps
+built out of `apps/`, in a small image the kernel grows to the whole partition
+on first mount. espix creates the rest for itself on first boot — the directory
+skeleton, `/etc/passwd`, `/etc/group`, `/etc/sudoers`, `/etc/hostname`, your
+home directory and the SSH host key — so skipping `make flash-fs` costs you
 `/bin`, not a working system.
 
 There is no separate download or configure step. `set-target` fetches the
@@ -130,8 +131,8 @@ command; `motd` reprints the greeting.
 ### Updating later
 
 ```bash
-idf.py -p /dev/ttyUSB0 flash            # firmware only; leaves your files alone
-idf.py -p /dev/ttyUSB0 storage-flash    # WARNING: replaces the whole rootfs
+make flash                              # firmware only; leaves your files alone
+make flash-fs                           # WARNING: replaces the whole rootfs
 ```
 
 Keeping them separate is deliberate: reflashing firmware should not destroy what
@@ -196,7 +197,8 @@ checkout means removing it first:
 rm -f sdkconfig
 SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/esp32s3-n8r8.conf" \
     idf.py set-target esp32s3
-idf.py -p /dev/ttyUSB0 flash storage-flash monitor
+idf.py -p /dev/ttyUSB0 flash monitor
+make flash-fs
 ```
 
 Reflash the rootfs too when the flash size changes — the partition table moves,

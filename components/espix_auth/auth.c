@@ -895,7 +895,7 @@ const char *espix_auth_name_for_uid(espix_uid_t uid)
  * specific home. The effect is that /home/esp and everything under it belongs
  * to esp, and the rest of the rootfs belongs to root -- with nothing written to
  * flash to say so, which is what keeps a freshly imaged device free of
- * attribute data and what makes a storage-flash come back correct.
+ * attribute data and what makes a rootfs flash come back correct.
  */
 static bool owner_rule(const char *abs_path, uint16_t *uid, uint16_t *gid)
 {

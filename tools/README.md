@@ -192,19 +192,20 @@ No `-O` flag: espix implements the SFTP subsystem, which is what `scp` uses by
 default from OpenSSH 9 onwards.
 
 Baking apps into the filesystem image is how the rootfs gets its initial
-contents, and now happens on its own:
+contents. `make flash-fs` builds that image from `fsroot/` and writes it:
 
 ```bash
-idf.py build && idf.py -p <port> storage-flash
+make flash-fs
 ```
 
 `scp` is still how you iterate — it does not disturb the rest of the filesystem,
-where `storage-flash` replaces all of it.
+where `make flash-fs` replaces all of it.
 
-`storage-flash` replaces the whole filesystem, losing anything created on the
-device. That is why `littlefs_create_partition_image()` deliberately does not
-use `FLASH_IN_PROJECT`: a plain `idf.py flash` updates the firmware and leaves
-the filesystem alone.
+`make flash-fs` replaces the whole filesystem, losing anything created on the
+device, which is why it is separate from `make flash`: a firmware flash updates
+the kernel and loader and leaves the filesystem alone. The image is sized to its
+contents and grown to the partition by the kernel on first mount, so it is a few
+hundred KB rather than the whole partition.
 
 ## What belongs here later
 

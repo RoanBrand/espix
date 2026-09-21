@@ -17,7 +17,7 @@
  *     with the ELF magic are 0755, everything else is 0644. Nothing is stored,
  *     so the flashed rootfs image needs no mode data -- which is not a nicety:
  *     the image builder writes no attributes at all, so without the rule
- *     nothing in /bin would be executable after a storage-flash.
+ *     nothing in /bin would be executable after a rootfs flash.
  *
  *   - The attribute records only what someone changed with chmod. A file
  *     nobody has chmod'd carries none, LFS_ERR_NOATTR comes back, and the rule
@@ -102,7 +102,7 @@ static mode_t mode_from_rule(const char *abs_path, const struct stat *st)
          *
          * In the rule rather than stamped on at boot, for the same reasons the
          * rest of the rule exists. It costs no flash write, it survives a
-         * storage-flash -- the image carries no attributes at all -- and a
+         * rootfs flash -- the image carries no attributes at all -- and a
          * deliberate chmod still wins, because a stored attribute always beats
          * the rule.
          *

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Build every project under apps/ and stage the result into fsroot/bin/, so the
-# rootfs image `idf.py storage-flash` writes actually contains the apps.
+# rootfs image `make flash-fs` writes actually contains the apps.
 #
 # Apps are separate ESP-IDF projects, not components of the firmware: they build
 # to relocatable ELFs that espix loads at runtime, which is why `idf.py build`

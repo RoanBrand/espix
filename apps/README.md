@@ -32,9 +32,8 @@ to the physical UART and be invisible over SSH — and delays are multiples of
 10ms, because espix runs a 100Hz tick and Arduino's `delay()` truncates.
 
 The firmware build builds and stages these for you — `idf.py build` runs
-`tools/build-apps.sh`, which drops each ELF into `fsroot/bin/` so
-`idf.py storage-flash` carries them. Skip it with
-`idf.py -DESPIX_BUILD_APPS=OFF build`.
+`tools/build-apps.sh`, which drops each ELF into `fsroot/bin/` so `make flash-fs`
+carries them. Skip it with `idf.py -DESPIX_BUILD_APPS=OFF build`.
 
 To build one by hand, or to iterate without reflashing the whole rootfs:
 
