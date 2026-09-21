@@ -5,10 +5,12 @@
 # make recipe's subshell. Nothing needs to be sourced first.
 #
 #   make build            firmware
-#   make flash            kernel only -- leaves the filesystem alone
-#   make flash-loader     the loader (ota_1); first move to this table needs both
-#   make fs               rootfs image -- REPLACES the filesystem
-#   make flash-all        both, in the order a first boot needs
+#   make flash            kernel and loader -- leaves the filesystem alone
+#   make flash-kernel     just the kernel (ota_0), with bootloader + table
+#   make flash-loader     just the loader (ota_1)
+#   make flash-fs         rootfs image -- REPLACES the filesystem (alias: fs)
+#   make flash-all        everything, in the order a first boot needs
+#   make release          tag, build and publish a GitHub release
 #   make monitor          attach, without resetting the board
 #   make monitor-reset    attach, resetting first (to catch boot output)
 #   make coredump         decode the core dump left by the last panic
@@ -36,8 +38,9 @@ else
   PORT_ARG = $(PORT)
 endif
 
-.PHONY: all build flash flash-loader fs flash-all monitor monitor-reset \
-        coredump apps test-app test test-panic stress clean help
+.PHONY: all build flash flash-kernel flash-loader flash-fs fs flash-all \
+        release monitor monitor-reset coredump apps test-app test test-panic \
+        stress clean help
 
 all: build
 
@@ -47,33 +50,47 @@ help:
 build:
 	$(IDF) build
 
-flash:
+# The historical "write the firmware": bootloader, partition table, the kernel
+# (ota_0) and the loader (ota_1). The rootfs is never touched; `flash-fs` does
+# that, deliberately, and only when asked.
+flash: flash-kernel flash-loader
+
+flash-kernel:
 	$(IDF) -p $(PORT_ARG) flash
+
+# The loader is the second app, in ota_1, and `idf.py flash` knows nothing about
+# it. Its offset comes from whichever partition table sdkconfig selects, because
+# the 8MB and 16MB tables put it in different places.
+flash-loader:
+	$(IDF) -C loader build
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	off=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$off" ]; then \
+	    echo "flash-loader: no ota_1 partition in $$csv" >&2; exit 1; \
+	fi; \
+	eval "$$($(IDF) --env)"; \
+	"$$ESPIX_PYTHON" -m esptool --chip esp32s3 -p $(PORT_ARG) -b 460800 \
+	    write_flash "$$off" loader/build/espix_loader.bin
 
 # Deliberately separate from `flash`: this replaces the whole rootfs, and
 # reflashing firmware should never destroy what is on the device.
-fs:
+flash-fs:
 	$(IDF) -p $(PORT_ARG) storage-flash
 
-flash-all:
-	$(IDF) -p $(PORT_ARG) flash storage-flash
+fs: flash-fs
 
-# The loader is the second app, in ota_1. `idf.py flash` writes only the kernel
-# to ota_0 and knows nothing about it, so it is written here by offset. A board
-# adopting the loader table needs `make flash` and then `make flash-loader`.
-LOADER_OFFSET = 0x3A0000
-
-flash-loader:
-	$(IDF) -C loader build
-	@eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip esp32s3 -p $(PORT_ARG) -b 460800 \
-	    write_flash $(LOADER_OFFSET) loader/build/espix_loader.bin
+flash-all: flash flash-fs
 
 # Push the firmware over the network instead of the UART cable: copy it to the
 # board, put it in /boot and queue it for the loader, over SSH. Needs the board
 # already on the network and its SSH reachable. See tools/flash-ota.sh.
 flash-ota: build
 	./tools/flash-ota.sh
+
+# Tag v<version.txt>, build it as a release, and publish the image and manifest
+# to GitHub. The tree must be clean; commit first. See tools/release.sh.
+release:
+	./tools/release.sh $(if $(DRY_RUN),--dry-run,)
 
 monitor:
 	$(IDF) -p $(PORT_ARG) monitor --no-reset

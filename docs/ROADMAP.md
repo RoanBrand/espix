@@ -963,8 +963,9 @@ both are the sort of thing that is cheaper to know now.
 - **OTA slots.** *Done.* The 16MB table has a large kernel slot (`ota_0`,
   0x380000) and a small loader (`ota_1`, 0x70000), plus `otadata`; `nvs`,
   `coredump` and `storage` stay at the offsets they have always had, so adopting
-  the table does not reformat the rootfs. The 8MB tables keep a single `factory`
-  partition and leave OTA off by default. Kernels are files under `/boot`: the
+  the table does not reformat the rootfs. The 8MB table uses the same shape
+  (2MB kernel, 320KB loader), so OTA is on for both flash sizes. Kernels are
+  files under `/boot`: the
   kernel archives and queues them, the loader installs into `ota_0`, rollback is
   enabled, and `make flash-ota` pushes over SSH. See [OTA.md](OTA.md).
 

@@ -102,14 +102,18 @@ Or through the Makefile, which finds the SDK and the serial port itself and
 needs nothing sourced first:
 
 ```bash
-make flash-all      # firmware and rootfs
+make flash          # kernel and loader -- leaves the rootfs alone
+make flash-fs       # the rootfs image -- REPLACES what is on the device
+make flash-all      # both, in the order a first boot needs
 make monitor        # attach without resetting
 make test           # the test suite -- see tests/README.md
+make release        # tag, build and publish a GitHub release
 ```
 
-**That flash command writes two images.** `flash` writes the firmware;
-`storage-flash` writes the rootfs image, which holds the apps built out of
-`apps/` and nothing else. espix creates the rest for itself on first boot — the
+**Those write different things.** `make flash` writes the firmware -- the
+bootloader, the partition table, the kernel (`ota_0`) and the loader (`ota_1`)
+-- and leaves the filesystem alone. `make flash-fs` (or `storage-flash`) writes
+the rootfs image, which holds the apps built out of `apps/` and nothing else. espix creates the rest for itself on first boot — the
 directory skeleton, `/etc/passwd`, `/etc/group`, `/etc/sudoers`, `/etc/hostname`,
 your home directory and the SSH host key — so skipping `storage-flash` costs you
 `/bin`, not a working system.

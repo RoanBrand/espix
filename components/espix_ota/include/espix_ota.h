@@ -25,6 +25,7 @@ extern "C" {
 
 typedef struct {
     char     name[16];                  /* "ota0", "ota1", "factory" */
+    char     role[8];                   /* "kernel" or "loader" */
     char     version[32];               /* from the slot's app descriptor */
     char     build[72];                 /* its espix build id, if any */
     uint32_t offset;

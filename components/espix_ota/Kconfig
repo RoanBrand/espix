@@ -1,15 +1,14 @@
 menu "espix OTA"
 
     config ESPIX_OTA_ENABLED
-        bool "Firmware updates over the network (A/B slots)"
-        default y if ESPTOOLPY_FLASHSIZE_16MB
+        bool "Firmware updates over the network"
+        default y if ESPTOOLPY_FLASHSIZE_16MB || ESPTOOLPY_FLASHSIZE_8MB
         default n
         help
-            Compiles the `upgrade` command and (later) the periodic update
-            check. This decides whether the code is present, not what the flash
-            looks like: the partition table must have ota_0/ota_1 and otadata,
-            which the 16MB table does and the 8MB factory table does not. A
-            build with this on and no second slot refuses to update and says so.
+            Compiles the `upgrade` command and the background update check.
+            The partition table must have ota_0 (the kernel), ota_1 (the loader)
+            and otadata, which both the 8MB and 16MB tables do. A build with
+            this on and no loader slot refuses to update and says so.
 
     config ESPIX_OTA_AUTO_CHECK
         bool "Check for updates in the background"
@@ -17,9 +16,9 @@ menu "espix OTA"
         default y
         help
             A low-priority task checks at most once per
-            ESPIX_OTA_CHECK_PERIOD_S, and only when there is a default route and
-            the clock is set. It never installs anything: the result only makes
-            the greeting mention that an update exists.
+            ESPIX_OTA_CHECK_PERIOD_S, woken by the network getting an address,
+            and never in the boot path. It never installs anything: the result
+            only makes the greeting mention that an update exists.
 
     config ESPIX_OTA_CHECK_PERIOD_S
         int "Minimum seconds between background checks"

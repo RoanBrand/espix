@@ -658,8 +658,15 @@ size_t espix_ota_slots(espix_ota_slot_t *out, size_t n)
         esp_ota_img_states_t st;
         slot->state = (esp_ota_get_state_partition(p, &st) == ESP_OK) ? (int)st : -1;
 
+        strlcpy(slot->role, "kernel", sizeof(slot->role));
+
         esp_app_desc_t desc;
         if (esp_ota_get_partition_description(p, &desc) == ESP_OK) {
+            /* The loader is the only app whose IDF project is not "espix"; that
+             * is a more honest discriminator than the partition's position. */
+            if (strcmp(desc.project_name, "espix_loader") == 0) {
+                strlcpy(slot->role, "loader", sizeof(slot->role));
+            }
             strlcpy(slot->version, desc.version, sizeof(slot->version));
             sha_prefix(&desc, slot->build, sizeof(slot->build));
         }

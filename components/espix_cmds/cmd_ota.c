@@ -43,8 +43,9 @@ static int show_slots(espix_session_t *s)
         return 1;
     }
 
-    espix_printf(s, "%-8s %-10s %-10s %-14s %-8s %-10s %s\n",
-                 "SLOT", "OFFSET", "SIZE", "STATE", "VERSION", "BUILD", "BOOT");
+    espix_printf(s, "%-8s %-10s %-10s %-8s %-14s %-8s %-10s %s\n",
+                 "SLOT", "OFFSET", "SIZE", "ROLE", "STATE", "VERSION", "BUILD",
+                 "BOOT");
     for (size_t i = 0; i < n; i++) {
         const espix_ota_slot_t *t = &slots[i];
         char boot[20] = "";
@@ -56,8 +57,9 @@ static int show_slots(espix_session_t *s)
             strlcat(boot, t->active ? " + boot" : "boot", sizeof(boot));
         }
 
-        espix_printf(s, "%-8s 0x%06x   0x%06x   %-14s %-8s %-10s %s\n",
+        espix_printf(s, "%-8s 0x%06x   0x%06x   %-8s %-14s %-8s %-10s %s\n",
                      t->name, (unsigned)t->offset, (unsigned)t->size,
+                     (t->role[0] != 0) ? t->role : "-",
                      state_name(t->state),
                      (t->version[0] != 0) ? t->version : "-",
                      (t->build[0] != 0) ? t->build : "-",

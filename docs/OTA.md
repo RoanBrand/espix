@@ -200,13 +200,11 @@ goal is to need it as rarely as possible.
 0x320000 leaves only 0x2F0000 for both, i.e. 1.46875 MiB each and 3.6% headroom
 against a 1.42 MiB image. On 8MB this is a genuine trade, not a free one.
 
-* **Default: no OTA,`factory` only.** The 8MB table stays exactly as it is. This
-  is what a build does unless someone asks otherwise (see the build options in
-  section 4). The 8MB variants are build-verified only and have never run on
-  hardware, so this is also the low-risk answer.
-* **Opt-in: A/B with a smaller rootfs.** A separate 8MB-with-OTA table -- two
-  1.75 MiB slots (0x1C0000) and `storage` 0x3B0000/0x450000 (4.3125 MiB) -- keeps
-  23% slot headroom for 0.5625 MiB of rootfs.
+* **Superseded.** The A/B-era decision was "no OTA, `factory` only" for 8MB,
+  because two useful slots did not fit. The loader design (section 11) removed
+  that trade -- one 2MB kernel slot, a 320KB loader and a 5.5MB rootfs fit -- so
+  the 8MB table now uses the same layout as the 16MB one and OTA is on for both.
+  The arithmetic above is what set the slot sizes, not whether to have any.
 
 One slot plus OTA is not a thing, and rollback is not why. OTA needs a *passive*
 slot to write while the active one runs; the partition the running image is
@@ -426,16 +424,15 @@ Two options, each defaulted so a plain build is right:
   (`ota.url=`) overrides it, and `ota.auto_check=off` disables the periodic check
   while leaving `upgrade` usable.
 
-**The option gates code, not layout.** The 16MB table carries `ota_0`/`ota_1`
-whether or not the option is set, so a build with OTA compiled out still flashes
-to `ota_0` and boots normally, and enabling the option later needs no
-repartitioning. There is no second 16MB table to keep in sync; the 8MB table
-stays `factory`-only, as it is today.
+**The option gates code, not layout.** Both the 16MB and 8MB tables carry
+`ota_0`/`ota_1` whether or not the option is set, so a build with OTA compiled
+out still flashes to `ota_0` and boots normally, and enabling the option later
+needs no repartitioning. The tables are the same shape at both sizes.
 
 The one mismatch worth catching is an OTA-enabled build paired with a table that
-has no slots (an 8MB board on the factory table). The top-level CMake can parse
-the selected CSV and fail the build with a clear message, rather than letting it
-appear later as `esp_ota_get_next_update_partition()` returning NULL.
+has no loader (no `ota_1`). The top-level CMake could parse the selected CSV and
+fail the build with a clear message, rather than letting it appear later as
+`upgrade` refusing.
 
 ### Memory: handle the failure, and say what was needed
 
@@ -556,11 +553,11 @@ Settled design:
   loader layout, the kernel and the loader. `ota0` rather than `ota_0`: IDF labels the partitions
   `ota_0`/`ota_1`, but `/dev` reads better in the `sda1` style and the mapping is
   one line.
-* **`/dev/factory` is present only when a `factory` partition exists.** With the
-  16MB table there is none, so the node is absent rather than broken; an 8MB
-  `factory`-only board keeps it exactly as today. That is the honest reading of
-  the name -- it is the factory partition, not "the running image" -- and it
-  removes the `EIO` failure without giving the node a second meaning.
+* **`/dev/factory` is present only when a `factory` partition exists.** Neither
+  shipped table has one now, so the node is absent rather than broken; a table
+  that does would keep it exactly as before. That is the honest reading of the
+  name -- it is the factory partition, not "the running image" -- and it removes
+  the `EIO` failure without giving the node a second meaning.
 * **Which slot is running is answered by `upgrade --slots`**, not by the `/dev`
   listing. That is also where each slot's otadata state belongs
   (`NEW`/`PENDING_VERIFY`/`VALID`/`INVALID`/`ABORTED`), the offsets and sizes, and
@@ -779,10 +776,11 @@ early.
 
 ## 10. Open decisions
 
-Decided in this document: the 16MB slot size (0x1F0000, so the rootfs does not
-move), the 8MB default (OTA off, `factory`-only), one table per board regardless
-of the option, the device-pull model, SSH rather than a push listener, and
-unifying the version rather than carrying two.
+Decided in this document: the A/B slot size (0x1F0000, so the rootfs does not
+move), one table per board regardless of the option, the device-pull model, SSH
+rather than a push listener, and unifying the version rather than carrying two.
+(Section 11 then replaced the layout: both sizes now run one kernel slot and a
+loader, and the kernel carries the version while the loader has its own.)
 
 Still open:
 
@@ -995,6 +993,20 @@ and that is exactly how the mount failure above went unnoticed; the few error
 lines are worth their bytes.
 
 ---
+
+### Publishing a release
+
+`make release` tags `v<version.txt>`, rebuilds as a release and publishes the
+image and the manifest with `gh`. The tag is created *before* the build because
+that is what makes motd stop calling it a development build
+(`espix_kernel`'s CMakeLists checks for the exact tag on a clean tree); the tag
+is deleted again if the build fails. The manifest's `url` points at the tag's
+asset, and the device's default URL is
+`.../releases/latest/download/espix-ota.json`, so one release is enough.
+
+The loader is not part of an OTA release. It is flashed by cable, changes far
+less often than the kernel, and has its own version (`loader/version.txt`), so
+an OTA update never has to carry it.
 
 **What is still missing**: automated tests for the fail-to-confirm-then-restore
 cycle and for the retention and `--rollback` policy. The loader logic, the
