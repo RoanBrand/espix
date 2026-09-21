@@ -558,11 +558,12 @@ Settled design:
   that does would keep it exactly as before. That is the honest reading of the
   name -- it is the factory partition, not "the running image" -- and it removes
   the `EIO` failure without giving the node a second meaning.
-* **Which slot is running is answered by `upgrade --slots`**, not by the `/dev`
-  listing. That is also where each slot's otadata state belongs
-  (`NEW`/`PENDING_VERIFY`/`VALID`/`INVALID`/`ABORTED`), the offsets and sizes, and
-  -- under the loader design -- the images in `/boot` with their good /
-  previous / pending roles, which is the state a slot table cannot show.
+* **Which slot is running is implicit** -- `upgrade --slots` is run by the
+  kernel -- and that is where each slot's role, otadata state
+  (`NEW`/`PENDING_VERIFY`/`VALID`/`INVALID`/`ABORTED`), offset and size belong,
+  along with the images in `/boot` and their good / previous / pending roles, the
+  state a slot table cannot show. There is deliberately no "next boot" column:
+  otadata points back at the kernel before a prompt is available.
 * `45-throughput.sh` pulls whichever of `/dev/ota0` or `/dev/factory` exists, and
   sizes the transfer from the bytes it actually received rather than a hardcoded
   4 MiB.

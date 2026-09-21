@@ -638,8 +638,6 @@ size_t espix_ota_slots(espix_ota_slot_t *out, size_t n)
         return 0;
     }
 
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    const esp_partition_t *boot    = esp_ota_get_boot_partition();
     size_t count = 0;
 
     esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP,
@@ -652,8 +650,6 @@ size_t espix_ota_slots(espix_ota_slot_t *out, size_t n)
         strlcpy(slot->name, short_name(p->subtype, p->label), sizeof(slot->name));
         slot->offset = p->address;
         slot->size   = p->size;
-        slot->active = (p == running);
-        slot->boot   = (p == boot);
 
         esp_ota_img_states_t st;
         slot->state = (esp_ota_get_state_partition(p, &st) == ESP_OK) ? (int)st : -1;

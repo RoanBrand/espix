@@ -31,8 +31,6 @@ typedef struct {
     uint32_t offset;
     uint32_t size;
     int      state;                     /* esp_ota_img_states_t, or -1 */
-    bool     active;                    /* the slot we booted from */
-    bool     boot;                      /* otadata's target for the next boot */
 } espix_ota_slot_t;
 
 bool   espix_ota_enabled(void);
