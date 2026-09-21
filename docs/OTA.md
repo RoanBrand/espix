@@ -846,6 +846,34 @@ IDF's rollback machinery rather than a replacement for it.
   treats the image actually in `ota_0` as good -- it can read its descriptor --
   and repairs the record.
 
+### Who does what
+
+The split that keeps the loader trivial: **the kernel archives itself, and the
+loader only ever installs a file that is already there.**
+
+* **Kernel, on boot:** if `/boot` has no file matching its own build id, copy its
+  own partition there -- `/boot/espix-<version>-<build>.bin`. That happens once
+  per freshly flashed image, it makes the running image visible like any other,
+  and it means a single-image board still has a rollback target. Reading its own
+  partition is safe; nothing writes `ota_0` while the kernel is running.
+* **Kernel, on upgrade:** write the new image to `/boot`, set NVS `pending` to
+  that filename, select `ota_1` (the loader), reboot.
+* **Loader, every run:** if `ota_0` is `ABORTED` -- a try failed -- install NVS
+  `good`; else if `pending` is set, install that; else do nothing. Select
+  `ota_0`, reboot. It never writes `/boot` and never downloads, which is why
+  it needs no TLS and stays at 153 KiB.
+* **Kernel, on confirm:** `good` becomes itself, `pending` cleared.
+
+The invariant is one line: **every image in `ota_0` has a file in `/boot`, and the
+loader only ever writes `ota_0` from one of those files.** A wiped rootfs breaks
+it, and the kernel repairs it by re-archiving itself on the next boot.
+
+Two corners to decide up front: if `good` is missing when a rollback is needed
+(a rootfs wiped at the wrong moment) the loader has nothing to restore, and it
+must say so rather than loop on a failed `ota_0`; and `/boot` should keep the
+current and pending images only, deleting older ones after a confirm, or a
+12 MiB rootfs slowly fills with kernels.
+
 The files themselves live in `/boot`, named for their version, which is the
 whole point: a kernel version is a file you can list, copy and keep, not an
 offset.
