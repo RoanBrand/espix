@@ -150,24 +150,16 @@ if(NOT espix_lwext4_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-lwext4.py failed; see the message above")
 endif()
 
-# Build fsroot/ into a LittleFS image for the "storage" partition. This is how
-# the initial rootfs (and, until SCP exists, cross-compiled apps) get onto the
-# device: `idf.py storage-flash`.
-#
-# Deliberately NOT FLASH_IN_PROJECT: that would rewrite the whole rootfs on
-# every `idf.py flash`, destroying anything created on the device. For a system
-# whose point is a persistent, mutable filesystem, flashing it has to be an
-# explicit act.
-#
-# fsroot/ is entirely gitignored -- see the note there -- so a fresh clone has
-# no such directory and the image rule below would fail on it. Create it here
-# rather than committing a placeholder: the device builds its own filesystem on
-# first boot, so an empty image is a perfectly good starting point, and
-# ESPIX_BUILD_APPS=OFF means nothing else would create it either.
+# fsroot/ is the tree the dev rootfs is packaged from. It is gitignored and a
+# fresh clone has none, so create it: the device builds its own filesystem on
+# first boot, and an empty one is a fine starting point.
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/fsroot")
 
-# Provided by managed_components/joltwallet__littlefs/project_include.cmake.
-littlefs_create_partition_image(storage fsroot)
+# The image itself is made by tools/make-fs-image.sh rather than during every
+# `idf.py build`: it is sized to its contents and grown to the whole partition
+# by the kernel's grow_on_mount, so there is no reason to write a partition-sized
+# file into the build directory on every build. `make flash-fs` builds and
+# flashes it; release.sh builds the apps-only variant a release ships.
 
 # Build apps/ and stage the ELFs into fsroot/bin before that image is packaged.
 #
@@ -181,15 +173,14 @@ littlefs_create_partition_image(storage fsroot)
 option(ESPIX_BUILD_APPS "Build apps/ and stage them into fsroot/bin" ON)
 
 if(ESPIX_BUILD_APPS)
-    add_custom_target(espix_apps
+    # ALL, because nothing packages an image at build time any more; the dev
+    # rootfs is built on demand by `make flash-fs`.
+    add_custom_target(espix_apps ALL
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-apps.sh"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Building apps/ and staging into fsroot/bin"
         VERBATIM
         USES_TERMINAL)
-
-    # The image is packaged from fsroot/, so staging has to have happened first.
-    add_dependencies(littlefs_storage_bin espix_apps)
 endif()
 
 # A symbol an app resolves a layer below is usable only if its definition is in

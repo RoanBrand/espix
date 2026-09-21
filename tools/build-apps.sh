@@ -22,7 +22,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 apps_dir="$root/apps"
-stage_dir="$root/fsroot/bin"
+# Normally the dev tree. A release sets ESPIX_APPS_STAGE to a clean directory so
+# that only apps/ -- never whatever else is in the local fsroot -- is packaged.
+stage_dir="${ESPIX_APPS_STAGE:-$root/fsroot/bin}"
 
 # tools/idf.sh finds the SDK, puts the toolchain on PATH and sets the variables
 # idf.py needs, so nothing has to be sourced first. It used to be duplicated

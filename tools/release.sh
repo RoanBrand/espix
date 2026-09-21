@@ -90,10 +90,21 @@ printf 'release: writing the manifest\n'
 manifest="$root/build/espix-ota-$board.json"
 [ -f "$manifest" ] || die "no manifest was written"
 
-# One-file flash images. The offsets come from the same partition table sdkconfig
-# selects. The minimal image omits the rootfs, which the kernel formats for
-# itself on first boot -- it has no stock apps until a rootfs is flashed, which
-# is what the full image is for.
+# The rootfs a release carries is built from apps/ into a clean directory, never
+# from the local fsroot/: that tree is a development convenience and may hold a
+# test app or a personal wifi.conf, neither of which belongs in a release.
+factory_root="$root/build/factory-fsroot"
+rm -rf "$factory_root"
+mkdir -p "$factory_root/bin"
+( cd "$root" && ESPIX_APPS_STAGE="$factory_root/bin" tools/build-apps.sh >/dev/null )
+factory_fs="$root/build/factory-storage.bin"
+( cd "$root" && tools/make-fs-image.sh "$factory_root" "$factory_fs" >/dev/null )
+
+# One-file flash images, offsets from the same partition table sdkconfig selects.
+# The minimal one omits the rootfs: the kernel formats the partition and grows it
+# itself on first boot, but /bin stays empty. The full one carries a small seed
+# filesystem (grown on first mount) with the stock apps, and rewrites storage --
+# it is the factory image, not the one to flash over a live device.
 csv=$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' "$root/sdkconfig")
 off_of() {
     awk -F, -v n="$1" '$1 == n { gsub(/ /, "", $4); print $4 }' "$root/$csv"
@@ -125,7 +136,7 @@ merge "$full" \
     "0xf000" "$root/build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$root/build/espix.bin" \
     "$(off_of ota_1)" "$loader" \
-    "$(off_of storage)" "$root/build/storage.bin"
+    "$(off_of storage)" "$factory_fs"
 
 notes="$root/build/release-notes.md"
 cat > "$notes" <<EOF
@@ -142,9 +153,13 @@ That is the whole system, and it makes its own filesystem on first boot. It has
 no stock apps in /bin; take espix-$board-full.bin instead if you want those.
 
   espix-$board-minimal.bin   bootloader, partition table, kernel, loader -- smallest
-  espix-$board-full.bin      the same plus the rootfs, with the stock apps
+  espix-$board-full.bin      the same plus the stock apps; reflashes everything
   espix-loader-$model.bin    the loader alone, for a cable update
   espix-$board.bin           the kernel, as delivered over OTA
+
+The rootfs in the full image holds only the stock applications; a development
+tree's test app and local configuration are never packaged. Flashing it replaces
+whatever is on the device.
 
 Updating an espix already on the network
 ----------------------------------------

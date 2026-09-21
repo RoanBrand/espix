@@ -65,17 +65,31 @@ flash-loader:
 	$(IDF) -C loader build
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
 	off=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
 	if [ -z "$$off" ]; then \
 	    echo "flash-loader: no ota_1 partition in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip esp32s3 -p $(PORT_ARG) -b 460800 \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
 	    write_flash "$$off" loader/build/espix_loader.bin
 
 # Deliberately separate from `flash`: this replaces the whole rootfs, and
 # reflashing firmware should never destroy what is on the device.
-flash-fs:
-	$(IDF) -p $(PORT_ARG) storage-flash
+#
+# The image is sized to its contents and grown to the partition by the kernel on
+# first mount, so this is a small write (a few hundred KB) rather than the whole
+# partition. It packages the *dev* fsroot, test app and local config included.
+flash-fs: build
+	./tools/make-fs-image.sh fsroot build/storage.bin
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	off=$$(awk -F, '/^storage,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	if [ -z "$$off" ]; then \
+	    echo "flash-fs: no storage partition in $$csv" >&2; exit 1; \
+	fi; \
+	eval "$$($(IDF) --env)"; \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
+	    write_flash "$$off" build/storage.bin
 
 fs: flash-fs
 
