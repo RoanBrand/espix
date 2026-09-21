@@ -922,11 +922,47 @@ writes the new image to `/boot` and records it as pending; the loader then has
 a local file and nothing else to do. The only path that needs the network is the
 one that is still running.
 
+### Keeping the previous version, and running out of room
+
+Steady state is two files: the running image and the one before it.
+
+* **On confirm**, the kernel sets `previous = good`, `good = <itself>`, and
+  deletes anything else. The pair rolls forward one step each time.
+* **A failed boot** still restores `good` -- the loader never consults
+  `previous`. The second file is not part of the automatic path.
+* **What `previous` buys** is a *manual* rollback: if a new image boots but a
+  runtime bug makes it unwelcome, `upgrade --rollback` queues the previous
+  file and the loader installs it. That is the A/B convenience without a second
+  slot, for one NVS key, one retention rule and a flag. Confirming a rollback
+  swaps the pair again, so it is not one-way.
+
+Every upgrade path ends the same way: `upgrade <url>`, `upgrade --file` and
+`upgrade --rollback` all *queue a `/boot` file* and select the loader. The
+kernel never writes a slot, the loader never downloads.
+
+Space needs a policy, because images now live on the rootfs:
+
+* Downloading wants room for a third file beyond `good` and `previous`.
+  With room, verify first and commit after -- a failed download then costs
+  nothing.
+* If only two will fit, delete `previous` first and say so. The fallback for
+  this upgrade is still `good`, so nothing important is given up.
+* If two will not fit, refuse. Upgrading would mean deleting the only known-good
+  image, so a boot that fails has nothing to restore. A `--force` can
+  proceed with that stated plainly, for someone who would rather risk a cable
+  than keep the old version.
+
+This is the one place the loader design is weaker than A/B: two fixed slots
+always have room for an image, and a full rootfs does not. Better said out loud
+than found at three in the morning.
+
+---
+
 **What is still missing** for the prototype to become the design: the loader's
 selection and restore logic, a flash target that writes the kernel to `ota_0`
 and the loader to `ota_1` (a plain `idf.py flash` of either project writes to
 `ota_0`), the first-boot seeding of `/boot`, and tests for the
-fail-to-confirm-then-restore cycle.
+fail-to-confirm-then-restore cycle, and the retention and --rollback policy above.
 
 ---
 
