@@ -23,7 +23,7 @@ static const char *state_name(int state)
     case ESP_OTA_IMG_VALID:          return "VALID";
     case ESP_OTA_IMG_INVALID:        return "INVALID";
     case ESP_OTA_IMG_ABORTED:        return "ABORTED";
-    case ESP_OTA_IMG_UNDEFINED:      return "UNDEFINED";
+    case ESP_OTA_IMG_UNDEFINED:      return "-";
     default:                         return "unknown";
     }
 }
