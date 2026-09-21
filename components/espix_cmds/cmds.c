@@ -106,5 +106,6 @@ void espix_cmds_register_all(void)
     espix_cmds_register_blk();
     espix_cmds_register_usbhost();
     espix_cmds_register_ota();
+    espix_cmds_register_hash();
     espix_cmds_register_exec_fallback();
 }
