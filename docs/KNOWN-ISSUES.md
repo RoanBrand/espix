@@ -1544,12 +1544,12 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Updates
 
-- **`/dev/factory` does not exist on the A/B table.** The 16MB layout has no
+- **`/dev/factory` does not exist on the 16MB table.** That layout has no
   `factory` partition, so the node is gone and `/dev/ota0` and `/dev/ota1` take its
-  place -- both always present, the passive one included. Anything reading
-  `/dev/factory` to pull the running image, `45-throughput.sh` included, has to take
-  whichever node the image actually exposes. Which slot is *running* is
-  `upgrade --slots`, not the directory listing.
+  place -- the kernel slot and the loader. Anything reading `/dev/factory` to pull
+  the running image, `45-throughput.sh` included, has to take whichever node the
+  image actually exposes. Which slot is *running* is `upgrade --slots`, not the
+  directory listing.
 
 - **A command with its own task cannot read stdin.** `run_on_own_task()` spawns
   the command and waits on it, and the connection task is the only reader of the
@@ -1557,7 +1557,7 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   session ends dead with otadata mid-write. Foreground *apps* read stdin fine
   because the connection task pumps while they run. This is why `upgrade
   --stdin` does not exist and `make flash-ota` copies the image to `/tmp` and
-  installs it with `--file`.
+  queues it with `--file`.
 
 - **The update cache is root's to write.** The background check records what it
   found in `/var/lib/espix/update`, and `/var` is root-owned, so `upgrade --check`

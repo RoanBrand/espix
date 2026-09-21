@@ -10,12 +10,35 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 #
 # Nothing in the loader is interactive: it runs for a few seconds, chooses an
-# image and reboots. Asserts, the log strings and the full printf formatter are
-# all weight it does not need, and every byte here is a byte the kernel cannot
-# use. (Logging can come back at ERROR if the loader ever needs to explain
-# itself on a serial console.)
+# image and reboots. Asserts and the full printf formatter are weight it does
+# not need, and every byte here is a byte the kernel cannot use.
 #
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
-CONFIG_LOG_DEFAULT_LEVEL_NONE=y
 CONFIG_NEWLIB_NANO_FORMAT=y
-CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+
+#
+# littlefs refuses to mount when the superblock's name_max and the mounter's
+# disagree. The rootfs image is built with --name-max=64, which is
+# CONFIG_LITTLEFS_OBJ_NAME_LEN in the kernel project; the default here is 255,
+# and a loader that cannot mount cannot install anything. This was the bug that
+# made the first loader fall back silently.
+#
+CONFIG_LITTLEFS_OBJ_NAME_LEN=64
+
+#
+# esp_ota_set_boot_partition() writes otadata's state as set_new_state_otadata(),
+# which is ESP_OTA_IMG_NEW only when rollback is enabled in the app doing the
+# writing. Without it the loader leaves the installed kernel UNDEFINED, so the
+# bootloader never marks it PENDING_VERIFY and a kernel that fails to come up is
+# never rolled back. The kernel project already sets this; the loader writes the
+# slot, so it needs it too.
+#
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+#
+# Errors only. The loader should be silent when it works, but a silent fallback
+# is exactly how the mount failure above went unnoticed; err-to-name stays on so
+# the few lines it does print are legible.
+#
+CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=y

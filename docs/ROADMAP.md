@@ -960,12 +960,13 @@ both are the sort of thing that is cheaper to know now.
   developer runs, plus one line from `make flash` when the detected chip and the
   configured strategy disagree, is the shape that works.
 
-- **OTA slots.** *Done.* The 16MB table has two application slots (`ota_0` and
-  `ota_1`, 0x1F0000 each) and an `otadata` partition; `nvs`, `coredump` and
-  `storage` stay at the offsets they have always had, so adopting the table does
-  not reformat the rootfs. The 8MB tables keep a single `factory` partition and
-  leave OTA off by default. Rollback is enabled, `upgrade` installs into the
-  passive slot, and `make flash-ota` does it over SSH. See [OTA.md](OTA.md).
+- **OTA slots.** *Done.* The 16MB table has a large kernel slot (`ota_0`,
+  0x380000) and a small loader (`ota_1`, 0x70000), plus `otadata`; `nvs`,
+  `coredump` and `storage` stay at the offsets they have always had, so adopting
+  the table does not reformat the rootfs. The 8MB tables keep a single `factory`
+  partition and leave OTA off by default. Kernels are files under `/boot`: the
+  kernel archives and queues them, the loader installs into `ota_0`, rollback is
+  enabled, and `make flash-ota` pushes over SSH. See [OTA.md](OTA.md).
 
 - **USB host beyond storage.** Enumeration, identification, the partition table,
   superfloppy volumes and hotplug are done and shipped — see

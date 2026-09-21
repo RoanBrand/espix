@@ -6,6 +6,7 @@ idf_component_register(
     REQUIRES
         esp_partition
         app_update
+        freertos
         nvs_flash
         joltwallet__littlefs
 )

@@ -1,12 +1,11 @@
 /*
- * OTA: the device side of the A/B update path.
+ * OTA: kernels are files, and the loader installs them.
  *
- * The two application slots and otadata belong to the bootloader; this is what
- * writes the passive slot, points the bootloader at it, and then confirms the
- * result on the next boot so the bootloader does not roll it back.
- *
- * Which slot is running is a question for espix_ota_slots() (and `upgrade
- * --slots`), not for the /dev listing: a device node cannot carry otadata state.
+ * The kernel never writes an application slot -- it cannot write the one it is
+ * running from, and with a single kernel slot there is no other. Instead it
+ * keeps images as files under /boot, records which is good, previous and
+ * pending in NVS, and hands over to the loader (ota_1) when something needs
+ * installing. The loader does the flash write. See docs/OTA.md section 11.
  */
 #pragma once
 
@@ -21,77 +20,78 @@
 extern "C" {
 #endif
 
-#define ESPIX_OTA_NAME_MAX 16
+#define ESPIX_OTA_NAME_MAX  64
+#define ESPIX_OTA_BOOT_DIR  "/boot"
 
 typedef struct {
-    char     name[ESPIX_OTA_NAME_MAX];  /* "ota0", "ota1", "factory", ... */
+    char     name[16];                  /* "ota0", "ota1", "factory" */
+    char     version[32];               /* from the slot's app descriptor */
+    char     build[72];                 /* its espix build id, if any */
     uint32_t offset;
     uint32_t size;
-    char     version[32];               /* from that slot's descriptor, "" if none */
-    char     build[12];                 /* its 9-hex ELF SHA, "" if none */
-    int      state;                     /* esp_ota_img_states_t, or -1 if unknown */
-    bool     active;                    /* the image is running from here */
-    bool     next;                      /* the next update would be written here */
+    int      state;                     /* esp_ota_img_states_t, or -1 */
+    bool     active;                    /* the slot we booted from */
+    bool     boot;                      /* otadata's target for the next boot */
 } espix_ota_slot_t;
 
-/* Whether `upgrade` was compiled in. */
-bool espix_ota_enabled(void);
-
-/* Whether the running image has a second slot to write an update into. */
-bool espix_ota_available(void);
-
-/* Read the scan and report what it found. Never fatal. */
+bool   espix_ota_enabled(void);
+bool   espix_ota_available(void);
 esp_err_t espix_ota_init(void);
 
+/* The name this running image should have under /boot. */
+void   espix_ota_self_name(char *buf, size_t len);
+
+/* "ota0" / "ota1" / "factory" for the partition we booted from. */
+const char *espix_ota_running_slot_name(void);
+
 /*
- * Confirm the running image if the bootloader is holding it as pending-verify.
- * Called once the system is up; a no-op on a normal boot.
+ * Make sure /boot holds this running image, verified against the hash baked
+ * into the slot, and record it as good. Called on every boot; cheap when the
+ * file is already there.
  */
-void espix_ota_confirm_boot(void);
+esp_err_t espix_ota_archive_self(char *name, size_t len);
 
-/* The running slot's short name ("ota0", "factory", ...). */
-void espix_ota_running_slot(char *buf, size_t len);
+/* The NVS triad, for the greeting and for --slots. */
+void   espix_ota_state(char *good, size_t gl,
+                       char *previous, size_t pl,
+                       char *pending, size_t nl);
 
-/* The application partitions, in table order. Returns how many were written. */
+/* Application partitions, for --slots. */
 size_t espix_ota_slots(espix_ota_slot_t *out, size_t n);
 
-/* Called during an install with progress, in bytes. */
+/* ------------------------------------------------------------------ */
+/* Handing an image to the loader                                      */
+/* ------------------------------------------------------------------ */
+
 typedef void (*espix_ota_progress_fn)(void *ctx, size_t done, size_t total);
 
-/*
- * Write the image at `path` into the passive slot and select it to boot.
- *
- * On failure `err` carries a sentence worth showing a person, including the
- * figures behind an out-of-memory failure. On success it says which slot was
- * written.
- */
-esp_err_t espix_ota_install_file(const char *path,
-                                 espix_ota_progress_fn progress, void *ctx,
-                                 char *err, size_t err_len);
+/* Download url into /boot/<name>, then check it against expect_sha256. */
+esp_err_t espix_ota_download(const char *url, const char *name,
+                             const char *expect_sha256,
+                             espix_ota_progress_fn progress, void *ctx,
+                             char *err, size_t err_len);
 
-/* The same, reading the image from an open stream -- an SSH session's stdin, so
- * a locally built image never has to land on the rootfs first. */
-esp_err_t espix_ota_install_stream(FILE *in,
-                                   espix_ota_progress_fn progress, void *ctx,
-                                   char *err, size_t err_len);
+/* Record name as pending and select the loader; the caller then reboots. */
+esp_err_t espix_ota_queue(const char *name, char *err, size_t err_len);
 
-/* The same, over the network: an HTTPS URL, or HTTP in a dev build with
- * CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP. Follows redirects, so a GitHub
- * releases/latest/download link works as-is. */
-esp_err_t espix_ota_install_url(const char *url,
-                                espix_ota_progress_fn progress, void *ctx,
-                                char *err, size_t err_len);
+/* Name one of these, if set. */
+bool   espix_ota_pending(char *name, size_t len);
+bool   espix_ota_previous(char *name, size_t len);
+
+/* Copy a local file into /boot under its own basename. --file. */
+esp_err_t espix_ota_adopt(const char *path, char *name, size_t len,
+                          char *err, size_t err_len);
 
 /* ------------------------------------------------------------------ */
 /* The update repo                                                     */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char version[32];       /* semver, as the release was tagged */
-    char build[72];         /* the release image's ELF SHA-256 */
-    char url[256];          /* where the image is fetched from */
-    char sha256[72];        /* optional; the .bin's own digest */
-    char min_version[32];   /* optional; refuse to update below this */
+    char version[32];
+    char build[72];
+    char url[256];
+    char sha256[72];
+    char min_version[32];
 } espix_ota_manifest_t;
 
 typedef enum {
@@ -100,36 +100,17 @@ typedef enum {
     ESPIX_OTA_UPDATE_UNKNOWN,
 } espix_ota_update_t;
 
-/*
- * Where updates come from: ota.url in /etc/espix.conf, or the URL this build
- * was configured with. Cached after the first call.
- */
 const char *espix_ota_source(void);
-
-/* Fetch and parse the manifest. One small GET; the image is not touched. */
 esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
                                    char *err, size_t err_len);
-
-/*
- * A newer semver is an update; so is the same semver with a different build
- * (a rebuilt or rolling release -- see the note in docs/OTA.md). An older
- * semver never is.
- */
 espix_ota_update_t espix_ota_compare(const espix_ota_manifest_t *m);
-
-/* False when the manifest demands a newer espix than this one (min_version). */
 bool espix_ota_meets_min(const espix_ota_manifest_t *m);
-
-/* Fetch the manifest and record the verdict for the greeting. */
 esp_err_t espix_ota_check(const char *url, espix_ota_manifest_t *m,
                           char *err, size_t err_len);
-
-/*
- * What the last check found, from the cached state only -- this is what the
- * greeting calls, and it must never touch the network. Returns false when no
- * check has found anything newer.
- */
 bool espix_ota_known_update(char *version, size_t len);
+
+/* Confirm this image: roll the NVS triad, prune /boot, cancel rollback. */
+void espix_ota_confirm_boot(void);
 
 #ifdef __cplusplus
 }

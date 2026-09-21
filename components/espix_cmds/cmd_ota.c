@@ -1,17 +1,17 @@
 /*
- * `upgrade`: write a firmware image into the passive application slot and
- * point the bootloader at it.
+ * \`upgrade\`: get a kernel image into /boot and hand it to the loader.
  *
- * Network sources (a manifest over HTTPS, and pulling from the dev machine)
- * come next; --file is the local half, and the one that proves slot selection
- * and rollback without TLS in the picture.
+ * Nothing here writes flash. The image is archived as a file, checked, and
+ * queued; the loader installs it on the next boot. See docs/OTA.md section 11.
  */
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "esp_ota_ops.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_ota.h"
 
@@ -33,6 +33,11 @@ static int show_slots(espix_session_t *s)
     espix_ota_slot_t slots[4];
     const size_t n = espix_ota_slots(slots, sizeof(slots) / sizeof(slots[0]));
 
+    char good[ESPIX_OTA_NAME_MAX] = {0};
+    char prev[ESPIX_OTA_NAME_MAX] = {0};
+    char pend[ESPIX_OTA_NAME_MAX] = {0};
+    espix_ota_state(good, sizeof(good), prev, sizeof(prev), pend, sizeof(pend));
+
     if (n == 0) {
         espix_eprintf(s, "upgrade: no application partitions found\n");
         return 1;
@@ -47,8 +52,8 @@ static int show_slots(espix_session_t *s)
         if (t->active) {
             strlcpy(boot, "running", sizeof(boot));
         }
-        if (t->next) {
-            strlcat(boot, t->active ? " + next" : "next", sizeof(boot));
+        if (t->boot) {
+            strlcat(boot, t->active ? " + boot" : "boot", sizeof(boot));
         }
 
         espix_printf(s, "%-8s 0x%06x   0x%06x   %-14s %-8s %-10s %s\n",
@@ -58,13 +63,36 @@ static int show_slots(espix_session_t *s)
                      (t->build[0] != 0) ? t->build : "-",
                      boot);
     }
+
+    /* What the loader would install, which is the half a slot table cannot
+     * show: images that are files until the loader writes one. */
+    DIR *d = opendir(ESPIX_OTA_BOOT_DIR);
+    if (d == NULL) {
+        return 0;
+    }
+
+    espix_printf(s, "\n%-32s %s\n", "IMAGE", "ROLE");
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const size_t l = strlen(de->d_name);
+
+        if (strncmp(de->d_name, "espix-", 6) != 0 || l < 5 ||
+            strcmp(de->d_name + l - 4, ".bin") != 0) {
+            continue;
+        }
+        const char *role = (strcmp(de->d_name, pend) == 0) ? "pending"
+                         : (strcmp(de->d_name, good) == 0) ? "good"
+                         : (strcmp(de->d_name, prev) == 0) ? "previous"
+                         : "-";
+        espix_printf(s, "%-32s %s\n", de->d_name, role);
+    }
+    closedir(d);
     return 0;
 }
 
 typedef struct {
     espix_session_t *s;
     int              last_decile;
-    size_t           last_step;
 } progress_ctx_t;
 
 #define PROGRESS_STEP (256 * 1024)
@@ -77,7 +105,7 @@ static void report_progress(void *ctx, size_t done, size_t total)
         const int pct = (int)((done * 100) / total);
         if (pct / 10 != p->last_decile) {
             p->last_decile = pct / 10;
-            espix_printf(p->s, "\r  writing %3d%%", pct);
+            espix_printf(p->s, "\r  downloading %3d%%", pct);
         }
         if (done == total) {
             espix_printf(p->s, "\n");
@@ -85,18 +113,57 @@ static void report_progress(void *ctx, size_t done, size_t total)
         return;
     }
 
-    /* Unknown length (stdin): count in steps rather than invent a percentage. */
-    if (done / PROGRESS_STEP != p->last_step) {
-        p->last_step = done / PROGRESS_STEP;
-        espix_printf(p->s, "\r  %u KiB written", (unsigned)(done / 1024));
+    if (done / PROGRESS_STEP != 0) {
+        espix_printf(p->s, "\r  %u KiB downloaded", (unsigned)(done / 1024));
     }
 }
 
-/* The repo half: check the manifest, then install what it points at. */
+/* Last path component of a URL, without any query or fragment. */
+static void url_basename(const char *url, char *out, size_t len)
+{
+    const char *p = strrchr(url, '/');
+    p = (p != NULL) ? p + 1 : url;
+
+    size_t i = 0;
+    while (p[i] != 0 && p[i] != '?' && p[i] != '#' && i + 1 < len) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = 0;
+    if (i == 0) {
+        strlcpy(out, "kernel.bin", len);
+    }
+}
+
+/* Download, verify, queue: the tail every install path shares. */
+static int fetch_and_queue(espix_session_t *s, const char *url, const char *name,
+                           const char *sha256)
+{
+    char err[192];
+    progress_ctx_t p = { .s = s, .last_decile = -1 };
+
+    espix_printf(s, "upgrade: fetching %s\n", url);
+    const esp_err_t e = espix_ota_download(url, name, sha256,
+                                           report_progress, &p, err, sizeof(err));
+    if (e != ESP_OK) {
+        espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : esp_err_to_name(e));
+        return 1;
+    }
+    espix_printf(s, "upgrade: %s\n", err);
+
+    if (espix_ota_queue(name, err, sizeof(err)) != ESP_OK) {
+        espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot queue it");
+        return 1;
+    }
+    espix_printf(s, "upgrade: %s; run 'reboot' to install it\n", err);
+    return 0;
+}
+
+/* The repo half: check the manifest, then download what it points at. */
 static int run_manifest(espix_session_t *s, bool check_only, bool assume_yes)
 {
     const char *src = espix_ota_source();
-    char err[160];
+    char err[192];
 
     espix_printf(s, "upgrade: checking %s\n", src);
 
@@ -138,7 +205,6 @@ static int run_manifest(espix_session_t *s, bool check_only, bool assume_yes)
         return 1;           /* 1 means "there is one", for a script */
     }
 
-    /* A release can refuse to be installed on an espix too old to run it. */
     if (!espix_ota_meets_min(&m)) {
         espix_eprintf(s, "upgrade: this update needs espix %s or newer; this is %s\n",
                       m.min_version, espix_version());
@@ -158,19 +224,13 @@ static int run_manifest(espix_session_t *s, bool check_only, bool assume_yes)
         }
     }
 
-    char ierr[160];
-    progress_ctx_t p = { .s = s, .last_decile = -1, .last_step = (size_t)-1 };
-
-    espix_printf(s, "upgrade: fetching %s\n", m.url);
-    const esp_err_t ie = espix_ota_install_url(m.url, report_progress, &p,
-                                               ierr, sizeof(ierr));
-    if (ie != ESP_OK) {
-        espix_eprintf(s, "upgrade: %s\n", (ierr[0] != '\0') ? ierr : esp_err_to_name(ie));
-        return 1;
+    char name[ESPIX_OTA_NAME_MAX];
+    if (m.build[0] != '\0') {
+        snprintf(name, sizeof(name), "espix-%s-%.9s.bin", m.version, m.build);
+    } else {
+        snprintf(name, sizeof(name), "espix-%s.bin", m.version);
     }
-    espix_printf(s, "upgrade: %s\n", ierr);
-    espix_printf(s, "run 'reboot' to start it\n");
-    return 0;
+    return fetch_and_queue(s, m.url, name, m.sha256);
 }
 
 static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
@@ -179,23 +239,24 @@ static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
         espix_eprintf(s, "upgrade: this build has no firmware update support\n");
         return 1;
     }
-    /* Reading the slot table is harmless, so it is not root-only; writing one
-     * is, and that check sits below. */
+
     if (argc == 2 && strcmp(argv[1], "--slots") == 0) {
         return show_slots(s);
     }
-
-    /* --check only reads, so it is not root-only either. */
     if (argc == 2 && strcmp(argv[1], "--check") == 0) {
         return run_manifest(s, true, false);
     }
 
     if (s == NULL || s->uid != 0) {
-        espix_eprintf(s, "upgrade: only root can write a firmware slot\n");
+        espix_eprintf(s, "upgrade: only root can install a firmware image\n");
         return 1;
     }
 
-    /* No argument (or -y) is the repo path: check, then ask, then install. */
+    if (!espix_ota_available()) {
+        espix_eprintf(s, "upgrade: this image has no loader slot (ota1) to install from\n");
+        return 1;
+    }
+
     if (argc == 1) {
         return run_manifest(s, false, false);
     }
@@ -204,47 +265,56 @@ static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
     }
 
     if (argc == 3 && strcmp(argv[1], "--file") == 0) {
-        char err[128];
-        progress_ctx_t p = { .s = s, .last_decile = -1, .last_step = (size_t)-1 };
+        char name[ESPIX_OTA_NAME_MAX];
+        char err[192];
 
-        espix_printf(s, "upgrade: writing %s\n", argv[2]);
-        const esp_err_t e = espix_ota_install_file(argv[2], report_progress,
-                                                   &p, err, sizeof(err));
-        if (e != ESP_OK) {
-            espix_eprintf(s, "upgrade: %s\n",
-                          (err[0] != '\0') ? err : esp_err_to_name(e));
+        espix_printf(s, "upgrade: adopting %s\n", argv[2]);
+        if (espix_ota_adopt(argv[2], name, sizeof(name), err, sizeof(err)) != ESP_OK) {
+            espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot read it");
             return 1;
         }
         espix_printf(s, "upgrade: %s\n", err);
-        espix_printf(s, "run 'reboot' to start it\n");
+
+        if (espix_ota_queue(name, err, sizeof(err)) != ESP_OK) {
+            espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot queue it");
+            return 1;
+        }
+        espix_printf(s, "upgrade: %s; run 'reboot' to install it\n", err);
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--rollback") == 0) {
+        char name[ESPIX_OTA_NAME_MAX];
+        char err[192];
+
+        if (!espix_ota_previous(name, sizeof(name))) {
+            espix_eprintf(s, "upgrade: there is no previous image to roll back to\n");
+            return 1;
+        }
+        espix_printf(s, "upgrade: rolling back to %s\n", name);
+        if (espix_ota_queue(name, err, sizeof(err)) != ESP_OK) {
+            espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot queue it");
+            return 1;
+        }
+        espix_printf(s, "upgrade: %s; run 'reboot' to install it\n", err);
         return 0;
     }
 
     if (argc == 2 && argv[1][0] != '-') {
-        char err[160];
-        progress_ctx_t p = { .s = s, .last_decile = -1, .last_step = (size_t)-1 };
-
-        espix_printf(s, "upgrade: fetching %s\n", argv[1]);
-        const esp_err_t e = espix_ota_install_url(argv[1], report_progress,
-                                                  &p, err, sizeof(err));
-        if (e != ESP_OK) {
-            espix_eprintf(s, "upgrade: %s\n",
-                          (err[0] != '\0') ? err : esp_err_to_name(e));
-            return 1;
-        }
-        espix_printf(s, "upgrade: %s\n", err);
-        espix_printf(s, "run 'reboot' to start it\n");
-        return 0;
+        char name[ESPIX_OTA_NAME_MAX];
+        url_basename(argv[1], name, sizeof(name));
+        return fetch_and_queue(s, argv[1], name, NULL);
     }
 
-    espix_eprintf(s, "usage: upgrade [-y|--check] | --slots | --file <path> | <url>\n");
+    espix_eprintf(s, "usage: upgrade [-y|--check] | --slots | --file <path> | "
+                     "--rollback | <url>\n");
     return 1;
 }
 
 static espix_cmd_t s_ota_cmds[] = {
     { .name = "upgrade", .fn = cmd_upgrade,
-      .help = "write a firmware image to the passive slot",
-      .usage = "upgrade [-y|--check] | --slots | --file <path> | <url>",
+      .help = "fetch a kernel image, queue it for the loader",
+      .usage = "upgrade [-y|--check] | --slots | --file <path> | --rollback | <url>",
       .stack = 8192 },
 };
 

@@ -1,13 +1,16 @@
-# espix OTA: A/B firmware updates over the network
+# espix OTA: kernels as files, installed by a loader
 
-**Status: design. Nothing described here is built yet.** This document exists to
-settle the decisions that are expensive to change later -- the partition layout
-most of all -- and to record what was verified against ESP-IDF v6.1 rather than
-assumed.
+**Status: built and running.** Sections 1--10 work out the A/B design; section
+11 is the single-kernel-slot + loader design that replaced it and is what the
+tree implements. The reasoning in 1--10 about space, version identity, the
+manifest, security and costs still holds, but wherever those sections describe
+*writing the passive slot* as the mechanism, section 11 governs: the kernel
+never writes a slot. It archives the running image to `/boot`, verifies and
+queues other images, and the loader installs them.
 
-The goal is the Ubuntu/pi A/B experience applied to espix: two application
-slots, an update written to the passive one, the bootloader switching to it, and
-an automatic rollback if it does not come up. Plus the part that makes it
+The goal is the Ubuntu/pi A/B experience applied to espix: an update arrives,
+the bootloader switches to it, and a kernel that does not come up is rolled back
+automatically. Plus the part that makes it
 pleasant to use: `upgrade` on the device, an update repository it can point at,
 and a login that mentions an available update without going near the network.
 
@@ -47,9 +50,9 @@ Both 16MB rows end at the last flash byte and leave a working second slot. The
 difference between them is whether the rootfs moves, and the recommended row is
 the one that does not.
 
-The commented-out variant already sitting in `partitions/esp32s3-16mb.csv` uses
-4 MiB slots and costs 4 MiB of rootfs (11.9 -> 7.8 MiB) -- paying for a slot size
-2.8x the image for nothing.
+The 4 MiB-slot variant considered here was rejected for the same reason: it
+costs 4 MiB of rootfs (11.9 -> 7.8 MiB) -- paying for a slot size 2.8x the image
+for nothing.
 
 ### Proposed 16MB table -- and `/` keeps everything on it
 
@@ -398,13 +401,18 @@ so the graph stays acyclic.
 
 Public surface, roughly:
 
-* `espix_ota_init()` -- read config, mark the running image valid (see section 6),
-  start the periodic checker.
-* `espix_ota_check(bool force, ...)` -- fetch and parse the manifest, compare.
-* `espix_ota_install(..., progress)` -- download and write the passive slot.
+* `espix_ota_init()` -- read config, archive the running image, start the
+  periodic checker.
+* `espix_ota_check(url, ...)` -- fetch and parse the manifest, compare.
+* `espix_ota_download(url, name, sha256, ...)` -- fetch an image into `/boot`,
+  verifying it against the manifest's hash.
+* `espix_ota_adopt(path, ...)` and `espix_ota_queue(name, ...)` -- put a local
+  image in `/boot` and hand it to the loader.
+* `espix_ota_archive_self(...)` -- keep this running image as a file, verified
+  against the hash in its own header.
 * `espix_ota_known_update(char *ver, ...)` -- the cached answer, for motd.
   Touches no network.
-* `espix_ota_running_slot(char *buf, ...)` -- `ota_0`/`ota_1`, for `uname`/motd.
+* `espix_ota_running_slot_name()` -- `ota0`/`ota1`, for `uname`/motd.
 
 ### Build options
 
@@ -544,21 +552,20 @@ off the board.
 
 Settled design:
 
-* **`/dev/ota0` and `/dev/ota1`** name the two slots, and both are always present
-  when those partitions exist -- including the passive one, so the previous image
-  can be read. `ota0` rather than `ota_0`: IDF labels the partitions
+* **`/dev/ota0` and `/dev/ota1`** name the app partitions that exist -- in the
+  loader layout, the kernel and the loader. `ota0` rather than `ota_0`: IDF labels the partitions
   `ota_0`/`ota_1`, but `/dev` reads better in the `sda1` style and the mapping is
   one line.
 * **`/dev/factory` is present only when a `factory` partition exists.** With the
-  16MB A/B table there is none, so the node is absent rather than broken; an 8MB
+  16MB table there is none, so the node is absent rather than broken; an 8MB
   `factory`-only board keeps it exactly as today. That is the honest reading of
   the name -- it is the factory partition, not "the running image" -- and it
   removes the `EIO` failure without giving the node a second meaning.
 * **Which slot is running is answered by `upgrade --slots`**, not by the `/dev`
   listing. That is also where each slot's otadata state belongs
   (`NEW`/`PENDING_VERIFY`/`VALID`/`INVALID`/`ABORTED`), the offsets and sizes, and
-  which one a new update would be written to -- information a device node cannot
-  carry.
+  -- under the loader design -- the images in `/boot` with their good /
+  previous / pending roles, which is the state a slot table cannot show.
 * `45-throughput.sh` pulls whichever of `/dev/ota0` or `/dev/factory` exists, and
   sizes the transfer from the bytes it actually received rather than a hardcoded
   4 MiB.
@@ -578,17 +585,22 @@ read.
 
 A low-priority task, deliberately undemanding:
 
-* only when there is a default route **and** `espix_time_is_synced()`;
-* at most once per 24h, plus a few minutes of jitter after boot so a fleet does
-  not stampede; back off after a failure rather than retrying hard;
+* woken by an `IP_EVENT` when an address appears, so it runs as soon as there
+  is a route rather than on a fixed delay, and never in the boot path;
+* otherwise due at most once per 24h, measured on the monotonic clock so an NTP
+  step cannot move the interval; the stored wall time guards only the
+  across-reboot case, and only while the clock is synced (a device with no time
+  source checks once per boot);
+* a 15-minute timeout is the backstop for the 24h re-check and for a route that
+  was already up when the handler was registered;
 * never while an install is running;
 * records the outcome for motd and moves on.
 
-(The clock is not actually required for the TLS handshake in this
-configuration -- `CONFIG_MBEDTLS_HAVE_TIME_DATE` is off, so certificate
-validity dates are not checked -- but requiring it is the right policy: it keeps
-the door open to turning date validation on, and a check that runs at the epoch
-is reporting on a world that no longer exists.)
+Reachability is the gate, not the clock. The clock is not required for the TLS
+handshake here (`CONFIG_MBEDTLS_HAVE_TIME_DATE` is off, so certificate
+validity dates are not checked), and gating on it would disable the check
+entirely on a device whose time server is unreachable but whose network is
+fine.
 
 ## 5. Rollback, and when espix counts as "good"
 
@@ -956,13 +968,39 @@ This is the one place the loader design is weaker than A/B: two fixed slots
 always have room for an image, and a full rootfs does not. Better said out loud
 than found at three in the morning.
 
+### Three things the loader bring-up taught us
+
+Each of these was a real failure on hardware, not a hypothetical:
+
+* **The rootfs image is built with `--name-max=64`.** littlefs refuses to mount
+  when the superblock's `name_max` and the mounter's disagree, and the default
+  is 255. That is `CONFIG_LITTLEFS_OBJ_NAME_LEN=64`, and it has to be set in the
+  loader project as well as the kernel's -- a loader that cannot mount cannot
+  install anything.
+* **IDF's VFS will not mount at `/`.** `is_path_prefix_valid()` requires at
+  least two characters, so the loader mounts the rootfs at `/fs` and reaches the
+  images as `/fs/boot/<name>`. The kernel never notices: it does not register
+  littlefs at a path at all.
+* **The loader must enable `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`.**
+  `esp_ota_set_boot_partition()` writes otadata's state as
+  `set_new_state_otadata()`, which is `ESP_OTA_IMG_NEW` only when the *writing*
+  app has rollback enabled. Without it the loader leaves the installed kernel
+  `UNDEFINED`, the bootloader never marks it `PENDING_VERIFY`, and a kernel
+  that does not come up is never rolled back -- the whole point of the design,
+  silently off.
+
+The loader keeps `CONFIG_LOG_DEFAULT_LEVEL_ERROR` and `ESP_ERR_TO_NAME_LOOKUP`
+on. It should be silent when it works, but the first version fell back silently
+and that is exactly how the mount failure above went unnoticed; the few error
+lines are worth their bytes.
+
 ---
 
-**What is still missing** for the prototype to become the design: the loader's
-selection and restore logic, a flash target that writes the kernel to `ota_0`
-and the loader to `ota_1` (a plain `idf.py flash` of either project writes to
-`ota_0`), the first-boot seeding of `/boot`, and tests for the
-fail-to-confirm-then-restore cycle, and the retention and --rollback policy above.
+**What is still missing**: automated tests for the fail-to-confirm-then-restore
+cycle and for the retention and `--rollback` policy. The loader logic, the
+pair-flash target (`make flash-loader`), the first-boot seeding of `/boot` and
+the full install/confirm/rollback cycle were all exercised on hardware, but by
+hand over the console rather than by the suite.
 
 ---
 

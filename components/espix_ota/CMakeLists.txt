@@ -12,10 +12,13 @@ idf_component_register(
         espix_time
         app_update
         esp_partition
-        esp_https_ota
         esp_http_client
+        esp_event
+        esp_timer
+        esp_netif
         mbedtls
         esp_app_format
+        nvs_flash
         heap
         freertos
         log

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Install build/espix.bin into the board's passive slot, over SSH. No cable.
+# Copy build/espix.bin to the board and queue it, over SSH. No cable.
 #
 #   make flash-ota
 #   ESPIX_HOST=10.0.0.5 make flash-ota
@@ -8,7 +8,8 @@
 # This is the dev loop the OTA work exists to enable: build, push, reboot, and
 # never touch the UART.
 #
-# The image is copied to /tmp and installed from there with "upgrade --file".
+# The image is copied to /tmp and adopted from there with "upgrade --file",
+# which puts it in /boot and selects the loader; the next reboot installs it.
 # The obvious alternative -- streaming it into the command's stdin -- does not
 # work with this shell: a command that declares a stack of its own runs on a new
 # task while the connection task waits on it (session.c run_on_own_task), and the
@@ -52,4 +53,4 @@ if [ "$rc" -ne 0 ]; then
     exit 1
 fi
 
-printf 'flash-ota: installed. Start it with:  tools/esp.sh reboot\n'
+printf 'flash-ota: queued. Install it with:  tools/esp.sh reboot\n'

@@ -3,11 +3,16 @@
 # Layout fills the flash exactly; last byte is 0xFFFFFF (ends at 0x1000000).
 # The partition table itself lives at 0x8000 (CONFIG_PARTITION_TABLE_OFFSET).
 #
-# Two application slots, so the kernel can be updated over the network: the
-# running slot keeps running while the other is written, and the bootloader
-# switches to it once the write is verified. nvs, coredump and storage are at the
-# offsets they have always had, so adopting this table does NOT reformat the
-# rootfs -- the over-allocated single 'factory' slot simply becomes two.
+# The A/B layout, worked out first: two equal application slots, the running one
+# kept while the other is written, the bootloader switching on the next boot.
+# Section 11 of docs/OTA.md replaced this with one large kernel slot and a small
+# loader, and esp32s3-16mb-loader.csv is now the 16MB default -- nothing writes a
+# slot any more, so this table is kept for its arithmetic, not for use. The
+# 0x10000 offset alignment it records is what still sizes the loader layout.
+#
+# nvs, coredump and storage are at the offsets they have always had, so adopting
+# this table does NOT reformat the rootfs -- the over-allocated single 'factory'
+# slot simply becomes two.
 #
 # Both slots are 0x1F0000. The constraint that sets that number is not the image
 # but the partition table: an *application partition offset* must be 0x10000

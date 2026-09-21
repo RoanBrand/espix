@@ -5,7 +5,8 @@
 # make recipe's subshell. Nothing needs to be sourced first.
 #
 #   make build            firmware
-#   make flash            firmware only -- leaves the filesystem alone
+#   make flash            kernel only -- leaves the filesystem alone
+#   make flash-loader     the loader (ota_1); first move to this table needs both
 #   make fs               rootfs image -- REPLACES the filesystem
 #   make flash-all        both, in the order a first boot needs
 #   make monitor          attach, without resetting the board
@@ -35,8 +36,8 @@ else
   PORT_ARG = $(PORT)
 endif
 
-.PHONY: all build flash fs flash-all monitor monitor-reset coredump apps \
-        test-app test test-panic stress clean help
+.PHONY: all build flash flash-loader fs flash-all monitor monitor-reset \
+        coredump apps test-app test test-panic stress clean help
 
 all: build
 
@@ -57,9 +58,20 @@ fs:
 flash-all:
 	$(IDF) -p $(PORT_ARG) flash storage-flash
 
-# Push the firmware over the network instead of the UART cable: install it into
-# the board's passive slot over SSH and reboot into it. Needs the board already
-# on the network and its SSH reachable. See tools/flash-ota.sh.
+# The loader is the second app, in ota_1. `idf.py flash` writes only the kernel
+# to ota_0 and knows nothing about it, so it is written here by offset. A board
+# adopting the loader table needs `make flash` and then `make flash-loader`.
+LOADER_OFFSET = 0x3A0000
+
+flash-loader:
+	$(IDF) -C loader build
+	@eval "$$($(IDF) --env)"; \
+	"$$ESPIX_PYTHON" -m esptool --chip esp32s3 -p $(PORT_ARG) -b 460800 \
+	    write_flash $(LOADER_OFFSET) loader/build/espix_loader.bin
+
+# Push the firmware over the network instead of the UART cable: copy it to the
+# board, put it in /boot and queue it for the loader, over SSH. Needs the board
+# already on the network and its SSH reachable. See tools/flash-ota.sh.
 flash-ota: build
 	./tools/flash-ota.sh
 
