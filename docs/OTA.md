@@ -874,6 +874,40 @@ must say so rather than loop on a failed `ota_0`; and `/boot` should keep the
 current and pending images only, deleting older ones after a confirm, or a
 12 MiB rootfs slowly fills with kernels.
 
+### Why the kernel is `ota_0`, and where hashes come from
+
+**Chosen: kernel first (`ota_0`), loader second (`ota_1`), kernel archives
+itself.** The loader never touches the rootfs, and the rootfs lifecycle stays
+where it is today -- `espix_fs` creates and mounts it. Putting the loader first
+would make it own (or duplicate) that bring-up just to write `/boot`, and the
+kernel would still need its own mount-or-format path for the case where the
+loader is the thing that failed. The extra boot buys nothing, since on a fresh
+flash there is no decision to make.
+
+**Two hashes live in the image, and they answer different questions:**
+
+* `app_elf_sha256` in the descriptor -- a SHA-256 of the *ELF*, patched in by
+  esptool. That is the build identity `uname -v` already prints, and it is what
+  a `/boot` filename should carry. Naming a file needs no hashing at all.
+* an appended SHA-256 of the image itself -- what `esp_image_verify()` checks.
+
+A digest computed on the device is only worth what it can be compared against,
+so:
+
+* **Archiving the running image** is guarded by
+  `esp_image_verify(ESP_IMAGE_VERIFY_SILENT, ...)`: the device recomputes the
+  image hash and compares it to the one baked in at build time, so a corrupted
+  flash fails instead of being certified by a digest of its own corrupt bytes.
+  (A corrupt flash is caught even earlier in practice -- esptool verifies after
+  writing and the bootloader verifies before jumping -- but this is the right
+  reference and it is cheap.)
+* **Installing a download** is where a self-computed hash is exactly right,
+  because the manifest is the independent authority: hash the file, compare to
+  the manifest's `sha256`, and only then record it as pending. That check
+  belongs in the running kernel, before the loader is ever selected, so a bad
+  download is reported to the session that fetched it rather than becoming a
+  reboot, a failed install and a rollback with nobody watching.
+
 The files themselves live in `/boot`, named for their version, which is the
 whole point: a kernel version is a file you can list, copy and keep, not an
 offset.
