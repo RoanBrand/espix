@@ -42,11 +42,15 @@ menu "espix OTA"
         range 1000 300000
         default 30000
 
-    config ESPIX_OTA_URL
-        string "Default update manifest URL"
+    config ESPIX_OTA_BASE_URL
+        string "Update manifest base URL"
         depends on ESPIX_OTA_ENABLED
-        default "https://github.com/RoanBrand/espix/releases/latest/download/espix-ota.json"
+        default "https://github.com/RoanBrand/espix/releases/latest/download"
         help
-            Where `upgrade` looks when /etc/espix.conf has no ota.url.
+            The device fetches <base>/espix-ota-<board>.json, where <board> is the
+            target/flash/PSRAM identity it was built for (e.g. s3-n16r8). One
+            base URL then serves every target, and a release carries one manifest
+            per board. /etc/espix.conf `ota.url=` overrides the whole URL, for
+            pinning a version or pointing at a development server.
 
 endmenu

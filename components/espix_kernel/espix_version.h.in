@@ -18,3 +18,10 @@
 
 /* "v0.3.0-4-g2ebf416-dirty" and the like, for a boot-time mention. */
 #define ESPIX_GIT_DESCRIBE  "@espix_git_describe@"
+
+/*
+ * The board identity, derived from the target, flash and PSRAM size at
+ * configure time -- "s3-n16r8", "s3-n8r2". Not a name anyone maintains; it
+ * names the OTA release assets and the manifest this device asks for.
+ */
+#define ESPIX_BOARD "@ESPIX_BOARD@"

@@ -91,6 +91,8 @@ typedef struct {
     char url[256];
     char sha256[72];
     char min_version[32];
+    char board[24];                     /* "s3-n16r8"; empty means "any" */
+    char chip[16];                      /* "esp32s3"; empty means "any" */
 } espix_ota_manifest_t;
 
 typedef enum {

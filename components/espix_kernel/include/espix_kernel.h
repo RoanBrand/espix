@@ -104,6 +104,7 @@ unsigned espix_kernel_boot_pending(void);
 
 const char *espix_version(void);        /* "0.3.0", from version.txt */
 const char *espix_target(void);         /* "esp32s3" */
+const char *espix_board(void);          /* "s3-n16r8": target + flash + PSRAM */
 const char *espix_chip_model(void);     /* "ESP32-S3" */
 int64_t espix_uptime_us(void);
 

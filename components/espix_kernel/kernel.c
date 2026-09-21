@@ -86,6 +86,11 @@ const char *espix_target(void)
     return CONFIG_IDF_TARGET;
 }
 
+const char *espix_board(void)
+{
+    return ESPIX_BOARD;
+}
+
 int64_t espix_uptime_us(void)
 {
     return esp_timer_get_time();

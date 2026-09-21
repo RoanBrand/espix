@@ -967,15 +967,10 @@ This is the one place the loader design is weaker than A/B: two fixed slots
 always have room for an image, and a full rootfs does not. Better said out loud
 than found at three in the morning.
 
-### Three things the loader bring-up taught us
+### Two things the loader bring-up taught us
 
 Each of these was a real failure on hardware, not a hypothetical:
 
-* **The rootfs image is built with `--name-max=64`.** littlefs refuses to mount
-  when the superblock's `name_max` and the mounter's disagree, and the default
-  is 255. That is `CONFIG_LITTLEFS_OBJ_NAME_LEN=64`, and it has to be set in the
-  loader project as well as the kernel's -- a loader that cannot mount cannot
-  install anything.
 * **IDF's VFS will not mount at `/`.** `is_path_prefix_valid()` requires at
   least two characters, so the loader mounts the rootfs at `/fs` and reaches the
   images as `/fs/boot/<name>`. The kernel never notices: it does not register
@@ -987,6 +982,15 @@ Each of these was a real failure on hardware, not a hypothetical:
   `UNDEFINED`, the bootloader never marks it `PENDING_VERIFY`, and a kernel
   that does not come up is never rolled back -- the whole point of the design,
   silently off.
+
+What looked like a third cause was not. The rootfs image is built with
+`--name-max=64`, and the loader does set `CONFIG_LITTLEFS_OBJ_NAME_LEN=64` --
+but littlefs only refuses to mount when the image's stored `name_max` is
+*larger* than the mounter's, and it adopts the smaller of the two. The loader's
+default was already 64, so nothing was wrong there. (The setting is a format
+parameter: it sizes the generated image, not a run-time buffer, so there is
+almost nothing to trade against it.) It must merely never be set *below* the
+kernel's value.
 
 The loader keeps `CONFIG_LOG_DEFAULT_LEVEL_ERROR` and `ESP_ERR_TO_NAME_LOOKUP`
 on. It should be silent when it works, but the first version fell back silently

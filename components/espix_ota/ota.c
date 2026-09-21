@@ -691,11 +691,16 @@ const char *espix_ota_source(void)
     static char url[256];
 
     char conf[256] = {0};
+
+    /* An override is a whole URL, for pinning a version or a dev server.
+     * Otherwise one base serves every target: the device asks for the manifest
+     * filed under the board it is. */
     if (espix_fs_conf_get(OTA_CONF_PATH, "ota.url", conf, sizeof(conf)) &&
         conf[0] != '\0') {
         strlcpy(url, conf, sizeof(url));
     } else {
-        strlcpy(url, CONFIG_ESPIX_OTA_URL, sizeof(url));
+        snprintf(url, sizeof(url), "%s/espix-ota-%s.json",
+                 CONFIG_ESPIX_OTA_BASE_URL, espix_board());
     }
     return url;
 }
@@ -875,6 +880,8 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
     json_string(buf, "\"url\"",         m->url,         sizeof(m->url));
     json_string(buf, "\"sha256\"",      m->sha256,      sizeof(m->sha256));
     json_string(buf, "\"min_version\"", m->min_version, sizeof(m->min_version));
+    json_string(buf, "\"board\"",       m->board,       sizeof(m->board));
+    json_string(buf, "\"chip\"",        m->chip,        sizeof(m->chip));
     free(buf);
 
     if (m->version[0] == '\0') {
@@ -886,6 +893,23 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
     if (m->url[0] == '\0') {
         if (err != NULL) {
             snprintf(err, err_len, "%s: the manifest has no image URL", url);
+        }
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Refuse a manifest that is not for this device, with a sentence rather
+     * than a failed install. An empty field means "any" for older manifests. */
+    if (m->board[0] != '\0' && strcmp(m->board, espix_board()) != 0) {
+        if (err != NULL) {
+            snprintf(err, err_len, "that update is for %s; this is %s",
+                     m->board, espix_board());
+        }
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (m->chip[0] != '\0' && strcmp(m->chip, espix_target()) != 0) {
+        if (err != NULL) {
+            snprintf(err, err_len, "that update is for %s silicon; this is %s",
+                     m->chip, espix_target());
         }
         return ESP_ERR_INVALID_RESPONSE;
     }

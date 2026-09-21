@@ -3,10 +3,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 # For an 8MB board build the loader with ../partitions/esp32s3-8mb.csv instead.
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s3-16mb.csv"
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_USE_MALLOC=y
+#
+# Deliberately no PSRAM. The loader never needs it, and without it one loader
+# serves every module of a target regardless of PSRAM size or mode. It also
+# finds the kernel and storage partitions by label at run time, so it does not
+# depend on the partition layout either -- one loader per target, not per board.
+#
+CONFIG_SPIRAM=n
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 #
@@ -18,11 +21,10 @@ CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
 CONFIG_NEWLIB_NANO_FORMAT=y
 
 #
-# littlefs refuses to mount when the superblock's name_max and the mounter's
-# disagree. The rootfs image is built with --name-max=64, which is
-# CONFIG_LITTLEFS_OBJ_NAME_LEN in the kernel project; the default here is 255,
-# and a loader that cannot mount cannot install anything. This was the bug that
-# made the first loader fall back silently.
+# The rootfs image is generated with --name-max=CONFIG_LITTLEFS_OBJ_NAME_LEN in
+# the kernel project. littlefs refuses to mount when the image's stored name_max
+# is *larger* than the mounter's, so this must be at least the kernel's value;
+# a smaller one is the only way to get it wrong. 64 is the default on both sides.
 #
 CONFIG_LITTLEFS_OBJ_NAME_LEN=64
 
