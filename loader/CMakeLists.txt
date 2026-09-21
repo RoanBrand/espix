@@ -7,3 +7,9 @@
 cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(espix_loader)
+
+#
+# LTO was tried here and does not link: IDF's assembly stubs reference symbols
+# that the LTO pass removes (xt_unhandled_exception). Not worth chasing for a
+# loader that is already 153 KiB. See docs/OTA.md section 11.
+#

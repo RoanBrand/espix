@@ -797,8 +797,29 @@ storage,    data, littlefs, 0x420000,  0xBE0000,
 ```
 
 3.5 MiB for the kernel against 1.9375 MiB today, and `storage` is byte-for-byte
-where it was. The loader is measured, not guessed: **218 KiB** of the 448 KiB
-slot, with littlefs + `app_update` + NVS and no networking.
+where it was.
+
+The loader is measured, not guessed. It is already built with `-Os` (the
+kernel is on `-Og` and stays there); the rest is stripping what a
+run-once-then-reboot app does not need:
+
+| loader build | size |
+|---|---|
+| `-Os`, INFO logs, asserts, full printf | 218.1 KiB |
+| `-Os`, logs off, asserts off, nano printf, no err-to-name | **153.4 KiB** (-30%) |
+| plus `-flto` | does not link -- IDF's asm stubs lose `xt_unhandled_exception` |
+
+153 KiB sits in a 448 KiB slot with 66% free, so the slot can be cut. **256 KiB**
+leaves 40% for the real selection and restore logic and for bringing logging back
+at ERROR, and hands the kernel another 192 KiB:
+
+```
+ota_0,      app,  ota_0,    0x20000,   0x3B0000,
+ota_1,      app,  ota_1,    0x3D0000,  0x40000,
+```
+
+which is 3.6875 MiB for the kernel. The 448 KiB table above is the cautious end
+of the same choice.
 
 **The loader must be an OTA partition, not `factory`.** `factory` is not an
 OTA subtype (`esp_ota_ops.c`, `is_ota_partition()`), so
