@@ -778,6 +778,75 @@ Still open:
 2. **Signed images / Secure Boot now, or after OTA works?**
 3. **Rootfs updates: explicitly out of scope for v1?** (section 7)
 
+## 11. Alternative: one kernel slot and a loader
+
+A second shape, prototyped on the `bootloader-and-bigger-kernel-space` branch.
+Instead of two equal A/B slots, one big kernel slot plus a small app that puts a
+kernel `file` into it. The kernel gets the space two slots used to share, and
+rootfs does not move.
+
+```
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+ota_0,      app,  ota_0,    0x20000,   0x380000,
+ota_1,      app,  ota_1,    0x3A0000,  0x70000,
+coredump,   data, coredump, 0x410000,  0x10000,
+storage,    data, littlefs, 0x420000,  0xBE0000,
+```
+
+3.5 MiB for the kernel against 1.9375 MiB today, and `storage` is byte-for-byte
+where it was. The loader is measured, not guessed: **218 KiB** of the 448 KiB
+slot, with littlefs + `app_update` + NVS and no networking.
+
+**The loader must be an OTA partition, not `factory`.** `factory` is not an
+OTA subtype (`esp_ota_ops.c`, `is_ota_partition()`), so
+`esp_ota_set_boot_partition()` cannot target it, and `esp_ota_begin()` on it is
+`ESP_ERR_INVALID_ARG`. As `ota_1` it is both writable and selectable, and
+`esp_ota_set_boot_partition()` switches to it like any slot.
+
+**Why rollback still works, for free.** The kernel in `ota_0` boots as
+`PENDING_VERIFY`; if it does not confirm, the bootloader marks it `ABORTED` and
+falls back to the other app -- `ota_1`, the loader -- which restores the previous
+kernel file. The kernel decides it is healthy; the loader performs the restore.
+That is the same division of labour as `piboot-try-validate`, and it is
+IDF's rollback machinery rather than a replacement for it.
+
+**State does not live in rootfs.** Two different things, two places:
+
+* **Did the last kernel confirm?** `otadata` already answers this -- `NEW`,
+  `PENDING_VERIFY`, `VALID`, `ABORTED` -- and IDF maintains it. The loader only
+  has to read `esp_ota_get_state_partition()` (or
+  `esp_ota_get_last_invalid_partition()`) to know a try failed.
+* **Which file is which?** NVS: a namespace with a couple of keys naming the
+  good and pending files. Small, persistent, survives a rootfs wipe, and does
+  not live in the thing being replaced. If NVS and rootfs disagree, the loader
+  treats the image actually in `ota_0` as good -- it can read its descriptor --
+  and repairs the record.
+
+The files themselves live in `/boot`, named for their version, which is the
+whole point: a kernel version is a file you can list, copy and keep, not an
+offset.
+
+```
+/boot/espix-0.3.0.bin     good
+/boot/espix-0.4.0.bin     pending
+```
+
+**The loader never needs TLS.** Downloading happens in the running kernel, which
+writes the new image to `/boot` and records it as pending; the loader then has
+a local file and nothing else to do. The only path that needs the network is the
+one that is still running.
+
+**What is still missing** for the prototype to become the design: the loader's
+selection and restore logic, a flash target that writes the kernel to `ota_0`
+and the loader to `ota_1` (a plain `idf.py flash` of either project writes to
+`ota_0`), the first-boot seeding of `/boot`, and tests for the
+fail-to-confirm-then-restore cycle.
+
+---
+
 ## Sources
 
 Claims here that did not come from the ESP-IDF checkout or a measurement on the
