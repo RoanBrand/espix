@@ -39,9 +39,10 @@ CONFIG_LITTLEFS_OBJ_NAME_LEN=64
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 #
-# Errors only. The loader should be silent when it works, but a silent fallback
-# is exactly how the mount failure above went unnoticed; err-to-name stays on so
-# the few lines it does print are legible.
+# The loader runs for about a second and then reboots, so its output is only
+# visible to someone watching UART right after a flash. It is still worth
+# having: a short banner and a line per decision make the one component that
+# chooses what boots no longer a black box.
 #
-CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_ESP_ERR_TO_NAME_LOOKUP=y

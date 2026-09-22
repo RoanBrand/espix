@@ -20,8 +20,9 @@
 #define ESPIX_GIT_DESCRIBE  "@espix_git_describe@"
 
 /*
- * The board identity, derived from the target, flash and PSRAM size at
- * configure time -- "s3-n16r8", "s3-n8r2". Not a name anyone maintains; it
- * names the OTA release assets and the manifest this device asks for.
+ * The board identity, derived from the target and PSRAM size at configure time
+ * -- "s3-r8", "s3-r2", "s3". Not a name anyone maintains, and deliberately not
+ * including flash size: one image covers every flash size of that PSRAM config,
+ * because the loader writes the partition table for whatever it finds.
  */
 #define ESPIX_BOARD "@ESPIX_BOARD@"

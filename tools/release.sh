@@ -78,7 +78,7 @@ printf 'release: board %s\n' "$board"
 # Assets are filed by board and target, so a release can hold several without
 # the names colliding. The loader is per target, not per board: it is built
 # without PSRAM and finds partitions by label, so one serves every S3 module.
-img="$root/build/espix-$board.bin"
+img="$root/build/espix-$board-ota.bin"
 cp "$root/build/espix.bin" "$img"
 
 loader="$root/build/espix-loader-$model.bin"
@@ -128,14 +128,14 @@ merge "$minimal" \
     "0x0"    "$root/build/bootloader/bootloader.bin" \
     "0x8000" "$root/build/partition_table/partition-table.bin" \
     "0xf000" "$root/build/ota_data_initial.bin" \
-    "$(off_of ota_0)" "$root/build/espix.bin" \
-    "$(off_of ota_1)" "$loader"
+    "$(off_of ota_0)" "$loader" \
+    "$(off_of ota_1)" "$root/build/espix.bin"
 merge "$full" \
     "0x0"    "$root/build/bootloader/bootloader.bin" \
     "0x8000" "$root/build/partition_table/partition-table.bin" \
     "0xf000" "$root/build/ota_data_initial.bin" \
-    "$(off_of ota_0)" "$root/build/espix.bin" \
-    "$(off_of ota_1)" "$loader" \
+    "$(off_of ota_0)" "$loader" \
+    "$(off_of ota_1)" "$root/build/espix.bin" \
     "$(off_of storage)" "$factory_fs"
 
 notes="$root/build/release-notes.md"
@@ -154,7 +154,7 @@ no stock apps in /bin; take espix-$board-full.bin instead if you want those.
 
   espix-$board-minimal.bin   bootloader, partition table, kernel, loader -- smallest
   espix-$board-full.bin      the same plus the stock apps; reflashes everything
-  espix-$board.bin           the kernel, as delivered over OTA
+  espix-$board-ota.bin       the kernel, for remote updating
 
 The rootfs in the full image holds only the stock applications; a development
 tree's test app and local configuration are never packaged. Flashing it replaces

@@ -792,55 +792,47 @@ Still open:
 ## 11. Alternative: one kernel slot and a loader
 
 A second shape, prototyped on the `bootloader-and-bigger-kernel-space` branch.
-Instead of two equal A/B slots, one big kernel slot plus a small app that puts a
-kernel `file` into it. The kernel gets the space two slots used to share, and
-rootfs does not move.
+Instead of two equal A/B slots, a small loader and one big kernel slot. The
+kernel gets the space two slots used to share, the loader goes first so it can
+do its work before a kernel exists, and rootfs does not move.
 
 ```
 # Name,     Type, SubType,  Offset,    Size,      Flags
 nvs,        data, nvs,      0x9000,    0x6000,
 otadata,    data, ota,      0xf000,    0x2000,
 phy_init,   data, phy,      0x11000,   0x1000,
-ota_0,      app,  ota_0,    0x20000,   0x380000,
-ota_1,      app,  ota_1,    0x3A0000,  0x70000,
+ota_0,      app,  ota_0,    0x20000,   0x70000,     # loader, runs first
+ota_1,      app,  ota_1,    0x90000,   0x380000,    # kernel
 coredump,   data, coredump, 0x410000,  0x10000,
 storage,    data, littlefs, 0x420000,  0xBE0000,
 ```
 
-3.5 MiB for the kernel against 1.9375 MiB today, and `storage` is byte-for-byte
+3.5 MiB for the kernel and 448 KiB for the loader -- the two app slots occupy
+exactly the region two equal A/B slots did -- and `storage` is byte-for-byte
 where it was.
 
-The loader is measured, not guessed. It is already built with `-Os` (the
-kernel is on `-Og` and stays there); the rest is stripping what a
-run-once-then-reboot app does not need:
+The loader is built with `-Os` (the kernel is on `-Og` and stays there),
+asserts off, nano printf and no err-to-name. It keeps INFO logging, a banner and
+a line per decision: it runs for about a second and reboots, so those lines are
+only visible to whoever is watching UART, and that is worth the few kilobytes.
 
 | loader build | size |
 |---|---|
-| `-Os`, INFO logs, asserts, full printf | 218.1 KiB |
-| `-Os`, logs off, asserts off, nano printf, no err-to-name | **153.4 KiB** (-30%) |
+| `-Os`, INFO logs and banner, asserts off, nano printf | **198 KiB** |
 | plus `-flto` | does not link -- IDF's asm stubs lose `xt_unhandled_exception` |
 
-153 KiB sits in a 448 KiB slot with 66% free, so the slot can be cut. **256 KiB**
-leaves 40% for the real selection and restore logic and for bringing logging back
-at ERROR, and hands the kernel another 192 KiB:
-
-```
-ota_0,      app,  ota_0,    0x20000,   0x3B0000,
-ota_1,      app,  ota_1,    0x3D0000,  0x40000,
-```
-
-which is 3.6875 MiB for the kernel. The 448 KiB table above is the cautious end
-of the same choice.
+198 KiB sits in a 448 KiB slot with 57% free, which is the headroom the partition
+tables it will carry are meant to use.
 
 **The loader must be an OTA partition, not `factory`.** `factory` is not an
 OTA subtype (`esp_ota_ops.c`, `is_ota_partition()`), so
 `esp_ota_set_boot_partition()` cannot target it, and `esp_ota_begin()` on it is
-`ESP_ERR_INVALID_ARG`. As `ota_1` it is both writable and selectable, and
+`ESP_ERR_INVALID_ARG`. As `ota_0` it is both writable and selectable, and
 `esp_ota_set_boot_partition()` switches to it like any slot.
 
-**Why rollback still works, for free.** The kernel in `ota_0` boots as
+**Why rollback still works, for free.** The kernel in `ota_1` boots as
 `PENDING_VERIFY`; if it does not confirm, the bootloader marks it `ABORTED` and
-falls back to the other app -- `ota_1`, the loader -- which restores the previous
+falls back to the other app -- `ota_0`, the loader -- which restores the previous
 kernel file. The kernel decides it is healthy; the loader performs the restore.
 That is the same division of labour as `piboot-try-validate`, and it is
 IDF's rollback machinery rather than a replacement for it.
@@ -854,7 +846,7 @@ IDF's rollback machinery rather than a replacement for it.
 * **Which file is which?** NVS: a namespace with a couple of keys naming the
   good and pending files. Small, persistent, survives a rootfs wipe, and does
   not live in the thing being replaced. If NVS and rootfs disagree, the loader
-  treats the image actually in `ota_0` as good -- it can read its descriptor --
+  treats the image actually in `ota_1` as good -- it can read its descriptor --
   and repairs the record.
 
 ### Who does what
@@ -866,34 +858,39 @@ loader only ever installs a file that is already there.**
   own partition there -- `/boot/espix-<version>-<build>.bin`. That happens once
   per freshly flashed image, it makes the running image visible like any other,
   and it means a single-image board still has a rollback target. Reading its own
-  partition is safe; nothing writes `ota_0` while the kernel is running.
+  partition is safe; nothing writes `ota_1` while the kernel is running.
 * **Kernel, on upgrade:** write the new image to `/boot`, set NVS `pending` to
-  that filename, select `ota_1` (the loader), reboot.
-* **Loader, every run:** if `ota_0` is `ABORTED` -- a try failed -- install NVS
+  that filename, select `ota_0` (the loader), reboot.
+* **Loader, every run:** if `ota_1` is `ABORTED` -- a try failed -- install NVS
   `good`; else if `pending` is set, install that; else do nothing. Select
-  `ota_0`, reboot. It never writes `/boot` and never downloads, which is why
-  it needs no TLS and stays at 153 KiB.
+  `ota_1`, reboot. It never writes `/boot` and never downloads, which is why
+  it needs no TLS and stays under 200 KiB.
 * **Kernel, on confirm:** `good` becomes itself, `pending` cleared.
 
-The invariant is one line: **every image in `ota_0` has a file in `/boot`, and the
-loader only ever writes `ota_0` from one of those files.** A wiped rootfs breaks
+The invariant is one line: **every image in `ota_1` has a file in `/boot`, and the
+loader only ever writes `ota_1` from one of those files.** A wiped rootfs breaks
 it, and the kernel repairs it by re-archiving itself on the next boot.
 
 Two corners to decide up front: if `good` is missing when a rollback is needed
 (a rootfs wiped at the wrong moment) the loader has nothing to restore, and it
-must say so rather than loop on a failed `ota_0`; and `/boot` should keep the
+must say so rather than loop on a failed `ota_1`; and `/boot` should keep the
 current and pending images only, deleting older ones after a confirm, or a
 12 MiB rootfs slowly fills with kernels.
 
-### Why the kernel is `ota_0`, and where hashes come from
+### Why the loader is `ota_0`
 
-**Chosen: kernel first (`ota_0`), loader second (`ota_1`), kernel archives
-itself.** The loader never touches the rootfs, and the rootfs lifecycle stays
-where it is today -- `espix_fs` creates and mounts it. Putting the loader first
-would make it own (or duplicate) that bring-up just to write `/boot`, and the
-kernel would still need its own mount-or-format path for the case where the
-loader is the thing that failed. The extra boot buys nothing, since on a fresh
-flash there is no decision to make.
+**Chosen: loader first (`ota_0`), kernel second (`ota_1`).** A blank otadata
+boots `ota_0`, so the loader runs before the kernel on a fresh flash and after
+every update. That is what lets it own the work that must happen before a kernel
+exists or before a kernel can be trusted: writing the partition table for the
+detected flash size, and selecting the kernel. The kernel keeps only what is its
+own -- creating, mounting and seeding the rootfs -- and the bootloader still
+provides rollback: a kernel that does not confirm falls back to the loader.
+
+The cost is one extra reset on a fresh flash, since the loader selects the kernel
+and reboots. Kernel-first was tried and worked, but it left the loader unable to
+do anything before the first kernel boot, which is exactly what provisioning
+needs.
 
 **Two hashes live in the image, and they answer different questions:**
 

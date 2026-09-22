@@ -46,19 +46,19 @@ else()
 endif()
 
 #
-# The board identity, derived rather than named: target, flash size and PSRAM
-# size. It has to agree between the image, the release asset it is published as
-# and the manifest URL the device asks for, so it is computed once, here, and
-# carried in espix_version.h. Adding a target adds no name to maintain.
+# The board identity, derived rather than named: target and PSRAM size. Flash
+# size is deliberately absent -- one build covers every flash size of that PSRAM
+# config, because the loader writes the partition table for the size it finds.
+# The identity has to agree between the image, the release asset it is published
+# as and the manifest entry the device reads, so it is computed once, here.
 #
 set(ESPIX_BOARD "")
 if(DEFINED CONFIG_IDF_TARGET AND NOT CONFIG_IDF_TARGET STREQUAL "")
     string(REGEX REPLACE "^esp32" "" ESPIX_MODEL "${CONFIG_IDF_TARGET}")
-    string(REGEX REPLACE "MB$" "" ESPIX_FLASH_MB "${CONFIG_ESPTOOLPY_FLASHSIZE}")
     if(CONFIG_SPIRAM AND CONFIG_ESPIX_PSRAM_MB GREATER 0)
-        set(ESPIX_BOARD "${ESPIX_MODEL}-n${ESPIX_FLASH_MB}r${CONFIG_ESPIX_PSRAM_MB}")
+        set(ESPIX_BOARD "${ESPIX_MODEL}-r${CONFIG_ESPIX_PSRAM_MB}")
     else()
-        set(ESPIX_BOARD "${ESPIX_MODEL}-n${ESPIX_FLASH_MB}")
+        set(ESPIX_BOARD "${ESPIX_MODEL}")
     endif()
     message(STATUS "espix: board ${ESPIX_BOARD}")
 endif()

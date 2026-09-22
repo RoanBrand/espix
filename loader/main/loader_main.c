@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_app_format.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -38,7 +39,7 @@
 #define NVS_NS    "espix_boot"
 #define NAME_MAX_ 64
 
-static const esp_partition_t *s_kernel;   /* ota_0 */
+static const esp_partition_t *s_kernel;   /* ota_1 */
 
 static esp_err_t mount_rootfs(void)
 {
@@ -123,8 +124,29 @@ static void boot_kernel(void)
         ESP_LOGE(TAG, "cannot select %s", s_kernel->label);
         return;
     }
-    ESP_LOGI(TAG, "booting %s", s_kernel->label);
+    ESP_LOGI(TAG, "selecting %s and restarting", s_kernel->label);
     esp_restart();
+}
+
+/*
+ * A short banner, so a board watched over UART right after a flash makes it
+ * obvious the loader ran between the bootloader and the kernel. The version is
+ * the loader's own (loader/version.txt), not the kernel's.
+ */
+static void banner(void)
+{
+    const esp_app_desc_t *d = esp_app_get_description();
+
+    /* printf, not ESP_LOGI: the log prefix would run down the left of the logo
+     * and wreck it. The activity lines that follow stay on the log. */
+    printf("\n"
+           "  ___  ___ _ __ (_)_  __\n"
+           " / _ \\/ __| '_ \\| \\ \\/ /\n"
+           "|  __/\\__ \\ |_) | |>  <    loader %s\n"
+           " \\___||___/ .__/|_/_/\\_\\   %s\n"
+           "          |_|\n"
+           "\n",
+           d->version, CONFIG_IDF_TARGET);
 }
 
 /* Nowhere left to go: say so, slowly, instead of thrashing the slot. */
@@ -144,17 +166,19 @@ void app_main(void)
     char previous[NAME_MAX_] = {0};
     char path[160];
 
-    ESP_LOGI(TAG, "espix loader");
+    banner();
 
     /* The loader is running, so it is good: keep the bootloader from marking it
      * aborted and losing it as a fallback target. */
     (void)esp_ota_mark_app_valid_cancel_rollback();
 
     s_kernel = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
-                                        ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+                                        ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
     if (s_kernel == NULL) {
         stall("no kernel slot in the partition table");
     }
+    ESP_LOGI(TAG, "kernel slot %s at 0x%06x", s_kernel->label,
+             (unsigned)s_kernel->address);
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -171,12 +195,16 @@ void app_main(void)
     state_get(nvs, "pending", pending, sizeof(pending));
     state_get(nvs, "previous", previous, sizeof(previous));
 
+    ESP_LOGI(TAG, "state: good='%s' previous='%s' pending='%s'",
+             good, previous, pending);
+
     if (mount_rootfs() != ESP_OK) {
         ESP_LOGW(TAG, "no rootfs; booting what is already installed");
         nvs_close(nvs);
         boot_kernel();
         return;
     }
+    ESP_LOGI(TAG, "rootfs mounted");
 
     /* Did the last try fail? Then the kernel slot holds an image that did not
      * confirm, and the good file is what to put back. */
@@ -216,6 +244,7 @@ void app_main(void)
         }
     }
 
+    ESP_LOGI(TAG, "nothing queued and nothing to restore");
     nvs_close(nvs);
     boot_kernel();
 }

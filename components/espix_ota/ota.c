@@ -552,7 +552,7 @@ esp_err_t espix_ota_queue(const char *name, char *err, size_t err_len)
     }
 
     const esp_partition_t *loader = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
     if (loader == NULL) {
         if (err != NULL) {
             snprintf(err, err_len, "the partition table has no loader slot (ota1)");
@@ -614,7 +614,7 @@ bool espix_ota_enabled(void)
 bool espix_ota_available(void)
 {
     const esp_partition_t *loader = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
     if (loader == NULL) {
         return false;
     }

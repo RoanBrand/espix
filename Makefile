@@ -5,9 +5,10 @@
 # make recipe's subshell. Nothing needs to be sourced first.
 #
 #   make build            firmware
-#   make flash            kernel and loader -- leaves the filesystem alone
-#   make flash-kernel     just the kernel (ota_0), with bootloader + table
-#   make flash-loader     just the loader (ota_1)
+#   make flash            loader and kernel -- leaves the filesystem alone
+#   make flash-kernel     just the kernel (ota_1), with bootloader + table
+#   make flash-loader     just the loader (ota_0)
+#   make flash-monitor    flash, then attach with the only reset (to see the loader)
 #   make flash-fs         rootfs image -- REPLACES the filesystem (alias: fs)
 #   make flash-all        everything, in the order a first boot needs
 #   make release          tag, build and publish a GitHub release
@@ -38,7 +39,7 @@ else
   PORT_ARG = $(PORT)
 endif
 
-.PHONY: all build flash flash-kernel flash-loader flash-fs fs flash-all \
+.PHONY: all build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release monitor monitor-reset coredump apps test-app test test-panic \
         stress clean help
 
@@ -50,28 +51,79 @@ help:
 build:
 	$(IDF) build
 
-# The historical "write the firmware": bootloader, partition table, the kernel
-# (ota_0) and the loader (ota_1). The rootfs is never touched; `flash-fs` does
-# that, deliberately, and only when asked.
-flash: flash-kernel flash-loader
-
-flash-kernel:
-	$(IDF) -p $(PORT_ARG) flash
-
-# The loader is the second app, in ota_1, and `idf.py flash` knows nothing about
-# it. Its offset comes from whichever partition table sdkconfig selects, because
-# the 8MB and 16MB tables put it in different places.
-flash-loader:
+# The historical "write the firmware": bootloader, partition table, the loader
+# (ota_0, which runs first) and the kernel (ota_1). The rootfs is never touched;
+# `flash-fs` does that, deliberately, and only when asked.
+#
+# `idf.py flash` cannot be used here: it writes the app to the first OTA slot,
+# which is the loader's. Everything is written by offset instead, from whichever
+# partition table sdkconfig selects, and in one esptool invocation so the board
+# resets once -- into the loader, which then selects the kernel.
+flash: build
 	$(IDF) -C loader build
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	off=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
-	if [ -z "$$off" ]; then \
-	    echo "flash-loader: no ota_1 partition in $$csv" >&2; exit 1; \
+	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
+	    echo "flash: no ota_0/ota_1 in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 write_flash \
+	    0x0     build/bootloader/bootloader.bin \
+	    0x8000  build/partition_table/partition-table.bin \
+	    0xf000  build/ota_data_initial.bin \
+	    "$$lo"  loader/build/espix_loader.bin \
+	    "$$ko"  build/espix.bin
+
+# Bootloader, table, otadata and the kernel, without touching the loader -- the
+# common case while iterating on the kernel.
+flash-kernel: build
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$ko" ]; then echo "flash-kernel: no ota_1 in $$csv" >&2; exit 1; fi; \
+	eval "$$($(IDF) --env)"; \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 write_flash \
+	    0x0     build/bootloader/bootloader.bin \
+	    0x8000  build/partition_table/partition-table.bin \
+	    0xf000  build/ota_data_initial.bin \
+	    "$$ko"  build/espix.bin
+
+# Flash without resetting, then attach with a reset: the one reset is the
+# monitor's, so the loader's first lines are on screen. An extra monitor after
+# an ordinary flash is too late -- the loader has already handed over to the
+# kernel -- and resetting again would boot the kernel, not the loader.
+flash-monitor: build
+	$(IDF) -C loader build
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
+	    echo "flash-monitor: no ota_0/ota_1 in $$csv" >&2; exit 1; \
+	fi; \
+	eval "$$($(IDF) --env)"; \
+	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
+	    write_flash \
+	    0x0     build/bootloader/bootloader.bin \
+	    0x8000  build/partition_table/partition-table.bin \
+	    0xf000  build/ota_data_initial.bin \
+	    "$$lo"  loader/build/espix_loader.bin \
+	    "$$ko"  build/espix.bin
+	$(IDF) -p $(PORT_ARG) monitor
+
+# The loader alone, in ota_0.
+flash-loader:
+
+	$(IDF) -C loader build
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$lo" ]; then echo "flash-loader: no ota_0 in $$csv" >&2; exit 1; fi; \
+	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
-	    write_flash "$$off" loader/build/espix_loader.bin
+	    write_flash "$$lo" loader/build/espix_loader.bin
 
 # Deliberately separate from `flash`: this replaces the whole rootfs, and
 # reflashing firmware should never destroy what is on the device.

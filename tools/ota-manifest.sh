@@ -79,7 +79,7 @@ cat > "$out" <<EOF
   "sha256": "$img_sha",
   "chip": "$chip",
   "board": "$board",
-  "url": "$1/espix-$board.bin"
+  "url": "$1/espix-$board-ota.bin"
 }
 EOF
 

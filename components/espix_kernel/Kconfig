@@ -40,8 +40,8 @@ menu "espix kernel"
             The module's PSRAM size, which ESP-IDF cannot know: on the S3 the
             size is auto-detected at runtime, so R2 and R8 modules share one
             sdkconfig. espix uses it for exactly one thing -- the board identity
-            it is built for (model, flash and PSRAM size, e.g. `s3-n16r8`), which
-            names OTA release assets and the manifest the device asks for.
-            Nothing branches on it.
+            it is built for (model and PSRAM size, e.g. `s3-r8`), which names the
+            release assets and the manifest entry the device reads. Flash size is
+            deliberately not part of it. Nothing branches on it.
 
 endmenu
