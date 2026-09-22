@@ -78,7 +78,7 @@ printf 'release: board %s\n' "$board"
 # Assets are filed by board and target, so a release can hold several without
 # the names colliding. The loader is per target, not per board: it is built
 # without PSRAM and finds partitions by label, so one serves every S3 module.
-img="$root/build/espix-$board-ota.bin"
+img="$root/build/espix-$model-ota.bin"
 cp "$root/build/espix.bin" "$img"
 
 loader="$root/build/espix-loader-$model.bin"
@@ -87,7 +87,7 @@ cp "$root/loader/build/espix_loader.bin" "$loader"
 printf 'release: writing the manifest\n'
 ( cd "$root" && tools/ota-manifest.sh \
     "https://github.com/$slug/releases/download/$tag" )
-manifest="$root/build/espix-ota-$board.json"
+manifest="$root/build/espix-ota.json"
 [ -f "$manifest" ] || die "no manifest was written"
 
 # The rootfs a release carries is built from apps/ into a clean directory, never
@@ -114,8 +114,8 @@ fm=$(printf '%s' "$flashargs" | sed -n 's/.*--flash-mode \([a-z]*\).*/\1/p')
 ff=$(printf '%s' "$flashargs" | sed -n 's/.*--flash-freq \([0-9a-z]*\).*/\1/p')
 fs=$(printf '%s' "$flashargs" | sed -n 's/.*--flash-size \([0-9A-Za-z]*\).*/\1/p')
 
-minimal="$root/build/espix-$board-minimal.bin"
-full="$root/build/espix-$board-full.bin"
+minimal="$root/build/espix-$model-minimal.bin"
+full="$root/build/espix-$model-full.bin"
 merge() {
     out="$1"
     shift
@@ -145,16 +145,16 @@ espix $ver
 Flashing a board for the first time
 -----------------------------------
 
-Download espix-$board-minimal.bin and write it at offset 0:
+Download espix-$model-minimal.bin and write it at offset 0:
 
-    esptool.py --chip $kmodel -p <port> write_flash 0x0 espix-$board-minimal.bin
+    esptool.py --chip $kmodel -p <port> write_flash 0x0 espix-$model-minimal.bin
 
 That is the whole system, and it makes its own filesystem on first boot. It has
-no stock apps in /bin; take espix-$board-full.bin instead if you want those.
+no stock apps in /bin; take espix-$model-full.bin instead if you want those.
 
-  espix-$board-minimal.bin   bootloader, partition table, kernel, loader -- smallest
-  espix-$board-full.bin      the same plus the stock apps; reflashes everything
-  espix-$board-ota.bin       the kernel, for remote updating
+  espix-$model-minimal.bin   bootloader, partition table, kernel, loader -- smallest
+  espix-$model-full.bin      the same plus the stock apps; reflashes everything
+  espix-$model-ota.bin       the kernel, for remote updating
 
 The rootfs in the full image holds only the stock applications; a development
 tree's test app and local configuration are never packaged. Flashing it replaces
@@ -165,7 +165,7 @@ Updating an espix already on the network
 
     sudo upgrade
 
-It reads espix-ota-$board.json from this release.
+It reads espix-ota.json from this release.
 EOF
 
 trap - ERR

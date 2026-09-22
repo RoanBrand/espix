@@ -1,7 +1,7 @@
 CONFIG_IDF_TARGET="esp32s3"
+# Built like the kernel, for the largest size; the loader provisions the table.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
-# For an 8MB board build the loader with ../partitions/esp32s3-8mb.csv instead.
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s3-16mb.csv"
 #
 # Deliberately no PSRAM. The loader never needs it, and without it one loader
@@ -46,3 +46,11 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 #
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
+
+#
+# Writing the partition table is refused by default: main_flash_region_protected()
+# returns ESP_ERR_NOT_SUPPORTED for an address outside any partition and
+# CHECK_WRITE_ADDRESS turns that into abort(). The loader is the app that
+# legitimately writes the table for the flash it finds.
+#
+CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y

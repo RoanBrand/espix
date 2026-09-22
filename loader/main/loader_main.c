@@ -17,6 +17,8 @@
 #include "freertos/task.h"
 
 #include "esp_app_format.h"
+#include "esp_flash.h"
+#include "esp_flash_partitions.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -25,6 +27,8 @@
 #include "nvs_flash.h"
 
 #include "esp_littlefs.h"
+
+#include "espix_partition_tables.h"
 
 #define TAG       "loader"
 
@@ -149,6 +153,73 @@ static void banner(void)
            d->version, CONFIG_IDF_TARGET);
 }
 
+/*
+ * Make the partition table match the flash this board actually has.
+ *
+ * The first-flash image carries the smallest table (8 MB), which is valid on any
+ * larger chip, so the rest of the flash is unreachable until this grows storage
+ * to fill it. The tables differ only in storage's size, so this is a pure size
+ * fix-up. It writes nothing until the new table has passed
+ * esp_partition_table_verify(), and it restarts so the bootloader re-reads it.
+ */
+static void provision(void)
+{
+    uint32_t flash = 0;
+    if (esp_flash_get_physical_size(esp_flash_default_chip, &flash) != ESP_OK || flash == 0) {
+        return;                     /* cannot tell; leave the table alone */
+    }
+
+    const esp_partition_t *storage = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
+    if (storage != NULL && storage->size == flash - storage->address) {
+        return;                     /* the table already matches the flash */
+    }
+
+    const unsigned char *table = espix_pt_8mb;
+    unsigned len = espix_pt_8mb_len;
+    if (flash >= 16u * 1024 * 1024) {
+        table = espix_pt_16mb;
+        len = espix_pt_16mb_len;
+    }
+
+    int count = 0;
+    if (esp_partition_table_verify((const esp_partition_info_t *)table,
+                                   true, &count) != ESP_OK) {
+        ESP_LOGE(TAG, "refusing to write a partition table that does not verify");
+        return;
+    }
+
+    ESP_LOGW(TAG, "flash is %u MB; writing the %u-byte table to match",
+             (unsigned)(flash / (1024 * 1024)), len);
+
+    const uint32_t off = 0x8000;    /* CONFIG_PARTITION_TABLE_OFFSET */
+    if (esp_flash_erase_region(esp_flash_default_chip, off, 0x1000) != ESP_OK ||
+        esp_flash_write(esp_flash_default_chip, table, off, len) != ESP_OK) {
+        ESP_LOGE(TAG, "could not write the partition table; leaving it as it was");
+        return;
+    }
+
+    /* Read it straight back. If it did not take, keep running on the table we
+     * have rather than restarting into the same state forever. */
+    unsigned char back[4] = {0};
+    if (esp_flash_read(esp_flash_default_chip, back, off + 200, sizeof(back)) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot read the table back; not restarting");
+        return;
+    }
+    ESP_LOGW(TAG, "read back storage size 0x%02x%02x%02x%02x, wanted 0x%02x%02x%02x%02x",
+             back[3], back[2], back[1], back[0],
+             table[203], table[202], table[201], table[200]);
+    if (back[0] != table[200] || back[1] != table[201] ||
+        back[2] != table[202] || back[3] != table[203]) {
+        ESP_LOGE(TAG, "the partition table did not take; not restarting");
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGW(TAG, "partition table written; restarting");
+    esp_restart();
+}
+
 /* Nowhere left to go: say so, slowly, instead of thrashing the slot. */
 static void stall(const char *why)
 {
@@ -167,6 +238,11 @@ void app_main(void)
     char path[160];
 
     banner();
+
+    /* Before anything else: make the partition table match the flash we have.
+     * This may write it and restart, in which case the next run does the work
+     * below. */
+    provision();
 
     /* The loader is running, so it is good: keep the bootloader from marking it
      * aborted and losing it as a fallback target. */

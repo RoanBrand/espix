@@ -70,16 +70,20 @@ if [ -z "$ver" ] || [ -z "$sha" ]; then
     exit 1
 fi
 
-out="$build/espix-ota-$board.json"
+model=$(printf '%s' "$board" | cut -d- -f1)
+out="$build/espix-ota.json"
 cat > "$out" <<EOF
 {
-  "name": "espix",
-  "version": "$ver",
-  "build": "$sha",
-  "sha256": "$img_sha",
-  "chip": "$chip",
-  "board": "$board",
-  "url": "$1/espix-$board-ota.bin"
+  "format": 1,
+  "boards": {
+    "$board": {
+      "version": "$ver",
+      "build": "$sha",
+      "sha256": "$img_sha",
+      "chip": "$chip",
+      "url": "$1/espix-$model-ota.bin"
+    }
+  }
 }
 EOF
 

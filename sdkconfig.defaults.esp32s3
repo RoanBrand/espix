@@ -11,8 +11,13 @@ CONFIG_IDF_TARGET="esp32s3"
 #
 # Flash
 #
+# The build targets the largest flash espix supports (16 MB), so the flash is
+# addressable to the top; the image itself is flashed with the smallest table
+# (8 MB), which is valid on any larger chip, and the loader writes the table for
+# the physical flash it finds. One image then runs on 8 and 16 MB.
+# See docs/OTA.md section 11.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s3-16mb.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s3-8mb.csv"
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 

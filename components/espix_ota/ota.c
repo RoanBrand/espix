@@ -711,8 +711,8 @@ const char *espix_ota_source(void)
         conf[0] != '\0') {
         strlcpy(url, conf, sizeof(url));
     } else {
-        snprintf(url, sizeof(url), "%s/espix-ota-%s.json",
-                 CONFIG_ESPIX_OTA_BASE_URL, espix_board());
+        snprintf(url, sizeof(url), "%s/espix-ota.json",
+                 CONFIG_ESPIX_OTA_BASE_URL);
     }
     return url;
 }
@@ -823,6 +823,59 @@ static esp_err_t on_manifest_data(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/*
+ * Return the object value for quoted_key in a flat top-level object: the text
+ * from its '{' through the matching '}'. The manifest is one file for every
+ * board, and this is how a device finds its own entry without a JSON library.
+ */
+static bool json_subobject(const char *json, const char *quoted_key,
+                           const char **out, size_t *out_len)
+{
+    const char *p = strstr(json, quoted_key);
+    if (p == NULL) {
+        return false;
+    }
+    p += strlen(quoted_key);
+    while (*p != '\0' && *p != ':') {
+        p++;
+    }
+    if (*p != ':') {
+        return false;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    if (*p != '{') {
+        return false;
+    }
+
+    const char *start = p;
+    int depth = 0;
+    bool in_string = false;
+
+    for (; *p != '\0'; p++) {
+        if (in_string) {
+            if (*p == '\\' && p[1] != '\0') {
+                p++;
+            } else if (*p == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (*p == '"') {
+            in_string = true;
+        } else if (*p == '{') {
+            depth++;
+        } else if (*p == '}' && --depth == 0) {
+            *out = start;
+            *out_len = (size_t)(p - start + 1);
+            return true;
+        }
+    }
+    return false;
+}
+
 esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
                                    char *err, size_t err_len)
 {
@@ -900,13 +953,29 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
         return e;
     }
 
-    json_string(buf, "\"version\"",     m->version,     sizeof(m->version));
-    json_string(buf, "\"build\"",       m->build,       sizeof(m->build));
-    json_string(buf, "\"url\"",         m->url,         sizeof(m->url));
-    json_string(buf, "\"sha256\"",      m->sha256,      sizeof(m->sha256));
-    json_string(buf, "\"min_version\"", m->min_version, sizeof(m->min_version));
-    json_string(buf, "\"board\"",       m->board,       sizeof(m->board));
-    json_string(buf, "\"chip\"",        m->chip,        sizeof(m->chip));
+    const char *obj = buf;
+    char key[40];
+    snprintf(key, sizeof(key), "\"%s\"", espix_board());
+
+    const char *sub = NULL;
+    size_t sublen = 0;
+    if (json_subobject(buf, key, &sub, &sublen)) {
+        ((char *)sub)[sublen] = '\0';   /* we own buf */
+        obj = sub;
+    } else if (strstr(buf, "\"boards\"") != NULL) {
+        if (err != NULL) {
+            snprintf(err, err_len, "%s: no build for %s", url, espix_board());
+        }
+        free(buf);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    json_string(obj, "\"version\"",     m->version,     sizeof(m->version));
+    json_string(obj, "\"build\"",       m->build,       sizeof(m->build));
+    json_string(obj, "\"url\"",         m->url,         sizeof(m->url));
+    json_string(obj, "\"sha256\"",      m->sha256,      sizeof(m->sha256));
+    json_string(obj, "\"min_version\"", m->min_version, sizeof(m->min_version));
+    json_string(obj, "\"chip\"",        m->chip,        sizeof(m->chip));
     free(buf);
 
     if (m->version[0] == '\0') {
