@@ -312,6 +312,40 @@ static esp_err_t sha256_file(const char *path, char out[65])
     return ESP_OK;
 }
 
+/*
+ * esp_http_client only follows redirects inside the blocking perform(), and
+ * GitHub answers both releases/latest/download and a tag's asset URL with a 302
+ * to release-assets.githubusercontent.com. So the body has to be consumed by an
+ * event handler during perform() rather than read afterwards -- here it streams
+ * straight to the file.
+ */
+typedef struct {
+    FILE                 *f;
+    size_t                done;
+    bool                  failed;
+    espix_ota_progress_fn progress;
+    void                 *ctx;
+} dl_sink_t;
+
+static esp_err_t on_download_data(esp_http_client_event_t *evt)
+{
+    dl_sink_t *s = evt->user_data;
+
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
+        if (fwrite(evt->data, 1, (size_t)evt->data_len, s->f) !=
+            (size_t)evt->data_len) {
+            s->failed = true;
+            return ESP_FAIL;            /* aborts the perform */
+        }
+        s->done += (size_t)evt->data_len;
+        if (s->progress != NULL) {
+            const int total = esp_http_client_get_content_length(evt->client);
+            s->progress(s->ctx, s->done, (total > 0) ? (size_t)total : 0);
+        }
+    }
+    return ESP_OK;
+}
+
 esp_err_t espix_ota_download(const char *url, const char *name,
                              const char *expect_sha256,
                              espix_ota_progress_fn progress, void *ctx,
@@ -336,11 +370,27 @@ esp_err_t espix_ota_download(const char *url, const char *name,
     snprintf(path, sizeof(path), ESPIX_OTA_BOOT_DIR "/%s", name);
     snprintf(part, sizeof(part), ESPIX_OTA_BOOT_DIR "/.%s.part", name);
 
+    FILE *f = fopen(part, "wb");
+    if (f == NULL) {
+        if (err != NULL) {
+            snprintf(err, err_len, "cannot write %s: %s", part, strerror(errno));
+        }
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    dl_sink_t sink = { .f = f, .progress = progress, .ctx = ctx };
+
     esp_http_client_config_t cfg = {
-        .url               = url,
-        .timeout_ms        = CONFIG_ESPIX_OTA_TIMEOUT_MS,
-        .buffer_size       = 4096,
-        .keep_alive_enable = true,
+        .url                   = url,
+        .timeout_ms            = CONFIG_ESPIX_OTA_TIMEOUT_MS,
+        .buffer_size           = 4096,
+        /* The redirect target is a signed URL whose query is ~1KB; the request
+         * line is built in buffer_size_tx, whose default is 512. */
+        .buffer_size_tx        = 2048,
+        .keep_alive_enable     = true,
+        .event_handler         = on_download_data,
+        .user_data             = &sink,
+        .max_redirection_count = 5,
     };
     if (strncmp(url, "https://", 8) == 0) {
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -351,63 +401,29 @@ esp_err_t espix_ota_download(const char *url, const char *name,
 
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (c == NULL) {
+        fclose(f);
+        unlink(part);
         if (err != NULL) {
             snprintf(err, err_len, "cannot start an HTTP client");
         }
         return ESP_FAIL;
     }
 
-    esp_err_t e = esp_http_client_open(c, 0);
-    if (e != ESP_OK) {
-        if (err != NULL) {
+    esp_err_t e = esp_http_client_perform(c);
+    const int status = esp_http_client_get_status_code(c);
+    if (e == ESP_OK && status != 200) {
+        e = ESP_ERR_NOT_FOUND;
+    }
+    if (e != ESP_OK && err != NULL) {
+        if (sink.failed) {
+            snprintf(err, err_len, "out of space");
+        } else if (status != 200 && status != 0) {
+            snprintf(err, err_len, "%s: the server answered HTTP %d", url, status);
+        } else {
             snprintf(err, err_len, "cannot reach %s: %s", url,
                      (e == ESP_ERR_TIMEOUT) ? "timed out" : esp_err_to_name(e));
         }
-        esp_http_client_cleanup(c);
-        return e;
     }
-
-    esp_http_client_fetch_headers(c);
-    const int status = esp_http_client_get_status_code(c);
-    if (status != 200) {
-        if (err != NULL) {
-            snprintf(err, err_len, "%s: the server answered HTTP %d", url, status);
-        }
-        esp_http_client_close(c);
-        esp_http_client_cleanup(c);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    const int total = esp_http_client_get_content_length(c);
-    FILE *f = fopen(part, "wb");
-    if (f == NULL) {
-        if (err != NULL) {
-            snprintf(err, err_len, "cannot write %s: %s", part, strerror(errno));
-        }
-        esp_http_client_close(c);
-        esp_http_client_cleanup(c);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    static char buf[OTA_CHUNK];
-    int got;
-    size_t done = 0;
-
-    while ((got = esp_http_client_read(c, buf, sizeof(buf))) > 0) {
-        if (fwrite(buf, 1, (size_t)got, f) != (size_t)got) {
-            e = ESP_ERR_NO_MEM;         /* almost always ENOSPC */
-            break;
-        }
-        done += (size_t)got;
-        if (progress != NULL) {
-            progress(ctx, done, (total > 0) ? (size_t)total : 0);
-        }
-    }
-    if (e == ESP_OK && got < 0) {
-        e = ESP_FAIL;
-    }
-
-    esp_http_client_close(c);
     esp_http_client_cleanup(c);
     if (fclose(f) != 0 && e == ESP_OK) {
         e = ESP_FAIL;
@@ -415,10 +431,6 @@ esp_err_t espix_ota_download(const char *url, const char *name,
 
     if (e != ESP_OK) {
         unlink(part);
-        if (err != NULL) {
-            snprintf(err, err_len, "the download failed: %s",
-                     (e == ESP_ERR_NO_MEM) ? "out of space" : esp_err_to_name(e));
-        }
         return e;
     }
 
@@ -451,7 +463,7 @@ esp_err_t espix_ota_download(const char *url, const char *name,
     }
 
     if (err != NULL) {
-        snprintf(err, err_len, "downloaded %s (%u bytes)", name, (unsigned)done);
+        snprintf(err, err_len, "downloaded %s (%u bytes)", name, (unsigned)sink.done);
     }
     return ESP_OK;
 }
@@ -790,6 +802,27 @@ bool espix_ota_meets_min(const espix_ota_manifest_t *m)
     return semver_cmp(espix_version(), m->min_version) >= 0;
 }
 
+/* Collects the manifest body during perform(), for the same redirect reason as
+ * the download sink above. */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} body_sink_t;
+
+static esp_err_t on_manifest_data(esp_http_client_event_t *evt)
+{
+    body_sink_t *s = evt->user_data;
+
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0 &&
+        s->len + (size_t)evt->data_len < s->cap) {
+        memcpy(s->buf + s->len, evt->data, evt->data_len);
+        s->len += (size_t)evt->data_len;
+        s->buf[s->len] = '\0';
+    }
+    return ESP_OK;
+}
+
 esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
                                    char *err, size_t err_len)
 {
@@ -816,11 +849,18 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
         return ESP_ERR_NO_MEM;
     }
 
+    buf[0] = '\0';
+    body_sink_t sink = { .buf = buf, .cap = MANIFEST_MAX };
+
     esp_http_client_config_t cfg = {
-        .url               = url,
-        .timeout_ms        = CONFIG_ESPIX_OTA_TIMEOUT_MS,
-        .buffer_size       = 1024,
-        .keep_alive_enable = true,
+        .url                   = url,
+        .timeout_ms            = CONFIG_ESPIX_OTA_TIMEOUT_MS,
+        .buffer_size           = 1024,
+        .buffer_size_tx        = 2048,
+        .keep_alive_enable     = true,
+        .event_handler         = on_manifest_data,
+        .user_data             = &sink,
+        .max_redirection_count = 5,
     };
     if (strncmp(url, "https://", 8) == 0) {
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -835,39 +875,24 @@ esp_err_t espix_ota_manifest_fetch(const char *url, espix_ota_manifest_t *m,
         return ESP_FAIL;
     }
 
-    esp_err_t e = esp_http_client_open(c, 0);
-    if (e == ESP_OK) {
-        esp_http_client_fetch_headers(c);
-        const int status = esp_http_client_get_status_code(c);
-        if (status != 200) {
-            if (err != NULL) {
-                if (status == 404) {
-                    snprintf(err, err_len, "no manifest found (HTTP 404)");
-                } else {
-                    snprintf(err, err_len,
-                             "%s: the server answered HTTP %d", url, status);
-                }
+    esp_err_t e = esp_http_client_perform(c);
+    const int status = esp_http_client_get_status_code(c);
+    if (e == ESP_OK && status != 200) {
+        if (err != NULL) {
+            if (status == 404) {
+                snprintf(err, err_len, "no manifest found (HTTP 404)");
+            } else {
+                snprintf(err, err_len, "%s: the server answered HTTP %d", url, status);
             }
-            e = ESP_ERR_NOT_FOUND;
-        } else {
-            int n = 0;
-            while (n < MANIFEST_MAX - 1) {
-                const int got = esp_http_client_read(c, buf + n, MANIFEST_MAX - 1 - n);
-                if (got <= 0) {
-                    break;
-                }
-                n += got;
-            }
-            buf[n] = '\0';
         }
-    } else if (err != NULL) {
+        e = ESP_ERR_NOT_FOUND;
+    } else if (e != ESP_OK && err != NULL) {
         const char *why = (e == ESP_ERR_TIMEOUT)      ? "timed out"
                         : (e == ESP_ERR_HTTP_CONNECT) ? "could not connect"
                         : esp_err_to_name(e);
         snprintf(err, err_len, "cannot reach %s: %s", url, why);
     }
 
-    esp_http_client_close(c);
     esp_http_client_cleanup(c);
 
     if (e != ESP_OK) {
