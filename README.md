@@ -24,7 +24,7 @@ together.
 
 ## Capabilities
 
-<sub>Tested on ESP32-S3N16R8 with ESP-IDF v6.1</sub>
+<sub>Run on ESP32-S3N16R8 with ESP-IDF v6.1; the ESP32-S31 builds (a preview target)</sub>
 
 | Category | | | |
 |---|---|---|---|
@@ -52,7 +52,7 @@ together.
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
-| Networking | Ethernet | **planned** | the P4 and the S31 have it; the S3 has no wired peripheral |
+| Networking | Ethernet | **partial** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route); builds, hardware not yet; the S3 has no wired peripheral |
 | Networking | IP routing, NAT and bridging | **planned** | `route` exists; forwarding and NAT do not — a router built from an ESP32 |
 | Networking | DHCP server and DNS for the LAN | **planned** | an app-side resolver already exists to build on |
 | Networking | A VPN endpoint | **planned** | WireGuard-shaped, for the router case |
@@ -66,7 +66,7 @@ together.
 
 ## Targets
 
-| | **S3** — verified | **P4** — planned | **S31** — planned |
+| | **S3** — verified | **P4** — planned | **S31** — builds |
 |---|---|---|---|
 | ISA | Xtensa | RISC-V | RISC-V |
 | MMU | none | address translation and RISC-V PMP | a real one — a Linux BSP exists |
@@ -75,7 +75,7 @@ together.
 | Radio | WiFi | none built in — companion chip needed | WiFi |
 | Wired | — | 100M Ethernet | Gigabit Ethernet |
 | Display | parallel RGB and i8080, through `LCD_CAM` | MIPI DSI, plus RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; no MIPI, and weaker than the P4 |
-| Runs today | **yes** | no | no |
+| Runs today | **yes** | no | **builds** (hardware pending) |
 
 The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),
 which is also where the one build option hardware decides today is explained.
@@ -92,10 +92,17 @@ same release. `main/idf_component.yml` declares `idf: ">=6.1"`, so an older one
 is refused with a single clear line rather than failing halfway through a
 compile.
 
+Choose a target once — `tools/espix` remembers it in `.espix/`, which the
+Makefile and `tools/idf.sh` both read:
+
 ```bash
-. $IDF_PATH/export.sh
-idf.py set-target esp32s3     # see Hardware Targets
+tools/espix target s3     # or s31; no argument opens a menu
 ```
+
+Each target keeps its own `sdkconfig.<target>` and `build-<target>/`, so
+switching is remember-and-build rather than a full reconfigure. `tools/espix
+config` runs `idf.py menuconfig` for the selected target; `tools/espix reset`
+drops its saved options and returns it to the defaults.
 
 Then use the Makefile, which finds the SDK and the serial port itself and needs
 nothing sourced first. (`make flash` writes the app by offset; `idf.py flash`
@@ -119,10 +126,10 @@ skeleton, `/etc/passwd`, `/etc/group`, `/etc/sudoers`, `/etc/hostname`, your
 home directory and the SSH host key — so skipping `make flash-fs` costs you
 `/bin`, not a working system.
 
-There is no separate download or configure step. `set-target` fetches the
+There is no separate download or configure step. The first build fetches the
 managed components at the versions pinned in `dependencies.lock` — it needs
-network the first time — and generates `sdkconfig` from the `sdkconfig.defaults*`
-files. No `menuconfig` required.
+network the first time — and generates `sdkconfig.<target>` from the
+`sdkconfig.defaults*` files. No `menuconfig` required.
 
 Boot prints kernel messages, then the greeting at the top of this README, with
 `Network` reading `not connected` until you join one. `help` lists every
@@ -160,7 +167,8 @@ From the development machine, with no cable at all:
 
 The update source is `ota.url` in `/etc/espix.conf`, defaulting to espix's GitHub
 release page. A release publishes `espix-ota.json` (the manifest,
-`tools/ota-manifest.sh`) and the `espix-s3-*` images. See [docs/OTA.md](docs/OTA.md).
+`tools/ota-manifest.sh`, with every target's entry merged by `tools/ota-merge.py`)
+and the `espix-<model>-*` images (`s3`, `s31`). See [docs/OTA.md](docs/OTA.md).
 
 **After changing ESP-IDF versions, clean twice.** `idf.py fullclean` covers the
 firmware, but each project under `apps/` is a *separate* IDF project with its
@@ -216,6 +224,14 @@ That associates immediately *and* writes `/etc/wifi.conf`, so every later boot
 reconnects on its own. `wifi status`, `wifi scan`, `ip addr` and `route` report
 where it got to. The hostname is derived from the MAC — `esp32s3-cb5d74` — and
 `hostname <name>` changes it.
+
+### Ethernet
+
+On the S31 the Gigabit MAC comes up as `eth0` beside `wlan0`, a DHCP client
+like it. It is on by default; when both have an address the default route
+prefers `eth0` and falls back to `wlan0` if the link drops. The reference
+board's YT8531 PHY and its pins are the defaults under `espix networking` in
+`menuconfig`.
 
 ### Logging in over SSH
 
@@ -319,6 +335,12 @@ rest on.
 
 Support priority and per-chip feature availability (isolation model,
 display, networking) still to be finalized as the design matures.
+
+A second hardware fact decides another: **`SOC_EMAC_SUPPORTED` separates the
+S31 from the S3.** The S31 has a Gigabit Ethernet MAC, so `ESPIX_ETH_ENABLED`
+exists only where the MAC does and the S3 build never sees it. It is on by
+default on the S31 (RGMII, an external YT8531 on the reference board); the P4's
+100M RMII MAC is not brought up yet.
 
 One hardware fact decides a build option today: **`SOC_USB_OTG_PERIPH_NUM` is 1
 on the S3 and the S31, and 2 only on the P4.** The OTG peripheral is either a

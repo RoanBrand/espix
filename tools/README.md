@@ -2,6 +2,31 @@
 
 Host-side tooling.
 
+## espix
+
+Selects the target this tree builds for, and its board, and remembers them in
+`.espix/` (gitignored). Everything else -- `make build`, `tools/idf.sh` -- reads
+that. `tools/espix config` runs `idf.py menuconfig` for the selected target,
+`tools/espix reset` drops its saved `sdkconfig.<target>` and board, and
+`tools/espix status` prints what is selected.
+
+```bash
+tools/espix              # interactive menu: target, board, menuconfig, reset
+tools/espix target s31
+tools/espix status
+```
+
+Each target has its own `sdkconfig.<target>` and `build-<target>/`, so switching
+does not rebuild the other. S3 and S31 are listed; the P4 is listed as planned.
+
+## ota-merge.py
+
+Merges the per-board `espix-ota.json` files `tools/ota-manifest.sh` writes into
+the one manifest a release publishes, rewriting each entry's `url` to the tag
+being released. `release.sh` runs it over `build-*/espix-ota.json`, so running
+`make release` once per target produces one release whose manifest serves all of
+them.
+
 ## build-apps.sh
 
 Builds every project under `apps/` and stages the ELFs into `fsroot/bin/`, so

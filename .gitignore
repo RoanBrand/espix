@@ -8,6 +8,15 @@ sdkconfig
 sdkconfig.old
 managed_components/
 
+# Per-target configuration is local state, not source: .espix/active says which
+# target this tree builds for, and each target keeps its own generated
+# sdkconfig.<target>. The sdkconfig.defaults* files ARE source, so they are
+# excluded from the glob by name.
+.espix/
+sdkconfig.*
+!sdkconfig.defaults
+!sdkconfig.defaults.*
+
 # The test app is a separate IDF project, with the same build artefacts.
 tests/app/build/
 tests/app/sdkconfig
@@ -54,4 +63,10 @@ compile_commands.json
 
 # NOTE: dependencies.lock IS committed, deliberately — it pins the exact
 # component versions so builds are reproducible.
+#
+# Its target: line follows the target last built, because IDF 6.1's build
+# rewrites the lock and offers no per-target lock path. That one line is the
+# whole difference between espix targets -- every component lists all of them,
+# so the resolved set is identical -- and git checkout dependencies.lock
+# loader/dependencies.lock is the way to drop it from a diff after a switch.
 coredump.bin

@@ -29,6 +29,14 @@
 SHELL := /bin/bash
 IDF   := ./tools/idf.sh
 
+# The target this tree is configured for, and the build directory and sdkconfig
+# it implies. tools/espix writes .espix/active and tools/idf.sh reads the same
+# file, so the two cannot disagree. Override for one run with TARGET=esp32s31.
+TARGET       ?= $(shell cat .espix/active 2>/dev/null || echo esp32s3)
+BUILD        := build-$(TARGET)
+SDKCONF      := sdkconfig.$(TARGET)
+LOADER_BUILD := loader/build-$(TARGET)
+
 # Serial port. Detected late (only when a target needs one) so that `make
 # build` works with no board attached.
 PANIC_LOG ?= serial.log
@@ -61,8 +69,8 @@ build:
 # resets once -- into the loader, which then selects the kernel.
 flash: build
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
@@ -70,25 +78,25 @@ flash: build
 	fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 write_flash \
-	    0x0     build/bootloader/bootloader.bin \
-	    0x8000  build/partition_table/partition-table.bin \
-	    0xf000  build/ota_data_initial.bin \
-	    "$$lo"  loader/build/espix_loader.bin \
-	    "$$ko"  build/espix.bin
+	    0x0     $(BUILD)/bootloader/bootloader.bin \
+	    0x8000  $(BUILD)/partition_table/partition-table.bin \
+	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$lo"  $(LOADER_BUILD)/espix_loader.bin \
+	    "$$ko"  $(BUILD)/espix.bin
 
 # Bootloader, table, otadata and the kernel, without touching the loader -- the
 # common case while iterating on the kernel.
 flash-kernel: build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$ko" ]; then echo "flash-kernel: no ota_1 in $$csv" >&2; exit 1; fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 write_flash \
-	    0x0     build/bootloader/bootloader.bin \
-	    0x8000  build/partition_table/partition-table.bin \
-	    0xf000  build/ota_data_initial.bin \
-	    "$$ko"  build/espix.bin
+	    0x0     $(BUILD)/bootloader/bootloader.bin \
+	    0x8000  $(BUILD)/partition_table/partition-table.bin \
+	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$ko"  $(BUILD)/espix.bin
 
 # Flash without resetting, then attach with a reset: the one reset is the
 # monitor's, so the loader's first lines are on screen. An extra monitor after
@@ -96,8 +104,8 @@ flash-kernel: build
 # kernel -- and resetting again would boot the kernel, not the loader.
 flash-monitor: build
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
@@ -106,24 +114,24 @@ flash-monitor: build
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
 	    write_flash \
-	    0x0     build/bootloader/bootloader.bin \
-	    0x8000  build/partition_table/partition-table.bin \
-	    0xf000  build/ota_data_initial.bin \
-	    "$$lo"  loader/build/espix_loader.bin \
-	    "$$ko"  build/espix.bin
+	    0x0     $(BUILD)/bootloader/bootloader.bin \
+	    0x8000  $(BUILD)/partition_table/partition-table.bin \
+	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$lo"  $(LOADER_BUILD)/espix_loader.bin \
+	    "$$ko"  $(BUILD)/espix.bin
 	$(IDF) -p $(PORT_ARG) monitor
 
 # The loader alone, in ota_0.
 flash-loader:
 
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ]; then echo "flash-loader: no ota_0 in $$csv" >&2; exit 1; fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
-	    write_flash "$$lo" loader/build/espix_loader.bin
+	    write_flash "$$lo" $(LOADER_BUILD)/espix_loader.bin
 
 # Deliberately separate from `flash`: this replaces the whole rootfs, and
 # reflashing firmware should never destroy what is on the device.
@@ -132,16 +140,16 @@ flash-loader:
 # first mount, so this is a small write (a few hundred KB) rather than the whole
 # partition. It packages the *dev* fsroot, test app and local config included.
 flash-fs: build
-	./tools/make-fs-image.sh fsroot build/storage.bin
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	./tools/make-fs-image.sh fsroot $(BUILD)/storage.bin
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	off=$$(awk -F, '/^storage,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	if [ -z "$$off" ]; then \
 	    echo "flash-fs: no storage partition in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
-	    write_flash "$$off" build/storage.bin
+	    write_flash "$$off" $(BUILD)/storage.bin
 
 fs: flash-fs
 
@@ -243,4 +251,5 @@ stress: test-app
 
 clean:
 	$(IDF) fullclean
+	$(IDF) -C loader fullclean
 	rm -rf apps/*/build apps/*/sdkconfig tests/app/build tests/app/sdkconfig

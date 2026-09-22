@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# Write <build>/espix-ota-<board>.json, the manifest a release publishes next to
-# its image.
+# Write <build>/espix-ota.json, one board's entry in the manifest a release
+# publishes next to its images.
 #
 #   tools/ota-manifest.sh <release-asset-base-url> [build-dir]
 #
 # e.g.
 #   tools/ota-manifest.sh https://github.com/RoanBrand/espix/releases/download/v0.3.1
 #
-# The board ("s3-n16r8") is read from the image's own generated header, so it is
-# the board the binary was actually built for -- target, flash and PSRAM size --
-# and the manifest, the asset name and the URL the device asks for all agree
-# without anyone keeping a list.
+# The board ("s3-r8", "s31") is read from the image's own generated header, so it
+# is the board the binary was actually built for -- target and PSRAM mode -- and
+# the manifest, the asset name and the URL the device asks for all agree without
+# anyone keeping a list. release.sh merges the per-board files into the one
+# espix-ota.json a release carries (tools/ota-merge.py); this writes only its own.
 #
 # The build id is the same content hash the device reports as "uname -v", read
 # straight out of the app descriptor in espix.bin -- the first nine hex digits of
@@ -32,7 +33,9 @@ root="$(cd "$here/.." && pwd)"
 if [ "$#" -eq 2 ]; then
     build="$2"
 else
-    build="$root/build"
+    # The active target's build directory, the same one tools/idf.sh uses.
+    eval "$(cd "$root" && tools/idf.sh --env 2>/dev/null)" 2>/dev/null || true
+    build="${ESPIX_BUILD:-$root/build}"
 fi
 bin="$build/espix.bin"
 

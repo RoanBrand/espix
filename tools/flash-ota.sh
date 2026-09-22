@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Copy build/espix.bin to the board and queue it, over SSH. No cable.
+# Copy the active target's espix.bin to the board and queue it, over SSH. No cable.
 #
 #   make flash-ota
 #   ESPIX_HOST=10.0.0.5 make flash-ota
@@ -29,7 +29,8 @@ export ESPIX_ROOT
 . "$ESPIX_ROOT/tests/lib/assert.sh"
 . "$ESPIX_ROOT/tests/lib/device.sh"
 
-bin="$ESPIX_ROOT/build/espix.bin"
+eval "$("$ESPIX_ROOT/tools/idf.sh" --env)"
+bin="$ESPIX_BUILD/espix.bin"
 if [ ! -f "$bin" ]; then
     printf 'flash-ota: %s does not exist; build first\n' "$bin" >&2
     exit 1

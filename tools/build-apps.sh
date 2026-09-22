@@ -33,8 +33,24 @@ stage_dir="${ESPIX_APPS_STAGE:-$root/fsroot/bin}"
 # it.
 idf=("$root/tools/idf.sh")
 
-target="${IDF_TARGET:-esp32s3}"
+# The target comes from the environment when the firmware build calls this
+# (tools/idf.sh exports IDF_TARGET), and from .espix/active when run by hand.
+target="${IDF_TARGET:-}"
+if [ -z "$target" ]; then
+    target=$(head -n1 "$root/.espix/active" 2>/dev/null || true)
+fi
+target="${target:-esp32s3}"
+
 mkdir -p "$stage_dir"
+
+# Staged ELFs are not target-neutral: an S31 image cannot load an S3 binary.
+# Remember which target staged them and rebuild rather than call a foreign one
+# up to date.
+stamp="$stage_dir/.espix-target"
+staged_target=""
+[ -f "$stamp" ] && staged_target=$(head -n1 "$stamp" 2>/dev/null || true)
+force=0
+[ "$staged_target" = "$target" ] || force=1
 
 # Named apps, or everything that looks like a project.
 if [ $# -gt 0 ]; then
@@ -60,7 +76,7 @@ for name in "${names[@]}"; do
     # Without this, every firmware build pays for an app build that has nothing
     # to do. -newer is portable in a way that `find -newermt` and stat(1) are
     # not, macOS and Linux disagreeing on both.
-    if [ -f "$staged" ]; then
+    if [ "$force" = 0 ] && [ -f "$staged" ]; then
         newer=$(find "$app" -type f \
                     -not -path "*/build/*" \
                     -not -path "*/managed_components/*" \
@@ -84,7 +100,13 @@ for name in "${names[@]}"; do
         # `idf.py elf` is only available under the Makefiles generator, and
         # set-target is what creates the generator and sdkconfig in the first
         # place, so it runs once per app rather than on every build.
-        if [ ! -f "sdkconfig" ]; then
+        have=""
+        [ -f "sdkconfig" ] && have=$(grep '^CONFIG_IDF_TARGET=' sdkconfig 2>/dev/null | head -1 | cut -d'"' -f2)
+        if [ "$have" != "$target" ]; then
+            # A different target's sdkconfig is stale, and set-target's implicit
+            # fullclean refuses a build dir left by a failed configure, so start
+            # from nothing.
+            rm -rf build
             "${idf[@]}" -G 'Unix Makefiles' set-target "$target" > build-apps.log 2>&1 \
                 || { echo "build-apps: $name: set-target failed; see $app/build-apps.log" >&2; exit 1; }
         fi
@@ -98,5 +120,6 @@ for name in "${names[@]}"; do
     fi
 
     cp "$elf" "$staged"
+    printf '%s\n' "$target" > "$stamp"
     echo "build-apps: staged $name ($(wc -c < "$staged" | tr -d ' ') bytes)"
 done

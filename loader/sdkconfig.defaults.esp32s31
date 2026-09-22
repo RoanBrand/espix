@@ -1,0 +1,4 @@
+# ESP32-S31 loader: built for the largest supported flash (32 MB); the loader
+# provisions the table for the flash it finds, so one loader serves every module.
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s31-32mb.csv"

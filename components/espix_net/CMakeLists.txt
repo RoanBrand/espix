@@ -14,6 +14,9 @@ set(espix_net_srcs "net.c" "wifi.c" "abi.c")
 if(CONFIG_ESPIX_USB_NCM_ENABLED)
     list(APPEND espix_net_srcs "usb_ncm.c")
 endif()
+if(CONFIG_ESPIX_ETH_ENABLED)
+    list(APPEND espix_net_srcs "eth.c")
+endif()
 
 idf_component_register(
     SRCS
@@ -29,6 +32,7 @@ idf_component_register(
         espix_fs
         esp_netif
         esp_wifi
+        esp_eth
         esp_event
         esp_timer
         esp_hw_support

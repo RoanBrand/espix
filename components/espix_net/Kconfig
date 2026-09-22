@@ -96,4 +96,127 @@ menu "espix networking"
             point default -- keeping them apart means a future AP cannot collide
             with the USB link.
 
+    #
+    # Ethernet. The S31 has a Gigabit MAC and needs an external PHY; the S3 has
+    # no wired peripheral at all, so SOC_EMAC_SUPPORTED is what makes this
+    # visible and the S3 build never sees it. Default on for the S31 alone: it
+    # is the target this was written for, and the P4's MAC is a different
+    # interface that has not been brought up.
+    #
+    config ESPIX_ETH_ENABLED
+        bool "Ethernet (eth0)"
+        depends on SOC_EMAC_SUPPORTED
+        default y if IDF_TARGET_ESP32S31
+        default n
+        help
+            Brings up the internal EMAC and an external PHY as eth0, a DHCP
+            client like wlan0. It is named and registered like any other
+            interface, and when both it and wlan0 have an address the default
+            route prefers Ethernet.
+
+            Off on the P4 for now. Its MAC is a 100M RMII interface, not the
+            S31's RGMII, so it needs its own configuration first.
+
+    if ESPIX_ETH_ENABLED
+        config ESPIX_ETH_MDC_GPIO
+            int "SMI MDC GPIO"
+            range 0 60
+            default 5
+            help
+                Management clock of the PHY's SMI bus. The S31 has no dedicated
+                IO_MUX pin for it, so any free GPIO will do.
+
+        config ESPIX_ETH_MDIO_GPIO
+            int "SMI MDIO GPIO"
+            range 0 60
+            default 6
+
+        config ESPIX_ETH_PHY_ADDR
+            int "PHY address (-1 probes 0..31)"
+            range -1 31
+            default -1
+
+        config ESPIX_ETH_PHY_RST_GPIO
+            int "PHY reset GPIO (-1 for none)"
+            range -1 60
+            default 7
+
+        config ESPIX_ETH_PHY_YT8531
+            bool "YT8531 RGMII fix-ups"
+            default y
+            help
+                The S31 reference board's PHY is a Motorcomm YT8531, which needs
+                two things the generic 802.3 driver cannot know: auto-negotiation
+                is disabled by its hardware reset and must be switched back on,
+                and RGMII needs about 2 ns of Tx and Rx internal clock delay.
+                Both are written through the generic driver's register ioctls.
+
+                Turn this off for a different PHY and set the pins above to match.
+
+        config ESPIX_ETH_RGMII_TX_CLK_GPIO
+            int "RGMII TX_CLK GPIO"
+            range 0 60
+            default 13
+
+        config ESPIX_ETH_RGMII_RX_CLK_GPIO
+            int "RGMII RX_CLK GPIO"
+            range 0 60
+            default 14
+
+        config ESPIX_ETH_RGMII_PHY_REF_CLK_GPIO
+            int "RGMII PHY 50 MHz reference clock GPIO (-1 for none)"
+            range -1 60
+            default -1
+
+        config ESPIX_ETH_RGMII_TX_CTL_GPIO
+            int "RGMII TX_CTL GPIO"
+            range 0 60
+            default 12
+
+        config ESPIX_ETH_RGMII_TXD0_GPIO
+            int "RGMII TXD0 GPIO"
+            range 0 60
+            default 8
+
+        config ESPIX_ETH_RGMII_TXD1_GPIO
+            int "RGMII TXD1 GPIO"
+            range 0 60
+            default 9
+
+        config ESPIX_ETH_RGMII_TXD2_GPIO
+            int "RGMII TXD2 GPIO"
+            range 0 60
+            default 10
+
+        config ESPIX_ETH_RGMII_TXD3_GPIO
+            int "RGMII TXD3 GPIO"
+            range 0 60
+            default 11
+
+        config ESPIX_ETH_RGMII_RX_CTL_GPIO
+            int "RGMII RX_CTL GPIO"
+            range 0 60
+            default 15
+
+        config ESPIX_ETH_RGMII_RXD0_GPIO
+            int "RGMII RXD0 GPIO"
+            range 0 60
+            default 19
+
+        config ESPIX_ETH_RGMII_RXD1_GPIO
+            int "RGMII RXD1 GPIO"
+            range 0 60
+            default 18
+
+        config ESPIX_ETH_RGMII_RXD2_GPIO
+            int "RGMII RXD2 GPIO"
+            range 0 60
+            default 17
+
+        config ESPIX_ETH_RGMII_RXD3_GPIO
+            int "RGMII RXD3 GPIO"
+            range 0 60
+            default 16
+    endif
+
 endmenu

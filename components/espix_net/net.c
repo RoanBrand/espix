@@ -376,6 +376,18 @@ esp_err_t espix_net_init(void)
     }
 #endif
 
+#if CONFIG_ESPIX_ETH_ENABLED
+    /*
+     * Last, so eth0 is registered after wlan0: the route policy prefers
+     * Ethernet, and starting it after WiFi means it can see WiFi's state.
+     */
+    err = espix_net_eth_start();
+    if (err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "eth start failed: %s",
+                   esp_err_to_name(err));
+    }
+#endif
+
     return ESP_OK;
 }
 

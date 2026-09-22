@@ -1,0 +1,4 @@
+# ESP32-S3 loader: built for the largest supported flash (16 MB); the loader
+# provisions the table for the flash it finds, so one loader serves every module.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s3-16mb.csv"

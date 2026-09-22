@@ -1,0 +1,48 @@
+# espix — ESP32-S31 with in-package PSRAM (WROOM-3: 16 MB flash, 16 MB PSRAM).
+#
+# One build covers every S31 module. The PSRAM is always octal and always
+# 250 MHz (there is no mode or speed to choose), and IDF detects its size at
+# runtime, so there is no compile-time difference between a 16 MB and a 32 MB
+# part -- which is why the board identity is plain `s31`, with no PSRAM suffix.
+# Flash size is not part of the identity either: the loader provisions the table
+# for the flash it finds, so one image spans 8, 16 and 32 MB modules.
+
+CONFIG_IDF_TARGET="esp32s31"
+
+#
+# Flash
+#
+# Built for the largest we target so the flash is addressable to the top, and
+# flashed with the smallest table (8 MB), which is valid on any larger chip. The
+# loader writes the table that matches the physical flash. See docs/OTA.md 11.
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s31-8mb.csv"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+#
+# PSRAM — apps are loaded here, so it is not optional on this target.
+#
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_250M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+#
+# Load relocated ELF text/data into PSRAM. The S31 moves firmware into PSRAM at
+# boot (SPIRAM_XIP_FROM_PSRAM is an S31 feature), so the same option the S3 uses
+# applies here. There is no bus-address mirror to rely on as on the S3; the
+# elf_loader handles the target itself.
+#
+CONFIG_ELF_LOADER_LOAD_PSRAM=y
+
+#
+# CPU
+#
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_320=y
+
+#
+# Networking: the S31 has a Gigabit Ethernet MAC. The option lives in
+# components/espix_net/Kconfig and is on by default wherever SOC_EMAC_SUPPORTED.
+#
+CONFIG_ESPIX_ETH_ENABLED=y
