@@ -94,15 +94,15 @@ compile.
 
 ```bash
 . $IDF_PATH/export.sh
-idf.py set-target esp32s3                              # see Hardware Targets
-idf.py -p /dev/ttyUSB0 flash monitor                   # firmware; rootfs: make flash-fs
+idf.py set-target esp32s3     # see Hardware Targets
 ```
 
-Or through the Makefile, which finds the SDK and the serial port itself and
-needs nothing sourced first:
+Then use the Makefile, which finds the SDK and the serial port itself and needs
+nothing sourced first. (`make flash` writes the app by offset; `idf.py flash`
+would put it in the loader's slot.)
 
 ```bash
-make flash          # kernel and loader -- leaves the rootfs alone
+make flash          # bootloader, table, loader and kernel -- rootfs untouched
 make flash-fs       # the rootfs image -- REPLACES what is on the device
 make flash-all      # both, in the order a first boot needs
 make monitor        # attach without resetting
@@ -111,7 +111,7 @@ make release        # tag, build and publish a GitHub release
 ```
 
 **Those write different things.** `make flash` writes the firmware -- the
-bootloader, the partition table, the kernel (`ota_0`) and the loader (`ota_1`)
+bootloader, the partition table, the loader (`ota_0`) and the kernel (`ota_1`)
 -- and leaves the filesystem alone. `make flash-fs` writes the rootfs: the apps
 built out of `apps/`, in a small image the kernel grows to the whole partition
 on first mount. espix creates the rest for itself on first boot — the directory
@@ -140,14 +140,13 @@ is on the device.
 
 #### Over the network, without the cable
 
-The 16MB image has two application slots, so a running espix can write a new
-kernel into the spare one and the bootloader switches to it on the next reboot.
-If the new image does not confirm itself on its first boot, the previous one is
-restored automatically.
+The kernel is a file, not a slot: `upgrade` writes it to `/boot` and the loader
+installs it on the next reboot. If it does not confirm itself, the bootloader
+falls back to the loader, which restores the previous one.
 
 From the device:
 
-    upgrade --slots          # which slots exist, their state, and which is running
+    upgrade --slots          # the app slots, their role and state, and /boot
     upgrade --check          # is there a newer release? (exit 1 means yes)
     sudo upgrade             # check, ask, then install
     sudo upgrade -y          # ...without asking
@@ -160,8 +159,8 @@ From the development machine, with no cable at all:
     tools/esp.sh reboot      # then start it
 
 The update source is `ota.url` in `/etc/espix.conf`, defaulting to espix's GitHub
-release page. A release publishes `espix.bin` and `espix-ota.json`, the latter
-written by `tools/ota-manifest.sh`. See [docs/OTA.md](docs/OTA.md).
+release page. A release publishes `espix-ota.json` (the manifest,
+`tools/ota-manifest.sh`) and the `espix-s3-*` images. See [docs/OTA.md](docs/OTA.md).
 
 **After changing ESP-IDF versions, clean twice.** `idf.py fullclean` covers the
 firmware, but each project under `apps/` is a *separate* IDF project with its
@@ -179,14 +178,14 @@ from the tracked `sdkconfig.defaults*`, so deleting them loses nothing.
 
 ### Board variants
 
-The default targets an **N16R8** module — 16MB flash, 8MB octal PSRAM, as on the
-ESP32-S3-DevKitC-1 v1.1. That is the only variant espix has actually been run
-on; the rest are build-verified only.
+The default targets an **N16R8** module and covers every flash size of that
+PSRAM: the image is built for 16MB but flashed with the 8MB table, and the
+loader writes the table for the chip it finds. Only PSRAM needs its own build,
+and only the default has been run on hardware.
 
 | File | Module | Flash | PSRAM |
 |---|---|---|---|
-| *(none — the default)* | N16R8 | 16MB | 8MB octal |
-| [boards/esp32s3-n8r8.conf](boards/esp32s3-n8r8.conf) | N8R8 | 8MB | 8MB octal |
+| *(none — the default)* | N16R8, N8R8 | 8-16MB | 8MB octal |
 | [boards/esp32s3-n8r2.conf](boards/esp32s3-n8r2.conf) | N8R2 | 8MB | 2MB quad |
 | [boards/esp32s3-n8.conf](boards/esp32s3-n8.conf) | N8 | 8MB | none |
 
@@ -195,15 +194,11 @@ checkout means removing it first:
 
 ```bash
 rm -f sdkconfig
-SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/esp32s3-n8r8.conf" \
+SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/esp32s3-n8r2.conf" \
     idf.py set-target esp32s3
-idf.py -p /dev/ttyUSB0 flash monitor
+make flash
 make flash-fs
 ```
-
-Reflash the rootfs too when the flash size changes — the partition table moves,
-so whatever was at the old offset is no longer there. Partition tables live in
-[partitions/](partitions/) and are selected by the board file.
 
 A board with **no PSRAM** builds and falls back to internal RAM, but WiFi, lwIP,
 SSH and the app image then compete for ~343K instead of 8MB. Expect small apps
