@@ -194,5 +194,5 @@ else
 fi
 
 printf 'release: %s is up. Devices ask:\n' "$tag"
-printf 'release:   https://github.com/%s/releases/latest/download/espix-ota-%s.json\n' \
-    "$slug" "$board"
+printf 'release:   https://github.com/%s/releases/latest/download/espix-ota.json\n' \
+    "$slug"
