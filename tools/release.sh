@@ -154,7 +154,6 @@ no stock apps in /bin; take espix-$board-full.bin instead if you want those.
 
   espix-$board-minimal.bin   bootloader, partition table, kernel, loader -- smallest
   espix-$board-full.bin      the same plus the stock apps; reflashes everything
-  espix-loader-$model.bin    the loader alone, for a cable update
   espix-$board.bin           the kernel, as delivered over OTA
 
 The rootfs in the full image holds only the stock applications; a development
@@ -171,7 +170,9 @@ EOF
 
 trap - ERR
 
-assets="$img $manifest $loader $minimal $full"
+# The loader is in both merged images and is never delivered over OTA, so it is
+# not published on its own; `make flash-loader` writes it when it needs a cable update.
+assets="$img $manifest $minimal $full"
 
 if [ "$dry" = 1 ]; then
     printf 'release: dry run; would push %s and publish:\n' "$tag"
