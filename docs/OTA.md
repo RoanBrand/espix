@@ -892,6 +892,41 @@ and reboots. Kernel-first was tried and worked, but it left the loader unable to
 do anything before the first kernel boot, which is exactly what provisioning
 needs.
 
+### One image for every flash size
+
+The build targets the largest supported flash (16 MB), so the whole chip is
+addressable, but it is flashed with the *smallest* partition table (8 MB), which
+is valid on any larger chip. On the first boot the loader reads
+`esp_flash_get_physical_size()` -- the real chip size, as opposed to
+`esp_flash_get_size()`, which a build configured for 8 MB would clamp -- writes
+the matching table at 0x8000, verifies it with `esp_partition_table_verify()`,
+reads it back, and restarts. The kernel then sees the full partition.
+
+The two tables differ only in `storage`'s size, so this is a pure size fix-up.
+Both are generated from the same CSVs at build time and carried as byte arrays,
+so the loader needs no partition-table format knowledge.
+
+**It took a Kconfig option to be allowed to do it.** IDF refuses application
+writes outside a partition: `main_flash_region_protected()` returns
+`ESP_ERR_NOT_SUPPORTED` for the partition-table region, and `CHECK_WRITE_ADDRESS`
+turns that into `abort()` under the default
+`CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS`. The symptom was a board that reset in
+a loop with no error at all; `CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y` in the
+loader -- the knob for an app that legitimately writes the table -- is what makes
+the write land.
+
+The cost is one build-time warning: IDF checks the app against the first OTA
+partition, which here is the *loader*, so it prints
+
+    Warning: 1/2 app partitions are too small for binary espix.bin ...
+      - Part 'ota_0' ... size 0x70000 (overflow ...)
+
+The kernel goes to `ota_1` (0x380000) and fits; the warning is aimed at the
+wrong slot and is harmless.
+
+The board identity follows from this: target and PSRAM size only (`s3-r8`), with
+flash size deliberately absent, because one image covers them all.
+
 **Two hashes live in the image, and they answer different questions:**
 
 * `app_elf_sha256` in the descriptor -- a SHA-256 of the *ELF*, patched in by
@@ -921,8 +956,8 @@ whole point: a kernel version is a file you can list, copy and keep, not an
 offset.
 
 ```
-/boot/espix-0.3.0.bin     good
-/boot/espix-0.4.0.bin     pending
+/boot/espix-0.3.0-26ea8a3ab.bin   good
+/boot/espix-0.4.0-9f1c2b7d4.bin   pending
 ```
 
 **The loader never needs TLS.** Downloading happens in the running kernel, which
@@ -989,32 +1024,46 @@ parameter: it sizes the generated image, not a run-time buffer, so there is
 almost nothing to trade against it.) It must merely never be set *below* the
 kernel's value.
 
-The loader keeps `CONFIG_LOG_DEFAULT_LEVEL_ERROR` and `ESP_ERR_TO_NAME_LOOKUP`
-on. It should be silent when it works, but the first version fell back silently
-and that is exactly how the mount failure above went unnoticed; the few error
-lines are worth their bytes.
+The loader logs at INFO: a banner and a line per decision (`make flash-monitor`
+flashes without resetting and lets the monitor's reset be the only one, which is
+how you see them). It runs for about a second and reboots, so those lines are
+only visible to whoever is watching UART -- which is exactly when they are
+useful. The first version was silent, and that is how the mount failure above
+went unnoticed.
 
 ---
 
 ### Publishing a release
 
-`make release` tags `v<version.txt>`, rebuilds as a release and publishes the
-image and the manifest with `gh`. The tag is created *before* the build because
-that is what makes motd stop calling it a development build
-(`espix_kernel`'s CMakeLists checks for the exact tag on a clean tree); the tag
-is deleted again if the build fails. The manifest's `url` points at the tag's
-asset, and the device's default URL is
+`make release` tags `v<version.txt>`, rebuilds as a release, and publishes with
+`gh`. The tag is created *before* the build because that is what makes motd stop
+calling it a development build (`espix_kernel`'s CMakeLists checks for the exact
+tag on a clean tree); the tag is deleted again if the build fails.
+
+One build now covers every flash size of a PSRAM config, so the assets are named
+for the model and what they are, not for the module:
+
+    espix-s3-ota.bin         the kernel, for remote updating
+    espix-s3-minimal.bin     first flash, no rootfs (the kernel provisions the FS)
+    espix-s3-full.bin        first flash, with the stock apps
+    espix-ota.json           one manifest, keyed by board identity
+
+The manifest is one file for every board. The device finds its own entry
+(`s3-r8`) and reads the `url` from it, so an asset name never has to encode the
+flash size, and adding a PSRAM variant later adds an entry rather than renaming
+anything. The default URL is
 `.../releases/latest/download/espix-ota.json`, so one release is enough.
 
-The loader is not part of an OTA release. It is flashed by cable, changes far
-less often than the kernel, and has its own version (`loader/version.txt`), so
-an OTA update never has to carry it.
+The loader is not part of an OTA release. It is in both flash images, is flashed
+by cable, changes far less often than the kernel, and has its own version
+(`loader/version.txt`), so an OTA update never has to carry it.
 
-**What is still missing**: automated tests for the fail-to-confirm-then-restore
-cycle and for the retention and `--rollback` policy. The loader logic, the
-pair-flash target (`make flash-loader`), the first-boot seeding of `/boot` and
-the full install/confirm/rollback cycle were all exercised on hardware, but by
-hand over the console rather than by the suite.
+**What is still missing**: automated tests for the provisioning step, for the
+fail-to-confirm-then-restore cycle, and for the retention and `--rollback`
+policy. Everything else here is exercised on hardware -- the swap and the loader
+banner (`make flash-monitor`), table provisioning from the 8 MB bootstrap, the
+single manifest and its `s3-r8` lookup, and a full GitHub download, SHA-256
+check, queue, loader install and confirm -- but by hand, not by the suite.
 
 ---
 
