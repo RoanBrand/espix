@@ -23,6 +23,7 @@
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_ota.h"
+#include "espix_usb.h"
 
 /*
  * The logo is two marks in one column: the wordmark, and the antenna beneath
@@ -69,12 +70,17 @@ static const char *const ANTENNA[] = {
 #define LOGO_WIDTH  25
 #define GAP         "    "
 
-/* Kept modest so the widest row still fits an 80-column terminal. */
-#define VALUE_MAX   48
+/*
+ * Long enough for a "Disk" row -- a mount point plus two sizes plus the
+ * percentage -- while ordinary rows stay well inside 80 columns.
+ */
+#define VALUE_MAX   80
 
 #define ANSI_LOGO   "\033[36m"          /* cyan */
 #define ANSI_LABEL  "\033[1m"           /* bold */
 #define ANSI_WARN   "\033[33m"          /* yellow */
+#define ANSI_OK     "\033[32m"          /* green */
+#define ANSI_BAD    "\033[31m"          /* red */
 #define ANSI_RESET  "\033[0m"
 
 /*
@@ -173,12 +179,54 @@ static void fact_host(char *out, size_t len)
              chip.cores, chip.cores == 1 ? "" : "s");
 }
 
+/* A compact size, 1G rather than 1048576K, so a USB volume's row stays on
+ * one line. Integer arithmetic only -- no float printf to link. Truncated,
+ * not rounded: this is a glance at a banner, not `df`. */
+static void size_h(uint64_t bytes, char *out, size_t len)
+{
+    static const char *const unit[] = { "B", "K", "M", "G", "T" };
+    int i = 0;
+
+    while (bytes >= 1024 && i < 4) {
+        bytes /= 1024;
+        i++;
+    }
+    snprintf(out, len, "%llu%s", (unsigned long long)bytes, unit[i]);
+}
+
+static unsigned pct_of(uint64_t used, uint64_t total)
+{
+    return total > 0 ? (unsigned)((used * 100) / total) : 0;
+}
+
+/*
+ * Append " (NN%)" in a colour that says how full it is: green while there is
+ * room, yellow past 75%, red past 90%. Added only when the whole sequence
+ * fits, so a row truncated elsewhere cannot swallow the reset and bleed
+ * colour into the rest of the banner.
+ */
+static void append_pct(char *out, size_t len, bool ansi, unsigned pct)
+{
+    const size_t n = strlen(out);
+    const char  *color = "";
+    const char  *reset = "";
+
+    if (len - n < 17) {           /* " " + colour + "(100%)" + reset + NUL */
+        return;
+    }
+    if (ansi) {
+        color = (pct >= 90) ? ANSI_BAD : (pct >= 75) ? ANSI_WARN : ANSI_OK;
+        reset = ANSI_RESET;
+    }
+    snprintf(out + n, len - n, " %s(%u%%)%s", color, pct, reset);
+}
+
 /*
  * One heap per row. Packing both onto a single line risked running past 80
  * columns once the numbers grew to five digits, and splitting them costs a row
  * the logo has to spare anyway.
  */
-static void fact_heap(char *out, size_t len, uint32_t caps)
+static void fact_heap(char *out, size_t len, uint32_t caps, bool ansi)
 {
     multi_heap_info_t info;
     heap_caps_get_info(&info, caps);
@@ -197,9 +245,10 @@ static void fact_heap(char *out, size_t len, uint32_t caps)
     snprintf(out, len, "%uK / %uK",
              (unsigned)(info.total_allocated_bytes / 1024),
              (unsigned)(total / 1024));
+    append_pct(out, len, ansi, pct_of(info.total_allocated_bytes, total));
 }
 
-static void fact_storage(char *out, size_t len)
+static void fact_storage(char *out, size_t len, bool ansi)
 {
     espix_fs_info_t fs;
 
@@ -211,24 +260,88 @@ static void fact_storage(char *out, size_t len)
     snprintf(out, len, "%uK / %uK on /",
              (unsigned)(fs.used_bytes / 1024),
              (unsigned)(fs.total_bytes / 1024));
+    append_pct(out, len, ansi, pct_of(fs.used_bytes, fs.total_bytes));
 }
 
-/* First interface carrying an address. `lo` always has one and never says
- * anything useful, so it is skipped. */
+/*
+ * One row per mounted volume beyond the root, which is where a USB disk lands.
+ * The volume's own driver answers -- FAT/exFAT or ext, chosen by the type the
+ * mount record kept -- and a mount whose device is gone is skipped rather than
+ * shown as empty, the same call `df` makes.
+ */
+static void print_disks(motd_ctx_t *ctx)
+{
+    const bool ansi = (ctx->s != NULL && ctx->s->ansi);
+    char       value[VALUE_MAX];
+
+    for (size_t i = 0; ; i++) {
+        char path[ESPIX_PATH_MAX];
+        if (espix_fs_mount_at(i, path, sizeof(path)) != ESP_OK) {
+            break;
+        }
+
+        char type[16];
+        if (!espix_blk_mount_type(path, type, sizeof(type))) {
+            continue;
+        }
+
+        uint64_t  total  = 0;
+        uint64_t  free_b = 0;
+        esp_err_t err;
+
+#if CONFIG_ESPIX_FS_EXT4
+        if (espix_usb_fstype_is_ext(type)) {
+            err = espix_fs_stat_ext(path, &total, &free_b);
+        } else
+#endif
+        {
+            err = espix_fs_stat_fat(path, &total, &free_b);
+        }
+        if (err != ESP_OK || total == 0) {
+            continue;
+        }
+
+        const uint64_t used_b = (total > free_b) ? (total - free_b) : 0;
+        char used_s[12], total_s[12], path_s[33];
+
+        snprintf(path_s, sizeof(path_s), "%.32s", path);
+        size_h(used_b, used_s, sizeof(used_s));
+        size_h(total, total_s, sizeof(total_s));
+        snprintf(value, sizeof(value), "%s %s / %s", path_s, used_s, total_s);
+        append_pct(value, sizeof(value), ansi, pct_of(used_b, total));
+        row_fact(ctx, "Disk", value);
+    }
+}
+
+/*
+ * The interface carrying off-link traffic, so the row agrees with `ip route`
+ * -- `eth0` when a cable is live even though `wlan0` registered first. A link
+ * with no router (usb0 in server mode) has no default route, so fall back to
+ * the first interface carrying an address; `lo` always has one and never says
+ * anything useful, so it is skipped.
+ */
 static void fact_network(char *out, size_t len)
 {
     espix_ifinfo_t ifs[4];
     const size_t   n = espix_net_iflist(ifs, sizeof(ifs) / sizeof(ifs[0]));
 
-    for (size_t i = 0; i < n; i++) {
-        if (ifs[i].kind == ESPIX_IF_LO || !ifs[i].has_addr || !ifs[i].up) {
-            continue;
+    char def[ESPIX_IF_NAME_MAX] = "";
+    const bool have_def = espix_net_default_route(def, sizeof(def), NULL);
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < n; i++) {
+            if (ifs[i].kind == ESPIX_IF_LO || !ifs[i].has_addr || !ifs[i].up) {
+                continue;
+            }
+            if (pass == 0 && (!have_def || strcmp(ifs[i].name, def) != 0)) {
+                continue;
+            }
+            char ip[ESPIX_IP4STR_MAX];
+            snprintf(out, len, "%s %s/%d", ifs[i].name,
+                     espix_net_ip4str(ifs[i].ip, ip, sizeof(ip)),
+                     espix_net_prefix_len(ifs[i].netmask));
+            return;
         }
-        char ip[ESPIX_IP4STR_MAX];
-        snprintf(out, len, "%s %s/%d", ifs[i].name,
-                 espix_net_ip4str(ifs[i].ip, ip, sizeof(ip)),
-                 espix_net_prefix_len(ifs[i].netmask));
-        return;
     }
 
     strlcpy(out, "not connected", len);
@@ -296,16 +409,18 @@ void espix_cmds_print_greeting(espix_session_t *s)
              (s != NULL && s->name != NULL) ? s->name : "?");
     row_fact(&ctx, "Shell", value);
 
-    fact_heap(value, sizeof(value), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    fact_heap(value, sizeof(value), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, ansi);
     row_fact(&ctx, "Memory", value);
 
-    fact_heap(value, sizeof(value), MALLOC_CAP_SPIRAM);
+    fact_heap(value, sizeof(value), MALLOC_CAP_SPIRAM, ansi);
     if (value[0] != '\0') {
         row_fact(&ctx, "PSRAM", value);
     }
 
-    fact_storage(value, sizeof(value));
+    fact_storage(value, sizeof(value), ansi);
     row_fact(&ctx, "Storage", value);
+
+    print_disks(&ctx);
 
     fact_network(value, sizeof(value));
     row_fact(&ctx, "Network", value);

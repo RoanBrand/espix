@@ -4,6 +4,7 @@
 # `idf.py` is frequently a *shell function*, and a function is invisible to a
 # make recipe's subshell. Nothing needs to be sourced first.
 #
+#   make menu             target/board/options: the remembered setup
 #   make build            firmware
 #   make flash            loader and kernel -- leaves the filesystem alone
 #   make flash-kernel     just the kernel (ota_1), with bootloader + table
@@ -11,6 +12,7 @@
 #   make flash-monitor    flash, then attach with the only reset (to see the loader)
 #   make flash-fs         rootfs image -- REPLACES the filesystem (alias: fs)
 #   make flash-all        everything, in the order a first boot needs
+#   make flash-ota        firmware over the network (SSH), not the cable
 #   make release          tag, build and publish a GitHub release
 #   make monitor          attach, without resetting the board
 #   make monitor-reset    attach, resetting first (to catch boot output)
@@ -25,9 +27,30 @@
 #   make clean            fullclean, firmware and apps
 #
 # PORT= overrides serial port detection. IDF_PATH= overrides SDK discovery.
+# ESPIX_HOST= overrides the board address for network commands (tools/espix host).
 
+# ESPIX_TARGET is what makes `TARGET=` a real override: tools/idf.sh reads
+# that variable, not TARGET. Without it the two disagree -- the Makefile would
+# flash build-<TARGET>/ while idf.sh rebuilt the active target's tree. Recursive
+# on purpose, so it sees a TARGET given later on the command line.
 SHELL := /bin/bash
-IDF   := ./tools/idf.sh
+IDF   = ESPIX_TARGET=$(TARGET) ./tools/idf.sh
+
+# The target this tree is configured for, and the build directory and sdkconfig
+# it implies. tools/espix writes .espix/active and tools/idf.sh reads the same
+# file, so the two cannot disagree. Override for one run with TARGET=esp32s31.
+TARGET       ?= $(shell cat .espix/active 2>/dev/null || echo esp32s3)
+BUILD        := build-$(TARGET)
+SDKCONF      := sdkconfig.$(TARGET)
+LOADER_BUILD := loader/build-$(TARGET)
+
+# Two esptool facts come from the target, not the partition CSV. The S31
+# reserves its first two flash sectors, so its bootloader goes at 0x2000
+# rather than 0x0, and IDF builds it without the flasher stub
+# (CONFIG_ESPTOOLPY_NO_STUB). Keep in step with espix_target_is_preview in
+# tools/idf.sh.
+BOOT_OFF := $(if $(filter esp32s31,$(TARGET)),0x2000,0x0)
+NO_STUB  := $(if $(filter esp32s31,$(TARGET)),--no-stub)
 
 # Serial port. Detected late (only when a target needs one) so that `make
 # build` works with no board attached.
@@ -39,14 +62,17 @@ else
   PORT_ARG = $(PORT)
 endif
 
-.PHONY: all build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
+.PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release monitor monitor-reset coredump apps test-app test test-panic \
         stress clean help
 
 all: build
 
 help:
-	@sed -n '3,24p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,27p' Makefile | sed 's/^# \{0,1\}//'
+
+menu:
+	./tools/espix
 
 build:
 	$(IDF) build
@@ -61,34 +87,34 @@ build:
 # resets once -- into the loader, which then selects the kernel.
 flash: build
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
 	    echo "flash: no ota_0/ota_1 in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 write_flash \
-	    0x0     build/bootloader/bootloader.bin \
-	    0x8000  build/partition_table/partition-table.bin \
-	    0xf000  build/ota_data_initial.bin \
-	    "$$lo"  loader/build/espix_loader.bin \
-	    "$$ko"  build/espix.bin
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 write_flash \
+	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
+	    0x8000  $(BUILD)/partition_table/partition-table.bin \
+	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$lo"  $(LOADER_BUILD)/espix_loader.bin \
+	    "$$ko"  $(BUILD)/espix.bin
 
 # Bootloader, table, otadata and the kernel, without touching the loader -- the
 # common case while iterating on the kernel.
 flash-kernel: build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$ko" ]; then echo "flash-kernel: no ota_1 in $$csv" >&2; exit 1; fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 write_flash \
-	    0x0     build/bootloader/bootloader.bin \
-	    0x8000  build/partition_table/partition-table.bin \
-	    0xf000  build/ota_data_initial.bin \
-	    "$$ko"  build/espix.bin
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 write_flash \
+	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
+	    0x8000  $(BUILD)/partition_table/partition-table.bin \
+	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$ko"  $(BUILD)/espix.bin
 
 # Flash without resetting, then attach with a reset: the one reset is the
 # monitor's, so the loader's first lines are on screen. An extra monitor after
@@ -96,34 +122,34 @@ flash-kernel: build
 # kernel -- and resetting again would boot the kernel, not the loader.
 flash-monitor: build
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
 	    echo "flash-monitor: no ota_0/ota_1 in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
+	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 \
 	    write_flash \
-	    0x0     build/bootloader/bootloader.bin \
-	    0x8000  build/partition_table/partition-table.bin \
-	    0xf000  build/ota_data_initial.bin \
-	    "$$lo"  loader/build/espix_loader.bin \
-	    "$$ko"  build/espix.bin
+	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
+	    0x8000  $(BUILD)/partition_table/partition-table.bin \
+	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$lo"  $(LOADER_BUILD)/espix_loader.bin \
+	    "$$ko"  $(BUILD)/espix.bin
 	$(IDF) -p $(PORT_ARG) monitor
 
 # The loader alone, in ota_0.
 flash-loader:
 
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ]; then echo "flash-loader: no ota_0 in $$csv" >&2; exit 1; fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
-	    write_flash "$$lo" loader/build/espix_loader.bin
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 \
+	    write_flash "$$lo" $(LOADER_BUILD)/espix_loader.bin
 
 # Deliberately separate from `flash`: this replaces the whole rootfs, and
 # reflashing firmware should never destroy what is on the device.
@@ -132,24 +158,25 @@ flash-loader:
 # first mount, so this is a small write (a few hundred KB) rather than the whole
 # partition. It packages the *dev* fsroot, test app and local config included.
 flash-fs: build
-	./tools/make-fs-image.sh fsroot build/storage.bin
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' sdkconfig); \
+	./tools/make-fs-image.sh fsroot $(BUILD)/storage.bin
+	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	off=$$(awk -F, '/^storage,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
-	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' sdkconfig); \
+	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	if [ -z "$$off" ]; then \
 	    echo "flash-fs: no storage partition in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" -p $(PORT_ARG) -b 460800 \
-	    write_flash "$$off" build/storage.bin
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 \
+	    write_flash "$$off" $(BUILD)/storage.bin
 
 fs: flash-fs
 
 flash-all: flash flash-fs
 
 # Push the firmware over the network instead of the UART cable: copy it to the
-# board, put it in /boot and queue it for the loader, over SSH. Needs the board
-# already on the network and its SSH reachable. See tools/flash-ota.sh.
+# board, put it in /boot, queue it for the loader, reboot and wait for it back,
+# over SSH. The address comes from .espix/hosts (tools/espix host); the board
+# must be on the network with SSH reachable. See tools/flash-ota.sh.
 flash-ota: build
 	./tools/flash-ota.sh
 
@@ -243,4 +270,5 @@ stress: test-app
 
 clean:
 	$(IDF) fullclean
+	$(IDF) -C loader fullclean
 	rm -rf apps/*/build apps/*/sdkconfig tests/app/build tests/app/sdkconfig

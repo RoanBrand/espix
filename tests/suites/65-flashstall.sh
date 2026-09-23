@@ -73,9 +73,14 @@ esac
 #
 # Board-specific, deliberately, and it says so when it fails: on the N16R8 that
 # is espix's target of record, `free` reports 8189K of PSRAM with the image in
-# flash and 7114K with it in PSRAM.
+# flash and 7114K with it in PSRAM. The S31's WROOM-3 is a 16 MB part, whose
+# heap is 16384K in flash and about 14.6 MB with the image in PSRAM; the same
+# 8 MB ceiling would read "not in PSRAM" for a board that is.
 
-FS_PSRAM_CEILING_K=7800     # between 7114 (in PSRAM) and 8189 (in flash)
+case "$ESPIX_TARGET" in
+    esp32s31) FS_PSRAM_CEILING_K=15360 ;;
+    *)        FS_PSRAM_CEILING_K=7800  ;;
+esac
 FS_SAMPLES=5
 FS_BATCH=25
 FS_ERASERS=2

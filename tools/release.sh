@@ -40,6 +40,15 @@ case "$slug" in
     *) die "cannot parse a github owner/repo from '$remote'" ;;
 esac
 
+# A release is cut for whichever target tools/espix has selected: each target
+# has its own build directory and sdkconfig, so nothing is shared but the tag.
+# Run it once per target to publish several boards under one version.
+eval "$(tools/idf.sh --env)"
+build="$ESPIX_BUILD"
+sdkconfig="$ESPIX_SDKCONFIG"
+loader_build="$ESPIX_LOADER_BUILD"
+printf 'release: target %s\n' "$ESPIX_TARGET"
+
 case "$(git -C "$root" status --porcelain)" in
     "") ;;
     *) die "working tree is dirty; commit first -- a release is the tagged commit" ;;
@@ -68,36 +77,52 @@ printf 'release: building the kernel and loader\n'
 ( cd "$root" && tools/idf.sh reconfigure >/dev/null && tools/idf.sh build )
 ( cd "$root" && tools/idf.sh -C loader build >/dev/null )
 
-header="$root/build/esp-idf/espix_kernel/espix_version.h"
+header="$build/esp-idf/espix_kernel/espix_version.h"
 board=$(sed -n 's/^#define ESPIX_BOARD "\(.*\)"$/\1/p' "$header" | head -1)
 [ -n "$board" ] || die "no ESPIX_BOARD in $header; did the build fail?"
 model=$(printf '%s' "$board" | cut -d- -f1)
-kmodel=$(sed -n 's/^#define CONFIG_IDF_TARGET "\(.*\)"$/\1/p' "$root/build/config/sdkconfig.h" | head -1)
+kmodel=$(sed -n 's/^#define CONFIG_IDF_TARGET "\(.*\)"$/\1/p' "$build/config/sdkconfig.h" | head -1)
+
+# The S31 reserves its first two flash sectors, so its bootloader lands at
+# 0x2000 in a merged image too; the image is still written at offset 0.
+boot_off=0x0
+[ "$kmodel" = esp32s31 ] && boot_off=0x2000
 printf 'release: board %s\n' "$board"
 
 # Assets are filed by board and target, so a release can hold several without
 # the names colliding. The loader is per target, not per board: it is built
 # without PSRAM and finds partitions by label, so one serves every S3 module.
-img="$root/build/espix-$model-ota.bin"
-cp "$root/build/espix.bin" "$img"
+img="$build/espix-$model-ota.bin"
+cp "$build/espix.bin" "$img"
 
-loader="$root/build/espix-loader-$model.bin"
-cp "$root/loader/build/espix_loader.bin" "$loader"
+loader="$build/espix-loader-$model.bin"
+cp "$loader_build/espix_loader.bin" "$loader"
 
 printf 'release: writing the manifest\n'
 ( cd "$root" && tools/ota-manifest.sh \
-    "https://github.com/$slug/releases/download/$tag" )
-manifest="$root/build/espix-ota.json"
-[ -f "$manifest" ] || die "no manifest was written"
+    "https://github.com/$slug/releases/download/$tag" "$build" )
+single="$build/espix-ota.json"
+[ -f "$single" ] || die "no manifest was written"
+
+# One release can hold several boards. Merge every target manifest already in
+# the tree, rewriting each URL to this tag, so the published espix-ota.json
+# serves every board without a second URL list to keep in sync. A target that
+# was released earlier and not rebuilt still contributes its entry.
+mkdir -p "$build/release"
+manifest="$build/release/espix-ota.json"
+"$ESPIX_PYTHON" "$root/tools/ota-merge.py" "$manifest" \
+    "https://github.com/$slug/releases/download/$tag" \
+    "$root"/build-*/espix-ota.json
+[ -f "$manifest" ] || die "could not merge the manifests"
 
 # The rootfs a release carries is built from apps/ into a clean directory, never
 # from the local fsroot/: that tree is a development convenience and may hold a
 # test app or a personal wifi.conf, neither of which belongs in a release.
-factory_root="$root/build/factory-fsroot"
+factory_root="$build/factory-fsroot"
 rm -rf "$factory_root"
 mkdir -p "$factory_root/bin"
 ( cd "$root" && ESPIX_APPS_STAGE="$factory_root/bin" tools/build-apps.sh >/dev/null )
-factory_fs="$root/build/factory-storage.bin"
+factory_fs="$build/factory-storage.bin"
 ( cd "$root" && tools/make-fs-image.sh "$factory_root" "$factory_fs" >/dev/null )
 
 # One-file flash images, offsets from the same partition table sdkconfig selects.
@@ -105,17 +130,17 @@ factory_fs="$root/build/factory-storage.bin"
 # itself on first boot, but /bin stays empty. The full one carries a small seed
 # filesystem (grown on first mount) with the stock apps, and rewrites storage --
 # it is the factory image, not the one to flash over a live device.
-csv=$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' "$root/sdkconfig")
+csv=$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' "$sdkconfig")
 off_of() {
     awk -F, -v n="$1" '$1 == n { gsub(/ /, "", $4); print $4 }' "$root/$csv"
 }
-flashargs=$(head -1 "$root/build/flash_args")
+flashargs=$(head -1 "$build/flash_args")
 fm=$(printf '%s' "$flashargs" | sed -n 's/.*--flash-mode \([a-z]*\).*/\1/p')
 ff=$(printf '%s' "$flashargs" | sed -n 's/.*--flash-freq \([0-9a-z]*\).*/\1/p')
 fs=$(printf '%s' "$flashargs" | sed -n 's/.*--flash-size \([0-9A-Za-z]*\).*/\1/p')
 
-minimal="$root/build/espix-$model-minimal.bin"
-full="$root/build/espix-$model-full.bin"
+minimal="$build/espix-$model-minimal.bin"
+full="$build/espix-$model-full.bin"
 merge() {
     out="$1"
     shift
@@ -125,20 +150,20 @@ merge() {
 }
 printf 'release: merging flash images\n'
 merge "$minimal" \
-    "0x0"    "$root/build/bootloader/bootloader.bin" \
-    "0x8000" "$root/build/partition_table/partition-table.bin" \
-    "0xf000" "$root/build/ota_data_initial.bin" \
+    "$boot_off" "$build/bootloader/bootloader.bin" \
+    "0x8000" "$build/partition_table/partition-table.bin" \
+    "0xf000" "$build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$loader" \
-    "$(off_of ota_1)" "$root/build/espix.bin"
+    "$(off_of ota_1)" "$build/espix.bin"
 merge "$full" \
-    "0x0"    "$root/build/bootloader/bootloader.bin" \
-    "0x8000" "$root/build/partition_table/partition-table.bin" \
-    "0xf000" "$root/build/ota_data_initial.bin" \
+    "$boot_off" "$build/bootloader/bootloader.bin" \
+    "0x8000" "$build/partition_table/partition-table.bin" \
+    "0xf000" "$build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$loader" \
-    "$(off_of ota_1)" "$root/build/espix.bin" \
+    "$(off_of ota_1)" "$build/espix.bin" \
     "$(off_of storage)" "$factory_fs"
 
-notes="$root/build/release-notes.md"
+notes="$build/release-notes.md"
 cat > "$notes" <<EOF
 espix $ver
 

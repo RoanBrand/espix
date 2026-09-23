@@ -1,0 +1,27 @@
+# espix partition table — ESP32-S31, 16 MB flash. Single kernel slot + loader.
+#
+# Layout is identical for every S31 flash size; only `storage` changes, so one
+# kernel and one first-flash image serve 8, 16 and 32 MB modules. The build
+# flashes the 8 MB table, and the loader rewrites the table for the flash it
+# finds (see docs/OTA.md section 11).
+#
+# A small loader (ota_0) and one big kernel slot (ota_1), instead of two equal
+# A/B slots. Blank otadata boots the loader, which installs a kernel file from
+# the rootfs into ota_1 and selects it. The loader is also where the bootloader
+# falls back when a new kernel does not confirm.
+#
+# coredump sits in the gap between phy_init and the first 64 KB-aligned app
+# offset, so storage starts as low as the table allows. It carries task stacks
+# only, which is why 56 KB is enough.
+#
+# S31 has no legacy table: the first row is what a fresh board gets.
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+coredump,   data, coredump, 0x12000,   0xE000,
+# ota_0 is the loader, which runs first; ota_1 is the kernel it selects.
+ota_0,      app,  ota_0,    0x20000,   0x50000,
+ota_1,      app,  ota_1,    0x70000,   0x380000,
+storage,    data, littlefs, 0x3F0000,  0xC10000,

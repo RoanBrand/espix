@@ -17,6 +17,32 @@
 
 set -u
 
+# The project root, so a caller finds .espix/ no matter where it runs from.
+espix_root_dir=$(cd "$(dirname "$0")/.." && pwd)
+
+# The target this tree is configured for. .espix/active is written by
+# tools/espix; ESPIX_TARGET overrides it for a one-off build.
+espix_active_target() {
+    if [ -n "${ESPIX_TARGET:-}" ]; then
+        printf '%s' "$ESPIX_TARGET"
+        return 0
+    fi
+    local t=""
+    if [ -f "$espix_root_dir/.espix/active" ]; then
+        t=$(tr -d ' \t\r\n' < "$espix_root_dir/.espix/active")
+    fi
+    printf '%s' "${t:-esp32s3}"
+}
+
+# A target IDF refuses without --preview. Keep in sync with IDF's PREVIEW_TARGETS
+# (tools/idf_py_actions/constants.py).
+espix_target_is_preview() {
+    case "$1" in
+        esp32s31|esp32h21|esp32h4|linux) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 espix_idf_want_major=6
 espix_idf_want_minor=1
 
@@ -128,9 +154,14 @@ espix_idf_path=$(espix_find_idf) || exit 1
 espix_python=$(espix_find_python "$espix_idf_path")
 
 if [ "${1:-}" = "--env" ]; then
+    espix_env_target=$(espix_active_target)
     printf 'IDF_PATH=%s\n' "$espix_idf_path"
     printf 'ESPIX_PYTHON=%s\n' "$espix_python"
     printf 'IDF_VERSION=%s\n' "$(idf_version "$espix_idf_path")"
+    printf 'ESPIX_TARGET=%s\n' "$espix_env_target"
+    printf 'ESPIX_BUILD=%s\n' "$espix_root_dir/build-$espix_env_target"
+    printf 'ESPIX_SDKCONFIG=%s\n' "$espix_root_dir/sdkconfig.$espix_env_target"
+    printf 'ESPIX_LOADER_BUILD=%s\n' "$espix_root_dir/loader/build-$espix_env_target"
     exit 0
 fi
 
@@ -186,4 +217,95 @@ if ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1 && \
     warn "no cross-compiler on PATH after activation; the build will fail at the compiler check"
 fi
 
-exec "$espix_python" "$espix_idf_path/tools/idf.py" "$@"
+# ---------------------------------------------------------------------------
+# Target and build layout.
+#
+# One tree holds several targets side by side: each gets its own sdkconfig and
+# build directory, so switching is not a full rebuild and two configurations
+# coexist. .espix/active names the target (tools/espix writes it); IDF_TARGET is
+# exported so every project in the tree -- firmware, loader, apps -- agrees.
+# ---------------------------------------------------------------------------
+espix_target=$(espix_active_target)
+export IDF_TARGET="$espix_target"
+
+espix_args=()
+if espix_target_is_preview "$espix_target"; then
+    espix_args+=(--preview)
+fi
+
+# Which project is this? The firmware is the root project; the loader is its own
+# under loader/; anything else (an app, the test app) manages its own build
+# directory and sdkconfig, and only needs the target.
+espix_project=main
+espix_has_build=0
+espix_has_sdkconfig=0
+espix_expect=""
+for espix_a in "$@"; do
+    if [ "$espix_expect" = project ]; then
+        case "$espix_a" in
+            "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
+            loader|./loader|"$espix_root_dir/loader") espix_project=loader ;;
+            *) espix_project=other ;;
+        esac
+        espix_expect=""
+        continue
+    fi
+    if [ "$espix_expect" = define ]; then
+        case "$espix_a" in SDKCONFIG=*) espix_has_sdkconfig=1 ;; esac
+        espix_expect=""
+        continue
+    fi
+    case "$espix_a" in
+        -C|--project-dir) espix_expect=project ;;
+        -Cloader|--project-dir=loader) espix_project=loader ;;
+        --project-dir=*)
+            case "${espix_a#--project-dir=}" in
+                loader) espix_project=loader ;;
+                "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
+                *) espix_project=other ;;
+            esac ;;
+        -C*)
+            case "${espix_a#-C}" in
+                loader) espix_project=loader ;;
+                "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
+                *) espix_project=other ;;
+            esac ;;
+        -B|--build-dir) espix_has_build=1 ;;
+        -B*) espix_has_build=1 ;;
+        -D|--define) espix_expect=define ;;
+        -DSDKCONFIG=*|SDKCONFIG=*) espix_has_sdkconfig=1 ;;
+    esac
+done
+
+if [ "$espix_project" = main ]; then
+    espix_build_dir="$espix_root_dir/build-$espix_target"
+    espix_sdkconfig="$espix_root_dir/sdkconfig.$espix_target"
+
+    # A board is a defaults file that lands after the target's own defaults. It
+    # only matters when sdkconfig is generated, which tools/espix arranges by
+    # deleting it; an existing sdkconfig is authoritative.
+    espix_board_file="$espix_root_dir/.espix/board-$espix_target"
+    if [ -f "$espix_board_file" ]; then
+        espix_board=$(head -n1 "$espix_board_file")
+        if [ -n "$espix_board" ] && [ -f "$espix_root_dir/boards/$espix_board.conf" ]; then
+            export SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/$espix_board.conf"
+        fi
+    fi
+elif [ "$espix_project" = loader ]; then
+    espix_build_dir="$espix_root_dir/loader/build-$espix_target"
+    espix_sdkconfig="$espix_root_dir/loader/sdkconfig.$espix_target"
+else
+    # An app or the test app: it has its own defaults. Do not leak the
+    # firmware's board selection into a different project's defaults search.
+    unset SDKCONFIG_DEFAULTS
+fi
+
+if [ "$espix_project" = main ] || [ "$espix_project" = loader ]; then
+    [ "$espix_has_build" = 0 ] && espix_args+=(-B "$espix_build_dir")
+    [ "$espix_has_sdkconfig" = 0 ] && espix_args+=(-D "SDKCONFIG=$espix_sdkconfig")
+fi
+
+# ${espix_args[@]+"..."} rather than "${espix_args[@]}": bash 3.2 treats an
+# empty array as unbound under `set -u`.
+exec "$espix_python" "$espix_idf_path/tools/idf.py" \
+    ${espix_args[@]+"${espix_args[@]}"} "$@"

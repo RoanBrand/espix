@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# Write <build>/espix-ota-<board>.json, the manifest a release publishes next to
-# its image.
+# Write <build>/espix-ota.json, one board's entry in the manifest a release
+# publishes next to its images.
 #
 #   tools/ota-manifest.sh <release-asset-base-url> [build-dir]
 #
 # e.g.
 #   tools/ota-manifest.sh https://github.com/RoanBrand/espix/releases/download/v0.3.1
 #
-# The board ("s3-n16r8") is read from the image's own generated header, so it is
-# the board the binary was actually built for -- target, flash and PSRAM size --
-# and the manifest, the asset name and the URL the device asks for all agree
-# without anyone keeping a list.
+# The board ("s3-r8", "s31") is read from the image's own generated header, so it
+# is the board the binary was actually built for -- target and PSRAM mode -- and
+# the manifest, the asset name and the URL the device asks for all agree without
+# anyone keeping a list. release.sh merges the per-board files into the one
+# espix-ota.json a release carries (tools/ota-merge.py); this writes only its own.
 #
 # The build id is the same content hash the device reports as "uname -v", read
 # straight out of the app descriptor in espix.bin -- the first nine hex digits of
@@ -29,10 +30,14 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+. "$root/tests/lib/portable.sh"   # espix_sha256, for either spelling
+
 if [ "$#" -eq 2 ]; then
     build="$2"
 else
-    build="$root/build"
+    # The active target's build directory, the same one tools/idf.sh uses.
+    eval "$(cd "$root" && tools/idf.sh --env 2>/dev/null)" 2>/dev/null || true
+    build="${ESPIX_BUILD:-$root/build}"
 fi
 bin="$build/espix.bin"
 
@@ -59,11 +64,7 @@ ver=$(tr -d ' \t\r\n' < "$root/version.txt")
 sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null |
       od -An -tx1 -v | tr -d ' \n' | cut -c1-9)
 
-if command -v sha256sum >/dev/null 2>&1; then
-    img_sha=$(sha256sum "$bin" | awk '{print $1}')
-else
-    img_sha=$(shasum -a 256 "$bin" | awk '{print $1}')
-fi
+img_sha="$(espix_sha256 "$bin")"
 
 if [ -z "$ver" ] || [ -z "$sha" ]; then
     printf 'ota-manifest: could not read version.txt or the app descriptor\n' >&2

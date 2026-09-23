@@ -24,11 +24,21 @@ set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${1:-coredump.bin}"
 
-# espix's coredump partition: 0x410000/0x10000 is partitions/esp32s3-16mb.csv,
-# and the 8MB board is 0x310000. Overridable rather than parsed, because reading
-# the wrong offset would look exactly like corruption.
-off="${ESPIX_COREDUMP_OFF:-0x410000}"
-size="${ESPIX_COREDUMP_SIZE:-0x10000}"
+# The coredump partition comes from the active target's partition table, so a
+# target whose layout differs is not read at the S3 offset and mistaken for
+# corruption. Overridable for a hand-built board.
+eval "$(bash "$here/idf.sh" --env 2>/dev/null)" 2>/dev/null || true
+csv="${ESPIX_SDKCONFIG:-$here/../sdkconfig}"
+csvfile=""
+[ -f "$csv" ] && csvfile=$(grep '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=' "$csv" | head -1 | cut -d'"' -f2)
+off="${ESPIX_COREDUMP_OFF:-}"
+size="${ESPIX_COREDUMP_SIZE:-}"
+if [ -z "$off" ] && [ -n "$csvfile" ] && [ -f "$here/../$csvfile" ]; then
+    off=$(awk -F, '$1 == "coredump" { gsub(/ /, "", $4); print $4 }' "$here/../$csvfile")
+    size=$(awk -F, '$1 == "coredump" { gsub(/ /, "", $5); print $5 }' "$here/../$csvfile")
+fi
+off="${off:-0x410000}"
+size="${size:-0x10000}"
 baud="${ESPIX_COREDUMP_BAUD:-115200}"
 
 port="${PORT:-${ESPIX_PORT:-}}"

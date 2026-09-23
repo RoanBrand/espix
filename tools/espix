@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+espix setup: choose the target (and board) this tree builds for, and the build
+options that go with it.
+
+  tools/espix                    interactive menu
+  tools/espix target [TARGET]    show or set the target (s3, s31)
+  tools/espix board [BOARD]      show or set the board for the active target
+  tools/espix host [MODEL [IFACE [ADDR]]]
+                                 show or set LAN addresses (.espix/hosts)
+  tools/espix config             run idf.py menuconfig for it
+  tools/espix reset              forget this target's saved options and board
+  tools/espix status             print what is selected and where it lives
+
+The choice lives in .espix/ (gitignored): .espix/active is the target and
+.espix/board-<target> an optional boards/*.conf. Each target also keeps its own
+sdkconfig.<target> and build-<target>/, so switching never rebuilds the other.
+tools/idf.sh and the Makefile read these, so make build just works.
+
+Options themselves are ESP-IDF's own Kconfig -- every espix menu is in
+menuconfig already, so this does not reimplement it. The target cannot be a
+Kconfig choice (it decides the whole toolchain), which is the one thing that
+lives here.
+"""
+
+import glob
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE = os.path.join(ROOT, ".espix")
+HOSTS = os.path.join(STATE, "hosts")
+HOST_IFACES = ("eth", "wifi", "usb")
+DEFAULT_TARGET = "esp32s3"
+
+
+class Target:
+    def __init__(self, idf, model, label, preview, available, default_board, note):
+        self.idf = idf
+        self.model = model
+        self.label = label
+        self.preview = preview
+        self.available = available
+        self.default_board = default_board
+        self.note = note
+
+
+TARGETS = [
+    Target("esp32s3", "s3", "S3", False, True,
+           "default - N16R8 (16 MB flash, 8 MB octal PSRAM)", "verified"),
+    Target("esp32s31", "s31", "S31", True, True,
+           "default - WROOM-3 (8/16/32 MB flash, 16/32 MB PSRAM)",
+           "build-verified"),
+    Target("esp32p4", "p4", "P4", False, False, "", "planned"),
+]
+
+
+def target_by(name):
+    name = (name or "").strip().lower()
+    for t in TARGETS:
+        if name in (t.idf, t.model, t.label.lower()):
+            return t
+    return None
+
+
+def active_target():
+    try:
+        with open(os.path.join(STATE, "active")) as f:
+            name = f.read().strip()
+    except OSError:
+        name = ""
+    return target_by(name) or target_by(DEFAULT_TARGET)
+
+
+def set_active(t):
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "active"), "w") as f:
+        f.write(t.idf + "\n")
+
+
+def board_file(t):
+    return os.path.join(STATE, "board-" + t.idf)
+
+
+def active_board(t):
+    try:
+        with open(board_file(t)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def sdkconfig(t):
+    return os.path.join(ROOT, "sdkconfig." + t.idf)
+
+
+def loader_sdkconfig(t):
+    return os.path.join(ROOT, "loader", "sdkconfig." + t.idf)
+
+
+def build_dir(t):
+    return os.path.join(ROOT, "build-" + t.idf)
+
+
+def forget_sdkconfig(t):
+    """Drop the generated config so the next build regenerates from defaults."""
+    for p in (sdkconfig(t), sdkconfig(t) + ".old",
+              loader_sdkconfig(t), loader_sdkconfig(t) + ".old"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def set_board(t, stem):
+    # Re-selecting the current board changes nothing; without this, opening
+    # the menu and leaving the board alone would still delete the sdkconfig
+    # and force a full reconfigure.
+    if stem == active_board(t):
+        return
+    os.makedirs(STATE, exist_ok=True)
+    if stem:
+        with open(board_file(t), "w") as f:
+            f.write(stem + "\n")
+    else:
+        try:
+            os.remove(board_file(t))
+        except OSError:
+            pass
+    forget_sdkconfig(t)
+
+
+def board_label(t, stem):
+    if not stem:
+        return t.default_board
+    try:
+        with open(os.path.join(ROOT, "boards", stem + ".conf")) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") and len(line) > 1:
+                    return line.lstrip("# ").strip()
+    except OSError:
+        pass
+    return stem
+
+
+def discover_boards(t):
+    out = []
+    for conf in sorted(glob.glob(os.path.join(ROOT, "boards", t.idf + "-*.conf"))):
+        stem = os.path.basename(conf)[: -len(".conf")]
+        out.append((stem, board_label(t, stem)))
+    return out
+
+
+def host_model(name):
+    n = (name or "").strip().lower()
+    return {"esp32s3": "s3", "s3": "s3",
+            "esp32s31": "s31", "s31": "s31"}.get(n, n)
+
+
+def read_hosts():
+    """The (model, iface, address) rows of .espix/hosts, comments dropped."""
+    rows = []
+    try:
+        with open(HOSTS) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                parts = s.split()
+                if len(parts) >= 3:
+                    rows.append((host_model(parts[0]), parts[1], parts[2]))
+    except OSError:
+        pass
+    return rows
+
+
+def host_first(t, prefer=None):
+    """The most preferred address configured for a target, or ''."""
+    m = host_model(t.idf)
+    ifaces = [prefer] if prefer else list(HOST_IFACES)
+    for iface in ifaces:
+        for mm, ii, aa in read_hosts():
+            if mm == m and ii == iface:
+                return "%s %s" % (ii, aa)
+    return ""
+
+
+def list_hosts(only=None):
+    rows = read_hosts()
+    active = host_model(active_target().idf)
+    if only is not None:
+        rows = [r for r in rows if r[0] == only]
+    if not rows:
+        print("no addresses in %s" % HOSTS)
+        print("set one with: tools/espix host <model> <iface> <address>")
+        return 0
+    print("%s:" % HOSTS)
+    for m, i, a in rows:
+        mark = "*" if m == active else " "
+        print("  %s %-4s %-5s %s" % (mark, m, i, a))
+    return 0
+
+
+def host_set(model, iface, addr):
+    m = host_model(model)
+    os.makedirs(STATE, exist_ok=True)
+    try:
+        with open(HOSTS) as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    out, replaced = [], False
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#"):
+            parts = s.split()
+            if len(parts) >= 3 and host_model(parts[0]) == m and parts[1] == iface:
+                if not replaced and addr != "-":
+                    out.append("%s %s %s\n" % (m, iface, addr))
+                replaced = True
+                continue
+        out.append(line)
+    if not replaced and addr != "-":
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append("%s %s %s\n" % (m, iface, addr))
+    with open(HOSTS, "w") as f:
+        f.writelines(out)
+    return 0
+
+
+def host_init():
+    if os.path.exists(HOSTS):
+        print("%s already exists" % HOSTS)
+        return 0
+    try:
+        with open(os.path.join(ROOT, "tools", "hosts.example")) as f:
+            data = f.read()
+    except OSError:
+        data = ""
+    os.makedirs(STATE, exist_ok=True)
+    with open(HOSTS, "w") as f:
+        f.write(data)
+    print("created %s from tools/hosts.example" % HOSTS)
+    return 0
+
+
+def partition_table(t):
+    try:
+        with open(sdkconfig(t)) as f:
+            for line in f:
+                if line.startswith("CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        return None
+    return None
+
+
+def print_status():
+    t = active_target()
+    stem = active_board(t)
+    print("target:      %s (%s)%s" % (t.label, t.idf,
+                                     "  [preview]" if t.preview else ""))
+    print("status:      %s" % t.note)
+    print("board:       %s" % (stem or "default"))
+    print("             %s" % board_label(t, stem))
+    p = sdkconfig(t)
+    print("sdkconfig:   %s%s" % (p, "" if os.path.exists(p) else "  (not generated yet)"))
+    print("build dir:   %s" % build_dir(t))
+    addr = host_first(t)
+    print("host:        %s" % (addr if addr else "(none in .espix/hosts)"))
+    csv = partition_table(t)
+    if csv:
+        print("partitions:  %s" % csv)
+
+
+def run_idf(t, args):
+    env = dict(os.environ)
+    env["ESPIX_TARGET"] = t.idf
+    return subprocess.call([os.path.join(ROOT, "tools", "idf.sh")] + list(args),
+                           cwd=ROOT, env=env)
+
+
+def do_config(t):
+    if not t.available:
+        sys.stderr.write("espix: %s is planned, not buildable yet\n" % t.label)
+        return 1
+    return run_idf(t, ["menuconfig"])
+
+
+# ---------------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------------
+
+def _menu(stdscr, title, items):
+    import curses
+    sel = 0
+    while not items[sel][2]:
+        sel += 1
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, title, w - 1, curses.A_BOLD)
+        for i, (label, _value, enabled, note) in enumerate(items):
+            y = 2 + i
+            if y >= h - 1:
+                break
+            text = label + ("  - " + note if note else "")
+            if i == sel:
+                attr = curses.A_REVERSE
+            elif not enabled:
+                attr = curses.A_DIM
+            else:
+                attr = curses.A_NORMAL
+            stdscr.addnstr(y, 2, text, max(0, w - 3), attr)
+        stdscr.addnstr(h - 1, 0, "up/down move   enter select   q back",
+                       max(0, w - 1), curses.A_DIM)
+        stdscr.refresh()
+        c = stdscr.getch()
+        if c in (curses.KEY_UP, ord("k")):
+            for _ in range(len(items)):
+                sel = (sel - 1) % len(items)
+                if items[sel][2]:
+                    break
+        elif c in (curses.KEY_DOWN, ord("j")):
+            for _ in range(len(items)):
+                sel = (sel + 1) % len(items)
+                if items[sel][2]:
+                    break
+        elif c in (curses.KEY_ENTER, 10, 13):
+            if items[sel][2]:
+                return items[sel][1]
+        elif c in (ord("q"), 27):
+            return None
+
+
+def _run_in_place(stdscr, argv):
+    import curses
+    curses.def_prog_mode()
+    curses.endwin()
+    subprocess.call(argv, cwd=ROOT)
+    sys.stdout.write("\npress enter to return to espix setup")
+    sys.stdout.flush()
+    try:
+        sys.stdin.readline()
+    except KeyboardInterrupt:
+        pass
+    curses.reset_prog_mode()
+    stdscr.refresh()
+
+
+def _choose_target(stdscr):
+    items = [(t.label, t.idf, t.available, t.note) for t in TARGETS]
+    v = _menu(stdscr, "Target", items)
+    t = target_by(v) if v else None
+    if t:
+        set_active(t)
+
+
+def _choose_board(stdscr):
+    t = active_target()
+    items = [("default", "", True, t.default_board)]
+    for stem, label in discover_boards(t):
+        items.append((stem, stem, True, label))
+    v = _menu(stdscr, "Board / module", items)
+    if v is not None:
+        set_board(t, v)
+
+
+def _tui():
+    import curses
+
+    def inner(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        me = os.path.abspath(__file__)
+        while True:
+            t = active_target()
+            items = [
+                ("Target", "target", True,
+                 t.label + (" [preview]" if t.preview else "")),
+                ("Board / module", "board", t.available,
+                 board_label(t, active_board(t))),
+                ("Hosts (LAN addresses)", "hosts", True,
+                 host_first(t) or "none set"),
+                ("Configure options (menuconfig)", "config", t.available, ""),
+                ("Reset " + t.label + " to defaults", "reset", t.available, ""),
+                ("Status", "status", True, ""),
+                ("Quit", "quit", True, ""),
+            ]
+            v = _menu(stdscr, "espix setup", items)
+            if v in (None, "quit"):
+                return
+            if v == "target":
+                _choose_target(stdscr)
+            elif v == "board":
+                _choose_board(stdscr)
+            elif v == "hosts":
+                _run_in_place(stdscr, [sys.executable, me, "host"])
+            elif v == "config":
+                _run_in_place(stdscr,
+                              [os.path.join(ROOT, "tools", "idf.sh"), "menuconfig"])
+            elif v == "reset":
+                set_board(t, "")
+                forget_sdkconfig(t)
+                _run_in_place(stdscr, [sys.executable, me, "status"])
+            elif v == "status":
+                _run_in_place(stdscr, [sys.executable, me, "status"])
+
+    curses.wrapper(inner)
+
+
+# ---------------------------------------------------------------------------
+
+def usage():
+    print(__doc__.strip())
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "":
+        if sys.stdout.isatty() and sys.stdin.isatty():
+            _tui()
+        else:
+            usage()
+        return 0
+
+    if cmd in ("help", "-h", "--help"):
+        usage()
+        return 0
+
+    if cmd == "target":
+        if len(argv) > 2:
+            t = target_by(argv[2])
+            if t is None:
+                sys.stderr.write("espix: unknown target '%s'\n" % argv[2])
+                return 2
+            if not t.available:
+                sys.stderr.write("espix: %s is planned, not buildable yet\n" % t.label)
+                return 2
+            set_active(t)
+        print_status()
+        return 0
+
+    if cmd == "board":
+        t = active_target()
+        if len(argv) > 2:
+            stem = "" if argv[2] in ("default", "-") else argv[2]
+            if stem and not os.path.exists(os.path.join(ROOT, "boards", stem + ".conf")):
+                sys.stderr.write("espix: no boards/%s.conf\n" % stem)
+                return 2
+            set_board(t, stem)
+        # Always list, with the active one marked.
+        cur = active_board(t)
+        print("boards for %s:" % t.label)
+        for stem, label in [("", t.default_board)] + discover_boards(t):
+            print("  %s %-24s %s" % ("*" if stem == cur else " ", stem or "default", label))
+        return 0
+
+    if cmd == "host":
+        args = argv[2:]
+        if not args:
+            return list_hosts()
+        if args[0] in ("--init", "init"):
+            return host_init()
+        m = host_model(args[0])
+        if len(args) == 1:
+            return list_hosts(m)
+        if len(args) == 2:
+            for mm, ii, aa in read_hosts():
+                if mm == m and ii == args[1]:
+                    print(aa)
+                    return 0
+            return 1
+        host_set(m, args[1], args[2])
+        return list_hosts(m)
+
+    if cmd in ("config", "menuconfig"):
+        return do_config(active_target())
+
+    if cmd == "reset":
+        t = active_target()
+        set_board(t, "")
+        forget_sdkconfig(t)
+        print("espix: %s reset to defaults" % t.label)
+        print_status()
+        return 0
+
+    if cmd == "status":
+        print_status()
+        return 0
+
+    sys.stderr.write("espix: unknown command '%s'\n\n" % cmd)
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

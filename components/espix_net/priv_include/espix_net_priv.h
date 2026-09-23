@@ -45,6 +45,12 @@ esp_err_t espix_net_wifi_start(void);
 esp_err_t espix_net_usb_start(void);
 #endif
 
+/* eth.c: bring up eth0. Absent when CONFIG_ESPIX_ETH_ENABLED is off (and that
+ * option does not exist at all on a target without SOC_EMAC_SUPPORTED). */
+#if CONFIG_ESPIX_ETH_ENABLED
+esp_err_t espix_net_eth_start(void);
+#endif
+
 /* abi.c: publish the network syscall surface to loadable apps. */
 void espix_net_abi_register(void);
 

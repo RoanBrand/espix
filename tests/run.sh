@@ -28,6 +28,11 @@ ESPIX_ROOT="$(cd "$ESPIX_TEST_DIR/.." && pwd)"
 
 export ESPIX_ROOT
 
+# The active target, so a suite can be target-aware without each deriving it.
+ESPIX_TARGET=$(tr -d ' \t\r\n' < "$ESPIX_ROOT/.espix/active" 2>/dev/null || true)
+ESPIX_TARGET="${ESPIX_TARGET:-esp32s3}"
+export ESPIX_TARGET
+
 SUITE_FILTER=""
 : "${ESPIX_STRESS:=0}"
 : "${ESPIX_STRESS_N:=30}"
@@ -209,13 +214,16 @@ fi
 #
 # The build identity is the first CONFIG_APP_RETRIEVE_LEN_ELF_SHA (9) hex
 # characters of app_elf_sha256 in the app description -- 0xB0 into the image, so
-# it is readable from build/espix.bin with dd, no toolchain and no second build.
+# it is readable from build-<target>/espix.bin with dd, no toolchain and no
+# second build. The target is the active one, the same file the Makefile and
+# tools/idf.sh agree on; a bare build/ is a pre-multi-target leftover.
 # It is a content hash, and that is the point: `-dirty` is the same string for
 # every modified tree, so a rebuild-without-flash at the same commit could
 # compare equal on the describe alone. The SHA cannot collide that way, and
 # espix_build_id() reports exactly this string as `uname -v`.
 _local_build_id() {
-    local bin="$ESPIX_ROOT/build/espix.bin" sha
+    local target="${ESPIX_TARGET:-esp32s3}" bin sha
+    bin="$ESPIX_ROOT/build-$target/espix.bin"
     [ -f "$bin" ] || return 1
     sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null | od -An -tx1 -v |
           tr -d ' \n' | cut -c1-9)
@@ -249,7 +257,7 @@ _device_build_id() {
 check_build_matches() {
     local on_device on_disk
     on_disk=$(_local_build_id) || {
-        printf '  %s no build/espix.bin; cannot check what the board is running\n' \
+        printf '  %s no build-<target>/espix.bin; cannot check what the board is running\n' \
                "$(_espix_dim note:)"
         return 0
     }
@@ -673,7 +681,8 @@ if [ -s "$RUNDIR/watchdog.log" ]; then
     while IFS='|' read -r when n task running; do
         [ -n "$when" ] || continue
         printf '  %s  %s trigger(s), task %s, while running:%s\n' \
-               "$(date -r "$when" '+%H:%M:%S' 2>/dev/null || echo "$when")" \
+               "$(date -r "$when" '+%H:%M:%S' 2>/dev/null ||
+                  date -d "@$when" '+%H:%M:%S' 2>/dev/null || echo "$when")" \
                "$n" "${task:-unknown}" "$running"
         case "${task:-}" in app:*) ;; *) ours=1 ;; esac
     done < "$RUNDIR/watchdog.log"

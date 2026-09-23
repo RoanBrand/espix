@@ -28,7 +28,7 @@
 
 #include "esp_littlefs.h"
 
-#include "espix_partition_tables.h"
+#include "espix_pt_index.h"
 
 #define TAG       "loader"
 
@@ -161,6 +161,10 @@ static void banner(void)
  * to fill it. The tables differ only in storage's size, so this is a pure size
  * fix-up. It writes nothing until the new table has passed
  * esp_partition_table_verify(), and it restarts so the bootloader re-reads it.
+ *
+ * Which tables exist is the target's business (loader/main/CMakeLists.txt), and
+ * this picks the largest one that fits -- so the same code provisions an 8, 16
+ * or 32 MB S31, or an 8 or 16 MB S3, without naming a table per target.
  */
 static void provision(void)
 {
@@ -175,26 +179,31 @@ static void provision(void)
         return;                     /* the table already matches the flash */
     }
 
-    const unsigned char *table = espix_pt_8mb;
-    unsigned len = espix_pt_8mb_len;
-    if (flash >= 16u * 1024 * 1024) {
-        table = espix_pt_16mb;
-        len = espix_pt_16mb_len;
+    const espix_pt_entry_t *pt = NULL;
+    for (size_t i = 0; i < ESPIX_PT_TABLE_COUNT; i++) {
+        if (espix_pt_tables[i].bytes <= flash) {
+            pt = &espix_pt_tables[i];
+        }
+    }
+    if (pt == NULL) {
+        ESP_LOGW(TAG, "flash is %u MB, smaller than any table we carry; leaving it",
+                 (unsigned)(flash / (1024 * 1024)));
+        return;
     }
 
     int count = 0;
-    if (esp_partition_table_verify((const esp_partition_info_t *)table,
+    if (esp_partition_table_verify((const esp_partition_info_t *)pt->data,
                                    true, &count) != ESP_OK) {
         ESP_LOGE(TAG, "refusing to write a partition table that does not verify");
         return;
     }
 
     ESP_LOGW(TAG, "flash is %u MB; writing the %u-byte table to match",
-             (unsigned)(flash / (1024 * 1024)), len);
+             (unsigned)(flash / (1024 * 1024)), pt->len);
 
     const uint32_t off = 0x8000;    /* CONFIG_PARTITION_TABLE_OFFSET */
     if (esp_flash_erase_region(esp_flash_default_chip, off, 0x1000) != ESP_OK ||
-        esp_flash_write(esp_flash_default_chip, table, off, len) != ESP_OK) {
+        esp_flash_write(esp_flash_default_chip, pt->data, off, pt->len) != ESP_OK) {
         ESP_LOGE(TAG, "could not write the partition table; leaving it as it was");
         return;
     }
@@ -208,9 +217,9 @@ static void provision(void)
     }
     ESP_LOGW(TAG, "read back storage size 0x%02x%02x%02x%02x, wanted 0x%02x%02x%02x%02x",
              back[3], back[2], back[1], back[0],
-             table[203], table[202], table[201], table[200]);
-    if (back[0] != table[200] || back[1] != table[201] ||
-        back[2] != table[202] || back[3] != table[203]) {
+             pt->data[203], pt->data[202], pt->data[201], pt->data[200]);
+    if (back[0] != pt->data[200] || back[1] != pt->data[201] ||
+        back[2] != pt->data[202] || back[3] != pt->data[203]) {
         ESP_LOGE(TAG, "the partition table did not take; not restarting");
         return;
     }

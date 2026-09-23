@@ -249,8 +249,9 @@ do, and it needs no new on-device attack surface.
 
 For pushing a locally built image there is a second, arguably better route that
 needs no HTTP server and no new listener at all: the SSH session is already an
-authenticated, encrypted channel that espix owns. `make flash-ota` copies the
-image to the board and installs it:
+authenticated, encrypted channel that espix owns. `make flash-ota` finds the
+board in the gitignored `.espix/hosts`, copies the image over, installs it and
+reboots to run it:
 
     scp build/espix.bin esp@espix:/tmp/espix.bin
     ssh esp@espix 'sudo upgrade --file /tmp/espix.bin'
@@ -924,8 +925,17 @@ partition, which here is the *loader*, so it prints
 The kernel goes to `ota_1` (0x380000) and fits; the warning is aimed at the
 wrong slot and is harmless.
 
-The board identity follows from this: target and PSRAM size only (`s3-r8`), with
-flash size deliberately absent, because one image covers them all.
+The board identity follows from this: target and PSRAM, with flash size
+deliberately absent because one image covers them all. On the S3 the two PSRAM
+modes differ, so the name carries it (`s3-r8` octal, `s3-r2` quad); on the S31
+there is only one PSRAM mode and its size is detected at runtime, so the identity
+is plain `s31`, and one build serves every WROOM-3 module (the image targets
+that module's 16 MB flash).
+
+The S31's table also starts fresh, with no legacy to match: the loader takes
+320 KB, the kernel slot 3.5 MB, and `storage` begins at 0x3F0000 and fills the
+rest -- about 4 MB even on an 8 MB module. There are 8, 16 and 32 MB tables,
+differing only in `storage`'s size, exactly as the S3's pair does.
 
 **Two hashes live in the image, and they answer different questions:**
 
@@ -1043,16 +1053,19 @@ tag on a clean tree); the tag is deleted again if the build fails.
 One build now covers every flash size of a PSRAM config, so the assets are named
 for the model and what they are, not for the module:
 
-    espix-s3-ota.bin         the kernel, for remote updating
+    espix-s3-ota.bin         the kernel, for remote updating          (likewise s31)
     espix-s3-minimal.bin     first flash, no rootfs (the kernel provisions the FS)
     espix-s3-full.bin        first flash, with the stock apps
     espix-ota.json           one manifest, keyed by board identity
 
-The manifest is one file for every board. The device finds its own entry
-(`s3-r8`) and reads the `url` from it, so an asset name never has to encode the
-flash size, and adding a PSRAM variant later adds an entry rather than renaming
-anything. The default URL is
-`.../releases/latest/download/espix-ota.json`, so one release is enough.
+Each target's identity is an entry: the S3's is `s3-r8`/`s3-r2`, the S31's is
+`s31`. The device finds its own entry and reads the `url` from it, so an asset
+name never has to encode the flash size, and a new target adds an entry rather
+than renaming anything. release.sh merges every target's entry that is present in
+the tree (`tools/ota-merge.py`), rewriting the URL to the tag being released, so
+`make release` run once per target builds one release serving them all. The
+default URL is `.../releases/latest/download/espix-ota.json`, so one release is
+enough.
 
 The loader is not part of an OTA release. It is in both flash images, is flashed
 by cable, changes far less often than the kernel, and has its own version

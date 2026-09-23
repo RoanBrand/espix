@@ -1,8 +1,10 @@
-CONFIG_IDF_TARGET="esp32s3"
-# Built like the kernel, for the largest size; the loader provisions the table.
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+#
+# Target and partition table are per-target: see loader/sdkconfig.defaults.<target>.
+# This file is target-neutral, so one loader source serves every target; the
+# target comes from IDF_TARGET, which tools/idf.sh sets from .espix/active.
+# Built for the largest size, because the loader provisions the table.
+#
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s3-16mb.csv"
 #
 # Deliberately no PSRAM. The loader never needs it, and without it one loader
 # serves every module of a target regardless of PSRAM size or mode. It also

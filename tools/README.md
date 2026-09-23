@@ -2,6 +2,75 @@
 
 Host-side tooling.
 
+## espix
+
+Selects the target this tree builds for, and its board, and remembers them in
+`.espix/` (gitignored). Everything else -- `make build`, `tools/idf.sh` -- reads
+that. `tools/espix config` runs `idf.py menuconfig` for the selected target,
+`tools/espix host` shows and edits the LAN address map (below), `tools/espix
+reset` drops its saved `sdkconfig.<target>` and board, and `tools/espix status`
+prints what is selected.
+
+```bash
+tools/espix              # interactive menu: target, board, hosts, menuconfig, reset
+tools/espix target s31
+tools/espix status
+```
+
+Each target has its own `sdkconfig.<target>` and `build-<target>/`, so switching
+does not rebuild the other. S3 and S31 are listed; the P4 is listed as planned.
+
+## .espix/hosts (LAN addresses)
+
+Where each board is, for everything that reaches it over the network:
+`make flash-ota`, `tools/esp.sh`, and the test suite all resolve through it,
+so an address is written down once, not in each script. Gitignored, like the
+rest of `.espix/`.
+
+```
+# .espix/hosts -- <model> <iface> <address>
+s3   wifi 192.168.110.55
+s31  wifi 192.168.110.254
+s31  eth  192.168.110.203
+```
+
+`model` is `s3`/`s31` (`esp32s3`/`esp32s31` are accepted too). `iface` is
+free-form, but resolvers try `eth`, then `wifi`, then `usb`, probing TCP port
+22, so a board with a cable is used over it without being told. `ESPIX_HOST`
+overrides everything; `ESPIX_IFACE` pins one interface.
+
+```bash
+tools/espix host                           # list
+tools/espix host s31 eth 192.168.110.203   # set
+tools/espix host s31 eth -                 # remove
+tools/espix host --init                    # create from tools/hosts.example
+```
+
+A fresh checkout has no `.espix/hosts`; set it up before the first network
+command.
+
+## backup-flash.sh
+
+Dumps a board's whole SPI flash to `~/S31-backups/<target>-<mac>.bin`, before
+anything is written to it. The name is the chip's own MAC -- unique per board,
+and the same thing espix uses for the device's network name -- so two boards
+never collide. A `.txt` sidecar records the MAC, flash size, date and SHA-256,
+and the read is verified by a second pass. Override the directory with
+`ESPIX_BACKUP_DIR` and the speed with `BAUD`.
+
+```bash
+tools/espix target s31
+tools/backup-flash.sh                 # detect the port, or pass /dev/...
+```
+
+## ota-merge.py
+
+Merges the per-board `espix-ota.json` files `tools/ota-manifest.sh` writes into
+the one manifest a release publishes, rewriting each entry's `url` to the tag
+being released. `release.sh` runs it over `build-*/espix-ota.json`, so running
+`make release` once per target produces one release whose manifest serves all of
+them.
+
 ## build-apps.sh
 
 Builds every project under `apps/` and stages the ELFs into `fsroot/bin/`, so
@@ -170,7 +239,7 @@ argument, and the list it guards, are in
 [`components/espix_proc/abi_libc.c`](../components/espix_proc/abi_libc.c).
 
 ```bash
-python3 tools/check-abi.py --elf build/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm
+python3 tools/check-abi.py --elf build-esp32s3/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm
 ```
 
 ## Deploying an app

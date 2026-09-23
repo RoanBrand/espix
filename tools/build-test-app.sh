@@ -19,17 +19,24 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 app="$root/tests/app"
 stage_dir="$root/fsroot/home/esp"
 stage="$stage_dir/testapp"
-target="${IDF_TARGET:-esp32s3}"
+target="${IDF_TARGET:-}"
+if [ -z "$target" ]; then
+    target=$(head -n1 "$root/.espix/active" 2>/dev/null || true)
+fi
+target="${target:-esp32s3}"
 
 [ -f "$app/CMakeLists.txt" ] || { echo "build-test-app: no project at $app" >&2; exit 1; }
 
 mkdir -p "$stage_dir"
 
 # `idf.py elf` needs a Makefiles generator, which is what the apps use too.
-if [ ! -f "$app/sdkconfig" ]; then
+have=""
+[ -f "$app/sdkconfig" ] && have=$(grep '^CONFIG_IDF_TARGET=' "$app/sdkconfig" 2>/dev/null | head -1 | cut -d'"' -f2)
+if [ "$have" != "$target" ]; then
     # A build directory left by a failed configure is not a CMake build
     # directory yet, and set-target's implicit fullclean refuses to touch it --
-    # so first-configure has to start from nothing.
+    # so a (re)configure has to start from nothing. A stale target's config is
+    # the same situation for a different reason.
     rm -rf "$app/build"
     "$root/tools/idf.sh" -C "$app" -G 'Unix Makefiles' set-target "$target" \
         > "$app/build-test-app.log" 2>&1 \
