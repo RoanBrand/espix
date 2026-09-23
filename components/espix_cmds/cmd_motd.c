@@ -322,7 +322,7 @@ static void print_disks(motd_ctx_t *ctx)
  */
 static void fact_network(char *out, size_t len)
 {
-    espix_ifinfo_t ifs[5];
+    espix_ifinfo_t ifs[6];
     const size_t   n = espix_net_iflist(ifs, sizeof(ifs) / sizeof(ifs[0]));
 
     char def[ESPIX_IF_NAME_MAX] = "";

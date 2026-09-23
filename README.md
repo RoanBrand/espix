@@ -55,7 +55,7 @@ together.
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
 | Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
 | Networking | IPv4 routing and NAT | **yes** | `nat on <dev>` masquerades an inside interface out the default route; `ESPIX_NET_ROUTER` is on by default |
-| Networking | L2 bridging | **planned** | lwIP 802.1D, AP↔Ethernet only: 802.11's three-address frames make a station unusable as a bridge port |
+| Networking | L2 bridging | **yes** | `bridge add <port>` then reboot: `br0` owns the address, ports have none; AP↔Ethernet, never a station (802.11 three-address frames) |
 | Networking | DHCP server for the LAN | **partial** | the AP and `usb0` both serve; DNS is the uplink's resolver passed through, not a local one |
 | Networking | Isolation and firewall | **planned** | NAT is not a firewall; guest zones and port-forwards are later |
 | Networking | A VPN endpoint | **planned** | WireGuard-shaped, for the router case |

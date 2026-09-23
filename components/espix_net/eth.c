@@ -240,7 +240,23 @@ esp_err_t espix_net_eth_start(void)
     }
 #endif
 
-    const esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_inherent_config_t port_cfg;
+    if (espix_net_bridge_wants("eth0")) {
+        /*
+         * A bridge port carries frames and has no address of its own -- the
+         * bridge does. IDF's bridge example asks for flags=0 and no IP, and
+         * it is a creation-time choice, which is why membership needs a
+         * reboot. The cable and this netif never go away.
+         */
+        port_cfg               = (esp_netif_inherent_config_t)ESP_NETIF_INHERENT_DEFAULT_ETH();
+        port_cfg.flags         = 0;
+        port_cfg.ip_info       = NULL;
+        port_cfg.get_ip_event  = 0;
+        port_cfg.lost_ip_event = 0;
+        port_cfg.route_prio    = 0;
+        netif_cfg.base         = &port_cfg;
+    }
     s_netif = esp_netif_new(&netif_cfg);
     if (s_netif == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the netif");

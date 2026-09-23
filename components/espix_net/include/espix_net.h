@@ -35,6 +35,7 @@ typedef enum {
     ESPIX_IF_WIFI_AP,
     ESPIX_IF_ETH,
     ESPIX_IF_USB,
+    ESPIX_IF_BRIDGE,
 } espix_if_kind_t;
 
 typedef struct {
@@ -80,6 +81,20 @@ size_t    espix_net_dns(uint32_t *out, size_t n);
  */
 esp_err_t espix_net_napt(const char *name, bool enable);
 bool      espix_net_napt_enabled(const char *name);
+
+/*
+ * L2 bridge. br0 is created at boot from /etc/bridge.conf; these apply that
+ * configuration, report it, and edit it. `add`/`del`/`addr` are boot-time,
+ * like `usb mode`: a port must have been created as a port, so membership
+ * changes reboot rather than rebuild a live bridge.
+ */
+esp_err_t espix_net_bridge_apply(void);
+bool      espix_net_bridge_active(void);
+bool      espix_net_bridge_server(void);
+size_t    espix_net_bridge_portlist(char (*out)[ESPIX_IF_NAME_MAX], size_t n);
+esp_err_t espix_net_bridge_conf_add(const char *port);
+esp_err_t espix_net_bridge_conf_del(const char *port);
+esp_err_t espix_net_bridge_conf_addr(bool server);
 
 const char *espix_net_hostname(void);
 

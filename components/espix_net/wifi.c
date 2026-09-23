@@ -17,6 +17,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_defaults.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
@@ -234,7 +235,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
          * or becomes it when it gets its address (the AP's prio is 10, below
          * Ethernet's 50 and the station's 100, so it never wins).
          */
-        if (s_ap != NULL) {
+        if (s_ap != NULL && !espix_net_bridge_wants("wlan1")) {
             /* Through the espix helper, so the status view agrees with lwIP. */
 #if CONFIG_LWIP_IPV4_NAPT
             if (espix_net_napt("wlan1", true) == ESP_OK) {
@@ -594,7 +595,24 @@ esp_err_t espix_net_wifi_ap_start(const char *ssid, const char *psk,
     }
 
     if (s_ap == NULL) {
-        s_ap = esp_netif_create_default_wifi_ap();
+        if (espix_net_bridge_wants("wlan1")) {
+            /*
+             * A bridge port: no address, no DHCP server, no NAT -- br0 owns
+             * all of that. Same creation-time rule as eth0.
+             */
+            esp_netif_inherent_config_t base =
+                (esp_netif_inherent_config_t)ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
+            base.flags         = ESP_NETIF_FLAG_AUTOUP;
+            base.ip_info       = NULL;
+            base.get_ip_event  = 0;
+            base.lost_ip_event = 0;
+            s_ap = esp_netif_create_wifi(WIFI_IF_AP, &base);
+            if (s_ap != NULL) {
+                ESP_ERROR_CHECK(esp_wifi_set_default_wifi_ap_handlers());
+            }
+        } else {
+            s_ap = esp_netif_create_default_wifi_ap();
+        }
         if (s_ap == NULL) {
             return ESP_FAIL;
         }

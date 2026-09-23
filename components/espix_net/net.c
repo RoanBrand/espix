@@ -425,6 +425,12 @@ esp_err_t espix_net_init(void)
     }
 #endif
 
+    /*
+     * After every interface, because it can only bridge ones that exist; the
+     * configuration decided which of them were created as ports.
+     */
+    (void)espix_net_bridge_apply();
+
     return ESP_OK;
 }
 

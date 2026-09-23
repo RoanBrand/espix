@@ -20,7 +20,7 @@
 #include "espix_shell.h"
 #include "sdkconfig.h"
 
-#define IFLIST_MAX 5
+#define IFLIST_MAX 6
 #define SCAN_MAX   24
 
 /* ------------------------------------------------------------------ */
@@ -743,6 +743,83 @@ static int cmd_nat(espix_session_t *s, int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * The bridge is setup, not a hot-plug: membership is fixed when the port
+ * netifs are created, so these edit /etc/bridge.conf and say so.
+ */
+static int cmd_bridge(espix_session_t *s, int argc, char **argv)
+{
+    const char *sub = (argc > 1) ? argv[1] : "show";
+
+    if (strcmp(sub, "add") == 0 || strcmp(sub, "del") == 0) {
+        if (argc < 3) {
+            espix_eprintf(s, "usage: bridge {add|del} <port>\n");
+            return 1;
+        }
+        const char *port = argv[2];
+        if (strcmp(port, "wlan0") == 0) {
+            espix_eprintf(s, "bridge: wlan0 is the station; 802.11 frames carry three\n");
+            espix_eprintf(s, "        addresses, and a bridge needs the fourth -- it cannot\n");
+            espix_eprintf(s, "        be a port. A station uplink uses the L2 forwarder.\n");
+            return 1;
+        }
+        const esp_err_t err = (sub[0] == 'a')
+                                  ? espix_net_bridge_conf_add(port)
+                                  : espix_net_bridge_conf_del(port);
+        if (err != ESP_OK) {
+            espix_eprintf(s, "bridge: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "bridge: %s %s; takes effect after reboot\n", sub, port);
+        return 0;
+    }
+
+    if (strcmp(sub, "addr") == 0) {
+        if (argc < 3 ||
+            (strcmp(argv[2], "client") != 0 && strcmp(argv[2], "server") != 0)) {
+            espix_eprintf(s, "usage: bridge addr {client|server}\n");
+            return 1;
+        }
+        const bool server = strcmp(argv[2], "server") == 0;
+        if (espix_net_bridge_conf_addr(server) != ESP_OK) {
+            espix_eprintf(s, "bridge: cannot write /etc/bridge.conf\n");
+            return 1;
+        }
+        espix_printf(s, "bridge: address %s; takes effect after reboot\n", argv[2]);
+        return 0;
+    }
+
+    if (strcmp(sub, "show") != 0) {
+        espix_eprintf(s, "usage: bridge {show|add|del <port>|addr {client|server}}\n");
+        return 1;
+    }
+
+    if (!espix_net_bridge_active()) {
+        espix_printf(s, "br0: not up (no ports in /etc/bridge.conf)\n");
+        return 0;
+    }
+
+    espix_printf(s, "br0: address %s\n",
+                 espix_net_bridge_server() ? "server" : "client");
+
+    espix_ifinfo_t br;
+    if (espix_net_ifinfo("br0", &br) == ESP_OK && br.has_addr) {
+        char ip[ESPIX_IP4STR_MAX];
+        espix_printf(s, "ip:      %s/%d\n",
+                     espix_net_ip4str(br.ip, ip, sizeof(ip)),
+                     espix_net_prefix_len(br.netmask));
+    }
+
+    char ports[IFLIST_MAX][ESPIX_IF_NAME_MAX];
+    const size_t n = espix_net_bridge_portlist(ports, IFLIST_MAX);
+    espix_printf(s, "ports:  ");
+    for (size_t i = 0; i < n; i++) {
+        espix_printf(s, " %s", ports[i]);
+    }
+    espix_printf(s, "\n");
+    return 0;
+}
+
 static espix_cmd_t s_net_cmds[] = {
     { .name = "ip",       .fn = cmd_ip,
       .help = "show addresses, links and routes",
@@ -759,6 +836,9 @@ static espix_cmd_t s_net_cmds[] = {
     { .name = "nat",      .fn = cmd_nat,
       .help = "masquerade an interface behind the default route",
       .usage = "nat [status] | nat {on|off} <dev>" },
+    { .name = "bridge",   .fn = cmd_bridge,
+      .help = "show or configure the L2 bridge (br0)",
+      .usage = "bridge {show|add|del <port>|addr {client|server}}" },
     { .name = "wifi",     .fn = cmd_wifi,
       .help = "scan, connect and inspect the WiFi station",
       .usage = "wifi {scan|connect|disconnect|status|ap ...}" },

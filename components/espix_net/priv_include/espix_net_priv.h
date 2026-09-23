@@ -14,7 +14,7 @@ extern "C" {
  * create the underlying netif, so names are deterministic rather than
  * discovered. `lo` is synthesised and has no netif.
  */
-#define ESPIX_IF_MAX 5
+#define ESPIX_IF_MAX 6
 
 typedef struct {
     char            name[ESPIX_IF_NAME_MAX];
@@ -39,6 +39,9 @@ const char *espix_net_name_of(esp_netif_t *netif);
 
 /* wifi.c */
 esp_err_t espix_net_wifi_start(void);
+
+/* bridge.c: is `name` configured as a bridge port? Used at netif creation time. */
+bool espix_net_bridge_wants(const char *name);
 
 /* usb_ncm.c: bring up usb0. Absent when CONFIG_ESPIX_USB_NCM_ENABLED is off,
  * so callers guard on it rather than relying on a stub. */

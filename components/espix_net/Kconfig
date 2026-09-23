@@ -241,4 +241,24 @@ menu "espix networking"
             Off removes lwIP's forwarding and NAT code and hides the `nat`
             command: espix is then a host, not a router.
 
+    #
+    # L2 bridging. Ports carry frames and have no address of their own; br0
+    # does, exactly as br-lan does on Linux.
+    #
+    config ESPIX_NET_BRIDGE
+        bool "L2 bridging (br0)"
+        select ESP_NETIF_BRIDGE_EN
+        default y
+        help
+            Bridges Ethernet and the access point into one L2 segment, with
+            br0 owning the address and, if asked, the DHCP server. List the
+            ports in /etc/bridge.conf (or `bridge add <port>`) and reboot:
+            a bridge port is created as a port, so membership is a boot-time
+            choice rather than a hot-plug.
+
+            The station (wlan0) can never be a port: 802.11 frames carry
+            three addresses, not the four a bridge needs to carry both peer
+            addresses across the link. A station uplink uses the L2
+            forwarder instead.
+
 endmenu
