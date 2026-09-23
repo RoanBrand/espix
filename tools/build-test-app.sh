@@ -19,7 +19,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 app="$root/tests/app"
 stage_dir="$root/fsroot/home/esp"
 stage="$stage_dir/testapp"
-target="${IDF_TARGET:-}"
+target="${IDF_TARGET:-${ESPIX_TARGET:-}}"
 if [ -z "$target" ]; then
     target=$(head -n1 "$root/.espix/active" 2>/dev/null || true)
 fi

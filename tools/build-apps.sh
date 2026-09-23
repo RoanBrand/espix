@@ -35,7 +35,7 @@ idf=("$root/tools/idf.sh")
 
 # The target comes from the environment when the firmware build calls this
 # (tools/idf.sh exports IDF_TARGET), and from .espix/active when run by hand.
-target="${IDF_TARGET:-}"
+target="${IDF_TARGET:-${ESPIX_TARGET:-}}"
 if [ -z "$target" ]; then
     target=$(head -n1 "$root/.espix/active" 2>/dev/null || true)
 fi

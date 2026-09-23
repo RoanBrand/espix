@@ -159,6 +159,9 @@ if [ "${1:-}" = "--env" ]; then
     printf 'ESPIX_PYTHON=%s\n' "$espix_python"
     printf 'IDF_VERSION=%s\n' "$(idf_version "$espix_idf_path")"
     printf 'ESPIX_TARGET=%s\n' "$espix_env_target"
+    # Exported, so a caller's child processes (build-apps.sh during a release,
+    # for one) build for the same target rather than falling back to active.
+    printf 'export IDF_TARGET=%s\n' "$espix_env_target"
     printf 'ESPIX_BUILD=%s\n' "$espix_root_dir/build-$espix_env_target"
     printf 'ESPIX_SDKCONFIG=%s\n' "$espix_root_dir/sdkconfig.$espix_env_target"
     printf 'ESPIX_LOADER_BUILD=%s\n' "$espix_root_dir/loader/build-$espix_env_target"
