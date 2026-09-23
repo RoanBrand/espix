@@ -10,15 +10,19 @@
 # the SHA-256, and the read is verified by a second pass over the flash.
 #
 #   ESPIX_BACKUP_DIR   where to write (default: ~/S31-backups)
-#   BAUD               serial speed (default 460800)
+#   BAUD               serial speed (default 230400; 460800+ drops packets on
+#                      the USB-UART bridge, and a whole-chip read is long)
 #
 # Reads the active target from .espix/active; run `tools/espix target s31`
-# first. esptool on a preview target gets --no-stub.
+# first. Reads through esptool's stub -- much faster than the ROM-only --no-stub
+# path -- and the read is verified at this speed before the file is kept.
 
 set -eu
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+. "$root/tests/lib/portable.sh"   # espix_sha256, for either spelling
+
 outdir="${ESPIX_BACKUP_DIR:-$HOME/S31-backups}"
 baud="${BAUD:-230400}"
 
@@ -62,7 +66,7 @@ printf 'backup: verifying (a second pass over the flash)...\n'
 "$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" \
     verify-flash 0 "$image"
 
-sha="$(shasum -a 256 "$image" | awk '{print $1}')"
+sha="$(espix_sha256 "$image")"
 {
     printf 'file:    %s\n' "$image"
     printf 'chip:    %s\n' "$target"

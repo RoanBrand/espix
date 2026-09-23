@@ -71,6 +71,11 @@ espix_host_candidates() {  # <model> [iface]
 
 # Reachable on TCP 22? If no probe tool exists, say yes so the first configured
 # address is used rather than none.
+#
+# Two spellings, because the *connect* timeout is what matters and the flag is
+# not the same everywhere: macOS nc needs -G (plain -w bounds only the idle read,
+# so a black-holed address hangs north of a minute), while GNU/OpenBSD nc has no
+# -G and bounds the connect with -w. Try each.
 espix_host_up() {  # <address>
     if command -v nc >/dev/null 2>&1; then
         nc -z -G 2 -w 2 "$1" 22 >/dev/null 2>&1 && return 0
@@ -102,7 +107,7 @@ espix_host_set() {  # <model> <iface> <address>
     tmp="$ESPIX_HOSTS_FILE.tmp.$$"
     if [ -f "$ESPIX_HOSTS_FILE" ]; then
         awk -v m="$m" -v i="$2" \
-            '!(/^[[:space:]]*#/ == 0 && NF >= 3 && $1 == m && $2 == i) { print }' \
+            '/^[[:space:]]*#/ { print; next } NF < 3 || $1 != m || $2 != i { print }' \
             "$ESPIX_HOSTS_FILE" > "$tmp" || return 1
     fi
     if [ "$3" != "-" ]; then

@@ -673,7 +673,8 @@ if [ -s "$RUNDIR/watchdog.log" ]; then
     while IFS='|' read -r when n task running; do
         [ -n "$when" ] || continue
         printf '  %s  %s trigger(s), task %s, while running:%s\n' \
-               "$(date -r "$when" '+%H:%M:%S' 2>/dev/null || echo "$when")" \
+               "$(date -r "$when" '+%H:%M:%S' 2>/dev/null ||
+                  date -d "@$when" '+%H:%M:%S' 2>/dev/null || echo "$when")" \
                "$n" "${task:-unknown}" "$running"
         case "${task:-}" in app:*) ;; *) ours=1 ;; esac
     done < "$RUNDIR/watchdog.log"

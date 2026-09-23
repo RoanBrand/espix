@@ -30,6 +30,8 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+. "$root/tests/lib/portable.sh"   # espix_sha256, for either spelling
+
 if [ "$#" -eq 2 ]; then
     build="$2"
 else
@@ -62,11 +64,7 @@ ver=$(tr -d ' \t\r\n' < "$root/version.txt")
 sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null |
       od -An -tx1 -v | tr -d ' \n' | cut -c1-9)
 
-if command -v sha256sum >/dev/null 2>&1; then
-    img_sha=$(sha256sum "$bin" | awk '{print $1}')
-else
-    img_sha=$(shasum -a 256 "$bin" | awk '{print $1}')
-fi
+img_sha="$(espix_sha256 "$bin")"
 
 if [ -z "$ver" ] || [ -z "$sha" ]; then
     printf 'ota-manifest: could not read version.txt or the app descriptor\n' >&2
