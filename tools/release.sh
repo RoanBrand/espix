@@ -82,6 +82,11 @@ board=$(sed -n 's/^#define ESPIX_BOARD "\(.*\)"$/\1/p' "$header" | head -1)
 [ -n "$board" ] || die "no ESPIX_BOARD in $header; did the build fail?"
 model=$(printf '%s' "$board" | cut -d- -f1)
 kmodel=$(sed -n 's/^#define CONFIG_IDF_TARGET "\(.*\)"$/\1/p' "$build/config/sdkconfig.h" | head -1)
+
+# The S31 reserves its first two flash sectors, so its bootloader lands at
+# 0x2000 in a merged image too; the image is still written at offset 0.
+boot_off=0x0
+[ "$kmodel" = esp32s31 ] && boot_off=0x2000
 printf 'release: board %s\n' "$board"
 
 # Assets are filed by board and target, so a release can hold several without
@@ -145,13 +150,13 @@ merge() {
 }
 printf 'release: merging flash images\n'
 merge "$minimal" \
-    "0x0"    "$build/bootloader/bootloader.bin" \
+    "$boot_off" "$build/bootloader/bootloader.bin" \
     "0x8000" "$build/partition_table/partition-table.bin" \
     "0xf000" "$build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$loader" \
     "$(off_of ota_1)" "$build/espix.bin"
 merge "$full" \
-    "0x0"    "$build/bootloader/bootloader.bin" \
+    "$boot_off" "$build/bootloader/bootloader.bin" \
     "0x8000" "$build/partition_table/partition-table.bin" \
     "0xf000" "$build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$loader" \

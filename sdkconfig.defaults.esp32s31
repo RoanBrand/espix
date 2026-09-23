@@ -1,23 +1,26 @@
-# espix — ESP32-S31 with in-package PSRAM (WROOM-3: 16 MB flash, 16 MB PSRAM).
+# espix — ESP32-S31 with in-package PSRAM (WROOM-3: 16 MB flash, 8/16 MB PSRAM).
 #
-# One build covers every S31 module. The PSRAM is always octal and always
-# 250 MHz (there is no mode or speed to choose), and IDF detects its size at
-# runtime, so there is no compile-time difference between a 16 MB and a 32 MB
-# part -- which is why the board identity is plain `s31`, with no PSRAM suffix.
-# Flash size is not part of the identity either: the loader provisions the table
-# for the flash it finds, so one image spans 8, 16 and 32 MB modules.
+# The PSRAM is always octal and always 250 MHz (there is no mode or speed to
+# choose), and IDF detects its size at runtime, so there is no compile-time
+# difference between the PSRAM variants -- which is why the board identity is
+# plain `s31`, with no PSRAM suffix. The image is built for the WROOM-3's 16 MB
+# flash; the loader provisions the partition table for whatever flash it finds,
+# from the 8, 16 and 32 MB tables it carries.
 
 CONFIG_IDF_TARGET="esp32s31"
 
 #
 # Flash
 #
-# Built for the largest we target so the flash is addressable to the top, and
-# flashed with the smallest table (8 MB), which is valid on any larger chip. The
-# loader writes the table that matches the physical flash. See docs/OTA.md 11.
-CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+# The WROOM-3 is a 16 MB part, and IDF puts the flash size in the image header and
+# refuses to probe a chip larger than it. The image is still flashed with the
+# smallest table (8 MB), which is valid on any larger chip; the loader writes the
+# table that matches the physical flash. See docs/OTA.md 11.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s31-8mb.csv"
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+# DIO, IDF's own default for this target (the S3 uses QIO).
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 #
@@ -28,11 +31,11 @@ CONFIG_SPIRAM_SPEED_250M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
-#
-# Load relocated ELF text/data into PSRAM. The S31 moves firmware into PSRAM at
-# boot (SPIRAM_XIP_FROM_PSRAM is an S31 feature), so the same option the S3 uses
-# applies here. There is no bus-address mirror to rely on as on the S3; the
-# elf_loader handles the target itself.
+# XIP-from-PSRAM is inherited from the target-independent defaults (it is what
+# closes the flash-cache crash documented there).
+# Load relocated ELF text/data into PSRAM (this is the elf_loader, not XIP).
+# There is no bus-address mirror to rely on as on the S3; the component
+# handles the target itself.
 #
 CONFIG_ELF_LOADER_LOAD_PSRAM=y
 

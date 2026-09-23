@@ -928,7 +928,8 @@ The board identity follows from this: target and PSRAM, with flash size
 deliberately absent because one image covers them all. On the S3 the two PSRAM
 modes differ, so the name carries it (`s3-r8` octal, `s3-r2` quad); on the S31
 there is only one PSRAM mode and its size is detected at runtime, so the identity
-is plain `s31` and one build serves every module.
+is plain `s31`, and one build serves every WROOM-3 module (the image targets
+that module's 16 MB flash).
 
 The S31's table also starts fresh, with no legacy to match: the loader takes
 320 KB, the kernel slot 3.5 MB, and `storage` begins at 0x3F0000 and fills the

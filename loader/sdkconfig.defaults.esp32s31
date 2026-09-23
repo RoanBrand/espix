@@ -1,4 +1,12 @@
-# ESP32-S31 loader: built for the largest supported flash (32 MB); the loader
-# provisions the table for the flash it finds, so one loader serves every module.
-CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s31-32mb.csv"
+# ESP32-S31 loader: the WROOM-3 is a 16 MB part (see sdkconfig.defaults.esp32s31).
+# The loader provisions the table for the flash it finds, so one loader serves
+# every module of that size.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions/esp32s31-16mb.csv"
+
+# PSRAM on, unlike the S3 loader: on the S31, a loader built with SPIRAM=n
+# leaves the in-package PSRAM uninitialised, and the kernel booted after its
+# soft reset then fails with "PSRAM chip is not connected". Initialising it
+# here (the same as any app) makes the hand-off work.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_250M=y
