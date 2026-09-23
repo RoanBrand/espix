@@ -239,7 +239,7 @@ argument, and the list it guards, are in
 [`components/espix_proc/abi_libc.c`](../components/espix_proc/abi_libc.c).
 
 ```bash
-python3 tools/check-abi.py --elf build/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm
+python3 tools/check-abi.py --elf build-esp32s3/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm
 ```
 
 ## Deploying an app
