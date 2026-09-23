@@ -24,7 +24,7 @@ together.
 
 ## Capabilities
 
-<sub>Run on ESP32-S3N16R8 with ESP-IDF v6.1; the ESP32-S31 builds (a preview target)</sub>
+<sub>Run on ESP32-S3N16R8 and ESP32-S31 (WROOM-3) with ESP-IDF v6.1; the ESP32-P4 is planned</sub>
 
 | Category | | | |
 |---|---|---|---|
@@ -52,7 +52,7 @@ together.
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
-| Networking | Ethernet | **partial** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route); builds, hardware not yet; the S3 has no wired peripheral |
+| Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
 | Networking | IP routing, NAT and bridging | **planned** | `route` exists; forwarding and NAT do not — a router built from an ESP32 |
 | Networking | DHCP server and DNS for the LAN | **planned** | an app-side resolver already exists to build on |
 | Networking | A VPN endpoint | **planned** | WireGuard-shaped, for the router case |
@@ -66,7 +66,7 @@ together.
 
 ## Targets
 
-| | **S3** — verified | **P4** — planned | **S31** — builds |
+| | **S3** — verified | **P4** — planned | **S31** — verified |
 |---|---|---|---|
 | ISA | Xtensa | RISC-V | RISC-V |
 | MMU | none | address translation and RISC-V PMP | a real one — a Linux BSP exists |
@@ -75,7 +75,7 @@ together.
 | Radio | WiFi | none built in — companion chip needed | WiFi |
 | Wired | — | 100M Ethernet | Gigabit Ethernet |
 | Display | parallel RGB and i8080, through `LCD_CAM` | MIPI DSI, plus RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; no MIPI, and weaker than the P4 |
-| Runs today | **yes** | no | **builds** (hardware pending) |
+| Runs today | **yes** | no | **yes** |
 
 The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),
 which is also where the one build option hardware decides today is explained.

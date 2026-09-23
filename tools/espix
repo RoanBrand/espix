@@ -51,7 +51,7 @@ TARGETS = [
            "default - N16R8 (16 MB flash, 8 MB octal PSRAM)", "verified"),
     Target("esp32s31", "s31", "S31", True, True,
            "default - WROOM-3 (8/16/32 MB flash, 16/32 MB PSRAM)",
-           "build-verified"),
+           "verified"),
     Target("esp32p4", "p4", "P4", False, False, "", "planned"),
 ]
 
