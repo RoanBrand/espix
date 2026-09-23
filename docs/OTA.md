@@ -249,8 +249,9 @@ do, and it needs no new on-device attack surface.
 
 For pushing a locally built image there is a second, arguably better route that
 needs no HTTP server and no new listener at all: the SSH session is already an
-authenticated, encrypted channel that espix owns. `make flash-ota` copies the
-image to the board and installs it:
+authenticated, encrypted channel that espix owns. `make flash-ota` finds the
+board in the gitignored `.espix/hosts`, copies the image over, installs it and
+reboots to run it:
 
     scp build/espix.bin esp@espix:/tmp/espix.bin
     ssh esp@espix 'sudo upgrade --file /tmp/espix.bin'

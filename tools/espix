@@ -6,6 +6,8 @@ options that go with it.
   tools/espix                    interactive menu
   tools/espix target [TARGET]    show or set the target (s3, s31)
   tools/espix board [BOARD]      show or set the board for the active target
+  tools/espix host [MODEL [IFACE [ADDR]]]
+                                 show or set LAN addresses (.espix/hosts)
   tools/espix config             run idf.py menuconfig for it
   tools/espix reset              forget this target's saved options and board
   tools/espix status             print what is selected and where it lives
@@ -28,6 +30,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(ROOT, ".espix")
+HOSTS = os.path.join(STATE, "hosts")
+HOST_IFACES = ("eth", "wifi", "usb")
 DEFAULT_TARGET = "esp32s3"
 
 
@@ -149,6 +153,100 @@ def discover_boards(t):
     return out
 
 
+def host_model(name):
+    n = (name or "").strip().lower()
+    return {"esp32s3": "s3", "s3": "s3",
+            "esp32s31": "s31", "s31": "s31"}.get(n, n)
+
+
+def read_hosts():
+    """The (model, iface, address) rows of .espix/hosts, comments dropped."""
+    rows = []
+    try:
+        with open(HOSTS) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                parts = s.split()
+                if len(parts) >= 3:
+                    rows.append((host_model(parts[0]), parts[1], parts[2]))
+    except OSError:
+        pass
+    return rows
+
+
+def host_first(t, prefer=None):
+    """The most preferred address configured for a target, or ''."""
+    m = host_model(t.idf)
+    ifaces = [prefer] if prefer else list(HOST_IFACES)
+    for iface in ifaces:
+        for mm, ii, aa in read_hosts():
+            if mm == m and ii == iface:
+                return "%s %s" % (ii, aa)
+    return ""
+
+
+def list_hosts(only=None):
+    rows = read_hosts()
+    active = host_model(active_target().idf)
+    if only is not None:
+        rows = [r for r in rows if r[0] == only]
+    if not rows:
+        print("no addresses in %s" % HOSTS)
+        print("set one with: tools/espix host <model> <iface> <address>")
+        return 0
+    print("%s:" % HOSTS)
+    for m, i, a in rows:
+        mark = "*" if m == active else " "
+        print("  %s %-4s %-5s %s" % (mark, m, i, a))
+    return 0
+
+
+def host_set(model, iface, addr):
+    m = host_model(model)
+    os.makedirs(STATE, exist_ok=True)
+    try:
+        with open(HOSTS) as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    out, replaced = [], False
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#"):
+            parts = s.split()
+            if len(parts) >= 3 and host_model(parts[0]) == m and parts[1] == iface:
+                if not replaced and addr != "-":
+                    out.append("%s %s %s\n" % (m, iface, addr))
+                replaced = True
+                continue
+        out.append(line)
+    if not replaced and addr != "-":
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append("%s %s %s\n" % (m, iface, addr))
+    with open(HOSTS, "w") as f:
+        f.writelines(out)
+    return 0
+
+
+def host_init():
+    if os.path.exists(HOSTS):
+        print("%s already exists" % HOSTS)
+        return 0
+    try:
+        with open(os.path.join(ROOT, "tools", "hosts.example")) as f:
+            data = f.read()
+    except OSError:
+        data = ""
+    os.makedirs(STATE, exist_ok=True)
+    with open(HOSTS, "w") as f:
+        f.write(data)
+    print("created %s from tools/hosts.example" % HOSTS)
+    return 0
+
+
 def partition_table(t):
     try:
         with open(sdkconfig(t)) as f:
@@ -171,6 +269,8 @@ def print_status():
     p = sdkconfig(t)
     print("sdkconfig:   %s%s" % (p, "" if os.path.exists(p) else "  (not generated yet)"))
     print("build dir:   %s" % build_dir(t))
+    addr = host_first(t)
+    print("host:        %s" % (addr if addr else "(none in .espix/hosts)"))
     csv = partition_table(t)
     if csv:
         print("partitions:  %s" % csv)
@@ -283,6 +383,8 @@ def _tui():
                  t.label + (" [preview]" if t.preview else "")),
                 ("Board / module", "board", t.available,
                  board_label(t, active_board(t))),
+                ("Hosts (LAN addresses)", "hosts", True,
+                 host_first(t) or "none set"),
                 ("Configure options (menuconfig)", "config", t.available, ""),
                 ("Reset " + t.label + " to defaults", "reset", t.available, ""),
                 ("Status", "status", True, ""),
@@ -295,6 +397,8 @@ def _tui():
                 _choose_target(stdscr)
             elif v == "board":
                 _choose_board(stdscr)
+            elif v == "hosts":
+                _run_in_place(stdscr, [sys.executable, me, "host"])
             elif v == "config":
                 _run_in_place(stdscr,
                               [os.path.join(ROOT, "tools", "idf.sh"), "menuconfig"])
@@ -354,6 +458,24 @@ def main(argv):
         for stem, label in [("", t.default_board)] + discover_boards(t):
             print("  %s %-24s %s" % ("*" if stem == cur else " ", stem or "default", label))
         return 0
+
+    if cmd == "host":
+        args = argv[2:]
+        if not args:
+            return list_hosts()
+        if args[0] in ("--init", "init"):
+            return host_init()
+        m = host_model(args[0])
+        if len(args) == 1:
+            return list_hosts(m)
+        if len(args) == 2:
+            for mm, ii, aa in read_hosts():
+                if mm == m and ii == args[1]:
+                    print(aa)
+                    return 0
+            return 1
+        host_set(m, args[1], args[2])
+        return list_hosts(m)
 
     if cmd in ("config", "menuconfig"):
         return do_config(active_target())

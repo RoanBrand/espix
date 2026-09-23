@@ -7,17 +7,47 @@ Host-side tooling.
 Selects the target this tree builds for, and its board, and remembers them in
 `.espix/` (gitignored). Everything else -- `make build`, `tools/idf.sh` -- reads
 that. `tools/espix config` runs `idf.py menuconfig` for the selected target,
-`tools/espix reset` drops its saved `sdkconfig.<target>` and board, and
-`tools/espix status` prints what is selected.
+`tools/espix host` shows and edits the LAN address map (below), `tools/espix
+reset` drops its saved `sdkconfig.<target>` and board, and `tools/espix status`
+prints what is selected.
 
 ```bash
-tools/espix              # interactive menu: target, board, menuconfig, reset
+tools/espix              # interactive menu: target, board, hosts, menuconfig, reset
 tools/espix target s31
 tools/espix status
 ```
 
 Each target has its own `sdkconfig.<target>` and `build-<target>/`, so switching
 does not rebuild the other. S3 and S31 are listed; the P4 is listed as planned.
+
+## .espix/hosts (LAN addresses)
+
+Where each board is, for everything that reaches it over the network:
+`make flash-ota`, `tools/esp.sh`, and the test suite all resolve through it,
+so an address is written down once, not in each script. Gitignored, like the
+rest of `.espix/`.
+
+```
+# .espix/hosts -- <model> <iface> <address>
+s3   wifi 192.168.110.55
+s31  wifi 192.168.110.254
+s31  eth  192.168.110.203
+```
+
+`model` is `s3`/`s31` (`esp32s3`/`esp32s31` are accepted too). `iface` is
+free-form, but resolvers try `eth`, then `wifi`, then `usb`, probing TCP port
+22, so a board with a cable is used over it without being told. `ESPIX_HOST`
+overrides everything; `ESPIX_IFACE` pins one interface.
+
+```bash
+tools/espix host                           # list
+tools/espix host s31 eth 192.168.110.203   # set
+tools/espix host s31 eth -                 # remove
+tools/espix host --init                    # create from tools/hosts.example
+```
+
+A fresh checkout has no `.espix/hosts`; set it up before the first network
+command.
 
 ## backup-flash.sh
 

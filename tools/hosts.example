@@ -1,0 +1,9 @@
+# Copy to .espix/hosts (or run: tools/espix host --init) and fill in.
+#
+#   <model> <iface> <address>
+#
+# model:  s3, s31 (esp32s3/esp32s31 also accepted)
+# iface:  eth, wifi, usb   -- resolvers try eth, then wifi, then usb
+s3   wifi 192.168.110.55
+s31  wifi 192.168.110.254
+s31  eth  192.168.110.203

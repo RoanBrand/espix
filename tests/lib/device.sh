@@ -1,6 +1,18 @@
 # Talking to the device: one long-lived SSH session, one-shot commands for
 # exit statuses, file transfer, and the health check that runs between suites.
-
+#
+# Where the board is: an explicit ESPIX_HOST wins; otherwise the gitignored
+# .espix/hosts for this target (tools/espix host), preferring a live cable to
+# WiFi. The historical default is the last resort, so a fresh checkout with no
+# .espix/hosts still has somewhere to point.
+if [ -z "${ESPIX_HOST:-}" ]; then
+    _espix_hosts_lib="${ESPIX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/tools/hosts.sh"
+    if [ -f "$_espix_hosts_lib" ]; then
+        # shellcheck source=/dev/null
+        . "$_espix_hosts_lib"
+        ESPIX_HOST="$(espix_host_pick "$(espix_hosts_target)" || true)"
+    fi
+fi
 : "${ESPIX_HOST:=192.168.110.55}"
 : "${ESPIX_USER:=esp}"
 : "${ESPIX_PASS:=espix}"

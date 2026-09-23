@@ -163,8 +163,12 @@ From the device:
 
 From the development machine, with no cable at all:
 
-    make flash-ota           # build, copy the image over SSH, install it
-    tools/esp.sh reboot      # then start it
+    make flash-ota           # build, push over SSH, reboot, wait for it back
+
+It finds the board from the gitignored `.espix/hosts` (below), preferring a
+live cable to WiFi, so the update goes over Ethernet when one is plugged in.
+`ESPIX_HOST=1.2.3.4` skips the lookup and `ESPIX_NO_REBOOT=1` stops after
+queueing it.
 
 The update source is `ota.url` in `/etc/espix.conf`, defaulting to espix's GitHub
 release page. A release publishes `espix-ota.json` (the manifest,

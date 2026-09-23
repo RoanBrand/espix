@@ -12,6 +12,7 @@
 #   make flash-monitor    flash, then attach with the only reset (to see the loader)
 #   make flash-fs         rootfs image -- REPLACES the filesystem (alias: fs)
 #   make flash-all        everything, in the order a first boot needs
+#   make flash-ota        firmware over the network (SSH), not the cable
 #   make release          tag, build and publish a GitHub release
 #   make monitor          attach, without resetting the board
 #   make monitor-reset    attach, resetting first (to catch boot output)
@@ -26,6 +27,7 @@
 #   make clean            fullclean, firmware and apps
 #
 # PORT= overrides serial port detection. IDF_PATH= overrides SDK discovery.
+# ESPIX_HOST= overrides the board address for network commands (tools/espix host).
 
 SHELL := /bin/bash
 IDF   := ./tools/idf.sh
@@ -63,7 +65,7 @@ endif
 all: build
 
 help:
-	@sed -n '3,25p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,27p' Makefile | sed 's/^# \{0,1\}//'
 
 menu:
 	./tools/espix
@@ -168,8 +170,9 @@ fs: flash-fs
 flash-all: flash flash-fs
 
 # Push the firmware over the network instead of the UART cable: copy it to the
-# board, put it in /boot and queue it for the loader, over SSH. Needs the board
-# already on the network and its SSH reachable. See tools/flash-ota.sh.
+# board, put it in /boot, queue it for the loader, reboot and wait for it back,
+# over SSH. The address comes from .espix/hosts (tools/espix host); the board
+# must be on the network with SSH reachable. See tools/flash-ota.sh.
 flash-ota: build
 	./tools/flash-ota.sh
 
