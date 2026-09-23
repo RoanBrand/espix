@@ -1,6 +1,7 @@
 /*
  * Bluetooth, espix-shaped: a native layer over esp_bt with the names
- * bluetoothctl uses on Linux. Phase 1 is the S31 (Classic + BLE).
+ * bluetoothctl uses on Linux. Phase 1 is the S31 (Classic + BLE), with the
+ * A2DP source as the audio output.
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -13,19 +14,30 @@
 
 #define TAG      "bt"
 #define DEV_MAX  32
+#define PCM_BUF  (32 * 1024)
 
 #if CONFIG_ESPIX_BT
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/stream_buffer.h"
+#include "esp_heap_caps.h"
+
 #include "esp_bt.h"
 #include "esp_bt_main.h"
-#include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
+#include "esp_a2dp_api.h"
+#include "esp_a2dp_legacy_api.h"
 
 static espix_bt_dev_t s_devs[DEV_MAX];
 static size_t         s_dev_count;
 static bool           s_inited;
 static bool           s_scanning;
 static char           s_pin[ESPIX_BT_PIN_MAX] = "0000";
+
+static StreamBufferHandle_t s_pcm;        /* decoded PCM, waiting for the stack */
+static StaticStreamBuffer_t s_pcm_cb;     /* its control block (internal RAM) */
+static uint8_t             *s_pcm_storage;/* its storage (PSRAM) */
+static bool                 s_a2d_connected;
 
 static int dev_find(const uint8_t bda[ESPIX_BDA_LEN])
 {
@@ -53,7 +65,6 @@ static void dev_upsert(const uint8_t bda[ESPIX_BDA_LEN], const char *name)
     }
 }
 
-/* Fold the bonded list into the discovered one, so 'devices' shows both. */
 static void mark_bonded(void)
 {
     esp_bd_addr_t list[DEV_MAX];
@@ -76,6 +87,8 @@ static void mark_bonded(void)
         }
     }
 }
+
+/* ---- GAP: discovery, pairing ---- */
 
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
@@ -134,6 +147,55 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     }
 }
 
+/* ---- A2DP source ---- */
+
+/*
+ * The stack pulls PCM here, in the SBC frame size it needs; the play command
+ * fills the buffer. An empty buffer yields silence rather than a stall, so a
+ * connected speaker does not decide the link is dead between tracks.
+ */
+static int32_t a2d_data_cb(uint8_t *data, int32_t len)
+{
+    if (data == NULL || len <= 0) {
+        return 0;
+    }
+    const size_t got = xStreamBufferReceive(s_pcm, data, (size_t)len, 0);
+    if (got < (size_t)len) {
+        memset(data + got, 0, (size_t)len - got);
+    }
+    return len;
+}
+
+static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_A2D_CONNECTION_STATE_EVT: {
+        const esp_a2d_connection_state_t st = param->conn_stat.state;
+        const int i = dev_find((const uint8_t *)param->conn_stat.remote_bda);
+        if (i >= 0) {
+            s_devs[i].connected = (st == ESP_A2D_CONNECTION_STATE_CONNECTED);
+        }
+        if (st == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            s_a2d_connected = true;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connected; checking source");
+            (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+        } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            s_a2d_connected = false;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp disconnected");
+        }
+        break;
+    }
+    case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+        if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
+            param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 esp_err_t espix_bt_init(void)
 {
     if (s_inited) {
@@ -162,13 +224,39 @@ esp_err_t espix_bt_init(void)
     (void)esp_bt_gap_set_device_name(CONFIG_ESPIX_BT_NAME);
     (void)esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
+    /*
+     * PSRAM for the PCM: 32 KB of contiguous internal RAM is not there once
+     * Bluetooth, WiFi and Ethernet have taken theirs, and PSRAM is where
+     * audio belongs on this chip anyway.
+     */
+    s_pcm_storage = heap_caps_malloc(PCM_BUF, MALLOC_CAP_SPIRAM);
+    if (s_pcm_storage == NULL) {
+        s_pcm_storage = malloc(PCM_BUF);
+    }
+    if (s_pcm_storage == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "no PCM buffer");
+        return ESP_ERR_NO_MEM;
+    }
+    s_pcm = xStreamBufferCreateStatic(PCM_BUF, 1, s_pcm_storage, &s_pcm_cb);
+    if (s_pcm == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    (void)esp_a2d_register_callback(a2d_cb);
+    (void)esp_a2d_source_register_data_callback(a2d_data_cb);
+    err = esp_a2d_source_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
     s_inited = true;
-    espix_klog(ESPIX_KLOG_INFO, TAG, "up as '%s'", CONFIG_ESPIX_BT_NAME);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "up as '%s' (a2dp source)", CONFIG_ESPIX_BT_NAME);
     return ESP_OK;
 }
 
-bool espix_bt_ready(void)    { return s_inited; }
-bool espix_bt_scanning(void) { return s_scanning; }
+bool espix_bt_ready(void)         { return s_inited; }
+bool espix_bt_scanning(void)      { return s_scanning; }
+bool espix_bt_a2d_connected(void) { return s_a2d_connected; }
 
 esp_err_t espix_bt_scan(bool on)
 {
@@ -176,7 +264,7 @@ esp_err_t espix_bt_scan(bool on)
         return ESP_ERR_INVALID_STATE;
     }
     if (on) {
-        s_dev_count = 0;        /* a fresh inquiry is a fresh list */
+        s_dev_count = 0;
         return esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 0x30, 0);
     }
     return esp_bt_gap_cancel_discovery();
@@ -207,6 +295,52 @@ esp_err_t espix_bt_info(const uint8_t bda[ESPIX_BDA_LEN], espix_bt_dev_t *out)
     return ESP_OK;
 }
 
+/* For a speaker, pairing and connecting are the same act: bonding follows the
+ * A2DP link. pair exists because bluetoothctl has it and people reach for it. */
+esp_err_t espix_bt_pair(const uint8_t bda[ESPIX_BDA_LEN])
+{
+    return espix_bt_connect(bda);
+}
+
+esp_err_t espix_bt_connect(const uint8_t bda[ESPIX_BDA_LEN])
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    dev_upsert(bda, NULL);
+    return esp_a2d_source_connect((uint8_t *)bda);
+}
+
+esp_err_t espix_bt_disconnect(const uint8_t bda[ESPIX_BDA_LEN])
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_a2d_source_disconnect((uint8_t *)bda);
+}
+
+esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN])
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t err = esp_bt_gap_remove_bond_device((uint8_t *)bda);
+    const int i = dev_find(bda);
+    if (i >= 0 && err == ESP_OK) {
+        s_devs[i].bonded = false;
+    }
+    return err;
+}
+
+esp_err_t espix_bt_audio_write(const void *pcm, size_t len)
+{
+    if (!s_inited || s_pcm == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const size_t sent = xStreamBufferSend(s_pcm, pcm, len, 0);
+    return sent == len ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 esp_err_t espix_bt_set_pin(const char *pin)
 {
     if (pin == NULL || strlen(pin) > ESPIX_BT_PIN_MAX - 1) {
@@ -223,10 +357,16 @@ const char *espix_bt_pin(void) { return s_pin; }
 esp_err_t espix_bt_init(void)                 { return ESP_ERR_NOT_SUPPORTED; }
 bool      espix_bt_ready(void)                { return false; }
 bool      espix_bt_scanning(void)             { return false; }
+bool      espix_bt_a2d_connected(void)        { return false; }
 esp_err_t espix_bt_scan(bool on)              { (void)on; return ESP_ERR_NOT_SUPPORTED; }
 size_t    espix_bt_devices(espix_bt_dev_t *o, size_t n) { (void)o; (void)n; return 0; }
 esp_err_t espix_bt_info(const uint8_t b[ESPIX_BDA_LEN], espix_bt_dev_t *o)
                                               { (void)b; (void)o; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_pair(const uint8_t b[ESPIX_BDA_LEN])       { (void)b; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_connect(const uint8_t b[ESPIX_BDA_LEN])    { (void)b; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_disconnect(const uint8_t b[ESPIX_BDA_LEN]) { (void)b; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_remove(const uint8_t b[ESPIX_BDA_LEN])     { (void)b; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_audio_write(const void *p, size_t n)       { (void)p; (void)n; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_set_pin(const char *p)     { (void)p; return ESP_ERR_NOT_SUPPORTED; }
 const char *espix_bt_pin(void)                { return ""; }
 

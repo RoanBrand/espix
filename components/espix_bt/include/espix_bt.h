@@ -39,6 +39,21 @@ esp_err_t espix_bt_scan(bool on);
 size_t    espix_bt_devices(espix_bt_dev_t *out, size_t n);
 esp_err_t espix_bt_info(const uint8_t bda[ESPIX_BDA_LEN], espix_bt_dev_t *out);
 
+/* Pairing and connection. Phase 1 is A2DP source, so pair/connect both mean
+ * "bring up the audio link" (bonding follows from it). */
+esp_err_t espix_bt_pair(const uint8_t bda[ESPIX_BDA_LEN]);
+esp_err_t espix_bt_connect(const uint8_t bda[ESPIX_BDA_LEN]);
+esp_err_t espix_bt_disconnect(const uint8_t bda[ESPIX_BDA_LEN]);
+esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN]);
+bool      espix_bt_a2d_connected(void);
+
+/*
+ * PCM for the source to send: 44.1 kHz, stereo, signed 16-bit, as A2DP's SBC
+ * encoder expects. `play` decodes into this; the stack pulls it on its own
+ * callback. Short writes are the caller's to retry.
+ */
+esp_err_t espix_bt_audio_write(const void *pcm, size_t len);
+
 /*
  * Pairing policy, for now: a PIN for legacy pairing, and auto-accept for SSP
  * (the "just works" passkey). An interactive agent is later.
