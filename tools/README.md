@@ -67,9 +67,9 @@ tools/backup-flash.sh                 # detect the port, or pass /dev/...
 
 Merges the per-board `espix-ota.json` files `tools/ota-manifest.sh` writes into
 the one manifest a release publishes, rewriting each entry's `url` to the tag
-being released. `release.sh` runs it over `build-*/espix-ota.json`, so running
-`make release` once per target produces one release whose manifest serves all of
-them.
+being released. `release.sh` runs it over `build-*/espix-ota.json`, so `make release-all` (or
+`make release` once per target) produces one release whose manifest serves all
+of them.
 
 ## build-apps.sh
 

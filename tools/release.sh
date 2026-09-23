@@ -49,10 +49,15 @@ sdkconfig="$ESPIX_SDKCONFIG"
 loader_build="$ESPIX_LOADER_BUILD"
 printf 'release: target %s\n' "$ESPIX_TARGET"
 
-case "$(git -C "$root" status --porcelain)" in
-    "") ;;
-    *) die "working tree is dirty; commit first -- a release is the tagged commit" ;;
-esac
+# dependencies.lock carries a per-target `target:` field that IDF 6.1 ignores,
+# so building one target dirties it for the next. That is not a source change
+# and must not block a release -- release-all builds several in a row.
+dirty=$(git -C "$root" status --porcelain | grep -v 'dependencies\.lock$' || true)
+if [ -n "$dirty" ]; then
+    printf 'release: working tree is dirty; commit first -- a release is the tagged commit:\n' >&2
+    printf '%s\n' "$dirty" >&2
+    exit 1
+fi
 
 # A tag for this version either does not exist yet (a new release) or points at
 # HEAD (adding a board to one). Anything else means version.txt was not bumped.
@@ -164,34 +169,10 @@ merge "$full" \
     "$(off_of storage)" "$factory_fs"
 
 notes="$build/release-notes.md"
-cat > "$notes" <<EOF
-espix $ver
-
-Flashing a board for the first time
------------------------------------
-
-Download espix-$model-minimal.bin and write it at offset 0:
-
-    esptool.py --chip $kmodel -p <port> write_flash 0x0 espix-$model-minimal.bin
-
-That is the whole system, and it makes its own filesystem on first boot. It has
-no stock apps in /bin; take espix-$model-full.bin instead if you want those.
-
-  espix-$model-minimal.bin   bootloader, partition table, kernel, loader -- smallest
-  espix-$model-full.bin      the same plus the stock apps; reflashes everything
-  espix-$model-ota.bin       the kernel, for remote updating
-
-The rootfs in the full image holds only the stock applications; a development
-tree's test app and local configuration are never packaged. Flashing it replaces
-whatever is on the device.
-
-Updating an espix already on the network
-----------------------------------------
-
-    sudo upgrade
-
-It reads espix-ota.json from this release.
-EOF
+# One set of notes for the whole release, generated from the merged manifest, so
+# a later run that adds a board regenerates them to cover it (see the release
+# edit below).
+"$ESPIX_PYTHON" "$root/tools/release-notes.py" "$manifest" "$ver" > "$notes"
 
 trap - ERR
 
@@ -202,7 +183,9 @@ assets="$img $manifest $minimal $full"
 if [ "$dry" = 1 ]; then
     printf 'release: dry run; would push %s and publish:\n' "$tag"
     for a in $assets; do printf '  %10s  %s\n' "$(wc -c < "$a")" "$a"; done
-    printf 'release: local tag %s is left in place; delete it to retry\n' "$tag"
+    printf 'release: notes:\n\n'
+    cat "$notes"
+    printf '\nrelease: local tag %s is left in place; delete it to retry\n' "$tag"
     exit 0
 fi
 
@@ -211,6 +194,9 @@ git -C "$root" push origin "$tag"
 
 if gh release view "$tag" --repo "$slug" >/dev/null 2>&1; then
     printf 'release: adding to the existing release\n'
+    # Regenerate the body too: a later run's merged manifest may cover boards the
+    # first run did not, and upload alone leaves the notes describing one.
+    gh release edit "$tag" --repo "$slug" --notes-file "$notes"
     gh release upload "$tag" --repo "$slug" --clobber $assets
 else
     printf 'release: creating the GitHub release\n'

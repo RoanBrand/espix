@@ -1062,10 +1062,13 @@ Each target's identity is an entry: the S3's is `s3-r8`/`s3-r2`, the S31's is
 `s31`. The device finds its own entry and reads the `url` from it, so an asset
 name never has to encode the flash size, and a new target adds an entry rather
 than renaming anything. release.sh merges every target's entry that is present in
-the tree (`tools/ota-merge.py`), rewriting the URL to the tag being released, so
-`make release` run once per target builds one release serving them all. The
-default URL is `.../releases/latest/download/espix-ota.json`, so one release is
-enough.
+the tree (`tools/ota-merge.py`), rewriting the URL to the tag being released.
+`make release-all` loops the targets and is the usual way to cut one; `make
+release` does the active target alone, and running it once per target reaches the
+same release. The body is regenerated from the merged manifest
+(`tools/release-notes.py`) on every run, including a refresh, so a release that
+gains a board also gains that board's notes. The default URL is
+`.../releases/latest/download/espix-ota.json`, so one release is enough.
 
 The loader is not part of an OTA release. It is in both flash images, is flashed
 by cable, changes far less often than the kernel, and has its own version

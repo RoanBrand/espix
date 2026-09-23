@@ -115,7 +115,8 @@ make flash-fs       # the rootfs image -- REPLACES what is on the device
 make flash-all      # both, in the order a first boot needs
 make monitor        # attach without resetting
 make test           # the test suite -- see tests/README.md
-make release        # tag, build and publish a GitHub release
+make release        # tag, build and publish one target's GitHub release
+make release-all    # every target, one release with combined notes
 ```
 
 **Those write different things.** `make flash` writes the firmware -- the

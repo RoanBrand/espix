@@ -13,7 +13,8 @@
 #   make flash-fs         rootfs image -- REPLACES the filesystem (alias: fs)
 #   make flash-all        everything, in the order a first boot needs
 #   make flash-ota        firmware over the network (SSH), not the cable
-#   make release          tag, build and publish a GitHub release
+#   make release          tag, build and publish one target's GitHub release
+#   make release-all      every target, one release with combined notes
 #   make monitor          attach, without resetting the board
 #   make monitor-reset    attach, resetting first (to catch boot output)
 #   make coredump         decode the core dump left by the last panic
@@ -63,13 +64,13 @@ else
 endif
 
 .PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
-        release monitor monitor-reset coredump apps test-app test test-panic \
+        release release-all monitor monitor-reset coredump apps test-app test test-panic \
         stress clean help
 
 all: build
 
 help:
-	@sed -n '3,27p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,28p' Makefile | sed 's/^# \{0,1\}//'
 
 menu:
 	./tools/espix
@@ -182,6 +183,11 @@ flash-ota: build
 
 # Tag v<version.txt>, build it as a release, and publish the image and manifest
 # to GitHub. The tree must be clean; commit first. See tools/release.sh.
+# Build every target and publish one release serving all of them, with one
+# set of notes covering every board. See tools/release-all.sh.
+release-all:
+	./tools/release-all.sh $(if $(DRY_RUN),--dry-run,)
+
 release:
 	./tools/release.sh $(if $(DRY_RUN),--dry-run,)
 
