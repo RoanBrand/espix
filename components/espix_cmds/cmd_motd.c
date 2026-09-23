@@ -213,22 +213,35 @@ static void fact_storage(char *out, size_t len)
              (unsigned)(fs.total_bytes / 1024));
 }
 
-/* First interface carrying an address. `lo` always has one and never says
- * anything useful, so it is skipped. */
+/*
+ * The interface carrying off-link traffic, so the row agrees with `ip route`
+ * -- `eth0` when a cable is live even though `wlan0` registered first. A link
+ * with no router (usb0 in server mode) has no default route, so fall back to
+ * the first interface carrying an address; `lo` always has one and never says
+ * anything useful, so it is skipped.
+ */
 static void fact_network(char *out, size_t len)
 {
     espix_ifinfo_t ifs[4];
     const size_t   n = espix_net_iflist(ifs, sizeof(ifs) / sizeof(ifs[0]));
 
-    for (size_t i = 0; i < n; i++) {
-        if (ifs[i].kind == ESPIX_IF_LO || !ifs[i].has_addr || !ifs[i].up) {
-            continue;
+    char def[ESPIX_IF_NAME_MAX] = "";
+    const bool have_def = espix_net_default_route(def, sizeof(def), NULL);
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < n; i++) {
+            if (ifs[i].kind == ESPIX_IF_LO || !ifs[i].has_addr || !ifs[i].up) {
+                continue;
+            }
+            if (pass == 0 && (!have_def || strcmp(ifs[i].name, def) != 0)) {
+                continue;
+            }
+            char ip[ESPIX_IP4STR_MAX];
+            snprintf(out, len, "%s %s/%d", ifs[i].name,
+                     espix_net_ip4str(ifs[i].ip, ip, sizeof(ip)),
+                     espix_net_prefix_len(ifs[i].netmask));
+            return;
         }
-        char ip[ESPIX_IP4STR_MAX];
-        snprintf(out, len, "%s %s/%d", ifs[i].name,
-                 espix_net_ip4str(ifs[i].ip, ip, sizeof(ip)),
-                 espix_net_prefix_len(ifs[i].netmask));
-        return;
     }
 
     strlcpy(out, "not connected", len);
