@@ -29,8 +29,12 @@
 # PORT= overrides serial port detection. IDF_PATH= overrides SDK discovery.
 # ESPIX_HOST= overrides the board address for network commands (tools/espix host).
 
+# ESPIX_TARGET is what makes `TARGET=` a real override: tools/idf.sh reads
+# that variable, not TARGET. Without it the two disagree -- the Makefile would
+# flash build-<TARGET>/ while idf.sh rebuilt the active target's tree. Recursive
+# on purpose, so it sees a TARGET given later on the command line.
 SHELL := /bin/bash
-IDF   := ./tools/idf.sh
+IDF   = ESPIX_TARGET=$(TARGET) ./tools/idf.sh
 
 # The target this tree is configured for, and the build directory and sdkconfig
 # it implies. tools/espix writes .espix/active and tools/idf.sh reads the same
