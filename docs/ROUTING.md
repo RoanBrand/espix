@@ -57,3 +57,15 @@ addresses itself.
 - **NAT is not a firewall.** Guest isolation and port-forwards are not here yet.
 - Bridging puts the AP's clients on your LAN's L2; NAT isolates them. Choose per
   AP.
+
+## L2 forwarder (planned, not built)
+
+The one thing layer-2 bridging cannot carry is a WiFi **station**: 802.11
+frames have three addresses, not four. The opt-in alternative is a 1-1
+forwarder (IDF's `sta2eth`): relay raw frames between `wlan0` and one wired
+port (`eth0` or `usb0`), rewriting MACs so the AP sees a single device.
+
+It is deliberately last. It uses internal APIs (`esp_wifi_internal_tx`) and
+promiscuous mode, it serves exactly one downstream client, and espix is not
+reachable as itself on that uplink while it runs. NAT covers the same "give a
+wired device WiFi" job today, with a double-NAT in the path.
