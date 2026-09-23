@@ -243,7 +243,9 @@ espix_expect=""
 for espix_a in "$@"; do
     if [ "$espix_expect" = project ]; then
         case "$espix_a" in
+            "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
             loader|./loader|"$espix_root_dir/loader") espix_project=loader ;;
+            *) espix_project=other ;;
         esac
         espix_expect=""
         continue
@@ -256,6 +258,18 @@ for espix_a in "$@"; do
     case "$espix_a" in
         -C|--project-dir) espix_expect=project ;;
         -Cloader|--project-dir=loader) espix_project=loader ;;
+        --project-dir=*)
+            case "${espix_a#--project-dir=}" in
+                loader) espix_project=loader ;;
+                "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
+                *) espix_project=other ;;
+            esac ;;
+        -C*)
+            case "${espix_a#-C}" in
+                loader) espix_project=loader ;;
+                "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
+                *) espix_project=other ;;
+            esac ;;
         -B|--build-dir) espix_has_build=1 ;;
         -B*) espix_has_build=1 ;;
         -D|--define) espix_expect=define ;;
