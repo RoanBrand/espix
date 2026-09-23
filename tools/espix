@@ -110,6 +110,11 @@ def forget_sdkconfig(t):
 
 
 def set_board(t, stem):
+    # Re-selecting the current board changes nothing; without this, opening
+    # the menu and leaving the board alone would still delete the sdkconfig
+    # and force a full reconfigure.
+    if stem == active_board(t):
+        return
     os.makedirs(STATE, exist_ok=True)
     if stem:
         with open(board_file(t), "w") as f:
@@ -256,7 +261,7 @@ def _choose_target(stdscr):
 
 def _choose_board(stdscr):
     t = active_target()
-    items = [("", "default", True, t.default_board)]
+    items = [("default", "", True, t.default_board)]
     for stem, label in discover_boards(t):
         items.append((stem, stem, True, label))
     v = _menu(stdscr, "Board / module", items)

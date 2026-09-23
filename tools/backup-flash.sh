@@ -20,14 +20,11 @@ set -eu
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 outdir="${ESPIX_BACKUP_DIR:-$HOME/S31-backups}"
-baud="${BAUD:-460800}"
+baud="${BAUD:-230400}"
 
 target="$(tr -d ' \t\r\n' < "$root/.espix/active" 2>/dev/null || true)"
 target="${target:-esp32s3}"
-case "$target" in
-    esp32s31) preview="--no-stub" ;;
-    *)        preview="" ;;
-esac
+preview=""
 
 if [ "$#" -ge 1 ]; then
     port="$1"
@@ -43,14 +40,14 @@ py="${ESPIX_PYTHON:-python3}"
 
 mkdir -p "$outdir"
 
-read_mac="$("$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" read_mac 2>&1)"
-mac="$(printf '%s\n' "$read_mac" | sed -n 's/^MAC: //p' | head -1 | tr -d ':')"
+read_mac="$("$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" read-mac 2>&1)"
+mac="$(printf '%s\n' "$read_mac" | sed -n 's/^MAC:[[:space:]]*//p' | head -1 | tr -d ' \r\n:')"
 if [ -z "$mac" ]; then
     printf 'backup: no MAC came back; esptool said:\n%s\n' "$read_mac" >&2
     exit 1
 fi
 
-flash_id="$("$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" flash_id 2>&1)"
+flash_id="$("$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" flash-id 2>&1)"
 size="$(printf '%s\n' "$flash_id" | sed -n 's/^Detected flash size: //p' | head -1)"
 [ -n "$size" ] || size="16MB"
 
@@ -59,11 +56,11 @@ image="$base.bin"
 
 printf 'backup: %s, %s -> %s\n' "$target" "$size" "$image"
 "$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" \
-    read_flash 0 "${size%MB}M" "$image"
+    read-flash 0 "${size%MB}M" "$image"
 
 printf 'backup: verifying (a second pass over the flash)...\n'
 "$py" -m esptool --chip "$target" $preview -p "$port" -b "$baud" \
-    verify_flash 0 "$image"
+    verify-flash 0 "$image"
 
 sha="$(shasum -a 256 "$image" | awk '{print $1}')"
 {
