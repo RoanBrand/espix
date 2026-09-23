@@ -236,17 +236,18 @@ fi
 # Which project is this? The firmware is the root project; the loader is its own
 # under loader/; anything else (an app, the test app) manages its own build
 # directory and sdkconfig, and only needs the target.
-espix_project=main
+#
+# The project directory is the -C/--project-dir argument when there is one, and
+# the working directory otherwise -- build-apps.sh cds into the app and calls
+# idf.sh with no -C at all, so looking only at the arguments sent every app
+# build into the firmware's build directory and sdkconfig.
+espix_project_dir="$PWD"
 espix_has_build=0
 espix_has_sdkconfig=0
 espix_expect=""
 for espix_a in "$@"; do
     if [ "$espix_expect" = project ]; then
-        case "$espix_a" in
-            "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
-            loader|./loader|"$espix_root_dir/loader") espix_project=loader ;;
-            *) espix_project=other ;;
-        esac
+        espix_project_dir="$espix_a"
         espix_expect=""
         continue
     fi
@@ -257,25 +258,23 @@ for espix_a in "$@"; do
     fi
     case "$espix_a" in
         -C|--project-dir) espix_expect=project ;;
-        -Cloader|--project-dir=loader) espix_project=loader ;;
-        --project-dir=*)
-            case "${espix_a#--project-dir=}" in
-                loader) espix_project=loader ;;
-                "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
-                *) espix_project=other ;;
-            esac ;;
-        -C*)
-            case "${espix_a#-C}" in
-                loader) espix_project=loader ;;
-                "$espix_root_dir"|"$espix_root_dir/"|.|./|"") espix_project=main ;;
-                *) espix_project=other ;;
-            esac ;;
+        -Cloader|--project-dir=loader) espix_project_dir="$espix_root_dir/loader" ;;
+        --project-dir=*) espix_project_dir="${espix_a#--project-dir=}" ;;
+        -C*) espix_project_dir="${espix_a#-C}" ;;
         -B|--build-dir) espix_has_build=1 ;;
         -B*) espix_has_build=1 ;;
         -D|--define) espix_expect=define ;;
         -DSDKCONFIG=*|SDKCONFIG=*) espix_has_sdkconfig=1 ;;
     esac
 done
+
+espix_project_real=$(cd "$espix_project_dir" 2>/dev/null && pwd) \
+    || espix_project_real="$espix_project_dir"
+case "$espix_project_real" in
+    "$espix_root_dir")        espix_project=main ;;
+    "$espix_root_dir/loader") espix_project=loader ;;
+    *)                        espix_project=other ;;
+esac
 
 if [ "$espix_project" = main ]; then
     espix_build_dir="$espix_root_dir/build-$espix_target"

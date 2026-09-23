@@ -44,13 +44,7 @@ target="${target:-esp32s3}"
 mkdir -p "$stage_dir"
 
 # Staged ELFs are not target-neutral: an S31 image cannot load an S3 binary.
-# Remember which target staged them and rebuild rather than call a foreign one
-# up to date.
-stamp="$stage_dir/.espix-target"
-staged_target=""
-[ -f "$stamp" ] && staged_target=$(head -n1 "$stamp" 2>/dev/null || true)
-force=0
-[ "$staged_target" = "$target" ] || force=1
+# Each app's stamp names the target that staged *it*, checked per app below.
 
 # Named apps, or everything that looks like a project.
 if [ $# -gt 0 ]; then
@@ -69,8 +63,24 @@ for name in "${names[@]}"; do
         exit 1
     fi
 
+    # An app may name the targets it supports, one per line; neopixel needs an
+    # Arduino variant the S31 does not have, so it is S3-only. Skipping it, and
+    # clearing a binary staged for another target, keeps an image from carrying
+    # an app the board cannot load.
+    if [ -f "$app/targets" ] && ! grep -qx "$target" "$app/targets"; then
+        rm -f "$stage_dir/$name" "$stage_dir/.espix-target-$name"
+        echo "build-apps: $name: not for $target (apps/$name/targets)"
+        continue
+    fi
+
     staged="$stage_dir/$name"
     elf="$app/build/$name.app.elf"
+    stamp="$stage_dir/.espix-target-$name"
+
+    # The target that staged *this* app. One shared stamp used to let an app
+    # built for a new target mark every foreign binary current.
+    force=1
+    [ -f "$stamp" ] && [ "$(head -n1 "$stamp" 2>/dev/null || true)" = "$target" ] && force=0
 
     # Skip when the staged binary is newer than every source that feeds it.
     # Without this, every firmware build pays for an app build that has nothing
