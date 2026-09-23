@@ -38,8 +38,21 @@ execute_process(
     OUTPUT_VARIABLE espix_git_describe OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET)
 
+# dependencies.lock is generated per target: the component manager rewrites its
+# `target:` field while CMake is already running, before this check. That is not
+# a source change, so drop those lines rather than call a tagged, clean tree a
+# development build (which is what happened to the second target of a release).
+string(REPLACE "\n" ";" espix_status_lines "${espix_status}")
+set(espix_status_sources "")
+foreach(espix_line ${espix_status_lines})
+    if(NOT espix_line MATCHES "dependencies\\.lock")
+        string(APPEND espix_status_sources "${espix_line}\n")
+    endif()
+endforeach()
+string(STRIP "${espix_status_sources}" espix_status_sources)
+
 if(espix_tag_rc EQUAL 0 AND espix_tag STREQUAL "v${espix_version}"
-   AND espix_status_rc EQUAL 0 AND espix_status STREQUAL "")
+   AND espix_status_rc EQUAL 0 AND espix_status_sources STREQUAL "")
     set(ESPIX_BUILD_IS_RELEASE 1)
 else()
     set(ESPIX_BUILD_IS_RELEASE 0)
