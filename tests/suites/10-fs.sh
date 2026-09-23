@@ -65,7 +65,7 @@ assert_not_contains "rm -r removes the tree" "$TNAME" "$(dev_run 'ls /tmp')"
 
 dev_out=$(dev_run 'ls /dev')
 assert_contains     "ls /dev lists the null device"    "null"    "$dev_out"
-assert_contains     "ls /dev lists the factory device" "factory" "$dev_out"
+assert_contains     "ls /dev lists an OTA slot device" "ota0" "$dev_out"
 assert_not_contains "ls /dev hides anything else"      "keep"    "$dev_out"
 # ESP-IDF's own UART VFS is a separate mount at a longer prefix; /dev lists
 # only what espix owns.
@@ -77,7 +77,7 @@ assert_contains "/ is still a directory listing with dev in it" "dev" \
 dev_l=$(dev_run 'ls -l /dev')
 assert_contains "null is a character device"  "c"           "$dev_l"
 assert_contains "null is world-writable"      "crw-rw-rw-"  "$dev_l"
-assert_contains "factory is read-only"        "-r--r--r--"  "$dev_l"
+assert_contains "an OTA slot is read-only"     "-r--r--r--"  "$dev_l"
 
 assert_eq "cat /dev/null is empty" "" "$(dev_run 'cat /dev/null')"
 
