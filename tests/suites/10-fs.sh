@@ -41,7 +41,7 @@ assert_contains "an ordinary account cannot read the SSH host key" "denied" \
 # /etc/hostname is 0644 and derived from the MAC, so assert on the shape
 # rather than a literal -- the point is that a world-readable file is readable,
 # not what this particular board is called.
-assert_contains "world-readable files are still readable" "esp32s3-" \
+assert_contains "world-readable files are still readable" "$ESPIX_TARGET-" \
     "$(dev_run 'cat /etc/hostname')"
 
 dev_run "mv $T/a.txt $T/b.txt" >/dev/null
@@ -190,6 +190,8 @@ else
         # path on a writable volume while it is there.
         if ! dev_testapp_present; then
             espix_skip "test app not built -- run 'make test-app'"
+        elif ! dev_status 'ls /bin/hello'; then
+            espix_skip "truncate tests need /bin/hello to seed the file (make apps && make fs)"
         else
             app=/home/$ESPIX_USER/testapp
             dev_run "sudo cp /bin/hello $ext_mnt/trunc.txt" >/dev/null 2>&1

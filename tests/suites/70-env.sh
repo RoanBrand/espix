@@ -131,14 +131,22 @@ fi
 # PATH is walked, not assumed
 # ---------------------------------------------------------------------------
 
-assert_contains "a bare name is found on the default PATH" "hello from" \
-    "$(dev_run 'hello')"
+if dev_status 'ls /bin/hello'; then
+    assert_contains "a bare name is found on the default PATH" "hello from" \
+        "$(dev_run 'hello')"
+else
+    espix_skip "a bare name is found on the default PATH: /bin/hello not in this rootfs (make apps && make fs)"
+fi
 assert_contains "an empty PATH finds nothing" "not found" \
     "$(dev_run 'PATH= hello' 2>&1)"
 assert_contains "a PATH without it finds nothing" "not found" \
     "$(dev_run 'PATH=/nowhere hello' 2>&1)"
-assert_contains "and a later entry is still searched" "hello from" \
-    "$(dev_run 'PATH=/nowhere:/bin hello')"
+if dev_status 'ls /bin/hello'; then
+    assert_contains "and a later entry is still searched" "hello from" \
+        "$(dev_run 'PATH=/nowhere:/bin hello')"
+else
+    espix_skip "and a later entry is still searched: /bin/hello not in this rootfs"
+fi
 
 # ---------------------------------------------------------------------------
 # The limits are refusals, not truncations

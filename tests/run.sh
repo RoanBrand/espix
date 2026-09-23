@@ -28,6 +28,11 @@ ESPIX_ROOT="$(cd "$ESPIX_TEST_DIR/.." && pwd)"
 
 export ESPIX_ROOT
 
+# The active target, so a suite can be target-aware without each deriving it.
+ESPIX_TARGET=$(tr -d ' \t\r\n' < "$ESPIX_ROOT/.espix/active" 2>/dev/null || true)
+ESPIX_TARGET="${ESPIX_TARGET:-esp32s3}"
+export ESPIX_TARGET
+
 SUITE_FILTER=""
 : "${ESPIX_STRESS:=0}"
 : "${ESPIX_STRESS_N:=30}"
@@ -217,9 +222,7 @@ fi
 # compare equal on the describe alone. The SHA cannot collide that way, and
 # espix_build_id() reports exactly this string as `uname -v`.
 _local_build_id() {
-    local target bin sha
-    target=$(tr -d ' \t\r\n' < "$ESPIX_ROOT/.espix/active" 2>/dev/null || true)
-    target="${target:-esp32s3}"
+    local target="${ESPIX_TARGET:-esp32s3}" bin sha
     bin="$ESPIX_ROOT/build-$target/espix.bin"
     [ -f "$bin" ] || return 1
     sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null | od -An -tx1 -v |

@@ -116,8 +116,14 @@ t0=$(now_ms); dev_pull /etc/hostname  "$TMP/tiny" >/dev/null 2>&1; t_dt=$(( $(no
 # has factory. Take whichever this image exposes -- and take its size from the
 # device, because the slot is 4 MiB on the factory table and 0x1F0000 on the A/B
 # one, so a hardcoded expectation would pin this test to a single layout.
-fwdev=/dev/ota0
-dev_run 'ls /dev/ota0' >/dev/null 2>&1 || fwdev=/dev/factory
+# Prefer the kernel slot: on the loader-first tables /dev/ota0 is only the
+# 320 KB loader, which a gigabit link reads in tens of milliseconds -- enough
+# for the differential to fall inside RATE_MIN_DT_MS and be read as collapsed.
+# ota1 is the kernel; factory is the single-slot fallback.
+fwdev=
+for d in /dev/ota1 /dev/ota0 /dev/factory; do
+    if dev_status "ls $d"; then fwdev=$d; break; fi
+done
 fwsize=$(dev_run "ls -l $fwdev" 2>/dev/null |
              awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) { print $i; exit } }')
 t0=$(now_ms); dev_pull "$fwdev" "$TMP/got" >/dev/null 2>&1; t_db=$(( $(now_ms) - t0 ))
