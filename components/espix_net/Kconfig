@@ -219,4 +219,26 @@ menu "espix networking"
             default 16
     endif
 
+    #
+    # Routing and NAT: the basis of an AP that provides internet, and of a
+    # wired client NATed through WiFi. The lwIP options are selected rather
+    # than suggested, so NAPT cannot be half-set (it depends on forwarding).
+    #
+    # This is not a firewall: nothing is blocked by turning it on, and it is
+    # per-interface (`nat on <inside>`) rather than a policy.
+    #
+    config ESPIX_NET_ROUTER
+        bool "Router (IPv4 forwarding and NAT)"
+        select LWIP_IP_FORWARD
+        select LWIP_IPV4_NAPT
+        default y
+        help
+            Lets espix forward between its interfaces and masquerade one
+            behind another. A WiFi AP whose clients reach the internet
+            through the uplink, or a wired client NATed through WiFi, need
+            this.
+
+            Off removes lwIP's forwarding and NAT code and hides the `nat`
+            command: espix is then a host, not a router.
+
 endmenu

@@ -43,6 +43,7 @@ typedef struct {
     int             index;          /* ifindex, as lwip sees it */
     uint16_t        mtu;
     bool            up;
+    bool            napt;           /* masqueraded behind the default route */
     bool            has_mac;
     uint8_t         mac[6];
     bool            has_addr;
@@ -70,6 +71,15 @@ bool      espix_net_default_route(char *ifname, size_t len, uint32_t *gw);
 
 /* Nameservers of the default interface, as DHCP supplied them. */
 size_t    espix_net_dns(uint32_t *out, size_t n);
+
+/*
+ * Routing. NAPT on an interface means packets from it are masqueraded behind
+ * whichever interface carries the default route, so an AP's clients (or a
+ * wired client) reach the uplink under one address. ESP_ERR_NOT_SUPPORTED
+ * when ESPIX_NET_ROUTER is off, ESP_ERR_NOT_FOUND for an unknown interface.
+ */
+esp_err_t espix_net_napt(const char *name, bool enable);
+bool      espix_net_napt_enabled(const char *name);
 
 const char *espix_net_hostname(void);
 

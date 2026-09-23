@@ -20,6 +20,7 @@ typedef struct {
     char            name[ESPIX_IF_NAME_MAX];
     espix_if_kind_t kind;
     esp_netif_t    *netif;      /* NULL for synthesised entries */
+    bool            napt;       /* espix turned NAPT on for this one */
 } espix_if_entry_t;
 
 /*

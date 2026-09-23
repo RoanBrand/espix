@@ -629,6 +629,50 @@ static int cmd_usb(espix_session_t *s, int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * NAPT enable/disable, and the status view. Linux reaches this through
+ * nftables/iptables; espix has no firewall, so this is the one knob and it is
+ * deliberately per-interface and explicit (`nat on wlan1`).
+ */
+static int cmd_nat(espix_session_t *s, int argc, char **argv)
+{
+    if (argc >= 3 && (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "off") == 0)) {
+        const bool on = strcmp(argv[1], "on") == 0;
+        const esp_err_t err = espix_net_napt(argv[2], on);
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            espix_eprintf(s, "nat: this image is not a router (CONFIG_ESPIX_NET_ROUTER)\n");
+            return 1;
+        }
+        if (err == ESP_ERR_NOT_FOUND) {
+            espix_eprintf(s, "nat: no such interface: %s\n", argv[2]);
+            return 1;
+        }
+        if (err != ESP_OK) {
+            espix_eprintf(s, "nat: %s: %s\n", argv[2], esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "%s: nat %s\n", argv[2], on ? "on" : "off");
+        return 0;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "status") != 0 && strcmp(argv[1], "show") != 0) {
+        espix_eprintf(s, "usage: nat [status] | nat {on|off} <dev>\n");
+        return 1;
+    }
+
+    espix_ifinfo_t ifs[IFLIST_MAX];
+    const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
+    for (size_t i = 0; i < n; i++) {
+        if (ifs[i].kind == ESPIX_IF_LO) {
+            continue;
+        }
+        espix_printf(s, "%-8s nat %s\n", ifs[i].name, ifs[i].napt ? "on" : "off");
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+
 static espix_cmd_t s_net_cmds[] = {
     { .name = "ip",       .fn = cmd_ip,
       .help = "show addresses, links and routes",
@@ -642,6 +686,9 @@ static espix_cmd_t s_net_cmds[] = {
     { .name = "ping",     .fn = cmd_ping,
       .help = "send ICMP echo requests",
       .usage = "ping [-c count] <host>" },
+    { .name = "nat",      .fn = cmd_nat,
+      .help = "masquerade an interface behind the default route",
+      .usage = "nat [status] | nat {on|off} <dev>" },
     { .name = "wifi",     .fn = cmd_wifi,
       .help = "scan, connect and inspect the WiFi station",
       .usage = "wifi {scan|connect [ssid] [psk]|disconnect|status}" },

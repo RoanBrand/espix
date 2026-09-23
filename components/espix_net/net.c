@@ -131,6 +131,7 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
     }
 
     out->up    = esp_netif_is_netif_up(e->netif);
+    out->napt  = e->napt;
     out->index = esp_netif_get_netif_impl_index(e->netif);
 
     uint16_t mtu = 0;
@@ -168,6 +169,42 @@ esp_err_t espix_net_ifinfo(const char *name, espix_ifinfo_t *out)
     }
     fill_ifinfo(e, out);
     return ESP_OK;
+}
+
+/*
+ * NAPT is per interface and lwIP keeps no query for it, so the table
+ * remembers what espix turned on. The netif is the authority for the
+ * forwarding itself; this is only so `nat status` can answer.
+ */
+esp_err_t espix_net_napt(const char *name, bool enable)
+{
+#if CONFIG_LWIP_IPV4_NAPT
+    for (size_t i = 0; i < s_if_count; i++) {
+        if (strcmp(s_ifs[i].name, name) != 0) {
+            continue;
+        }
+        if (s_ifs[i].netif == NULL) {
+            return ESP_ERR_NOT_FOUND;
+        }
+        const esp_err_t err = enable ? esp_netif_napt_enable(s_ifs[i].netif)
+                                     : esp_netif_napt_disable(s_ifs[i].netif);
+        if (err == ESP_OK) {
+            s_ifs[i].napt = enable;
+        }
+        return err;
+    }
+    return ESP_ERR_NOT_FOUND;
+#else
+    (void)name;
+    (void)enable;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool espix_net_napt_enabled(const char *name)
+{
+    const espix_if_entry_t *e = espix_net_find_if(name);
+    return e != NULL && e->napt;
 }
 
 bool espix_net_default_route(char *ifname, size_t len, uint32_t *gw)
