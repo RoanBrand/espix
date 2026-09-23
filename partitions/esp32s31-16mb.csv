@@ -23,5 +23,5 @@ phy_init,   data, phy,      0x11000,   0x1000,
 coredump,   data, coredump, 0x12000,   0xE000,
 # ota_0 is the loader, which runs first; ota_1 is the kernel it selects.
 ota_0,      app,  ota_0,    0x20000,   0x50000,
-ota_1,      app,  ota_1,    0x70000,   0x280000,
-storage,    data, littlefs, 0x2F0000,  0xD10000,
+ota_1,      app,  ota_1,    0x70000,   0x380000,
+storage,    data, littlefs, 0x3F0000,  0xC10000,

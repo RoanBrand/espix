@@ -931,8 +931,8 @@ there is only one PSRAM mode and its size is detected at runtime, so the identit
 is plain `s31` and one build serves every module.
 
 The S31's table also starts fresh, with no legacy to match: the loader takes
-320 KB, the kernel slot 2.5 MB, and `storage` begins at 0x300000 and fills the
-rest -- about 5 MB even on an 8 MB module. There are 8, 16 and 32 MB tables,
+320 KB, the kernel slot 3.5 MB, and `storage` begins at 0x3F0000 and fills the
+rest -- about 4 MB even on an 8 MB module. There are 8, 16 and 32 MB tables,
 differing only in `storage`'s size, exactly as the S3's pair does.
 
 **Two hashes live in the image, and they answer different questions:**
