@@ -49,10 +49,17 @@ sdkconfig="$ESPIX_SDKCONFIG"
 loader_build="$ESPIX_LOADER_BUILD"
 printf 'release: target %s\n' "$ESPIX_TARGET"
 
-# dependencies.lock carries a per-target `target:` field that IDF 6.1 ignores,
-# so building one target dirties it for the next. That is not a source change
-# and must not block a release -- release-all builds several in a row.
-dirty=$(git -C "$root" status --porcelain | grep -v 'dependencies\.lock$' || true)
+# dependencies.lock carries a per-target `target:` field that a build rewrites,
+# so building one target dirties it for the next. That is not a source change,
+# but espix_kernel marks a release only on a *clean* tree (it runs git status in
+# its CMakeLists), so restore the tracked lockfiles rather than tolerate them --
+# otherwise a second target's release is silently a development build.
+lockfiles=$(git -C "$root" ls-files '*dependencies.lock')
+if [ -n "$lockfiles" ]; then
+    git -C "$root" checkout -- $lockfiles
+fi
+
+dirty=$(git -C "$root" status --porcelain)
 if [ -n "$dirty" ]; then
     printf 'release: working tree is dirty; commit first -- a release is the tagged commit:\n' >&2
     printf '%s\n' "$dirty" >&2
