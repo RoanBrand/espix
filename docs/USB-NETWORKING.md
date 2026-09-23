@@ -364,7 +364,6 @@ The choice that decides whether any of this exists is `ESPIX_USB_ROLE` in
 `components/espix_net/Kconfig`: **host** (the default) builds the host stack
 instead, and **device** builds what is described here. Turning USB-NCM off in a
 device-role build drops espix's driver and the whole TinyUSB stack from the
-image — about 51KB of flash. The `usb` command still exists in such a build and
-says the feature was not compiled in, rather than disappearing and leaving you
-comparing your device
-against this page.
+image — about 51KB of flash. The `usb` command is compiled out with it, so
+`help` lists only what the image can do: host-role builds have
+`lsusb`/`usbscan`, device-role builds have `usb`.

@@ -18,6 +18,7 @@
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_shell.h"
+#include "sdkconfig.h"
 
 #define IFLIST_MAX 4
 #define SCAN_MAX   24
@@ -528,6 +529,8 @@ static int cmd_hostname(espix_session_t *s, int argc, char **argv)
 /* usb                                                                 */
 /* ------------------------------------------------------------------ */
 
+#if CONFIG_ESPIX_USB_NCM_ENABLED
+
 /*
  * usb0's configuration, beside `wifi` and for the same reason: espix has no
  * text editor, so a setting that lives in a file needs a command to write it.
@@ -622,6 +625,8 @@ static int cmd_usb(espix_session_t *s, int argc, char **argv)
     return 1;
 }
 
+#endif /* CONFIG_ESPIX_USB_NCM_ENABLED */
+
 /* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_net_cmds[] = {
@@ -640,9 +645,11 @@ static espix_cmd_t s_net_cmds[] = {
     { .name = "wifi",     .fn = cmd_wifi,
       .help = "scan, connect and inspect the WiFi station",
       .usage = "wifi {scan|connect [ssid] [psk]|disconnect|status}" },
+#if CONFIG_ESPIX_USB_NCM_ENABLED
     { .name = "usb",      .fn = cmd_usb,
       .help = "configure and inspect the USB-NCM link",
       .usage = "usb {status|mode {server|client}}" },
+#endif
     { .name = "hostname", .fn = cmd_hostname,
       .help = "show or set the hostname",
       .usage = "hostname [name]" },

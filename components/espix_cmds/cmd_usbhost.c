@@ -18,12 +18,15 @@
 
 #include "espix_cmds_priv.h"
 #include "espix_shell.h"
+#include "sdkconfig.h"
 #include "espix_usb.h"
 
 #define LSUSB_USAGE "usage: lsusb [-v]\n"
 
 /* usb_speed_t, spelled out. The enum lives in the USB headers, which this
  * component's public header deliberately does not include. */
+#if CONFIG_ESPIX_USB_ROLE_HOST
+
 static const char *speed_name(uint8_t speed)
 {
     switch (speed) {
@@ -261,3 +264,5 @@ void espix_cmds_register_usbhost(void)
     espix_cmds_register_table(s_usbhost_cmds,
                               sizeof(s_usbhost_cmds) / sizeof(s_usbhost_cmds[0]));
 }
+
+#endif /* CONFIG_ESPIX_USB_ROLE_HOST */

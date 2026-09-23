@@ -8,6 +8,7 @@
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "sdkconfig.h"
 
 #define TAG "cmds"
 
@@ -104,7 +105,9 @@ void espix_cmds_register_all(void)
     espix_cmds_register_motd();
     espix_cmds_register_time();
     espix_cmds_register_blk();
+#if CONFIG_ESPIX_USB_ROLE_HOST
     espix_cmds_register_usbhost();
+#endif
     espix_cmds_register_ota();
     espix_cmds_register_hash();
     espix_cmds_register_exec_fallback();
