@@ -20,7 +20,7 @@
 #include "espix_shell.h"
 #include "sdkconfig.h"
 
-#define IFLIST_MAX 4
+#define IFLIST_MAX 5
 #define SCAN_MAX   24
 
 /* ------------------------------------------------------------------ */
@@ -473,10 +473,80 @@ static int wifi_status(espix_session_t *s)
     return 0;
 }
 
+/*
+ * The AP half of `wifi`: a separate interface (wlan1) because it can run
+ * beside the station, not instead of it.
+ */
+static int wifi_ap(espix_session_t *s, int argc, char **argv)
+{
+    const char *action = (argc > 0) ? argv[0] : "status";
+
+    if (strcmp(action, "start") == 0) {
+        const char *ssid = (argc > 1) ? argv[1] : NULL;
+        const char *psk  = (argc > 2) ? argv[2] : NULL;
+        const uint8_t channel = (argc > 3) ? (uint8_t)atoi(argv[3]) : 0;
+
+        const esp_err_t err = espix_net_wifi_ap_start(ssid, psk, channel);
+        if (err == ESP_ERR_NOT_FOUND) {
+            espix_eprintf(s, "wifi ap: no SSID given and none in /etc/wifi.conf\n");
+            espix_eprintf(s, "         usage: wifi ap start <ssid> [psk] [channel]\n");
+            return 1;
+        }
+        if (err != ESP_OK) {
+            espix_eprintf(s, "wifi ap: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "wlan1: AP '%s' starting; see 'wifi ap status'\n",
+                     (ssid != NULL) ? ssid : "(from /etc/wifi.conf)");
+        if (ssid != NULL && s->uid != 0) {
+            espix_printf(s, "note: not saved; run as root to keep it across reboots\n");
+        }
+        return 0;
+    }
+
+    if (strcmp(action, "stop") == 0) {
+        const esp_err_t err = espix_net_wifi_ap_stop();
+        if (err == ESP_ERR_INVALID_STATE) {
+            espix_printf(s, "wlan1: AP is not running\n");
+            return 0;
+        }
+        if (err != ESP_OK) {
+            espix_eprintf(s, "wifi ap: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        return 0;
+    }
+
+    if (strcmp(action, "status") == 0) {
+        espix_wifi_ap_status_t st;
+        espix_net_wifi_ap_status(&st);
+        if (!st.started) {
+            espix_printf(s, "wlan1: AP not running\n");
+            return 0;
+        }
+        char ip[ESPIX_IP4STR_MAX];
+        espix_printf(s, "wlan1: AP '%s' on channel %u%s\n", st.ssid,
+                     (unsigned)st.channel, st.napt ? ", nat on" : "");
+        if (st.ip != 0) {
+            espix_printf(s, "ip:      %s/%d\n",
+                         espix_net_ip4str(st.ip, ip, sizeof(ip)),
+                         espix_net_prefix_len(st.netmask));
+        }
+        espix_printf(s, "clients: %u\n", st.clients);
+        return 0;
+    }
+
+    espix_eprintf(s, "usage: wifi ap {start [ssid] [psk] [channel]|stop|status}\n");
+    return 1;
+}
+
 static int cmd_wifi(espix_session_t *s, int argc, char **argv)
 {
     const char *sub = (argc > 1) ? argv[1] : "status";
 
+    if (strcmp(sub, "ap") == 0) {
+        return wifi_ap(s, (argc > 2) ? argc - 2 : 0, (argc > 2) ? argv + 2 : NULL);
+    }
     if (strcmp(sub, "scan") == 0) {
         return wifi_scan(s);
     }
@@ -691,7 +761,7 @@ static espix_cmd_t s_net_cmds[] = {
       .usage = "nat [status] | nat {on|off} <dev>" },
     { .name = "wifi",     .fn = cmd_wifi,
       .help = "scan, connect and inspect the WiFi station",
-      .usage = "wifi {scan|connect [ssid] [psk]|disconnect|status}" },
+      .usage = "wifi {scan|connect|disconnect|status|ap ...}" },
 #if CONFIG_ESPIX_USB_NCM_ENABLED
     { .name = "usb",      .fn = cmd_usb,
       .help = "configure and inspect the USB-NCM link",

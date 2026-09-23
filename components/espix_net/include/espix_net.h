@@ -167,6 +167,31 @@ esp_err_t espix_net_wifi_scan(espix_ap_t *out, size_t n, size_t *found);
 esp_err_t espix_net_wifi_status(espix_wifi_status_t *out);
 
 /* ------------------------------------------------------------------ */
+/* WiFi access point (wlan1)                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The AP is a separate interface from the station because the two can run at
+ * once (APSTA): its clients are NATed out the uplink, which is routing, not a
+ * bridge. `started` is the AP being up, not the netif existing -- wlan1 keeps
+ * its name when stopped.
+ */
+typedef struct {
+    bool     started;
+    bool     napt;                  /* masqueraded out the default route */
+    char     ssid[ESPIX_SSID_MAX];
+    uint8_t  channel;
+    uint32_t ip;
+    uint32_t netmask;
+    unsigned clients;
+} espix_wifi_ap_status_t;
+
+/* No arguments re-reads ap.ssid/ap.psk/ap.channel from /etc/wifi.conf. */
+esp_err_t espix_net_wifi_ap_start(const char *ssid, const char *psk, uint8_t channel);
+esp_err_t espix_net_wifi_ap_stop(void);
+void      espix_net_wifi_ap_status(espix_wifi_ap_status_t *out);
+
+/* ------------------------------------------------------------------ */
 /* USB-NCM (usb0)                                                      */
 /* ------------------------------------------------------------------ */
 

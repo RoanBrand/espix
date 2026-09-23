@@ -14,7 +14,7 @@ extern "C" {
  * create the underlying netif, so names are deterministic rather than
  * discovered. `lo` is synthesised and has no netif.
  */
-#define ESPIX_IF_MAX 4
+#define ESPIX_IF_MAX 5
 
 typedef struct {
     char            name[ESPIX_IF_NAME_MAX];

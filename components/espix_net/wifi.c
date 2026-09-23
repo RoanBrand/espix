@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -72,6 +73,13 @@ static unsigned s_auth_failures;
 static bool     s_gave_up;
 static int      s_last_reason;
 static char     s_ssid[ESPIX_SSID_MAX];
+
+/* The access point (wlan1): created on first `wifi ap start` and kept, so the
+ * name is stable; started and stopped with the WiFi mode. */
+static esp_netif_t *s_ap;
+static bool         s_ap_started;
+static uint8_t      s_ap_channel;
+static char         s_ap_ssid[ESPIX_SSID_MAX];
 
 /*
  * Did the AP reject who we are, as opposed to simply not being there?
@@ -148,7 +156,9 @@ static void secure_conf(void)
     (void)espix_fs_ensure_mode(WIFI_CONF_PATH, 0600);
 }
 
-esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk)
+static esp_err_t conf_write(const char *ssid, const char *psk,
+                            const char *ap_ssid, const char *ap_psk,
+                            int ap_channel)
 {
     FILE *f = fopen(WIFI_CONF_PATH, "w");
     if (f == NULL) {
@@ -161,10 +171,41 @@ esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk)
     fprintf(f, "ssid=%s\n", ssid ? ssid : "");
     fprintf(f, "psk=%s\n", psk ? psk : "");
     fprintf(f, "# dhcp=yes is the default\n");
+
+    if (ap_ssid != NULL) {
+        fprintf(f, "\n# access point (wlan1), started with 'wifi ap start'\n");
+        fprintf(f, "ap.ssid=%s\n", ap_ssid);
+        fprintf(f, "ap.psk=%s\n", ap_psk ? ap_psk : "");
+        fprintf(f, "ap.channel=%d\n", ap_channel);
+    }
+
     fclose(f);
 
     secure_conf();
     return ESP_OK;
+}
+
+esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk)
+{
+    char ap_ssid[ESPIX_SSID_MAX] = {0};
+    char ap_psk[ESPIX_PSK_MAX]   = {0};
+    char chan[8] = {0};
+    const bool have_ap =
+        espix_fs_conf_get(WIFI_CONF_PATH, "ap.ssid", ap_ssid, sizeof(ap_ssid));
+    espix_fs_conf_get(WIFI_CONF_PATH, "ap.psk", ap_psk, sizeof(ap_psk));
+    espix_fs_conf_get(WIFI_CONF_PATH, "ap.channel", chan, sizeof(chan));
+    return conf_write(ssid, psk, have_ap ? ap_ssid : NULL, ap_psk,
+                      chan[0] ? atoi(chan) : 0);
+}
+
+static esp_err_t espix_net_conf_write_ap(const char *ap_ssid,
+                                         const char *ap_psk, int channel)
+{
+    char ssid[ESPIX_SSID_MAX] = {0};
+    char psk[ESPIX_PSK_MAX]   = {0};
+    espix_fs_conf_get(WIFI_CONF_PATH, "ssid", ssid, sizeof(ssid));
+    espix_fs_conf_get(WIFI_CONF_PATH, "psk", psk, sizeof(psk));
+    return conf_write(ssid, psk, ap_ssid, ap_psk, channel);
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,6 +225,36 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
             s_state = ESPIX_WIFI_CONNECTING;
             esp_wifi_connect();
         }
+        break;
+
+    case WIFI_EVENT_AP_START:
+        /*
+         * Only now is the AP netif up, which NAPT needs; `wifi ap start`
+         * returns before this event. The uplink is already the default route
+         * or becomes it when it gets its address (the AP's prio is 10, below
+         * Ethernet's 50 and the station's 100, so it never wins).
+         */
+        if (s_ap != NULL) {
+            /* Through the espix helper, so the status view agrees with lwIP. */
+#if CONFIG_LWIP_IPV4_NAPT
+            if (espix_net_napt("wlan1", true) == ESP_OK) {
+                espix_klog(ESPIX_KLOG_INFO, TAG,
+                           "wlan1: AP up; nat out the default route");
+            }
+#endif
+        }
+        break;
+
+    case WIFI_EVENT_AP_STOP:
+        if (s_ap != NULL) {
+#if CONFIG_LWIP_IPV4_NAPT
+            (void)espix_net_napt("wlan1", false);
+#endif
+        }
+        break;
+
+    case WIFI_EVENT_AP_STACONNECTED:
+        espix_klog(ESPIX_KLOG_INFO, TAG, "wlan1: a client joined");
         break;
 
     case WIFI_EVENT_STA_CONNECTED: {
@@ -393,6 +464,18 @@ esp_err_t espix_net_wifi_start(void)
         return err;
     }
 
+    /*
+     * A configured AP comes back on boot, so a device set up as an access
+     * point does not need `wifi ap start` typed at every power-up. It runs
+     * beside the station when one is configured (APSTA); whether NAT has
+     * somewhere to go is the uplink's business, not this one's.
+     */
+    char ap_ssid[ESPIX_SSID_MAX] = {0};
+    if (espix_fs_conf_get(WIFI_CONF_PATH, "ap.ssid", ap_ssid, sizeof(ap_ssid)) &&
+        ap_ssid[0] != '\0') {
+        (void)espix_net_wifi_ap_start(NULL, NULL, 0);
+    }
+
     if (!have_ssid) {
         espix_klog(ESPIX_KLOG_INFO, TAG,
                    "no network configured (%s); use 'wifi connect'",
@@ -474,6 +557,129 @@ esp_err_t espix_net_wifi_disconnect(void)
     s_want_connect = false;
     s_state        = ESPIX_WIFI_IDLE;
     return esp_wifi_disconnect();
+}
+
+/* ------------------------------------------------------------------ */
+/* Access point (wlan1)                                                */
+/* ------------------------------------------------------------------ */
+
+esp_err_t espix_net_wifi_ap_start(const char *ssid, const char *psk,
+                                  uint8_t channel)
+{
+    char file_ssid[ESPIX_SSID_MAX] = {0};
+    char file_psk[ESPIX_PSK_MAX]   = {0};
+    char chan[8] = {0};
+
+    if (ssid == NULL) {
+        if (!espix_fs_conf_get(WIFI_CONF_PATH, "ap.ssid", file_ssid,
+                               sizeof(file_ssid)) ||
+            file_ssid[0] == '\0') {
+            return ESP_ERR_NOT_FOUND;
+        }
+        espix_fs_conf_get(WIFI_CONF_PATH, "ap.psk", file_psk, sizeof(file_psk));
+        ssid = file_ssid;
+        psk  = file_psk;
+        if (channel == 0 &&
+            espix_fs_conf_get(WIFI_CONF_PATH, "ap.channel", chan, sizeof(chan))) {
+            channel = (uint8_t)atoi(chan);
+        }
+    } else if (espix_net_conf_write_ap(ssid, psk, channel) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "wlan1: AP config not saved (run as root to persist)");
+    }
+
+    esp_err_t err = driver_start();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (s_ap == NULL) {
+        s_ap = esp_netif_create_default_wifi_ap();
+        if (s_ap == NULL) {
+            return ESP_FAIL;
+        }
+        /* Named here, not by esp_netif's own key ("WIFI_AP_DEF"). */
+        espix_net_register_if("wlan1", ESPIX_IF_WIFI_AP, s_ap);
+    }
+
+    /*
+     * APSTA always: an Ethernet uplink needs no station, a station uplink
+     * needs the AP on the same channel (the driver enforces that), and
+     * switching back to STA-only on stop does not disturb the station.
+     */
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    wifi_config_t wc = {0};
+    strlcpy((char *)wc.ap.ssid, ssid, sizeof(wc.ap.ssid));
+    wc.ap.ssid_len       = strlen(ssid);
+    wc.ap.channel        = channel;
+    wc.ap.max_connection = 4;
+    if (psk != NULL && psk[0] != '\0') {
+        strlcpy((char *)wc.ap.password, psk, sizeof(wc.ap.password));
+        wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        wc.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &wc);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_ap_started = true;
+    s_ap_channel = channel;
+    strlcpy(s_ap_ssid, ssid, sizeof(s_ap_ssid));
+    espix_klog(ESPIX_KLOG_INFO, TAG, "wlan1: AP '%s' starting on channel %u",
+               ssid, (unsigned)channel);
+    return ESP_OK;
+}
+
+esp_err_t espix_net_wifi_ap_stop(void)
+{
+    if (s_ap == NULL || !s_ap_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_ap_started = false;
+    s_ap_ssid[0] = '\0';
+    /* Station-only again; the netif stays so wlan1 keeps its name. */
+    return esp_wifi_set_mode(WIFI_MODE_STA);
+}
+
+void espix_net_wifi_ap_status(espix_wifi_ap_status_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->started = s_ap_started;
+    out->channel = s_ap_channel;
+    strlcpy(out->ssid, s_ap_ssid, sizeof(out->ssid));
+
+    if (s_ap == NULL) {
+        return;
+    }
+
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(s_ap, &ip) == ESP_OK) {
+        out->ip      = ip.ip.addr;
+        out->netmask = ip.netmask.addr;
+    }
+
+    /* The live channel, not the requested one: 0 means "whichever the
+     * driver picked", and in APSTA it follows the station. */
+    if (s_ap_started) {
+        uint8_t primary = 0;
+        wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+        if (esp_wifi_get_channel(&primary, &second) == ESP_OK) {
+            out->channel = primary;
+        }
+    }
+
+    wifi_sta_list_t stas;
+    if (s_ap_started && esp_wifi_ap_get_sta_list(&stas) == ESP_OK) {
+        out->clients = stas.num;
+    }
+    out->napt = espix_net_napt_enabled("wlan1");
 }
 
 esp_err_t espix_net_wifi_scan(espix_ap_t *out, size_t n, size_t *found)

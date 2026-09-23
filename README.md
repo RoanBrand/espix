@@ -50,11 +50,14 @@ together.
 | Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
 | Shell | Line editing, history, TAB completion | **yes** | |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
+| Networking | WiFi access point | **yes** | `wifi ap start` brings up `wlan1` beside the station and NATs clients out the uplink; one radio, one AP, shared channel |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
 | Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
-| Networking | IP routing, NAT and bridging | **planned** | `route` exists; forwarding and NAT do not — a router built from an ESP32 |
-| Networking | DHCP server and DNS for the LAN | **planned** | an app-side resolver already exists to build on |
+| Networking | IPv4 routing and NAT | **yes** | `nat on <dev>` masquerades an inside interface out the default route; `ESPIX_NET_ROUTER` is on by default |
+| Networking | L2 bridging | **planned** | lwIP 802.1D, AP↔Ethernet only: 802.11's three-address frames make a station unusable as a bridge port |
+| Networking | DHCP server for the LAN | **partial** | the AP and `usb0` both serve; DNS is the uplink's resolver passed through, not a local one |
+| Networking | Isolation and firewall | **planned** | NAT is not a firewall; guest zones and port-forwards are later |
 | Networking | A VPN endpoint | **planned** | WireGuard-shaped, for the router case |
 | Faults | Permissions enforced in espix's own VFS | **yes** | builtins, loaded apps and SFTP alike |
 | Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
