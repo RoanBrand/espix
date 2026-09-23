@@ -12,6 +12,7 @@ idf_component_register(
         "cmd_usbhost.c"
         "cmd_ota.c"
         "cmd_hash.c"
+        "cmd_bt.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -25,6 +26,7 @@ idf_component_register(
         espix_shell
         espix_fault
         espix_net
+        espix_bt
         espix_usb
         espix_auth
         espix_time

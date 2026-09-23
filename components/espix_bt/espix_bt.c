@@ -1,0 +1,262 @@
+/*
+ * Bluetooth, espix-shaped: a native layer over esp_bt with the names
+ * bluetoothctl uses on Linux. Phase 1 is the S31 (Classic + BLE).
+ */
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "sdkconfig.h"
+
+#include "espix_kernel.h"
+#include "espix_bt.h"
+
+#define TAG      "bt"
+#define DEV_MAX  32
+
+#if CONFIG_ESPIX_BT
+
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+
+static espix_bt_dev_t s_devs[DEV_MAX];
+static size_t         s_dev_count;
+static bool           s_inited;
+static bool           s_scanning;
+static char           s_pin[ESPIX_BT_PIN_MAX] = "0000";
+
+static int dev_find(const uint8_t bda[ESPIX_BDA_LEN])
+{
+    for (size_t i = 0; i < s_dev_count; i++) {
+        if (memcmp(s_devs[i].bda, bda, ESPIX_BDA_LEN) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void dev_upsert(const uint8_t bda[ESPIX_BDA_LEN], const char *name)
+{
+    int i = dev_find(bda);
+    if (i < 0) {
+        if (s_dev_count >= DEV_MAX) {
+            return;
+        }
+        i = (int)s_dev_count++;
+        memset(&s_devs[i], 0, sizeof(s_devs[i]));
+        memcpy(s_devs[i].bda, bda, ESPIX_BDA_LEN);
+    }
+    if (name != NULL && name[0] != '\0') {
+        strlcpy(s_devs[i].name, name, sizeof(s_devs[i].name));
+    }
+}
+
+/* Fold the bonded list into the discovered one, so 'devices' shows both. */
+static void mark_bonded(void)
+{
+    esp_bd_addr_t list[DEV_MAX];
+    int n = esp_bt_gap_get_bond_device_num();
+
+    if (n <= 0) {
+        return;
+    }
+    if (n > DEV_MAX) {
+        n = DEV_MAX;
+    }
+    if (esp_bt_gap_get_bond_device_list(&n, list) != ESP_OK) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        dev_upsert((const uint8_t *)list[i], NULL);
+        const int j = dev_find((const uint8_t *)list[i]);
+        if (j >= 0) {
+            s_devs[j].bonded = true;
+        }
+    }
+}
+
+static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_BT_GAP_DISC_RES_EVT: {
+        char name[ESPIX_BT_NAME_MAX] = {0};
+        for (int i = 0; i < param->disc_res.num_prop; i++) {
+            if (param->disc_res.prop[i].type == ESP_BT_GAP_DEV_PROP_BDNAME) {
+                strlcpy(name, (const char *)param->disc_res.prop[i].val, sizeof(name));
+            }
+        }
+        dev_upsert((const uint8_t *)param->disc_res.bda, name);
+        break;
+    }
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+        s_scanning = (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED);
+        espix_klog(ESPIX_KLOG_INFO, TAG, "discovery %s",
+                   s_scanning ? "started" : "stopped");
+        break;
+    case ESP_BT_GAP_PIN_REQ_EVT: {
+        esp_bt_pin_code_t pin = {0};
+        const size_t len = strlen(s_pin);
+        memcpy(pin, s_pin, len < sizeof(pin) ? len : sizeof(pin));
+        (void)esp_bt_gap_pin_reply(param->pin_req.bda, true, (uint8_t)len, pin);
+        espix_klog(ESPIX_KLOG_INFO, TAG, "pin requested; replied '%s'", s_pin);
+        break;
+    }
+    case ESP_BT_GAP_CFM_REQ_EVT:
+        (void)esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+        espix_klog(ESPIX_KLOG_INFO, TAG, "ssp %06" PRIu32 " auto-accepted",
+                   param->cfm_req.num_val);
+        break;
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+        espix_klog(ESPIX_KLOG_INFO, TAG, "ssp passkey %06" PRIu32,
+                   param->key_notif.passkey);
+        break;
+    case ESP_BT_GAP_KEY_REQ_EVT:
+        (void)esp_bt_gap_ssp_passkey_reply(param->key_req.bda, true, 0);
+        break;
+    case ESP_BT_GAP_AUTH_CMPL_EVT: {
+        const int i = dev_find((const uint8_t *)param->auth_cmpl.bda);
+        if (i >= 0 && param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            s_devs[i].bonded = true;
+            if (param->auth_cmpl.device_name[0] != 0) {
+                strlcpy(s_devs[i].name, (const char *)param->auth_cmpl.device_name,
+                        sizeof(s_devs[i].name));
+            }
+        }
+        espix_klog(param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS ? ESPIX_KLOG_INFO
+                                                                 : ESPIX_KLOG_WARN,
+                   TAG, "pairing: %s", esp_err_to_name(param->auth_cmpl.stat));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+esp_err_t espix_bt_init(void)
+{
+    if (s_inited) {
+        return ESP_OK;
+    }
+
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_bt_controller_init(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_bluedroid_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_bluedroid_enable();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    (void)esp_bt_gap_register_callback(gap_cb);
+    (void)esp_bt_gap_set_device_name(CONFIG_ESPIX_BT_NAME);
+    (void)esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+    s_inited = true;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "up as '%s'", CONFIG_ESPIX_BT_NAME);
+    return ESP_OK;
+}
+
+bool espix_bt_ready(void)    { return s_inited; }
+bool espix_bt_scanning(void) { return s_scanning; }
+
+esp_err_t espix_bt_scan(bool on)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (on) {
+        s_dev_count = 0;        /* a fresh inquiry is a fresh list */
+        return esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 0x30, 0);
+    }
+    return esp_bt_gap_cancel_discovery();
+}
+
+size_t espix_bt_devices(espix_bt_dev_t *out, size_t n)
+{
+    size_t count = 0;
+    if (s_inited) {
+        mark_bonded();
+    }
+    for (size_t i = 0; i < s_dev_count && count < n; i++) {
+        out[count++] = s_devs[i];
+    }
+    return count;
+}
+
+esp_err_t espix_bt_info(const uint8_t bda[ESPIX_BDA_LEN], espix_bt_dev_t *out)
+{
+    if (s_inited) {
+        mark_bonded();
+    }
+    const int i = dev_find(bda);
+    if (i < 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *out = s_devs[i];
+    return ESP_OK;
+}
+
+esp_err_t espix_bt_set_pin(const char *pin)
+{
+    if (pin == NULL || strlen(pin) > ESPIX_BT_PIN_MAX - 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    strlcpy(s_pin, pin, sizeof(s_pin));
+    return ESP_OK;
+}
+
+const char *espix_bt_pin(void) { return s_pin; }
+
+#else  /* !CONFIG_ESPIX_BT */
+
+esp_err_t espix_bt_init(void)                 { return ESP_ERR_NOT_SUPPORTED; }
+bool      espix_bt_ready(void)                { return false; }
+bool      espix_bt_scanning(void)             { return false; }
+esp_err_t espix_bt_scan(bool on)              { (void)on; return ESP_ERR_NOT_SUPPORTED; }
+size_t    espix_bt_devices(espix_bt_dev_t *o, size_t n) { (void)o; (void)n; return 0; }
+esp_err_t espix_bt_info(const uint8_t b[ESPIX_BDA_LEN], espix_bt_dev_t *o)
+                                              { (void)b; (void)o; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_set_pin(const char *p)     { (void)p; return ESP_ERR_NOT_SUPPORTED; }
+const char *espix_bt_pin(void)                { return ""; }
+
+#endif /* CONFIG_ESPIX_BT */
+
+const char *espix_bt_bdastr(const uint8_t bda[ESPIX_BDA_LEN], char *buf, size_t len)
+{
+    if (buf == NULL || len < 18) {
+        return "";
+    }
+    snprintf(buf, len, "%02x:%02x:%02x:%02x:%02x:%02x",
+             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+    return buf;
+}
+
+esp_err_t espix_bt_parse_bda(const char *s, uint8_t out[ESPIX_BDA_LEN])
+{
+    unsigned v[ESPIX_BDA_LEN];
+    if (s == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (int i = 0; i < ESPIX_BDA_LEN; i++) {
+        if (v[i] > 0xff) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out[i] = (uint8_t)v[i];
+    }
+    return ESP_OK;
+}

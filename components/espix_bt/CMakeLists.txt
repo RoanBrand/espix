@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "espix_bt.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_REQUIRES
+        espix_kernel
+        bt
+        nvs_flash
+)

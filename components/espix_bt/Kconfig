@@ -1,0 +1,22 @@
+menu "espix bluetooth"
+
+    config ESPIX_BT
+        bool "Bluetooth"
+        default n
+        help
+            Bluetooth host, and the `bluetoothctl` command. On a target with
+            Bluetooth Classic (S31) this is Bluedroid, which A2DP and HFP
+            require; the S3 has BLE only and takes a NimBLE path in phase 2.
+
+            Off by default: Bluedroid Classic is one of the larger things that
+            can be linked in. The stack is configured per target in
+            sdkconfig.defaults.esp32s31.
+
+    config ESPIX_BT_NAME
+        string "Device name"
+        depends on ESPIX_BT
+        default "espix"
+        help
+            The name other devices see while discovering.
+
+endmenu

@@ -1,0 +1,54 @@
+/*
+ * Bluetooth, espix-shaped.
+ *
+ * A native layer over the ESP-IDF host stack -- there is no BlueZ and no D-Bus
+ * here -- with the names `bluetoothctl` uses on Linux. Phase 1 is the S31
+ * (Classic + BLE); the S3's BLE-only NimBLE path comes later.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define ESPIX_BDA_LEN     6
+#define ESPIX_BT_NAME_MAX 64
+#define ESPIX_BT_PIN_MAX  16
+
+typedef struct {
+    uint8_t bda[ESPIX_BDA_LEN];
+    char    name[ESPIX_BT_NAME_MAX];
+    bool    bonded;
+    bool    connected;      /* A2DP connected; phase 1 */
+} espix_bt_dev_t;
+
+/* Bring the host up. Idempotent; returns ESP_ERR_NOT_SUPPORTED without ESPIX_BT. */
+esp_err_t espix_bt_init(void);
+bool      espix_bt_ready(void);
+bool      espix_bt_scanning(void);
+
+/* Classic inquiry for now; BLE scanning arrives with the NimBLE path. */
+esp_err_t espix_bt_scan(bool on);
+
+size_t    espix_bt_devices(espix_bt_dev_t *out, size_t n);
+esp_err_t espix_bt_info(const uint8_t bda[ESPIX_BDA_LEN], espix_bt_dev_t *out);
+
+/*
+ * Pairing policy, for now: a PIN for legacy pairing, and auto-accept for SSP
+ * (the "just works" passkey). An interactive agent is later.
+ */
+esp_err_t espix_bt_set_pin(const char *pin);
+const char *espix_bt_pin(void);
+
+const char *espix_bt_bdastr(const uint8_t bda[ESPIX_BDA_LEN], char *buf, size_t len);
+esp_err_t   espix_bt_parse_bda(const char *s, uint8_t out[ESPIX_BDA_LEN]);
+
+#ifdef __cplusplus
+}
+#endif

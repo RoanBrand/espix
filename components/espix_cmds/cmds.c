@@ -110,5 +110,6 @@ void espix_cmds_register_all(void)
 #endif
     espix_cmds_register_ota();
     espix_cmds_register_hash();
+    espix_cmds_register_bt();
     espix_cmds_register_exec_fallback();
 }
