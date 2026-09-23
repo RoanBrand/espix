@@ -4,6 +4,7 @@
 # `idf.py` is frequently a *shell function*, and a function is invisible to a
 # make recipe's subshell. Nothing needs to be sourced first.
 #
+#   make menu             target/board/options: the remembered setup
 #   make build            firmware
 #   make flash            loader and kernel -- leaves the filesystem alone
 #   make flash-kernel     just the kernel (ota_1), with bootloader + table
@@ -47,14 +48,17 @@ else
   PORT_ARG = $(PORT)
 endif
 
-.PHONY: all build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
+.PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release monitor monitor-reset coredump apps test-app test test-panic \
         stress clean help
 
 all: build
 
 help:
-	@sed -n '3,24p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,25p' Makefile | sed 's/^# \{0,1\}//'
+
+menu:
+	./tools/espix
 
 build:
 	$(IDF) build

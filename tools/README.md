@@ -19,6 +19,20 @@ tools/espix status
 Each target has its own `sdkconfig.<target>` and `build-<target>/`, so switching
 does not rebuild the other. S3 and S31 are listed; the P4 is listed as planned.
 
+## backup-flash.sh
+
+Dumps a board's whole SPI flash to `~/S31-backups/<target>-<mac>.bin`, before
+anything is written to it. The name is the chip's own MAC -- unique per board,
+and the same thing espix uses for the device's network name -- so two boards
+never collide. A `.txt` sidecar records the MAC, flash size, date and SHA-256,
+and the read is verified by a second pass. Override the directory with
+`ESPIX_BACKUP_DIR` and the speed with `BAUD`.
+
+```bash
+tools/espix target s31
+tools/backup-flash.sh                 # detect the port, or pass /dev/...
+```
+
 ## ota-merge.py
 
 Merges the per-board `espix-ota.json` files `tools/ota-manifest.sh` writes into

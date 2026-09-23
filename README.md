@@ -96,7 +96,8 @@ Choose a target once — `tools/espix` remembers it in `.espix/`, which the
 Makefile and `tools/idf.sh` both read:
 
 ```bash
-tools/espix target s3     # or s31; no argument opens a menu
+make menu                 # target, board, options, reset -- remembered
+tools/espix target s3     # or s31, without the menu
 ```
 
 Each target keeps its own `sdkconfig.<target>` and `build-<target>/`, so
@@ -197,16 +198,17 @@ and only the default has been run on hardware.
 | [boards/esp32s3-n8r2.conf](boards/esp32s3-n8r2.conf) | N8R2 | 8MB | 2MB quad |
 | [boards/esp32s3-n8.conf](boards/esp32s3-n8.conf) | N8 | 8MB | none |
 
-Board files only seed a *new* `sdkconfig`, so switching board on an existing
-checkout means removing it first:
+Board files are S3-only, and selecting one only seeds a *new* `sdkconfig`, so
+use the menu rather than editing it by hand:
 
 ```bash
-rm -f sdkconfig
-SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/esp32s3-n8r2.conf" \
-    idf.py set-target esp32s3
+tools/espix board esp32s3-n8r2   # `tools/espix board` lists them
 make flash
 make flash-fs
 ```
+
+The S31 has no board file: one PSRAM mode, its size read at runtime, and the
+loader provisions the table for the flash, so one build covers every module.
 
 A board with **no PSRAM** builds and falls back to internal RAM, but WiFi, lwIP,
 SSH and the app image then compete for ~343K instead of 8MB. Expect small apps
