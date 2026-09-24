@@ -260,13 +260,6 @@ esp_err_t espix_bt_init(void)
         return ESP_OK;
     }
 
-    /*
-     * The example releases the BLE half's memory before enabling a Classic-only
-     * controller; match it -- it is the one code difference from an example
-     * whose configuration is otherwise identical.
-     */
-    (void)esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-
     esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&cfg);
     if (err != ESP_OK) {
