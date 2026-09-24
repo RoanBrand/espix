@@ -79,14 +79,40 @@ framework stays below our own API, not exposed to apps.
 
 ### Phase 1 (built now): Bluetooth speaker playback
 
-S31 only. `bluetoothctl` pairs/connects the speaker, then
+S31 only. `bluetoothctl` pairs/connects the sink, then
 
-    play <file.mp3>              # from an espix filesystem
-    play http://.../stream.mp3   # a public stream
+    play <file|url>      # /home/esp/song.mp3, http(s)://..., or embed://...
+    play status
+    play stop
 
-pipeline: source (file via espix_fs, or HTTP via esp_http_client) -> MP3 decode
-(esp_audio_codec) -> PCM -> A2DP source -> speaker. No GMF in this slice; the
-decode/sink seam is where GMF slots in later.
+It is **GMF-based**: `play` drives Espressif's `esp_audio_simple_player`, which
+takes a URI, picks the decoder from the extension, converts bit depth, channels
+and rate, and hands PCM to a callback -- espix's callback, which writes into the
+A2DP source's PCM ring. (A decoder earlier in this phase did the seam by hand;
+the GMF player replaced it, because that is the layer phase 2 builds on.)
+
+`play` does not need the sink first: it fills the ring and blocks in its output
+callback until A2DP connects, so it can be issued while the link is still down --
+which matters, because a connected link is what costs a memory-tight shell its
+SSH sessions.
+
+**Rates.** Resampling is off -- but not because the part cannot do it. The S31
+has a **hardware ASRC** (`CONFIG_SOC_ASRC_SUPPORTED`; `esp_asrc`, and GMF's
+`aud_asrc` element with `perf_type AUTO`). The problem is that the player path
+does not use it: `esp_audio_simple_player` hardcodes the **software** converter
+(`aud_rate_cvt` -> `esp_audio_effects`), which against a 48 kHz source loses
+~250 short reads/s (~110 kB/s) and starves the PCM ring -- where the same
+pipeline without it has **zero** short reads. Until resampling rides the
+hardware ASRC, the source must match the sink's negotiated rate; SBC sinks pick
+44.1 kHz in practice (the soundcore Q45 does), which is what a CD-rate MP3
+already is. Routing `play` through `esp_gmf_asrc` (or a custom pipeline that
+uses it) is the fix, not accepting a limit the silicon does not have.
+
+**IDF version, on S31: use the `release/v6.1` branch, not the `v6.1` tag.** The
+tag predates the S31 BR/EDR fixes (wrong TX-power table, ACL performance under
+Wi-Fi coexistence, controller-lib LMP bugs). On the tag, A2DP drains at ~0.7x
+realtime -- music with gaps and noise; on the branch it is realtime (~180 kB/s,
+~352 SBC frames/s, zero ring underruns). See docs/UPSTREAM.md.
 
 S3 I2S output is deferred. The S31 coreboard has a mono amp and a speaker
 header (no speaker attached yet) and a mic; both are phase 2.

@@ -175,6 +175,40 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
  * fills the buffer. An empty buffer yields silence rather than a stall, so a
  * connected speaker does not decide the link is dead between tracks.
  */
+static const char *sbc_freq_str(uint8_t f)
+{
+    switch (f) {
+    case 0: return "16000";
+    case 1: return "32000";
+    case 2: return "44100";
+    case 3: return "48000";
+    default: return "?";
+    }
+}
+
+static const char *sbc_ch_str(uint8_t c)
+{
+    switch (c) {
+    case 0: return "mono";
+    case 1: return "dual";
+    case 2: return "stereo";
+    case 3: return "joint";
+    default: return "?";
+    }
+}
+
+/*
+ * Drain accounting. The PCM ring is only ever pulled from here, so bytes per
+ * second is the sink's real consumption rate: at 48 kHz stereo it should read
+ * ~192000 B/s, at 44.1 kHz ~176400 B/s. A lower number, or a ring that keeps
+ * reading empty, is the stutter.
+ */
+static uint32_t s_drain_bytes;
+static uint32_t s_drain_calls;
+static uint32_t s_short_calls;
+static uint32_t s_short_bytes;
+static int64_t  s_drain_mark_us;
+
 static int32_t a2d_data_cb(uint8_t *data, int32_t len)
 {
     if (data == NULL || len <= 0) {
@@ -183,6 +217,26 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
     const size_t got = xStreamBufferReceive(s_pcm, data, (size_t)len, 0);
     if (got < (size_t)len) {
         memset(data + got, 0, (size_t)len - got);
+        s_short_calls++;
+        s_short_bytes += (uint32_t)((size_t)len - got);
+    }
+
+    s_drain_bytes += (uint32_t)len;
+    s_drain_calls++;
+    const int64_t now = esp_timer_get_time();
+    if (s_drain_mark_us == 0) {
+        s_drain_mark_us = now;
+    } else if (now - s_drain_mark_us >= 1000000) {
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "drain %u B/s, %u calls/s, ring %u B, short %u calls/%u B",
+                   (unsigned)s_drain_bytes, (unsigned)s_drain_calls,
+                   (unsigned)xStreamBufferBytesAvailable(s_pcm),
+                   (unsigned)s_short_calls, (unsigned)s_short_bytes);
+        s_drain_bytes = 0;
+        s_drain_calls = 0;
+        s_short_calls = 0;
+        s_short_bytes = 0;
+        s_drain_mark_us = now;
     }
     return len;
 }
@@ -240,6 +294,23 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             if (s_want_connect && s_retry != NULL) {
                 (void)esp_timer_start_once(s_retry, 2 * 1000 * 1000);
             }
+        }
+        break;
+    }
+    case ESP_A2D_AUDIO_CFG_EVT: {
+        const esp_a2d_mcc_t *m = &param->audio_cfg.mcc;
+        if (m->type == ESP_A2D_MCT_SBC) {
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "sink cfg: SBC %s Hz, %s, subbands %u, block %u, bitpool %u-%u",
+                       sbc_freq_str(m->cie.sbc_info.samp_freq),
+                       sbc_ch_str(m->cie.sbc_info.ch_mode),
+                       (unsigned)m->cie.sbc_info.num_subbands,
+                       (unsigned)m->cie.sbc_info.block_len,
+                       (unsigned)m->cie.sbc_info.min_bitpool,
+                       (unsigned)m->cie.sbc_info.max_bitpool);
+        } else {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "sink cfg: codec type 0x%x",
+                       (unsigned)m->type);
         }
         break;
     }
