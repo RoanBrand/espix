@@ -1,0 +1,114 @@
+W (23790) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (23790) BT_AV: event: 17
+I (30750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (30750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (30750) BT_APPL: reset flags
+I (30750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (31930) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (31930) OLM_LMP: opcode:54
+
+W (31950) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (31960) BT_AV: event: 16
+W (32250) BT_AVCT: Out of ccbs
+W (32300) BT_APPL: bta_dm_act no entry for connected service cbs
+W (32310) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 3
+
+I (32310) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (34470) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (34470) BT_AV: event: 17
+I (40750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (40750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (40750) BT_APPL: reset flags
+I (40750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (41330) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (41330) OLM_LMP: opcode:54
+
+W (41360) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (41360) BT_AV: event: 16
+W (41640) BT_AVCT: Out of ccbs
+W (41710) BT_APPL: bta_dm_act no entry for connected service cbs
+W (41710) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 3
+
+I (41710) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (43890) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (43890) BT_AV: event: 17
+I (50750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (50750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (50750) BT_APPL: reset flags
+I (50750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (52020) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (52020) OLM_LMP: opcode:54
+
+W (52040) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (52050) BT_AV: event: 16
+W (52280) BT_AVCT: Out of ccbs
+W (52340) BT_APPL: bta_dm_act no entry for connected service cbs
+W (52340) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 3
+
+I (52340) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (54500) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (54500) BT_AV: event: 17
+I (60750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (60750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (60750) BT_APPL: reset flags
+I (60750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (63930) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (63930) OLM_LMP: opcode:54
+
+W (63930) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (63930) BT_AV: event: 16
+W (64170) BT_AVCT: Out of ccbs
+W (64220) BT_APPL: bta_dm_act no entry for connected service cbs
+W (64220) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 3
+
+I (64220) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (66380) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (66390) BT_AV: event: 17
+I (70750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (70750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (70750) BT_APPL: reset flags
+I (70750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (71950) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (71950) OLM_LMP: opcode:54
+
+W (71970) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (71970) BT_AV: event: 16
+W (72270) BT_AVCT: Out of ccbs
+W (72320) BT_APPL: bta_dm_act no entry for connected service cbs
+W (72320) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 3
+
+I (72320) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (74490) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (74490) BT_AV: event: 17
+I (80750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (80750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (80750) BT_APPL: reset flags
+I (80750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (80910) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (80910) OLM_LMP: opcode:54
+
+W (80940) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (80940) BT_AV: event: 16
+W (81240) BT_AVCT: Out of ccbs
+W (81290) BT_APPL: bta_dm_act no entry for connected service cbs
+W (81290) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 3
+
+I (81290) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (83450) BT_HCI: hcif disc complete: hdl 0x801, rsn 0x13 dev_find 1
+I (83450) BT_AV: event: 17
+I (90750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (90750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+W (90750) BT_APPL: reset flags
+I (90750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+E (91590) OLM_LMP: acl lmp unpack failed, err:262!
+
+E (91600) OLM_LMP: opcode:54
+
+W (91620) BT_HCI: hcif conn complete: hdl 0x801, st 0x0
+I (91620) BT_AV: event: 16

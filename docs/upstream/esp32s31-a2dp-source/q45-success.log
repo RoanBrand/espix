@@ -1,0 +1,47 @@
+I (1874800) RC_CT: AVRC event notification: 13
+I (1874800) RC_CT: Volume changed: 71
+I (1874800) RC_CT: Set absolute volume: volume 76
+I (1874830) RC_CT: Set absolute volume response: volume 76
+I (1875160) RC_CT: AVRC event notification: 13
+I (1875160) RC_CT: Volume changed: 71
+I (1875160) RC_CT: Set absolute volume: volume 76
+I (1875190) RC_CT: Set absolute volume response: volume 76
+I (1875340) RC_CT: AVRC event notification: 13
+I (1875340) RC_CT: Volume changed: 71
+I (1875340) RC_CT: Set absolute volume: volume 76
+I (1875370) RC_CT: Set absolute volume response: volume 76
+I (1875880) RC_CT: AVRC event notification: 13
+I (1875880) RC_CT: Volume changed: 71
+I (1875880) RC_CT: Set absolute volume: volume 76
+I (1875910) RC_CT: Set absolute volume response: volume 76
+I (1876510) RC_CT: AVRC event notification: 13
+I (1876510) RC_CT: Volume changed: 71
+I (1876510) RC_CT: Set absolute volume: volume 76
+I (1876540) RC_CT: Set absolute volume response: volume 76
+I (1877440) RC_CT: AVRC event notification: 13
+I (1877440) RC_CT: Volume changed: 71
+I (1877440) RC_CT: Set absolute volume: volume 76
+I (1877470) RC_CT: Set absolute volume response: volume 76
+I (1877620) RC_CT: AVRC event notification: 13
+I (1877620) RC_CT: Volume changed: 71
+I (1877620) RC_CT: Set absolute volume: volume 76
+I (1877650) RC_CT: Set absolute volume response: volume 76
+I (1877920) RC_CT: AVRC event notification: 13
+I (1877920) RC_CT: Volume changed: 71
+I (1877920) RC_CT: Set absolute volume: volume 76
+I (1877950) RC_CT: Set absolute volume response: volume 76
+I (1878100) RC_CT: AVRC event notification: 13
+I (1878100) RC_CT: Volume changed: 71
+I (1878100) RC_CT: Set absolute volume: volume 76
+I (1878130) RC_CT: Set absolute volume response: volume 76
+I (1878880) RC_CT: AVRC event notification: 13
+I (1878880) RC_CT: Volume changed: 71
+I (1878880) RC_CT: Set absolute volume: volume 76
+I (1878910) RC_CT: Set absolute volume response: volume 76
+I (1880740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00
+I (1890740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00
+I (1900740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00
+I (1910740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00
+I (1920740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00
+I (1930740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00
+I (1940740) BT_AV: bt_app_av_sm_hdlr state: 5, event: 0xff00

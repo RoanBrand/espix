@@ -1,0 +1,70 @@
+W (95870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x41
+
+W (95870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (95870) BT_AV: event: 16
+W (95870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (95880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (100750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (100750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (100750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (105870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x40
+
+W (105870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (105870) BT_AV: event: 16
+W (105870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (105880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (110750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (110750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (110750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (115870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x41
+
+W (115870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (115870) BT_AV: event: 16
+W (115870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (115880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (120750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (120750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (120750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (125870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x40
+
+W (125870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (125870) BT_AV: event: 16
+W (125870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (125880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (130750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (130750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (130750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (135870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x41
+
+W (135870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (135870) BT_AV: event: 16
+W (135870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (135880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (140750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (140750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (140750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (145870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x40
+
+W (145870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (145870) BT_AV: event: 16
+W (145870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (145880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (150750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (150750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (150750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+W (155870) BT_SDP: SDP - Rcvd conn cnf with error: 0x4  CID 0x41
+
+W (155870) BT_HCI: hcif conn complete: hdl 0xfff, st 0x4
+I (155870) BT_AV: event: 16
+W (155870) BT_BTC: BTA_AV_OPEN_EVT::FAILED status: 2
+
+I (155880) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
+I (160750) BT_AV: bt_app_av_sm_hdlr state: 3, event: 0xff00
+I (160750) BT_AV: a2dp connecting to peer: 00:22:d9:00:1a:ee
+I (160750) BT_AV: bt_app_av_sm_hdlr state: 4, event: 0x0
