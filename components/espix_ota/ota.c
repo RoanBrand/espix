@@ -492,6 +492,20 @@ esp_err_t espix_ota_adopt(const char *path, char *name, size_t len,
         return ESP_OK;                  /* already where the loader looks */
     }
 
+    /*
+     * Move when we can. The image normally arrives on the same littlefs
+     * (/tmp/espix.bin) as /boot, and rename is atomic and needs no free space --
+     * where the copy below needs the whole image's worth, which is what made an
+     * OTA fail on a nearly-full filesystem. A source on another filesystem
+     * (upgrade --file pointed at a mounted disk) still falls through to a copy.
+     */
+    if (rename(path, dst) == 0) {
+        if (err != NULL) {
+            snprintf(err, err_len, "adopted %s (moved)", name);
+        }
+        return ESP_OK;
+    }
+
     FILE *in = fopen(path, "rb");
     if (in == NULL) {
         if (err != NULL) {

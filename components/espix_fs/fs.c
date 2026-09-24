@@ -49,6 +49,68 @@ bool espix_fs_is_mounted(void)
     return s_mounted;
 }
 
+/*
+ * /tmp has to survive as a place, not as contents. A failed OTA leaves its
+ * image there -- 3.6 MB on a 12 MB filesystem -- and nothing in it is meant to
+ * outlive a boot, so it is emptied here, right after the mount and before
+ * anything can use it.
+ */
+static void remove_tree(const char *path)
+{
+    DIR *d = opendir(path);
+    if (d == NULL) {
+        unlink(path);
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+            continue;
+        }
+        char child[320];
+        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            remove_tree(child);
+        } else {
+            unlink(child);
+        }
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+static void clear_tmp(void)
+{
+    char names[32][64];
+    size_t n = 0;
+
+    DIR *d = opendir("/tmp");
+    if (d == NULL) {
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && n < 32) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+            continue;
+        }
+        strlcpy(names[n], de->d_name, sizeof(names[n]));
+        n++;
+    }
+    closedir(d);
+
+    for (size_t i = 0; i < n; i++) {
+        char child[320];
+        snprintf(child, sizeof(child), "/tmp/%s", names[i]);
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            remove_tree(child);
+        } else {
+            unlink(child);
+        }
+    }
+}
+
 static void ensure_skeleton(void)
 {
     for (size_t i = 0; i < sizeof(k_skeleton) / sizeof(k_skeleton[0]); i++) {
@@ -116,6 +178,7 @@ esp_err_t espix_fs_mount_root(void)
 
     s_mounted = true;
     ensure_skeleton();
+    clear_tmp();
 
     /* No chdir() here on purpose. ESP-IDF has no process-wide working
      * directory: chdir() is a hardcoded ENOSYS stub and getcwd() always answers
