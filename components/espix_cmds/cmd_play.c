@@ -3,6 +3,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "sdkconfig.h"
 
@@ -30,16 +31,34 @@ static int cmd_play(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    const esp_err_t err = espix_audio_play(argv[1]);
-    if (err == ESP_ERR_INVALID_STATE) {
-        espix_eprintf(s, "play: no A2DP sink connected; pair/connect first\n");
-        return 1;
+    /*
+     * A URL passes through untouched; a path is resolved against the shell's
+     * cwd first. GMF's IO scoring accepts a leading "/" or a scheme, so a bare
+     * "test.mp3" is neither and comes back as "invalid URI". Resolving here also
+     * lets a missing file fail before any player state is built.
+     */
+    char path[320];
+    const char *uri = argv[1];
+
+    if (strstr(argv[1], "://") == NULL) {
+        if (!espix_cmd_path(s, argv[1], path, sizeof(path))) {
+            return 1;
+        }
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            espix_eprintf(s, "play: %s: no such file\n", argv[1]);
+            return 1;
+        }
+        uri = path;
     }
+
+    const esp_err_t err = espix_audio_play(uri);
     if (err != ESP_OK) {
-        espix_eprintf(s, "play: cannot start '%s'\n", argv[1]);
+        espix_eprintf(s, "play: cannot start '%s': %s\n", argv[1],
+                      esp_err_to_name(err));
         return 1;
     }
-    espix_printf(s, "play: %s\n", argv[1]);
+    espix_printf(s, "play: %s\n", uri);
     return 0;
 }
 

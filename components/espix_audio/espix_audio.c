@@ -57,11 +57,22 @@ esp_err_t espix_audio_play(const char *uri)
         return ESP_ERR_INVALID_ARG;
     }
     if (!espix_bt_ready()) {
-        return ESP_ERR_INVALID_STATE;
+        /* `play` may be the first command; bring the controller up here. The
+         * sink is not required yet (see the connect check below). */
+        const esp_err_t e = espix_bt_init();
+        if (e != ESP_OK) {
+            return e;
+        }
     }
     if (!espix_bt_a2d_connected()) {
-        /* Without a sink nothing drains the ring, so the player would stall. */
-        return ESP_ERR_INVALID_STATE;
+        /*
+         * No sink yet: the player fills the ring and blocks in its output
+         * callback until one connects. That is deliberate -- `play` can be
+         * started before the link, which matters because the link is what
+         * costs the shell its memory, so the command that starts playback can
+         * be issued while SSH still works.
+         */
+        espix_klog(ESPIX_KLOG_INFO, TAG, "no sink yet; playback waits for A2DP");
     }
 
     if (s_player == NULL) {
@@ -113,22 +124,22 @@ esp_err_t espix_audio_stop(void)
  */
 #define MEDIA_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
-void *media_lib_malloc(size_t size)
+__attribute__((used)) void *media_lib_malloc(size_t size)
 {
     return heap_caps_malloc(size, MEDIA_CAPS);
 }
 
-void *media_lib_calloc(size_t num, size_t size)
+__attribute__((used)) void *media_lib_calloc(size_t num, size_t size)
 {
     return heap_caps_calloc(num, size, MEDIA_CAPS);
 }
 
-void *media_lib_realloc(void *buf, size_t size)
+__attribute__((used)) void *media_lib_realloc(void *buf, size_t size)
 {
     return heap_caps_realloc(buf, size, MEDIA_CAPS);
 }
 
-void media_lib_free(void *buf)
+__attribute__((used)) void media_lib_free(void *buf)
 {
     heap_caps_free(buf);
 }
