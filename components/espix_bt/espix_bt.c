@@ -182,6 +182,12 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
     return len;
 }
 
+static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    (void)event;
+    (void)param;
+}
+
 /* Minimal AVRCP controller callback: its existence is what A2DP requires, and
  * the connection state is worth a line in the log. */
 static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
@@ -227,6 +233,13 @@ esp_err_t espix_bt_init(void)
     if (s_inited) {
         return ESP_OK;
     }
+
+    /*
+     * The example releases the BLE half's memory before enabling a Classic-only
+     * controller; match it -- it is the one code difference from an example
+     * whose configuration is otherwise identical.
+     */
+    (void)esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
 
     esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&cfg);
@@ -278,6 +291,14 @@ esp_err_t espix_bt_init(void)
         return err;
     }
     (void)esp_avrc_ct_register_callback(avrc_ct_cb);
+
+    /* The target half too: without it the SDP record lacks the AVRCP
+     * protocol list Bluedroid warns about, and a sink's discovery can fail. */
+    err = esp_avrc_tg_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)esp_avrc_tg_register_callback(avrc_tg_cb);
 
     err = esp_a2d_source_init();
     if (err != ESP_OK) {
