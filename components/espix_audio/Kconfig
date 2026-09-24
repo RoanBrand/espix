@@ -1,0 +1,11 @@
+menu "espix audio"
+
+    config ESPIX_AUDIO
+        bool "Audio playback (play)"
+        default y
+        help
+            The play command: a GMF-based player (esp_audio_simple_player) that
+            reads a URI -- a local file or an HTTP(S) stream -- decodes it, and
+            hands PCM to the A2DP source. It is on by default where Bluetooth is.
+
+endmenu

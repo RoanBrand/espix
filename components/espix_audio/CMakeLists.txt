@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "espix_audio.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_REQUIRES
+        espix_kernel
+        espix_bt
+        esp_audio_simple_player
+)

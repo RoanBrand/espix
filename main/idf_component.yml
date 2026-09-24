@@ -79,3 +79,10 @@ dependencies:
   esp_lwext4:
     git: https://github.com/huming2207/esp_lwext4.git
     version: "d774c178f0211d62d3f0d49e9164aa655573ecfe"
+
+  # The engine behind `play`: a GMF-based player. It takes a URI ("file:///..."
+  # or "http://..."), picks the decoder from the extension, and hands PCM to a
+  # callback -- which is where the A2DP source's ring buffer is filled. Chosen
+  # over raw esp_audio_codec because it is the GMF family the audio phase builds
+  # on, and because the URI/format/transform handling is exactly `play`.
+  espressif/esp_audio_simple_player: "^1"

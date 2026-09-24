@@ -14,7 +14,7 @@
 
 #define TAG      "bt"
 #define DEV_MAX  32
-#define PCM_BUF  (32 * 1024)
+#define PCM_BUF  (64 * 1024)
 
 #if CONFIG_ESPIX_BT
 

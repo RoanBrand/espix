@@ -13,6 +13,7 @@ idf_component_register(
         "cmd_ota.c"
         "cmd_hash.c"
         "cmd_bt.c"
+        "cmd_play.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -27,6 +28,7 @@ idf_component_register(
         espix_fault
         espix_net
         espix_bt
+        espix_audio
         espix_usb
         espix_auth
         espix_time
