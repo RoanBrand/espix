@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -36,6 +37,10 @@ static bool           s_scanning;
 static char           s_pin[ESPIX_BT_PIN_MAX] = "0000";
 
 static StreamBufferHandle_t s_pcm;        /* decoded PCM, waiting for the stack */
+static esp_timer_handle_t   s_retry;      /* re-issues a failed A2DP connect */
+static uint8_t              s_target[ESPIX_BDA_LEN];
+static bool                 s_want_connect;
+static unsigned             s_retries;
 static StaticStreamBuffer_t s_pcm_cb;     /* its control block (internal RAM) */
 static uint8_t             *s_pcm_storage;/* its storage (PSRAM) */
 static bool                 s_a2d_connected;
@@ -198,6 +203,22 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
     }
 }
 
+/*
+ * A2DP source connections habitually fail the first several times with HCI
+ * Page Timeout (st 0x4) and then succeed -- issue #15913 has the same log on a
+ * plain ESP32. IDF's example retries until connected; so does espix now, or a
+ * single connect would look like a permanent failure.
+ */
+static void retry_connect(void *arg)
+{
+    (void)arg;
+    if (s_want_connect && s_retries < 40) {
+        s_retries++;
+        espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connect retry %u", s_retries);
+        (void)esp_a2d_source_connect(s_target);
+    }
+}
+
 static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     switch (event) {
@@ -209,11 +230,16 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         }
         if (st == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             s_a2d_connected = true;
+            s_want_connect = false;
+            s_retries = 0;
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connected; checking source");
             (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_a2d_connected = false;
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp disconnected");
+            if (s_want_connect && s_retry != NULL) {
+                (void)esp_timer_start_once(s_retry, 2 * 1000 * 1000);
+            }
         }
         break;
     }
@@ -279,6 +305,15 @@ esp_err_t espix_bt_init(void)
     s_pcm = xStreamBufferCreateStatic(PCM_BUF, 1, s_pcm_storage, &s_pcm_cb);
     if (s_pcm == NULL) {
         return ESP_ERR_NO_MEM;
+    }
+
+    const esp_timer_create_args_t retry_args = {
+        .callback = retry_connect,
+        .name     = "bt_retry",
+    };
+    err = esp_timer_create(&retry_args, &s_retry);
+    if (err != ESP_OK) {
+        return err;
     }
 
     /*
@@ -366,6 +401,9 @@ esp_err_t espix_bt_connect(const uint8_t bda[ESPIX_BDA_LEN])
         return ESP_ERR_INVALID_STATE;
     }
     dev_upsert(bda, NULL);
+    memcpy(s_target, bda, ESPIX_BDA_LEN);
+    s_want_connect = true;
+    s_retries      = 0;
     return esp_a2d_source_connect((uint8_t *)bda);
 }
 
@@ -373,6 +411,10 @@ esp_err_t espix_bt_disconnect(const uint8_t bda[ESPIX_BDA_LEN])
 {
     if (!s_inited) {
         return ESP_ERR_INVALID_STATE;
+    }
+    s_want_connect = false;
+    if (s_retry != NULL) {
+        (void)esp_timer_stop(s_retry);
     }
     return esp_a2d_source_disconnect((uint8_t *)bda);
 }

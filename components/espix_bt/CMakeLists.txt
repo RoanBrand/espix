@@ -7,4 +7,5 @@ idf_component_register(
         espix_kernel
         bt
         nvs_flash
+        esp_timer
 )
