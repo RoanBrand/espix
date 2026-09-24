@@ -27,6 +27,7 @@
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
 #include "esp_a2dp_legacy_api.h"
+#include "esp_avrc_api.h"
 
 static espix_bt_dev_t s_devs[DEV_MAX];
 static size_t         s_dev_count;
@@ -38,6 +39,18 @@ static StreamBufferHandle_t s_pcm;        /* decoded PCM, waiting for the stack 
 static StaticStreamBuffer_t s_pcm_cb;     /* its control block (internal RAM) */
 static uint8_t             *s_pcm_storage;/* its storage (PSRAM) */
 static bool                 s_a2d_connected;
+
+/* A zero address turns up in connection-state events for "no device"; it is
+ * not a device and must not enter the list (it showed as 00:00:...). */
+static bool bda_valid(const uint8_t bda[ESPIX_BDA_LEN])
+{
+    for (int i = 0; i < ESPIX_BDA_LEN; i++) {
+        if (bda[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static int dev_find(const uint8_t bda[ESPIX_BDA_LEN])
 {
@@ -51,6 +64,9 @@ static int dev_find(const uint8_t bda[ESPIX_BDA_LEN])
 
 static void dev_upsert(const uint8_t bda[ESPIX_BDA_LEN], const char *name)
 {
+    if (!bda_valid(bda)) {
+        return;
+    }
     int i = dev_find(bda);
     if (i < 0) {
         if (s_dev_count >= DEV_MAX) {
@@ -166,6 +182,16 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
     return len;
 }
 
+/* Minimal AVRCP controller callback: its existence is what A2DP requires, and
+ * the connection state is worth a line in the log. */
+static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
+{
+    if (event == ESP_AVRC_CT_CONNECTION_STATE_EVT) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "avrc %s",
+                   param->conn_stat.connected ? "connected" : "disconnected");
+    }
+}
+
 static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     switch (event) {
@@ -242,12 +268,23 @@ esp_err_t espix_bt_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    (void)esp_a2d_register_callback(a2d_cb);
-    (void)esp_a2d_source_register_data_callback(a2d_data_cb);
+    /*
+     * AVRCP first. Bluedroid refuses the A2DP link with "A2DP Enable without
+     * AVRC" when the controller half is missing -- exactly the
+     * BTA_AV_OPEN_EVT::FAILED the speaker produced.
+     */
+    err = esp_avrc_ct_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)esp_avrc_ct_register_callback(avrc_ct_cb);
+
     err = esp_a2d_source_init();
     if (err != ESP_OK) {
         return err;
     }
+    (void)esp_a2d_register_callback(a2d_cb);
+    (void)esp_a2d_source_register_data_callback(a2d_data_cb);
 
     s_inited = true;
     espix_klog(ESPIX_KLOG_INFO, TAG, "up as '%s' (a2dp source)", CONFIG_ESPIX_BT_NAME);
