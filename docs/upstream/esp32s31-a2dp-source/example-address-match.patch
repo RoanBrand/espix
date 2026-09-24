@@ -1,0 +1,23 @@
+--- /Users/roanb/.espressif/v6.1/esp-idf/examples/bluetooth/bluedroid/classic_bt/a2dp_source/main/main.c	2026-09-04 10:04:15
++++ /tmp/a2dp_clean/main/main.c	2026-09-24 12:27:30
+@@ -194,6 +194,20 @@
+         case ESP_BT_GAP_DEV_PROP_BDNAME:
+         default:
+             break;
++        }
++    }
++
++    /* HD3 only, for the role-switch-bypass test. */
++    static const uint8_t targets[][ESP_BD_ADDR_LEN] = {
++        {0x00, 0x22, 0xd9, 0x00, 0x1a, 0xee},   /* Audioengine HD3 */
++    };
++    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
++        if (memcmp(param->disc_res.bda, targets[i], ESP_BD_ADDR_LEN) == 0) {
++            ESP_LOGI(BT_AV_TAG, "Found target device by address, %s", bda_str);
++            s_a2d_state = APP_AV_STATE_DISCOVERED;
++            memcpy(s_peer_bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
++            esp_bt_gap_cancel_discovery();
++            return;
+         }
+     }
+ 
