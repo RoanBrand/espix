@@ -132,3 +132,16 @@ CONFIG_BTDM_CTRL_MODE_BTDM=n
 # host is not draining it -- exactly the case while OpenOCD holds the port.
 # Off, so the USB-DBG port carries JTAG and nothing else.
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+#
+# Audio codec
+#
+# Two library variants exist for S31 -- lib/esp32s31 (assembly) and
+# lib/esp32s31_esp_c (portable C) -- selected by ESP_AUDIO_CODEC_S31_USE_ASM,
+# which 2.6.2 defaults to n. Keep the default. Disassembling both shows the
+# assembly variant uses the PIE coprocessor only in LC3 (114 sites) and Opus
+# (19), and not in MP3 at all; and on S31 only core 1 has PIE, so FreeRTOS pins
+# the calling task to core 1 on its first PIE instruction (IDF's own
+# freertos/test_apps/freertos/port/test_pie_in_task.c says so). No MP3 gain,
+# and a core-affinity constraint not worth taking on yet. Revisit for LE Audio.
+# CONFIG_ESP_AUDIO_CODEC_S31_USE_ASM is not set

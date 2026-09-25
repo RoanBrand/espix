@@ -80,16 +80,14 @@ dependencies:
     git: https://github.com/huming2207/esp_lwext4.git
     version: "d774c178f0211d62d3f0d49e9164aa655573ecfe"
 
-  # The engine behind `play`: a GMF-based player. It takes a URI ("file:///..."
-  # or "http://..."), picks the decoder from the extension, and hands PCM to a
-  # callback -- which is where the A2DP source's ring buffer is filled. Chosen
-  # over raw esp_audio_codec because it is the GMF family the audio phase builds
-  # on, and because the URI/format/transform handling is exactly `play`.
-  espressif/esp_audio_simple_player: "^1"
-
-  # GMF's pool loader: registers the default IO readers, the audio decoder and
-  # the effect elements into a pool, so espix's playback pipeline can be
-  # assembled by name. The hardware ASRC is registered separately --
-  # esp_audio_simple_player hardcodes the software rate converter, which is why
-  # espix drives the pipeline itself.
-  espressif/gmf_loader: "~1.0"
+  # The decoders and parsers behind `play`, used directly. The GMF player and
+  # loader went with the GMF pipeline -- they pulled the whole GMF family into
+  # the image, and its task/IO/event loop cost more than the decode itself -- so
+  # this is the only audio dependency now.
+  #
+  # The version matters: 2.6.1 added an ESP32-S31 library variant built with
+  # PIE assembly plus the option to choose it (CONFIG_AUDIO_CODEC_S31_USE_ASM),
+  # and 2.6.2 defaults that option to *off* -- so it has to be turned on
+  # explicitly to get the faster decoder. 2.5.0, which the GMF dependencies
+  # pinned us to, predates both.
+  espressif/esp_audio_codec: "^2.6.2"
