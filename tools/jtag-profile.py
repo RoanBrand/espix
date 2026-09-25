@@ -14,6 +14,16 @@ input, plus a top-functions summary on stdout so it is useful on its own.
 
 Needs the board's USB-JTAG connected, and the OpenOCD that knows esp32s31
 (20260703 in the tool tree; the IDF-pinned 20260424 has no S31 target).
+
+A sample halts the target while GDB reads it. The normal path detaches (which
+resumes), but killing OpenOCD mid-sample leaves the board frozen -- there is no
+console output and no hint why. Resume it with:
+
+    openocd -f .../board/esp32s31-builtin.cfg -c 'init' -c 'reset run' -c shutdown
+
+Note too that only the task(s) on a core are recorded; OpenOCD's S31 RTOS
+support lists every task but gives blocked ones a halt-artifact leaf frame, so
+their stacks are excluded rather than allowed to swamp the histogram.
 """
 import argparse
 import glob
