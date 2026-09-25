@@ -125,6 +125,18 @@ static void feed(const uint8_t *p, size_t n)
  * optimization flags, which is the only lever for MP3 on this part. Kept as an
  * A/B: see docs/AUDIO.md and the S31 PIE note.
  */
+/*
+ * Read micro-mp3 in sub-frame chunks. Its decode_direct() path -- taken when
+ * the caller's buffer already holds a whole frame -- bounds the slice to that
+ * frame, so a frame referencing the bit reservoir cannot reach the earlier main
+ * data and comes back MP3_DECODE_ERROR ("a bit-reservoir reference the bounded
+ * slice can't reach", in the library's own words). decode_buffered(), taken
+ * when a frame spans chunks, keeps the history and decodes those frames. A
+ * frame is ~418 bytes at 128 kbps/44.1 kHz, so 256 keeps us in the buffered
+ * path.
+ */
+#define ESPIX_MP3_READ_CHUNK 256
+
 #define ESPIX_MP3_OK                  0
 #define ESPIX_MP3_NEED_MORE_DATA      1
 #define ESPIX_MP3_STREAM_INFO_READY   2
@@ -139,7 +151,7 @@ int   espix_mp3_sample_rate(void *h);
 int   espix_mp3_channels(void *h);
 int   espix_mp3_bit_depth(void *h);
 
-static void play_mp3(int fd, uint8_t *in, uint8_t *out)
+__attribute__((unused)) static void play_mp3(int fd, uint8_t *in, uint8_t *out)
 {
     void *mp3 = espix_mp3_open();
     if (mp3 == NULL) {
@@ -156,7 +168,7 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
     while (!s_stop) {
         if (in_off >= in_len) {
             const int64_t r0 = esp_timer_get_time();
-            const int n = (int)read(fd, in, IN_CHUNK);
+            const int n = (int)read(fd, in, ESPIX_MP3_READ_CHUNK);
             t_read += (uint32_t)(esp_timer_get_time() - r0);
             if (n <= 0) {
                 break;
@@ -189,7 +201,7 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
             if (rem > 0 && in_off > 0) {
                 memmove(in, in + in_off, rem);
             }
-            const int n = (int)read(fd, in + rem, IN_CHUNK - rem);
+            const int n = (int)read(fd, in + rem, ESPIX_MP3_READ_CHUNK - rem);
             if (n <= 0) {
                 if (rem == 0) {
                     break;
@@ -203,6 +215,15 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
             continue;
         }
         if (r < 0) {
+            if (n_err == 0) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "micro-mp3 first error r=%d consumed=%u in=%u",
+                           r, (unsigned)consumed, (unsigned)(in_len - in_off));
+            }
+            if (n_err < 5 || (n_err % 100) == 0) {
+                espix_klog(ESPIX_KLOG_WARN, TAG, "micro-mp3 err#%u r=%d consumed=%u",
+                           (unsigned)n_err, r, (unsigned)consumed);
+            }
             n_err++;
             /* A bad frame is recoverable; skip at least one byte so it cannot
              * spin on the same input. */
@@ -279,11 +300,22 @@ static void audio_task(void *arg)
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "playing %s", uri);
 
-    /* MP3 goes through micro-mp3, everything else through esp_audio_simple_dec. */
+    /*
+     * MP3 stays on esp_audio_simple_dec. esphome/micro-mp3 was wired in as an
+     * A/B (same OpenCore decoder, built from source with its own per-file
+     * optimization flags) and could not decode this file: every frame came back
+     * MP3_DECODE_ERROR. Its decode_direct() bounds the slice to one frame, so a
+     * frame referencing the bit reservoir cannot reach the earlier main data,
+     * and feeding sub-frame chunks to force decode_buffered() did not help
+     * either. The finding is worth reporting upstream; play_mp3() is kept below
+     * for that, unused.
+     */
+#if 0
     if (type == ESP_AUDIO_SIMPLE_DEC_TYPE_MP3) {
         play_mp3(fd, in, out);
         goto out;
     }
+#endif
 
     esp_audio_simple_dec_cfg_t cfg = {
         .dec_type      = type,

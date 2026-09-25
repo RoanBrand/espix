@@ -136,6 +136,32 @@ which is the scarce one, and it starved the next task creation.) MP3 is
 compressed (~16 kB/s of reads), so its file read is never the problem. See the
 open items below for the read path proper.
 
+**MP3 decode is software, scalar, and just under realtime.** There is no
+hardware audio decoder on any ESP32, and on S31 there is no accelerated MP3
+library either: the codec is the OpenCore/Helix fixed point decoder built for
+the target, and its `pvmp3_poly_phase_synthesis`/`pvmp3_equalizer` measured at
+**~93% of one core** for 44.1 kHz stereo (the log's read/decode/feed interval is
+several seconds, so read it as a fraction of the interval, not per second). The
+S31 does have a PIE/SIMD coprocessor, but `esp_audio_codec`'s assembly variant
+uses it only for **LC3 (114 sites) and Opus (19)** -- never for MP3 -- and only
+core 1 has PIE at all, which is why the assembly option pins its caller there.
+The S3 is not faster silicon, it is better codegen: its codec lib uses the LX7
+DSP/MAC instructions (`mul16s`, `addx2/4/8`, `madd.s`).
+
+**A second decoder was tried and cannot handle this file.**
+`esphome/micro-mp3` is the same OpenCore decoder built from source with its own
+per-file optimization flags, which is the one lever a prebuilt library denies.
+It decodes streams that do not use the bit reservoir, but a 64 kbps stereo MP3
+always does -- this one references up to 487 bytes of main data from earlier
+frames in 198 of its first 200 frames -- and micro-mp3 hands pvmp3 a buffer that
+starts at the frame and is bounded to it, so that look-back falls outside the
+buffer and pvmp3 returns `NO_ENOUGH_MAIN_DATA_ERROR` (`MP3_DECODE_ERROR`). Both
+its direct and buffered paths do this; only parallel paths down to pvmp3 differ.
+The prebuilt `esp_audio_codec` feeds pvmp3 the caller's contiguous chunk, so the
+reservoir is in range. Worth reporting upstream with the file; until then MP3
+stays on the prebuilt decoder. See `play_mp3()` in `components/espix_audio`, kept
+for that report.
+
 **IDF version, on S31: use the `release/v6.1` branch, not the `v6.1` tag.** The
 tag predates the S31 BR/EDR fixes (wrong TX-power table, ACL performance under
 Wi-Fi coexistence, controller-lib LMP bugs). On the tag, A2DP drains at ~0.7x
