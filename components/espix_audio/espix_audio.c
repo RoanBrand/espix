@@ -16,7 +16,9 @@
 #include "espix_kernel.h"
 #include "espix_bt.h"
 #include "espix_audio.h"
-#include "espix_gmf_sink.h"
+#include "esp_gmf_obj.h"
+#include "esp_gmf_port.h"
+#include "esp_gmf_data_bus.h"
 
 #define TAG "audio"
 
@@ -65,9 +67,47 @@ __attribute__((used)) void media_lib_free(void *buf)
 /* ------------------------------------------------------------------ */
 
 /*
+ * The pipeline's output is a *port*, not an IO -- the same shape the simple
+ * player uses: the tail element is handed a writer port whose release callback
+ * is where the PCM leaves the framework. (An IO registered in the pool does not
+ * give the element an out port to acquire from; that was "Failed to acquire
+ * out".)
+ *
+ * A full A2DP ring is not an error: it is the sink saying it has enough, so the
+ * callback blocks (yielding) and the pipeline slows to the link's rate rather
+ * than dropping samples.
+ */
+static int a2dp_acquire_write(void *handle, esp_gmf_data_bus_block_t *blk,
+                              uint32_t wanted_size, int block_ticks)
+{
+    (void)handle;
+    (void)blk;
+    (void)block_ticks;
+    return (int)wanted_size;
+}
+
+static int a2dp_release_write(void *handle, esp_gmf_data_bus_block_t *blk, int block_ticks)
+{
+    (void)handle;
+    (void)block_ticks;
+    if (blk == NULL || blk->valid_size == 0) {
+        return 0;
+    }
+    size_t off = 0;
+    while (off < blk->valid_size) {
+        if (espix_bt_audio_write((const uint8_t *)blk->buf + off, blk->valid_size - off) == ESP_OK) {
+            off = blk->valid_size;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    return 0;
+}
+
+/*
  * One pool for the process: the loader registers the IO readers, the decoder
  * and the effect elements (including the hardware ASRC, when
- * CONFIG_GMF_AUDIO_EFFECT_INIT_ASRC is on), and espix adds its A2DP writer.
+ * CONFIG_GMF_AUDIO_EFFECT_INIT_ASRC is on).
  */
 static esp_err_t ensure_pool(void)
 {
@@ -81,12 +121,6 @@ static esp_err_t ensure_pool(void)
     gmf_loader_setup_audio_codec_default(s_pool);
     gmf_loader_setup_audio_effects_default(s_pool);
 
-    esp_gmf_io_handle_t sink = NULL;
-    if (espix_gmf_sink_init("io_a2dp", &sink) != ESP_GMF_ERR_OK ||
-        esp_gmf_pool_register_io(s_pool, sink, "io_a2dp") != ESP_GMF_ERR_OK) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot register the A2DP sink");
-        return ESP_FAIL;
-    }
     return ESP_OK;
 }
 
@@ -133,8 +167,18 @@ esp_err_t espix_audio_play(const char *uri)
     const char *els[] = { "aud_dec", "aud_asrc" };
 
     if (esp_gmf_pool_new_pipeline(s_pool, net ? "io_http" : "io_file",
-                                  els, 2, "io_a2dp", &s_pipe) != ESP_GMF_ERR_OK) {
+                                  els, 2, NULL, &s_pipe) != ESP_GMF_ERR_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot build the pipeline");
+        teardown();
+        return ESP_FAIL;
+    }
+
+    esp_gmf_port_handle_t out_port = NEW_ESP_GMF_PORT_OUT_BYTE(
+        a2dp_acquire_write, a2dp_release_write, NULL, NULL, 8192, ESP_GMF_MAX_DELAY);
+    if (out_port == NULL ||
+        esp_gmf_pipeline_reg_el_port(s_pipe, OBJ_GET_TAG(s_pipe->last_el),
+                                     ESP_GMF_IO_DIR_WRITER, out_port) != ESP_GMF_ERR_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot attach the A2DP out port");
         teardown();
         return ESP_FAIL;
     }

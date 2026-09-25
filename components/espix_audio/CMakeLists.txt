@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "espix_audio.c"
-        "espix_gmf_sink.c"
     INCLUDE_DIRS
         "include"
     PRIV_REQUIRES
