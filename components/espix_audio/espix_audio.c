@@ -412,7 +412,14 @@ static void audio_task(void *arg)
 
         const int64_t now = esp_timer_get_time();
         if (now - mark >= 1000000) {
-            espix_klog(ESPIX_KLOG_INFO, TAG,
+            /*
+             * DEBUG, not INFO, on purpose. klog's ring is asynchronous, but its
+             * console echo is not: it does fprintf + fflush to a line-buffered
+             * tty, which is a blocking UART write of ~8-10 ms at 115200. An INFO
+             * line here fired every 2-3 s during playback and was audible as a
+             * burst of static. DEBUG stays in the ring, so dmesg still has it.
+             */
+            espix_klog(ESPIX_KLOG_DEBUG, TAG,
                        "read %ums decode %ums feed %ums, %u B/s produced",
                        (unsigned)(t_read / 1000), (unsigned)(t_dec / 1000),
                        (unsigned)(t_feed / 1000), (unsigned)produce);

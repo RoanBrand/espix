@@ -16,7 +16,13 @@
 
 #define TAG      "bt"
 #define DEV_MAX  32
-#define PCM_BUF  (64 * 1024)
+/*
+ * The PCM ring, in PSRAM. Sized for slack, not for the frame: at 44.1 kHz
+ * stereo the sink takes ~180 kB/s, so 64 kB was only ~350 ms and the ring could
+ * be seen dipping to zero whenever the producer paused for a read or a decode
+ * burst -- audible as padded-silence artefacts. PSRAM is the free pool here.
+ */
+#define PCM_BUF  (256 * 1024)
 
 #if CONFIG_ESPIX_BT
 
@@ -257,7 +263,9 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
     if (s_drain_mark_us == 0) {
         s_drain_mark_us = now;
     } else if (now - s_drain_mark_us >= 1000000) {
-        espix_klog(ESPIX_KLOG_INFO, TAG,
+        /* DEBUG, not INFO: see the note in espix_audio.c -- an INFO line here
+         * is a blocking UART write once a second, audible during playback. */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
                    "drain %u B/s, %u calls/s, ring %u B, short %u calls/%u B",
                    (unsigned)s_drain_bytes, (unsigned)s_drain_calls,
                    (unsigned)xStreamBufferBytesAvailable(s_pcm),
