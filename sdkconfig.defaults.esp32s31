@@ -56,6 +56,10 @@ CONFIG_ESPIX_ETH_ENABLED=y
 #
 CONFIG_ESPIX_BT=y
 
+# NB: CONFIG_ESP_SYSTEM_USE_FRAME_POINTER would make watchdog dumps readable,
+# but it adds ~152 KB of code -- enough to overflow the 3.5 MB kernel slot. Not
+# on this part; the coredump backtrace is the tool for real faults.
+
 # Audio playback (play). Resampling is OFF -- not because the part cannot
 # do it. The S31 has a hardware ASRC (CONFIG_SOC_ASRC_SUPPORTED; esp_asrc, and
 # GMF's aud_asrc element with perf_type AUTO). What cannot keep up is *this

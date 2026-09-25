@@ -164,10 +164,18 @@ esp_err_t espix_audio_play(const char *uri)
 
     const bool net = (strncmp(uri, "http://", 7) == 0 ||
                       strncmp(uri, "https://", 8) == 0);
-    const char *els[] = { "aud_dec", "aud_asrc" };
+    /*
+     * aud_dec and nothing else, for now. Including aud_asrc unconditionally
+     * put the pipeline behind the sink even for a 44.1 kHz source into a
+     * 44.1 kHz sink -- the ring stayed empty and CPU 1 ran hot -- so the ASRC
+     * is held back until it can be added only when the rates actually differ.
+     * Sources must therefore match the sink's negotiated rate (SBC sinks pick
+     * 44.1 kHz in practice).
+     */
+    const char *els[] = { "aud_dec" };
 
     if (esp_gmf_pool_new_pipeline(s_pool, net ? "io_http" : "io_file",
-                                  els, 2, NULL, &s_pipe) != ESP_GMF_ERR_OK) {
+                                  els, 1, NULL, &s_pipe) != ESP_GMF_ERR_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot build the pipeline");
         teardown();
         return ESP_FAIL;
@@ -204,8 +212,21 @@ esp_err_t espix_audio_play(const char *uri)
     cfg.thread.core         = 1;
     cfg.thread.stack_in_ext = true; /* the stack is in PSRAM */
 
-    if (esp_gmf_task_init(&cfg, &s_task) != ESP_GMF_ERR_OK ||
-        esp_gmf_pipeline_bind_task(s_pipe, s_task) != ESP_GMF_ERR_OK ||
+    if (esp_gmf_task_init(&cfg, &s_task) != ESP_GMF_ERR_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the task for %s", uri);
+        teardown();
+        return ESP_FAIL;
+    }
+
+    /*
+     * Without a timeout the task's job loop busy-polls instead of blocking:
+     * CPU 1 runs hot (IDLE1 starved) while the decode makes slow progress and
+     * the PCM ring starves. The simple player sets exactly this, and it is the
+     * one thing its task setup did that espix's did not.
+     */
+    esp_gmf_task_set_timeout(s_task, 5000);
+
+    if (esp_gmf_pipeline_bind_task(s_pipe, s_task) != ESP_GMF_ERR_OK ||
         esp_gmf_pipeline_loading_jobs(s_pipe) != ESP_GMF_ERR_OK ||
         esp_gmf_pipeline_run(s_pipe) != ESP_GMF_ERR_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start %s", uri);
