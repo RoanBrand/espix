@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
@@ -147,8 +148,16 @@ static void audio_task(void *arg)
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "playing %s", uri);
 
+    /* Where does the time go? Read, decode, and the ring write are timed
+     * separately and reported once a second; guessing from watchdog symbols
+     * has not worked. */
+    uint32_t t_read = 0, t_dec = 0, t_feed = 0, produce = 0;
+    int64_t  mark = esp_timer_get_time();
+
     while (!s_stop) {
+        const int64_t r0 = esp_timer_get_time();
         const int n = (int)fread(in, 1, IN_CHUNK, f);
+        t_read += (uint32_t)(esp_timer_get_time() - r0);
         if (n <= 0) {
             break;
         }
@@ -162,7 +171,9 @@ static void audio_task(void *arg)
                 .buffer = out,
                 .len    = OUT_CHUNK,
             };
+            const int64_t d0 = esp_timer_get_time();
             const esp_audio_err_t e = esp_audio_simple_dec_process(dec, &raw, &frame);
+            t_dec += (uint32_t)(esp_timer_get_time() - d0);
             if (e == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
                 uint8_t *nb = heap_caps_realloc(out, frame.needed_size, MEDIA_CAPS);
                 if (nb == NULL) {
@@ -186,13 +197,26 @@ static void audio_task(void *arg)
                     }
                     info_logged = true;
                 }
+                const int64_t f0 = esp_timer_get_time();
                 feed(frame.buffer, frame.decoded_size);
+                t_feed += (uint32_t)(esp_timer_get_time() - f0);
+                produce += frame.decoded_size;
             }
             raw.len -= raw.consumed;
             raw.buffer += raw.consumed;
         }
         if (raw.eos) {
             break;
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (now - mark >= 1000000) {
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "read %ums decode %ums feed %ums, %u B/s produced",
+                       (unsigned)(t_read / 1000), (unsigned)(t_dec / 1000),
+                       (unsigned)(t_feed / 1000), (unsigned)produce);
+            t_read = t_dec = t_feed = produce = 0;
+            mark = now;
         }
     }
 
