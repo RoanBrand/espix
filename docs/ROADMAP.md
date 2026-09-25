@@ -1300,6 +1300,33 @@ matters.
   small. Worth writing the registration interface early, so caches are born able
   to be evicted instead of retrofitted.
 
+## Logging
+
+- **Decouple the console write from the log call.** `espix_klog()` already
+  stores into a fixed-size ring -- that is what `dmesg` reads -- but it also
+  echoes to the console *in the caller's context*: `fprintf` + `fflush` to a
+  line-buffered tty, which is a blocking UART write (~8-10 ms per line at
+  115200, worse when the FIFO is busy). Every `ESP_LOGx` from IDF and from
+  components funnels through the same path, so *any* logging in a hot path is a
+  latency spike -- and it does not show up as task CPU, because the task is
+  blocked rather than busy.
+
+  It was audible before it was visible: the playback telemetry at INFO fired
+  every 2-3 s, and each line stalled the audio producer into a burst of static.
+  Fixed for now by logging that telemetry at DEBUG, which stays in the ring (the
+  console level is INFO and the test is `level <= level`).
+
+  The fix is the shape a real system uses -- Linux writes `printk` to a ring
+  and lets a separate context drive the console. Here: `klog_store()` formats,
+  pushes to the ring, notifies a flusher and returns; a **klog task** drains new
+  entries to the console, sharing the existing console lock with the shell. If
+  nobody is reading the serial port the lines stay in the ring and the oldest
+  drop, which is right for a console with no reader. The early-boot path keeps
+  the inline echo, since there is no flusher before the scheduler starts.
+
+  Worth doing on its own, and it is the same off-the-critical-path shape as the
+  audio read-ahead source layer above.
+
 ## Further out
 
 Not costed, not committed to, and further from the current shape of espix than
