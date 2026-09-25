@@ -52,7 +52,9 @@ bool      espix_bt_a2d_connected(void);
  * encoder expects. `play` decodes into this; the stack pulls it on its own
  * callback. Short writes are the caller's to retry.
  */
-esp_err_t espix_bt_audio_write(const void *pcm, size_t len);
+/* Accepts as much PCM as the ring has room for and returns that count. The
+ * caller must advance by it; a full ring is normal while the sink pulls. */
+size_t espix_bt_audio_write(const void *pcm, size_t len);
 
 /*
  * Pairing policy, for now: a PIN for legacy pairing, and auto-accept for SSP

@@ -109,11 +109,11 @@ static void feed(const uint8_t *p, size_t n)
 {
     size_t off = 0;
     while (off < n && !s_stop) {
-        if (espix_bt_audio_write(p + off, n - off) == ESP_OK) {
-            off = n;
-        } else {
+        const size_t sent = espix_bt_audio_write(p + off, n - off);
+        if (sent == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+        off += sent;
     }
 }
 

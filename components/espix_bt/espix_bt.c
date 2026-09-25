@@ -10,6 +10,8 @@
 #include "sdkconfig.h"
 
 #include "espix_kernel.h"
+#include <math.h>
+
 #include "espix_bt.h"
 
 #define TAG      "bt"
@@ -209,16 +211,44 @@ static uint32_t s_short_calls;
 static uint32_t s_short_bytes;
 static int64_t  s_drain_mark_us;
 
+/*
+ * The negotiated stream is MONO (see the preferred codec config in a2d_cb), so
+ * the encoder asks for mono frames while the ring holds stereo PCM. Downmix
+ * here rather than converting on the feed side: the callback already runs per
+ * frame, and this keeps the ring's format a plain stereo PCM stream.
+ */
+static bool     s_mono;
+static int16_t  s_dm[1024];   /* stereo samples for up to 512 mono samples */
+
 static int32_t a2d_data_cb(uint8_t *data, int32_t len)
 {
     if (data == NULL || len <= 0) {
         return 0;
     }
-    const size_t got = xStreamBufferReceive(s_pcm, data, (size_t)len, 0);
-    if (got < (size_t)len) {
-        memset(data + got, 0, (size_t)len - got);
-        s_short_calls++;
-        s_short_bytes += (uint32_t)((size_t)len - got);
+
+    size_t got;
+    if (s_mono) {
+        const size_t need = (size_t)len * 2;
+        const size_t want = (need <= sizeof(s_dm)) ? need : sizeof(s_dm);
+        got = xStreamBufferReceive(s_pcm, s_dm, want, 0);
+        if (got < want) {
+            memset((uint8_t *)s_dm + got, 0, want - got);
+            s_short_calls++;
+            s_short_bytes += (uint32_t)(want - got);
+        }
+        int16_t *out = (int16_t *)data;
+        const int n = len >> 1;
+        for (int i = 0; i < n; i++) {
+            out[i] = (int16_t)(((int32_t)s_dm[2 * i] + (int32_t)s_dm[2 * i + 1]) / 2);
+        }
+        got = (size_t)len;
+    } else {
+        got = xStreamBufferReceive(s_pcm, data, (size_t)len, 0);
+        if (got < (size_t)len) {
+            memset(data + got, 0, (size_t)len - got);
+            s_short_calls++;
+            s_short_bytes += (uint32_t)((size_t)len - got);
+        }
     }
 
     s_drain_bytes += (uint32_t)len;
@@ -239,12 +269,6 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
         s_drain_mark_us = now;
     }
     return len;
-}
-
-static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
-{
-    (void)event;
-    (void)param;
 }
 
 /* Minimal AVRCP controller callback: its existence is what A2DP requires, and
@@ -311,6 +335,37 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         } else {
             espix_klog(ESPIX_KLOG_INFO, TAG, "sink cfg: codec type 0x%x",
                        (unsigned)m->type);
+        }
+        break;
+    }
+    case ESP_A2D_REPORT_SNK_CODEC_CAPS_EVT: {
+        /*
+         * The stock a2dp_source example sets a preferred codec config here,
+         * and it is load-bearing: with the sink's defaults (joint stereo,
+         * bitpool up to 52/53) this link delivers a garbled stream that the
+         * sink plays as harsh noise, while the example's mono + bitpool<=35
+         * config is clean. Matched to the example's values.
+         */
+        const esp_a2d_conn_hdl_t h = param->a2d_report_snk_codec_caps_stat.conn_hdl;
+        const esp_a2d_mcc_t *caps = &param->a2d_report_snk_codec_caps_stat.mcc;
+
+        esp_a2d_mcc_t pref;
+        memset(&pref, 0, sizeof(pref));
+        pref.type                         = ESP_A2D_MCT_SBC;
+        pref.cie.sbc_info.samp_freq       = ESP_A2D_SBC_CIE_SF_44K;
+        pref.cie.sbc_info.ch_mode         = ESP_A2D_SBC_CIE_CH_MODE_MONO;
+        pref.cie.sbc_info.block_len       = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+        pref.cie.sbc_info.num_subbands    = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+        pref.cie.sbc_info.alloc_mthd      = ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+        pref.cie.sbc_info.min_bitpool     = 2;
+        pref.cie.sbc_info.max_bitpool     = 35;
+
+        if (caps->type == ESP_A2D_MCT_SBC &&
+            (caps->cie.sbc_info.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO)) {
+            const esp_err_t e = esp_a2d_source_set_pref_mcc(h, &pref);
+            s_mono = (e == ESP_OK);
+            espix_klog(e == ESP_OK ? ESPIX_KLOG_INFO : ESPIX_KLOG_WARN, TAG,
+                       "preferred mcc: %s (mono %d)", esp_err_to_name(e), (int)s_mono);
         }
         break;
     }
@@ -391,14 +446,12 @@ esp_err_t espix_bt_init(void)
     }
     (void)esp_avrc_ct_register_callback(avrc_ct_cb);
 
-    /* The target half too: without it the SDP record lacks the AVRCP
-     * protocol list Bluedroid warns about, and a sink's discovery can fail. */
-    err = esp_avrc_tg_init();
-    if (err != ESP_OK) {
-        return err;
-    }
-    (void)esp_avrc_tg_register_callback(avrc_tg_cb);
-
+    /*
+     * No AVRCP target. A source is an AVRCP controller; enabling the target
+     * role too is what espix did and the stock a2dp_source example does not,
+     * and it is the last structural difference between them. CT alone is what
+     * a source needs.
+     */
     err = esp_a2d_source_init();
     if (err != ESP_OK) {
         return err;
@@ -496,13 +549,22 @@ esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN])
     return err;
 }
 
-esp_err_t espix_bt_audio_write(const void *pcm, size_t len)
+/*
+ * Returns the number of bytes the ring accepted, not an error code.
+ *
+ * xStreamBufferSend takes what fits and reports how much, so a full ring (the
+ * normal state while playing) accepts part of a chunk. Reporting that as an
+ * error and letting the caller retry the whole chunk re-sends the bytes that
+ * were already consumed, and the stream desynchronises -- clean for the first
+ * moment, then harsh noise. The caller must advance by exactly this count.
+ * The short blocking timeout waits for space; the caller paces on it.
+ */
+size_t espix_bt_audio_write(const void *pcm, size_t len)
 {
     if (!s_inited || s_pcm == NULL) {
-        return ESP_ERR_INVALID_STATE;
+        return 0;
     }
-    const size_t sent = xStreamBufferSend(s_pcm, pcm, len, 0);
-    return sent == len ? ESP_OK : ESP_ERR_TIMEOUT;
+    return xStreamBufferSend(s_pcm, pcm, len, pdMS_TO_TICKS(20));
 }
 
 esp_err_t espix_bt_set_pin(const char *pin)
@@ -530,7 +592,7 @@ esp_err_t espix_bt_pair(const uint8_t b[ESPIX_BDA_LEN])       { (void)b; return 
 esp_err_t espix_bt_connect(const uint8_t b[ESPIX_BDA_LEN])    { (void)b; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_disconnect(const uint8_t b[ESPIX_BDA_LEN]) { (void)b; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_remove(const uint8_t b[ESPIX_BDA_LEN])     { (void)b; return ESP_ERR_NOT_SUPPORTED; }
-esp_err_t espix_bt_audio_write(const void *p, size_t n)       { (void)p; (void)n; return ESP_ERR_NOT_SUPPORTED; }
+size_t    espix_bt_audio_write(const void *p, size_t n)       { (void)p; (void)n; return 0; }
 esp_err_t espix_bt_set_pin(const char *p)     { (void)p; return ESP_ERR_NOT_SUPPORTED; }
 const char *espix_bt_pin(void)                { return ""; }
 
