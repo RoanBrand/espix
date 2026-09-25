@@ -1,0 +1,91 @@
+# Profiling and tracing
+
+What exists for ESP32-S31, what works today, and what needs the USB-JTAG port
+plugged in. This exists because the alternative -- adding timing instrumentation,
+rebuilding, flashing and testing by hand -- cost far too much during the audio
+work, and could not answer "which task is actually running" at all.
+
+## Works today, no JTAG
+
+### Per-task CPU and stack: `top` and `ps`
+
+FreeRTOS runtime stats are already on (`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y`,
+`CONFIG_FREERTOS_USE_TRACE_FACILITY=y`), and espix already reads them:
+`uxTaskGetSystemState()` in `components/espix_cmds/cmd_sys.c`, where `top` samples
+`ulRunTimeCounter` twice and reports the difference per task, and `ps` reports the
+one-shot share and stack high-water. This is the first thing to reach for, and it
+is how the audio task was shown burning a core flat while making little progress.
+
+    top                     # per-task CPU%, sampled
+    ps                      # one-shot share, stack, priority, core
+
+### Heap sampling: `heap_trace` (to add)
+
+`CONFIG_HEAP_TRACING_STANDALONE` records every allocation and free into an in-RAM
+buffer; a `heap_trace` command would start it, stop it and dump the records,
+answering "who allocates, and does it come back". It needs a trace buffer, so it
+belongs behind a debug config option, not in the default build.
+
+### Cycle counting
+
+For a focused question, `esp_cpu_get_cycle_count()` around a region is exact and
+cheap; the audio engine already carries a version of this (the read/decode/feed
+milliseconds). It is the fallback when the question is narrower than a profiler.
+
+## Needs the USB-JTAG port
+
+The S31 has built-in USB-JTAG, and the newer OpenOCD in the tool tree has S31
+support -- `board/esp32s31-builtin.cfg` and `target/esp32s31.cfg` under
+`openocd-esp32/v0.12.0-esp32-20260703`. **Watch the version**: the IDF-pinned
+`20260424` in the same directory has no S31 target and `idf.py openocd` will
+choose it, so point `OPENOCD` at the 20260703 binary. With no port connected
+(`/dev/cu.usbmodem*` absent) OpenOCD finds the target but cannot identify it:
+
+    Error: [esp32s31.hp.cpu0] Unsupported DTM version: -1
+    Error: [esp32s31.hp.cpu0] Could not identify target type.
+
+### 1. Sample-based PC profiling
+
+OpenOCD samples the program counter as fast as it can and writes gprof's
+`gmon.out` -- no instrumentation, no rebuild:
+
+    openocd -f board/esp32s31-builtin.cfg -c 'profile 10 gmon.out' -c shutdown
+    gprof build-esp32s31-maint/espix.elf gmon.out
+
+It halts and resumes the target to sample, so it perturbs timing and is coarse
+(a few thousand samples over ten seconds), but it answers "where is the time
+going" at function granularity with nothing added to the build.
+
+### 2. Stack sampling into a flamegraph
+
+Better, because it yields call stacks rather than a single PC. GDB halts, dumps
+every task's backtrace, resumes, and repeats; the folded stacks aggregate into a
+flamegraph, the same shape as sampling profilers on Linux. The unwind comes from
+DWARF, so `CONFIG_ESP_SYSTEM_USE_FRAME_POINTER` is **not** needed -- which
+matters here, since frame pointers cost ~152 kB of code and do not fit in the
+kernel slot.
+
+### 3. SystemView: the timeline
+
+Task switches, ISR entry and CPU load on a timeline, which no sampling profiler
+gives. In IDF v6.1 this lives in the **`esp_trace`** component: it coordinates
+encoders (the `espressif/esp_sysview` component provides the SystemView encoder)
+and transports (apptrace over JTAG, or UART for real-time viewing). The resulting
+trace opens in SEGGER's SystemView application. `app_trace` still carries
+`APPTRACE_DEST_JTAG` for the transport end.
+
+### 4. Core dump and live GDB
+
+`tools/coredump.sh` already decodes panic dumps. With JTAG the same GDB attaches
+to a live target instead, so a fault can be inspected where it happened rather
+than reconstructed from a written image.
+
+## Plan
+
+- `top` first, for "what is eating the CPU". It is already built and needs nothing.
+- `heap_trace` behind a config option, for allocation questions.
+- `tools/jtag-profile.sh`: the halting stack sampler folded into a flamegraph,
+  to be written and tested once the USB-JTAG cable is connected. It is the piece
+  worth having, because it replaces "instrument, rebuild, flash, read the log"
+  with one command that can be run on every build.
+- SystemView only if the question is scheduling, not cost.
