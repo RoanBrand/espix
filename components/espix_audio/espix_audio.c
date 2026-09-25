@@ -119,6 +119,117 @@ static void feed(const uint8_t *p, size_t n)
     }
 }
 
+/*
+ * MP3 decoding. esp_audio_simple_dec's prebuilt Helix decoder is the reference;
+ * this is the same decoder built from source with its own per-file
+ * optimization flags, which is the only lever for MP3 on this part. Kept as an
+ * A/B: see docs/AUDIO.md and the S31 PIE note.
+ */
+#define ESPIX_MP3_OK                  0
+#define ESPIX_MP3_NEED_MORE_DATA      1
+#define ESPIX_MP3_STREAM_INFO_READY   2
+#define ESPIX_MP3_STREAM_INFO_CHANGED (-5)
+
+void *espix_mp3_open(void);
+void  espix_mp3_close(void *h);
+int   espix_mp3_decode(void *h, const uint8_t *in, size_t in_len,
+                       uint8_t *out, size_t out_len,
+                       size_t *consumed, size_t *samples);
+int   espix_mp3_sample_rate(void *h);
+int   espix_mp3_channels(void *h);
+int   espix_mp3_bit_depth(void *h);
+
+static void play_mp3(int fd, uint8_t *in, uint8_t *out)
+{
+    void *mp3 = espix_mp3_open();
+    if (mp3 == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "micro-mp3: cannot create decoder");
+        return;
+    }
+
+    size_t in_len = 0, in_off = 0;
+    bool   info_logged = false;
+    uint32_t t_read = 0, t_dec = 0, t_feed = 0, produce = 0;
+    int64_t  mark = esp_timer_get_time();
+
+    while (!s_stop) {
+        if (in_off >= in_len) {
+            const int64_t r0 = esp_timer_get_time();
+            const int n = (int)read(fd, in, IN_CHUNK);
+            t_read += (uint32_t)(esp_timer_get_time() - r0);
+            if (n <= 0) {
+                break;
+            }
+            in_len = (size_t)n;
+            in_off = 0;
+        }
+
+        size_t consumed = 0, samples = 0;
+        const int64_t d0 = esp_timer_get_time();
+        const int r = espix_mp3_decode(mp3, in + in_off, in_len - in_off,
+                                       out, OUT_CHUNK, &consumed, &samples);
+        t_dec += (uint32_t)(esp_timer_get_time() - d0);
+        in_off += consumed;
+
+        if (r == ESPIX_MP3_STREAM_INFO_READY || r == ESPIX_MP3_STREAM_INFO_CHANGED) {
+            if (!info_logged) {
+                espix_klog(ESPIX_KLOG_INFO, TAG, "%d Hz, %d ch, %d bits (micro-mp3)",
+                           espix_mp3_sample_rate(mp3), espix_mp3_channels(mp3),
+                           espix_mp3_bit_depth(mp3));
+                info_logged = true;
+            }
+            continue;
+        }
+        if (r == ESPIX_MP3_NEED_MORE_DATA) {
+            /* Carry the tail of a partial frame and read more behind it. */
+            const size_t rem = in_len - in_off;
+            if (rem > 0 && in_off > 0) {
+                memmove(in, in + in_off, rem);
+            }
+            const int n = (int)read(fd, in + rem, IN_CHUNK - rem);
+            if (n <= 0) {
+                if (rem == 0) {
+                    break;
+                }
+                in_len = rem;
+                in_off = 0;
+                continue;
+            }
+            in_len = rem + (size_t)n;
+            in_off = 0;
+            continue;
+        }
+        if (r < 0) {
+            /* A bad frame is recoverable; skip at least one byte so it cannot
+             * spin on the same input. */
+            if (consumed == 0) {
+                in_off += 1;
+            }
+            continue;
+        }
+        if (samples > 0) {
+            const size_t bytes = samples * (size_t)espix_mp3_channels(mp3) * 2u;
+            const int64_t f0 = esp_timer_get_time();
+            feed(out, bytes);
+            t_feed += (uint32_t)(esp_timer_get_time() - f0);
+            produce += (uint32_t)bytes;
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (now - mark >= 1000000) {
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "read %ums decode %ums feed %ums over %ums, %u B produced",
+                       (unsigned)(t_read / 1000), (unsigned)(t_dec / 1000),
+                       (unsigned)(t_feed / 1000), (unsigned)((now - mark) / 1000),
+                       (unsigned)produce);
+            t_read = t_dec = t_feed = produce = 0;
+            mark = now;
+        }
+    }
+
+    espix_mp3_close(mp3);
+}
+
 static void audio_task(void *arg)
 {
     const char *uri = (const char *)arg;
@@ -148,15 +259,6 @@ static void audio_task(void *arg)
         goto out;
     }
 
-    esp_audio_simple_dec_cfg_t cfg = {
-        .dec_type      = type,
-        .use_frame_dec = false,
-    };
-    if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot open decoder %d", (int)type);
-        goto out;
-    }
-
     in = heap_caps_malloc(IN_CHUNK, IO_CAPS);
     out = heap_caps_malloc(OUT_CHUNK, IO_CAPS);
     if (in == NULL || out == NULL) {
@@ -165,6 +267,21 @@ static void audio_task(void *arg)
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "playing %s", uri);
+
+    /* MP3 goes through micro-mp3, everything else through esp_audio_simple_dec. */
+    if (type == ESP_AUDIO_SIMPLE_DEC_TYPE_MP3) {
+        play_mp3(fd, in, out);
+        goto out;
+    }
+
+    esp_audio_simple_dec_cfg_t cfg = {
+        .dec_type      = type,
+        .use_frame_dec = false,
+    };
+    if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot open decoder %d", (int)type);
+        goto out;
+    }
 
     /* Where does the time go? Read, decode, and the ring write are timed
      * separately and reported once a second; guessing from watchdog symbols

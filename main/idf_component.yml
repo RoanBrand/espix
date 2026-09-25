@@ -91,3 +91,13 @@ dependencies:
   # explicitly to get the faster decoder. 2.5.0, which the GMF dependencies
   # pinned us to, predates both.
   espressif/esp_audio_codec: "^2.6.2"
+
+  # MP3 decoding, used directly by espix_audio's engine.
+  #
+  # The same OpenCore/Helix fixed-point decoder esp_audio_codec ships, but built
+  # from source with per-file optimization tuning: the hot transforms/dequant at
+  # -Os (they are bound by register spills, not multiplies) and the polyphase
+  # synthesis at -O2, which the component says decodes measurably faster on
+  # hardware. That tuning is the only lever available for MP3 here, because the
+  # S31's PIE/SIMD is used by LC3 and Opus only, never by pvmp3.
+  esphome/micro-mp3: "^0.4"

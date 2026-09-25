@@ -1,10 +1,12 @@
 idf_component_register(
     SRCS
         "espix_audio.c"
+        "espix_mp3.cpp"
     INCLUDE_DIRS
         "include"
     PRIV_REQUIRES
         espix_kernel
         espix_bt
         esp_audio_codec
+        micro-mp3
 )

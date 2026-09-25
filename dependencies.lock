@@ -7,6 +7,16 @@ dependencies:
       path: .
       type: git
     version: d774c178f0211d62d3f0d49e9164aa655573ecfe
+  esphome/micro-mp3:
+    component_hash: 51106d6a6ef13d37b598aa06b4a4de39249319110f990950eb123203a9e2eb6d
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.4.0
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -159,6 +169,7 @@ dependencies:
     version: 1.22.3
 direct_dependencies:
 - esp_lwext4
+- esphome/micro-mp3
 - espressif/elf_loader
 - espressif/esp_audio_codec
 - espressif/esp_ext_part_tables
@@ -168,6 +179,6 @@ direct_dependencies:
 - espressif/usb_host_msc
 - idf
 - joltwallet/littlefs
-manifest_hash: 470672f74f4cfa40a9c2e614e35f3dbef4053ec86a73d8d1cf87f28c710ec471
+manifest_hash: 77c90d1c585ca0d0b06c9b56c95c5126647a65f84965f5ed5c865b5dfc450c9c
 target: esp32s31
 version: 3.0.0
