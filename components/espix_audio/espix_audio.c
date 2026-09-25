@@ -268,6 +268,8 @@ static void audio_task(void *arg)
     int fd = -1;
     uint8_t *in = NULL;
     uint8_t *out = NULL;
+    uint8_t *up = NULL;   /* mono -> stereo upmix, so the ring is always stereo */
+    int      src_channels = 2;
     esp_audio_simple_dec_handle_t dec = NULL;
     bool info_logged = false;
 
@@ -293,7 +295,8 @@ static void audio_task(void *arg)
 
     in = heap_caps_malloc(IN_CHUNK, IO_CAPS);
     out = heap_caps_malloc(OUT_CHUNK, IO_CAPS);
-    if (in == NULL || out == NULL) {
+    up = heap_caps_malloc(OUT_CHUNK * 2, IO_CAPS);
+    if (in == NULL || out == NULL || up == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "no buffers");
         goto out;
     }
@@ -372,13 +375,33 @@ static void audio_task(void *arg)
                         espix_klog(ESPIX_KLOG_INFO, TAG, "%u Hz, %u ch, %u bits",
                                    (unsigned)info.sample_rate, (unsigned)info.channel,
                                    (unsigned)info.bits_per_sample);
+                        src_channels = info.channel;
                     }
                     info_logged = true;
                 }
                 const int64_t f0 = esp_timer_get_time();
-                feed(frame.buffer, frame.decoded_size);
+                if (src_channels == 1) {
+                    /*
+                     * The ring is stereo by contract: the A2DP data callback
+                     * downmixes stereo to the sink's (mono) SBC frame. Feeding
+                     * a mono file through unchanged made that callback read two
+                     * bytes per sample and drain the ring at twice the rate, so
+                     * a mono source underran. Duplicate each sample instead.
+                     */
+                    const int16_t *src = (const int16_t *)frame.buffer;
+                    int16_t       *dst = (int16_t *)up;
+                    const size_t   n = frame.decoded_size / 2;
+                    for (size_t i = 0; i < n; i++) {
+                        dst[2 * i]     = src[i];
+                        dst[2 * i + 1] = src[i];
+                    }
+                    feed(up, n * 4);
+                    produce += (uint32_t)(n * 4);
+                } else {
+                    feed(frame.buffer, frame.decoded_size);
+                    produce += frame.decoded_size;
+                }
                 t_feed += (uint32_t)(esp_timer_get_time() - f0);
-                produce += frame.decoded_size;
             }
             raw.len -= raw.consumed;
             raw.buffer += raw.consumed;
@@ -404,6 +427,7 @@ out:
     }
     heap_caps_free(in);
     heap_caps_free(out);
+    heap_caps_free(up);
     if (fd >= 0) {
         close(fd);
     }
