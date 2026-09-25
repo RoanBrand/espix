@@ -74,6 +74,25 @@ and transports (apptrace over JTAG, or UART for real-time viewing). The resultin
 trace opens in SEGGER's SystemView application. `app_trace` still carries
 `APPTRACE_DEST_JTAG` for the transport end.
 
+### What halting cannot sample: live Bluetooth audio
+
+Both the OpenOCD `profile` command and the GDB stack sampler **halt the cores**
+to read them. OpenOCD's `init` halts them too, which is why simply leaving
+OpenOCD running freezes the console. For a live A2DP stream that is fatal: each
+sample stops the CPU for the round trip, the link starves, and the sink drops.
+So these tools cannot profile the audio path *while it is playing* -- the
+measurement prevents the thing being measured.
+
+The honest split:
+
+- **Realtime / BT audio timing** -> **SystemView** (section 3). It streams
+events without halting, so the target keeps running. That is the tool for "is
+the audio task getting scheduled", not the sampler.
+- **Anything not tied to the link** -- boot, filesystem, a decode loop, a
+  benchmark command -- the halt sampler is ideal and instrumentation-free.
+- **Narrow questions** -> the timing already in the build (read/decode/feed ms)
+or `esp_cpu_get_cycle_count()` around one region.
+
 ### 4. Core dump and live GDB
 
 `tools/coredump.sh` already decodes panic dumps. With JTAG the same GDB attaches
