@@ -86,3 +86,10 @@ dependencies:
   # over raw esp_audio_codec because it is the GMF family the audio phase builds
   # on, and because the URI/format/transform handling is exactly `play`.
   espressif/esp_audio_simple_player: "^1"
+
+  # GMF's pool loader: registers the default IO readers, the audio decoder and
+  # the effect elements into a pool, so espix's playback pipeline can be
+  # assembled by name. The hardware ASRC is registered separately --
+  # esp_audio_simple_player hardcodes the software rate converter, which is why
+  # espix drives the pipeline itself.
+  espressif/gmf_loader: "~1.0"

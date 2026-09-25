@@ -68,6 +68,36 @@ CONFIG_ESPIX_BT=y
 # in practice (the soundcore Q45 does), which is what a CD-rate MP3 already is.
 # The fix is to route resampling through the hardware ASRC -- a player/pipeline
 # change -- not to accept a limit the silicon does not have.
+# play's pipeline is espix's own (components/espix_audio), so the elements it
+# needs come from gmf_loader: the file/http readers, the decoder, and the
+# HARDWARE ASRC. The simple player's software converter is not on this path.
+CONFIG_GMF_IO_INIT_FILE_READER=y
+CONFIG_GMF_IO_INIT_HTTP_READER=y
+# Only the MP3 decoder. The codecs are one prebuilt per-chip archive, and
+# registering all of them is what pushed the kernel past its 3.5 MB partition;
+# the choice below selects the one the loader's aud_dec is built around.
+CONFIG_GMF_AUDIO_CODEC_INIT_DECODER=y
+CONFIG_AUDIO_DECODER_MP3_SUPPORT=y
+# CONFIG_AUDIO_DECODER_AAC_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_G711_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_AMRNB_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_AMRWB_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_FLAC_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_OPUS_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_VORBIS_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_ADPCM_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_ALAC_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_PCM_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_SBC_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_LC3_SUPPORT is not set
+# CONFIG_AUDIO_DECODER_G722_SUPPORT is not set
+CONFIG_GMF_AUDIO_CODEC_DECODER_TYPE_MP3=y
+CONFIG_GMF_AUDIO_EFFECT_INIT_ASRC=y
+CONFIG_GMF_AUDIO_EFFECT_ASRC_DEST_RATE=44100
+CONFIG_GMF_AUDIO_EFFECT_ASRC_PERF_TYPE_AUTO=y
+
+# The simple player is no longer play's engine, but stays a dependency until
+# its config surface is removed too.
 # CONFIG_ESP_AUDIO_SIMPLE_PLAYER_RESAMPLE_EN is not set
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
