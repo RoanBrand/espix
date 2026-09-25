@@ -1197,6 +1197,109 @@ both are the sort of thing that is cheaper to know now.
 
   Job control wants the same objects, so the two are worth designing together.
 
+## Audio
+
+Phase 1 (Bluetooth speaker playback) is built; [AUDIO.md](AUDIO.md) has what it
+is and what it is not. These are the things it needs next, roughly in the order
+they block.
+
+- **A source layer with read-ahead, above the filesystem.** The engine reads PCM
+  with `read()` into a 32 kB chunk it owns in PSRAM, which is correct but
+  blocking: the decoder waits on the filesystem, and the filesystem is slow
+  enough that a 44.1 kHz stereo WAV sits right at the edge (~880-960 ms of read
+  per second of audio on USB, ~1050 ms on littlefs, which underruns). A small
+  double buffer, or a prefetch task, reading 32-64 kB ahead of the decoder,
+  hides that latency instead of exposing it. It is also the one place a file and
+  a URL source should share: an HTTP source needs the buffering more, and the
+  decoder should not know which it is talking to. This is the page-cache and
+  readahead analog, and it is the architectural fix rather than a bigger read.
+
+  What it is not: a general page cache. It holds one stream ahead of the
+  decoder, for as long as the stream is open, and frees it after.
+
+- **A truthful `st_blksize` in espix's VFS.** newlib's `fopen` sizes its `FILE`
+  buffer from `fstat`'s `st_blksize`, or its own `BUFSIZ` (1024) when there is
+  none -- and espix's VFS sets neither, while fatfs is configured
+  `CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0`. So every stdio user reads in 1 kB calls,
+  and only the paths that avoid stdio (the `play` engine) read well. Reporting
+  the real block size (4096 for littlefs; the FAT cluster or sector for fatfs) is
+  a few lines and fixes every program at once, not just this one. Cheap, and
+  worth doing before the source layer.
+
+- **Chunk to the medium.** Reads should be a multiple of the filesystem's block,
+  and for USB the mass-storage transfer size should be big enough to amortize
+  the BOT overhead. The engine's 32 kB is a fixed number today; per-medium (and,
+  for USB, per-transfer) sizing is the small version of this.
+
+- **littlefs tuning.** Larger cache and read sizes, and never run the volume
+  near-full -- littlefs degrades when it is. Held back deliberately: the cache
+  is internal RAM, the scarce pool, so this waits for the memory work below
+  rather than taking another kilobyte today.
+
+- **Resampling, and when not to.** The engine converts neither rate nor
+  channels, so a source must match the rate the sink negotiated; a 48 kHz file
+  into a 44.1 kHz SBC stream is wrong. The order should be: (1) if the sink
+  advertises the source's rate in its codec capabilities, ask for it in the
+  preferred codec config and pass the PCM through untouched; (2) only if it does
+  not, convert -- and then with the **hardware ASRC** (`esp_asrc`,
+  `CONFIG_SOC_ASRC_SUPPORTED`) rather than a software converter. (1) is free and
+  is the common case: the Q45 advertises every SBC sample rate.
+
+- **The codec and quality choice should be our policy over the library's API.**
+  `esp_a2d_source_set_pref_mcc()` is the right call and is in use, but its values
+  are hardcoded (mono, bitpool <= 35). They should be *computed*: intersect what
+  espix can encode with what the sink advertises -- rates, channel modes,
+  subbands, block length, allocation, bitpool range -- take the best of the
+  intersection, then de-rate to what the link has been *measured* to hold.
+  Today's mono/35 is the measured point, not the capability: the sink advertises
+  joint stereo and bitpool 52 and the link cannot hold it. Keeping capability and
+  measured-reliable separate is what lets testing raise it later.
+
+- **MP3 decode is the blocker for the phase-1 goal.** WAV decodes in 10-27 ms per
+  second of audio; `esp_audio_simple_dec`'s MP3 path measures ~2900 ms, so the
+  ring never stays fed. Next measurement: decode with Bluetooth off, to tell a
+  slow library from CPU throttling under coexistence.
+
+## Memory
+
+Internal RAM is the scarce pool (about 296 kB, and Bluetooth Classic takes a
+large share of it). PSRAM is 13 MB and nearly free. Most of the work so far has
+been moving things off internal by hand -- GMF's allocator preference, this
+engine's buffers, the PCM ring's storage -- and hand-tuning does not scale. It is
+also how a subsystem ends up with no headroom for the one allocation that
+matters.
+
+- **Budgets before a reaper.** The simple, predictable version is a static cap
+  per subsystem (cache bytes, stream bytes, task stacks), enforced at the
+  allocation site. An MCU has no swap and no MMU to make overcommit safe, so the
+  failure mode to design for is not "slow", it is "this allocation must not
+  fail". Budgets give that, and they make the next idea safe by marking which
+  memory is cache and may be lost.
+
+- **A reclaimable-cache registry, then a reaper.** The idea worth keeping from
+  the sketch: let caches register themselves -- a size, a priority, and an
+  eviction callback -- so that when an allocation that *must* succeed would fail,
+  the allocator can evict the least important cache and retry, disk/VFS cache
+  first, oldest first. Two rules make it trustworthy rather than clever: only
+  *registered caches* are evictable (never task stacks, DMA buffers, live
+  streams, or anything with a pointer out), and eviction is the cache's own
+  code, so it cannot break its invariants. Under those rules "keep little free
+  memory and reclaim on demand" is safe -- but only for the pools it is allowed
+  to touch. In practice that means PSRAM: internal RAM should stay budgeted,
+  because reclaiming internal while a Bluetooth allocation waits is exactly the
+  failure the reaper is meant to prevent.
+
+  It pairs with the fault reaper in Processes: both need *per-process ownership*
+  of memory before they can free what a dead task held, and that is the same
+  missing piece. And it is a policy layer, not isolation -- without an MMU it
+  cannot reclaim memory an app has already corrupted, only memory a cache has
+  declared expendable. The MMU/isolation work is what would turn it into a
+  safety mechanism rather than a convenience.
+
+  Not small, and not urgent while `play` holds one stream and the caches are
+  small. Worth writing the registration interface early, so caches are born able
+  to be evicted instead of retrofitted.
+
 ## Further out
 
 Not costed, not committed to, and further from the current shape of espix than
