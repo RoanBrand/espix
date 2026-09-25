@@ -68,54 +68,95 @@ PipeWire) that mixes, routes and converts. espix takes the parts that matter:
 - **A mixer/router:** sum streams, resample, route to a sink -- the PipeWire
   graph, without the graph.
 - **App interface:** a native `espix_audio` API and app ABI, plus optionally
-  an OSS-style `/dev/dsp` (open, ioctl format, write PCM). This is the
-  "ALSA/PipeWire for espix" in minimal code; no `libasound`, no D-Bus.
+  an OSS-style `/dev/dsp` (open, ioctl format, write PCM).
 - **Commands:** `play`, `aplay`/`arecord`, `amixer`-ish volume.
-
-Engine library: **esp-gmf** (modular; the newer framework) plus `esp_codec_dev`
-(codecs/I2S) and `esp_audio_codec` (MP3/AAC). **esp-adf** is now built on top of
-ESP-GMF and is product-oriented; it is not the layer espix wants. Either way the
-framework stays below our own API, not exposed to apps.
 
 ### Phase 1 (built now): Bluetooth speaker playback
 
 S31 only. `bluetoothctl` pairs/connects the sink, then
 
-    play <file|url>      # /home/esp/song.mp3, http(s)://..., or embed://...
+    play <file|url>      # /home/esp/song.mp3, /mnt/song.wav, http(s)://...
     play status
     play stop
 
-It is **GMF-based**: `play` drives Espressif's `esp_audio_simple_player`, which
-takes a URI, picks the decoder from the extension, converts bit depth, channels
-and rate, and hands PCM to a callback -- espix's callback, which writes into the
-A2DP source's PCM ring. (A decoder earlier in this phase did the seam by hand;
-the GMF player replaced it, because that is the layer phase 2 builds on.)
+**The engine is not GMF.** `play` decodes with `esp_audio_simple_dec`
+(`espressif/esp_audio_codec`) directly: one task of ours reads the file, feeds
+the decoder, and writes the PCM into the A2DP source's ring buffer; the ring's
+backpressure paces playback to the link. A GMF pipeline was tried twice
+(`esp_audio_simple_player`, then an owned `gmf_loader` pipeline carrying the
+hardware ASRC) and removed both times: on this part the GMF task spends its CPU
+in `gmf_core`'s job/IO/event loop rather than in the decoder, and `gmf_loader`
+pulls the whole GMF family into the image (3.57 MB against 2.86 MB). The direct
+engine is smaller and easier to reason about. GMF stays the phase-2 reference,
+not the engine.
 
 `play` does not need the sink first: it fills the ring and blocks in its output
-callback until A2DP connects, so it can be issued while the link is still down --
-which matters, because a connected link is what costs a memory-tight shell its
-SSH sessions.
+callback until A2DP connects, so it can be issued while the link is still down.
 
-**Rates.** Resampling is off -- but not because the part cannot do it. The S31
-has a **hardware ASRC** (`CONFIG_SOC_ASRC_SUPPORTED`; `esp_asrc`, and GMF's
-`aud_asrc` element with `perf_type AUTO`). The problem is that the player path
-does not use it: `esp_audio_simple_player` hardcodes the **software** converter
-(`aud_rate_cvt` -> `esp_audio_effects`), which against a 48 kHz source loses
-~250 short reads/s (~110 kB/s) and starves the PCM ring -- where the same
-pipeline without it has **zero** short reads. Until resampling rides the
-hardware ASRC, the source must match the sink's negotiated rate; SBC sinks pick
-44.1 kHz in practice (the soundcore Q45 does), which is what a CD-rate MP3
-already is. Routing `play` through `esp_gmf_asrc` (or a custom pipeline that
-uses it) is the fix, not accepting a limit the silicon does not have.
+**The stream is mono, 44.1 kHz, bitpool <= 35**, set with
+`esp_a2d_source_set_pref_mcc()` on the sink-codec-caps event -- the same choice
+IDF's stock `a2dp_source` example makes (mono, bitpool 35, loudness, 8
+subbands, block 16). With the sink's defaults (joint stereo, bitpool up to 52)
+the link cannot hold the stream together and known-good sinks play harsh noise.
+The source role also initialises AVRCP **controller** only; the target half is
+not espix's.
+
+**PCM writes must be accounted, not retried.** `xStreamBufferSend()` takes what
+fits and reports how much; while playing, the ring is full, so that is a partial
+amount. Treating it as failure and retrying the whole chunk re-sends the bytes
+already consumed and desynchronises the stream -- which is exactly the harsh
+noise the engine had: clean for the first moment, then garbage. `play`'s feed
+advances by the count the ring accepted.
+
+**Resampling: none yet.** The direct engine converts neither rate nor channels,
+so the source must match the rate the sink negotiated. SBC sinks pick 44.1 kHz
+in practice (the soundcore Q45 and Audioengine HD3 both do), which a CD-rate MP3
+already is. A 48 kHz WAV fed into a 44.1 kHz SBC stream is wrong (it sounds like
+garbage), and with no resampler there is no way to play it yet. The S31 does have
+a **hardware ASRC** (`CONFIG_SOC_ASRC_SUPPORTED`, `esp_asrc`), unused by this
+engine; a software rate convert is the cheap alternative. Either is the fix for
+non-44.1 kHz sources. Note the alternative to resampling: if the sink advertises
+48 kHz, ask for 48 kHz in the preferred codec config and feed it natively.
+
+**Reading the file limits uncompressed audio, and stdio is why.** The build
+uses **newlib** (`CONFIG_LIBC_NEWLIB`), whose default stdio buffer is
+`BUFSIZ` = **1024** -- and neither espix's VFS nor fatfs supplies `st_blksize`
+(`CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0`), so newlib's `__smakebuf_r` never picks a
+better one. A 16 kB `fread()` therefore becomes ~16 `read()` calls of 1 kB,
+every one crossing the VFS into littlefs or FAT, and the per-call cost
+saturates around **~176-200 kB/s** -- exactly what a 44.1 kHz stereo WAV needs
+and no more, so it underruns (littlefs measured ~1050 ms of read per second of
+audio; the same file on USB FAT32 ~880-960 ms/s, just enough for zero short
+reads).
+
+The engine now reads with **`open()`/`read()` directly**, 32 kB into a buffer it
+owns in PSRAM -- no FILE buffer, one `read()` per chunk. (`setvbuf` is the
+wrong fix here: a large stdio buffer is allocated from the **internal** heap,
+which is the scarce one, and it starved the next task creation.) MP3 is
+compressed (~16 kB/s of reads), so its file read is never the problem. See the
+open items below for the read path proper.
 
 **IDF version, on S31: use the `release/v6.1` branch, not the `v6.1` tag.** The
 tag predates the S31 BR/EDR fixes (wrong TX-power table, ACL performance under
 Wi-Fi coexistence, controller-lib LMP bugs). On the tag, A2DP drains at ~0.7x
-realtime -- music with gaps and noise; on the branch it is realtime (~180 kB/s,
-~352 SBC frames/s, zero ring underruns). See docs/UPSTREAM.md.
+realtime; on the branch it is realtime (~180 kB/s, ~352 SBC frames/s, zero ring
+underruns), and the Audioengine HD3 -- which the tag could not connect at all --
+connects. See docs/UPSTREAM.md.
 
-S3 I2S output is deferred. The S31 coreboard has a mono amp and a speaker
-header (no speaker attached yet) and a mic; both are phase 2.
+### Known issues
+
+- **MP3 decode is ~2.9x realtime on S31.** `esp_audio_simple_dec`'s MP3 path
+  measures ~2900 ms of decode per second of audio (WAV is 10-27 ms), so the ring
+  cannot stay fed and MP3 playback is choppy at any source rate. This is the
+  main blocker for the phase-1 goal. Next measurement: decode with Bluetooth
+  off, to separate a slow library from CPU throttling under coexistence.
+- **littlefs read throughput** (~176 kB/s) -- too slow for raw PCM; fix or route
+  around.
+- **No resampling**, so non-44.1 kHz sources do not play correctly.
+- **No volume or AVRCP absolute volume** yet.
+
+S3 I2S output is deferred. The S31 coreboard has a mono amp and a speaker header
+(no speaker attached yet) and a mic; both are phase 2.
 
 ### Phase 2 (roadmap)
 
@@ -146,5 +187,6 @@ header (no speaker attached yet) and a mic; both are phase 2.
 
 - S3 has no Bluetooth audio at all (no Classic, no LE Audio).
 - WiFi and Classic Bluetooth share one radio on S31; streaming a URL to a BT
-  speaker is the demanding case -- fine at low bitrates, worth measuring.
+  speaker is the demanding case, and with the present single-task engine it is
+  unproven.
 - There is no hardware mixer; software mixing costs CPU and latency.

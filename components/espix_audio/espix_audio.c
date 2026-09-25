@@ -7,9 +7,11 @@
  * and put the task's CPU into gmf_core's job/IO/event loop rather than the
  * decoder, which is why it sits this one out.
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,7 +29,7 @@
 
 #define TAG "audio"
 
-#define IN_CHUNK   (16 * 1024)
+#define IN_CHUNK   (32 * 1024)
 #define OUT_CHUNK  (16 * 1024)
 #define TASK_STACK (6 * 1024)
 
@@ -120,14 +122,22 @@ static void feed(const uint8_t *p, size_t n)
 static void audio_task(void *arg)
 {
     const char *uri = (const char *)arg;
-    FILE *f = NULL;
+    int fd = -1;
     uint8_t *in = NULL;
     uint8_t *out = NULL;
     esp_audio_simple_dec_handle_t dec = NULL;
     bool info_logged = false;
 
-    f = fopen(uri, "rb");
-    if (f == NULL) {
+    /*
+     * open()/read(), not stdio. The FILE buffer here is 128 bytes (picolibc's
+     * BUFSIZ), so a large fread becomes one read() per 128 bytes and the
+     * per-call cost down in littlefs/FAT dominates; and asking stdio for a
+     * large buffer puts it in internal RAM, the scarce heap, which starved the
+     * next task creation. Reading directly into our own PSRAM chunk keeps the
+     * reads large and the internal heap untouched.
+     */
+    fd = open(uri, O_RDONLY);
+    if (fd < 0) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: cannot open", uri);
         goto out;
     }
@@ -164,7 +174,7 @@ static void audio_task(void *arg)
 
     while (!s_stop) {
         const int64_t r0 = esp_timer_get_time();
-        const int n = (int)fread(in, 1, IN_CHUNK, f);
+        const int n = (int)read(fd, in, IN_CHUNK);
         t_read += (uint32_t)(esp_timer_get_time() - r0);
         if (n <= 0) {
             break;
@@ -234,8 +244,8 @@ out:
     }
     heap_caps_free(in);
     heap_caps_free(out);
-    if (f != NULL) {
-        fclose(f);
+    if (fd >= 0) {
+        close(fd);
     }
     s_running = false;
     s_task = NULL;
