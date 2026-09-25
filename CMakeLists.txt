@@ -150,6 +150,19 @@ if(NOT espix_lwext4_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-lwext4.py failed; see the message above")
 endif()
 
+# Teach GMF to allocate from PSRAM before internal RAM. Its object allocator
+# prefers internal, and on the S31 a full GMF pipeline there starves Bluedroid's
+# BTU task, which aborts in fixed_queue_new the moment a sink connects.
+# See tools/patch-gmf.py, and docs/AUDIO.md.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-gmf.py"
+            --components-path "${CMAKE_CURRENT_SOURCE_DIR}/managed_components"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_gmf_patch_result)
+if(NOT espix_gmf_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-gmf.py failed; see the message above")
+endif()
+
 # fsroot/ is the tree the dev rootfs is packaged from. It is gitignored and a
 # fresh clone has none, so create it: the device builds its own filesystem on
 # first boot, and an empty one is a fine starting point.
