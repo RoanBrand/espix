@@ -32,6 +32,30 @@ For a focused question, `esp_cpu_get_cycle_count()` around a region is exact and
 cheap; the audio engine already carries a version of this (the read/decode/feed
 milliseconds). It is the fallback when the question is narrower than a profiler.
 
+## Ports on this board
+
+Two USB ports, and which one is which matters:
+
+| port | device | what it carries |
+|---|---|---|
+| USB-UART (external chip) | \`/dev/cu.usbserial-*\` | **the console**, input and output -- UART0 |
+| USB-DBG (USB-Serial/JTAG) | \`/dev/cu.usbmodem*\` | **JTAG** for OpenOCD/GDB, plus a **mirrored console output** |
+
+The console is configured with a primary and a secondary:
+
+    CONFIG_ESP_CONSOLE_UART_DEFAULT=y                    primary = UART0
+    CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y       secondary = output mirror
+
+The secondary is **output-only** -- the USB-DBG port prints the boot log but
+ignores typed input. That is why it looks like a console and is not one. It is
+IDF's default because many S3/S31 boards expose only the USB-Serial/JTAG, so the
+console appears whichever cable is plugged in; on a board with a real UART it is
+redundant and can be dropped with \`CONFIG_ESP_CONSOLE_SECONDARY_NONE=y\`.
+
+Neither port's presence changes the halt problem below: a halted CPU prints on
+nothing. The two are separate USB devices, so OpenOCD and the console do not
+contend at the USB level.
+
 ## Needs the USB-JTAG port
 
 The S31 has built-in USB-JTAG, and the newer OpenOCD in the tool tree has S31
