@@ -16,6 +16,7 @@
 
 #include "esp_heap_caps.h"
 
+#include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
 
@@ -231,6 +232,10 @@ esp_err_t espix_audio_play(const char *uri)
 
     static bool registered;
     if (!registered) {
+        /* The simple decoder's own default set is WAV/M4A/TS/OGG; MP3 lives
+         * in the advanced registry, and it is the one the simple decoder
+         * delegates to for MP3 (without this: "Decoder MP3 not registered"). */
+        esp_audio_dec_register_default();
         esp_audio_simple_dec_register_default();
         registered = true;
     }
