@@ -176,6 +176,16 @@ def main():
     finally:
         print(file=sys.stderr)
         if proc:
+            # Leave the target running. A sample halts it, and OpenOCD's init
+            # halts it too, so terminating without resuming freezes the board --
+            # console silent, no hint why.
+            subprocess.run(
+                [gdb, "-q", "-batch",
+                 "-ex", f"target remote :{args.port}",
+                 "-ex", "monitor resume",
+                 "-ex", "detach",
+                 elf],
+                capture_output=True, text=True, timeout=30)
             proc.terminate()
             try:
                 proc.wait(timeout=5)

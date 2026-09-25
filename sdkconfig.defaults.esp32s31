@@ -121,3 +121,14 @@ CONFIG_BTDM_CTRL_MODE_BTDM=n
 # -> 13 kB). Not worth it while internal is the scarce pool, and not the real
 # limit either -- the USB path is just as slow, at the same ~180 kB/s.
 # See docs/ROADMAP.md.
+
+#
+# Console
+#
+# The primary console is UART0 on the external chip, which is what this board is
+# wired for. IDF also mirrors output to the USB-Serial/JTAG secondary by
+# default, and on a board with a real UART that is redundant and not free:
+# every log line is written twice, and the USB-Serial/JTAG write spins when the
+# host is not draining it -- exactly the case while OpenOCD holds the port.
+# Off, so the USB-DBG port carries JTAG and nothing else.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
