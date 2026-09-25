@@ -47,7 +47,15 @@ static char          s_uri[200];
 /* __attribute__((used)) keeps --gc-sections from dropping the ones     */
 /* nothing names.                                                       */
 /* ------------------------------------------------------------------ */
-#define MEDIA_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+/*
+ * The decoder's own memory goes to internal RAM. Its state and tables are
+ * random-access, and PSRAM random access is many times slower: with these in
+ * PSRAM the MP3 decode measured ~2900 ms per second of audio (about 2.9x
+ * realtime) while read and the ring write were negligible. espix's own chunk
+ * buffers are sequential, so those stay in PSRAM below.
+ */
+#define MEDIA_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define IO_CAPS    (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 __attribute__((used)) void *media_lib_malloc(size_t size)
 {
@@ -139,8 +147,8 @@ static void audio_task(void *arg)
         goto out;
     }
 
-    in = heap_caps_malloc(IN_CHUNK, MEDIA_CAPS);
-    out = heap_caps_malloc(OUT_CHUNK, MEDIA_CAPS);
+    in = heap_caps_malloc(IN_CHUNK, IO_CAPS);
+    out = heap_caps_malloc(OUT_CHUNK, IO_CAPS);
     if (in == NULL || out == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "no buffers");
         goto out;
@@ -175,7 +183,7 @@ static void audio_task(void *arg)
             const esp_audio_err_t e = esp_audio_simple_dec_process(dec, &raw, &frame);
             t_dec += (uint32_t)(esp_timer_get_time() - d0);
             if (e == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                uint8_t *nb = heap_caps_realloc(out, frame.needed_size, MEDIA_CAPS);
+                uint8_t *nb = heap_caps_realloc(out, frame.needed_size, IO_CAPS);
                 if (nb == NULL) {
                     espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot grow the out buffer");
                     goto out;
