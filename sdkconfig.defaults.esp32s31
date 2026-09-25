@@ -114,3 +114,10 @@ CONFIG_BTDM_CTRL_MODE_BLE_ONLY=n
 CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
 CONFIG_BTDM_CTRL_MODE_BTDM=n
 
+
+# littlefs I/O units were tried here (read_size 128->512, cache_size 512->4096,
+# lookahead 128->1024) and measured: about 10% faster (read per second of audio
+# ~1150-1330 ms down to ~1076-1245) for 4 kB of internal RAM gone (30 kB free
+# -> 13 kB). Not worth it while internal is the scarce pool, and not the real
+# limit either -- the USB path is just as slow, at the same ~180 kB/s.
+# See docs/ROADMAP.md.
