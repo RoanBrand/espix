@@ -1,0 +1,1 @@
+vPortTaskWrapper;prvIdleTask;esp_vApplicationIdleHook;esp_cpu_wait_for_intr 50
