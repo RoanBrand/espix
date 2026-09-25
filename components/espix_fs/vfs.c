@@ -746,8 +746,24 @@ static int vfs_fstat(void *ctx, int fd, struct stat *st)
         return ebadf();
     }
     const lower_t *l = mount_of_slot(&slot);
-    return NO_LOWER(l->ops->fstat_p)
-               ? enosys() : l->ops->fstat_p(l->ctx, slot.lower_fd, st);
+    if (NO_LOWER(l->ops->fstat_p)) {
+        return enosys();
+    }
+    const int r = l->ops->fstat_p(l->ctx, slot.lower_fd, st);
+
+    /*
+     * stdio sizes its FILE buffer from st_blksize, and newlib falls back to
+     * BUFSIZ (1024) when a filesystem reports none -- littlefs reports none,
+     * and fatfs is configured with 0. A 1 kB FILE buffer turns every large
+     * fread into one read() per kilobyte down here, which capped the
+     * filesystems at ~200 kB/s. Report a real block, whatever the lower layer
+     * said, so every stdio user reads in sensible units, not just the paths
+     * that avoid stdio.
+     */
+    if (r == 0 && st->st_blksize < 4096) {
+        st->st_blksize = 4096;
+    }
+    return r;
 }
 
 static int vfs_fsync(void *ctx, int fd)

@@ -297,6 +297,71 @@ static void retry_connect(void *arg)
     }
 }
 
+/*
+ * Which SBC configuration to ask the sink for.
+ *
+ * This is a *policy over the sink's capabilities*, not a capability limit. The
+ * sink advertises what it can decode (the Q45: every sample rate, every channel
+ * mode, bitpool 2-52); what espix should send is the intersection of that with
+ * what espix can encode, de-rated to what the link has been *measured* to hold.
+ *
+ * ESPIX_BT_SBC_QUALITY is that de-rating dial:
+ *   0  mono, bitpool <= 35   the measured-reliable point on this link, and what
+ *                            IDF's stock a2dp_source example picks; plays clean.
+ *   1  joint stereo, <= 35
+ *   2  joint stereo, <= 52   the sink's full advertised bitpool
+ * Raise it by testing, one step at a time -- which is the point of keeping
+ * capability and measured-reliable separate.
+ */
+#define ESPIX_BT_SBC_QUALITY 0
+
+static esp_err_t a2d_pick_pref_mcc(const esp_a2d_mcc_t *caps, esp_a2d_mcc_t *out)
+{
+    if (caps->type != ESP_A2D_MCT_SBC) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const esp_a2d_cie_sbc_t *c = &caps->cie.sbc_info;
+
+    memset(out, 0, sizeof(*out));
+    out->type = ESP_A2D_MCT_SBC;
+    esp_a2d_cie_sbc_t *p = &out->cie.sbc_info;
+
+    /* No resampler yet, so 44.1 kHz or nothing. */
+    if (!(c->samp_freq & ESP_A2D_SBC_CIE_SF_44K)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    p->samp_freq = ESP_A2D_SBC_CIE_SF_44K;
+
+    /* Best channels this level is willing to send and the sink can take. */
+    if (ESPIX_BT_SBC_QUALITY >= 1 && (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO)) {
+        p->ch_mode = ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
+    } else if (ESPIX_BT_SBC_QUALITY >= 1 && (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO)) {
+        p->ch_mode = ESP_A2D_SBC_CIE_CH_MODE_STEREO;
+    } else if (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO) {
+        p->ch_mode = ESP_A2D_SBC_CIE_CH_MODE_MONO;
+    } else {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /* Where more is better, take the best the sink offers. */
+    p->block_len    = (c->block_len    & ESP_A2D_SBC_CIE_BLOCK_LEN_16)        ? ESP_A2D_SBC_CIE_BLOCK_LEN_16
+                    : (c->block_len    & ESP_A2D_SBC_CIE_BLOCK_LEN_12)        ? ESP_A2D_SBC_CIE_BLOCK_LEN_12
+                    : c->block_len;
+    p->num_subbands = (c->num_subbands & ESP_A2D_SBC_CIE_NUM_SUBBANDS_8)      ? ESP_A2D_SBC_CIE_NUM_SUBBANDS_8
+                    : c->num_subbands;
+    p->alloc_mthd   = (c->alloc_mthd   & ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS) ? ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS
+                    : c->alloc_mthd;
+
+    /* Bitpool: inside the sink's range and under this level's cap. */
+    const uint8_t cap = (ESPIX_BT_SBC_QUALITY >= 2) ? 52 : 35;
+    p->min_bitpool = (c->min_bitpool < 2) ? 2 : c->min_bitpool;
+    p->max_bitpool = (c->max_bitpool > cap) ? cap : c->max_bitpool;
+    if (p->max_bitpool < p->min_bitpool) {
+        p->max_bitpool = p->min_bitpool;
+    }
+    return ESP_OK;
+}
+
 static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     switch (event) {
@@ -350,23 +415,21 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         const esp_a2d_mcc_t *caps = &param->a2d_report_snk_codec_caps_stat.mcc;
 
         esp_a2d_mcc_t pref;
-        memset(&pref, 0, sizeof(pref));
-        pref.type                         = ESP_A2D_MCT_SBC;
-        pref.cie.sbc_info.samp_freq       = ESP_A2D_SBC_CIE_SF_44K;
-        pref.cie.sbc_info.ch_mode         = ESP_A2D_SBC_CIE_CH_MODE_MONO;
-        pref.cie.sbc_info.block_len       = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
-        pref.cie.sbc_info.num_subbands    = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
-        pref.cie.sbc_info.alloc_mthd      = ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
-        pref.cie.sbc_info.min_bitpool     = 2;
-        pref.cie.sbc_info.max_bitpool     = 35;
-
-        if (caps->type == ESP_A2D_MCT_SBC &&
-            (caps->cie.sbc_info.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO)) {
-            const esp_err_t e = esp_a2d_source_set_pref_mcc(h, &pref);
-            s_mono = (e == ESP_OK);
-            espix_klog(e == ESP_OK ? ESPIX_KLOG_INFO : ESPIX_KLOG_WARN, TAG,
-                       "preferred mcc: %s (mono %d)", esp_err_to_name(e), (int)s_mono);
+        const esp_err_t picked = a2d_pick_pref_mcc(caps, &pref);
+        if (picked != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "sink offers nothing this engine can encode (type 0x%x)",
+                       (unsigned)caps->type);
+            break;
         }
+        const esp_err_t e = esp_a2d_source_set_pref_mcc(h, &pref);
+        s_mono = (e == ESP_OK) && (pref.cie.sbc_info.ch_mode == ESP_A2D_SBC_CIE_CH_MODE_MONO);
+        espix_klog(e == ESP_OK ? ESPIX_KLOG_INFO : ESPIX_KLOG_WARN, TAG,
+                   "preferred mcc: %s (q%d, %s, bitpool %u-%u)",
+                   esp_err_to_name(e), ESPIX_BT_SBC_QUALITY,
+                   s_mono ? "mono" : "stereo",
+                   (unsigned)pref.cie.sbc_info.min_bitpool,
+                   (unsigned)pref.cie.sbc_info.max_bitpool);
         break;
     }
     case ESP_A2D_MEDIA_CTRL_ACK_EVT:
