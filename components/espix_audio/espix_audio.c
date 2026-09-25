@@ -249,8 +249,15 @@ esp_err_t espix_audio_play(const char *uri)
     s_stop = false;
     strlcpy(s_uri, uri, sizeof(s_uri));
 
-    if (xTaskCreatePinnedToCoreWithCaps(audio_task, "audio", TASK_STACK, s_uri, 20,
-                                        &s_task, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
+    /*
+     * The stack is deliberately in internal RAM. A decode task's stack is
+     * touched on every call, local and return, and PSRAM makes that path many
+     * times slower -- the version of this task whose stack was in PSRAM burned
+     * CPU 1 flat but only produced about half realtime. The buffers below are
+     * still PSRAM; only the stack is internal, and a few KB is affordable.
+     */
+    if (xTaskCreatePinnedToCore(audio_task, "audio", TASK_STACK, s_uri, 20,
+                                &s_task, 1) != pdPASS) {
         s_task = NULL;
         return ESP_FAIL;
     }
