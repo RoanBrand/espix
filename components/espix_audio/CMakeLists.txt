@@ -6,9 +6,5 @@ idf_component_register(
     PRIV_REQUIRES
         espix_kernel
         espix_bt
-        gmf_core
-        gmf_io
-        gmf_audio
-        gmf_loader
-        esp_audio_simple_player
+        esp_audio_codec
 )
