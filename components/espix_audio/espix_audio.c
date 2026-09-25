@@ -150,6 +150,7 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
     size_t in_len = 0, in_off = 0;
     bool   info_logged = false;
     uint32_t t_read = 0, t_dec = 0, t_feed = 0, produce = 0;
+    uint32_t n_ok = 0, n_need = 0, n_info = 0, n_err = 0;
     int64_t  mark = esp_timer_get_time();
 
     while (!s_stop) {
@@ -172,6 +173,7 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
         in_off += consumed;
 
         if (r == ESPIX_MP3_STREAM_INFO_READY || r == ESPIX_MP3_STREAM_INFO_CHANGED) {
+            n_info++;
             if (!info_logged) {
                 espix_klog(ESPIX_KLOG_INFO, TAG, "%d Hz, %d ch, %d bits (micro-mp3)",
                            espix_mp3_sample_rate(mp3), espix_mp3_channels(mp3),
@@ -181,6 +183,7 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
             continue;
         }
         if (r == ESPIX_MP3_NEED_MORE_DATA) {
+            n_need++;
             /* Carry the tail of a partial frame and read more behind it. */
             const size_t rem = in_len - in_off;
             if (rem > 0 && in_off > 0) {
@@ -200,12 +203,16 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
             continue;
         }
         if (r < 0) {
+            n_err++;
             /* A bad frame is recoverable; skip at least one byte so it cannot
              * spin on the same input. */
             if (consumed == 0) {
                 in_off += 1;
             }
             continue;
+        }
+        if (r == ESPIX_MP3_OK) {
+            n_ok++;
         }
         if (samples > 0) {
             const size_t bytes = samples * (size_t)espix_mp3_channels(mp3) * 2u;
@@ -227,6 +234,10 @@ static void play_mp3(int fd, uint8_t *in, uint8_t *out)
         }
     }
 
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "micro-mp3 done: %u B fed, ok %u need %u info %u err %u, %u B left",
+               (unsigned)produce, (unsigned)n_ok, (unsigned)n_need,
+               (unsigned)n_info, (unsigned)n_err, (unsigned)(in_len - in_off));
     espix_mp3_close(mp3);
 }
 
@@ -409,16 +420,21 @@ esp_err_t espix_audio_play(const char *uri)
     strlcpy(s_uri, uri, sizeof(s_uri));
 
     /*
-     * The stack is explicitly internal DRAM. A decode task's stack is touched
-     * on every call, local and return; a stack out of PSRAM (or RTC RAM) makes
-     * that path many times slower, which is what the watchdog showed -- SP in
-     * 0x2e00.... xTaskCreatePinnedToCore alone can still take the stack from
-     * any 8-bit heap (CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY), so the caps
-     * are explicit. Buffers stay in PSRAM; a few KB of stack is affordable.
+     * PSRAM first, internal as a fallback.
+     *
+     * This stack was pinned to internal because an earlier PSRAM-stack build
+     * underran badly -- but that was before the feed() accounting bug was
+     * found, so the stack's memory was never actually the variable. Internal is
+     * the scarce pool, and a 6 kB block there is exactly what made `play`
+     * intermittently fail with ESP_FAIL when the heap was momentarily
+     * exhausted. This task's working set is small, so try PSRAM and fall back
+     * if it is not available.
      */
     if (xTaskCreatePinnedToCoreWithCaps(audio_task, "audio", TASK_STACK, s_uri, 20,
                                         &s_task, 1,
-                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS &&
+        xTaskCreatePinnedToCore(audio_task, "audio", TASK_STACK, s_uri, 20,
+                                &s_task, 1) != pdPASS) {
         s_task = NULL;
         return ESP_FAIL;
     }
