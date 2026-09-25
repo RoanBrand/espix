@@ -257,4 +257,8 @@ void espix_kernel_early_init(void)
     espix_klog_install_esp_log_hook();
     espix_klog(ESPIX_KLOG_INFO, TAG, "espix %s starting on %s",
                s_version, CONFIG_IDF_TARGET);
+
+    /* Hand the console to a flusher now that there is a scheduler, so no log
+     * call in the tree blocks on the UART from here on. */
+    espix_klog_start_flusher();
 }

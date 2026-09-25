@@ -156,6 +156,13 @@ void espix_klog(espix_klog_level_t level, const char *tag, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 void espix_klog_put(espix_klog_level_t level, const char *line);
 
+/*
+ * Start the console flusher: after this, log calls only format and queue, and
+ * this task writes to the console. Called once the scheduler is running; before
+ * it, klog echoes inline. See the note in klog.c.
+ */
+void espix_klog_start_flusher(void);
+
 /* Iterate the ring oldest-first. Return false from `cb` to stop early. */
 typedef bool (*espix_klog_iter_fn)(void *ctx, const espix_klog_entry_t *e);
 void espix_klog_foreach(espix_klog_iter_fn cb, void *ctx);

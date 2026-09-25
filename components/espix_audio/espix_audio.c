@@ -419,7 +419,7 @@ static void audio_task(void *arg)
              * line here fired every 2-3 s during playback and was audible as a
              * burst of static. DEBUG stays in the ring, so dmesg still has it.
              */
-            espix_klog(ESPIX_KLOG_DEBUG, TAG,
+            espix_klog(ESPIX_KLOG_INFO, TAG,
                        "read %ums decode %ums feed %ums, %u B/s produced",
                        (unsigned)(t_read / 1000), (unsigned)(t_dec / 1000),
                        (unsigned)(t_feed / 1000), (unsigned)produce);

@@ -11,7 +11,9 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
@@ -52,6 +54,26 @@ static const espix_klog_console_hooks_t *s_console;
  * task, before any app exists to have redirected anything.
  */
 static FILE *s_console_out;
+
+/*
+ * The console flusher.
+ *
+ * The ring was always asynchronous; the console write was not. klog_store()
+ * used to fprintf + fflush to a line-buffered tty in the *caller's* context,
+ * which is a blocking UART write (~8-10 ms per line at 115200), and every
+ * ESP_LOGx in the tree reached the console the same way. That is a latency
+ * spike in whatever happened to be running -- it does not show up as task CPU,
+ * because the task is blocked, not busy. It was audible: playback telemetry
+ * logged at INFO once every 2-3 s stalled the audio producer into a burst of
+ * static.
+ *
+ * So the caller now only formats and queues, and this task drains the ring to
+ * the console. Linux's printk-to-ring with a separate console context, same
+ * shape. Before it starts (early boot) the inline echo is kept, because there
+ * is no task to hand the work to.
+ */
+static TaskHandle_t s_flusher;
+static uint32_t     s_flushed;      /* next seq this task will echo */
 
 /* What reaches the console, as `dmesg -n` sets it; the ring keeps everything
  * regardless. See espix_klog_set_console_level(). */
@@ -133,6 +155,9 @@ static void copy_sanitised(char *dst, size_t dst_len, const char *src)
  * pass false: they are already on their way to the console by definition, and
  * echoing them would double every ESP_LOGx.
  */
+static void klog_echo(const espix_klog_entry_t *e);
+static void klog_wake(void);
+
 static void klog_store(espix_klog_level_t level, const char *line, bool echo)
 {
     if (line == NULL) {
@@ -162,28 +187,110 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
     portEXIT_CRITICAL_SAFE(&s_lock);
 
 #if !CONFIG_ESPIX_KLOG_QUIET
-    /* Console gets INFO and above by default; DEBUG stays in the ring for
-     * `dmesg`. Same split Linux draws with its console loglevel — routine
-     * per-event chatter should not be on the terminal you are trying to work
-     * in — and `dmesg -n` moves the line at runtime. */
-    if (echo && level <= s_console_level) {
-        if (s_console_out == NULL) {
-            s_console_out = stdout;     /* boot, on the main task */
+    if (echo) {
+        if (s_flusher != NULL) {
+            klog_wake();
+        } else {
+            /* No flusher yet: this runs during early boot, before the scheduler
+             * or before the task is created. Echo inline, as always. */
+            klog_echo(&staged);
         }
-
-        /* Outside the critical section: this is stdio, not a quick memcpy.
-         * To the captured console, never to the caller's stdout -- see the note
-         * on s_console_out for what that cost the SSH server. */
-        console_output_begin();
-        fprintf(s_console_out, "espix: %s\n", staged.text);
-        fflush(s_console_out);
-        console_output_done();
-
-        s_last_echo_ms = staged.ts_ms;
     }
 #else
     (void)echo;
 #endif
+}
+
+/*
+ * One line to the console. Only ever called from the flusher task (or from the
+ * caller during early boot), so the stdio here is off every hot path.
+ */
+static void klog_echo(const espix_klog_entry_t *e)
+{
+    /* Console gets INFO and above by default; DEBUG stays in the ring for
+     * `dmesg`. Same split Linux draws with its console loglevel -- routine
+     * per-event chatter should not be on the terminal you are trying to work
+     * in -- and `dmesg -n` moves the line at runtime. */
+    if (e->level > s_console_level) {
+        return;
+    }
+
+    if (s_console_out == NULL) {
+        s_console_out = stdout;     /* boot, on the main task */
+    }
+
+    /* To the captured console, never to the caller's stdout -- see the note on
+     * s_console_out for what that cost the SSH server. */
+    console_output_begin();
+    fprintf(s_console_out, "%s\n", e->text);
+    fflush(s_console_out);
+    console_output_done();
+
+    s_last_echo_ms = e->ts_ms;
+}
+
+static void klog_wake(void)
+{
+    if (s_flusher != NULL && !xPortInIsrContext()) {
+        xTaskNotifyGive(s_flusher);
+    }
+}
+
+/* Echo every line stored since the last flush, oldest first. */
+static void klog_flush_pending(void)
+{
+    portENTER_CRITICAL_SAFE(&s_lock);
+    const uint32_t next = s_next;
+    portEXIT_CRITICAL_SAFE(&s_lock);
+
+    const uint32_t oldest = (next > KLOG_LINES) ? next - KLOG_LINES : 0;
+    if (s_flushed < oldest) {
+        s_flushed = oldest;     /* fell behind; the ring already dropped them */
+    }
+
+    for (; s_flushed < next; s_flushed++) {
+        espix_klog_entry_t copy;
+
+        portENTER_CRITICAL_SAFE(&s_lock);
+        copy = s_ring[s_flushed % KLOG_LINES];
+        portEXIT_CRITICAL_SAFE(&s_lock);
+
+        if (copy.seq == s_flushed) {
+            klog_echo(&copy);
+        }
+    }
+}
+
+static void klog_flusher_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        /* Wake on demand, with a timeout as a backstop: a missed notification
+         * (an ISR, or a line queued in a race) still reaches the console. */
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+        klog_flush_pending();
+    }
+}
+
+void espix_klog_start_flusher(void)
+{
+    if (s_flusher != NULL) {
+        return;
+    }
+
+    /* Start from whatever is already there; those lines were echoed inline. */
+    portENTER_CRITICAL_SAFE(&s_lock);
+    s_flushed = s_next;
+    portEXIT_CRITICAL_SAFE(&s_lock);
+
+    /* PSRAM first, internal as a fallback: this task is not realtime, and
+     * internal is the pool that has to stay spare for Bluetooth. */
+    if (xTaskCreateWithCaps(klog_flusher_task, "espix:klog", 4096, NULL, 2,
+                            &s_flusher, MALLOC_CAP_SPIRAM) != pdPASS) {
+        (void)xTaskCreateWithCaps(klog_flusher_task, "espix:klog", 4096, NULL, 2,
+                                  &s_flusher, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
 }
 
 void espix_klog_put(espix_klog_level_t level, const char *line)
@@ -297,22 +404,30 @@ static int klog_vprintf(const char *fmt, va_list ap)
 
     /* Stack buffer, so this stays reentrant across tasks. */
     char line[ESPIX_KLOG_LINE_MAX + 1];
-    if (vsnprintf(line, sizeof(line), fmt, ap_copy) > 0) {
-        klog_store(level_from_esp_log(line), line, false);
+    const int n = vsnprintf(line, sizeof(line), fmt, ap_copy);
+    if (n > 0) {
+        klog_store(level_from_esp_log(line), line, true);
     }
     va_end(ap_copy);
 
     /*
-     * Forwarded verbatim rather than printed from `line` above, so a driver
-     * message longer than ESPIX_KLOG_LINE_MAX reaches the console whole -- the
-     * ring's copy is the one that gets clipped. Which is also why the console
-     * owner is only notified afterwards rather than handed the text.
+     * Once the flusher runs, the console belongs to it: this hook only queues,
+     * so an ESP_LOGx in a hot path no longer pays a UART round trip. The cost
+     * is that a driver message longer than ESPIX_KLOG_LINE_MAX reaches the
+     * console clipped rather than whole, and that colour is dropped with the
+     * rest of the escape sequences (both the price of the ring being the one
+     * path to the console).
      */
+    if (s_flusher != NULL) {
+        return n;
+    }
+
+    /* Early boot: no flusher yet, so keep the stock synchronous output. */
     console_output_begin();
-    const int n = s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
+    const int w = s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
     console_output_done();
 
-    return n;
+    return w;
 }
 
 void espix_klog_install_esp_log_hook(void)

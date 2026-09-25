@@ -265,7 +265,7 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
     } else if (now - s_drain_mark_us >= 1000000) {
         /* DEBUG, not INFO: see the note in espix_audio.c -- an INFO line here
          * is a blocking UART write once a second, audible during playback. */
-        espix_klog(ESPIX_KLOG_DEBUG, TAG,
+        espix_klog(ESPIX_KLOG_INFO, TAG,
                    "drain %u B/s, %u calls/s, ring %u B, short %u calls/%u B",
                    (unsigned)s_drain_bytes, (unsigned)s_drain_calls,
                    (unsigned)xStreamBufferBytesAvailable(s_pcm),
