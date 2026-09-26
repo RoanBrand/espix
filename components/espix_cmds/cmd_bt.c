@@ -147,6 +147,36 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    /*
+     * AVRCP absolute volume, 0..127. Setting asks the sink to change its own
+     * volume; with no argument it prints what the sink last reported. A sink with
+     * an analogue knob (the HD3) has no such value and never reports one, so it
+     * stays unknown there -- which is the honest answer, not an error.
+     */
+    if (strcmp(sub, "volume") == 0) {
+        if (argc > 2) {
+            const int v = atoi(argv[2]);
+            if (v < 0 || v > 127) {
+                espix_eprintf(s, "bluetoothctl: volume takes 0..127\n");
+                return 1;
+            }
+            if (espix_bt_set_volume((uint8_t)v) != ESP_OK) {
+                espix_eprintf(s, "bluetoothctl: volume: the sink did not take it\n");
+                return 1;
+            }
+            espix_printf(s, "volume: set to %d/127\n", v);
+            return 0;
+        }
+
+        const int v = espix_bt_volume();
+        if (v < 0) {
+            espix_printf(s, "volume: unknown (the sink has not reported one)\n");
+        } else {
+            espix_printf(s, "volume: %d/127\n", v);
+        }
+        return 0;
+    }
+
     if (strcmp(sub, "info") == 0) {
         if (bt_addr_arg(s, argc, argv, bda) != 0) {
             return 1;
@@ -248,11 +278,14 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "disconnect <addr>  drop it\n");
         espix_printf(s, "remove <addr>      forget a bond\n");
         espix_printf(s, "agent [pin]        pairing policy (default pin 0000)\n");
+        espix_printf(s, "quality [0|1|2]    SBC quality (restarts the controller)\n");
+        espix_printf(s, "volume [0..127]    AVRCP absolute volume; no argument prints it\n");
         return 0;
     }
 
     espix_eprintf(s, "usage: bluetoothctl {power|scan {on|off}|devices|"
-                     "info|pair|connect|disconnect|remove|trust|agent|help}\n");
+                     "info|pair|connect|disconnect|remove|trust|agent|"
+                     "quality|volume|help}\n");
     return 1;
 }
 
@@ -260,7 +293,7 @@ static espix_cmd_t s_bt_cmds[] = {
     { .name = "bluetoothctl", .fn = cmd_bt,
       .help = "Bluetooth: power, scan, devices, pairing, A2DP",
       .usage = "bluetoothctl {power|scan {on|off}|devices|info|pair|connect|"
-               "disconnect|remove|trust|agent}" },
+               "disconnect|remove|trust|agent|quality|volume}" },
 };
 
 #endif /* CONFIG_ESPIX_BT */

@@ -324,11 +324,147 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
 
 /* Minimal AVRCP controller callback: its existence is what A2DP requires, and
  * the connection state is worth a line in the log. */
+/*
+ * AVRCP absolute volume.
+ *
+ * A sink with a digital volume (the Q45) changes it itself and reports the new
+ * value; we can also set it. The register-notification command is one-shot, so
+ * it is re-armed after every report -- miss that and the sink's later changes
+ * are silent. A sink whose volume is an analogue knob (the HD3) simply never
+ * reports, which is why the value stays unknown there and setting it does
+ * nothing audible.
+ */
+static uint8_t s_sink_volume;
+static bool    s_sink_volume_known;
+static uint8_t s_rc_tl;
+
+/*
+ * The volume we present as an AVRCP target, 0..127, and whether it means
+ * anything yet. A sink whose buttons are not local (the Q45) sends passthrough
+ * volume-up/down to the *source*, expecting the source to hold the volume and
+ * tell it back -- and it does not move its own volume while it waits. With no
+ * TG those commands had nowhere to land, which is why its buttons did nothing.
+ */
+static uint8_t s_tg_volume = 64;
+static bool    s_tg_volume_valid;
+
+static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        espix_klog(ESPIX_KLOG_INFO, TAG, "avrc tg %s",
+                   param->conn_stat.connected ? "connected" : "disconnected");
+        break;
+
+    case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+        /* Act on the press; ignore the release that follows it. */
+        if (param->psth_cmd.key_state != ESP_AVRC_PT_CMD_STATE_PRESSED) {
+            break;
+        }
+        if (param->psth_cmd.key_code == ESP_AVRC_PT_CMD_VOL_UP ||
+            param->psth_cmd.key_code == ESP_AVRC_PT_CMD_VOL_DOWN) {
+            const int step = (param->psth_cmd.key_code == ESP_AVRC_PT_CMD_VOL_UP) ? 5 : -5;
+            int v = (int)s_tg_volume + step;
+            v = (v < 0) ? 0 : (v > 127 ? 127 : v);
+
+            /* There is no PCM gain yet, so the audible level is the sink's own
+             * absolute volume: set that, which is the effect the button asked
+             * for. When a mixer arrives this becomes the gain instead. */
+            (void)espix_bt_set_volume((uint8_t)v);
+            espix_klog(ESPIX_KLOG_INFO, TAG, "sink volume %d/127 (its buttons)", v);
+        }
+        break;
+
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+        /* The sink setting *our* volume -- it is the CT for this direction. */
+        s_tg_volume       = param->set_abs_vol.volume;
+        s_tg_volume_valid = true;
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "sink set our volume to %u/127",
+                   (unsigned)s_tg_volume);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static uint8_t rc_next_tl(void)
+{
+    s_rc_tl = (uint8_t)((s_rc_tl + 1) & 0x0f);   /* 0..15, consecutive differ */
+    return s_rc_tl;
+}
+
+static void avrc_arm_volume(void)
+{
+    const esp_err_t e = esp_avrc_ct_send_register_notification_cmd(rc_next_tl(),
+                                                                  ESP_AVRC_RN_VOLUME_CHANGE, 0);
+    if (e != ESP_OK) {
+        /*
+         * If this fails, the sink's later changes cannot reach us and the value
+         * stays unknown forever -- so say so rather than leaving it a mystery.
+         */
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "cannot register for volume notifications: %s",
+                   esp_err_to_name(e));
+    }
+}
+
+esp_err_t espix_bt_set_volume(uint8_t v)
+{
+    if (v > 0x7f) {
+        v = 0x7f;
+    }
+
+    s_tg_volume       = v;
+    s_tg_volume_valid = true;
+
+    return esp_avrc_ct_send_set_absolute_volume_cmd(rc_next_tl(), v);
+}
+
+int espix_bt_volume(void)
+{
+    if (s_sink_volume_known) {
+        return (int)s_sink_volume;      /* the sink told us */
+    }
+    if (s_tg_volume_valid) {
+        return (int)s_tg_volume;        /* the value we last set */
+    }
+    return -1;
+}
+
 static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
 {
-    if (event == ESP_AVRC_CT_CONNECTION_STATE_EVT) {
+    switch (event) {
+    case ESP_AVRC_CT_CONNECTION_STATE_EVT:
         espix_klog(ESPIX_KLOG_INFO, TAG, "avrc %s",
                    param->conn_stat.connected ? "connected" : "disconnected");
+        if (param->conn_stat.connected) {
+            avrc_arm_volume();
+        } else {
+            s_sink_volume_known = false;
+        }
+        break;
+
+    case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
+        /*
+         * DEBUG, not INFO: a chatty sink (the Q45 reports more than volume) would
+         * otherwise fill the console. It is in dmesg, which is where to look when
+         * asking whether a sink reports at all.
+         */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "avrc notify %d",
+                   (int)param->change_ntf.event_id);
+        if (param->change_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+            s_sink_volume       = param->change_ntf.event_parameter.volume;
+            s_sink_volume_known = true;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "sink volume %u/127",
+                       (unsigned)s_sink_volume);
+            avrc_arm_volume();      /* one-shot: ask for the next change */
+        }
+        break;
+
+    default:
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "avrc ct event %d", (int)event);
+        break;
     }
 }
 
@@ -599,6 +735,18 @@ esp_err_t espix_bt_init(void)
         return err;
     }
     (void)esp_avrc_ct_register_callback(avrc_ct_cb);
+
+    /*
+     * And the target half, which is what lets a sink's own buttons reach us.
+     * A sink whose volume is not local sends passthrough volume-up/down to the
+     * source and waits for it to hold the level; with CT alone those commands
+     * had nowhere to land.
+     */
+    err = esp_avrc_tg_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)esp_avrc_tg_register_callback(avrc_tg_cb);
 
     /*
      * No AVRCP target. A source is an AVRCP controller; enabling the target

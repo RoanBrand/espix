@@ -222,9 +222,19 @@ connects. See docs/UPSTREAM.md.
 - **littlefs read throughput** (~176 kB/s) -- too slow for raw PCM; fix or route
   around.
 - **No resampling**, so non-44.1 kHz sources do not play correctly.
-- **No volume or AVRCP absolute volume** yet. The AVRCP target half is not
-  enabled, so the sink's attempt to reach it logs
-  `handle_rc_connect Connect failed with error code: 2` -- harmless.
+- **A sink's buttons only work while it is streaming.** espix runs AVRCP both
+  ways now -- CT to send, TG to receive -- and the Q45's volume buttons do reach
+  us and step the level. But it stops sending them when the stream is down: with
+  nothing playing, pressing them produces no AVRCP event at all (checked in
+  `dmesg`), so there is nothing to receive. That is the sink's behaviour rather
+  than ours, and it is why the feature reads as "works during playback".
+- **Volume is absolute volume, held on our side.** `bluetoothctl volume [0..127]`
+  sets the sink's digital volume and, with no argument, prints the value: what the
+  sink last reported if it ever has, otherwise what we last set. There is no PCM
+  gain yet, so the sink's own absolute volume *is* the level -- which is why the
+  TG's passthrough buttons adjust that. A sink whose knob is analogue (the HD3)
+  has no AVRCP volume at all and never reports one, so setting it does nothing
+  audible there, which is the honest answer rather than an error.
 - **`OLM_LMP: acl lmp unpack failed, err:262! opcode:54` on every HD3 connect**,
   on the fixed branch too. It no longer aborts the open, so the fix made it
   non-fatal rather than making the LMP parser understand it -- see
@@ -241,6 +251,12 @@ S3 I2S output is deferred. The S31 coreboard has a mono amp and a speaker header
 
 ### Phase 2 (roadmap)
 
+- **A PCM gain**, so the volume we hold is ours. The AVRCP **TG** exists now
+  (the sink's passthrough buttons reach it, and the Q45's volume keys step the
+  level), but with no mixer the step is applied to the sink's absolute volume. A
+  gain in the feed would make it ours, and would also be what the sink's
+  *play/pause* buttons drive once there is a pause/resume for them to map to --
+  today the TG receives them and has nothing to do with them.
 - Multiple simultaneous streams and real mixing; per-app streams and names.
 - Format conversion, resampling, volume, mute; recording.
 - `espix_audio` ABI and `/dev/dsp` so loaded apps play audio like on Linux.

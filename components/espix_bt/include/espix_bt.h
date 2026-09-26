@@ -75,6 +75,15 @@ void espix_bt_set_sbc_quality(int q);
 int  espix_bt_sbc_quality(void);
 
 /*
+ * AVRCP absolute volume, 0..127. `set` asks the sink to change its own volume;
+ * `volume` returns the value the sink last reported, or -1 if it never has (a
+ * sink with an analogue knob has no such value). Both are no-ops from the
+ * sink's point of view when it does not implement absolute volume.
+ */
+esp_err_t espix_bt_set_volume(uint8_t v);
+int       espix_bt_volume(void);
+
+/*
  * Bring the controller down (and free the PCM ring). `power off` in the shell;
  * also what makes a quality change take effect, since the dial only applies to a
  * new codec negotiation. `connect` calls espix_bt_init() again.
