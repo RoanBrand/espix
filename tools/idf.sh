@@ -83,20 +83,46 @@ idf_is_prerelease() {
     case "$1" in *-*) return 0 ;; *) return 1 ;; esac
 }
 
-# Print "version<TAB>path" for every 6.1.x install found, stable first.
+# How strongly to prefer a candidate at the same version.
+#
+# A `release-<version>` checkout is the branch this project actually builds
+# against -- it carries fixes the plain tag lacks (the S31 Bluetooth ones, and a
+# linker script that can place .ext_ram.bss beside the S31's PSRAM XIP). The tag
+# and the branch both report "v6.1", so version alone cannot choose between
+# them, and picking the tag produces confusing link failures.
+#
+#   2  a release-<version> directory, i.e. the branch install
+#   1  any other checkout that is on a git branch (not detached)
+#   0  a detached checkout, i.e. a tag
+idf_pref() {
+    local d="$1" base
+    base=$(basename "$(dirname "$d")")
+    case "$base" in
+        release-*) printf '2'; return 0 ;;
+    esac
+    if git -C "$d" symbolic-ref -q HEAD >/dev/null 2>&1; then
+        printf '1'; return 0
+    fi
+    printf '0'
+}
+
+# Print "version<TAB>preference<TAB>path" for every 6.1.x install found, stable
+# first. The preference breaks ties between equal versions; sort -Vr orders by
+# version first, then by preference (2 before 0 in reverse).
 idf_candidates() {
-    local stable="" pre="" d v
+    local stable="" pre="" d v p
     for d in "$HOME"/.espressif/*/esp-idf "$HOME"/esp/*/esp-idf \
              "$HOME"/esp/esp-idf /opt/esp-idf; do
         idf_valid "$d" || continue
         v=$(idf_version "$d")
         [ -n "$v" ] || continue
         idf_version_ok "$v" || continue
+        p=$(idf_pref "$d")
         if idf_is_prerelease "$v"; then
-            pre="$pre$v	$d
+            pre="$pre$v	$p	$d
 "
         else
-            stable="$stable$v	$d
+            stable="$stable$v	$p	$d
 "
         fi
     done
@@ -125,7 +151,7 @@ espix_find_idf() {
     fi
 
     ver=${line%%	*}
-    dir=${line#*	}
+    dir=${line##*	}   # path is the last field; the middle one is the preference
     if idf_is_prerelease "$ver"; then
         warn "using $ver -- a pre-release, because no stable v$espix_idf_want_major.$espix_idf_want_minor is installed"
     fi

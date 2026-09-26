@@ -155,8 +155,3 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # to remember: PSRAM data is NOT in a core dump (so a BT fault there is blind),
 # and there is no runtime fallback if PSRAM init fails (link-time assignment).
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
-
-# TEMPORARY (testing): no Wi-Fi stack, to see what audio looks like when the
-# codec can get internal RAM. Bluetooth Classic plus Wi-Fi do not leave enough
-# internal for the audio codec's own allocations. Revert once measured.
-CONFIG_ESP_WIFI_ENABLED=n
