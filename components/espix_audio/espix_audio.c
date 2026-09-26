@@ -29,7 +29,14 @@
 
 #define TAG "audio"
 
-#define IN_CHUNK   (32 * 1024)
+/*
+ * The decoder's input buffer lives in internal RAM, not PSRAM, even though it
+ * is the read() target: the codec walks it bit by bit per frame, so its access
+ * pattern is random-ish and PSRAM costs there are the same shape that made GMF
+ * slow. 8 kB is enough for several frames and affordable in internal; the
+ * output buffers stay in PSRAM (the decoder writes them once).
+ */
+#define IN_CHUNK   (8 * 1024)
 #define OUT_CHUNK  (16 * 1024)
 #define TASK_STACK (6 * 1024)
 
@@ -293,7 +300,7 @@ static void audio_task(void *arg)
         goto out;
     }
 
-    in = heap_caps_malloc(IN_CHUNK, IO_CAPS);
+    in = heap_caps_malloc(IN_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     out = heap_caps_malloc(OUT_CHUNK, IO_CAPS);
     up = heap_caps_malloc(OUT_CHUNK * 2, IO_CAPS);
     if (in == NULL || out == NULL || up == NULL) {
@@ -420,9 +427,10 @@ static void audio_task(void *arg)
              * burst of static. DEBUG stays in the ring, so dmesg still has it.
              */
             espix_klog(ESPIX_KLOG_INFO, TAG,
-                       "read %ums decode %ums feed %ums, %u B/s produced",
+                       "read %ums decode %ums feed %ums over %ums, %u B produced",
                        (unsigned)(t_read / 1000), (unsigned)(t_dec / 1000),
-                       (unsigned)(t_feed / 1000), (unsigned)produce);
+                       (unsigned)(t_feed / 1000), (unsigned)((now - mark) / 1000),
+                       (unsigned)produce);
             t_read = t_dec = t_feed = produce = 0;
             mark = now;
         }
