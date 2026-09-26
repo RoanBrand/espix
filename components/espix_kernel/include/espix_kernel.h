@@ -152,6 +152,10 @@ size_t espix_uptime_str(char *buf, size_t len);
  * Neither is safe from panic context — they use stdio. The fault handler uses
  * panic_print_str() and a noinit record instead; see espix_fault.h.
  */
+/* Allocate the ring (PSRAM). Must run before the first espix_klog(); called by
+ * espix_kernel_early_init(). */
+void espix_klog_init(void);
+
 void espix_klog(espix_klog_level_t level, const char *tag, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 void espix_klog_put(espix_klog_level_t level, const char *line);

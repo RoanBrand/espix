@@ -24,15 +24,38 @@
 #define KLOG_LINES CONFIG_ESPIX_KLOG_LINES
 
 /*
- * In PSRAM, with CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY. The ring is 12.4
- * kB of internal RAM (96 x ~132 B) and internal is the pool Bluetooth needs;
- * nothing touches it before app_main, by which point PSRAM is up. The "before
- * the heap exists" note in the file header still holds: this is a static
- * placement, not an allocation.
+ * Allocated in PSRAM at init rather than a static array.
+ *
+ * It is 12.4 kB (96 x ~132 B), and internal RAM is the pool the audio decoder
+ * and Bluetooth both need; PSRAM is 13 MB. The file header's "usable before the
+ * heap" property is given up deliberately: espix_klog_init() runs from
+ * espix_kernel_early_init(), which is the first espix call and already has the
+ * heap, and every use site tolerates a NULL ring (logging then reaches the
+ * console but not dmesg). The alternative was moving Bluedroid's own .bss to
+ * PSRAM to make room, which corrupted A2DP audio -- the A2DP/SBC state does not
+ * want to be slow.
  */
-EXT_RAM_BSS_ATTR static espix_klog_entry_t s_ring[KLOG_LINES];
+static espix_klog_entry_t *s_ring;
 static uint32_t           s_next;       /* total lines ever written */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
+
+void espix_klog_init(void)
+{
+    if (s_ring != NULL) {
+        return;
+    }
+
+    s_ring = heap_caps_malloc((size_t)KLOG_LINES * sizeof(*s_ring), MALLOC_CAP_SPIRAM);
+    if (s_ring == NULL) {
+        s_ring = heap_caps_malloc((size_t)KLOG_LINES * sizeof(*s_ring),
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s_ring == NULL) {
+        return;     /* console logging still works; dmesg has no ring */
+    }
+
+    memset(s_ring, 0, (size_t)KLOG_LINES * sizeof(*s_ring));
+}
 
 /* Plain uint32 read/written without the lock: a torn read is impossible on a
  * 32-bit aligned word, and the only consumer wants "roughly when", not exactly. */
@@ -188,11 +211,13 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
         return;
     }
 
-    portENTER_CRITICAL_SAFE(&s_lock);
-    staged.seq = s_next;
-    s_ring[s_next % KLOG_LINES] = staged;
-    s_next++;
-    portEXIT_CRITICAL_SAFE(&s_lock);
+    if (s_ring != NULL) {
+        portENTER_CRITICAL_SAFE(&s_lock);
+        staged.seq = s_next;
+        s_ring[s_next % KLOG_LINES] = staged;
+        s_next++;
+        portEXIT_CRITICAL_SAFE(&s_lock);
+    }
 
 #if !CONFIG_ESPIX_KLOG_QUIET
     if (echo) {
@@ -328,7 +353,7 @@ void espix_klog(espix_klog_level_t level, const char *tag, const char *fmt, ...)
 
 void espix_klog_foreach(espix_klog_iter_fn cb, void *ctx)
 {
-    if (cb == NULL) {
+    if (cb == NULL || s_ring == NULL) {
         return;
     }
 

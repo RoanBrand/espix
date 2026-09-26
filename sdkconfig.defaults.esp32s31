@@ -149,4 +149,4 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # Put .bss in PSRAM where a symbol asks for it (EXT_RAM_BSS_ATTR). Internal RAM
 # is the scarce pool -- Bluetooth Classic needs it -- and PSRAM is 13 MB, so a
 # large static buffer that need not be internal belongs there.
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set   # moved BT/WiFi BSS to PSRAM and corrupted A2DP audio

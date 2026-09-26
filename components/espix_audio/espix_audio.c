@@ -37,7 +37,15 @@
  * output buffers stay in PSRAM (the decoder writes them once).
  */
 #define IN_CHUNK   (8 * 1024)
-#define OUT_CHUNK  (16 * 1024)
+/*
+ * Sized to an MP3 frame, not to the read: 1152 samples x 2 ch x 2 B = 4608 B is
+ * the largest frame any of our sources decodes to, and the buffer is internal
+ * (the decoder writes it sample by sample, so PSRAM there costs ~7x). 16 kB was
+ * a guess from the original design; the extra 11 kB is internal RAM we do not
+ * have. A larger frame grows it through the BUFF_NOT_ENOUGH path, which for
+ * WAV will fall back to whatever the heap can give.
+ */
+#define OUT_CHUNK  (6 * 1024)
 #define TASK_STACK (6 * 1024)
 
 static TaskHandle_t  s_task;
