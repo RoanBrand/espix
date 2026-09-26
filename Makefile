@@ -63,6 +63,24 @@ else
   PORT_ARG = $(PORT)
 endif
 
+# Refuse to flash without a port, before the recipe runs.
+#
+# port.sh deliberately refuses rather than guesses -- this board enumerates both
+# a UART and the USB-JTAG bridge, so several ports can match -- and flashing the
+# wrong one is worse than being asked. But its exit status is lost inside the
+# $$(...) of a recipe, and the empty -p that results makes esptool read the next
+# argument as its subcommand: "No such command '460800'". Hence its own target,
+# listed ahead of every port-using one.
+ifeq ($(origin PORT), undefined)
+  PORT_CHECK = ./tools/port.sh >/dev/null
+else
+  PORT_CHECK = true
+endif
+
+.PHONY: port-check
+port-check:
+	@$(PORT_CHECK)
+
 .PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release release-all monitor monitor-reset coredump apps test-app test test-panic \
         stress clean help
@@ -86,7 +104,7 @@ build:
 # which is the loader's. Everything is written by offset instead, from whichever
 # partition table sdkconfig selects, and in one esptool invocation so the board
 # resets once -- into the loader, which then selects the kernel.
-flash: build
+flash: build port-check
 	$(IDF) -C loader build
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
@@ -105,7 +123,7 @@ flash: build
 
 # Bootloader, table, otadata and the kernel, without touching the loader -- the
 # common case while iterating on the kernel.
-flash-kernel: build
+flash-kernel: build port-check
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
@@ -121,7 +139,7 @@ flash-kernel: build
 # monitor's, so the loader's first lines are on screen. An extra monitor after
 # an ordinary flash is too late -- the loader has already handed over to the
 # kernel -- and resetting again would boot the kernel, not the loader.
-flash-monitor: build
+flash-monitor: build port-check
 	$(IDF) -C loader build
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
@@ -141,7 +159,7 @@ flash-monitor: build
 	$(IDF) -p $(PORT_ARG) monitor
 
 # The loader alone, in ota_0.
-flash-loader:
+flash-loader: port-check
 
 	$(IDF) -C loader build
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
@@ -158,7 +176,7 @@ flash-loader:
 # The image is sized to its contents and grown to the partition by the kernel on
 # first mount, so this is a small write (a few hundred KB) rather than the whole
 # partition. It packages the *dev* fsroot, test app and local config included.
-flash-fs: build
+flash-fs: build port-check
 	./tools/make-fs-image.sh fsroot $(BUILD)/storage.bin
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	off=$$(awk -F, '/^storage,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
@@ -191,10 +209,10 @@ release-all:
 release:
 	./tools/release.sh $(if $(DRY_RUN),--dry-run,)
 
-monitor:
+monitor: port-check
 	$(IDF) -p $(PORT_ARG) monitor --no-reset
 
-monitor-reset:
+monitor-reset: port-check
 	$(IDF) -p $(PORT_ARG) monitor
 
 # The core dump the last panic left in flash, decoded against build/espix.elf.
