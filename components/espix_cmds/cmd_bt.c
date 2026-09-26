@@ -93,6 +93,22 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    /*
+     * The SBC quality dial, for A/B-ing an artefact by ear without a rebuild.
+     * It only changes the *next* codec negotiation, so reconnect afterwards.
+     */
+    if (strcmp(sub, "quality") == 0) {
+        if (argc > 2) {
+            espix_bt_set_sbc_quality(atoi(argv[2]));
+        }
+        espix_printf(s, "sbc quality %d: %s\n", espix_bt_sbc_quality(),
+                     espix_bt_sbc_quality() == 0 ? "mono, bitpool <= 35" :
+                     espix_bt_sbc_quality() == 1 ? "joint/stereo, bitpool <= 35" :
+                                                   "joint stereo, bitpool <= 52");
+        espix_printf(s, "reconnect for it to take effect\n");
+        return 0;
+    }
+
     if (strcmp(sub, "info") == 0) {
         if (bt_addr_arg(s, argc, argv, bda) != 0) {
             return 1;

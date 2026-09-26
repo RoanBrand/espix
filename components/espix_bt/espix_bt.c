@@ -194,14 +194,20 @@ static const char *sbc_freq_str(uint8_t f)
     }
 }
 
+/*
+ * The CIE channel-mode field is a *bitmask*, not an index: MONO 0x8, DUAL 0x4,
+ * STEREO 0x2, JOINT 0x1 (esp_a2dp_api.h). The old 0-3 mapping printed "?" for
+ * every real value, which hid which mode was actually negotiated -- exactly the
+ * thing to know when a per-ear artefact is being chased.
+ */
 static const char *sbc_ch_str(uint8_t c)
 {
     switch (c) {
-    case 0: return "mono";
-    case 1: return "dual";
-    case 2: return "stereo";
-    case 3: return "joint";
-    default: return "?";
+    case 0x8: return "mono";
+    case 0x4: return "dual";
+    case 0x2: return "stereo";
+    case 0x1: return "joint";
+    default:  return "?";
     }
 }
 
@@ -344,7 +350,23 @@ static void retry_connect(void *arg)
  * Raise it by testing, one step at a time -- which is the point of keeping
  * capability and measured-reliable separate.
  */
-#define ESPIX_BT_SBC_QUALITY 0
+/*
+ * Runtime rather than a #define: the quality dial is the thing to A/B by ear
+ * when chasing an artefact, and rebuilding for each setting is a wasted cycle.
+ * `bluetoothctl quality [0|1|2]` sets it; it applies to the next codec
+ * negotiation, so reconnect (or re-run `bluetoothctl connect`) after changing.
+ */
+static int s_sbc_quality = 0;
+
+void espix_bt_set_sbc_quality(int q)
+{
+    s_sbc_quality = (q < 0) ? 0 : (q > 2 ? 2 : q);
+}
+
+int espix_bt_sbc_quality(void)
+{
+    return s_sbc_quality;
+}
 
 static esp_err_t a2d_pick_pref_mcc(const esp_a2d_mcc_t *caps, esp_a2d_mcc_t *out)
 {
@@ -364,9 +386,9 @@ static esp_err_t a2d_pick_pref_mcc(const esp_a2d_mcc_t *caps, esp_a2d_mcc_t *out
     p->samp_freq = ESP_A2D_SBC_CIE_SF_44K;
 
     /* Best channels this level is willing to send and the sink can take. */
-    if (ESPIX_BT_SBC_QUALITY >= 1 && (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO)) {
+    if (s_sbc_quality >= 1 && (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO)) {
         p->ch_mode = ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
-    } else if (ESPIX_BT_SBC_QUALITY >= 1 && (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO)) {
+    } else if (s_sbc_quality >= 1 && (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO)) {
         p->ch_mode = ESP_A2D_SBC_CIE_CH_MODE_STEREO;
     } else if (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO) {
         p->ch_mode = ESP_A2D_SBC_CIE_CH_MODE_MONO;
@@ -384,7 +406,7 @@ static esp_err_t a2d_pick_pref_mcc(const esp_a2d_mcc_t *caps, esp_a2d_mcc_t *out
                     : c->alloc_mthd;
 
     /* Bitpool: inside the sink's range and under this level's cap. */
-    const uint8_t cap = (ESPIX_BT_SBC_QUALITY >= 2) ? 52 : 35;
+    const uint8_t cap = (s_sbc_quality >= 2) ? 52 : 35;
     p->min_bitpool = (c->min_bitpool < 2) ? 2 : c->min_bitpool;
     p->max_bitpool = (c->max_bitpool > cap) ? cap : c->max_bitpool;
     if (p->max_bitpool < p->min_bitpool) {
@@ -457,7 +479,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_mono = (e == ESP_OK) && (pref.cie.sbc_info.ch_mode == ESP_A2D_SBC_CIE_CH_MODE_MONO);
         espix_klog(e == ESP_OK ? ESPIX_KLOG_INFO : ESPIX_KLOG_WARN, TAG,
                    "preferred mcc: %s (q%d, %s, bitpool %u-%u)",
-                   esp_err_to_name(e), ESPIX_BT_SBC_QUALITY,
+                   esp_err_to_name(e), s_sbc_quality,
                    s_mono ? "mono" : "stereo",
                    (unsigned)pref.cie.sbc_info.min_bitpool,
                    (unsigned)pref.cie.sbc_info.max_bitpool);

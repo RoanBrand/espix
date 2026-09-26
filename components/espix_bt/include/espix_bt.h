@@ -63,6 +63,14 @@ size_t espix_bt_audio_write(const void *pcm, size_t len);
 void espix_bt_audio_start(void);
 
 /*
+ * SBC quality dial: 0 = mono, bitpool <= 35 (the measured-reliable point on this
+ * link); 1 = joint/stereo, <= 35; 2 = joint stereo, <= 52. Applies to the next
+ * codec negotiation, so reconnect after changing it.
+ */
+void espix_bt_set_sbc_quality(int q);
+int  espix_bt_sbc_quality(void);
+
+/*
  * Pairing policy, for now: a PIN for legacy pairing, and auto-accept for SSP
  * (the "just works" passkey). An interactive agent is later.
  */
