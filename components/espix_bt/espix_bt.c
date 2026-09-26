@@ -357,14 +357,19 @@ static void retry_connect(void *arg)
  * negotiation, so reconnect (or re-run `bluetoothctl connect`) after changing.
  */
 /*
- * Default q1: real two-channel playback (joint stereo, falling back to stereo),
- * bitpool <= 35. q0 is mono and cheaper, q2 spends more bitpool on the channels
- * and is the heaviest on the link and on internal-memory contention with the
- * decoder. A mono *source* is still sent as two channels at q1 -- the ring is
- * stereo by contract and the difference channel is then empty -- so the choice
- * here is about the link, not about the file.
+ * Default q2: joint stereo, bitpool <= 52 -- the full budget the sink offers,
+ * and the setting that sounded right on the Q45.
+ *
+ * It was q0/q1 out of caution, after one measurement showed the audio task at
+ * 77% with q2. A repeat measurement over many intervals showed ~43%, the same as
+ * q1 (decode ~430 ms per ~1020 ms), so that 77% was a transient -- the first
+ * sample after a codec change, or SSH traffic in that window -- and not a
+ * property of q2. The link is the only thing it really spends.
+ *
+ * A mono source is still sent as two channels (the ring is stereo by contract,
+ * so the difference channel is empty); this dial is about the link, not the file.
  */
-static int s_sbc_quality = 1;
+static int s_sbc_quality = 2;
 
 void espix_bt_set_sbc_quality(int q)
 {
