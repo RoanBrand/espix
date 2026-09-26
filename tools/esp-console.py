@@ -57,16 +57,28 @@ def openocd(last_cmd):
     return res.stdout
 
 
-def probe(timeout=2.0):
-    """Send a newline and see whether a prompt comes back."""
+def probe(timeout=8.0):
+    """Poke the console once a second until the prompt answers.
+
+    One newline is not enough: the prompt is printed when the shell *reads*
+    input, so a board that finished booting before we opened the port has
+    nothing pending, and a board still booting needs ~11 s. So send a newline
+    every second for `timeout` seconds, and treat silence over that whole window
+    as a real answer -- no output at all means booting, halted, or starved, and
+    the caller decides which with the JTAG state.
+    """
     try:
         s = serial.Serial(PORT, 115200, timeout=0.2)
     except Exception as e:
         return None, "cannot open " + PORT + ": " + str(e)
-    s.write(b"\r\n")
-    t = time.time()
+
     buf = bytearray()
+    t = time.time()
+    next_poke = 0.0
     while time.time() - t < timeout:
+        if time.time() - t >= next_poke:
+            s.write(b"\r\n")
+            next_poke += 1.0
         line = s.readline()
         if line:
             buf += line
