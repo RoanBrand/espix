@@ -52,6 +52,7 @@ static unsigned             s_retries;
 static StaticStreamBuffer_t s_pcm_cb;     /* its control block (internal RAM) */
 static uint8_t             *s_pcm_storage;/* its storage (PSRAM) */
 static bool                 s_a2d_connected;
+static uint8_t              s_connected_bda[ESPIX_BDA_LEN];
 
 /* A zero address turns up in connection-state events for "no device"; it is
  * not a device and must not enter the list (it showed as 00:00:...). */
@@ -439,6 +440,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         }
         if (st == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             s_a2d_connected = true;
+            memcpy(s_connected_bda, param->conn_stat.remote_bda, ESPIX_BDA_LEN);
             s_want_connect = false;
             s_retries = 0;
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connected; checking source");
@@ -689,6 +691,19 @@ esp_err_t espix_bt_connect(const uint8_t bda[ESPIX_BDA_LEN])
     if (!s_inited) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    /*
+     * Already connected to this one: re-requesting it is not a harmless no-op.
+     * Bluedroid's A2DP state machine is in "started", so it drops the request
+     * with "btc_av_state_started_handler : unhandled event:BTC_AV_CONNECT_REQ_EVT"
+     * and nothing happens -- which reads as the command being broken. This is
+     * also the common case when the sink connects by itself, since a bonded
+     * sink re-opens the link unprompted.
+     */
+    if (s_a2d_connected && memcmp(s_connected_bda, bda, ESPIX_BDA_LEN) == 0) {
+        return ESP_OK;
+    }
+
     dev_upsert(bda, NULL);
     memcpy(s_target, bda, ESPIX_BDA_LEN);
     s_want_connect = true;

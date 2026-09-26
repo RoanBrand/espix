@@ -149,6 +149,14 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
             espix_eprintf(s, "bluetoothctl: Bluetooth is not up\n");
             return 1;
         }
+
+        /* Say so rather than issuing a request the A2DP state machine drops. */
+        espix_bt_dev_t cur;
+        if (espix_bt_a2d_connected() && espix_bt_info(bda, &cur) == ESP_OK && cur.connected) {
+            espix_printf(s, "%s is already connected\n", argv[2]);
+            return 0;
+        }
+
         const esp_err_t err = (sub[1] == 'a')
                                   ? espix_bt_pair(bda)
                                   : espix_bt_connect(bda);

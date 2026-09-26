@@ -313,6 +313,38 @@ __attribute__((unused)) static void play_mp3(int fd, uint8_t *in, uint8_t *out)
     espix_mp3_close(mp3);
 }
 
+/*
+ * One audio buffer: internal first, PSRAM as the graceful fallback.
+ *
+ * espix expects low memory, so a failure must not be a surprise: the caller gets
+ * a NULL and the buffer's name, and frees whatever else it took. Internal is
+ * preferred because the decoder walks these per sample -- PSRAM there measured
+ * about 7x slower -- but PSRAM is far better than refusing to play, and which
+ * buffer degraded is logged so a slow decode is explained rather than a mystery.
+ */
+static uint8_t *audio_buf_alloc(const char *name, size_t len, bool *from_psram)
+{
+    *from_psram = false;
+
+    uint8_t *p = heap_caps_malloc(len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (p == NULL) {
+        p = heap_caps_malloc(len, IO_CAPS);
+        *from_psram = (p != NULL);
+    }
+
+    if (p == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "%s buffer: no memory for %u bytes; internal and PSRAM both refused",
+                   name, (unsigned)len);
+    } else if (*from_psram) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s buffer: internal exhausted, using PSRAM (%u bytes); decode will be slower",
+                   name, (unsigned)len);
+    }
+
+    return p;
+}
+
 static void audio_task(void *arg)
 {
     const char *uri = (const char *)arg;
@@ -346,11 +378,27 @@ static void audio_task(void *arg)
         goto out;
     }
 
-    in = heap_caps_malloc(IN_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    out = heap_caps_malloc(OUT_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    up = heap_caps_malloc(OUT_CHUNK * 2, IO_CAPS);
+    /*
+     * Most important first: `in` is what the decoder reads and what the source
+     * read fills, `out` is what it decodes into, and `up` only matters for a
+     * mono source. Each degrades to PSRAM on its own, so one tight pool does
+     * not fail the whole playback.
+     */
+    bool in_ps = false, out_ps = false, up_ps = false;
+    in  = audio_buf_alloc("in",  IN_CHUNK,      &in_ps);
+    out = audio_buf_alloc("out", OUT_CHUNK,     &out_ps);
+    up  = audio_buf_alloc("up",  OUT_CHUNK * 2, &up_ps);
+
     if (in == NULL || out == NULL || up == NULL) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "no buffers");
+        char missing[16] = "";
+        if (in == NULL)  { strlcat(missing, " in",  sizeof(missing)); }
+        if (out == NULL) { strlcat(missing, " out", sizeof(missing)); }
+        if (up == NULL)  { strlcat(missing, " up",  sizeof(missing)); }
+
+        /* Nothing is left half-allocated: the label below frees all three. */
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "cannot play %s: not enough memory for the%s audio buffer(s)",
+                   uri, missing);
         goto out;
     }
 
