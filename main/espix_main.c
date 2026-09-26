@@ -29,6 +29,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "espix_audio.h"
 #include "espix_auth.h"
 #include "espix_cmds.h"
 #include "espix_fault.h"
@@ -112,6 +113,14 @@ void app_main(void)
     if (espix_time_init() != ESP_OK) {
         ESP_LOGW(TAG, "system time unavailable; the clock stays at the epoch");
     }
+
+    /*
+     * Before the network: reserve the audio decoder's internal memory while the
+     * heap is still free. Wi-Fi here and Bluetooth later take most of internal,
+     * and a decoder opened after them spills to PSRAM (see espix_audio.h).
+     * Not fatal -- playback still works, just slower.
+     */
+    (void)espix_audio_reserve();
 
     /* Not fatal: no network is a perfectly usable espix. */
     const esp_err_t net_err = espix_net_init();

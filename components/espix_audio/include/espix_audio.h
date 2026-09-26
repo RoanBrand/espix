@@ -1,11 +1,11 @@
 /*
  * espix audio playback.
  *
- * This is deliberately thin: the engine is Espressif's GMF-based simple player
- * (esp_audio_simple_player), which knows the URI schemes, picks the decoder from
- * the file extension and converts bit depth / channels / rate. espix supplies the
- * one thing the player cannot know: where the PCM goes. Here that is the
- * Bluetooth A2DP source, and it is where an I2S sink will later attach too.
+ * The engine decodes straight into the Bluetooth A2DP ring: esp_audio_simple_dec
+ * for the codec, our own open()/read() for the source, and a task that keeps the
+ * ring fed. It picks the decoder from the file extension, and mono sources are
+ * upmixed to stereo because the ring is stereo by contract (the A2DP callback
+ * downmixes to the sink's mono SBC frame). An I2S sink will attach the same way.
  */
 #pragma once
 
@@ -22,6 +22,15 @@ extern "C" {
  * or "file:///home/esp/x.mp3"). Requires the A2DP link to be up, because that is
  * what consumes the PCM. Returns immediately; playback runs on its own task.
  */
+/*
+ * Open the MP3 decoder and hold it, so its working memory is allocated while
+ * internal RAM is still free -- Bluetooth and Wi-Fi take most of it, and a
+ * decoder opened after them spills to PSRAM and decodes ~7x slower. Call once
+ * at boot, before espix_net_init(). Playback still works without it, just
+ * slower.
+ */
+esp_err_t espix_audio_reserve(void);
+
 esp_err_t espix_audio_play(const char *uri);
 
 /* Stop the current playback. */

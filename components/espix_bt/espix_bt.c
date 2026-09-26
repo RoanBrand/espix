@@ -226,10 +226,33 @@ static int64_t  s_drain_mark_us;
 static bool     s_mono;
 static int16_t  s_dm[1024];   /* stereo samples for up to 512 mono samples */
 
+/*
+ * Pre-roll.
+ *
+ * A play that starts with an empty ring underruns until the producer has built
+ * a cushion, because the producer only runs slightly ahead of realtime: a mono
+ * tone measured 34 short calls (17 kB) in its first moments, heard as gaps,
+ * then short 0 once the ring was deep. Until the cushion exists, hand the sink
+ * silence rather than a partly-filled frame -- it is already playing, so
+ * silence is inaudible where a gap is not. Reset for each play.
+ */
+#define PREROLL_BYTES (64 * 1024)
+static bool     s_prerolled;
+
 static int32_t a2d_data_cb(uint8_t *data, int32_t len)
 {
     if (data == NULL || len <= 0) {
         return 0;
+    }
+
+    if (!s_prerolled) {
+        if (xStreamBufferBytesAvailable(s_pcm) < PREROLL_BYTES) {
+            memset(data, 0, (size_t)len);
+            s_drain_bytes += (uint32_t)len;
+            s_drain_calls++;
+            return (int32_t)len;
+        }
+        s_prerolled = true;
     }
 
     size_t got;
@@ -630,6 +653,14 @@ esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN])
  * moment, then harsh noise. The caller must advance by exactly this count.
  * The short blocking timeout waits for space; the caller paces on it.
  */
+void espix_bt_audio_start(void)
+{
+    s_prerolled = false;
+    if (s_pcm != NULL) {
+        (void)xStreamBufferReset(s_pcm);
+    }
+}
+
 size_t espix_bt_audio_write(const void *pcm, size_t len)
 {
     if (!s_inited || s_pcm == NULL) {

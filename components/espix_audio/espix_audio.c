@@ -96,6 +96,42 @@ __attribute__((used)) void media_lib_free(void *buf)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * The MP3 decoder, opened at boot and reused by every play.
+ *
+ * This is about *when* it allocates, not what it allocates. Its state and tables
+ * are random-access and must be internal, but by the time a user runs `play`,
+ * Bluetooth has taken most of internal and the allocations spill to PSRAM --
+ * CONFIG_SPIRAM_USE_MALLOC lets anything above SPIRAM_MALLOC_ALWAYSINTERNAL go
+ * there, and the decode then measures ~7x slower. Opening it before espix_net
+ * (and before espix_bt_init, which `play` triggers) gets it the internal heap
+ * while it is still free.
+ */
+static esp_audio_simple_dec_handle_t s_reserved_mp3;
+
+esp_err_t espix_audio_reserve(void)
+{
+    /* The simple decoder's own default set is WAV/M4A/TS/OGG; MP3 lives in the
+     * advanced registry, which it delegates to for MP3. */
+    esp_audio_dec_register_default();
+    esp_audio_simple_dec_register_default();
+
+    esp_audio_simple_dec_cfg_t cfg = {
+        .dec_type      = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
+        .use_frame_dec = false,
+    };
+    if (esp_audio_simple_dec_open(&cfg, &s_reserved_mp3) != ESP_AUDIO_ERR_OK) {
+        s_reserved_mp3 = NULL;
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "no MP3 decoder reserved; playback will open one late");
+        return ESP_FAIL;
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "MP3 decoder reserved before Bluetooth and Wi-Fi");
+    return ESP_OK;
+}
+
 static esp_audio_simple_dec_type_t type_from_uri(const char *uri)
 {
     const char *dot = strrchr(uri, '.');
@@ -286,7 +322,9 @@ static void audio_task(void *arg)
     uint8_t *up = NULL;   /* mono -> stereo upmix, so the ring is always stereo */
     int      src_channels = 2;
     esp_audio_simple_dec_handle_t dec = NULL;
+    bool owns_dec = true;   /* false when reusing the boot-time reserved handle */
     bool info_logged = false;
+    int64_t s_last_yield = esp_timer_get_time();
 
     /*
      * open()/read(), not stdio. The FILE buffer here is 128 bytes (picolibc's
@@ -335,13 +373,28 @@ static void audio_task(void *arg)
     }
 #endif
 
-    esp_audio_simple_dec_cfg_t cfg = {
-        .dec_type      = type,
-        .use_frame_dec = false,
-    };
-    if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot open decoder %d", (int)type);
-        goto out;
+    /*
+     * MP3 reuses the handle opened at boot (see espix_audio_reserve). Its state
+     * and tables must be internal: by the time a user runs `play`, Bluetooth has
+     * taken most of internal, and the decoder's allocations then spill to PSRAM
+     * (CONFIG_SPIRAM_USE_MALLOC admits it for anything over
+     * SPIRAM_MALLOC_ALWAYSINTERNAL), which costs ~7x. Opening it before
+     * Bluetooth and Wi-Fi claim the heap keeps it internal. Other types are
+     * opened per play, as before.
+     */
+    if (type == ESP_AUDIO_SIMPLE_DEC_TYPE_MP3 && s_reserved_mp3 != NULL) {
+        dec = s_reserved_mp3;
+        owns_dec = false;
+        (void)esp_audio_simple_dec_reset(dec);
+    } else {
+        esp_audio_simple_dec_cfg_t cfg = {
+            .dec_type      = type,
+            .use_frame_dec = false,
+        };
+        if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK) {
+            espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot open decoder %d", (int)type);
+            goto out;
+        }
     }
 
     /* Where does the time go? Read, decode, and the ring write are timed
@@ -425,6 +478,21 @@ static void audio_task(void *arg)
             break;
         }
 
+        /*
+         * Yield a little, a few times a second.
+         *
+         * While the ring is filling, feed() returns immediately, so this loop
+         * never blocks and core 1's idle task starves -- long enough to trip the
+         * task watchdog (seen as "IDLE1 (CPU 1) did not reset the watchdog").
+         * Once the ring is full feed() blocks on its own and this costs nothing.
+         * 1 tick twice a second is ~2% of the producer at worst.
+         */
+        const int64_t ynow = esp_timer_get_time();
+        if (ynow - s_last_yield >= 500000) {
+            s_last_yield = ynow;
+            vTaskDelay(1);
+        }
+
         const int64_t now = esp_timer_get_time();
         if (now - mark >= 1000000) {
             /*
@@ -445,7 +513,7 @@ static void audio_task(void *arg)
     }
 
 out:
-    if (dec != NULL) {
+    if (owns_dec && dec != NULL) {
         esp_audio_simple_dec_close(dec);
     }
     heap_caps_free(in);
@@ -497,6 +565,10 @@ esp_err_t espix_audio_play(const char *uri)
     }
     s_stop = false;
     strlcpy(s_uri, uri, sizeof(s_uri));
+
+    /* New stream: drop the last one's PCM and re-arm the sink's pre-roll, so
+     * this one starts with a cushion instead of underrunning. */
+    espix_bt_audio_start();
 
     /*
      * PSRAM first, internal as a fallback.

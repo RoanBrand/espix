@@ -150,3 +150,8 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # is the scarce pool -- Bluetooth Classic needs it -- and PSRAM is 13 MB, so a
 # large static buffer that need not be internal belongs there.
 # CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set   # moved BT/WiFi BSS to PSRAM and corrupted A2DP audio
+
+# TEMPORARY (testing): no Wi-Fi stack, to see what audio looks like when the
+# codec can get internal RAM. Bluetooth Classic plus Wi-Fi do not leave enough
+# internal for the audio codec's own allocations. Revert once measured.
+CONFIG_ESP_WIFI_ENABLED=n

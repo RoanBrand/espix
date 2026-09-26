@@ -57,6 +57,12 @@ bool      espix_bt_a2d_connected(void);
 size_t espix_bt_audio_write(const void *pcm, size_t len);
 
 /*
+ * Begin a new stream: drop any PCM left from the last one and re-arm the
+ * pre-roll, so the new stream starts with a cushion rather than underrunning.
+ */
+void espix_bt_audio_start(void);
+
+/*
  * Pairing policy, for now: a PIN for legacy pairing, and auto-accept for SSP
  * (the "just works" passkey). An interactive agent is later.
  */

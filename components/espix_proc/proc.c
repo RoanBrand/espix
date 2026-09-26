@@ -8,6 +8,7 @@
 #include <strings.h>    /* strcasecmp, for `kill -TERM` */
 #include <sys/stat.h>   /* stat, for chdir's directory check */
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #include "espix_kernel.h"

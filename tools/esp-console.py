@@ -34,6 +34,23 @@ ESP = os.path.expanduser("~/.espressif/tools")
 PORT = os.environ.get("ESPIX_CONSOLE", "/dev/cu.usbserial-110")
 
 
+def port_holders():
+    """PIDs other than ours holding the console port.
+
+    A serial port is not exclusive on macOS: idf_monitor can hold it while our
+    open() still succeeds, and then we read nothing (the monitor consumed the
+    output) or steal a keystroke from it. Check first and say so, instead of
+    reporting a board that looks dead when a monitor is in the way.
+    """
+    try:
+        out = subprocess.run(["lsof", "-t", PORT], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return []
+    me = str(os.getpid())
+    return [p for p in out.split() if p.isdigit() and p != me]
+
+
 def find_openocd():
     best = None
     for ocd in sorted(glob.glob(ESP + "/openocd-esp32/*/openocd-esp32")):
@@ -67,6 +84,10 @@ def probe(timeout=8.0):
     as a real answer -- no output at all means booting, halted, or starved, and
     the caller decides which with the JTAG state.
     """
+    holders = port_holders()
+    if holders:
+        return False, "port held by PID " + ",".join(holders) + " (a monitor?)"
+
     try:
         s = serial.Serial(PORT, 115200, timeout=0.2)
     except Exception as e:
@@ -129,8 +150,13 @@ def main():
         sys.stdout.write(out.decode("utf-8", "replace"))
         return
 
-    ok, _ = probe(2)
-    print("READY" if ok else "NO-RESPONSE (try resume)")
+    ok, why = probe(2)
+    if ok:
+        print("READY")
+    elif isinstance(why, str) and "held by" in why:
+        print("BUSY: " + why)
+    else:
+        print("NO-RESPONSE (try resume)")
 
 
 if __name__ == "__main__":

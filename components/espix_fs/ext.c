@@ -48,6 +48,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "esp_heap_caps.h"
 #include "esp_vfs_ops.h"
 
 #include "ext4.h"

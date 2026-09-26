@@ -5,6 +5,7 @@ idf_component_register(
         "."
     REQUIRES
         espix_kernel
+        espix_audio
         espix_fault
         espix_fs
         espix_proc
