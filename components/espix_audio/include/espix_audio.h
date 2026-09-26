@@ -33,6 +33,13 @@ esp_err_t espix_audio_reserve(void);
 
 esp_err_t espix_audio_play(const char *uri);
 
+/*
+ * Same, but starts the task even with no sink connected and lets it fill the
+ * ring until one arrives (`play --wait`). The default refuses, because holding
+ * the decoder and its buffers for an unknown wait is worse than an error.
+ */
+esp_err_t espix_audio_play_wait(const char *uri);
+
 /* Stop the current playback. */
 esp_err_t espix_audio_stop(void);
 

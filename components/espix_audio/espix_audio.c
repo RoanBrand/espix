@@ -576,22 +576,30 @@ out:
     vTaskDelete(NULL);
 }
 
-esp_err_t espix_audio_play(const char *uri)
+static esp_err_t play_common(const char *uri, bool wait)
 {
     if (uri == NULL || uri[0] == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!espix_bt_ready()) {
-        /* play may be the first command; bring the controller up here. The
-         * sink is not required yet -- the ring holds playback until A2DP
-         * connects. */
-        const esp_err_t e = espix_bt_init();
-        if (e != ESP_OK) {
-            return e;
-        }
-    }
+    /*
+     * No sink, no playback.
+     *
+     * This used to start the task anyway and let it fill the ring while waiting
+     * for A2DP. That held the decoder and its buffers for as long as the wait
+     * lasted -- measured at 38 s -- and made `play` look like it had succeeded
+     * when nothing would be heard. A real player refuses instead ("audio open
+     * error: No such device"). `play --wait` keeps the old behaviour for a sink
+     * that is expected shortly.
+     *
+     * The controller is not brought up here either: Bluetooth starts from
+     * bluetoothctl, and a connected sink is a precondition for playing to it.
+     */
     if (!espix_bt_a2d_connected()) {
+        if (!wait) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "no audio sink; not starting %s", uri);
+            return ESP_ERR_INVALID_STATE;
+        }
         espix_klog(ESPIX_KLOG_INFO, TAG, "no sink yet; playback waits for A2DP");
     }
 
@@ -639,6 +647,16 @@ esp_err_t espix_audio_play(const char *uri)
     }
     s_running = true;
     return ESP_OK;
+}
+
+esp_err_t espix_audio_play(const char *uri)
+{
+    return play_common(uri, false);
+}
+
+esp_err_t espix_audio_play_wait(const char *uri)
+{
+    return play_common(uri, true);
 }
 
 esp_err_t espix_audio_stop(void)
