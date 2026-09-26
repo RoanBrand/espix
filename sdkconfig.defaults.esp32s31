@@ -149,7 +149,12 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # Put .bss in PSRAM where a symbol asks for it (EXT_RAM_BSS_ATTR). Internal RAM
 # is the scarce pool -- Bluetooth Classic needs it -- and PSRAM is 13 MB, so a
 # large static buffer that need not be internal belongs there.
-# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set   # moved BT/WiFi BSS to PSRAM and corrupted A2DP audio
+# Move the lwip/net80211/libpp/wpa_supplicant/bluedroid .bss to PSRAM. The
+# IDF docs name those libraries explicitly: it is a supported feature, and it
+# frees ~63 kB of internal RAM, which is what the audio decoder needs. Caveats
+# to remember: PSRAM data is NOT in a core dump (so a BT fault there is blind),
+# and there is no runtime fallback if PSRAM init fails (link-time assignment).
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 
 # TEMPORARY (testing): no Wi-Fi stack, to see what audio looks like when the
 # codec can get internal RAM. Bluetooth Classic plus Wi-Fi do not leave enough
