@@ -145,3 +145,8 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # freertos/test_apps/freertos/port/test_pie_in_task.c says so). No MP3 gain,
 # and a core-affinity constraint not worth taking on yet. Revisit for LE Audio.
 # CONFIG_ESP_AUDIO_CODEC_S31_USE_ASM is not set
+
+# Put .bss in PSRAM where a symbol asks for it (EXT_RAM_BSS_ATTR). Internal RAM
+# is the scarce pool -- Bluetooth Classic needs it -- and PSRAM is 13 MB, so a
+# large static buffer that need not be internal belongs there.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y

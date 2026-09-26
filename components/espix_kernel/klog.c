@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -22,7 +23,14 @@
 
 #define KLOG_LINES CONFIG_ESPIX_KLOG_LINES
 
-static espix_klog_entry_t s_ring[KLOG_LINES];
+/*
+ * In PSRAM, with CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY. The ring is 12.4
+ * kB of internal RAM (96 x ~132 B) and internal is the pool Bluetooth needs;
+ * nothing touches it before app_main, by which point PSRAM is up. The "before
+ * the heap exists" note in the file header still holds: this is a static
+ * placement, not an allocation.
+ */
+EXT_RAM_BSS_ATTR static espix_klog_entry_t s_ring[KLOG_LINES];
 static uint32_t           s_next;       /* total lines ever written */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
 

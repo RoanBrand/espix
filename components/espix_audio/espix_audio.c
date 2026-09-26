@@ -301,7 +301,7 @@ static void audio_task(void *arg)
     }
 
     in = heap_caps_malloc(IN_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    out = heap_caps_malloc(OUT_CHUNK, IO_CAPS);
+    out = heap_caps_malloc(OUT_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     up = heap_caps_malloc(OUT_CHUNK * 2, IO_CAPS);
     if (in == NULL || out == NULL || up == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "no buffers");
