@@ -356,7 +356,15 @@ static void retry_connect(void *arg)
  * `bluetoothctl quality [0|1|2]` sets it; it applies to the next codec
  * negotiation, so reconnect (or re-run `bluetoothctl connect`) after changing.
  */
-static int s_sbc_quality = 0;
+/*
+ * Default q1: real two-channel playback (joint stereo, falling back to stereo),
+ * bitpool <= 35. q0 is mono and cheaper, q2 spends more bitpool on the channels
+ * and is the heaviest on the link and on internal-memory contention with the
+ * decoder. A mono *source* is still sent as two channels at q1 -- the ring is
+ * stereo by contract and the difference channel is then empty -- so the choice
+ * here is about the link, not about the file.
+ */
+static int s_sbc_quality = 1;
 
 void espix_bt_set_sbc_quality(int q)
 {
