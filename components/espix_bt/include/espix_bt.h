@@ -71,6 +71,13 @@ void espix_bt_set_sbc_quality(int q);
 int  espix_bt_sbc_quality(void);
 
 /*
+ * Bring the controller down (and free the PCM ring). `power off` in the shell;
+ * also what makes a quality change take effect, since the dial only applies to a
+ * new codec negotiation. `connect` calls espix_bt_init() again.
+ */
+esp_err_t espix_bt_shutdown(void);
+
+/*
  * Pairing policy, for now: a PIN for legacy pairing, and auto-accept for SSP
  * (the "just works" passkey). An interactive agent is later.
  */

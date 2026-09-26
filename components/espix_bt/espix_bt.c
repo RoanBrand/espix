@@ -580,6 +580,49 @@ esp_err_t espix_bt_init(void)
     return ESP_OK;
 }
 
+/*
+ * Take the controller down, mirroring espix_bt_init(). Needed for two things:
+ * a `power off` that is not a reboot, and a guaranteed fresh codec negotiation
+ * -- the SBC quality only applies to a new negotiation, and a plain A2DP
+ * disconnect leaves the sink free to re-establish with the old config.
+ */
+esp_err_t espix_bt_shutdown(void)
+{
+    if (!s_inited) {
+        return ESP_OK;
+    }
+
+    /* Stop wanting the link first: the retry timer would otherwise reconnect
+     * into a stack that is being torn down. */
+    s_want_connect = false;
+    if (s_retry != NULL) {
+        (void)esp_timer_stop(s_retry);
+    }
+
+    (void)esp_a2d_source_deinit();
+    (void)esp_avrc_ct_deinit();
+    (void)esp_bluedroid_disable();
+    (void)esp_bluedroid_deinit();
+    (void)esp_bt_controller_disable();
+    (void)esp_bt_controller_deinit();
+
+    if (s_retry != NULL) {
+        esp_timer_delete(s_retry);
+        s_retry = NULL;
+    }
+    if (s_pcm_storage != NULL) {
+        heap_caps_free(s_pcm_storage);
+        s_pcm_storage = NULL;
+        s_pcm = NULL;
+    }
+
+    s_inited = false;
+    s_a2d_connected = false;
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "powered off");
+    return ESP_OK;
+}
+
 bool espix_bt_ready(void)         { return s_inited; }
 bool espix_bt_scanning(void)      { return s_scanning; }
 bool espix_bt_a2d_connected(void) { return s_a2d_connected; }

@@ -54,8 +54,13 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
     if (strcmp(sub, "power") == 0) {
         const char *arg = (argc > 2) ? argv[2] : "on";
         if (strcmp(arg, "off") == 0) {
-            espix_eprintf(s, "bluetoothctl: power off is not wired yet\n");
-            return 1;
+            const esp_err_t err = espix_bt_shutdown();
+            if (err != ESP_OK) {
+                espix_eprintf(s, "bluetoothctl: %s\n", esp_err_to_name(err));
+                return 1;
+            }
+            espix_printf(s, "Controller off\n");
+            return 0;
         }
         const esp_err_t err = espix_bt_init();
         if (err != ESP_OK) {
@@ -100,6 +105,16 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
     if (strcmp(sub, "quality") == 0) {
         if (argc > 2) {
             espix_bt_set_sbc_quality(atoi(argv[2]));
+            if (espix_bt_ready()) {
+                /*
+                 * The dial only applies to a new codec negotiation, and a plain
+                 * A2DP disconnect leaves the sink free to re-establish with the
+                 * old configuration -- which is why changing it needed a reboot.
+                 * Take the controller down; `connect` calls espix_bt_init again.
+                 */
+                (void)espix_bt_shutdown();
+                espix_printf(s, "controller restarted for a fresh negotiation\n");
+            }
         }
         espix_printf(s, "sbc quality %d: %s\n", espix_bt_sbc_quality(),
                      espix_bt_sbc_quality() == 0 ? "mono, bitpool <= 35" :
