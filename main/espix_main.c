@@ -115,12 +115,14 @@ void app_main(void)
     }
 
     /*
-     * Before the network: reserve the audio decoder's internal memory while the
-     * heap is still free. Wi-Fi here and Bluetooth later take most of internal,
-     * and a decoder opened after them spills to PSRAM (see espix_audio.h).
-     * Not fatal -- playback still works, just slower.
+     * Audio is not reserved here on purpose: everything is loaded on demand.
+     * `play` opens the decoder and allocates its buffers, and the task frees
+     * them again when it finishes; Bluetooth is only brought up by `play` or by
+     * bluetoothctl. The decoder used to be opened at boot to win the internal
+     * memory before Bluetooth and Wi-Fi took theirs -- that mattered while the
+     * BT/Wi-Fi .bss was in internal RAM, and stopped mattering once it moved to
+     * PSRAM (internal now has ~78 kB free with Bluetooth connected).
      */
-    (void)espix_audio_reserve();
 
     /* Not fatal: no network is a perfectly usable espix. */
     const esp_err_t net_err = espix_net_init();
