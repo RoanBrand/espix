@@ -31,6 +31,9 @@ extern "C" {
  */
 esp_err_t espix_audio_reserve(void);
 
+/* Give the reservation back (stops playback first). Paired with the above. */
+void espix_audio_release(void);
+
 esp_err_t espix_audio_play(const char *uri);
 
 /*

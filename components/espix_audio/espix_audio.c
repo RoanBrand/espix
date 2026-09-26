@@ -132,6 +132,27 @@ esp_err_t espix_audio_reserve(void)
     return ESP_OK;
 }
 
+/*
+ * Give the reservation back. Stops playback first: the reserved handle may be
+ * the one a running play is decoding with, and closing it underneath that task
+ * would be a use-after-free.
+ */
+void espix_audio_release(void)
+{
+    if (s_task != NULL) {
+        s_stop = true;
+        while (s_task != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (s_reserved_mp3 != NULL) {
+        esp_audio_simple_dec_close(s_reserved_mp3);
+        s_reserved_mp3 = NULL;
+        espix_klog(ESPIX_KLOG_INFO, TAG, "MP3 decoder reservation released");
+    }
+}
+
 static esp_audio_simple_dec_type_t type_from_uri(const char *uri)
 {
     const char *dot = strrchr(uri, '.');
