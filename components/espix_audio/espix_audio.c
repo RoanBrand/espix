@@ -51,6 +51,16 @@
 static TaskHandle_t  s_task;
 static volatile bool s_stop;
 static volatile bool s_running;
+
+/*
+ * Whether the running task's stack came from xTaskCreatePinnedToCoreWithCaps
+ * (PSRAM) or the plain xTaskCreatePinnedToCore fallback (internal). It decides
+ * how it must be deleted: a WithCaps task deleted with vTaskDelete() leaks its
+ * stack, because the idle task only frees what FreeRTOS allocated itself -- and
+ * deleting a plain task with vTaskDeleteWithCaps() would double-free. IDF's own
+ * comment says as much in idf_additions.c.
+ */
+static bool s_task_caps;
 static char          s_uri[200];
 
 /* ------------------------------------------------------------------ */
@@ -120,59 +130,28 @@ __attribute__((used)) void media_lib_free(void *buf)
 /* ------------------------------------------------------------------ */
 
 /*
- * The MP3 decoder, opened at boot and reused by every play.
+ * Stop the current playback and wait for the task to go.
  *
- * This is about *when* it allocates, not what it allocates. Its state and tables
- * are random-access and must be internal, but by the time a user runs `play`,
- * Bluetooth has taken most of internal and the allocations spill to PSRAM --
- * CONFIG_SPIRAM_USE_MALLOC lets anything above SPIRAM_MALLOC_ALWAYSINTERNAL go
- * there, and the decode then measures ~7x slower. Opening it before espix_net
- * (and before espix_bt_init, which `play` triggers) gets it the internal heap
- * while it is still free.
+ * Used when the sink is going away (`bluetoothctl power off`): the task owns the
+ * decoder and its buffers, and letting it run on with no sink would hold them
+ * for nothing.
+ *
+ * There is deliberately no decoder reservation here any more. One existed to
+ * take the codec's internal memory before Bluetooth fragmented the heap, and it
+ * did make the difference between a 430 ms and a 1200 ms decode -- but once the
+ * reaper, ota:check and cmd_task stacks moved to PSRAM there was enough
+ * contiguous internal to open the decoder at `play` time, and measurement
+ * showed the reservation no longer buying anything. Simpler wins.
  */
-static esp_audio_simple_dec_handle_t s_reserved_mp3;
-
-esp_err_t espix_audio_reserve(void)
+void espix_audio_stop_wait(void)
 {
-    /* The simple decoder's own default set is WAV/M4A/TS/OGG; MP3 lives in the
-     * advanced registry, which it delegates to for MP3. */
-    esp_audio_dec_register_default();
-    esp_audio_simple_dec_register_default();
-
-    esp_audio_simple_dec_cfg_t cfg = {
-        .dec_type      = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
-        .use_frame_dec = false,
-    };
-    if (esp_audio_simple_dec_open(&cfg, &s_reserved_mp3) != ESP_AUDIO_ERR_OK) {
-        s_reserved_mp3 = NULL;
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "no MP3 decoder reserved; playback will open one late");
-        return ESP_FAIL;
+    if (s_task == NULL) {
+        return;
     }
 
-    espix_klog(ESPIX_KLOG_INFO, TAG,
-               "MP3 decoder reserved before Bluetooth and Wi-Fi");
-    return ESP_OK;
-}
-
-/*
- * Give the reservation back. Stops playback first: the reserved handle may be
- * the one a running play is decoding with, and closing it underneath that task
- * would be a use-after-free.
- */
-void espix_audio_release(void)
-{
-    if (s_task != NULL) {
-        s_stop = true;
-        while (s_task != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-
-    if (s_reserved_mp3 != NULL) {
-        esp_audio_simple_dec_close(s_reserved_mp3);
-        s_reserved_mp3 = NULL;
-        espix_klog(ESPIX_KLOG_INFO, TAG, "MP3 decoder reservation released");
+    s_stop = true;
+    while (s_task != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -466,27 +445,19 @@ static void audio_task(void *arg)
 #endif
 
     /*
-     * MP3 reuses the handle opened at boot (see espix_audio_reserve). Its state
-     * and tables must be internal: by the time a user runs `play`, Bluetooth has
-     * taken most of internal, and the decoder's allocations then spill to PSRAM
-     * (CONFIG_SPIRAM_USE_MALLOC admits it for anything over
-     * SPIRAM_MALLOC_ALWAYSINTERNAL), which costs ~7x. Opening it before
-     * Bluetooth and Wi-Fi claim the heap keeps it internal. Other types are
-     * opened per play, as before.
+     * Opened per play. The decoder's state and tables want internal RAM, and an
+     * earlier version reserved one at boot to get it before Bluetooth
+     * fragmented the heap; that stopped being necessary once the idle task
+     * stacks moved to PSRAM (enough contiguous internal survives Bluetooth), and
+     * measurement confirmed it (161 ms per interval either way).
      */
-    if (type == ESP_AUDIO_SIMPLE_DEC_TYPE_MP3 && s_reserved_mp3 != NULL) {
-        dec = s_reserved_mp3;
-        owns_dec = false;
-        (void)esp_audio_simple_dec_reset(dec);
-    } else {
-        esp_audio_simple_dec_cfg_t cfg = {
-            .dec_type      = type,
-            .use_frame_dec = false,
-        };
-        if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK) {
-            espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot open decoder %d", (int)type);
-            goto out;
-        }
+    esp_audio_simple_dec_cfg_t cfg = {
+        .dec_type      = type,
+        .use_frame_dec = false,
+    };
+    if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot open decoder %d", (int)type);
+        goto out;
     }
 
     /* Where does the time go? Read, decode, and the ring write are timed
@@ -614,10 +585,18 @@ out:
     if (fd >= 0) {
         close(fd);
     }
+    /* Nothing left to send: suspend the stream rather than encode silence. */
+    espix_bt_audio_suspend();
+
     s_running = false;
     s_task = NULL;
     espix_klog(ESPIX_KLOG_INFO, TAG, "finished");
-    vTaskDelete(NULL);
+
+    if (s_task_caps) {
+        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 static esp_err_t play_common(const char *uri, bool wait)
@@ -681,13 +660,20 @@ static esp_err_t play_common(const char *uri, bool wait)
      * exhausted. This task's working set is small, so try PSRAM and fall back
      * if it is not available.
      */
+    /*
+     * s_task_caps is set before each attempt, and the fallback only runs when
+     * the caps attempt failed -- so no task is alive to race the flag.
+     */
+    s_task_caps = true;
     if (xTaskCreatePinnedToCoreWithCaps(audio_task, "audio", TASK_STACK, s_uri, 20,
                                         &s_task, 1,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS &&
-        xTaskCreatePinnedToCore(audio_task, "audio", TASK_STACK, s_uri, 20,
-                                &s_task, 1) != pdPASS) {
-        s_task = NULL;
-        return ESP_FAIL;
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        s_task_caps = false;
+        if (xTaskCreatePinnedToCore(audio_task, "audio", TASK_STACK, s_uri, 20,
+                                    &s_task, 1) != pdPASS) {
+            s_task = NULL;
+            return ESP_FAIL;
+        }
     }
     s_running = true;
     return ESP_OK;

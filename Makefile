@@ -93,7 +93,30 @@ help:
 menu:
 	./tools/espix
 
-build:
+# A build directory records the ESP-IDF it was configured against, and CMake
+# refuses to reuse one from a different tree with a message about the bootloader
+# subproject's sources rather than about the IDF. That happens whenever the
+# selection changes -- e.g. from the v6.1 tag to release/v6.1 -- so check first
+# and say what to remove.
+.PHONY: build-idf-check
+build-idf-check:
+	@eval "$$(./tools/idf.sh --env)" >/dev/null 2>&1 || true; \
+	want="$$IDF_PATH"; \
+	for d in "$(BUILD)" "$(LOADER_BUILD)"; do \
+	    for c in "$$d/CMakeCache.txt" "$$d/bootloader/CMakeCache.txt"; do \
+	        [ -f "$$c" ] || continue; \
+	        cached=$$(sed -n 's/^IDF_PATH:UNINITIALIZED=//p' "$$c" | head -1); \
+	        [ -n "$$cached" ] || continue; \
+	        if [ "$$cached" != "$$want" ]; then \
+	            echo "make: $$d was generated with $$cached" >&2; \
+	            echo "make: this tree now uses $$want" >&2; \
+	            echo "make: remove it and rebuild:  rm -rf $$d" >&2; \
+	            exit 1; \
+	        fi; \
+	    done; \
+	done
+
+build: build-idf-check
 	$(IDF) build
 
 # The historical "write the firmware": bootloader, partition table, the loader
@@ -159,7 +182,7 @@ flash-monitor: build port-check
 	$(IDF) -p $(PORT_ARG) monitor
 
 # The loader alone, in ota_0.
-flash-loader: port-check
+flash-loader: port-check build-idf-check
 
 	$(IDF) -C loader build
 	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \

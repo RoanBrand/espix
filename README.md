@@ -62,6 +62,10 @@ together.
 | Faults | Permissions enforced in espix's own VFS | **yes** | builtins, loaded apps and SFTP alike |
 | Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
 | Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
+| Audio | Play an MP3 or WAV to a Bluetooth speaker | **yes** | S31 only: `bluetoothctl` pairs/connects the sink, then `play <file|url>` streams to it — a real 64 kbps stereo MP3 plays clean at ~16% of one core, ring full, no underruns; [AUDIO.md](docs/AUDIO.md) |
+| Audio | Choose the SBC quality | **yes** | `bluetoothctl quality 0|1|2` (mono ≤35, joint stereo ≤35, joint stereo ≤52); q2 is the default and applies to the next connect |
+| Audio | An I2S codec or the internal DAC | **planned** | the S31 coreboard's amp and mic are phase 2 |
+| Audio | Resampling, volume, mixing | **planned** | so non-44.1 kHz sources and two streams at once wait — [ROADMAP](docs/ROADMAP.md#audio) |
 | Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **planned** | the desktop case, once there is a panel and a pointer |
 | Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
@@ -75,7 +79,7 @@ together.
 | MMU | none | address translation and RISC-V PMP | a real one — a Linux BSP exists |
 | Process isolation | guardrail only | fault isolation between tasks, to confirm | **planned**, `fork()`-shaped |
 | USB | one OTG: host **or** device | two, so both at once | one OTG |
-| Radio | WiFi | none built in — companion chip needed | WiFi |
+| Radio | WiFi 4 / BLE 5.0 | none built in — companion chip needed | WiFi 6 / BT Classic / BT 5.4 LE / IEEE 802.15.4 |
 | Wired | — | 100M Ethernet | Gigabit Ethernet |
 | Display | parallel RGB and i8080, through `LCD_CAM` | MIPI DSI, plus RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; no MIPI, and weaker than the P4 |
 | Runs today | **yes** | no | **yes** |

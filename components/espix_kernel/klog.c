@@ -37,6 +37,7 @@
  */
 static espix_klog_entry_t *s_ring;
 static uint32_t           s_next;       /* total lines ever written */
+static uint32_t           s_dropped_debug;  /* DEBUG lines dropped to keep higher levels */
 static portMUX_TYPE       s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 void espix_klog_init(void)
@@ -213,9 +214,24 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
 
     if (s_ring != NULL) {
         portENTER_CRITICAL_SAFE(&s_lock);
-        staged.seq = s_next;
-        s_ring[s_next % KLOG_LINES] = staged;
-        s_next++;
+        const uint32_t idx = s_next % KLOG_LINES;
+
+        /*
+         * One ring holds every level, so a chatty DEBUG source would otherwise
+         * push out the INFO/WARN/ERROR lines that explain a boot. Once the ring
+         * has wrapped, a DEBUG line is dropped rather than displacing a line of
+         * a higher level -- it still takes slots that hold DEBUG, so it is only
+         * lost when everything around it matters more. Counted separately from
+         * wraparound losses so `dmesg` can say which happened.
+         */
+        if (s_next >= KLOG_LINES && level == ESPIX_KLOG_DEBUG &&
+            s_ring[idx].level != ESPIX_KLOG_DEBUG) {
+            s_dropped_debug++;
+        } else {
+            staged.seq = s_next;
+            s_ring[idx] = staged;
+            s_next++;
+        }
         portEXIT_CRITICAL_SAFE(&s_lock);
     }
 
@@ -389,6 +405,11 @@ size_t espix_klog_count(void)
 uint32_t espix_klog_dropped(void)
 {
     return (s_next > KLOG_LINES) ? s_next - KLOG_LINES : 0;
+}
+
+uint32_t espix_klog_dropped_debug(void)
+{
+    return s_dropped_debug;
 }
 
 uint32_t espix_klog_last_echo_ms(void)

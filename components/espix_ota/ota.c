@@ -196,9 +196,21 @@ esp_err_t espix_ota_archive_self(char *name, size_t len)
         return ESP_ERR_NO_MEM;
     }
 
+    /*
+     * Say what is about to happen before it does: this writes a couple of MB to
+     * littlefs, which is a visible pause in boot, and a silent pause reads as a
+     * hang. Progress every 10% rather than an in-place line -- klog's flusher
+     * writes whole lines, so a \r-updating bar would need the console lock for a
+     * cosmetic gain.
+     */
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "archiving this image to /boot/%s (%u bytes); this takes a moment",
+               name, (unsigned)meta.image_len);
+
     esp_err_t e = ESP_OK;
     uint32_t off = 0;
     uint32_t remain = meta.image_len;
+    uint32_t next_pct = 10;
 
     while (remain > 0) {
         const size_t n = (remain > OTA_CHUNK) ? OTA_CHUNK : remain;
@@ -209,6 +221,13 @@ esp_err_t espix_ota_archive_self(char *name, size_t len)
         }
         off += n;
         remain -= n;
+
+        const uint32_t pct = (uint32_t)((uint64_t)off * 100 / meta.image_len);
+        if (pct >= next_pct) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "archiving %s: %u%%", name,
+                       (unsigned)pct);
+            next_pct = pct + 10;
+        }
     }
     free(buf);
 

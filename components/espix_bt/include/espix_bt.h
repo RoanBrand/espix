@@ -62,6 +62,10 @@ size_t espix_bt_audio_write(const void *pcm, size_t len);
  */
 void espix_bt_audio_start(void);
 
+/* Suspend the A2DP stream again: called when playback finishes, so an idle
+ * connection stops encoding silence. */
+void espix_bt_audio_suspend(void);
+
 /*
  * SBC quality dial: 0 = mono, bitpool <= 35 (the measured-reliable point on this
  * link); 1 = joint/stereo, <= 35; 2 = joint stereo, <= 52. Applies to the next

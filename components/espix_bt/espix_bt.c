@@ -54,6 +54,14 @@ static uint8_t             *s_pcm_storage;/* its storage (PSRAM) */
 static bool                 s_a2d_connected;
 static uint8_t              s_connected_bda[ESPIX_BDA_LEN];
 
+/*
+ * Whether the A2DP stream is on the air. START and SUSPEND are sent only on
+ * transitions: two `play`s in quick succession otherwise had the first one's
+ * SUSPEND and the second one's START cross, and Bluedroid logged "un-acked
+ * a2dp cmd: 3" and stalled the ring while it sorted itself out.
+ */
+static bool                 s_streaming;
+
 /* A zero address turns up in connection-state events for "no device"; it is
  * not a device and must not enter the list (it showed as 00:00:...). */
 static bool bda_valid(const uint8_t bda[ESPIX_BDA_LEN])
@@ -293,9 +301,14 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
     if (s_drain_mark_us == 0) {
         s_drain_mark_us = now;
     } else if (now - s_drain_mark_us >= 1000000) {
-        /* DEBUG, not INFO: see the note in espix_audio.c -- an INFO line here
-         * is a blocking UART write once a second, audible during playback. */
-        espix_klog(ESPIX_KLOG_INFO, TAG,
+        /*
+         * DEBUG, not INFO. The comment said so while the call said INFO, which is
+         * why this spammed the console once a second: klog's ring is asynchronous
+         * but its console echo is not, and this line has no business on the
+         * terminal unless someone is debugging the drain. It stays in the ring
+         * for dmesg.
+         */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
                    "drain %u B/s, %u calls/s, ring %u B, short %u calls/%u B",
                    (unsigned)s_drain_bytes, (unsigned)s_drain_calls,
                    (unsigned)xStreamBufferBytesAvailable(s_pcm),
@@ -447,6 +460,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_a2d_connected = false;
+            s_streaming     = false;
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp disconnected");
             if (s_want_connect && s_retry != NULL) {
                 (void)esp_timer_start_once(s_retry, 2 * 1000 * 1000);
@@ -503,7 +517,16 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     case ESP_A2D_MEDIA_CTRL_ACK_EVT:
         if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
             param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
-            (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            /*
+             * Suspend rather than start: a source that starts here streams
+             * continuously, so an idle connection had Bluedroid encoding silence
+             * once a second forever -- measured at 8% of a core on BTC_TASK, plus
+             * the link airtime, plus a drain log line a second. The stream is
+             * started by `play` (espix_bt_audio_start) and suspended again when
+             * playback finishes, which is what a phone does.
+             */
+            (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+            s_streaming = false;
         }
         break;
     default:
@@ -751,6 +774,20 @@ void espix_bt_audio_start(void)
     s_prerolled = false;
     if (s_pcm != NULL) {
         (void)xStreamBufferReset(s_pcm);
+    }
+
+    /* The stream is suspended at connect; this is what puts it on the air. */
+    if (s_a2d_connected && !s_streaming) {
+        (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        s_streaming = true;
+    }
+}
+
+void espix_bt_audio_suspend(void)
+{
+    if (s_a2d_connected && s_streaming) {
+        (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+        s_streaming = false;
     }
 }
 

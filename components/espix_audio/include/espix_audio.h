@@ -23,16 +23,11 @@ extern "C" {
  * what consumes the PCM. Returns immediately; playback runs on its own task.
  */
 /*
- * Open the MP3 decoder and hold it, so its working memory is allocated while
- * internal RAM is still free -- Bluetooth and Wi-Fi take most of it, and a
- * decoder opened after them spills to PSRAM and decodes ~7x slower. Call once
- * at boot, before espix_net_init(). Playback still works without it, just
- * slower.
+ * Stop the current playback and wait for its task to go. Used when the sink is
+ * going away, so the task does not keep the decoder and its buffers alive with
+ * nowhere to play.
  */
-esp_err_t espix_audio_reserve(void);
-
-/* Give the reservation back (stops playback first). Paired with the above. */
-void espix_audio_release(void);
+void espix_audio_stop_wait(void);
 
 esp_err_t espix_audio_play(const char *uri);
 

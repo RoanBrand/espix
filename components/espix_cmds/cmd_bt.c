@@ -14,22 +14,22 @@
 #if CONFIG_ESPIX_BT
 
 /*
- * Bring Bluetooth up, reserving the audio decoder's internal memory first.
+ * Bring Bluetooth up.
  *
- * The MP3 decoder needs a contiguous block of internal RAM and must take it
- * before Bluedroid's own allocations fragment the heap: opened afterwards it
- * spills to PSRAM and decodes about 3x slower (measured 1200 ms vs 430 ms per
- * interval). espix_bt cannot do this itself -- espix_audio already depends on
- * espix_bt, so the reverse would be a cycle -- which is why the command layer,
- * which sees both, does it here. Released again on `power off`, so idle memory
- * still comes back to where it started.
+ * EXPERIMENT (uncommitted): the audio decoder reservation that used to happen
+ * here is disabled, to find out whether it is still needed now that the reaper,
+ * ota:check and cmd_task stacks live in PSRAM (+10 kB of largest free block).
  *
- * This is a workaround for Bluetooth being the only audio sink: when the sink
- * is not Bluetooth, the reservation belongs wherever that sink is brought up.
+ * If playback is still ~430 ms per interval and no "decoder memory: internal
+ * refused" line appears, the reservation can go for good and this stays simple.
+ * If the decode drops back to ~1150 ms with that line, it is load-bearing and
+ * comes back with the reason written down.
+ *
+ * It lived here rather than in espix_bt_init() because espix_audio already
+ * depends on espix_bt, so the reverse would be a component cycle.
  */
 static esp_err_t bt_up(void)
 {
-    (void)espix_audio_reserve();
     return espix_bt_init();
 }
 
@@ -75,9 +75,8 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
     if (strcmp(sub, "power") == 0) {
         const char *arg = (argc > 2) ? argv[2] : "on";
         if (strcmp(arg, "off") == 0) {
-            /* The decoder reservation goes back with the controller, so idle
-             * memory returns to where it started. */
-            espix_audio_release();
+            /* Stop playback with the controller: nothing left to play to. */
+            espix_audio_stop_wait();
             const esp_err_t err = espix_bt_shutdown();
             if (err != ESP_OK) {
                 espix_eprintf(s, "bluetoothctl: %s\n", esp_err_to_name(err));

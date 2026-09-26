@@ -176,6 +176,14 @@ size_t   espix_klog_count(void);
 uint32_t espix_klog_dropped(void);
 
 /*
+ * DEBUG lines dropped because the ring was full of higher-level lines. The ring
+ * is one buffer for every level, so a chatty DEBUG source would otherwise evict
+ * the INFO/WARN/ERROR lines that explain a boot; this is how many were given up
+ * to avoid that.
+ */
+uint32_t espix_klog_dropped_debug(void);
+
+/*
  * Timestamp of the most recent line echoed to the console, or 0 if none.
  *
  * Exists so a console session can hold its first prompt until boot chatter has

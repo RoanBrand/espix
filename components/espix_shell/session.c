@@ -422,6 +422,13 @@ typedef struct {
     uint32_t         stack;
     int              status;
     TaskHandle_t     caller;        /* notified when the command is done */
+    /*
+     * How this task's stack was allocated, so it is deleted the matching way:
+     * a WithCaps task deleted with vTaskDelete() leaks its stack (the idle task
+     * only frees what FreeRTOS allocated itself), while a plain task deleted
+     * with vTaskDeleteWithCaps() would be double-freed.
+     */
+    bool             caps;
 } cmd_task_ctx_t;
 
 static void cmd_task(void *arg)
@@ -457,7 +464,12 @@ static void cmd_task(void *arg)
              (unsigned)(c->stack - free_min), (unsigned)c->stack);
 
     xTaskNotifyGive(c->caller);
-    vTaskDelete(NULL);
+
+    if (c->caps) {
+        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
@@ -488,13 +500,18 @@ static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
      * big copy, an update -- not something realtime, and internal is the pool the
      * audio codec needs. Internal stays the fallback.
      */
+    /* ctx.caps is set before each attempt; the fallback runs only after the
+     * caps attempt failed, so no task is alive to race the flag. */
+    ctx.caps = true;
     if (xTaskCreateWithCaps(cmd_task, name, cmd->stack, &ctx,
                             uxTaskPriorityGet(NULL), NULL,
-                            MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
-                    NULL) != pdPASS) {
-        espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
-        return 1;
+                            MALLOC_CAP_SPIRAM) != pdPASS) {
+        ctx.caps = false;
+        if (xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
+                        NULL) != pdPASS) {
+            espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
+            return 1;
+        }
     }
 
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);

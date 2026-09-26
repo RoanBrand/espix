@@ -385,6 +385,29 @@ Not a defect — worth recording only because its presence suggests a POSIX laye
 that is not there. Upstream never implemented signals either, so it is not a
 source to draw on.
 
+## Bluetooth Classic on ESP32-S31
+
+### An A2DP source cannot open against some sinks (issue #19130)
+
+The `v6.1` **tag** cannot open an A2DP stream to an Audioengine HD3: every attempt
+logs `OLM_LMP: acl lmp unpack failed, err:262! opcode:54` at link setup, then
+`BTA_AV_OPEN_EVT::FAILED status: 3` (`BTA_AV_FAIL_ROLE`) and the sink drops the
+link (`rsn 0x13`). A soundcore Q45 works on the same build, so it is
+sink-dependent rather than a general source failure.
+
+Fixed on the `release/v6.1` **branch**, which the tag predates: the HD3 then
+connects and streams for hours. The commits that cover it are `0eb0ffea5` (wrong
+BR/EDR power table on S31 -- `btdm_user_cfg.h` was not included), `ec6c7bea5`
+(delete the unused AVRCP acceptor RCB) and `ca97da138` (Bluetooth Classic CVE
+fixes). Note that the `OLM_LMP ... opcode:54` line **still appears** on the
+branch -- the open simply no longer aborts because of it, so the failure is
+tolerated rather than understood, and the report stays open upstream.
+
+espix therefore **requires the branch**. `tools/idf.sh` prefers a
+`release-<version>` checkout over the plain tag for exactly this reason, and
+`make` refuses to reuse a build directory generated against a different tree.
+See issue #19130 and [AUDIO.md](AUDIO.md).
+
 ## `espressif/esp_ext_part_tables`
 
 ### A `0x00` type byte ends the table, and on real media it does not

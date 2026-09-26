@@ -90,16 +90,27 @@ pulls the whole GMF family into the image (3.57 MB against 2.86 MB). The direct
 engine is smaller and easier to reason about. GMF stays the phase-2 reference,
 not the engine.
 
-`play` does not need the sink first: it fills the ring and blocks in its output
-callback until A2DP connects, so it can be issued while the link is still down.
+**`play` requires a sink.** With none connected it refuses and allocates nothing:
+`no audio sink: connect one first (bluetoothctl connect <addr>), or use --wait`.
+It used to start the task anyway and fill the ring until A2DP arrived, which held
+the decoder and its buffers for the whole wait -- measured at 38 s -- and made
+`play` look like it had succeeded while nothing could be heard. `play --wait`
+keeps that behaviour for a sink that is expected shortly.
 
-**The stream is mono, 44.1 kHz, bitpool <= 35**, set with
-`esp_a2d_source_set_pref_mcc()` on the sink-codec-caps event -- the same choice
-IDF's stock `a2dp_source` example makes (mono, bitpool 35, loudness, 8
-subbands, block 16). With the sink's defaults (joint stereo, bitpool up to 52)
-the link cannot hold the stream together and known-good sinks play harsh noise.
-The source role also initialises AVRCP **controller** only; the target half is
-not espix's.
+**The stream is joint stereo, 44.1 kHz, bitpool <= 52 by default**, set with
+`esp_a2d_source_set_pref_mcc()` on the sink-codec-caps event. `bluetoothctl
+quality [0|1|2]` changes it at runtime (0 = mono/<=35, 1 = joint stereo/<=35,
+2 = joint stereo/<=52) and restarts the controller, because the dial only applies
+to a new codec negotiation. Mono was the first choice, taken from the stock
+example; on the bench q2 measured the same CPU as q1 and sounded right on both
+the soundcore Q45 and the Audioengine HD3, so it is the default now. A **mono
+source** is still sent as two channels -- the ring is stereo by contract, so the
+difference channel is empty.
+
+The source role initialises AVRCP **controller** only; the target half is not
+espix's, so the sink's attempt to reach it logs
+`handle_rc_connect Connect failed with error code: 2` on every connect. Harmless,
+and worth knowing before it is mistaken for a fault.
 
 **PCM writes must be accounted, not retried.** `xStreamBufferSend()` takes what
 fits and reports how much; while playing, the ring is full, so that is a partial
@@ -136,15 +147,47 @@ which is the scarce one, and it starved the next task creation.) MP3 is
 compressed (~16 kB/s of reads), so its file read is never the problem. See the
 open items below for the read path proper.
 
-**MP3 decode is software, scalar, and just under realtime.** There is no
-hardware audio decoder on any ESP32, and on S31 there is no accelerated MP3
-library either: the codec is the OpenCore/Helix fixed point decoder built for
-the target, and its `pvmp3_poly_phase_synthesis`/`pvmp3_equalizer` measured at
-**~93% of one core** for 44.1 kHz stereo (the log's read/decode/feed interval is
-several seconds, so read it as a fraction of the interval, not per second). The
-S31 does have a PIE/SIMD coprocessor, but `esp_audio_codec`'s assembly variant
-uses it only for **LC3 (114 sites) and Opus (19)** -- never for MP3 -- and only
-core 1 has PIE at all, which is why the assembly option pins its caller there.
+**MP3 decode is fast now, and what fixed it was memory, not arithmetic.** There is
+no hardware audio decoder on any ESP32, and on S31 no accelerated MP3 library
+either -- the codec is the OpenCore/Helix fixed-point decoder, and its state and
+tables are random-access, so they must live in internal RAM. Get that wrong and
+it is **~7x slower**: `decode` measured **161 ms per 1 s interval** (~16% of one
+core, ring full, `short 0`) against **1200 ms** (spilling, underrunning) with no
+code change at all -- only where the buffers and the codec's allocations sat. Two
+things fixed it:
+
+- **The lwip/net80211/pp/bluedroid `.bss` moved to PSRAM**
+  (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`). IDF documents this and names
+  exactly those libraries; it frees ~63 kB of internal. Two caveats, recorded
+  beside the option in `sdkconfig.defaults.esp32s31`: PSRAM data is **not** in a
+  core dump, and there is no runtime fallback if PSRAM init fails.
+- **The reaper, ota:check and cmd_task stacks moved to PSRAM**
+  (`xTaskCreate...WithCaps`, internal as the fallback). This is what put a
+  *contiguous* block back: after Bluetooth, internal had plenty free but the
+  largest single block was too small.
+
+The codec's own `in`/`out` buffers stay internal by preference, with a PSRAM
+fallback that is **logged** -- a silent 7x slowdown is worse than a loud one. A
+reservation that opened the decoder early (before Bluetooth fragmented the heap)
+was tried and then removed: once the task stacks moved, it bought nothing.
+
+**The stream is started by `play` and suspended when it ends**, not at connect.
+Starting it at connect made Bluedroid encode silence forever: 8% of a core on
+`BTC_TASK`, link airtime, and a drain line a second, none of it audible. A phone
+behaves the same way (AVDTP START/SUSPEND). START and SUSPEND are sent only on
+transitions, so two quick `play`s cannot cross them.
+
+**The sink is pre-rolled.** Playback starts with the ring empty and the sink
+pulling, so the first moments underran (34 short calls on a mono tone, audible).
+The A2DP callback now hands the sink silence until the ring holds 64 kB, which is
+inaudible where a partly-filled frame is not.
+
+**A WithCaps task must be deleted with `vTaskDeleteWithCaps()`.** IDF's own
+comment says why: the idle task does not free a stack that `xTaskCreateWithCaps()`
+allocated. The audio task and `cmd_task` both self-deleted with plain
+`vTaskDelete()`, leaking their stacks on every play and every command that asked
+for one. Fixed, and the check is PSRAM free memory **plateauing** across
+play/power-off cycles rather than climbing ~6 kB each.
 The S3 is not faster silicon, it is better codegen: its codec lib uses the LX7
 DSP/MAC instructions (`mul16s`, `addx2/4/8`, `madd.s`).
 
@@ -171,15 +214,27 @@ connects. See docs/UPSTREAM.md.
 
 ### Known issues
 
-- **MP3 decode is ~2.9x realtime on S31.** `esp_audio_simple_dec`'s MP3 path
-  measures ~2900 ms of decode per second of audio (WAV is 10-27 ms), so the ring
-  cannot stay fed and MP3 playback is choppy at any source rate. This is the
-  main blocker for the phase-1 goal. Next measurement: decode with Bluetooth
-  off, to separate a slow library from CPU throttling under coexistence.
+- **The Q45 has a faint right-ear rumble that the HD3 does not.** Sink-specific:
+  the same stream is clean on an Audioengine HD3, the Q45 is clean from a phone,
+  and a mono stream is by construction identical in both ears. So it is an
+  interaction between that unit and this source rather than our pipeline. Not
+  chased further; other sinks are the way to test it.
 - **littlefs read throughput** (~176 kB/s) -- too slow for raw PCM; fix or route
   around.
 - **No resampling**, so non-44.1 kHz sources do not play correctly.
-- **No volume or AVRCP absolute volume** yet.
+- **No volume or AVRCP absolute volume** yet. The AVRCP target half is not
+  enabled, so the sink's attempt to reach it logs
+  `handle_rc_connect Connect failed with error code: 2` -- harmless.
+- **`OLM_LMP: acl lmp unpack failed, err:262! opcode:54` on every HD3 connect**,
+  on the fixed branch too. It no longer aborts the open, so the fix made it
+  non-fatal rather than making the LMP parser understand it -- see
+  docs/UPSTREAM.md and issue #19130.
+- **`HCI: unhandled HCI command, opcode:0xfc82`** on every connect/disconnect: an
+  Espressif vendor command this controller library rejects as `Illegal Command`.
+  Harmless so far, but it is a host/controller mismatch on a preview target.
+- **A core dump does not include PSRAM data**, which matters now that the
+  Bluetooth and Wi-Fi `.bss` lives there: a fault inside Bluedroid in this
+  configuration cannot be reconstructed from its dump.
 
 S3 I2S output is deferred. The S31 coreboard has a mono amp and a speaker header
 (no speaker attached yet) and a mic; both are phase 2.
