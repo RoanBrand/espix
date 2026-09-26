@@ -482,8 +482,16 @@ static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
      * before the command has run. */
     ulTaskNotifyTake(pdTRUE, 0);
 
-    /* The session's priority, so a command behaves the same either way. */
-    if (xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
+    /*
+     * The session's priority, so a command behaves the same either way. PSRAM
+     * first: a command that asks for its own stack is doing something long -- a
+     * big copy, an update -- not something realtime, and internal is the pool the
+     * audio codec needs. Internal stays the fallback.
+     */
+    if (xTaskCreateWithCaps(cmd_task, name, cmd->stack, &ctx,
+                            uxTaskPriorityGet(NULL), NULL,
+                            MALLOC_CAP_SPIRAM) != pdPASS &&
+        xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
                     NULL) != pdPASS) {
         espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
         return 1;

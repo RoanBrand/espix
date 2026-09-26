@@ -1240,7 +1240,15 @@ esp_err_t espix_ota_init(void)
     if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no event loop: %s",
                    esp_err_to_name(loop_err));
-    } else if (xTaskCreate(check_task, "ota:check", 8192, NULL,
+    /*
+     * PSRAM first: this task spends almost all its life blocked on a timer, and
+     * its 8 kB of internal RAM is better spent on the audio codec. Internal is
+     * still the fallback.
+     */
+    } else if (xTaskCreateWithCaps(check_task, "ota:check", 8192, NULL,
+                                   tskIDLE_PRIORITY + 1, &s_check_task,
+                                   MALLOC_CAP_SPIRAM) != pdPASS &&
+               xTaskCreate(check_task, "ota:check", 8192, NULL,
                            tskIDLE_PRIORITY + 1, &s_check_task) != pdPASS) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task for the periodic check");
     } else if (esp_event_handler_instance_register(

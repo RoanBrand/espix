@@ -91,7 +91,14 @@ esp_err_t espix_fault_reaper_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreate(reaper_task, "espix:reaper", REAPER_STACK_SIZE, NULL,
+    /*
+     * PSRAM first: the reaper is a background janitor that has never run in
+     * anger, and internal RAM is the pool the audio codec needs. Internal stays
+     * the fallback so a board without PSRAM still reaps.
+     */
+    if (xTaskCreateWithCaps(reaper_task, "espix:reaper", REAPER_STACK_SIZE, NULL,
+                            REAPER_PRIORITY, NULL, MALLOC_CAP_SPIRAM) != pdPASS &&
+        xTaskCreate(reaper_task, "espix:reaper", REAPER_STACK_SIZE, NULL,
                     REAPER_PRIORITY, NULL) != pdPASS) {
         vQueueDelete(s_queue);
         s_queue = NULL;

@@ -74,14 +74,37 @@ static char          s_uri[200];
 #define MEDIA_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #define IO_CAPS    (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
+/*
+ * The codec's memory must be internal -- its tables are random-access and PSRAM
+ * there measured ~3x slower -- but returning NULL when internal refuses turns a
+ * slow decode into no decode. So take PSRAM as a last resort and say so: that
+ * line is the signal that something else has fragmented internal, which is
+ * exactly what was invisible before.
+ */
+static void *media_fallback(size_t size, bool zeroed)
+{
+    void *p = zeroed ? heap_caps_calloc(1, size, MEDIA_CAPS)
+                     : heap_caps_malloc(size, MEDIA_CAPS);
+    if (p == NULL) {
+        p = zeroed ? heap_caps_calloc(1, size, IO_CAPS)
+                   : heap_caps_malloc(size, IO_CAPS);
+        if (p != NULL) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "decoder memory: internal refused %u bytes, using PSRAM "
+                       "(decode will be slower)", (unsigned)size);
+        }
+    }
+    return p;
+}
+
 __attribute__((used)) void *media_lib_malloc(size_t size)
 {
-    return heap_caps_malloc(size, MEDIA_CAPS);
+    return media_fallback(size, false);
 }
 
 __attribute__((used)) void *media_lib_calloc(size_t num, size_t size)
 {
-    return heap_caps_calloc(num, size, MEDIA_CAPS);
+    return media_fallback(num * size, true);
 }
 
 __attribute__((used)) void *media_lib_realloc(void *buf, size_t size)
