@@ -66,8 +66,13 @@ together.
 | Audio | Choose the SBC quality | **yes** | `bluetoothctl quality 0|1|2` (mono ≤35, joint stereo ≤35, joint stereo ≤52); q2 is the default and applies to the next connect |
 | Audio | An I2S codec or the internal DAC | **planned** | the S31 coreboard's amp and mic are phase 2 |
 | Audio | Resampling, volume, mixing | **planned** | so non-44.1 kHz sources and two streams at once wait — [ROADMAP](docs/ROADMAP.md#audio) |
+| Display | A desktop, served over VNC | **yes** | `vnc start` puts an 800x600 RGB565 framebuffer on port 5900 and speaks RFB (RFC 6143), so any VNC client is the monitor — no panel needed; Hextile keeps a flat first frame near 10 KiB rather than 1.9 MiB; [DISPLAY.md](docs/DISPLAY.md) |
+| Display | The clients people actually use | **yes** | RFB 3.3 and 3.7/3.8, plus VNC authentication for the ones that insist on a password: TigerVNC, RealVNC on Android and macOS Screen Sharing have each painted a full desktop |
+| Display | Authentication | **partial** | VNC auth (DES) with a built-in default password, public on purpose; security type None is still offered to 3.7+ clients, so it is a compatibility mechanism rather than a security boundary — [DISPLAY.md](docs/DISPLAY.md) |
+| Display | A cursor, and a keyboard round-trip | **yes** | a server-side cursor plus a window that echoes keys; input is one queue, so VNC today and USB HID later share a path |
+| Display | PPA, JPEG and 2D-DMA acceleration | **planned** | the reason the virtual screen exists — each accelerator gets measured against the CPU path it replaces |
 | Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
-| Display | A window system | **planned** | the desktop case, once there is a panel and a pointer |
+| Display | A window system | **planned** | surfaces, z-order and a compositor, on top of the VNC backend |
 | Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
 | Services | Scheduled work: a `cron` | **planned** | the same missing supervisor, from the other end |
 

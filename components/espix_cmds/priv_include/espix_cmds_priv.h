@@ -24,6 +24,7 @@ void espix_cmds_register_ota(void);
 void espix_cmds_register_hash(void);
 void espix_cmds_register_bt(void);
 void espix_cmds_register_play(void);
+void espix_cmds_register_display(void);
 
 /* Resolves a non-builtin command name to a program in /bin or by path. */
 void espix_cmds_register_exec_fallback(void);
