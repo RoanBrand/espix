@@ -32,6 +32,7 @@
 #include "espix_audio.h"
 #include "espix_auth.h"
 #include "espix_cmds.h"
+#include "espix_display.h"
 #include "espix_fault.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -95,6 +96,13 @@ void app_main(void)
     ESP_ERROR_CHECK(espix_fault_init());
     ESP_ERROR_CHECK(espix_fs_mount_root());
     ESP_ERROR_CHECK(espix_proc_init());
+
+    /*
+     * The shell ends a session; this is what ends the processes in it. Wired
+     * here because espix_proc is above espix_shell and cannot call down into
+     * it, and because this file is the one place that knows both.
+     */
+    espix_shell_set_session_end_hook(espix_proc_hangup);
 
     /* Before networking: SSH will authenticate against this, and it warns while
      * the shipped default password is still in place. */
@@ -161,6 +169,19 @@ void app_main(void)
      * docs/OTA.md.
      */
     espix_ota_confirm_boot();
+
+    /*
+     * What a viewer sees when nothing else owns the screen. Registered here
+     * because this is the only place that knows both the display service and
+     * the shell -- the same reason the USB device-node hook lives here.
+     */
+    {
+        static const espix_display_default_t vnc_console = {
+            .start = espix_console_canvas_start,
+            .stop  = espix_console_canvas_stop,
+        };
+        espix_display_set_default(&vnc_console);
+    }
 
     const esp_err_t err = espix_console_session_start();
     if (err != ESP_OK) {

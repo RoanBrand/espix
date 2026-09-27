@@ -717,6 +717,14 @@ int espix_shell_run_line(espix_session_t *s, const char *line)
     return s->last_status;
 }
 
+/* See espix_shell_set_session_end_hook(). */
+static size_t (*s_end_hook)(const espix_session_t *s);
+
+void espix_shell_set_session_end_hook(size_t (*fn)(const espix_session_t *s))
+{
+    s_end_hook = fn;
+}
+
 void espix_shell_session_run(espix_session_t *s)
 {
     if (s == NULL || s->read_line == NULL) {
@@ -740,6 +748,23 @@ void espix_shell_session_run(espix_session_t *s)
         }
 
         (void)espix_shell_run_line(s, line);
+    }
+
+    /*
+     * The session is over, so what it spawned goes with it -- and before the
+     * caller tears its transport down, because a process still writing through
+     * that transport would be writing into state about to go.
+     *
+     * Including a background job: that is what Linux does too, where a job
+     * started with & still gets SIGHUP when the terminal closes. An escape
+     * hatch is a feature nobody has asked for yet.
+     */
+    if (s_end_hook != NULL) {
+        const size_t orphans = s_end_hook(s);
+        if (orphans > 0) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",
+                       s->user, (unsigned)orphans, orphans == 1 ? "" : "es");
+        }
     }
 
     espix_shell_set_current(NULL);

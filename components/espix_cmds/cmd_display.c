@@ -123,7 +123,12 @@ static int cmd_vnc(espix_session_t *s, int argc, char **argv)
             return 0;
         }
         espix_display_vnc_stop();
-        espix_printf(s, "vnc: stopped\n");
+        if (espix_display_ready()) {
+            espix_printf(s, "vnc: stopped (the desktop is still up; "
+                            "'display stop' frees it)\n");
+        } else {
+            espix_printf(s, "vnc: stopped\n");
+        }
         return 0;
     }
 
@@ -156,10 +161,108 @@ static int cmd_vnc(espix_session_t *s, int argc, char **argv)
     return 1;
 }
 
+/*
+ * The desktop without a viewer attached. This is what a panel would use, and
+ * what makes local input meaningful with no network involved at all -- which is
+ * the reason the display and its backends are separate things.
+ */
+static int cmd_display(espix_session_t *s, int argc, char **argv)
+{
+    const char *sub = (argc > 1) ? argv[1] : NULL;
+
+    if (sub == NULL || strcmp(sub, "status") == 0) {
+        espix_canvas_t *cv = espix_display_canvas();
+        if (cv == NULL) {
+            espix_printf(s, "display: down\n");
+            return 0;
+        }
+        espix_printf(s, "display: %dx%d canvas up, vnc %s\n",
+                     espix_canvas_width(cv), espix_canvas_height(cv),
+                     espix_display_vnc_running() ? "attached" : "not attached");
+        return 0;
+    }
+
+    if (strcmp(sub, "start") == 0) {
+        const esp_err_t err = espix_display_start();
+        if (err != ESP_OK) {
+            espix_eprintf(s, "display: cannot start: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "display: %dx%d canvas up\n",
+                     ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
+        return 0;
+    }
+
+    if (strcmp(sub, "stop") == 0) {
+        if (!espix_display_ready()) {
+            espix_printf(s, "display: already down\n");
+            return 0;
+        }
+        /*
+         * Refused while a viewer is attached, rather than taking it down too:
+         * the connection would be left holding a canvas that no longer exists,
+         * and two commands say clearly what one command would have guessed at.
+         */
+        if (espix_display_vnc_running()) {
+            espix_eprintf(s, "display: vnc is attached; stop that first\n");
+            return 1;
+        }
+        espix_display_stop();
+        espix_printf(s, "display: down\n");
+        return 0;
+    }
+
+    espix_eprintf(s, "usage: display [start | stop | status]\n");
+    return 1;
+}
+
+/*
+ * The placeholder desktop, claimed and released. It is what the display draws
+ * when nothing owns the screen, so this puts it in front of a viewer -- which
+ * is the only way to see the pointer until a real desktop program exists.
+ */
+static int cmd_desktop(espix_session_t *s, int argc, char **argv)
+{
+    const char *sub = (argc > 1) ? argv[1] : NULL;
+
+    if (sub == NULL || strcmp(sub, "status") == 0) {
+        const char *owner = espix_display_owner();
+        espix_printf(s, "desktop: screen owner is %s\n",
+                     owner[0] != '\0' ? owner : "(none -- the default content)");
+        return 0;
+    }
+
+    if (strcmp(sub, "start") == 0) {
+        const esp_err_t err = espix_display_desktop_start();
+        if (err != ESP_OK) {
+            espix_eprintf(s, "desktop: %s is already on the screen\n",
+                          espix_display_owner());
+            return 1;
+        }
+        espix_printf(s, "desktop: up\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "stop") == 0) {
+        espix_display_desktop_stop();
+        espix_printf(s, "desktop: down\n");
+        return 0;
+    }
+
+    espix_eprintf(s, "usage: desktop [start | stop | status]\n");
+    return 1;
+}
+
 static espix_cmd_t s_display_cmds[] = {
     { .name = "vnc", .fn = cmd_vnc,
       .help = "serve the desktop over RFB, so any VNC client is the monitor",
       .usage = "vnc [start [port] | stop | status | password <pw> | nopassword]" },
+    { .name = "display", .fn = cmd_display,
+      .help = "the desktop on its own: the canvas a panel or local input uses",
+      .usage = "display [start | stop | status]" },
+    { .name = "desktop", .fn = cmd_desktop,
+      .help = "the placeholder desktop, so the pointer has something to draw on",
+      .usage = "desktop [start | stop | status]" },
 };
 
 void espix_cmds_register_display(void)

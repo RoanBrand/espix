@@ -99,20 +99,93 @@ bool   espix_canvas_damaged(const espix_canvas_t *c);
  * local one exists.
  */
 typedef enum {
+    /* A viewer saying where the pointer *is*. Absolute, canvas coordinates. */
     ESPIX_INPUT_POINTER = 0,
+
+    /*
+     * A local device saying how far it *moved*. Relative, because that is what
+     * a mouse reports -- and because the cursor's position has to live in
+     * exactly one place. The desktop owns it, so a local mouse and a remote
+     * one move the same cursor instead of each keeping its own idea of where it
+     * is and fighting.
+     */
+    ESPIX_INPUT_MOTION,
+
     ESPIX_INPUT_KEY,
 } espix_input_kind_t;
 
 typedef struct {
     espix_input_kind_t kind;
-    uint16_t           x, y;      /* POINTER: absolute, canvas coordinates */
+
+    /* POINTER: absolute. MOTION: a delta. Signed, because a mouse goes left. */
+    int16_t            x, y;
     uint8_t            buttons;   /* POINTER: RFB button mask */
     uint32_t           keysym;    /* KEY: an X11 keysym, as RFB delivers */
     bool               down;      /* KEY */
 } espix_input_event_t;
 
-/* Post an event from a source. Never blocks; a full queue drops the event. */
+/* Post an event from a source. Never blocks. */
 void espix_display_input(const espix_input_event_t *ev);
+
+/* The pointer's position, which the service owns because two sources feed it:
+ * a viewer says where it is, a local mouse says how far it moved. Rendering it
+ * is the owner's business -- a text console has no arrow. */
+void espix_display_pointer(int *x, int *y);
+
+/*
+ * The character an X11 keysym stands for, or 0 for keys with no text meaning.
+ * Here rather than in each source so that a viewer, a local keyboard and the
+ * console cannot disagree about what a key produces.
+ */
+char espix_keysym_char(uint32_t keysym);
+
+/* ------------------------------------------------------------------ */
+/* The screen's owner                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The screen has exactly one owner. There is no window list, no focus and no
+ * arbitration: ownership means "whose model is rendered to the canvas", so each
+ * side keeps its own state and a switch is a repaint. That is what lets a
+ * console keep running, invisibly, while a desktop is in front of it.
+ *
+ * Callbacks run in the context of whoever posted the input -- the RFB
+ * connection task -- so they must be quick and must not block.
+ */
+typedef struct {
+    const char *name;
+    void (*input)(void *ctx, const espix_input_event_t *ev);
+    void (*repaint)(void *ctx);   /* redraw the whole canvas from your model */
+    void *ctx;
+} espix_screen_t;
+
+esp_err_t   espix_display_claim(const espix_screen_t *screen);
+void        espix_display_release(const espix_screen_t *screen);
+const char *espix_display_owner(void);   /* "" when the default content is up */
+
+/*
+ * What a viewer gets when nothing else owns the screen -- the on-screen
+ * console. Registered by main, which is the only place that knows both the
+ * display and the shell, and started only while a viewer is attached, so a
+ * headless board pays for none of it.
+ */
+typedef struct {
+    esp_err_t (*start)(void);   /* claim the screen and begin drawing */
+    void      (*stop)(void);    /* release it and stop */
+} espix_display_default_t;
+
+/*
+ * The built-in placeholder content: background, window and cursor. Claimable so
+ * the pointer has something to render on -- and so the input path can be proven
+ * end to end -- before there is a real desktop program. It is what the default
+ * content already draws; this puts it in front of a viewer.
+ */
+esp_err_t espix_display_desktop_start(void);
+void      espix_display_desktop_stop(void);
+
+void espix_display_set_default(const espix_display_default_t *def);
+void espix_display_viewer_attached(void);
+void espix_display_viewer_detached(void);
 
 /* ------------------------------------------------------------------ */
 /* Service                                                             */
@@ -121,6 +194,17 @@ void espix_display_input(const espix_input_event_t *ev);
 /* The desktop canvas, or NULL when the display is down. */
 espix_canvas_t *espix_display_canvas(void);
 bool            espix_display_ready(void);
+
+/*
+ * Bring the desktop up, and take it down.
+ *
+ * Independent of any backend, because the canvas is what every output shares: a
+ * panel needs it with no network at all, local input needs somewhere to land,
+ * and a VNC session comes and goes underneath. So this is the only thing that
+ * frees the canvas; stopping a backend is not.
+ */
+esp_err_t espix_display_start(void);
+void      espix_display_stop(void);
 
 /*
  * Bring the desktop up and listen for RFB clients on port. Idempotent:

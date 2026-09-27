@@ -615,11 +615,16 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
         if (!read_full(c->fd, buf, sizeof(buf))) {
             return false;
         }
+        /*
+         * RFB coordinates are unsigned and the event's are signed, because a
+         * local mouse reports a delta. A peer that names a point past the
+         * canvas is clamped by the desktop, which is where that belongs.
+         */
         const espix_input_event_t ev = {
-            .kind = ESPIX_INPUT_POINTER,
+            .kind    = ESPIX_INPUT_POINTER,
             .buttons = buf[0],
-            .x = rd16(buf + 1),
-            .y = rd16(buf + 3),
+            .x       = (int16_t)rd16(buf + 1),
+            .y       = (int16_t)rd16(buf + 3),
         };
         espix_display_input(&ev);
         return c->pending ? update_send(c) : true;
@@ -939,6 +944,13 @@ static void rfb_serve(int fd)
     s_clients = 1;
     espix_klog(ESPIX_KLOG_INFO, TAG, "client connected from %s", s_peer);
 
+    /*
+     * A viewer with nothing on the screen gets the console, and only then: a
+     * desktop that is already running is what it should see. Created here and
+     * torn down below, so a board with nobody watching allocates none of it.
+     */
+    espix_display_viewer_attached();
+
     while (s_run) {
         uint8_t type;
         const int rc = recv_byte(fd, &type);
@@ -959,6 +971,7 @@ static void rfb_serve(int fd)
 
     s_clients = 0;
     s_peer[0] = '\0';
+    espix_display_viewer_detached();
     espix_klog(ESPIX_KLOG_INFO, TAG, "client disconnected");
 
 done:

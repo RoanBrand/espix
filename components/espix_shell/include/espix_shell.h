@@ -528,7 +528,33 @@ int espix_session_write(espix_session_t *s, const char *data, size_t len,
  * Sets up the driver, line endings and the line editor, then runs the session
  * loop on the calling task. Normally never returns.
  */
+/*
+ * Called when a session ends and whatever it spawned must go with it.
+ *
+ * Registered rather than called directly because the component that owns the
+ * process table -- espix_proc -- sits *above* this one: it depends on
+ * espix_shell for espix_session_t, so the call cannot go the other way. Same
+ * shape, and the same reason, as task_gone and poll_interrupt.
+ *
+ * It is here, rather than in each transport, because that is where Linux puts
+ * it: losing a session's controlling terminal hangs its processes up in the
+ * *kernel*, so sshd only has to close the pty and no transport can forget.
+ * espix's equivalent of losing the terminal is read_line() reporting EOF, which
+ * happens inside espix_shell_session_run() -- so that is where it lands, and
+ * every transport gets it without knowing it exists.
+ */
+void espix_shell_set_session_end_hook(size_t (*fn)(const espix_session_t *s));
+
 esp_err_t espix_console_session_start(void);
+
+/*
+ * The on-screen console: the same shell, rendered into the display canvas and
+ * fed from the display's input queue. Started and stopped by the display
+ * service when a viewer attaches and leaves, so a headless board pays for
+ * none of it.
+ */
+esp_err_t espix_console_canvas_start(void);
+void      espix_console_canvas_stop(void);
 
 #ifdef __cplusplus
 }

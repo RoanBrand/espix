@@ -2149,16 +2149,13 @@ static void apply_account(espix_session_t *session, const char *user)
  */
 static void finish_session(ssh_chan_t *ch, espix_session_t *session)
 {
-    const size_t orphans = espix_proc_hangup(session);
-
-    /* Before the processes are gone rather than after would be wrong: each
-     * copied what it needed at spawn, so this frees the session's table only. */
+    /*
+     * The processes are no longer this function's business: the shell hangs up
+     * whatever a session spawned as it returns, so every transport has that for
+     * free instead of each one remembering. What is left here is the session's
+     * own table, which only the transport knows when it has finished with.
+     */
     espix_env_free(session);
-
-    if (orphans > 0) {
-        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",
-                   session->user, (unsigned)orphans, orphans == 1 ? "" : "es");
-    }
 
     if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
         /*

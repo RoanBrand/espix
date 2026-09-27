@@ -5,6 +5,7 @@ idf_component_register(
         "registry.c"
         "session.c"
         "tty_console.c"
+        "canvas_console.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -15,6 +16,7 @@ idf_component_register(
         console
         esp_timer
         espix_fs
+        espix_display
         freertos
         vfs
         esp_driver_uart

@@ -306,10 +306,17 @@ static bool       s_cursor_on;
 static int        s_cx, s_cy;
 
 static espix_canvas_t *s_canvas;
-static QueueHandle_t   s_input;
-static TaskHandle_t    s_desktop_task;
-static volatile bool   s_desktop_quit;
 static bool            s_up;
+
+/* The one owner of the screen, or NULL for the default content. */
+static const espix_screen_t *s_owner;
+
+/* Pointer position; see espix_display_pointer(). */
+static int s_ptr_x, s_ptr_y;
+
+/* What a viewer gets when nothing owns the screen. */
+static espix_display_default_t s_default;
+static bool                    s_default_up;
 
 static char s_grid[TEXT_ROWS][TEXT_COLS];
 static int  s_trow, s_tcol;
@@ -445,8 +452,9 @@ static void text_window_draw(void)
     espix_canvas_outline(s_canvas, (espix_rect_t){ WIN_X, WIN_Y, WIN_W, WIN_H }, COL_WIN_EDGE);
 }
 
-/* RFB delivers X11 keysyms; the ASCII range is its own keysym. */
-static char keysym_char(uint32_t ks)
+/* RFB delivers X11 keysyms; the ASCII range is its own keysym. Exported so
+ * every input source and the console agree on what a key means. */
+char espix_keysym_char(uint32_t ks)
 {
     if (ks >= 0x20 && ks <= 0x7E) {
         return (char)ks;
@@ -461,7 +469,7 @@ static char keysym_char(uint32_t ks)
 
 static void text_key(uint32_t keysym)
 {
-    const char ch = keysym_char(keysym);
+    const char ch = espix_keysym_char(keysym);
 
     if (ch == '\r') {
         s_tcol = 0;
@@ -501,32 +509,193 @@ static void text_key(uint32_t keysym)
     }
 }
 
-static void desktop_task(void *arg)
+/*
+ * The default content: a background, a window that echoes keys, and the cursor.
+ * A placeholder for a real desktop program, which is why it is kept small --
+ * its job is to make the screen never blank and to give the input path
+ * something to prove itself against.
+ */
+static void desktop_paint(void)
 {
-    (void)arg;
-    espix_input_event_t ev;
-
-    while (!s_desktop_quit) {
-        if (xQueueReceive(s_input, &ev, pdMS_TO_TICKS(200)) != pdTRUE) {
-            continue;
-        }
-        if (ev.kind == ESPIX_INPUT_POINTER) {
-            cursor_put(ev.x, ev.y);
-        } else if (ev.kind == ESPIX_INPUT_KEY && ev.down) {
-            text_key(ev.keysym);
-        }
+    if (s_canvas == NULL) {
+        return;
     }
 
-    s_desktop_task = NULL;
-    vTaskDeleteWithCaps(NULL);          /* frees the PSRAM stack it was given */
+    espix_canvas_lock(s_canvas);
+    espix_canvas_fill(s_canvas,
+                      (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
+                      COL_DESKTOP);
+    text_window_draw();
+    espix_canvas_unlock(s_canvas);
+
+    /* Everything under the cursor was just painted over, so the save-under
+     * buffer no longer describes what is on the canvas. */
+    s_cursor_on = false;
+    cursor_put(s_ptr_x, s_ptr_y);
+}
+
+static void desktop_input(void *ctx, const espix_input_event_t *ev)
+{
+    (void)ctx;
+
+    if (ev->kind == ESPIX_INPUT_POINTER) {
+        cursor_put(ev->x, ev->y);
+    } else if (ev->kind == ESPIX_INPUT_MOTION) {
+        /*
+         * Applied to where cursor_put() last put it, which is where the cursor
+         * actually is. That makes an edge clamp rather than letting the delta
+         * accumulate somewhere off-screen -- so pushing into a corner and
+         * pulling back moves immediately, the way a mouse does.
+         */
+        cursor_put(s_cx + ev->x, s_cy + ev->y);
+    } else if (ev->kind == ESPIX_INPUT_KEY && ev->down) {
+        text_key(ev->keysym);
+    }
+}
+
+static void desktop_repaint(void *ctx)
+{
+    (void)ctx;
+    desktop_paint();
+}
+
+static const espix_screen_t s_desktop_screen = {
+    .name    = "desktop",
+    .input   = desktop_input,
+    .repaint = desktop_repaint,
+};
+
+esp_err_t espix_display_desktop_start(void)
+{
+    return espix_display_claim(&s_desktop_screen);
+}
+
+void espix_display_desktop_stop(void)
+{
+    espix_display_release(&s_desktop_screen);
 }
 
 void espix_display_input(const espix_input_event_t *ev)
 {
-    if (s_input == NULL || ev == NULL) {
+    if (ev == NULL || !s_up) {
         return;
     }
-    (void)xQueueSend(s_input, ev, 0);   /* full queue drops the event */
+
+    if (ev->kind == ESPIX_INPUT_POINTER) {
+        s_ptr_x = ev->x;
+        s_ptr_y = ev->y;
+    } else if (ev->kind == ESPIX_INPUT_MOTION) {
+        s_ptr_x += ev->x;
+        s_ptr_y += ev->y;
+    }
+
+    /*
+     * Dispatched in the poster's context rather than through a queue of this
+     * service's own. The owner is the only consumer, so a queue would buy a
+     * task and a copy for nothing -- and it would make the round trip
+     * asynchronous, which is exactly what the old desktop task needed a
+     * priority above the RFB task to paper over.
+     */
+    if (s_owner != NULL) {
+        s_owner->input(s_owner->ctx, ev);
+    } else {
+        desktop_input(NULL, ev);
+    }
+}
+
+void espix_display_pointer(int *x, int *y)
+{
+    if (x != NULL) {
+        *x = s_ptr_x;
+    }
+    if (y != NULL) {
+        *y = s_ptr_y;
+    }
+}
+
+esp_err_t espix_display_claim(const espix_screen_t *screen)
+{
+    if (!s_up || screen == NULL || screen->input == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /*
+     * Takeover, not refusal. A new owner is what `startx` does to a console:
+     * the old one is not destroyed and not consulted -- it keeps its own state
+     * and simply stops being the thing that is rendered. Refusing instead made
+     * "run the desktop from the console" impossible, which is the one place
+     * you would most want to do it from.
+     */
+    if (s_owner != NULL && s_owner != screen) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "screen owner: %s -> %s",
+                   s_owner->name, screen->name);
+    } else {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "screen owner: %s", screen->name);
+    }
+
+    s_owner = screen;
+    if (screen->repaint != NULL) {
+        screen->repaint(screen->ctx);
+    }
+    return ESP_OK;
+}
+
+void espix_display_release(const espix_screen_t *screen)
+{
+    if (s_owner != screen) {
+        return;
+    }
+
+    s_owner = NULL;
+
+    /*
+     * Whatever a viewer should see when nothing owns the screen. The console
+     * re-claims itself if it is still running -- which is what makes
+     * "desktop stop" bring it back -- and the built-in content is the floor
+     * when there is no console either.
+     */
+    if (s_default_up && s_default.start != NULL &&
+        s_default.start() == ESP_OK) {
+        return;
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "screen owner: none");
+    desktop_paint();
+}
+
+const char *espix_display_owner(void)
+{
+    return s_owner != NULL ? s_owner->name : "";
+}
+
+void espix_display_set_default(const espix_display_default_t *def)
+{
+    if (def != NULL) {
+        s_default = *def;
+    } else {
+        memset(&s_default, 0, sizeof(s_default));
+    }
+}
+
+void espix_display_viewer_attached(void)
+{
+    /*
+     * Only when nothing else owns the screen. A desktop that is already
+     * running is what the viewer should see -- starting a console over it
+     * would be the server second-guessing the user.
+     */
+    if (s_owner == NULL && s_default.start != NULL) {
+        if (s_default.start() == ESP_OK) {
+            s_default_up = true;
+        }
+    }
+}
+
+void espix_display_viewer_detached(void)
+{
+    if (s_default_up && s_default.stop != NULL) {
+        s_default.stop();
+        s_default_up = false;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -549,48 +718,21 @@ static esp_err_t desktop_up(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_input = xQueueCreate(32, sizeof(espix_input_event_t));
-    if (s_input == NULL) {
-        espix_canvas_free(s_canvas);
-        s_canvas = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
     cursor_build();
-    s_desktop_quit = false;
     s_cursor_on = false;
     s_trow = s_tcol = 0;
     memset(s_grid, ' ', sizeof(s_grid));
 
-    espix_canvas_lock(s_canvas);
-    espix_canvas_fill(s_canvas,
-                      (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
-                      COL_DESKTOP);
-    text_window_draw();
-    espix_canvas_unlock(s_canvas);
-
-    cursor_put(ESPIX_DISPLAY_W / 3, ESPIX_DISPLAY_H / 3);
-
     /*
-     * Outranks the RFB task (4) on purpose. When a pointer event arrives the
-     * RFB task posts it and then turns round to send the damage -- if the
-     * desktop task could not preempt, the damage would not be there yet and
-     * the cursor would move only on the next poll timeout, a quarter of a
-     * second later. Priority makes the round trip synchronous.
+     * No task and no queue of this service's own. Input is dispatched in the
+     * poster's context and the owner draws, so a task would buy nothing but a
+     * copy per event and a priority puzzle -- which is exactly what the old
+     * desktop task needed one to paper over.
      */
-    if (xTaskCreateWithCaps(desktop_task, "espix:desk", 4096, NULL, 5,
-                            &s_desktop_task, MALLOC_CAP_SPIRAM) != pdPASS) {
-        (void)xTaskCreateWithCaps(desktop_task, "espix:desk", 4096, NULL, 5,
-                                  &s_desktop_task,
-                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (s_desktop_task == NULL) {
-        vQueueDelete(s_input);
-        s_input = NULL;
-        espix_canvas_free(s_canvas);
-        s_canvas = NULL;
-        return ESP_ERR_NO_MEM;
-    }
+    s_ptr_x = ESPIX_DISPLAY_W / 3;
+    s_ptr_y = ESPIX_DISPLAY_H / 3;
+
+    s_up = true;
 
     /*
      * The whole screen is damage once, so a client that asks for an
@@ -602,7 +744,7 @@ static esp_err_t desktop_up(void)
                         (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H });
     espix_canvas_unlock(s_canvas);
 
-    s_up = true;
+    desktop_paint();
     espix_klog(ESPIX_KLOG_INFO, TAG, "desktop %dx%d up", ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
     return ESP_OK;
 }
@@ -614,22 +756,17 @@ static void desktop_down(void)
     }
 
     /*
-     * Ask the task to stop and wait for it to clear its own handle: a task
-     * created with xTaskCreateWithCaps must be deleted with the matching
-     * vTaskDeleteWithCaps, and the only place that can safely do that is the
-     * task itself. Deleting it from here would leak its PSRAM stack.
+     * An owner that outlived its canvas would be holding a pointer to freed
+     * memory, and its own teardown is what releases it -- so say so rather than
+     * guessing at a teardown from here.
      */
-    if (s_desktop_task != NULL) {
-        s_desktop_quit = true;
-        for (int i = 0; i < 100 && s_desktop_task != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+    if (s_owner != NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "display stopped while %s still owned the screen",
+                   s_owner->name);
+        s_owner = NULL;
     }
 
-    if (s_input != NULL) {
-        vQueueDelete(s_input);
-        s_input = NULL;
-    }
     if (s_canvas != NULL) {
         espix_canvas_free(s_canvas);
         s_canvas = NULL;
@@ -638,6 +775,9 @@ static void desktop_down(void)
     s_cursor_on = false;
     s_up = false;
 }
+
+esp_err_t espix_display_start(void) { return desktop_up(); }
+void      espix_display_stop(void)  { desktop_down(); }
 
 /* Defined in rfb.c: the RFB listener is a backend of this service. */
 esp_err_t espix_display_rfb_listen(uint16_t port);
@@ -655,14 +795,23 @@ esp_err_t espix_display_vnc_start(uint16_t port)
         return espix_display_vnc_port() == port ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
 
-    const esp_err_t err = desktop_up();
+    /*
+     * The backend needs a canvas; the canvas does not need the backend. Brought
+     * up here for convenience -- "vnc start" on a cold board should just work
+     * -- but only taken back down on the failure path if this call is what
+     * brought it up.
+     */
+    const bool      was_up = s_up;
+    const esp_err_t err    = desktop_up();
     if (err != ESP_OK) {
         return err;
     }
 
     const esp_err_t lerr = espix_display_rfb_listen(port);
     if (lerr != ESP_OK) {
-        desktop_down();
+        if (!was_up) {
+            desktop_down();
+        }
         return lerr;
     }
     return ESP_OK;
@@ -670,6 +819,10 @@ esp_err_t espix_display_vnc_start(uint16_t port)
 
 void espix_display_vnc_stop(void)
 {
+    /*
+     * The backend only: the canvas outlives it, which is the whole point of the
+     * split. "display stop" is what frees the memory, and the command says so
+     * rather than leaving someone to wonder where two megabytes went.
+     */
     espix_display_rfb_stop();
-    desktop_down();
 }
