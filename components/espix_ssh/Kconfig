@@ -137,6 +137,34 @@ menu "espix SSH"
             AES, so a small per-block penalty would not show. A much faster
             link could expose one.
 
+    choice ESPIX_SSH_TCPIP_FORWARD
+        prompt "TCP forwarding (direct-tcpip, the server half of ssh -L)"
+        depends on ESPIX_SSH_ENABLED
+        default ESPIX_SSH_TCPIP_FORWARD_LOOPBACK
+        help
+            Whether a client may ask espix to open a TCP connection on its
+            behalf. This is what `ssh -L` uses, and it is a different privilege
+            from running a shell: the client never logs in, and can reach
+            whatever espix can reach.
+
+            The middle option is the default because it is what a tunnel to a
+            service running here actually needs -- VNC on 5900 -- and it cannot
+            be turned into a way to reach the network behind the board. The last
+            one can, which is why it is not the default.
+
+            Note that `ssh -R` is not this. A client asking espix to *listen*
+            is tcpip-forward plus forwarded-tcpip, and is not implemented.
+
+        config ESPIX_SSH_TCPIP_FORWARD_OFF
+            bool "Off"
+
+        config ESPIX_SSH_TCPIP_FORWARD_LOOPBACK
+            bool "To the device itself only (127.0.0.0/8)"
+
+        config ESPIX_SSH_TCPIP_FORWARD_ANY
+            bool "To anywhere the device can reach"
+    endchoice
+
     config ESPIX_SSH_TASK_PRIO
         int "SSH task priority"
         depends on ESPIX_SSH_ENABLED

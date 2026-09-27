@@ -9,12 +9,18 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
@@ -1232,6 +1238,35 @@ static esp_err_t chan_pump(ssh_chan_t *ch)
     case SSH_MSG_DEBUG:
         break;
 
+    case SSH_MSG_CHANNEL_OPEN: {
+        /*
+         * A second channel on a connection that already has one. This is what
+         * `ssh -L ...` -- as opposed to `ssh -N -L ...` -- produces the moment
+         * a forwarded port is used: the shell holds this connection's single
+         * channel, and the forward arrives here.
+         *
+         * The default case below would ignore it, which leaves the client
+         * waiting for a confirmation that is never coming, so refuse it and say
+         * why. Silence is the one answer a user cannot act on.
+         */
+        size_t type_len = 0;
+        (void)ssh_get_string(&in, &type_len);
+        const uint32_t sender = ssh_get_u32(&in);
+
+        if (chan_tx_take(ch)) {
+            ssh_buf_t b;
+            ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
+            ssh_put_u8(&b, SSH_MSG_CHANNEL_OPEN_FAILURE);
+            ssh_put_u32(&b, sender);
+            ssh_put_u32(&b, 1);         /* administratively prohibited */
+            ssh_put_cstr(&b, "one channel per connection; use ssh -N -L");
+            ssh_put_cstr(&b, "");
+            (void)send_packet(ch, &b);
+            xSemaphoreGiveRecursive(ch->tx_lock);
+        }
+        break;
+    }
+
     default:
         /* Not fatal: an unknown request mid-session is better ignored than
          * treated as a reason to drop someone's shell. */
@@ -1696,6 +1731,355 @@ static void close_channel(ssh_chan_t *ch)
     xSemaphoreGiveRecursive(ch->tx_lock);
 }
 
+/* ------------------------------------------------------------------ */
+/* direct-tcpip: a TCP connection carried over the channel             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Outbound forwarding, which is the server half of `ssh -L`.
+ *
+ * It is a different privilege from running a shell: an authenticated peer asks
+ * espix to connect somewhere, and never sees a login. That is why it has its own
+ * setting rather than following from "SSH is on", and why the default is the
+ * device itself -- which is what a tunnel to a service here, VNC on 5900, needs.
+ *
+ * Not implemented, and worth saying so: `ssh -R` -- a client asking espix to
+ * *listen* -- is the other direction (tcpip-forward plus forwarded-tcpip) and is
+ * a separate piece of work.
+ */
+
+#define FORWARD_CONNECT_MS  4000   /* a SYN that black-holes must not park us */
+#define FORWARD_STALL_LIMIT 20     /* * SO_SNDTIMEO before giving the tunnel up */
+
+static bool forward_allowed(uint32_t addr_be)
+{
+#if defined(CONFIG_ESPIX_SSH_TCPIP_FORWARD_ANY)
+    (void)addr_be;
+    return true;
+#elif defined(CONFIG_ESPIX_SSH_TCPIP_FORWARD_LOOPBACK)
+    return (ntohl(addr_be) >> 24) == 127;   /* 127.0.0.0/8 */
+#else
+    (void)addr_be;
+    return false;                           /* forwarding off */
+#endif
+}
+
+/*
+ * Connect, without ever parking the connection task indefinitely.
+ *
+ * The socket is briefly non-blocking so that the connect can be bounded: lwIP's
+ * own timeout for an unanswered SYN is far longer than anything an interactive
+ * client will wait, and this runs on the task that owns the SSH connection.
+ */
+static int tcp_connect_to(const struct sockaddr_in *dst, int timeout_ms)
+{
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    if (connect(fd, (const struct sockaddr *)dst, sizeof(*dst)) != 0 &&
+        errno != EINPROGRESS && errno != EAGAIN) {
+        close(fd);
+        return -1;
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+
+    /* Not const: select() is allowed to write the remaining time back. */
+    struct timeval tv = { .tv_sec  = timeout_ms / 1000,
+                          .tv_usec = (timeout_ms % 1000) * 1000 };
+    if (select(fd + 1, NULL, &wfds, NULL, &tv) != 1) {
+        close(fd);
+        return -1;
+    }
+
+    int       soerr = 0;
+    socklen_t slen  = sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0 || soerr != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags);
+    }
+    return fd;
+}
+
+static int forward_connect(const char *host, uint32_t port, bool *refused)
+{
+    *refused = false;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char portstr[8];
+    snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || res == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "forward: cannot resolve %s", host);
+        return -1;
+    }
+
+    int fd = -1;
+    for (const struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        const struct sockaddr_in *dst = (const struct sockaddr_in *)ai->ai_addr;
+        if (!forward_allowed(dst->sin_addr.s_addr)) {
+            *refused = true;
+            continue;
+        }
+        fd = tcp_connect_to(dst, FORWARD_CONNECT_MS);
+        if (fd >= 0) {
+            break;
+        }
+    }
+
+    freeaddrinfo(res);
+    return fd;
+}
+
+/* EOF is "I will send no more", not "stop sending": the other half stays open. */
+static void send_eof(ssh_chan_t *ch)
+{
+    if (!chan_tx_take(ch)) {
+        return;
+    }
+
+    ssh_buf_t b;
+    ssh_buf_init(&b, ch->conn->out_buf, sizeof(ch->conn->out_buf));
+    ssh_put_u8(&b, SSH_MSG_CHANNEL_EOF);
+    ssh_put_u32(&b, ch->peer_chan);
+    (void)send_packet(ch, &b);
+
+    xSemaphoreGiveRecursive(ch->tx_lock);
+}
+
+/*
+ * One packet from the peer. CHANNEL_DATA goes straight out the socket.
+ *
+ * The bytes are copied out of the packet buffer before anything that can block,
+ * for the reason chan_pump() gives: a send can wait on the peer's window, and
+ * waiting reads a packet, which decrypts straight over the buffer they would
+ * otherwise still be sitting in.
+ */
+static esp_err_t forward_packet(ssh_chan_t *ch, int tcp_fd, bool *peer_eof)
+{
+    ssh_conn_t *c = ch->conn;
+
+    xSemaphoreTake(ch->rx_lock, portMAX_DELAY);
+    const esp_err_t rd = ssh_packet_read(c);
+    xSemaphoreGive(ch->rx_lock);
+
+    if (rd != ESP_OK) {
+        ch->closed = true;
+        return ESP_FAIL;
+    }
+
+    ssh_buf_t in;
+    ssh_buf_read_from(&in, c->in_payload, c->in_len);
+
+    switch (ssh_get_u8(&in)) {
+    case SSH_MSG_CHANNEL_DATA: {
+        ssh_get_u32(&in);                   /* recipient channel */
+        size_t         n    = 0;
+        const uint8_t *data = ssh_get_string(&in, &n);
+
+        /* The peer is bound by the maximum packet size we advertised. */
+        if (in.bad || data == NULL || n > sizeof(ch->pending)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "forward: oversized channel data");
+            return ESP_FAIL;
+        }
+
+        memcpy(ch->pending, data, n);
+        adjust_local_window(ch, (uint32_t)n);
+
+        size_t off     = 0;
+        int    stalled = 0;
+
+        while (off < n && !ch->closed) {
+            const ssize_t w = send(tcp_fd, ch->pending + off, n - off, 0);
+            if (w > 0) {
+                off += (size_t)w;
+                stalled = 0;
+                continue;
+            }
+            /*
+             * SO_SNDTIMEO expired, so the far end has stopped reading. Retry
+             * while that is plausibly transient rather than tearing down a
+             * tunnel that is merely backpressured -- but not forever, because
+             * nothing here is reading the peer while it waits.
+             */
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+                ++stalled < FORWARD_STALL_LIMIT) {
+                continue;
+            }
+            ch->closed = true;
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+
+    case SSH_MSG_CHANNEL_WINDOW_ADJUST:
+        ssh_get_u32(&in);
+        ch->peer_window += ssh_get_u32(&in);
+        return ESP_OK;
+
+    case SSH_MSG_CHANNEL_EOF:
+        *peer_eof = true;
+        (void)shutdown(tcp_fd, SHUT_WR);    /* the far end should see EOF too */
+        return ESP_OK;
+
+    case SSH_MSG_CHANNEL_CLOSE:
+    case SSH_MSG_DISCONNECT:
+        ch->closed = true;
+        return ESP_FAIL;
+
+    default:
+        /* A forwarding channel carries data and nothing else. Requests,
+         * keepalives and the rest are noise here, and dropping a tunnel over
+         * one would be the wrong trade. */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "forward: ignoring message %u",
+                   c->in_payload[0]);
+        return ESP_OK;
+    }
+}
+
+/*
+ * Both directions at once, on one task.
+ *
+ * The socket is only polled when there is window to send into it. That is not
+ * just politeness: send_stream() would otherwise have to wait for the window,
+ * and its wait drops whatever packets arrive meanwhile -- which on a tunnel
+ * means silently losing the bytes the far end just sent.
+ */
+static esp_err_t forward_pump(ssh_chan_t *ch, int tcp_fd)
+{
+    ssh_conn_t *c       = ch->conn;
+    bool        tcp_eof = false;    /* the socket will send no more */
+    bool        peer_eof = false;   /* the client will send no more */
+    uint8_t     buf[SSH_CHANNEL_MAX_PACKET];
+
+    while (!ch->closed && !(tcp_eof && peer_eof)) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(c->fd, &rfds);
+        if (!tcp_eof && ch->peer_window > 0) {
+            FD_SET(tcp_fd, &rfds);
+        }
+
+        const int      maxfd = (c->fd > tcp_fd ? c->fd : tcp_fd) + 1;
+        struct timeval tv    = { .tv_sec  = 0,
+                                 .tv_usec = RX_WAIT_MS * 1000 };
+        const int      n     = select(maxfd, &rfds, NULL, NULL, &tv);
+        if (n < 0) {
+            break;
+        }
+        if (n == 0) {
+            continue;                       /* an idle tunnel, which is normal */
+        }
+
+        if (FD_ISSET(c->fd, &rfds)) {
+            if (forward_packet(ch, tcp_fd, &peer_eof) != ESP_OK) {
+                break;
+            }
+            continue;
+        }
+
+        if (!tcp_eof && ch->peer_window > 0 && FD_ISSET(tcp_fd, &rfds)) {
+            size_t want = sizeof(buf);
+            if (want > ch->peer_window) {
+                want = ch->peer_window;
+            }
+
+            const ssize_t r = recv(tcp_fd, buf, want, 0);
+            if (r > 0) {
+                if (send_data(ch, (const char *)buf, (size_t)r) != ESP_OK) {
+                    break;
+                }
+            } else if (r == 0) {
+                send_eof(ch);
+                tcp_eof = true;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                break;
+            }
+        }
+    }
+
+    return ch->closed ? ESP_FAIL : ESP_OK;
+}
+
+static esp_err_t forward_serve(ssh_chan_t *ch, const char *host, uint32_t port)
+{
+    ssh_conn_t *c = ch->conn;
+    ssh_buf_t   b;
+
+    bool      refused = false;
+    const int tcp_fd  = forward_connect(host, port, &refused);
+    if (tcp_fd < 0) {
+        /*
+         * Refused before it was attempted, versus tried and failed: the client
+         * should be able to tell those apart, and so should whoever reads the
+         * log.
+         */
+        espix_klog(ESPIX_KLOG_WARN, TAG, "forward to %s:%u refused (%s)",
+                   host, (unsigned)port,
+                   refused ? "destination not permitted"
+                           : "cannot connect");
+
+        ssh_buf_init(&b, c->out_buf, sizeof(c->out_buf));
+        ssh_put_u8(&b, SSH_MSG_CHANNEL_OPEN_FAILURE);
+        ssh_put_u32(&b, ch->peer_chan);
+        ssh_put_u32(&b, 2);                 /* connect failed */
+        ssh_put_cstr(&b, refused ? "destination not permitted"
+                                 : "connect failed");
+        ssh_put_cstr(&b, "");
+        (void)ssh_packet_write(c, &b);
+        return ESP_FAIL;
+    }
+
+    /*
+     * Confirm only once there is a connection. A confirmation promises a stream,
+     * and sending one for a connect that is still in flight would make "why did
+     * nothing arrive" a question the client cannot ask.
+     */
+    ssh_buf_init(&b, c->out_buf, sizeof(c->out_buf));
+    ssh_put_u8(&b, SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+    ssh_put_u32(&b, ch->peer_chan);
+    ssh_put_u32(&b, 0);                     /* our channel id; only ever one */
+    ssh_put_u32(&b, LOCAL_WINDOW);
+    ssh_put_u32(&b, SSH_CHANNEL_MAX_PACKET);
+    if (ssh_packet_write(c, &b) != ESP_OK) {
+        close(tcp_fd);
+        return ESP_FAIL;
+    }
+
+    /* Bounded, so a far end that stops reading cannot park this task. */
+    const struct timeval snd = { .tv_sec = 5, .tv_usec = 0 };
+    (void)setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "direct-tcpip for %s: %s:%u",
+               c->user, host, (unsigned)port);
+
+    const esp_err_t err = forward_pump(ch, tcp_fd);
+    close(tcp_fd);
+    close_channel(ch);
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "forward to %s:%u closed%s",
+               host, (unsigned)port, err == ESP_OK ? "" : " (broken)");
+    return err;
+}
+
 /*
  * Start where a login would: the account's home directory.
  *
@@ -1845,17 +2229,52 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         err = ESP_ERR_INVALID_SIZE;
         goto out;
     }
-    if (type_len != strlen("session") ||
-        memcmp(type, "session", type_len) != 0) {
+    const bool is_session = (type_len == strlen("session") &&
+                             memcmp(type, "session", type_len) == 0);
+    const bool is_tcpip   = (type_len == strlen("direct-tcpip") &&
+                             memcmp(type, "direct-tcpip", type_len) == 0);
+
+    if (!is_session && !is_tcpip) {
         ssh_buf_t b;
         ssh_buf_init(&b, c->out_buf, sizeof(c->out_buf));
         ssh_put_u8(&b, SSH_MSG_CHANNEL_OPEN_FAILURE);
         ssh_put_u32(&b, ch->peer_chan);
         ssh_put_u32(&b, 3);             /* unknown channel type */
-        ssh_put_cstr(&b, "only session channels are supported");
+        ssh_put_cstr(&b, "only session and direct-tcpip channels are supported");
         ssh_put_cstr(&b, "");
         ssh_packet_write(c, &b);
         err = ESP_ERR_NOT_SUPPORTED;
+        goto out;
+    }
+
+    /*
+     * direct-tcpip, which is `ssh -L`: an address, a port, and who asked for
+     * it. The host is copied out of the packet buffer immediately, because
+     * everything downstream reads packets and can block -- and both overwrite
+     * what it points at.
+     *
+     * One channel per connection, so this is `ssh -N -L`: a connection
+     * carrying a forward rather than a shell. A client that wants both on one
+     * connection is asking for multiplexing, which this server does not do.
+     */
+    if (is_tcpip) {
+        size_t          host_len = 0;
+        size_t          orig_len = 0;
+        const uint8_t  *host     = ssh_get_string(&in, &host_len);
+        const uint32_t  port     = ssh_get_u32(&in);
+        (void)ssh_get_string(&in, &orig_len);   /* originator address */
+        (void)ssh_get_u32(&in);                 /* originator port */
+
+        if (in.bad || host == NULL || host_len == 0 || host_len > 255) {
+            err = ESP_ERR_INVALID_SIZE;
+            goto out;
+        }
+
+        char hostname[256];
+        memcpy(hostname, host, host_len);
+        hostname[host_len] = '\0';
+
+        err = forward_serve(ch, hostname, port);
         goto out;
     }
 

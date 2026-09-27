@@ -171,6 +171,22 @@ stored (`/etc/vnc.key`, 0600, read back at `vnc start`), never the password --
 and it is a password equivalent, which is what RFB type 2 requires and what
 every VNC server keeps on disk.
 
+### For a network you do not control
+
+Tunnel it rather than adding a security type:
+
+    ssh -N -L 5900:127.0.0.1:5900 esp@192.168.110.254
+
+then point the VNC client at `localhost:5900`. espix already runs an SSH server
+with a real key exchange and a host key, so this needs no certificate to manage
+and covers *every* client -- including macOS Screen Sharing, which has no
+VeNCrypt at all -- because from the client's side it is connecting to localhost.
+
+The `-N` matters. espix's sshd carries one channel per connection, so a forward
+and a shell cannot share one; `ssh -L` without it is refused, with that as the
+stated reason rather than a hang. See the SSH section of [ROADMAP](docs/ROADMAP.md)
+for what closing that gap would take.
+
 Then point any VNC client at `espix:5900` (or the address `vnc status` prints).
 Nothing is allocated at boot: `vnc start` creates the canvas and the desktop
 task, and `vnc stop` gives all of it back.

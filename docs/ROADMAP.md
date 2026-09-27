@@ -759,6 +759,20 @@ both are the sort of thing that is cheaper to know now.
 
 ## SSH
 
+- **More than one channel per connection.** `direct-tcpip` landed, so
+  `ssh -N -L` works -- but the server carries exactly one channel for the life
+  of a connection, which is why `ssh -L` (a shell *and* a forward) is refused.
+  Closing that gap changes the shape of `ssh_channel.c`: a table of channels, a
+  receive loop that dispatches on the recipient channel id instead of assuming
+  there is one, and per-channel windows. The blocking I/O the shell depends on
+  (`chan_read_line`, the editor's own callbacks) makes that more than a
+  refactor -- today the connection task *is* the channel.
+- **`ssh -R`, and `ssh -D`.** The other two directions. `-R` is a client
+  asking espix to *listen*: the global `tcpip-forward` request plus
+  `forwarded-tcpip`, and the listener side has no equivalent here at all. `-D`
+  is a SOCKS proxy, which is `direct-tcpip` with the destination chosen per
+  connection -- nearly free once `-L` exists, and it wants the same policy
+  decision `ESPIX_SSH_TCPIP_FORWARD` already makes.
 - **Rekeying.** RFC 4253 recommends new keys after an hour or a gigabyte;
   espix does neither, and worse, ignores a client that asks — so a long or
   high-volume session is dropped rather than degraded. Two things to know before
