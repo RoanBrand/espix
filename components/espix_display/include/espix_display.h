@@ -196,7 +196,16 @@ typedef struct {
 
     /* POINTER: absolute. MOTION: a delta. Signed, because a mouse goes left. */
     int16_t            x, y;
-    uint8_t            buttons;   /* POINTER: RFB button mask */
+    /*
+     * POINTER: the RFB button mask, and the only event that carries one.
+     *
+     * MOTION does not, because a mouse's motion report is not where its buttons
+     * live -- so an owner that cares about a drag holds this from the last
+     * POINTER event and treats a change to or from zero as the press and the
+     * release. Both sources deliver it that way: RFB in the event itself, and a
+     * local mouse as a POINTER event when its button byte changes.
+     */
+    uint8_t            buttons;
     uint32_t           keysym;    /* KEY: an X11 keysym, as RFB delivers */
     bool               down;      /* KEY */
 } espix_input_event_t;

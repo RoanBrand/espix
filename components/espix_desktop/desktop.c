@@ -567,13 +567,81 @@ static void windows_destroy(void)
 /* The screen owner                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A drag in progress. `s_buttons` is the last mask any event carried, because
+ * only POINTER events have one: a motion report is not where a mouse's buttons
+ * live, so the press and the release have to be recognised as changes in this
+ * rather than looked for on the event that moves the window.
+ */
+static uint8_t        s_buttons;
+static espix_window_t *s_drag;
+static int            s_grab_x, s_grab_y;   /* where in the window it was grabbed */
+
+static void drag_begin(espix_window_t *w, int x, int y)
+{
+    s_drag   = w;
+    s_grab_x = x - w->x;
+    s_grab_y = y - w->y;
+}
+
+static void drag_end(void)
+{
+    s_drag = NULL;
+}
+
+static void drag_to(int x, int y)
+{
+    /*
+     * Kept on the screen, allowing the window to be pushed off all but a strip
+     * of its title bar -- which is what makes it recoverable. A window dragged
+     * entirely out of sight is a window you cannot get back without a command.
+     */
+    espix_canvas_t *c = espix_display_canvas();
+    int nx = x - s_grab_x;
+    int ny = y - s_grab_y;
+
+    if (c != NULL) {
+        const int cw = espix_canvas_width(c);
+        const int ch = espix_canvas_height(c);
+
+        if (nx + s_drag->w < 32) { nx = 32 - s_drag->w; }
+        if (nx > cw - 32)        { nx = cw - 32; }
+        if (ny < 0)              { ny = 0; }
+        if (ny > ch - TITLE_H)   { ny = ch - TITLE_H; }
+    }
+
+    espix_window_move(s_drag, nx, ny);
+}
+
 static void desktop_input(void *ctx, const espix_input_event_t *ev)
 {
     (void)ctx;
 
     if (ev->kind == ESPIX_INPUT_POINTER) {
+        const uint8_t was = s_buttons;
+        s_buttons = ev->buttons;
+
         cursor_put(ev->x, ev->y);
-        focus_at(ev->x, ev->y);
+
+        if (was != 0 && s_buttons == 0) {
+            drag_end();                 /* the button came up */
+            return;
+        }
+        if (was == 0 && s_buttons != 0) {
+            focus_at(ev->x, ev->y);     /* a press focuses and raises first */
+            if (s_focus != NULL &&
+                ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
+                drag_begin(s_focus, ev->x, ev->y);
+            }
+            return;
+        }
+
+        /* Held: either following the pointer or dragging what it is holding. */
+        if (s_drag != NULL) {
+            drag_to(ev->x, ev->y);
+        } else if (s_buttons == 0) {
+            focus_at(ev->x, ev->y);
+        }
     } else if (ev->kind == ESPIX_INPUT_MOTION) {
         /*
          * Applied to where cursor_put() last put it, which is where the cursor
@@ -582,7 +650,12 @@ static void desktop_input(void *ctx, const espix_input_event_t *ev)
          * pulling back moves immediately, the way a mouse does.
          */
         cursor_put(s_cx + ev->x, s_cy + ev->y);
-        focus_at(s_cx, s_cy);
+
+        if (s_drag != NULL) {
+            drag_to(s_cx, s_cy);
+        } else if (s_buttons == 0) {
+            focus_at(s_cx, s_cy);
+        }
     } else if (ev->kind == ESPIX_INPUT_KEY && s_focus != NULL &&
                s_focus->key != NULL) {
         s_focus->key(s_focus, ev->keysym, ev->down, s_focus->ctx);
