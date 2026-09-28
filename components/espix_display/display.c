@@ -366,11 +366,23 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
     return ppa_do_fill(s_ppa_fill, &cfg) == ESP_OK;
 }
 
+/*
+ * A block of `src` into a block of `dst`, both described by an offset within
+ * their picture rather than by a moved pointer.
+ *
+ * That distinction is load-bearing and was got wrong twice. PPA checks the
+ * *output* buffer's address and size for cache-line alignment and takes the
+ * input on trust -- so a source pointer offset by an odd number of pixels is
+ * read unaligned and comes back as garbage rather than as an error. The offsets
+ * belong in block_offset_x/block_offset_y, where the hardware expects them, and
+ * the buffer stays at the allocation's aligned base.
+ */
 static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
-                          int dx, int dy, const espix_px_t *src,
+                          int dx, int dy,
+                          const espix_px_t *src, int sx, int sy,
                           int sw, int sh, int sstride)
 {
-    if (s_sw_only || dstride != dw || sstride != sw) {
+    if (s_sw_only || dstride != dw) {
         return false;
     }
     if (!s_force_hw && sw * sh < PPA_MIN_PIXELS) {
@@ -379,6 +391,11 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
     /* PPA does not clip, so a block that hangs off either picture stays with
      * the software loop -- which is the loop that already clips. */
     if (dx < 0 || dy < 0 || dx + sw > dw || dy + sh > dh) {
+        return false;
+    }
+    /* The guard PPA does not have. An unaligned base is a driver error, and
+     * the loop below is the right answer rather than a slow one. */
+    if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0) {
         return false;
     }
     if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
@@ -397,11 +414,11 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
              * compositing is made of.
              */
             .pic_w          = (uint32_t)sstride,
-            .pic_h          = (uint32_t)sh,
+            .pic_h          = (uint32_t)(sy + sh),
             .block_w        = (uint32_t)sw,
             .block_h        = (uint32_t)sh,
-            .block_offset_x = 0,
-            .block_offset_y = 0,
+            .block_offset_x = (uint32_t)sx,
+            .block_offset_y = (uint32_t)sy,
             .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
         },
         .out = {
@@ -460,12 +477,13 @@ static void op_fill(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
 }
 
 static void op_blit(espix_px_t *px, int w, int h, int stride,
-                    int dst_x, int dst_y, const espix_px_t *src,
+                    int dst_x, int dst_y,
+                    const espix_px_t *src, int src_x, int src_y,
                     int src_w, int src_h, int src_stride)
 {
 #if SOC_PPA_SUPPORTED
-    if (ppa_blit_rect(px, w, h, stride, dst_x, dst_y, src, src_w, src_h,
-                      src_stride)) {
+    if (ppa_blit_rect(px, w, h, stride, dst_x, dst_y, src, src_x, src_y,
+                      src_w, src_h, src_stride)) {
         return;
     }
 #endif
@@ -479,7 +497,8 @@ static void op_blit(espix_px_t *px, int w, int h, int stride,
             if (cx < 0 || cx >= w) {
                 continue;
             }
-            px[(size_t)cy * stride + cx] = src[(size_t)y * src_stride + x];
+            px[(size_t)cy * stride + cx] =
+                src[(size_t)(src_y + y) * src_stride + src_x + x];
         }
     }
 }
@@ -530,7 +549,8 @@ void espix_canvas_fill(espix_canvas_t *c, espix_rect_t r, espix_px_t px)
 void espix_canvas_blit(espix_canvas_t *c, int dst_x, int dst_y,
                        const espix_px_t *src, int src_w, int src_h, int src_stride)
 {
-    op_blit(c->px, c->w, c->h, c->w, dst_x, dst_y, src, src_w, src_h, src_stride);
+    op_blit(c->px, c->w, c->h, c->w, dst_x, dst_y, src, 0, 0, src_w, src_h,
+            src_stride);
     espix_canvas_damage(c, (espix_rect_t){ dst_x, dst_y, src_w, src_h });
 }
 
@@ -565,12 +585,13 @@ void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
     }
 
     /*
-     * The source pointer is offset into the surface and the block is the whole
-     * of what is copied, so the row pitch stays the surface's -- which is what
-     * op_blit and PPA both want.
+     * The offset goes in as an offset, not into the pointer. PPA takes the input
+     * buffer's alignment on trust, so a pointer moved by an odd number of pixels
+     * is read unaligned and comes back as garbage -- which looked like a window
+     * being eaten by the one dragged over it.
      */
     op_blit(c->px, c->w, c->h, c->w, x + r.x, y + r.y,
-            s->px + (size_t)r.y * s->stride + r.x, r.w, r.h, s->stride);
+            s->px, r.x, r.y, r.w, r.h, s->stride);
     espix_canvas_damage(c, (espix_rect_t){ x + r.x, y + r.y, r.w, r.h });
 }
 
@@ -646,8 +667,8 @@ void espix_surface_blit(espix_surface_t *s, int dst_x, int dst_y,
                         const espix_px_t *src, int src_w, int src_h,
                         int src_stride)
 {
-    op_blit(s->px, s->w, s->h, s->stride, dst_x, dst_y, src, src_w, src_h,
-            src_stride);
+    op_blit(s->px, s->w, s->h, s->stride, dst_x, dst_y, src, 0, 0, src_w,
+            src_h, src_stride);
 }
 
 void espix_surface_outline(espix_surface_t *s, espix_rect_t r, espix_px_t px)

@@ -756,8 +756,11 @@ static void windows_create(void)
      * the state the pixels would otherwise still show.
      */
     if (s_term != NULL) {
-        s_focus = NULL;
         window_raise_raw(s_term);
+        /* Not `s_focus = s_term`: that leaves the about window wearing the
+         * focused title bar it was given when it was created. Going through
+         * espix_window_focus() repaints both, because it knows which one is
+         * losing the focus. */
         espix_window_focus(s_term);
     }
 }
