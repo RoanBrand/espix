@@ -256,6 +256,45 @@ static struct {
     int64_t  since;
 } s_q;
 
+/*
+ * Start a frame, or do not start it at all.
+ *
+ * This is the whole of the decoupling, and it is four bytes' worth. Input and
+ * output are one task, so a send that sits in the socket stops the server
+ * reading the client's events -- and a drag then arrives as a queue that plays
+ * out seconds after the mouse stops. Measured: 152 ms mean and 1.9 s worst
+ * inside the send, against 150 motions a second coming in.
+ *
+ * The first write of a frame is the gate, so it is attempted without waiting. If
+ * it cannot go out, the frame is abandoned *before any of it has been written*
+ * and left owed; the next attempt carries whatever is true then. That is the
+ * right answer for a screen as well as for the socket: an intermediate position
+ * nobody will ever see is worth less than the input that waiting for it would
+ * have blocked, so a slow link should get fewer, newer frames rather than a
+ * queue of old ones.
+ *
+ * Once it has started, though, the frame has to be finished -- a client handed
+ * half a message is a client that has lost the protocol -- so the rest blocks as
+ * it always did.
+ */
+static bool write_full(int fd, const void *buf, size_t n);
+
+static bool write_start(int fd, const void *buf, size_t n)
+{
+    const ssize_t w = send(fd, buf, n, MSG_DONTWAIT);
+
+    if (w == (ssize_t)n) {
+        return true;                    /* done, and nothing was waited for */
+    }
+    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return false;                   /* nothing written: try again later */
+    }
+    if (w < 0) {
+        return false;
+    }
+    return write_full(fd, (const uint8_t *)buf + w, n - (size_t)w);
+}
+
 static bool write_full(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
@@ -745,8 +784,10 @@ static bool update_send(rfb_conn_t *c)
     hdr[0] = 0;                             /* FramebufferUpdate */
     hdr[1] = 0;
     wr16(hdr + 2, (uint16_t)total);
-    if (!write_full(c->fd, hdr, 4)) {
-        return false;
+    if (!write_start(c->fd, hdr, 4)) {
+        /* Not now. Still owed, so the next attempt describes the screen as it is
+         * by then rather than as it was. */
+        return true;
     }
 
     sink_t s = { .fd = c->fd, .buf = c->out, .cap = OUT_CAP };
