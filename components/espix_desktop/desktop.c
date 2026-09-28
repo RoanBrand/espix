@@ -110,23 +110,6 @@ static uint8_t         s_buttons;
 static espix_window_t *s_drag;
 static espix_window_t *s_press_win;     /* who took the press, for the release */
 
-/*
- * A window is being dragged, which changes what a repair has to do.
- *
- * The client is moving the window's own pixels -- it was told to, as a copy --
- * so our canvas does not have to be right about them until the mouse stops. What
- * it does have to be right about is the strips the move uncovers, and those are
- * cheap. Repainting the rectangle in between was 5.7 ms of a motion that costs
- * seven, and it was repainting pixels that were already correct somewhere else.
- *
- * The cursor is the casualty: it is drawn into the canvas, so a canvas we are
- * deliberately leaving stale cannot have it moved across. It holds still while
- * the drag lasts and is put right when it ends. Which is worth replacing with
- * RFB's cursor pseudo-encoding -- the client draws its own and none of this
- * matters -- but that is a piece of work and this is a line.
- */
-static bool s_dragging;
-
 static void desk_lock(void)
 {
     if (s_desk_lock != NULL) {
@@ -311,15 +294,6 @@ static void cursor_show(int hx, int hy)
 /* Move it: undo where it was, then draw it where it is going. */
 static void cursor_put(int hx, int hy)
 {
-    if (s_dragging) {
-        /* Position only. The cursor is off the canvas for the drag and its
-         * save-under is from before it, so drawing it would put stale pixels on
-         * top of the rectangle the client has already moved. It comes back,
-         * correct, when the drag ends. */
-        s_cx = hx;
-        s_cy = hy;
-        return;
-    }
     cursor_hide();
     cursor_show(hx, hy);
 }
@@ -556,9 +530,7 @@ static void desktop_repair_locked(espix_rect_t r)
     }
 
     /* Off first: its save-under is pixels from before the change. */
-    if (!s_dragging) {
-        cursor_hide();
-    }
+    cursor_hide();
 
     espix_canvas_lock(c);
     espix_canvas_fill(c, r, COL_DESKTOP);
@@ -586,11 +558,9 @@ static void desktop_repair_locked(espix_rect_t r)
     menu_paint(c, r);
     espix_canvas_unlock(c);
 
-    if (!s_dragging) {
-        int px = 0, py = 0;
-        espix_display_pointer(&px, &py);
-        cursor_show(px, py);
-    }
+    int px = 0, py = 0;
+    espix_display_pointer(&px, &py);
+    cursor_show(px, py);
 }
 
 static void desktop_repair(espix_rect_t r)
@@ -919,31 +889,6 @@ void espix_window_move(espix_window_t *w, int x, int y)
      * told to move its own pixels is the only reason a drag is affordable, and
      * that part works.
      */
-    /*
-     * While the drag lasts, the rectangle in between is left alone.
-     *
-     * The client was told to move those pixels itself, as a copy, so repainting
-     * them here is 5.7 ms of work to arrive at pixels that are already correct
-     * somewhere else -- and it was most of what a motion cost. What is put back
-     * is only what the move uncovered: the strip it came from and the strip it
-     * arrived on, where the desktop and the windows underneath show through.
-     */
-    if (s_dragging && ov.w > 0 && ov.h > 0 && s_nwin > 0 &&
-        s_wins[s_nwin - 1] == w) {
-        espix_rect_t parts[4];
-        const size_t np = rect_cut(box, dst, parts);
-
-        for (size_t i = 0; i < np; i++) {
-            desktop_repair(parts[i]);
-        }
-        if (c != NULL) {
-            espix_canvas_lock(c);
-            espix_canvas_moved(c, dst, ov.x, ov.y);
-            espix_canvas_unlock(c);
-        }
-        return;
-    }
-
     desktop_repair(box);
 
     if (c != NULL && ov.w > 0 && ov.h > 0) {
@@ -951,6 +896,7 @@ void espix_window_move(espix_window_t *w, int x, int y)
         espix_canvas_moved(c, dst, ov.x, ov.y);
         espix_canvas_unlock(c);
     }
+    (void)rect_cut;
 }
 
 /*
@@ -2124,23 +2070,11 @@ static void drag_begin(espix_window_t *w, int x, int y)
     s_drag   = w;
     s_grab_x = x - w->x;
     s_grab_y = y - w->y;
-
-    /* Off the canvas for the duration, so the stale rectangle it would be
-     * restored from is never drawn on top of anything. */
-    s_dragging = true;
-    cursor_hide();
 }
 
 static void drag_end(void)
 {
-    if (s_drag != NULL) {
-        s_drag     = NULL;
-        s_dragging = false;
-
-        /* Everything, once: the canvas has been stale since the drag began and
-         * the cursor has not moved, and one full repair puts both right. */
-        espix_desktop_repaint();
-    }
+    s_drag = NULL;
 }
 
 static void drag_to(int x, int y)
