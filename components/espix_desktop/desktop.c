@@ -2120,8 +2120,24 @@ static void drag_begin(espix_window_t *w, int x, int y)
 
 static void drag_end(void)
 {
+    const espix_rect_t last = s_drag_shown;
+
     s_drag     = NULL;
     s_dragging = false;
+
+    /*
+     * Catch up from where the screen actually is, not from where the window is.
+     *
+     * Inside a drag the two are allowed to differ -- that is the whole of the
+     * coalescing -- but the moment it ends they must not, because every repair
+     * from here on measures from the window's real position and would never
+     * cover where it was last *drawn*. That is a window's worth of pixels left
+     * on the desktop: a part copy of itself, behind it, which is what it looked
+     * like.
+     */
+    if (s_nwin > 0) {
+        desktop_repair(last);
+    }
 }
 
 static void drag_to(int x, int y)
