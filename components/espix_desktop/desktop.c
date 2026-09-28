@@ -136,7 +136,42 @@ static void cursor_build(void)
  * Put the cursor at a hotspot, restoring whatever was underneath the old one.
  * The hotspot is the arrow tip, which sits at box offset (1, 1).
  */
-static void cursor_put(int hx, int hy)
+/*
+ * Undo the cursor: put back what was under it. Separate from drawing it
+ * because a repair has to take it off first -- its save-under holds pixels from
+ * before the change, so restoring it afterwards would put back a window that
+ * has since moved.
+ */
+static void cursor_hide(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL || !s_cursor_on) {
+        return;
+    }
+
+    const int cw = espix_canvas_width(c);
+    const int ch = espix_canvas_height(c);
+
+    espix_canvas_lock(c);
+    espix_px_t *px = espix_canvas_pixels(c);
+
+    for (int by = 0; by < CUR_BH; by++) {
+        for (int bx = 0; bx < CUR_BW; bx++) {
+            const int cx = s_cx - 1 + bx, cy = s_cy - 1 + by;
+            if (cx < 0 || cx >= cw || cy < 0 || cy >= ch) {
+                continue;
+            }
+            px[(size_t)cy * cw + cx] = s_under[by * CUR_BW + bx];
+        }
+    }
+    espix_canvas_damage(c, (espix_rect_t){ s_cx - 1, s_cy - 1, CUR_BW, CUR_BH });
+    espix_canvas_unlock(c);
+
+    s_cursor_on = false;
+}
+
+/* Save what is under it, then draw it. */
+static void cursor_show(int hx, int hy)
 {
     espix_canvas_t *c = espix_display_canvas();
     if (c == NULL) {
@@ -153,19 +188,6 @@ static void cursor_put(int hx, int hy)
 
     espix_canvas_lock(c);
     espix_px_t *px = espix_canvas_pixels(c);
-
-    if (s_cursor_on) {
-        for (int by = 0; by < CUR_BH; by++) {
-            for (int bx = 0; bx < CUR_BW; bx++) {
-                const int cx = s_cx - 1 + bx, cy = s_cy - 1 + by;
-                if (cx < 0 || cx >= cw || cy < 0 || cy >= ch) {
-                    continue;
-                }
-                px[(size_t)cy * cw + cx] = s_under[by * CUR_BW + bx];
-            }
-        }
-        espix_canvas_damage(c, (espix_rect_t){ s_cx - 1, s_cy - 1, CUR_BW, CUR_BH });
-    }
 
     s_cx = hx;
     s_cy = hy;
@@ -204,6 +226,13 @@ static void cursor_put(int hx, int hy)
     espix_canvas_unlock(c);
 }
 
+/* Move it: undo where it was, then draw it where it is going. */
+static void cursor_put(int hx, int hy)
+{
+    cursor_hide();
+    cursor_show(hx, hy);
+}
+
 /* ------------------------------------------------------------------ */
 /* Windows                                                             */
 /* ------------------------------------------------------------------ */
@@ -215,6 +244,9 @@ static bool desktop_on_screen(void)
 {
     return espix_display_owns(&s_desktop_screen);
 }
+
+/* Defined below; damaging a window is a repair of the region it covers. */
+static void desktop_repair(espix_rect_t r);
 
 espix_rect_t espix_window_content(const espix_window_t *w)
 {
@@ -275,17 +307,6 @@ static void window_paint(espix_window_t *w, espix_rect_t r)
     espix_surface_unlock(w->surf);
 }
 
-static void window_blit(espix_window_t *w, espix_rect_t r)
-{
-    espix_canvas_t *c = espix_display_canvas();
-    if (c == NULL) {
-        return;
-    }
-    espix_canvas_lock(c);
-    espix_canvas_blit_surface_rect(c, w->x, w->y, w->surf, r);
-    espix_canvas_unlock(c);
-}
-
 void espix_window_damage(espix_window_t *w, espix_rect_t r)
 {
     if (w == NULL || w->surf == NULL) {
@@ -297,9 +318,15 @@ void espix_window_damage(espix_window_t *w, espix_rect_t r)
     }
 
     window_paint(w, r);
-    if (desktop_on_screen()) {
-        window_blit(w, r);
-    }
+
+    /*
+     * Then the *region*, from every window that reaches it and in z-order -- not
+     * this window's surface alone. Blitting just the damaged window paints over
+     * whatever is above it, which is visible the moment a window is focused
+     * without being raised: its title bar appears through the window on top of
+     * it. The region is one window's worth, so this is still cheap.
+     */
+    desktop_repair((espix_rect_t){ w->x + r.x, w->y + r.y, r.w, r.h });
 }
 
 void espix_window_repaint(espix_window_t *w)
@@ -310,35 +337,65 @@ void espix_window_repaint(espix_window_t *w)
     espix_window_damage(w, (espix_rect_t){ 0, 0, w->w, w->h });
 }
 
-void espix_desktop_repaint(void)
+/*
+ * Put the background and every window back within `r`, and nothing else.
+ *
+ * The surfaces are *not* repainted. They already hold each window's frame and
+ * content, and a window changes only when its owner says so -- so a repair is a
+ * fill and one blit per window, with no drawing at all. Repainting every
+ * surface here is what made a drag pay 8ms of glyphs per window per motion.
+ *
+ * The region is what makes a drag affordable: a motion only uncovers the union
+ * of the window's old and new rectangles, so filling and blitting those instead
+ * of the whole canvas is a few times less work for the same picture.
+ */
+static void desktop_repair(espix_rect_t r)
 {
     espix_canvas_t *c = espix_display_canvas();
     if (c == NULL || !desktop_on_screen()) {
         return;
     }
 
-    /*
-     * The surfaces are *not* repainted. They already hold each window's frame
-     * and content, and a window changes only when its owner says so -- so a
-     * structural repaint, a move or a raise or a window appearing, is a canvas
-     * fill and one blit per window with no drawing at all. Repainting every
-     * surface here is what made a drag pay 8ms of glyphs per window per motion.
-     */
+    r = win_clip(r, espix_canvas_width(c), espix_canvas_height(c));
+    if (r.w <= 0 || r.h <= 0) {
+        return;
+    }
+
+    /* Off first: its save-under is pixels from before the change. */
+    cursor_hide();
+
     espix_canvas_lock(c);
-    espix_canvas_fill(c, (espix_rect_t){ 0, 0, espix_canvas_width(c),
-                                        espix_canvas_height(c) }, COL_DESKTOP);
+    espix_canvas_fill(c, r, COL_DESKTOP);
+
     for (int i = 0; i < s_nwin; i++) {
-        espix_canvas_blit_surface(c, s_wins[i]->x, s_wins[i]->y, s_wins[i]->surf);
+        const espix_window_t *w = s_wins[i];
+        const int x0 = w->x > r.x ? w->x : r.x;
+        const int y0 = w->y > r.y ? w->y : r.y;
+        const int x1 = (w->x + w->w) < (r.x + r.w) ? (w->x + w->w) : (r.x + r.w);
+        const int y1 = (w->y + w->h) < (r.y + r.h) ? (w->y + w->h) : (r.y + r.h);
+
+        if (x1 <= x0 || y1 <= y0) {
+            continue;                   /* does not reach the region */
+        }
+        espix_canvas_blit_surface_rect(c, w->x, w->y, w->surf,
+                                       (espix_rect_t){ x0 - w->x, y0 - w->y,
+                                                       x1 - x0, y1 - y0 });
     }
     espix_canvas_unlock(c);
 
-    /* Everything under the cursor was just painted over, so the save-under
-     * buffer no longer describes what is on the canvas. */
-    s_cursor_on = false;
-
     int px = 0, py = 0;
     espix_display_pointer(&px, &py);
-    cursor_put(px, py);
+    cursor_show(px, py);
+}
+
+void espix_desktop_repaint(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+    desktop_repair((espix_rect_t){ 0, 0, espix_canvas_width(c),
+                                    espix_canvas_height(c) });
 }
 
 espix_window_t *espix_window_new(int x, int y, int w, int h, const char *title)
@@ -404,8 +461,10 @@ void espix_window_set_ctx(espix_window_t *w, void *ctx) { w->ctx = ctx; }
 void espix_window_set_draw(espix_window_t *w, espix_window_draw_fn fn) { w->draw = fn; }
 void espix_window_set_key(espix_window_t *w, espix_window_key_fn fn) { w->key = fn; }
 
-/* The array order is the z-order, so raising is a move to the end. */
-static void window_raise_raw(espix_window_t *w)
+/* The array order is the z-order, so raising is a move to the end. True when
+ * the order actually changed, which is what decides whether anything must be
+ * recomposited. */
+static bool window_raise_raw(espix_window_t *w)
 {
     int i = 0;
     for (; i < s_nwin; i++) {
@@ -414,18 +473,42 @@ static void window_raise_raw(espix_window_t *w)
         }
     }
     if (i >= s_nwin || i == s_nwin - 1) {
-        return;
+        return false;
     }
     for (int j = i; j < s_nwin - 1; j++) {
         s_wins[j] = s_wins[j + 1];
     }
     s_wins[s_nwin - 1] = w;
+    return true;
 }
 
 void espix_window_raise(espix_window_t *w)
 {
-    window_raise_raw(w);
-    espix_desktop_repaint();
+    if (window_raise_raw(w)) {
+        espix_desktop_repaint();
+    }
+}
+
+/* The title bar is the only part of a window whose look follows the focus. */
+static espix_rect_t window_title(const espix_window_t *w)
+{
+    return (espix_rect_t){ 0, 0, w->w, TITLE_H };
+}
+
+/*
+ * Focus without raising, which is what makes crossing a border cheap: the
+ * compositing order has not changed, so nothing has to be recomposited -- two
+ * title bars are repainted and that is the whole of it. Raising is the pointer's
+ * *press* doing it, below.
+ */
+static void focus_draw(espix_window_t *was, espix_window_t *hit)
+{
+    if (was != NULL) {
+        espix_window_damage(was, window_title(was));
+    }
+    if (hit != NULL) {
+        espix_window_damage(hit, window_title(hit));
+    }
 }
 
 void espix_window_focus(espix_window_t *w)
@@ -433,20 +516,37 @@ void espix_window_focus(espix_window_t *w)
     if (s_focus == w) {
         return;
     }
+    espix_window_t *was = s_focus;
     s_focus = w;
-    espix_desktop_repaint();
+    focus_draw(was, w);
 }
 
 void espix_window_move(espix_window_t *w, int x, int y)
 {
+    if (w == NULL || (w->x == x && w->y == y)) {
+        return;
+    }
+
+    /*
+     * Only what the old and new positions cover. What was underneath the window
+     * is not known -- that is what occlusion costs -- but it does not have to be
+     * known *everywhere*, which is the difference between repairing two window-
+     * sized rectangles and repairing the canvas.
+     */
+    const espix_rect_t was = { w->x, w->y, w->w, w->h };
+    const espix_rect_t now = { x, y, w->w, w->h };
+
     w->x = x;
     w->y = y;
-    /*
-     * A full repaint rather than a blit and a repair, because what was
-     * underneath the window is no longer known -- that is what occlusion costs,
-     * and it is the operation the accelerators exist to make cheap.
-     */
-    espix_desktop_repaint();
+
+    const int x0 = was.x < now.x ? was.x : now.x;
+    const int y0 = was.y < now.y ? was.y : now.y;
+    const int x1 = (was.x + was.w) > (now.x + now.w) ? (was.x + was.w)
+                                                      : (now.x + now.w);
+    const int y1 = (was.y + was.h) > (now.y + now.h) ? (was.y + was.h)
+                                                      : (now.y + now.h);
+
+    desktop_repair((espix_rect_t){ x0, y0, x1 - x0, y1 - y0 });
 }
 
 /*
@@ -471,25 +571,14 @@ static void focus_at(int x, int y)
 
     espix_window_t *was = s_focus;
     s_focus = hit;
-    if (hit != NULL) {
-        window_raise_raw(hit);
-    }
 
     /*
-     * The title bar is the only thing that follows the focus, so the two title
-     * bars are what get redrawn -- into the surfaces, because the compositing
-     * order changed underneath them and the repaint below blits in the new one.
-     * Redrawing every window's *content* to change a title colour is what this
-     * avoids.
+     * Two title bars and nothing else, because focusing reorders nothing --
+     * raising is the pointer's *press* doing that, below. So crossing a window
+     * edge costs two title bars rather than a recomposite, which is the
+     * difference between a pointer that feels continuous and one that does not.
      */
-    if (was != NULL) {
-        window_paint(was, (espix_rect_t){ 0, 0, was->w, TITLE_H });
-    }
-    if (hit != NULL) {
-        window_paint(hit, (espix_rect_t){ 0, 0, hit->w, TITLE_H });
-    }
-
-    espix_desktop_repaint();
+    focus_draw(was, hit);
 }
 
 /* ------------------------------------------------------------------ */
@@ -659,10 +748,17 @@ static void windows_create(void)
         espix_window_repaint(s_about);
     }
 
-    /* The terminal is the one to type at, so it starts in front. */
+    /*
+     * The terminal is the one to type at, so it starts in front and focused.
+     * Through espix_window_focus() rather than by assigning s_focus, because
+     * creating the about window focused it -- and that painted the about's title
+     * bar as the focused one and the terminal's as the unfocused one, which is
+     * the state the pixels would otherwise still show.
+     */
     if (s_term != NULL) {
+        s_focus = NULL;
         window_raise_raw(s_term);
-        s_focus = s_term;
+        espix_window_focus(s_term);
     }
 }
 
@@ -744,10 +840,14 @@ static void desktop_input(void *ctx, const espix_input_event_t *ev)
             return;
         }
         if (was == 0 && s_buttons != 0) {
-            focus_at(ev->x, ev->y);     /* a press focuses and raises first */
-            if (s_focus != NULL &&
-                ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
-                drag_begin(s_focus, ev->x, ev->y);
+            focus_at(ev->x, ev->y);     /* focus first, so the title is right */
+            if (s_focus != NULL) {
+                /* The press is what raises, which is why a border crossing does
+                 * not have to recomposite anything. */
+                espix_window_raise(s_focus);
+                if (ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
+                    drag_begin(s_focus, ev->x, ev->y);
+                }
             }
             return;
         }
