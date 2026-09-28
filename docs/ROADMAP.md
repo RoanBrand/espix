@@ -1058,6 +1058,41 @@ both are the sort of thing that is cheaper to know now.
 
 ## Networking and time
 
+- **A latency request, so a component that needs the radio can say so.** ssh,
+  vnc, an sftp transfer, audio streamed over the network -- each of them is
+  interactive and each of them pays for a power saving it did not ask for. The
+  shape to copy is Linux's `PM QoS` and Android's `WifiLock`, because it is the
+  same problem: the component knows what it needs, the subsystem knows what to do
+  about it, and neither should know the other's details.
+
+  Measured, and it is what makes this worth doing at all: the station's default
+  `MIN_MODEM` costs **76 ms average and 46 ms standard deviation** pinging this
+  board, against **4.9 ms and 2.0 ms** with the radio awake, and 4.1 ms / 1.7 ms
+  on a cable. The radio is as good as the wire once it stops sleeping, so
+  everything interactive has been paying a beacon interval per exchange for a
+  saving nobody wanted. `wifi ps off` is the manual version; this is the
+  automatic one.
+
+  Three things decide whether it stays simple or becomes a liability, and they
+  are worth settling before the first caller:
+
+  - **A request is released by the task that made it.** A boolean leaks on every
+    crashed session, and the radio then stays awake for good -- a silent battery
+    and heat cost, and the classic `WifiLock` bug. Tying a request to a task and
+    dropping it from the reaper is the same shape `task_gone` already has for a
+    socket lock, so it cannot leak rather than being remembered not to.
+  - **Count, do not flag.** vnc and ssh overlap, and the last one to leave is
+    what turns it off.
+  - **The vocabulary is the quality, not the mode.** A caller asks for low
+    latency; espix decides that this means `PS_NONE` today and might mean TX
+    power or a protocol mask later. An API that names `WIFI_PS_NONE` is a UI for
+    IDF's API rather than a policy for espix's.
+
+  Not decided: whether it should also cover Bluetooth coexistence while audio
+  plays -- that would be an observation to make rather than assume -- and whether
+  a short grace period before the last release is worth the state it costs, to
+  stop the mode flapping during a pause in typing.
+
 - **Routing and NAT: be the bridge people buy a Raspberry Pi for.** With WiFi on
   one side and USB-NCM or Ethernet on the other, espix is one feature short of
   being an access point, a bridge or a range extender — which is a large part of
