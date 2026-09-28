@@ -213,7 +213,43 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    espix_eprintf(s, "usage: display [start | stop | status]\n");
+    /*
+     * The software path, measured, before there is anything to compare it
+     * with. Mpx/s rather than MB/s because bytes per pixel is a convention and
+     * pixels per second is not -- and it is the figure the accelerators have to
+     * beat on this board rather than on another one.
+     */
+    if (strcmp(sub, "bench") == 0) {
+        espix_display_bench_t rows[ESPIX_DISPLAY_BENCH_MAX];
+        const size_t n = espix_display_bench(rows, ESPIX_DISPLAY_BENCH_MAX);
+
+        espix_printf(s, "%-5s %-9s %6s %9s %11s  %s\n",
+                     "OP", "SIZE", "ITERS", "SW ms", "SW Mpx/s", "HW");
+        for (size_t i = 0; i < n; i++) {
+            const espix_display_bench_t *r = &rows[i];
+            char size[16];
+            snprintf(size, sizeof(size), "%dx%d", r->w, r->h);
+
+            if (r->us_sw == 0) {
+                espix_printf(s, "%-5s %-9s %6u %9s %11s  %s\n", r->op, size,
+                             (unsigned)r->iters, "no memory", "-", "-");
+                continue;
+            }
+
+            const uint64_t px    = (uint64_t)r->w * r->h * r->iters;
+            const uint64_t mpx10 = px * 10 / r->us_sw;      /* Mpx/s, times ten */
+
+            espix_printf(s, "%-5s %-9s %6u %6u.%01u %8u.%01u  %s\n",
+                         r->op, size, (unsigned)r->iters,
+                         (unsigned)(r->us_sw / 1000),
+                         (unsigned)((r->us_sw / 100) % 10),
+                         (unsigned)(mpx10 / 10), (unsigned)(mpx10 % 10),
+                         r->hw != NULL ? r->hw : "-");
+        }
+        return 0;
+    }
+
+    espix_eprintf(s, "usage: display [start | stop | status | bench]\n");
     return 1;
 }
 
@@ -268,7 +304,7 @@ static espix_cmd_t s_display_cmds[] = {
       .usage = "vnc [start [port] | stop | status | password <pw> | nopassword]" },
     { .name = "display", .fn = cmd_display,
       .help = "the desktop on its own: the canvas a panel or local input uses",
-      .usage = "display [start | stop | status]" },
+      .usage = "display [start | stop | status | bench]" },
     { .name = "desktop", .fn = cmd_desktop,
       .help = "the placeholder desktop, so the pointer has something to draw on",
       .usage = "desktop [start | stop | status]" },

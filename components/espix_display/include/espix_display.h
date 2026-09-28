@@ -89,6 +89,33 @@ void   espix_canvas_damage_clear(espix_canvas_t *c);
 bool   espix_canvas_damaged(const espix_canvas_t *c);
 
 /* ------------------------------------------------------------------ */
+/* Benchmark                                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * What one operation at one size costs, on each path that exists.
+ *
+ * `us_sw` is the software path -- the only one on the S3, which has no PPA, no
+ * 2D-DMA and no JPEG codec at all, and therefore the one every target keeps.
+ * `us_hw` is the accelerated path and is zero when there is none, with `hw`
+ * naming it. Both are measured on the same board in the same run, because a
+ * number from another chip is not a comparison.
+ */
+typedef struct {
+    const char *op;         /* "fill" or "blit" */
+    int         w, h;
+    uint32_t    iters;
+    uint32_t    us_sw;      /* the whole run, microseconds */
+    uint32_t    us_hw;      /* ...and accelerated; 0 when there is none */
+    const char *hw;         /* "PPA FILL", "2D-DMA", ... or NULL */
+} espix_display_bench_t;
+
+#define ESPIX_DISPLAY_BENCH_MAX 8
+
+/* Fills up to `max` rows and returns how many. Allocates its own buffers. */
+size_t espix_display_bench(espix_display_bench_t *out, size_t max);
+
+/* ------------------------------------------------------------------ */
 /* Surfaces                                                            */
 /* ------------------------------------------------------------------ */
 

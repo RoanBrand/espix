@@ -20,11 +20,22 @@
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+
+#include "soc/soc_caps.h"
 
 #include "espix_display.h"
 #include "espix_kernel.h"
 
 #define TAG "display"
+
+/*
+ * This target's accelerator blocks, for the benchmark to report against: the
+ * S3 has none of them, the S31 and P4 have all three. `soc_caps.h` rather than
+ * a Kconfig option, because the question is what the chip has and not what the
+ * build was asked for.
+ */
+#define GFX_ACCEL ((SOC_PPA_SUPPORTED ? 1 : 0) + (SOC_DMA2D_SUPPORTED ? 1 : 0))
 
 /* The font table in font8x8.c. Bit 0 of a row byte is the leftmost pixel. */
 extern const unsigned char espix_font8x8[128][8];
@@ -232,6 +243,12 @@ static void op_fill(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
                     espix_px_t v)
 {
     r = rect_clip_wh(r, w, h);
+
+    /*
+     * PPA FILL goes here, and it is a whole-rectangle operation, so it wins on
+     * exactly the case this loop is worst at: a large rectangle. It cannot
+     * report anything PPA cannot do, so the fall-through is the loop.
+     */
     for (int y = 0; y < r.h; y++) {
         espix_px_t *row = px + (size_t)(r.y + y) * stride + r.x;
         for (int x = 0; x < r.w; x++) {
@@ -244,6 +261,12 @@ static void op_blit(espix_px_t *px, int w, int h, int stride,
                     int dst_x, int dst_y, const espix_px_t *src,
                     int src_w, int src_h, int src_stride)
 {
+    /*
+     * PPA SRM or 2D-DMA goes here. Both copy rectangles; SRM also scales and
+     * converts colour, which is the other half of the same operation and the
+     * reason it is the one that matters for a client that wants a different
+     * pixel format.
+     */
     for (int y = 0; y < src_h; y++) {
         const int cy = dst_y + y;
         if (cy < 0 || cy >= h) {
@@ -418,6 +441,90 @@ void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
                         espix_px_t fg, espix_px_t bg)
 {
     px_text(s->px, s->w, s->h, s->stride, x, y, str, fg, bg);
+}
+
+/* ------------------------------------------------------------------ */
+/* Benchmark                                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One operation, repeated, into a surface of its own.
+ *
+ * A surface rather than the canvas, so the number is about the operation and
+ * not about whatever happens to be on the screen -- and so a full-size case does
+ * not have to be the canvas's size.
+ */
+static uint32_t bench_run(bool fill, int w, int h, uint32_t iters)
+{
+    espix_surface_t *dst = espix_surface_new(w, h);
+    espix_surface_t *src = fill ? NULL : espix_surface_new(w, h);
+
+    if (dst == NULL || (!fill && src == NULL)) {
+        espix_surface_free(dst);
+        espix_surface_free(src);
+        return 0;
+    }
+
+    if (src != NULL) {
+        /* Non-zero, so a path that writes nothing cannot pass by silence. */
+        espix_surface_fill(src, (espix_rect_t){ 0, 0, w, h }, 0x1234);
+    }
+
+    const int64_t t0 = esp_timer_get_time();
+    for (uint32_t i = 0; i < iters; i++) {
+        if (fill) {
+            espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, (espix_px_t)i);
+        } else {
+            espix_surface_blit(dst, 0, 0, espix_surface_pixels(src), w, h, w);
+        }
+    }
+    const int64_t t1 = esp_timer_get_time();
+
+    espix_surface_free(dst);
+    espix_surface_free(src);
+    return (uint32_t)(t1 - t0);
+}
+
+size_t espix_display_bench(espix_display_bench_t *out, size_t max)
+{
+    static const struct { int w, h; } sizes[] = {
+        { 64, 64 }, { 256, 256 }, { 800, 600 },
+    };
+    static const char *const ops[] = { "fill", "blit" };
+    size_t n = 0;
+
+    if (out == NULL) {
+        return 0;
+    }
+
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        const int w = sizes[s].w, h = sizes[s].h;
+
+        /*
+         * A million pixels of work per row: measurable at every size, and about
+         * one and a half frames at 800x600 rather than a second of the command.
+         */
+        uint32_t iters = 1000000u / (uint32_t)(w * h);
+        if (iters < 1)   { iters = 1; }
+        if (iters > 500) { iters = 500; }
+
+        for (size_t o = 0; o < sizeof(ops) / sizeof(ops[0]); o++) {
+            if (n >= max) {
+                return n;
+            }
+            espix_display_bench_t *row = &out[n++];
+
+            row->op    = ops[o];
+            row->w     = w;
+            row->h     = h;
+            row->iters = iters;
+            row->hw    = NULL;      /* nothing wired up yet; see op_fill() */
+            row->us_hw = 0;
+            row->us_sw = bench_run(o == 0, w, h, iters);
+        }
+    }
+
+    return n;
 }
 
 /* ------------------------------------------------------------------ */
