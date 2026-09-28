@@ -112,6 +112,18 @@ const char *espix_term_row_text(const espix_term_t *t, int row);
 /* Bytes into the parser, as if a program had written them. */
 void espix_term_write(espix_term_t *t, const char *data, size_t len);
 
+/*
+ * A bigger or smaller grid, for a window that changed size.
+ *
+ * What is already on the screen keeps its row and its column and the rest of each
+ * line is blank: it is *not* re-wrapped, which is what a terminal does rather
+ * than a limitation of this one. The grid is the only record of what was
+ * written, and reflowing it would mean keeping the logical lines as well -- which
+ * is a scrollback, which is a different thing to build. New output wraps at the
+ * new width from the moment this returns.
+ */
+bool espix_term_resize(espix_term_t *t, int cols, int rows);
+
 #ifdef __cplusplus
 }
 #endif

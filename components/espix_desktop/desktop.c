@@ -74,7 +74,10 @@ struct espix_window {
     espix_surface_t *surf;
     espix_window_draw_fn draw;
     espix_window_key_fn  key;
+    espix_window_resize_fn resize;
     void            *ctx;
+    bool             maxed;     /* filling the work area, with `rest` to go back to */
+    espix_rect_t     rest;
 };
 
 /* Bottom first, top last: the array *is* the z-order. */
@@ -355,21 +358,36 @@ static espix_window_t *window_top_visible(void)
 }
 
 /*
- * Two buttons, at the right of the title bar: minimise inboard of close. In
- * surface coordinates, and the same rectangles draw them and hittest them.
+ * Three buttons at the right of the title bar, inboard from the edge in the
+ * order every desktop has used for forty years: close outermost, then minimise,
+ * then maximise. In surface coordinates, and the same rectangles draw them and
+ * hittest them -- a button drawn in one place and pressed in another is the
+ * whole class of bug this avoids.
  */
 #define WIN_BTN (TITLE_H - 6)
 #define WIN_BTN_GAP 4
 
+#define WIN_BTN_MAX   0
+#define WIN_BTN_MIN   1
+#define WIN_BTN_CLOSE 2
+
+static espix_rect_t window_button_box(const espix_window_t *w, int which)
+{
+    const int from_right = WIN_BTN_CLOSE - which;
+
+    return (espix_rect_t){ w->w - 3 - (from_right + 1) * WIN_BTN
+                                 - from_right * WIN_BTN_GAP,
+                           3, WIN_BTN, WIN_BTN };
+}
+
 static espix_rect_t window_close_box(const espix_window_t *w)
 {
-    return (espix_rect_t){ w->w - WIN_BTN - 3, 3, WIN_BTN, WIN_BTN };
+    return window_button_box(w, WIN_BTN_CLOSE);
 }
 
 static espix_rect_t window_min_box(const espix_window_t *w)
 {
-    return (espix_rect_t){ w->w - 2 * WIN_BTN - WIN_BTN_GAP - 3, 3,
-                           WIN_BTN, WIN_BTN };
+    return window_button_box(w, WIN_BTN_MIN);
 }
 
 static bool window_button_hit(const espix_window_t *w, espix_rect_t b,
@@ -387,6 +405,11 @@ static bool window_close_hit(const espix_window_t *w, int x, int y)
 static bool window_min_hit(const espix_window_t *w, int x, int y)
 {
     return window_button_hit(w, window_min_box(w), x, y);
+}
+
+static bool window_max_hit(const espix_window_t *w, int x, int y)
+{
+    return window_button_hit(w, window_button_box(w, WIN_BTN_MAX), x, y);
 }
 
 espix_surface_t *espix_window_surface(espix_window_t *w) { return w->surf; }
@@ -424,11 +447,17 @@ static void window_frame(espix_window_t *w, espix_rect_t r)
         espix_surface_fill(s, x, COL_CLOSE);
         espix_surface_text(s, x.x + 2, x.y + 2, "x", COL_TITLE_FG, COL_CLOSE);
 
-        /* Minimise is a bar rather than a glyph, as every desktop draws it. */
+        /* Minimise is a bar and maximise is a box, which is how every desktop
+         * has drawn them since before this one existed. */
         const espix_rect_t m = window_min_box(w);
         espix_surface_fill(s, m, COL_TITLE_BTN);
         espix_surface_fill(s, (espix_rect_t){ m.x + 3, m.y + WIN_BTN - 5,
                                               WIN_BTN - 6, 2 }, COL_TITLE_FG);
+
+        const espix_rect_t u = window_button_box(w, WIN_BTN_MAX);
+        espix_surface_fill(s, u, COL_TITLE_BTN);
+        espix_surface_outline(s, (espix_rect_t){ u.x + 3, u.y + 3, 6, 6 },
+                              COL_TITLE_FG);
     }
 
     if (r.x == 0 || r.y == 0 || r.x + r.w >= w->w || r.y + r.h >= w->h) {
@@ -633,6 +662,67 @@ void espix_window_free(espix_window_t *w)
 void espix_window_set_ctx(espix_window_t *w, void *ctx) { w->ctx = ctx; }
 void espix_window_set_draw(espix_window_t *w, espix_window_draw_fn fn) { w->draw = fn; }
 void espix_window_set_key(espix_window_t *w, espix_window_key_fn fn) { w->key = fn; }
+void espix_window_set_resize(espix_window_t *w, espix_window_resize_fn fn) { w->resize = fn; }
+
+/* A new surface, because the surface is the window -- frame included -- so a
+ * bigger window is not a bigger blit of a smaller buffer. */
+bool espix_window_resize(espix_window_t *w, int x, int y, int width, int height)
+{
+    espix_canvas_t *c = espix_display_canvas();
+
+    if (w == NULL || c == NULL || width <= 2 * PAD || height <= TITLE_H + 2 * PAD) {
+        return false;
+    }
+    /* Kept on the screen, like a new one: a window wider than the canvas is a
+     * window you cannot see the edge of. */
+    if (width > espix_canvas_width(c)) {
+        width = espix_canvas_width(c);
+    }
+    if (height > espix_canvas_height(c) - TASKBAR_H) {
+        height = espix_canvas_height(c) - TASKBAR_H;
+    }
+    if (w->x == x && w->y == y && w->w == width && w->h == height) {
+        return true;
+    }
+
+    espix_surface_t *surf = espix_surface_new(width, height);
+    if (surf == NULL) {
+        return false;
+    }
+
+    const espix_rect_t was = { w->x, w->y, w->w, w->h };
+
+    desk_lock();
+    espix_surface_t *old = w->surf;
+    w->surf = surf;
+    w->x    = x;
+    w->y    = y;
+    w->w    = width;
+    w->h    = height;
+
+    /* Before anything is drawn into it or composited out of it. */
+    if (w->resize != NULL) {
+        w->resize(w, espix_window_content(w), w->ctx);
+    }
+
+    espix_surface_free(old);
+    desk_unlock();
+
+    /* The frame and the content into the new surface, then the union of where it
+     * was and where it is -- the first covers the new rectangle, the second the
+     * part of the old one it no longer covers. */
+    espix_window_repaint(w);
+
+    const espix_rect_t now = { w->x, w->y, w->w, w->h };
+    const int x0 = was.x < now.x ? was.x : now.x;
+    const int y0 = was.y < now.y ? was.y : now.y;
+    const int x1 = (was.x + was.w) > (now.x + now.w) ? (was.x + was.w)
+                                                     : (now.x + now.w);
+    const int y1 = (was.y + was.h) > (now.y + now.h) ? (was.y + was.h)
+                                                     : (now.y + now.h);
+    desktop_repair((espix_rect_t){ x0, y0, x1 - x0, y1 - y0 });
+    return true;
+}
 
 /* The array order is the z-order, so raising is a move to the end. True when
  * the order actually changed, which is what decides whether anything must be
@@ -845,45 +935,97 @@ static bool photo_load(void)
 }
 
 /*
- * The image, one-to-one in the window's content. The window is sized to the
- * picture, so there is nothing to scale -- fitting an arbitrary image to an
- * arbitrary window is PPA SRM's job and is a separate thing to get right.
+ * Fitting the picture to the window.
+ *
+ * Three rules, and they are the ones an image viewer has: scaled down if it is
+ * too big, left alone if it is not, and centred either way on a neutral
+ * background. Never scaled *up* -- a 64-pixel icon blown up to fill a maximised
+ * window is a decision nobody asked for, and "it fits, so show it" is what a
+ * viewer is for.
+ *
+ * Done once, into a surface of its own, rather than on every repaint: a drag
+ * repaints a window several times a second and would otherwise rescale a
+ * photograph each time. PPA SRM with the scale factors set where there is
+ * hardware, and a nearest-neighbour loop where there is not.
  */
+static espix_surface_t *s_img_fit;
+
+static void photo_fit(espix_window_t *w)
+{
+    if (s_img == NULL) {
+        return;
+    }
+
+    const espix_rect_t box = espix_window_content(w);
+    const int          iw  = espix_surface_width(s_img);
+    const int          ih  = espix_surface_height(s_img);
+
+    int fw = iw;
+    int fh = ih;
+
+    if (fw > box.w || fh > box.h) {
+        /* One factor for both axes, or the picture is stretched. */
+        if ((int64_t)box.w * ih <= (int64_t)box.h * iw) {
+            fw = box.w;
+            fh = (int)((int64_t)ih * box.w / iw);
+        } else {
+            fh = box.h;
+            fw = (int)((int64_t)iw * box.h / ih);
+        }
+    }
+    if (fw < 1) { fw = 1; }
+    if (fh < 1) { fh = 1; }
+
+    espix_surface_free(s_img_fit);
+    s_img_fit = espix_surface_new(fw, fh);
+    if (s_img_fit == NULL) {
+        return;                     /* photo_draw() says so on the screen */
+    }
+    (void)espix_surface_scale(s_img_fit, s_img);
+}
+
+static void photo_resize(espix_window_t *w, espix_rect_t content, void *ctx)
+{
+    (void)content;
+    (void)ctx;
+    photo_fit(w);
+}
+
+/* The neutral around a picture that does not fill its window. */
+#define COL_PHOTO_BG RGB565(0x50, 0x54, 0x5A)
+
 static void photo_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
                        void *ctx)
 {
     (void)ctx;
     const espix_rect_t c = espix_window_content(w);
 
-    if (s_img == NULL) {
+    if (s_img == NULL || s_img_fit == NULL) {
         if (r.y < c.y + CELL_H) {
             espix_surface_text(s, c.x, c.y, "no image", COL_TEXT_FG, COL_WIN_BG);
         }
         return;
     }
 
-    const int         iw  = espix_surface_width(s_img);
-    const int         ih  = espix_surface_height(s_img);
-    const espix_px_t *src = espix_surface_pixels(s_img);
-    espix_px_t       *dst = espix_surface_pixels(s);
-    const int         sw  = espix_surface_width(s);
+    /* Only what the region reaches, so a drag pays for the pixels it uncovers
+     * rather than for the window. */
+    const int bx0 = c.x > r.x ? c.x : r.x;
+    const int by0 = c.y > r.y ? c.y : r.y;
+    const int bx1 = (c.x + c.w) < (r.x + r.w) ? (c.x + c.w) : (r.x + r.w);
+    const int by1 = (c.y + c.h) < (r.y + r.h) ? (c.y + c.h) : (r.y + r.h);
 
-    for (int y = 0; y < ih; y++) {
-        const int cy = c.y + y;
-
-        if (cy < r.y || cy >= r.y + r.h) {
-            continue;
-        }
-
-        int x0 = 0;
-        int x1 = iw;
-        if (c.x + x0 < r.x)             { x0 = r.x - c.x; }
-        if (c.x + x1 > r.x + r.w)       { x1 = r.x + r.w - c.x; }
-        if (x1 <= x0)                   { continue; }
-
-        memcpy(&dst[(size_t)cy * sw + c.x + x0], &src[(size_t)y * iw + x0],
-               (size_t)(x1 - x0) * sizeof(espix_px_t));
+    if (bx1 > bx0 && by1 > by0) {
+        espix_surface_fill(s, (espix_rect_t){ bx0, by0, bx1 - bx0, by1 - by0 },
+                           COL_PHOTO_BG);
     }
+
+    const int fw = espix_surface_width(s_img_fit);
+    const int fh = espix_surface_height(s_img_fit);
+
+    /* op_blit() clips it to the surface, so the whole picture every time is
+     * right as well as cheap -- it is one PPA SRM call. */
+    espix_surface_blit(s, c.x + (c.w - fw) / 2, c.y + (c.h - fh) / 2,
+                       espix_surface_pixels(s_img_fit), fw, fh, fw);
 }
 
 static void photo_open(void)
@@ -896,12 +1038,28 @@ static void photo_open(void)
         const int iw = got ? espix_surface_width(s_img) : 160;
         const int ih = got ? espix_surface_height(s_img) : 24;
 
-        s_img_win = espix_window_new(120, 120, iw + 2 * PAD,
-                                     ih + TITLE_H + 2 * PAD, "photo");
+        /*
+         * No bigger than the work area, whatever the picture is. A 4000-pixel
+         * photograph asked for a window 4000 pixels wide, which cannot be shown
+         * and whose edges cannot be reached; the picture fits itself to whatever
+         * it gets instead.
+         */
+        espix_canvas_t *c  = espix_display_canvas();
+        const int       cw = (c != NULL) ? espix_canvas_width(c) : iw;
+        const int       ch = (c != NULL) ? espix_canvas_height(c) - TASKBAR_H : ih;
+
+        int ww = iw + 2 * PAD;
+        int wh = ih + TITLE_H + 2 * PAD;
+        if (ww > cw - 16) { ww = cw - 16; }
+        if (wh > ch - 16) { wh = ch - 16; }
+
+        s_img_win = espix_window_new(120, 120, ww, wh, "photo");
         if (s_img_win == NULL) {
             return;
         }
         espix_window_set_draw(s_img_win, photo_draw);
+        espix_window_set_resize(s_img_win, photo_resize);
+        photo_fit(s_img_win);
         espix_window_repaint(s_img_win);
     }
 
@@ -938,10 +1096,15 @@ static espix_rect_t term_cell(const espix_window_t *w, int row, int col)
     return (espix_rect_t){ c.x + col * CELL_W, c.y + row * CELL_H, CELL_W, CELL_H };
 }
 
+/* The grid's size is the terminal's, not the constant it was created with:
+ * maximising the window makes it a different shape. */
 static espix_rect_t term_grid_rect(const espix_window_t *w)
 {
-    const espix_rect_t c = espix_window_content(w);
-    return (espix_rect_t){ c.x, c.y, TERM_COLS * CELL_W, TERM_ROWS * CELL_H };
+    const espix_rect_t c    = espix_window_content(w);
+    const int          cols = s_shell != NULL ? espix_term_cols(s_shell) : TERM_COLS;
+    const int          rows = s_shell != NULL ? espix_term_rows(s_shell) : TERM_ROWS;
+
+    return (espix_rect_t){ c.x, c.y, cols * CELL_W, rows * CELL_H };
 }
 
 /*
@@ -979,7 +1142,8 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
         espix_surface_unlock(s);
 
         espix_window_damage(w, (espix_rect_t){ c.x, c.y + row * CELL_H,
-                                               TERM_COLS * CELL_W, CELL_H });
+                                               espix_term_cols(s_shell) * CELL_W,
+                                               CELL_H });
     }
     desk_unlock();
 }
@@ -1044,9 +1208,11 @@ static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
     if (s_shell == NULL) {
         return;
     }
-    const espix_rect_t c = espix_window_content(w);
+    const espix_rect_t c    = espix_window_content(w);
+    const int          cols = espix_term_cols(s_shell);
+    const int          rows = espix_term_rows(s_shell);
 
-    for (int row = 0; row < TERM_ROWS; row++) {
+    for (int row = 0; row < rows; row++) {
         const int y = c.y + row * CELL_H;
         if (y + CELL_H <= r.y || y >= r.y + r.h) {
             continue;
@@ -1055,10 +1221,23 @@ static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
         if (cells == NULL) {
             continue;
         }
-        char line[TERM_COLS + 1];
-        memcpy(line, cells, TERM_COLS);
-        line[TERM_COLS] = '\0';
+        char line[ESPIX_TERM_MAX_COLS + 1];
+        memcpy(line, cells, (size_t)cols);
+        line[cols] = '\0';
         espix_surface_text(s, c.x, y, line, COL_TEXT_FG, COL_WIN_BG);
+    }
+}
+
+/* A bigger window is a bigger grid. Nothing tells the shell: it writes and the
+ * grid wraps at whatever width it now has, which is what a terminal does. */
+static void term_resize(espix_window_t *w, espix_rect_t content, void *ctx)
+{
+    (void)w;
+    (void)ctx;
+
+    if (s_shell != NULL) {
+        (void)espix_term_resize(s_shell, content.w / CELL_W,
+                                content.h / CELL_H);
     }
 }
 
@@ -1123,6 +1302,7 @@ static void term_start(void)
 
     espix_window_set_draw(s_term, term_draw);
     espix_window_set_key(s_term, term_key);
+    espix_window_set_resize(s_term, term_resize);
 
     /*
      * A new window's *surface* is painted by espix_window_new, and the canvas is
@@ -1665,6 +1845,39 @@ static void window_restore(espix_window_t *w)
 }
 
 /*
+ * Maximise: the work area, or wherever it was.
+ *
+ * No rescaling is involved in the window itself -- a maximised window is a
+ * bigger surface, which is a new buffer and not a stretched one. What the
+ * *content* does about it is the content's business, and it is told: the terminal
+ * resizes its grid and the viewer refits its picture. A window whose content has
+ * no opinion simply gets more room.
+ */
+static void window_toggle_max(espix_window_t *w)
+{
+    espix_canvas_t *c = espix_display_canvas();
+
+    if (w == NULL || c == NULL) {
+        return;
+    }
+
+    if (w->maxed) {
+        if (espix_window_resize(w, w->rest.x, w->rest.y, w->rest.w, w->rest.h)) {
+            w->maxed = false;
+        }
+        return;
+    }
+
+    const espix_rect_t rest = { w->x, w->y, w->w, w->h };
+
+    if (espix_window_resize(w, 0, 0, espix_canvas_width(c),
+                            espix_canvas_height(c) - TASKBAR_H)) {
+        w->rest  = rest;
+        w->maxed = true;
+    }
+}
+
+/*
  * Bring a window to the front, unhiding it if it was minimised.
  *
  * The one way anything opens a window on request: the menu, the launcher and the
@@ -1768,7 +1981,9 @@ static void windows_destroy(void)
      * and the codec decodes it again in 12 ms.
      */
     espix_surface_free(s_img);
-    s_img       = NULL;
+    s_img = NULL;
+    espix_surface_free(s_img_fit);
+    s_img_fit   = NULL;
     s_img_tried = false;
 
     /* A drag that was in progress ends with the window it was holding. */
@@ -1904,6 +2119,10 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
             }
             if (titled != NULL && window_min_hit(titled, ev->x, ev->y)) {
                 window_minimize(titled);
+                return;
+            }
+            if (titled != NULL && window_max_hit(titled, ev->x, ev->y)) {
+                window_toggle_max(titled);
                 return;
             }
             focus_at(ev->x, ev->y);     /* focus first, so the title is right */

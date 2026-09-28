@@ -437,6 +437,58 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
     };
     return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
 }
+
+/*
+ * The same operation with the scale factors set, which is the whole of what
+ * scaling is: SRM is scale-rotate-mirror, and the blit above is it at 1:1.
+ *
+ * The source is the whole picture and the destination is a whole surface, so
+ * there is no block offset anywhere -- which is deliberate, because an offset
+ * is the field this driver has already been got wrong on twice.
+ */
+static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
+                           const espix_px_t *src, int sw, int sh)
+{
+    if (s_sw_only || sw <= 0 || sh <= 0) {
+        return false;
+    }
+    if (!s_force_hw && sw * sh < PPA_MIN_PIXELS) {
+        return false;
+    }
+    if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0) {
+        return false;
+    }
+    if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
+        return false;
+    }
+
+    const ppa_srm_oper_config_t cfg = {
+        .in = {
+            .buffer         = src,
+            .pic_w          = (uint32_t)sw,
+            .pic_h          = (uint32_t)sh,
+            .block_w        = (uint32_t)sw,
+            .block_h        = (uint32_t)sh,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer         = dst,
+            .buffer_size    = (uint32_t)buf_size(dw, dh),
+            .pic_w          = (uint32_t)dw,
+            .pic_h          = (uint32_t)dh,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x        = (float)dw / (float)sw,
+        .scale_y        = (float)dh / (float)sh,
+        .mode           = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+}
 #else
 static bool s_sw_only;      /* unused without an accelerator, but harmless */
 #endif  /* SOC_PPA_SUPPORTED */
@@ -669,6 +721,47 @@ void espix_surface_blit(espix_surface_t *s, int dst_x, int dst_y,
 {
     op_blit(s->px, s->w, s->h, s->stride, dst_x, dst_y, src, 0, 0, src_w,
             src_h, src_stride);
+}
+
+/*
+ * The software scale: nearest neighbour, and deliberately so.
+ *
+ * A bilinear filter over a whole photograph is not something this board should
+ * be doing in software, and the hardware path filters properly where there is
+ * hardware. On the S3 -- which has no PPA at all, so this *is* its
+ * implementation -- nearest neighbour at speed beats bilinear at a crawl, and
+ * the difference is visible mostly on edges that a downscale was going to
+ * soften anyway.
+ */
+static void sw_scale(espix_px_t *dst, int dw, int dh,
+                     const espix_px_t *src, int sw, int sh)
+{
+    for (int y = 0; y < dh; y++) {
+        const espix_px_t *srow = src + (size_t)((int64_t)y * sh / dh) * sw;
+        espix_px_t       *drow = dst + (size_t)y * dw;
+
+        for (int x = 0; x < dw; x++) {
+            drow[x] = srow[(int)((int64_t)x * sw / dw)];
+        }
+    }
+}
+
+esp_err_t espix_surface_scale(espix_surface_t *dst, const espix_surface_t *src)
+{
+    if (dst == NULL || src == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (dst->w <= 0 || dst->h <= 0 || src->w <= 0 || src->h <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+#if SOC_PPA_SUPPORTED
+    if (ppa_scale_rect(dst->px, dst->w, dst->h, src->px, src->w, src->h)) {
+        return ESP_OK;
+    }
+#endif
+    sw_scale(dst->px, dst->w, dst->h, src->px, src->w, src->h);
+    return ESP_OK;
 }
 
 void espix_surface_outline(espix_surface_t *s, espix_rect_t r, espix_px_t px)

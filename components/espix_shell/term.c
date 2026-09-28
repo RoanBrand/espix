@@ -407,6 +407,50 @@ void espix_term_repaint(espix_term_t *t)
     }
 }
 
+bool espix_term_resize(espix_term_t *t, int cols, int rows)
+{
+    if (t == NULL || cols <= 0 || cols > ESPIX_TERM_MAX_COLS ||
+        rows <= 0 || rows > ESPIX_TERM_MAX_ROWS) {
+        return false;
+    }
+    if (cols == t->cols && rows == t->rows) {
+        return true;
+    }
+
+    const size_t cells = (size_t)cols * (size_t)rows;
+
+    char *grid = heap_caps_malloc(cells, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (grid == NULL) {
+        grid = heap_caps_malloc(cells, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (grid == NULL) {
+        return false;                   /* the old size stays, and still works */
+    }
+    memset(grid, ' ', cells);
+
+    /* Same row, same column, for as much of both grids as exists. */
+    const int keep_rows = rows < t->rows ? rows : t->rows;
+    const int keep_cols = cols < t->cols ? cols : t->cols;
+
+    for (int r = 0; r < keep_rows; r++) {
+        memcpy(grid + (size_t)r * (size_t)cols,
+               t->grid + (size_t)r * (size_t)t->cols, (size_t)keep_cols);
+    }
+
+    heap_caps_free(t->grid);
+    t->grid = grid;
+    t->cols = cols;
+    t->rows = rows;
+
+    if (t->row >= rows) { t->row = rows - 1; }
+    if (t->col >= cols) { t->col = cols - 1; }
+    if (t->row < 0)     { t->row = 0; }
+    if (t->col < 0)     { t->col = 0; }
+
+    term_repaint(t);
+    return true;
+}
+
 int espix_term_cols(const espix_term_t *t)
 {
     return t != NULL ? t->cols : 0;

@@ -72,12 +72,34 @@ typedef void (*espix_window_draw_fn)(espix_window_t *w, espix_surface_t *s,
 typedef void (*espix_window_key_fn)(espix_window_t *w, uint32_t keysym,
                                     bool down, void *ctx);
 
+/*
+ * The window changed size, and here is the new content rectangle.
+ *
+ * Called after the surface has been replaced and before anything is composited,
+ * so a client lays itself out once rather than redrawing into a surface whose
+ * geometry it has not been told about. A terminal resizes its grid here; a
+ * viewer rescales what it is showing.
+ */
+typedef void (*espix_window_resize_fn)(espix_window_t *w, espix_rect_t content,
+                                       void *ctx);
+
 espix_window_t *espix_window_new(int x, int y, int w, int h, const char *title);
 void            espix_window_free(espix_window_t *w);
 
 void espix_window_set_ctx(espix_window_t *w, void *ctx);
 void espix_window_set_draw(espix_window_t *w, espix_window_draw_fn fn);
 void espix_window_set_key(espix_window_t *w, espix_window_key_fn fn);
+void espix_window_set_resize(espix_window_t *w, espix_window_resize_fn fn);
+
+/*
+ * A new size, and a new surface to go with it -- because the surface is the
+ * window, frame included, so a resize cannot be a bigger blit of a smaller
+ * buffer. The content callback is told in between, and the region the window
+ * used to cover is put back.
+ *
+ * False when the surface could not be allocated, in which case nothing moved.
+ */
+bool espix_window_resize(espix_window_t *w, int x, int y, int width, int height);
 
 espix_surface_t *espix_window_surface(espix_window_t *w);
 

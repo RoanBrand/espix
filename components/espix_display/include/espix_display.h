@@ -150,6 +150,19 @@ void        espix_surface_unlock(espix_surface_t *s);
 
 /* Drawing. All clip to the surface. None of them marks anything. */
 void espix_surface_fill(espix_surface_t *s, espix_rect_t r, espix_px_t px);
+/*
+ * Scale the whole of `src` into `dst`, which must already be the size it should
+ * end up. Both are RGB565.
+ *
+ * PPA SRM does it where there is hardware -- the hardware that already does the
+ * 1:1 blit, at a size rather than at a copy -- and a nearest-neighbour loop does
+ * it where there is not, which on the S3 is every time. The two are the same
+ * function on purpose: a caller that fits an image to a window should not have to
+ * know which board it is on, and the software path is the one that gets measured
+ * against the hardware rather than the other way round.
+ */
+esp_err_t espix_surface_scale(espix_surface_t *dst, const espix_surface_t *src);
+
 void espix_surface_blit(espix_surface_t *s, int dst_x, int dst_y,
                         const espix_px_t *src, int src_w, int src_h,
                         int src_stride);
