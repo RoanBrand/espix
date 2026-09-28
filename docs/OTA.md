@@ -860,8 +860,10 @@ loader only ever installs a file that is already there.**
   per freshly flashed image, it makes the running image visible like any other,
   and it means a single-image board still has a rollback target. Reading its own
   partition is safe; nothing writes `ota_1` while the kernel is running.
-* **Kernel, on upgrade:** write the new image to `/boot`, set NVS `pending` to
-  that filename, select `ota_0` (the loader), reboot.
+* **Kernel, on upgrade:** queue the new image -- write it to `/boot` and set NVS
+  `pending` to its filename, or point `pending` straight at a file that is
+  already on the device (see *Installing a file you already have* below) --
+  select `ota_0` (the loader), reboot.
 * **Loader, every run:** if `ota_1` is `ABORTED` -- a try failed -- install NVS
   `good`; else if `pending` is set, install that; else do nothing. Select
   `ota_1`, reboot. It never writes `/boot` and never downloads, which is why
@@ -877,6 +879,47 @@ Two corners to decide up front: if `good` is missing when a rollback is needed
 must say so rather than loop on a failed `ota_1`; and `/boot` should keep the
 current and pending images only, deleting older ones after a confirm, or a
 12 MiB rootfs slowly fills with kernels.
+
+### Installing a file you already have
+
+The repository path is not the only one, and for development it is not the
+useful one. `upgrade --file <path>` installs an image that is already on the
+device -- pushed with `scp`, typically to `/tmp`:
+
+    scp build-esp32s31/espix.bin esp@<board>:/tmp/espix.bin
+    ssh esp@<board> 'sudo upgrade --file /tmp/espix.bin'
+    ssh esp@<board> 'sudo reboot'
+
+which is `make flash-ota`.
+
+**Nothing is copied into `/boot`.** A name still means "a file in `/boot`",
+which is where a repository update is adopted; an absolute path means "install
+this and keep no copy", and the two retained images in `/boot` are left exactly
+as they were. The loader resolves the same way -- a path is prefixed with the
+rootfs mount point, so `/tmp/espix.bin` is `/fs/tmp/espix.bin`, and a name with
+`/boot` -- which is why the same `pending` key carries both.
+
+**The file is reclaimed by the reboot that installs it.** `/tmp` is littlefs,
+and the kernel clears it at boot by design. So nothing has to delete the image
+and there is no window in which a delete could race the loader -- which is why
+`tools/flash-ota.sh` no longer removes it. If the file is gone when the loader
+runs, it says so and boots what is installed rather than looping on a missing
+target.
+
+The kernel archives itself into `/boot` on the next boot as usual, so by the
+time the installed image is running, the invariant above holds again.
+
+One constraint is not obvious and cost a panic: **this command must not run on
+a PSRAM stack.** Queueing ends in `esp_ota_set_boot_partition()`,
+which validates the loader slot by mmapping its first page
+(`image_validate()` -> `esp_image_verify()`, one 64 KiB MMU page at `0x20000`
+on this part). Rewriting the MMU is done with the external-memory cache frozen,
+and on the S31 flash and PSRAM are both behind that cache -- so while it is
+frozen neither is addressable, and the stack underneath it has to be internal
+RAM. `esp_mm` asserts exactly that (`s_task_stack_is_sane_when_cache_frozen`).
+Every other command runs on a PSRAM stack, because internal RAM is the pool the
+audio codec needs, so `upgrade` is the one that declares
+`.internal_stack = true` and the dispatcher honours it.
 
 ### Why the loader is `ota_0`
 

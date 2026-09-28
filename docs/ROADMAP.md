@@ -809,6 +809,18 @@ both are the sort of thing that is cheaper to know now.
 
 ## Shell and console
 
+- **Polite, then forced.** `Ctrl-C` today only *asks*: `poll_interrupt` reports
+  that the key was pressed and a foreground program is expected to notice. A
+  program that ignores it cannot be stopped from the console at all, which is
+  not what a terminal user expects and not what Unix does. Both halves already
+  exist here -- the cooperative ask, and `espix_proc_kill()` with `task_gone`
+  to write off what a deleted task can never hand back. What is missing is
+  wiring the second `Ctrl-C` to the second one, and deciding the window
+  between them. There is deliberately no asynchronous signal to build on:
+  signals are delivered when a process calls in (see ARCHITECTURE.md, *Signals
+  are delivered when a process calls in, not asynchronously*), so the ask half
+  of this cannot be made preemptive and the pair is the honest shape.
+
 - ~~**Remove `run`.**~~ Done. It was redundant, and only history explained it:
   there was no executable bit when it was written, so something had to say "this
   file is a program". The shell's exec fallback (`exec_fallback()` in

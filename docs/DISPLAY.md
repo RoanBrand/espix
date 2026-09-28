@@ -40,14 +40,14 @@ Neither is needed for the first milestone; both are a later, optional spike.
 ## Architecture
 
 ```
-  input sources                    the desktop                backends
-  -------------                    -----------                --------
-  RFB connection  --+                                        +--> RFB (rfb.c)
-                    +--> input queue --> desktop task --+    |
-  USB HID (later) --+                  (cursor, text)   |    |
-                                        |               |    |
-                                        v               v    |
-                                   canvas (RGB565, PSRAM) ----+
+  input sources                  the screen                backends
+  -------------                  ----------                --------
+  RFB connection  --+
+                    +--> espix_display_input() --> owner->input()
+  USB HID (later) --+                                    |
+                                                         v
+                            canvas (RGB565, PSRAM) + damage list ---+--> RFB
+                                                                     +--> panel
 ```
 
 Three pieces, and the seams between them are the point:
@@ -55,14 +55,68 @@ Three pieces, and the seams between them are the point:
 - **The canvas** (`display.c`) is an RGB565 surface in PSRAM plus a damage
   list. RGB565 because that is what the hardware path wants -- PPA converts and
   scales it, the JPEG encoder eats it, an RGB panel matches it.
-- **The input queue** is one FreeRTOS queue with many sources. The desktop
-  consumes events and never learns whether a pointer moved because a VNC client
-  said so or because a USB mouse did. This is the abstraction that delivers
-  "keyboard and mouse support" from two directions at once, and it is why a
-  remote mouse works today while a local one is still roadmapped.
+- **Input is a call, not a queue.** One entry point, `espix_display_input()`,
+  serves every source and dispatches straight into the current owner's
+  `input()` in the poster's context -- the RFB task today, a USB HID task when
+  there is one. There is no input queue and no display task, and a queue bought
+  nothing: it cost a copy per event, a 4 KiB task, and a priority inversion to
+  make one cursor move look synchronous. The pointer position belongs to the
+  service, because two sources feed it -- a viewer says *where* it is, a local
+  mouse says *how far* it moved.
+- **The screen has exactly one owner.** `espix_display_claim()` / `release()` /
+  `owner()` name whose model is rendered, not who owns the canvas: each side
+  keeps its own state and a switch is a repaint, which is what lets the console
+  keep running invisibly behind a desktop. A new owner takes over rather than
+  being refused, because the console is where you would start a desktop from --
+  the one place refusing could not work.
 - **The backend** (`rfb.c`) serves the canvas over TCP. It is a client of the
   canvas, not part of it, which is what lets a second backend (an RGB panel, an
-  SPI display) be added without the desktop knowing.
+  SPI display) be added without either owner knowing.
+
+## The on-screen console
+
+`components/espix_shell/canvas_console.c` is the third transport for the same
+shell, after the UART console and the SSH channel: the same command registry,
+the same history, the same line editor, drawn into the canvas instead of a
+terminal. It is a screen owner like any other program -- it claims the screen
+when a viewer attaches and nothing else owns it, which is why a board with a
+VNC client and no desktop still gives you a shell. It runs as `esp`, not root:
+the serial console is root because holding the board has already won, and a
+viewer over the network has not. A headless board allocates none of it.
+
+The output side is a terminal, because the shell's output assumes one: CSI
+sequences that move the cursor or erase are acted on, unknown ones are parsed
+and dropped, and UTF-8 is decoded one cell per code point -- box drawing is
+three bytes per glyph, so counting bytes made the greeting wrap. Control
+characters are synthesised from modifiers, because an RFB `KeyEvent` carries a
+keysym and no modifier field: Ctrl-C arrives as Control, then `c`.
+
+**The console answers the queries it is asked.** This is not optional: an RFB
+viewer is a framebuffer, so on this side espix *is* the terminal, and nothing
+else will answer. `esp_linenoise` finds the terminal by sending `ESC[5n` and
+reading the reply, so with nobody answering it waits for ever inside
+`create_instance()` -- before a frame is ever sent, which is what a black screen
+was. It wants exactly `ESC[0n` within 500 ms; without it, it concludes the
+terminal is dumb and turns line editing and history off. `ESC[6n` (cursor
+position) and `ESC[c` (device attributes) are answered for the same reason:
+every query answered is one fewer way to hang.
+
+Three preconditions when starting the editor here, each of which cost a bug:
+
+- **The key queue must exist before `esp_linenoise_create_instance()`.** The
+  instance sends its query at creation and reads the reply back through the
+  transport's read callback, which pulls from that queue -- so creating the
+  editor first was an `xQueueReceive(NULL)` assert on the RFB task the moment a
+  viewer connected, which is where the console is started from.
+- **Never call `esp_linenoise_probe()`.** It `fcntl()`s the descriptor, and the
+  descriptor here is a key rather than a terminal: both callbacks are supplied
+  and nothing reads or writes it.
+- **ICRNL is the transport's job.** A terminal sends CR for Enter and
+  `esp_linenoise` tests for LF, so without it Enter does nothing at all. The
+  UART gets this from IDF's VFS and SSH does it in its own read callback; espix
+  *is* the pty here, so it is the console's job too. And `Ctrl-C` is the
+  editor's `EAGAIN` -- abandon the line -- not end of input; treating the two
+  alike drops the console on Ctrl-C, which no other shell does.
 
 ## What the S31 gives us
 
@@ -110,15 +164,18 @@ frame. Over WiFi that is a slideshow. So:
 
 ## Milestones
 
-**M0 -- the server, no acceleration.** TCP on 5900, RFB 3.7/3.8 handshake,
-security type None, `SetPixelFormat` / `SetEncodings` / `FramebufferUpdateRequest`
-/ `KeyEvent` / `PointerEvent` / `ClientCutText`, raw and Hextile encoders,
-dirty-rectangle updates. This is what exists now.
+**M0 -- the server, no acceleration.** *Done.* TCP on 5900, RFB 3.3 and
+3.7/3.8 -- both, because the two real clients here each pick one -- security
+type None and VNC authentication, `SetPixelFormat` / `SetEncodings` /
+`FramebufferUpdateRequest` / `KeyEvent` / `PointerEvent` / `ClientCutText`,
+raw and Hextile encoders, dirty-rectangle updates.
 
-**M1 -- a desktop worth looking at.** A solid background, a cursor drawn
-server-side with save-under, and a window that echoes keystrokes so the
-keyboard round-trip is visibly proven. Also in this milestone: a bitmap font
-(embedded 8x8, no freetype).
+**M1 -- a desktop worth looking at.** *Done.* A solid background, a cursor
+drawn server-side with save-under, a placeholder desktop, and an embedded 8x8
+bitmap font (no freetype). One thing sits beside this milestone rather than in
+it, because it was not obvious it came first: the **on-screen console** above.
+It is what makes the screen useful before there is any GUI at all, and it is
+the reason a VNC client with no desktop running still gives you a shell.
 
 **M2 -- the accelerators.** PPA FILL for clears, PPA SRM for blit/scale/convert,
 DMA2D for moves, JPEG for encode. Each one benchmarked against the CPU path it
@@ -140,11 +197,14 @@ is only worth starting once the layer under it is honest.
 ## Using it
 
 ```
-espix> vnc start              # 800x600 desktop, listening on 5900
+espix> vnc start              # 800x600 canvas + desktop, listening on 5900
 espix> vnc status             # port, clients, authentication, and the address to use
 espix> vnc password espix     # require VNC authentication from the next client
 espix> vnc nopassword         # back to no authentication
 espix> vnc stop               # stops the listener and frees the canvas
+
+espix> display start          # the canvas alone: what a panel or local input uses
+espix> desktop start          # the placeholder desktop, so there is something to draw on
 ```
 
 There is a password out of the box, so there is nothing to set up: it is the
@@ -188,8 +248,10 @@ stated reason rather than a hang. See the SSH section of [ROADMAP](docs/ROADMAP.
 for what closing that gap would take.
 
 Then point any VNC client at `espix:5900` (or the address `vnc status` prints).
-Nothing is allocated at boot: `vnc start` creates the canvas and the desktop
-task, and `vnc stop` gives all of it back.
+Nothing is allocated at boot: `vnc start` (or `display start`) creates the
+canvas, and stopping gives all of it back. A client attaching when nothing owns
+the screen gets the console; `desktop start` is how you ask for the placeholder
+instead.
 
 ## Clients, and what they need
 
@@ -217,6 +279,10 @@ Two clients were tried first, and both taught something.
 
 ## Known limitations
 
+- **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
+  font is one bit per pixel and the grid holds one byte per cell, so colour
+  wants an attribute per cell and a renderer that reads it. Until then a
+  program that colours its output is perfectly readable, just not coloured.
 - **One client at a time**, like `sshd` for now: memory and failure isolation
   are worth proving with a single session before multiplying them.
 - **Authentication is weak and not enforced against a client that can
