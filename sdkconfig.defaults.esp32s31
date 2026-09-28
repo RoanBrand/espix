@@ -183,3 +183,9 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
 
+
+# Was set in the generated sdkconfig and never here, so regenerating silently
+# turned it off. Kept because that is the state the board has been running in --
+# whether it should be on is a separate question, and not one to answer by
+# accident during an unrelated change.
+CONFIG_ESPIX_USB_VERBOSE=y
