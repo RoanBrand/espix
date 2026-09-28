@@ -49,35 +49,56 @@ port and a USB-NCM device on the other. espix does not build both for it yet:
 which socket reaches which controller is a property of the board's wiring, and no
 espix board file describes that today.
 
-### A device powered up with the board does not enumerate
+### Two things a Logitech receiver does, and neither is the host stack's fault
 
-`SOC_USB_FSLS_PHY_NUM` is not the same on every espix target -- 1 on the S3 and
-the P4, **0** on the S31. It is tempting to read that 0 as "high speed only, so
-a full-speed device cannot work here". **That reading is wrong, and this
-section said so for an afternoon.** A full-speed device works on the S31's port:
-a Logitech G305 receiver (`046d:c53f`, full speed) enumerates and runs, and so
-does a full-speed keyboard. Whatever that capability counts, it does not mean
-the port cannot talk to a full-speed device.
+Both found the hard way, and both recorded because the obvious reading of each is
+wrong.
 
-What the failure actually was is narrower, and still open. A receiver that is
-**already plugged in when the board boots** does not answer the first control
-transfer:
+**It obeys a request the host reports as failed.** A HID interface sits in
+*report* protocol until the host asks for boot, and the layouts espix decodes are
+the boot ones, so `hid.c` sends `SET_PROTOCOL(BOOT)`. This receiver does not
+answer it: the control transfer on the keyboard interface sits out the library's
+full five-second timeout, and the request on the mouse interface cannot even be
+submitted while the first is outstanding.
+
+    E hid-host: hid_control_transfer(1034): Control transfer timeout
+    I usb:hid: iface 0 reported ESP_ERR_TIMEOUT to the boot protocol request
+    E hid-host: hid_control_transfer(1028): Unable to submit control transfer
+    I usb:hid: iface 1 reported ESP_ERR_NOT_FINISHED to the boot protocol request
+
+It is not ignored, though. **With the request the mouse works; without it the
+mouse interface is silent** -- not misread, silent -- which is what a
+boot-capable interface in report protocol does when it has nothing useful to say
+there. So the request stays, and it is sent *before* the interface is started, so
+the five seconds it costs are paid once at attach and never on the report path.
+Removing it looks like an easy win and is not; the comment in `hid.c` says so.
+
+The behaviour is not peculiar to this receiver. tinyusb carries it open as
+[hathach/tinyusb#2436](https://github.com/hathach/tinyusb/issues/2436), where
+toggling protocol on the mouse interface of a Logitech receiver stops the
+keyboard interface being serviced at all while its endpoint goes on replying.
+
+**It does not always enumerate when it was powered up with the board.** Observed
+across several boots, and then not observed at all:
 
     E (7351) ENUM: Bad transfer status 1: CHECK_SHORT_DEV_DESC
     E (7351) ENUM: CHECK_SHORT_DEV_DESC FAILED
     D (7351) HUB: Disabling root port 0
 
-The enumerator then disables the root port and never retries, so the device stays
-invisible until it is unplugged and plugged again -- after which the *same*
-receiver on the *same* port enumerates normally, as a boot keyboard on interface
-0 and a boot mouse on interface 1.
+The first control transfer after the port reset comes back as
+`USB_TRANSFER_STATUS_ERROR`, the enumerator disables the root port, and it never
+retries -- so the device stays invisible until it is unplugged and plugged again,
+after which the same receiver on the same port enumerates normally. Later boots
+have gone straight through (`HUB: Root port reset` ... `GET_SHORT_DEV_DESC OK`),
+so this is intermittent rather than a property of the device or the port, and
+what makes it intermittent is not known. Two things to try if it returns: whether
+a retry after the port is disabled finds it, and whether the delay between VBUS
+and the first control transfer is simply too short.
 
-Same device, same port, same firmware; the only difference is whether it was
-powered up with the board. That points at something settling -- the device, the
-port, or VBUS -- rather than at a driver, and it is worth chasing, because "it
-works if you replug it" is not something to ship. Two things to try first:
-whether a retry after the port is disabled finds it, and whether the delay
-between VBUS and the first control transfer is simply too short.
+Do not read either of these as `SOC_USB_FSLS_PHY_NUM`, which is 1 on the S3 and
+the P4 and **0** on the S31, and invites the conclusion that a full-speed device
+cannot work here. It can: this receiver is full speed, so is the keyboard, and
+both run.
 
 ## What it does
 

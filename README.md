@@ -44,7 +44,7 @@ together.
 | Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
 | Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |
-| Programs | USB keyboard and mouse | **planned** | a console you type on, on the host port |
+| Programs | USB keyboard and mouse | **yes** | boot-protocol HID on the host port, decoded to X11 keysyms and fed to the same input path a viewer's events use; a keyboard and a wireless receiver's mouse both verified — [USB-HOST.md](docs/USB-HOST.md) |
 | Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
 | Shell | Serial console and SSH, same commands | **yes** | 61 commands |
 | Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
@@ -70,7 +70,7 @@ together.
 | Display | A desktop, served over VNC | **yes** | `vnc start` puts an 800x600 RGB565 framebuffer on port 5900 and speaks RFB (RFC 6143), so any VNC client is the monitor — no panel needed; Hextile keeps a flat first frame near 10 KiB rather than 1.9 MiB; [DISPLAY.md](docs/DISPLAY.md) |
 | Display | The clients people actually use | **yes** | RFB 3.3 and 3.7/3.8, plus VNC authentication for the ones that insist on a password: TigerVNC, RealVNC on Android and macOS Screen Sharing have each painted a full desktop |
 | Display | Authentication | **partial** | VNC auth (DES) with a built-in default password, public on purpose; security type None is still offered to 3.7+ clients, so it is a compatibility mechanism rather than a security boundary — [DISPLAY.md](docs/DISPLAY.md) |
-| Display | A cursor, and a keyboard round-trip | **yes** | a server-side cursor plus a window that echoes keys; input is one queue, so VNC today and USB HID later share a path |
+| Display | A cursor, and a keyboard round-trip | **yes** | a server-side cursor plus a window that echoes keys; input is one entry point, so a viewer and a local keyboard or mouse arrive the same way |
 | Display | PPA, JPEG and 2D-DMA acceleration | **planned** | the reason the virtual screen exists — each accelerator gets measured against the CPU path it replaces |
 | Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **planned** | surfaces, z-order and a compositor, on top of the VNC backend |

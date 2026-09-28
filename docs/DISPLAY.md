@@ -44,7 +44,7 @@ Neither is needed for the first milestone; both are a later, optional spike.
   -------------                  ----------                --------
   RFB connection  --+
                     +--> espix_display_input() --> owner->input()
-  USB HID (later) --+                                    |
+  USB HID         --+                                    |
                                                          v
                             canvas (RGB565, PSRAM) + damage list ---+--> RFB
                                                                      +--> panel
@@ -57,8 +57,12 @@ Three pieces, and the seams between them are the point:
   scales it, the JPEG encoder eats it, an RGB panel matches it.
 - **Input is a call, not a queue.** One entry point, `espix_display_input()`,
   serves every source and dispatches straight into the current owner's
-  `input()` in the poster's context -- the RFB task today, a USB HID task when
-  there is one. There is no input queue and no display task, and a queue bought
+  `input()` in the poster's context -- the RFB task for a viewer, the HID task
+  for a local keyboard or mouse, which is what that second input source turned
+  out to be: `espix_usb` decodes boot-protocol HID reports into the same X11
+  keysyms a viewer sends, so the console and the desktop cannot tell them apart,
+  and neither of them had to change. There is no input queue and no display task,
+  and a queue bought
   nothing: it cost a copy per event, a 4 KiB task, and a priority inversion to
   make one cursor move look synchronous. The pointer position belongs to the
   service, because two sources feed it -- a viewer says *where* it is, a local
@@ -72,6 +76,16 @@ Three pieces, and the seams between them are the point:
 - **The backend** (`rfb.c`) serves the canvas over TCP. It is a client of the
   canvas, not part of it, which is what lets a second backend (an RGB panel, an
   SPI display) be added without either owner knowing.
+- **What drives an update, and why a local mouse used to feel slow.** A viewer
+  keeps one `FramebufferUpdateRequest` outstanding, and the server holds it
+  rather than answering with an empty update -- so the only thing that decides
+  how long a change made by *another task* waits is the loop's receive timeout.
+  It is 10 ms while an update is owed and 250 ms while none is, because there is
+  nothing to send until the client asks. That is the entire difference between a
+  local pointer and a remote one: a remote move is sent the instant the client's
+  own message is handled, while a local one has nothing to wake the loop but that
+  timeout. At 250 ms it was measurable -- 5-12 updates a second, against 40-108
+  after.
 
 ## The on-screen console
 
@@ -279,6 +293,10 @@ Two clients were tried first, and both taught something.
 
 ## Known limitations
 
+- **Mouse buttons go nowhere.** A press is decoded and carried on a POINTER
+  event, and an owner may read it, but nothing acts on one: there is no window
+  manager to click at yet, so a click reaches the desktop and stops there. The
+  position is still updated, which is the only reason it is sent at all.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a
