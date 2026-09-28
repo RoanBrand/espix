@@ -55,9 +55,15 @@ typedef struct espix_window espix_window_t;
 
 #define ESPIX_WINDOW_TITLE_MAX 48
 
-/* Draw the content. Called with the surface locked, in surface coordinates. */
+/*
+ * Draw the content.
+ *
+ * `r` is the region that needs redrawing, in the surface's coordinates, and
+ * only what intersects it has to be drawn -- which is the whole point: a change
+ * of one cell should cost one cell, not a window. Called with the surface locked.
+ */
 typedef void (*espix_window_draw_fn)(espix_window_t *w, espix_surface_t *s,
-                                     void *ctx);
+                                     espix_rect_t r, void *ctx);
 
 /*
  * A key for the focused window. `keysym` is X11, as it is everywhere else here,
@@ -83,7 +89,16 @@ void espix_window_move(espix_window_t *w, int x, int y);
 void espix_window_raise(espix_window_t *w);
 void espix_window_focus(espix_window_t *w);
 
-/* Content changed: this window is redrawn and blitted, and nothing else is. */
+/*
+ * These pixels changed: redraw them, into the surface and onto the canvas.
+ *
+ * The window's frame is redrawn too if the region reaches it, so a caller never
+ * has to know which parts of a window are the desktop's -- only which parts it
+ * changed.
+ */
+void espix_window_damage(espix_window_t *w, espix_rect_t r);
+
+/* All of it: for a caller that does not track cells, and after a frame change. */
 void espix_window_repaint(espix_window_t *w);
 
 /* Everything: background, every window in z-order, the cursor. */

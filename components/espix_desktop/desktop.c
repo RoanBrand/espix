@@ -229,37 +229,77 @@ static bool window_hit(const espix_window_t *w, int x, int y)
 
 espix_surface_t *espix_window_surface(espix_window_t *w) { return w->surf; }
 
-static void window_paint(espix_window_t *w)
+static espix_rect_t win_clip(espix_rect_t r, int w, int h)
 {
-    espix_surface_t *s = w->surf;
-    const espix_px_t bar = (w == s_focus) ? COL_TITLE_FOC : COL_TITLE;
-
-    espix_surface_lock(s);
-
-    espix_surface_fill(s, (espix_rect_t){ 0, 0, w->w, w->h }, COL_WIN_BG);
-    espix_surface_fill(s, (espix_rect_t){ 0, 0, w->w, TITLE_H }, bar);
-
-    const int tw = (int)strlen(w->title) * CELL_W;
-    espix_surface_text(s, (w->w - tw) / 2, (TITLE_H - CELL_H) / 2, w->title,
-                       COL_TITLE_FG, bar);
-    espix_surface_outline(s, (espix_rect_t){ 0, 0, w->w, w->h }, COL_WIN_EDGE);
-
-    if (w->draw != NULL) {
-        w->draw(w, s, w->ctx);
-    }
-
-    espix_surface_unlock(s);
+    const int x0 = r.x < 0 ? 0 : r.x;
+    const int y0 = r.y < 0 ? 0 : r.y;
+    const int x1 = r.x + r.w > w ? w : r.x + r.w;
+    const int y1 = r.y + r.h > h ? h : r.y + r.h;
+    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
 }
 
-static void window_blit(espix_window_t *w)
+/*
+ * The parts of a window that are the desktop's, within `r`: the background, the
+ * title bar, the outline. The title is only touched when the region reaches it,
+ * and the outline only when the region touches an edge, because redrawing either
+ * for a cell in the middle cannot change a pixel.
+ */
+static void window_frame(espix_window_t *w, espix_rect_t r)
+{
+    espix_surface_t *s = w->surf;
+
+    espix_surface_fill(s, r, COL_WIN_BG);
+
+    if (r.y < TITLE_H) {
+        const espix_px_t bar = (w == s_focus) ? COL_TITLE_FOC : COL_TITLE;
+        const int tw = (int)strlen(w->title) * CELL_W;
+
+        espix_surface_fill(s, (espix_rect_t){ 0, 0, w->w, TITLE_H }, bar);
+        espix_surface_text(s, (w->w - tw) / 2, (TITLE_H - CELL_H) / 2, w->title,
+                           COL_TITLE_FG, bar);
+    }
+
+    if (r.x == 0 || r.y == 0 || r.x + r.w >= w->w || r.y + r.h >= w->h) {
+        espix_surface_outline(s, (espix_rect_t){ 0, 0, w->w, w->h }, COL_WIN_EDGE);
+    }
+}
+
+/* Into the surface only, so a caller can batch it with a compositing change. */
+static void window_paint(espix_window_t *w, espix_rect_t r)
+{
+    espix_surface_lock(w->surf);
+    window_frame(w, r);
+    if (w->draw != NULL) {
+        w->draw(w, w->surf, r, w->ctx);
+    }
+    espix_surface_unlock(w->surf);
+}
+
+static void window_blit(espix_window_t *w, espix_rect_t r)
 {
     espix_canvas_t *c = espix_display_canvas();
     if (c == NULL) {
         return;
     }
     espix_canvas_lock(c);
-    espix_canvas_blit_surface(c, w->x, w->y, w->surf);
+    espix_canvas_blit_surface_rect(c, w->x, w->y, w->surf, r);
     espix_canvas_unlock(c);
+}
+
+void espix_window_damage(espix_window_t *w, espix_rect_t r)
+{
+    if (w == NULL || w->surf == NULL) {
+        return;
+    }
+    r = win_clip(r, w->w, w->h);
+    if (r.w <= 0 || r.h <= 0) {
+        return;
+    }
+
+    window_paint(w, r);
+    if (desktop_on_screen()) {
+        window_blit(w, r);
+    }
 }
 
 void espix_window_repaint(espix_window_t *w)
@@ -267,10 +307,7 @@ void espix_window_repaint(espix_window_t *w)
     if (w == NULL || w->surf == NULL) {
         return;
     }
-    window_paint(w);
-    if (desktop_on_screen()) {
-        window_blit(w);
-    }
+    espix_window_damage(w, (espix_rect_t){ 0, 0, w->w, w->h });
 }
 
 void espix_desktop_repaint(void)
@@ -280,10 +317,13 @@ void espix_desktop_repaint(void)
         return;
     }
 
-    for (int i = 0; i < s_nwin; i++) {
-        window_paint(s_wins[i]);
-    }
-
+    /*
+     * The surfaces are *not* repainted. They already hold each window's frame
+     * and content, and a window changes only when its owner says so -- so a
+     * structural repaint, a move or a raise or a window appearing, is a canvas
+     * fill and one blit per window with no drawing at all. Repainting every
+     * surface here is what made a drag pay 8ms of glyphs per window per motion.
+     */
     espix_canvas_lock(c);
     espix_canvas_fill(c, (espix_rect_t){ 0, 0, espix_canvas_width(c),
                                         espix_canvas_height(c) }, COL_DESKTOP);
@@ -325,6 +365,14 @@ espix_window_t *espix_window_new(int x, int y, int w, int h, const char *title)
              title != NULL ? title : "window");
 
     s_wins[s_nwin++] = win;
+
+    /*
+     * Painted once here, so the surface is never the heap's leftovers -- the
+     * frame only, since there is no draw callback yet. A window whose content
+     * arrives later asks for the whole of itself once with
+     * espix_window_repaint().
+     */
+    window_paint(win, (espix_rect_t){ 0, 0, w, h });
     espix_window_focus(win);
     return win;
 }
@@ -420,10 +468,27 @@ static void focus_at(int x, int y)
     if (hit == s_focus) {
         return;
     }
+
+    espix_window_t *was = s_focus;
     s_focus = hit;
     if (hit != NULL) {
         window_raise_raw(hit);
     }
+
+    /*
+     * The title bar is the only thing that follows the focus, so the two title
+     * bars are what get redrawn -- into the surfaces, because the compositing
+     * order changed underneath them and the repaint below blits in the new one.
+     * Redrawing every window's *content* to change a title colour is what this
+     * avoids.
+     */
+    if (was != NULL) {
+        window_paint(was, (espix_rect_t){ 0, 0, was->w, TITLE_H });
+    }
+    if (hit != NULL) {
+        window_paint(hit, (espix_rect_t){ 0, 0, hit->w, TITLE_H });
+    }
+
     espix_desktop_repaint();
 }
 
@@ -442,17 +507,51 @@ static char s_grid[TERM_ROWS][TERM_COLS];
 static int  s_trow, s_tcol;
 static espix_window_t *s_term;
 
-static void term_draw(espix_window_t *w, espix_surface_t *s, void *ctx)
+/* The rectangle one character cell occupies, in surface coordinates. */
+static espix_rect_t term_cell(const espix_window_t *w, int row, int col)
+{
+    const espix_rect_t c = espix_window_content(w);
+    return (espix_rect_t){ c.x + col * CELL_W, c.y + row * CELL_H, CELL_W, CELL_H };
+}
+
+static espix_rect_t rect_union(espix_rect_t a, espix_rect_t b)
+{
+    const int x0 = a.x < b.x ? a.x : b.x;
+    const int y0 = a.y < b.y ? a.y : b.y;
+    const int x1 = a.x + a.w > b.x + b.w ? a.x + a.w : b.x + b.w;
+    const int y1 = a.y + a.h > b.y + b.h ? a.y + a.h : b.y + b.h;
+    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+}
+
+/*
+ * Only the cells the region reaches. A keystroke reaches one, a backspace two,
+ * and a whole-window repaint all of them -- so this is where drawing a window
+ * stops costing a window.
+ */
+static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
+                      void *ctx)
 {
     (void)ctx;
-    const espix_rect_t r = espix_window_content(w);
+    const espix_rect_t c = espix_window_content(w);
 
-    for (int row = 0; row < TERM_ROWS; row++) {
+    int row0 = (r.y - c.y) / CELL_H;
+    int row1 = (r.y + r.h - 1 - c.y) / CELL_H;
+    int col0 = (r.x - c.x) / CELL_W;
+    int col1 = (r.x + r.w - 1 - c.x) / CELL_W;
+
+    if (row0 < 0) { row0 = 0; }
+    if (col0 < 0) { col0 = 0; }
+    if (row1 > TERM_ROWS - 1) { row1 = TERM_ROWS - 1; }
+    if (col1 > TERM_COLS - 1) { col1 = TERM_COLS - 1; }
+
+    for (int row = row0; row <= row1; row++) {
         char line[TERM_COLS + 1];
-        memcpy(line, s_grid[row], TERM_COLS);
-        line[TERM_COLS] = '\0';
-        espix_surface_text(s, r.x, r.y + row * CELL_H, line, COL_TEXT_FG,
-                           COL_WIN_BG);
+        const int n = col1 - col0 + 1;
+
+        memcpy(line, &s_grid[row][col0], (size_t)n);
+        line[n] = '\0';
+        espix_surface_text(s, c.x + col0 * CELL_W, c.y + row * CELL_H, line,
+                           COL_TEXT_FG, COL_WIN_BG);
     }
 }
 
@@ -464,6 +563,7 @@ static void term_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
     }
 
     const char ch = espix_keysym_char(keysym);
+    const int  was_row = s_trow, was_col = s_tcol;
 
     if (ch == '\r') {
         s_tcol = 0;
@@ -494,9 +594,17 @@ static void term_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
         s_trow = 0;
         s_tcol = 0;
         memset(s_grid, ' ', sizeof(s_grid));
+        espix_window_repaint(w);
+        return;
     }
 
-    espix_window_repaint(w);
+    /*
+     * The cell it was in and the cell it moved to. A keystroke touches one and
+     * a backspace two; a wrap touches the end of one row and the start of the
+     * next. Two cells is the most a key can change, so this is the whole of it.
+     */
+    espix_window_damage(w, rect_union(term_cell(w, was_row, was_col),
+                                      term_cell(w, s_trow, s_tcol)));
 }
 
 /*
@@ -506,10 +614,11 @@ static void term_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
  */
 static espix_window_t *s_about;
 
-static void about_draw(espix_window_t *w, espix_surface_t *s, void *ctx)
+static void about_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
+                       void *ctx)
 {
     (void)ctx;
-    const espix_rect_t r = espix_window_content(w);
+    const espix_rect_t c = espix_window_content(w);
     static const char *const lines[] = {
         "espix desktop",
         "",
@@ -520,8 +629,11 @@ static void about_draw(espix_window_t *w, espix_surface_t *s, void *ctx)
     };
 
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
-        espix_surface_text(s, r.x, r.y + (int)i * CELL_H, lines[i], COL_TEXT_FG,
-                           COL_WIN_BG);
+        const int y = c.y + (int)i * CELL_H;
+        if (y + CELL_H <= r.y || y >= r.y + r.h) {
+            continue;                   /* not in the region */
+        }
+        espix_surface_text(s, c.x, y, lines[i], COL_TEXT_FG, COL_WIN_BG);
     }
 }
 
@@ -536,11 +648,15 @@ static void windows_create(void)
         espix_window_set_key(s_term, term_key);
         memset(s_grid, ' ', sizeof(s_grid));
         s_trow = s_tcol = 0;
+        /* The surface exists but was painted frame-only at creation, so the
+         * content is asked for once, here. */
+        espix_window_repaint(s_term);
     }
 
     s_about = espix_window_new(300, 190, 220, 96, "about");
     if (s_about != NULL) {
         espix_window_set_draw(s_about, about_draw);
+        espix_window_repaint(s_about);
     }
 
     /* The terminal is the one to type at, so it starts in front. */

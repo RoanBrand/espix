@@ -165,6 +165,16 @@ void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
 void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
                                const espix_surface_t *s);
 
+/*
+ * A rectangle of one, which is the compositor's operation most of the time.
+ *
+ * A window whose content changed by one cell should send one cell: redrawing
+ * the whole surface and blitting all of it is the difference between a cursor
+ * that keeps up and one that does not.
+ */
+void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
+                                    const espix_surface_t *s, espix_rect_t r);
+
 /* ------------------------------------------------------------------ */
 /* Input                                                               */
 /* ------------------------------------------------------------------ */

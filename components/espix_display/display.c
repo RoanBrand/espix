@@ -553,14 +553,35 @@ void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
     espix_canvas_damage(c, (espix_rect_t){ x0, y, x - x0, 8 });
 }
 
-void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
-                               const espix_surface_t *s)
+void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
+                                    const espix_surface_t *s, espix_rect_t r)
 {
     if (s == NULL || s->px == NULL) {
         return;
     }
-    op_blit(c->px, c->w, c->h, c->w, x, y, s->px, s->w, s->h, s->stride);
-    espix_canvas_damage(c, (espix_rect_t){ x, y, s->w, s->h });
+    r = rect_clip_wh(r, s->w, s->h);
+    if (r.w <= 0 || r.h <= 0) {
+        return;
+    }
+
+    /*
+     * The source pointer is offset into the surface and the block is the whole
+     * of what is copied, so the row pitch stays the surface's -- which is what
+     * op_blit and PPA both want.
+     */
+    op_blit(c->px, c->w, c->h, c->w, x + r.x, y + r.y,
+            s->px + (size_t)r.y * s->stride + r.x, r.w, r.h, s->stride);
+    espix_canvas_damage(c, (espix_rect_t){ x + r.x, y + r.y, r.w, r.h });
+}
+
+void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
+                               const espix_surface_t *s)
+{
+    if (s == NULL) {
+        return;
+    }
+    espix_canvas_blit_surface_rect(c, x, y, s,
+                                   (espix_rect_t){ 0, 0, s->w, s->h });
 }
 
 /* ------------------------------------------------------------------ */

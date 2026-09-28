@@ -212,19 +212,30 @@ underneath is no longer known. `window content` is what one window costs on top
 of that, and it is `window_paint()`: the frame, the title, the outline, and a
 grid of text.
 
-**The second row is the one that explains a slow drag, and it is not about the
+**The second row is the one that explained a slow drag, and it is not about the
 accelerator.** Only the fills have an accelerated path: the glyphs are drawn
 pixel by pixel by the CPU and nothing here touches them. So the accelerator
 removes 2.9 ms of 11.2 and cannot reach the other 8.3, which is 20 rows of 56
-8x8 glyphs -- 71,680 pixels written one branch at a time. A drag repaints every
-window on every motion, so that is the cost per window per motion, and it is why
-the alignment fix that made the fills accelerated barely moved the drag.
+8x8 glyphs -- 71,680 pixels written one branch at a time.
 
-The way out is not an accelerator. It is drawing fewer glyphs: the terminal
-redraws its whole grid on every keystroke and the desktop repaints every window
-on every motion, when both know exactly which cells changed -- the terminal knew
-before the window model landed, and drawing the whole grid was simpler. That is
-the work, and it is software.
+**That row is now mostly a bound rather than a routine cost, because the answer
+was to draw fewer glyphs.** A window whose owner says which region changed is
+redrawn in that region and no other, the terminal turns that into the two cells a
+keystroke can touch, and a *structural* repaint -- a move, a raise -- no longer
+repaints any surface at all: they already hold their content. So the two rows
+above describe the work that used to be inside a drag motion and is not any more.
+
+| | before | after |
+|---|---|---|
+| a drag motion | repaint + both window rows, ~21 ms | the repaint row, **7.1 ms** |
+| a keystroke | one window row, ~11.2 ms | two cells, ~0.1 ms |
+
+Those two "after" figures are arithmetic on measured rows rather than measurements
+of the drag itself, and the difference matters. **The drag cannot be timed from a
+VNC client**: 108 ms a motion either side of the change, because the number is the
+full-frame send over WiFi and not the repaint. A client-side timing here measures
+the network, so the only honest claims about a drag are the ones the benchmark
+rows support.
 
 **The crossover is the interesting part, and it is why the sizes run below it.**
 PPA costs a fixed ~57 µs per transaction -- descriptor setup, the DMA start, and
