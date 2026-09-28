@@ -122,8 +122,28 @@ static bool rect_touches(espix_rect_t a, espix_rect_t b)
  */
 #define BUF_ALIGN 128
 
+/*
+ * The bytes a w x h RGB565 buffer needs, rounded up to whole cache lines.
+ *
+ * The *size* has to be aligned as well as the address, and that is not obvious:
+ * PPA checks both (`out.buffer addr or out.buffer_size not aligned to cache line
+ * size`) and refuses the transaction otherwise, so a buffer that is exactly as
+ * large as its pixels is unaligned whenever w*h*2 is not a multiple of 128 --
+ * which is most sizes. A 456x186 window is 169632 bytes, so every window blit
+ * silently fell back to the software loop until this was rounded.
+ */
+static size_t buf_size(int w, int h)
+{
+    const size_t bytes = (size_t)w * (size_t)h * sizeof(espix_px_t);
+    return (bytes + BUF_ALIGN - 1) & ~(size_t)(BUF_ALIGN - 1);
+}
+
 static void *buf_alloc(size_t bytes)
 {
+    /* Rounded here too, so a caller that passes a raw size still gets a buffer
+     * large enough for the aligned size it will be described by. */
+    bytes = (bytes + BUF_ALIGN - 1) & ~(size_t)(BUF_ALIGN - 1);
+
     void *p = heap_caps_aligned_alloc(BUF_ALIGN, bytes,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (p == NULL) {
@@ -331,7 +351,7 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
     const ppa_fill_oper_config_t cfg = {
         .out = {
             .buffer         = px,
-            .buffer_size    = (uint32_t)w * (uint32_t)h * sizeof(espix_px_t),
+            .buffer_size    = (uint32_t)buf_size(w, h),
             .pic_w          = (uint32_t)w,
             .pic_h          = (uint32_t)h,
             .block_offset_x = (uint32_t)r.x,
@@ -386,7 +406,7 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
         },
         .out = {
             .buffer         = dst,
-            .buffer_size    = (uint32_t)dw * (uint32_t)dh * sizeof(espix_px_t),
+            .buffer_size    = (uint32_t)buf_size(dw, dh),
             .pic_w          = (uint32_t)dw,
             .pic_h          = (uint32_t)dh,
             .block_offset_x = (uint32_t)dx,
