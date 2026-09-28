@@ -754,8 +754,21 @@ static bool window_raise_raw(espix_window_t *w)
 
 void espix_window_raise(espix_window_t *w)
 {
+    if (w == NULL) {
+        return;
+    }
     if (window_raise_raw(w)) {
-        espix_desktop_repaint();
+        /*
+         * The window's own rectangle, not the canvas.
+         *
+         * Raising changes what is visible *inside* a window's rectangle and
+         * nothing outside it, so repairing the whole screen was paying for a
+         * screen to redraw one window. On the wire that is a full frame -- a
+         * couple of hundred kilobytes -- which is why clicking anywhere with a
+         * window open froze the view for half a second while it arrived, and
+         * why clicking with no window open did not.
+         */
+        desktop_repair((espix_rect_t){ w->x, w->y, w->w, w->h });
     }
 }
 
@@ -2120,7 +2133,13 @@ static void drag_begin(espix_window_t *w, int x, int y)
 
 static void drag_end(void)
 {
-    const espix_rect_t last = s_drag_shown;
+    if (s_drag == NULL) {
+        return;                     /* a click, not a drag: nothing moved */
+    }
+
+    const espix_rect_t last  = s_drag_shown;
+    const bool         moved = (s_drag->x != s_drag_shown.x ||
+                                s_drag->y != s_drag_shown.y);
 
     s_drag     = NULL;
     s_dragging = false;
@@ -2138,7 +2157,9 @@ static void drag_end(void)
      * of a drag, where 7 ms does not matter.
      */
     (void)last;
-    espix_desktop_repaint();
+    if (moved) {
+        espix_desktop_repaint();
+    }
 }
 
 static void drag_to(int x, int y)
