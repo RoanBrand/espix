@@ -76,6 +76,7 @@ together.
 | Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |
 | Display | A system tray, beyond the clock | **no** | one item is the look; radio status, volume and the rest wait for something to report them |
+| Display | A terminal you can work in | **yes** | the desktop's terminal window runs a real shell session — the same `espix_term` as the on-screen console, so the motd, the prompt, history, arrows, Ctrl-C and every command work there; a close button sits in the title bar |
 | Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
 | Services | Scheduled work: a `cron` | **planned** | the same missing supervisor, from the other end |
 

@@ -351,6 +351,15 @@ nothing else, and the menu has three items -- because it is the frame the rest o
 those apps will arrive in, and a frame is worth seeing before it is worth
 filling.
 
+What is not a look is the terminal window: it runs a real session, and it is the
+same `espix_term` the on-screen console runs rather than a second implementation
+of one. The terminal was lifted out of the console for it -- grid, CSI parser,
+UTF-8, editor, session -- and both are now a target and a task around a shared
+middle. The seam is three functions (a cell, a row, a blank screen), and the two
+things that want a terminal are drawn in completely different places: one into
+the canvas as the screen owner, the other into a window's surface as a client of
+the desktop.
+
 The longer list (radio status and volume in the tray, a file browser, image and
 movie viewer, audio player, text editor) is a GUI stack, and each of those is
 only worth starting once the layer under it is honest.
