@@ -32,12 +32,14 @@ extern const unsigned char espix_font8x8[128][8];
 #define RGB565(r, g, b) \
     ((espix_px_t)((((r) & 0xF8u) << 8) | (((g) & 0xFCu) << 3) | (((b) & 0xF8u) >> 3)))
 
-#define COL_DESKTOP  RGB565(0x2B, 0x30, 0x3A)
-#define COL_WIN_BG   RGB565(0x16, 0x1A, 0x20)
-#define COL_WIN_EDGE RGB565(0x4A, 0x54, 0x66)
-#define COL_TITLE    RGB565(0x3A, 0x42, 0x52)
-#define COL_TITLE_FG RGB565(0xE8, 0xEC, 0xF2)
-#define COL_TEXT_FG  RGB565(0xC8, 0xD8, 0xE8)
+/*
+ * What the canvas is cleared to when nothing owns it. Deliberately not a
+ * desktop colour: the service has no opinion about what a desktop looks like,
+ * and this is only what a viewer sees in the gap between one owner releasing
+ * and the next claiming -- which is normally the console, and is normally
+ * never seen at all.
+ */
+#define COL_BG RGB565(0x10, 0x12, 0x16)
 
 /* ------------------------------------------------------------------ */
 /* Canvas                                                              */
@@ -419,49 +421,13 @@ void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
 }
 
 /* ------------------------------------------------------------------ */
-/* The desktop                                                         */
+/* The service                                                         */
 /* ------------------------------------------------------------------ */
-
-/* A window, a cursor, and the grid the keys land in. */
-#define WIN_X       40
-#define WIN_Y       40
-#define WIN_W       480
-#define WIN_H       200
-#define WIN_TITLE_H 20
-#define WIN_PAD     6
-#define CELL_W      8
-#define CELL_H      8
-#define TEXT_COLS   ((WIN_W - 2 * WIN_PAD) / CELL_W)
-#define TEXT_ROWS   ((WIN_H - WIN_TITLE_H - 2 * WIN_PAD) / CELL_H)
-#define TEXT_X      (WIN_X + WIN_PAD)
-#define TEXT_Y      (WIN_Y + WIN_TITLE_H + WIN_PAD)
-
-/*
- * The cursor is the classic left arrow, 12x19, drawn inside a box one pixel
- * larger on every side so its outline has somewhere to live. The box is saved
- * before the sprite is drawn and put back before it moves -- the usual
- * save-under, which is also exactly the composite PPA BLEND will do.
- */
-#define CUR_W  12
-#define CUR_H  19
-#define CUR_BW (CUR_W + 2)
-#define CUR_BH (CUR_H + 2)
-
-static const uint16_t s_arrow[CUR_H] = {
-    0x800, 0xC00, 0xA00, 0x900, 0x880, 0x840, 0x820, 0x810, 0x808, 0x804,
-    0x83E, 0x920, 0xA90, 0xC90, 0x848, 0x048, 0x024, 0x024, 0x018,
-};
-
-static uint16_t   s_fill[CUR_BH];
-static uint16_t   s_edge[CUR_BH];
-static espix_px_t s_under[CUR_BW * CUR_BH];
-static bool       s_cursor_on;
-static int        s_cx, s_cy;
 
 static espix_canvas_t *s_canvas;
 static bool            s_up;
 
-/* The one owner of the screen, or NULL for the default content. */
+/* The one owner of the screen, or NULL when nothing does. */
 static const espix_screen_t *s_owner;
 
 /* Pointer position; see espix_display_pointer(). */
@@ -475,144 +441,10 @@ static bool                    s_default_up;
  * Whether a viewer is attached at all -- which is a different question from
  * whether the viewer started the default content, and conflating the two is
  * what lost the console: start a desktop from the serial console, attach a
- * viewer to it, and `desktop stop` fell back to the built-in placeholder
- * rather than a shell, because this viewer had never started a console.
+ * viewer to it, and `desktop stop` fell back to a plain canvas rather than a
+ * shell, because this viewer had never started a console.
  */
 static bool                    s_viewer;
-
-static char s_grid[TEXT_ROWS][TEXT_COLS];
-static int  s_trow, s_tcol;
-
-static void cursor_build(void)
-{
-    /* Fill, offset by one so the box has a border to dilate into. */
-    for (int by = 0; by < CUR_BH; by++) {
-        uint16_t f = 0;
-        for (int bx = 0; bx < CUR_BW; bx++) {
-            const int ax = bx - 1, ay = by - 1;
-            if (ax < 0 || ax >= CUR_W || ay < 0 || ay >= CUR_H) {
-                continue;
-            }
-            if (s_arrow[ay] & (1u << (CUR_W - 1 - ax))) {
-                f |= 1u << (CUR_BW - 1 - bx);
-            }
-        }
-        s_fill[by] = f;
-    }
-
-    /* Edge: anything not filled that touches a filled pixel. */
-    for (int by = 0; by < CUR_BH; by++) {
-        uint16_t e = 0;
-        for (int bx = 0; bx < CUR_BW; bx++) {
-            if (s_fill[by] & (1u << (CUR_BW - 1 - bx))) {
-                continue;
-            }
-            bool near = false;
-            for (int dy = -1; dy <= 1 && !near; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    const int nx = bx + dx, ny = by + dy;
-                    if (nx < 0 || nx >= CUR_BW || ny < 0 || ny >= CUR_BH) {
-                        continue;
-                    }
-                    if (s_fill[ny] & (1u << (CUR_BW - 1 - nx))) {
-                        near = true;
-                        break;
-                    }
-                }
-            }
-            if (near) {
-                e |= 1u << (CUR_BW - 1 - bx);
-            }
-        }
-        s_edge[by] = e;
-    }
-}
-
-/*
- * Put the cursor at a hotspot, restoring whatever was underneath the old one.
- * The hotspot is the arrow tip, which sits at box offset (1, 1).
- */
-static void cursor_put(int hx, int hy)
-{
-    espix_canvas_t *c = s_canvas;
-    if (c == NULL) {
-        return;
-    }
-
-    if (hx < 0) { hx = 0; }
-    if (hy < 0) { hy = 0; }
-    if (hx > c->w - 1) { hx = c->w - 1; }
-    if (hy > c->h - 1) { hy = c->h - 1; }
-
-    espix_canvas_lock(c);
-    espix_px_t *px = c->px;
-
-    if (s_cursor_on) {
-        for (int by = 0; by < CUR_BH; by++) {
-            for (int bx = 0; bx < CUR_BW; bx++) {
-                const int cx = s_cx - 1 + bx, cy = s_cy - 1 + by;
-                if (cx < 0 || cx >= c->w || cy < 0 || cy >= c->h) {
-                    continue;
-                }
-                px[(size_t)cy * c->w + cx] = s_under[by * CUR_BW + bx];
-            }
-        }
-        espix_canvas_damage(c, (espix_rect_t){ s_cx - 1, s_cy - 1, CUR_BW, CUR_BH });
-    }
-
-    s_cx = hx;
-    s_cy = hy;
-
-    for (int by = 0; by < CUR_BH; by++) {
-        for (int bx = 0; bx < CUR_BW; bx++) {
-            const int cx = hx - 1 + bx, cy = hy - 1 + by;
-            if (cx < 0 || cx >= c->w || cy < 0 || cy >= c->h) {
-                continue;
-            }
-            s_under[by * CUR_BW + bx] = px[(size_t)cy * c->w + cx];
-        }
-    }
-
-    for (int by = 0; by < CUR_BH; by++) {
-        for (int bx = 0; bx < CUR_BW; bx++) {
-            const int cx = hx - 1 + bx, cy = hy - 1 + by;
-            if (cx < 0 || cx >= c->w || cy < 0 || cy >= c->h) {
-                continue;
-            }
-            const uint16_t bit = 1u << (CUR_BW - 1 - bx);
-            espix_px_t v;
-            if (s_fill[by] & bit) {
-                v = 0xFFFF;                 /* white body */
-            } else if (s_edge[by] & bit) {
-                v = 0x0000;                 /* black outline */
-            } else {
-                continue;
-            }
-            px[(size_t)cy * c->w + cx] = v;
-        }
-    }
-
-    espix_canvas_damage(c, (espix_rect_t){ hx - 1, hy - 1, CUR_BW, CUR_BH });
-    s_cursor_on = true;
-    espix_canvas_unlock(c);
-}
-
-static void text_draw_cell(int row, int col, char ch)
-{
-    const int x = TEXT_X + col * CELL_W;
-    const int y = TEXT_Y + row * CELL_H;
-    const char cell[2] = { ch, '\0' };
-    espix_canvas_text(s_canvas, x, y, cell, COL_TEXT_FG, COL_WIN_BG);
-}
-
-static void text_window_draw(void)
-{
-    espix_canvas_fill(s_canvas, (espix_rect_t){ WIN_X, WIN_Y, WIN_W, WIN_H }, COL_WIN_BG);
-    espix_canvas_fill(s_canvas, (espix_rect_t){ WIN_X, WIN_Y, WIN_W, WIN_TITLE_H }, COL_TITLE);
-    espix_canvas_text(s_canvas, WIN_X + WIN_PAD, WIN_Y + (WIN_TITLE_H - 8) / 2,
-                      "espix - keyboard and mouse", COL_TITLE_FG, COL_TITLE);
-    espix_canvas_outline(s_canvas, (espix_rect_t){ WIN_X, WIN_Y, WIN_W, WIN_H }, COL_WIN_EDGE);
-}
 
 /* RFB delivers X11 keysyms; the ASCII range is its own keysym. Exported so
  * every input source and the console agree on what a key means. */
@@ -627,114 +459,6 @@ char espix_keysym_char(uint32_t ks)
     case 0xFF08: return '\b';     /* BackSpace */
     default:     return 0;
     }
-}
-
-static void text_key(uint32_t keysym)
-{
-    const char ch = espix_keysym_char(keysym);
-
-    if (ch == '\r') {
-        s_tcol = 0;
-        s_trow++;
-    } else if (ch == '\b') {
-        if (s_tcol > 0) {
-            s_tcol--;
-        } else if (s_trow > 0) {
-            s_trow--;
-            s_tcol = TEXT_COLS - 1;
-        } else {
-            return;
-        }
-        s_grid[s_trow][s_tcol] = ' ';
-        text_draw_cell(s_trow, s_tcol, ' ');
-    } else if (ch >= 0x20 && ch < 0x7F) {
-        s_grid[s_trow][s_tcol] = ch;
-        text_draw_cell(s_trow, s_tcol, ch);
-        if (++s_tcol >= TEXT_COLS) {
-            s_tcol = 0;
-            s_trow++;
-        }
-    } else {
-        return;                     /* modifiers, arrows: not a text window yet */
-    }
-
-    if (s_trow >= TEXT_ROWS) {
-        /* Clear rather than scroll: this window exists to prove the keyboard,
-         * not to be a terminal. */
-        s_trow = 0;
-        s_tcol = 0;
-        memset(s_grid, ' ', sizeof(s_grid));
-        espix_canvas_fill(s_canvas,
-                          (espix_rect_t){ TEXT_X, TEXT_Y,
-                                          TEXT_COLS * CELL_W, TEXT_ROWS * CELL_H },
-                          COL_WIN_BG);
-    }
-}
-
-/*
- * The default content: a background, a window that echoes keys, and the cursor.
- * A placeholder for a real desktop program, which is why it is kept small --
- * its job is to make the screen never blank and to give the input path
- * something to prove itself against.
- */
-static void desktop_paint(void)
-{
-    if (s_canvas == NULL) {
-        return;
-    }
-
-    espix_canvas_lock(s_canvas);
-    espix_canvas_fill(s_canvas,
-                      (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
-                      COL_DESKTOP);
-    text_window_draw();
-    espix_canvas_unlock(s_canvas);
-
-    /* Everything under the cursor was just painted over, so the save-under
-     * buffer no longer describes what is on the canvas. */
-    s_cursor_on = false;
-    cursor_put(s_ptr_x, s_ptr_y);
-}
-
-static void desktop_input(void *ctx, const espix_input_event_t *ev)
-{
-    (void)ctx;
-
-    if (ev->kind == ESPIX_INPUT_POINTER) {
-        cursor_put(ev->x, ev->y);
-    } else if (ev->kind == ESPIX_INPUT_MOTION) {
-        /*
-         * Applied to where cursor_put() last put it, which is where the cursor
-         * actually is. That makes an edge clamp rather than letting the delta
-         * accumulate somewhere off-screen -- so pushing into a corner and
-         * pulling back moves immediately, the way a mouse does.
-         */
-        cursor_put(s_cx + ev->x, s_cy + ev->y);
-    } else if (ev->kind == ESPIX_INPUT_KEY && ev->down) {
-        text_key(ev->keysym);
-    }
-}
-
-static void desktop_repaint(void *ctx)
-{
-    (void)ctx;
-    desktop_paint();
-}
-
-static const espix_screen_t s_desktop_screen = {
-    .name    = "desktop",
-    .input   = desktop_input,
-    .repaint = desktop_repaint,
-};
-
-esp_err_t espix_display_desktop_start(void)
-{
-    return espix_display_claim(&s_desktop_screen);
-}
-
-void espix_display_desktop_stop(void)
-{
-    espix_display_release(&s_desktop_screen);
 }
 
 void espix_display_input(const espix_input_event_t *ev)
@@ -775,11 +499,14 @@ void espix_display_input(const espix_input_event_t *ev)
      * task and a copy for nothing -- and it would make the round trip
      * asynchronous, which is exactly what the old desktop task needed a
      * priority above the RFB task to paper over.
+     *
+     * With no owner the event is dropped rather than given to anything. The
+     * desktop used to be this service's own fallback consumer and is a client
+     * now, so there is nobody here to hand it to -- and the position above has
+     * already moved, which is the part the service owns.
      */
     if (s_owner != NULL) {
         s_owner->input(s_owner->ctx, ev);
-    } else {
-        desktop_input(NULL, ev);
     }
 }
 
@@ -840,8 +567,19 @@ void espix_display_release(const espix_screen_t *screen)
         }
     }
 
+    /*
+     * Nothing to fall back to, so the floor is a plain background rather than
+     * content. The desktop is a client now, like the console, so the service
+     * has nothing of its own to draw.
+     */
     espix_klog(ESPIX_KLOG_INFO, TAG, "screen owner: none");
-    desktop_paint();
+    if (s_canvas != NULL) {
+        espix_canvas_lock(s_canvas);
+        espix_canvas_fill(s_canvas,
+                          (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
+                          COL_BG);
+        espix_canvas_unlock(s_canvas);
+    }
 }
 
 const char *espix_display_owner(void)
@@ -896,7 +634,7 @@ void espix_display_viewer_detached(void)
 espix_canvas_t *espix_display_canvas(void) { return s_canvas; }
 bool            espix_display_ready(void)  { return s_up; }
 
-static esp_err_t desktop_up(void)
+static esp_err_t display_up(void)
 {
     if (s_up) {
         return ESP_OK;
@@ -908,11 +646,6 @@ static esp_err_t desktop_up(void)
                    "cannot allocate a %dx%d canvas", ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
         return ESP_ERR_NO_MEM;
     }
-
-    cursor_build();
-    s_cursor_on = false;
-    s_trow = s_tcol = 0;
-    memset(s_grid, ' ', sizeof(s_grid));
 
     /*
      * No task and no queue of this service's own. Input is dispatched in the
@@ -935,12 +668,22 @@ static esp_err_t desktop_up(void)
                         (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H });
     espix_canvas_unlock(s_canvas);
 
-    desktop_paint();
-    espix_klog(ESPIX_KLOG_INFO, TAG, "desktop %dx%d up", ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
+    /*
+     * Cleared rather than painted: what goes on the screen is an owner's
+     * business and there is none yet. A viewer that attaches gets the console;
+     * one that attaches while something already owns the screen gets that.
+     */
+    espix_canvas_lock(s_canvas);
+    espix_canvas_fill(s_canvas,
+                      (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
+                      COL_BG);
+    espix_canvas_unlock(s_canvas);
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "display %dx%d up", ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
     return ESP_OK;
 }
 
-static void desktop_down(void)
+static void display_down(void)
 {
     if (!s_up) {
         return;
@@ -963,12 +706,11 @@ static void desktop_down(void)
         s_canvas = NULL;
     }
 
-    s_cursor_on = false;
     s_up = false;
 }
 
-esp_err_t espix_display_start(void) { return desktop_up(); }
-void      espix_display_stop(void)  { desktop_down(); }
+esp_err_t espix_display_start(void) { return display_up(); }
+void      espix_display_stop(void)  { display_down(); }
 
 /* Defined in rfb.c: the RFB listener is a backend of this service. */
 esp_err_t espix_display_rfb_listen(uint16_t port);
@@ -993,7 +735,7 @@ esp_err_t espix_display_vnc_start(uint16_t port)
      * brought it up.
      */
     const bool      was_up = s_up;
-    const esp_err_t err    = desktop_up();
+    const esp_err_t err    = display_up();
     if (err != ESP_OK) {
         return err;
     }
@@ -1001,7 +743,7 @@ esp_err_t espix_display_vnc_start(uint16_t port)
     const esp_err_t lerr = espix_display_rfb_listen(port);
     if (lerr != ESP_OK) {
         if (!was_up) {
-            desktop_down();
+            display_down();
         }
         return lerr;
     }

@@ -31,6 +31,7 @@ idf_component_register(
         espix_bt
         espix_audio
         espix_display
+        espix_desktop
         espix_usb
         espix_auth
         espix_time

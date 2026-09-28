@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "desktop.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_REQUIRES
+        espix_display
+        espix_kernel
+        freertos
+)

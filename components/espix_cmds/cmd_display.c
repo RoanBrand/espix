@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "espix_cmds_priv.h"
+#include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_net.h"
 #include "espix_shell.h"
@@ -233,7 +234,7 @@ static int cmd_desktop(espix_session_t *s, int argc, char **argv)
     }
 
     if (strcmp(sub, "start") == 0) {
-        const esp_err_t err = espix_display_desktop_start();
+        const esp_err_t err = espix_desktop_start();
         if (err != ESP_OK) {
             /*
              * claim() has exactly one failure mode, and it is not this one: it
@@ -252,7 +253,7 @@ static int cmd_desktop(espix_session_t *s, int argc, char **argv)
     }
 
     if (strcmp(sub, "stop") == 0) {
-        espix_display_desktop_stop();
+        espix_desktop_stop();
         espix_printf(s, "desktop: down\n");
         return 0;
     }

@@ -234,14 +234,10 @@ typedef struct {
 } espix_display_default_t;
 
 /*
- * The built-in placeholder content: background, window and cursor. Claimable so
- * the pointer has something to render on -- and so the input path can be proven
- * end to end -- before there is a real desktop program. It is what the default
- * content already draws; this puts it in front of a viewer.
+ * Whatever a viewer gets when nothing owns the screen -- the console, today.
+ * The service does not draw it: it asks, and if the answer is no it clears the
+ * canvas and says so.
  */
-esp_err_t espix_display_desktop_start(void);
-void      espix_display_desktop_stop(void);
-
 void espix_display_set_default(const espix_display_default_t *def);
 void espix_display_viewer_attached(void);
 void espix_display_viewer_detached(void);
