@@ -20,6 +20,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -27,6 +28,8 @@
 #include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_shell.h"
+#include "espix_term.h"
 
 #define TAG "desktop"
 
@@ -40,6 +43,7 @@
 #define COL_TITLE_FOC RGB565(0x4C, 0x6E, 0xA8)
 #define COL_TITLE_FG  RGB565(0xE8, 0xEC, 0xF2)
 #define COL_TEXT_FG   RGB565(0xC8, 0xD8, 0xE8)
+#define COL_CLOSE     RGB565(0x8C, 0x30, 0x36)
 
 #define TITLE_H 18
 #define PAD     4
@@ -321,6 +325,35 @@ static bool window_hit(const espix_window_t *w, int x, int y)
     return x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h;
 }
 
+/* The top window under the pointer, or NULL. The array is the z-order, so the
+ * search is from the top down. */
+static espix_window_t *window_at(int x, int y)
+{
+    for (int i = s_nwin - 1; i >= 0; i--) {
+        if (window_hit(s_wins[i], x, y)) {
+            return s_wins[i];
+        }
+    }
+    return NULL;
+}
+
+/* One button, and only one: close. In surface coordinates, at the right of the
+ * title bar, and the same rectangle draws it and hittests it. */
+static espix_rect_t window_close_box(const espix_window_t *w)
+{
+    const int side = TITLE_H - 6;
+
+    return (espix_rect_t){ w->w - side - 3, 3, side, side };
+}
+
+static bool window_close_hit(const espix_window_t *w, int x, int y)
+{
+    const espix_rect_t b = window_close_box(w);
+
+    return x >= w->x + b.x && x < w->x + b.x + b.w &&
+           y >= w->y + b.y && y < w->y + b.y + b.h;
+}
+
 espix_surface_t *espix_window_surface(espix_window_t *w) { return w->surf; }
 
 static espix_rect_t win_clip(espix_rect_t r, int w, int h)
@@ -351,6 +384,10 @@ static void window_frame(espix_window_t *w, espix_rect_t r)
         espix_surface_fill(s, (espix_rect_t){ 0, 0, w->w, TITLE_H }, bar);
         espix_surface_text(s, (w->w - tw) / 2, (TITLE_H - CELL_H) / 2, w->title,
                            COL_TITLE_FG, bar);
+
+        const espix_rect_t x = window_close_box(w);
+        espix_surface_fill(s, x, COL_CLOSE);
+        espix_surface_text(s, x.x + 2, x.y + 2, "x", COL_TITLE_FG, COL_CLOSE);
     }
 
     if (r.x == 0 || r.y == 0 || r.x + r.w >= w->w || r.y + r.h >= w->h) {
@@ -650,13 +687,8 @@ void espix_window_move(espix_window_t *w, int x, int y)
  */
 static void focus_at(int x, int y)
 {
-    espix_window_t *hit = NULL;
-    for (int i = s_nwin - 1; i >= 0; i--) {
-        if (window_hit(s_wins[i], x, y)) {
-            hit = s_wins[i];
-            break;
-        }
-    }
+    espix_window_t *hit = window_at(x, y);
+
     if (hit == s_focus) {
         return;
     }
@@ -836,15 +868,23 @@ static void photo_open(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * A terminal that echoes keys. It exists to prove the keyboard round trip
- * visibly, and it is the reason this is a desktop rather than a background.
+ * A terminal window: a real shell session, drawn by the same espix_term the
+ * on-screen console uses. It is the reason this is a desktop rather than a
+ * background -- and the difference between a window that echoes keys and one
+ * you can work in.
+ *
+ * The task is the terminal's, not the desktop's: a shell blocks in read_line
+ * for as long as nobody types, so running one on the input path would freeze the
+ * desktop. Input arrives from the display's callback and is pushed into the
+ * terminal's queue; output arrives on this task and paints the window.
  */
-#define TERM_COLS 56
-#define TERM_ROWS 20
+#define TERM_COLS 76
+#define TERM_ROWS 28
 
-static char s_grid[TERM_ROWS][TERM_COLS];
-static int  s_trow, s_tcol;
-static espix_window_t *s_term;
+static espix_window_t *s_term;          /* the window */
+static espix_term_t   *s_shell;         /* the terminal inside it */
+static TaskHandle_t    s_term_task;
+static uint32_t        s_term_gen;
 
 /* The rectangle one character cell occupies, in surface coordinates. */
 static espix_rect_t term_cell(const espix_window_t *w, int row, int col)
@@ -853,97 +893,264 @@ static espix_rect_t term_cell(const espix_window_t *w, int row, int col)
     return (espix_rect_t){ c.x + col * CELL_W, c.y + row * CELL_H, CELL_W, CELL_H };
 }
 
-static espix_rect_t rect_union(espix_rect_t a, espix_rect_t b)
+static espix_rect_t term_grid_rect(const espix_window_t *w)
 {
-    const int x0 = a.x < b.x ? a.x : b.x;
-    const int y0 = a.y < b.y ? a.y : b.y;
-    const int x1 = a.x + a.w > b.x + b.w ? a.x + a.w : b.x + b.w;
-    const int y1 = a.y + a.h > b.y + b.h ? a.y + a.h : b.y + b.h;
-    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+    const espix_rect_t c = espix_window_content(w);
+    return (espix_rect_t){ c.x, c.y, TERM_COLS * CELL_W, TERM_ROWS * CELL_H };
 }
 
 /*
- * Only the cells the region reaches. A keystroke reaches one, a backspace two,
- * and a whole-window repaint all of them -- so this is where drawing a window
- * stops costing a window.
+ * The terminal's view, into the window's surface.
+ *
+ * Three locks, in one order, each there for a different reason. The desktop's
+ * own lock is what makes the window pointer mean anything: the window can be
+ * closed from the input task while this task is halfway through a row, and the
+ * close takes the same lock before it clears the pointer. The surface lock is
+ * what stops this interleaving with the compositor reading the surface -- and it
+ * is released before the damage, because damaging a window repaints it, which
+ * takes the surface lock again, and that one is not recursive.
+ */
+static void term_view_row(void *ctx, int row, const char *cells, int len)
+{
+    (void)ctx;
+
+    desk_lock();
+    if (s_term != NULL && s_shell != NULL) {
+        char line[ESPIX_TERM_MAX_COLS + 1];
+
+        if (len > ESPIX_TERM_MAX_COLS) {
+            len = ESPIX_TERM_MAX_COLS;
+        }
+        memcpy(line, cells, (size_t)len);
+        line[len] = '\0';
+
+        espix_window_t    *w = s_term;
+        espix_surface_t   *s = espix_window_surface(w);
+        const espix_rect_t c = espix_window_content(w);
+
+        espix_surface_lock(s);
+        espix_surface_text(s, c.x, c.y + row * CELL_H, line, COL_TEXT_FG,
+                           COL_WIN_BG);
+        espix_surface_unlock(s);
+
+        espix_window_damage(w, (espix_rect_t){ c.x, c.y + row * CELL_H,
+                                               TERM_COLS * CELL_W, CELL_H });
+    }
+    desk_unlock();
+}
+
+static void term_view_cell(void *ctx, int row, int col, char ch)
+{
+    (void)ctx;
+
+    desk_lock();
+    if (s_term != NULL && s_shell != NULL) {
+        const char cell[2] = { ch, '\0' };
+
+        espix_window_t    *w = s_term;
+        espix_surface_t   *s = espix_window_surface(w);
+        const espix_rect_t c = espix_window_content(w);
+
+        espix_surface_lock(s);
+        espix_surface_text(s, c.x + col * CELL_W, c.y + row * CELL_H, cell,
+                           COL_TEXT_FG, COL_WIN_BG);
+        espix_surface_unlock(s);
+
+        espix_window_damage(w, term_cell(w, row, col));
+    }
+    desk_unlock();
+}
+
+static void term_view_clear(void *ctx)
+{
+    (void)ctx;
+
+    desk_lock();
+    if (s_term != NULL && s_shell != NULL) {
+        espix_window_t  *w = s_term;
+        espix_surface_t *s = espix_window_surface(w);
+        const espix_rect_t g = term_grid_rect(w);
+
+        espix_surface_lock(s);
+        espix_surface_fill(s, g, COL_WIN_BG);
+        espix_surface_unlock(s);
+
+        espix_window_damage(w, g);
+    }
+    desk_unlock();
+}
+
+static const espix_term_view_t s_term_view = {
+    .ctx   = NULL,
+    .cell  = term_view_cell,
+    .row   = term_view_row,
+    .clear = term_view_clear,
+};
+
+/*
+ * Redrawing from the model, for a window being composited. The surface lock is
+ * already held by the caller and is not recursive, so this reads the grid
+ * through espix_term's own accessors rather than through the view.
  */
 static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
                       void *ctx)
 {
     (void)ctx;
+    if (s_shell == NULL) {
+        return;
+    }
     const espix_rect_t c = espix_window_content(w);
 
-    int row0 = (r.y - c.y) / CELL_H;
-    int row1 = (r.y + r.h - 1 - c.y) / CELL_H;
-    int col0 = (r.x - c.x) / CELL_W;
-    int col1 = (r.x + r.w - 1 - c.x) / CELL_W;
-
-    if (row0 < 0) { row0 = 0; }
-    if (col0 < 0) { col0 = 0; }
-    if (row1 > TERM_ROWS - 1) { row1 = TERM_ROWS - 1; }
-    if (col1 > TERM_COLS - 1) { col1 = TERM_COLS - 1; }
-
-    for (int row = row0; row <= row1; row++) {
+    for (int row = 0; row < TERM_ROWS; row++) {
+        const int y = c.y + row * CELL_H;
+        if (y + CELL_H <= r.y || y >= r.y + r.h) {
+            continue;
+        }
+        const char *cells = espix_term_row_text(s_shell, row);
+        if (cells == NULL) {
+            continue;
+        }
         char line[TERM_COLS + 1];
-        const int n = col1 - col0 + 1;
-
-        memcpy(line, &s_grid[row][col0], (size_t)n);
-        line[n] = '\0';
-        espix_surface_text(s, c.x + col0 * CELL_W, c.y + row * CELL_H, line,
-                           COL_TEXT_FG, COL_WIN_BG);
+        memcpy(line, cells, TERM_COLS);
+        line[TERM_COLS] = '\0';
+        espix_surface_text(s, c.x, y, line, COL_TEXT_FG, COL_WIN_BG);
     }
 }
 
 static void term_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
 {
+    (void)w;
     (void)ctx;
-    if (!down) {
+
+    if (s_shell != NULL) {
+        espix_term_key(s_shell, keysym, down);
+    }
+}
+
+static void term_task(void *arg)
+{
+    const uint32_t gen = (uint32_t)(uintptr_t)arg;
+    espix_term_t  *t   = s_shell;
+
+    if (t != NULL) {
+        espix_session_t *s = espix_term_session(t);
+
+        s->name = "term0";
+        /* The esp account, like the VNC console: a window on a screen someone
+         * reached over the network is not the serial cable. */
+        s->uid  = 1000;
+        s->gid  = 1000;
+        strlcpy(s->user, "esp", sizeof(s->user));
+        strlcpy(s->home, "/home/esp", sizeof(s->home));
+
+        espix_term_run(t);
+    }
+
+    /* This task is the only thing that knows it has stopped touching the grid,
+     * so it owns the freeing -- the same bargain the console makes. */
+    espix_term_free(t);
+
+    desk_lock();
+    if (gen == s_term_gen) {
+        s_term_task = NULL;
+    }
+    desk_unlock();
+
+    vTaskDeleteWithCaps(NULL);
+}
+
+static void term_start(void)
+{
+    s_term = espix_window_new(40, 40,
+                              TERM_COLS * CELL_W + 2 * PAD,
+                              TERM_ROWS * CELL_H + TITLE_H + 2 * PAD,
+                              "terminal");
+    if (s_term == NULL) {
         return;
     }
 
-    const char ch = espix_keysym_char(keysym);
-    const int  was_row = s_trow, was_col = s_tcol;
-
-    if (ch == '\r') {
-        s_tcol = 0;
-        s_trow++;
-    } else if (ch == '\b') {
-        if (s_tcol > 0) {
-            s_tcol--;
-        } else if (s_trow > 0) {
-            s_trow--;
-            s_tcol = TERM_COLS - 1;
-        } else {
-            return;
-        }
-        s_grid[s_trow][s_tcol] = ' ';
-    } else if (ch >= 0x20 && ch < 0x7F) {
-        s_grid[s_trow][s_tcol] = ch;
-        if (++s_tcol >= TERM_COLS) {
-            s_tcol = 0;
-            s_trow++;
-        }
-    } else {
-        return;                     /* modifiers, arrows: not a text window yet */
-    }
-
-    if (s_trow >= TERM_ROWS) {
-        /* Clear rather than scroll: this window exists to prove the keyboard,
-         * not to be a terminal. */
-        s_trow = 0;
-        s_tcol = 0;
-        memset(s_grid, ' ', sizeof(s_grid));
-        espix_window_repaint(w);
+    s_shell = espix_term_new(&s_term_view, TERM_COLS, TERM_ROWS, "esp");
+    if (s_shell == NULL) {
+        espix_window_free(s_term);
+        s_term = NULL;
         return;
     }
+
+    espix_window_set_draw(s_term, term_draw);
+    espix_window_set_key(s_term, term_key);
+
+    void *const gen = (void *)(uintptr_t)++s_term_gen;
+
+    if (xTaskCreateWithCaps(term_task, "espix:term", 8192, gen, 4, &s_term_task,
+                            MALLOC_CAP_SPIRAM) != pdPASS) {
+        (void)xTaskCreateWithCaps(term_task, "espix:term", 8192, gen, 4,
+                                  &s_term_task,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s_term_task == NULL) {
+        espix_term_free(s_shell);
+        s_shell = NULL;
+    }
+}
+
+/*
+ * Stop the shell and take the window with it.
+ *
+ * The window pointer is cleared under the desktop's lock before the window is
+ * freed, and the view checks it under that same lock -- so a task halfway
+ * through painting a row either finishes first or sees NULL and draws nothing.
+ * Without that ordering this is a window freed out from under the task that is
+ * drawing into its surface.
+ *
+ * The terminal itself is the task's to free, and it may take a moment: it is
+ * blocked in read_line, which notices the stop within its 100 ms poll.
+ */
+static void term_stop(void)
+{
+    espix_term_t *t;
+
+    desk_lock();
+    t = s_shell;
+    s_shell = NULL;
+    if (s_term != NULL) {
+        espix_window_t *w = s_term;
+        s_term = NULL;
+        espix_window_free(w);
+    }
+    desk_unlock();
+
+    if (t == NULL) {
+        return;
+    }
+
+    espix_term_stop(t);
 
     /*
-     * The cell it was in and the cell it moved to. A keystroke touches one and
-     * a backspace two; a wrap touches the end of one row and the start of the
-     * next. Two cells is the most a key can change, so this is the whole of it.
+     * And then let it go: nothing here waits for the task, because there is
+     * nothing left that needs it to have finished. The window is already gone,
+     * the view checks both pointers under the lock, so the task cannot touch a
+     * freed surface -- it only has its own grid to free, which it does on its
+     * way out.
+     *
+     * It is worth saying why, because the obvious thing is to wait and the
+     * obvious thing is wrong twice over. This runs from the input handler, which
+     * is inside the desktop's lock -- and that lock is recursive, so unlocking
+     * here does not release it. A wait would be a two-second hold on the lock
+     * that the task needs to finish, every time a terminal window is closed.
      */
-    espix_window_damage(w, rect_union(term_cell(w, was_row, was_col),
-                                      term_cell(w, s_trow, s_tcol)));
+}
+
+/* Open the terminal, or bring back the one that is already there. Closing a
+ * window should not be the end of the application in it. */
+static void term_open(void)
+{
+    if (s_term == NULL) {
+        term_start();
+    }
+    if (s_term != NULL) {
+        espix_window_focus(s_term);
+        espix_window_raise(s_term);
+    }
 }
 
 /*
@@ -1269,18 +1476,28 @@ static void bar_damage(void)
     desktop_repair((espix_rect_t){ 0, y, espix_canvas_width(c), h - y });
 }
 
+static void term_open(void);
+
 static void menu_activate(int i)
 {
     s_menu = false;
 
     if (strcmp(s_menu_items[i], "photo") == 0) {
         photo_open();
-    } else if (strcmp(s_menu_items[i], "about") == 0 && s_about != NULL) {
-        espix_window_focus(s_about);
-        espix_window_raise(s_about);
-    } else if (strcmp(s_menu_items[i], "terminal") == 0 && s_term != NULL) {
-        espix_window_focus(s_term);
-        espix_window_raise(s_term);
+    } else if (strcmp(s_menu_items[i], "about") == 0) {
+        if (s_about == NULL) {
+            s_about = espix_window_new(300, 190, 220, 96, "about");
+            if (s_about != NULL) {
+                espix_window_set_draw(s_about, about_draw);
+                espix_window_repaint(s_about);
+            }
+        }
+        if (s_about != NULL) {
+            espix_window_focus(s_about);
+            espix_window_raise(s_about);
+        }
+    } else if (strcmp(s_menu_items[i], "terminal") == 0) {
+        term_open();
     }
     bar_damage();
 }
@@ -1328,21 +1545,35 @@ static void clock_tick(void *arg)
     }
 }
 
+/*
+ * Close a window. Everything that holds a pointer to one has to forget it here,
+ * or the next thing that looks it up -- a task button, the menu, a repaint --
+ * is looking at freed memory. The terminal is the awkward case: its window is
+ * freed by term_stop(), which is the only thing that knows the shell task has
+ * stopped drawing into the surface.
+ */
+static void window_close(espix_window_t *w)
+{
+    if (w == NULL) {
+        return;
+    }
+    if (w == s_term) {
+        term_stop();                    /* takes the window with it */
+        return;
+    }
+    if (w == s_img_win) {
+        s_img_win = NULL;
+    }
+    if (w == s_about) {
+        s_about = NULL;
+    }
+    espix_window_free(w);
+}
+
 static void windows_create(void)
 {
-    s_term = espix_window_new(40, 40,
-                              TERM_COLS * CELL_W + 2 * PAD,
-                              TERM_ROWS * CELL_H + TITLE_H + 2 * PAD,
-                              "terminal");
-    if (s_term != NULL) {
-        espix_window_set_draw(s_term, term_draw);
-        espix_window_set_key(s_term, term_key);
-        memset(s_grid, ' ', sizeof(s_grid));
-        s_trow = s_tcol = 0;
-        /* The surface exists but was painted frame-only at creation, so the
-         * content is asked for once, here. */
-        espix_window_repaint(s_term);
-    }
+    /* The window, the terminal inside it and the shell that runs in that. */
+    term_start();
 
     s_about = espix_window_new(300, 190, 220, 96, "about");
     if (s_about != NULL) {
@@ -1369,6 +1600,10 @@ static void windows_create(void)
 
 static void windows_destroy(void)
 {
+    /* Before the windows, not with them: the shell task is drawing into the
+     * terminal window's surface, and term_stop() is what makes it stop. */
+    term_stop();
+
     while (s_nwin > 0) {
         espix_window_t *w = s_wins[s_nwin - 1];
         espix_surface_free(w->surf);
@@ -1507,6 +1742,17 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
             }
             if (button_hit(ev->x, ev->y)) {
                 photo_open();
+                return;
+            }
+            /*
+             * Close before focus, and on the window under the pointer rather
+             * than on the focused one: the button belongs to the window it is
+             * drawn on, so pressing it must close that one even when it was not
+             * the focused window.
+             */
+            espix_window_t *closing = window_at(ev->x, ev->y);
+            if (closing != NULL && window_close_hit(closing, ev->x, ev->y)) {
+                window_close(closing);
                 return;
             }
             focus_at(ev->x, ev->y);     /* focus first, so the title is right */

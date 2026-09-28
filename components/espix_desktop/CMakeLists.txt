@@ -7,5 +7,6 @@ idf_component_register(
         espix_display
     PRIV_REQUIRES
         espix_kernel
+        espix_shell
         freertos
 )
