@@ -105,6 +105,7 @@ typedef struct {
     const char *op;         /* "fill" or "blit" */
     int         w, h;
     uint32_t    iters;
+    uint64_t    px_per_iter;/* pixels touched per iteration, for the rate */
     uint32_t    us_sw;      /* the whole run, microseconds */
     uint32_t    us_hw;      /* ...and accelerated; 0 when there is none */
     const char *hw;         /* "PPA FILL", "2D-DMA", ... or NULL */

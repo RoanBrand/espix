@@ -368,7 +368,15 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
     const ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
-            .pic_w          = (uint32_t)sw,
+            /*
+             * The *picture* width, which is the source's row pitch and not the
+             * block's width: the hardware steps pic_w pixels per row. They are
+             * the same number for a whole-surface copy, which is why this was
+             * wrong without being noticeable until a block was copied out of a
+             * wider picture -- a window out of the canvas, which is the case
+             * compositing is made of.
+             */
+            .pic_w          = (uint32_t)sstride,
             .pic_h          = (uint32_t)sh,
             .block_w        = (uint32_t)sw,
             .block_h        = (uint32_t)sh,
@@ -623,6 +631,33 @@ void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
  * not about whatever happens to be on the screen -- and so a full-size case does
  * not have to be the canvas's size.
  */
+enum { BENCH_FILL, BENCH_BLIT, BENCH_REPAINT };
+
+/*
+ * A full repaint is what the desktop does when a window moves: the background,
+ * then every window in z-order. The two blocks are the two windows it actually
+ * has -- the terminal and the about box -- so the row is the workload rather
+ * than a shape that happens to be convenient.
+ */
+#define BENCH_WIN1_X 40
+#define BENCH_WIN1_Y 40
+#define BENCH_WIN1_W 456
+#define BENCH_WIN1_H 186
+#define BENCH_WIN2_X 300
+#define BENCH_WIN2_Y 190
+#define BENCH_WIN2_W 220
+#define BENCH_WIN2_H 96
+
+/* Pixels an operation touches, which is what makes a rate comparable. */
+static uint64_t bench_pixels(int op, int w, int h)
+{
+    if (op == BENCH_REPAINT) {
+        return (uint64_t)w * h + (uint64_t)BENCH_WIN1_W * BENCH_WIN1_H +
+               (uint64_t)BENCH_WIN2_W * BENCH_WIN2_H;
+    }
+    return (uint64_t)w * h;
+}
+
 /*
  * The accelerated path, checked against the pixels it was supposed to write.
  *
@@ -679,38 +714,143 @@ static bool bench_verify(int w, int h)
         }
     }
 
+    /*
+     * And the composite a repaint is: a background, then two blocks at offsets.
+     * An offset is a different thing from a copy and is where a block offset
+     * that is off by one would show, which is why it is checked separately.
+     */
+    if (ok && w > BENCH_WIN2_X + BENCH_WIN2_W && h > BENCH_WIN2_Y + BENCH_WIN2_H) {
+        s_sw_only = true;
+        espix_surface_fill(src, (espix_rect_t){ 0, 0, w, h }, 0x1234);
+        s_sw_only = false;
+
+        espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, 0x2222);
+        espix_surface_blit(dst, BENCH_WIN1_X, BENCH_WIN1_Y, s,
+                           BENCH_WIN1_W, BENCH_WIN1_H, w);
+        espix_surface_blit(dst, BENCH_WIN2_X, BENCH_WIN2_Y, s,
+                           BENCH_WIN2_W, BENCH_WIN2_H, w);
+
+        if (d[0] != 0x2222 ||
+            d[(size_t)BENCH_WIN1_Y * w + BENCH_WIN1_X] != 0x1234 ||
+            d[(size_t)BENCH_WIN2_Y * w + BENCH_WIN2_X] != 0x1234) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "bench: PPA composite is %04x/%04x/%04x, wanted "
+                       "2222/1234/1234",
+                       (unsigned)d[0],
+                       (unsigned)d[(size_t)BENCH_WIN1_Y * w + BENCH_WIN1_X],
+                       (unsigned)d[(size_t)BENCH_WIN2_Y * w + BENCH_WIN2_X]);
+            ok = false;
+        }
+    }
+
+    /*
+     * And the shape the compositor actually blits: a *contiguous* window-sized
+     * surface into the canvas at an offset, which is the opposite striding from
+     * the check above. Both are real -- one is a canvas blit, the other is a
+     * surface into a canvas -- and they fail differently, so both are checked.
+     */
+    espix_surface_t *win = espix_surface_new(BENCH_WIN1_W, BENCH_WIN1_H);
+    if (ok && win != NULL &&
+        w >= BENCH_WIN1_X + BENCH_WIN1_W && h >= BENCH_WIN1_Y + BENCH_WIN1_H) {
+        espix_px_t *wp = espix_surface_pixels(win);
+
+        s_sw_only = true;
+        espix_surface_fill(win, (espix_rect_t){ 0, 0, BENCH_WIN1_W, BENCH_WIN1_H },
+                           0x4321);
+        s_sw_only = false;
+
+        espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, 0x2222);
+        espix_surface_blit(dst, BENCH_WIN1_X, BENCH_WIN1_Y, wp,
+                           BENCH_WIN1_W, BENCH_WIN1_H, BENCH_WIN1_W);
+
+        if (d[0] != 0x2222 ||
+            d[(size_t)BENCH_WIN1_Y * w + BENCH_WIN1_X] != 0x4321 ||
+            d[(size_t)(BENCH_WIN1_Y + BENCH_WIN1_H - 1) * w +
+              (BENCH_WIN1_X + BENCH_WIN1_W - 1)] != 0x4321) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "bench: contiguous composite is %04x/%04x, wanted 2222/4321",
+                       (unsigned)d[0],
+                       (unsigned)d[(size_t)BENCH_WIN1_Y * w + BENCH_WIN1_X]);
+            ok = false;
+        }
+    }
+    espix_surface_free(win);
+
     espix_surface_free(dst);
     espix_surface_free(src);
     return ok;
 }
-static uint32_t bench_run(bool fill, int w, int h, uint32_t iters)
+
+static uint32_t bench_run(int op, int w, int h, uint32_t iters)
 {
     espix_surface_t *dst = espix_surface_new(w, h);
-    espix_surface_t *src = fill ? NULL : espix_surface_new(w, h);
+    espix_surface_t *src = (op == BENCH_BLIT) ? espix_surface_new(w, h) : NULL;
 
-    if (dst == NULL || (!fill && src == NULL)) {
+    /*
+     * Two window-sized surfaces for the repaint, because that is the shape a
+     * compositor actually blits: a *contiguous* surface into the canvas at an
+     * offset. A block copied out of a wider buffer is a different operation with
+     * a different cost -- the source is strided -- and the first version of this
+     * row measured that instead, which understated the desktop by half.
+     */
+    espix_surface_t *win1 = (op == BENCH_REPAINT)
+                            ? espix_surface_new(BENCH_WIN1_W, BENCH_WIN1_H) : NULL;
+    espix_surface_t *win2 = (op == BENCH_REPAINT)
+                            ? espix_surface_new(BENCH_WIN2_W, BENCH_WIN2_H) : NULL;
+
+    if (dst == NULL || (op == BENCH_BLIT && src == NULL) ||
+        (op == BENCH_REPAINT && (win1 == NULL || win2 == NULL))) {
         espix_surface_free(dst);
         espix_surface_free(src);
+        espix_surface_free(win1);
+        espix_surface_free(win2);
         return 0;
     }
 
+    espix_px_t *s  = NULL;
+    espix_px_t *w1 = NULL;
+    espix_px_t *w2 = NULL;
+
     if (src != NULL) {
+        s = espix_surface_pixels(src);
         /* Non-zero, so a path that writes nothing cannot pass by silence. */
         espix_surface_fill(src, (espix_rect_t){ 0, 0, w, h }, 0x1234);
+    }
+    if (win1 != NULL) {
+        w1 = espix_surface_pixels(win1);
+        espix_surface_fill(win1, (espix_rect_t){ 0, 0, BENCH_WIN1_W, BENCH_WIN1_H },
+                           0x1111);
+    }
+    if (win2 != NULL) {
+        w2 = espix_surface_pixels(win2);
+        espix_surface_fill(win2, (espix_rect_t){ 0, 0, BENCH_WIN2_W, BENCH_WIN2_H },
+                           0x2222);
     }
 
     const int64_t t0 = esp_timer_get_time();
     for (uint32_t i = 0; i < iters; i++) {
-        if (fill) {
+        switch (op) {
+        case BENCH_FILL:
             espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, (espix_px_t)i);
-        } else {
-            espix_surface_blit(dst, 0, 0, espix_surface_pixels(src), w, h, w);
+            break;
+        case BENCH_BLIT:
+            espix_surface_blit(dst, 0, 0, s, w, h, w);
+            break;
+        default:
+            espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, 0x3333);
+            espix_surface_blit(dst, BENCH_WIN1_X, BENCH_WIN1_Y, w1,
+                               BENCH_WIN1_W, BENCH_WIN1_H, BENCH_WIN1_W);
+            espix_surface_blit(dst, BENCH_WIN2_X, BENCH_WIN2_Y, w2,
+                               BENCH_WIN2_W, BENCH_WIN2_H, BENCH_WIN2_W);
+            break;
         }
     }
     const int64_t t1 = esp_timer_get_time();
 
     espix_surface_free(dst);
     espix_surface_free(src);
+    espix_surface_free(win1);
+    espix_surface_free(win2);
     return (uint32_t)(t1 - t0);
 }
 
@@ -722,58 +862,72 @@ size_t espix_display_bench(espix_display_bench_t *out, size_t max)
      * cannot say. 32x32 is 1024 pixels, which is a glyph-sized fill; 800x600 is
      * a frame.
      */
-    static const struct { int w, h; } sizes[] = {
-        { 32, 32 }, { 64, 64 }, { 128, 128 }, { 256, 256 }, { 800, 600 },
+    /*
+     * Two sizes below the accelerator's break-even, three above it, and the
+     * desktop's own repaint at the canvas size. The interesting number is where
+     * the two curves cross, and a curve drawn only above it cannot say.
+     */
+    static const struct { const char *op; int kind; int w, h; } cases[] = {
+        { "fill",    BENCH_FILL,     32,   32 },
+        { "blit",    BENCH_BLIT,     32,   32 },
+        { "fill",    BENCH_FILL,     64,   64 },
+        { "blit",    BENCH_BLIT,     64,   64 },
+        { "fill",    BENCH_FILL,    128,  128 },
+        { "blit",    BENCH_BLIT,    128,  128 },
+        { "fill",    BENCH_FILL,    256,  256 },
+        { "blit",    BENCH_BLIT,    256,  256 },
+        { "fill",    BENCH_FILL,    800,  600 },
+        { "blit",    BENCH_BLIT,    800,  600 },
+        { "repaint", BENCH_REPAINT, 800,  600 },
     };
-    static const char *const ops[] = { "fill", "blit" };
     size_t n = 0;
 
     if (out == NULL) {
         return 0;
     }
 
-    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
-        const int w = sizes[s].w, h = sizes[s].h;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const int w = cases[c].w, h = cases[c].h;
+        const uint64_t px = bench_pixels(cases[c].kind, w, h);
 
         /*
          * A million pixels of work per row: measurable at every size, and about
          * one and a half frames at 800x600 rather than a second of the command.
          */
-        uint32_t iters = 1000000u / (uint32_t)(w * h);
+        uint32_t iters = 1000000u / (uint32_t)px;
         if (iters < 1)   { iters = 1; }
         if (iters > 500) { iters = 500; }
 
-        for (size_t o = 0; o < sizeof(ops) / sizeof(ops[0]); o++) {
-            if (n >= max) {
-                return n;
-            }
-            espix_display_bench_t *row = &out[n++];
+        if (n >= max) {
+            return n;
+        }
+        espix_display_bench_t *row = &out[n++];
 
-            row->op    = ops[o];
-            row->w     = w;
-            row->h     = h;
-            row->iters = iters;
-            row->hw    = NULL;
-            row->us_hw = 0;
+        row->op          = cases[c].op;
+        row->w           = w;
+        row->h           = h;
+        row->iters       = iters;
+        row->px_per_iter = px;
+        row->hw          = NULL;
+        row->us_hw       = 0;
 
-            s_sw_only  = true;
-            row->us_sw = bench_run(o == 0, w, h, iters);
-            s_sw_only  = false;
+        s_sw_only  = true;
+        row->us_sw = bench_run(cases[c].kind, w, h, iters);
+        s_sw_only  = false;
 
 #if SOC_PPA_SUPPORTED
-            /*
-             * Forced, because the point of the benchmark is to measure a path
-             * that the production policy would decline to use at this size.
-             * Without it the small rows would report the software number twice
-             * and the crossover would stay invisible.
-             */
-            s_force_hw = true;
-            row->hw_ok = bench_verify(w, h);
-            row->us_hw = bench_run(o == 0, w, h, iters);
-            row->hw    = (o == 0) ? "PPA FILL" : "PPA SRM";
-            s_force_hw = false;
+        /*
+         * Forced, because the point of the benchmark is to measure a path the
+         * production policy would decline to use at this size. Without it the
+         * small rows would report the software number twice and the crossover
+         * would stay invisible.
+         */
+        s_force_hw = true;
+        row->hw_ok = bench_verify(w, h);
+        row->us_hw = bench_run(cases[c].kind, w, h, iters);
+        row->hw    = (cases[c].kind == BENCH_FILL) ? "PPA FILL" : "PPA SRM";
+        s_force_hw = false;
 #endif
-        }
     }
 
     return n;

@@ -240,7 +240,7 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
                 continue;
             }
 
-            const uint64_t px = (uint64_t)r->w * r->h * r->iters;
+            const uint64_t px = r->px_per_iter * r->iters;
 
             if (r->us_hw != 0) {
                 const uint64_t hw10 = px * 10 / r->us_hw;

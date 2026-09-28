@@ -190,12 +190,17 @@ two.
 
 | | 32x32 | 64x64 | 128x128 | 256x256 | 800x600 |
 |---|---|---|---|---|---|
-| **S31 fill, software** | 26.3 | 27.7 | 28.3 | 21.4 | 21.7 |
-| **S31 fill, PPA FILL** | 14.5 | 42.3 | 76.4 | 96.9 | **104.9** |
-| **S31 blit, software** | 13.5 | 13.6 | 13.6 | 10.6 | 10.6 |
-| **S31 blit, PPA SRM** | 7.2 | 18.7 | 36.3 | 47.3 | **49.2** |
-| **S3 fill, software** | — | — | — | — | — |
-| **S3 blit, software** | — | — | — | — | — |
+| **S31 fill, software** | 26.4 | 27.6 | 27.8 | 21.9 | 22.0 |
+| **S31 fill, PPA FILL** | 15.1 | 43.1 | 76.9 | 97.0 | **105.1** |
+| **S31 blit, software** | 13.2 | 13.5 | 13.6 | 10.7 | 10.6 |
+| **S31 blit, PPA SRM** | 7.2 | 18.9 | 36.2 | 47.2 | **49.1** |
+| **S31 repaint, software** | — | — | — | — | 18.5 |
+| **S31 repaint, PPA SRM** | — | — | — | — | **79.2** |
+| **S3, every row above** | — | — | — | — | — |
+
+`repaint` is the desktop's own workload rather than a primitive: the background,
+then both windows at their offsets, which is what a window move costs. It is
+only measured at the canvas size because that is the only size it has.
 
 Mpx/s, higher is better. A dash is a row that has not been measured yet rather
 than one that is slow.
@@ -231,6 +236,21 @@ has no PPA, no 2D-DMA and no JPEG codec at all -- `SOC_PPA_SUPPORTED`,
 `soc_caps.h`, where the S31 and the P4 have all three. So on the S3 the software
 path is not a fallback that nobody exercises: it is the implementation, and
 every target keeps it for exactly that reason.
+
+**The repaint is the row that decides something: 31.5 ms to 7.3 ms, 4.3x.** A
+full repaint is what a window move costs, because occlusion means what was
+underneath is no longer known. At 31.5 ms it is 32 updates a second at best, so
+a drag is a slideshow; at 7.3 ms it is 137, so a drag is a drag. That is the
+number the accelerators were wanted for, and it is the desktop's own shape
+rather than a primitive's.
+
+**The striding matters more than the size, and this row got it wrong first.**
+Blitting a *contiguous* window surface *into* a strided canvas -- which is what
+a compositor does -- is a different operation from copying a block *out of* a
+wider buffer, where the source is strided. The first version of this row
+measured the second, and reported 2.1x where the truth is 4.3x. Both are
+checked now, because a block offset that is off by one and a row pitch that is
+wrong look identical from the outside.
 
 **The software loop is memory-bound, which is why the accelerator can win at
 all.** A blit runs at about half a fill's rate -- 10.6 against 21.7 Mpx/s at
