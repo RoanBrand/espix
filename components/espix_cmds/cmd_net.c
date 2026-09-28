@@ -398,6 +398,17 @@ static int wifi_scan(espix_session_t *s)
     return 0;
 }
 
+/* NULL when the driver is not up; the state line already says so. */
+static const char *wifi_ps_name(espix_wifi_ps_t ps)
+{
+    switch (ps) {
+    case ESPIX_WIFI_PS_NONE:      return "off (radio stays on)";
+    case ESPIX_WIFI_PS_MIN_MODEM: return "modem sleep (wakes for the AP's beacon)";
+    case ESPIX_WIFI_PS_MAX_MODEM: return "modem sleep, long listen interval";
+    default:                      return NULL;
+    }
+}
+
 static int wifi_status(espix_session_t *s)
 {
     espix_wifi_status_t st;
@@ -429,19 +440,9 @@ static int wifi_status(espix_session_t *s)
      * soft-AP. Printing 100 TU because it is the usual default would be a
      * number that looks measured and is not.
      */
-    switch (st.ps) {
-    case ESPIX_WIFI_PS_NONE:
-        espix_printf(s, "power:  off (radio stays on)\n");
-        break;
-    case ESPIX_WIFI_PS_MIN_MODEM:
-        espix_printf(s, "power:  modem sleep (wakes for the AP's beacon)\n");
-        break;
-    case ESPIX_WIFI_PS_MAX_MODEM:
-        espix_printf(s, "power:  modem sleep, long listen interval\n");
-        break;
-    case ESPIX_WIFI_PS_UNKNOWN:
-    default:
-        break;      /* driver not started; the state line already says so */
+    const char *ps = wifi_ps_name(st.ps);
+    if (ps != NULL) {
+        espix_printf(s, "power:  %s\n", ps);
     }
 
     if (st.retries > 0) {
@@ -556,6 +557,42 @@ static int cmd_wifi(espix_session_t *s, int argc, char **argv)
     if (strcmp(sub, "disconnect") == 0) {
         return espix_net_wifi_disconnect() == ESP_OK ? 0 : 1;
     }
+    /*
+     * The radio's sleep behaviour, which is the difference between a board that
+     * answers in 4ms and one that answers in 60 -- see espix_wifi_set_ps().
+     */
+    if (strcmp(sub, "ps") == 0) {
+        if (argc <= 2 || strcmp(argv[2], "status") == 0) {
+            espix_wifi_status_t st;
+            if (espix_net_wifi_status(&st) != ESP_OK) {
+                espix_eprintf(s, "wifi ps: the driver is not up\n");
+                return 1;
+            }
+            const char *name = wifi_ps_name(st.ps);
+            espix_printf(s, "wifi ps: %s\n", name != NULL ? name : "unknown");
+            return 0;
+        }
+
+        espix_wifi_ps_t mode;
+        if (strcmp(argv[2], "off") == 0 || strcmp(argv[2], "none") == 0) {
+            mode = ESPIX_WIFI_PS_NONE;
+        } else if (strcmp(argv[2], "min") == 0) {
+            mode = ESPIX_WIFI_PS_MIN_MODEM;
+        } else if (strcmp(argv[2], "max") == 0) {
+            mode = ESPIX_WIFI_PS_MAX_MODEM;
+        } else {
+            espix_eprintf(s, "usage: wifi ps {status|off|min|max}\n");
+            return 1;
+        }
+
+        const esp_err_t err = espix_wifi_set_ps(mode);
+        if (err != ESP_OK) {
+            espix_eprintf(s, "wifi ps: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "wifi ps: %s\n", argv[2]);
+        return 0;
+    }
     if (strcmp(sub, "connect") == 0) {
         const char *ssid = (argc > 2) ? argv[2] : NULL;
         const char *psk  = (argc > 3) ? argv[3] : "";
@@ -573,7 +610,8 @@ static int cmd_wifi(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    espix_eprintf(s, "usage: wifi {scan|connect [ssid] [psk]|disconnect|status}\n");
+    espix_eprintf(s, "usage: wifi {scan|connect [ssid] [psk]|disconnect|status"
+                     "|ps [off|min|max]}\n");
     return 1;
 }
 

@@ -129,10 +129,10 @@ typedef enum {
  * already gives about `last_reason` below: it does not drag in esp_wifi. That
  * also keeps the numbering ours, so a renderer cannot quietly depend on IDF's.
  *
- * espix never calls esp_wifi_set_ps(), so in practice this reports IDF's
- * default of MIN_MODEM -- which is worth being able to see, because it costs a
- * beacon interval of latency on every exchange and there is nothing else in the
- * system that says so.
+ * Until it is set, this reports IDF's default of MIN_MODEM -- which is worth
+ * being able to see, because it costs a beacon interval of latency on every
+ * exchange and nothing else in the system said so. `wifi status` prints it, and
+ * `wifi ps` chooses it; see espix_wifi_set_ps() for what the choice is worth.
  */
 typedef enum {
     ESPIX_WIFI_PS_UNKNOWN = 0,  /* driver not started, or the query failed */
@@ -140,6 +140,19 @@ typedef enum {
     ESPIX_WIFI_PS_MIN_MODEM,    /* wakes per DTIM to hear the beacon */
     ESPIX_WIFI_PS_MAX_MODEM,    /* as above, plus a longer listen interval */
 } espix_wifi_ps_t;
+
+/*
+ * Set the station's sleep behaviour, or ESP_ERR_INVALID_STATE before the driver
+ * is up.
+ *
+ * The default is not free: on MIN_MODEM every exchange can wait for the AP's
+ * beacon, which measured as 58ms average and 28ms standard deviation pinging
+ * this board, against 4ms and 1.7ms on the cable. Nothing is wrong with the
+ * driver -- that is the mode doing exactly what it says -- so the answer is to
+ * let it be chosen. Not persisted: a board that wants it off every boot has
+ * nowhere to say so yet.
+ */
+esp_err_t espix_wifi_set_ps(espix_wifi_ps_t mode);
 
 typedef struct {
     char     ssid[ESPIX_SSID_MAX];

@@ -700,6 +700,22 @@ void espix_net_wifi_ap_status(espix_wifi_ap_status_t *out)
     out->napt = espix_net_napt_enabled("wlan1");
 }
 
+esp_err_t espix_wifi_set_ps(espix_wifi_ps_t mode)
+{
+    if (s_sta == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_ps_type_t ps;
+    switch (mode) {
+    case ESPIX_WIFI_PS_NONE:      ps = WIFI_PS_NONE;      break;
+    case ESPIX_WIFI_PS_MIN_MODEM: ps = WIFI_PS_MIN_MODEM; break;
+    case ESPIX_WIFI_PS_MAX_MODEM: ps = WIFI_PS_MAX_MODEM; break;
+    default:                      return ESP_ERR_INVALID_ARG;
+    }
+    return esp_wifi_set_ps(ps);
+}
+
 esp_err_t espix_net_wifi_scan(espix_ap_t *out, size_t n, size_t *found)
 {
     if (out == NULL || found == NULL) {
