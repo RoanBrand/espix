@@ -129,6 +129,30 @@ dependencies:
     - esp32h4
     - linux
     version: 1.5.0
+  espressif/usb_host_hid:
+    component_hash: 74b9c84cd2921a5e987f504c1713ca7819f7e8be80565e5253e9e9c7e07ab881
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    - name: espressif/usb
+      registry_url: https://components.espressif.com
+      require: public
+      rules:
+      - if: idf_version >=6.0
+      - if: target not in ["linux"]
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
+    - linux
+    version: 1.2.1
   espressif/usb_host_msc:
     component_hash: d8765c212bb4915d42560886fac3cc5059d61a0bfa14152b32ea9a5258e7a0c9
     dependencies:
@@ -176,9 +200,10 @@ direct_dependencies:
 - espressif/esp_linenoise
 - espressif/esp_tinyusb
 - espressif/usb
+- espressif/usb_host_hid
 - espressif/usb_host_msc
 - idf
 - joltwallet/littlefs
-manifest_hash: 77c90d1c585ca0d0b06c9b56c95c5126647a65f84965f5ed5c865b5dfc450c9c
+manifest_hash: 604c49adc4b3d684078e77af01808612f4e19cf482a8def2142e3eaa011a16f7
 target: esp32s31
 version: 3.0.0

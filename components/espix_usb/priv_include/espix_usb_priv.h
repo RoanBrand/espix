@@ -23,6 +23,13 @@ esp_err_t espix_usb_host_probe_addr(uint8_t addr);
 size_t    espix_usb_host_scan_pool(void);
 esp_blockdev_handle_t espix_usb_host_dev_blockdev(const char *name);
 
+/*
+ * hid.c: the local keyboard and mouse. Installed by host.c once the host
+ * library is up, and non-fatal if it fails -- a board with no keyboard plugged
+ * in still has storage, a shell and a screen.
+ */
+esp_err_t espix_usb_hid_start(void);
+
 /* Fires the hook espix_usb_set_dev_hook() installed; nothing when there is none. */
 void espix_usb_dev_hook_fire(const espix_usb_dev_t *dev, bool attached);
 

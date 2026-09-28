@@ -2576,6 +2576,15 @@ esp_err_t espix_usb_host_init(void)
         return err;
     }
 
+    /*
+     * The keyboard and mouse, and deliberately not fatal: storage and the shell
+     * are what a board with no keyboard needs, and a class driver that will not
+     * install should cost the port, not the boot.
+     */
+    if (espix_usb_hid_start() != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no HID support on this port");
+    }
+
     s_installed = true;
     espix_klog(ESPIX_KLOG_INFO, TAG, "host mode, %d device slot%s",
                ESPIX_USB_MAX_DEVS, ESPIX_USB_MAX_DEVS == 1 ? "" : "s");

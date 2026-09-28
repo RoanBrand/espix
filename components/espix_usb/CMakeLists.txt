@@ -12,7 +12,7 @@
 # already downloaded both stacks by the time Kconfig exists.
 set(espix_usb_srcs "usb.c")
 if(CONFIG_ESPIX_USB_ROLE_HOST)
-    list(APPEND espix_usb_srcs "host.c")
+    list(APPEND espix_usb_srcs "host.c" "hid.c")
 endif()
 
 idf_component_register(
@@ -26,9 +26,11 @@ idf_component_register(
         esp_common
     PRIV_REQUIRES
         espix_kernel
+        espix_display
         freertos
         heap
         espressif__usb
         espressif__usb_host_msc
+        espressif__usb_host_hid
         espressif__esp_ext_part_tables
 )
