@@ -1504,10 +1504,16 @@ esp_err_t espix_display_rfb_listen(uint16_t port)
      * Watched on the board while dragging: core 0 at 64% and core 1 at 1%. This
      * task does the desktop's drawing as well as the connection's reading and
      * encoding -- input callbacks are dispatched in the context of whoever
-     * posted them -- so it *is* that 64%, and it is sharing a core with the
-     * network stack that feeds it. Measured before, on a much slower baseline,
-     * pinning changed nothing; the baseline has moved four times since, and this
-     * is worth re-measuring rather than remembering.
+     * posted them -- so it *is* that 64%, and it was sharing a core with the
+     * network stack that feeds it.
+     *
+     * Which it now does not, and it is felt: with the drawing, the reading and
+     * the encoding all off core 0, a drag runs smooth where it used to stutter.
+     * Worth saying that the first attempt at this measured *nothing*, and the
+     * measurement is why -- the test client waits for a frame after every
+     * motion, so the server was never saturated and there was no contention to
+     * remove. A hand on a mouse keeps both busy at once, and that is the case
+     * this is for.
      *
      * The cost is a cross-core wakeup per event, which at these rates is noise
      * next to a core that is a third idle.
