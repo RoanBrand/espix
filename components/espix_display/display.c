@@ -306,6 +306,33 @@ void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
      * refuses to send more than one copy per update, and the drag falls back to
      * pixels -- feeling exactly as slow as before, which is what it did.
      */
+    /*
+     * The same rectangle, still moving: follow it and keep the source.
+     *
+     * The source is where the *client* last saw it -- nothing has been sent
+     * since this note was taken, so the client is still showing the window
+     * there -- and the destination is that source carried along by the whole
+     * motion. Which is not the same as this motion's own overlap shifted: the
+     * overlap is clipped by the window's old and new positions, so taking it
+     * fresh each time lands the pixels a few columns further along every
+     * motion, and the window arrives distorted by exactly the error.
+     *
+     * So the stored destination is shifted by this motion's delta, and its size
+     * is left alone. It is the same rectangle from beginning to end of the drag.
+     */
+    if (c->nmoves == 1 && r.w == c->moves[0].r.w && r.h == c->moves[0].r.h) {
+        espix_move_t *m = &c->moves[0];
+
+        m->r.x += r.x - sx;
+        m->r.y += r.y - sy;
+
+        if (m->r.x < 0 || m->r.y < 0 ||
+            m->r.x + m->r.w > c->w || m->r.y + m->r.h > c->h) {
+            c->nmoves = 0;              /* off the canvas: send the pixels */
+        }
+        return;
+    }
+
     if (c->nmoves == 1) {
         espix_move_t       *m   = &c->moves[0];
         const espix_rect_t  src = { sx, sy, r.w, r.h };
