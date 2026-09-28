@@ -44,6 +44,8 @@
 #define COL_TITLE_FG  RGB565(0xE8, 0xEC, 0xF2)
 #define COL_TEXT_FG   RGB565(0xC8, 0xD8, 0xE8)
 #define COL_CLOSE     RGB565(0x8C, 0x30, 0x36)
+#define COL_TITLE_BTN RGB565(0x30, 0x38, 0x46)
+#define COL_BTN_DIM   RGB565(0x1E, 0x23, 0x2B)
 
 #define TITLE_H 18
 #define PAD     4
@@ -67,6 +69,7 @@
 struct espix_window {
     int              x, y, w, h;
     uint32_t         seq;       /* creation order, so the taskbar holds still */
+    bool             hidden;    /* minimised: still a window, not on the screen */
     char             title[ESPIX_WINDOW_TITLE_MAX];
     espix_surface_t *surf;
     espix_window_draw_fn draw;
@@ -310,6 +313,8 @@ static void button_paint(espix_canvas_t *c);
 
 /* The taskbar is painted over the windows, and its menu over the taskbar. */
 static void taskbar_paint(espix_canvas_t *c, espix_rect_t r);
+static void task_button_damage(espix_window_t *w);
+static void window_present(espix_window_t *w);
 static void menu_paint(espix_canvas_t *c, espix_rect_t r);
 static espix_rect_t menu_rect(void);
 static void bar_damage(void);
@@ -330,28 +335,58 @@ static bool window_hit(const espix_window_t *w, int x, int y)
 static espix_window_t *window_at(int x, int y)
 {
     for (int i = s_nwin - 1; i >= 0; i--) {
-        if (window_hit(s_wins[i], x, y)) {
+        if (!s_wins[i]->hidden && window_hit(s_wins[i], x, y)) {
             return s_wins[i];
         }
     }
     return NULL;
 }
 
-/* One button, and only one: close. In surface coordinates, at the right of the
- * title bar, and the same rectangle draws it and hittests it. */
+/* The topmost window that is actually on the screen, which is what takes the
+ * focus when the one wearing it is minimised. */
+static espix_window_t *window_top_visible(void)
+{
+    for (int i = s_nwin - 1; i >= 0; i--) {
+        if (!s_wins[i]->hidden) {
+            return s_wins[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Two buttons, at the right of the title bar: minimise inboard of close. In
+ * surface coordinates, and the same rectangles draw them and hittest them.
+ */
+#define WIN_BTN (TITLE_H - 6)
+#define WIN_BTN_GAP 4
+
 static espix_rect_t window_close_box(const espix_window_t *w)
 {
-    const int side = TITLE_H - 6;
+    return (espix_rect_t){ w->w - WIN_BTN - 3, 3, WIN_BTN, WIN_BTN };
+}
 
-    return (espix_rect_t){ w->w - side - 3, 3, side, side };
+static espix_rect_t window_min_box(const espix_window_t *w)
+{
+    return (espix_rect_t){ w->w - 2 * WIN_BTN - WIN_BTN_GAP - 3, 3,
+                           WIN_BTN, WIN_BTN };
+}
+
+static bool window_button_hit(const espix_window_t *w, espix_rect_t b,
+                              int x, int y)
+{
+    return x >= w->x + b.x && x < w->x + b.x + b.w &&
+           y >= w->y + b.y && y < w->y + b.y + b.h;
 }
 
 static bool window_close_hit(const espix_window_t *w, int x, int y)
 {
-    const espix_rect_t b = window_close_box(w);
+    return window_button_hit(w, window_close_box(w), x, y);
+}
 
-    return x >= w->x + b.x && x < w->x + b.x + b.w &&
-           y >= w->y + b.y && y < w->y + b.y + b.h;
+static bool window_min_hit(const espix_window_t *w, int x, int y)
+{
+    return window_button_hit(w, window_min_box(w), x, y);
 }
 
 espix_surface_t *espix_window_surface(espix_window_t *w) { return w->surf; }
@@ -388,6 +423,12 @@ static void window_frame(espix_window_t *w, espix_rect_t r)
         const espix_rect_t x = window_close_box(w);
         espix_surface_fill(s, x, COL_CLOSE);
         espix_surface_text(s, x.x + 2, x.y + 2, "x", COL_TITLE_FG, COL_CLOSE);
+
+        /* Minimise is a bar rather than a glyph, as every desktop draws it. */
+        const espix_rect_t m = window_min_box(w);
+        espix_surface_fill(s, m, COL_TITLE_BTN);
+        espix_surface_fill(s, (espix_rect_t){ m.x + 3, m.y + WIN_BTN - 5,
+                                              WIN_BTN - 6, 2 }, COL_TITLE_FG);
     }
 
     if (r.x == 0 || r.y == 0 || r.x + r.w >= w->w || r.y + r.h >= w->h) {
@@ -469,6 +510,9 @@ static void desktop_repair_locked(espix_rect_t r)
 
     for (int i = 0; i < s_nwin; i++) {
         const espix_window_t *w = s_wins[i];
+        if (w->hidden) {
+            continue;                   /* minimised: not on the screen */
+        }
         const int x0 = w->x > r.x ? w->x : r.x;
         const int y0 = w->y > r.y ? w->y : r.y;
         const int x1 = (w->x + w->w) < (r.x + r.w) ? (w->x + w->w) : (r.x + r.w);
@@ -634,9 +678,11 @@ static void focus_draw(espix_window_t *was, espix_window_t *hit)
 {
     if (was != NULL) {
         espix_window_damage(was, window_title(was));
+        task_button_damage(was);
     }
     if (hit != NULL) {
         espix_window_damage(hit, window_title(hit));
+        task_button_damage(hit);
     }
 }
 
@@ -859,8 +905,7 @@ static void photo_open(void)
         espix_window_repaint(s_img_win);
     }
 
-    espix_window_focus(s_img_win);
-    espix_window_raise(s_img_win);
+    window_present(s_img_win);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1079,6 +1124,16 @@ static void term_start(void)
     espix_window_set_draw(s_term, term_draw);
     espix_window_set_key(s_term, term_key);
 
+    /*
+     * A new window's *surface* is painted by espix_window_new, and the canvas is
+     * not: the first frame shows the title bar (focus did that) and nothing
+     * else until something composites the window. On the first start the claim
+     * repaints everything, which hid that -- but a terminal reopened from the
+     * start menu got no such repaint and showed its title bar and its text
+     * cells, with no background and no border, until it was moved.
+     */
+    espix_window_repaint(s_term);
+
     void *const gen = (void *)(uintptr_t)++s_term_gen;
 
     if (xTaskCreateWithCaps(term_task, "espix:term", 8192, gen, 4, &s_term_task,
@@ -1147,10 +1202,7 @@ static void term_open(void)
     if (s_term == NULL) {
         term_start();
     }
-    if (s_term != NULL) {
-        espix_window_focus(s_term);
-        espix_window_raise(s_term);
-    }
+    window_present(s_term);
 }
 
 /*
@@ -1415,7 +1467,8 @@ static void taskbar_paint(espix_canvas_t *c, espix_rect_t r)
         if (!task_at(i, &t, &w) || !rects_overlap(t, r)) {
             continue;
         }
-        const espix_px_t bg  = (w == s_focus) ? COL_TITLE_FOC : COL_BTN;
+        const espix_px_t bg  = w->hidden ? COL_BTN_DIM
+                             : (w == s_focus) ? COL_TITLE_FOC : COL_BTN;
         const int        fit = (t.w - 16) / CELL_W;
         char             label[17];
 
@@ -1423,6 +1476,30 @@ static void taskbar_paint(espix_canvas_t *c, espix_rect_t r)
         espix_canvas_fill(c, t, bg);
         espix_canvas_text(c, t.x + 8, t.y + (t.h - CELL_H) / 2, label,
                           COL_TITLE_FG, bg);
+    }
+}
+
+/*
+ * Repair the one task button that belongs to `w`.
+ *
+ * A focus change repaints two title bars and has to repaint the two buttons that
+ * show which window is focused -- otherwise the bar goes on claiming the old
+ * one is, which is what it did: move the pointer off a window and onto the
+ * desktop and the title bar went grey while its button stayed lit.
+ *
+ * One button some eighty pixels wide rather than the whole bar, because this is
+ * on the pointer path.
+ */
+static void task_button_damage(espix_window_t *w)
+{
+    for (int i = 0; i < s_nwin; i++) {
+        espix_rect_t    t;
+        espix_window_t *at;
+
+        if (task_at(i, &t, &at) && at == w) {
+            desktop_repair(t);
+            return;
+        }
     }
 }
 
@@ -1492,10 +1569,7 @@ static void menu_activate(int i)
                 espix_window_repaint(s_about);
             }
         }
-        if (s_about != NULL) {
-            espix_window_focus(s_about);
-            espix_window_raise(s_about);
-        }
+        window_present(s_about);
     } else if (strcmp(s_menu_items[i], "terminal") == 0) {
         term_open();
     }
@@ -1543,6 +1617,71 @@ static void clock_tick(void *arg)
         desktop_repair_locked(tray_rect());
         desk_unlock();
     }
+}
+
+/*
+ * Minimise: the window stops being composited and stays in the list, and its
+ * task button is where it comes back from. That is the whole reason the taskbar
+ * was worth having before this existed -- a minimised window with nowhere to go
+ * is a lost window.
+ */
+static void window_minimize(espix_window_t *w)
+{
+    if (w == NULL || w->hidden) {
+        return;
+    }
+
+    const espix_rect_t was_drawn = { w->x, w->y, w->w, w->h };
+    const bool         had_focus = (s_focus == w);
+
+    w->hidden = true;
+
+    if (had_focus) {
+        /* Cleared first, because espix_window_focus() compares against it and
+         * would otherwise decide there is nothing to do. */
+        s_focus = NULL;
+        espix_window_focus(window_top_visible());
+    }
+
+    desktop_repair(was_drawn);          /* what it was covering comes back */
+    bar_damage();                       /* and its button changes colour */
+}
+
+static void window_restore(espix_window_t *w)
+{
+    if (w == NULL || !w->hidden) {
+        return;
+    }
+
+    w->hidden = false;
+    window_raise_raw(w);
+    espix_window_focus(w);
+
+    /* The whole screen, because a window that was not being composited could
+     * have been anywhere -- and the repair is a fill and a blit per window, so
+     * it is the cheap kind of full repaint. */
+    espix_desktop_repaint();
+    bar_damage();
+}
+
+/*
+ * Bring a window to the front, unhiding it if it was minimised.
+ *
+ * The one way anything opens a window on request: the menu, the launcher and the
+ * taskbar all want this, and every one of them that forgot the unhiding made a
+ * minimised window impossible to get back through that door.
+ */
+static void window_present(espix_window_t *w)
+{
+    if (w == NULL) {
+        return;
+    }
+    if (w->hidden) {
+        window_restore(w);
+        return;
+    }
+    espix_window_focus(w);
+    espix_window_raise(w);
 }
 
 /*
@@ -1735,8 +1874,16 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                 espix_window_t *w;
 
                 if (task_at(i, &t, &w) && in_rect(t, ev->x, ev->y)) {
-                    espix_window_focus(w);
-                    espix_window_raise(w);
+                    if (w->hidden) {
+                        window_restore(w);
+                    } else if (w == s_focus) {
+                        /* Pressing the button of the window you are looking at
+                         * puts it away, as every taskbar does. */
+                        window_minimize(w);
+                    } else {
+                        espix_window_focus(w);
+                        espix_window_raise(w);
+                    }
                     return;
                 }
             }
@@ -1750,9 +1897,13 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
              * drawn on, so pressing it must close that one even when it was not
              * the focused window.
              */
-            espix_window_t *closing = window_at(ev->x, ev->y);
-            if (closing != NULL && window_close_hit(closing, ev->x, ev->y)) {
-                window_close(closing);
+            espix_window_t *titled = window_at(ev->x, ev->y);
+            if (titled != NULL && window_close_hit(titled, ev->x, ev->y)) {
+                window_close(titled);
+                return;
+            }
+            if (titled != NULL && window_min_hit(titled, ev->x, ev->y)) {
+                window_minimize(titled);
                 return;
             }
             focus_at(ev->x, ev->y);     /* focus first, so the title is right */
