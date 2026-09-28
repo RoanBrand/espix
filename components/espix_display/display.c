@@ -24,6 +24,10 @@
 
 #include "soc/soc_caps.h"
 
+#if SOC_PPA_SUPPORTED
+#include "driver/ppa.h"
+#endif
+
 #include "espix_display.h"
 #include "espix_kernel.h"
 
@@ -108,6 +112,27 @@ static bool rect_touches(espix_rect_t a, espix_rect_t b)
              b.y > a.y + a.h || b.y + b.h < a.y);
 }
 
+/*
+ * A pixel buffer: PSRAM first, internal as a fallback, and cache-line aligned.
+ *
+ * The alignment is not decoration. PPA and the 2D-DMA engine both require an
+ * external-memory buffer to be aligned to the cache line, and an unaligned one
+ * is a driver error rather than a slower path -- so it is cheaper to allocate
+ * everything this way than to discover which operations need it.
+ */
+#define BUF_ALIGN 128
+
+static void *buf_alloc(size_t bytes)
+{
+    void *p = heap_caps_aligned_alloc(BUF_ALIGN, bytes,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == NULL) {
+        p = heap_caps_aligned_alloc(BUF_ALIGN, bytes,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return p;
+}
+
 espix_canvas_t *espix_canvas_new(int w, int h, const char *name)
 {
     if (w <= 0 || h <= 0) {
@@ -119,14 +144,7 @@ espix_canvas_t *espix_canvas_new(int w, int h, const char *name)
         return NULL;
     }
 
-    /* PSRAM first: the whole point of a virtual screen is that it is big.
-     * Internal is a fallback only because a small canvas may fit. */
-    c->px = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
-                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (c->px == NULL) {
-        c->px = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
-                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    c->px = buf_alloc((size_t)w * h * sizeof(espix_px_t));
     if (c->px == NULL) {
         free(c);
         return NULL;
@@ -222,6 +240,162 @@ void espix_canvas_damage_clear(espix_canvas_t *c) { c->ndamage = 0; }
 
 bool espix_canvas_damaged(const espix_canvas_t *c) { return c->ndamage > 0; }
 
+#if SOC_PPA_SUPPORTED
+/*
+ * PPA, for the two operations below.
+ *
+ * One client per operation, registered on first use: a client is bound to one
+ * operation at registration and the two are independent. Blocking mode, because
+ * the caller is whichever task is drawing and the driver has its own queue --
+ * there is no espix task to add here and nothing to wait on.
+ *
+ * The driver does its own cache maintenance on both buffers, which is the part
+ * that would otherwise be easy to get wrong: a CPU write to PSRAM is not
+ * necessarily visible to a DMA engine until it has been written back.
+ */
+static ppa_client_handle_t s_ppa_fill;
+static ppa_client_handle_t s_ppa_srm;
+
+/*
+ * Below this many pixels the loop wins, and it is measured rather than modelled.
+ *
+ * PPA costs a fixed ~57us per transaction -- descriptor setup, the DMA start and
+ * waiting for completion -- against the loop's ~36ns per pixel and nothing else.
+ * At 32x32 (1024 pixels) the accelerator runs at 0.55x the software rate; at
+ * 64x64 (4096) it is 1.5x, and by 800x600 it is 4.8x. This sits between the two
+ * measured points, and it is where most of what a desktop draws lives: a cursor,
+ * a character cell, a small icon. Above it the accelerator is simply better, and
+ * the gap widens with size because the software path has no fixed cost to amortise.
+ */
+#define PPA_MIN_PIXELS 2048
+
+/* The benchmark's two columns, and nothing else: production never sets either. */
+static bool s_sw_only;
+static bool s_force_hw;
+
+static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
+{
+    if (*client != NULL) {
+        return true;
+    }
+    const ppa_client_config_t cfg = {
+        .oper_type             = op,
+        .max_pending_trans_num = 1,
+    };
+    if (ppa_register_client(&cfg, client) != ESP_OK) {
+        *client = NULL;
+        return false;
+    }
+    return true;
+}
+
+/*
+ * The fill colour is taken as RGB888, not as the raw RGB565 the buffer holds.
+ *
+ * `fill_color_val` is documented as "a raw 32-bit value, the interpretation
+ * depends on fill_cm", which reads as though RGB565 means an RGB565 word. It
+ * does not: the hardware takes the value as 0x00RRGGBB and converts. The tell
+ * was 0xABCD landing as 0x0559 -- R=0, G=0xAB, B=0xCD in RGB565 is exactly
+ * 0x0559, so the upper byte was being read as red.
+ *
+ * The high bits are replicated rather than zero-extended so the round trip is
+ * exact: 0xABCD comes back as 0xABCD and not as the nearest colour.
+ */
+static uint32_t rgb565_to_rgb888(espix_px_t v)
+{
+    const uint32_t r = (uint32_t)(v >> 11) & 0x1F;
+    const uint32_t g = (uint32_t)(v >> 5)  & 0x3F;
+    const uint32_t b = (uint32_t)v         & 0x1F;
+
+    return (((r << 3) | (r >> 2)) << 16) |
+           (((g << 2) | (g >> 4)) << 8)  |
+            ((b << 3) | (b >> 2));
+}
+
+static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
+                          espix_rect_t r, espix_px_t v)
+{
+    /*
+     * A stride that is not the width cannot be said in the config -- the picture
+     * is contiguous and pic_w is its stride -- so that case stays on the
+     * software path. Nothing allocates one today; the check is here so that
+     * nothing silently draws in the wrong place when something does.
+     */
+    if (s_sw_only || stride != w || !ppa_ready(PPA_OPERATION_FILL, &s_ppa_fill)) {
+        return false;
+    }
+    if (!s_force_hw && r.w * r.h < PPA_MIN_PIXELS) {
+        return false;
+    }
+
+    const ppa_fill_oper_config_t cfg = {
+        .out = {
+            .buffer         = px,
+            .buffer_size    = (uint32_t)w * (uint32_t)h * sizeof(espix_px_t),
+            .pic_w          = (uint32_t)w,
+            .pic_h          = (uint32_t)h,
+            .block_offset_x = (uint32_t)r.x,
+            .block_offset_y = (uint32_t)r.y,
+            .fill_cm        = PPA_FILL_COLOR_MODE_RGB565,
+        },
+        .fill_block_w   = (uint32_t)r.w,
+        .fill_block_h   = (uint32_t)r.h,
+        .fill_color_val = rgb565_to_rgb888(v),
+        .mode           = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_fill(s_ppa_fill, &cfg) == ESP_OK;
+}
+
+static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
+                          int dx, int dy, const espix_px_t *src,
+                          int sw, int sh, int sstride)
+{
+    if (s_sw_only || dstride != dw || sstride != sw) {
+        return false;
+    }
+    if (!s_force_hw && sw * sh < PPA_MIN_PIXELS) {
+        return false;
+    }
+    /* PPA does not clip, so a block that hangs off either picture stays with
+     * the software loop -- which is the loop that already clips. */
+    if (dx < 0 || dy < 0 || dx + sw > dw || dy + sh > dh) {
+        return false;
+    }
+    if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
+        return false;
+    }
+
+    const ppa_srm_oper_config_t cfg = {
+        .in = {
+            .buffer         = src,
+            .pic_w          = (uint32_t)sw,
+            .pic_h          = (uint32_t)sh,
+            .block_w        = (uint32_t)sw,
+            .block_h        = (uint32_t)sh,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer         = dst,
+            .buffer_size    = (uint32_t)dw * (uint32_t)dh * sizeof(espix_px_t),
+            .pic_w          = (uint32_t)dw,
+            .pic_h          = (uint32_t)dh,
+            .block_offset_x = (uint32_t)dx,
+            .block_offset_y = (uint32_t)dy,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x        = 1.0f,
+        .scale_y        = 1.0f,
+        .mode           = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+}
+#else
+static bool s_sw_only;      /* unused without an accelerator, but harmless */
+#endif  /* SOC_PPA_SUPPORTED */
+
 /* ------------------------------------------------------------------ */
 /* Drawing                                                             */
 /* ------------------------------------------------------------------ */
@@ -244,11 +418,11 @@ static void op_fill(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
 {
     r = rect_clip_wh(r, w, h);
 
-    /*
-     * PPA FILL goes here, and it is a whole-rectangle operation, so it wins on
-     * exactly the case this loop is worst at: a large rectangle. It cannot
-     * report anything PPA cannot do, so the fall-through is the loop.
-     */
+#if SOC_PPA_SUPPORTED
+    if (ppa_fill_rect(px, w, h, stride, r, v)) {
+        return;
+    }
+#endif
     for (int y = 0; y < r.h; y++) {
         espix_px_t *row = px + (size_t)(r.y + y) * stride + r.x;
         for (int x = 0; x < r.w; x++) {
@@ -261,12 +435,12 @@ static void op_blit(espix_px_t *px, int w, int h, int stride,
                     int dst_x, int dst_y, const espix_px_t *src,
                     int src_w, int src_h, int src_stride)
 {
-    /*
-     * PPA SRM or 2D-DMA goes here. Both copy rectangles; SRM also scales and
-     * converts colour, which is the other half of the same operation and the
-     * reason it is the one that matters for a client that wants a different
-     * pixel format.
-     */
+#if SOC_PPA_SUPPORTED
+    if (ppa_blit_rect(px, w, h, stride, dst_x, dst_y, src, src_w, src_h,
+                      src_stride)) {
+        return;
+    }
+#endif
     for (int y = 0; y < src_h; y++) {
         const int cy = dst_y + y;
         if (cy < 0 || cy >= h) {
@@ -376,12 +550,7 @@ espix_surface_t *espix_surface_new(int w, int h)
         return NULL;
     }
 
-    s->px = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
-                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s->px == NULL) {
-        s->px = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
-                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    s->px = buf_alloc((size_t)w * h * sizeof(espix_px_t));
     if (s->px == NULL) {
         free(s);
         return NULL;
@@ -454,6 +623,66 @@ void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
  * not about whatever happens to be on the screen -- and so a full-size case does
  * not have to be the canvas's size.
  */
+/*
+ * The accelerated path, checked against the pixels it was supposed to write.
+ *
+ * A fast wrong answer is worse than a slow right one, and the failure modes here
+ * are quiet: a cache that was not written back, a block offset off by one, a
+ * colour mode that is nearly right. So every accelerated row is verified once
+ * before it is timed, on the same buffers, and the answer is reported rather
+ * than assumed.
+ */
+static bool bench_verify(int w, int h)
+{
+    espix_surface_t *dst = espix_surface_new(w, h);
+    espix_surface_t *src = espix_surface_new(w, h);
+    bool ok = false;
+
+    if (dst == NULL || src == NULL) {
+        espix_surface_free(dst);
+        espix_surface_free(src);
+        return false;
+    }
+
+    espix_px_t *d = espix_surface_pixels(dst);
+    espix_px_t *s = espix_surface_pixels(src);
+
+    /* Fill through the accelerator, then look at every pixel. */
+    s_sw_only = false;
+    espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, 0xABCD);
+
+    ok = true;
+    for (int i = 0; i < w * h && ok; i++) {
+        if (d[i] != 0xABCD) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "bench: PPA fill wrote %04x at %d, wanted abcd",
+                       (unsigned)d[i], i);
+            ok = false;
+        }
+    }
+
+    /* A source written by the software path, copied by the accelerator. */
+    if (ok) {
+        s_sw_only = true;
+        espix_surface_fill(src, (espix_rect_t){ 0, 0, w, h }, 0x1234);
+        espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, 0x0000);
+        s_sw_only = false;
+
+        espix_surface_blit(dst, 0, 0, s, w, h, w);
+        for (int i = 0; i < w * h && ok; i++) {
+            if (d[i] != 0x1234) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "bench: PPA blit wrote %04x at %d, wanted 1234",
+                           (unsigned)d[i], i);
+                ok = false;
+            }
+        }
+    }
+
+    espix_surface_free(dst);
+    espix_surface_free(src);
+    return ok;
+}
 static uint32_t bench_run(bool fill, int w, int h, uint32_t iters)
 {
     espix_surface_t *dst = espix_surface_new(w, h);
@@ -487,8 +716,14 @@ static uint32_t bench_run(bool fill, int w, int h, uint32_t iters)
 
 size_t espix_display_bench(espix_display_bench_t *out, size_t max)
 {
+    /*
+     * Two sizes below the accelerator's break-even and three above it, because
+     * the interesting number is where they cross and a curve drawn only above it
+     * cannot say. 32x32 is 1024 pixels, which is a glyph-sized fill; 800x600 is
+     * a frame.
+     */
     static const struct { int w, h; } sizes[] = {
-        { 64, 64 }, { 256, 256 }, { 800, 600 },
+        { 32, 32 }, { 64, 64 }, { 128, 128 }, { 256, 256 }, { 800, 600 },
     };
     static const char *const ops[] = { "fill", "blit" };
     size_t n = 0;
@@ -518,9 +753,26 @@ size_t espix_display_bench(espix_display_bench_t *out, size_t max)
             row->w     = w;
             row->h     = h;
             row->iters = iters;
-            row->hw    = NULL;      /* nothing wired up yet; see op_fill() */
+            row->hw    = NULL;
             row->us_hw = 0;
+
+            s_sw_only  = true;
             row->us_sw = bench_run(o == 0, w, h, iters);
+            s_sw_only  = false;
+
+#if SOC_PPA_SUPPORTED
+            /*
+             * Forced, because the point of the benchmark is to measure a path
+             * that the production policy would decline to use at this size.
+             * Without it the small rows would report the software number twice
+             * and the crossover would stay invisible.
+             */
+            s_force_hw = true;
+            row->hw_ok = bench_verify(w, h);
+            row->us_hw = bench_run(o == 0, w, h, iters);
+            row->hw    = (o == 0) ? "PPA FILL" : "PPA SRM";
+            s_force_hw = false;
+#endif
         }
     }
 

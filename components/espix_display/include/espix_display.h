@@ -108,9 +108,10 @@ typedef struct {
     uint32_t    us_sw;      /* the whole run, microseconds */
     uint32_t    us_hw;      /* ...and accelerated; 0 when there is none */
     const char *hw;         /* "PPA FILL", "2D-DMA", ... or NULL */
+    bool        hw_ok;      /* the accelerated path produced the right pixels */
 } espix_display_bench_t;
 
-#define ESPIX_DISPLAY_BENCH_MAX 8
+#define ESPIX_DISPLAY_BENCH_MAX 12
 
 /* Fills up to `max` rows and returns how many. Allocates its own buffers. */
 size_t espix_display_bench(espix_display_bench_t *out, size_t max);

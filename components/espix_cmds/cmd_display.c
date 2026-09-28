@@ -223,28 +223,60 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
         espix_display_bench_t rows[ESPIX_DISPLAY_BENCH_MAX];
         const size_t n = espix_display_bench(rows, ESPIX_DISPLAY_BENCH_MAX);
 
-        espix_printf(s, "%-5s %-9s %6s %9s %11s  %s\n",
-                     "OP", "SIZE", "ITERS", "SW ms", "SW Mpx/s", "HW");
+        espix_printf(s, "%-5s %-9s %6s %9s %10s %9s %10s  %s\n",
+                     "OP", "SIZE", "ITERS", "SW ms", "SW Mpx/s",
+                     "HW ms", "HW Mpx/s", "PATH");
         for (size_t i = 0; i < n; i++) {
             const espix_display_bench_t *r = &rows[i];
             char size[16];
+            char hw_ms[16]  = "-";
+            char hw_mpx[16] = "-";
             snprintf(size, sizeof(size), "%dx%d", r->w, r->h);
 
             if (r->us_sw == 0) {
-                espix_printf(s, "%-5s %-9s %6u %9s %11s  %s\n", r->op, size,
-                             (unsigned)r->iters, "no memory", "-", "-");
+                espix_printf(s, "%-5s %-9s %6u %9s %10s %9s %10s  %s\n",
+                             r->op, size, (unsigned)r->iters, "no memory",
+                             "-", "-", "-", "-");
                 continue;
             }
 
-            const uint64_t px    = (uint64_t)r->w * r->h * r->iters;
+            const uint64_t px = (uint64_t)r->w * r->h * r->iters;
+
+            if (r->us_hw != 0) {
+                const uint64_t hw10 = px * 10 / r->us_hw;
+                snprintf(hw_ms, sizeof(hw_ms), "%u.%01u",
+                         (unsigned)(r->us_hw / 1000),
+                         (unsigned)((r->us_hw / 100) % 10));
+                snprintf(hw_mpx, sizeof(hw_mpx), "%u.%01u",
+                         (unsigned)(hw10 / 10), (unsigned)(hw10 % 10));
+            }
+
             const uint64_t mpx10 = px * 10 / r->us_sw;      /* Mpx/s, times ten */
 
-            espix_printf(s, "%-5s %-9s %6u %6u.%01u %8u.%01u  %s\n",
+            espix_printf(s, "%-5s %-9s %6u %6u.%01u %7u.%01u %9s %10s  %s\n",
                          r->op, size, (unsigned)r->iters,
                          (unsigned)(r->us_sw / 1000),
                          (unsigned)((r->us_sw / 100) % 10),
                          (unsigned)(mpx10 / 10), (unsigned)(mpx10 % 10),
+                         hw_ms, hw_mpx,
                          r->hw != NULL ? r->hw : "-");
+        }
+
+        /* A fast wrong answer is worse than a slow right one, so the path is
+         * checked against the pixels before its numbers are worth reading. */
+        int any_hw = 0, all_ok = 1;
+        for (size_t i = 0; i < n; i++) {
+            if (rows[i].hw != NULL) {
+                any_hw = 1;
+                if (!rows[i].hw_ok) {
+                    all_ok = 0;
+                }
+            }
+        }
+        if (any_hw) {
+            espix_printf(s, "\naccelerated path %s\n",
+                         all_ok ? "verified: every pixel matches the software path"
+                                : "FAILED verification -- the HW numbers are wrong");
         }
         return 0;
     }

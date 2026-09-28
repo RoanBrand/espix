@@ -16,4 +16,8 @@ idf_component_register(
         esp_timer
         esp_hw_support
         esp_system
+        # Unconditional, and free where it does not apply: esp_driver_ppa
+        # guards its own sources on CONFIG_SOC_PPA_SUPPORTED, so on the S3 it
+        # compiles nothing and this file's PPA code is not built either.
+        esp_driver_ppa
 )

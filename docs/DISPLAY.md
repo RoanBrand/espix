@@ -176,6 +176,74 @@ frame. Over WiFi that is a slideshow. So:
    alone until something shows it matters, because at 480k pixels a frame it is
    milliseconds and nothing like the audio decoder's memory wall.
 
+## What it costs
+
+`display bench` times the two operations an accelerator replaces -- a rectangle
+fill and a rectangle blit -- at five sizes, two below the accelerator's
+break-even and three above it. Megapixels per second, not
+megabytes: bytes per pixel is a convention and pixels are not.
+
+Every number below was measured on the board named in its column, in the same
+run as the others in that row. A number from another chip is not a comparison,
+which is why the harness measures both paths on one board rather than quoting
+two.
+
+| | 32x32 | 64x64 | 128x128 | 256x256 | 800x600 |
+|---|---|---|---|---|---|
+| **S31 fill, software** | 26.3 | 27.7 | 28.3 | 21.4 | 21.7 |
+| **S31 fill, PPA FILL** | 14.5 | 42.3 | 76.4 | 96.9 | **104.9** |
+| **S31 blit, software** | 13.5 | 13.6 | 13.6 | 10.6 | 10.6 |
+| **S31 blit, PPA SRM** | 7.2 | 18.7 | 36.3 | 47.3 | **49.2** |
+| **S3 fill, software** | — | — | — | — | — |
+| **S3 blit, software** | — | — | — | — | — |
+
+Mpx/s, higher is better. A dash is a row that has not been measured yet rather
+than one that is slow.
+
+**The crossover is the interesting part, and it is why the sizes run below it.**
+PPA costs a fixed ~57 µs per transaction -- descriptor setup, the DMA start, and
+waiting for completion -- where the software loop costs ~36 ns per pixel and
+nothing else. So at 32x32 the accelerator is *slower* (0.55x), at 64x64 it is
+1.5x, and by 800x600 it is 4.8x. `PPA_MIN_PIXELS` is 2048, between the two
+measured points, and it matters because that range is where most of what a
+desktop draws lives: a cursor, a character cell, a small icon. The accelerator
+is not a blanket win and the threshold is not a guess.
+
+**The software numbers are flat, which is the other half of it.** 26 to 28 Mpx/s
+across a 470-fold range in size, because a loop has no fixed cost to amortise.
+The accelerated column climbs with size for exactly the same reason, and the two
+curves are what make the threshold a number rather than a preference.
+
+**Every accelerated number is verified against the pixels before it is timed.** A
+fast wrong answer is worse than a slow right one, and the failure modes here are
+quiet: a cache that was not written back, an offset off by one, a colour mode
+that is nearly right. It earned its keep immediately -- the first PPA run
+reported `FAILED verification`, and the mismatch said why: `fill_color_val` is
+documented as "a raw 32-bit value, the interpretation depends on fill_cm", which
+reads as though RGB565 means an RGB565 word. It does not. The hardware takes
+0x00RRGGBB and converts, so 0xABCD landed as 0x0559 -- R=0, G=0xAB, B=0xCD in
+RGB565 is exactly that. Without the check the table above would have been four
+times faster and wrong.
+
+**The S3 has no accelerated row, and that is the design rather than a gap.** It
+has no PPA, no 2D-DMA and no JPEG codec at all -- `SOC_PPA_SUPPORTED`,
+`SOC_DMA2D_SUPPORTED` and `SOC_JPEG_CODEC_SUPPORTED` are simply absent from its
+`soc_caps.h`, where the S31 and the P4 have all three. So on the S3 the software
+path is not a fallback that nobody exercises: it is the implementation, and
+every target keeps it for exactly that reason.
+
+**The software loop is memory-bound, which is why the accelerator can win at
+all.** A blit runs at about half a fill's rate -- 10.6 against 21.7 Mpx/s at
+800x600 -- exactly what a copy that reads *and* writes should do against one that
+only writes. There is no arithmetic left to remove; what PPA and 2D-DMA bring is
+a better route to the memory, not fewer instructions, and the 4.8x says the route
+was the problem.
+
+**And a full-screen software fill is 20 ms**, which is the number that decides
+whether repainting everything when a window moves is acceptable: at 50 Hz it is
+the whole frame budget, so it is fine for a click and hopeless for a drag. PPA
+makes it 4.5 ms, which is a drag. See [Milestones](#milestones).
+
 ## Milestones
 
 **M0 -- the server, no acceleration.** *Done.* TCP on 5900, RFB 3.3 and
