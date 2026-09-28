@@ -3,8 +3,9 @@ idf_component_register(
         "desktop.c"
     INCLUDE_DIRS
         "include"
-    PRIV_REQUIRES
+    REQUIRES
         espix_display
+    PRIV_REQUIRES
         espix_kernel
         freertos
 )
