@@ -5,6 +5,7 @@ idf_component_register(
         "registry.c"
         "session.c"
         "tty_console.c"
+        "term.c"
         "canvas_console.c"
     INCLUDE_DIRS
         "include"

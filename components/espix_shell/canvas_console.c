@@ -1,5 +1,5 @@
 /*
- * The on-screen console: an espix shell rendered into the display canvas.
+ * The on-screen console: an espix terminal rendered into the display canvas.
  *
  * It is the third transport for the same shell, after the UART console and the
  * SSH channel, and it exists so that a viewer always has something useful to
@@ -12,33 +12,24 @@
  * service: it is a shell transport that happens to draw to a canvas, and a
  * display should not need a shell to exist.
  *
- * The line reader below is still deliberately plain -- no history, no arrows,
- * no completion -- but the *output* side is a terminal: CSI sequences that move
- * the cursor or erase are acted on, so a full-screen program redraws in place,
- * and UTF-8 is decoded one cell per code point. Switching the input side to the
- * real editor is the next step, and is now unblocked rather than blocked.
- *
- * Colour is parsed and dropped: the font is 1-bit and the grid holds one byte
- * per cell, so rendering it means a colour attribute per cell.
+ * What is left here is the part that is about the canvas: the screen owner, the
+ * three functions that draw a terminal into it, and the task. The terminal
+ * itself -- the grid, the parser, the editor, the session -- is espix_term, and
+ * the desktop's terminal window is the same object drawn somewhere else.
  */
 
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
-#include <sys/stat.h>
-
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
 
-#include "esp_linenoise.h"
-
 #include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_term.h"
 
 #define TAG "vnc0"
 
@@ -52,46 +43,17 @@
 #define CON_COLS ((ESPIX_DISPLAY_W - 2 * CON_MARGIN) / 8)
 #define CON_ROWS ((ESPIX_DISPLAY_H - 2 * CON_MARGIN) / 8)
 
-/* The editor wants a descriptor it never uses; see the note where it is set. */
-#define CON_EDIT_FD (-1)
-
 #define CON_FG 0xC618   /* light grey on black, the usual terminal look */
 #define CON_BG 0x0000
 
 typedef struct {
-    char         *grid;     /* CON_ROWS * CON_COLS, PSRAM */
-    int           row, col;
-    QueueHandle_t keys;     /* chars from the input callback */
+    espix_term_t *term;
     TaskHandle_t  task;
-    volatile bool quit;
     bool          up;
     /* Set while the console is shutting down, so that a release -- which asks
      * the display for its fallback -- does not start this console again. */
     bool          leaving;
-    /* 0 outside an escape sequence, 1 after ESC, 2 inside CSI. */
-    int           esc;
     uint32_t      gen;
-
-    /* CSI parameter accumulator: up to four numeric parameters, as every
-     * terminal has. Only a handful are used below; the rest are parsed so an
-     * unknown sequence is consumed rather than drawn. */
-    uint16_t      params[4];
-    int           nparam;
-    int           param;
-
-    /* Partial UTF-8 code point, and how many continuation bytes are still to
-     * come. One code point must occupy exactly one cell. */
-    uint32_t      utf;
-    int           utf_need;
-
-    /* RFB KeyEvent has no modifier field: Control arrives as its own key. */
-    bool          ctrl;
-
-    /* The same editor the UART and SSH consoles run. Its read and write
-     * callbacks are the only place it touches this console. */
-    esp_linenoise_handle_t editor;
-    espix_history_t       *history;
-    espix_session_t session;
 } canvas_console_t;
 
 static canvas_console_t s_con;
@@ -112,16 +74,13 @@ static const espix_screen_t s_console_screen = {
 /*
  * Whether this console is the one being rendered.
  *
- * The owner slot means "whose model is on the screen", so being taken over
- * does not stop the console: it keeps its grid, its history and its session,
- * and stops being drawn. Every drawing entry point therefore checks this --
+ * The owner slot means "whose model is on the screen", so being taken over does
+ * not stop the console: it keeps its grid, its history and its session, and
+ * stops being drawn. Every drawing entry point therefore checks this --
  * without it, output from a console that is no longer on the screen is painted
  * over whatever replaced it. That is what "the console shines through the
  * desktop" is: `desktop start` typed on the console, and then the console's
  * own `desktop: up` and prompt drawn on top of the desktop.
- *
- * Deliberately not gated on s_con.up: the first repaint runs from claim(),
- * which happens before that flag is set.
  */
 static bool con_on_screen(void)
 {
@@ -132,359 +91,73 @@ static bool con_on_screen(void)
 /* Drawing                                                             */
 /* ------------------------------------------------------------------ */
 
-static void con_cell(int row, int col, char ch)
+/*
+ * The terminal's view, which is the only part of it that knows about the
+ * canvas. Each entry point locks the canvas for itself and does not nest --
+ * espix_canvas_lock() is a plain mutex, and the drawing calls below it take no
+ * lock of their own. A repaint therefore holds the lock per row rather than
+ * across the lot; the damage each row marks is what keeps a viewer correct.
+ */
+static void con_view_cell(void *ctx, int row, int col, char ch)
 {
+    (void)ctx;
+
     espix_canvas_t *cv = espix_display_canvas();
-    if (cv == NULL || !con_on_screen() ||
-        row < 0 || row >= CON_ROWS || col < 0 || col >= CON_COLS) {
+    if (cv == NULL || !con_on_screen()) {
         return;
     }
     const char cell[2] = { ch, '\0' };
+
     espix_canvas_lock(cv);
     espix_canvas_text(cv, CON_MARGIN + col * 8, CON_MARGIN + row * 8,
                       cell, CON_FG, CON_BG);
     espix_canvas_unlock(cv);
 }
 
-static void con_scroll(void)
+static void con_view_row(void *ctx, int row, const char *cells, int len)
 {
-    memmove(s_con.grid, s_con.grid + CON_COLS,
-            (size_t)(CON_ROWS - 1) * CON_COLS);
-    memset(s_con.grid + (size_t)(CON_ROWS - 1) * CON_COLS, ' ', CON_COLS);
-    s_con.row = CON_ROWS - 1;
+    (void)ctx;
 
-    /*
-     * The model moved, so the canvas has to follow. Without this the screen
-     * never scrolls: everything above the newest line stays frozen and only the
-     * bottom row changes, which is exactly what it looked like.
-     *
-     * A full repaint per scrolled line is not cheap. It is correct, and the
-     * accelerator path -- PPA on this chip -- is where it becomes cheap.
-     */
-    con_repaint(NULL);
-}
-
-static void con_newline(void)
-{
-    if (++s_con.row >= CON_ROWS) {
-        con_scroll();
-    }
-}
-
-static void con_putc(char c);
-
-/* One row, from the model. */
-static void con_draw_row(int row)
-{
     espix_canvas_t *cv = espix_display_canvas();
-    if (cv == NULL || !con_on_screen() || row < 0 || row >= CON_ROWS) {
+    if (cv == NULL || !con_on_screen()) {
         return;
     }
+    if (len > ESPIX_TERM_MAX_COLS) {
+        len = ESPIX_TERM_MAX_COLS;
+    }
 
-    char line[CON_COLS + 1];
-    memcpy(line, s_con.grid + (size_t)row * CON_COLS, CON_COLS);
-    line[CON_COLS] = '\0';
+    char line[ESPIX_TERM_MAX_COLS + 1];
+    memcpy(line, cells, (size_t)len);
+    line[len] = '\0';
 
     espix_canvas_lock(cv);
     espix_canvas_text(cv, CON_MARGIN, CON_MARGIN + row * 8, line, CON_FG, CON_BG);
     espix_canvas_unlock(cv);
 }
 
-/* 0 = cursor to end, 1 = start to cursor, 2 = the whole line. */
-static void con_erase_line(int mode)
-{
-    if (s_con.grid == NULL) {
-        return;
-    }
-
-    int from = 0;
-    int to   = CON_COLS;
-    if (mode == 0) {
-        from = s_con.col;
-    } else if (mode == 1) {
-        to = s_con.col + 1;
-    }
-
-    memset(s_con.grid + (size_t)s_con.row * CON_COLS + from, ' ',
-           (size_t)(to - from));
-    con_draw_row(s_con.row);
-}
-
-static void con_erase_screen(int mode)
-{
-    if (s_con.grid == NULL) {
-        return;
-    }
-
-    if (mode == 2 || mode == 3) {
-        memset(s_con.grid, ' ', (size_t)CON_ROWS * CON_COLS);
-        con_repaint(NULL);
-        return;
-    }
-    if (mode == 0) {
-        con_erase_line(0);
-        for (int r = s_con.row + 1; r < CON_ROWS; r++) {
-            memset(s_con.grid + (size_t)r * CON_COLS, ' ', CON_COLS);
-        }
-        con_repaint(NULL);
-    }
-}
-
-/*
- * One code point, one cell -- which is the whole reason this exists. The motd's
- * antenna is drawn with box-drawing characters, and each is three bytes in
- * UTF-8; drawing them byte by byte made every glyph three columns wide and
- * wrapped the line, shifting everything under it. The 8x8 font has no such
- * glyphs, so they are approximated in ASCII: the drawing still does not look
- * right, but the columns hold, which is what alignment means.
- */
-static void con_glyph(uint32_t cp)
-{
-    char ch;
-
-    switch (cp) {
-    case 0x2500: case 0x2501: case 0x2504: case 0x2505:
-        ch = '-';
-        break;
-    case 0x2502: case 0x2503: case 0x2506: case 0x2507:
-        ch = '|';
-        break;
-    case 0x250C: case 0x2510: case 0x2514: case 0x2518:
-    case 0x251C: case 0x2524: case 0x252C: case 0x2534:
-    case 0x253C:
-    case 0x250F: case 0x2513: case 0x2517: case 0x251B:
-    case 0x2523: case 0x252B: case 0x2533: case 0x253B:
-    case 0x254B:
-        ch = '+';
-        break;
-    default:
-        ch = (cp < 0x80) ? (char)cp : ' ';
-        break;
-    }
-
-    con_putc(ch);
-}
-
-/*
- * The bit that makes this a terminal rather than a printer: a program that
- * wants the cursor somewhere says so with an escape sequence, and this moves
- * it. Only the handful that line editors and full-screen programs actually use
- * are implemented; everything else is parsed and dropped, which is the
- * property that keeps this robust rather than exhaustive.
- */
-static void con_csi(char final)
-{
-    if (s_con.nparam < 4) {
-        s_con.params[s_con.nparam++] = (uint16_t)s_con.param;
-    }
-
-    const int a = s_con.nparam > 0 ? s_con.params[0] : 0;
-    const int b = s_con.nparam > 1 ? s_con.params[1] : 0;
-
-    switch (final) {
-    case 'A': s_con.row -= (a ? a : 1); break;
-    case 'B': s_con.row += (a ? a : 1); break;
-    case 'C': s_con.col += (a ? a : 1); break;
-    case 'D': s_con.col -= (a ? a : 1); break;
-    case 'G': s_con.col = (a ? a : 1) - 1; break;
-    case 'H':
-    case 'f':
-        s_con.row = (a ? a : 1) - 1;
-        s_con.col = (b ? b : 1) - 1;
-        break;
-    case 'K': con_erase_line(a); break;
-    case 'J': con_erase_screen(a); break;
-
-    case 'n':
-        /*
-         * Device Status Report -- "where is your cursor?". This is ours to
-         * answer, because we *are* the terminal on this side: there is nothing
-         * else between the shell and the screen.
-         *
-         * It is not optional. esp_linenoise finds the terminal width by sending
-         * this query and reading the reply, so with nobody answering it waits
-         * for ever inside create_instance -- before the console task exists and
-         * before a frame is ever sent, which is why the viewer was simply
-         * black. Over SSH the client's terminal emulator answers; a VNC viewer
-         * is a framebuffer and never will.
-         */
-        if (a == 5) {
-            /*
-             * Status report, which is what esp_linenoise_probe() actually
-             * sends -- not the cursor-position request it looks like. It
-             * requires exactly "ESC[0n" (four bytes) within 500 ms, and if it
-             * does not get it it concludes the terminal is dumb and turns line
-             * editing and history OFF. So this reply is what makes arrows,
-             * history and completion work at all.
-             */
-            for (const char *p = "\x1b[0n"; *p != '\0'; p++) {
-                (void)xQueueSend(s_con.keys, p, 0);
-            }
-        } else if (a == 6) {
-            /* Cursor position, the other thing a program may ask for. */
-            char reply[16];
-            const int n = snprintf(reply, sizeof(reply), "\x1b[%d;%dR",
-                                   s_con.row + 1, s_con.col + 1);
-            for (int i = 0; i < n; i++) {
-                (void)xQueueSend(s_con.keys, &reply[i], 0);
-            }
-        }
-        break;
-
-    case 'c':
-        /*
-         * Device Attributes. Not used for anything here, but a terminal that
-         * does not answer is a terminal something will wait on -- and every
-         * query answered is one fewer way to hang.
-         */
-        {
-            /* The primary attributes, which is what a VT100-ish terminal
-             * reports: no private modes, no extensions. Enough to satisfy a
-             * question, which is the only thing this is for. */
-            for (const char *p = "\x1b[?1;2c"; *p != '\0'; p++) {
-                (void)xQueueSend(s_con.keys, p, 0);
-            }
-        }
-        break;
-    default:  break;    /* SGR and the rest: recognised, nothing to render */
-    }
-
-    if (s_con.row < 0)              { s_con.row = 0; }
-    if (s_con.row >= CON_ROWS)      { s_con.row = CON_ROWS - 1; }
-    if (s_con.col < 0)              { s_con.col = 0; }
-    if (s_con.col >= CON_COLS)      { s_con.col = CON_COLS - 1; }
-}
-
-static void con_putc(char c)
-{
-    if (s_con.grid == NULL) {
-        return;
-    }
-
-    /*
-     * Escape sequences: parsed, and the ones that move the cursor acted on.
-     * Dropping the ESC alone is not harmless -- its arguments are printable, so
-     * a colour sequence draws as "[36m" -- and dropping the whole thing is not
-     * enough either, because then a cursor-home does not go home and a
-     * full-screen program appends for ever.
-     *
-     * Unknown sequences are consumed and ignored, which is what keeps this
-     * robust rather than exhaustive.
-     */
-    if (c == 0x1B) {
-        s_con.esc    = 1;
-        s_con.nparam = 0;
-        s_con.param  = 0;
-        return;
-    }
-    if (s_con.esc == 1) {
-        s_con.esc = (c == '[') ? 2 : 0;     /* only CSI is understood */
-        return;
-    }
-    if (s_con.esc == 2) {
-        if (c >= '0' && c <= '9') {
-            s_con.param = s_con.param * 10 + (c - '0');
-            if (s_con.param > 9999) {
-                s_con.param = 9999;
-            }
-        } else if (c == ';') {
-            if (s_con.nparam < 4) {
-                s_con.params[s_con.nparam++] = (uint16_t)s_con.param;
-            }
-            s_con.param = 0;
-        } else if (c >= 0x40 && c <= 0x7E) {
-            s_con.esc = 0;
-            con_csi(c);
-        }
-        return;
-    }
-
-    /*
-     * UTF-8, one cell per code point. Without this the motd's antenna -- box
-     * drawing, three bytes each -- drew three columns per glyph and wrapped,
-     * shifting every line underneath it.
-     */
-    if (s_con.utf_need > 0) {
-        if (((unsigned char)c & 0xC0) == 0x80) {
-            s_con.utf = (s_con.utf << 6) | ((unsigned char)c & 0x3F);
-            if (--s_con.utf_need == 0) {
-                con_glyph(s_con.utf);
-            }
-        } else {
-            s_con.utf_need = 0;             /* malformed: drop it */
-        }
-        return;
-    }
-    if ((unsigned char)c >= 0xC0) {
-        const unsigned char u = (unsigned char)c;
-        s_con.utf      = u & (u >= 0xF0 ? 0x07u : (u >= 0xE0 ? 0x0Fu : 0x1Fu));
-        s_con.utf_need = u >= 0xF0 ? 3 : (u >= 0xE0 ? 2 : 1);
-        return;
-    }
-
-    if (c == '\n') { s_con.col = 0; con_newline(); return; }
-    if (c == '\r') { s_con.col = 0; return; }
-
-    if (c == '\b') {
-        if (s_con.col > 0) {
-            s_con.col--;
-            s_con.grid[s_con.row * CON_COLS + s_con.col] = ' ';
-            con_cell(s_con.row, s_con.col, ' ');
-        }
-        return;
-    }
-
-    if (c == '\t') {
-        /* The motd aligns its columns with tabs, and a tab is not one character
-         * of output -- dropping it pulls everything after it leftwards, which
-         * is exactly how it looked. Next multiple of eight, as every terminal
-         * does it. */
-        do {
-            con_putc(' ');
-        } while (s_con.col % 8 != 0);
-        return;
-    }
-
-    if (c < 0x20 || c > 0x7E) {
-        return;                         /* no escape sequences yet */
-    }
-
-    s_con.grid[s_con.row * CON_COLS + s_con.col] = c;
-    con_cell(s_con.row, s_con.col, c);
-
-    if (++s_con.col >= CON_COLS) {
-        s_con.col = 0;
-        con_newline();
-    }
-}
-
-/* Redraw from the model. This is what makes ownership a repaint rather than a
- * handover of state -- the console keeps its screen whether or not it is the
- * one on display. */
-static void con_repaint(void *ctx)
+/* The margin is outside the grid, so it is painted too -- otherwise whatever
+ * the previous owner left there shows through. */
+static void con_view_clear(void *ctx)
 {
     (void)ctx;
 
     espix_canvas_t *cv = espix_display_canvas();
-    if (cv == NULL || s_con.grid == NULL || !con_on_screen()) {
+    if (cv == NULL || !con_on_screen()) {
         return;
     }
 
     espix_canvas_lock(cv);
-
-    /* The margin is outside the grid, so it is painted separately -- otherwise
-     * whatever the previous owner left there shows through. */
     espix_canvas_fill(cv, (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
                       CON_BG);
-
-    for (int r = 0; r < CON_ROWS; r++) {
-        char line[CON_COLS + 1];
-        memcpy(line, s_con.grid + (size_t)r * CON_COLS, CON_COLS);
-        line[CON_COLS] = '\0';
-        espix_canvas_text(cv, CON_MARGIN, CON_MARGIN + r * 8, line, CON_FG, CON_BG);
-    }
     espix_canvas_unlock(cv);
 }
+
+static const espix_term_view_t s_con_view = {
+    .ctx   = NULL,
+    .cell  = con_view_cell,
+    .row   = con_view_row,
+    .clear = con_view_clear,
+};
 
 /* ------------------------------------------------------------------ */
 /* Input and output                                                    */
@@ -494,237 +167,22 @@ static void con_input(void *ctx, const espix_input_event_t *ev)
 {
     (void)ctx;
 
-    if (ev->kind != ESPIX_INPUT_KEY) {
+    if (ev->kind != ESPIX_INPUT_KEY || s_con.term == NULL) {
         return;                         /* a text console has no pointer */
     }
 
-    /*
-     * Modifiers are key events of their own -- an RFB KeyEvent carries a keysym
-     * and nothing else -- so Ctrl-C arrives as Control down, then 'c' down.
-     * Without tracking that, the console saw the letter 'c' and no interrupt at
-     * all, which is why Ctrl-C did nothing however well everything else worked.
-     */
-    if (ev->keysym == 0xFFE3 || ev->keysym == 0xFFE4) {    /* Control_L, _R */
-        s_con.ctrl = ev->down;
-        return;
-    }
-    if (!ev->down) {
-        return;
-    }
-
-    char ch = espix_keysym_char(ev->keysym);
-    if (ch == '\0') {
-        return;
-    }
-
-    /* Ctrl-<key> is the key's low five bits, which is where ^C = 0x03 comes
-     * from. Shift needs nothing: the client sends the shifted keysym. */
-    if (s_con.ctrl) {
-        if (ch >= 'a' && ch <= 'z') {
-            ch = (char)(ch - 'a' + 1);
-        } else if (ch >= 'A' && ch <= 'Z') {
-            ch = (char)(ch - 'A' + 1);
-        } else if (ch == ' ') {
-            ch = 0x00;
-        } else if (ch >= '@' && ch <= '_') {
-            ch = (char)(ch - '@');
-        }
-    }
-
-    (void)xQueueSend(s_con.keys, &ch, 0);
+    /* The keysym-to-byte and Ctrl-<key> translation lives with the terminal,
+     * because a local keyboard and a VNC viewer arrive the same way. */
+    espix_term_key(s_con.term, ev->keysym, ev->down);
 }
 
-static int con_write(espix_session_t *s, const char *data, size_t len)
+/* Redraw from the model. This is what makes ownership a repaint rather than a
+ * handover of state -- the console keeps its screen whether or not it is the
+ * one on display. */
+static void con_repaint(void *ctx)
 {
-    (void)s;
-
-    for (size_t i = 0; i < len; i++) {
-        con_putc(data[i]);
-    }
-    return (int)len;
-}
-
-/*
- * A spawned process's stdio.
- *
- * Without this an app's printf goes nowhere: the session's write() is the
- * shell's output path, and a program that calls libc does not go through it.
- * espix_proc points the task's streams at whatever this returns, which is how
- * an app's output reaches the screen at all.
- *
- * funopen over the same paths the shell uses, exactly as the SSH transport
- * does, so there is one rendering path for both.
- */
-static int con_stream_write(void *cookie, const char *buf, int len)
-{
-    return con_write((espix_session_t *)cookie, buf, (size_t)len);
-}
-
-static int con_stream_read(void *cookie, char *buf, int len)
-{
-    (void)cookie;
-
-    /*
-     * Blocks only until there is something, then takes whatever else is already
-     * queued: waiting for a full request would leave an interactive reader
-     * stuck behind a buffer that will not fill.
-     */
-    int n = 0;
-    while (n < len) {
-        char ch;
-        if (xQueueReceive(s_con.keys, &ch,
-                          n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
-            break;
-        }
-        buf[n++] = ch;
-    }
-    return n;
-}
-
-static FILE *con_open_stream(espix_session_t *s, espix_stream_t which)
-{
-    if (which == ESPIX_STREAM_IN) {
-        FILE *f = funopen(s, con_stream_read, NULL, NULL, NULL);
-        if (f != NULL) {
-            setvbuf(f, NULL, _IOFBF, 512);
-        }
-        return f;
-    }
-
-    /* Buffered, not unbuffered: a repaint is expensive and a byte at a time
-     * would be absurd. */
-    FILE *f = funopen(s, NULL, con_stream_write, NULL, NULL);
-    if (f != NULL) {
-        setvbuf(f, NULL, _IOLBF, 128);
-    }
-    return f;
-}
-
-/*
- * The editor's two ends. esp_linenoise hands its callbacks an int fd and no
- * context pointer, so the fd is only a key -- the same arrangement the SSH
- * transport uses, and the reason neither ever calls esp_linenoise_probe(),
- * which would fcntl() a descriptor that is not a terminal.
- */
-static ssize_t con_edit_read(int fd, void *buf, size_t count)
-{
-    (void)fd;
-
-    char *p = buf;
-    size_t n = 0;
-
-    while (n < count) {
-        char ch;
-        if (xQueueReceive(s_con.keys, &ch,
-                          n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
-            if (s_con.quit) {
-                break;                      /* the viewer is gone: EOF */
-            }
-            if (n > 0) {
-                break;
-            }
-            continue;
-        }
-
-        /*
-         * ICRNL. A terminal sends CR for Enter and esp_linenoise tests for LF,
-         * so without this Enter does nothing at all. The serial console gets it
-         * from IDF's UART VFS (ESP_LINE_ENDINGS_CR) and SSH does it in its own
-         * read callback -- "espix *is* the pty here, so the line discipline's
-         * job is ours". Same job, same place.
-         */
-        if (ch == '\r') {
-            ch = '\n';
-        }
-        p[n++] = ch;
-    }
-    return (ssize_t)n;
-}
-
-static ssize_t con_edit_write(int fd, const void *buf, size_t count)
-{
-    (void)fd;
-
-    /* Through the parser, which is what makes the editor's cursor addressing
-     * land where it means to. */
-    return (ssize_t)con_write(NULL, buf, count);
-}
-
-/*
- * Read one line off the key queue.
- *
- * The session's own read_line is what the shell blocks in, so this is where the
- * console's task spends its life -- and where the owner's input callback is the
- * only other party. Neither touches the other's state: the callback pushes a
- * char, this pulls one.
- */
-static int con_read_line(espix_session_t *s, const char *prompt,
-                         char *buf, size_t len)
-{
-    (void)s;
-
-    if (s_con.quit || s_con.editor == NULL) {
-        return -1;
-    }
-
-    esp_linenoise_set_prompt(s_con.editor, prompt);
-
-    /* get_line() returns ESP_OK for an empty line without writing the buffer,
-     * so anything left from last time would be run as a command. */
-    buf[0] = '\0';
-
-    if (esp_linenoise_get_line(s_con.editor, buf, len) != ESP_OK) {
-        /*
-         * Two different keys land here, exactly as they do over SSH: the editor
-         * sets EAGAIN for Ctrl-C, which abandons the line and should leave a
-         * fresh prompt, and leaves errno alone for Ctrl-D on an empty line,
-         * which is end of input. Treating both as the end would drop the
-         * console on Ctrl-C, which no other shell does.
-         */
-        if (errno == EAGAIN) {
-            return 0;
-        }
-        return -1;
-    }
-
-    if (buf[0] != '\0') {
-        espix_history_push(s_con.history, buf);
-        espix_history_apply(s_con.history, s_con.editor);
-    }
-
-    return (int)strlen(buf);
-}
-
-/*
- * Called by the shell between writes while a command runs. It is the only
- * reader of the key queue during a command, which is what makes Ctrl-C work --
- * and what stops typed keys from piling up and then being replayed as a line
- * the moment the command exits.
- */
-static bool con_poll_interrupt(espix_session_t *s)
-{
-    (void)s;
-
-    /*
-     * The viewer is gone. A running command never sees s_con.quit -- this
-     * callback is the only thing the shell consults while one runs -- so
-     * without this, `top` sat there for ever and the console task could never
-     * be joined. That is what left the screen owned by a console nobody could
-     * see, and what made the next connection get nothing at all.
-     */
-    if (s_con.quit) {
-        return true;
-    }
-
-    bool interrupted = false;
-    char ch;
-
-    while (xQueueReceive(s_con.keys, &ch, 0) == pdTRUE) {
-        if (ch == 0x03) {
-            interrupted = true;
-        }
-    }
-    return interrupted;
+    (void)ctx;
+    espix_term_repaint(s_con.term);
 }
 
 /* ------------------------------------------------------------------ */
@@ -737,119 +195,54 @@ static void con_task(void *arg)
      * running while a newer console exists, and its teardown must then free
      * nothing -- those buffers are the new console's. */
     const uint32_t gen = (uint32_t)(uintptr_t)arg;
+    espix_term_t  *t   = s_con.term;
 
-    espix_session_t *s = &s_con.session;
-    *s = (espix_session_t){
-        .name      = "vnc0",
-        .cwd       = "/",
-        .read_line = con_read_line,
-        .write     = con_write,
-        .poll_interrupt = con_poll_interrupt,
-        .open_stream    = con_open_stream,
-        .transport = NULL,
-        .fg_pid    = ESPIX_PID_NONE,
+    if (t != NULL) {
+        espix_session_t *s = espix_term_session(t);
+
+        s->name = "vnc0";
         /*
          * The esp account, not root -- the deliberate difference from the
-         * serial console. That one is root because whoever is holding the
-         * board has already won; a viewer over the network has not, so this
-         * console starts unprivileged and escalates with sudo when it means
-         * to. The protection against someone who does hold the cable, or the
-         * VNC password, is the SSH tunnel rather than RFB's own authentication.
+         * serial console. That one is root because whoever is holding the board
+         * has already won; a viewer over the network has not, so this console
+         * starts unprivileged and escalates with sudo when it means to. The
+         * protection against someone who does hold the cable, or the VNC
+         * password, is the SSH tunnel rather than RFB's own authentication.
          *
          * 1000 and "esp" are written out rather than named because espix_auth
          * owns the names and this component cannot reach it: espix_auth is
          * above espix_fs, which is above this one. Same reason, and the same
          * shape, as the uid in tty_console.c.
          */
-        .uid       = 1000,      /* esp */
-        .gid       = 1000,
-        .login     = false,
-        /*
-         * True now that there is a parser behind this. It is not cosmetic:
-         * commands read it to decide whether they may use cursor addressing,
-         * and `top` printed a fresh screenful per update while it was false --
-         * which is the "scrolling for ever" that a terminal without escapes
-         * genuinely should do.
-         */
-        .ansi      = true,
-    };
-    strlcpy(s->user, "esp", sizeof(s->user));
+        s->uid   = 1000;            /* esp */
+        s->gid   = 1000;
+        strlcpy(s->user, "esp", sizeof(s->user));
+        strlcpy(s->home, "/home/esp", sizeof(s->home));
 
-    /*
-     * The account's home, or root if it is not there. A rootfs can be replaced
-     * wholesale, and refusing to open a console because a directory went
-     * missing would be a poor trade -- the same bargain apply_account() makes.
-     */
-    strlcpy(s->home, "/home/esp", sizeof(s->home));
-    strlcpy(s->cwd,  "/home/esp", sizeof(s->cwd));
-
-    struct stat st;
-    if (stat(s->cwd, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        strlcpy(s->cwd, "/", sizeof(s->cwd));
+        espix_term_run(t);
     }
 
-    /*
-     * `exit` ends the session, not the console.
-     *
-     * A VT that dropped to a blank screen on logout would be a poor getty: what
-     * follows an exit is a *fresh* session, which is what init respawning getty
-     * gives you on Linux. The only thing that ends the console itself is the
-     * viewer leaving -- and that is why this loop is bounded by s_con.quit and
-     * not by the shell returning.
-     */
-    do {
-        /* Cleared before reuse, or the next session_run() would return
-         * immediately and spin. */
-        s->want_exit = false;
-
-        /* The same greeting the serial console and an SSH login print, by
-         * construction: both go through the same command. */
-        espix_shell_exec(s, "motd");
-
-        espix_shell_session_run(s);
-
-        /* Per-session and heap-allocated; the shell hung the processes up as
-         * it returned. */
-        espix_env_free(s);
-        strlcpy(s->cwd, s->home, sizeof(s->cwd));
-    } while (!s_con.quit);
-
-    /*
-     * The task owns its own teardown, exactly as it owns its own deletion: it
-     * is the only thing that knows it has stopped touching the queue and the
-     * grid. Freeing them from stop() left a window in which a task still inside
-     * read_line touched a queue that no longer existed -- which is the
-     * xQueueReceive(NULL) assert that rebooted the board.
-     */
     s_con.leaving = true;
 
     /*
-     * Said before the stale check, not after: this instance belongs to this
-     * task, so it goes with it whether or not a newer console exists.
+     * The terminal owns its grid, its queue and its editor, and this task is the
+     * only thing that knows it has stopped touching them -- which is why the
+     * freeing was here in the first place. Doing it from stop() left a window in
+     * which a task still inside read_line touched a queue that no longer
+     * existed, which is the xQueueReceive(NULL) assert that rebooted the board.
      */
-    if (s_con.editor != NULL) {
-        esp_linenoise_delete_instance(s_con.editor);
-        s_con.editor = NULL;
-    }
+    espix_term_free(t);
 
     if (gen != s_gen) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "stale console task exiting");
         vTaskDeleteWithCaps(NULL);
     }
 
-    if (s_con.keys != NULL) {
-        vQueueDelete(s_con.keys);
-        s_con.keys = NULL;
-    }
-    if (s_con.grid != NULL) {
-        heap_caps_free(s_con.grid);
-        s_con.grid = NULL;
-    }
-
-    espix_display_release(&s_console_screen);
-
+    s_con.term = NULL;
     s_con.up   = false;
     s_con.task = NULL;
+
+    espix_display_release(&s_console_screen);
     vTaskDeleteWithCaps(NULL);          /* frees the PSRAM stack it was given */
 }
 
@@ -869,73 +262,17 @@ esp_err_t espix_console_canvas_start(void)
 
     memset(&s_con, 0, sizeof(s_con));
 
-    s_con.grid = heap_caps_malloc((size_t)CON_ROWS * CON_COLS,
-                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_con.grid == NULL) {
-        s_con.grid = heap_caps_malloc((size_t)CON_ROWS * CON_COLS,
-                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (s_con.grid == NULL) {
+    s_con.term = espix_term_new(&s_con_view, CON_COLS, CON_ROWS, "esp");
+    if (s_con.term == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the terminal");
         return ESP_ERR_NO_MEM;
     }
-    memset(s_con.grid, ' ', (size_t)CON_ROWS * CON_COLS);
-
-    /*
-     * Before the editor, not after it. esp_linenoise issues a cursor-position
-     * query when it starts and reads the reply back through con_edit_read(),
-     * which pulls from this queue -- so creating the editor first was an
-     * xQueueReceive(NULL) assert the moment a viewer connected, on the RFB
-     * task, which is where the console is started from.
-     */
-    s_con.keys = xQueueCreate(64, sizeof(char));
-    if (s_con.keys == NULL) {
-        heap_caps_free(s_con.grid);
-        s_con.grid = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
-    /*
-     * The same editor the UART and SSH consoles run, so history, arrows and
-     * completion behave identically on all three. The parser is what made this
-     * possible: it emits cursor addressing, and until there was something to
-     * interpret it the console could only append.
-     *
-     * The fd is a key, not a descriptor -- both callbacks are supplied, so
-     * nothing reads or writes it. probe() is deliberately not called; it
-     * fcntl()s the descriptor and gives up when that fails.
-     */
-    s_con.history = espix_history_for("esp");
-
-    esp_linenoise_config_t ed;
-    esp_linenoise_get_instance_config_default(&ed);
-    ed.in_fd               = CON_EDIT_FD;
-    ed.out_fd              = CON_EDIT_FD;
-    ed.max_cmd_line_length = ESPIX_LINE_MAX;
-    ed.history_max_length  = 32;
-    ed.allow_multi_line    = true;
-    ed.allow_empty_line    = true;
-    ed.completion_cb       = espix_shell_completion;
-    ed.hints_cb            = espix_shell_hint;
-    ed.read_bytes_cb       = con_edit_read;
-    ed.write_bytes_cb      = con_edit_write;
-
-    if (esp_linenoise_create_instance(&ed, &s_con.editor) != ESP_OK) {
-        /* Without it con_read_line() cannot run a line, and a session that
-         * cannot read would end immediately and respawn in a loop. Better to
-         * refuse the console than to spin. */
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the line editor");
-        s_con.editor = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    espix_history_apply(s_con.history, s_con.editor);
 
     /* Claimed before the task runs, so the first frame is the console's and
      * nothing can slip in between. */
     if (espix_display_claim(&s_console_screen) != ESP_OK) {
-        vQueueDelete(s_con.keys);
-        s_con.keys = NULL;
-        heap_caps_free(s_con.grid);
-        s_con.grid = NULL;
+        espix_term_free(s_con.term);
+        s_con.term = NULL;
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -961,11 +298,9 @@ esp_err_t espix_console_canvas_start(void)
     }
     if (s_con.task == NULL) {
         espix_display_release(&s_console_screen);
-        vQueueDelete(s_con.keys);
-        s_con.keys = NULL;
-        heap_caps_free(s_con.grid);
-        s_con.grid = NULL;
-        s_con.up = false;
+        espix_term_free(s_con.term);
+        s_con.term = NULL;
+        s_con.up   = false;
         return ESP_ERR_NO_MEM;
     }
 
@@ -981,13 +316,13 @@ void espix_console_canvas_stop(void)
 
     /*
      * Asked, not forced -- and nothing is freed here. The task releases the
-     * screen and frees the buffers as its last act, because only it knows when
+     * screen and frees the terminal as its last act, because only it knows when
      * it has stopped using them. Waiting for it to be gone is the whole of this
      * function; anything freed here would be freed while the task might still
      * be in read_line.
      */
     s_con.leaving = true;
-    s_con.quit    = true;
+    espix_term_stop(s_con.term);
 
     for (int i = 0; i < 300 && s_con.task != NULL; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -995,7 +330,7 @@ void espix_console_canvas_stop(void)
 
     if (s_con.task != NULL) {
         /*
-         * Better a leaked buffer than a freed one under a live task, so the
+         * Better a leaked terminal than a freed one under a live task, so the
          * task keeps its own -- but the screen is released here regardless. A
          * console that is gone must not hold it: that is what left the next
          * connection staring at a frozen image with no console of its own.

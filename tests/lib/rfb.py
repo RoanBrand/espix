@@ -335,6 +335,58 @@ def count_differing(a, b):
     return sum(1 for i in range(0, len(a), 4) if a[i:i + 4] != b[i:i + 4])
 
 
+def load_font(path="components/espix_display/font8x8.c"):
+    """The 8x8 font, read out of the C table it lives in.
+
+    `espix_font8x8[128][8]`, one byte a row, bit 0 the leftmost pixel -- which is
+    the only thing about it that cannot be guessed and is worth the comment it
+    has in the source.
+    """
+    import re
+
+    glyphs = []
+    with open(path) as f:
+        for line in f:
+            found = re.findall(r"0x([0-9A-Fa-f]{2})", line)
+            if len(found) == 8:
+                glyphs.append(tuple(int(v, 16) for v in found))
+    if len(glyphs) < 128:
+        raise RfbError("font table looks wrong: %d glyphs" % len(glyphs))
+    return glyphs
+
+
+def _cell_bits(fb, w, x, y, fg):
+    rows = []
+    for r in range(8):
+        bits = 0
+        for c in range(8):
+            if pixel(fb, w, x + c, y + r) == fg:
+                bits |= 1 << c
+        rows.append(bits)
+    return tuple(rows)
+
+
+def read_screen(fb, w, cols, rows, origin, fg, font):
+    """Decode a grid of cells back into text.
+
+    This is what makes "the console printed the command" a test rather than a
+    count of lit pixels that happened to go up: the screen is read the same way
+    it was written, through the font, and the result is a string.
+    """
+    lookup = {bits: i for i, bits in enumerate(font)}
+    lines = []
+    for r in range(rows):
+        line = ""
+        for c in range(cols):
+            bits = _cell_bits(fb, w, origin[0] + c * 8, origin[1] + r * 8, fg)
+            if bits == (0,) * 8:
+                line += " "
+            else:
+                line += chr(lookup.get(bits, ord("?")))
+        lines.append(line.rstrip())
+    return lines
+
+
 def count_in(fb, w, r, colour, tol=0):
     """How many pixels in a rectangle are within `tol` of a colour, per channel.
     The way to ask "did the focused title bar get drawn here" without trusting
