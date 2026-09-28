@@ -346,9 +346,31 @@ void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
     if (c == NULL) {
         return;
     }
+    /*
+     * Both rectangles have to be inside the canvas, and clipped by the same
+     * amount. A destination clipped without its source is a copy *from* a
+     * rectangle that does not exist -- and a window may be dragged half off the
+     * screen, which is exactly when it happens. One real client refused the
+     * update and closed the connection, with the source named: 513x247 at
+     * 292,43, five pixels past the right edge.
+     *
+     * So the translation is kept and both ends are clipped together; if the
+     * source cannot come along, the note is dropped and the pixels are sent as
+     * pixels instead, which is always right.
+     */
+    const int dx = sx - r.x;
+    const int dy = sy - r.y;
+
     r = rect_clip_wh(r, c->w, c->h);
     if (r.w <= 0 || r.h <= 0) {
         return;
+    }
+
+    sx = r.x + dx;
+    sy = r.y + dy;
+
+    if (sx < 0 || sy < 0 || sx + r.w > c->w || sy + r.h > c->h) {
+        return;                     /* not a copy of anything that exists */
     }
     if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
         return;
