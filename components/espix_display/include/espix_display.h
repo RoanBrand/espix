@@ -176,6 +176,24 @@ void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
                                     const espix_surface_t *s, espix_rect_t r);
 
 /* ------------------------------------------------------------------ */
+/* Images                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Decode a JPEG held in memory into a new surface, or NULL.
+ *
+ * In memory, because the caller owns the file: reading it is not the display
+ * service's job, and decoding is. The software path is TJpgDec in the ROM, which
+ * the S3 and the S31 both carry -- so the fallback every target needs costs
+ * nothing but the call, and the S3, which has no JPEG block at all, decodes in
+ * software because that is all there is. The hardware path is the JPEG codec,
+ * which the S31 and the P4 have.
+ *
+ * The caller frees the surface.
+ */
+espix_surface_t *espix_image_jpeg(const uint8_t *jpg, size_t len);
+
+/* ------------------------------------------------------------------ */
 /* Input                                                               */
 /* ------------------------------------------------------------------ */
 

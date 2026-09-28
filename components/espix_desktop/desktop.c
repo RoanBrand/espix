@@ -12,6 +12,7 @@
  * refused, but the pointer must not be cached across that.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "espix_desktop.h"
 #include "espix_display.h"
@@ -248,6 +250,9 @@ static bool desktop_on_screen(void)
 /* Defined below; damaging a window is a repair of the region it covers. */
 static void desktop_repair(espix_rect_t r);
 
+/* And the launcher square, which sits on the background under the windows. */
+static void button_paint(espix_canvas_t *c);
+
 espix_rect_t espix_window_content(const espix_window_t *w)
 {
     return (espix_rect_t){ PAD, TITLE_H + PAD,
@@ -366,6 +371,7 @@ static void desktop_repair(espix_rect_t r)
 
     espix_canvas_lock(c);
     espix_canvas_fill(c, r, COL_DESKTOP);
+    button_paint(c);        /* under the windows, over the background */
 
     for (int i = 0; i < s_nwin; i++) {
         const espix_window_t *w = s_wins[i];
@@ -579,6 +585,164 @@ static void focus_at(int x, int y)
      * difference between a pointer that feels continuous and one that does not.
      */
     focus_draw(was, hit);
+}
+
+/* ------------------------------------------------------------------ */
+/* The launcher square, and the window it opens                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A hardcoded path, deliberately. There is no file browser and no launcher, and
+ * the point of this is the smallest thing that proves the shape: something on
+ * the desktop, clicked with the mouse, that puts a window on the screen. A path
+ * from somewhere else is one line, once there is a somewhere else.
+ */
+#define PHOTO_PATH "/home/esp/test.jpg"
+
+#define BTN_X 696
+#define BTN_Y 24
+#define BTN_W 80
+#define BTN_H 80
+
+static espix_window_t  *s_img_win;
+static espix_surface_t *s_img;          /* decoded once, then kept */
+static bool             s_img_tried;
+
+static void button_paint(espix_canvas_t *c)
+{
+    const espix_rect_t r = { BTN_X, BTN_Y, BTN_W, BTN_H };
+
+    espix_canvas_fill(c, r, COL_TITLE);
+    espix_canvas_outline(c, r, COL_WIN_EDGE);
+    espix_canvas_text(c, BTN_X + (BTN_W - 5 * CELL_W) / 2, BTN_Y + BTN_H / 2 - 4,
+                      "photo", COL_TITLE_FG, COL_TITLE);
+}
+
+static bool button_hit(int x, int y)
+{
+    return x >= BTN_X && x < BTN_X + BTN_W && y >= BTN_Y && y < BTN_Y + BTN_H;
+}
+
+/*
+ * Read the file and decode it, once. The whole file is in memory before the
+ * decode because that is what the decoder takes -- reading it is not the display
+ * service's job -- and because a JPEG is read forwards, backwards and twice.
+ */
+static bool photo_load(void)
+{
+    if (s_img != NULL) {
+        return true;
+    }
+    if (s_img_tried) {
+        return false;             /* said why once already */
+    }
+    s_img_tried = true;
+
+    FILE *f = fopen(PHOTO_PATH, "rb");
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: %s", PHOTO_PATH, strerror(errno));
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    uint8_t *buf = NULL;
+    if (n > 4 && n < (4 << 20)) {
+        buf = heap_caps_malloc((size_t)n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf != NULL && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+            heap_caps_free(buf);
+            buf = NULL;
+        }
+    }
+    fclose(f);
+
+    if (buf == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot read %ld bytes",
+                   PHOTO_PATH, n);
+        return false;
+    }
+
+    const int64_t t0 = esp_timer_get_time();
+    s_img = espix_image_jpeg(buf, (size_t)n);
+    const int64_t t1 = esp_timer_get_time();
+    heap_caps_free(buf);
+
+    if (s_img == NULL) {
+        return false;
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: %dx%d decoded in %lld ms",
+               PHOTO_PATH, espix_surface_width(s_img),
+               espix_surface_height(s_img),
+               (long long)((t1 - t0) / 1000));
+    return true;
+}
+
+/*
+ * The image, one-to-one in the window's content. The window is sized to the
+ * picture, so there is nothing to scale -- fitting an arbitrary image to an
+ * arbitrary window is PPA SRM's job and is a separate thing to get right.
+ */
+static void photo_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
+                       void *ctx)
+{
+    (void)ctx;
+    const espix_rect_t c = espix_window_content(w);
+
+    if (s_img == NULL) {
+        if (r.y < c.y + CELL_H) {
+            espix_surface_text(s, c.x, c.y, "no image", COL_TEXT_FG, COL_WIN_BG);
+        }
+        return;
+    }
+
+    const int         iw  = espix_surface_width(s_img);
+    const int         ih  = espix_surface_height(s_img);
+    const espix_px_t *src = espix_surface_pixels(s_img);
+    espix_px_t       *dst = espix_surface_pixels(s);
+    const int         sw  = espix_surface_width(s);
+
+    for (int y = 0; y < ih; y++) {
+        const int cy = c.y + y;
+
+        if (cy < r.y || cy >= r.y + r.h) {
+            continue;
+        }
+
+        int x0 = 0;
+        int x1 = iw;
+        if (c.x + x0 < r.x)             { x0 = r.x - c.x; }
+        if (c.x + x1 > r.x + r.w)       { x1 = r.x + r.w - c.x; }
+        if (x1 <= x0)                   { continue; }
+
+        memcpy(&dst[(size_t)cy * sw + c.x + x0], &src[(size_t)y * iw + x0],
+               (size_t)(x1 - x0) * sizeof(espix_px_t));
+    }
+}
+
+static void photo_open(void)
+{
+    if (s_img_win == NULL) {
+        const bool got = photo_load();
+
+        /* A window either way: one that says why there is no picture is more
+         * use than a click that appears to do nothing. */
+        const int iw = got ? espix_surface_width(s_img) : 160;
+        const int ih = got ? espix_surface_height(s_img) : 24;
+
+        s_img_win = espix_window_new(120, 120, iw + 2 * PAD,
+                                     ih + TITLE_H + 2 * PAD, "photo");
+        if (s_img_win == NULL) {
+            return;
+        }
+        espix_window_set_draw(s_img_win, photo_draw);
+        espix_window_repaint(s_img_win);
+    }
+
+    espix_window_focus(s_img_win);
+    espix_window_raise(s_img_win);
 }
 
 /* ------------------------------------------------------------------ */
@@ -843,6 +1007,10 @@ static void desktop_input(void *ctx, const espix_input_event_t *ev)
             return;
         }
         if (was == 0 && s_buttons != 0) {
+            if (button_hit(ev->x, ev->y)) {
+                photo_open();
+                return;
+            }
             focus_at(ev->x, ev->y);     /* focus first, so the title is right */
             if (s_focus != NULL) {
                 /* The press is what raises, which is why a border crossing does
