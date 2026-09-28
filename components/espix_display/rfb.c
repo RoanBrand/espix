@@ -542,8 +542,43 @@ typedef struct {
     uint8_t    *row;
 } rfb_conn_t;
 
+/*
+ * What a frame costs to put on the wire, reported every hundred.
+ *
+ * The twin of the desktop's input counter, and the two together answer the
+ * question a slow drag asks: is it the drawing or the encoding and sending.
+ */
+static struct {
+    uint32_t n;
+    uint64_t us;
+    uint64_t rects;
+    int64_t  worst;
+} s_send_stat;
+
+static void send_stat(int64_t us, size_t rects)
+{
+    s_send_stat.n++;
+    s_send_stat.us += (uint64_t)us;
+    s_send_stat.rects += rects;
+    if (us > s_send_stat.worst) {
+        s_send_stat.worst = us;
+    }
+    if (s_send_stat.n < 100) {
+        return;
+    }
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "send: 100 updates, mean %lld us, worst %lld us, mean %lld rects",
+               (long long)(s_send_stat.us / 100), (long long)s_send_stat.worst,
+               (long long)((s_send_stat.rects + 50) / 100));
+    s_send_stat.n     = 0;
+    s_send_stat.us    = 0;
+    s_send_stat.rects = 0;
+    s_send_stat.worst = 0;
+}
+
 static bool update_send(rfb_conn_t *c)
 {
+    const int64_t  t0 = esp_timer_get_time();
     espix_canvas_t *cv = espix_display_canvas();
     if (cv == NULL || c->stage == NULL) {
         return false;
@@ -689,6 +724,7 @@ static bool update_send(rfb_conn_t *c)
 
     c->pending = false;
     c->pending_full = false;
+    send_stat(esp_timer_get_time() - t0, n + (copy ? 1 : 0));
     return true;
 }
 

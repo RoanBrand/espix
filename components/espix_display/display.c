@@ -260,18 +260,39 @@ size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max
 
 void espix_canvas_damage_clear(espix_canvas_t *c) { c->ndamage = 0; }
 
-void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
+void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
 {
-    if (c == NULL) {
+    if (c == NULL || c->px == NULL) {
         return;
     }
-    r = rect_clip_wh(r, c->w, c->h);
+    if (sx < 0 || sy < 0 || r.x < 0 || r.y < 0 ||
+        sx + r.w > c->w || sy + r.h > c->h ||
+        r.x + r.w > c->w || r.y + r.h > c->h) {
+        return;                     /* a move from or to off-screen: not a move */
+    }
     if (r.w <= 0 || r.h <= 0) {
         return;
     }
+
+    /*
+     * The pixels, first. Rows rather than one block, because the destination is
+     * in the same buffer: which way to walk depends on which way it is going, or
+     * a row would be written before another one has read it. Horizontal overlap
+     * inside a row is memmove's problem, and it has one.
+     */
+    const int dx = sx - r.x;
+    const int dy = sy - r.y;
+
+    for (int i = 0; i < r.h; i++) {
+        const int         k   = (dy > 0) ? (r.h - 1 - i) : i;
+        espix_px_t       *dst = c->px + (size_t)(r.y + k) * c->w + r.x;
+        const espix_px_t *src = dst + (size_t)dy * c->w + dx;
+
+        memmove(dst, src, (size_t)r.w * sizeof(espix_px_t));
+    }
     /*
      * A move that starts where the last one ended is the same thing still
-     * moving, and the two have to become one move: a copy is an instruction
+     * moving, and the two notes have to become one: a copy is an instruction
      * about the client's framebuffer *as it is*, and there has been no chance
      * to apply anything in between -- so the only copy it can act on is the
      * whole of it.
@@ -281,17 +302,34 @@ void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
      * refuses to send more than one copy per update, and the drag falls back to
      * pixels -- feeling exactly as slow as before, which is what it did.
      */
-    for (int i = 0; i < c->nmoves; i++) {
-        espix_move_t *m = &c->moves[i];
+    if (c->nmoves == 1) {
+        espix_move_t       *m   = &c->moves[0];
+        const espix_rect_t  src = { sx, sy, r.w, r.h };
 
-        if (sx == m->r.x && sy == m->r.y && r.w == m->r.w && r.h == m->r.h) {
-            m->r = r;               /* from where it started, to where it is now */
+        /*
+         * Contained in where the last one ended means the same thing still
+         * moving: keep the original source and follow it, so the client is told
+         * one net move instead of a sequence it cannot apply.
+         *
+         * Contained, not equal, and that is the whole of why this was written
+         * twice. Consecutive overlaps are *clipped*: the second motion's source
+         * is where the window was and still is, which is the first motion's
+         * destination only when nothing else is in the way. Asking for equality
+         * matched nothing, no copy was ever sent, and the drag went back to
+         * pixels -- while the note list quietly filled up and stopped meaning
+         * what the backend thought it meant.
+         */
+        if (r.w == m->r.w && r.h == m->r.h &&
+            src.x >= m->r.x && src.y >= m->r.y &&
+            src.x + src.w <= m->r.x + m->r.w &&
+            src.y + src.h <= m->r.y + m->r.h) {
+            m->r = r;
             return;
         }
     }
 
     if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
-        return;                     /* the pixels are sent instead; always right */
+        return;                     /* no room for the note; the pixels are sent */
     }
     c->moves[c->nmoves].r  = r;
     c->moves[c->nmoves].sx = sx;

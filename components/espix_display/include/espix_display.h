@@ -102,14 +102,21 @@ void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
 
 /* Damage: the rectangles changed since the last drain. */
 /*
- * Note that the pixels now in `r` are the ones that were at (sx, sy).
+ * Move the pixels that are in `r` from (sx, sy), and note that they moved.
  *
- * A hint, and only a hint: the canvas is painted either way, by whoever repairs
- * the region. The destination is *not* marked as damaged -- the copy is the
- * update for those pixels, and a backend that uses it must not also send them --
- * so a caller has to have painted them first.
+ * The move is the point and the note is the second half of it. A dragged window
+ * is the same pixels somewhere else, so the canvas should slide them rather than
+ * repaint them -- which measured 5.7 ms a motion as a fill and a blit, and is
+ * well under one as a row-wise memmove. And a *client* that already has those
+ * pixels can be told to move them too, which is CopyRect.
+ *
+ * The destination is not marked as damaged: an accelerated backend sends the
+ * copy as the update for those pixels and must not also send them. So a caller
+ * has to repair whatever this did *not* cover -- the strips it left behind.
+ *
+ * The source and the destination must both be inside the canvas.
  */
-void   espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
+void   espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
 size_t espix_canvas_move_take(espix_canvas_t *c, espix_move_t *out, size_t max);
 void   espix_canvas_move_clear(espix_canvas_t *c);
 

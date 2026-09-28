@@ -26,14 +26,18 @@ extern "C" {
 
 /* One row of text, and the padding a row of them wants. */
 /*
- * A row is two text rows tall, and the text sits on the top one. That is not
- * only tidier than centring: an 8-pixel font wants its origins on 8-pixel
- * boundaries, and a row of 20 with the text centred lands every glyph four
- * pixels off the grid -- which is invisible until something tries to read the
- * screen back a cell at a time, and then it is a page of question marks.
+ * A row is three text rows tall, and the text sits on the middle one.
+ *
+ * Which is the only height that does both jobs. An 8-pixel font wants its
+ * origins on 8-pixel boundaries -- not for looks but because a glyph at a
+ * half-cell offset cannot be read back a cell at a time, and the first thing
+ * that tried got a page of question marks. And a glyph wants to be centred,
+ * because a label at the top of its button is the first thing an eye notices.
+ * Centring 8 in 16 is 4, which is off the grid; centring 8 in 24 is 8, which is
+ * on it.
  */
 #define WGT_TEXT_H 8
-#define WGT_ROW_H  16
+#define WGT_ROW_H  24
 
 #define WGT_RGB(r, g, b) \
     ((espix_px_t)((((r) & 0xF8u) << 8) | (((g) & 0xFCu) << 3) | (((b) & 0xF8u) >> 3)))

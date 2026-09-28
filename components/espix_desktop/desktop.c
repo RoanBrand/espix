@@ -796,6 +796,40 @@ static espix_rect_t rect_meet(espix_rect_t a, espix_rect_t b)
     return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
 }
 
+/* `r` without the part of it inside `hole`, as at most four rectangles. */
+static size_t rect_cut(espix_rect_t r, espix_rect_t hole, espix_rect_t *out)
+{
+    if (hole.w <= 0 || hole.h <= 0 ||
+        hole.x >= r.x + r.w || hole.x + hole.w <= r.x ||
+        hole.y >= r.y + r.h || hole.y + hole.h <= r.y) {
+        out[0] = r;
+        return 1;
+    }
+
+    size_t n = 0;
+
+    if (hole.y > r.y) {
+        out[n++] = (espix_rect_t){ r.x, r.y, r.w, hole.y - r.y };
+    }
+    if (hole.y + hole.h < r.y + r.h) {
+        out[n++] = (espix_rect_t){ r.x, hole.y + hole.h, r.w,
+                                   r.y + r.h - (hole.y + hole.h) };
+    }
+
+    const int y0 = hole.y > r.y ? hole.y : r.y;
+    const int y1 = (hole.y + hole.h) < (r.y + r.h) ? (hole.y + hole.h)
+                                                   : (r.y + r.h);
+
+    if (hole.x > r.x) {
+        out[n++] = (espix_rect_t){ r.x, y0, hole.x - r.x, y1 - y0 };
+    }
+    if (hole.x + hole.w < r.x + r.w) {
+        out[n++] = (espix_rect_t){ hole.x + hole.w, y0,
+                                   r.x + r.w - (hole.x + hole.w), y1 - y0 };
+    }
+    return n;
+}
+
 void espix_window_move(espix_window_t *w, int x, int y)
 {
     if (w == NULL || (w->x == x && w->y == y)) {
@@ -821,26 +855,47 @@ void espix_window_move(espix_window_t *w, int x, int y)
     const int y1 = (was.y + was.h) > (now.y + now.h) ? (was.y + was.h)
                                                       : (now.y + now.h);
 
-    desktop_repair((espix_rect_t){ x0, y0, x1 - x0, y1 - y0 });
+    const espix_rect_t box = { x0, y0, x1 - x0, y1 - y0 };
+    const espix_rect_t ov  = rect_meet(was, now);
+    const espix_rect_t dst = { ov.x + (x - was.x), ov.y + (y - was.y),
+                               ov.w, ov.h };
+
+    espix_canvas_t *c = espix_display_canvas();
 
     /*
-     * And say which part of that was not drawn at all but *moved*.
+     * The fast path, and the one a drag always takes: the press raised the
+     * window, so it is on top, the overlap holds nothing but its own pixels, and
+     * sliding those across is both correct and about ten times cheaper than
+     * painting them again.
      *
-     * The repair has already put the right pixels there; this is not how the
-     * canvas is painted, it is what the canvas is told. A backend that gets it
-     * tells a client to copy three bytes instead of sending a rectangle of
-     * pixels -- and a dragged window is almost entirely this one rectangle.
+     * Which was the whole of the problem. Repainting that rectangle is a fill of
+     * the union and a blit of the window over it -- measured at 5.7 ms a motion,
+     * with a motion arriving every few milliseconds, so the window could not keep
+     * up with the pointer. That is what still slow meant.
      */
-    espix_canvas_t    *c  = espix_display_canvas();
-    const espix_rect_t ov = rect_meet(was, now);
+    if (c != NULL && ov.w > 0 && ov.h > 0 && s_nwin > 0 &&
+        s_wins[s_nwin - 1] == w) {
+        espix_rect_t parts[4];
+        size_t       np;
 
-    if (c != NULL && ov.w > 0 && ov.h > 0) {
         espix_canvas_lock(c);
-        espix_canvas_moved(c, (espix_rect_t){ ov.x + (x - was.x),
-                                              ov.y + (y - was.y), ov.w, ov.h },
-                           ov.x, ov.y);
+        espix_canvas_move(c, dst, ov.x, ov.y);
+        np = rect_cut(box, dst, parts);
         espix_canvas_unlock(c);
+
+        /* Only what the move left uncovered: the strip it came from, and the
+         * strip it arrived on. */
+        for (size_t i = 0; i < np; i++) {
+            desktop_repair(parts[i]);
+        }
+        return;
     }
+
+    /*
+     * Anything else -- a window moved while something is above it, or a move
+     * with no overlap -- is drawn the long way. Same pixels, more of them.
+     */
+    desktop_repair(box);
 }
 
 /*
@@ -2196,11 +2251,52 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
     }
 }
 
+/*
+ * What input costs, reported every hundred events.
+ *
+ * Here because a drag that is still slow after the bytes were cut 37-fold is a
+ * question about *this*, not about the wire -- and three guesses at it had
+ * already cost three flashes. The numbers say which half is the problem: if a
+ * motion is milliseconds here, the repair is the cost and the fix is to move
+ * pixels instead of repainting them; if it is microseconds here and the frame
+ * task is the slow one, the answer is somewhere else entirely.
+ */
+static struct {
+    uint32_t n;
+    uint64_t us;
+    int64_t  worst;
+} s_input_stat[4];
+
+static void input_stat(const espix_input_event_t *ev, int64_t us)
+{
+    const int kind = ((int)ev->kind >= 0 && (int)ev->kind < 4) ? (int)ev->kind : 3;
+
+    s_input_stat[kind].n++;
+    s_input_stat[kind].us += (uint64_t)us;
+    if (us > s_input_stat[kind].worst) {
+        s_input_stat[kind].worst = us;
+    }
+    if (s_input_stat[kind].n < 100) {
+        return;
+    }
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "input kind %d: 100 events, mean %lld us, worst %lld us",
+               kind, (long long)(s_input_stat[kind].us / 100),
+               (long long)s_input_stat[kind].worst);
+    s_input_stat[kind].n     = 0;
+    s_input_stat[kind].us    = 0;
+    s_input_stat[kind].worst = 0;
+}
+
 static void desktop_input(void *ctx, const espix_input_event_t *ev)
 {
+    const int64_t t0 = esp_timer_get_time();
+
     desk_lock();
     desktop_input_locked(ctx, ev);
     desk_unlock();
+
+    input_stat(ev, esp_timer_get_time() - t0);
 }
 
 static void desktop_repaint(void *ctx)
