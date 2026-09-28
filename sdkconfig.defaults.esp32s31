@@ -171,6 +171,9 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # The cost is 64 kB of lwIP buffers in internal RAM between the two. Free
 # internal memory has stayed above 96 kB, so there is room; revisit if a
 # connection ever fails to allocate.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
-CONFIG_LWIP_TCP_WND_DEFAULT=32768
+# The default is deliberately modest: this is *every* TCP connection on the
+# board, and 32K each would be 64K of internal RAM per socket. The VNC connection
+# asks for 32K for itself, which it can because the ceiling here is above it.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
 

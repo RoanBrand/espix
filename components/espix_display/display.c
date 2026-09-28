@@ -322,13 +322,38 @@ void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
      */
     if (c->nmoves == 1) {
         espix_move_t *m = &c->moves[0];
+        int           x0, y0, x1, y1;
 
         m->r.x += r.x - sx;
         m->r.y += r.y - sy;
 
-        if (m->r.x < 0 || m->r.y < 0 ||
-            m->r.x + m->r.w > c->w || m->r.y + m->r.h > c->h) {
-            c->nmoves = 0;              /* off the canvas: send the pixels */
+        /*
+         * Clipped into the canvas, with its source taken along by the same
+         * amount -- rather than dropped, which is what a window at the edge of
+         * the screen used to pay for. A dropped note is not a smaller copy, it is
+         * *no* copy: the whole rectangle goes as pixels instead, three hundred
+         * kilobytes instead of three bytes, and it happened for as long as any
+         * part of the window was off the screen.
+         */
+        x0 = m->r.x < 0 ? 0 : m->r.x;
+        y0 = m->r.y < 0 ? 0 : m->r.y;
+        x1 = m->r.x + m->r.w;
+        y1 = m->r.y + m->r.h;
+        if (x1 > c->w) { x1 = c->w; }
+        if (y1 > c->h) { y1 = c->h; }
+
+        if (x1 <= x0 || y1 <= y0) {
+            c->nmoves = 0;
+            return;
+        }
+
+        m->sx += x0 - m->r.x;
+        m->sy += y0 - m->r.y;
+        m->r = (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+
+        if (m->sx < 0 || m->sy < 0 || m->sx + m->r.w > c->w ||
+            m->sy + m->r.h > c->h) {
+            c->nmoves = 0;              /* the source has left: send pixels */
         }
         return;
     }

@@ -1383,6 +1383,24 @@ static void rfb_task(void *arg)
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+        /*
+         * Room in this socket for a whole frame, and only this socket.
+         *
+         * lwIP's default send buffer is smaller than one incremental frame, so a
+         * frame took several round trips to hand over -- measured at 39 ms for
+         * frames that should cost microseconds, and 1.7 ms with room for them.
+         *
+         * The compile-time default is what *every* connection gets, so it is the
+         * wrong place to raise: an SSH session and a VNC session do not want the
+         * same thing, and 32K each is 64K of internal RAM per socket. The ceiling
+         * is raised in sdkconfig and the one connection that streams a screen
+         * asks for it here.
+         */
+        int sndbuf = 32 * 1024;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "no room for a 32K send buffer");
+        }
+
         const struct timeval io = { .tv_sec = 0, .tv_usec = POLL_US };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io, sizeof(io));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io, sizeof(io));
