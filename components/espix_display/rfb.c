@@ -234,17 +234,43 @@ static bool read_full(int fd, void *buf, size_t n)
     return true;
 }
 
+/*
+ * The queue, not the cost.
+ *
+ * A drag that is smooth and then chugs, and finishes seconds after the mouse
+ * stops, is a backlog -- events arriving faster than updates leave -- and cost
+ * per motion does not say whether one is growing. These do: input events in,
+ * updates out, and how often the socket made us wait. If in outruns out for as
+ * long as the drag lasts, the backlog is ours and the fix is to make a motion
+ * cheap; if they keep pace and it still feels slow, the queue is somewhere else
+ * and no amount of server-side work will find it.
+ *
+ * The socket is non-blocking, so "made us wait" is a spin on EAGAIN rather than
+ * a sleep: it burns the input path's time either way, and counting it is the
+ * difference between knowing and guessing.
+ */
+static struct {
+    uint32_t updates;
+    uint32_t stalls;
+    uint64_t waited_us;
+    int64_t  since;
+} s_q;
+
 static bool write_full(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
     int            stalls = 0;
+    const int64_t  t0 = esp_timer_get_time();
 
     while (n > 0) {
         const ssize_t w = send(fd, p, n, 0);
         if (w > 0) {
             p += w;
             n -= (size_t)w;
-            stalls = 0;
+            if (stalls != 0) {
+                s_q.stalls += (uint32_t)stalls;
+                stalls = 0;
+            }
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -255,6 +281,12 @@ static bool write_full(int fd, const void *buf, size_t n)
             continue;
         }
         return false;
+    }
+    if (stalls != 0) {
+        s_q.stalls += (uint32_t)stalls;
+    }
+    if (s_q.stalls != 0) {
+        s_q.waited_us += (uint64_t)(esp_timer_get_time() - t0);
     }
     return true;
 }
@@ -557,6 +589,23 @@ static struct {
 
 static void send_stat(int64_t us, size_t rects)
 {
+    const int64_t now = esp_timer_get_time();
+
+    s_q.updates++;
+    if (s_q.since == 0) {
+        s_q.since = now;
+    }
+    if (now - s_q.since >= 1000000) {
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "queue: %u updates out, %u socket stalls, %lld ms waiting",
+                   (unsigned)s_q.updates, (unsigned)s_q.stalls,
+                   (long long)(s_q.waited_us / 1000));
+        s_q.updates   = 0;
+        s_q.stalls    = 0;
+        s_q.waited_us = 0;
+        s_q.since     = now;
+    }
+
     s_send_stat.n++;
     s_send_stat.us += (uint64_t)us;
     s_send_stat.rects += rects;

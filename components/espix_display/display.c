@@ -1332,10 +1332,34 @@ char espix_keysym_char(uint32_t ks)
     }
 }
 
+/*
+ * How many input events a second are arriving, which with the update counter at
+ * the other end is what says whether a drag is queueing. See the note on the
+ * queue counters in rfb.c: a smooth-then-chugging drag is a backlog, and a
+ * backlog is invisible in a cost per motion.
+ */
+static struct {
+    uint32_t n;
+    int64_t  since;
+} s_in_q;
+
 void espix_display_input(const espix_input_event_t *ev)
 {
     if (ev == NULL || !s_up) {
         return;
+    }
+
+    const int64_t now = esp_timer_get_time();
+
+    s_in_q.n++;
+    if (s_in_q.since == 0) {
+        s_in_q.since = now;
+    }
+    if (now - s_in_q.since >= 1000000) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "queue: %u input events in the last "
+                   "second", (unsigned)s_in_q.n);
+        s_in_q.n     = 0;
+        s_in_q.since = now;
     }
 
     if (ev->kind == ESPIX_INPUT_POINTER) {
