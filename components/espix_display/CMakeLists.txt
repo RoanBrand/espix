@@ -11,6 +11,9 @@ idf_component_register(
         "priv_include"
     PRIV_REQUIRES
         espix_kernel
+        # The display asks the network to keep the radio awake while a viewer is
+        # attached: see latency_want() in rfb.c. A request, not a setting.
+        espix_net
         freertos
         lwip
         heap

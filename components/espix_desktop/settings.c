@@ -52,6 +52,7 @@ typedef enum {
     ACT_SCAN,
     ACT_UNPAIR,
     ACT_DEVICE,
+    ACT_BT_POWER,
 } action_t;
 
 typedef enum {
@@ -109,7 +110,11 @@ static espix_rect_t nav_row(const espix_window_t *w, int i)
 {
     const espix_rect_t n = nav_rect(w);
 
-    return (espix_rect_t){ n.x + 8, n.y + 8 + i * 24, NAV_W - 16, ROW_H };
+    /* As tall as the spacing, so the text can sit on the middle cell row of the
+     * blue rectangle rather than at the top of it -- which is where an 8-pixel
+     * font lands when a 16-pixel row is centred and the centring is rounded
+     * down to the grid. */
+    return (espix_rect_t){ n.x + 8, n.y + 8 + i * 24, NAV_W - 16, 24 };
 }
 
 static espix_rect_t pane_rect(const espix_window_t *w)
@@ -246,6 +251,9 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         rows[n++] = (row_t){ ROW_HEAD, "Audio", NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Adapter", ready ? "ready" : "not started",
                              ready, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON,
+                             ready ? "Turn Bluetooth off" : "Turn Bluetooth on",
+                             NULL, true, false, ACT_BT_POWER, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Scanning",
                              espix_bt_scanning() ? "yes" : "no", ready, false,
                              ACT_NONE, 0 };
@@ -379,6 +387,14 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             break;
         case ACT_SCAN:
             (void)espix_bt_scan(!espix_bt_scanning());
+            refresh_audio();
+            break;
+        case ACT_BT_POWER:
+            if (espix_bt_ready()) {
+                (void)espix_bt_shutdown();
+            } else {
+                (void)espix_bt_init();
+            }
             refresh_audio();
             break;
         case ACT_UNPAIR:

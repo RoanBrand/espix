@@ -40,6 +40,7 @@
 
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_net.h"
 
 #include "vnc_des.h"
 
@@ -87,6 +88,43 @@ static uint16_t      s_port;
 static int           s_clients;
 static char          s_peer[32];
 static char          s_encodings[48];
+
+/*
+ * What the radio was doing before a viewer asked it to stay awake.
+ *
+ * A viewer wants the screen as soon as it changes, and a station that sleeps
+ * between beacons cannot deliver that: measured on this board, the default
+ * sleep costs 58 ms average and 28 ms of jitter on a round trip against 4 ms
+ * and 1.7 ms on the cable. Nothing is wrong with the sleep -- it is the whole
+ * point of a battery-powered radio -- but it is the wrong trade for the one
+ * thing here whose entire job is latency, and a drag is a round trip per
+ * motion.
+ *
+ * So the display asks rather than takes: the mode it found is the mode it puts
+ * back, so a wifi-ps-off set by hand stays off and the default returns when the
+ * last viewer goes. That is the shape ROADMAP.md asks for -- a component says
+ * it wants a low-latency link, and the network decides what that means.
+ */
+static espix_wifi_ps_t s_ps_saved = ESPIX_WIFI_PS_UNKNOWN;
+
+static void latency_want(bool on)
+{
+    if (on) {
+        espix_wifi_status_t st;
+        if (s_ps_saved == ESPIX_WIFI_PS_UNKNOWN &&
+            espix_net_wifi_status(&st) == ESP_OK &&
+            st.ps != ESPIX_WIFI_PS_UNKNOWN && st.ps != ESPIX_WIFI_PS_NONE) {
+            s_ps_saved = st.ps;
+            (void)espix_wifi_set_ps(ESPIX_WIFI_PS_NONE);
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "radio kept awake while a viewer is attached");
+        }
+    } else if (s_ps_saved != ESPIX_WIFI_PS_UNKNOWN) {
+        (void)espix_wifi_set_ps(s_ps_saved);
+        espix_klog(ESPIX_KLOG_INFO, TAG, "radio back to its own sleep setting");
+        s_ps_saved = ESPIX_WIFI_PS_UNKNOWN;
+    }
+}
 
 /*
  * The DES key VNC authentication checks against.
@@ -1092,6 +1130,7 @@ static void rfb_serve(int fd)
 
     s_clients = 1;
     espix_klog(ESPIX_KLOG_INFO, TAG, "client connected from %s", s_peer);
+    latency_want(true);
 
     /*
      * A viewer with nothing on the screen gets the console, and only then: a
@@ -1130,6 +1169,7 @@ static void rfb_serve(int fd)
     s_peer[0] = '\0';
     espix_display_viewer_detached();
     espix_klog(ESPIX_KLOG_INFO, TAG, "client disconnected");
+    latency_want(false);
 
 done:
     heap_caps_free(c.stage);
