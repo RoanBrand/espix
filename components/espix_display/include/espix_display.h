@@ -112,7 +112,7 @@ typedef struct {
     bool        hw_ok;      /* the accelerated path produced the right pixels */
 } espix_display_bench_t;
 
-#define ESPIX_DISPLAY_BENCH_MAX 12
+#define ESPIX_DISPLAY_BENCH_MAX 16
 
 /* Fills up to `max` rows and returns how many. Allocates its own buffers. */
 size_t espix_display_bench(espix_display_bench_t *out, size_t max);
@@ -192,6 +192,16 @@ void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
  * The caller frees the surface.
  */
 espix_surface_t *espix_image_jpeg(const uint8_t *jpg, size_t len);
+
+/*
+ * Both paths on one file, for the benchmark: software, and the codec where there
+ * is one, with hw_ok saying whether the two agree -- so a fast wrong answer is
+ * not worth more than a slow right one. Fills one row and returns false when the
+ * file cannot be decoded at all. Which path espix_image_jpeg() picks is the
+ * display service's business; this is the comparison, and it is the only reason
+ * the hardware path is reachable other than through a picture on the screen.
+ */
+bool espix_image_bench(espix_display_bench_t *row, const uint8_t *jpg, size_t len);
 
 /* ------------------------------------------------------------------ */
 /* Input                                                               */

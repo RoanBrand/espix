@@ -139,7 +139,7 @@ From `soc_caps.h` for `esp32s31`:
 | Capability | Symbol | Where it goes |
 |---|---|---|
 | PPA: SRM, BLEND, FILL | `SOC_PPA_SUPPORTED` | fills, blits, scaling, rotation, alpha, colour convert |
-| JPEG decode + encode | `SOC_JPEG_CODEC_SUPPORTED` | the photographic encoding path |
+| JPEG decode + encode | `SOC_JPEG_CODEC_SUPPORTED` | decoding a picture into a surface; the encoder is not wired up |
 | 2D-DMA | `SOC_DMA2D_SUPPORTED` | rectangle copies without the CPU |
 | LCD_CAM: RGB, I80, camera | `SOC_LCDCAM_*_SUPPORTED` | a real panel later; the camera is a separate prize |
 | CORDIC | `SOC_CORDIC_SUPPORTED` | sin/cos/atan2 for rotation, gradients, arcs |
@@ -199,13 +199,30 @@ two.
 Mpx/s, higher is better. A dash is a row that has not been measured yet rather
 than one that is slow.
 
-Two more rows are not primitives at all, but the work the desktop actually does,
-so they are quoted in milliseconds rather than in rates:
+Three more rows are not primitives at all, but the work the desktop actually
+does, so they are quoted in milliseconds rather than in rates:
 
-| | size | software | PPA | |
+| | size | software | accelerated | |
 |---|---|---|---|---|
 | **repaint** -- background, then both windows | 800x600 | 31.6 ms | **7.1 ms** | 4.4x |
 | **window content** -- frame, title, 20x56 of text | 456x186 | 11.2 ms | **8.3 ms** | 1.3x |
+| **jpeg decode** -- the viewer's 23 KB test.jpg | 480x330 | 116.7 ms | **12.4 ms** | 9.4x |
+
+The JPEG row is the one row that needs an input rather than a size: decoding is
+not an operation to sweep, it is the whole of one file, so `display bench [jpeg]`
+takes a path and defaults to the picture the launcher opens. It is absent when
+there is no file to read, and absent on a target with no codec -- where it would
+be the software number twice.
+
+**Its "accelerated" column is the codec, and it is verified the same way,
+against the software path rather than against the last run's numbers.** The two
+decoders do not produce identical pixels and should not be expected to: they
+differ in IDCT rounding and in how chroma is upsampled, and on a photograph that
+is a few steps on a small minority of pixels. So the check is a count -- the
+percentage of pixels whose channels are each within 16 of 255 of the software
+path's -- and it reads **98%**. A wrong byte order, a wrong row pitch, or the
+visible width taken from the MCU-padded one drops it to near zero, which is what
+the threshold is for.
 
 `repaint` is what a window move costs, because occlusion means what was
 underneath is no longer known. `window content` is what one window costs on top

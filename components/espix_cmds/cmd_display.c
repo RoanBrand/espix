@@ -221,7 +221,49 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
      */
     if (strcmp(sub, "bench") == 0) {
         espix_display_bench_t rows[ESPIX_DISPLAY_BENCH_MAX];
-        const size_t n = espix_display_bench(rows, ESPIX_DISPLAY_BENCH_MAX);
+        size_t n = espix_display_bench(rows, ESPIX_DISPLAY_BENCH_MAX);
+
+        /*
+         * A JPEG row, and the one row that needs an input rather than a size:
+         * decoding is not an operation to sweep, it is the whole of one file,
+         * and the comparison worth having is the two paths on the same picture.
+         * So it comes from a path -- the viewer's own test.jpg by default --
+         * rather than from a synthetic size, and it is simply absent when there
+         * is no file to decode.
+         */
+        if (n < ESPIX_DISPLAY_BENCH_MAX) {
+            const char *path = argc >= 3 ? argv[2] : "/home/esp/test.jpg";
+            uint8_t    *jpg  = NULL;
+            size_t      len  = 0;
+            FILE       *f    = fopen(path, "rb");
+
+            if (f != NULL) {
+                fseek(f, 0, SEEK_END);
+                const long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+
+                if (sz > 4 && sz < (4 << 20)) {
+                    jpg = malloc((size_t)sz);
+                    if (jpg != NULL && fread(jpg, 1, (size_t)sz, f) != (size_t)sz) {
+                        free(jpg);
+                        jpg = NULL;
+                    }
+                    if (jpg != NULL) {
+                        len = (size_t)sz;
+                    }
+                }
+                fclose(f);
+            }
+
+            if (jpg == NULL) {
+                espix_eprintf(s, "display bench: cannot read %s\n", path);
+            } else {
+                if (espix_image_bench(&rows[n], jpg, len)) {
+                    n++;
+                }
+                free(jpg);
+            }
+        }
 
         espix_printf(s, "%-5s %-9s %6s %9s %10s %9s %10s  %s\n",
                      "OP", "SIZE", "ITERS", "SW ms", "SW Mpx/s",
@@ -281,7 +323,7 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    espix_eprintf(s, "usage: display [start | stop | status | bench]\n");
+    espix_eprintf(s, "usage: display [start | stop | status | bench [jpeg]]\n");
     return 1;
 }
 
@@ -336,7 +378,7 @@ static espix_cmd_t s_display_cmds[] = {
       .usage = "vnc [start [port] | stop | status | password <pw> | nopassword]" },
     { .name = "display", .fn = cmd_display,
       .help = "the desktop on its own: the canvas a panel or local input uses",
-      .usage = "display [start | stop | status | bench]" },
+      .usage = "display [start | stop | status | bench [jpeg]]" },
     { .name = "desktop", .fn = cmd_desktop,
       .help = "the placeholder desktop, so the pointer has something to draw on",
       .usage = "desktop [start | stop | status]" },
