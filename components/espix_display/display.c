@@ -318,6 +318,15 @@ static int s_ptr_x, s_ptr_y;
 static espix_display_default_t s_default;
 static bool                    s_default_up;
 
+/*
+ * Whether a viewer is attached at all -- which is a different question from
+ * whether the viewer started the default content, and conflating the two is
+ * what lost the console: start a desktop from the serial console, attach a
+ * viewer to it, and `desktop stop` fell back to the built-in placeholder
+ * rather than a shell, because this viewer had never started a console.
+ */
+static bool                    s_viewer;
+
 static char s_grid[TEXT_ROWS][TEXT_COLS];
 static int  s_trow, s_tcol;
 
@@ -653,9 +662,11 @@ void espix_display_release(const espix_screen_t *screen)
      * "desktop stop" bring it back -- and the built-in content is the floor
      * when there is no console either.
      */
-    if (s_default_up && s_default.start != NULL &&
-        s_default.start() == ESP_OK) {
-        return;
+    if (s_default.start != NULL && (s_default_up || s_viewer)) {
+        if (s_default.start() == ESP_OK) {
+            s_default_up = true;
+            return;
+        }
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "screen owner: none");
@@ -688,6 +699,8 @@ void espix_display_viewer_attached(void)
      * running is what the viewer should see -- starting a console over it
      * would be the server second-guessing the user.
      */
+    s_viewer = true;
+
     if (s_owner == NULL && s_default.start != NULL) {
         if (s_default.start() == ESP_OK) {
             s_default_up = true;
@@ -697,6 +710,8 @@ void espix_display_viewer_attached(void)
 
 void espix_display_viewer_detached(void)
 {
+    s_viewer = false;
+
     if (s_default_up && s_default.stop != NULL) {
         s_default.stop();
         s_default_up = false;
