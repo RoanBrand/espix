@@ -194,16 +194,37 @@ two.
 | **S31 fill, PPA FILL** | 15.1 | 43.1 | 76.9 | 97.0 | **105.1** |
 | **S31 blit, software** | 13.2 | 13.5 | 13.6 | 10.7 | 10.6 |
 | **S31 blit, PPA SRM** | 7.2 | 18.9 | 36.2 | 47.2 | **49.1** |
-| **S31 repaint, software** | — | — | — | — | 18.5 |
-| **S31 repaint, PPA SRM** | — | — | — | — | **79.2** |
 | **S3, every row above** | — | — | — | — | — |
-
-`repaint` is the desktop's own workload rather than a primitive: the background,
-then both windows at their offsets, which is what a window move costs. It is
-only measured at the canvas size because that is the only size it has.
 
 Mpx/s, higher is better. A dash is a row that has not been measured yet rather
 than one that is slow.
+
+Two more rows are not primitives at all, but the work the desktop actually does,
+so they are quoted in milliseconds rather than in rates:
+
+| | size | software | PPA | |
+|---|---|---|---|---|
+| **repaint** -- background, then both windows | 800x600 | 31.6 ms | **7.1 ms** | 4.4x |
+| **window content** -- frame, title, 20x56 of text | 456x186 | 11.2 ms | **8.3 ms** | 1.3x |
+
+`repaint` is what a window move costs, because occlusion means what was
+underneath is no longer known. `window content` is what one window costs on top
+of that, and it is `window_paint()`: the frame, the title, the outline, and a
+grid of text.
+
+**The second row is the one that explains a slow drag, and it is not about the
+accelerator.** Only the fills have an accelerated path: the glyphs are drawn
+pixel by pixel by the CPU and nothing here touches them. So the accelerator
+removes 2.9 ms of 11.2 and cannot reach the other 8.3, which is 20 rows of 56
+8x8 glyphs -- 71,680 pixels written one branch at a time. A drag repaints every
+window on every motion, so that is the cost per window per motion, and it is why
+the alignment fix that made the fills accelerated barely moved the drag.
+
+The way out is not an accelerator. It is drawing fewer glyphs: the terminal
+redraws its whole grid on every keystroke and the desktop repaints every window
+on every motion, when both know exactly which cells changed -- the terminal knew
+before the window model landed, and drawing the whole grid was simpler. That is
+the work, and it is software.
 
 **The crossover is the interesting part, and it is why the sizes run below it.**
 PPA costs a fixed ~57 µs per transaction -- descriptor setup, the DMA start, and

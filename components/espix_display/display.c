@@ -651,7 +651,43 @@ void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
  * not about whatever happens to be on the screen -- and so a full-size case does
  * not have to be the canvas's size.
  */
-enum { BENCH_FILL, BENCH_BLIT, BENCH_REPAINT };
+enum { BENCH_FILL, BENCH_BLIT, BENCH_REPAINT, BENCH_WINDOW };
+
+/*
+ * A window's content, which is what window_paint() does and what a drag
+ * actually pays for: the frame, the title, the outline, and a grid of text.
+ *
+ * Only the fills have an accelerated path. The glyphs are drawn pixel by pixel
+ * by the CPU and nothing here touches them, so this row is where the two columns
+ * are expected to converge -- and the gap between them says how much of a window
+ * repaint is text.
+ */
+static const char BENCH_LINE[] =
+    "the quick brown fox jumps over the lazy dog 0123456789";
+
+#define BENCH_TERM_ROWS 20
+#define BENCH_WIN_TITLE 18
+#define BENCH_WIN_PAD   4
+#define BENCH_FG        0xC8D8
+#define BENCH_BG        0x18C4
+#define BENCH_TITLE_BG  0x3A42
+#define BENCH_EDGE      0x4A54
+
+static void bench_window(espix_surface_t *dst, int w, int h)
+{
+    espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, BENCH_BG);
+    espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, BENCH_WIN_TITLE },
+                       BENCH_TITLE_BG);
+    espix_surface_text(dst, BENCH_WIN_PAD, (BENCH_WIN_TITLE - 8) / 2, "terminal",
+                       BENCH_FG, BENCH_TITLE_BG);
+    espix_surface_outline(dst, (espix_rect_t){ 0, 0, w, h }, BENCH_EDGE);
+
+    for (int r = 0; r < BENCH_TERM_ROWS; r++) {
+        espix_surface_text(dst, BENCH_WIN_PAD,
+                           BENCH_WIN_TITLE + BENCH_WIN_PAD + r * 8,
+                           BENCH_LINE, BENCH_FG, BENCH_BG);
+    }
+}
 
 /*
  * A full repaint is what the desktop does when a window moves: the background,
@@ -856,6 +892,9 @@ static uint32_t bench_run(int op, int w, int h, uint32_t iters)
         case BENCH_BLIT:
             espix_surface_blit(dst, 0, 0, s, w, h, w);
             break;
+        case BENCH_WINDOW:
+            bench_window(dst, w, h);
+            break;
         default:
             espix_surface_fill(dst, (espix_rect_t){ 0, 0, w, h }, 0x3333);
             espix_surface_blit(dst, BENCH_WIN1_X, BENCH_WIN1_Y, w1,
@@ -899,6 +938,7 @@ size_t espix_display_bench(espix_display_bench_t *out, size_t max)
         { "fill",    BENCH_FILL,    800,  600 },
         { "blit",    BENCH_BLIT,    800,  600 },
         { "repaint", BENCH_REPAINT, 800,  600 },
+        { "window",  BENCH_WINDOW,  456,  186 },
     };
     size_t n = 0;
 
@@ -945,7 +985,9 @@ size_t espix_display_bench(espix_display_bench_t *out, size_t max)
         s_force_hw = true;
         row->hw_ok = bench_verify(w, h);
         row->us_hw = bench_run(cases[c].kind, w, h, iters);
-        row->hw    = (cases[c].kind == BENCH_FILL) ? "PPA FILL" : "PPA SRM";
+        row->hw    = (cases[c].kind == BENCH_BLIT)   ? "PPA SRM"
+                   : (cases[c].kind == BENCH_REPAINT) ? "PPA SRM"
+                   : "PPA FILL";
         s_force_hw = false;
 #endif
     }
