@@ -320,7 +320,7 @@ void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
      * So the stored destination is shifted by this motion's delta, and its size
      * is left alone. It is the same rectangle from beginning to end of the drag.
      */
-    if (c->nmoves == 1 && r.w == c->moves[0].r.w && r.h == c->moves[0].r.h) {
+    if (c->nmoves == 1) {
         espix_move_t *m = &c->moves[0];
 
         m->r.x += r.x - sx;
