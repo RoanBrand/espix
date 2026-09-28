@@ -321,6 +321,14 @@ static void menu_paint(espix_canvas_t *c, espix_rect_t r);
 static espix_rect_t menu_rect(void);
 static void bar_damage(void);
 
+/* How often a drag lets the screen catch up. See the note where it is used. */
+#define DRAG_TICK_US (16 * 1000)
+
+/* A drag in progress, and where the screen last had the window. */
+static bool         s_dragging;
+static int64_t      s_drag_repair_at;
+static espix_rect_t s_drag_shown;
+
 espix_rect_t espix_window_content(const espix_window_t *w)
 {
     return (espix_rect_t){ PAD, TITLE_H + PAD,
@@ -844,20 +852,38 @@ void espix_window_move(espix_window_t *w, int x, int y)
      */
     const espix_rect_t was = { w->x, w->y, w->w, w->h };
     const espix_rect_t now = { x, y, w->w, w->h };
+    const bool         topmost = (s_nwin > 0 && s_wins[s_nwin - 1] == w);
 
     w->x = x;
     w->y = y;
 
-    const int x0 = was.x < now.x ? was.x : now.x;
-    const int y0 = was.y < now.y ? was.y : now.y;
-    const int x1 = (was.x + was.w) > (now.x + now.w) ? (was.x + was.w)
-                                                      : (now.x + now.w);
-    const int y1 = (was.y + was.h) > (now.y + now.h) ? (was.y + was.h)
-                                                      : (now.y + now.h);
+    /* In a drag, motions inside one tick are one motion: the window has moved
+     * and the screen has not been told yet. See DRAG_TICK_US. */
+    if (s_dragging && topmost &&
+        esp_timer_get_time() - s_drag_repair_at < DRAG_TICK_US) {
+        return;
+    }
+
+    /* Where the screen has the window -- during a drag, where it was when we
+     * last caught up rather than where it was a moment ago. Measuring the move
+     * from there is what keeps the copy and the strips from overlapping. */
+    const espix_rect_t from = (s_dragging && topmost) ? s_drag_shown : was;
+
+    if (s_dragging && topmost) {
+        s_drag_repair_at = esp_timer_get_time();
+        s_drag_shown     = now;
+    }
+
+    const int x0 = from.x < now.x ? from.x : now.x;
+    const int y0 = from.y < now.y ? from.y : now.y;
+    const int x1 = (from.x + from.w) > (now.x + now.w) ? (from.x + from.w)
+                                                       : (now.x + now.w);
+    const int y1 = (from.y + from.h) > (now.y + now.h) ? (from.y + from.h)
+                                                       : (now.y + now.h);
 
     const espix_rect_t box = { x0, y0, x1 - x0, y1 - y0 };
-    const espix_rect_t ov  = rect_meet(was, now);
-    const espix_rect_t dst = { ov.x + (x - was.x), ov.y + (y - was.y),
+    const espix_rect_t ov  = rect_meet(from, now);
+    const espix_rect_t dst = { ov.x + (x - from.x), ov.y + (y - from.y),
                                ov.w, ov.h };
 
     espix_canvas_t *c = espix_display_canvas();
@@ -2065,16 +2091,37 @@ static void windows_destroy(void)
  */
 static int            s_grab_x, s_grab_y;   /* where in the window it was grabbed */
 
+/*
+ * How often a drag lets the screen catch up.
+ *
+ * A mouse reports far more often than a screen changes, and every motion used to
+ * cost a full repair -- 5.7 ms of a motion that costs seven, which is how a mouse
+ * outruns a desktop. So motions arriving inside one tick of the last repair do
+ * nothing but record where the window now is, and the next tick moves it there in
+ * one go. Sixty a second, as a screen does.
+ *
+ * And it is not only the cost. Coalescing makes the copy one *net* move from
+ * where the client last saw the window, which is what makes the geometry work
+ * out: the strips sent for the space it left cannot land inside the rectangle the
+ * copy reads from, because both are measured from the same old position. One
+ * motion at a time is the only case that is correct, and this makes every case
+ * one motion.
+ */
 static void drag_begin(espix_window_t *w, int x, int y)
 {
     s_drag   = w;
     s_grab_x = x - w->x;
     s_grab_y = y - w->y;
+
+    s_drag_repair_at = 0;               /* the first motion always repairs */
+    s_drag_shown     = (espix_rect_t){ w->x, w->y, w->w, w->h };
+    s_dragging       = true;
 }
 
 static void drag_end(void)
 {
-    s_drag = NULL;
+    s_drag     = NULL;
+    s_dragging = false;
 }
 
 static void drag_to(int x, int y)
