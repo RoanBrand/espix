@@ -49,6 +49,36 @@ port and a USB-NCM device on the other. espix does not build both for it yet:
 which socket reaches which controller is a property of the board's wiring, and no
 espix board file describes that today.
 
+### A device powered up with the board does not enumerate
+
+`SOC_USB_FSLS_PHY_NUM` is not the same on every espix target -- 1 on the S3 and
+the P4, **0** on the S31. It is tempting to read that 0 as "high speed only, so
+a full-speed device cannot work here". **That reading is wrong, and this
+section said so for an afternoon.** A full-speed device works on the S31's port:
+a Logitech G305 receiver (`046d:c53f`, full speed) enumerates and runs, and so
+does a full-speed keyboard. Whatever that capability counts, it does not mean
+the port cannot talk to a full-speed device.
+
+What the failure actually was is narrower, and still open. A receiver that is
+**already plugged in when the board boots** does not answer the first control
+transfer:
+
+    E (7351) ENUM: Bad transfer status 1: CHECK_SHORT_DEV_DESC
+    E (7351) ENUM: CHECK_SHORT_DEV_DESC FAILED
+    D (7351) HUB: Disabling root port 0
+
+The enumerator then disables the root port and never retries, so the device stays
+invisible until it is unplugged and plugged again -- after which the *same*
+receiver on the *same* port enumerates normally, as a boot keyboard on interface
+0 and a boot mouse on interface 1.
+
+Same device, same port, same firmware; the only difference is whether it was
+powered up with the board. That points at something settling -- the device, the
+port, or VBUS -- rather than at a driver, and it is worth chasing, because "it
+works if you replug it" is not something to ship. Two things to try first:
+whether a retry after the port is disabled finds it, and whether the delay
+between VBUS and the first control transfer is simply too short.
+
 ## What it does
 
 `lsblk` is the command to run after plugging something in, and the example above
@@ -662,12 +692,15 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   SSD behind a hub; a direct connection (no hub) has not been tried, and would
   separate power from the drive's own firmware.
 
-- **A USB keyboard (HID).** Deferred until there is a display, which is the
-  honest position: with no screen, a keyboard's only use would be a test that
-  prints what was typed, and nothing else in espix would consume the events. The
-  test itself is cheap when a display arrives — SSH in over WiFi, run a command
-  that prints decoded keystrokes, type on the keyboard — and it sidesteps the
-  can't-plug-both-sockets problem entirely.
+- ~~**A USB keyboard (HID).**~~ **Done**, and the mouse with it, because one
+  class driver does both. The condition it waited on — a display to consume the
+  events — is met, and the test it predicted is the test that was run: a keyboard
+  on the OTG socket, typed into the on-screen console and into the desktop's text
+  window over VNC. `components/espix_usb/hid.c` decodes boot keyboard and boot
+  mouse reports. The part worth knowing is that a HID report is *state*: the
+  keyboard report is every key held right now, so a keystroke exists only as the
+  difference between two reports and not as an event inside one. Boot interfaces
+  only (`bInterfaceSubClass` 1); anything else is logged with that as the reason.
 - **exFAT.** Done, and it took four edits in `tools/patch-fatfs.py` rather than
   one, because `FF_FS_EXFAT` alone mounts nothing on the volume that wants it.
 
