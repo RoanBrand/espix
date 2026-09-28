@@ -2126,18 +2126,19 @@ static void drag_end(void)
     s_dragging = false;
 
     /*
-     * Catch up from where the screen actually is, not from where the window is.
+     * Catch up completely, and "completely" is the word that was missing.
      *
-     * Inside a drag the two are allowed to differ -- that is the whole of the
-     * coalescing -- but the moment it ends they must not, because every repair
-     * from here on measures from the window's real position and would never
-     * cover where it was last *drawn*. That is a window's worth of pixels left
-     * on the desktop: a part copy of itself, behind it, which is what it looked
-     * like.
+     * Inside a drag the window and the screen are allowed to differ -- that is
+     * the whole of the coalescing -- so at the end there are *three* places that
+     * matter: where the screen last drew it, where it has been moved to since,
+     * and the space in between that was never drawn at all. Repairing only the
+     * first leaves the window's pixels on the desktop; repairing only the last
+     * leaves the window undrawn, which is a side of it chopped off in the
+     * direction it was going. One full repair covers all three, once, at the end
+     * of a drag, where 7 ms does not matter.
      */
-    if (s_nwin > 0) {
-        desktop_repair(last);
-    }
+    (void)last;
+    espix_desktop_repaint();
 }
 
 static void drag_to(int x, int y)
