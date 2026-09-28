@@ -46,8 +46,30 @@
 #define TAG "vnc"
 
 #define LISTEN_BACKLOG 1
-#define POLL_US        (250 * 1000)   /* recv/send/accept timeout */
+#define POLL_US        (250 * 1000)   /* send and accept timeout */
 #define STALL_LIMIT    40             /* * POLL_US before a peer is gone */
+
+/*
+ * How long a change made by *another task* may wait to be sent.
+ *
+ * Nothing wakes this task when the canvas is damaged, and it blocks in recv(),
+ * so the only thing that can notice a local mouse is the receive timeout. At
+ * POLL_US that is a quarter of a second, and it showed: the update rate for a
+ * local mouse was 5-12 a second with a floor at 1/250ms, while a pointer moved
+ * over VNC was sent the instant the client's own message was handled. The
+ * asymmetry was never the input path -- it was this wait.
+ *
+ * A viewer keeps one FramebufferUpdateRequest outstanding, and update_send()
+ * holds it rather than answering with an empty update, so polling fast is only
+ * worth doing while an update is actually owed: the loop picks the timeout from
+ * c->pending, and an idle connection still sleeps for POLL_US.
+ */
+#define TICK_US        (10 * 1000)
+
+/* The same ten seconds as STALL_LIMIT, counted at the tick rather than at
+ * POLL_US: read_full() is the path that waits on a peer part-way through a
+ * message, and it uses whichever receive timeout is current. */
+#define READ_STALL_LIMIT (STALL_LIMIT * POLL_US / TICK_US)
 #define OUT_CAP        (64 * 1024)    /* encode buffer, flushed to the socket */
 
 /* VNC uses the first eight characters of a password and ignores the rest. */
@@ -137,6 +159,13 @@ static int recv_byte(int fd, uint8_t *b)
     return -2;
 }
 
+/* How long recv() may block for, which is the only clock this loop has. */
+static void set_recv_timeout(int fd, int us)
+{
+    const struct timeval tv = { .tv_sec = 0, .tv_usec = us };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 static bool read_full(int fd, void *buf, size_t n)
 {
     uint8_t *p = buf;
@@ -155,7 +184,7 @@ static bool read_full(int fd, void *buf, size_t n)
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Part-way through a message: wait, but not forever. */
-            if (!s_run || ++stalls > STALL_LIMIT) {
+            if (!s_run || ++stalls > READ_STALL_LIMIT) {
                 return false;
             }
             continue;
@@ -953,6 +982,14 @@ static void rfb_serve(int fd)
 
     while (s_run) {
         uint8_t type;
+
+        /*
+         * Owed an update, poll at the tick so a change another task made goes
+         * out promptly. Not owed one, sleep on the socket: there is nothing to
+         * send until the client asks, so waking early would only burn cycles.
+         */
+        set_recv_timeout(fd, c.pending ? TICK_US : POLL_US);
+
         const int rc = recv_byte(fd, &type);
         if (rc <= 0) {
             if (rc == -1) {

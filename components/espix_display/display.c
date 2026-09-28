@@ -599,6 +599,24 @@ void espix_display_input(const espix_input_event_t *ev)
     }
 
     /*
+     * Clamped here, because this is where the position is owned -- and because
+     * a delta pushed against an edge accumulates without ever leaving it. A
+     * local mouse held at the right-hand border adds to s_ptr_x for as long as
+     * it is pushed; the cursor stops at the border, which is the owner's
+     * clamping, and the number underneath does not.
+     *
+     * That number is handed out again by espix_display_pointer(), and
+     * espix_input_event_t.x is 16 bits -- so a pointer event built from a
+     * position that has run past 32767 wraps, and the cursor lands somewhere
+     * unrelated the next time a button is pressed. Which is exactly what it
+     * looked like: push the pointer into an edge, click, and it jumps.
+     */
+    if (s_ptr_x < 0)                   { s_ptr_x = 0; }
+    if (s_ptr_y < 0)                   { s_ptr_y = 0; }
+    if (s_ptr_x > ESPIX_DISPLAY_W - 1) { s_ptr_x = ESPIX_DISPLAY_W - 1; }
+    if (s_ptr_y > ESPIX_DISPLAY_H - 1) { s_ptr_y = ESPIX_DISPLAY_H - 1; }
+
+    /*
      * Dispatched in the poster's context rather than through a queue of this
      * service's own. The owner is the only consumer, so a queue would buy a
      * task and a copy for nothing -- and it would make the round trip
