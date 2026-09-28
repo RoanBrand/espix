@@ -155,3 +155,22 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # to remember: PSRAM data is NOT in a core dump (so a BT fault there is blind),
 # and there is no runtime fallback if PSRAM init fails (link-time assignment).
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# A TCP send buffer that can hold a frame.
+#
+# lwIP defaults to 5760 bytes, which is smaller than one incremental VNC frame,
+# so handing one over takes several round trips however fast the link is. A drag
+# measured 39 ms on the wire at that size and 1.7 ms at this one -- 24x -- because
+# a frame is only a few kilobytes once the client is moving the window's pixels
+# itself rather than being sent them. A full repaint is a couple of hundred and
+# still takes more than one call; this is for the frames a desktop actually sends.
+#
+# setsockopt(SO_SNDBUF) cannot do it: a socket's buffer may not exceed the
+# compile-time TCP_SND_BUF, and asking was refused before this existed.
+#
+# The cost is 64 kB of lwIP buffers in internal RAM between the two. Free
+# internal memory has stayed above 96 kB, so there is room; revisit if a
+# connection ever fails to allocate.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+
