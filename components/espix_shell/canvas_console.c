@@ -99,6 +99,35 @@ static canvas_console_t s_con;
 /* Bumped for each console, so a task that outlives its own can tell. */
 static uint32_t s_gen;
 
+static void con_input(void *ctx, const espix_input_event_t *ev);
+static void con_repaint(void *ctx);
+
+static const espix_screen_t s_console_screen = {
+    .name    = "vnc-console",
+    .input   = con_input,
+    .repaint = con_repaint,
+    .ctx     = NULL,
+};
+
+/*
+ * Whether this console is the one being rendered.
+ *
+ * The owner slot means "whose model is on the screen", so being taken over
+ * does not stop the console: it keeps its grid, its history and its session,
+ * and stops being drawn. Every drawing entry point therefore checks this --
+ * without it, output from a console that is no longer on the screen is painted
+ * over whatever replaced it. That is what "the console shines through the
+ * desktop" is: `desktop start` typed on the console, and then the console's
+ * own `desktop: up` and prompt drawn on top of the desktop.
+ *
+ * Deliberately not gated on s_con.up: the first repaint runs from claim(),
+ * which happens before that flag is set.
+ */
+static bool con_on_screen(void)
+{
+    return espix_display_owns(&s_console_screen);
+}
+
 /* ------------------------------------------------------------------ */
 /* Drawing                                                             */
 /* ------------------------------------------------------------------ */
@@ -106,7 +135,8 @@ static uint32_t s_gen;
 static void con_cell(int row, int col, char ch)
 {
     espix_canvas_t *cv = espix_display_canvas();
-    if (cv == NULL || row < 0 || row >= CON_ROWS || col < 0 || col >= CON_COLS) {
+    if (cv == NULL || !con_on_screen() ||
+        row < 0 || row >= CON_ROWS || col < 0 || col >= CON_COLS) {
         return;
     }
     const char cell[2] = { ch, '\0' };
@@ -115,8 +145,6 @@ static void con_cell(int row, int col, char ch)
                       cell, CON_FG, CON_BG);
     espix_canvas_unlock(cv);
 }
-
-static void con_repaint(void *ctx);
 
 static void con_scroll(void)
 {
@@ -149,7 +177,7 @@ static void con_putc(char c);
 static void con_draw_row(int row)
 {
     espix_canvas_t *cv = espix_display_canvas();
-    if (cv == NULL || row < 0 || row >= CON_ROWS) {
+    if (cv == NULL || !con_on_screen() || row < 0 || row >= CON_ROWS) {
         return;
     }
 
@@ -438,7 +466,7 @@ static void con_repaint(void *ctx)
     (void)ctx;
 
     espix_canvas_t *cv = espix_display_canvas();
-    if (cv == NULL || s_con.grid == NULL) {
+    if (cv == NULL || s_con.grid == NULL || !con_on_screen()) {
         return;
     }
 
@@ -698,13 +726,6 @@ static bool con_poll_interrupt(espix_session_t *s)
     }
     return interrupted;
 }
-
-static const espix_screen_t s_console_screen = {
-    .name    = "vnc-console",
-    .input   = con_input,
-    .repaint = con_repaint,
-    .ctx     = NULL,
-};
 
 /* ------------------------------------------------------------------ */
 /* The session                                                         */

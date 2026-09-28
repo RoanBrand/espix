@@ -235,8 +235,16 @@ static int cmd_desktop(espix_session_t *s, int argc, char **argv)
     if (strcmp(sub, "start") == 0) {
         const esp_err_t err = espix_display_desktop_start();
         if (err != ESP_OK) {
-            espix_eprintf(s, "desktop: %s is already on the screen\n",
-                          espix_display_owner());
+            /*
+             * claim() has exactly one failure mode, and it is not this one: it
+             * takes over rather than refusing, so "already on the screen" was
+             * never what the error meant -- it printed the empty owner name and
+             * read as nonsense. What it actually means is that there is no
+             * canvas to claim, which is what `desktop start` as the first
+             * command after a boot looks like.
+             */
+            espix_eprintf(s, "desktop: the display is down; 'display start' "
+                             "or 'vnc start' brings it up\n");
             return 1;
         }
         espix_printf(s, "desktop: up\n");

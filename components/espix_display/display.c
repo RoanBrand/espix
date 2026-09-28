@@ -667,6 +667,11 @@ const char *espix_display_owner(void)
     return s_owner != NULL ? s_owner->name : "";
 }
 
+bool espix_display_owns(const espix_screen_t *screen)
+{
+    return screen != NULL && s_owner == screen;
+}
+
 void espix_display_set_default(const espix_display_default_t *def)
 {
     if (def != NULL) {

@@ -164,6 +164,17 @@ void        espix_display_release(const espix_screen_t *screen);
 const char *espix_display_owner(void);   /* "" when the default content is up */
 
 /*
+ * Is this screen the one being rendered?
+ *
+ * Claiming gives a screen the canvas; it does not take it away from anyone
+ * else, because a screen that has been taken over keeps its own model and
+ * simply stops being drawn. So a screen that draws checks this first -- the
+ * console does, and without it output from a console that is no longer on the
+ * screen is painted over whatever replaced it.
+ */
+bool        espix_display_owns(const espix_screen_t *screen);
+
+/*
  * What a viewer gets when nothing else owns the screen -- the on-screen
  * console. Registered by main, which is the only place that knows both the
  * display and the shell, and started only while a viewer is attached, so a
