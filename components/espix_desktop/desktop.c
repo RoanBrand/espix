@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -45,10 +46,23 @@
 #define CELL_W  8
 #define CELL_H  8
 
+/*
+ * The taskbar's geometry, here rather than with its code because the window
+ * geometry has to know where the bar is: a window is kept above it, and a drag
+ * is stopped by it.
+ */
+#define TASKBAR_H   26
+#define START_X     2
+#define START_W     22
+#define TRAY_W      64
+#define ITEM_H      20
+#define BUTTON_MAX  120
+
 #define WIN_MAX 8
 
 struct espix_window {
     int              x, y, w, h;
+    uint32_t         seq;       /* creation order, so the taskbar holds still */
     char             title[ESPIX_WINDOW_TITLE_MAX];
     espix_surface_t *surf;
     espix_window_draw_fn draw;
@@ -60,6 +74,40 @@ struct espix_window {
 static espix_window_t *s_wins[WIN_MAX];
 static int             s_nwin;
 static espix_window_t *s_focus;
+static uint32_t        s_win_seq;
+
+/*
+ * The desktop's own lock, and it is here rather than on the canvas because
+ * there is now more than one thing that repaints: the owner's callbacks arrive
+ * in the context of whoever posted them -- the RFB task for input, the console
+ * task for a claim -- and the clock in the taskbar ticks in the timer task.
+ * Three tasks all moving windows and painting the same pixels.
+ *
+ * Recursive, because a repair nests in a repair: espix_window_damage() repaints
+ * a surface and then repairs the region it is in. Held across a whole input
+ * event, so a press that opens a window and a tick that redraws the clock cannot
+ * interleave, and released for the long ones -- the JPEG decode behind the photo
+ * launcher runs with it held, which is why the number in the benchmark matters
+ * here too.
+ */
+static SemaphoreHandle_t s_desk_lock;
+
+/* The last button mask any event carried; see the input handler below. */
+static uint8_t s_buttons;
+
+static void desk_lock(void)
+{
+    if (s_desk_lock != NULL) {
+        xSemaphoreTakeRecursive(s_desk_lock, portMAX_DELAY);
+    }
+}
+
+static void desk_unlock(void)
+{
+    if (s_desk_lock != NULL) {
+        xSemaphoreGiveRecursive(s_desk_lock);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Cursor                                                              */
@@ -253,6 +301,12 @@ static void desktop_repair(espix_rect_t r);
 /* And the launcher square, which sits on the background under the windows. */
 static void button_paint(espix_canvas_t *c);
 
+/* The taskbar is painted over the windows, and its menu over the taskbar. */
+static void taskbar_paint(espix_canvas_t *c, espix_rect_t r);
+static void menu_paint(espix_canvas_t *c, espix_rect_t r);
+static espix_rect_t menu_rect(void);
+static void bar_damage(void);
+
 espix_rect_t espix_window_content(const espix_window_t *w)
 {
     return (espix_rect_t){ PAD, TITLE_H + PAD,
@@ -354,7 +408,7 @@ void espix_window_repaint(espix_window_t *w)
  * of the window's old and new rectangles, so filling and blitting those instead
  * of the whole canvas is a few times less work for the same picture.
  */
-static void desktop_repair(espix_rect_t r)
+static void desktop_repair_locked(espix_rect_t r)
 {
     espix_canvas_t *c = espix_display_canvas();
     if (c == NULL || !desktop_on_screen()) {
@@ -387,11 +441,22 @@ static void desktop_repair(espix_rect_t r)
                                        (espix_rect_t){ x0 - w->x, y0 - w->y,
                                                        x1 - x0, y1 - y0 });
     }
+    /* Over the windows, not beside them: a window that reaches the bottom of
+     * the screen goes under the bar, which is what makes it a bar. */
+    taskbar_paint(c, r);
+    menu_paint(c, r);
     espix_canvas_unlock(c);
 
     int px = 0, py = 0;
     espix_display_pointer(&px, &py);
     cursor_show(px, py);
+}
+
+static void desktop_repair(espix_rect_t r)
+{
+    desk_lock();
+    desktop_repair_locked(r);
+    desk_unlock();
 }
 
 void espix_desktop_repaint(void)
@@ -410,6 +475,23 @@ espix_window_t *espix_window_new(int x, int y, int w, int h, const char *title)
         return NULL;
     }
 
+    /*
+     * Kept in the work area, so nothing is ever created with its title bar under
+     * the taskbar and no way to reach it. A window taller than the work area is
+     * put at the top and allowed to run under the bar, which is the one case
+     * where there is nowhere better to put it.
+     */
+    espix_canvas_t *c = espix_display_canvas();
+    if (c != NULL) {
+        const int ww = espix_canvas_width(c);
+        const int wh = espix_canvas_height(c) - TASKBAR_H;
+
+        if (x + w > ww) { x = ww - w; }
+        if (y + h > wh) { y = wh - h; }
+        if (x < 0)      { x = 0; }
+        if (y < 0)      { y = 0; }
+    }
+
     espix_window_t *win = calloc(1, sizeof(*win));
     if (win == NULL) {
         return NULL;
@@ -420,10 +502,11 @@ espix_window_t *espix_window_new(int x, int y, int w, int h, const char *title)
         return NULL;
     }
 
-    win->x = x;
-    win->y = y;
-    win->w = w;
-    win->h = h;
+    win->x   = x;
+    win->y   = y;
+    win->w   = w;
+    win->h   = h;
+    win->seq = ++s_win_seq;
     snprintf(win->title, sizeof(win->title), "%s",
              title != NULL ? title : "window");
 
@@ -890,6 +973,358 @@ static void about_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* The taskbar                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A strip along the bottom, because that is where a desktop has kept the
+ * launcher, the windows and the time since before this one existed.
+ *
+ * The round mark on the launcher is *drawn*, not copied. Espressif's own logo is
+ * a trademark, and Apache-2.0 -- the licence the file lives under -- says in as
+ * many words that it grants no rights to trade marks or product names. So this
+ * is ours: a disc with a letter on it, in the colour anybody associates with
+ * this silicon. Putting the real one there is a decision for whoever ships this,
+ * not a line to slip in here.
+ */
+#define COL_BAR      RGB565(0x18, 0x1C, 0x24)
+#define COL_BAR_EDGE RGB565(0x3A, 0x42, 0x52)
+#define COL_BTN      RGB565(0x2A, 0x30, 0x3A)
+#define COL_TRAY     RGB565(0x12, 0x15, 0x1B)
+#define COL_TRAY_FG  RGB565(0xD0, 0xDE, 0xEC)
+#define COL_MENU     RGB565(0x22, 0x28, 0x32)
+#define COL_MENU_HOT RGB565(0x4C, 0x6E, 0xA8)
+#define COL_LOGO     RGB565(0xE0, 0x2E, 0x32)
+#define COL_LOGO_FG  RGB565(0xFF, 0xFF, 0xFF)
+
+static char               s_clock[8];       /* "HH:MM", or "--:--" until set */
+static bool               s_menu;
+static int                s_menu_hot = -1;
+static esp_timer_handle_t s_clock_timer;
+
+static bool in_rect(espix_rect_t r, int x, int y)
+{
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+}
+
+static bool rects_overlap(espix_rect_t a, espix_rect_t b)
+{
+    return a.x < b.x + b.w && b.x < a.x + a.w &&
+           a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+static espix_rect_t rect_intersect(espix_rect_t a, espix_rect_t b)
+{
+    const int x0 = a.x > b.x ? a.x : b.x;
+    const int y0 = a.y > b.y ? a.y : b.y;
+    const int x1 = (a.x + a.w) < (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    const int y1 = (a.y + a.h) < (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+}
+
+/* The bar's strip of canvas, and the line windows stop at. */
+static espix_rect_t bar_rect(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return (espix_rect_t){ 0, 0, 0, 0 };
+    }
+    return (espix_rect_t){ 0, espix_canvas_height(c) - TASKBAR_H,
+                           espix_canvas_width(c), TASKBAR_H };
+}
+
+static int work_bottom(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    return (c == NULL) ? 0 : espix_canvas_height(c) - TASKBAR_H;
+}
+
+static espix_rect_t start_rect(void)
+{
+    const espix_rect_t b = bar_rect();
+    return (espix_rect_t){ START_X, b.y + 2, START_W, TASKBAR_H - 4 };
+}
+
+static espix_rect_t tray_rect(void)
+{
+    espix_canvas_t    *c = espix_display_canvas();
+    const espix_rect_t b = bar_rect();
+    const int          w = (c == NULL) ? 0 : espix_canvas_width(c);
+    return (espix_rect_t){ w - TRAY_W, b.y, TRAY_W, TASKBAR_H };
+}
+
+static const char *const s_menu_items[] = { "photo", "about", "terminal" };
+#define MENU_N ((int)(sizeof(s_menu_items) / sizeof(s_menu_items[0])))
+
+static espix_rect_t menu_rect(void)
+{
+    const espix_rect_t b = bar_rect();
+    const int          h = MENU_N * ITEM_H + 6;
+    return (espix_rect_t){ START_X, b.y - h, 132, h };
+}
+
+/*
+ * A filled circle, one scanline at a time, which is all a canvas of rectangles
+ * needs for one. It is 20-odd fills, once per full repaint, on a 22-pixel disc.
+ */
+static void disc_paint(espix_canvas_t *c, int cx, int cy, int rad, espix_px_t col)
+{
+    for (int dy = -rad; dy <= rad; dy++) {
+        int dx = 0;
+        while ((dx + 1) * (dx + 1) + dy * dy <= rad * rad) {
+            dx++;
+        }
+        espix_canvas_fill(c, (espix_rect_t){ cx - dx, cy + dy, 2 * dx + 1, 1 },
+                          col);
+    }
+}
+
+static void start_paint(espix_canvas_t *c)
+{
+    const espix_rect_t b  = start_rect();
+    const espix_px_t   bg = s_menu ? COL_TITLE_FOC : COL_BTN;
+    const int          cx = b.x + b.w / 2;
+    const int          cy = b.y + b.h / 2;
+
+    espix_canvas_fill(c, b, bg);
+    espix_canvas_outline(c, b, COL_BAR_EDGE);
+
+    disc_paint(c, cx, cy, b.h / 2 - 2, COL_LOGO);
+    /* The 8x8 cell sits inside the disc at this size, so the glyph's background
+     * is the disc's colour and there is no square left over. */
+    espix_canvas_text(c, cx - CELL_W / 2, cy - CELL_H / 2, "e",
+                      COL_LOGO_FG, COL_LOGO);
+}
+
+static void tray_paint(espix_canvas_t *c)
+{
+    const espix_rect_t t = tray_rect();
+
+    espix_canvas_fill(c, t, COL_TRAY);
+    espix_canvas_fill(c, (espix_rect_t){ t.x, t.y, 1, t.h }, COL_BAR_EDGE);
+    espix_canvas_text(c, t.x + (TRAY_W - 5 * CELL_W) / 2,
+                      t.y + (TASKBAR_H - CELL_H) / 2, s_clock,
+                      COL_TRAY_FG, COL_TRAY);
+}
+
+/*
+ * One button per window, between the launcher and the tray. The geometry is
+ * derived here once and read back for the hit test, because a button that is
+ * drawn in one place and pressed in another is the whole class of bug this
+ * avoids.
+ */
+/*
+ * The windows in the order they were opened, which is the order the bar lists
+ * them in -- not the z-order they are stacked in. A button that moves the moment
+ * you click it is a button you have to find again, and it moves every time a
+ * window is raised.
+ */
+static int task_order(espix_window_t **out)
+{
+    int n = 0;
+
+    for (int i = 0; i < s_nwin; i++) {
+        out[n++] = s_wins[i];
+    }
+    for (int i = 1; i < n; i++) {               /* insertion sort, and n <= 8 */
+        espix_window_t *w = out[i];
+        int             j = i - 1;
+
+        while (j >= 0 && out[j]->seq > w->seq) {
+            out[j + 1] = out[j];
+            j--;
+        }
+        out[j + 1] = w;
+    }
+    return n;
+}
+
+static bool task_at(int i, espix_rect_t *out, espix_window_t **win)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    espix_window_t *list[WIN_MAX];
+
+    if (c == NULL || i < 0 || i >= task_order(list)) {
+        return false;
+    }
+
+    const espix_rect_t s  = start_rect();
+    const int          x1 = espix_canvas_width(c) - TRAY_W - 6;
+    int                x  = s.x + s.w + 6;
+
+    for (int k = 0; k <= i; k++) {
+        espix_window_t *w  = list[k];
+        int             tw = (int)strlen(w->title) * CELL_W + 16;
+
+        if (tw > BUTTON_MAX) { tw = BUTTON_MAX; }
+        if (x + tw > x1)     { tw = x1 - x; }
+        if (tw < 24) {
+            return false;
+        }
+        if (k == i) {
+            if (out != NULL) {
+                *out = (espix_rect_t){ x, s.y, tw, s.h };
+            }
+            if (win != NULL) {
+                *win = w;
+            }
+            return true;
+        }
+        x += tw + 4;
+    }
+    return false;
+}
+
+static void taskbar_paint(espix_canvas_t *c, espix_rect_t r)
+{
+    const espix_rect_t b = bar_rect();
+
+    if (c == NULL || b.h <= 0 || !rects_overlap(b, r)) {
+        return;
+    }
+
+    const espix_rect_t d = rect_intersect(b, r);
+
+    espix_canvas_fill(c, d, COL_BAR);
+    if (d.y == b.y) {
+        espix_canvas_fill(c, (espix_rect_t){ d.x, b.y, d.w, 1 }, COL_BAR_EDGE);
+    }
+
+    if (rects_overlap(start_rect(), r)) {
+        start_paint(c);
+    }
+    if (rects_overlap(tray_rect(), r)) {
+        tray_paint(c);
+    }
+
+    for (int i = 0; i < s_nwin; i++) {
+        espix_rect_t    t;
+        espix_window_t *w;
+
+        if (!task_at(i, &t, &w) || !rects_overlap(t, r)) {
+            continue;
+        }
+        const espix_px_t bg  = (w == s_focus) ? COL_TITLE_FOC : COL_BTN;
+        const int        fit = (t.w - 16) / CELL_W;
+        char             label[17];
+
+        snprintf(label, sizeof(label), "%.*s", fit > 0 ? fit : 0, w->title);
+        espix_canvas_fill(c, t, bg);
+        espix_canvas_text(c, t.x + 8, t.y + (t.h - CELL_H) / 2, label,
+                          COL_TITLE_FG, bg);
+    }
+}
+
+static int menu_hot(void)
+{
+    if (!s_menu || s_buttons != 0) {
+        return -1;
+    }
+    const espix_rect_t m = menu_rect();
+    if (!in_rect(m, s_cx, s_cy)) {
+        return -1;
+    }
+    const int i = (s_cy - (m.y + 3)) / ITEM_H;
+    return (i >= 0 && i < MENU_N) ? i : -1;
+}
+
+static void menu_paint(espix_canvas_t *c, espix_rect_t r)
+{
+    if (!s_menu || c == NULL) {
+        return;
+    }
+    const espix_rect_t m = menu_rect();
+    if (!rects_overlap(m, r)) {
+        return;
+    }
+
+    espix_canvas_fill(c, m, COL_MENU);
+    espix_canvas_outline(c, m, COL_BAR_EDGE);
+
+    for (int i = 0; i < MENU_N; i++) {
+        const espix_rect_t it = { m.x + 1, m.y + 3 + i * ITEM_H,
+                                  m.w - 2, ITEM_H };
+        const espix_px_t   bg = (i == s_menu_hot) ? COL_MENU_HOT : COL_MENU;
+
+        espix_canvas_fill(c, it, bg);
+        espix_canvas_text(c, it.x + 10, it.y + (ITEM_H - CELL_H) / 2,
+                          s_menu_items[i], COL_TITLE_FG, bg);
+    }
+}
+
+static void bar_damage(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+    const espix_rect_t m = menu_rect();
+    const int          h = espix_canvas_height(c);
+    const int          y = m.y < work_bottom() ? m.y : work_bottom();
+
+    desktop_repair((espix_rect_t){ 0, y, espix_canvas_width(c), h - y });
+}
+
+static void menu_activate(int i)
+{
+    s_menu = false;
+
+    if (strcmp(s_menu_items[i], "photo") == 0) {
+        photo_open();
+    } else if (strcmp(s_menu_items[i], "about") == 0 && s_about != NULL) {
+        espix_window_focus(s_about);
+        espix_window_raise(s_about);
+    } else if (strcmp(s_menu_items[i], "terminal") == 0 && s_term != NULL) {
+        espix_window_focus(s_term);
+        espix_window_raise(s_term);
+    }
+    bar_damage();
+}
+
+/*
+ * The clock, from the system clock the kernel already keeps -- the one SNTP
+ * sets. Before that it reads 1970, and printing 00:00 with a straight face
+ * would be worse than saying nothing, so it says nothing.
+ */
+static void clock_text(char *out, size_t len)
+{
+    const time_t now = time(NULL);
+    struct tm    tm;
+
+    if (now < 1600000000 || localtime_r(&now, &tm) == NULL) {
+        snprintf(out, len, "--:--");
+        return;
+    }
+    strftime(out, len, "%H:%M", &tm);
+}
+
+/*
+ * Once a minute the bar changes, and once a minute this repaints the 64-pixel
+ * column it changed in. The tick is every five seconds so the minute is never
+ * more than five seconds late; the string comparison is what keeps it to one
+ * repair rather than twelve.
+ */
+static void clock_tick(void *arg)
+{
+    (void)arg;
+
+    char now[8];
+    clock_text(now, sizeof(now));
+
+    if (strcmp(now, s_clock) == 0 || !desktop_on_screen()) {
+        return;
+    }
+    snprintf(s_clock, sizeof(s_clock), "%s", now);
+
+    espix_canvas_t *c = espix_display_canvas();
+    if (c != NULL) {
+        desk_lock();
+        desktop_repair_locked(tray_rect());
+        desk_unlock();
+    }
+}
+
 static void windows_create(void)
 {
     s_term = espix_window_new(40, 40,
@@ -952,7 +1387,6 @@ static void windows_destroy(void)
  * live, so the press and the release have to be recognised as changes in this
  * rather than looked for on the event that moves the window.
  */
-static uint8_t        s_buttons;
 static espix_window_t *s_drag;
 static int            s_grab_x, s_grab_y;   /* where in the window it was grabbed */
 
@@ -986,13 +1420,15 @@ static void drag_to(int x, int y)
         if (nx + s_drag->w < 32) { nx = 32 - s_drag->w; }
         if (nx > cw - 32)        { nx = cw - 32; }
         if (ny < 0)              { ny = 0; }
-        if (ny > ch - TITLE_H)   { ny = ch - TITLE_H; }
+        /* Stopped by the bar, not by the screen: the title bar stays reachable
+         * and the taskbar stays a thing windows go under rather than through. */
+        if (ny > ch - TASKBAR_H - TITLE_H) { ny = ch - TASKBAR_H - TITLE_H; }
     }
 
     espix_window_move(s_drag, nx, ny);
 }
 
-static void desktop_input(void *ctx, const espix_input_event_t *ev)
+static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
 {
     (void)ctx;
 
@@ -1007,6 +1443,44 @@ static void desktop_input(void *ctx, const espix_input_event_t *ev)
             return;
         }
         if (was == 0 && s_buttons != 0) {
+            /*
+             * The bar is drawn over everything, so it is pressed before anything
+             * under it -- and while the menu is open it swallows the click, so
+             * that a click anywhere else closes it rather than pressing whatever
+             * was behind it. That is the order a menu has, and getting it wrong
+             * is a menu you cannot dismiss without choosing something.
+             */
+            if (s_menu) {
+                const espix_rect_t m = menu_rect();
+
+                if (in_rect(m, ev->x, ev->y)) {
+                    const int i = (ev->y - (m.y + 3)) / ITEM_H;
+                    if (i >= 0 && i < MENU_N) {
+                        menu_activate(i);
+                    }
+                } else {
+                    s_menu = false;
+                    s_menu_hot = -1;
+                    bar_damage();
+                }
+                return;
+            }
+            if (in_rect(start_rect(), ev->x, ev->y)) {
+                s_menu = true;
+                s_menu_hot = -1;
+                bar_damage();
+                return;
+            }
+            for (int i = 0; i < s_nwin; i++) {
+                espix_rect_t    t;
+                espix_window_t *w;
+
+                if (task_at(i, &t, &w) && in_rect(t, ev->x, ev->y)) {
+                    espix_window_focus(w);
+                    espix_window_raise(w);
+                    return;
+                }
+            }
             if (button_hit(ev->x, ev->y)) {
                 photo_open();
                 return;
@@ -1038,6 +1512,16 @@ static void desktop_input(void *ctx, const espix_input_event_t *ev)
          */
         cursor_put(s_cx + ev->x, s_cy + ev->y);
 
+        /* Only when it changes: a highlight that repaints on every report of a
+         * mouse crossing a menu is 132x66 of canvas per motion. */
+        if (s_menu) {
+            const int hot = menu_hot();
+            if (hot != s_menu_hot) {
+                s_menu_hot = hot;
+                desktop_repair(menu_rect());
+            }
+        }
+
         if (s_drag != NULL) {
             drag_to(s_cx, s_cy);
         } else if (s_buttons == 0) {
@@ -1047,6 +1531,13 @@ static void desktop_input(void *ctx, const espix_input_event_t *ev)
                s_focus->key != NULL) {
         s_focus->key(s_focus, ev->keysym, ev->down, s_focus->ctx);
     }
+}
+
+static void desktop_input(void *ctx, const espix_input_event_t *ev)
+{
+    desk_lock();
+    desktop_input_locked(ctx, ev);
+    desk_unlock();
 }
 
 static void desktop_repaint(void *ctx)
@@ -1069,6 +1560,23 @@ esp_err_t espix_desktop_start(void)
     if (!s_arrow_built) {
         cursor_build();
     }
+    if (s_desk_lock == NULL) {
+        s_desk_lock = xSemaphoreCreateRecursiveMutex();
+    }
+    if (s_clock_timer == NULL) {
+        clock_text(s_clock, sizeof(s_clock));
+
+        const esp_timer_create_args_t args = {
+            .callback = clock_tick,
+            .name     = "taskbar",
+        };
+        if (esp_timer_create(&args, &s_clock_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_clock_timer, 5 * 1000 * 1000);
+        } else {
+            /* A bar with a clock that never moves is better than no bar. */
+            s_clock_timer = NULL;
+        }
+    }
     if (s_nwin == 0) {
         windows_create();
     }
@@ -1077,6 +1585,14 @@ esp_err_t espix_desktop_start(void)
 
 void espix_desktop_stop(void)
 {
+    /* Stopped before the canvas goes, so the tick cannot repaint into a display
+     * that is on its way down. */
+    if (s_clock_timer != NULL) {
+        esp_timer_stop(s_clock_timer);
+        esp_timer_delete(s_clock_timer);
+        s_clock_timer = NULL;
+    }
+
     espix_display_release(&s_desktop_screen);
 
     /*
@@ -1086,4 +1602,6 @@ void espix_desktop_stop(void)
      */
     windows_destroy();
     s_cursor_on = false;
+    s_menu      = false;
+    s_menu_hot  = -1;
 }

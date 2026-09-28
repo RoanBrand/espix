@@ -333,17 +333,27 @@ DMA2D for moves, JPEG for encode. Each one benchmarked against the CPU path it
 replaces, with the VNC client as the visual check. This is the milestone that
 answers "what do we actually need from these peripherals".
 
-**M3 -- a surface and compositor contract.** Surfaces, z-order, alpha via PPA
-BLEND, a cursor layer, and a `DesktopSize` pseudo-encoding so the canvas can
-change size. The window-manager API, in other words, kept deliberately thin.
+**M3 -- a surface and compositor contract.** *Done, except the last two.*
+Surfaces, z-order, focus, a cursor layer and a window-manager API kept
+deliberately thin. Alpha via PPA BLEND and a `DesktopSize` pseudo-encoding are
+still unwritten, for the usual reason: nothing has needed them yet.
 
-**M4 -- the first real app: an image viewer.** It is the purest JPEG-accelerated
-demo and it needs no text-input model, which makes it the right first
-application -- before the file browser, the audio player, and the text editor.
+**M4 -- the first real app: an image viewer.** *Done.* It is the purest
+JPEG-accelerated demo and it needs no text-input model, which makes it the right
+first application -- before the file browser, the audio player, and the text
+editor.
 
-The longer list (system tray with clock and radio status, file browser, image
-and movie viewer, audio player, text editor) is a GUI stack, and each of those
-is only worth starting once the layer under it is honest.
+**M5 -- the shell around the apps.** *Started.* A taskbar along the bottom: a
+launcher that opens a menu, a button per window in the order the windows were
+opened, and a clock that reads the system clock the kernel already keeps. It is
+deliberately a look rather than a feature -- the tray reports the time and
+nothing else, and the menu has three items -- because it is the frame the rest of
+those apps will arrive in, and a frame is worth seeing before it is worth
+filling.
+
+The longer list (radio status and volume in the tray, a file browser, image and
+movie viewer, audio player, text editor) is a GUI stack, and each of those is
+only worth starting once the layer under it is honest.
 
 ## Using it
 

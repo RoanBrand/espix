@@ -71,9 +71,11 @@ together.
 | Display | The clients people actually use | **yes** | RFB 3.3 and 3.7/3.8, plus VNC authentication for the ones that insist on a password: TigerVNC, RealVNC on Android and macOS Screen Sharing have each painted a full desktop |
 | Display | Authentication | **partial** | VNC auth (DES) with a built-in default password, public on purpose; security type None is still offered to 3.7+ clients, so it is a compatibility mechanism rather than a security boundary — [DISPLAY.md](docs/DISPLAY.md) |
 | Display | A cursor, and a keyboard round-trip | **yes** | a server-side cursor plus a window that echoes keys; input is one entry point, so a viewer and a local keyboard or mouse arrive the same way |
-| Display | PPA, JPEG and 2D-DMA acceleration | **planned** | the reason the virtual screen exists — each accelerator gets measured against the CPU path it replaces |
+| Display | PPA and JPEG acceleration | **yes** | the reason the virtual screen exists: a fill/blit/scale path and a JPEG codec, each measured against the CPU path it replaces and kept, because the S3 has neither — [DISPLAY.md](docs/DISPLAY.md#what-it-costs) |
+| Display | 2D-DMA for moves and colour conversion | **no** | PPA SRM already does what the desktop needs, so it is unwritten until something needs it |
 | Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
-| Display | A window system | **planned** | surfaces, z-order and a compositor, on top of the VNC backend |
+| Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |
+| Display | A system tray, beyond the clock | **no** | one item is the look; radio status, volume and the rest wait for something to report them |
 | Services | Something that starts at boot and stays up | **planned** | no init or supervision yet — [ROADMAP](docs/ROADMAP.md) |
 | Services | Scheduled work: a `cron` | **planned** | the same missing supervisor, from the other end |
 
