@@ -126,6 +126,82 @@ def sample(gdb, elf, port):
     return [s for t, s in stacks if t in running]
 
 
+def render_svg(folded, path):
+    """Draw folded stacks as an SVG flamegraph.
+
+    The standard renderer is flamegraph.pl, which is frequently not installed.
+    Reading the folded format back and laying out rectangles is less code than
+    the dependency, and the output is the same shape: width is share of samples,
+    depth is call depth, and a frame is only labelled when the label fits.
+    """
+    root = {"name": "all", "value": 0, "kids": {}}
+    for stack, count in folded.items():
+        node = root
+        node["value"] += count
+        for name in stack.split(";"):
+            node = node["kids"].setdefault(
+                name, {"name": name, "value": 0, "kids": {}})
+            node["value"] += count
+    total = root["value"] or 1
+
+    def depth_of(n, d=0):
+        return max([d] + [depth_of(k, d + 1) for k in n["kids"].values()])
+    depth = depth_of(root)
+
+    row, width = 16, 1200
+    height = (depth + 1) * row
+
+    def place(n, x, d):
+        n["x"], n["y"] = x, d
+        cx = x
+        for k in sorted(n["kids"].values(), key=lambda k: -k["value"]):
+            place(k, cx, d + 1)
+            cx += k["value"] / total * width
+
+    place(root, 0, 0)
+
+    def colour(name):
+        h = 2166136261
+        for ch in name.encode():
+            h = ((h ^ ch) * 16777619) & 0xFFFFFFFF
+        return "hsl(%d,55%%,72%%)" % (h % 360)
+
+    def esc(s):
+        return (s.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;"))
+
+    body = []
+
+    def emit(n):
+        w = n["value"] / total * width
+        x, y = n["x"], n["y"]
+        body.append(
+            '<g><title>%s (%d samples, %.1f%%)</title>'
+            '<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="%s" '
+            'stroke="#fff" stroke-width="0.5"/>'
+            % (esc(n["name"]), n["value"], 100.0 * n["value"] / total,
+               x, y * row, max(w, 0.5), row - 1, colour(n["name"])))
+        chars = int((w - 6) / 6.4)
+        if chars >= 3:
+            label = n["name"] if len(n["name"]) <= chars \
+                else n["name"][:chars - 2] + ".."
+            body.append('<text x="%.1f" y="%d" font-size="11" '
+                        'font-family="monospace" fill="#111">%s</text>'
+                        % (x + 3, y * row + 12, esc(label)))
+        body.append("</g>")
+        for k in n["kids"].values():
+            emit(k)
+
+    emit(root)
+    with open(path, "w") as f:
+        f.write('<svg xmlns="http://www.w3.org/2000/svg" width="%d" '
+                'height="%d" viewBox="0 0 %d %d">\n'
+                '<rect width="100%%" height="100%%" fill="#f7f7f7"/>\n'
+                % (width, height, width, height))
+        f.write("\n".join(body))
+        f.write("\n</svg>\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", "--samples", type=int, default=30)
@@ -203,14 +279,16 @@ def main():
         print(f"  {count * 100 // max(total, 1):3d}%  {fn}")
 
     if args.flamegraph:
+        svg = args.out.rsplit(".", 1)[0] + ".svg"
         fg = shutil.which("flamegraph.pl")
-        if not fg:
-            print("\nflamegraph.pl not on PATH; " + args.out + " is standard input for it")
-        else:
-            svg = args.out.rsplit(".", 1)[0] + ".svg"
+        if fg:
             with open(svg, "w") as out:
                 subprocess.run([fg, args.out], stdout=out, check=True)
-            print("wrote " + svg)
+        else:
+            # flamegraph.pl is the usual renderer and is usually absent. The
+            # folded format is small enough to draw here rather than depend on it.
+            render_svg(folded, svg)
+        print("wrote " + svg)
 
 
 if __name__ == "__main__":
