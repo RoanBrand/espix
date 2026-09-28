@@ -208,6 +208,28 @@ does, so they are quoted in milliseconds rather than in rates:
 | **window content** -- frame, title, 20x56 of text | 456x186 | 11.2 ms | **8.3 ms** | 1.3x |
 | **jpeg decode** -- the viewer's 23 KB test.jpg | 480x330 | 116.7 ms | **12.4 ms** | 9.4x |
 
+And one number that is not a row, because it is not a primitive: **a window
+drag**. Moving a window is the desktop's most obvious interaction and was its
+worst, at **301,380 bytes per four-pixel motion** -- the union of where the window
+was and where it went, with the window's own text in it, as Hextile.
+
+It is **8,048** now, which is 37x, and the reason is a protocol feature rather
+than a faster loop: RFC 6143's **CopyRect**. A dragged window is not new pixels,
+it is the same pixels somewhere else, and a client that already has them can be
+told to move them -- sixteen bytes against a hundred kilobytes. The desktop says
+which rectangle moved and where from; the backend sends that as a copy and
+subtracts it from the damage so the pixels are not sent twice.
+
+Which is worth a note on how the number was found, because the first measurement
+said something else. The test client asked for a *full* frame after every motion,
+so every motion was answered with the whole canvas and cost what a whole canvas
+costs -- 198 KiB, which looked like a plausible bad number and was really a
+measurement of the harness. A viewer keeps one incremental request outstanding
+and paints into a framebuffer it already has; the harness does that now, and the
+real figure is the 301,380 above. Measured on the S31, and checked rather than
+assumed: after a drag, a framebuffer built entirely from incremental updates and
+copies agrees with a raw full frame to the pixel, 0 of 480,000.
+
 The JPEG row is the one row that needs an input rather than a size: decoding is
 not an operation to sweep, it is the whole of one file, so `display bench [jpeg]`
 takes a path and defaults to the picture the launcher opens. It is absent when

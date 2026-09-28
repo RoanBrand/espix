@@ -121,8 +121,9 @@ enum {
 
 /* Encodings. Raw is mandatory; Hextile is the one worth having. */
 enum {
-    RFB_ENC_RAW     = 0,
-    RFB_ENC_HEXTILE = 5,
+    RFB_ENC_RAW      = 0,
+    RFB_ENC_COPYRECT = 1,
+    RFB_ENC_HEXTILE  = 5,
 };
 
 /* ------------------------------------------------------------------ */
@@ -401,6 +402,46 @@ static void enc_raw(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
  * across tiles. One byte and one pixel per tile buys not having to reason
  * about what a client believes the previous tile left behind.
  */
+/*
+ * `r` without the part of it inside `hole`, as at most four rectangles.
+ *
+ * This is what a copy needs: the pixels a client is told to move are *not* also
+ * sent, so every damaged rectangle that ran under the moved one has to come back
+ * as the parts that did not.
+ */
+static size_t rect_subtract(espix_rect_t r, espix_rect_t hole, espix_rect_t *out)
+{
+    if (hole.w <= 0 || hole.h <= 0 ||
+        hole.x >= r.x + r.w || hole.x + hole.w <= r.x ||
+        hole.y >= r.y + r.h || hole.y + hole.h <= r.y) {
+        out[0] = r;
+        return 1;
+    }
+
+    size_t n = 0;
+
+    if (hole.y > r.y) {                     /* above */
+        out[n++] = (espix_rect_t){ r.x, r.y, r.w, hole.y - r.y };
+    }
+    if (hole.y + hole.h < r.y + r.h) {       /* below */
+        out[n++] = (espix_rect_t){ r.x, hole.y + hole.h, r.w,
+                                   r.y + r.h - (hole.y + hole.h) };
+    }
+
+    const int y0 = hole.y > r.y ? hole.y : r.y;
+    const int y1 = (hole.y + hole.h) < (r.y + r.h) ? (hole.y + hole.h)
+                                                   : (r.y + r.h);
+
+    if (hole.x > r.x) {                     /* left */
+        out[n++] = (espix_rect_t){ r.x, y0, hole.x - r.x, y1 - y0 };
+    }
+    if (hole.x + hole.w < r.x + r.w) {       /* right */
+        out[n++] = (espix_rect_t){ hole.x + hole.w, y0,
+                                   r.x + r.w - (hole.x + hole.w), y1 - y0 };
+    }
+    return n;
+}
+
 static void enc_hextile(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
                         const rfb_pf_t *pf, uint8_t *row)
 {
@@ -454,6 +495,7 @@ typedef struct {
     bool      hextile;
     bool      pending;        /* an update is owed to the client */
     bool      pending_full;   /* ...and it asked for a whole frame */
+    bool      copyrect;       /* ...and it can be told to move pixels itself */
     bool      logged_req;     /* the first request is worth one line */
     bool      logged_send;    /* and so is the first update */
     espix_px_t *stage;        /* canvas copy, so encoding is off the lock */
@@ -472,20 +514,66 @@ static bool update_send(rfb_conn_t *c)
     const int ch = espix_canvas_height(cv);
 
     espix_rect_t rects[ESPIX_DISPLAY_DAMAGE_MAX];
+    espix_rect_t keep[ESPIX_DISPLAY_DAMAGE_MAX];
+    espix_move_t moves[ESPIX_DISPLAY_MOVE_MAX];
+    const bool   full = c->pending_full;
+    size_t       nmove = 0;
     size_t       n;
 
     espix_canvas_lock(cv);
-    if (c->pending_full) {
+    if (full) {
         rects[0] = (espix_rect_t){ 0, 0, cw, ch };
         n = 1;
         espix_canvas_damage_clear(cv);
+        espix_canvas_move_clear(cv);        /* a whole frame needs no copies */
     } else {
-        n = espix_canvas_damage_take(cv, rects, ESPIX_DISPLAY_DAMAGE_MAX);
+        nmove = espix_canvas_move_take(cv, moves, ESPIX_DISPLAY_MOVE_MAX);
+        n     = espix_canvas_damage_take(cv, rects, ESPIX_DISPLAY_DAMAGE_MAX);
     }
 
-    if (n == 0) {
+    if (n == 0 && nmove == 0) {
         espix_canvas_unlock(cv);
         return true;                        /* nothing changed; stay owed */
+    }
+
+    /*
+     * One move, and only one.
+     *
+     * A copy is an instruction about the client's framebuffer as it is *now*, so
+     * a second one in the same update would depend on the first having been
+     * applied -- which it has, in order, but the pixel updates in between would
+     * too, and reasoning about that is how a protocol bug gets written. A drag
+     * sends a frame per motion anyway, so one is all a drag needs; anything else
+     * goes as pixels, which is always right.
+     */
+    bool copy = c->copyrect && !full && nmove == 1;
+
+    /*
+     * And the moved pixels come out of the damage, because sending both would
+     * send the same rectangle twice -- once as a copy and once as itself.
+     */
+    if (copy) {
+        size_t k = 0;
+
+        for (size_t i = 0; i < n; i++) {
+            espix_rect_t parts[4];
+            const size_t np = rect_subtract(rects[i], moves[0].r, parts);
+
+            for (size_t j = 0; j < np; j++) {
+                if (k >= ESPIX_DISPLAY_DAMAGE_MAX) {
+                    copy = false;           /* no room: send everything */
+                    break;
+                }
+                keep[k++] = parts[j];
+            }
+            if (!copy) {
+                break;
+            }
+        }
+        if (copy) {
+            memcpy(rects, keep, k * sizeof(keep[0]));
+            n = k;
+        }
     }
 
     /*
@@ -510,15 +598,31 @@ static bool update_send(rfb_conn_t *c)
                    cw, ch, c->pf.bpp, c->hextile ? "hextile" : "raw");
     }
 
+    const size_t total = n + (copy ? 1 : 0);
+
     uint8_t hdr[4];
     hdr[0] = 0;                             /* FramebufferUpdate */
     hdr[1] = 0;
-    wr16(hdr + 2, (uint16_t)n);
+    wr16(hdr + 2, (uint16_t)total);
     if (!write_full(c->fd, hdr, 4)) {
         return false;
     }
 
     sink_t s = { .fd = c->fd, .buf = c->out, .cap = OUT_CAP };
+
+    if (copy) {
+        /* Twelve bytes of header and four of payload, against a hundred
+         * kilobytes of pixels: this is the whole of why a drag is affordable. */
+        uint8_t ch[16];
+        wr16(ch + 0, (uint16_t)moves[0].r.x);
+        wr16(ch + 2, (uint16_t)moves[0].r.y);
+        wr16(ch + 4, (uint16_t)moves[0].r.w);
+        wr16(ch + 6, (uint16_t)moves[0].r.h);
+        wr32(ch + 8, RFB_ENC_COPYRECT);
+        wr16(ch + 12, (uint16_t)moves[0].sx);
+        wr16(ch + 14, (uint16_t)moves[0].sy);
+        sink_write(&s, ch, sizeof(ch));
+    }
 
     for (size_t i = 0; i < n; i++) {
         const espix_rect_t r = rects[i];
@@ -583,7 +687,8 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
             return false;
         }
         const uint16_t n = rd16(buf + 1);
-        bool           hextile = false;
+        bool           hextile  = false;
+        bool           copyrect = false;
 
         for (uint16_t i = 0; i < n; i++) {
             uint8_t e[4];
@@ -592,11 +697,15 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
             }
             if (rd32(e) == RFB_ENC_HEXTILE) {
                 hextile = true;
+            } else if (rd32(e) == RFB_ENC_COPYRECT) {
+                copyrect = true;
             }
         }
-        c->hextile = hextile;
-        espix_klog(ESPIX_KLOG_DEBUG, TAG, "%u encodings offered; hextile %s",
-                   n, hextile ? "yes" : "no");
+        c->hextile  = hextile;
+        c->copyrect = copyrect;
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "%u encodings offered; hextile %s, "
+                   "copyrect %s", n, hextile ? "yes" : "no",
+                   copyrect ? "yes" : "no");
         return true;
     }
 

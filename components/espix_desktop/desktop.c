@@ -311,9 +311,6 @@ static bool desktop_on_screen(void)
 /* Defined below; damaging a window is a repair of the region it covers. */
 static void desktop_repair(espix_rect_t r);
 
-/* And the launcher square, which sits on the background under the windows. */
-static void button_paint(espix_canvas_t *c);
-
 /* The taskbar is painted over the windows, and its menu over the taskbar. */
 static void taskbar_paint(espix_canvas_t *c, espix_rect_t r);
 static void task_button_damage(espix_window_t *w);
@@ -535,7 +532,6 @@ static void desktop_repair_locked(espix_rect_t r)
 
     espix_canvas_lock(c);
     espix_canvas_fill(c, r, COL_DESKTOP);
-    button_paint(c);        /* under the windows, over the background */
 
     for (int i = 0; i < s_nwin; i++) {
         const espix_window_t *w = s_wins[i];
@@ -786,6 +782,17 @@ void espix_window_focus(espix_window_t *w)
     focus_draw(was, w);
 }
 
+/* The overlap of two rectangles, which is empty when they do not meet. */
+static espix_rect_t rect_meet(espix_rect_t a, espix_rect_t b)
+{
+    const int x0 = a.x > b.x ? a.x : b.x;
+    const int y0 = a.y > b.y ? a.y : b.y;
+    const int x1 = (a.x + a.w) < (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    const int y1 = (a.y + a.h) < (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+
+    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+}
+
 void espix_window_move(espix_window_t *w, int x, int y)
 {
     if (w == NULL || (w->x == x && w->y == y)) {
@@ -812,6 +819,25 @@ void espix_window_move(espix_window_t *w, int x, int y)
                                                       : (now.y + now.h);
 
     desktop_repair((espix_rect_t){ x0, y0, x1 - x0, y1 - y0 });
+
+    /*
+     * And say which part of that was not drawn at all but *moved*.
+     *
+     * The repair has already put the right pixels there; this is not how the
+     * canvas is painted, it is what the canvas is told. A backend that gets it
+     * tells a client to copy three bytes instead of sending a rectangle of
+     * pixels -- and a dragged window is almost entirely this one rectangle.
+     */
+    espix_canvas_t    *c  = espix_display_canvas();
+    const espix_rect_t ov = rect_meet(was, now);
+
+    if (c != NULL && ov.w > 0 && ov.h > 0) {
+        espix_canvas_lock(c);
+        espix_canvas_moved(c, (espix_rect_t){ ov.x + (x - was.x),
+                                              ov.y + (y - was.y), ov.w, ov.h },
+                           ov.x, ov.y);
+        espix_canvas_unlock(c);
+    }
 }
 
 /*
@@ -853,29 +879,9 @@ static void focus_at(int x, int y)
  */
 #define PHOTO_PATH "/home/esp/test.jpg"
 
-#define BTN_X 696
-#define BTN_Y 24
-#define BTN_W 80
-#define BTN_H 80
-
 static espix_window_t  *s_img_win;
 static espix_surface_t *s_img;          /* decoded once, then kept */
 static bool             s_img_tried;
-
-static void button_paint(espix_canvas_t *c)
-{
-    const espix_rect_t r = { BTN_X, BTN_Y, BTN_W, BTN_H };
-
-    espix_canvas_fill(c, r, COL_TITLE);
-    espix_canvas_outline(c, r, COL_WIN_EDGE);
-    espix_canvas_text(c, BTN_X + (BTN_W - 5 * CELL_W) / 2, BTN_Y + BTN_H / 2 - 4,
-                      "photo", COL_TITLE_FG, COL_TITLE);
-}
-
-static bool button_hit(int x, int y)
-{
-    return x >= BTN_X && x < BTN_X + BTN_W && y >= BTN_Y && y < BTN_Y + BTN_H;
-}
 
 /*
  * Read the file and decode it, once. The whole file is in memory before the
@@ -1456,15 +1462,6 @@ static bool rects_overlap(espix_rect_t a, espix_rect_t b)
            a.y < b.y + b.h && b.y < a.y + a.h;
 }
 
-static espix_rect_t rect_intersect(espix_rect_t a, espix_rect_t b)
-{
-    const int x0 = a.x > b.x ? a.x : b.x;
-    const int y0 = a.y > b.y ? a.y : b.y;
-    const int x1 = (a.x + a.w) < (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
-    const int y1 = (a.y + a.h) < (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
-    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
-}
-
 /* The bar's strip of canvas, and the line windows stop at. */
 static espix_rect_t bar_rect(void)
 {
@@ -1626,7 +1623,7 @@ static void taskbar_paint(espix_canvas_t *c, espix_rect_t r)
         return;
     }
 
-    const espix_rect_t d = rect_intersect(b, r);
+    const espix_rect_t d = rect_meet(b, r);
 
     espix_canvas_fill(c, d, COL_BAR);
     if (d.y == b.y) {
@@ -2101,10 +2098,6 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                     }
                     return;
                 }
-            }
-            if (button_hit(ev->x, ev->y)) {
-                photo_open();
-                return;
             }
             /*
              * Close before focus, and on the window under the pointer rather

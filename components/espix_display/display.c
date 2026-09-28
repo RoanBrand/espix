@@ -67,6 +67,8 @@ struct espix_canvas {
     SemaphoreHandle_t lock;
     espix_rect_t     damage[ESPIX_DISPLAY_DAMAGE_MAX];
     int              ndamage;
+    espix_move_t     moves[ESPIX_DISPLAY_MOVE_MAX];
+    int              nmoves;
 };
 
 /*
@@ -257,6 +259,35 @@ size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max
 }
 
 void espix_canvas_damage_clear(espix_canvas_t *c) { c->ndamage = 0; }
+
+void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
+{
+    if (c == NULL) {
+        return;
+    }
+    r = rect_clip_wh(r, c->w, c->h);
+    if (r.w <= 0 || r.h <= 0) {
+        return;
+    }
+    if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
+        return;                     /* the pixels are sent instead; always right */
+    }
+    c->moves[c->nmoves].r  = r;
+    c->moves[c->nmoves].sx = sx;
+    c->moves[c->nmoves].sy = sy;
+    c->nmoves++;
+}
+
+size_t espix_canvas_move_take(espix_canvas_t *c, espix_move_t *out, size_t max)
+{
+    size_t n = 0;
+    while (c->nmoves > 0 && n < max) {
+        out[n++] = c->moves[--c->nmoves];
+    }
+    return n;
+}
+
+void espix_canvas_move_clear(espix_canvas_t *c) { c->nmoves = 0; }
 
 bool espix_canvas_damaged(const espix_canvas_t *c) { return c->ndamage > 0; }
 

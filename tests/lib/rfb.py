@@ -36,6 +36,7 @@ import time
 
 # RFB encoding numbers, and the pixel format asked for at handshake.
 ENC_RAW = 0
+ENC_COPYRECT = 1
 ENC_HEXTILE = 5
 
 # The VNC authentication challenge: DES with the password left-justified and the
@@ -115,12 +116,19 @@ class Reader:
 
 class Rfb:
     def __init__(self, host, port=5900, password=DEFAULT_PASSWORD, timeout=30.0,
-                 raw_only=False):
+                 raw_only=False, copyrect=True):
         self.host = host
         self.port = port
         self.password = password
         self.timeout = timeout
         self.raw_only = raw_only
+        self.copyrect = copyrect
+        # The client's own framebuffer, which incremental updates are applied
+        # to. A viewer is a long-lived framebuffer with updates painted into it,
+        # not a sequence of unrelated full frames -- and asking for a full frame
+        # after every event is how a drag gets measured as a whole screen per
+        # motion, which is what this harness did until it was asked why.
+        self.fb = None
         self.sock = None
         self.width = 0
         self.height = 0
@@ -172,7 +180,12 @@ class Rfb:
                           struct.pack(">HHH", 255, 255, 255) +
                           bytes([16, 8, 0, 0, 0, 0]))
 
-        encodings = [ENC_RAW] if self.raw_only else [ENC_HEXTILE, ENC_RAW]
+        if self.raw_only:
+            encodings = [ENC_RAW]
+        elif self.copyrect:
+            encodings = [ENC_HEXTILE, ENC_COPYRECT, ENC_RAW]
+        else:
+            encodings = [ENC_HEXTILE, ENC_RAW]
         self.sock.sendall(bytes([2, 0]) + struct.pack(">H", len(encodings)) +
                           b"".join(struct.pack(">i", e) for e in encodings))
         return self
@@ -233,19 +246,29 @@ class Rfb:
 
     # -- output -------------------------------------------------------
 
-    def frame(self, incremental=False):
-        """One FramebufferUpdate, as the whole framebuffer.
+    def frame(self, full=False):
+        """One FramebufferUpdate, into this client's framebuffer.
 
-        Not "a frame's worth of damage": the server answers a full request with
-        the full rectangle, so what comes back can be indexed without tracking
-        what an earlier frame left behind.
+        Incremental by default -- which is what a viewer asks for and what makes
+        a timing mean anything, because the server then sends only what changed.
+        `full=True` asks for the lot, which is what a check wants when it has to
+        be sure of every pixel; the first frame on a connection is always full.
+
+        The return is a *copy*, so a caller can hold on to it while the next
+        update lands.
         """
-        request = bytes([3, 1 if incremental else 0]) + \
+        if self.fb is None:
+            full = True
+
+        request = bytes([3, 0 if full else 1]) + \
             struct.pack(">HHHH", 0, 0, self.width, self.height)
         self.sock.sendall(request)
 
+        if full:
+            self.fb = bytearray(self.width * self.height * 4)
+        fb = self.fb
+
         r = Reader(self.sock)
-        fb = bytearray(self.width * self.height * 4)
         while True:
             mtype = r.byte()
             if mtype == 0:                                  # FramebufferUpdate
@@ -260,11 +283,13 @@ class Rfb:
                         self._raw(fb, x, y, w, h, r)
                     elif enc == ENC_HEXTILE:
                         self._hextile(fb, x, y, w, h, r)
+                    elif enc == ENC_COPYRECT:
+                        self._copyrect(fb, x, y, w, h, r)
                     else:
                         raise RfbError("server sent encoding %d, unasked" % enc)
                 self.wire["bytes"] += r.consumed
                 self.wire["frames"] += 1
-                return fb
+                return bytearray(fb)
             elif mtype == 1:                                # SetColourMapEntries
                 r.skip(3)
                 r.u16()
@@ -276,6 +301,16 @@ class Rfb:
                 r.skip(r.u32())
             else:
                 raise RfbError("unexpected server message %d" % mtype)
+
+    def _copyrect(self, fb, x, y, w, h, r):
+        """Four bytes: where to copy from. The pixels are the ones already in
+        this framebuffer, which is the whole point -- a dragged window costs a
+        header instead of a rectangle of pixels."""
+        sx, sy = r.u16(), r.u16()
+        for row in range(h):
+            src = ((sy + row) * self.width + sx) * 4
+            dst = ((y + row) * self.width + x) * 4
+            fb[dst:dst + w * 4] = fb[src:src + w * 4]
 
     def _raw(self, fb, x, y, w, h, r):
         data = r.take(w * h * 4)

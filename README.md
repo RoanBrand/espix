@@ -72,6 +72,7 @@ together.
 | Display | Authentication | **partial** | VNC auth (DES) with a built-in default password, public on purpose; security type None is still offered to 3.7+ clients, so it is a compatibility mechanism rather than a security boundary — [DISPLAY.md](docs/DISPLAY.md) |
 | Display | A cursor, and a keyboard round-trip | **yes** | a server-side cursor plus a window that echoes keys; input is one entry point, so a viewer and a local keyboard or mouse arrive the same way |
 | Display | PPA and JPEG acceleration | **yes** | the reason the virtual screen exists: a fill/blit/scale path and a JPEG codec, each measured against the CPU path it replaces and kept, because the S3 has neither — [DISPLAY.md](docs/DISPLAY.md#what-it-costs) |
+| Display | Dragging a window | **yes** | CopyRect, so a four-pixel motion costs 8 KB rather than 301 KB — 37x, and the difference between a drag and a slideshow |
 | Display | 2D-DMA for moves and colour conversion | **no** | PPA SRM already does what the desktop needs, so it is unwritten until something needs it |
 | Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag, minimise, maximise and close, and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |

@@ -47,6 +47,24 @@ typedef struct {
     int x, y, w, h;
 } espix_rect_t;
 
+/* Pending moves a backend will be told about; see espix_canvas_moved(). */
+#define ESPIX_DISPLAY_MOVE_MAX 8
+
+/*
+ * Pixels that are where they are because they were somewhere else, and where
+ * that was.
+ *
+ * This is what a dragged window is almost entirely made of, and it is worth
+ * saying out loud because it is worth more than any amount of drawing faster: a
+ * client that already has those pixels can be told to move them, which is
+ * sixteen bytes on the wire rather than the hundred kilobytes the same
+ * rectangle costs as pixels. RFC 6143 calls it CopyRect.
+ */
+typedef struct {
+    espix_rect_t r;             /* where the pixels are now */
+    int          sx, sy;        /* where they were */
+} espix_move_t;
+
 typedef struct espix_canvas espix_canvas_t;
 
 /* ------------------------------------------------------------------ */
@@ -83,6 +101,18 @@ void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
                        espix_px_t fg, espix_px_t bg);
 
 /* Damage: the rectangles changed since the last drain. */
+/*
+ * Note that the pixels now in `r` are the ones that were at (sx, sy).
+ *
+ * A hint, and only a hint: the canvas is painted either way, by whoever repairs
+ * the region. The destination is *not* marked as damaged -- the copy is the
+ * update for those pixels, and a backend that uses it must not also send them --
+ * so a caller has to have painted them first.
+ */
+void   espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
+size_t espix_canvas_move_take(espix_canvas_t *c, espix_move_t *out, size_t max);
+void   espix_canvas_move_clear(espix_canvas_t *c);
+
 void   espix_canvas_damage(espix_canvas_t *c, espix_rect_t r);
 size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max);
 void   espix_canvas_damage_clear(espix_canvas_t *c);
