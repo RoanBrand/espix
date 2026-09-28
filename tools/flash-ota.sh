@@ -67,7 +67,8 @@ fi
 
 rc=0
 dev_ssh_raw 'sudo upgrade --file /tmp/espix.bin' || rc=$?
-dev_ssh_raw 'rm /tmp/espix.bin' >/dev/null 2>&1 || true
+# No rm here: the loader installs the image from /tmp, so it has to survive
+# until the reboot. The kernel clears /tmp on boot, which is what reclaims it.
 
 if [ "$rc" -ne 0 ]; then
     printf 'flash-ota: the install failed; the board is still running what it was\n' >&2

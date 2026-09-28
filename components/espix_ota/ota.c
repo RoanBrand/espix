@@ -593,8 +593,18 @@ esp_err_t espix_ota_queue(const char *name, char *err, size_t err_len)
         return ESP_ERR_NOT_FOUND;
     }
 
+    /*
+     * A name means a file in /boot, which is where a repository update is
+     * adopted. An absolute path is the local-install case: the loader reads it
+     * from where it already is, nothing is copied into /boot, and the two
+     * retained copies there are left alone.
+     */
     char path[320];
-    snprintf(path, sizeof(path), ESPIX_OTA_BOOT_DIR "/%s", name);
+    if (name[0] == '/') {
+        snprintf(path, sizeof(path), "%s", name);
+    } else {
+        snprintf(path, sizeof(path), ESPIX_OTA_BOOT_DIR "/%s", name);
+    }
     FILE *probe = fopen(path, "rb");
     if (probe == NULL) {
         if (err != NULL) {

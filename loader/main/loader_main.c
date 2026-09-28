@@ -307,7 +307,18 @@ void app_main(void)
     }
 
     if (target != NULL) {
-        snprintf(path, sizeof(path), "%s/%s", BOOT_DIR, target);
+        /*
+         * A name means "a file in /boot", which is how a repository update
+         * arrives and why /boot keeps two of them. A path means "install this
+         * and keep no copy" -- the local-file path, where the image is wherever
+         * it was pushed, /tmp is cleared by the kernel on the next boot, and
+         * /boot is not disturbed at all.
+         */
+        if (target[0] == '/') {
+            snprintf(path, sizeof(path), "%s%s", MOUNT_POINT, target);
+        } else {
+            snprintf(path, sizeof(path), "%s/%s", BOOT_DIR, target);
+        }
         FILE *probe = fopen(path, "rb");
         if (probe == NULL) {
             if (failed) {

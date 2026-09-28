@@ -499,19 +499,31 @@ static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
      * first: a command that asks for its own stack is doing something long -- a
      * big copy, an update -- not something realtime, and internal is the pool the
      * audio codec needs. Internal stays the fallback.
+     *
+     * Unless the command maps flash: freezing the external-memory cache to
+     * rewrite the MMU makes PSRAM unaddressable, so the stack underneath it
+     * must be internal RAM. See cmd->internal_stack.
      */
     /* ctx.caps is set before each attempt; the fallback runs only after the
      * caps attempt failed, so no task is alive to race the flag. */
-    ctx.caps = true;
-    if (xTaskCreateWithCaps(cmd_task, name, cmd->stack, &ctx,
-                            uxTaskPriorityGet(NULL), NULL,
-                            MALLOC_CAP_SPIRAM) != pdPASS) {
-        ctx.caps = false;
-        if (xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
-                        NULL) != pdPASS) {
-            espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
-            return 1;
+    ctx.caps = !cmd->internal_stack;
+    bool started = false;
+
+    if (ctx.caps) {
+        started = (xTaskCreateWithCaps(cmd_task, name, cmd->stack, &ctx,
+                                       uxTaskPriorityGet(NULL), NULL,
+                                       MALLOC_CAP_SPIRAM) == pdPASS);
+        if (!started) {
+            /* The fallback allocates internally, so there is nothing to free. */
+            ctx.caps = false;
         }
+    }
+
+    if (!started &&
+        xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
+                    NULL) != pdPASS) {
+        espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
+        return 1;
     }
 
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);

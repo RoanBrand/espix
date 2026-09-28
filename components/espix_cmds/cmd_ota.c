@@ -257,17 +257,38 @@ static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
     }
 
     if (argc == 3 && strcmp(argv[1], "--file") == 0) {
-        char name[ESPIX_OTA_NAME_MAX];
         char err[192];
 
-        espix_printf(s, "upgrade: adopting %s\n", argv[2]);
-        if (espix_ota_adopt(argv[2], name, sizeof(name), err, sizeof(err)) != ESP_OK) {
-            espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot read it");
+        /*
+         * A path, not a name. The loader installs the image from where it
+         * already is, so nothing is copied into /boot and the two retained
+         * copies there are left alone -- which is the point of a local install:
+         * the /boot bookkeeping exists for repository updates, not for a file
+         * someone just pushed.
+         *
+         * The file lives exactly until the install has happened, because the
+         * kernel clears /tmp at boot. Nothing has to delete it, and there is no
+         * window where a delete could race the loader.
+         */
+        FILE *f = fopen(argv[2], "rb");
+        if (f == NULL) {
+            espix_eprintf(s, "upgrade: %s: cannot read it\n", argv[2]);
             return 1;
         }
-        espix_printf(s, "upgrade: %s\n", err);
 
-        if (espix_ota_queue(name, err, sizeof(err)) != ESP_OK) {
+        /* The application magic, so a truncated upload is refused here rather
+         * than by the loader at the next boot. The loader verifies properly;
+         * this only catches the obvious. */
+        uint8_t magic = 0;
+        const size_t got = fread(&magic, 1, 1, f);
+        fclose(f);
+
+        if (got != 1 || magic != 0xE9) {
+            espix_eprintf(s, "upgrade: %s: not a firmware image\n", argv[2]);
+            return 1;
+        }
+
+        if (espix_ota_queue(argv[2], err, sizeof(err)) != ESP_OK) {
             espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot queue it");
             return 1;
         }
@@ -307,7 +328,16 @@ static espix_cmd_t s_ota_cmds[] = {
     { .name = "upgrade", .fn = cmd_upgrade,
       .help = "fetch a kernel image, queue it for the loader",
       .usage = "upgrade [-y|--check] | --slots | --file <path> | --rollback | <url>",
-      .stack = 8192 },
+      .stack = 8192,
+
+      /*
+       * Queueing ends in esp_ota_set_boot_partition(), which validates the
+       * loader slot first: image_validate() -> esp_image_verify() mmaps the
+       * partition's first page (0x20000, 64K on this part). Mapping rewrites
+       * the MMU, and that is done with the external-memory cache frozen -- so
+       * the stack under it has to be internal RAM.
+       */
+      .internal_stack = true },
 };
 
 void espix_cmds_register_ota(void)

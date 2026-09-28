@@ -22,6 +22,7 @@
  * per cell, so rendering it means a colour attribute per cell.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,6 +33,8 @@
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
+
+#include "esp_linenoise.h"
 
 #include "espix_display.h"
 #include "espix_kernel.h"
@@ -48,6 +51,9 @@
 #define CON_MARGIN 16
 #define CON_COLS ((ESPIX_DISPLAY_W - 2 * CON_MARGIN) / 8)
 #define CON_ROWS ((ESPIX_DISPLAY_H - 2 * CON_MARGIN) / 8)
+
+/* The editor wants a descriptor it never uses; see the note where it is set. */
+#define CON_EDIT_FD (-1)
 
 #define CON_FG 0xC618   /* light grey on black, the usual terminal look */
 #define CON_BG 0x0000
@@ -80,6 +86,11 @@ typedef struct {
 
     /* RFB KeyEvent has no modifier field: Control arrives as its own key. */
     bool          ctrl;
+
+    /* The same editor the UART and SSH consoles run. Its read and write
+     * callbacks are the only place it touches this console. */
+    esp_linenoise_handle_t editor;
+    espix_history_t       *history;
     espix_session_t session;
 } canvas_console_t;
 
@@ -255,6 +266,58 @@ static void con_csi(char final)
         break;
     case 'K': con_erase_line(a); break;
     case 'J': con_erase_screen(a); break;
+
+    case 'n':
+        /*
+         * Device Status Report -- "where is your cursor?". This is ours to
+         * answer, because we *are* the terminal on this side: there is nothing
+         * else between the shell and the screen.
+         *
+         * It is not optional. esp_linenoise finds the terminal width by sending
+         * this query and reading the reply, so with nobody answering it waits
+         * for ever inside create_instance -- before the console task exists and
+         * before a frame is ever sent, which is why the viewer was simply
+         * black. Over SSH the client's terminal emulator answers; a VNC viewer
+         * is a framebuffer and never will.
+         */
+        if (a == 5) {
+            /*
+             * Status report, which is what esp_linenoise_probe() actually
+             * sends -- not the cursor-position request it looks like. It
+             * requires exactly "ESC[0n" (four bytes) within 500 ms, and if it
+             * does not get it it concludes the terminal is dumb and turns line
+             * editing and history OFF. So this reply is what makes arrows,
+             * history and completion work at all.
+             */
+            for (const char *p = "\x1b[0n"; *p != '\0'; p++) {
+                (void)xQueueSend(s_con.keys, p, 0);
+            }
+        } else if (a == 6) {
+            /* Cursor position, the other thing a program may ask for. */
+            char reply[16];
+            const int n = snprintf(reply, sizeof(reply), "\x1b[%d;%dR",
+                                   s_con.row + 1, s_con.col + 1);
+            for (int i = 0; i < n; i++) {
+                (void)xQueueSend(s_con.keys, &reply[i], 0);
+            }
+        }
+        break;
+
+    case 'c':
+        /*
+         * Device Attributes. Not used for anything here, but a terminal that
+         * does not answer is a terminal something will wait on -- and every
+         * query answered is one fewer way to hang.
+         */
+        {
+            /* The primary attributes, which is what a VT100-ish terminal
+             * reports: no private modes, no extensions. Enough to satisfy a
+             * question, which is the only thing this is for. */
+            for (const char *p = "\x1b[?1;2c"; *p != '\0'; p++) {
+                (void)xQueueSend(s_con.keys, p, 0);
+            }
+        }
+        break;
     default:  break;    /* SGR and the rest: recognised, nothing to render */
     }
 
@@ -454,6 +517,112 @@ static int con_write(espix_session_t *s, const char *data, size_t len)
 }
 
 /*
+ * A spawned process's stdio.
+ *
+ * Without this an app's printf goes nowhere: the session's write() is the
+ * shell's output path, and a program that calls libc does not go through it.
+ * espix_proc points the task's streams at whatever this returns, which is how
+ * an app's output reaches the screen at all.
+ *
+ * funopen over the same paths the shell uses, exactly as the SSH transport
+ * does, so there is one rendering path for both.
+ */
+static int con_stream_write(void *cookie, const char *buf, int len)
+{
+    return con_write((espix_session_t *)cookie, buf, (size_t)len);
+}
+
+static int con_stream_read(void *cookie, char *buf, int len)
+{
+    (void)cookie;
+
+    /*
+     * Blocks only until there is something, then takes whatever else is already
+     * queued: waiting for a full request would leave an interactive reader
+     * stuck behind a buffer that will not fill.
+     */
+    int n = 0;
+    while (n < len) {
+        char ch;
+        if (xQueueReceive(s_con.keys, &ch,
+                          n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
+            break;
+        }
+        buf[n++] = ch;
+    }
+    return n;
+}
+
+static FILE *con_open_stream(espix_session_t *s, espix_stream_t which)
+{
+    if (which == ESPIX_STREAM_IN) {
+        FILE *f = funopen(s, con_stream_read, NULL, NULL, NULL);
+        if (f != NULL) {
+            setvbuf(f, NULL, _IOFBF, 512);
+        }
+        return f;
+    }
+
+    /* Buffered, not unbuffered: a repaint is expensive and a byte at a time
+     * would be absurd. */
+    FILE *f = funopen(s, NULL, con_stream_write, NULL, NULL);
+    if (f != NULL) {
+        setvbuf(f, NULL, _IOLBF, 128);
+    }
+    return f;
+}
+
+/*
+ * The editor's two ends. esp_linenoise hands its callbacks an int fd and no
+ * context pointer, so the fd is only a key -- the same arrangement the SSH
+ * transport uses, and the reason neither ever calls esp_linenoise_probe(),
+ * which would fcntl() a descriptor that is not a terminal.
+ */
+static ssize_t con_edit_read(int fd, void *buf, size_t count)
+{
+    (void)fd;
+
+    char *p = buf;
+    size_t n = 0;
+
+    while (n < count) {
+        char ch;
+        if (xQueueReceive(s_con.keys, &ch,
+                          n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
+            if (s_con.quit) {
+                break;                      /* the viewer is gone: EOF */
+            }
+            if (n > 0) {
+                break;
+            }
+            continue;
+        }
+
+        /*
+         * ICRNL. A terminal sends CR for Enter and esp_linenoise tests for LF,
+         * so without this Enter does nothing at all. The serial console gets it
+         * from IDF's UART VFS (ESP_LINE_ENDINGS_CR) and SSH does it in its own
+         * read callback -- "espix *is* the pty here, so the line discipline's
+         * job is ours". Same job, same place.
+         */
+        if (ch == '\r') {
+            ch = '\n';
+        }
+        p[n++] = ch;
+    }
+    return (ssize_t)n;
+}
+
+static ssize_t con_edit_write(int fd, const void *buf, size_t count)
+{
+    (void)fd;
+
+    /* Through the parser, which is what makes the editor's cursor addressing
+     * land where it means to. */
+    return (ssize_t)con_write(NULL, buf, count);
+}
+
+/*
  * Read one line off the key queue.
  *
  * The session's own read_line is what the shell blocks in, so this is where the
@@ -464,42 +633,38 @@ static int con_write(espix_session_t *s, const char *data, size_t len)
 static int con_read_line(espix_session_t *s, const char *prompt,
                          char *buf, size_t len)
 {
-    con_write(s, prompt, strlen(prompt));
+    (void)s;
 
-    size_t n = 0;
-    for (;;) {
-        char ch;
-        if (xQueueReceive(s_con.keys, &ch, pdMS_TO_TICKS(100)) != pdTRUE) {
-            if (s_con.quit) {
-                return -1;              /* the viewer went away */
-            }
-            continue;
-        }
-
-        if (ch == '\r' || ch == '\n') {
-            con_write(s, "\n", 1);
-            break;
-        }
-        if (ch == 0x08 || ch == 0x7F) {         /* Backspace, DEL */
-            if (n > 0) {
-                n--;
-                con_write(s, "\b", 1);
-            }
-            continue;
-        }
-        if (ch == 0x03) {                       /* Ctrl-C abandons the line */
-            con_write(s, "^C\n", 3);
-            n = 0;
-            break;
-        }
-        if (ch >= 0x20 && ch < 0x7F && n + 1 < len) {
-            buf[n++] = ch;
-            con_write(s, &ch, 1);
-        }
+    if (s_con.quit || s_con.editor == NULL) {
+        return -1;
     }
 
-    buf[n] = '\0';
-    return (int)n;
+    esp_linenoise_set_prompt(s_con.editor, prompt);
+
+    /* get_line() returns ESP_OK for an empty line without writing the buffer,
+     * so anything left from last time would be run as a command. */
+    buf[0] = '\0';
+
+    if (esp_linenoise_get_line(s_con.editor, buf, len) != ESP_OK) {
+        /*
+         * Two different keys land here, exactly as they do over SSH: the editor
+         * sets EAGAIN for Ctrl-C, which abandons the line and should leave a
+         * fresh prompt, and leaves errno alone for Ctrl-D on an empty line,
+         * which is end of input. Treating both as the end would drop the
+         * console on Ctrl-C, which no other shell does.
+         */
+        if (errno == EAGAIN) {
+            return 0;
+        }
+        return -1;
+    }
+
+    if (buf[0] != '\0') {
+        espix_history_push(s_con.history, buf);
+        espix_history_apply(s_con.history, s_con.editor);
+    }
+
+    return (int)strlen(buf);
 }
 
 /*
@@ -559,6 +724,7 @@ static void con_task(void *arg)
         .read_line = con_read_line,
         .write     = con_write,
         .poll_interrupt = con_poll_interrupt,
+        .open_stream    = con_open_stream,
         .transport = NULL,
         .fg_pid    = ESPIX_PID_NONE,
         /*
@@ -636,6 +802,15 @@ static void con_task(void *arg)
      */
     s_con.leaving = true;
 
+    /*
+     * Said before the stale check, not after: this instance belongs to this
+     * task, so it goes with it whether or not a newer console exists.
+     */
+    if (s_con.editor != NULL) {
+        esp_linenoise_delete_instance(s_con.editor);
+        s_con.editor = NULL;
+    }
+
     if (gen != s_gen) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "stale console task exiting");
         vTaskDeleteWithCaps(NULL);
@@ -684,12 +859,54 @@ esp_err_t espix_console_canvas_start(void)
     }
     memset(s_con.grid, ' ', (size_t)CON_ROWS * CON_COLS);
 
+    /*
+     * Before the editor, not after it. esp_linenoise issues a cursor-position
+     * query when it starts and reads the reply back through con_edit_read(),
+     * which pulls from this queue -- so creating the editor first was an
+     * xQueueReceive(NULL) assert the moment a viewer connected, on the RFB
+     * task, which is where the console is started from.
+     */
     s_con.keys = xQueueCreate(64, sizeof(char));
     if (s_con.keys == NULL) {
         heap_caps_free(s_con.grid);
         s_con.grid = NULL;
         return ESP_ERR_NO_MEM;
     }
+
+    /*
+     * The same editor the UART and SSH consoles run, so history, arrows and
+     * completion behave identically on all three. The parser is what made this
+     * possible: it emits cursor addressing, and until there was something to
+     * interpret it the console could only append.
+     *
+     * The fd is a key, not a descriptor -- both callbacks are supplied, so
+     * nothing reads or writes it. probe() is deliberately not called; it
+     * fcntl()s the descriptor and gives up when that fails.
+     */
+    s_con.history = espix_history_for("esp");
+
+    esp_linenoise_config_t ed;
+    esp_linenoise_get_instance_config_default(&ed);
+    ed.in_fd               = CON_EDIT_FD;
+    ed.out_fd              = CON_EDIT_FD;
+    ed.max_cmd_line_length = ESPIX_LINE_MAX;
+    ed.history_max_length  = 32;
+    ed.allow_multi_line    = true;
+    ed.allow_empty_line    = true;
+    ed.completion_cb       = espix_shell_completion;
+    ed.hints_cb            = espix_shell_hint;
+    ed.read_bytes_cb       = con_edit_read;
+    ed.write_bytes_cb      = con_edit_write;
+
+    if (esp_linenoise_create_instance(&ed, &s_con.editor) != ESP_OK) {
+        /* Without it con_read_line() cannot run a line, and a session that
+         * cannot read would end immediately and respawn in a loop. Better to
+         * refuse the console than to spin. */
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the line editor");
+        s_con.editor = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    espix_history_apply(s_con.history, s_con.editor);
 
     /* Claimed before the task runs, so the first frame is the console's and
      * nothing can slip in between. */

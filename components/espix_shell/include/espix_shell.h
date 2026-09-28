@@ -299,6 +299,20 @@ typedef struct espix_cmd {
      */
     uint32_t         stack;
 
+    /*
+     * Run this command on an internal-RAM stack, never on a PSRAM one.
+     *
+     * Rewriting the MMU -- esp_partition_mmap(), and therefore
+     * esp_ota_set_boot_partition() -- freezes the external-memory cache for the
+     * duration. On this part flash and PSRAM are both behind that cache, so
+     * while it is frozen neither is addressable and the stack the code is
+     * running on has to be in internal RAM. esp_mm asserts exactly that
+     * (s_task_stack_is_sane_when_cache_frozen, esp_cache_utils.c), and the
+     * spi_flash write path asserts the same thing. A command that maps flash
+     * sets this; upgrade panicked once because it did not.
+     */
+    bool             internal_stack;
+
     struct espix_cmd *next;                /* registry-owned; do not set */
 } espix_cmd_t;
 
