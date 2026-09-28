@@ -77,6 +77,7 @@ static int cmd_vnc(espix_session_t *s, int argc, char **argv)
                      (unsigned)port, espix_display_vnc_clients());
         if (espix_display_vnc_clients() > 0) {
             espix_printf(s, "vnc: connected: %s\n", espix_display_vnc_peer());
+            espix_printf(s, "vnc: client %s\n", espix_display_vnc_encodings());
         }
         espix_printf(s, "vnc: authentication: %s\n", auth_str());
         print_reach(s, port);

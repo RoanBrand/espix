@@ -86,6 +86,7 @@ static TaskHandle_t  s_task;
 static uint16_t      s_port;
 static int           s_clients;
 static char          s_peer[32];
+static char          s_encodings[48];
 
 /*
  * The DES key VNC authentication checks against.
@@ -703,9 +704,19 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
         }
         c->hextile  = hextile;
         c->copyrect = copyrect;
-        espix_klog(ESPIX_KLOG_DEBUG, TAG, "%u encodings offered; hextile %s, "
-                   "copyrect %s", n, hextile ? "yes" : "no",
-                   copyrect ? "yes" : "no");
+        snprintf(s_encodings, sizeof(s_encodings), "%u offered: hextile %s, "
+                 "copyrect %s", n, hextile ? "yes" : "no",
+                 copyrect ? "yes" : "no");
+        /*
+         * At INFO rather than DEBUG, and it is the line that decides whether a
+         * drag is 8 KB or 300 KB: CopyRect is a *client* capability, and a
+         * client that does not ask for it gets pixels and no way to tell from
+         * the outside which it is.
+         */
+        espix_klog(ESPIX_KLOG_INFO, TAG, "client offered %u encodings: hextile "
+                   "%s, copyrect %s (%s)", n, hextile ? "yes" : "no",
+                   copyrect ? "yes" : "no",
+                   copyrect ? "drags will be copies" : "drags will be pixels");
         return true;
     }
 
@@ -1303,3 +1314,12 @@ bool     espix_display_vnc_running(void) { return s_run; }
 uint16_t espix_display_vnc_port(void)    { return s_port; }
 int      espix_display_vnc_clients(void) { return s_clients; }
 const char *espix_display_vnc_peer(void) { return s_peer; }
+
+/*
+ * What the last client said it can decode, as a short list.
+ *
+ * Worth a command rather than only a log line, because it is the answer to
+ * "why is dragging still slow": CopyRect is the client's capability to declare,
+ * and a server that is not allowed to use it can only fall back to pixels.
+ */
+const char *espix_display_vnc_encodings(void) { return s_encodings; }

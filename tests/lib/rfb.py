@@ -391,17 +391,22 @@ def load_font(path="components/espix_display/font8x8.c"):
 
 
 def _cell_bits(fb, w, x, y, fg):
+    fgs = (fg,) if isinstance(fg[0], int) else tuple(fg)
     rows = []
     for r in range(8):
         bits = 0
         for c in range(8):
-            if pixel(fb, w, x + c, y + r) == fg:
+            if pixel(fb, w, x + c, y + r) in fgs:
                 bits |= 1 << c
         rows.append(bits)
     return tuple(rows)
 
 
 def read_screen(fb, w, cols, rows, origin, fg, font):
+    """`fg` is a colour, or several: a panel uses a bright one for the text, a
+    brighter one for headings and a dim one for what is disabled, and all three
+    are the same glyphs."""
+    fgs = (fg,) if isinstance(fg[0], int) else tuple(fg)
     """Decode a grid of cells back into text.
 
     This is what makes "the console printed the command" a test rather than a
@@ -413,7 +418,7 @@ def read_screen(fb, w, cols, rows, origin, fg, font):
     for r in range(rows):
         line = ""
         for c in range(cols):
-            bits = _cell_bits(fb, w, origin[0] + c * 8, origin[1] + r * 8, fg)
+            bits = _cell_bits(fb, w, origin[0] + c * 8, origin[1] + r * 8, fgs)
             if bits == (0,) * 8:
                 line += " "
             else:

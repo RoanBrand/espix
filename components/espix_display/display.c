@@ -269,6 +269,27 @@ void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
     if (r.w <= 0 || r.h <= 0) {
         return;
     }
+    /*
+     * A move that starts where the last one ended is the same thing still
+     * moving, and the two have to become one move: a copy is an instruction
+     * about the client's framebuffer *as it is*, and there has been no chance
+     * to apply anything in between -- so the only copy it can act on is the
+     * whole of it.
+     *
+     * Which is not a nicety. A fast drag is several motions between two frames,
+     * and without this every one of them counts as a separate move, the backend
+     * refuses to send more than one copy per update, and the drag falls back to
+     * pixels -- feeling exactly as slow as before, which is what it did.
+     */
+    for (int i = 0; i < c->nmoves; i++) {
+        espix_move_t *m = &c->moves[i];
+
+        if (sx == m->r.x && sy == m->r.y && r.w == m->r.w && r.h == m->r.h) {
+            m->r = r;               /* from where it started, to where it is now */
+            return;
+        }
+    }
+
     if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
         return;                     /* the pixels are sent instead; always right */
     }

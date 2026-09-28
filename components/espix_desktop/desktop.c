@@ -75,6 +75,7 @@ struct espix_window {
     espix_window_draw_fn draw;
     espix_window_key_fn  key;
     espix_window_resize_fn resize;
+    espix_window_pointer_fn pointer;
     void            *ctx;
     bool             maxed;     /* filling the work area, with `rest` to go back to */
     espix_rect_t     rest;
@@ -107,6 +108,7 @@ static SemaphoreHandle_t s_desk_lock;
  * both, and it is above the input handler. */
 static uint8_t         s_buttons;
 static espix_window_t *s_drag;
+static espix_window_t *s_press_win;     /* who took the press, for the release */
 
 static void desk_lock(void)
 {
@@ -659,6 +661,7 @@ void espix_window_set_ctx(espix_window_t *w, void *ctx) { w->ctx = ctx; }
 void espix_window_set_draw(espix_window_t *w, espix_window_draw_fn fn) { w->draw = fn; }
 void espix_window_set_key(espix_window_t *w, espix_window_key_fn fn) { w->key = fn; }
 void espix_window_set_resize(espix_window_t *w, espix_window_resize_fn fn) { w->resize = fn; }
+void espix_window_set_pointer(espix_window_t *w, espix_window_pointer_fn fn) { w->pointer = fn; }
 
 /* A new surface, because the surface is the window -- frame included -- so a
  * bigger window is not a bigger blit of a smaller buffer. */
@@ -1493,7 +1496,8 @@ static espix_rect_t tray_rect(void)
     return (espix_rect_t){ w - TRAY_W, b.y, TRAY_W, TASKBAR_H };
 }
 
-static const char *const s_menu_items[] = { "photo", "about", "terminal" };
+static const char *const s_menu_items[] = { "photo", "terminal", "settings",
+                                           "about" };
 #define MENU_N ((int)(sizeof(s_menu_items) / sizeof(s_menu_items[0])))
 
 static espix_rect_t menu_rect(void)
@@ -1749,6 +1753,8 @@ static void menu_activate(int i)
         window_present(s_about);
     } else if (strcmp(s_menu_items[i], "terminal") == 0) {
         term_open();
+    } else if (strcmp(s_menu_items[i], "settings") == 0) {
+        window_present(espix_settings_open());
     }
     bar_damage();
 }
@@ -1916,6 +1922,9 @@ static void window_close(espix_window_t *w)
     if (w == s_about) {
         s_about = NULL;
     }
+    if (w == espix_settings_window()) {
+        espix_settings_forget();
+    }
     espix_window_free(w);
 }
 
@@ -2049,6 +2058,13 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
         cursor_put(ev->x, ev->y);
 
         if (was != 0 && s_buttons == 0) {
+            /* To whoever took the press, even if the pointer has left it: a
+             * button that never hears a release is a button stuck down. */
+            if (s_press_win != NULL && s_press_win->pointer != NULL) {
+                s_press_win->pointer(s_press_win, ev->x - s_press_win->x,
+                                     ev->y - s_press_win->y, 0, s_press_win->ctx);
+            }
+            s_press_win = NULL;
             drag_end();                 /* the button came up */
             return;
         }
@@ -2123,7 +2139,21 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                 /* The press is what raises, which is why a border crossing does
                  * not have to recomposite anything. */
                 espix_window_raise(s_focus);
-                if (ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
+
+                const espix_rect_t c = espix_window_content(s_focus);
+
+                if (ev->x >= s_focus->x + c.x &&
+                    ev->x <  s_focus->x + c.x + c.w &&
+                    ev->y >= s_focus->y + c.y &&
+                    ev->y <  s_focus->y + c.y + c.h) {
+                    /* In the content, so it is the client's: a panel of buttons
+                     * is not a place to start dragging a window from. */
+                    if (s_focus->pointer != NULL) {
+                        const uint8_t b = ev->buttons;
+                        s_focus->pointer(s_focus, ev->x - s_focus->x,
+                                         ev->y - s_focus->y, b, s_focus->ctx);
+                    }
+                } else if (ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
                     drag_begin(s_focus, ev->x, ev->y);
                 }
             }

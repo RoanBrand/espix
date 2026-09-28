@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "desktop.c"
+        "widgets.c"
+        "settings.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -8,5 +10,7 @@ idf_component_register(
     PRIV_REQUIRES
         espix_kernel
         espix_shell
+        espix_net
+        espix_bt
         freertos
 )

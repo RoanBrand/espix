@@ -83,6 +83,19 @@ typedef void (*espix_window_key_fn)(espix_window_t *w, uint32_t keysym,
 typedef void (*espix_window_resize_fn)(espix_window_t *w, espix_rect_t content,
                                        void *ctx);
 
+/*
+ * A press or a release inside the window's content, in *surface* coordinates --
+ * the same ones the draw callback and espix_window_content() use, so a client
+ * hit-tests against exactly what it drew. A press on the title bar never arrives
+ * here at all.
+ *
+ * The release is delivered to whichever window took the press, even if the
+ * pointer has left it since, which is what a button needs in order to know it
+ * was released rather than abandoned.
+ */
+typedef void (*espix_window_pointer_fn)(espix_window_t *w, int x, int y,
+                                        uint8_t buttons, void *ctx);
+
 espix_window_t *espix_window_new(int x, int y, int w, int h, const char *title);
 void            espix_window_free(espix_window_t *w);
 
@@ -90,6 +103,7 @@ void espix_window_set_ctx(espix_window_t *w, void *ctx);
 void espix_window_set_draw(espix_window_t *w, espix_window_draw_fn fn);
 void espix_window_set_key(espix_window_t *w, espix_window_key_fn fn);
 void espix_window_set_resize(espix_window_t *w, espix_window_resize_fn fn);
+void espix_window_set_pointer(espix_window_t *w, espix_window_pointer_fn fn);
 
 /*
  * A new size, and a new surface to go with it -- because the surface is the
@@ -125,6 +139,18 @@ void espix_window_repaint(espix_window_t *w);
 
 /* Everything: background, every window in z-order, the cursor. */
 void espix_desktop_repaint(void);
+
+/*
+ * The windows the desktop ships with. Each opens its window the first time and
+ * brings back the one that is already there after that -- so the caller does not
+ * have to know whether it has been opened before, which is the difference
+ * between a menu item and a state machine.
+ */
+espix_window_t *espix_settings_open(void);
+
+/* It has been closed: the desktop forgets it, and so must this. */
+void espix_settings_forget(void);
+espix_window_t *espix_settings_window(void);
 
 #ifdef __cplusplus
 }

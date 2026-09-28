@@ -392,6 +392,8 @@ bool        espix_display_vnc_running(void);
 uint16_t    espix_display_vnc_port(void);
 int         espix_display_vnc_clients(void);
 const char *espix_display_vnc_peer(void);   /* "192.168.1.5:52344", or "" */
+/* What the last client offered, which decides whether a drag can be copies. */
+const char *espix_display_vnc_encodings(void);
 
 /*
  * The password VNC authentication falls back to when none has been set.
