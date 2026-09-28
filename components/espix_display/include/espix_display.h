@@ -89,6 +89,54 @@ void   espix_canvas_damage_clear(espix_canvas_t *c);
 bool   espix_canvas_damaged(const espix_canvas_t *c);
 
 /* ------------------------------------------------------------------ */
+/* Surfaces                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A window's own pixels.
+ *
+ * The canvas is what a backend sends; a surface is what a window draws into
+ * before the compositor puts it on the canvas. That distinction is the whole
+ * reason for it: moving a window becomes a blit rather than a redraw, occlusion
+ * and z-order fall out of the order the compositor blits in, and there is
+ * something for an accelerator to accelerate -- a single canvas has nothing to
+ * copy.
+ *
+ * Same primitives as the canvas and no damage list: what changed is the
+ * compositor's business, and it knows, because it did the blitting.
+ */
+typedef struct espix_surface espix_surface_t;
+
+/* PSRAM first, internal as a fallback, NULL when neither fits. */
+espix_surface_t *espix_surface_new(int w, int h);
+void             espix_surface_free(espix_surface_t *s);
+
+int         espix_surface_width(const espix_surface_t *s);
+int         espix_surface_height(const espix_surface_t *s);
+espix_px_t *espix_surface_pixels(espix_surface_t *s);
+
+/* The compositor and the window's own task both touch these pixels. */
+void        espix_surface_lock(espix_surface_t *s);
+void        espix_surface_unlock(espix_surface_t *s);
+
+/* Drawing. All clip to the surface. None of them marks anything. */
+void espix_surface_fill(espix_surface_t *s, espix_rect_t r, espix_px_t px);
+void espix_surface_blit(espix_surface_t *s, int dst_x, int dst_y,
+                        const espix_px_t *src, int src_w, int src_h,
+                        int src_stride);
+void espix_surface_outline(espix_surface_t *s, espix_rect_t r, espix_px_t px);
+void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
+                        espix_px_t fg, espix_px_t bg);
+
+/*
+ * The compositor's one operation: a surface onto the canvas at (x, y), clipped
+ * to the canvas, marking the damage. An accelerator's natural unit, and the
+ * call that makes a window move cheap.
+ */
+void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
+                               const espix_surface_t *s);
+
+/* ------------------------------------------------------------------ */
 /* Input                                                               */
 /* ------------------------------------------------------------------ */
 

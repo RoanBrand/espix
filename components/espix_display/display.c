@@ -52,13 +52,30 @@ struct espix_canvas {
     int              ndamage;
 };
 
-static espix_rect_t rect_clip(const espix_canvas_t *c, espix_rect_t r)
+/*
+ * A surface is the same pixels without the backend's bookkeeping: no name, no
+ * damage list. The stride is carried separately even though it is the width
+ * today, because every accelerator wants it as its own argument and pretending
+ * otherwise is how a padded buffer becomes a rewrite later.
+ */
+struct espix_surface {
+    int               w, h, stride;
+    espix_px_t       *px;
+    SemaphoreHandle_t lock;
+};
+
+static espix_rect_t rect_clip_wh(espix_rect_t r, int w, int h)
 {
     int x0 = r.x < 0 ? 0 : r.x;
     int y0 = r.y < 0 ? 0 : r.y;
-    int x1 = r.x + r.w > c->w ? c->w : r.x + r.w;
-    int y1 = r.y + r.h > c->h ? c->h : r.y + r.h;
+    int x1 = r.x + r.w > w ? w : r.x + r.w;
+    int y1 = r.y + r.h > h ? h : r.y + r.h;
     return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+}
+
+static espix_rect_t rect_clip(const espix_canvas_t *c, espix_rect_t r)
+{
+    return rect_clip_wh(r, c->w, c->h);
 }
 
 static espix_rect_t rect_union(espix_rect_t a, espix_rect_t b)
@@ -196,50 +213,54 @@ bool espix_canvas_damaged(const espix_canvas_t *c) { return c->ndamage > 0; }
 /* Drawing                                                             */
 /* ------------------------------------------------------------------ */
 
-void espix_canvas_fill(espix_canvas_t *c, espix_rect_t r, espix_px_t px)
+/*
+ * The two operations an accelerator can do, and the software that stands in for
+ * each.
+ *
+ * This is the seam the surface design exists for. `op_fill` and `op_blit` are
+ * what PPA FILL and PPA SRM or 2D-DMA replace, and the CPU loop underneath is
+ * not a fallback in the apologetic sense -- it is the S3's only implementation,
+ * since the S3 has none of those blocks, and every target keeps it so the two
+ * can be measured against each other on one board rather than across two.
+ *
+ * Both take the destination as pixels and geometry rather than as a canvas or a
+ * surface, because both are called with either.
+ */
+static void op_fill(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
+                    espix_px_t v)
 {
-    r = rect_clip(c, r);
+    r = rect_clip_wh(r, w, h);
     for (int y = 0; y < r.h; y++) {
-        espix_px_t *row = c->px + (size_t)(r.y + y) * c->w + r.x;
+        espix_px_t *row = px + (size_t)(r.y + y) * stride + r.x;
         for (int x = 0; x < r.w; x++) {
-            row[x] = px;
+            row[x] = v;
         }
     }
-    espix_canvas_damage(c, r);
 }
 
-void espix_canvas_blit(espix_canvas_t *c, int dst_x, int dst_y,
-                       const espix_px_t *src, int src_w, int src_h, int src_stride)
+static void op_blit(espix_px_t *px, int w, int h, int stride,
+                    int dst_x, int dst_y, const espix_px_t *src,
+                    int src_w, int src_h, int src_stride)
 {
     for (int y = 0; y < src_h; y++) {
         const int cy = dst_y + y;
-        if (cy < 0 || cy >= c->h) {
+        if (cy < 0 || cy >= h) {
             continue;
         }
         for (int x = 0; x < src_w; x++) {
             const int cx = dst_x + x;
-            if (cx < 0 || cx >= c->w) {
+            if (cx < 0 || cx >= w) {
                 continue;
             }
-            c->px[(size_t)cy * c->w + cx] = src[(size_t)y * src_stride + x];
+            px[(size_t)cy * stride + cx] = src[(size_t)y * src_stride + x];
         }
     }
-    espix_canvas_damage(c, (espix_rect_t){ dst_x, dst_y, src_w, src_h });
 }
 
-void espix_canvas_outline(espix_canvas_t *c, espix_rect_t r, espix_px_t px)
+/* Text is glyph work, not a copy: there is nothing here for an accelerator. */
+static void px_text(espix_px_t *px, int w, int h, int stride, int x, int y,
+                    const char *s, espix_px_t fg, espix_px_t bg)
 {
-    espix_canvas_fill(c, (espix_rect_t){ r.x, r.y, r.w, 1 }, px);
-    espix_canvas_fill(c, (espix_rect_t){ r.x, r.y + r.h - 1, r.w, 1 }, px);
-    espix_canvas_fill(c, (espix_rect_t){ r.x, r.y, 1, r.h }, px);
-    espix_canvas_fill(c, (espix_rect_t){ r.x + r.w - 1, r.y, 1, r.h }, px);
-}
-
-void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
-                       espix_px_t fg, espix_px_t bg)
-{
-    const int x0 = x;
-
     for (; *s != '\0'; s++, x += 8) {
         unsigned ch = (unsigned char)*s;
         if (ch > 127) {
@@ -248,21 +269,153 @@ void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
         const unsigned char *glyph = espix_font8x8[ch];
         for (int row = 0; row < 8; row++) {
             const int cy = y + row;
-            if (cy < 0 || cy >= c->h) {
+            if (cy < 0 || cy >= h) {
                 continue;
             }
             for (int col = 0; col < 8; col++) {
                 const int cx = x + col;
-                if (cx < 0 || cx >= c->w) {
+                if (cx < 0 || cx >= w) {
                     continue;
                 }
-                c->px[(size_t)cy * c->w + cx] =
+                px[(size_t)cy * stride + cx] =
                     (glyph[row] & (1u << col)) ? fg : bg;
             }
         }
     }
+}
 
-    espix_canvas_damage(c, (espix_rect_t){ x0, y, (int)(x - x0), 8 });
+static void px_outline(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
+                       espix_px_t v)
+{
+    op_fill(px, w, h, stride, (espix_rect_t){ r.x, r.y, r.w, 1 }, v);
+    op_fill(px, w, h, stride, (espix_rect_t){ r.x, r.y + r.h - 1, r.w, 1 }, v);
+    op_fill(px, w, h, stride, (espix_rect_t){ r.x, r.y, 1, r.h }, v);
+    op_fill(px, w, h, stride, (espix_rect_t){ r.x + r.w - 1, r.y, 1, r.h }, v);
+}
+
+void espix_canvas_fill(espix_canvas_t *c, espix_rect_t r, espix_px_t px)
+{
+    r = rect_clip(c, r);
+    op_fill(c->px, c->w, c->h, c->w, r, px);
+    espix_canvas_damage(c, r);
+}
+
+void espix_canvas_blit(espix_canvas_t *c, int dst_x, int dst_y,
+                       const espix_px_t *src, int src_w, int src_h, int src_stride)
+{
+    op_blit(c->px, c->w, c->h, c->w, dst_x, dst_y, src, src_w, src_h, src_stride);
+    espix_canvas_damage(c, (espix_rect_t){ dst_x, dst_y, src_w, src_h });
+}
+
+void espix_canvas_outline(espix_canvas_t *c, espix_rect_t r, espix_px_t px)
+{
+    px_outline(c->px, c->w, c->h, c->w, r, px);
+    espix_canvas_damage(c, r);
+}
+
+void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
+                       espix_px_t fg, espix_px_t bg)
+{
+    const int x0 = x;
+
+    px_text(c->px, c->w, c->h, c->w, x, y, s, fg, bg);
+    for (; *s != '\0'; s++) {
+        x += 8;
+    }
+
+    espix_canvas_damage(c, (espix_rect_t){ x0, y, x - x0, 8 });
+}
+
+void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
+                               const espix_surface_t *s)
+{
+    if (s == NULL || s->px == NULL) {
+        return;
+    }
+    op_blit(c->px, c->w, c->h, c->w, x, y, s->px, s->w, s->h, s->stride);
+    espix_canvas_damage(c, (espix_rect_t){ x, y, s->w, s->h });
+}
+
+/* ------------------------------------------------------------------ */
+/* Surfaces                                                            */
+/* ------------------------------------------------------------------ */
+
+espix_surface_t *espix_surface_new(int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return NULL;
+    }
+
+    espix_surface_t *s = calloc(1, sizeof(*s));
+    if (s == NULL) {
+        return NULL;
+    }
+
+    s->px = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s->px == NULL) {
+        s->px = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
+                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s->px == NULL) {
+        free(s);
+        return NULL;
+    }
+
+    s->lock = xSemaphoreCreateMutex();
+    if (s->lock == NULL) {
+        heap_caps_free(s->px);
+        free(s);
+        return NULL;
+    }
+
+    s->w = w;
+    s->h = h;
+    s->stride = w;
+    return s;
+}
+
+void espix_surface_free(espix_surface_t *s)
+{
+    if (s == NULL) {
+        return;
+    }
+    if (s->lock != NULL) {
+        vSemaphoreDelete(s->lock);
+    }
+    heap_caps_free(s->px);
+    free(s);
+}
+
+int         espix_surface_width(const espix_surface_t *s)  { return s->w; }
+int         espix_surface_height(const espix_surface_t *s) { return s->h; }
+espix_px_t *espix_surface_pixels(espix_surface_t *s)       { return s->px; }
+
+void espix_surface_lock(espix_surface_t *s)   { xSemaphoreTake(s->lock, portMAX_DELAY); }
+void espix_surface_unlock(espix_surface_t *s) { xSemaphoreGive(s->lock); }
+
+void espix_surface_fill(espix_surface_t *s, espix_rect_t r, espix_px_t px)
+{
+    op_fill(s->px, s->w, s->h, s->stride, r, px);
+}
+
+void espix_surface_blit(espix_surface_t *s, int dst_x, int dst_y,
+                        const espix_px_t *src, int src_w, int src_h,
+                        int src_stride)
+{
+    op_blit(s->px, s->w, s->h, s->stride, dst_x, dst_y, src, src_w, src_h,
+            src_stride);
+}
+
+void espix_surface_outline(espix_surface_t *s, espix_rect_t r, espix_px_t px)
+{
+    px_outline(s->px, s->w, s->h, s->stride, r, px);
+}
+
+void espix_surface_text(espix_surface_t *s, int x, int y, const char *str,
+                        espix_px_t fg, espix_px_t bg)
+{
+    px_text(s->px, s->w, s->h, s->stride, x, y, str, fg, bg);
 }
 
 /* ------------------------------------------------------------------ */
