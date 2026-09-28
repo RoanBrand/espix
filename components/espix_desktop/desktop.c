@@ -92,8 +92,11 @@ static uint32_t        s_win_seq;
  */
 static SemaphoreHandle_t s_desk_lock;
 
-/* The last button mask any event carried; see the input handler below. */
-static uint8_t s_buttons;
+/* The last button mask any event carried, and the drag in progress; see the
+ * input handler below. Declared here because stopping the desktop has to end
+ * both, and it is above the input handler. */
+static uint8_t         s_buttons;
+static espix_window_t *s_drag;
 
 static void desk_lock(void)
 {
@@ -1375,6 +1378,28 @@ static void windows_destroy(void)
     s_focus = NULL;
     s_term  = NULL;
     s_about = NULL;
+
+    /*
+     * The viewer's window is in that list too, and it used to be the one
+     * pointer out of it that nobody cleared -- so a stop followed by a click on
+     * the launcher took a Store access fault in espix_surface_lock, on a window
+     * that had been freed a second earlier.
+     */
+    s_img_win = NULL;
+
+    /*
+     * And the picture goes with the windows it was for. "Decode once and keep
+     * it" means once per session: holding a few hundred kilobytes of PSRAM for
+     * a window that no longer exists is the opposite of what stopping is for,
+     * and the codec decodes it again in 12 ms.
+     */
+    espix_surface_free(s_img);
+    s_img       = NULL;
+    s_img_tried = false;
+
+    /* A drag that was in progress ends with the window it was holding. */
+    s_drag    = NULL;
+    s_buttons = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1387,7 +1412,6 @@ static void windows_destroy(void)
  * live, so the press and the release have to be recognised as changes in this
  * rather than looked for on the event that moves the window.
  */
-static espix_window_t *s_drag;
 static int            s_grab_x, s_grab_y;   /* where in the window it was grabbed */
 
 static void drag_begin(espix_window_t *w, int x, int y)
