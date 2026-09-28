@@ -358,9 +358,30 @@ static void hid_driver_cb(hid_host_device_handle_t dev,
                    (unsigned)params.iface_num, esp_err_to_name(err));
         return;
     }
+
     if (hid_host_device_start(dev) != ESP_OK) {
         (void)hid_host_device_close(dev);
         return;
+    }
+
+    /*
+     * Boot protocol, asked for explicitly -- and *after* the interface is
+     * running, which is not the order the examples use. A configured device is
+     * in report protocol until it is told otherwise, and the layouts decoded
+     * here are the boot ones, so a device whose descriptor differs would be
+     * misread without this. But the request is the one thing here that can
+     * block: a device that does not answer it holds the caller for the control
+     * transfer's full five-second timeout, and this receiver does exactly that,
+     * on both interfaces. Requesting it first therefore meant ten seconds
+     * between the plug and the first keystroke. Started first, reports flow
+     * immediately and the switch, when it lands, applies to the ones after it.
+     */
+    const esp_err_t proto = hid_class_request_set_protocol(dev, HID_REPORT_PROTOCOL_BOOT);
+    if (proto != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "iface %u did not take the boot protocol: %s; reports are "
+                   "decoded as boot anyway",
+                   (unsigned)params.iface_num, esp_err_to_name(proto));
     }
 
     switch (params.proto) {
