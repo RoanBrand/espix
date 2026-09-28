@@ -1396,10 +1396,20 @@ static void rfb_task(void *arg)
          * is raised in sdkconfig and the one connection that streams a screen
          * asks for it here.
          */
-        int sndbuf = 32 * 1024;
-        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0) {
-            espix_klog(ESPIX_KLOG_WARN, TAG, "no room for a 32K send buffer");
-        }
+        /*
+         * There is no per-socket send buffer to ask for. lwIP defines SO_SNDBUF
+         * and does not implement it -- "Unimplemented: send buffer size" in its
+         * own header -- and TCP_SNDBUF was removed from the driver. So a socket
+         * cannot exceed what the compile-time TCP_SND_BUF allows, and the size
+         * is set there or not at all.
+         *
+         * Which is less of a problem than it reads, because TCP_SND_BUF is a
+         * ceiling on *queued* bytes rather than a reservation: the memory is
+         * taken as data is queued. It is TCP_WND that holds memory, by
+         * advertising how much a peer may have in flight -- so the receive
+         * window stays modest, since the only thing this connection receives is
+         * pointer events, and the send ceiling is what is raised.
+         */
 
         const struct timeval io = { .tv_sec = 0, .tv_usec = POLL_US };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io, sizeof(io));
@@ -1488,9 +1498,25 @@ esp_err_t espix_display_rfb_listen(uint16_t port)
     s_port = port;
     s_run = true;
 
-    if (xTaskCreateWithCaps(rfb_task, "espix:vnc", 8192, NULL, 4, &s_task,
+    /*
+     * Core 1.
+     *
+     * Watched on the board while dragging: core 0 at 64% and core 1 at 1%. This
+     * task does the desktop's drawing as well as the connection's reading and
+     * encoding -- input callbacks are dispatched in the context of whoever
+     * posted them -- so it *is* that 64%, and it is sharing a core with the
+     * network stack that feeds it. Measured before, on a much slower baseline,
+     * pinning changed nothing; the baseline has moved four times since, and this
+     * is worth re-measuring rather than remembering.
+     *
+     * The cost is a cross-core wakeup per event, which at these rates is noise
+     * next to a core that is a third idle.
+     */
+    if (xTaskCreatePinnedToCoreWithCaps(rfb_task, "espix:vnc", 8192, NULL, 4,
+                            &s_task, 1,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
-        (void)xTaskCreateWithCaps(rfb_task, "espix:vnc", 8192, NULL, 4, &s_task,
+        (void)xTaskCreatePinnedToCoreWithCaps(rfb_task, "espix:vnc", 8192, NULL,
+                                  4, &s_task, 1,
                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (s_task == NULL) {
