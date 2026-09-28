@@ -256,6 +256,14 @@ static struct {
     int64_t  since;
 } s_q;
 
+/* Where one update's time goes, averaged over a hundred of them. */
+static struct {
+    uint32_t n;
+    uint64_t canvas_us;
+    uint64_t encode_us;
+    uint64_t write_us;
+} s_phase;
+
 /*
  * Start a frame, or do not start it at all.
  *
@@ -339,12 +347,20 @@ typedef struct {
     bool     bad;
 } sink_t;
 
+/* Which part of an update costs: the canvas copy, the encoding, or the wire.
+ * Accumulated rather than reasoned about, because three rounds of reasoning
+ * about it produced three different answers. */
+static uint64_t s_write_us;
+
 static void sink_flush(sink_t *s)
 {
     if (s->len > 0) {
+        const int64_t t = esp_timer_get_time();
+
         if (!write_full(s->fd, s->buf, s->len)) {
             s->bad = true;
         }
+        s_write_us += (uint64_t)(esp_timer_get_time() - t);
         s->len = 0;
     }
 }
@@ -654,10 +670,21 @@ static void send_stat(int64_t us, size_t rects)
     if (s_send_stat.n < 100) {
         return;
     }
+    const uint32_t u = s_phase.n ? s_phase.n : 1;
+
     espix_klog(ESPIX_KLOG_INFO, TAG,
-               "send: 100 updates, mean %lld us, worst %lld us, mean %lld rects",
-               (long long)(s_send_stat.us / 100), (long long)s_send_stat.worst,
+               "send: 100 updates, mean %lld us (canvas %lld, encode %lld, "
+               "wire %lld), worst %lld, mean %lld rects",
+               (long long)(s_send_stat.us / 100),
+               (long long)(s_phase.canvas_us / u),
+               (long long)(s_phase.encode_us / u),
+               (long long)(s_phase.write_us / u),
+               (long long)s_send_stat.worst,
                (long long)((s_send_stat.rects + 50) / 100));
+    s_phase.n = 0;
+    s_phase.canvas_us = 0;
+    s_phase.encode_us = 0;
+    s_phase.write_us = 0;
     s_send_stat.n     = 0;
     s_send_stat.us    = 0;
     s_send_stat.rects = 0;
@@ -667,6 +694,8 @@ static void send_stat(int64_t us, size_t rects)
 static bool update_send(rfb_conn_t *c)
 {
     const int64_t  t0 = esp_timer_get_time();
+    int64_t        t_canvas;
+    int64_t        t_sent;
     espix_canvas_t *cv = espix_display_canvas();
     if (cv == NULL || c->stage == NULL) {
         return false;
@@ -771,6 +800,7 @@ static bool update_send(rfb_conn_t *c)
         }
     }
     espix_canvas_unlock(cv);
+    t_canvas = esp_timer_get_time();
 
     if (!c->logged_send) {
         c->logged_send = true;
@@ -826,9 +856,16 @@ static bool update_send(rfb_conn_t *c)
         }
     }
     sink_flush(&s);
+    t_sent = esp_timer_get_time();
     if (s.bad) {
         return false;
     }
+
+    s_phase.n++;
+    s_phase.canvas_us += (uint64_t)(t_canvas - t0);
+    s_phase.encode_us += (uint64_t)(t_sent - t_canvas) - s_write_us;
+    s_phase.write_us  += s_write_us;
+    s_write_us = 0;
 
     c->pending = false;
     c->pending_full = false;
