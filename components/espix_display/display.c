@@ -260,6 +260,10 @@ size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max
 
 void espix_canvas_damage_clear(espix_canvas_t *c) { c->ndamage = 0; }
 
+/* The note without the move: for a caller that has already painted the pixels
+ * and only wants a client told that they moved. */
+void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
+
 void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
 {
     if (c == NULL || c->px == NULL) {
@@ -330,6 +334,24 @@ void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
 
     if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
         return;                     /* no room for the note; the pixels are sent */
+    }
+    c->moves[c->nmoves].r  = r;
+    c->moves[c->nmoves].sx = sx;
+    c->moves[c->nmoves].sy = sy;
+    c->nmoves++;
+}
+
+void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
+{
+    if (c == NULL) {
+        return;
+    }
+    r = rect_clip_wh(r, c->w, c->h);
+    if (r.w <= 0 || r.h <= 0) {
+        return;
+    }
+    if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
+        return;
     }
     c->moves[c->nmoves].r  = r;
     c->moves[c->nmoves].sx = sx;

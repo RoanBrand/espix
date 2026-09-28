@@ -117,6 +117,9 @@ void espix_canvas_text(espix_canvas_t *c, int x, int y, const char *s,
  * The source and the destination must both be inside the canvas.
  */
 void   espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
+
+/* The note without the move, for a caller that has already painted the pixels. */
+void   espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
 size_t espix_canvas_move_take(espix_canvas_t *c, espix_move_t *out, size_t max);
 void   espix_canvas_move_clear(espix_canvas_t *c);
 

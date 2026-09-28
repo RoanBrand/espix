@@ -651,6 +651,24 @@ static bool update_send(rfb_conn_t *c)
     }
 
     /*
+     * And when there is no copy -- more than one move since the last update, or
+     * a client that never asked for CopyRect -- the moved pixels have to be
+     * sent as pixels. Nothing else will say they moved.
+     *
+     * Which is the whole of a bug that warped every dragged window: the desktop
+     * moves its own canvas and repairs only the strips it uncovers, so with no
+     * copy in the update the client was told about the strips and not about the
+     * rectangle between them. The window sat where it had been, torn at the
+     * edges, until something repainted it -- and moving *another* window
+     * repainted it, which is why the damage appeared to chase the drag around.
+     */
+    if (!copy) {
+        for (size_t i = 0; i < nmove && n < ESPIX_DISPLAY_DAMAGE_MAX; i++) {
+            rects[n++] = moves[i].r;
+        }
+    }
+
+    /*
      * Copy out under the lock, encode outside it. Holding it across the send
      * would freeze the cursor for as long as the client takes to read a frame,
      * which on a slow link is the difference between a desktop and a slideshow.
