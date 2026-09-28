@@ -359,29 +359,40 @@ static void hid_driver_cb(hid_host_device_handle_t dev,
         return;
     }
 
-    if (hid_host_device_start(dev) != ESP_OK) {
-        (void)hid_host_device_close(dev);
-        return;
-    }
-
     /*
-     * Boot protocol, asked for explicitly -- and *after* the interface is
-     * running, which is not the order the examples use. A configured device is
-     * in report protocol until it is told otherwise, and the layouts decoded
-     * here are the boot ones, so a device whose descriptor differs would be
-     * misread without this. But the request is the one thing here that can
-     * block: a device that does not answer it holds the caller for the control
-     * transfer's full five-second timeout, and this receiver does exactly that,
-     * on both interfaces. Requesting it first therefore meant ten seconds
-     * between the plug and the first keystroke. Started first, reports flow
-     * immediately and the switch, when it lands, applies to the ones after it.
+     * Boot protocol, and this is the request the whole file turns on.
+     *
+     * It is sent even though the host will report it as failed on a Logitech
+     * receiver, because the receiver obeys it anyway: the control transfer on
+     * the keyboard interface sits out its full five-second timeout and the one
+     * on the mouse interface cannot even be submitted, and then the mouse works.
+     * Take the request out and the mouse stops dead -- not misread, silent --
+     * which says the interface was in report protocol and sends nothing useful
+     * there. The failure is in the host's status-stage handling, not in the
+     * device's compliance.
+     *
+     * The timeout is why this runs *before* start() rather than after: the
+     * interface is started afterwards, so the ten seconds are paid once, at
+     * attach, and never on the report path. It is also not peculiar to this
+     * receiver -- tinyusb carries the same behaviour open as
+     * https://github.com/hathach/tinyusb/issues/2436, where toggling protocol
+     * on the mouse interface stops the keyboard interface being serviced at all
+     * while its endpoint goes on replying.
+     *
+     * Worth revisiting: five seconds is the library's timeout, and a device that
+     * answers by not answering costs ten of them for a two-interface receiver.
      */
     const esp_err_t proto = hid_class_request_set_protocol(dev, HID_REPORT_PROTOCOL_BOOT);
     if (proto != ESP_OK) {
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "iface %u did not take the boot protocol: %s; reports are "
-                   "decoded as boot anyway",
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "iface %u reported %s to the boot protocol request; the "
+                   "receiver obeys it anyway",
                    (unsigned)params.iface_num, esp_err_to_name(proto));
+    }
+
+    if (hid_host_device_start(dev) != ESP_OK) {
+        (void)hid_host_device_close(dev);
+        return;
     }
 
     switch (params.proto) {
