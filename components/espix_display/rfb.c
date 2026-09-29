@@ -566,16 +566,6 @@ static void enc_raw(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
 }
 
 /*
- * Hextile, in its simplest correct form: a tile is either one colour or it is
- * raw. The subrect machinery -- foreground colours, per-subrect runs -- would
- * shrink a window full of text a little; a uniform tile, which is what a
- * desktop mostly is, is already down from 512 bytes to five.
- *
- * The background is specified on every uniform tile rather than remembered
- * across tiles. One byte and one pixel per tile buys not having to reason
- * about what a client believes the previous tile left behind.
- */
-/*
  * `r` without the part of it inside `hole`, as at most four rectangles.
  *
  * This is what a copy needs: the pixels a client is told to move are *not* also
@@ -615,45 +605,211 @@ static size_t rect_subtract(espix_rect_t r, espix_rect_t hole, espix_rect_t *out
     return n;
 }
 
+/*
+ * Hextile, with the subrect form.
+ *
+ * A tile that is not one colour is offered as a background plus a list of
+ * subrectangles (RFC 6143 7.7.4) and falls back to Raw when that would be
+ * larger. The background is the tile's top-left pixel: for the flat chrome and
+ * text a desktop is made of, that is the majority colour, and where it is not
+ * -- a photograph -- the subrects come out larger than Raw and Raw is what is
+ * sent.
+ *
+ * Background is specified on every tile, as it always was: one pixel per tile
+ * buys not having to reason about what the client believes the previous tile
+ * left behind. The foreground is specified only for the monochrome form.
+ */
+
+/* One subrect, packed as it goes on the wire. */
+typedef struct {
+    uint8_t    xy;      /* x << 4 | y */
+    uint8_t    wh;      /* (w - 1) << 4 | (h - 1) */
+    espix_px_t px;
+} subrect_t;
+
+#define SUBRECT_MAX 255
+
+static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
+                             int tw, int th, const rfb_pf_t *pf, uint8_t *row)
+{
+    const int bytes = pf->bpp / 8;
+    const espix_px_t bg = base[0];
+
+    bool uniform = true;
+    for (int y = 0; y < th && uniform; y++) {
+        const espix_px_t *p = base + (size_t)y * stride;
+        for (int x = 0; x < tw; x++) {
+            if (p[x] != bg) {
+                uniform = false;
+                break;
+            }
+        }
+    }
+
+    if (uniform) {
+        const uint8_t mask = 0x02;              /* BackgroundSpecified */
+        uint8_t       pix[4];
+        sink_write(s, &mask, 1);
+        row_to_pf(&bg, pix, 1, pf);
+        sink_write(s, pix, (size_t)bytes);
+        return;
+    }
+
+    /*
+     * Split each row into maximal runs of one colour, then extend a rectangle
+     * from the row above when a run shares its x, width and colour. That is
+     * the RRE decomposition Hextile is a variation on, and it turns a text row
+     * into a handful of subrects instead of a whole tile of pixels.
+     *
+     * Every rectangle in the next row corresponds to one run in that row
+     * (either an extended one or a new one), so nnext <= nspan <= 16 and the
+     * scratch arrays are one tile wide at most.
+     */
+    subrect_t  closed[SUBRECT_MAX];
+    subrect_t  active[16];
+    size_t     nclosed = 0;
+    size_t     nactive = 0;
+    bool       overflow = false;
+
+    for (int y = 0; y < th; y++) {
+        const espix_px_t *p = base + (size_t)y * stride;
+
+        uint8_t    span_xy[16], span_wh[16];
+        espix_px_t span_px[16];
+        int        nspan = 0;
+
+        for (int x = 0; x < tw; ) {
+            const espix_px_t c = p[x];
+            int w = 1;
+            while (x + w < tw && p[x + w] == c) {
+                w++;
+            }
+            if (c != bg && nspan < 16) {
+                span_xy[nspan] = (uint8_t)((x << 4) | y);
+                span_wh[nspan] = (uint8_t)((w - 1) << 4);
+                span_px[nspan] = c;
+                nspan++;
+            }
+            x += w;
+        }
+
+        bool      used[16] = { false };
+        subrect_t next[16];
+        size_t    nnext = 0;
+
+        for (size_t i = 0; i < nactive; i++) {
+            subrect_t a    = active[i];
+            bool      grew = false;
+
+            for (int j = 0; j < nspan; j++) {
+                /* Same x (low nibble of xy is the row) and same width (low
+                 * nibble of wh is the height); the colour must match too. */
+                if (!used[j] && (span_xy[j] & 0xF0) == (a.xy & 0xF0) &&
+                    (span_wh[j] & 0xF0) == (a.wh & 0xF0) &&
+                    span_px[j] == a.px) {
+                    used[j] = true;
+                    a.wh    = (uint8_t)(a.wh + 1);   /* h += 1 */
+                    next[nnext++] = a;
+                    grew = true;
+                    break;
+                }
+            }
+
+            if (!grew) {
+                if (nclosed >= SUBRECT_MAX) {
+                    overflow = true;
+                    break;
+                }
+                closed[nclosed++] = a;
+            }
+        }
+        if (overflow) {
+            break;
+        }
+
+        for (int j = 0; j < nspan; j++) {
+            if (!used[j]) {
+                next[nnext++] = (subrect_t){ span_xy[j], span_wh[j], span_px[j] };
+            }
+        }
+
+        for (size_t i = 0; i < nnext; i++) {
+            active[i] = next[i];
+        }
+        nactive = nnext;
+    }
+
+    if (!overflow) {
+        for (size_t i = 0; i < nactive; i++) {
+            if (nclosed >= SUBRECT_MAX) {
+                overflow = true;
+                break;
+            }
+            closed[nclosed++] = active[i];
+        }
+    }
+
+    const size_t raw_size = 1 + (size_t)tw * th * bytes;
+
+    if (!overflow && nclosed > 0) {
+        bool mono = true;
+        for (size_t i = 1; i < nclosed; i++) {
+            if (closed[i].px != closed[0].px) {
+                mono = false;
+                break;
+            }
+        }
+
+        /* 1 mask + background + [foreground] + 1 count + the subrects. */
+        const size_t sub_size = mono
+            ? 1 + (size_t)2 * bytes + 1 + 2 * nclosed
+            : 1 + (size_t)bytes + 1 + (size_t)(bytes + 2) * nclosed;
+
+        if (sub_size < raw_size) {
+            const uint8_t mask = mono ? (uint8_t)(0x02 | 0x04 | 0x08)
+                                      : (uint8_t)(0x02 | 0x10 | 0x08);
+            uint8_t       pix[4];
+
+            sink_write(s, &mask, 1);
+            row_to_pf(&bg, pix, 1, pf);
+            sink_write(s, pix, (size_t)bytes);
+            if (mono) {
+                row_to_pf(&closed[0].px, pix, 1, pf);
+                sink_write(s, pix, (size_t)bytes);
+            }
+            const uint8_t count = (uint8_t)nclosed;
+            sink_write(s, &count, 1);
+
+            for (size_t i = 0; i < nclosed; i++) {
+                if (!mono) {
+                    row_to_pf(&closed[i].px, pix, 1, pf);
+                    sink_write(s, pix, (size_t)bytes);
+                }
+                sink_write(s, &closed[i].xy, 1);
+                sink_write(s, &closed[i].wh, 1);
+            }
+            return;
+        }
+    }
+
+    const uint8_t mask = 0x01;                  /* Raw */
+    sink_write(s, &mask, 1);
+    for (int y = 0; y < th; y++) {
+        row_to_pf(base + (size_t)y * stride, row, tw, pf);
+        sink_write(s, row, (size_t)tw * bytes);
+    }
+}
+
 static void enc_hextile(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
                         const rfb_pf_t *pf, uint8_t *row)
 {
-    const int bytes = pf->bpp / 8;
-
     for (int ty = 0; ty < r.h && !s->bad; ty += 16) {
         const int th = (r.h - ty) < 16 ? (r.h - ty) : 16;
 
         for (int tx = 0; tx < r.w && !s->bad; tx += 16) {
             const int tw = (r.w - tx) < 16 ? (r.w - tx) : 16;
-            const espix_px_t *base = px + (size_t)(r.y + ty) * stride + (r.x + tx);
-
-            const espix_px_t first = base[0];
-            bool uniform = true;
-            for (int y = 0; y < th && uniform; y++) {
-                const espix_px_t *p = base + (size_t)y * stride;
-                for (int x = 0; x < tw; x++) {
-                    if (p[x] != first) {
-                        uniform = false;
-                        break;
-                    }
-                }
-            }
-
-            if (uniform) {
-                uint8_t mask = 0x02;            /* BackgroundSpecified */
-                uint8_t bg[4];
-                sink_write(s, &mask, 1);
-                row_to_pf(&first, bg, 1, pf);
-                sink_write(s, bg, (size_t)bytes);
-                continue;
-            }
-
-            uint8_t mask = 0x01;                /* Raw */
-            sink_write(s, &mask, 1);
-            for (int y = 0; y < th; y++) {
-                row_to_pf(base + (size_t)y * stride, row, tw, pf);
-                sink_write(s, row, (size_t)tw * bytes);
-            }
+            enc_hextile_tile(s, px + (size_t)(r.y + ty) * stride + (r.x + tx),
+                             stride, tw, th, pf, row);
         }
     }
 }

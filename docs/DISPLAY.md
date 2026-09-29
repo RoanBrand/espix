@@ -243,6 +243,17 @@ for the client that once refused "Source rect 513x247 at 292,43 exceeds
 framebuffer 800x600", so a window crossing the screen edge still copies the part
 present before and after.
 
+The remaining pixel cost was in the encoder. Hextile had only two tile forms --
+one colour, or raw -- so any tile that was not perfectly flat cost its full 1024
+bytes, and a drag's exposed strip is full of tiles that are flat *plus* a window
+edge or a line of text. The encoder now emits Hextile's subrect form (RFC 6143
+7.7.4): a background plus a list of monochrome or coloured subrectangles, falling
+back to raw whenever that would be larger. On the same drag the traffic went from
+**3.66 MB to 0.72 MB**, the wire from **37% to 19%** of update time, and encode
+CPU went *down* rather than up -- only the subrect pixels are converted, not every
+pixel of every non-flat tile. Photographic tiles are the case it does not help:
+the scan finds many runs, loses to raw, and is wasted work.
+
 The JPEG row is the one row that needs an input rather than a size: decoding is
 not an operation to sweep, it is the whole of one file, so `display bench [jpeg]`
 takes a path and defaults to the picture the launcher opens. It is absent when
