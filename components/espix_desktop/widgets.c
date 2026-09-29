@@ -85,14 +85,19 @@ static void radio_dot(espix_surface_t *s, int cx, int cy, bool selected, bool on
         while ((dx + 1) * (dx + 1) + dy * dy <= 16) {
             dx++;
         }
-        /* A ring: the middle two rows of the dot are left out. */
+        /* Unselected is a ring; selected is that ring filled solid to the
+         * edge, in the selected colour -- a five-pixel plus in the middle read
+         * as "slightly lighter", which is not a state you can see at a glance. */
         for (int x = -dx; x <= dx; x++) {
             const bool edge = (x == -dx || x == dx || dy == -4 || dy == 4);
-            const bool core = selected && (dx * dx + dy * dy <= 3);
+            /* x*x, not dx*dx: dx is the row's half-width, so dx*dx+dy*dy is
+             * >= 16 in the middle rows and the fill never happened at all. */
+            const bool core = selected && (x * x + dy * dy <= 9);
+            const bool lit  = core || (selected && edge);
 
             if (edge || core) {
                 espix_surface_fill(s, (espix_rect_t){ cx + x, cy + dy, 1, 1 },
-                                   core ? WGT_SEL_FG : fg);
+                                   lit ? WGT_SEL_FG : fg);
             }
         }
     }
