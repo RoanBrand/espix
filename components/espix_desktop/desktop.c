@@ -1636,6 +1636,9 @@ static const struct {
     const char *path;
 } s_icons[] = {
     { "plasma", "/bin/plasma" },
+    /* A one-off: the same program, but loaded off the USB stick through the
+     * /etc/fstab mount, so the icon proves the whole path end to end. */
+    { "usb", "/mnt/sda1/usbplasma" },
 };
 #define ICON_N ((int)(sizeof(s_icons) / sizeof(s_icons[0])))
 
