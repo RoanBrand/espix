@@ -895,11 +895,31 @@ void espix_window_move(espix_window_t *w, int x, int y)
                                                        : (now.y + now.h);
 
     const espix_rect_t box = { x0, y0, x1 - x0, y1 - y0 };
-    const espix_rect_t ov  = rect_meet(from, now);
-    const espix_rect_t dst = { ov.x + (x - from.x), ov.y + (y - from.y),
-                               ov.w, ov.h };
 
     espix_canvas_t *c = espix_display_canvas();
+
+    /*
+     * What the client is told to copy.
+     *
+     * The source is the window where the client last saw it, clipped to the
+     * screen: that is the only rectangle the client actually has, and the clip
+     * is what keeps the source inside its framebuffer -- a client once refused
+     * an update ("Source rect 513x247 at 292,43 exceeds framebuffer 800x600")
+     * when it was not.
+     *
+     * The destination is that rectangle carried by the motion. Clipping the
+     * source rather than giving up is what lets a window crossing the screen
+     * edge still copy the part present both before and after; only the pixels
+     * that were genuinely never on the client go as pixels. RFC 6143 puts no
+     * overlap requirement on CopyRect, so a source that merely intersects the
+     * destination is fine -- and when the window is fully on-screen this is the
+     * whole-window copy an ordinary VNC server sends.
+     */
+    const int cw = (c != NULL) ? espix_canvas_width(c)  : 0;
+    const int ch = (c != NULL) ? espix_canvas_height(c) : 0;
+    const espix_rect_t src = rect_meet(from, (espix_rect_t){ 0, 0, cw, ch });
+    const espix_rect_t dst = { src.x + (x - from.x), src.y + (y - from.y),
+                               src.w, src.h };
 
     /*
      * The fast path, and the one a drag always takes: the press raised the
@@ -930,9 +950,9 @@ void espix_window_move(espix_window_t *w, int x, int y)
      */
     desktop_repair(box);
 
-    if (c != NULL && ov.w > 0 && ov.h > 0) {
+    if (c != NULL && src.w > 0 && src.h > 0) {
         espix_canvas_lock(c);
-        espix_canvas_moved(c, dst, ov.x, ov.y);
+        espix_canvas_moved(c, dst, src.x, src.y);
         espix_canvas_unlock(c);
     }
     (void)rect_cut;

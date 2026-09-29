@@ -230,6 +230,19 @@ real figure is the 301,380 above. Measured on the S31, and checked rather than
 assumed: after a drag, a framebuffer built entirely from incremental updates and
 copies agrees with a raw full frame to the pixel, 0 of 480,000.
 
+The copy then had a second cost that only a timeline showed. Measured with
+SystemView on the board (docs/PROFILING.md), a drag motion that did use CopyRect
+still sent ~190 KB: the copy moved only where the old and new window **overlapped**,
+so the newly exposed side of the window went as pixels as well. RFC 6143 puts no
+overlap requirement on CopyRect -- the client's framebuffer holds the whole window
+at its previous position -- so the copy is now the window clipped to the canvas,
+with the two ends clipped by the same amount. The same drag went from **9.4 MB to
+2.05 MB**, the wire from **67% to 34%** of update time, and the encode tail
+disappeared. The clip is the same one that keeps the source inside the framebuffer
+for the client that once refused "Source rect 513x247 at 292,43 exceeds
+framebuffer 800x600", so a window crossing the screen edge still copies the part
+present before and after.
+
 The JPEG row is the one row that needs an input rather than a size: decoding is
 not an operation to sweep, it is the whole of one file, so `display bench [jpeg]`
 takes a path and defaults to the picture the launcher opens. It is absent when

@@ -260,6 +260,70 @@ size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max
 
 void espix_canvas_damage_clear(espix_canvas_t *c) { c->ndamage = 0; }
 
+/*
+ * Take one move note, merging it into the note already pending when it is the
+ * same rectangle still moving.
+ *
+ * This is the difference between a drag that is CopyRects and a drag that is
+ * pixels. The client is told where to copy *from* once -- its framebuffer still
+ * holds the rectangle at the stored source, because nothing has been sent since
+ * that note was taken -- and the stored destination is carried along by each
+ * later motion's delta. Without it, a drag faster than the frame rate leaves
+ * several notes, the backend only turns exactly one into a CopyRect, and every
+ * motion re-sends the window as pixels. Measured on the board: 69% of drag
+ * updates went as pixels, 85 KB mean and 331 KB worst, with the wire 67% of the
+ * update. See docs/PROFILING.md.
+ *
+ * `r` is the destination and `sx,sy` the source, both already inside the
+ * canvas -- the two callers differ only in how they got them there.
+ */
+static void canvas_note_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
+{
+    if (c->nmoves == 1) {
+        espix_move_t *m = &c->moves[0];
+        int           x0, y0, x1, y1;
+
+        m->r.x += r.x - sx;
+        m->r.y += r.y - sy;
+
+        /*
+         * Clipped into the canvas, with its source taken along by the same
+         * amount -- rather than dropped, which is what a window at the edge of
+         * the screen used to pay for. A dropped note is not a smaller copy, it
+         * is *no* copy: the whole rectangle goes as pixels instead.
+         */
+        x0 = m->r.x < 0 ? 0 : m->r.x;
+        y0 = m->r.y < 0 ? 0 : m->r.y;
+        x1 = m->r.x + m->r.w;
+        y1 = m->r.y + m->r.h;
+        if (x1 > c->w) { x1 = c->w; }
+        if (y1 > c->h) { y1 = c->h; }
+
+        if (x1 <= x0 || y1 <= y0) {
+            c->nmoves = 0;
+            return;
+        }
+
+        m->sx += x0 - m->r.x;
+        m->sy += y0 - m->r.y;
+        m->r = (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+
+        if (m->sx < 0 || m->sy < 0 || m->sx + m->r.w > c->w ||
+            m->sy + m->r.h > c->h) {
+            c->nmoves = 0;              /* the source has left: send pixels */
+        }
+        return;
+    }
+
+    if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
+        return;                     /* no room for the note; the pixels are sent */
+    }
+    c->moves[c->nmoves].r  = r;
+    c->moves[c->nmoves].sx = sx;
+    c->moves[c->nmoves].sy = sy;
+    c->nmoves++;
+}
+
 /* The note without the move: for a caller that has already painted the pixels
  * and only wants a client told that they moved. */
 void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy);
@@ -320,77 +384,7 @@ void espix_canvas_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
      * So the stored destination is shifted by this motion's delta, and its size
      * is left alone. It is the same rectangle from beginning to end of the drag.
      */
-    if (c->nmoves == 1) {
-        espix_move_t *m = &c->moves[0];
-        int           x0, y0, x1, y1;
-
-        m->r.x += r.x - sx;
-        m->r.y += r.y - sy;
-
-        /*
-         * Clipped into the canvas, with its source taken along by the same
-         * amount -- rather than dropped, which is what a window at the edge of
-         * the screen used to pay for. A dropped note is not a smaller copy, it is
-         * *no* copy: the whole rectangle goes as pixels instead, three hundred
-         * kilobytes instead of three bytes, and it happened for as long as any
-         * part of the window was off the screen.
-         */
-        x0 = m->r.x < 0 ? 0 : m->r.x;
-        y0 = m->r.y < 0 ? 0 : m->r.y;
-        x1 = m->r.x + m->r.w;
-        y1 = m->r.y + m->r.h;
-        if (x1 > c->w) { x1 = c->w; }
-        if (y1 > c->h) { y1 = c->h; }
-
-        if (x1 <= x0 || y1 <= y0) {
-            c->nmoves = 0;
-            return;
-        }
-
-        m->sx += x0 - m->r.x;
-        m->sy += y0 - m->r.y;
-        m->r = (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
-
-        if (m->sx < 0 || m->sy < 0 || m->sx + m->r.w > c->w ||
-            m->sy + m->r.h > c->h) {
-            c->nmoves = 0;              /* the source has left: send pixels */
-        }
-        return;
-    }
-
-    if (c->nmoves == 1) {
-        espix_move_t       *m   = &c->moves[0];
-        const espix_rect_t  src = { sx, sy, r.w, r.h };
-
-        /*
-         * Contained in where the last one ended means the same thing still
-         * moving: keep the original source and follow it, so the client is told
-         * one net move instead of a sequence it cannot apply.
-         *
-         * Contained, not equal, and that is the whole of why this was written
-         * twice. Consecutive overlaps are *clipped*: the second motion's source
-         * is where the window was and still is, which is the first motion's
-         * destination only when nothing else is in the way. Asking for equality
-         * matched nothing, no copy was ever sent, and the drag went back to
-         * pixels -- while the note list quietly filled up and stopped meaning
-         * what the backend thought it meant.
-         */
-        if (r.w == m->r.w && r.h == m->r.h &&
-            src.x >= m->r.x && src.y >= m->r.y &&
-            src.x + src.w <= m->r.x + m->r.w &&
-            src.y + src.h <= m->r.y + m->r.h) {
-            m->r = r;
-            return;
-        }
-    }
-
-    if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
-        return;                     /* no room for the note; the pixels are sent */
-    }
-    c->moves[c->nmoves].r  = r;
-    c->moves[c->nmoves].sx = sx;
-    c->moves[c->nmoves].sy = sy;
-    c->nmoves++;
+    canvas_note_move(c, r, sx, sy);
 }
 
 void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
@@ -424,13 +418,7 @@ void espix_canvas_moved(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
     if (sx < 0 || sy < 0 || sx + r.w > c->w || sy + r.h > c->h) {
         return;                     /* not a copy of anything that exists */
     }
-    if (c->nmoves >= ESPIX_DISPLAY_MOVE_MAX) {
-        return;
-    }
-    c->moves[c->nmoves].r  = r;
-    c->moves[c->nmoves].sx = sx;
-    c->moves[c->nmoves].sy = sy;
-    c->nmoves++;
+    canvas_note_move(c, r, sx, sy);
 }
 
 size_t espix_canvas_move_take(espix_canvas_t *c, espix_move_t *out, size_t max)
