@@ -1,0 +1,22 @@
+--- a/components/esp_driver_ppa/src/ppa_srm.c
++++ b/components/esp_driver_ppa/src/ppa_srm.c
+@@ -282,7 +282,7 @@
+         uint32_t out_ext_window_aligned = PPA_ALIGN_DOWN(out_ext_window, out_buf_alignment);
+         uint32_t out_ext_window_len = (uint32_t)((uint64_t)config->out.pic_w * new_block_h * out_pixel_depth / 8); // actual ext_window_len must be less than or equal to this, since actual block_h <= new_block_h (may round down)
+         assert(out_ext_window + out_ext_window_len <= (uint32_t)config->out.buffer + config->out.buffer_size);
+-        esp_cache_msync((void *)out_ext_window_aligned, PPA_ALIGN_UP(out_ext_window_len + (out_ext_window - out_ext_window_aligned), out_buf_alignment), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
++        esp_cache_msync((void *)out_ext_window_aligned, PPA_ALIGN_UP(out_ext_window_len + (out_ext_window - out_ext_window_aligned), out_buf_alignment), ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+     }
+ 
+     esp_err_t ret = ESP_OK;
+--- a/components/esp_driver_ppa/src/ppa_blend.c
++++ b/components/esp_driver_ppa/src/ppa_blend.c
+@@ -300,7 +300,7 @@
+         uint32_t out_ext_window = (uint32_t)config->out.buffer + (uint32_t)((uint64_t)config->out.block_offset_y * config->out.pic_w * out_pixel_depth / 8);
+         uint32_t out_ext_window_aligned = PPA_ALIGN_DOWN(out_ext_window, out_buf_alignment);
+         uint32_t out_ext_window_len = (uint32_t)((uint64_t)config->out.pic_w * config->in_bg.block_h * out_pixel_depth / 8);
+-        esp_cache_msync((void *)out_ext_window_aligned, PPA_ALIGN_UP(out_ext_window_len + (out_ext_window - out_ext_window_aligned), out_buf_alignment), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
++        esp_cache_msync((void *)out_ext_window_aligned, PPA_ALIGN_UP(out_ext_window_len + (out_ext_window - out_ext_window_aligned), out_buf_alignment), ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+     }
+ 
+     esp_err_t ret = ESP_OK;

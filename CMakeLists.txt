@@ -114,6 +114,32 @@ if(NOT espix_libc_offt_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-libc-offt.py failed; see the message above")
 endif()
 
+# Stop the PPA blit and scale engines discarding CPU-written pixels.
+#
+# Their output cache sync asks for M2C only, which invalidates without writing
+# back, so any pixel the CPU drew in the destination's rows is silently lost.
+# The fill engine already does it correctly with C2M | INVALIDATE, which is the
+# shape of the bug rather than a coincidence -- see tools/patch-ppa.py for the
+# measured symptom (the launcher icons) and why a drag is asymmetric.
+#
+# Temporary by construction: tools/esp_driver_ppa-out-sync.patch is the same
+# change ready to send upstream, and this hook goes when it lands.
+#
+# Re-configure when either patched file changes, as for fatfs above: a reinstall
+# or a `git checkout` in the IDF tree reverts them, and a reverted one is a
+# desktop that quietly eats what it draws rather than a build that fails.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${IDF_PATH}/components/esp_driver_ppa/src/ppa_srm.c"
+    "${IDF_PATH}/components/esp_driver_ppa/src/ppa_blend.c")
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-ppa.py"
+            --idf-path "${IDF_PATH}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_ppa_patch_result)
+if(NOT espix_ppa_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-ppa.py failed; see the message above")
+endif()
+
 # Add READ CAPACITY(16), READ(16) and WRITE(16) to espressif/usb_host_msc,
 # which speaks only the (10) commands and their 32-bit LBAs -- unreadable past
 # 2TiB, and READ CAPACITY(10) itself saturates there rather than reporting the
