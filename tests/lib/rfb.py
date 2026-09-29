@@ -39,8 +39,9 @@ ENC_RAW = 0
 ENC_COPYRECT = 1
 ENC_HEXTILE = 5
 # A pseudo-encoding (negative 32-bit): the server can change the screen size
-# under a live connection with it.
-ENC_EXTENDED_DESKTOP_SIZE = -16703
+# under a live connection with it. The value is TigerVNC's, so the test client
+# and the real one agree.
+ENC_EXTENDED_DESKTOP_SIZE = -308
 
 # The VNC authentication challenge: DES with the password left-justified and the
 # *bits of each byte* reversed, which is the one detail of this that is not
@@ -337,6 +338,7 @@ class Rfb:
         area, which is what makes a resize live rather than a reconnect.
         """
         n = r.byte()
+        r.skip(3)                       # padding, per the spec
         w = h = 0
         for _ in range(n):
             r.u32()                     # screen id

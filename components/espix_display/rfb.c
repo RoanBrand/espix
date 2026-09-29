@@ -206,8 +206,12 @@ enum {
  * ExtendedDesktopSize is a pseudo-encoding: a negative 32-bit number. It is
  * what lets a client be told the screen changed size without reconnecting, and
  * the only way a resize is live on the same connection.
+ *
+ * The value is TigerVNC's (common/rfb/encodings.h: -308). An earlier guess of
+ * -16703 was self-consistent with the test client and wrong against every real
+ * viewer, which is the failure this constant must not have.
  */
-#define RFB_ENC_EXTENDED_DESKTOP_SIZE  0xFFFFBEC1u
+#define RFB_ENC_EXTENDED_DESKTOP_SIZE  ((uint32_t)-308)
 
 /* ------------------------------------------------------------------ */
 /* Byte order helpers                                                  */
@@ -913,7 +917,7 @@ static void send_stat(int64_t us, size_t rects)
  */
 static bool send_desktop_size(rfb_conn_t *c, int w, int h)
 {
-    uint8_t b[4 + 12 + 1 + 16];
+    uint8_t b[4 + 12 + 4 + 16];
 
     b[0] = 0;                       /* FramebufferUpdate */
     b[1] = 0;
@@ -925,13 +929,19 @@ static bool send_desktop_size(rfb_conn_t *c, int w, int h)
     wr16(r + 4, (uint16_t)w);
     wr16(r + 6, (uint16_t)h);
     wr32(r + 8, RFB_ENC_EXTENDED_DESKTOP_SIZE);
+
+    /* One screen, then three bytes of padding before the screen entries --
+     * which the spec has and this first did not, so the client read the id out
+     * of the padding and every field after it was three bytes early. */
     r[12] = 1;                      /* number of screens */
-    wr32(r + 13, 0);                /* screen id */
-    wr16(r + 17, 0);
-    wr16(r + 19, 0);
-    wr16(r + 21, (uint16_t)w);
-    wr16(r + 23, (uint16_t)h);
-    wr32(r + 25, 0);                /* flags */
+    r[13] = r[14] = r[15] = 0;      /* padding */
+
+    wr32(r + 16, 0);                /* screen id */
+    wr16(r + 20, 0);                /* screen x */
+    wr16(r + 22, 0);                /* screen y */
+    wr16(r + 24, (uint16_t)w);
+    wr16(r + 26, (uint16_t)h);
+    wr32(r + 28, 0);                /* flags */
 
     return write_full(c->fd, b, sizeof(b));
 }
@@ -1235,7 +1245,7 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
                 hextile = true;
             } else if (enc == RFB_ENC_COPYRECT) {
                 copyrect = true;
-            } else if (enc == RFB_ENC_EXTENDED_DESKTOP_SIZE || enc == 0x0000C801u) {
+            } else if (enc == RFB_ENC_EXTENDED_DESKTOP_SIZE) {
                 eds = true;
             }
         }
