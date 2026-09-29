@@ -53,6 +53,12 @@ esp_err_t espix_net_usb_start(void);
  * option does not exist at all on a target without SOC_EMAC_SUPPORTED). */
 #if CONFIG_ESPIX_ETH_ENABLED
 esp_err_t espix_net_eth_start(void);
+
+/* eth.c: the PHY's last negotiated link, as the connect/disconnect events left
+ * it. Zeros mean no carrier. Read by fill_ifinfo() for eth0's media line; the
+ * event that sets it and the shell task that reads it are different tasks, but
+ * a one-call-stale pair is harmless for a display value. */
+void espix_net_eth_link(uint16_t *mbps, bool *full);
 #endif
 
 /* abi.c: publish the network syscall surface to loadable apps. */

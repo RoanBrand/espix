@@ -36,6 +36,11 @@ static esp_eth_handle_t            s_handle;
 static esp_netif_t                *s_netif;
 static esp_eth_netif_glue_handle_t s_glue;
 
+/* What the PHY negotiated, kept so it can be asked for long after the event.
+ * Zero speed is "no carrier", so the log line and the query share one source. */
+static uint16_t                    s_link_mbps;
+static bool                        s_link_full;
+
 static bool netif_has_addr(esp_netif_t *n)
 {
     if (n == NULL) {
@@ -132,11 +137,14 @@ static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *dat
         eth_duplex_t duplex = ETH_DUPLEX_HALF;
         esp_eth_ioctl(s_handle, ETH_CMD_G_SPEED, &speed);
         esp_eth_ioctl(s_handle, ETH_CMD_G_DUPLEX_MODE, &duplex);
+        s_link_mbps = (uint16_t)(speed == ETH_SPEED_10M ? 10
+                                 : speed == ETH_SPEED_100M ? 100 : 1000);
+        s_link_full = duplex == ETH_DUPLEX_FULL;
         espix_klog(ESPIX_KLOG_INFO, TAG, "eth0: link up, %u Mbps %s duplex",
-                   (unsigned)(speed == ETH_SPEED_10M ? 10
-                              : speed == ETH_SPEED_100M ? 100 : 1000),
-                   duplex == ETH_DUPLEX_FULL ? "full" : "half");
+                   (unsigned)s_link_mbps, s_link_full ? "full" : "half");
     } else if (id == ETHERNET_EVENT_DISCONNECTED) {
+        s_link_mbps = 0;
+        s_link_full = false;
         espix_klog(ESPIX_KLOG_WARN, TAG, "eth0: link down");
         choose_default_route();
     }
@@ -174,6 +182,16 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         if (netif_has_addr(s_netif)) {
             esp_netif_set_default_netif(s_netif);
         }
+    }
+}
+
+void espix_net_eth_link(uint16_t *mbps, bool *full)
+{
+    if (mbps != NULL) {
+        *mbps = s_link_mbps;
+    }
+    if (full != NULL) {
+        *full = s_link_full;
     }
 }
 

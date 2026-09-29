@@ -143,6 +143,13 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
         out->has_mac = true;
     }
 
+    /* The PHY's negotiated media, which no esp_netif getter exposes. */
+#if CONFIG_ESPIX_ETH_ENABLED
+    if (e->kind == ESPIX_IF_ETH) {
+        espix_net_eth_link(&out->link_mbps, &out->link_full);
+    }
+#endif
+
     esp_netif_ip_info_t ip;
     if (esp_netif_get_ip_info(e->netif, &ip) == ESP_OK && ip.ip.addr != 0) {
         out->has_addr = true;

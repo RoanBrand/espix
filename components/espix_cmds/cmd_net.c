@@ -42,6 +42,29 @@ static void mac_str(const uint8_t mac[6], char *buf, size_t len)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+/*
+ * The negotiated Ethernet media, in the shape net-tools prints it. Only eth0
+ * has such a thing; everything else gets no line rather than an empty one.
+ * "none" is no carrier -- the PHY reports no speed until the link comes up.
+ */
+static bool media_str(const espix_ifinfo_t *i, char *buf, size_t len)
+{
+    if (i->kind != ESPIX_IF_ETH) {
+        return false;
+    }
+    if (i->link_mbps == 0) {
+        snprintf(buf, len, "Ethernet autoselect (none)");
+        return true;
+    }
+    const char *base = (i->link_mbps == 1000) ? "1000baseT"
+                     : (i->link_mbps == 100)  ? "100baseTX"
+                     : (i->link_mbps == 10)   ? "10baseT"
+                                              : "unknown";
+    snprintf(buf, len, "Ethernet autoselect (%s <%s-duplex>)", base,
+             i->link_full ? "full" : "half");
+    return true;
+}
+
 static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
                            bool with_addr)
 {
@@ -184,8 +207,14 @@ static int cmd_ifconfig(espix_session_t *s, int argc, char **argv)
                          espix_net_ip4str(f->netmask, nm, sizeof(nm)));
         }
 
-        espix_printf(s, "          %s  MTU:%u\n\n",
+        espix_printf(s, "          %s  MTU:%u\n",
                      f->up ? "UP RUNNING" : "DOWN", (unsigned)f->mtu);
+
+        char media[48];
+        if (media_str(f, media, sizeof(media))) {
+            espix_printf(s, "          media: %s\n", media);
+        }
+        espix_puts(s, "\n");
     }
 
     if (dev != NULL && !shown) {

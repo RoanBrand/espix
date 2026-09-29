@@ -51,6 +51,14 @@ typedef struct {
     uint32_t        ip;
     uint32_t        netmask;
     uint32_t        gw;
+
+    /*
+     * Ethernet only: what the PHY negotiated. Zero speed means no carrier, so
+     * there is one sentinel rather than a separate "has_link" flag. Every other
+     * kind leaves these zero and has no such thing to report.
+     */
+    uint16_t        link_mbps;
+    bool            link_full;
 } espix_ifinfo_t;
 
 /*

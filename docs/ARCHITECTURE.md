@@ -643,7 +643,7 @@ addresses, a default route, DHCP, DNS. `espix_net` adds a table mapping
 net-tools views cannot disagree. `ping` is `esp_ping_new_session()` from the
 lwip component.
 
-Three things worth knowing:
+Things worth knowing:
 
 - **The hostname is per-netif.** lwip stores it on each `netif`, so it is
   applied in `espix_net_register_if()` rather than in the WiFi path — every
@@ -657,6 +657,11 @@ Three things worth knowing:
 - **Credentials in `/etc/wifi.conf` are plaintext.** Consistent with the
   trusted-code-only model: there is no permissions system, and any app can
   already read any file.
+- **Ethernet media is read back from the PHY, not the netif.** Nothing in
+  `esp_netif` exposes the negotiated speed or duplex, so `eth.c` keeps what the
+  connect event read and `ifconfig` prints it as net-tools' `media:` line
+  (`1000baseT <full-duplex>`, or `(none)` with no carrier). A 10/100/1000
+  mismatch is otherwise invisible until something is slow.
 - **Retries back off, and distinguish two kinds of failure.** 5s doubling to a
   60s ceiling, because a flat interval retried forever splats the prompt every
   few seconds indefinitely and churns the 96-line klog ring until boot history
