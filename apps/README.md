@@ -55,10 +55,18 @@ publishes: the ELF loader's own libc/IDF tables, plus espix's
 (`espix_net/abi.c` for sockets and name resolution, `espix_proc/abi_cxx.cpp` for
 the C++ runtime, `espix_proc/abi_drivers.c` for peripherals and FreeRTOS).
 
-espix publishes **only** libc, FreeRTOS, ESP-IDF and its own calls. It does not
-publish an Arduino API: a sketch gets Arduino by linking the Arduino component
-into the app, which is why `apps/neopixel` carries that dependency and the
-firmware does not.
+espix publishes **only** libc, libm, FreeRTOS, ESP-IDF and its own calls. It does
+not publish an Arduino API: a sketch gets Arduino by linking the Arduino
+component into the app, which is why `apps/neopixel` carries that dependency and
+the firmware does not.
+
+libm is published by `espix_proc/abi_libm.c` — `sinf`, `sqrtf`, `atan2f`,
+`powf` and the rest — because an app cannot carry its own. An app is linked
+`-fPIC -shared` and the toolchain's `libm.a` is not PIC, so `ld` refuses it
+("relocation R_RISCV_HI20 ... can not be used when making a shared object").
+The firmware already links `-lm`; naming the calls is what pulls them into the
+image. The S31 has a hardware FPU, so `sqrtf`/`fabsf`/`floorf` are single
+instructions and this is not the compromise it would be on a chip without one.
 
 Anything not in those tables fails the load with `Can't find symbol X` — the
 loader names it, on the line directly above espix's own `relocation failed`, and

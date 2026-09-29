@@ -274,6 +274,7 @@ void espix_proc_abi_fs_register(void);
 /* The app identity calls: getuid/geteuid, getgid/getegid. */
 void espix_proc_abi_ident_register(void);
 void espix_proc_abi_libc_register(void);
+void espix_proc_abi_libm_register(void);
 
 /* Publish the POSIX signal surface, and interpose the blocking calls that have
  * to become delivery points. See abi_signal.c: this one installs a symbol
