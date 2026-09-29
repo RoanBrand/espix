@@ -319,6 +319,7 @@ static void task_button_damage(espix_window_t *w);
 static void window_present(espix_window_t *w);
 static void menu_paint(espix_canvas_t *c, espix_rect_t r);
 static espix_rect_t menu_rect(void);
+static espix_rect_t bar_rect(void);
 static void bar_damage(void);
 
 /* How often a drag lets the screen catch up. See the note where it is used. */
@@ -917,9 +918,25 @@ void espix_window_move(espix_window_t *w, int x, int y)
      */
     const int cw = (c != NULL) ? espix_canvas_width(c)  : 0;
     const int ch = (c != NULL) ? espix_canvas_height(c) : 0;
-    const espix_rect_t src = rect_meet(from, (espix_rect_t){ 0, 0, cw, ch });
-    const espix_rect_t dst = { src.x + (x - from.x), src.y + (y - from.y),
-                               src.w, src.h };
+    /*
+     * The taskbar is painted over every window, so the canvas pixels it covers
+     * are the taskbar's, not the window's. Neither end of the copy may cross
+     * into it: a source taken across it would paste the taskbar into the window
+     * when the window is dragged back up, and a destination inside it would
+     * leave window pixels where the taskbar belongs -- and, because the damage
+     * subtracts the copy, stop the taskbar being repainted there at all. So the
+     * copy lives in the work area above the bar, and the window's part below it
+     * goes as pixels, which is what the canvas holds there anyway.
+     */
+    const espix_rect_t bar = bar_rect();
+    espix_rect_t src = rect_meet(from, (espix_rect_t){ 0, 0, cw, bar.y });
+    espix_rect_t dst = { src.x + (x - from.x), src.y + (y - from.y),
+                         src.w, src.h };
+    if (dst.y + dst.h > bar.y) {
+        const int cut = dst.y + dst.h - bar.y;
+        src.h -= cut;
+        dst.h -= cut;
+    }
 
     /*
      * The fast path, and the one a drag always takes: the press raised the
