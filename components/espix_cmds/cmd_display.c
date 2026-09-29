@@ -336,7 +336,7 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
             espix_eprintf(s, "usage: display size <w>x<h>\n");
             return 1;
         }
-        if (w < 320 || h < 200 || w > 1920 || h > 1200) {
+        if (!espix_display_size_ok(w, h)) {
             espix_eprintf(s, "display: %dx%d out of range (320x200 .. 1920x1200)\n",
                           w, h);
             return 1;

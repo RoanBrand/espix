@@ -404,6 +404,10 @@ bool            espix_display_ready(void);
  */
 esp_err_t       espix_display_resize(int w, int h);
 
+/* Whether a size is one this service will take. Shared so the command, the
+ * settings panel and the config file cannot disagree about the range. */
+bool            espix_display_size_ok(int w, int h);
+
 /*
  * Bring the desktop up, and take it down.
  *

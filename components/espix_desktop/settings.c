@@ -21,8 +21,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_timer.h"
+
 #include "espix_bt.h"
 #include "espix_desktop.h"
+#include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_widgets.h"
@@ -48,6 +51,10 @@ static const char *const s_section_names[SEC_COUNT] = {
 typedef enum {
     ACT_NONE = 0,
     ACT_RESOLUTION,
+    ACT_RES_APPLY,
+    ACT_RES_CANCEL,
+    ACT_RES_KEEP,
+    ACT_RES_REVERT,
     ACT_DEPTH,
     ACT_SCAN,
     ACT_UNPAIR,
@@ -94,6 +101,68 @@ static int             s_nif;
 static uint32_t        s_gw;
 static char            s_ifname[ESPIX_IF_NAME_MAX];
 static char            s_dns[ESPIX_IP4STR_MAX * 4];
+
+/*
+ * The resolution dialog.
+ *
+ * Choosing a mode does not apply it -- it asks first -- and applying starts a
+ * ten-second countdown that puts the old size back unless it is confirmed. That
+ * is not ceremony: a size the viewer cannot handle is exactly the case where
+ * you cannot click "undo", so the undo has to happen by itself.
+ */
+typedef enum {
+    CONF_NONE = 0,
+    CONF_CONFIRM,
+    CONF_REVERT,
+} conf_state_t;
+
+static const struct { int w, h; } s_modes[] = {
+    { 800, 600 }, { 1024, 768 }, { 1280, 800 }, { 1920, 1080 },
+};
+#define NMODES ((int)(sizeof(s_modes) / sizeof(s_modes[0])))
+
+static conf_state_t       s_conf;
+static int                s_conf_w, s_conf_h;       /* the size being confirmed */
+static int                s_conf_prev_w, s_conf_prev_h;
+static int                s_conf_left;              /* seconds left to confirm */
+static esp_timer_handle_t s_conf_timer;
+
+static void canvas_size(int *w, int *h)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    *w = c != NULL ? espix_canvas_width(c) : 0;
+    *h = c != NULL ? espix_canvas_height(c) : 0;
+}
+
+/* Nobody confirmed: put the previous size back and stop asking. */
+static void conf_tick(void *arg)
+{
+    (void)arg;
+    if (s_conf != CONF_REVERT) {
+        return;
+    }
+    if (--s_conf_left <= 0) {
+        /* Cleared before the resize, because the resize repaints the desktop
+         * and would otherwise draw the dialog it is dismissing. */
+        s_conf = CONF_NONE;
+        if (s_conf_timer != NULL) {
+            esp_timer_stop(s_conf_timer);
+        }
+        (void)espix_display_resize(s_conf_prev_w, s_conf_prev_h);
+        return;
+    }
+    if (s_win != NULL) {
+        espix_window_repaint(s_win);
+    }
+}
+
+static void conf_end(void)
+{
+    if (s_conf_timer != NULL) {
+        esp_timer_stop(s_conf_timer);
+    }
+    s_conf = CONF_NONE;
+}
 
 /* ------------------------------------------------------------------ */
 /* Layout                                                              */
@@ -184,15 +253,53 @@ static int section_rows(const espix_window_t *w, row_t *rows)
     char buf[64];
 
     switch (s_sec) {
-    case SEC_SCREEN:
+    case SEC_SCREEN: {
+        int cw, ch;
+        canvas_size(&cw, &ch);
+
         rows[n++] = (row_t){ ROW_HEAD, "Display", NULL, true, false, ACT_NONE, 0 };
+
+        if (s_conf == CONF_CONFIRM) {
+            snprintf(s_val[n], sizeof(s_val[n]), "%d x %d", s_conf_w, s_conf_h);
+            rows[n++] = (row_t){ ROW_FIELD, "Change the screen to",
+                                 s_val[n], true, false, ACT_NONE, 0 };
+            rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
+            rows[n++] = (row_t){ ROW_BUTTON, "Apply", NULL, true, false,
+                                 ACT_RES_APPLY, 0 };
+            rows[n++] = (row_t){ ROW_BUTTON, "Cancel", NULL, true, false,
+                                 ACT_RES_CANCEL, 0 };
+            break;
+        }
+
+        if (s_conf == CONF_REVERT) {
+            snprintf(s_val[n], sizeof(s_val[n]), "%d x %d",
+                     s_conf_prev_w, s_conf_prev_h);
+            rows[n++] = (row_t){ ROW_FIELD, "Keep this size, or revert to",
+                                 s_val[n], true, false, ACT_NONE, 0 };
+            snprintf(s_val[n], sizeof(s_val[n]), "%d s", s_conf_left);
+            rows[n++] = (row_t){ ROW_FIELD, "Reverting in", s_val[n], true,
+                                 false, ACT_NONE, 0 };
+            rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
+            rows[n++] = (row_t){ ROW_BUTTON, "Keep", NULL, true, false,
+                                 ACT_RES_KEEP, 0 };
+            rows[n++] = (row_t){ ROW_BUTTON, "Revert now", NULL, true, false,
+                                 ACT_RES_REVERT, 0 };
+            break;
+        }
+
+        snprintf(s_val[n], sizeof(s_val[n]), "%d x %d", cw, ch);
+        rows[n++] = (row_t){ ROW_FIELD, "Current size", s_val[n], true, false,
+                             ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_TEXT, "Resolution", NULL, true, false, ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_RADIO, "800 x 600  (current)", NULL, true, true,
-                             ACT_RESOLUTION, 0 };
-        rows[n++] = (row_t){ ROW_RADIO, "1024 x 768", NULL, false, false,
-                             ACT_RESOLUTION, 1 };
-        rows[n++] = (row_t){ ROW_RADIO, "1280 x 800", NULL, false, false,
-                             ACT_RESOLUTION, 2 };
+
+        for (int i = 0; i < NMODES; i++) {
+            const bool cur = (s_modes[i].w == cw && s_modes[i].h == ch);
+            snprintf(s_val[n], sizeof(s_val[n]), "%d x %d",
+                     s_modes[i].w, s_modes[i].h);
+            rows[n++] = (row_t){ ROW_RADIO, s_val[n], NULL, !cur, cur,
+                                 ACT_RESOLUTION, i };
+        }
+
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_TEXT, "Colour depth", NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_RADIO, "High colour  (RGB565, 16-bit, current)",
@@ -201,11 +308,12 @@ static int section_rows(const espix_window_t *w, row_t *rows)
                              NULL, false, false, ACT_DEPTH, 1 };
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_TEXT,
-                             "Neither changes without a restart, so both",
+                             "Colour depth wants a panel; it is shown and",
                              NULL, false, false, ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_TEXT, "are shown and not offered.", NULL,
+        rows[n++] = (row_t){ ROW_TEXT, "not offered until one exists.", NULL,
                              false, false, ACT_NONE, 0 };
         break;
+    }
 
     case SEC_NETWORK:
         rows[n++] = (row_t){ ROW_HEAD, "Network", NULL, true, false, ACT_NONE, 0 };
@@ -382,6 +490,55 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             continue;
         }
         switch (rows[i].action) {
+        case ACT_RESOLUTION: {
+            const int m = rows[i].arg;
+            if (m >= 0 && m < NMODES) {
+                s_conf_w = s_modes[m].w;
+                s_conf_h = s_modes[m].h;
+                s_conf   = CONF_CONFIRM;
+            }
+            break;
+        }
+        case ACT_RES_APPLY: {
+            int cw, ch;
+            canvas_size(&cw, &ch);
+            const int pw = cw, ph = ch;
+
+            if (espix_display_resize(s_conf_w, s_conf_h) != ESP_OK) {
+                conf_end();
+                break;
+            }
+
+            s_conf_prev_w = pw;
+            s_conf_prev_h = ph;
+            s_conf_left   = 10;
+            s_conf        = CONF_REVERT;
+
+            if (s_conf_timer == NULL) {
+                const esp_timer_create_args_t args = {
+                    .callback = conf_tick,
+                    .name     = "settings-conf",
+                };
+                if (esp_timer_create(&args, &s_conf_timer) != ESP_OK) {
+                    s_conf_timer = NULL;
+                }
+            }
+            if (s_conf_timer != NULL) {
+                esp_timer_stop(s_conf_timer);
+                esp_timer_start_periodic(s_conf_timer, 1000 * 1000);
+            }
+            break;
+        }
+        case ACT_RES_CANCEL:
+            conf_end();
+            break;
+        case ACT_RES_KEEP:
+            conf_end();
+            break;
+        case ACT_RES_REVERT:
+            (void)espix_display_resize(s_conf_prev_w, s_conf_prev_h);
+            conf_end();
+            break;
         case ACT_DEVICE:
             s_dev_sel = (s_dev_sel == rows[i].arg) ? -1 : rows[i].arg;
             break;

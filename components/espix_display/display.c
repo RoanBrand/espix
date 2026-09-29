@@ -29,9 +29,59 @@
 #endif
 
 #include "espix_display.h"
+#include "espix_fs.h"
 #include "espix_kernel.h"
 
 #define TAG "display"
+
+/*
+ * The screen size, remembered across boots.
+ *
+ * One key=value per line like every other espix config: /etc/display.conf with
+ * width= and height=. Absent or malformed means the built-in default, so a board
+ * that has never been resized reads exactly as it did before this existed, and a
+ * hand-written file works too.
+ */
+#define DISPLAY_CONF_PATH "/etc/display.conf"
+
+bool espix_display_size_ok(int w, int h)
+{
+    return w >= 320 && w <= 1920 && h >= 200 && h <= 1200;
+}
+
+static bool display_conf_read(int *w, int *h)
+{
+    char b[16];
+
+    if (!espix_fs_conf_get(DISPLAY_CONF_PATH, "width", b, sizeof(b))) {
+        return false;
+    }
+    const int rw = atoi(b);
+    if (!espix_fs_conf_get(DISPLAY_CONF_PATH, "height", b, sizeof(b))) {
+        return false;
+    }
+    const int rh = atoi(b);
+
+    if (!espix_display_size_ok(rw, rh)) {
+        return false;
+    }
+    *w = rw;
+    *h = rh;
+    return true;
+}
+
+static void display_conf_write(int w, int h)
+{
+    FILE *f = fopen(DISPLAY_CONF_PATH, "w");
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot write %s", DISPLAY_CONF_PATH);
+        return;
+    }
+    fprintf(f, "# espix display configuration\n");
+    fprintf(f, "width=%d\n", w);
+    fprintf(f, "height=%d\n", h);
+    fclose(f);
+}
 
 /*
  * This target's accelerator blocks, for the benchmark to report against: the
@@ -1605,6 +1655,9 @@ esp_err_t espix_display_resize(int w, int h)
     if (s_ptr_x > w - 1) { s_ptr_x = w - 1; }
     if (s_ptr_y > h - 1) { s_ptr_y = h - 1; }
 
+    /* Remembered now, so a reboot comes back at the size that was chosen. */
+    display_conf_write(w, h);
+
     espix_klog(ESPIX_KLOG_INFO, TAG, "display resized to %dx%d", w, h);
 
     /*
@@ -1624,10 +1677,13 @@ static esp_err_t display_up(void)
         return ESP_OK;
     }
 
-    s_canvas = espix_canvas_new(ESPIX_DISPLAY_W, ESPIX_DISPLAY_H, "espix");
+    /* Whatever /etc/display.conf last saved, or the built-in default. */
+    int w = ESPIX_DISPLAY_W, h = ESPIX_DISPLAY_H;
+    (void)display_conf_read(&w, &h);
+
+    s_canvas = espix_canvas_new(w, h, "espix");
     if (s_canvas == NULL) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG,
-                   "cannot allocate a %dx%d canvas", ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot allocate a %dx%d canvas", w, h);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1637,8 +1693,8 @@ static esp_err_t display_up(void)
      * copy per event and a priority puzzle -- which is exactly what the old
      * desktop task needed one to paper over.
      */
-    s_ptr_x = ESPIX_DISPLAY_W / 3;
-    s_ptr_y = ESPIX_DISPLAY_H / 3;
+    s_ptr_x = w / 3;
+    s_ptr_y = h / 3;
 
     s_up = true;
 
@@ -1648,8 +1704,7 @@ static esp_err_t display_up(void)
      * behaved clients ask for a full update first and this is simply dropped.
      */
     espix_canvas_lock(s_canvas);
-    espix_canvas_damage(s_canvas,
-                        (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H });
+    espix_canvas_damage(s_canvas, (espix_rect_t){ 0, 0, w, h });
     espix_canvas_unlock(s_canvas);
 
     /*
@@ -1658,12 +1713,10 @@ static esp_err_t display_up(void)
      * one that attaches while something already owns the screen gets that.
      */
     espix_canvas_lock(s_canvas);
-    espix_canvas_fill(s_canvas,
-                      (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
-                      COL_BG);
+    espix_canvas_fill(s_canvas, (espix_rect_t){ 0, 0, w, h }, COL_BG);
     espix_canvas_unlock(s_canvas);
 
-    espix_klog(ESPIX_KLOG_INFO, TAG, "display %dx%d up", ESPIX_DISPLAY_W, ESPIX_DISPLAY_H);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "display %dx%d up", w, h);
     return ESP_OK;
 }
 
