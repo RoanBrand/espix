@@ -238,6 +238,12 @@ void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
 void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
                                     const espix_surface_t *s, espix_rect_t r);
 
+/*
+ * Scale a surface to fill the canvas -- the whole-canvas case a game wants:
+ * render small, and let PPA stretch it to whatever the screen is.
+ */
+void espix_canvas_scale_surface(espix_canvas_t *c, const espix_surface_t *s);
+
 /* ------------------------------------------------------------------ */
 /* Images                                                              */
 /* ------------------------------------------------------------------ */

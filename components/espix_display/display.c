@@ -1043,6 +1043,26 @@ void espix_canvas_blit_surface(espix_canvas_t *c, int x, int y,
                                    (espix_rect_t){ 0, 0, s->w, s->h });
 }
 
+/* Defined with the surface scaler below; this is the canvas's entry to it. */
+static void sw_scale(espix_px_t *dst, int dw, int dh,
+                     const espix_px_t *src, int sw, int sh);
+
+void espix_canvas_scale_surface(espix_canvas_t *c, const espix_surface_t *s)
+{
+    if (c == NULL || s == NULL || s->w <= 0 || s->h <= 0) {
+        return;
+    }
+
+#if SOC_PPA_SUPPORTED
+    if (ppa_scale_rect(c->px, c->w, c->h, s->px, s->w, s->h)) {
+        espix_canvas_damage(c, (espix_rect_t){ 0, 0, c->w, c->h });
+        return;
+    }
+#endif
+    sw_scale(c->px, c->w, c->h, s->px, s->w, s->h);
+    espix_canvas_damage(c, (espix_rect_t){ 0, 0, c->w, c->h });
+}
+
 /* ------------------------------------------------------------------ */
 /* Surfaces                                                            */
 /* ------------------------------------------------------------------ */

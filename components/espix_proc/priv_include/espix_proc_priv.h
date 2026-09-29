@@ -258,6 +258,9 @@ void espix_proc_abi_cxx_register(void);
 void espix_proc_abi_drivers_register(void);
 void espix_proc_abi_time_register(void);
 
+/* Publish the screen and the input queue to an app. See abi_gfx.c. */
+void espix_proc_abi_gfx_register(void);
+
 /* Publish the filesystem an app needs: fopen, open, stat, opendir and the rest,
  * plus espix's own chdir/getcwd because IDF's are stubs. See abi_fs.c -- almost
  * all of it is unwrapped libc, because those calls already dispatch into

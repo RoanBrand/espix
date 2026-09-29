@@ -11,6 +11,7 @@ idf_component_register(
         "abi_ident.c"
         "abi_signal.c"
         "abi_time.c"
+        "abi_gfx.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -22,6 +23,8 @@ idf_component_register(
     PRIV_REQUIRES
         espix_fs
         espix_shell
+        # abi_gfx.c publishes the screen and its input queue to apps.
+        espix_display
         espressif__elf_loader
         esp_timer
         heap
