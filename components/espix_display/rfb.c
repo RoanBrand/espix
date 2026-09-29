@@ -1451,8 +1451,8 @@ static void rfb_task(void *arg)
      * "Unimplemented: send buffer size" in its own header, and TCP_SNDBUF is
      * not a socket option either. What a socket may queue is the compile-time
      * TCP_SND_BUF (CONFIG_LWIP_TCP_SND_BUF_DEFAULT), which
-     * sdkconfig.defaults.esp32s31 raises to 32768 -- without it, a frame that
-     * should cost microseconds took 39 ms of round trips.
+     * sdkconfig.defaults.esp32s31 raises to 114688 -- without it, a frame that
+     * should cost microseconds took several round trips on the wire.
      *
      * Which is fine, because it is a ceiling on *queued* bytes and not a
      * reservation: nothing is charged per connection, and each byte is
