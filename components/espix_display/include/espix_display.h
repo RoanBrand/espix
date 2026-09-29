@@ -78,6 +78,16 @@ typedef struct espix_canvas espix_canvas_t;
 espix_canvas_t *espix_canvas_new(int w, int h, const char *name);
 void            espix_canvas_free(espix_canvas_t *c);
 
+/*
+ * Replace the canvas's pixel buffer at a new size, in place.
+ *
+ * The object keeps its identity, so a caller that fetched it before the resize
+ * is not left holding freed memory; only the buffer changes. Everything the
+ * canvas held is discarded and the whole of it is marked damaged, because a
+ * resize is a full repaint from the owner's model.
+ */
+esp_err_t       espix_canvas_resize(espix_canvas_t *c, int w, int h);
+
 int         espix_canvas_width(const espix_canvas_t *c);
 int         espix_canvas_height(const espix_canvas_t *c);
 const char *espix_canvas_name(const espix_canvas_t *c);
@@ -333,6 +343,12 @@ typedef struct {
     const char *name;
     void (*input)(void *ctx, const espix_input_event_t *ev);
     void (*repaint)(void *ctx);   /* redraw the whole canvas from your model */
+    /*
+     * The canvas changed size. Re-clamp whatever absolute coordinates you hold
+     * and repaint. Optional: a screen that lays itself out relative to the
+     * canvas every time needs nothing here. Called with the canvas unlocked.
+     */
+    void (*resized)(void *ctx);
     void *ctx;
 } espix_screen_t;
 
@@ -378,6 +394,15 @@ void espix_display_viewer_detached(void);
 /* The desktop canvas, or NULL when the display is down. */
 espix_canvas_t *espix_display_canvas(void);
 bool            espix_display_ready(void);
+
+/*
+ * Resize the screen, live. Reallocates the canvas, marks it damaged, and tells
+ * the current owner so it can re-lay out. A viewer keeps its connection: the
+ * RFB backend reports the new size with the ExtendedDesktopSize pseudo-encoding
+ * and reallocates its staging copy. Fails with ESP_ERR_NO_MEM if the new buffer
+ * does not fit, leaving the current size in place.
+ */
+esp_err_t       espix_display_resize(int w, int h);
 
 /*
  * Bring the desktop up, and take it down.

@@ -324,7 +324,42 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    espix_eprintf(s, "usage: display [start | stop | status | bench [jpeg]]\n");
+    /*
+     * Live resize. The canvas is reallocated in place and a connected viewer is
+     * told with ExtendedDesktopSize, so this does not drop the connection -- a
+     * client that never offered that encoding is dropped and reconnects at the
+     * new size instead.
+     */
+    if (strcmp(sub, "size") == 0) {
+        int w = 0, h = 0;
+        if (argc < 3 || sscanf(argv[2], "%dx%d", &w, &h) != 2) {
+            espix_eprintf(s, "usage: display size <w>x<h>\n");
+            return 1;
+        }
+        if (w < 320 || h < 200 || w > 1920 || h > 1200) {
+            espix_eprintf(s, "display: %dx%d out of range (320x200 .. 1920x1200)\n",
+                          w, h);
+            return 1;
+        }
+        const esp_err_t err = espix_display_resize(w, h);
+        if (err == ESP_ERR_INVALID_STATE) {
+            espix_eprintf(s, "display: not up\n");
+            return 1;
+        }
+        if (err == ESP_ERR_NO_MEM) {
+            espix_eprintf(s, "display: no memory for a %dx%d canvas\n", w, h);
+            return 1;
+        }
+        if (err != ESP_OK) {
+            espix_eprintf(s, "display: resize failed: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "display: %dx%d\n", w, h);
+        return 0;
+    }
+
+    espix_eprintf(s, "usage: display [start | stop | status | size <w>x<h> | "
+                     "bench [jpeg]]\n");
     return 1;
 }
 
@@ -379,7 +414,7 @@ static espix_cmd_t s_display_cmds[] = {
       .usage = "vnc [start [port] | stop | status | password <pw> | nopassword]" },
     { .name = "display", .fn = cmd_display,
       .help = "the desktop on its own: the canvas a panel or local input uses",
-      .usage = "display [start | stop | status | bench [jpeg]]" },
+      .usage = "display [start | stop | status | size <w>x<h> | bench [jpeg]]" },
     { .name = "desktop", .fn = cmd_desktop,
       .help = "the placeholder desktop, so the pointer has something to draw on",
       .usage = "desktop [start | stop | status]" },

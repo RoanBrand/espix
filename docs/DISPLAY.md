@@ -421,7 +421,23 @@ espix> vnc stop               # stops the listener and frees the canvas
 
 espix> display start          # the canvas alone: what a panel or local input uses
 espix> desktop start          # the placeholder desktop, so there is something to draw on
+espix> display size 1024x768  # live resize; the viewer resizes, it does not reconnect
 ```
+
+### Resizing, live
+
+`display size <w>x<h>` reallocates the canvas in place and tells an attached
+viewer with the RFB **ExtendedDesktopSize** pseudo-encoding, so the client
+resizes its framebuffer on the *same connection* -- no reconnect, no reboot. The
+desktop re-clamps its windows into the new bounds (the same keep-a-strip-visible
+rule a drag uses) and repaints; window surfaces are per-window, so they survive
+untouched. A client that never offered that encoding cannot be resized in place,
+so it is dropped instead and reconnects at the new size -- ServerInit is only
+ever sent once.
+
+The size is **runtime only**: it reverts to the built-in 800x600 on a reboot.
+And the on-screen console does not reflow, because its terminal grid is a fixed
+96x71; it repaints into the same grid rather than growing with the canvas.
 
 There is a password out of the box, so there is nothing to set up: it is the
 built-in default `espix`. That default is **public**, and deliberately so -- it

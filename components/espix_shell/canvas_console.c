@@ -68,6 +68,13 @@ static const espix_screen_t s_console_screen = {
     .name    = "vnc-console",
     .input   = con_input,
     .repaint = con_repaint,
+    /*
+     * The grid is a fixed CON_COLS x CON_ROWS (the terminal has no reflow), so
+     * a resize cannot give the console more room -- but the canvas it drew into
+     * is gone, so it must at least draw its grid again or the screen stays
+     * blank until the next output.
+     */
+    .resized = con_repaint,
     .ctx     = NULL,
 };
 

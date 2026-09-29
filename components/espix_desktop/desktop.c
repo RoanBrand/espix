@@ -214,10 +214,11 @@ static void cursor_hide(void)
         return;
     }
 
+    /* Dimensions under the lock: a live resize can change them, and this loop
+     * indexes the buffer with cw. */
+    espix_canvas_lock(c);
     const int cw = espix_canvas_width(c);
     const int ch = espix_canvas_height(c);
-
-    espix_canvas_lock(c);
     espix_px_t *px = espix_canvas_pixels(c);
 
     for (int by = 0; by < CUR_BH; by++) {
@@ -243,6 +244,7 @@ static void cursor_show(int hx, int hy)
         return;
     }
 
+    espix_canvas_lock(c);
     const int cw = espix_canvas_width(c);
     const int ch = espix_canvas_height(c);
 
@@ -251,7 +253,6 @@ static void cursor_show(int hx, int hy)
     if (hx > cw - 1) { hx = cw - 1; }
     if (hy > ch - 1) { hy = ch - 1; }
 
-    espix_canvas_lock(c);
     espix_px_t *px = espix_canvas_pixels(c);
 
     s_cx = hx;
@@ -2428,10 +2429,45 @@ static void desktop_repaint(void *ctx)
     espix_desktop_repaint();
 }
 
+/*
+ * The canvas changed size under us. Windows hold absolute coordinates, so a
+ * smaller screen can leave a title bar off the edge -- the same keep-a-strip
+ * rule the drag uses, applied in place. There is nothing to move on the canvas
+ * because it is brand new; the surfaces are per-window and survived, so this is
+ * a repaint from the model.
+ */
+static void desktop_resized(void *ctx)
+{
+    (void)ctx;
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+    const int cw = espix_canvas_width(c);
+    const int ch = espix_canvas_height(c);
+
+    for (int i = 0; i < s_nwin; i++) {
+        espix_window_t *w = s_wins[i];
+        if (w->x + w->w < 32) { w->x = 32 - w->w; }
+        if (w->x > cw - 32)   { w->x = cw - 32; }
+        if (w->y < 0)         { w->y = 0; }
+        if (w->y > ch - TASKBAR_H - TITLE_H) { w->y = ch - TASKBAR_H - TITLE_H; }
+    }
+
+    /* The cursor's save-under holds pixels from the old canvas, and its
+     * position may now be off the screen. */
+    s_cursor_on = false;
+    if (s_cx > cw - 1) { s_cx = cw - 1; }
+    if (s_cy > ch - 1) { s_cy = ch - 1; }
+
+    espix_desktop_repaint();
+}
+
 static const espix_screen_t s_desktop_screen = {
     .name    = "desktop",
     .input   = desktop_input,
     .repaint = desktop_repaint,
+    .resized = desktop_resized,
 };
 
 esp_err_t espix_desktop_start(void)

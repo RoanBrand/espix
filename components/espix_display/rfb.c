@@ -202,6 +202,13 @@ enum {
     RFB_ENC_HEXTILE  = 5,
 };
 
+/*
+ * ExtendedDesktopSize is a pseudo-encoding: a negative 32-bit number. It is
+ * what lets a client be told the screen changed size without reconnecting, and
+ * the only way a resize is live on the same connection.
+ */
+#define RFB_ENC_EXTENDED_DESKTOP_SIZE  0xFFFFBEC1u
+
 /* ------------------------------------------------------------------ */
 /* Byte order helpers                                                  */
 /* ------------------------------------------------------------------ */
@@ -825,8 +832,10 @@ typedef struct {
     bool      pending;        /* an update is owed to the client */
     bool      pending_full;   /* ...and it asked for a whole frame */
     bool      copyrect;       /* ...and it can be told to move pixels itself */
+    bool      eds;            /* ...and it can be resized without reconnecting */
     bool      logged_req;     /* the first request is worth one line */
     bool      logged_send;    /* and so is the first update */
+    int       stage_w, stage_h; /* the size stage and row were allocated for */
     espix_px_t *stage;        /* canvas copy, so encoding is off the lock */
     uint8_t    *out;
     uint8_t    *row;
@@ -894,6 +903,81 @@ static void send_stat(int64_t us, size_t rects)
     s_send_stat.worst = 0;
 }
 
+/*
+ * Tell the client the screen changed size (ExtendedDesktopSize).
+ *
+ * One FramebufferUpdate carrying one rectangle whose "encoding" is the
+ * pseudo-encoding and whose payload is a single screen at the origin. The
+ * client resizes its framebuffer and asks again -- which is what makes a resize
+ * live on the same connection rather than a reconnect.
+ */
+static bool send_desktop_size(rfb_conn_t *c, int w, int h)
+{
+    uint8_t b[4 + 12 + 1 + 16];
+
+    b[0] = 0;                       /* FramebufferUpdate */
+    b[1] = 0;
+    wr16(b + 2, 1);                 /* one rectangle */
+
+    uint8_t *r = b + 4;
+    wr16(r + 0, 0);
+    wr16(r + 2, 0);
+    wr16(r + 4, (uint16_t)w);
+    wr16(r + 6, (uint16_t)h);
+    wr32(r + 8, RFB_ENC_EXTENDED_DESKTOP_SIZE);
+    r[12] = 1;                      /* number of screens */
+    wr32(r + 13, 0);                /* screen id */
+    wr16(r + 17, 0);
+    wr16(r + 19, 0);
+    wr16(r + 21, (uint16_t)w);
+    wr16(r + 23, (uint16_t)h);
+    wr32(r + 25, 0);                /* flags */
+
+    return write_full(c->fd, b, sizeof(b));
+}
+
+/*
+ * The canvas changed size under a live connection: give the staging copy and
+ * the row scratch the new dimensions, then tell the client. A client that never
+ * offered ExtendedDesktopSize cannot be resized in place, so it is dropped and
+ * reconnects at the new size -- ServerInit is only ever sent once.
+ */
+static bool connection_resize(rfb_conn_t *c, int w, int h)
+{
+    espix_px_t *stage = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t    *row   = heap_caps_malloc((size_t)w * 4,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stage == NULL) {
+        stage = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
+                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (row == NULL) {
+        row = heap_caps_malloc((size_t)w * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (stage == NULL || row == NULL) {
+        heap_caps_free(stage);
+        heap_caps_free(row);
+        return false;
+    }
+
+    heap_caps_free(c->stage);
+    heap_caps_free(c->row);
+    c->stage   = stage;
+    c->row     = row;
+    c->stage_w = w;
+    c->stage_h = h;
+
+    if (!c->eds) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "client cannot resize; dropping it to reconnect at %dx%d", w, h);
+        return false;
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "client told the screen is now %dx%d", w, h);
+    return send_desktop_size(c, w, h);
+}
+
 static bool update_send(rfb_conn_t *c)
 {
     const int64_t  t0 = esp_timer_get_time();
@@ -906,6 +990,19 @@ static bool update_send(rfb_conn_t *c)
 
     const int cw = espix_canvas_width(cv);
     const int ch = espix_canvas_height(cv);
+
+    /*
+     * The screen can change size under a live connection. Reallocate to match
+     * before anything reads the stage, then tell the client; the frame itself
+     * follows on the request the client sends once it has resized.
+     */
+    if (cw != c->stage_w || ch != c->stage_h) {
+        if (!connection_resize(c, cw, ch)) {
+            return false;
+        }
+        c->pending = false;
+        return true;
+    }
 
     espix_rect_t rects[ESPIX_DISPLAY_DAMAGE_MAX];
     espix_rect_t keep[ESPIX_DISPLAY_DAMAGE_MAX];
@@ -1126,20 +1223,25 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
         const uint16_t n = rd16(buf + 1);
         bool           hextile  = false;
         bool           copyrect = false;
+        bool           eds      = false;
 
         for (uint16_t i = 0; i < n; i++) {
             uint8_t e[4];
             if (!read_full(c->fd, e, sizeof(e))) {
                 return false;
             }
-            if (rd32(e) == RFB_ENC_HEXTILE) {
+            const uint32_t enc = rd32(e);
+            if (enc == RFB_ENC_HEXTILE) {
                 hextile = true;
-            } else if (rd32(e) == RFB_ENC_COPYRECT) {
+            } else if (enc == RFB_ENC_COPYRECT) {
                 copyrect = true;
+            } else if (enc == RFB_ENC_EXTENDED_DESKTOP_SIZE || enc == 0x0000C801u) {
+                eds = true;
             }
         }
         c->hextile  = hextile;
         c->copyrect = copyrect;
+        c->eds      = eds;
         snprintf(s_encodings, sizeof(s_encodings), "%u offered: hextile %s, "
                  "copyrect %s", n, hextile ? "yes" : "no",
                  copyrect ? "yes" : "no");
@@ -1150,8 +1252,8 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
          * the outside which it is.
          */
         espix_klog(ESPIX_KLOG_INFO, TAG, "client offered %u encodings: hextile "
-                   "%s, copyrect %s (%s)", n, hextile ? "yes" : "no",
-                   copyrect ? "yes" : "no",
+                   "%s, copyrect %s%s (%s)", n, hextile ? "yes" : "no",
+                   copyrect ? "yes" : "no", eds ? ", resize yes" : "",
                    copyrect ? "drags will be copies" : "drags will be pixels");
         return true;
     }
@@ -1504,6 +1606,10 @@ static void rfb_serve(int fd)
         heap_caps_free(c.row);
         return;
     }
+
+    /* What stage and row were sized for; a change here is a live resize. */
+    c.stage_w = cw;
+    c.stage_h = ch;
 
     /*
      * Timed, because it is what tells the two failures apart: a client that

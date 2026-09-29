@@ -197,6 +197,51 @@ void espix_canvas_free(espix_canvas_t *c)
     free(c);
 }
 
+/*
+ * Replace the pixel buffer, in place, at a new size.
+ *
+ * The object is not reallocated on purpose: the desktop and the RFB connection
+ * both fetch the canvas per call rather than caching it, so keeping its identity
+ * and swapping only the buffer is what makes a live resize safe to do from
+ * another task. The swap is under the canvas lock, so a draw runs entirely
+ * before it or entirely after -- and every draw reads its width, height and
+ * pixels *after* taking that lock.
+ *
+ * The new buffer is allocated before the lock is taken, so a resize that cannot
+ * fit leaves the current canvas exactly as it was.
+ */
+esp_err_t espix_canvas_resize(espix_canvas_t *c, int w, int h)
+{
+    if (c == NULL || w <= 0 || h <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (w == c->w && h == c->h) {
+        return ESP_OK;
+    }
+
+    espix_px_t *px = buf_alloc(buf_size(w, h));
+    if (px == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    espix_canvas_lock(c);
+
+    espix_px_t *old = c->px;
+    c->px      = px;
+    c->w       = w;
+    c->h       = h;
+    c->ndamage = 0;
+    c->nmoves  = 0;
+    espix_canvas_damage(c, (espix_rect_t){ 0, 0, w, h });
+
+    espix_canvas_unlock(c);
+
+    /* Nothing can still reference it: the swap was under the lock, and no
+     * caller holds a pixel pointer across an unlock. */
+    heap_caps_free(old);
+    return ESP_OK;
+}
+
 int         espix_canvas_width(const espix_canvas_t *c)  { return c->w; }
 int         espix_canvas_height(const espix_canvas_t *c) { return c->h; }
 const char *espix_canvas_name(const espix_canvas_t *c)   { return c->name; }
@@ -1541,6 +1586,37 @@ void espix_display_viewer_detached(void)
 
 espix_canvas_t *espix_display_canvas(void) { return s_canvas; }
 bool            espix_display_ready(void)  { return s_up; }
+
+esp_err_t espix_display_resize(int w, int h)
+{
+    if (!s_up || s_canvas == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (w == espix_canvas_width(s_canvas) && h == espix_canvas_height(s_canvas)) {
+        return ESP_OK;
+    }
+
+    const esp_err_t err = espix_canvas_resize(s_canvas, w, h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* The pointer is the service's, not an owner's; keep it on the new screen. */
+    if (s_ptr_x > w - 1) { s_ptr_x = w - 1; }
+    if (s_ptr_y > h - 1) { s_ptr_y = h - 1; }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "display resized to %dx%d", w, h);
+
+    /*
+     * The owner re-lays out from its own model. Called with the canvas
+     * unlocked: the callback draws, and it must take the lock itself like any
+     * other draw.
+     */
+    if (s_owner != NULL && s_owner->resized != NULL) {
+        s_owner->resized(s_owner->ctx);
+    }
+    return ESP_OK;
+}
 
 static esp_err_t display_up(void)
 {

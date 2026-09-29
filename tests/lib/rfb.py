@@ -38,6 +38,9 @@ import time
 ENC_RAW = 0
 ENC_COPYRECT = 1
 ENC_HEXTILE = 5
+# A pseudo-encoding (negative 32-bit): the server can change the screen size
+# under a live connection with it.
+ENC_EXTENDED_DESKTOP_SIZE = -16703
 
 # The VNC authentication challenge: DES with the password left-justified and the
 # *bits of each byte* reversed, which is the one detail of this that is not
@@ -116,13 +119,17 @@ class Reader:
 
 class Rfb:
     def __init__(self, host, port=5900, password=DEFAULT_PASSWORD, timeout=30.0,
-                 raw_only=False, copyrect=True):
+                 raw_only=False, copyrect=True, eds=False):
         self.host = host
         self.port = port
         self.password = password
         self.timeout = timeout
         self.raw_only = raw_only
         self.copyrect = copyrect
+        self.eds = eds
+        # Set to (w, h) by the ExtendedDesktopSize handler when the server
+        # changes the size, so a caller can notice without polling.
+        self.resized = None
         # The client's own framebuffer, which incremental updates are applied
         # to. A viewer is a long-lived framebuffer with updates painted into it,
         # not a sequence of unrelated full frames -- and asking for a full frame
@@ -186,6 +193,8 @@ class Rfb:
             encodings = [ENC_HEXTILE, ENC_COPYRECT, ENC_RAW]
         else:
             encodings = [ENC_HEXTILE, ENC_RAW]
+        if self.eds:
+            encodings.append(ENC_EXTENDED_DESKTOP_SIZE)
         self.sock.sendall(bytes([2, 0]) + struct.pack(">H", len(encodings)) +
                           b"".join(struct.pack(">i", e) for e in encodings))
         return self
@@ -285,11 +294,14 @@ class Rfb:
                         self._hextile(fb, x, y, w, h, r)
                     elif enc == ENC_COPYRECT:
                         self._copyrect(fb, x, y, w, h, r)
+                    elif enc == ENC_EXTENDED_DESKTOP_SIZE:
+                        self._extended_desktop_size(r)
                     else:
                         raise RfbError("server sent encoding %d, unasked" % enc)
                 self.wire["bytes"] += r.consumed
                 self.wire["frames"] += 1
-                return bytearray(fb)
+                # self.fb, not fb: an ExtendedDesktopSize rectangle replaces it.
+                return bytearray(self.fb)
             elif mtype == 1:                                # SetColourMapEntries
                 r.skip(3)
                 r.u16()
@@ -317,6 +329,26 @@ class Rfb:
         for row in range(h):
             o = ((y + row) * self.width + x) * 4
             fb[o:o + w * 4] = data[row * w * 4:(row + 1) * w * 4]
+
+    def _extended_desktop_size(self, r):
+        """The server changed the screen size -- one screen, at the origin.
+
+        Resize our framebuffer and record it. The caller asks again for the new
+        area, which is what makes a resize live rather than a reconnect.
+        """
+        n = r.byte()
+        w = h = 0
+        for _ in range(n):
+            r.u32()                     # screen id
+            r.u16()                     # x
+            r.u16()                     # y
+            w = r.u16()
+            h = r.u16()
+            r.u32()                     # flags
+        if w and h:
+            self.width, self.height = w, h
+            self.fb = bytearray(w * h * 4)
+            self.resized = (w, h)
 
     def _hextile(self, fb, x, y, w, h, r):
         """Tiles are counted from the *rectangle's* corner. RFC 6143: "the
