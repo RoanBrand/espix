@@ -170,6 +170,22 @@ now merges consecutive motions of one rectangle (the note that says what moved),
 and `espix_window_move()` copies the clipped window rather than just its
 overlap. See docs/DISPLAY.md.
 
+**Worked example: the send buffer.** The same table answers "did that lwIP
+change help?" without guessing. Two drags recorded on the same path, one at
+`TCP_SND_BUF` 32768 and one at 114688, binned by bytes per update:
+
+| bytes/update | 32K wire | 114688 wire |
+|---|---|---|
+| < 4 KB | 3.3 MB/s | 3.1 MB/s |
+| 4-16 KB | 9.4 MB/s | 9.7 MB/s |
+| 16-64 KB | 7.7 MB/s | 11.4 MB/s |
+| > 64 KB | 6.5 MB/s | 10.1 MB/s |
+
+Small updates do not move: that wire time is the per-write cost, not the
+buffer. The large ones gain ~50%, and the worst update stayed ~16 ms even
+though the largest grew from 101 KB to 155 KB. Binning is what makes the two
+drags comparable -- the raw mean bytes/update differed by 50% between them.
+
 **Volume.** A busy trace is ~3.5k events/s, most of it the SEGGER port's own
 `xTaskGetTickCountFromISR` and `vTaskSetApplicationTaskTag` bookkeeping. The USJ
 ring is raised to 32 KB in `profiles/sysview.conf`; the 2 KB default overflows
