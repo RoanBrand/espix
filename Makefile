@@ -27,6 +27,9 @@
 #   make stress           transport regression check, expects zero failures [N=30]
 #   make clean            fullclean, firmware and apps
 #
+# PROFILE=sysview builds the SystemView profiling variant, into its own
+# build-<target>-sysview and sdkconfig.<target>-sysview. Never released.
+#
 # PORT= overrides serial port detection. IDF_PATH= overrides SDK discovery.
 # ESPIX_HOST= overrides the board address for network commands (tools/espix host).
 
@@ -35,14 +38,20 @@
 # flash build-<TARGET>/ while idf.sh rebuilt the active target's tree. Recursive
 # on purpose, so it sees a TARGET given later on the command line.
 SHELL := /bin/bash
-IDF   = ESPIX_TARGET=$(TARGET) ./tools/idf.sh
+IDF   = ESPIX_TARGET=$(TARGET) ESPIX_PROFILE=$(PROFILE) ./tools/idf.sh
 
 # The target this tree is configured for, and the build directory and sdkconfig
 # it implies. tools/espix writes .espix/active and tools/idf.sh reads the same
 # file, so the two cannot disagree. Override for one run with TARGET=esp32s31.
 TARGET       ?= $(shell cat .espix/active 2>/dev/null || echo esp32s3)
-BUILD        := build-$(TARGET)
-SDKCONF      := sdkconfig.$(TARGET)
+
+# A PROFILE is a tracked defaults overlay, profiles/<name>.conf, with its own
+# sdkconfig and build directory, so a profiling build coexists with the normal
+# one instead of reconfiguring it. PROFILE=sysview is the SystemView build; a
+# release is always the normal (empty PROFILE) build. See docs/PROFILING.md.
+PROFILE      ?=
+BUILD        := build-$(TARGET)$(if $(PROFILE),-$(PROFILE),)
+SDKCONF      := sdkconfig.$(TARGET)$(if $(PROFILE),-$(PROFILE),)
 LOADER_BUILD := loader/build-$(TARGET)
 
 # Two esptool facts come from the target, not the partition CSV. The S31
@@ -220,7 +229,7 @@ flash-all: flash flash-fs
 # over SSH. The address comes from .espix/hosts (tools/espix host); the board
 # must be on the network with SSH reachable. See tools/flash-ota.sh.
 flash-ota: build
-	./tools/flash-ota.sh
+	ESPIX_PROFILE=$(PROFILE) ./tools/flash-ota.sh
 
 # Tag v<version.txt>, build it as a release, and publish the image and manifest
 # to GitHub. The tree must be clean; commit first. See tools/release.sh.

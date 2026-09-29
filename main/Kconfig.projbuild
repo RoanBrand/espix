@@ -1,0 +1,17 @@
+menu "espix tracing"
+
+    config ESPIX_TRACE_CORE
+        int "SystemView: CPU whose scheduling is traced (0 or 1)"
+        depends on ESP_TRACE_LIB_EXTERNAL
+        range 0 1
+        default 0
+        help
+            The USB-Serial/JTAG transport carries one SystemView stream, so the
+            encoder can represent the scheduling events of one CPU only; the
+            other CPU's task and ISR state changes are dropped. espix pins
+            espix:vnc to CPU1, so profiling the desktop/display path wants 1 and
+            the network/ssh side wants 0. The JTAG transport is multi-core and
+            ignores this, but S31 apptrace does not work in OpenOCD yet.
+            See docs/PROFILING.md.
+
+endmenu

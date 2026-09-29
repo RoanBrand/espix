@@ -34,6 +34,17 @@ espix_active_target() {
     printf '%s' "${t:-esp32s3}"
 }
 
+# A profile is a tracked defaults overlay, profiles/<name>.conf, that gets its
+# own sdkconfig and build directory so a profiling build coexists with the
+# normal one instead of reconfiguring it. ESPIX_PROFILE names it; unset is the
+# normal build. Defined once so --env and the build path cannot disagree about
+# where the artifacts are.
+espix_profile_suffix() {
+    if [ -n "${ESPIX_PROFILE:-}" ]; then
+        printf -- '-%s' "$ESPIX_PROFILE"
+    fi
+}
+
 # A target IDF refuses without --preview. Keep in sync with IDF's PREVIEW_TARGETS
 # (tools/idf_py_actions/constants.py).
 espix_target_is_preview() {
@@ -181,15 +192,17 @@ espix_python=$(espix_find_python "$espix_idf_path")
 
 if [ "${1:-}" = "--env" ]; then
     espix_env_target=$(espix_active_target)
+    espix_env_suffix=$(espix_profile_suffix)
     printf 'IDF_PATH=%s\n' "$espix_idf_path"
     printf 'ESPIX_PYTHON=%s\n' "$espix_python"
     printf 'IDF_VERSION=%s\n' "$(idf_version "$espix_idf_path")"
     printf 'ESPIX_TARGET=%s\n' "$espix_env_target"
+    printf 'ESPIX_PROFILE=%s\n' "${ESPIX_PROFILE:-}"
     # Exported, so a caller's child processes (build-apps.sh during a release,
     # for one) build for the same target rather than falling back to active.
     printf 'export IDF_TARGET=%s\n' "$espix_env_target"
-    printf 'ESPIX_BUILD=%s\n' "$espix_root_dir/build-$espix_env_target"
-    printf 'ESPIX_SDKCONFIG=%s\n' "$espix_root_dir/sdkconfig.$espix_env_target"
+    printf 'ESPIX_BUILD=%s\n' "$espix_root_dir/build-$espix_env_target$espix_env_suffix"
+    printf 'ESPIX_SDKCONFIG=%s\n' "$espix_root_dir/sdkconfig.$espix_env_target$espix_env_suffix"
     printf 'ESPIX_LOADER_BUILD=%s\n' "$espix_root_dir/loader/build-$espix_env_target"
     exit 0
 fi
@@ -306,18 +319,34 @@ case "$espix_project_real" in
 esac
 
 if [ "$espix_project" = main ]; then
-    espix_build_dir="$espix_root_dir/build-$espix_target"
-    espix_sdkconfig="$espix_root_dir/sdkconfig.$espix_target"
+    espix_build_dir="$espix_root_dir/build-$espix_target$(espix_profile_suffix)"
+    espix_sdkconfig="$espix_root_dir/sdkconfig.$espix_target$(espix_profile_suffix)"
 
-    # A board is a defaults file that lands after the target's own defaults. It
-    # only matters when sdkconfig is generated, which tools/espix arranges by
-    # deleting it; an existing sdkconfig is authoritative.
+    # Defaults land in order: the project's, the target's own (IDF appends
+    # sdkconfig.defaults.<target> for every entry named here), then the board's,
+    # then the profile's. A board and a profile only matter when sdkconfig is
+    # generated, which tools/espix arranges by deleting it; an existing
+    # sdkconfig is authoritative.
+    espix_defaults="sdkconfig.defaults"
+
     espix_board_file="$espix_root_dir/.espix/board-$espix_target"
     if [ -f "$espix_board_file" ]; then
         espix_board=$(head -n1 "$espix_board_file")
         if [ -n "$espix_board" ] && [ -f "$espix_root_dir/boards/$espix_board.conf" ]; then
-            export SDKCONFIG_DEFAULTS="sdkconfig.defaults;boards/$espix_board.conf"
+            espix_defaults="$espix_defaults;boards/$espix_board.conf"
         fi
+    fi
+
+    if [ -n "${ESPIX_PROFILE:-}" ]; then
+        [ -f "$espix_root_dir/profiles/$ESPIX_PROFILE.conf" ] \
+            || die "no such profile: profiles/$ESPIX_PROFILE.conf"
+        espix_defaults="$espix_defaults;profiles/$ESPIX_PROFILE.conf"
+    fi
+
+    # Left unset when it names only sdkconfig.defaults, so a plain build keeps
+    # exactly the defaults resolution it had before profiles existed.
+    if [ "$espix_defaults" != "sdkconfig.defaults" ]; then
+        export SDKCONFIG_DEFAULTS="$espix_defaults"
     fi
 elif [ "$espix_project" = loader ]; then
     espix_build_dir="$espix_root_dir/loader/build-$espix_target"

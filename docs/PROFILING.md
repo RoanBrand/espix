@@ -114,12 +114,66 @@ Two things about it, both measured:
 
 ### 3. SystemView: the timeline
 
-Task switches, ISR entry and CPU load on a timeline, which no sampling profiler
-gives. In IDF v6.1 this lives in the **`esp_trace`** component: it coordinates
-encoders (the `espressif/esp_sysview` component provides the SystemView encoder)
-and transports (apptrace over JTAG, or UART for real-time viewing). The resulting
-trace opens in SEGGER's SystemView application. `app_trace` still carries
-`APPTRACE_DEST_JTAG` for the transport end.
+Task switches, ISR entry and CPU load on a timeline, streaming without halting --
+so it can watch the VNC or audio path *while it runs*. It is a separate build:
+
+    make PROFILE=sysview build
+    make PROFILE=sysview flash-ota
+
+`profiles/sysview.conf` becomes `sdkconfig.<target>-sysview` in
+`build-<target>-sysview`; a release is the normal build and links none of it
+(the release image is byte-identical with the component declared). The encoder is
+`espressif/esp_sysview`; `main/espix_main.c` overrides
+`esp_trace_get_user_params()` to name it "sysview" -- Kconfig's external-library
+default is the generic "ext" -- and to select the CPU. Without that override the
+image aborts at boot in `ipc0` with `init function ... has failed (0x105)`.
+
+**Transport: USB-Serial/JTAG, one CPU.** `esp_trace` has two transports and on
+S31 only one works:
+
+| | apptrace over JTAG (`esp sysview` / `_mcore`) | USB-Serial/JTAG |
+|---|---|---|
+| host | OpenOCD + GDB | SEGGER SystemView directly |
+| cores | multi-core, one file | one CPU, filtered |
+| S31 | **broken** | works |
+
+OpenOCD 20260703 and 20260831 both fail before touching the firmware --
+`Failed to get max trace block size!` / `Failed to init cmd ctx (-4)!` --
+because the apptrace control block comes from the target's semihosting parameter
+(`esp_riscv.c:842`) and never resolves for S31. No `CONFIG_` reaches it and no
+upstream issue covers it; `tools/sysview.py` automates the JTAG route for when
+that changes. Until then the profile traces **one CPU**:
+`CONFIG_ESPIX_TRACE_CORE` is 0 or 1, and since espix pins `espix:vnc` to core 1,
+the display path is 1.
+
+**Recording.** In SystemView: Target -> Start Recording, Target Interface
+**UART**, COM port `/dev/cu.usbmodem101` (the USB-DBG port -- not
+`/dev/cu.usbserial-*`, which is the shell console), any baud: the CDC ignores
+it. Use **SEGGER's stock** `SYSVIEW_FreeRTOS.txt`; the component emits SEGGER's
+event IDs, while the IDF file under `tools/esp_app_trace/` is the legacy
+apptrace mapping and mis-names every event. `Export Data -> CSV` is what the
+analyzer reads; saving the `.SVDat` is not needed.
+
+**Reading it.** `tools/sysview-csv.py <export.csv>` reduces the RFB markers to a
+per-update table -- canvas, encode CPU (encode minus wire), wire, the copy vs
+pixels path, and bytes and flushes per packet. The markers come from `rfb.c` in
+this build only: 0 canvas, 1 encode, 2 wire, 3 copy, 4 pixels.
+
+**Worked example: the drag.** The tool first reported that 69% of drag updates
+sent no copy, which looked like the bug. It was not: cross-tabbing `moves`
+against bytes showed the *copy* updates were the expensive ones, ~190 KB each,
+because CopyRect moved only the overlap of the old and new window and the newly
+exposed side went as pixels. Copying the whole window clipped to the canvas
+instead took the drag from **9.4 MB to 2.05 MB**, the wire from **67% to 34%** of
+update time, and removed the encode tail. Two changes: `espix_canvas_moved()`
+now merges consecutive motions of one rectangle (the note that says what moved),
+and `espix_window_move()` copies the clipped window rather than just its
+overlap. See docs/DISPLAY.md.
+
+**Volume.** A busy trace is ~3.5k events/s, most of it the SEGGER port's own
+`xTaskGetTickCountFromISR` and `vTaskSetApplicationTaskTag` bookkeeping. The USJ
+ring is raised to 32 KB in `profiles/sysview.conf`; the 2 KB default overflows
+on the first busy second.
 
 ### What halting cannot sample: live Bluetooth audio
 
@@ -157,9 +211,8 @@ than reconstructed from a written image.
 - **"Show me the call graph"** -> `tools/jtag-profile.py`. Verified working.
   It halts, so it suits boot, filesystems, decode loops and anything not driven
   by the network or the radio.
-- **"Show me the schedule"** -> SystemView, and only then, because it is not
-  free: it needs the `espressif/esp_sysview` component fetched from the
-  registry, a `CONFIG_ESP_TRACE_*` selection, a rebuild and a reflash. Once
-  in, it streams over the USB-JTAG port without halting, which is the only way
-  to watch the VNC or audio path while it runs.
+- **"Show me the schedule"** -> `make PROFILE=sysview flash-ota`, then SystemView
+  over USB-Serial/JTAG (section 3). Not free -- a separate build and reflash --
+  but it is the only live, non-halting view, and the JTAG route that would give
+  both cores at once is broken on S31.
 - `heap_trace` behind a config option, for allocation questions.

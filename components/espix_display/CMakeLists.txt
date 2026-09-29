@@ -1,3 +1,11 @@
+# rfb.c marks its canvas/encode/wire phases with SystemView user events, but
+# only in a tracing build -- and the header that declares them comes from
+# esp_sysview, so it is a dependency only then.
+set(espix_display_priv_trace "")
+if(CONFIG_ESP_TRACE_ENABLE)
+    list(APPEND espix_display_priv_trace esp_sysview)
+endif()
+
 idf_component_register(
     SRCS
         "display.c"
@@ -30,4 +38,7 @@ idf_component_register(
         # guards its own sources on CONFIG_SOC_PPA_SUPPORTED, so on the S3 it
         # compiles nothing and this file's PPA code is not built either.
         esp_driver_ppa
+        # rfb.c's SystemView phase markers. Only when tracing is on, so a
+        # release does not pull the encoder in just to compile markers out.
+        ${espix_display_priv_trace}
 )

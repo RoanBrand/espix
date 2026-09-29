@@ -44,6 +44,48 @@
 #include "espix_time.h"
 #include "espix_usb.h"
 
+#if CONFIG_ESP_TRACE_LIB_EXTERNAL
+#include "esp_trace.h"
+
+/*
+ * The espressif/esp_sysview encoder registers itself as "sysview"
+ * (ESP_TRACE_REGISTER_ENCODER in the component), but Kconfig's name for an
+ * external library is the generic "ext" -- and CONFIG_ESP_TRACE_LIB_NAME has no
+ * prompt, so a profile overlay cannot set it. Without this override
+ * esp_trace_init() returns ESP_ERR_NOT_FOUND at boot and the image aborts in
+ * ipc0 with "init function ... has failed (0x105)".
+ *
+ * This is the override the IDF custom-library example documents for an encoder
+ * registered under a name other than the default. It is compiled only when the
+ * trace library is external, which is only the PROFILE=sysview build, so a
+ * normal or release build neither links esp_trace nor defines this.
+ *
+ * The same override names the CPU to trace. A single-stream transport can carry
+ * only one CPU's scheduling, and the component's config type lives in its
+ * private header (src/esp/adapter_encoder_sysview.h), so this mirrors the one
+ * field the encoder reads -- it casts encoder_cfg to esp_trace_sysview_config_t
+ * and takes dest_cpu first.
+ */
+typedef struct {
+    int dest_cpu;
+} espix_trace_encoder_cfg_t;
+
+esp_trace_open_params_t esp_trace_get_user_params(void)
+{
+    static const espix_trace_encoder_cfg_t enc = {
+        .dest_cpu = CONFIG_ESPIX_TRACE_CORE,
+    };
+    const esp_trace_open_params_t params = {
+        .core_cfg = NULL,
+        .encoder_name = "sysview",
+        .encoder_cfg = &enc,
+        .transport_name = CONFIG_ESP_TRACE_TRANSPORT_NAME,
+        .transport_cfg = NULL,
+    };
+    return params;
+}
+#endif
+
 #define TAG "espix"
 
 /*

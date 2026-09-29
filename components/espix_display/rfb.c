@@ -44,6 +44,43 @@
 
 #include "vnc_des.h"
 
+/*
+ * SystemView user markers, for the profile build only.
+ *
+ * The per-hundred-update counters say what canvas/encode/wire cost in total;
+ * these put the same three phases on the timeline, so a slow drag shows which
+ * one it was waiting in and in what order, not just how long. Read them in
+ * SystemView as User Start/Stop with these ids. Compiled out unless tracing is
+ * on, so a release links none of it -- and then the id constants are unused,
+ * which is why they only exist in this branch.
+ */
+#ifdef CONFIG_ESP_TRACE_ENABLE
+#include "SEGGER_SYSVIEW.h"
+#define RFB_MARK_CANVAS 0
+#define RFB_MARK_ENCODE 1
+#define RFB_MARK_WIRE   2
+#define RFB_MARK_COPY   3
+#define RFB_MARK_PIXELS 4
+#define RFB_MARK_START(id) SEGGER_SYSVIEW_OnUserStart(id)
+#define RFB_MARK_STOP(id)  SEGGER_SYSVIEW_OnUserStop(id)
+
+/*
+ * One line per update, so packet size and which path it took are in the trace
+ * rather than only in the counters. Formatted on the target: over a plain USB
+ * stream the SystemView application cannot read this image's memory to resolve
+ * a host-side format string.
+ */
+#define RFB_TRACE_PACKET(copy, moves, full, cap, rects, bytes, flushes) \
+    SEGGER_SYSVIEW_PrintfTarget( \
+        "rfb copy=%d moves=%u full=%d cap=%d rects=%u bytes=%u flushes=%u", \
+        (copy), (unsigned)(moves), (full), (cap), (unsigned)(rects), \
+        (unsigned)(bytes), (unsigned)(flushes))
+#else
+#define RFB_MARK_START(id) ((void)0)
+#define RFB_MARK_STOP(id)  ((void)0)
+#define RFB_TRACE_PACKET(copy, moves, full, cap, rects, bytes, flushes) ((void)0)
+#endif
+
 #define TAG "vnc"
 
 #define LISTEN_BACKLOG 1
@@ -345,6 +382,10 @@ typedef struct {
     uint8_t *buf;
     size_t   cap, len;
     bool     bad;
+#ifdef CONFIG_ESP_TRACE_ENABLE
+    uint32_t bytes;                 /* trace only: what the update put on the wire */
+    uint32_t flushes;
+#endif
 } sink_t;
 
 /* Which part of an update costs: the canvas copy, the encoding, or the wire.
@@ -357,10 +398,16 @@ static void sink_flush(sink_t *s)
     if (s->len > 0) {
         const int64_t t = esp_timer_get_time();
 
+        RFB_MARK_START(RFB_MARK_WIRE);
         if (!write_full(s->fd, s->buf, s->len)) {
             s->bad = true;
         }
+        RFB_MARK_STOP(RFB_MARK_WIRE);
         s_write_us += (uint64_t)(esp_timer_get_time() - t);
+#ifdef CONFIG_ESP_TRACE_ENABLE
+        s->bytes += (uint32_t)s->len;
+        s->flushes++;
+#endif
         s->len = 0;
     }
 }
@@ -727,6 +774,8 @@ static bool update_send(rfb_conn_t *c)
         return true;                        /* nothing changed; stay owed */
     }
 
+    RFB_MARK_START(RFB_MARK_CANVAS);
+
     /*
      * One move, and only one.
      *
@@ -801,6 +850,8 @@ static bool update_send(rfb_conn_t *c)
     }
     espix_canvas_unlock(cv);
     t_canvas = esp_timer_get_time();
+    RFB_MARK_STOP(RFB_MARK_CANVAS);
+    RFB_MARK_START(RFB_MARK_ENCODE);
 
     if (!c->logged_send) {
         c->logged_send = true;
@@ -817,6 +868,7 @@ static bool update_send(rfb_conn_t *c)
     if (!write_start(c->fd, hdr, 4)) {
         /* Not now. Still owed, so the next attempt describes the screen as it is
          * by then rather than as it was. */
+        RFB_MARK_STOP(RFB_MARK_ENCODE);
         return true;
     }
 
@@ -833,9 +885,12 @@ static bool update_send(rfb_conn_t *c)
         wr32(ch + 8, RFB_ENC_COPYRECT);
         wr16(ch + 12, (uint16_t)moves[0].sx);
         wr16(ch + 14, (uint16_t)moves[0].sy);
+        RFB_MARK_START(RFB_MARK_COPY);
         sink_write(&s, ch, sizeof(ch));
+        RFB_MARK_STOP(RFB_MARK_COPY);
     }
 
+    RFB_MARK_START(RFB_MARK_PIXELS);
     for (size_t i = 0; i < n; i++) {
         const espix_rect_t r = rects[i];
         uint8_t            rh[12];
@@ -852,14 +907,20 @@ static bool update_send(rfb_conn_t *c)
             enc_raw(&s, c->stage, cw, r, &c->pf, c->row);
         }
         if (s.bad) {
+            RFB_MARK_STOP(RFB_MARK_PIXELS);
+            RFB_MARK_STOP(RFB_MARK_ENCODE);
             return false;
         }
     }
+    RFB_MARK_STOP(RFB_MARK_PIXELS);
     sink_flush(&s);
     t_sent = esp_timer_get_time();
+    RFB_MARK_STOP(RFB_MARK_ENCODE);
     if (s.bad) {
         return false;
     }
+
+    RFB_TRACE_PACKET(copy, nmove, full, c->copyrect, total, s.bytes, s.flushes);
 
     s_phase.n++;
     s_phase.canvas_us += (uint64_t)(t_canvas - t0);
@@ -1383,33 +1444,26 @@ static void rfb_task(void *arg)
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-        /*
-         * Room in this socket for a whole frame, and only this socket.
-         *
-         * lwIP's default send buffer is smaller than one incremental frame, so a
-         * frame took several round trips to hand over -- measured at 39 ms for
-         * frames that should cost microseconds, and 1.7 ms with room for them.
-         *
-         * The compile-time default is what *every* connection gets, so it is the
-         * wrong place to raise: an SSH session and a VNC session do not want the
-         * same thing, and 32K each is 64K of internal RAM per socket. The ceiling
-         * is raised in sdkconfig and the one connection that streams a screen
-         * asks for it here.
-         */
-        /*
-         * There is no per-socket send buffer to ask for. lwIP defines SO_SNDBUF
-         * and does not implement it -- "Unimplemented: send buffer size" in its
-         * own header -- and TCP_SNDBUF was removed from the driver. So a socket
-         * cannot exceed what the compile-time TCP_SND_BUF allows, and the size
-         * is set there or not at all.
-         *
-         * Which is less of a problem than it reads, because TCP_SND_BUF is a
-         * ceiling on *queued* bytes rather than a reservation: the memory is
-         * taken as data is queued. It is TCP_WND that holds memory, by
-         * advertising how much a peer may have in flight -- so the receive
-         * window stays modest, since the only thing this connection receives is
-         * pointer events, and the send ceiling is what is raised.
-         */
+    /*
+     * Room to hand a whole update over without stopping to wait for the wire.
+     *
+     * lwIP has no per-socket send buffer: SO_SNDBUF is defined and
+     * "Unimplemented: send buffer size" in its own header, and TCP_SNDBUF is
+     * not a socket option either. What a socket may queue is the compile-time
+     * TCP_SND_BUF (CONFIG_LWIP_TCP_SND_BUF_DEFAULT), which
+     * sdkconfig.defaults.esp32s31 raises to 32768 -- without it, a frame that
+     * should cost microseconds took 39 ms of round trips.
+     *
+     * Which is fine, because it is a ceiling on *queued* bytes and not a
+     * reservation: nothing is charged per connection, and each byte is
+     * allocated only as it is queued. With MEM_LIBC_MALLOC and MEMP_MEM_MALLOC
+     * set, those allocations come from the heap, and
+     * CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP makes lwIP ask PSRAM first -- so a
+     * busy VNC session's queue does not eat the internal RAM an SSH session
+     * needs. It is TCP_WND that holds memory, by advertising how much a peer
+     * may have in flight, which is why the receive window stays at its modest
+     * default: the only thing this connection receives is pointer events.
+     */
 
         const struct timeval io = { .tv_sec = 0, .tv_usec = POLL_US };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io, sizeof(io));

@@ -17,6 +17,14 @@
 
 set -eu
 
+# A profile is a development build by construction -- SystemView hooks every
+# task switch -- so a release must never be one, however ESPIX_PROFILE got set.
+if [ -n "${ESPIX_PROFILE:-}" ]; then
+    printf 'release: ESPIX_PROFILE=%s is set; a release is the normal build\n' \
+           "$ESPIX_PROFILE" >&2
+    exit 1
+fi
+
 dry=0
 if [ "$#" -ge 1 ] && [ "$1" = "--dry-run" ]; then
     dry=1

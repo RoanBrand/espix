@@ -111,3 +111,12 @@ dependencies:
   # hardware. That tuning is the only lever available for MP3 here, because the
   # S31's PIE/SIMD is used by LC3 and Opus only, never by pvmp3.
   esphome/micro-mp3: "^0.4"
+
+  # SEGGER SystemView encoder, for the profile build only. Declared
+  # unconditionally because the component manager resolves manifests before
+  # Kconfig exists and so cannot key off a project option -- the same reason
+  # esp_tinyusb above is declared unconditionally. What keeps it out of a
+  # release is `profiles/sysview.conf`: with ESP_TRACE_LIB_EXTERNAL off there
+  # is no adapter for the linker to pull in, so the encoder is compiled but not
+  # linked. See docs/PROFILING.md, "SystemView".
+  espressif/esp_sysview: "^1"
