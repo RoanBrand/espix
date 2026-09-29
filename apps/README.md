@@ -7,6 +7,7 @@ firmware. Each builds to a relocatable ELF that the device loads at runtime.
 |---|---|
 | [hello](hello/) | the minimum: a C app, argv, an exit status |
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
+| [plasma](plasma/) | the graphics/input ABI: a full-screen app the desktop launches from an icon |
 
 `neopixel` is a normal `setup()`/`loop()` sketch with one addition: a
 `teardown()`, called when someone stops the app. An Arduino sketch never needs
@@ -137,3 +138,27 @@ while (!espix_app_stopping()) { /* ... */ }
 
 An app that ignores it is deleted a few hundred milliseconds later, exactly as
 before.
+
+## Graphics and input
+
+`espix_gfx.h` is the app-facing graphics ABI: the whole screen, an optional
+render surface, and a queue of input events. An app claims the screen with
+`espix_gfx_open()`, draws into the framebuffer from `espix_gfx_lock()` -- or into
+a surface and `espix_gfx_present_surface()`, which the PPA scales -- presents,
+and drains `espix_gfx_poll_event()` once a frame. `espix_gfx_close()` gives the
+screen back. `apps/plasma` is the worked example.
+
+The canvas is RGB565 and shared with the desktop and the VNC encoder, so the
+lock is real: draw inside it and present promptly. A process killed while
+holding it is the one case it cannot survive -- the holder's TCB is gone, and
+handing a FreeRTOS mutex back walks it -- so the process layer **orphans** the
+lock instead. The canvas loses mutual exclusion for the rest of the boot, which
+is the price of not taking a watchdog reset.
+
+**The desktop launches apps from an icon.** Double-clicking a desktop icon runs
+the program full-screen: it claims the screen, and the desktop reclaims it when
+the app exits or is killed. Adding a program is one row in the `s_icons` table
+in `components/espix_desktop/desktop.c` plus its ELF in `/bin`; the launcher and
+its waiter live in the same file. The desktop also resets its pointer state on
+reclaim, because the click that started the app sent its *release* to the app --
+without that, the first click after every app would be swallowed.

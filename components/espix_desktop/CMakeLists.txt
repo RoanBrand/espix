@@ -9,6 +9,7 @@ idf_component_register(
         espix_display
     PRIV_REQUIRES
         espix_kernel
+        espix_proc
         espix_shell
         espix_net
         espix_bt

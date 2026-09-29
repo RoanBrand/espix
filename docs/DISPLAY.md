@@ -413,9 +413,20 @@ editor.
 launcher that opens a menu, a button per window in the order the windows were
 opened, and a clock that reads the system clock the kernel already keeps. It is
 deliberately a look rather than a feature -- the tray reports the time and
-nothing else, and the menu has three items -- because it is the frame the rest of
+nothing else, and the menu has five items -- because it is the frame the rest of
 those apps will arrive in, and a frame is worth seeing before it is worth
 filling.
+
+M5 also grew the first thing that runs *in* that frame: a desktop icon that
+double-clicks into a full-screen app. The app claims the screen through
+`espix_gfx` (see `apps/README.md`), the desktop stops being the owner for as long
+as it runs, and a waiter reclaims it when the app exits or is killed. Two
+details are load-bearing. The canvas lock is **orphaned** rather than
+force-released if an app dies holding it, because a FreeRTOS mutex walks its
+holder's TCB on the next give and that TCB is gone. And the desktop resets its
+pointer state on reclaim, because the click that launched the app delivered its
+*release* to the app -- without that, the first click after every app is read as
+a button that never came up and is swallowed.
 
 What is not a look is the terminal window: it runs a real session, and it is the
 same `espix_term` the on-screen console runs rather than a second implementation
@@ -531,10 +542,12 @@ Two clients were tried first, and both taught something.
 
 ## Known limitations
 
-- **Mouse buttons go nowhere.** A press is decoded and carried on a POINTER
-  event, and an owner may read it, but nothing acts on one: there is no window
-  manager to click at yet, so a click reaches the desktop and stops there. The
-  position is still updated, which is the only reason it is sent at all.
+- **The launcher is one hardcoded icon.** The desktop's icon table holds a
+  single entry (`plasma`) at an absolute path; there is no file browser and no
+  app registry yet. Double-click runs it full-screen and the desktop reclaims the
+  screen when it exits or is killed. A killed app that died holding the canvas
+  leaves the canvas lock orphaned for the rest of the boot -- correct rather than
+  mutually exclusive, which is the price of not wedging the board.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a

@@ -218,6 +218,7 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     const int index = (int)(slot - g_espix_procs);
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_pid_t pid = slot->info.pid;
     slot->info.state     = state;
     slot->info.exit_code = exit_code;
     slot->info.task      = NULL;
@@ -230,6 +231,15 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      */
     xEventGroupSetBits(g_espix_proc_events, (EventBits_t)1 << index);
     xSemaphoreGive(g_espix_proc_lock);
+
+    /*
+     * Anything the process held and did not give back now belongs to nobody.
+     * The canvas is the one such lock that wedges the whole board rather than
+     * the process -- the desktop and the VNC encoder both take it -- so it is
+     * handed back here, keyed on the pid captured above rather than on a task
+     * handle that has just been freed.
+     */
+    espix_gfx_recover(pid);
 }
 
 espix_proc_slot_t *espix_proc_find(espix_pid_t pid)

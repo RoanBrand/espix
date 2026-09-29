@@ -100,6 +100,9 @@ const char *espix_canvas_name(const espix_canvas_t *c);
  */
 void        espix_canvas_lock(espix_canvas_t *c);
 void        espix_canvas_unlock(espix_canvas_t *c);
+/* The holder died still holding it; the lock stops protecting the canvas
+ * rather than be force-released onto a freed task handle. See display.c. */
+void        espix_canvas_orphan(espix_canvas_t *c);
 espix_px_t *espix_canvas_pixels(espix_canvas_t *c);   /* w*h, RGB565 */
 
 /* Drawing. All clip to the canvas and mark what they touched. */

@@ -115,6 +115,7 @@ struct espix_canvas {
     char             name[ESPIX_DISPLAY_NAME_MAX];
     espix_px_t      *px;          /* w * h, RGB565, PSRAM */
     SemaphoreHandle_t lock;
+    bool             lock_orphaned;   /* holder died holding it; see the lock */
     espix_rect_t     damage[ESPIX_DISPLAY_DAMAGE_MAX];
     int              ndamage;
     espix_move_t     moves[ESPIX_DISPLAY_MOVE_MAX];
@@ -296,8 +297,34 @@ int         espix_canvas_width(const espix_canvas_t *c)  { return c->w; }
 int         espix_canvas_height(const espix_canvas_t *c) { return c->h; }
 const char *espix_canvas_name(const espix_canvas_t *c)   { return c->name; }
 
-void espix_canvas_lock(espix_canvas_t *c)   { xSemaphoreTake(c->lock, portMAX_DELAY); }
-void espix_canvas_unlock(espix_canvas_t *c) { xSemaphoreGive(c->lock); }
+/*
+ * The lock is a plain mutex, and its one hazard is an app killed while it
+ * holds it. A FreeRTOS mutex records its holder and walks that TCB on the next
+ * give, so force-releasing it once the holder has been deleted reads freed
+ * memory -- the same hazard the SSH transport meets with its transmit lock,
+ * and it solves it the same way: orphan the lock rather than give it back.
+ * The cost is that the canvas is no longer mutually exclusive for the rest of
+ * the boot; the alternative is a watchdog reset instead of a torn frame.
+ */
+void espix_canvas_lock(espix_canvas_t *c)
+{
+    if (!c->lock_orphaned) {
+        xSemaphoreTake(c->lock, portMAX_DELAY);
+    }
+}
+
+void espix_canvas_unlock(espix_canvas_t *c)
+{
+    if (!c->lock_orphaned) {
+        xSemaphoreGive(c->lock);
+    }
+}
+
+/* Called by the process layer when a process died still holding the lock. */
+void espix_canvas_orphan(espix_canvas_t *c)
+{
+    c->lock_orphaned = true;
+}
 
 espix_px_t *espix_canvas_pixels(espix_canvas_t *c) { return c->px; }
 

@@ -28,6 +28,7 @@
 #include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_shell.h"
 #include "espix_term.h"
 
@@ -322,6 +323,7 @@ static void menu_paint(espix_canvas_t *c, espix_rect_t r);
 static espix_rect_t menu_rect(void);
 static espix_rect_t bar_rect(void);
 static void bar_damage(void);
+static void icons_paint(espix_canvas_t *c, espix_rect_t r);
 
 /* How often a drag lets the screen catch up. See the note where it is used. */
 #define DRAG_TICK_US (16 * 1000)
@@ -330,6 +332,22 @@ static void bar_damage(void);
 static bool         s_dragging;
 static int64_t      s_drag_repair_at;
 static espix_rect_t s_drag_shown;
+
+/*
+ * The pointer state belongs to the screen, not to the desktop, and the desktop
+ * is not always the screen. The launcher's second click hands the screen to the
+ * app, so the release that ends that click goes to the app's input queue and
+ * the desktop is left believing a button is still down -- the next press then
+ * reads as "already held" and is swallowed, which is one dead click after every
+ * app. Called whenever the desktop takes the screen back.
+ */
+static void input_reset(void)
+{
+    s_buttons   = 0;
+    s_press_win = NULL;
+    s_drag      = NULL;
+    s_dragging  = false;
+}
 
 espix_rect_t espix_window_content(const espix_window_t *w)
 {
@@ -544,6 +562,7 @@ static void desktop_repair_locked(espix_rect_t r)
 
     espix_canvas_lock(c);
     espix_canvas_fill(c, r, COL_DESKTOP);
+    icons_paint(c, r);              /* on the bare desktop, under the windows */
 
     for (int i = 0; i < s_nwin; i++) {
         const espix_window_t *w = s_wins[i];
@@ -1427,7 +1446,8 @@ static void term_task(void *arg)
 
 static void term_start(void)
 {
-    s_term = espix_window_new(40, 40,
+    /* Right of the launcher column, so the desktop icons stay reachable. */
+    s_term = espix_window_new(120, 40,
                               TERM_COLS * CELL_W + 2 * PAD,
                               TERM_ROWS * CELL_H + TITLE_H + 2 * PAD,
                               "terminal");
@@ -1598,6 +1618,96 @@ static bool rects_overlap(espix_rect_t a, espix_rect_t b)
            a.y < b.y + b.h && b.y < a.y + a.h;
 }
 
+/*
+ * Desktop icons: the programs the desktop offers, laid down the left of the
+ * work area. The cell is the hit target and holds the label as well as the
+ * picture, so clicking the name works like clicking the icon -- a target you
+ * have to aim at is a target you miss.
+ */
+#define ICON_BOX     48
+#define ICON_CELL_W  80
+#define ICON_CELL_H  74
+#define ICON_GAP     8
+#define ICON_LEFT    12
+#define ICON_TOP     12
+
+static const struct {
+    const char *label;
+    const char *path;
+} s_icons[] = {
+    { "plasma", "/bin/plasma" },
+};
+#define ICON_N ((int)(sizeof(s_icons) / sizeof(s_icons[0])))
+
+static int     s_icon_sel = -1;
+static int64_t s_icon_click_us;
+
+static espix_rect_t icon_rect(int i)
+{
+    return (espix_rect_t){ ICON_LEFT,
+                           ICON_TOP + i * (ICON_CELL_H + ICON_GAP),
+                           ICON_CELL_W, ICON_CELL_H };
+}
+
+static int icon_at(int x, int y)
+{
+    for (int i = 0; i < ICON_N; i++) {
+        if (in_rect(icon_rect(i), x, y)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * A picture, not a word: four lit bands on a dark plate, which is enough to
+ * read as "something to look at". Drawn straight into the canvas, so it costs
+ * a handful of fills on the repaints that already touch its cell.
+ */
+static void icons_paint(espix_canvas_t *c, espix_rect_t r)
+{
+    static const espix_px_t band[4] = {
+        RGB565(0x3C, 0x6E, 0xC8), RGB565(0x38, 0xA0, 0xA8),
+        RGB565(0x86, 0x5A, 0xC0), RGB565(0xC0, 0x6E, 0x50),
+    };
+
+    for (int i = 0; i < ICON_N; i++) {
+        const espix_rect_t cell = icon_rect(i);
+        if (!rects_overlap(cell, r)) {
+            continue;
+        }
+
+        const espix_px_t   sel_bg = RGB565(0x3E, 0x46, 0x58);
+        const espix_px_t   label_bg = (i == s_icon_sel) ? sel_bg : COL_DESKTOP;
+
+        if (i == s_icon_sel) {
+            espix_canvas_fill(c, cell, sel_bg);
+        }
+
+        const int bx = cell.x + (cell.w - ICON_BOX) / 2;
+        const int by = cell.y + 4;
+
+        espix_canvas_fill(c, (espix_rect_t){ bx, by, ICON_BOX, ICON_BOX },
+                          RGB565(0x14, 0x18, 0x1E));
+        espix_canvas_outline(c, (espix_rect_t){ bx, by, ICON_BOX, ICON_BOX },
+                             RGB565(0x6A, 0x78, 0x90));
+
+        for (int b = 0; b < 4; b++) {
+            espix_canvas_fill(c, (espix_rect_t){ bx + 4, by + 6 + b * 9,
+                                                 ICON_BOX - 8, 5 }, band[b]);
+        }
+
+        const int len = (int)strlen(s_icons[i].label);
+        int       tx  = cell.x + (cell.w - len * CELL_W) / 2;
+        if (tx < cell.x) {
+            tx = cell.x;
+        }
+        espix_canvas_text(c, tx, by + ICON_BOX + 4, s_icons[i].label,
+                          (i == s_icon_sel) ? COL_TITLE_FG : COL_TEXT_FG,
+                          label_bg);
+    }
+}
+
 /* The bar's strip of canvas, and the line windows stop at. */
 static espix_rect_t bar_rect(void)
 {
@@ -1629,8 +1739,8 @@ static espix_rect_t tray_rect(void)
     return (espix_rect_t){ w - TRAY_W, b.y, TRAY_W, TASKBAR_H };
 }
 
-static const char *const s_menu_items[] = { "photo", "terminal", "settings",
-                                           "about" };
+static const char *const s_menu_items[] = { "plasma", "photo", "terminal",
+                                           "settings", "about" };
 #define MENU_N ((int)(sizeof(s_menu_items) / sizeof(s_menu_items[0])))
 
 static espix_rect_t menu_rect(void)
@@ -1869,11 +1979,89 @@ static void bar_damage(void)
 
 static void term_open(void);
 
+/*
+ * Run a program on the whole screen.
+ *
+ * The app claims the screen for itself, so the desktop stops being the owner
+ * the moment it starts. When it leaves, the display falls back to the console
+ * rather than to us -- which is why a waiter reclaims the desktop instead of
+ * letting the console keep it.
+ */
+static void app_waiter(void *arg)
+{
+    const espix_pid_t pid = (espix_pid_t)(uintptr_t)arg;
+
+    (void)espix_proc_wait(pid, NULL, portMAX_DELAY);
+    if (espix_display_canvas() != NULL) {
+        input_reset();
+        (void)espix_display_claim(&s_desktop_screen);
+    }
+    vTaskDelete(NULL);
+}
+
+static void launch_app(const char *path)
+{
+    /* argv[0] is the program's own name, as everywhere else; the loader
+     * refuses a spawn with no argument vector at all. */
+    char *const     argv[] = { (char *)path, NULL };
+    espix_pid_t     pid    = ESPIX_PID_NONE;
+    const esp_err_t err    = espix_proc_spawn_elf(path, 1, (char **)argv, NULL,
+                                                  NULL, false, &pid);
+    if (err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot run %s: %s", path,
+                   esp_err_to_name(err));
+        return;
+    }
+    if (xTaskCreate(app_waiter, "appwait", 2560, (void *)(uintptr_t)pid, 3,
+                    NULL) != pdPASS) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no task to wait for %s", path);
+    }
+}
+
+/*
+ * Double-click to launch. The first click selects; a second on the same icon
+ * inside the threshold runs it. One click on a different icon moves the
+ * selection instead of launching, which is what stops a slip between two
+ * neighbours from running the wrong program.
+ */
+#define ICON_DBLCLICK_US (400 * 1000)
+
+static void icon_set_sel(int i)
+{
+    if (i == s_icon_sel) {
+        return;
+    }
+    const int old = s_icon_sel;
+    s_icon_sel = i;
+    if (old >= 0) {
+        desktop_repair(icon_rect(old));
+    }
+    if (i >= 0) {
+        desktop_repair(icon_rect(i));
+    }
+}
+
+static void icon_press(int i)
+{
+    const int64_t now = esp_timer_get_time();
+
+    if (i == s_icon_sel && now - s_icon_click_us < ICON_DBLCLICK_US) {
+        const char *path = s_icons[i].path;
+        icon_set_sel(-1);
+        launch_app(path);
+        return;
+    }
+    s_icon_click_us = now;
+    icon_set_sel(i);
+}
+
 static void menu_activate(int i)
 {
     s_menu = false;
 
-    if (strcmp(s_menu_items[i], "photo") == 0) {
+    if (strcmp(s_menu_items[i], "plasma") == 0) {
+        launch_app("/bin/plasma");
+    } else if (strcmp(s_menu_items[i], "photo") == 0) {
         photo_open();
     } else if (strcmp(s_menu_items[i], "about") == 0) {
         if (s_about == NULL) {
@@ -2295,6 +2483,20 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                 }
             }
             /*
+             * The icons are on the bare desktop, so they are tried after the
+             * bar and before any window: a window drawn over an icon owns the
+             * press, because it is what you can see there.
+             */
+            if (window_at(ev->x, ev->y) == NULL) {
+                const int ic = icon_at(ev->x, ev->y);
+                if (ic >= 0) {
+                    icon_press(ic);
+                    return;
+                }
+            }
+            icon_set_sel(-1);
+
+            /*
              * Close before focus, and on the window under the pointer rather
              * than on the focused one: the button belongs to the window it is
              * drawn on, so pressing it must close that one even when it was not
@@ -2498,6 +2700,7 @@ esp_err_t espix_desktop_start(void)
     if (s_nwin == 0) {
         windows_create();
     }
+    input_reset();
     return espix_display_claim(&s_desktop_screen);
 }
 

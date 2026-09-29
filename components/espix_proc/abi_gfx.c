@@ -27,6 +27,7 @@
 #include "espix_display.h"
 #include "espix_gfx.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_proc_priv.h"
 
 #define TAG "gfx"
@@ -37,6 +38,8 @@ struct espix_gfx {
     espix_screen_t screen;      /* what the display calls; see the note above */
     QueueHandle_t  events;
     bool           open;
+    bool           canvas_locked;
+    espix_pid_t    lock_pid;    /* who holds the canvas; see espix_gfx_recover() */
 };
 
 struct espix_gfx_surface {
@@ -44,6 +47,46 @@ struct espix_gfx_surface {
 };
 
 static struct espix_gfx s_gfx;
+
+/*
+ * The canvas lock, with a note of who holds it.
+ *
+ * A task deleted between the take and the give leaves the mutex held by a TCB
+ * that no longer exists, and every later lock -- the desktop repainting, the
+ * VNC task encoding -- waits forever, which on this board is a watchdog reset
+ * rather than a stuck picture. The gfx handle is firmware memory and outlives
+ * the app, so it can remember the holder and orphan the lock once the process
+ * is gone; see espix_gfx_recover(). Keyed on the pid, never the task handle,
+ * because a deleted task's TCB is freed.
+ */
+static void gfx_canvas_take(espix_canvas_t *c)
+{
+    espix_canvas_lock(c);
+    s_gfx.lock_pid      = espix_proc_pid_of_task(xTaskGetCurrentTaskHandle());
+    s_gfx.canvas_locked = true;
+}
+
+static void gfx_canvas_give(espix_canvas_t *c)
+{
+    s_gfx.canvas_locked = false;
+    espix_canvas_unlock(c);
+}
+
+void espix_gfx_recover(espix_pid_t pid)
+{
+    if (!s_gfx.canvas_locked || s_gfx.lock_pid != pid) {
+        return;
+    }
+
+    espix_canvas_t *c = espix_display_canvas();
+    if (c != NULL) {
+        espix_canvas_orphan(c);     /* not give: the holder TCB is gone */
+    }
+    s_gfx.canvas_locked = false;
+
+    espix_klog(ESPIX_KLOG_WARN, TAG,
+               "canvas orphaned: pid %d died holding it", (int)pid);
+}
 
 /* Runs in whoever posted the input -- the RFB connection task. Never blocks: a
  * full queue drops the event rather than stalling the viewer. */
@@ -116,7 +159,7 @@ espix_gfx_fb_t espix_gfx_lock(espix_gfx_t *g)
         return fb;
     }
 
-    espix_canvas_lock(c);
+    gfx_canvas_take(c);
     fb.w      = espix_canvas_width(c);
     fb.h      = espix_canvas_height(c);
     fb.stride = fb.w;
@@ -136,7 +179,7 @@ void espix_gfx_present_rect(espix_gfx_t *g, int x, int y, int w, int h)
         return;
     }
     espix_canvas_damage(c, (espix_rect_t){ x, y, w, h });
-    espix_canvas_unlock(c);
+    gfx_canvas_give(c);
 }
 
 void espix_gfx_present(espix_gfx_t *g)
@@ -152,7 +195,7 @@ void espix_gfx_present(espix_gfx_t *g)
     }
     espix_canvas_damage(c, (espix_rect_t){ 0, 0, espix_canvas_width(c),
                                            espix_canvas_height(c) });
-    espix_canvas_unlock(c);
+    gfx_canvas_give(c);
 }
 
 void espix_gfx_unlock(espix_gfx_t *g)
@@ -164,7 +207,7 @@ void espix_gfx_unlock(espix_gfx_t *g)
     }
     c = espix_display_canvas();
     if (c != NULL) {
-        espix_canvas_unlock(c);
+        gfx_canvas_give(c);
     }
 }
 
@@ -228,9 +271,9 @@ void espix_gfx_present_surface(espix_gfx_t *g, const espix_gfx_surface_t *s)
         return;
     }
 
-    espix_canvas_lock(c);
+    gfx_canvas_take(c);
     espix_canvas_scale_surface(c, s->s);
-    espix_canvas_unlock(c);
+    gfx_canvas_give(c);
 }
 
 bool espix_gfx_poll_event(espix_gfx_t *g, espix_input_event_t *ev)
