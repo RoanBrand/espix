@@ -758,6 +758,123 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
     };
     return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
 }
+
+/*
+ * RGB565 -> ARGB8888, in one transaction.
+ *
+ * This is the conversion an RFB update pays when the client asks for 32bpp:
+ * every pixel the encoder emits is expanded on the way out. SRM does it with
+ * different input and output colour modes -- the same engine as the blit, which
+ * is this at 1:1 and one colour mode. The alpha byte is don't-care; the client
+ * asks for depth 24.
+ */
+static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
+{
+    if (s_sw_only || w <= 0 || h <= 0) {
+        return false;
+    }
+    if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0 ||
+        ((uintptr_t)dst & (BUF_ALIGN - 1)) != 0) {
+        return false;
+    }
+    if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
+        return false;
+    }
+
+    const ppa_srm_oper_config_t cfg = {
+        .in = {
+            .buffer         = src,
+            .pic_w          = (uint32_t)w,
+            .pic_h          = (uint32_t)h,
+            .block_w        = (uint32_t)w,
+            .block_h        = (uint32_t)h,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer         = dst,
+            .buffer_size    = (uint32_t)((size_t)w * h * 4),
+            .pic_w          = (uint32_t)w,
+            .pic_h          = (uint32_t)h,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_ARGB8888,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x        = 1.0f,
+        .scale_y        = 1.0f,
+        .mode           = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+}
+
+/* The conversion as a benchmark row: software expansion against PPA SRM. */
+static uint32_t bench_convert_run(const espix_px_t *src, uint32_t *dst,
+                                  int w, int h, uint32_t iters, bool hw)
+{
+    const size_t  n  = (size_t)w * h;
+    const int64_t t0 = esp_timer_get_time();
+
+    for (uint32_t i = 0; i < iters; i++) {
+        if (hw) {
+            (void)ppa_convert_rect(src, w, h, dst);
+        } else {
+            for (size_t p = 0; p < n; p++) {
+                dst[p] = rgb565_to_rgb888(src[p]);
+            }
+        }
+    }
+    return (uint32_t)(esp_timer_get_time() - t0);
+}
+
+static bool bench_convert_verify(const espix_px_t *src, uint32_t *dst, int w, int h)
+{
+    const size_t n   = (size_t)w * h;
+    uint32_t    *ref = buf_alloc(n * 4);
+    if (ref == NULL) {
+        return false;
+    }
+
+    for (size_t p = 0; p < n; p++) {
+        ref[p] = rgb565_to_rgb888(src[p]);
+    }
+
+    bool ok    = ppa_convert_rect(src, w, h, dst);
+    int  worst = 0;
+    for (size_t p = 0; p < n && ok; p++) {
+        /*
+         * PPA expands 565 as (v << 3), where the software path replicates the
+         * top bits -- (v << 3) | (v >> 2). The two differ by up to 7 in the low
+         * bits of a channel, which is a rounding difference rather than a wrong
+         * pixel; anything larger is a real mismatch.
+         */
+        const uint32_t a = dst[p], b = ref[p];
+        int d = (int)((a >> 16) & 0xFF) - (int)((b >> 16) & 0xFF);
+        if (d < 0) { d = -d; }
+        int dg = (int)((a >> 8) & 0xFF) - (int)((b >> 8) & 0xFF);
+        if (dg < 0) { dg = -dg; }
+        int db = (int)(a & 0xFF) - (int)(b & 0xFF);
+        if (db < 0) { db = -db; }
+        if (dg > d) { d = dg; }
+        if (db > d) { d = db; }
+
+        if (d > 8) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "bench: PPA convert wrote %08x at %u, wanted %08x",
+                       (unsigned)a, (unsigned)p, (unsigned)b);
+            ok = false;
+        }
+        if (d > worst) { worst = d; }
+    }
+    if (ok && worst > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "bench: PPA convert rounds by up to %d/255 (no low-bit "
+                   "replication)", worst);
+    }
+    heap_caps_free(ref);
+    return ok;
+}
 #else
 static bool s_sw_only;      /* unused without an accelerator, but harmless */
 #endif  /* SOC_PPA_SUPPORTED */
@@ -1395,6 +1512,62 @@ size_t espix_display_bench(espix_display_bench_t *out, size_t max)
         s_force_hw = false;
 #endif
     }
+
+#if SOC_PPA_SUPPORTED
+    /*
+     * The encode's per-pixel cost: RGB565 -> ARGB8888, which is what an RFB
+     * update pays when the client asks for 32bpp. It is neither a fill nor a
+     * blit, so the surface rows above cannot show it, and it is the operation
+     * the encoder does once per emitted pixel today.
+     */
+    static const struct { int w, h; } cvt[] = {
+        { 32, 32 }, { 128, 128 }, { 456, 186 }, { 800, 600 },
+    };
+
+    for (size_t c = 0; c < sizeof(cvt) / sizeof(cvt[0]) && n < max; c++) {
+        const int w = cvt[c].w, h = cvt[c].h;
+
+        espix_px_t *src = buf_alloc(buf_size(w, h));
+        uint32_t   *dst = buf_alloc((size_t)w * h * 4);
+        if (src == NULL || dst == NULL) {
+            heap_caps_free(src);
+            heap_caps_free(dst);
+            continue;
+        }
+
+        /* Varied and non-zero, so a path that writes nothing cannot pass. */
+        for (size_t p = 0; p < (size_t)w * h; p++) {
+            src[p] = (espix_px_t)(p * 2654435761u);
+        }
+
+        const uint64_t px = (uint64_t)w * h;
+        uint32_t iters = 1000000u / (uint32_t)px;
+        if (iters < 1)   { iters = 1; }
+        if (iters > 500) { iters = 500; }
+
+        espix_display_bench_t *row = &out[n++];
+        row->op          = "convert";
+        row->w           = w;
+        row->h           = h;
+        row->iters       = iters;
+        row->px_per_iter = px;
+        row->hw          = NULL;
+        row->us_hw       = 0;
+
+        s_sw_only  = true;
+        row->us_sw = bench_convert_run(src, dst, w, h, iters, false);
+        s_sw_only  = false;
+
+        s_force_hw = true;
+        row->hw_ok = bench_convert_verify(src, dst, w, h);
+        row->us_hw = bench_convert_run(src, dst, w, h, iters, true);
+        row->hw    = "PPA SRM";
+        s_force_hw = false;
+
+        heap_caps_free(src);
+        heap_caps_free(dst);
+    }
+#endif
 
     return n;
 }

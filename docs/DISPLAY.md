@@ -208,6 +208,26 @@ does, so they are quoted in milliseconds rather than in rates:
 | **window content** -- frame, title, 20x56 of text | 456x186 | 11.2 ms | **8.3 ms** | 1.3x |
 | **jpeg decode** -- the viewer's 23 KB test.jpg | 480x330 | 116.7 ms | **12.4 ms** | 9.4x |
 
+There is one more operation, neither a fill nor a blit, because it is what the
+encoder does once per emitted pixel: **RGB565 to ARGB8888**, the conversion an
+RFB update pays when the client asks for 32bpp.
+
+| | 32x32 | 128x128 | 456x186 | 800x600 |
+|---|---|---|---|---|
+| **S31 convert, software** | 10.9 | 7.9 | 7.8 | 7.8 |
+| **S31 convert, PPA SRM** | 5.9 | 31.5 | 38.0 | **41.9** |
+
+Mpx/s. PPA loses below about 64x64 -- its per-transaction cost is fixed -- and
+wins 4-5x above it. It is **not** a drop-in: PPA expands 565 as `v << 3` where the
+software path replicates the top bits (`(v << 3) | (v >> 2)`), so it rounds by up
+to 7/255, and the bench says so rather than calling it verified-equal. Wiring it
+in also means the staging copy would hold the *client's* format, so the Hextile
+subrect scan would run on 32-bit pixels instead of RGB565 -- a second encoder
+path. After the subrect change the conversion only dominates for a full frame or
+a photograph (the initial 800x600 frame's encode is ~66 ms, most of it this
+conversion), not for a drag. So it stays a measured option rather than a change:
+the number is here so the decision can be made with it.
+
 And one number that is not a row, because it is not a primitive: **a window
 drag**. Moving a window is the desktop's most obvious interaction and was its
 worst, at **301,380 bytes per four-pixel motion** -- the union of where the window
