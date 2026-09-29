@@ -117,7 +117,7 @@ typedef enum {
 } conf_state_t;
 
 static const struct { int w, h; } s_modes[] = {
-    { 800, 600 }, { 1024, 768 }, { 1280, 800 }, { 1920, 1080 },
+    { 800, 600 }, { 1024, 768 }, { 1280, 720 }, { 1280, 800 },
 };
 #define NMODES ((int)(sizeof(s_modes) / sizeof(s_modes[0])))
 
@@ -260,9 +260,10 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         rows[n++] = (row_t){ ROW_HEAD, "Display", NULL, true, false, ACT_NONE, 0 };
 
         if (s_conf == CONF_CONFIRM) {
-            snprintf(s_val[n], sizeof(s_val[n]), "%d x %d", s_conf_w, s_conf_h);
-            rows[n++] = (row_t){ ROW_FIELD, "Change the screen to",
-                                 s_val[n], true, false, ACT_NONE, 0 };
+            const int v = n;
+            snprintf(s_val[v], sizeof(s_val[v]), "%d x %d", s_conf_w, s_conf_h);
+            rows[n++] = (row_t){ ROW_FIELD, "Change the screen to", s_val[v],
+                                 true, false, ACT_NONE, 0 };
             rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
             rows[n++] = (row_t){ ROW_BUTTON, "Apply", NULL, true, false,
                                  ACT_RES_APPLY, 0 };
@@ -272,12 +273,14 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         }
 
         if (s_conf == CONF_REVERT) {
-            snprintf(s_val[n], sizeof(s_val[n]), "%d x %d",
+            const int v = n;
+            snprintf(s_val[v], sizeof(s_val[v]), "%d x %d",
                      s_conf_prev_w, s_conf_prev_h);
             rows[n++] = (row_t){ ROW_FIELD, "Keep this size, or revert to",
-                                 s_val[n], true, false, ACT_NONE, 0 };
-            snprintf(s_val[n], sizeof(s_val[n]), "%d s", s_conf_left);
-            rows[n++] = (row_t){ ROW_FIELD, "Reverting in", s_val[n], true,
+                                 s_val[v], true, false, ACT_NONE, 0 };
+            const int w2 = n;
+            snprintf(s_val[w2], sizeof(s_val[w2]), "%d s", s_conf_left);
+            rows[n++] = (row_t){ ROW_FIELD, "Reverting in", s_val[w2], true,
                                  false, ACT_NONE, 0 };
             rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
             rows[n++] = (row_t){ ROW_BUTTON, "Keep", NULL, true, false,
@@ -287,16 +290,18 @@ static int section_rows(const espix_window_t *w, row_t *rows)
             break;
         }
 
-        snprintf(s_val[n], sizeof(s_val[n]), "%d x %d", cw, ch);
-        rows[n++] = (row_t){ ROW_FIELD, "Current size", s_val[n], true, false,
+        const int vcur = n;
+        snprintf(s_val[vcur], sizeof(s_val[vcur]), "%d x %d", cw, ch);
+        rows[n++] = (row_t){ ROW_FIELD, "Current size", s_val[vcur], true, false,
                              ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_TEXT, "Resolution", NULL, true, false, ACT_NONE, 0 };
 
         for (int i = 0; i < NMODES; i++) {
             const bool cur = (s_modes[i].w == cw && s_modes[i].h == ch);
-            snprintf(s_val[n], sizeof(s_val[n]), "%d x %d",
+            const int  v   = n;
+            snprintf(s_val[v], sizeof(s_val[v]), "%d x %d",
                      s_modes[i].w, s_modes[i].h);
-            rows[n++] = (row_t){ ROW_RADIO, s_val[n], NULL, !cur, cur,
+            rows[n++] = (row_t){ ROW_RADIO, s_val[v], NULL, !cur, cur,
                                  ACT_RESOLUTION, i };
         }
 
@@ -330,9 +335,10 @@ static int section_rows(const espix_window_t *w, row_t *rows)
                          espix_net_ip4str(s_ifs[i].ip, ip, sizeof(ip)),
                          espix_net_prefix_len(s_ifs[i].netmask));
             }
-            snprintf(s_val[n], sizeof(s_val[n]), "%s", v);
-            rows[n++] = (row_t){ ROW_FIELD, s_ifs[i].name, s_val[n], true, false,
-                                 ACT_NONE, 0 };
+            const int vi = n;
+            snprintf(s_val[vi], sizeof(s_val[vi]), "%s", v);
+            rows[n++] = (row_t){ ROW_FIELD, s_ifs[i].name, s_val[vi], true,
+                                 false, ACT_NONE, 0 };
         }
 
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
@@ -343,11 +349,13 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         snprintf(buf, sizeof(buf), "%s via %s",
                  s_gw != 0 ? espix_net_ip4str(s_gw, gw, sizeof(gw)) : "none",
                  s_gw != 0 ? s_ifname : "-");
-        snprintf(s_val[n], sizeof(s_val[n]), "%s", buf);
-        rows[n++] = (row_t){ ROW_FIELD, "Default route", s_val[n],
+        const int vgw = n;
+        snprintf(s_val[vgw], sizeof(s_val[vgw]), "%s", buf);
+        rows[n++] = (row_t){ ROW_FIELD, "Default route", s_val[vgw],
                              s_gw != 0, false, ACT_NONE, 0 };
-        snprintf(s_val[n], sizeof(s_val[n]), "%s", s_dns);
-        rows[n++] = (row_t){ ROW_FIELD, "Nameservers", s_val[n],
+        const int vdns = n;
+        snprintf(s_val[vdns], sizeof(s_val[vdns]), "%s", s_dns);
+        rows[n++] = (row_t){ ROW_FIELD, "Nameservers", s_val[vdns],
                              s_dns_ok, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Hostname", espix_net_hostname(), true,
                              false, ACT_NONE, 0 };
