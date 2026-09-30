@@ -758,6 +758,16 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
          * spans on every row, 256 comparisons of three conditions for a tile
          * whose rows have nothing in common.
          */
+        /* Which span starts at each x, or -1. A run starts where the last one
+         * ended, so at most one per x -- and a subrect can only continue into a
+         * span that starts at its own x, which makes the matching below a lookup
+         * instead of sixteen comparisons of three conditions per active subrect
+         * per row. */
+        int8_t span_at[16];
+        for (int i = 0; i < 16; i++) {
+            span_at[i] = -1;
+        }
+
         for (int x = 0; x < tw; ) {
             const espix_px_t c = p[x];
             int w = 1;
@@ -768,6 +778,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
                 span_xy[nspan] = (uint8_t)((x << 4) | y);
                 span_wh[nspan] = (uint8_t)((w - 1) << 4);
                 span_px[nspan] = c;
+                span_at[x]     = (int8_t)nspan;
                 nspan++;
             }
             x += w;
@@ -781,18 +792,16 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
             subrect_t a    = active[i];
             bool      grew = false;
 
-            for (int j = 0; j < nspan; j++) {
-                /* Same x (the high nibble of xy) and same width (the high
-                 * nibble of wh); the colour must match too. */
-                if (!used[j] && (span_xy[j] & 0xF0) == (a.xy & 0xF0) &&
-                    (span_wh[j] & 0xF0) == (a.wh & 0xF0) &&
-                    span_px[j] == a.px) {
-                    used[j]       = true;
-                    a.wh          = (uint8_t)(a.wh + 1);    /* h += 1 */
-                    next[nnext++] = a;
-                    grew          = true;
-                    break;
-                }
+            const int j = span_at[(a.xy & 0xF0) >> 4];
+
+            /* The span that starts where this subrect does, of the same width
+             * (the high nibble of wh is the height) and the same colour. */
+            if (j >= 0 && !used[j] && (span_wh[j] & 0xF0) == (a.wh & 0xF0) &&
+                span_px[j] == a.px) {
+                used[j]       = true;
+                a.wh          = (uint8_t)(a.wh + 1);    /* h += 1 */
+                next[nnext++] = a;
+                grew          = true;
             }
 
             if (!grew) {
