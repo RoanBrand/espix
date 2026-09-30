@@ -1464,6 +1464,38 @@ and it is engine work rather than espix work — which is why it is parked here.
 - **Game data needed nothing new.** `pak0.pak` came off the USB stick through
   the `/etc/fstab` mount and was read with plain `fopen`/`fread`.
 
+## App data the program does not ship
+
+A program's *data* is not the kernel's business, and espix should not grow a
+per-game exception to prove it. The shape real systems use is the same one: the
+program declares what it needs, and whatever owns installation resolves it
+before the program runs -- `.desktop` plus a package manager on Linux, the app
+store plus a first-run download on mobile, expansion files in between. No
+program fetches its own content.
+
+Concretely: a manifest per app, beside the binary or under `/etc/apps/`:
+
+    data  <url>  <path>  sha256:<hex>
+
+`launch_app()` in the desktop -- and the shell's run path, so both agree --
+reads it, and if `<path>` is absent fetches it first, then spawns. The
+downloader is the one already written for `fetch`, which shares
+`esp_http_client`, mbedtls and the certificate bundle with `upgrade`; there is
+no second HTTP or TLS stack, and nothing new is exposed to apps, so a program
+still cannot reach the network except through what its manifest declares.
+
+Two things make it work on a small board, and both are already in `fetch`: it
+checks room before writing a byte and again against the server's
+Content-Length, and when there is not room it says where to get some -- which
+on espix is usually an old kernel still sitting in `/boot`. `tools/flash-ota.sh`
+prunes those now, but the loader is where they accumulate and where the pruning
+belongs.
+
+Not done. What exists is the downloader (`fetch`) and the space policy; what is
+missing is the manifest, the launcher hook, and a progress indication that does
+not look like a hung screen -- the display already has a black "hold" for the
+launch window, which is where a percentage belongs.
+
 ## Further out
 
 Not costed, not committed to, and further from the current shape of espix than

@@ -59,6 +59,24 @@ trap 'dev_askpass_cleanup' EXIT
 
 before="$(dev_once 'uname -v' 2>/dev/null || true)"
 
+# /boot accumulates one 3 MB kernel per install and nothing prunes them, so a
+# few OTA cycles fill the rootfs and the *next* push fails for want of space --
+# reported only as "could not copy the image to the board", with no mention of
+# why. Drop every kernel but the running one before pushing, so the copy has
+# room. The proper place for this is the loader, which is what installs them;
+# until it does it, the dev loop does.
+if [ -n "$before" ]; then
+    keep="${before#\#}"
+    # One rm per file, because tools/esp.sh execs a path rather than a shell:
+    # a remote `for` is "for: command not found".
+    dev_once 'ls /boot' 2>/dev/null | while read -r f; do
+        case "$f" in
+            *"$keep"*) ;;
+            espix-*.bin) dev_once "sudo rm /boot/$f" >/dev/null 2>&1 || true ;;
+        esac
+    done
+fi
+
 printf 'flash-ota: %s -> %s (%s)\n' "$bin" "$ESPIX_HOST" "$ESPIX_TARGET"
 if ! dev_push "$bin" /tmp/espix.bin >/dev/null 2>&1; then
     printf 'flash-ota: could not copy the image to the board\n' >&2
