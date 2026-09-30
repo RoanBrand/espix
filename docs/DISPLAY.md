@@ -579,3 +579,59 @@ Two clients were tried first, and both taught something.
 - **RFB is unencrypted and uncompressed at the transport.** It is for a LAN.
 - **3.3, or 3.7 and up.** Both are served because the two real clients here
   each picked one; 3.4-3.6 is a version nobody shipped a viewer for.
+
+## What the encoder costs, measured
+
+The server reports its own split every hundred updates, and the numbers below are
+a game (Doom) at two modes, viewer attached, one rect an update:
+
+| | 320x240 | 640x480 |
+|---|---|---|
+| canvas copy | 3.4 ms | 14.3 ms |
+| **encode** | **54 ms** | **161 ms** |
+| of which the RRE analysis | 40 ms | 121 ms |
+| of which emitting | 24 ms | 74 ms |
+| wire | 13.5 ms | 39 ms |
+| frame | ~70 ms | ~212 ms |
+
+The engine is not the problem: `doom -timedemo demo1` runs at **43.9 fps** with
+no viewer attached, which is rendering, palette conversion, surfacing and present
+all in. Everything above that cost is this file.
+
+Two things follow. The analysis is the largest single item, and it scales with how
+dense the imagery is -- a game frame is tens of thousands of subrects. And at the
+rate this pipeline manages, **most of a frame is identical to the one the client
+already has**: the status bar, the HUD, the static part of the view. The way to
+win is to stop encoding those, not to encode them faster.
+
+### The next lever: bands the client already has
+
+Keep the canvas as last *sent* per connection (`c->prev`, one canvas-sized PSRAM
+buffer: 150 KiB at 320x240, 600 KiB at 640x480) and, after copying the damaged
+region into `c->stage`, drop every sixteen-row band of it whose rows are
+byte-identical in the two. Bands are emitted *whole* when anything in them
+changed, so nothing can be missed -- that is the property that makes this safe to
+land before it is clever. Then update `prev` for the bands sent.
+
+Costs a `memcmp` per row (~0.3 ms a frame at 320x240) against the tens of
+milliseconds it can skip. If the band list would exceed
+`ESPIX_DISPLAY_DAMAGE_MAX`, fall back to the damage rects unchanged rather than
+merge them. `prev` wants the same treatment as `stage`: allocated in
+`connection_resize()` and in `rfb_serve()`, freed in the `done:` path, and
+cleared on a resize because the client's framebuffer is new.
+
+Finishing the job later means one rect per *changed run of tiles* rather than per
+band, which is the same comparison at finer granularity.
+
+### A PIE memcpy is not this lever
+
+The chip has the packed-SIMD unit (`CONFIG_SOC_CPU_HAS_PIE=y`) and this task is
+pinned to core 1 where it lives, so it is fair to ask. But there is exactly one
+bulk copy in the path -- the canvas-to-stage copy at the `stage` memcpy -- and it
+is 3.4 ms of a 70 ms frame at 320x240 and 14 of 212 at 640x480: **5-7% as a hard
+ceiling**, before the cost of vendoring PIE assembly and the vector-state care it
+needs across context switches. IDF ships no PIE memcpy for this part.
+
+Where PIE *would* pay is a pipeline whose per-frame work is a bulk conversion and
+copy rather than a per-pixel analysis -- if frames were ever sent raw, the
+320x200 surface becomes a 128 KiB pack per frame. Worth revisiting then, not now.
