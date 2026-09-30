@@ -128,6 +128,10 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(strcpy),
     ESP_ELFSYM_EXPORT(strncpy),
     ESP_ELFSYM_EXPORT(strncmp),
+    /* strings.h, not string.h, which is why they were missed: the engine's
+     * case-insensitive compares land here. */
+    ESP_ELFSYM_EXPORT(strcasecmp),
+    ESP_ELFSYM_EXPORT(strncasecmp),
     ESP_ELFSYM_EXPORT(strcat),
     ESP_ELFSYM_EXPORT(strstr),
     ESP_ELFSYM_EXPORT(strdup),
