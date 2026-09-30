@@ -195,6 +195,14 @@ enum {
     RFB_KEY_EVENT            = 4,
     RFB_POINTER_EVENT        = 5,
     RFB_CLIENT_CUT_TEXT      = 6,
+    /*
+     * An extension, and the *client* asking us to resize. RealVNC's viewer
+     * sends it when its window changes size ("RemoteResize", on by default).
+     * It is not one we implement, but it is one we must not choke on: the
+     * default case below closes the connection, and a window drag is not a
+     * reason to disconnect somebody.
+     */
+    RFB_SET_DESKTOP_SIZE     = 251,
 };
 
 /* Encodings. Raw is mandatory; Hextile is the one worth having. */
@@ -214,6 +222,20 @@ enum {
  * viewer, which is the failure this constant must not have.
  */
 #define RFB_ENC_EXTENDED_DESKTOP_SIZE  ((uint32_t)-308)
+
+/*
+ * And the one it replaced. DesktopSize (-223) was TightVNC's, is still what
+ * RealVNC offers, and -- measured on the viewer here -- RealVNC does *not*
+ * offer ExtendedDesktopSize. So a RealVNC client is resized this way or not at
+ * all: one rectangle whose width and height are the new size and which carries
+ * no payload, against the screen list above.
+ *
+ * The payload is the part worth being careful about. This sends none, because
+ * the size is in the rectangle header; if a client reads it as four bytes of
+ * payload it will desync on the next message and that is visible immediately,
+ * which is why the server also logs what a client offered.
+ */
+#define RFB_ENC_DESKTOP_SIZE           ((uint32_t)-223)
 
 /* ------------------------------------------------------------------ */
 /* Byte order helpers                                                  */
@@ -997,6 +1019,7 @@ typedef struct {
     bool      pending_full;   /* ...and it asked for a whole frame */
     bool      copyrect;       /* ...and it can be told to move pixels itself */
     bool      eds;            /* ...and it can be resized without reconnecting */
+    bool      desksize;       /* ...or it takes the older DesktopSize instead */
     bool      logged_req;     /* the first request is worth one line */
     bool      logged_send;    /* and so is the first update */
     int       stage_w, stage_h; /* the size stage and row were allocated for */
@@ -1108,7 +1131,7 @@ static void send_stat(int64_t us, size_t rects)
  * client resizes its framebuffer and asks again -- which is what makes a resize
  * live on the same connection rather than a reconnect.
  */
-static bool send_desktop_size(rfb_conn_t *c, int w, int h)
+static bool send_desktop_size_eds(rfb_conn_t *c, int w, int h)
 {
     uint8_t b[4 + 12 + 4 + 16];
 
@@ -1135,6 +1158,28 @@ static bool send_desktop_size(rfb_conn_t *c, int w, int h)
     wr16(r + 24, (uint16_t)w);
     wr16(r + 26, (uint16_t)h);
     wr32(r + 28, 0);                /* flags */
+
+    return write_full(c->fd, b, sizeof(b));
+}
+
+/*
+ * The older resize, for a client that never offered ExtendedDesktopSize:
+ * one rectangle whose width and height are the new framebuffer size and which
+ * carries no payload at all -- twelve bytes of header and a four of message.
+ */
+static bool send_desktop_size_old(rfb_conn_t *c, int w, int h)
+{
+    uint8_t b[4 + 12];
+
+    b[0] = 0;                       /* FramebufferUpdate */
+    b[1] = 0;
+    wr16(b + 2, 1);                 /* one rectangle */
+
+    wr16(b + 4, 0);                 /* x */
+    wr16(b + 6, 0);                 /* y */
+    wr16(b + 8, (uint16_t)w);       /* ...the new size */
+    wr16(b + 10, (uint16_t)h);
+    wr32(b + 12, RFB_ENC_DESKTOP_SIZE);
 
     return write_full(c->fd, b, sizeof(b));
 }
@@ -1171,14 +1216,15 @@ static bool connection_resize(rfb_conn_t *c, int w, int h)
     c->stage_w = w;
     c->stage_h = h;
 
-    if (!c->eds) {
+    if (!c->eds && !c->desksize) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "client cannot resize; dropping it to reconnect at %dx%d", w, h);
         return false;
     }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "client told the screen is now %dx%d", w, h);
-    return send_desktop_size(c, w, h);
+    return c->eds ? send_desktop_size_eds(c, w, h)
+                  : send_desktop_size_old(c, w, h);
 }
 
 static bool update_send(rfb_conn_t *c)
@@ -1438,6 +1484,11 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
         bool           hextile  = false;
         bool           copyrect = false;
         bool           eds      = false;
+        bool           desksize = false;
+        char           offered[192];
+        size_t         off = 0;
+
+        offered[0] = '\0';
 
         for (uint16_t i = 0; i < n; i++) {
             uint8_t e[4];
@@ -1451,24 +1502,42 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
                 copyrect = true;
             } else if (enc == RFB_ENC_EXTENDED_DESKTOP_SIZE) {
                 eds = true;
+            } else if (enc == RFB_ENC_DESKTOP_SIZE) {
+                desksize = true;
+            }
+            /*
+             * And the numbers themselves, because which pseudo-encoding a
+             * viewer offers is the whole question when a resize lands on a
+             * client that cannot take one -- and not something to guess at
+             * twice.
+             */
+            if (off + 12 < sizeof(offered)) {
+                const int w = snprintf(offered + off, sizeof(offered) - off,
+                                       "%s%ld", off ? " " : "", (long)(int32_t)enc);
+                if (w > 0) {
+                    off += (size_t)w;
+                }
             }
         }
         c->hextile  = hextile;
         c->copyrect = copyrect;
         c->eds      = eds;
+        c->desksize = desksize;
         snprintf(s_encodings, sizeof(s_encodings), "%u offered: hextile %s, "
                  "copyrect %s", n, hextile ? "yes" : "no",
                  copyrect ? "yes" : "no");
         /*
          * At INFO rather than DEBUG, and it is the line that decides whether a
-         * drag is 8 KB or 300 KB: CopyRect is a *client* capability, and a
-         * client that does not ask for it gets pixels and no way to tell from
-         * the outside which it is.
+         * drag is 8 KB or 300 KB and whether a resize is a blink or a
+         * reconnect: both are *client* capabilities, and a client that offers
+         * neither gives no other way to tell from the outside.
          */
         espix_klog(ESPIX_KLOG_INFO, TAG, "client offered %u encodings: hextile "
-                   "%s, copyrect %s%s (%s)", n, hextile ? "yes" : "no",
-                   copyrect ? "yes" : "no", eds ? ", resize yes" : "",
-                   copyrect ? "drags will be copies" : "drags will be pixels");
+                   "%s, copyrect %s, resize %s (%s) [%s]", n,
+                   hextile ? "yes" : "no", copyrect ? "yes" : "no",
+                   eds ? "extended" : (desksize ? "desktopsize" : "no"),
+                   copyrect ? "drags will be copies" : "drags will be pixels",
+                   offered);
         return true;
     }
 
@@ -1544,6 +1613,32 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
             }
         }
         return true;                        /* no clipboard yet */
+    }
+
+    case RFB_SET_DESKTOP_SIZE: {
+        /*
+         * The client asking us to resize -- RealVNC's viewer does this when
+         * its window changes size. Not implemented: a server that accepts one
+         * is meant to answer with a screen layout, and we have one screen and
+         * no interest in following a viewer's window. But it has to be read
+         * and dropped rather than closed on, because a window drag is not a
+         * reason to disconnect somebody.
+         */
+        uint8_t buf[7];                     /* pad, w, h, screens, pad */
+        if (!read_full(c->fd, buf, sizeof(buf))) {
+            return false;
+        }
+        const uint16_t screens = buf[5];
+        for (uint16_t i = 0; i < screens; i++) {
+            uint8_t s[16];
+            if (!read_full(c->fd, s, sizeof(s))) {
+                return false;
+            }
+        }
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "client asked for a %ux%u desktop; not implemented, ignoring",
+                   (unsigned)rd16(buf + 1), (unsigned)rd16(buf + 3));
+        return true;
     }
 
     default:
