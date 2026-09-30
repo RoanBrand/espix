@@ -1,6 +1,17 @@
 <p align="center">
-  <img src="docs/banner.png" alt="espix login greeting: ASCII logo beside OS, host, uptime, memory, storage and network" width="80%" max-width="800px">
+  <img src="docs/banner.png" alt="espix login greeting" width="60%" max-width="600px">
 </p>
+
+<table align="center">
+  <tr>
+    <td width="440">
+      <video src="https://github.com/user-attachments/assets/50dd1712-ef03-4bdc-8989-9bc64e26e0ef"></video>
+    </td>
+    <td width="440">
+      <video src="https://github.com/user-attachments/assets/0d29384d-b44a-4fc5-8c46-e333b48fac86"></video>
+    </td>
+  </tr>
+</table>
 
 # espix
 
