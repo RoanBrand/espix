@@ -29,10 +29,6 @@
 /* How often the foreground wait comes up for air to check for Ctrl-C. */
 #define RUN_POLL_MS 50
 
-/* How long a foreground command waits before giving up on the app and leaving
- * it running in the background. */
-#define RUN_FOREGROUND_TIMEOUT_MS 60000
-
 /*
  * Ctrl-C presses before the shell stops asking and starts insisting.
  *
@@ -145,14 +141,20 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
      *
      * 50ms is short enough to feel immediate and long enough that polling costs
      * nothing measurable.
+     *
+     * And there is no deadline. A foreground program holds the shell until it
+     * exits, as on Unix; the escalation below is what makes that safe, since a
+     * third Ctrl-C kills an app that will not listen. There *was* a sixty
+     * second deadline here, from before espix had signals at all: it detached
+     * the app and gave the prompt back, which also silently stopped pumping its
+     * output and its input, and on a system where a background program dies
+     * with the session it was not backgrounded so much as abandoned.
      */
     int       exit_code  = -1;
     esp_err_t wait_err   = ESP_ERR_TIMEOUT;
     unsigned  interrupts = 0;
 
-    for (unsigned waited = 0; waited < RUN_FOREGROUND_TIMEOUT_MS;
-         waited += RUN_POLL_MS) {
-
+    for (;;) {
         wait_err = espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(RUN_POLL_MS));
         if (wait_err != ESP_ERR_TIMEOUT) {
             break;                      /* finished, one way or another */
@@ -204,10 +206,6 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
 
     s->fg_pid = ESPIX_PID_NONE;
 
-    if (wait_err == ESP_ERR_TIMEOUT) {
-        espix_eprintf(s, "%s: pid %d still running, detaching\n", who, (int)pid);
-        return 1;
-    }
     if (wait_err != ESP_OK) {
         espix_eprintf(s, "%s: pid %d: %s\n", who, (int)pid, esp_err_to_name(wait_err));
         return 1;
