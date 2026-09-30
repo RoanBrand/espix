@@ -264,6 +264,54 @@ esp_err_t espix_net_conf_write_usb(espix_usb_mode_t mode);
 /* Resolve a hostname or dotted-quad to an address. */
 esp_err_t espix_net_resolve(const char *host, uint32_t *out_ip);
 
+/* ------------------------------------------------------------------ */
+/* Fetching a file over HTTP(S)                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * There is one of these on purpose. `upgrade` installs a kernel through it and
+ * `fetch` downloads everything else, because underneath they are the same
+ * operation; a second copy would be a second thing to fix when the redirect or
+ * TLS rules change. It is also why no app gets a network handle -- what a
+ * program needs off the network it declares in a manifest, and
+ * espix_appdata_ensure() is what acts on that.
+ *
+ * The bytes land in <path>.part and are renamed on success, so an interrupted
+ * transfer never leaves a file that looks whole. Room is checked before the
+ * first byte and again against the server's Content-Length: this filesystem
+ * also holds the kernel, and filling it is not a failure that ends cleanly.
+ */
+typedef void (*espix_fetch_progress_fn)(void *ctx, const char *path,
+                                         size_t done, size_t total);
+
+typedef enum {
+    ESPIX_FETCH_OK = 0,
+    ESPIX_FETCH_NO_ROOM,    /* larger than the free space */
+    ESPIX_FETCH_NO_NET,     /* DNS, connect, TLS, or a non-200 answer */
+    ESPIX_FETCH_IO,         /* could not create, write or rename */
+    ESPIX_FETCH_BAD_HASH,   /* the bytes do not match expect_sha256 */
+    ESPIX_FETCH_ARG,
+} espix_fetch_status_t;
+
+typedef struct {
+    size_t written;         /* bytes stored, on ESPIX_FETCH_OK */
+    size_t free_now;        /* room on / when the transfer started */
+    size_t need;            /* bytes the server said, 0 if it did not say */
+    int    http_status;     /* the server's answer, 0 if there was none */
+    int    err;             /* why an ESPIX_FETCH_IO failed, 0 otherwise */
+} espix_fetch_info_t;
+
+/*
+ * Download `url` into `path`. `expect_sha256` is 64 hex characters, or NULL;
+ * a mismatch discards the file rather than leaving it. `progress` is called as
+ * the body arrives and may be NULL; `total` is 0 when the server sent no
+ * Content-Length. Both output pointers may be NULL.
+ */
+espix_fetch_status_t espix_net_fetch(const char *url, const char *path,
+                                     const char *expect_sha256,
+                                     espix_fetch_progress_fn progress, void *ctx,
+                                     espix_fetch_info_t *info);
+
 #ifdef __cplusplus
 }
 #endif

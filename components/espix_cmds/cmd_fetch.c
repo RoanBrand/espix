@@ -2,10 +2,11 @@
  * fetch: pull a file from an HTTP(S) URL into the filesystem.
  *
  * This exists because a game's data is not the kernel's business. espix ships
- * the program; the data a program needs is fetched once, by the user, into the
- * rootfs. The HTTP and TLS stack is the one espix already links for `upgrade`
- * -- esp_http_client over mbedtls -- so a second client would be a second TLS
- * stack in RAM for no gain, and this costs nothing when it is not running.
+ * the program; the data a program needs is fetched, and the same downloader
+ * installs a kernel -- espix_net_fetch(), which shares esp_http_client, mbedtls
+ * and the certificate bundle with 'upgrade'. So this file is only the part that
+ * talks to a person: it names the URL, reports the progress, and turns the
+ * downloader's answer into something a user can act on.
  *
  *   fetch <url> <path>
  *
@@ -14,68 +15,50 @@
  * the worst possible moment. When there is not room, the message says where to
  * get some back: on this system the usual answer is an old kernel still
  * sitting in /boot.
- *
- * The bytes land in <path>.part and are renamed on success, so an interrupted
- * fetch never leaves a half file that looks whole.
  */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-#include "esp_crt_bundle.h"
-#include "esp_http_client.h"
 
 #include "espix_cmds.h"
 #include "espix_cmds_priv.h"
-#include "espix_fs.h"
-#include "espix_kernel.h"
+#include "espix_net.h"
 
-#define TAG "fetch"
-
-/* Leave the filesystem some room: one that writes its last byte cannot write
- * anything else, including the config that would tidy up next boot. */
-#define FETCH_RESERVE (64 * 1024)
-
-typedef struct {
-    FILE  *out;
-    size_t written;
-    size_t limit;      /* bytes we may write */
-    bool   too_big;
-} fetch_sink_t;
-
-static esp_err_t fetch_event(esp_http_client_event_t *evt)
+/*
+ * A line every tenth of the way, not every chunk. A 4 MB transfer arrives in
+ * thousands of pieces and one line each would be a wall of text that scrolls the
+ * useful part off the screen.
+ *
+ * An unknown length is mentioned once instead: the server may not have said how
+ * big the file is, and that must not look like a hang.
+ */
+void espix_cmds_fetch_progress(void *ctx, const char *path,
+                               size_t done, size_t total)
 {
-    fetch_sink_t *sink = evt->user_data;
+    espix_fetch_progress_t *p = ctx;
 
-    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key != NULL &&
-        strcasecmp(evt->header_key, "Content-Length") == 0) {
-        const size_t len = (size_t)strtoul(evt->header_value, NULL, 10);
-        if (len > sink->limit) {
-            sink->too_big = true;
-            return ESP_FAIL;        /* aborts the transfer */
+    (void)path;         /* the command named the destination already */
+
+    if (total == 0) {
+        /*
+         * Only once a real body is arriving. A host that answers with a
+         * redirect sends a few hundred bytes with no length first, and saying
+         * "length not given" for those would be technically true and useless.
+         */
+        if (!p->noted && done >= 64 * 1024) {
+            p->noted = true;
+            espix_printf(p->s, "fetch: receiving (length not given)\n");
         }
-    } else if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
-        if (sink->written + (size_t)evt->data_len > sink->limit) {
-            sink->too_big = true;
-            return ESP_FAIL;
-        }
-        if (fwrite(evt->data, 1, (size_t)evt->data_len, sink->out) !=
-            (size_t)evt->data_len) {
-            return ESP_FAIL;
-        }
-        sink->written += (size_t)evt->data_len;
+        return;
     }
-    return ESP_OK;
-}
 
-/* The one message that matters, said the same way wherever we run out. */
-static void fetch_no_room(espix_session_t *s, size_t need, size_t free_now)
-{
-    espix_eprintf(s, "fetch: %u bytes needed, %u free on /\n",
-                  (unsigned)need, (unsigned)free_now);
-    espix_eprintf(s, "fetch: free some space first. An old kernel in /boot is\n"
-                     "       the usual candidate: `ls /boot`, then rm one you are\n"
-                     "       not running.\n");
+    const unsigned decile = (unsigned)((done * 10) / total);
+    if (decile <= p->decile && done < total) {
+        return;
+    }
+    p->decile = decile;
+    espix_printf(p->s, "fetch: %3u%%  %u of %u KiB\n",
+                 (unsigned)((done * 100) / total),
+                 (unsigned)(done / 1024), (unsigned)(total / 1024));
 }
 
 int cmd_fetch(espix_session_t *s, int argc, char **argv)
@@ -85,75 +68,54 @@ int cmd_fetch(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    const char *url  = argv[1];
-    const char *path = argv[2];
+    espix_printf(s, "fetch: %s\n", argv[1]);
 
-    espix_fs_info_t info;
-    if (espix_fs_stat_root(&info) != ESP_OK) {
-        espix_eprintf(s, "fetch: cannot read the filesystem\n");
+    espix_fetch_progress_t progress = { .s = s };
+    espix_fetch_info_t     info     = { 0 };
+
+    const espix_fetch_status_t st =
+        espix_net_fetch(argv[1], argv[2], NULL, espix_cmds_fetch_progress,
+                        &progress, &info);
+
+    switch (st) {
+    case ESPIX_FETCH_OK:
+        espix_printf(s, "fetch: %u bytes -> %s\n", (unsigned)info.written,
+                     argv[2]);
+        return 0;
+
+    case ESPIX_FETCH_NO_ROOM:
+        if (info.need > 0) {
+            espix_eprintf(s, "fetch: %u bytes needed, %u free on /\n",
+                          (unsigned)info.need, (unsigned)info.free_now);
+        } else {
+            espix_eprintf(s, "fetch: larger than the %u bytes free on /\n",
+                          (unsigned)info.free_now);
+        }
+        espix_eprintf(s, "fetch: free some space first. An old kernel in /boot is\n"
+                         "       the usual candidate: 'ls /boot', then rm one you are\n"
+                         "       not running.\n");
+        return 1;
+
+    case ESPIX_FETCH_NO_NET:
+        if (info.http_status > 0) {
+            espix_eprintf(s, "fetch: the server answered HTTP %d\n",
+                          info.http_status);
+        } else {
+            espix_eprintf(s, "fetch: cannot reach %s\n", argv[1]);
+        }
+        return 1;
+
+    case ESPIX_FETCH_BAD_HASH:
+        espix_eprintf(s, "fetch: %s is not what was expected\n", argv[1]);
+        return 1;
+
+    case ESPIX_FETCH_IO:
+        espix_eprintf(s, "fetch: cannot write %s: %s\n", argv[2],
+                      strerror(info.err));
+        return 1;
+
+    default:
+        espix_eprintf(s, "fetch: bad request\n");
         return 1;
     }
-    const size_t free_now = info.total_bytes - info.used_bytes;
-    const size_t limit    = free_now > FETCH_RESERVE ? free_now - FETCH_RESERVE : 0;
-
-    char part[256];
-    if (snprintf(part, sizeof(part), "%s.part", path) >= (int)sizeof(part)) {
-        espix_eprintf(s, "fetch: path too long\n");
-        return 1;
-    }
-
-    FILE *out = fopen(part, "wb");
-    if (out == NULL) {
-        espix_eprintf(s, "fetch: cannot write %s\n", part);
-        return 1;
-    }
-
-    fetch_sink_t sink = { .out = out, .written = 0, .limit = limit };
-
-    esp_http_client_config_t cfg = {
-        .url               = url,
-        .event_handler     = fetch_event,
-        .user_data         = &sink,
-        .timeout_ms        = 30000,
-        .keep_alive_enable = false,
-        /* The same trust store `upgrade` uses -- one bundle, not two. */
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        /* esp_http_client follows 3xx itself; a raw file host redirects. */
-        .disable_auto_redirect = false,
-    };
-
-    espix_printf(s, "fetch: %s\n", url);
-
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == NULL) {
-        fclose(out);
-        remove(part);
-        espix_eprintf(s, "fetch: no client (no network?)\n");
-        return 1;
-    }
-
-    const esp_err_t err = esp_http_client_perform(c);
-    const int       code = esp_http_client_get_status_code(c);
-
-    esp_http_client_cleanup(c);
-    fclose(out);
-
-    if (sink.too_big) {
-        remove(part);
-        fetch_no_room(s, sink.written, free_now);
-        return 1;
-    }
-    if (err != ESP_OK || code != 200 || sink.written == 0) {
-        remove(part);
-        espix_eprintf(s, "fetch: failed (%s, HTTP %d)\n", esp_err_to_name(err), code);
-        return 1;
-    }
-    if (rename(part, path) != 0) {
-        remove(part);
-        espix_eprintf(s, "fetch: cannot rename into place\n");
-        return 1;
-    }
-
-    espix_printf(s, "fetch: %u bytes -> %s\n", (unsigned)sink.written, path);
-    return 0;
 }

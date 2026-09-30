@@ -10,7 +10,7 @@
 # Leaving the requirement unconditional costs nothing: with the option off,
 # usb_ncm.c is not built, nothing calls tinyusb_driver_install(), and
 # --gc-sections drops the stack from the image.
-set(espix_net_srcs "net.c" "wifi.c" "bridge.c" "abi.c")
+set(espix_net_srcs "net.c" "wifi.c" "bridge.c" "fetch.c" "abi.c")
 if(CONFIG_ESPIX_USB_NCM_ENABLED)
     list(APPEND espix_net_srcs "usb_ncm.c")
 endif()
@@ -39,6 +39,8 @@ idf_component_register(
         nvs_flash
         lwip
         freertos
+        esp_http_client
+        mbedtls
         espressif__elf_loader
         espressif__esp_tinyusb
 )

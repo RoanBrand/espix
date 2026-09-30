@@ -26,7 +26,6 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "psa/crypto.h"
 #include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
@@ -288,83 +287,6 @@ void espix_ota_confirm_boot(void)
 /* Handing an image to the loader                                      */
 /* ------------------------------------------------------------------ */
 
-static esp_err_t sha256_file(const char *path, char out[65])
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    psa_crypto_init();
-    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-    if (psa_hash_setup(&op, PSA_ALG_SHA_256) != PSA_SUCCESS) {
-        fclose(f);
-        return ESP_FAIL;
-    }
-
-    static uint8_t buf[OTA_CHUNK];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-        if (psa_hash_update(&op, buf, n) != PSA_SUCCESS) {
-            psa_hash_abort(&op);
-            fclose(f);
-            return ESP_FAIL;
-        }
-    }
-    const bool bad = ferror(f);
-    fclose(f);
-    if (bad) {
-        psa_hash_abort(&op);
-        return ESP_FAIL;
-    }
-
-    uint8_t mac[32];
-    size_t maclen = 0;
-    if (psa_hash_finish(&op, mac, sizeof(mac), &maclen) != PSA_SUCCESS ||
-        maclen != 32) {
-        return ESP_FAIL;
-    }
-    for (size_t i = 0; i < 32; i++) {
-        sprintf(out + i * 2, "%02x", mac[i]);
-    }
-    out[64] = 0;
-    return ESP_OK;
-}
-
-/*
- * esp_http_client only follows redirects inside the blocking perform(), and
- * GitHub answers both releases/latest/download and a tag's asset URL with a 302
- * to release-assets.githubusercontent.com. So the body has to be consumed by an
- * event handler during perform() rather than read afterwards -- here it streams
- * straight to the file.
- */
-typedef struct {
-    FILE                 *f;
-    size_t                done;
-    bool                  failed;
-    espix_ota_progress_fn progress;
-    void                 *ctx;
-} dl_sink_t;
-
-static esp_err_t on_download_data(esp_http_client_event_t *evt)
-{
-    dl_sink_t *s = evt->user_data;
-
-    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
-        if (fwrite(evt->data, 1, (size_t)evt->data_len, s->f) !=
-            (size_t)evt->data_len) {
-            s->failed = true;
-            return ESP_FAIL;            /* aborts the perform */
-        }
-        s->done += (size_t)evt->data_len;
-        if (s->progress != NULL) {
-            const int total = esp_http_client_get_content_length(evt->client);
-            s->progress(s->ctx, s->done, (total > 0) ? (size_t)total : 0);
-        }
-    }
-    return ESP_OK;
-}
-
 esp_err_t espix_ota_download(const char *url, const char *name,
                              const char *expect_sha256,
                              espix_ota_progress_fn progress, void *ctx,
@@ -384,107 +306,62 @@ esp_err_t espix_ota_download(const char *url, const char *name,
         return ESP_ERR_NOT_FOUND;
     }
 
+    /*
+     * The transfer is espix_net_fetch(): the same code the shell's `fetch` and
+     * the launcher's first-run data use. That is the point of it -- the redirect
+     * rules, the space check and the certificate bundle are one place rather
+     * than one per caller, and a second copy would be the copy nobody remembered
+     * to fix. What is left here is what is actually OTA's: where the file goes,
+     * and what a failure is called.
+     */
     char path[320];
-    char part[328];
     snprintf(path, sizeof(path), ESPIX_OTA_BOOT_DIR "/%s", name);
-    snprintf(part, sizeof(part), ESPIX_OTA_BOOT_DIR "/.%s.part", name);
 
-    FILE *f = fopen(part, "wb");
-    if (f == NULL) {
+    espix_fetch_info_t info = { 0 };
+    const espix_fetch_status_t st =
+        espix_net_fetch(url, path, expect_sha256, progress, ctx, &info);
+
+    switch (st) {
+    case ESPIX_FETCH_OK:
         if (err != NULL) {
-            snprintf(err, err_len, "cannot write %s: %s", part, strerror(errno));
+            snprintf(err, err_len, "downloaded %s (%u bytes)", name,
+                     (unsigned)info.written);
+        }
+        return ESP_OK;
+
+    case ESPIX_FETCH_NO_ROOM:
+        /* The one refusal a user can act on, so it names the number rather than
+         * saying "out of space" and leaving them to find the hole. */
+        if (err != NULL) {
+            snprintf(err, err_len, "no room: %u bytes free on /",
+                     (unsigned)info.free_now);
+        }
+        return ESP_ERR_NO_MEM;
+
+    case ESPIX_FETCH_BAD_HASH:
+        if (err != NULL) {
+            snprintf(err, err_len, "checksum mismatch: expected %.12s...",
+                     expect_sha256);
+        }
+        return ESP_ERR_INVALID_CRC;
+
+    case ESPIX_FETCH_NO_NET:
+        if (err != NULL) {
+            if (info.http_status > 0) {
+                snprintf(err, err_len, "%s: the server answered HTTP %d", url,
+                         info.http_status);
+            } else {
+                snprintf(err, err_len, "cannot reach %s", url);
+            }
         }
         return ESP_ERR_NOT_FOUND;
-    }
 
-    dl_sink_t sink = { .f = f, .progress = progress, .ctx = ctx };
-
-    esp_http_client_config_t cfg = {
-        .url                   = url,
-        .timeout_ms            = CONFIG_ESPIX_OTA_TIMEOUT_MS,
-        .buffer_size           = 4096,
-        /* The redirect target is a signed URL whose query is ~1KB; the request
-         * line is built in buffer_size_tx, whose default is 512. */
-        .buffer_size_tx        = 2048,
-        .keep_alive_enable     = true,
-        .event_handler         = on_download_data,
-        .user_data             = &sink,
-        .max_redirection_count = 5,
-    };
-    if (strncmp(url, "https://", 8) == 0) {
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    }
-
-    espix_klog(ESPIX_KLOG_INFO, TAG, "fetching %s (internal free %u KiB)", url,
-               (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
-
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == NULL) {
-        fclose(f);
-        unlink(part);
+    default:
         if (err != NULL) {
-            snprintf(err, err_len, "cannot start an HTTP client");
+            snprintf(err, err_len, "cannot write %s", path);
         }
         return ESP_FAIL;
     }
-
-    esp_err_t e = esp_http_client_perform(c);
-    const int status = esp_http_client_get_status_code(c);
-    if (e == ESP_OK && status != 200) {
-        e = ESP_ERR_NOT_FOUND;
-    }
-    if (e != ESP_OK && err != NULL) {
-        if (sink.failed) {
-            snprintf(err, err_len, "out of space");
-        } else if (status != 200 && status != 0) {
-            snprintf(err, err_len, "%s: the server answered HTTP %d", url, status);
-        } else {
-            snprintf(err, err_len, "cannot reach %s: %s", url,
-                     (e == ESP_ERR_TIMEOUT) ? "timed out" : esp_err_to_name(e));
-        }
-    }
-    esp_http_client_cleanup(c);
-    if (fclose(f) != 0 && e == ESP_OK) {
-        e = ESP_FAIL;
-    }
-
-    if (e != ESP_OK) {
-        unlink(part);
-        return e;
-    }
-
-    if (expect_sha256 != NULL && expect_sha256[0] != 0) {
-        char actual[65];
-        if (sha256_file(part, actual) != ESP_OK) {
-            unlink(part);
-            if (err != NULL) {
-                snprintf(err, err_len, "cannot hash what was downloaded");
-            }
-            return ESP_FAIL;
-        }
-        if (strcasecmp(actual, expect_sha256) != 0) {
-            unlink(part);
-            if (err != NULL) {
-                snprintf(err, err_len,
-                         "checksum mismatch: expected %.12s..., got %.12s...",
-                         expect_sha256, actual);
-            }
-            return ESP_ERR_INVALID_CRC;
-        }
-    }
-
-    if (rename(part, path) != 0) {
-        unlink(part);
-        if (err != NULL) {
-            snprintf(err, err_len, "cannot put %s in place", path);
-        }
-        return ESP_FAIL;
-    }
-
-    if (err != NULL) {
-        snprintf(err, err_len, "downloaded %s (%u bytes)", name, (unsigned)sink.done);
-    }
-    return ESP_OK;
 }
 
 esp_err_t espix_ota_adopt(const char *path, char *name, size_t len,

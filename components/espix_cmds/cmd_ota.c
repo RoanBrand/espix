@@ -89,9 +89,12 @@ typedef struct {
 
 #define PROGRESS_STEP (256 * 1024)
 
-static void report_progress(void *ctx, size_t done, size_t total)
+static void report_progress(void *ctx, const char *path, size_t done,
+                            size_t total)
 {
     progress_ctx_t *p = ctx;
+
+    (void)path;         /* one file at a time, and its name is printed already */
 
     if (total > 0) {
         const int pct = (int)((done * 100) / total);

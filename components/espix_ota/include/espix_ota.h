@@ -62,7 +62,10 @@ size_t espix_ota_slots(espix_ota_slot_t *out, size_t n);
 /* Handing an image to the loader                                      */
 /* ------------------------------------------------------------------ */
 
-typedef void (*espix_ota_progress_fn)(void *ctx, size_t done, size_t total);
+/* As espix_fetch_progress_fn: the destination is passed so one reporter can
+ * serve several files, which is what a caller watching a queue wants. */
+typedef void (*espix_ota_progress_fn)(void *ctx, const char *path,
+                                      size_t done, size_t total);
 
 /* Download url into /boot/<name>, then check it against expect_sha256. */
 esp_err_t espix_ota_download(const char *url, const char *name,

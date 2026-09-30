@@ -42,6 +42,20 @@ bool espix_cmd_path(espix_session_t *s, const char *arg,
 /* A byte count as a size column: plain, or -h for "1.4K"/"21K"/"28.7G"/"3.1T". */
 void espix_cmd_size(char *out, size_t len, uint64_t bytes, bool human);
 
+/*
+ * A download's progress, as a line every tenth, for a session watching one.
+ * Shared by 'fetch' and by the run path's first-launch download, so the two
+ * report the same way; the implementation is in cmd_fetch.c.
+ */
+typedef struct {
+    espix_session_t *s;
+    unsigned         decile;    /* the tenth reported last */
+    bool             noted;     /* an unknown-size transfer has been mentioned */
+} espix_fetch_progress_t;
+
+void espix_cmds_fetch_progress(void *ctx, const char *path,
+                               size_t done, size_t total);
+
 /* Register a NULL-terminated array of commands, logging any duplicates. */
 void espix_cmds_register_table(espix_cmd_t *table, size_t count);
 
