@@ -313,6 +313,25 @@ static struct {
 } s_phase;
 
 /*
+ * What the encoder does with those microseconds, tile by tile.
+ *
+ * The phase split above says "encode" and stops there, which is enough to know
+ * the encoder is the ceiling and not enough to know what to do about it. This
+ * says how much of it is the RRE analysis -- the part that can be abandoned
+ * early -- against the pixel conversion that every tile pays whatever encoding
+ * wins, and how many tiles each outcome took.
+ */
+static struct {
+    uint64_t analyse_us;    /* colour runs and subrect matching */
+    uint64_t emit_us;       /* converting pixels and writing them out */
+    uint32_t tiles;
+    uint32_t flat;          /* one colour: a background byte, done */
+    uint32_t raw;           /* sent as pixels */
+    uint32_t sub;           /* sent as subrects */
+    uint32_t subrects;      /* ...and how many rectangles those carried */
+} s_enc;
+
+/*
  * Start a frame, or do not start it at all.
  *
  * This is the whole of the decoupling, and it is four bytes' worth. Input and
@@ -440,6 +459,32 @@ static void sink_write(sink_t *s, const void *data, size_t n)
     }
 }
 
+/*
+ * A contiguous run of the output buffer, reserved rather than appended to a few
+ * bytes at a time. The caller writes exactly n bytes and commits them.
+ *
+ * NULL when the sink is dead or the run cannot fit in the buffer at all, which
+ * is the caller's cue to encode the rectangle some other way.
+ */
+static uint8_t *sink_gap(sink_t *s, size_t n)
+{
+    if (s->bad || n > s->cap) {
+        return NULL;
+    }
+    if (s->cap - s->len < n) {
+        sink_flush(s);
+        if (s->bad) {
+            return NULL;
+        }
+    }
+    return s->buf + s->len;
+}
+
+static void sink_commit(sink_t *s, uint8_t *end)
+{
+    s->len = (size_t)(end - s->buf);
+}
+
 /* ------------------------------------------------------------------ */
 /* Pixel format                                                        */
 /* ------------------------------------------------------------------ */
@@ -497,6 +542,54 @@ static void pf_write(uint8_t *b, const rfb_pf_t *pf)
  * goes through the general scale. This loop is the CPU work PPA SRM is meant
  * to take over, and the reason to keep it obvious.
  */
+/*
+ * One pixel in the client's format, returning how many bytes it took.
+ *
+ * Split out of the loop below because the hextile emitter converts a colour per
+ * subrect -- thousands of times an update -- and a call into row_to_pf() for a
+ * single pixel is worth avoiding. One implementation, so the two cannot drift.
+ */
+static int pix_to_pf(espix_px_t px, uint8_t *dst, const rfb_pf_t *pf)
+{
+    const int      bytes = pf->bpp / 8;
+    const uint32_t r5 = (uint32_t)((px >> 11) & 0x1F);
+    const uint32_t g6 = (uint32_t)((px >> 5) & 0x3F);
+    const uint32_t b5 = (uint32_t)(px & 0x1F);
+
+    uint32_t r, g, b;
+    if (pf->rmax == 255 && pf->gmax == 255 && pf->bmax == 255) {
+        r = (r5 << 3) | (r5 >> 2);
+        g = (g6 << 2) | (g6 >> 4);
+        b = (b5 << 3) | (b5 >> 2);
+    } else {
+        const uint32_t r8 = (r5 << 3) | (r5 >> 2);
+        const uint32_t g8 = (g6 << 2) | (g6 >> 4);
+        const uint32_t b8 = (b5 << 3) | (b5 >> 2);
+        r = pf->rmax ? (r8 * pf->rmax + 127) / 255 : 0;
+        g = pf->gmax ? (g8 * pf->gmax + 127) / 255 : 0;
+        b = pf->bmax ? (b8 * pf->bmax + 127) / 255 : 0;
+    }
+
+    const uint32_t v = (r << pf->rshift) | (g << pf->gshift) | (b << pf->bshift);
+
+    if (bytes == 1) {
+        dst[0] = (uint8_t)v;
+    } else if (bytes == 2) {
+        if (pf->big_endian) {
+            dst[0] = (uint8_t)(v >> 8); dst[1] = (uint8_t)v;
+        } else {
+            dst[0] = (uint8_t)v;        dst[1] = (uint8_t)(v >> 8);
+        }
+    } else if (pf->big_endian) {
+        dst[0] = (uint8_t)(v >> 24); dst[1] = (uint8_t)(v >> 16);
+        dst[2] = (uint8_t)(v >> 8);  dst[3] = (uint8_t)v;
+    } else {
+        dst[0] = (uint8_t)v;         dst[1] = (uint8_t)(v >> 8);
+        dst[2] = (uint8_t)(v >> 16); dst[3] = (uint8_t)(v >> 24);
+    }
+    return bytes;
+}
+
 static void row_to_pf(const espix_px_t *src, uint8_t *dst, int n, const rfb_pf_t *pf)
 {
     const int bytes = pf->bpp / 8;
@@ -516,48 +609,8 @@ static void row_to_pf(const espix_px_t *src, uint8_t *dst, int n, const rfb_pf_t
         return;
     }
 
-    const bool full = (pf->rmax == 255 && pf->gmax == 255 && pf->bmax == 255);
-
     for (int i = 0; i < n; i++) {
-        const uint32_t r5 = (uint32_t)((src[i] >> 11) & 0x1F);
-        const uint32_t g6 = (uint32_t)((src[i] >> 5) & 0x3F);
-        const uint32_t b5 = (uint32_t)(src[i] & 0x1F);
-
-        uint32_t r, g, b;
-        if (full) {
-            r = (r5 << 3) | (r5 >> 2);
-            g = (g6 << 2) | (g6 >> 4);
-            b = (b5 << 3) | (b5 >> 2);
-        } else {
-            const uint32_t r8 = (r5 << 3) | (r5 >> 2);
-            const uint32_t g8 = (g6 << 2) | (g6 >> 4);
-            const uint32_t b8 = (b5 << 3) | (b5 >> 2);
-            r = pf->rmax ? (r8 * pf->rmax + 127) / 255 : 0;
-            g = pf->gmax ? (g8 * pf->gmax + 127) / 255 : 0;
-            b = pf->bmax ? (b8 * pf->bmax + 127) / 255 : 0;
-        }
-
-        const uint32_t v = (r << pf->rshift) | (g << pf->gshift) | (b << pf->bshift);
-        uint8_t       *d = dst + (size_t)i * bytes;
-
-        switch (bytes) {
-        case 1:
-            d[0] = (uint8_t)v;
-            break;
-        case 2:
-            if (pf->big_endian) { d[0] = (uint8_t)(v >> 8); d[1] = (uint8_t)v; }
-            else                { d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); }
-            break;
-        default:
-            if (pf->big_endian) {
-                d[0] = (uint8_t)(v >> 24); d[1] = (uint8_t)(v >> 16);
-                d[2] = (uint8_t)(v >> 8);  d[3] = (uint8_t)v;
-            } else {
-                d[0] = (uint8_t)v;         d[1] = (uint8_t)(v >> 8);
-                d[2] = (uint8_t)(v >> 16); d[3] = (uint8_t)(v >> 24);
-            }
-            break;
-        }
+        (void)pix_to_pf(src[i], dst + (size_t)i * bytes, pf);
     }
 }
 
@@ -646,6 +699,8 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
     const int bytes = pf->bpp / 8;
     const espix_px_t bg = base[0];
 
+    const int64_t t_analyse = esp_timer_get_time();
+
     bool uniform = true;
     for (int y = 0; y < th && uniform; y++) {
         const espix_px_t *p = base + (size_t)y * stride;
@@ -663,6 +718,10 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         sink_write(s, &mask, 1);
         row_to_pf(&bg, pix, 1, pf);
         sink_write(s, pix, (size_t)bytes);
+
+        s_enc.analyse_us += esp_timer_get_time() - t_analyse;
+        s_enc.tiles++;
+        s_enc.flat++;
         return;
     }
 
@@ -689,6 +748,16 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         espix_px_t span_px[16];
         int        nspan = 0;
 
+        /*
+         * Which span starts at each x, or -1.
+         *
+         * A run starts where the last one ended, so at most one span per x, and
+         * a subrect can only continue into a span that starts at the subrect's
+         * own x. That makes the matching below an index lookup rather than a
+         * search -- it used to compare every active subrect against all sixteen
+         * spans on every row, 256 comparisons of three conditions for a tile
+         * whose rows have nothing in common.
+         */
         for (int x = 0; x < tw; ) {
             const espix_px_t c = p[x];
             int w = 1;
@@ -713,15 +782,15 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
             bool      grew = false;
 
             for (int j = 0; j < nspan; j++) {
-                /* Same x (low nibble of xy is the row) and same width (low
-                 * nibble of wh is the height); the colour must match too. */
+                /* Same x (the high nibble of xy) and same width (the high
+                 * nibble of wh); the colour must match too. */
                 if (!used[j] && (span_xy[j] & 0xF0) == (a.xy & 0xF0) &&
                     (span_wh[j] & 0xF0) == (a.wh & 0xF0) &&
                     span_px[j] == a.px) {
-                    used[j] = true;
-                    a.wh    = (uint8_t)(a.wh + 1);   /* h += 1 */
+                    used[j]       = true;
+                    a.wh          = (uint8_t)(a.wh + 1);    /* h += 1 */
                     next[nnext++] = a;
-                    grew = true;
+                    grew          = true;
                     break;
                 }
             }
@@ -760,6 +829,10 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         }
     }
 
+    /* Analysis over; from here it is pixels or subrects. */
+    s_enc.analyse_us += esp_timer_get_time() - t_analyse;
+    const int64_t t_emit = esp_timer_get_time();
+
     const size_t raw_size = 1 + (size_t)tw * th * bytes;
 
     if (!overflow && nclosed > 0) {
@@ -779,27 +852,42 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         if (sub_size < raw_size) {
             const uint8_t mask = mono ? (uint8_t)(0x02 | 0x04 | 0x08)
                                       : (uint8_t)(0x02 | 0x10 | 0x08);
-            uint8_t       pix[4];
 
-            sink_write(s, &mask, 1);
-            row_to_pf(&bg, pix, 1, pf);
-            sink_write(s, pix, (size_t)bytes);
-            if (mono) {
-                row_to_pf(&closed[0].px, pix, 1, pf);
-                sink_write(s, pix, (size_t)bytes);
-            }
-            const uint8_t count = (uint8_t)nclosed;
-            sink_write(s, &count, 1);
-
-            for (size_t i = 0; i < nclosed; i++) {
-                if (!mono) {
-                    row_to_pf(&closed[i].px, pix, 1, pf);
-                    sink_write(s, pix, (size_t)bytes);
+            /*
+             * Reserved once, then stored.
+             *
+             * This was three sink_write() calls per subrect, and each of those
+             * ended in a memcpy() whose length is the caller's -- a variable
+             * length, so a real call rather than an inlined move. Measured, the
+             * emission cost more than the analysis that produced it. The size is
+             * known here, so the buffer is taken once and the bytes are put
+             * where they go.
+             */
+            uint8_t *o = sink_gap(s, sub_size);
+            if (o != NULL) {
+                *o++ = mask;
+                o += pix_to_pf(bg, o, pf);
+                if (mono) {
+                    o += pix_to_pf(closed[0].px, o, pf);
                 }
-                sink_write(s, &closed[i].xy, 1);
-                sink_write(s, &closed[i].wh, 1);
+                *o++ = (uint8_t)nclosed;
+
+                for (size_t i = 0; i < nclosed; i++) {
+                    if (!mono) {
+                        o += pix_to_pf(closed[i].px, o, pf);
+                    }
+                    *o++ = closed[i].xy;
+                    *o++ = closed[i].wh;
+                }
+                sink_commit(s, o);
+
+                s_enc.subrects += (uint32_t)nclosed;
+                s_enc.emit_us += esp_timer_get_time() - t_emit;
+                s_enc.tiles++;
+                s_enc.sub++;
+                return;
             }
-            return;
+            /* No room for the subrect encoding: send it as pixels instead. */
         }
     }
 
@@ -809,6 +897,10 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         row_to_pf(base + (size_t)y * stride, row, tw, pf);
         sink_write(s, row, (size_t)tw * bytes);
     }
+
+    s_enc.emit_us += esp_timer_get_time() - t_emit;
+    s_enc.tiles++;
+    s_enc.raw++;
 }
 
 static void enc_hextile(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
@@ -897,6 +989,26 @@ static void send_stat(int64_t us, size_t rects)
                (long long)(s_phase.write_us / u),
                (long long)s_send_stat.worst,
                (long long)((s_send_stat.rects + 50) / 100));
+
+    const uint32_t tiles = s_enc.tiles ? s_enc.tiles : 1;
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "enc: %u tiles an update (%u flat, %u raw, %u sub, "
+               "%u subrects), %lld us a tile (analyse %lld, emit %lld)",
+               (unsigned)(s_enc.tiles / u),
+               (unsigned)(s_enc.flat / u), (unsigned)(s_enc.raw / u),
+               (unsigned)(s_enc.sub / u), (unsigned)(s_enc.subrects / u),
+               (long long)((s_enc.analyse_us + s_enc.emit_us) / tiles),
+               (long long)(s_enc.analyse_us / tiles),
+               (long long)(s_enc.emit_us / tiles));
+
+    s_enc.analyse_us = 0;
+    s_enc.emit_us    = 0;
+    s_enc.tiles      = 0;
+    s_enc.flat       = 0;
+    s_enc.raw        = 0;
+    s_enc.sub        = 0;
+    s_enc.subrects   = 0;
+
     s_phase.n = 0;
     s_phase.canvas_us = 0;
     s_phase.encode_us = 0;
