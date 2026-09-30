@@ -887,6 +887,10 @@ static int cmd_bridge(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/* Implemented in cmd_fetch.c: the HTTP(S) client lives there so this file
+ * keeps to sockets and interfaces. */
+extern int cmd_fetch(espix_session_t *s, int argc, char **argv);
+
 static espix_cmd_t s_net_cmds[] = {
     { .name = "ip",       .fn = cmd_ip,
       .help = "show addresses, links and routes",
@@ -917,6 +921,9 @@ static espix_cmd_t s_net_cmds[] = {
     { .name = "hostname", .fn = cmd_hostname,
       .help = "show or set the hostname",
       .usage = "hostname [name]" },
+    { .name = "fetch",    .fn = cmd_fetch,
+      .help = "download a file over HTTP(S)",
+      .usage = "fetch <url> <path>" },
 };
 
 void espix_cmds_register_net(void)

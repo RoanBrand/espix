@@ -5,6 +5,7 @@ idf_component_register(
         "cmd_fs.c"
         "cmd_sys.c"
         "cmd_run.c"
+        "cmd_fetch.c"
         "cmd_net.c"
         "cmd_motd.c"
         "cmd_time.c"
@@ -37,6 +38,7 @@ idf_component_register(
         espix_time
         espix_ota
         app_update
+        esp_http_client
         mbedtls
         esp_blockdev
         lwip
