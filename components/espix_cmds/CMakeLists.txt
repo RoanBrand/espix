@@ -28,6 +28,7 @@ idf_component_register(
         espix_proc
         espix_shell
         espix_fault
+        espix_appdata
         espix_net
         espix_bt
         espix_audio

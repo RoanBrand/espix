@@ -26,6 +26,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
+#include "espix_appdata.h"
 #include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_kernel.h"
@@ -2026,26 +2027,206 @@ static void app_waiter(void *arg)
     vTaskDelete(NULL);
 }
 
-static void launch_app(const char *path)
+/*
+ * First-launch data, drawn while it happens.
+ *
+ * A four megabyte download with nothing on the screen is indistinguishable from
+ * a hang, so the panel goes up before the first byte -- espix_appdata_ensure()
+ * calls back with a zero length for exactly that -- and the bar is what moves.
+ * It is drawn on the desktop's own canvas while the desktop is still up, and
+ * the desktop is torn down a moment later whatever happens, so there is nothing
+ * to repair behind it.
+ */
+typedef struct {
+    espix_rect_t box;
+    bool         up;
+} appdata_panel_t;
+
+/* Drawn, not composed: two lines of text and a bar, sized to whatever the
+ * display is, because the desktop runs at 320x240 as readily as at 1280x800. */
+static void appdata_panel(espix_canvas_t *c, appdata_panel_t *p,
+                          const char *line1, const char *line2, int permille)
 {
+    const int w = espix_canvas_width(c);
+    const int h = espix_canvas_height(c);
+
+    if (!p->up) {
+        const int bw = (w > 40 + 16 * CELL_W) ? w - 40 : w;
+        const int bh = 5 * CELL_H;
+        p->box = (espix_rect_t){ (w - bw) / 2, (h - bh) / 2, bw, bh };
+        p->up  = true;
+    }
+
+    espix_canvas_fill(c, p->box, COL_WIN_BG);
+    espix_canvas_outline(c, p->box, COL_WIN_EDGE);
+    espix_canvas_text(c, p->box.x + PAD, p->box.y + PAD, line1,
+                      COL_TITLE_FG, COL_WIN_BG);
+    espix_canvas_text(c, p->box.x + PAD, p->box.y + PAD + 2 * CELL_H, line2,
+                      COL_TEXT_FG, COL_WIN_BG);
+
+    /* The track is always there, so the panel reads as a bar before the first
+     * byte has arrived and the fill is what moves. A negative permille means
+     * "no progress to show" rather than an empty one. */
+    const espix_rect_t track = { p->box.x + PAD,
+                                 p->box.y + p->box.h - PAD - CELL_H,
+                                 p->box.w - 2 * PAD, CELL_H };
+    espix_canvas_outline(c, track, COL_WIN_EDGE);
+    if (permille > 0) {
+        const int fill = (track.w - 2) * permille / 1000;
+        if (fill > 0) {
+            espix_canvas_fill(c, (espix_rect_t){ track.x + 1, track.y + 1,
+                                                 fill, track.h - 2 },
+                              COL_TITLE_FOC);
+        }
+    }
+}
+
+static void appdata_progress(void *ctx, const char *path, size_t done,
+                             size_t total)
+{
+    appdata_panel_t *p = ctx;
+    espix_canvas_t  *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+
+    /* A copy, not a pointer into the path: the panel fits about thirty
+     * characters and the path may be a full one. */
+    const char *base = strrchr(path, '/');
+    char        name[40];
+    strlcpy(name, (base != NULL) ? base + 1 : path, sizeof(name));
+
+    char line[96];
+    int  permille = -1;
+
+    if (total > 0) {
+        permille = (int)((done * 1000) / total);
+        snprintf(line, sizeof(line), "%s  %u%%  of %u KiB", name,
+                 (unsigned)((done * 100) / total), (unsigned)(total / 1024));
+    } else if (done == 0) {
+        snprintf(line, sizeof(line), "connecting...");
+    } else {
+        snprintf(line, sizeof(line), "%s  %u KiB", name,
+                 (unsigned)(done / 1024));
+    }
+
+    appdata_panel(c, p, "Downloading app data", line, permille);
+}
+
+/* Why the data could not be fetched, said on the screen rather than in a log
+ * nobody can read on a board with no console attached. */
+static void appdata_report(const char *app, espix_appdata_status_t st,
+                           const espix_appdata_info_t *info)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+
+    appdata_panel_t panel = { 0 };
+
+    const char *base = strrchr(info->path, '/');
+    char        name[40];
+    strlcpy(name, (base != NULL) ? base + 1 : info->path, sizeof(name));
+
+    char line1[64];
+    char line2[64];
+
+    switch (st) {
+    case ESPIX_APPDATA_NO_ROOM:
+        snprintf(line1, sizeof(line1), "%s: not enough room", name);
+        snprintf(line2, sizeof(line2), "%u KiB free; remove one in /boot",
+                 (unsigned)(info->free_now / 1024));
+        break;
+
+    case ESPIX_APPDATA_NO_NET:
+        snprintf(line1, sizeof(line1), "%s: cannot fetch", name);
+        snprintf(line2, sizeof(line2), "no network, or the host is down");
+        break;
+
+    case ESPIX_APPDATA_BAD_HASH:
+        snprintf(line1, sizeof(line1), "%s: checksum mismatch", name);
+        snprintf(line2, sizeof(line2), "what arrived was discarded");
+        break;
+
+    default:
+        snprintf(line1, sizeof(line1), "%s: cannot write it", name);
+        snprintf(line2, sizeof(line2), "%s", strerror(info->err));
+        break;
+    }
+
+    espix_klog(ESPIX_KLOG_WARN, TAG, "%s: app data not available (%s)",
+               app, line1);
+    appdata_panel(c, &panel, line1, line2, -1);
+
+    /* Long enough to read and act on, and it is spent before the app's own
+     * screen takes over. */
+    vTaskDelay(pdMS_TO_TICKS(4000));
+}
+
+/*
+ * Fetch whatever the program declared it needs, if anything, while the desktop
+ * can still show it. A failure is not fatal here for the same reason it is not
+ * fatal on the command line: the manifest names where the data may be had, not
+ * everywhere the program may look.
+ */
+static void appdata_prepare(const char *path)
+{
+    const char *app = strrchr(path, '/');
+    app = (app != NULL) ? app + 1 : path;
+
+    appdata_panel_t     panel = { 0 };
+    espix_appdata_info_t info = { 0 };
+
+    const espix_appdata_status_t st =
+        espix_appdata_ensure(app, appdata_progress, &panel, &info);
+
+    if (st != ESPIX_APPDATA_OK) {
+        appdata_report(app, st, &info);
+    }
+}
+
+/*
+ * Starting an app happens on a task of its own, and that is not tidiness.
+ *
+ * espix_display_input() dispatches in the *poster's* context, so the desktop's
+ * input callback -- and therefore launch_app() -- runs on the viewer's task. A
+ * download done there stops the RFB encoder for the whole transfer: the desktop
+ * freezes, the cursor stops, and the progress panel that was meant to explain
+ * the wait never reaches the screen, because the task that would have sent it is
+ * the one doing the waiting. Which is exactly how the first version failed.
+ *
+ * So the fetch runs here, and the viewer's task stays free to send the panel
+ * this task draws.
+ */
+static volatile bool s_launching;
+
+static void launch_task(void *arg)
+{
+    const char *path = arg;
+
     /* argv[0] is the program's own name, as everywhere else; the loader
      * refuses a spawn with no argument vector at all. */
-    char *const     argv[] = { (char *)path, NULL };
-    espix_pid_t     pid    = ESPIX_PID_NONE;
+    char *const argv[] = { (char *)path, NULL };
+    espix_pid_t pid    = ESPIX_PID_NONE;
 
     /*
-     * The app owns the whole screen and, on a board this short of PSRAM, the
-     * desktop's windows and surfaces are several megabytes it cannot spare.
-     *
-     * Stopped *before* the spawn, not after: the app's task starts running the
-     * moment it exists and claims the screen as its first act, so a desktop
-     * torn down afterwards would release the canvas out from under it. The
-     * display falls back to the console in between, which is what the app then
-     * claims over. Rebuilt by app_waiter() when the app has gone.
+     * The app's data comes first, while the desktop is still up and the panel
+     * has somewhere to be drawn.
      */
+    appdata_prepare(path);
+
     /* Hold the screen: no console between the desktop and the app. */
     espix_display_hold(true);
+
+    /*
+     * The desktop's state belongs to whichever task the display dispatches
+     * input on, which is not this one -- so the lock it uses is the lock this
+     * takes. The clock's timer callback is stopped inside, and it repaints too.
+     */
+    desk_lock();
     espix_desktop_stop();
+    desk_unlock();
 
     const esp_err_t err = espix_proc_spawn_elf(path, 1, (char **)argv, NULL,
                                                NULL, false, &pid);
@@ -2053,13 +2234,47 @@ static void launch_app(const char *path)
         espix_klog(ESPIX_KLOG_WARN, TAG, "cannot run %s: %s", path,
                    esp_err_to_name(err));
         espix_display_hold(false);
+        desk_lock();
         (void)espix_desktop_start();    /* nothing was started after all */
+        desk_unlock();
+        s_launching = false;
+        vTaskDelete(NULL);
         return;
     }
 
     if (xTaskCreate(app_waiter, "appwait", 2560, (void *)(uintptr_t)pid, 3,
                     NULL) != pdPASS) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task to wait for %s", path);
+    }
+
+    s_launching = false;
+    vTaskDelete(NULL);
+}
+
+static void launch_app(const char *path)
+{
+    /*
+     * One at a time. The desktop stays usable while a first launch downloads,
+     * so a second double-click is a real possibility -- and two of these racing
+     * would tear the screen down twice and spawn twice.
+     */
+    if (s_launching) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s is already starting", path);
+        return;
+    }
+    s_launching = true;
+
+    /* On the heap and preferably in PSRAM, like the other long-lived stacks:
+     * this one holds a TLS handshake, and internal RAM is what the app that
+     * follows is about to want. */
+    if (xTaskCreatePinnedToCoreWithCaps(launch_task, "appstart", 8192,
+                            (void *)path, 3, NULL, tskNO_AFFINITY,
+                            MALLOC_CAP_SPIRAM) != pdPASS &&
+        xTaskCreatePinnedToCoreWithCaps(launch_task, "appstart", 8192,
+                            (void *)path, 3, NULL, tskNO_AFFINITY,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+        s_launching = false;
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no task to start %s", path);
     }
 }
 

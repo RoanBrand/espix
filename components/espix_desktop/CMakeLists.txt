@@ -11,6 +11,7 @@ idf_component_register(
         espix_kernel
         espix_proc
         espix_shell
+        espix_appdata
         espix_net
         espix_bt
         freertos

@@ -16,6 +16,13 @@
 # seconds of idf.py startup, and the Arduino one pulls a large dependency the
 # first time.
 #
+# An app that needs data it does not ship declares it in `apps/<name>/appdata.conf`,
+# and this stages it beside the binary's etc/ -- not into /bin, because it is
+# configuration the launcher reads rather than a program. It lives with the app
+# so that a release, which stages apps/ into a clean directory and never the
+# developer's fsroot, cannot ship a binary without the manifest that explains
+# its data.
+#
 # Requires an activated IDF environment, which the firmware build already has.
 
 set -euo pipefail
@@ -43,6 +50,22 @@ target="${target:-esp32s3}"
 
 mkdir -p "$stage_dir"
 
+# Where the manifests go: the etc/ beside this stage root, so one rule covers
+# the development fsroot/bin and a release's clean factory root alike.
+manifest_dir="$(dirname "$stage_dir")/etc/apps"
+
+# Idempotent, and deliberately not part of the "is it newer" decision below: a
+# manifest edited without touching a source line is a cheap copy here, and a
+# rootfs whose etc/apps was deleted still gets one back.
+stage_manifest() {
+    if [ -f "$app/appdata.conf" ]; then
+        mkdir -p "$manifest_dir"
+        cp "$app/appdata.conf" "$manifest_dir/$name.conf"
+    else
+        rm -f "$manifest_dir/$name.conf"
+    fi
+}
+
 # Staged ELFs are not target-neutral: an S31 image cannot load an S3 binary.
 # Each app's stamp names the target that staged *it*, checked per app below.
 
@@ -69,6 +92,7 @@ for name in "${names[@]}"; do
     # an app the board cannot load.
     if [ -f "$app/targets" ] && ! grep -qx "$target" "$app/targets"; then
         rm -f "$stage_dir/$name" "$stage_dir/.espix-target-$name"
+        stage_manifest
         echo "build-apps: $name: not for $target (apps/$name/targets)"
         continue
     fi
@@ -92,6 +116,7 @@ for name in "${names[@]}"; do
                     -not -path "*/managed_components/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
         if [ -z "$newer" ]; then
+            stage_manifest
             echo "build-apps: $name is up to date"
             continue
         fi
@@ -131,5 +156,6 @@ for name in "${names[@]}"; do
 
     cp "$elf" "$staged"
     printf '%s\n' "$target" > "$stamp"
+    stage_manifest
     echo "build-apps: staged $name ($(wc -c < "$staged" | tr -d ' ') bytes)"
 done

@@ -10,6 +10,7 @@
  * synonym: a second way to do the ordinary thing is a thing to explain.
  */
 
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 
 #include "freertos/FreeRTOS.h"
 
+#include "espix_appdata.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -44,6 +46,68 @@
 #define RUN_INTERRUPTS_TO_KILL 3
 
 /*
+ * Whatever the program declared it needs, before it starts.
+ *
+ * The data a program does not ship is fetched once, and doing it here rather
+ * than inside the program is what keeps a network handle out of the app ABI:
+ * what a program needs off the network it declares in /etc/apps/<name>.conf and
+ * the launcher resolves it, so a program still cannot open a connection.
+ *
+ * A failure is reported and *not* fatal. The manifest names one way to obtain
+ * the data, not the only place the program may find it -- Doom reads a WAD from
+ * a USB stick just as happily -- and refusing to run would make a declaration
+ * into a straitjacket.
+ */
+static void appdata_resolve(espix_session_t *s, const char *abs)
+{
+    const char *app = strrchr(abs, '/');
+    app = (app != NULL) ? app + 1 : abs;
+
+    espix_fetch_progress_t progress = { .s = s };
+    espix_appdata_info_t   info     = { 0 };
+
+    const espix_appdata_status_t st =
+        espix_appdata_ensure(app, espix_cmds_fetch_progress, &progress, &info);
+
+    switch (st) {
+    case ESPIX_APPDATA_OK:
+        return;
+
+    case ESPIX_APPDATA_NO_ROOM:
+        espix_eprintf(s, "%s: %s needs %u bytes and / has %u free\n", app,
+                      info.path, (unsigned)info.need, (unsigned)info.free_now);
+        espix_eprintf(s, "%s: free some space first; an old kernel in /boot is "
+                         "the usual candidate\n", app);
+        break;
+
+    case ESPIX_APPDATA_NO_NET:
+        espix_eprintf(s, "%s: cannot fetch %s\n", app, info.path);
+        break;
+
+    case ESPIX_APPDATA_BAD_HASH:
+        espix_eprintf(s, "%s: %s did not match its checksum, discarded\n",
+                      app, info.path);
+        break;
+
+    default:
+        espix_eprintf(s, "%s: cannot write %s: %s\n", app, info.path,
+                      strerror(info.err));
+        if (info.err == EACCES || info.err == EPERM) {
+            /* The one failure whose answer is a different command rather than
+             * a different disk. A system path needs the privilege to write it,
+             * exactly as installing anything does. */
+            espix_eprintf(s, "%s: installing it needs the privilege to write "
+                             "there -- try 'sudo %s', or the desktop icon\n",
+                          app, app);
+        }
+        break;
+    }
+
+    espix_eprintf(s, "%s: running anyway; it may find what it needs elsewhere\n",
+                  app);
+}
+
+/*
  * Spawn `abs` with the given argv and, unless backgrounded, wait for it and
  * report its status. Shared by `confine` and by the fallback that resolves a
  * bare command name to a program.
@@ -53,6 +117,9 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
                        const char *who)
 {
     espix_pid_t     pid = ESPIX_PID_NONE;
+
+    appdata_resolve(s, abs);
+
     const esp_err_t err = espix_proc_spawn_elf(abs, argc, argv, s, root,
                                                !background, &pid);
 
