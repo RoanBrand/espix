@@ -58,6 +58,15 @@ things are as they are.
   that without an MMU most corruption never reaches the fault handler at all.
   Shipping the easy half alone produces a system that limps rather than one that
   recovers.
+
+  **The memory half of this is not hypothetical.** After a handful of failed
+  Quake 2 runs, PSRAM read `used 7002 KB, largest 4096 KB`; a reboot restored
+  `largest 13312 KB`, and the next app then failed to allocate its own `.bss`
+  with `-ENOMEM`. The loader's image, `.text` and `.bss` are freed on a clean
+  exit, but the fault path is a reboot today, and an app that ends via `_Exit`
+  (the engine does) leaves the task before `proc_task`'s cleanup runs. Per-app
+  heap ownership is what makes this reclaimable; until then, a fragmented pool
+  is the cost of a crashed app.
 - **Per-app heap arenas.** The allocation path in `espix_proc` is the seam.
   Would shrink the blast radius of a crashing app without needing an MMU.
 - ~~**A real `top`.**~~ Done. `ps` still reports cumulative share since boot,
@@ -1387,6 +1396,73 @@ matters.
 
   Worth doing on its own, and it is the same off-the-critical-path shape as the
   audio read-ahead source layer above.
+
+## A game as the showcase app
+
+Attempted, and stopped at the memory wall. The target was **Quake 2** — the port
+that already exists for the ESP32-P4 (`alexkid77/ESP32_QUAKE2`, the
+`quake2generic` engine with its `ref_soft` software renderer) — packaged as an
+espix app, launched from a desktop icon, taking the screen and giving it back.
+It is the workload the whole loader/export-table/app-ABI stack exists for: a real
+program that names only the ABI, with nothing added to the kernel for it.
+
+**It builds, loads and runs up to the map.** The engine reads
+`baseq2/pak0.pak` (1106 files), initialises its console, loads `ref_soft` at
+320x240, runs `InitGame`, and starts the demo map:
+
+```
+====== Quake2 Initialized ======
+FS_BIG: maps/demo2.bsp (2102792 bytes)
+Error: Hunk_Alloc overflow
+```
+
+**The wall is PSRAM, not code.** The P4 port was tuned for 24 MB; this board has
+16 MB (about 13.5 MB usable, shared with the firmware). The demo needs roughly:
+map statics ~2.8 MB, other engine statics ~2.9 MB, hunk pool 5-6 MB (the P4 port
+used 7 MB), zone + surface cache + images 2-3 MB, app text/data/image/stack
+~1.6 MB, canvas 0.15-0.5 MB — about 15-16.5 MB. That is *after* quartering the
+map limits, carving the hunk out of the arena, and cutting the surface cache and
+the canvas; it does not close.
+
+**What it found, all on the espix side, all fixed:**
+
+- The loader maps only `.text`, `.data`, `.rodata`, `.data.rel.ro` and
+  `.bss`, so an app's statics in the P4 port's `.ext_ram.bss` had **no memory
+  at all**. They belong in `.bss`, which is `NOBITS` and allocated from PSRAM
+  by the loader (and does not inflate the image file).
+- A loaded app's task was created with `xTaskCreate` on the **internal** stack,
+  capped at 32 KB, while espix's own tasks already used `xTaskCreateWithCaps`.
+  Apps now get a PSRAM stack, and the option allows one large enough for a game.
+- The app task must be **pinned to core 1**: the S31's PIE coprocessor exists
+  only there and the toolchain vectorises everything, so the first vectorised
+  `memcpy` on core 0 raises an illegal-instruction trap. FreeRTOS migrates the
+  task, but the migration path itself faulted.
+- `esp_elf_relocate()` ends by flushing the instruction cache, and on this
+  target that disables the flash cache — which cannot be done from a PSRAM stack.
+  Relocation now runs on a small helper task with an internal stack.
+- The engine's own arena fallback ladder never tried a size below 3 MB, so a
+  board with 2 MB free got an arena of zero and the engine dereferenced NULL.
+  That is an engine bug, but it is what a smaller board looks like.
+
+**Outlook.** A board with 24 MB of PSRAM should run this as-is. On 16 MB it needs
+the engine's permanent statics moved into the hunk, where stock Quake 2 keeps
+them, so the map arrays share the level pool instead of occupying `.bss` for the
+system's lifetime. That is the one structural change that would close the gap,
+and it is engine work rather than espix work — which is why it is parked here.
+
+**Cheaper first steps, in order:**
+
+- **A smaller engine.** The same shape at a fraction of the memory: a Doom port
+  (`doomgeneric`) or a purpose-built demo, which exercises the same ABI with far
+  less to port.
+- **PIE `memcpy`/memset`.** The P4 port's SIMD routines assemble for the S31's
+  `xespv` extension unchanged, but S31 PIE is core-1-only, so the routines (and
+  the tasks that call them) must be pinned there. Worth benchmarking on the S31
+  before adopting.
+- **The graphics and input ABI it exercised** (`espix_gfx`), and the loader
+  fixes above, stand on their own whatever runs next.
+- **Game data needed nothing new.** `pak0.pak` came off the USB stick through
+  the `/etc/fstab` mount and was read with plain `fopen`/`fread`.
 
 ## Further out
 

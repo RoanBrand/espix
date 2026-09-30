@@ -1371,6 +1371,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Networking and time
 
+- **Ethernet can be up and still pass no traffic after a hard reset.** After an
+  `esptool` reset over the USB-Serial/JTAG (`--after hard-reset`, and the
+  coredump read does one), the board boots normally and the console prints
+  `eth: eth0: link up, 1000 Mbps full duplex` and `eth0: 192.168.110.203/24`
+  -- but it never answers ARP, so SSH and ping time out until it is power-cycled.
+  A soft `reboot` and an OTA upgrade both come back fine, so it is the hard
+  reset specifically, not the reboot: the EMAC/PHY is left in a state the boot
+  path does not clear. It cost this investigation several power cycles before it
+  was pinned down.
+
 - **A default build has no `usb0`.** USB host and USB-NCM are two uses of the one
   OTG peripheral, and the host role is the default — so a board flashed with the
   standard image has lost the cable-reachable interface a previous image had.
