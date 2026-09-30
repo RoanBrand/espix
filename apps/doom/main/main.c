@@ -33,21 +33,38 @@ espix_gfx_surface_t *doom_surface;
 static jmp_buf s_quit_jmp;
 static jmp_buf s_fatal_jmp;
 
+static int s_fatal_status;      /* what exit() was asked for */
+
 /*
- * abort(), the way a program expects it.
+ * exit() and abort(), the way a program expects them: end this program.
  *
- * The engine's fatal path -- I_Error, and every assert in it -- ends in abort(),
- * and espix's abort is the board's: it takes the system down. That is why a bad
- * WAD, or a timedemo finishing with its own result, rebooted the machine. espix
- * cannot give abort() process semantics yet (no per-process heap or fds, so a
- * dead app's are not reclaimed -- the reaper is a roadmap item), but the app
- * can: its own definition wins over the one the ABI publishes, and it leaves by
- * the same door the quit path uses -- a jump back to app_main, whose return is
- * espix's normal exit. I_Error has already printed what went wrong.
+ * espix's are the board's -- the ABI publishes the firmware's, and from an app
+ * task they panic and reboot the machine -- which is why a bad WAD rebooted it,
+ * and why a timedemo printed its own result and then reset the board. I_Error
+ * ends in exit(-1), and every assert ends in abort(); both arrive here.
+ *
+ * espix cannot give them process semantics yet -- a dead app's heap and fds are
+ * not reclaimed, which is the reaper's hard half -- but an app can, and by the
+ * same door the quit path already uses: a jump back to app_main, whose return is
+ * espix's normal exit. The app's own definition wins over the ABI's, so the
+ * engine's calls land here. What was printed before is the reason.
  */
+void exit(int status)
+{
+    fflush(stdout);
+    fflush(stderr);
+    s_fatal_status = status;
+    longjmp(s_fatal_jmp, 1);
+}
+
 void abort(void)
 {
-    longjmp(s_fatal_jmp, 1);
+    exit(-1);
+}
+
+void _Exit(int status)
+{
+    exit(status);
 }
 
 static void doom_request_quit(void)
@@ -97,7 +114,8 @@ void app_main(int app_argc, char **app_argv)
      * not return until the end.
      */
     if (setjmp(s_fatal_jmp) != 0) {
-        printf("doom: fatal error; leaving the app, not the board\n");
+        printf("doom: %s; leaving the app, not the board\n",
+               s_fatal_status == 0 ? "done" : "fatal error");
         fflush(stdout);
         return;
     }
