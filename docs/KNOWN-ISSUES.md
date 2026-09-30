@@ -1579,6 +1579,19 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   startup and holds for the session, so "delete the WAD and watch it fetch it
   again" needs a reboot first.
 
+- **Nothing releases the screen when a process exits.** `espix_display_release()`
+  is reached only through `espix_gfx_close()`, and an app that exits without
+  calling it -- the game does, deliberately: its quit path `longjmp`s out of the
+  engine's teardown -- leaves the display's owner pointing at a screen record
+  whose process no longer exists. It survives because the next owner *takes* the
+  screen rather than waiting to be given it, which is how the desktop comes back
+  after a game, and because the canvas size an app asked for is put back by
+  whoever claims next. What it costs is the console: an app run from a shell
+  never gives the screen back to it, so the canvas stays at the app's size with
+  nobody owning it until something claims. `espix_gfx.h` and apps/README used to
+  say the process teardown released the screen, which is not true and is now
+  corrected there.
+
 ## Building espix
 
 - **Building espix changes one line of your toolchain's headers.** `off_t` and

@@ -151,10 +151,20 @@ before.
 
 `espix_gfx.h` is the app-facing graphics ABI: the whole screen, an optional
 render surface, and a queue of input events. An app claims the screen with
-`espix_gfx_open()`, draws into the framebuffer from `espix_gfx_lock()` -- or into
-a surface and `espix_gfx_present_surface()`, which the PPA scales -- presents,
-and drains `espix_gfx_poll_event()` once a frame. `espix_gfx_close()` gives the
-screen back. `apps/plasma` is the worked example.
+`espix_gfx_open()`, draws into the framebuffer from
+`espix_gfx_lock()` -- or into a surface and `espix_gfx_present_surface()`,
+which the PPA scales -- presents, and drains `espix_gfx_poll_event()` once a
+frame. `espix_gfx_close()` gives the screen back. `apps/plasma` is the worked
+example.
+
+`espix_gfx_open_mode(w, h)` is the same claim with the app's video mode: the
+canvas it wants to itself while it owns the screen. `espix_gfx_open()` is
+`espix_gfx_open_mode(0, 0)` -- "leave it as it is" -- which is what an app that
+draws into a small surface and lets the display scale it up wants, and plasma
+passes. Doom passes `320, 240`: its own height rather than the 320x200 it
+renders, because that is the size that puts Doom's non-square pixels back at
+4:3. The desktop's resolution is restored when the app closes, and the mode is
+never written to `/etc/display.conf`.
 
 The canvas is RGB565 and shared with the desktop and the VNC encoder, so the
 lock is real: draw inside it and present promptly. A process killed while

@@ -120,7 +120,15 @@ void app_main(int app_argc, char **app_argv)
         return;
     }
 
-    doom_gfx = espix_gfx_open();
+    /*
+     * 320x240, not the 320x200 the engine renders into: Doom's pixels are not
+     * square, and 240 is the height that puts them back at 4:3 on a display
+     * whose pixels are. The canvas is the app's while it runs and the desktop's
+     * resolution comes back when it closes, and the 320x200 surface is scaled
+     * to fill this. 320x240 over the 320x200 framebuffer costs the encoder a
+     * fifth more rows, and buys the aspect the game was drawn for.
+     */
+    doom_gfx = espix_gfx_open_mode(320, 240);
     if (doom_gfx == NULL) {
         printf("doom: no display up (start it with 'vnc start')\n");
         return;

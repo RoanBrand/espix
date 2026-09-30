@@ -1629,6 +1629,73 @@ static bool            s_up;
 /* The one owner of the screen, or NULL when nothing does. */
 static const espix_screen_t *s_owner;
 
+/* The size to put back when the owner that changed it lets go. */
+static int  s_mode_restore_w;
+static int  s_mode_restore_h;
+static bool s_mode_restore_valid;
+
+/* Defined at the service end of this file; the owner's mode needs it here. */
+static esp_err_t display_set_size(int w, int h, bool persist);
+
+/*
+ * A screen that wants the canvas to itself declares the size it wants. Applied
+ * when it takes the canvas and put back when it gives it up, and deliberately
+ * not written to /etc/display.conf -- this is the running app's mode, not the
+ * user's desktop setting.
+ */
+static void display_owner_mode(const espix_screen_t *screen)
+{
+    if (s_canvas == NULL) {
+        return;
+    }
+
+    const int cw = espix_canvas_width(s_canvas);
+    const int ch = espix_canvas_height(s_canvas);
+
+    if (screen->full_w <= 0 || screen->full_h <= 0) {
+        /*
+         * No mode of its own: give back the size an app borrowed. This is here
+         * as well as in release() because an app that exits without closing its
+         * gfx handle never releases anything -- and the next owner claiming is
+         * what has to put the canvas right. Doom exits that way, deliberately.
+         */
+        if (s_mode_restore_valid) {
+            s_mode_restore_valid = false;
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "%s takes the canvas back at %dx%d", screen->name,
+                       s_mode_restore_w, s_mode_restore_h);
+            (void)display_set_size(s_mode_restore_w, s_mode_restore_h, false);
+        }
+        return;
+    }
+
+    if (screen->full_w == cw && screen->full_h == ch) {
+        return;
+    }
+    if (!espix_display_size_ok(screen->full_w, screen->full_h)) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s wants %dx%d, which this display will not take; staying "
+                   "at %dx%d", screen->name, screen->full_w, screen->full_h,
+                   cw, ch);
+        return;
+    }
+
+    /*
+     * The size to go back to is the one before the *first* app mode in this
+     * stretch, so an app handing over to another app does not make the second
+     * one's exit restore the first one's mode.
+     */
+    if (!s_mode_restore_valid) {
+        s_mode_restore_w     = cw;
+        s_mode_restore_h     = ch;
+        s_mode_restore_valid = true;
+    }
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "%s takes the canvas at %dx%d (was %dx%d)",
+               screen->name, screen->full_w, screen->full_h, cw, ch);
+    (void)display_set_size(screen->full_w, screen->full_h, false);
+}
+
 /* Pointer position; see espix_display_pointer(). */
 static int s_ptr_x, s_ptr_y;
 
@@ -1711,10 +1778,18 @@ void espix_display_input(const espix_input_event_t *ev)
      * unrelated the next time a button is pressed. Which is exactly what it
      * looked like: push the pointer into an edge, click, and it jumps.
      */
-    if (s_ptr_x < 0)                   { s_ptr_x = 0; }
-    if (s_ptr_y < 0)                   { s_ptr_y = 0; }
-    if (s_ptr_x > ESPIX_DISPLAY_W - 1) { s_ptr_x = ESPIX_DISPLAY_W - 1; }
-    if (s_ptr_y > ESPIX_DISPLAY_H - 1) { s_ptr_y = ESPIX_DISPLAY_H - 1; }
+    /*
+     * The canvas's size, not the build-time default. A display set to 1024x768
+     * has 224 more columns than this used to allow, and they were unreachable:
+     * every move re-clamped the pointer to the size the firmware was built at.
+     */
+    const int cw = s_canvas != NULL ? espix_canvas_width(s_canvas) : ESPIX_DISPLAY_W;
+    const int ch = s_canvas != NULL ? espix_canvas_height(s_canvas) : ESPIX_DISPLAY_H;
+
+    if (s_ptr_x < 0)      { s_ptr_x = 0; }
+    if (s_ptr_y < 0)      { s_ptr_y = 0; }
+    if (s_ptr_x > cw - 1) { s_ptr_x = cw - 1; }
+    if (s_ptr_y > ch - 1) { s_ptr_y = ch - 1; }
 
     /*
      * Dispatched in the poster's context rather than through a queue of this
@@ -1763,6 +1838,7 @@ esp_err_t espix_display_claim(const espix_screen_t *screen)
     }
 
     s_owner = screen;
+    display_owner_mode(screen);
     if (screen->repaint != NULL) {
         screen->repaint(screen->ctx);
     }
@@ -1792,11 +1868,26 @@ void espix_display_release(const espix_screen_t *screen)
 
     s_owner = NULL;
 
+    /*
+     * And the canvas goes back to the size the app borrowed it at -- before
+     * anything else draws, whoever that turns out to be.
+     */
+    if (screen->full_w > 0 && s_mode_restore_valid) {
+        s_mode_restore_valid = false;
+        (void)display_set_size(s_mode_restore_w, s_mode_restore_h, false);
+    }
+
     if (s_hold_default && s_canvas != NULL) {
+        /*
+         * The canvas's own size, not the build-time default: an app that took
+         * it at 320x240 gives it back at the desktop's size, and clearing the
+         * built-in one would leave the game's pixels down the right-hand side.
+         */
+        const espix_rect_t all = { 0, 0, espix_canvas_width(s_canvas),
+                                   espix_canvas_height(s_canvas) };
+
         espix_canvas_lock(s_canvas);
-        espix_canvas_fill(s_canvas,
-                          (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
-                          0x0000);
+        espix_canvas_fill(s_canvas, all, 0x0000);
         espix_canvas_unlock(s_canvas);
         return;
     }
@@ -1821,10 +1912,12 @@ void espix_display_release(const espix_screen_t *screen)
      */
     espix_klog(ESPIX_KLOG_INFO, TAG, "screen owner: none");
     if (s_canvas != NULL) {
+        /* The canvas's own size: the floor has to cover whatever it is now. */
+        const espix_rect_t all = { 0, 0, espix_canvas_width(s_canvas),
+                                   espix_canvas_height(s_canvas) };
+
         espix_canvas_lock(s_canvas);
-        espix_canvas_fill(s_canvas,
-                          (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
-                          COL_BG);
+        espix_canvas_fill(s_canvas, all, COL_BG);
         espix_canvas_unlock(s_canvas);
     }
 }
@@ -1881,7 +1974,13 @@ void espix_display_viewer_detached(void)
 espix_canvas_t *espix_display_canvas(void) { return s_canvas; }
 bool            espix_display_ready(void)  { return s_up; }
 
-esp_err_t espix_display_resize(int w, int h)
+/*
+ * The one place the canvas changes size. Persisting is the whole difference
+ * between the user choosing a desktop resolution, which is remembered, and an
+ * app's own mode being applied and put back, which is not -- /etc/display.conf
+ * is the user's to write and not an app's.
+ */
+static esp_err_t display_set_size(int w, int h, bool persist)
 {
     if (!s_up || s_canvas == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -1899,8 +1998,10 @@ esp_err_t espix_display_resize(int w, int h)
     if (s_ptr_x > w - 1) { s_ptr_x = w - 1; }
     if (s_ptr_y > h - 1) { s_ptr_y = h - 1; }
 
-    /* Remembered now, so a reboot comes back at the size that was chosen. */
-    display_conf_write(w, h);
+    if (persist) {
+        /* Remembered, so a reboot comes back at the size that was chosen. */
+        display_conf_write(w, h);
+    }
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "display resized to %dx%d", w, h);
 
@@ -1913,6 +2014,11 @@ esp_err_t espix_display_resize(int w, int h)
         s_owner->resized(s_owner->ctx);
     }
     return ESP_OK;
+}
+
+esp_err_t espix_display_resize(int w, int h)
+{
+    return display_set_size(w, h, true);
 }
 
 static esp_err_t display_up(void)

@@ -15,8 +15,9 @@
  * What a screen is: the display service has exactly one owner at a time (the
  * console, the desktop, or this). espix_gfx_open() claims it, and
  * espix_gfx_close() releases it, at which point whatever owned it before -- or
- * the console -- comes back. A program that exits without closing still
- * releases, because the process teardown does it.
+ * the console -- comes back. A program that exits without closing does NOT
+ * release: nothing does that for it, so whatever claims the screen next is what
+ * takes it back, and a program that wants the console back should close.
  *
  * RGB565, not 888: the canvas is 565 end to end, PPA scales it, and the RFB
  * encoder converts it to whatever the viewer asked for. A surface that is not
@@ -50,8 +51,19 @@ typedef struct {
  * Claim the screen. Returns NULL when there is no display up -- an app run
  * before 'vnc start' or 'display start' has nowhere to draw, and saying so is
  * better than drawing into nothing.
+ *
+ * espix_gfx_open_mode() is the same claim with a video mode: full_w and full_h
+ * are the canvas the app wants to itself. A full-screen game names its own
+ * size, and the desktop's resolution comes back when it closes. 0,0 -- what
+ * espix_gfx_open() passes -- means "leave the canvas as it is", which is right
+ * for an app that draws into a small surface and is happy for the display to
+ * scale it up.
+ *
+ * The size is a claim, not a request: one the display will not take is refused
+ * and logged, and the app draws at whatever it got.
  */
 espix_gfx_t *espix_gfx_open(void);
+espix_gfx_t *espix_gfx_open_mode(int full_w, int full_h);
 
 /* Release the screen. Idempotent; NULL is a no-op. */
 void         espix_gfx_close(espix_gfx_t *g);

@@ -108,7 +108,14 @@ static void gfx_input(void *ctx, const espix_input_event_t *ev)
 static void gfx_repaint(void *ctx) { (void)ctx; }
 static void gfx_resized(void *ctx) { (void)ctx; }
 
-espix_gfx_t *espix_gfx_open(void)
+/*
+ * Claim the screen, and take the canvas at full_w x full_h while this app owns
+ * it. A separate entry point rather than two arguments on espix_gfx_open(),
+ * and that is deliberate: the two are resolved by name at load, so an app built
+ * against the old one would otherwise hand two registers of whatever happened
+ * to be in them to the display as its video mode.
+ */
+espix_gfx_t *espix_gfx_open_mode(int full_w, int full_h)
 {
     if (espix_display_canvas() == NULL) {
         return NULL;            /* no display up: nothing to draw on */
@@ -127,6 +134,9 @@ espix_gfx_t *espix_gfx_open(void)
         .input   = gfx_input,
         .repaint = gfx_repaint,
         .resized = gfx_resized,
+        /* What the app asked for, applied while it owns the canvas. */
+        .full_w  = full_w,
+        .full_h  = full_h,
         .ctx     = &s_gfx,
     };
 
@@ -135,6 +145,12 @@ espix_gfx_t *espix_gfx_open(void)
     }
     s_gfx.open = true;
     return &s_gfx;
+}
+
+/* The whole of the original: claim the screen, ask for no size in particular. */
+espix_gfx_t *espix_gfx_open(void)
+{
+    return espix_gfx_open_mode(0, 0);
 }
 
 void espix_gfx_close(espix_gfx_t *g)
@@ -286,6 +302,7 @@ bool espix_gfx_poll_event(espix_gfx_t *g, espix_input_event_t *ev)
 
 static esp_elf_symbol_table_t s_gfx_syms[] = {
     ESP_ELFSYM_EXPORT(espix_gfx_open),
+    ESP_ELFSYM_EXPORT(espix_gfx_open_mode),
     ESP_ELFSYM_EXPORT(espix_gfx_close),
     ESP_ELFSYM_EXPORT(espix_gfx_lock),
     ESP_ELFSYM_EXPORT(espix_gfx_present),

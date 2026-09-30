@@ -358,6 +358,17 @@ typedef struct {
      * canvas every time needs nothing here. Called with the canvas unlocked.
      */
     void (*resized)(void *ctx);
+    /*
+     * The canvas this screen wants to itself, or 0x0 for "leave it as it is".
+     *
+     * A full-screen app's mode -- not the user's desktop resolution. Applied
+     * while this screen owns the canvas and put back when it releases, and
+     * never written to /etc/display.conf: it is what lets a game have the
+     * pipeline at its own size while the desktop keeps the size that was
+     * chosen for it. A claim, not a request: a size the display will not take
+     * is refused and logged, and the canvas stays as it was.
+     */
+    int full_w, full_h;
     void *ctx;
 } espix_screen_t;
 

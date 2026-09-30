@@ -458,17 +458,50 @@ espix> display size 1024x768  # live resize; the viewer resizes, it does not rec
 ### Resizing, live
 
 `display size <w>x<h>` reallocates the canvas in place and tells an attached
-viewer with the RFB **ExtendedDesktopSize** pseudo-encoding, so the client
-resizes its framebuffer on the *same connection* -- no reconnect, no reboot. The
-desktop re-clamps its windows into the new bounds (the same keep-a-strip-visible
-rule a drag uses) and repaints; window surfaces are per-window, so they survive
-untouched. A client that never offered that encoding cannot be resized in place,
-so it is dropped instead and reconnects at the new size -- ServerInit is only
-ever sent once.
+viewer, so the client resizes its framebuffer on the *same connection* -- no
+reconnect, no reboot. The desktop re-clamps its windows into the new bounds (the
+same keep-a-strip-visible rule a drag uses) and repaints; window surfaces are
+per-window, so they survive untouched.
 
-The size is **runtime only**: it reverts to the built-in 800x600 on a reboot.
-And the on-screen console does not reflow, because its terminal grid is a fixed
-96x71; it repaints into the same grid rather than growing with the canvas.
+There are two pseudo-encodings for this and which one is used is the client's to
+say. **ExtendedDesktopSize** (-308) carries the screen list, and is what TigerVNC
+speaks. **DesktopSize** (-223) is the older one -- a rectangle whose width and
+height *are* the new size and which carries no payload -- and it is what RealVNC's
+viewer speaks; measured here, RealVNC offers that and *not* ExtendedDesktopSize. A
+client that offered neither cannot be resized in place, so it is dropped instead
+and reconnects at the new size -- ServerInit is only ever sent once. Every client
+that connects logs the encoding numbers it offered, because which of these it
+speaks is otherwise a guess made twice.
+
+The size is remembered in /etc/display.conf, so it survives a reboot. The
+on-screen console does not reflow, because its terminal grid is a fixed 96x71;
+it repaints into the same grid rather than growing with the canvas.
+
+### A full-screen app's own mode
+
+A screen may declare the canvas it wants to itself, and the gfx ABI passes it
+through: `espix_gfx_open_mode(w, h)` -- a separate entry point rather than two
+more arguments on `espix_gfx_open()`, because the two are resolved by name and
+an already-built app would otherwise hand two registers of whatever to the
+display as its mode. It is applied when the screen claims
+the canvas and put back when it releases, and it is **never** written to
+/etc/display.conf -- this is the running app's video mode, not the user's desktop
+resolution. That is the whole of how a game gets a cheap pipeline while the
+desktop keeps the size that was chosen for it:
+
+    desktop at 800x600  ->  Doom opens at 320x240  ->  800x600 again on exit
+
+Doom asks for **320x240**, not the 320x200 it renders into. Its pixels are not
+square, and 240 is the height that puts them back at 4:3 on a display whose
+pixels are; the scaler stretches the 320x200 surface to fill it. `0, 0` means
+"leave the canvas as it is", which is what plasma passes -- being a small surface
+scaled up is the point of that one.
+
+What the viewer does with a canvas smaller than its window is not the server's to
+decide: RFB has no "scale this framebuffer" message, so a client with no scaling
+option shows a 320x240 canvas in a 320x240 window. RealVNC's viewer scales to the
+window and keeps it; TigerVNC's macOS viewer has no scaling at all and the window
+follows the framebuffer.
 
 There is a password out of the box, so there is nothing to set up: it is the
 built-in default `espix`. That default is **public**, and deliberately so -- it
@@ -571,8 +604,11 @@ Two clients were tried first, and both taught something.
 - **The canvas is a setting, not a build-time constant.** 800x600 RGB565
   (960 KiB) unless /etc/display.conf says otherwise, changed with
   `display size <w>x<h>` or the desktop's own Settings app, and carried across a
-  reboot. A live client that offered the `DesktopSize` pseudo-encoding is
-  resized in place; one that did not is dropped to reconnect at the new size.
+  reboot. A live client is resized in place with whichever resize
+  pseudo-encoding it offered -- ExtendedDesktopSize, or the older DesktopSize --
+  and one that offered neither is dropped to reconnect at the new size. An app
+  may take the canvas at its own size while it runs: see "A full-screen app's own
+  mode" above.
 - **Colour-map clients are refused**, and the pixel format stays true colour.
   Every desktop client asks for true colour; this only affects a client that
   explicitly asks for a palette, and the log says so when it happens.
