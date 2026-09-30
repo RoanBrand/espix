@@ -171,6 +171,10 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(strtoul),
     ESP_ELFSYM_EXPORT(strtoll),
     ESP_ELFSYM_EXPORT(strtoull),
+    ESP_ELFSYM_EXPORT(atof),
+    ESP_ELFSYM_EXPORT(putenv),
+    ESP_ELFSYM_EXPORT(vsprintf),
+    ESP_ELFSYM_EXPORT(_Exit),
 
     /*
      * Deliberately not here, and worth saying where the next person will look:

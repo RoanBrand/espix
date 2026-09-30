@@ -42,6 +42,11 @@
 #include "soc/gpio_struct.h"
 #include "soc/uart_struct.h"
 
+#include "esp_log.h"
+
+#include <sys/ioctl.h>
+#include <sys/select.h>
+
 #include "esp_elf.h"
 
 #include "espix_kernel.h"
@@ -55,6 +60,24 @@ extern unsigned long long __udivdi3(unsigned long long a, unsigned long long b);
 
 /* ROM printf. Arduino's logging macros reach for it directly. */
 extern int ets_printf(const char *fmt, ...);
+
+/*
+ * libgcc's soft-double helpers. The S31 FPU is single precision, so double
+ * arithmetic and comparison in an app land in these; the firmware links libgcc
+ * and the table only takes their addresses. Declared here because there is no
+ * header for them, exactly as __udivdi3 is above.
+ */
+extern double    __adddf3(double, double);
+extern double    __subdf3(double, double);
+extern double    __muldf3(double, double);
+extern long long __divdi3(long long, long long);
+extern int       __eqdf2(double, double);
+extern double    __extendsfdf2(float);
+extern int       __fixdfsi(double);
+extern double    __floatsidf(int);
+extern int       __gedf2(double, double);
+extern int       __ledf2(double, double);
+extern float     __truncdfsf2(double);
 
 static esp_elf_symbol_table_t s_driver_syms[] = {
 
@@ -116,8 +139,33 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
      * build time now rather than leaving that to be noticed.
      */
     ESP_ELFSYM_EXPORT(heap_caps_calloc),
+    ESP_ELFSYM_EXPORT(heap_caps_malloc),
+    ESP_ELFSYM_EXPORT(heap_caps_free),
+    ESP_ELFSYM_EXPORT(heap_caps_get_free_size),
+    ESP_ELFSYM_EXPORT(esp_log),
+    ESP_ELFSYM_EXPORT(esp_log_timestamp),
+    ESP_ELFSYM_EXPORT(ioctl),
+    ESP_ELFSYM_EXPORT(select),
     ESP_ELFSYM_EXPORT(__udivdi3),
     ESP_ELFSYM_EXPORT(vsnprintf),
+
+    /*
+     * libgcc's soft-double helpers. The S31 FPU is single precision, so an
+     * app's double arithmetic and comparisons land in these; the firmware
+     * already links libgcc, and naming them is what pulls the ones it does
+     * not otherwise use into the image.
+     */
+    ESP_ELFSYM_EXPORT(__adddf3),
+    ESP_ELFSYM_EXPORT(__subdf3),
+    ESP_ELFSYM_EXPORT(__muldf3),
+    ESP_ELFSYM_EXPORT(__divdi3),
+    ESP_ELFSYM_EXPORT(__eqdf2),
+    ESP_ELFSYM_EXPORT(__extendsfdf2),
+    ESP_ELFSYM_EXPORT(__fixdfsi),
+    ESP_ELFSYM_EXPORT(__floatsidf),
+    ESP_ELFSYM_EXPORT(__gedf2),
+    ESP_ELFSYM_EXPORT(__ledf2),
+    ESP_ELFSYM_EXPORT(__truncdfsf2),
 
     /* What assert() lands on. An app built with NDEBUG never references it;
      * one built without it fails to load unless this is here. */

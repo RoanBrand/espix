@@ -36,6 +36,8 @@ static const struct esp_elfsym s_libm_syms[] = {
      * depending on where the code was written. */
     ESP_ELFSYM_EXPORT(sinf),
     ESP_ELFSYM_EXPORT(cosf),
+    ESP_ELFSYM_EXPORT(acos),
+    ESP_ELFSYM_EXPORT(atan),
     ESP_ELFSYM_EXPORT(tanf),
     ESP_ELFSYM_EXPORT(asinf),
     ESP_ELFSYM_EXPORT(acosf),
