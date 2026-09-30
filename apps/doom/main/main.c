@@ -38,18 +38,18 @@ static void doom_request_quit(void)
 }
 
 /*
- * Where the WAD is looked for, in order. The stick first: 4 MB of shareware
- * data does not belong in the kernel image, and a flash drive is its natural
- * home. The rootfs is the fallback for a board without one.
+ * Where the WAD is looked for, in order.
+ *
+ * The rootfs first, because that is where the launcher puts what it fetched from
+ * the manifest in /etc/apps/doom.conf -- 4 MB of shareware does not belong in
+ * the kernel image, and trying espix should not require a flash drive. A stick
+ * second: how you bring a different WAD along without reflashing, and the only
+ * source on a board with no network.
  */
 static const char *const wad_paths[] = {
-    /* Installed with the image: trying espix should not require a flash
-     * drive. /bin is for executables, so the data lives under /var/lib. */
+    /* /bin is for executables, so the data lives under /var/lib. */
     "/var/lib/doom/doom1.wad",
-    /* A stick if there is one -- how you bring a different WAD along without
-     * reflashing. */
     "/mnt/sda1/doom1.wad",
-    "/mnt/sda1/baseq2/doom1.wad",
 };
 
 static const char *find_wad(void)
@@ -81,7 +81,7 @@ void app_main(void)
 
     const char *wad = find_wad();
     if (wad == NULL) {
-        printf("doom: no doom1.wad -- put the shareware WAD on the stick\n");
+        printf("doom: no doom1.wad in /var/lib/doom or on the stick\n");
         return;
     }
 

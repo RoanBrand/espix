@@ -116,21 +116,6 @@ static unsigned char keysym_to_doom(uint32_t ks)
     return 0;
 }
 
-/*
- * Every key event, appended to a file, so "the key did nothing" can be told
- * apart from "the key never arrived" without a serial console. Remove once the
- * input path is trusted.
- */
-static void trace_key(uint32_t ks, unsigned char k, int down)
-{
-    FILE *f = fopen("/tmp/doom.keys", "a");
-
-    if (f != NULL) {
-        fprintf(f, "sym %06x -> %02x %s\n", (unsigned)ks, k, down ? "down" : "up");
-        fclose(f);
-    }
-}
-
 int DG_GetKey(int *pressed, unsigned char *key)
 {
     if (doom_gfx == NULL) {
@@ -143,7 +128,6 @@ int DG_GetKey(int *pressed, unsigned char *key)
             continue;   /* the POC is keyboard-only */
         }
         const unsigned char k = keysym_to_doom(ev.keysym);
-        trace_key(ev.keysym, k, ev.down ? 1 : 0);
         if (k == 0) {
             continue;
         }
