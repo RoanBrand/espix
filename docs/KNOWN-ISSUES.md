@@ -1536,6 +1536,30 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   table. **Mounting this drive read-only** remains good advice for other reasons,
   but it was never the fix for this.
 
+## Display and desktop
+
+- **On a freshly created 320x240 desktop the icons cannot be clicked.** The
+  terminal window is 76 columns wide, which is 616 pixels, and
+  `espix_window_new()` keeps a window in the work area by moving it — `x = ww - w`,
+  then `x = 0` when that comes out negative. On a 320-pixel canvas the terminal
+  therefore lands at x = 0 and covers the whole launcher column, so the icons are
+  behind it and unpressable until it is minimised from the taskbar. A desktop
+  created at 640x480 has the terminal at x = 120, beside them — and one that is
+  *resized* down keeps that position, because `desktop_resized()` only pulls a
+  window back when it has left the work area entirely. So the same board behaves
+  differently depending on the resolution the desktop happened to start at, which
+  is why it is easy to miss. Nothing in the app launch depends on it, but
+  "launch it from the desktop icon" does.
+
+- **A file a program left open cannot be removed until the next boot.** With no
+  per-process ownership of fds, an app that is killed — or that exits without
+  closing, which is what the game's quit path does: it `longjmp`s out of
+  `I_Quit()` precisely to skip the engine's teardown — leaves its open file
+  behind, and LittleFS answers `Device or resource busy` to `rm` on it even as
+  root. For the game that is `/var/lib/doom/doom1.wad`, which it opens at
+  startup and holds for the session, so "delete the WAD and watch it fetch it
+  again" needs a reboot first.
+
 ## Building espix
 
 - **Building espix changes one line of your toolchain's headers.** `off_t` and

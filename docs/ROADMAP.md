@@ -1473,7 +1473,10 @@ before the program runs -- `.desktop` plus a package manager on Linux, the app
 store plus a first-run download on mobile, expansion files in between. No
 program fetches its own content.
 
-Concretely: a manifest per app, beside the binary or under `/etc/apps/`:
+Concretely: a manifest per app, `apps/<name>/appdata.conf` in the tree and
+`/etc/apps/<name>.conf` on the device -- staged by `tools/build-apps.sh`, so
+both the developer's rootfs and the clean one a release builds get it and a
+release cannot ship a binary without the manifest that explains its data:
 
     data  <url>  <path>  sha256:<hex>
 
@@ -1491,10 +1494,62 @@ on espix is usually an old kernel still sitting in `/boot`. `tools/flash-ota.sh`
 prunes those now, but the loader is where they accumulate and where the pruning
 belongs.
 
-Not done. What exists is the downloader (`fetch`) and the space policy; what is
-missing is the manifest, the launcher hook, and a progress indication that does
-not look like a hung screen -- the display already has a black "hold" for the
-launch window, which is where a percentage belongs.
+**Built**, in three pieces. `espix_net_fetch()` is the transfer itself: stream a
+body to `<path>.part`, refuse when it will not fit, check a digest when the
+caller knows one, rename into place. `espix_ota_download()` and the shell's
+`fetch` are now thin callers of it rather than two more copies of it, so the
+redirect rules, the space policy and the certificate bundle live in one place --
+and `upgrade` being the first caller is why the shared one is exercised on every
+flash.
+
+`espix_appdata_ensure()` reads the manifest, which lives in the release image as
+`fsroot/etc/apps/<name>.conf`. A missing manifest is not an error, and neither is
+a failed download: the desktop's `launch_app()` and the shell's run path both
+report it and spawn anyway, because a manifest names where the data *may be had*,
+not everywhere the program may look for it. A stick with a WAD on it still works
+with no network, which refusing to run would have broken.
+
+The desktop draws the progress across its own canvas before tearing itself down
+for the app -- a bar and two lines, sized to the display -- and the shell prints a
+line every tenth. Both are one `espix_appdata_ensure()` call with a different
+reporter, so the two paths cannot drift apart.
+
+**The launch runs on a task of its own, and that is not tidiness.**
+`espix_display_input()` dispatches in the *poster's* context, so the desktop's
+input callback — and therefore the launcher — runs on the viewer's task. A
+download done there stops the RFB encoder for the whole transfer, and on hardware
+that is exactly what it looked like: the desktop froze for the forty seconds, the
+cursor stopped, and the panel meant to explain the wait never reached the screen,
+because the task that would have sent it was the one waiting. The fetch now
+happens on an `appstart` task and the viewer's task stays free to send what that
+task draws — which is also why the panel updates while the transfer runs rather
+than appearing all at once at the end.
+
+**Installing into a system path is a privileged act, and is treated as one.** The
+destination's directory is created if it is missing -- a manifest names a file,
+not a directory, and a freshly imaged board has no `/var/lib` at all -- and a
+session that may not write there is refused *before* the download rather than
+halfway through it, with the `EACCES` said out loud and `sudo doom` named as the
+answer. The desktop needs none of that: it is a kernel task, so it is espix, and
+espix is allowed.
+
+Two things found on the way, both worth keeping:
+
+- **The manifest reader's buffers had to leave the stack.** The first version put
+  four 833-byte entries and a 900-byte line in the frame of a task with an 8 KB
+  stack that already holds a shell and a TLS handshake, and the board answered
+  with `Stack protection fault` in `sshd:conn`. They are the heap's now.
+  Anything that runs on a session's task has that budget to respect, and anything
+  that runs on the desktop's has a different one.
+- **A first launch is a download, so it is a screen.** The panel exists because
+  four megabytes of silence is indistinguishable from a hang, and the refusal is
+  the message `fetch` already gave: how many bytes are wanted, how many are
+  free, and that an old kernel in `/boot` is where the room usually is.
+
+Still open: the loader is where those old kernels accumulate and where the pruning
+belongs -- `tools/flash-ota.sh` only covers the development path. And the
+progress is a bar rather than a cancel: there is no way to stop a first launch
+short of killing it.
 
 ## Further out
 
