@@ -1996,8 +1996,9 @@ static void app_waiter(void *arg)
 
     (void)espix_proc_wait(pid, NULL, portMAX_DELAY);
     if (espix_display_canvas() != NULL) {
-        input_reset();
-        (void)espix_display_claim(&s_desktop_screen);
+        /* Rebuilt, not just reclaimed: launch_app() tore the desktop down so
+         * the app could have its PSRAM, so there are no windows to return to. */
+        (void)espix_desktop_start();
     }
     vTaskDelete(NULL);
 }
@@ -2008,13 +2009,28 @@ static void launch_app(const char *path)
      * refuses a spawn with no argument vector at all. */
     char *const     argv[] = { (char *)path, NULL };
     espix_pid_t     pid    = ESPIX_PID_NONE;
-    const esp_err_t err    = espix_proc_spawn_elf(path, 1, (char **)argv, NULL,
-                                                  NULL, false, &pid);
+
+    /*
+     * The app owns the whole screen and, on a board this short of PSRAM, the
+     * desktop's windows and surfaces are several megabytes it cannot spare.
+     *
+     * Stopped *before* the spawn, not after: the app's task starts running the
+     * moment it exists and claims the screen as its first act, so a desktop
+     * torn down afterwards would release the canvas out from under it. The
+     * display falls back to the console in between, which is what the app then
+     * claims over. Rebuilt by app_waiter() when the app has gone.
+     */
+    espix_desktop_stop();
+
+    const esp_err_t err = espix_proc_spawn_elf(path, 1, (char **)argv, NULL,
+                                               NULL, false, &pid);
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "cannot run %s: %s", path,
                    esp_err_to_name(err));
+        (void)espix_desktop_start();    /* nothing was started after all */
         return;
     }
+
     if (xTaskCreate(app_waiter, "appwait", 2560, (void *)(uintptr_t)pid, 3,
                     NULL) != pdPASS) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task to wait for %s", path);
