@@ -649,6 +649,16 @@ espix's answer is not to trust the file: `tests/suites/55-sessions.sh` reads the
 session limit back off the device, out of the refusal banner, and fails if it
 disagrees with what the tree says.
 
+**Which direction the edit goes matters.** A change meant to last is made in the
+generated `sdkconfig.<target>[-<profile>]` -- through `menuconfig`, or by hand --
+and the tracked `sdkconfig.defaults*` is then regenerated **from it**
+(`idf.py save-defconfig`), so the file that seeds a new build is downstream of
+the config that was actually exercised. Editing `sdkconfig.defaults*` first and
+expecting the build to follow is the trap above; it works only on a fresh
+`sdkconfig`. A throwaway flag is the exception, and belongs directly in
+`sdkconfig.defaults` for a quick build -- uncommitted, and gone at the next
+regenerate.
+
 ### `idf.py` is often a shell function
 
 Which makes it invisible to a `make` recipe's subshell, and `IDF_PATH` alone is
