@@ -1,0 +1,7 @@
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+CONFIG_ELF_LOADER=y
+CONFIG_LIBC_NEWLIB=y
+
+# The engine is linked into the app ELF rather than into the kernel, so its
+# text and data are loaded (into PSRAM) when the app starts.
+CONFIG_ELF_LOADER_LOAD_PSRAM=y

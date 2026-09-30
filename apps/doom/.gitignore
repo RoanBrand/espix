@@ -1,0 +1,8 @@
+# Fetched by fetch-doom.sh, never committed: GPL engine code and game data
+# that are not ours to redistribute from here.
+third_party/
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock

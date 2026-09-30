@@ -1,0 +1,8 @@
+dependencies:
+  # Matches the firmware: an app is built against the same libc flavour and
+  # Kconfig surface (CONFIG_LIBC_NEWLIB only exists from 6.x).
+  idf:
+    version: ">=6.1"
+
+  # Needed for the project_elf() CMake helper and the app-side link script.
+  espressif/elf_loader: "~1.3.3"
