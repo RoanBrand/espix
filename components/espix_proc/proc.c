@@ -687,7 +687,7 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
     xSemaphoreGive(g_espix_proc_lock);
 
     if (task != NULL) {
-        vTaskDelete(task);
+        vTaskDeleteWithCaps(task);      /* frees the PSRAM stack it was given */
 
         /*
          * And tell the transport which task just died.

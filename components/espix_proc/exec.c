@@ -17,6 +17,8 @@
 #include <sys/reent.h>      /* _REENT and the stdio a force-kill has to put back */
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_elf.h"
@@ -304,6 +306,33 @@ static int proc_write_err(void *cookie, const char *data, int len)
     return (espix_session_write(cookie, data, (size_t)len, true) < 0) ? -1 : len;
 }
 
+/*
+ * The relocation, on a stack that can survive it.
+ *
+ * esp_elf_relocate() finishes by flushing the instruction cache, and on this
+ * target that flush disables the flash cache (esp_elf_arch_flush:
+ * Cache_WriteBack_All, disable, Cache_Invalidate_All, enable). A task whose
+ * stack is in PSRAM cannot run with the cache disabled -- PSRAM is reached
+ * through it -- and IDF asserts exactly that (esp_task_stack_is_sane_cache_
+ * disabled). The app task has a PSRAM stack because a game wants a quarter of
+ * a megabyte, so it must not do the relocation itself: this helper has an
+ * internal stack and nothing else to do.
+ */
+typedef struct {
+    espix_proc_slot_t *slot;
+    int                rc;
+    SemaphoreHandle_t  done;
+} relocate_ctx_t;
+
+static void relocate_task(void *arg)
+{
+    relocate_ctx_t *ctx = arg;
+
+    ctx->rc = esp_elf_relocate(&ctx->slot->elf, ctx->slot->image);
+    xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
 static void proc_task(void *arg)
 {
     espix_proc_slot_t *slot = arg;
@@ -469,7 +498,21 @@ static void proc_task(void *arg)
     }
     slot->elf_valid = true;
 
-    if (esp_elf_relocate(&slot->elf, slot->image) != 0) {
+    relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary() };
+    if (rctx.done == NULL ||
+        xTaskCreate(relocate_task, "elfreloc", 8192, &rctx,
+                    CONFIG_ESPIX_PROC_PRIORITY, NULL) != pdPASS) {
+        if (rctx.done != NULL) {
+            vSemaphoreDelete(rctx.done);
+        }
+        espix_eprintf(slot->info.session, "espix: %s: no task to relocate\n",
+                     slot->info.path);
+        goto done;
+    }
+    (void)xSemaphoreTake(rctx.done, portMAX_DELAY);
+    vSemaphoreDelete(rctx.done);
+
+    if (rctx.rc != 0) {
         missing_sym_t     missing;
         const char *const sym = missing_symbol_name(&missing);
 
@@ -570,7 +613,7 @@ done:
                       status);
 
     espix_shell_set_current(NULL);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
 }
 
 /*
@@ -805,9 +848,25 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
              (int)(sizeof(task_name) - sizeof("app:")), slot->info.name);
 
     TaskHandle_t task = NULL;
-    const BaseType_t ok = xTaskCreate(proc_task, task_name,
-                                      CONFIG_ESPIX_PROC_STACK_SIZE, slot,
-                                      CONFIG_ESPIX_PROC_PRIORITY, &task);
+    /*
+     * Pinned to core 1, with a PSRAM stack.
+     *
+     * Core 1 because of PIE: on the S31 the coprocessor exists only on core 1,
+     * and the toolchain builds every translation unit with the vector extension,
+     * so an app's very first vectorised memcpy on core 0 takes an illegal
+     * instruction trap. FreeRTOS migrates the task when that happens, but the
+     * migration path itself faulted here (coredump: mcause 0x2 in
+     * rtos_pie_used_cpu0). Starting on the core that has the coprocessor avoids
+     * the trap rather than recovering from it.
+     *
+     * PSRAM because an app can need far more stack than internal RAM holds --
+     * the Quake 2 port wants a quarter of a megabyte -- and a stack is the one
+     * thing that cannot spill. Deleted with the matching vTaskDeleteWithCaps()
+     * on both the self-exit and kill paths.
+     */
+    const BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
+        proc_task, task_name, CONFIG_ESPIX_PROC_STACK_SIZE, slot,
+        CONFIG_ESPIX_PROC_PRIORITY, &task, 1, MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         free(slot->argv_block);
         free(slot->env_block);
