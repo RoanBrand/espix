@@ -116,8 +116,16 @@ typedef enum {
     CONF_REVERT,
 } conf_state_t;
 
+/*
+ * Smallest first, and they are not decoration: an app that renders at its own
+ * resolution (Doom is 320x200) is fastest when the canvas is close to it,
+ * because every frame the canvas differs from the last is a frame the RFB
+ * encoder has to compress and send. The 800x600 floor was a desktop default
+ * that quietly became a floor for everything.
+ */
 static const struct { int w, h; } s_modes[] = {
-    { 800, 600 }, { 1024, 768 }, { 1280, 720 }, { 1280, 800 },
+    { 320, 240 }, { 640, 480 }, { 800, 600 },
+    { 1024, 768 }, { 1280, 720 }, { 1280, 800 },
 };
 #define NMODES ((int)(sizeof(s_modes) / sizeof(s_modes[0])))
 

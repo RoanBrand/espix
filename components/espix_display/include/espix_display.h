@@ -393,6 +393,15 @@ typedef struct {
  * canvas and says so.
  */
 void espix_display_set_default(const espix_display_default_t *def);
+
+/*
+ * Suppress the default content (the console) while an app is starting, so the
+ * screen a viewer sees between the desktop going away and the app's first
+ * frame is blank rather than a console that has to be built and then thrown
+ * away. Holding the screen through a launch is what the hold is for; it is not
+ * a general "keep the console down".
+ */
+void espix_display_hold(bool on);
 void espix_display_viewer_attached(void);
 void espix_display_viewer_detached(void);
 

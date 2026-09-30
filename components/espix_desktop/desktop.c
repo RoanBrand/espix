@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -1636,9 +1637,7 @@ static const struct {
     const char *path;
 } s_icons[] = {
     { "plasma", "/bin/plasma" },
-    /* A one-off: the same program, but loaded off the USB stick through the
-     * /etc/fstab mount, so the icon proves the whole path end to end. */
-    { "usb", "/mnt/sda1/usbplasma" },
+    { "doom", "/bin/doom" },
 };
 #define ICON_N ((int)(sizeof(s_icons) / sizeof(s_icons[0])))
 
@@ -1667,6 +1666,22 @@ static int icon_at(int x, int y)
  * read as "something to look at". Drawn straight into the canvas, so it costs
  * a handful of fills on the repaints that already touch its cell.
  */
+/* An icon whose program is not installed draws greyed and refuses to launch,
+ * rather than starting nothing. The binary is the thing esperienced: /bin/doom
+ * is a release artifact, the WAD is fetched separately. */
+static bool icon_available(int i)
+{
+    /* fopen, not access(): LittleFS's port never implemented access(), and
+     * espix's ABI deliberately leaves it out -- so an access() test answers
+     * "no" for every path, which is how every icon greyed out at once. */
+    FILE *f = fopen(s_icons[i].path, "rb");
+    if (f == NULL) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
 static void icons_paint(espix_canvas_t *c, espix_rect_t r)
 {
     static const espix_px_t band[4] = {
@@ -1690,14 +1705,19 @@ static void icons_paint(espix_canvas_t *c, espix_rect_t r)
         const int bx = cell.x + (cell.w - ICON_BOX) / 2;
         const int by = cell.y + 4;
 
+        const bool avail = icon_available(i);
+
         espix_canvas_fill(c, (espix_rect_t){ bx, by, ICON_BOX, ICON_BOX },
-                          RGB565(0x14, 0x18, 0x1E));
+                          avail ? RGB565(0x14, 0x18, 0x1E)
+                                : RGB565(0x20, 0x22, 0x26));
         espix_canvas_outline(c, (espix_rect_t){ bx, by, ICON_BOX, ICON_BOX },
-                             RGB565(0x6A, 0x78, 0x90));
+                             avail ? RGB565(0x6A, 0x78, 0x90)
+                                   : RGB565(0x44, 0x48, 0x50));
 
         for (int b = 0; b < 4; b++) {
             espix_canvas_fill(c, (espix_rect_t){ bx + 4, by + 6 + b * 9,
-                                                 ICON_BOX - 8, 5 }, band[b]);
+                                                 ICON_BOX - 8, 5 },
+                              avail ? band[b] : RGB565(0x50, 0x54, 0x5A));
         }
 
         const int len = (int)strlen(s_icons[i].label);
@@ -1706,7 +1726,8 @@ static void icons_paint(espix_canvas_t *c, espix_rect_t r)
             tx = cell.x;
         }
         espix_canvas_text(c, tx, by + ICON_BOX + 4, s_icons[i].label,
-                          (i == s_icon_sel) ? COL_TITLE_FG : COL_TEXT_FG,
+                          avail ? ((i == s_icon_sel) ? COL_TITLE_FG : COL_TEXT_FG)
+                                : RGB565(0x70, 0x74, 0x7A),
                           label_bg);
     }
 }
@@ -1995,6 +2016,8 @@ static void app_waiter(void *arg)
     const espix_pid_t pid = (espix_pid_t)(uintptr_t)arg;
 
     (void)espix_proc_wait(pid, NULL, portMAX_DELAY);
+    espix_display_hold(false);
+
     if (espix_display_canvas() != NULL) {
         /* Rebuilt, not just reclaimed: launch_app() tore the desktop down so
          * the app could have its PSRAM, so there are no windows to return to. */
@@ -2020,6 +2043,8 @@ static void launch_app(const char *path)
      * display falls back to the console in between, which is what the app then
      * claims over. Rebuilt by app_waiter() when the app has gone.
      */
+    /* Hold the screen: no console between the desktop and the app. */
+    espix_display_hold(true);
     espix_desktop_stop();
 
     const esp_err_t err = espix_proc_spawn_elf(path, 1, (char **)argv, NULL,
@@ -2027,6 +2052,7 @@ static void launch_app(const char *path)
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "cannot run %s: %s", path,
                    esp_err_to_name(err));
+        espix_display_hold(false);
         (void)espix_desktop_start();    /* nothing was started after all */
         return;
     }
@@ -2067,6 +2093,12 @@ static void icon_press(int i)
     if (i == s_icon_sel && now - s_icon_click_us < ICON_DBLCLICK_US) {
         const char *path = s_icons[i].path;
         icon_set_sel(-1);
+
+        if (!icon_available(i)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s is not installed (%s)",
+                       s_icons[i].label, path);
+            return;
+        }
         launch_app(path);
         return;
     }

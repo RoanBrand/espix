@@ -1769,6 +1769,21 @@ esp_err_t espix_display_claim(const espix_screen_t *screen)
     return ESP_OK;
 }
 
+/*
+ * While an app is starting, the console is deliberately NOT brought back. The
+ * app has just freed the desktop to make room for itself, and re-creating the
+ * console's canvas in that window would spend the memory the app is waiting
+ * for -- as well as putting a console on screen for the second it takes to
+ * load. The canvas is cleared instead, so the viewer sees a blank screen until
+ * the app draws its first frame.
+ */
+static bool s_hold_default;
+
+void espix_display_hold(bool on)
+{
+    s_hold_default = on;
+}
+
 void espix_display_release(const espix_screen_t *screen)
 {
     if (s_owner != screen) {
@@ -1776,6 +1791,15 @@ void espix_display_release(const espix_screen_t *screen)
     }
 
     s_owner = NULL;
+
+    if (s_hold_default && s_canvas != NULL) {
+        espix_canvas_lock(s_canvas);
+        espix_canvas_fill(s_canvas,
+                          (espix_rect_t){ 0, 0, ESPIX_DISPLAY_W, ESPIX_DISPLAY_H },
+                          0x0000);
+        espix_canvas_unlock(s_canvas);
+        return;
+    }
 
     /*
      * Whatever a viewer should see when nothing owns the screen. The console
