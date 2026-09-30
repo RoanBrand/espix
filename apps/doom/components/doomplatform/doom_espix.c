@@ -8,7 +8,7 @@
  * from espix, and nothing about espix in the game.
  */
 
-#include <ctype.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "d_event.h"    /* event_t, ev_mouse, D_PostEvent */
 #include "doomgeneric.h"
 #include "doomkeys.h"
 #include "i_video.h"    /* struct color, colors[256] -- global under CMAP256 */
@@ -71,8 +72,8 @@ uint32_t DG_GetTicksMs(void)
 
 /*
  * X11 keysym -- what RFB and the console both deliver -- to Doom key code. The
- * rest of the printable range is the character, uppercased, which is what
- * Doom's default bindings expect for letters and the number row.
+ * rest of the printable range is the character as sent, which is what Doom's
+ * default bindings expect for letters and the number row.
  */
 static unsigned char keysym_to_doom(uint32_t ks)
 {
@@ -85,8 +86,14 @@ static unsigned char keysym_to_doom(uint32_t ks)
     case 0xFF1B: return KEY_ESCAPE;
     case 0xFF09: return KEY_TAB;
     case 0xFF08: return KEY_BACKSPACE;
+    /*
+     * Shift, ctrl and alt keep their engine meanings: run, fire, and strafe.
+     * Ctrl is KEY_FIRE and not KEY_RCTRL -- doomgeneric's scancode table says
+     * so in a comment, and its SDL port does the same. KEY_RCTRL is a different
+     * value, and sending it left the fire key dead.
+     */
     case 0xFFE1: case 0xFFE2: return KEY_RSHIFT;
-    case 0xFFE3: case 0xFFE4: return KEY_RCTRL;
+    case 0xFFE3: case 0xFFE4: return KEY_FIRE;
     case 0xFFE9: case 0xFFEA: return KEY_RALT;
     case 0xFFBE: return KEY_F1;
     case 0xFFBF: return KEY_F2;
@@ -101,6 +108,15 @@ static unsigned char keysym_to_doom(uint32_t ks)
     case 0xFFC8: return KEY_F11;
     case 0xFFC9: return KEY_F12;
     case 0x20:   return KEY_USE;    /* space: open doors, press switches */
+    /*
+     * Comma and period are Doom's own strafe keys, and the engine's defaults
+     * name the codes KEY_STRAFE_L and KEY_STRAFE_R rather than the characters --
+     * a rename doomgeneric made without remapping any platform. So the keys
+     * have to be translated here or strafing with them does nothing at all.
+     */
+    case 0x2C:   return KEY_STRAFE_L;
+    case 0x2E:   return KEY_STRAFE_R;
+    case 0xFF13: return KEY_PAUSE;
     default:     break;
     }
 
@@ -116,6 +132,78 @@ static unsigned char keysym_to_doom(uint32_t ks)
     return 0;
 }
 
+/*
+ * The mouse, held between calls because the engine only ever asks for keys.
+ *
+ * doomgeneric has one input hook -- DG_GetKey -- and I_GetEvent() drains it in a
+ * while loop. There is no DG_GetMouse, and the engine's own SDL mouse case is
+ * commented out, so the way in is the one that commented-out code used: build an
+ * ev_mouse and hand it to D_PostEvent() from here. G_Responder() takes data1 as
+ * the button bitmask and data2/data3 as the deltas, which is how a left click
+ * becomes fire and a horizontal movement becomes a turn without either the
+ * engine or this file knowing much about the other.
+ *
+ * espix delivers two shapes for one device and both are handled: a viewer says
+ * where the pointer *is* (absolute, from RFB), a local mouse says how far it
+ * *moved* (relative, HID). The first is differenced here, so the engine sees
+ * deltas either way. An absolute source has the limitation an absolute source
+ * has -- pushing the pointer against an edge stops producing movement, so a
+ * turn stops there too -- and a local mouse has no such edge.
+ */
+#define MOUSE_GAIN 4
+
+static int     s_mouse_x, s_mouse_y;    /* the last position a pointer event gave */
+static bool    s_mouse_run;             /* ...and whether it continued one */
+static int     s_mouse_dx, s_mouse_dy;  /* accumulated since the last post */
+static uint8_t s_mouse_buttons;         /* as of the last POINTER event */
+static uint8_t s_mouse_sent;            /* ...and what the engine was told */
+
+static int mouse_delta(int d)
+{
+    /*
+     * A gain, and a blunt one. The engine scales by (mouseSensitivity+5)/10 --
+     * 1 at the default -- and then does angleturn -= mousex*8, which was
+     * calibrated against a mouse reporting tens of counts per poll. A USB mouse
+     * reports a handful per report, which turns about three degrees a second
+     * unscaled. This is the number to change if it feels wrong; there is no
+     * menu for it and no config file is read (see below).
+     */
+    return d * MOUSE_GAIN;
+}
+
+static void mouse_post(void)
+{
+    if (s_mouse_dx == 0 && s_mouse_dy == 0 && s_mouse_buttons == s_mouse_sent) {
+        return;
+    }
+
+    event_t ev = { 0 };
+    ev.type  = ev_mouse;
+    ev.data1 = s_mouse_buttons;
+    ev.data2 = mouse_delta(s_mouse_dx);
+
+    /*
+     * Vertical movement is reported as nothing, deliberately.
+     *
+     * The engine's mouse-forward -- forward += mousey, with no threshold -- is
+     * the only thing it does with data3, and vanilla Doom expected a deliberate
+     * push of a *relative* device. This platform's pointers are mostly absolute:
+     * a viewer's cursor drifts vertically whenever it is moved horizontally, so
+     * every turn would also walk the player. The engine's novert option would be
+     * the answer if anything read it; it is declared as a config variable and
+     * never consulted, and no config is read here anyway (the config directory is
+     * the process's working directory, and the quit path skips M_SaveDefaults).
+     * So the axis is dropped in the one place that can drop it, and the arrow
+     * keys remain how you walk.
+     */
+    ev.data3 = 0;
+
+    D_PostEvent(&ev);
+
+    s_mouse_dx = s_mouse_dy = 0;
+    s_mouse_sent = s_mouse_buttons;
+}
+
 int DG_GetKey(int *pressed, unsigned char *key)
 {
     if (doom_gfx == NULL) {
@@ -124,9 +212,42 @@ int DG_GetKey(int *pressed, unsigned char *key)
 
     espix_input_event_t ev;
     while (espix_gfx_poll_event(doom_gfx, &ev)) {
-        if (ev.kind != ESPIX_INPUT_KEY) {
-            continue;   /* the POC is keyboard-only */
+        if (ev.kind == ESPIX_INPUT_POINTER) {
+            /*
+             * A position is evidence of movement only when it continues a run
+             * of positions.
+             *
+             * An absolute device -- a viewer -- sends one for every motion it
+             * sees, so the difference between two of them *is* the movement. A
+             * relative device sends MOTION for the movement and a POINTER only
+             * when its buttons change, carrying wherever the pointer has got to
+             * by then. Differencing *that* against the last button event
+             * reports the whole distance travelled since the last click as one
+             * delta: turn with a local mouse, click, and the view snapped to a
+             * new direction. Which is exactly what it did.
+             */
+            if (s_mouse_run) {
+                s_mouse_dx += ev.x - s_mouse_x;
+                s_mouse_dy += ev.y - s_mouse_y;
+            }
+            s_mouse_x       = ev.x;
+            s_mouse_y       = ev.y;
+            s_mouse_buttons = ev.buttons;
+            s_mouse_run     = true;
+            continue;
         }
+        if (ev.kind == ESPIX_INPUT_MOTION) {
+            /* Already a delta, and unbounded by any edge. It also ends a run of
+             * positions: whatever a POINTER says next is a place, not a move. */
+            s_mouse_dx += ev.x;
+            s_mouse_dy += ev.y;
+            s_mouse_run = false;
+            continue;
+        }
+        if (ev.kind != ESPIX_INPUT_KEY) {
+            continue;
+        }
+
         const unsigned char k = keysym_to_doom(ev.keysym);
         if (k == 0) {
             continue;
@@ -135,6 +256,10 @@ int DG_GetKey(int *pressed, unsigned char *key)
         *key     = k;
         return 1;
     }
+
+    /* No key left in the queue, which is where the mouse gets its turn: one
+     * event per call, and the engine is at the bottom of the loop. */
+    mouse_post();
     return 0;
 }
 

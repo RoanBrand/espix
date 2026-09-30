@@ -249,8 +249,20 @@ static void hid_mouse(const uint8_t *r, size_t n)
      * click at, and inventing a meaning for a click before there is one would be
      * guessing.
      */
-    if (r[0] != s_mouse_buttons) {
-        s_mouse_buttons = r[0];
+    /*
+     * HID's button byte is buttons 1, 2, 3 in bits 0, 1, 2 -- left, *right*,
+     * middle. The event model carries the RFB mask, whose bit 1 is the middle
+     * button and bit 2 the right, and Doom's button numbering follows that
+     * (mouseb_fire is 0, mouseb_strafe 1, mouseb_forward 2). So the two low bits
+     * are swapped on the way in; without it a local mouse's right and middle
+     * buttons change place the moment an owner cares which is which.
+     */
+    const uint8_t mask = (uint8_t)((r[0] & 0x01) |
+                                   ((r[0] & 0x02) ? 0x04 : 0x00) |
+                                   ((r[0] & 0x04) ? 0x02 : 0x00));
+
+    if (mask != s_mouse_buttons) {
+        s_mouse_buttons = mask;
         int x = 0, y = 0;
         espix_display_pointer(&x, &y);
         const espix_input_event_t ev = {

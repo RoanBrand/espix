@@ -1551,6 +1551,25 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   is why it is easy to miss. Nothing in the app launch depends on it, but
   "launch it from the desktop icon" does.
 
+- **The game's mouse is an adapter, and two of its limits are deliberate.**
+  doomgeneric has no mouse hook at all -- `DG_GetKey` is its only input entry,
+  and its SDL mouse case is commented out -- so the app builds the engine's own
+  `ev_mouse` and posts it with `D_PostEvent()`. Two consequences: vertical
+  movement is *ignored* (the engine's only use for it is `forward += mousey`, so
+  a pointer drifting as you sweep sideways would walk you, and its `novert`
+  option is declared and never consulted), and turning with a *viewer's* pointer
+  stops at the canvas edge, because that pointer is absolute -- a local USB mouse
+  sends deltas and has no such limit. The magnitude is one constant,
+  `MOUSE_GAIN` in `apps/doom/components/doomplatform/doom_espix.c`.
+
+  The wrinkle worth knowing for anything else that grows a mouse: a `POINTER`
+  event is a *place*, not a movement, unless it continues a run of them. An
+  absolute device sends one per motion, so the difference between two is the
+  movement; a relative device sends `MOTION` for the movement and a `POINTER`
+  only when its buttons change, carrying wherever the pointer got to. Differencing
+  across that reported the whole distance since the last click as one delta, and
+  a click after a turn snapped the view to a new direction.
+
 - **A file a program left open cannot be removed until the next boot.** With no
   per-process ownership of fds, an app that is killed — or that exits without
   closing, which is what the game's quit path does: it `longjmp`s out of
