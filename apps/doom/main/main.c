@@ -64,7 +64,14 @@ static const char *find_wad(void)
     return NULL;
 }
 
-void app_main(void)
+/*
+ * The working directory, the WAD and the zone are decided here, and everything
+ * the launcher was given after argv[0] is appended to the engine's command line.
+ * That is how a repeatable benchmark is run -- "doom -timedemo demo1" -- since
+ * the WAD is named here and the engine parses its arguments in one pass
+ * wherever they sit.
+ */
+void app_main(int app_argc, char **app_argv)
 {
     doom_gfx = espix_gfx_open();
     if (doom_gfx == NULL) {
@@ -120,7 +127,7 @@ void app_main(void)
     }
 
     char  mb_arg[8];
-    char *argv[6] = { "doom", "-iwad", (char *)wad, NULL, NULL, NULL };
+    char *argv[16] = { "doom", "-iwad", (char *)wad, NULL, NULL, NULL };
     int   argc    = 3;
 
     if (avail < 6) {
@@ -128,6 +135,12 @@ void app_main(void)
         argv[argc++] = "-mb";
         argv[argc++] = mb_arg;
         printf("doom: only %d MiB free; starting with a %d MiB zone\n", avail, avail);
+    }
+
+    /* The launcher's own arguments, argv[0] aside, leaving room for the NULL. */
+    for (int i = 1; i < app_argc && argc + 1 < (int)(sizeof(argv) / sizeof(argv[0]));
+         i++) {
+        argv[argc++] = app_argv[i];
     }
     fflush(stdout);
 
