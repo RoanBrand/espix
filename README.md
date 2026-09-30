@@ -45,8 +45,10 @@ together.
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
 | Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |
 | Programs | USB keyboard and mouse | **yes** | boot-protocol HID on the host port, decoded to X11 keysyms and fed to the same input path a viewer's events use; a keyboard and a wireless receiver's mouse both verified — [USB-HOST.md](docs/USB-HOST.md) |
+| Programs | A game as an app | **partial** | `apps/doom` runs the shareware's levels, launched from a desktop icon, keyboard only. Its frame rate is the RFB encoder's (hextile on game imagery is ~50x its desktop cost), not the engine's, and its ~7 MB per run is not reclaimed until a reboot — see [ROADMAP.md](docs/ROADMAP.md#app-data-the-program-does-not-ship) |
+| Programs | Fetching a file over HTTP(S) | **yes** | `fetch <url> <path>`, sharing `upgrade`'s HTTP and TLS stack and certificate bundle; checks room first and says where to get some back |
 | Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
-| Shell | Serial console and SSH, same commands | **yes** | 61 commands |
+| Shell | Serial console and SSH, same commands | **yes** | 62 commands |
 | Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
 | Shell | Line editing, history, TAB completion | **yes** | |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
