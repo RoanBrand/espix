@@ -31,6 +31,24 @@ espix_gfx_surface_t *doom_surface;
  * exit() behind the process machinery.
  */
 static jmp_buf s_quit_jmp;
+static jmp_buf s_fatal_jmp;
+
+/*
+ * abort(), the way a program expects it.
+ *
+ * The engine's fatal path -- I_Error, and every assert in it -- ends in abort(),
+ * and espix's abort is the board's: it takes the system down. That is why a bad
+ * WAD, or a timedemo finishing with its own result, rebooted the machine. espix
+ * cannot give abort() process semantics yet (no per-process heap or fds, so a
+ * dead app's are not reclaimed -- the reaper is a roadmap item), but the app
+ * can: its own definition wins over the one the ABI publishes, and it leaves by
+ * the same door the quit path uses -- a jump back to app_main, whose return is
+ * espix's normal exit. I_Error has already printed what went wrong.
+ */
+void abort(void)
+{
+    longjmp(s_fatal_jmp, 1);
+}
 
 static void doom_request_quit(void)
 {
@@ -73,6 +91,17 @@ static const char *find_wad(void)
  */
 void app_main(int app_argc, char **app_argv)
 {
+    /*
+     * Armed before anything else the engine can fail in, and for the whole run:
+     * a longjmp target is only good while its frame is alive, and app_main does
+     * not return until the end.
+     */
+    if (setjmp(s_fatal_jmp) != 0) {
+        printf("doom: fatal error; leaving the app, not the board\n");
+        fflush(stdout);
+        return;
+    }
+
     doom_gfx = espix_gfx_open();
     if (doom_gfx == NULL) {
         printf("doom: no display up (start it with 'vnc start')\n");
@@ -113,11 +142,11 @@ void app_main(int app_argc, char **app_argv)
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), avail);
 
     /*
-     * Refuse rather than die. The engine's I_Error calls abort(), and on espix
-     * an abort in an app takes the whole board down -- so a launch that cannot
-     * get its zone reboots the system instead of failing. Below 4 MiB the
-     * shareware's levels do not fit anyway, so say so and leave through the
-     * normal exit; between 4 and 6, ask the engine for a zone it can have.
+     * Refuse rather than die. I_Error is survivable now (see abort() above), but
+     * a zone too small to load a level with would fail *inside* the engine,
+     * after the WAD has been read and half the subsystems initialised -- so the
+     * check happens here, before any of that. Below 4 MiB the shareware's levels
+     * do not fit anyway; between 4 and 6, ask the engine for a zone it can have.
      */
     if (avail < 4) {
         printf("doom: not enough PSRAM (need 4 MiB, have %d) -- not starting\n",
