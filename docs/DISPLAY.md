@@ -568,8 +568,11 @@ Two clients were tried first, and both taught something.
   default instead of deriving one; making the two the same would mean storing a
   second password-derived secret beside the account, which is a change to
   espix_auth's on-disk format rather than to this component.
-- **The canvas is fixed at build time** (800x600 RGB565, 960 KiB). A
-  `DesktopSize` pseudo-encoding makes it resizable; that is M3.
+- **The canvas is a setting, not a build-time constant.** 800x600 RGB565
+  (960 KiB) unless /etc/display.conf says otherwise, changed with
+  `display size <w>x<h>` or the desktop's own Settings app, and carried across a
+  reboot. A live client that offered the `DesktopSize` pseudo-encoding is
+  resized in place; one that did not is dropped to reconnect at the new size.
 - **Colour-map clients are refused**, and the pixel format stays true colour.
   Every desktop client asks for true colour; this only affects a client that
   explicitly asks for a palette, and the log says so when it happens.
@@ -583,8 +586,10 @@ Two clients were tried first, and both taught something.
 ## What the encoder costs, measured
 
 The server reports its own split every hundred updates. The numbers below are a
-game (Doom) at 320x240, viewer attached, one rect an update -- first at the start
-of the optimization round, then after it:
+game (Doom) at a 320x240 canvas -- which is a setting, not the 800x600 default,
+so a viewer at another size should expect the numbers to move with it -- with one
+viewer attached and one rect an update. First at the start of the optimization
+round, then after it:
 
 | | before | after |
 |---|---|---|
@@ -669,10 +674,15 @@ none of them tried here:
   being serial (raw is; the analysis is not), so an encoder task on core 0
   alongside the one on core 1 could overlap two halves of the tile grid. It is
   the only remaining lever with a factor in it rather than a percentage.
-- **A smaller canvas.** The game renders 320x200 and the canvas is 320x240; the
-  scaler is doing 20% more pixels than the game has. That is the parked
-  ExtendedDesktopSize idea, and it needs the resize call published to apps and a
-  viewer that scales to fit.
+- **A canvas the size of the game.** Doom's own framebuffer is **320x200** --
+  `DOOM_W`/`DOOM_H` in apps/doom/components/doomplatform/doom_espix.c, the
+  surface it is created at, and the engine's own "DOOM screen size: w x h: 320 x
+  200" on startup. The canvas under it is whatever the display is set to, and the
+  scaler stretches the game to fill that. It is 320x240 in every measurement in
+  this file. A 320x200 canvas would be 17% fewer pixels than 320x240, but the
+  pixels are not the point: 320x200 is the aspect the original squeezed into
+  non-square pixels, and scaling it to 320x240 is what corrects it. Worth doing
+  only if the viewer then scales to fit with the aspect kept.
 
 ### A PIE memcpy is not this lever
 
