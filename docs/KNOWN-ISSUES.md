@@ -27,6 +27,32 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   or fds, so nothing can reclaim it for the app. `tests/suites/35-signals.sh`
   pins both halves.
 
+- **A clean exit does not give all of the app's PSRAM back either, and the game
+  shows it.** Measured: from a fresh boot with 13.2 MB of PSRAM free, two Doom
+  runs -- both exiting through the app's own `doom: quit` path, no kill -- left
+  **571 KB**, roughly 7.7 MB a run. Only a reboot returns it. This is the same
+  gap as above with a different trigger: the exit path does not hand back what
+  the app allocated, and the loader has no per-process heap ownership to reclaim
+  it with.
+
+  What it looks like is a game leaving the screen on a large canvas. The mode
+  switch back asks for a 1280x800 canvas and then an RFB staging buffer of the
+  same size, 2 MB each, and with the game's memory still held the allocation
+  fails -- which drops the viewer rather than merely leaving the screen small:
+
+      doom: quit
+      display: screen owner: app -> desktop
+      display: desktop takes the canvas back at 1280x800
+      display: display resized to 1280x800
+      vnc0: console down
+      vnc: client disconnected
+      vnc: radio back to its own sleep setting
+
+  Nothing here is display-specific: the desktop at 1280x800 is simply the
+  largest thing that asks for its memory back at once. Until the exit path
+  returns it, a reboot is the only reclaimer, and a game run on a large canvas
+  is the case that runs out first.
+
 - **`ps` shows at most 8 finished processes.** `cmd_ps` stack-allocates
   `espix_proc_info_t procs[8]` while `ESPIX_PROC_MAX` is 12, so on a busy table
   some exits are silently missing from the `finished:` list. The array is on the
