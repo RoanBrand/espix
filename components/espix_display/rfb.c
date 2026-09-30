@@ -34,8 +34,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 
 #include "espix_display.h"
@@ -320,16 +322,34 @@ static struct {
  * says how much of it is the RRE analysis -- the part that can be abandoned
  * early -- against the pixel conversion that every tile pays whatever encoding
  * wins, and how many tiles each outcome took.
+ *
+ * Counted in CPU cycles, not read from the timer: this is inside the loop it
+ * measures, and two esp_timer_get_time() calls a tile were themselves a
+ * measurable part of the number they reported. The cycle count is a register
+ * read, and the division into microseconds happens once, when the line prints.
+ *
+ * "runs" is the raw material the subrect list is made from, against the
+ * "subrects" that survived the vertical extension -- the one number that says
+ * whether that extension is earning its keep on this content.
  */
 static struct {
-    uint64_t analyse_us;    /* colour runs and subrect matching */
-    uint64_t emit_us;       /* converting pixels and writing them out */
+    uint64_t analyse_cyc;   /* colour runs and subrect matching */
+    uint64_t emit_cyc;      /* converting pixels and writing them out */
     uint32_t tiles;
     uint32_t flat;          /* one colour: a background byte, done */
     uint32_t raw;           /* sent as pixels */
     uint32_t sub;           /* sent as subrects */
-    uint32_t subrects;      /* ...and how many rectangles those carried */
+    uint32_t runs;          /* colour runs the tiles were made of */
+    uint32_t subrects;      /* ...and the rectangles those became */
 } s_enc;
+
+/* Cycles to microseconds, for the line below and nowhere else. */
+static uint64_t cyc_to_us(uint64_t cycles)
+{
+    const uint32_t per_us = esp_rom_get_cpu_ticks_per_us();
+
+    return per_us ? cycles / per_us : 0;
+}
 
 /*
  * Start a frame, or do not start it at all.
@@ -609,6 +629,33 @@ static void row_to_pf(const espix_px_t *src, uint8_t *dst, int n, const rfb_pf_t
         return;
     }
 
+    /*
+     * 32bpp, 8-8-8, red at bit 16: what every desktop client asks for, and the
+     * one loop where the general path below is measurably slow. It reloads the
+     * format out of *pf on every pixel, because nothing tells the compiler the
+     * format and the output cannot overlap. Hoisted here, with the 5-6-5
+     * expansion written out, and the four bytes stored from one word.
+     */
+    if (bytes == 4 && pf->true_color && !pf->big_endian &&
+        pf->rmax == 255 && pf->gmax == 255 && pf->bmax == 255 &&
+        pf->rshift == 16 && pf->gshift == 8 && pf->bshift == 0) {
+        for (int i = 0; i < n; i++) {
+            const uint32_t px = src[i];
+            const uint32_t r5 = (px >> 11) & 0x1F;
+            const uint32_t g6 = (px >> 5) & 0x3F;
+            const uint32_t b5 = px & 0x1F;
+            const uint32_t v  = (((r5 << 3) | (r5 >> 2)) << 16) |
+                                (((g6 << 2) | (g6 >> 4)) << 8) |
+                                ((b5 << 3) | (b5 >> 2));
+            uint8_t *d = dst + (size_t)i * 4;
+            d[0] = (uint8_t)v;
+            d[1] = (uint8_t)(v >> 8);
+            d[2] = (uint8_t)(v >> 16);
+            d[3] = 0;
+        }
+        return;
+    }
+
     for (int i = 0; i < n; i++) {
         (void)pix_to_pf(src[i], dst + (size_t)i * bytes, pf);
     }
@@ -619,13 +666,23 @@ static void row_to_pf(const espix_px_t *src, uint8_t *dst, int n, const rfb_pf_t
 /* ------------------------------------------------------------------ */
 
 static void enc_raw(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
-                    const rfb_pf_t *pf, uint8_t *row)
+                    const rfb_pf_t *pf)
 {
     const size_t rb = (size_t)r.w * (pf->bpp / 8);
 
+    /*
+     * The row is converted straight into the buffer it is sent from. It used to
+     * convert into the connection's row scratch and then memcpy it here, and on
+     * a whole-canvas raw frame that was 300 KiB of PSRAM traffic a frame spent
+     * moving bytes the encoder had just written.
+     */
     for (int y = 0; y < r.h && !s->bad; y++) {
-        row_to_pf(px + (size_t)(r.y + y) * stride + r.x, row, r.w, pf);
-        sink_write(s, row, rb);
+        uint8_t *o = sink_gap(s, rb);
+        if (o == NULL) {
+            break;
+        }
+        row_to_pf(px + (size_t)(r.y + y) * stride + r.x, o, r.w, pf);
+        sink_commit(s, o + rb);
     }
 }
 
@@ -699,7 +756,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
     const int bytes = pf->bpp / 8;
     const espix_px_t bg = base[0];
 
-    const int64_t t_analyse = esp_timer_get_time();
+    const uint32_t t_analyse = esp_cpu_get_cycle_count();
 
     bool uniform = true;
     for (int y = 0; y < th && uniform; y++) {
@@ -719,7 +776,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         row_to_pf(&bg, pix, 1, pf);
         sink_write(s, pix, (size_t)bytes);
 
-        s_enc.analyse_us += esp_timer_get_time() - t_analyse;
+        s_enc.analyse_cyc += (uint32_t)(esp_cpu_get_cycle_count() - t_analyse);
         s_enc.tiles++;
         s_enc.flat++;
         return;
@@ -749,7 +806,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         int        nspan = 0;
 
         /*
-         * Which span starts at each x, or -1.
+         * Which span starts at each x.
          *
          * A run starts where the last one ended, so at most one span per x, and
          * a subrect can only continue into a span that starts at the subrect's
@@ -757,16 +814,14 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
          * search -- it used to compare every active subrect against all sixteen
          * spans on every row, 256 comparisons of three conditions for a tile
          * whose rows have nothing in common.
+         *
+         * "span_have" is a bit per x rather than a sentinel in the array: the
+         * array only ever gets written where a span starts, and clearing
+         * sixteen entries on every row was the same work as scanning the row
+         * that filled them.
          */
-        /* Which span starts at each x, or -1. A run starts where the last one
-         * ended, so at most one per x -- and a subrect can only continue into a
-         * span that starts at its own x, which makes the matching below a lookup
-         * instead of sixteen comparisons of three conditions per active subrect
-         * per row. */
-        int8_t span_at[16];
-        for (int i = 0; i < 16; i++) {
-            span_at[i] = -1;
-        }
+        int8_t   span_at[16];
+        uint16_t span_have = 0;
 
         for (int x = 0; x < tw; ) {
             const espix_px_t c = p[x];
@@ -775,16 +830,19 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
                 w++;
             }
             if (c != bg && nspan < 16) {
-                span_xy[nspan] = (uint8_t)((x << 4) | y);
-                span_wh[nspan] = (uint8_t)((w - 1) << 4);
-                span_px[nspan] = c;
-                span_at[x]     = (int8_t)nspan;
+                span_xy[nspan]   = (uint8_t)((x << 4) | y);
+                span_wh[nspan]   = (uint8_t)((w - 1) << 4);
+                span_px[nspan]   = c;
+                span_at[x]       = (int8_t)nspan;
+                span_have       |= (uint16_t)1 << x;
                 nspan++;
             }
             x += w;
         }
+        s_enc.runs += (uint32_t)nspan;
 
-        bool      used[16] = { false };
+        /* The same trick for the spans this row's subrects consumed. */
+        uint16_t  used = 0;
         subrect_t next[16];
         size_t    nnext = 0;
 
@@ -792,13 +850,14 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
             subrect_t a    = active[i];
             bool      grew = false;
 
-            const int j = span_at[(a.xy & 0xF0) >> 4];
+            const int sx = (a.xy & 0xF0) >> 4;
+            const int j  = (span_have & ((uint16_t)1 << sx)) ? span_at[sx] : -1;
 
             /* The span that starts where this subrect does, of the same width
              * (the high nibble of wh is the height) and the same colour. */
-            if (j >= 0 && !used[j] && (span_wh[j] & 0xF0) == (a.wh & 0xF0) &&
-                span_px[j] == a.px) {
-                used[j]       = true;
+            if (j >= 0 && !(used & ((uint16_t)1 << j)) &&
+                (span_wh[j] & 0xF0) == (a.wh & 0xF0) && span_px[j] == a.px) {
+                used         |= (uint16_t)1 << j;
                 a.wh          = (uint8_t)(a.wh + 1);    /* h += 1 */
                 next[nnext++] = a;
                 grew          = true;
@@ -817,7 +876,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         }
 
         for (int j = 0; j < nspan; j++) {
-            if (!used[j]) {
+            if (!(used & ((uint16_t)1 << j))) {
                 next[nnext++] = (subrect_t){ span_xy[j], span_wh[j], span_px[j] };
             }
         }
@@ -839,8 +898,8 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
     }
 
     /* Analysis over; from here it is pixels or subrects. */
-    s_enc.analyse_us += esp_timer_get_time() - t_analyse;
-    const int64_t t_emit = esp_timer_get_time();
+    s_enc.analyse_cyc += (uint32_t)(esp_cpu_get_cycle_count() - t_analyse);
+    const uint32_t t_emit = esp_cpu_get_cycle_count();
 
     const size_t raw_size = 1 + (size_t)tw * th * bytes;
 
@@ -891,7 +950,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
                 sink_commit(s, o);
 
                 s_enc.subrects += (uint32_t)nclosed;
-                s_enc.emit_us += esp_timer_get_time() - t_emit;
+                s_enc.emit_cyc += (uint32_t)(esp_cpu_get_cycle_count() - t_emit);
                 s_enc.tiles++;
                 s_enc.sub++;
                 return;
@@ -907,7 +966,7 @@ static void enc_hextile_tile(sink_t *s, const espix_px_t *base, int stride,
         sink_write(s, row, (size_t)tw * bytes);
     }
 
-    s_enc.emit_us += esp_timer_get_time() - t_emit;
+    s_enc.emit_cyc += (uint32_t)(esp_cpu_get_cycle_count() - t_emit);
     s_enc.tiles++;
     s_enc.raw++;
 }
@@ -1000,23 +1059,36 @@ static void send_stat(int64_t us, size_t rects)
                (long long)((s_send_stat.rects + 50) / 100));
 
     const uint32_t tiles = s_enc.tiles ? s_enc.tiles : 1;
+    /*
+     * The emit counter covers the socket flush it triggered as well, and the
+     * phase split above already calls that wire. Taking it out here is what
+     * makes the two lines add up: without it, "emit" was reporting a third of
+     * the network as encoder time.
+     */
+    const uint64_t analyse_us = cyc_to_us(s_enc.analyse_cyc);
+    const uint64_t emit_all   = cyc_to_us(s_enc.emit_cyc);
+    const uint64_t emit_us    = emit_all > s_phase.write_us
+                                ? emit_all - s_phase.write_us : 0;
+
     espix_klog(ESPIX_KLOG_INFO, TAG,
                "enc: %u tiles an update (%u flat, %u raw, %u sub, "
-               "%u subrects), %lld us a tile (analyse %lld, emit %lld)",
+               "%u runs -> %u subrects), %lld us a tile (analyse %lld, emit %lld)",
                (unsigned)(s_enc.tiles / u),
                (unsigned)(s_enc.flat / u), (unsigned)(s_enc.raw / u),
-               (unsigned)(s_enc.sub / u), (unsigned)(s_enc.subrects / u),
-               (long long)((s_enc.analyse_us + s_enc.emit_us) / tiles),
-               (long long)(s_enc.analyse_us / tiles),
-               (long long)(s_enc.emit_us / tiles));
+               (unsigned)(s_enc.sub / u),
+               (unsigned)(s_enc.runs / u), (unsigned)(s_enc.subrects / u),
+               (long long)((analyse_us + emit_us) / tiles),
+               (long long)(analyse_us / tiles),
+               (long long)(emit_us / tiles));
 
-    s_enc.analyse_us = 0;
-    s_enc.emit_us    = 0;
-    s_enc.tiles      = 0;
-    s_enc.flat       = 0;
-    s_enc.raw        = 0;
-    s_enc.sub        = 0;
-    s_enc.subrects   = 0;
+    s_enc.analyse_cyc = 0;
+    s_enc.emit_cyc    = 0;
+    s_enc.tiles       = 0;
+    s_enc.flat        = 0;
+    s_enc.raw         = 0;
+    s_enc.sub         = 0;
+    s_enc.runs        = 0;
+    s_enc.subrects    = 0;
 
     s_phase.n = 0;
     s_phase.canvas_us = 0;
@@ -1226,6 +1298,17 @@ static bool update_send(rfb_conn_t *c)
     const espix_px_t *px = espix_canvas_pixels(cv);
     for (size_t i = 0; i < n; i++) {
         const espix_rect_t r = rects[i];
+
+        /*
+         * A full-width rectangle is one contiguous run of pixels, so the common
+         * case -- a game that damages the whole canvas every frame -- is one
+         * memcpy rather than one per row. Same bytes, a quarter of the calls.
+         */
+        if (r.w == cw) {
+            memcpy(c->stage + (size_t)r.y * cw, px + (size_t)r.y * cw,
+                   (size_t)r.h * cw * sizeof(espix_px_t));
+            continue;
+        }
         for (int y = 0; y < r.h; y++) {
             memcpy(c->stage + (size_t)(r.y + y) * cw + r.x,
                    px + (size_t)(r.y + y) * cw + r.x,
@@ -1288,7 +1371,7 @@ static bool update_send(rfb_conn_t *c)
         if (c->hextile) {
             enc_hextile(&s, c->stage, cw, r, &c->pf, c->row);
         } else {
-            enc_raw(&s, c->stage, cw, r, &c->pf, c->row);
+            enc_raw(&s, c->stage, cw, r, &c->pf);
         }
         if (s.bad) {
             RFB_MARK_STOP(RFB_MARK_PIXELS);

@@ -44,3 +44,9 @@ idf_component_register(
         # release does not pull the encoder in just to compile markers out.
         ${espix_display_priv_trace}
 )
+
+# The encoder and the canvas copy are the frame-rate ceiling for anything that
+# changes the whole screen -- a game -- and ESP-IDF's default -Og costs them
+# real time in the inner loops. -O2 on the two files on that path is the whole
+# of it, and the rest of the firmware stays as debuggable as it was.
+set_source_files_properties(rfb.c display.c PROPERTIES COMPILE_OPTIONS "-O2")

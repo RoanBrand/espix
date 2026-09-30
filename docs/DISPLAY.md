@@ -582,46 +582,97 @@ Two clients were tried first, and both taught something.
 
 ## What the encoder costs, measured
 
-The server reports its own split every hundred updates, and the numbers below are
-a game (Doom) at two modes, viewer attached, one rect an update:
+The server reports its own split every hundred updates. The numbers below are a
+game (Doom) at 320x240, viewer attached, one rect an update -- first at the start
+of the optimization round, then after it:
 
-| | 320x240 | 640x480 |
+| | before | after |
 |---|---|---|
-| canvas copy | 3.4 ms | 14.3 ms |
-| **encode** | **54 ms** | **161 ms** |
-| of which the RRE analysis | 40 ms | 121 ms |
-| of which emitting | 24 ms | 74 ms |
-| wire | 13.5 ms | 39 ms |
-| frame | ~70 ms | ~212 ms |
+| canvas copy | 3.5 ms | 3.3 ms |
+| **encode** | **35 ms** | **26 ms** |
+| of which the RRE analysis | 22 ms | 17.4 ms |
+| of which emitting | 8 ms | 5.9 ms |
+| wire | 12.1 ms | 11.9 ms |
+| frame, server side | 50 ms | 41 ms |
+| frame, as a viewer sees it | 71 ms / 13.9 fps | 63 ms / 15.8 fps |
 
-The engine is not the problem: `doom -timedemo demo1` runs at **43.9 fps** with
-no viewer attached, which is rendering, palette conversion, surfacing and present
-all in. Everything above that cost is this file.
+That is a 20% gain, and it is a small gain for the work, which is the useful part
+of the result. What the round established:
 
-Two things follow. The analysis is the largest single item, and it scales with how
-dense the imagery is -- a game frame is tens of thousands of subrects. And at the
-rate this pipeline manages, **most of a frame is identical to the one the client
-already has**: the status bar, the HUD, the static part of the view. The way to
-win is to stop encoding those, not to encode them faster.
+- **The firmware was built at -Og.** ESP-IDF's default, and it cost the two files
+  on this path a fifth of their time. They are -O2 now (see the component's
+  CMakeLists); the rest of the firmware is unchanged.
+- **The analysis is the encoder.** 17.4 ms of the 26 is the run-and-subrect pass,
+  against 5.9 ms of converting and writing. Any further work belongs there.
+- **The vertical extension earns its keep.** Measured with a counter added for
+  it: 119.5 colour runs a tile become 85.9 subrects, so removing it would cost
+  about 28% more rectangles, and bytes.
+- **Raw is not the answer.** Forcing the whole frame to Raw -- no analysis at all
+  -- was measured: encode falls to 20.5 ms, but the wire rises from 12 to 22.5 ms
+  and the bytes from 165 KiB to 300 KiB a frame, and the frame rate goes *down*
+  (15.0 against 15.8 fps). The screen is dense; the RRE compression is worth more
+  than the analysis costs.
+- **The server is not the frame rate a viewer sees.** The mean time inside
+  send() is 41 ms, so the server can produce about 24 updates a second. This
+  harness's decoder is Python and adds about 21 ms a frame; a C viewer would see
+  closer to the 24 than the 15.8 the test reports.
 
-### The next lever: bands the client already has
+The emit counter used to include the socket flush it triggers, and the phase line
+already called that wire -- so "emit" was reporting a third of the network as
+encoder time. Both are counted in CPU cycles now, read from the cycle counter
+rather than the timer, because two timer calls a tile were themselves part of
+what they measured.
+
+The engine is still not the problem: `doom -timedemo demo1` runs at 36-44 fps
+with no viewer attached, which is rendering, palette conversion, surfacing and
+present all in.
+
+### The next lever: bands the client already has, and what it is worth
 
 Keep the canvas as last *sent* per connection (`c->prev`, one canvas-sized PSRAM
-buffer: 150 KiB at 320x240, 600 KiB at 640x480) and, after copying the damaged
-region into `c->stage`, drop every sixteen-row band of it whose rows are
-byte-identical in the two. Bands are emitted *whole* when anything in them
-changed, so nothing can be missed -- that is the property that makes this safe to
-land before it is clever. Then update `prev` for the bands sent.
-
-Costs a `memcmp` per row (~0.3 ms a frame at 320x240) against the tens of
-milliseconds it can skip. If the band list would exceed
+buffer: 150 KiB at 320x240) and, after copying the damaged region into
+`c->stage`, drop every sixteen-row band of it whose rows are byte-identical in
+the two. Bands are emitted *whole* when anything in them changed, so nothing can
+be missed. Then update `prev` for the bands sent. If the band list would exceed
 `ESPIX_DISPLAY_DAMAGE_MAX`, fall back to the damage rects unchanged rather than
 merge them. `prev` wants the same treatment as `stage`: allocated in
 `connection_resize()` and in `rfb_serve()`, freed in the `done:` path, and
 cleared on a resize because the client's framebuffer is new.
 
+The earlier claim here -- that most of a frame is identical to the one the client
+already has -- is **wrong for this game**, and measuring is what showed it. Doom
+presents by scaling its surface onto the whole canvas, and it presents every
+frame, so every tile row is damaged every frame. What is genuinely unchanged is
+the status bar and whatever static part of the view there is, which is about 16%
+of the rows, and the comparison costs a pass over the whole surface (the `memcmp`
+is on two 153 KiB buffers, not the 0.3 ms guessed here). The net for a moving
+game is small.
+
+It is worth more where it was not aimed: the desktop, whose updates are small and
+mostly static, and where skipping unchanged tiles skips the analysis outright.
+
 Finishing the job later means one rect per *changed run of tiles* rather than per
 band, which is the same comparison at finer granularity.
+
+### What is left on the table
+
+The analysis is 17.4 ms a frame, and it is ~18,000 cycles a tile for about 700
+operations -- the cost is the memory, not the arithmetic. Three things follow,
+none of them tried here:
+
+- **Tighter damage from the presenter.** `espix_canvas_scale_surface()` damages
+  the whole canvas because the scaler writes the whole canvas. A rect-aware
+  present -- scale and damage only the part of the surface that changed -- would
+  give the encoder less to look at, and the game knows which part of its screen
+  it redrew.
+- **The second core.** The encode is not memory-bandwidth-bound to the point of
+  being serial (raw is; the analysis is not), so an encoder task on core 0
+  alongside the one on core 1 could overlap two halves of the tile grid. It is
+  the only remaining lever with a factor in it rather than a percentage.
+- **A smaller canvas.** The game renders 320x200 and the canvas is 320x240; the
+  scaler is doing 20% more pixels than the game has. That is the parked
+  ExtendedDesktopSize idea, and it needs the resize call published to apps and a
+  viewer that scales to fit.
 
 ### A PIE memcpy is not this lever
 
