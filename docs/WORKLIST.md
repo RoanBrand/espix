@@ -86,6 +86,11 @@ This file came out of a full review of the tree (first commit through
 
 ## R-P1 — per-process ownership (the keystone)
 
+**Design written before the code: [APP-MEMORY.md](APP-MEMORY.md).** It records the
+measured problem, the six things that must be true, the choice between tagging
+allocations and a private arena, the hazards in the order they bite, and the
+five open questions — of which the first decides the rest.
+
 | id | what | why | where | done when | status |
 |---|---|---|---|---|---|
 | R-P1.1 | Intercept `malloc`/`calloc`/`realloc`/`free`/`strdup` through the resolver, PSRAM-first with an internal fallback | Apps get the firmware's allocator, which puts everything under 16 KB in internal RAM; and it is the seam the arena needs | `abi_resolver.c` (the `getenv` pattern) | an app's allocations are visible to espix | todo |
