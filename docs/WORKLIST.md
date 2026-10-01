@@ -102,6 +102,8 @@ five open questions — of which the first decides the rest.
 | R-P1.7 | Reclaim the screen through R-P1.6 instead of the `espix_gfx_recover()` special case | Today the canvas is the one resource that *is* reclaimed, by hand | `proc.c:236` | the special case is gone | todo |
 | R-P1.8 | `dup`/`dup2`/`fcntl(F_DUPFD)` in the VFS | Currently "left out" only because IDF stubs it. Prerequisite for pipes and redirection, and portable to all targets | `vfs.c` | `dup2` from an app works | todo |
 
+| R-P1.9 | The C++ allocator path is unverified at runtime | `arduino-esp32` has **no S31 support at all** — zero files mention `ESP32S31`, against 35 for the P4 — so neopixel cannot be built for this target (its `apps/neopixel/targets` says `esp32s3` and `build-apps.sh` skips it correctly) and there is no C++ app to exercise `operator new`/`delete`. Compile, link and the resolver mapping are checked; the runtime path is not. Nothing to do here until an S31-capable C++ app exists — porting Arduino to the S31 is an upstream project, not an espix one | A whole half of the allocator ABI has no runtime coverage | — | revisit when a C++ app can run on the S31 | parked |
+
 ## R-P2 — the shell surface
 
 | id | what | why | where | done when | status |
