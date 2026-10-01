@@ -24,6 +24,23 @@ extern "C" {
 #define ESPIX_PROC_ENV_ADDED_MAX 8
 
 /*
+ * The thread-local slot an app's threads find their process by.
+ *
+ * TLS indices are a shared, hand-allocated space with no registry, and the
+ * build enables four (CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS): 0 is
+ * IDF's own pthread bookkeeping (PTHREAD_TLS_INDEX), 1 the shell's session,
+ * 2 espix_fs's privilege depth, 3 this. Adding one means changing the count
+ * beside them, and this comment is the only place the four are listed.
+ *
+ * It is the right home for this because the value is per *task*: an app thread
+ * cannot be identified by a task handle (a handle is the address of a TCB, and
+ * FreeRTOS hands a dead task's TCB to the next task created), but a pointer
+ * read out of the current task's own TLS cannot be another task's at all. See
+ * abi_pthread.c.
+ */
+#define ESPIX_TLS_PROC_IDX 3
+
+/*
  * An app's own memory: a small list of private heaps carved out of PSRAM.
  *
  * An app's malloc() used to be the firmware's, so nothing could say what the
@@ -443,6 +460,12 @@ void espix_proc_abi_exit_register(void);
  * resolver table because the loader's own answers for malloc and is searched
  * first, and it is where the per-process regions (R-P1.2) will attach. */
 void espix_proc_abi_alloc_register(void);
+
+/* Publish pthread_create, so a thread an app makes belongs to the app's
+ * process and its allocations land in the process's arena. See abi_pthread.c:
+ * this is a resolver table because espix does not own the pthread surface and
+ * only the resolver runs first. */
+void espix_proc_abi_pthread_register(void);
 
 /*
  * The allocator itself, so abi_cxx.cpp's operator new/delete reach the same one

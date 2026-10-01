@@ -397,3 +397,40 @@ and wants deciding on its own.
 3. A thread's free() still finds the region (already covered; must not regress).
 4. The table is cleaned both when a thread ends and when a process dies with a
    thread still live.
+
+
+### Built
+
+Two things changed from the sketch above, both for the better.
+
+**The slot travels in thread-local storage, not a table keyed on task handles.**
+A handle is the address of a TCB, and FreeRTOS hands a dead task's TCB to the
+next task created -- which is the whole reason the sketch wanted a generation
+counter. A pointer read out of the *current* task's own TLS cannot be another
+task's at all, so the problem is gone rather than guarded against. espix already
+keeps per-task state this way (the shell's session, espix_fs's privilege depth),
+so this is one more index beside them: ESPIX_TLS_PROC_IDX, with
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS raised from 3 to 4. The four are
+listed in one comment in espix_proc_priv.h, because there is no registry.
+
+What did not change: the free path needed none of it. free() finds the region by
+address and never asks who the caller is -- R-P1.2 had already made that half
+work.
+
+**The trap this opened, and closed.** espix_proc_self() answering for a thread
+changes what every caller of it means, and there are several. All but one want
+the *process*, and are now more correct for a thread than they were: signals,
+the environment, and cwd/root are per-process by POSIX. The exception is
+espix_proc_exit(). slot->exit_jmp is a frame in proc_task() -- the task that
+entered app_main() -- so a longjmp from a thread would land on that task's
+stack. It now requires that the caller *is* info.task, so a thread's exit()
+still ends only the thread, as KNOWN-ISSUES documents. Anyone adding a caller of
+espix_proc_self() has to ask which of the two questions they mean.
+
+**Still open, and deliberately not papered over.** A thread that *outlives its
+process* -- app_main returns while the thread still runs -- leaves its TLS
+pointing at a slot the table may recycle for the next process, and the state
+check cannot tell the difference. The real answer is that app threads do not
+outlive the process: stop them at teardown, which is R-P1.6's job. The same
+applies to a thread that ends through pthread_exit(), which the trampoline
+cannot clear up after.

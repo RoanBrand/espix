@@ -302,3 +302,26 @@ else
         "PSRAM free ${base5}K -> ${back5}K"
 fi
 
+
+
+# --- memory an app's *thread* allocates belongs to the process too ----------
+#
+# R-P1.10. A thread is a different FreeRTOS task from the one that entered
+# app_main(), so the allocator used to find no process for it and its malloc()
+# went to the global heap -- unowned, and still there after the process ended.
+# The command allocates in a thread, never frees, and returns.
+
+base6=$(psram_free_kb)
+out=$(dev_run "$APP leakthread 1048576")
+assert_contains "a thread can allocate and never free it" \
+    "thread done, process returning without freeing" "$out"
+
+sleep 2
+back6=$(psram_free_kb)
+if [ -n "$back6" ] && [ $((base6 - back6)) -le 1024 ]; then
+    espix_pass "and the process's arena reclaims what its thread took (${base6}K -> ${back6}K)"
+else
+    espix_fail "the arena reclaims a thread's allocation" \
+        "PSRAM free ${base6}K -> ${back6}K"
+fi
+

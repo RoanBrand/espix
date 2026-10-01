@@ -352,7 +352,16 @@ void espix_proc_exit(int status)
 {
     espix_proc_slot_t *const slot = espix_proc_self();
 
-    if (slot != NULL && slot->exit_jmp != NULL) {
+    /*
+     * Being *a task of the process* is no longer the same as being the task the
+     * jmp_buf belongs to. Since R-P1.10 a thread resolves to the same slot
+     * through its thread-local storage, and slot->exit_jmp is a frame in
+     * proc_task() -- the task that entered app_main(). A longjmp from any other
+     * task would land on that task's stack, which is the corruption this guard
+     * has always existed to prevent. Only the process's own task may take it.
+     */
+    if (slot != NULL && slot->exit_jmp != NULL &&
+        slot->info.task == xTaskGetCurrentTaskHandle()) {
         slot->exit_status = status;
         longjmp(*slot->exit_jmp, 1);
     }

@@ -6,6 +6,7 @@ idf_component_register(
         "abi_drivers.c"
         "abi_env.c"
         "abi_alloc.c"
+        "abi_pthread.c"
         "abi_exit.c"
         "abi_resolver.c"
         "abi_fs.c"
@@ -29,6 +30,9 @@ idf_component_register(
         # abi_gfx.c publishes the screen and its input queue to apps.
         espix_display
         espressif__elf_loader
+        # abi_pthread.c wraps pthread_create, to give an app's threads the
+        # process's slot.
+        pthread
         esp_timer
         heap
         esp_driver_rmt

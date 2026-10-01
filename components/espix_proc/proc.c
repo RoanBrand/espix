@@ -89,6 +89,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_env_register();
     espix_proc_abi_exit_register();
     espix_proc_abi_alloc_register();
+    espix_proc_abi_pthread_register();
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
     espix_proc_abi_libm_register();
@@ -322,6 +323,20 @@ espix_proc_slot_t *espix_proc_self(void)
             g_espix_proc_table.slots[i].info.state != ESPIX_PROC_FREE) {
             return &g_espix_proc_table.slots[i];
         }
+    }
+
+    /*
+     * Not the task that entered app_main(), so it may be a thread the process
+     * made: pthread_create put the slot in the thread's own TLS before the
+     * app's routine ran. A pointer read from the current task cannot belong to
+     * another task the way a recycled handle could, which is why it is stored
+     * there rather than in a table keyed on handles. See abi_pthread.c.
+     */
+    espix_proc_slot_t *const thread_slot =
+        (espix_proc_slot_t *)pvTaskGetThreadLocalStoragePointer(NULL,
+                                                               ESPIX_TLS_PROC_IDX);
+    if (thread_slot != NULL && thread_slot->info.state != ESPIX_PROC_FREE) {
+        return thread_slot;
     }
     return NULL;
 }

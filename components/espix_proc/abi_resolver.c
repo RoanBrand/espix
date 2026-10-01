@@ -37,7 +37,7 @@
 
 /* Small and fixed: one entry per subsystem that publishes overrides, which is
  * two today and will not be many. A miss costs a walk of both. */
-#define ABI_TABLES_MAX 6
+#define ABI_TABLES_MAX 8
 
 static struct {
     const abi_sym_t *syms;

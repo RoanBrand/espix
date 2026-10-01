@@ -903,6 +903,43 @@ static int cmd_leak(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Allocate, in a thread, and never free it -- not even from the thread.
+ *
+ * This is R-P1.10's whole point. R-P1.2 gave the process an arena, and a
+ * thread's free() already found it by address; its malloc() did not, because
+ * the allocator looks the process up by the task that entered app_main(), and a
+ * thread is a different task. Before this the block below went to the global
+ * heap, unowned, and was still there after the process ended.
+ */
+static void *alloc_and_abandon(void *arg)
+{
+    const size_t want = (size_t)arg;
+    void *const  p    = malloc(want);
+    if (p != NULL) {
+        ((volatile char *)p)[0]        = 1;
+        ((volatile char *)p)[want - 1] = 1;
+    }
+    printf("thread allocated %u bytes, not freeing\n", (unsigned)want);
+    return NULL;
+}
+
+static int cmd_leakthread(const char *bytes_s)
+{
+    const size_t want = (size_t)strtoul(bytes_s, NULL, 10);
+
+    pthread_t t;
+    const int rc = pthread_create(&t, NULL, alloc_and_abandon, (void *)want);
+    if (rc != 0) {
+        printf("leakthread: pthread_create failed (%d)\n", rc);
+        return 1;
+    }
+    pthread_join(t, NULL);
+
+    printf("thread done, process returning without freeing\n");
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -931,6 +968,7 @@ static void usage(void)
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"
            "  leak <bytes>...     allocate and return without freeing any of it\n"
+           "  leakthread <bytes> allocate in a new thread, never free it\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -1051,6 +1089,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "leak") == 0 && argc > 2) {
         return cmd_leak(argc - 2, argv + 2);
+    }
+    if (strcmp(cmd, "leakthread") == 0 && argc > 2) {
+        return cmd_leakthread(argv[2]);
     }
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {
