@@ -2242,7 +2242,7 @@ static void launch_task(void *arg)
         return;
     }
 
-    if (xTaskCreate(app_waiter, "appwait", 2560, (void *)(uintptr_t)pid, 3,
+    if (xTaskCreate(app_waiter, "espix:appwait", 2560, (void *)(uintptr_t)pid, 3,
                     NULL) != pdPASS) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task to wait for %s", path);
     }
@@ -2267,10 +2267,10 @@ static void launch_app(const char *path)
     /* On the heap and preferably in PSRAM, like the other long-lived stacks:
      * this one holds a TLS handshake, and internal RAM is what the app that
      * follows is about to want. */
-    if (xTaskCreatePinnedToCoreWithCaps(launch_task, "appstart", 8192,
+    if (xTaskCreatePinnedToCoreWithCaps(launch_task, "espix:appstart", 8192,
                             (void *)path, 3, NULL, tskNO_AFFINITY,
                             MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreatePinnedToCoreWithCaps(launch_task, "appstart", 8192,
+        xTaskCreatePinnedToCoreWithCaps(launch_task, "espix:appstart", 8192,
                             (void *)path, 3, NULL, tskNO_AFFINITY,
                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
         s_launching = false;

@@ -545,7 +545,7 @@ static void proc_task(void *arg)
 
     relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary() };
     if (rctx.done == NULL ||
-        xTaskCreate(relocate_task, "elfreloc", 8192, &rctx,
+        xTaskCreate(relocate_task, "espix:elfreloc", 8192, &rctx,
                     CONFIG_ESPIX_PROC_PRIORITY, NULL) != pdPASS) {
         if (rctx.done != NULL) {
             vSemaphoreDelete(rctx.done);

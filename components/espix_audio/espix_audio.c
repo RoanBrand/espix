@@ -665,11 +665,11 @@ static esp_err_t play_common(const char *uri, bool wait)
      * the caps attempt failed -- so no task is alive to race the flag.
      */
     s_task_caps = true;
-    if (xTaskCreatePinnedToCoreWithCaps(audio_task, "audio", TASK_STACK, s_uri, 20,
+    if (xTaskCreatePinnedToCoreWithCaps(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
                                         &s_task, 1,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_task_caps = false;
-        if (xTaskCreatePinnedToCore(audio_task, "audio", TASK_STACK, s_uri, 20,
+        if (xTaskCreatePinnedToCore(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
                                     &s_task, 1) != pdPASS) {
             s_task = NULL;
             return ESP_FAIL;
