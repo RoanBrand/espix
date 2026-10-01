@@ -77,6 +77,13 @@ keep a small list of them.
   Only a genuinely exhausted PSRAM fails, which is the condition that exists
   today — so **the exhaustion question dissolves**: there is no policy to pick,
   because there is no fixed size.
+
+  The new region is sized **from the request that failed**, not from a constant:
+  ask for 6 MiB and be given 256 KiB regions one at a time, and the list grows
+  while the allocation still cannot be served. This is not hypothetical — Doom
+  asks the engine for a single 6 MiB zone block (apps/doom/main/main.c), so the
+  first thing a real app does is demand one large *contiguous* region. Size the
+  region to the request, rounded up, and the list stays one or two long.
 - **Reclaim**: on exit or kill, release every region in the list. Still one
   operation per region rather than one per allocation, and the list is tiny.
 
@@ -158,8 +165,11 @@ the whole reason to prefer them.
    separate question.
 4. Does an app that never calls `malloc` get an arena? (Recommendation: no —
    lazy creation, so the answer is "no, until it asks".)
-5. Is arena usage worth a column in `ps`, or is that noise? The budget is
-   invisible until it is exceeded, and by then something has already failed.
+5. Is arena usage worth a column in `ps`? It costs nothing to know —
+   `multi_heap_get_info()` takes one call per region and the list is tiny — and
+   it is the number that would have explained the Doom leak on sight instead of
+   by two runs and a subtract. The argument against is width, and that an app's
+   memory is arguably its own business.
 
 ## Staging
 
