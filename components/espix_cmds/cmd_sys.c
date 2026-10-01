@@ -696,7 +696,19 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
     if (cores > 1) {
         for (unsigned c = 0; c < cores && c < TOP_CORES_MAX; c++) {
             const unsigned idle = idle_per_core[c] > 100 ? 100 : idle_per_core[c];
-            espix_printf(s, "   core%u %u%%", c, 100u - idle);
+            const unsigned core_pct = 100u - idle;
+
+            /*
+             * The same thresholds as the total beside it. Colouring one and not
+             * the other is worse than colouring neither: an uncoloured figure
+             * reads as "no colour means nothing to see".
+             */
+            const char *const core_color =
+                !s->ansi ? "" : (core_pct >= 90) ? ANSI_BAD
+                            : (core_pct >= 75) ? ANSI_WARN : ANSI_OK;
+
+            espix_printf(s, "   core%u %s%u%%%s", c, core_color, core_pct,
+                         s->ansi ? ANSI_RESET : "");
         }
     }
     espix_printf(s, "\n");
