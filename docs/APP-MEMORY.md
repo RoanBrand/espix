@@ -356,3 +356,44 @@ summed over the slot's regions, and `-` when there are none.
   where R-P1.3 (fds) and R-P1.7 (the screen) attach.
 - **R-P1.5** the live table separated from the completed log, so a slot is
   recycled when it is reaped rather than when the table fills.
+
+
+## R-P1.10 -- the thread-to-process lookup
+
+R-P1.2 closed the dangerous half of hazard 4: a thread's free() finds the region
+by address, because a mis-routed free is corruption. What remains is the leak:
+a thread's malloc() goes to the global heap, because attaching an allocation to a
+region needs a *slot*, and an address does not say which process it belongs to.
+So the free path could be answered without a lookup and the alloc path cannot.
+
+**Mechanism.** Publish pthread_create through the resolver -- it runs before every
+table below it, the same seam malloc, sleep and exit already use -- and have
+espix's version:
+
+1. wrap the app's start routine in a trampoline carrying (real_fn, arg, slot);
+2. record task-to-slot in the trampoline's first act, then call the real routine.
+
+The trampoline is what makes it race-free. IDF creates the task and it can run
+before pthread_create returns, so a mapping recorded *after* the call would leave
+a window in which the new thread allocates and finds no slot.
+
+**Storage and lifetime.** A small table of (TaskHandle_t, slot) in espix_proc,
+under the existing lock, removed when the thread returns (the trampoline's tail)
+and swept by espix_proc_release_resources() for its slot -- a thread abandoned
+when the process dies must not leave a stale handle behind. Key it on the slot
+*index* plus a generation, not the pointer: a slot is recycled, and the handle
+of a dead task is exactly the value FreeRTOS hands to the next one.
+
+**Worth knowing before starting.** This is also what would let espix_proc_self()
+answer for a thread, which is the stated reason exit() from a thread currently
+ends only that thread (KNOWN-ISSUES). That is a behaviour change, not a free win,
+and wants deciding on its own.
+
+**What the tests have to show.**
+
+1. A thread's malloc() lands in the process's arena and is reclaimed at exit --
+   the leak R-P1.2 deliberately left.
+2. The same when the process is killed while the thread holds memory.
+3. A thread's free() still finds the region (already covered; must not regress).
+4. The table is cleaned both when a thread ends and when a process dies with a
+   thread still live.
