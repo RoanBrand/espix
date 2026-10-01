@@ -60,11 +60,40 @@ it, and route the app's allocations there.
   that turns a fixed size into a growable one; see below. `free()` still needs a
   range check to tell a region pointer from a global one.
 
-**Recommendation: B.** The reclamation-is-one-operation property is the whole
-point, and the fixed size is not a defect if it is done the right way: **create
-the arena lazily on the app's first allocation, sized from a budget, and destroy
-it on exit.** A process that never allocates costs nothing, so a 12-slot table
-does not reserve twelve arenas.
+**Recommendation: B, with a list of regions rather than one region.**
+
+Nobody can know up front how much an app will need — the entire point of a heap
+is that the program finds out as it runs — so a fixed size is a guess wearing a
+budget's clothes. The fix costs one field: instead of one region per process,
+keep a small list of them.
+
+- **Allocate**: walk the list and use the first region that fits, or the one with
+  the largest free block. `multi_heap_get_info()` answers both cheaply, and the
+  list is one or two long in practice.
+- **Free**: find the region whose `[start, end)` contains the pointer, and free
+  there. That is the same range check that separates a region pointer from a
+  global one, doing both jobs at once.
+- **Grow**: when nothing fits, register another region from PSRAM and append it.
+  Only a genuinely exhausted PSRAM fails, which is the condition that exists
+  today — so **the exhaustion question dissolves**: there is no policy to pick,
+  because there is no fixed size.
+- **Reclaim**: on exit or kill, release every region in the list. Still one
+  operation per region rather than one per allocation, and the list is tiny.
+
+The costs are that a request may be served from a region other than the one that
+would fragment least, and that a walk happens per allocation. Both are bounded by
+the number of *regions*, which grows with how much the app needs — not by how
+many allocations it makes.
+
+**Why not simply track every allocation and free them at exit?** That is the
+obvious reading of "intercept, track, clean up", and it works, with no size
+question at all. What it costs is a record **per allocation**: either a header
+before each block — which breaks the pointer contract, since an app handing a
+buffer to DMA would hand an offset, and `free()` on a pointer from anywhere else
+would read a header that is not there — or a side table, which is a hash, a lock
+and a lookup on every malloc and free, in the one path a real app uses most.
+Regions pay nothing per allocation: membership is an address comparison. That is
+the whole reason to prefer them.
 
 ## The hazards, in the order they will bite
 
