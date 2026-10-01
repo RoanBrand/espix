@@ -1729,5 +1729,29 @@ overwrites the dump -- so the panic that actually mattered is unrecoverable and
 the board appears to reset at random. That is why this is worth more than its
 own severity: it destroys the evidence for everything else.
 
+**Why overwriting happens, since it is not obvious and is a choice.** ESP-IDF
+offers both behaviours and defaults to this one:
+
+    config ESP_COREDUMP_FLASH_NO_OVERWRITE
+        bool "Don't overwrite existing core dump"
+        default n
+        help
+            ... Enable this option to only keep the first of multiple core dumps.
+            If enabled, the core dump partition must be erased before the first
+            core dump can be written.
+
+and espix leaves it unset (`# CONFIG_ESP_COREDUMP_FLASH_NO_OVERWRITE is not
+set`). With it off, `esp_core_dump_flash_write_prepare()` erases the sectors the
+*new* dump needs at `core_dump_flash.c:239` before writing, with no test for an
+existing one. There is a single `coredump` partition (0x12000, 0xE000 on the
+S31), so it is strictly last-crash-wins.
+
+Turning it on keeps the **first** dump until someone runs `coredump erase`,
+which is the behaviour wanted while this whole class of panic is being chased --
+at the stated cost that the partition must be erased before the next dump can be
+written. `CONFIG_ESP_COREDUMP_USE_STACK_SIZE=y` is already set and is unrelated:
+it gives the coredump *writer* a DRAM stack, which is why writing a dump from a
+PSRAM-stacked task is fine, and reading one is not.
+
 This is unrelated to the per-process arena (R-P1.2): it is the transport and
 IDF's cache rule.
