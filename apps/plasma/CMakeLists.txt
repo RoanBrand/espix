@@ -7,8 +7,9 @@ cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(plasma)
 
-set(ESPIX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-include("${ESPIX_ROOT}/cmake/offt64.cmake")
+# An espix app: this one line is what says so, and what makes the app agree with
+# the kernel about the ABI they share. See cmake/espix-app.cmake.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/espix-app.cmake")
 
 include(elf_loader)
 project_elf(plasma)

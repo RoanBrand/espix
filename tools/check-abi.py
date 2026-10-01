@@ -45,6 +45,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SOURCE = REPO / "managed_components/espressif__elf_loader/src/esp_elf_symbol.c"
 PROC = REPO / "components/espix_proc/proc.c"
+APP_CMAKE = REPO / "cmake/espix-app.cmake"
 
 # The two ways a name reaches an app. Separate because their places in the
 # resolution order differ, which is what decides whether an entry is live.
@@ -200,6 +201,38 @@ def registration_order():
                       strip_comments(PROC.read_text(encoding="utf-8")))
 
 
+def strip_cmake_comments(text):
+    """CMake comments run from # to end of line, and a # inside a quoted path is
+    not a thing in this tree."""
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def app_projects():
+    """Every project in the tree that builds an app rather than the firmware."""
+    return (sorted(REPO.glob("apps/*/CMakeLists.txt"))
+            + sorted(REPO.glob("tests/*/CMakeLists.txt")))
+
+
+def apps_without_agreement():
+    """App projects that do not include cmake/espix-app.cmake.
+
+    An app that does not is compiled with a 32-bit off_t while the kernel has
+    64, so stat() writes a struct stat past the end of the app's buffer -- and
+    neither side can see it. The app never reads the header that asserts the
+    width, and the kernel cannot know what the caller thinks struct stat is. So
+    the check lives here, in the build everyone runs, rather than in the apps:
+    an app author is not supposed to have to know about off_t at all.
+    """
+    pattern = re.compile(r'include\s*\(\s*"[^"]*espix-app\.cmake"\s*\)')
+    missing = []
+    for path in app_projects():
+        if not path.is_file():
+            continue
+        if not pattern.search(strip_cmake_comments(path.read_text(encoding="utf-8"))):
+            missing.append(str(path.relative_to(REPO)))
+    return missing
+
+
 # The three ways a name is written into a table. ESP_ELFSYM_EXPORT and the
 # written-out entries are the *same* mechanism -- both are tables handed to
 # esp_elf_register_symbol() -- and are grouped so a name in two of them is seen
@@ -308,6 +341,20 @@ def main():
                          for name, where, live, why in dead)
         )
 
+    if not APP_CMAKE.is_file():
+        die(f"{APP_CMAKE} does not exist; has the app boilerplate moved?")
+
+    missing_apps = apps_without_agreement()
+    if missing_apps:
+        problems.append(
+            "app projects that do not include cmake/espix-app.cmake, so they are\n"
+            "  compiled with a 32-bit off_t while the kernel has 64 -- struct stat then\n"
+            "  crosses the boundary wrong, and nothing else can catch it:\n    "
+            + "\n    ".join(missing_apps)
+            + "\n  Add the one line to each:\n"
+            + '    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/espix-app.cmake")'
+        )
+
     promised = export_names(source)
     if not promised:
         die(f"no exports found in {SOURCE}; the file moved or changed shape")
@@ -329,7 +376,8 @@ def main():
     published = sum(len(entries) for entries in found.values())
     print(f"check-abi: {len(promised)} names promised a layer below are in the image;"
           f" {len(found)} names published by espix in {published} entries across"
-          f" {len(abi_sources())} files, none of them shadowed")
+          f" {len(abi_sources())} files, none of them shadowed;"
+          f" and all {len(app_projects())} app projects agree about off_t")
     return 0
 
 

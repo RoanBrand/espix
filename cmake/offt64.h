@@ -48,4 +48,19 @@
 #define __machine_off_t_defined 1
 typedef int64_t _off_t;
 
+/*
+ * <sys/types.h> now resolves off_t through the guard above, so including it
+ * here is what *verifies* the chain rather than merely using it.
+ */
+#include <sys/types.h>
+
+/*
+ * Asserted where the mechanism is, and not only in the one consumer that
+ * thought to check it -- components/espix_fs/fs.c asserts the same thing. A
+ * translation unit that has this force-include and still ends up with a 32-bit
+ * off_t has found a toolchain change or a lost guard, and what not noticing
+ * looks like is a filesystem reporting a 5 GiB file as its low 32 bits.
+ */
+_Static_assert(sizeof(off_t) == 8, "off_t is not 64 bits: see cmake/offt64.h");
+
 #endif /* __ASSEMBLER__ */

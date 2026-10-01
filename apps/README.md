@@ -90,6 +90,12 @@ And to see what is actually published, which is the other half of the question:
 } | sed 's/.*(\(.*\))//' | sort -u
 ```
 
+That grep finds one of the three mechanisms espix publishes through. The
+resolver (`ABI_SYM(...)`) and the tables written out by hand are not
+`ESP_ELFSYM_EXPORT` -- so it misses them, and they are where an entry that
+cannot be reached hides. `tools/check-abi.py` reads all three and runs on every
+build; it is the answer to "is this name actually reachable".
+
 ### Why the list is hand-written
 
 elf_loader ships `tool/symbols.py`, which generates a complete table from a
@@ -102,6 +108,24 @@ are an allowlist — `abi_fs.c`, `abi_time.c`, `abi_drivers.c` and `abi_libc.c`
 are it being curated. Adding a name is nearly free (a string and a pointer in
 the firmware, nothing in any app), but it should be something that cannot reach
 past the caller's own memory.
+
+## What an app's CMakeLists has to say
+
+One line connects an app to the kernel, and it is the app saying *what it is*
+rather than knowing how espix is built:
+
+```cmake
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/espix-app.cmake")
+```
+
+It is where the two sides agree about the ABI they share — today that means
+`off_t`, and therefore the layout of `struct stat`, which crosses the loader's
+boundary in both directions. An app that leaves it out compiles cleanly, with a
+32-bit `off_t`, and then has `struct stat` written past the end of its buffer.
+Nothing on either side can see that at runtime, so `tools/check-abi.py` fails
+the firmware build when a project under `apps/` or `tests/` does not include
+it. An app author should not have to know any of this; the check exists so they
+do not have to.
 
 ## Three things that will catch you
 
