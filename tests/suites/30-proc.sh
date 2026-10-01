@@ -25,6 +25,32 @@ assert_contains "arguments arrive in order"      "argv[2] one"  "$argv_out"
 assert_status "an app's exit status reaches the client" 7 dev_status "$APP exit 7"
 assert_status "and zero is zero"                        0 dev_status "$APP exit 0"
 
+# The library exit path, which is a different path from the return above. The
+# firmware's exit() ends at IDF's _exit() == abort(), so these used to reset the
+# board rather than report a status. All of them are claimed by espix's symbol
+# resolver now -- see components/espix_proc/abi_exit.c -- and the assertions
+# that follow each one are also the evidence that the board survived it.
+assert_status "exit() reaches the client" 5 dev_status "$APP exitcall 5"
+assert_contains "and says so on the way out" "calling exit(5)" \
+    "$(dev_run "$APP exitcall 5")"
+
+assert_status "_Exit() reaches the client" 6 dev_status "$APP _Exit 6"
+
+# 128 + SIGABRT.
+assert_status "abort() reports 128 + SIGABRT" 134 dev_status "$APP abort"
+
+# assert() is the one a symbol override could not have fixed on its own: a
+# failing assert calls the *firmware's* __assert_func, which calls the
+# firmware's abort at its own link time. __assert_func is claimed by the same
+# table, so the wording is newlib's and the status is the same 134.
+assert_status "a failing assert reports 128 + SIGABRT" 134 dev_status "$APP assert"
+assert_contains "and prints newlib's own wording" "assertion" \
+    "$(dev_run "$APP assert" 2>&1)"
+
+# The whole point, and what the three above depend on being true afterwards.
+assert_contains "the device is still up after all four" "espix" \
+    "$(dev_run uname)"
+
 # The file ABI: an app reaching the filesystem through libc, checked by espix.
 dev_run "rm $APPTXT" >/dev/null 2>&1
 assert_contains "an app can create a file" "ok" \

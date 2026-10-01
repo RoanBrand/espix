@@ -15,6 +15,7 @@
  * assert on with a substring match and no parsing.
  */
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -779,7 +780,11 @@ static int cmd_truncate(const char *path, const char *len_s)
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
-           "  exit <n>            exit with status n\n"
+           "  exit <n>            return from main with status n\n"
+           "  exitcall <n>        call exit(n) -- the library path, not a return\n"
+           "  _Exit <n>           call _Exit(n)\n"
+           "  abort               call abort(); ends the app, not the board\n"
+           "  assert              fail an assertion, which reaches __assert_func\n"
            "  argv [args...]      echo argc and each argument\n"
            "  probe <path>...     open each path, report ok or errno\n"
            "  stat <path>         stat and fstat, with the app own uid\n"
@@ -815,6 +820,41 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "exit") == 0 && argc > 2) {
         return (int)strtol(argv[2], NULL, 10);
+    }
+    /*
+     * exit() itself, which is a different path from the return above and the
+     * one that used to take the board down: the firmware's exit() ends at IDF's
+     * _exit() == abort(). espix claims all of these through its resolver now
+     * (components/espix_proc/abi_exit.c), and each must reach the shell as a
+     * status with the device still running.
+     *
+     * The flush is the test's own, so the line the shell asserts on is there
+     * whatever the buffering does -- what is under test is which code path
+     * terminates the process, not what is lost on the way out.
+     */
+    if (strcmp(cmd, "exitcall") == 0 && argc > 2) {
+        const int n = (int)strtol(argv[2], NULL, 10);
+        printf("calling exit(%d)\n", n);
+        fflush(stdout);
+        exit(n);
+    }
+    if (strcmp(cmd, "_Exit") == 0 && argc > 2) {
+        const int n = (int)strtol(argv[2], NULL, 10);
+        printf("calling _Exit(%d)\n", n);
+        fflush(stdout);
+        _Exit(n);
+    }
+    if (strcmp(cmd, "abort") == 0) {
+        printf("calling abort()\n");
+        fflush(stdout);
+        abort();
+    }
+    if (strcmp(cmd, "assert") == 0) {
+        printf("about to fail an assertion\n");
+        fflush(stdout);
+        assert(argc < 0);
+        printf("assert did not fire\n");
+        return 1;
     }
     if (strcmp(cmd, "argv") == 0) {
         printf("argc %d\n", argc);

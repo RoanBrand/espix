@@ -25,47 +25,19 @@ espix_gfx_surface_t *doom_surface;
  * Doom's I_Quit() tears the game down and then, because doomgeneric builds with
  * ORIGCODE undefined (config.h), returns without exiting -- so "quit" left the
  * engine running and the screen unchanged. I_Quit runs its registered exit
- * functions first, so one of ours records the request instead, and the loop
- * below leaves through espix's normal exit path: the canvas and the screen go
- * back the way every other app gives them back, rather than the app calling
- * exit() behind the process machinery.
+ * functions first, and those were written for a process about to exit(): run
+ * from a live task they abort. So a function of ours records the request
+ * instead, and the jump below leaves the loop before any of them runs.
+ *
+ * This is engine teardown ordering, not process exit, and it is the only jump
+ * this app still needs. exit()/abort()/_Exit() used to be overridden here too,
+ * because the firmware's exit() ended at IDF's _exit() == abort() and reset the
+ * board -- which is why a bad WAD rebooted the machine and a timedemo printed
+ * its result and then reset. espix gives them process semantics now, in
+ * components/espix_proc/abi_exit.c, so I_Error's exit(-1) and the engine's
+ * asserts end the app with a status and leave the board alone.
  */
 static jmp_buf s_quit_jmp;
-static jmp_buf s_fatal_jmp;
-
-static int s_fatal_status;      /* what exit() was asked for */
-
-/*
- * exit() and abort(), the way a program expects them: end this program.
- *
- * espix's are the board's -- the ABI publishes the firmware's, and from an app
- * task they panic and reboot the machine -- which is why a bad WAD rebooted it,
- * and why a timedemo printed its own result and then reset the board. I_Error
- * ends in exit(-1), and every assert ends in abort(); both arrive here.
- *
- * espix cannot give them process semantics yet -- a dead app's heap and fds are
- * not reclaimed, which is the reaper's hard half -- but an app can, and by the
- * same door the quit path already uses: a jump back to app_main, whose return is
- * espix's normal exit. The app's own definition wins over the ABI's, so the
- * engine's calls land here. What was printed before is the reason.
- */
-void exit(int status)
-{
-    fflush(stdout);
-    fflush(stderr);
-    s_fatal_status = status;
-    longjmp(s_fatal_jmp, 1);
-}
-
-void abort(void)
-{
-    exit(-1);
-}
-
-void _Exit(int status)
-{
-    exit(status);
-}
 
 static void doom_request_quit(void)
 {
@@ -108,18 +80,6 @@ static const char *find_wad(void)
  */
 void app_main(int app_argc, char **app_argv)
 {
-    /*
-     * Armed before anything else the engine can fail in, and for the whole run:
-     * a longjmp target is only good while its frame is alive, and app_main does
-     * not return until the end.
-     */
-    if (setjmp(s_fatal_jmp) != 0) {
-        printf("doom: %s; leaving the app, not the board\n",
-               s_fatal_status == 0 ? "done" : "fatal error");
-        fflush(stdout);
-        return;
-    }
-
     /*
      * 320x240, not the 320x200 the engine renders into: Doom's pixels are not
      * square, and 240 is the height that puts them back at 4:3 on a display
@@ -168,7 +128,7 @@ void app_main(int app_argc, char **app_argv)
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), avail);
 
     /*
-     * Refuse rather than die. I_Error is survivable now (see abort() above), but
+     * Refuse rather than die. I_Error is survivable now that exit() ends the app, but
      * a zone too small to load a level with would fail *inside* the engine,
      * after the WAD has been read and half the subsystems initialised -- so the
      * check happens here, before any of that. Below 4 MiB the shareware's levels
