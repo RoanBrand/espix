@@ -116,10 +116,11 @@ void espix_proc_abi_resolver_register(void)
  * of two. Nothing here ever rewrites s_table_count after boot, so whatever did
  * it was outside this file, and the board stayed broken until it was rebooted.
  *
- * s_table_count is the first word after g_espix_procs, so one word written past
- * the end of the process table lands on it. That is the leading theory and not
- * a finding: the watchpoint exists to name the writer rather than to confirm a
- * guess, and it will catch a wild store from anywhere just as well.
+ * The first word past the process table is now the table's own guard member
+ * rather than s_table_count, which only sat there by linker accident -- and on
+ * RISC-V does not sit there at all. That is the leading theory about the reach
+ * and not a finding about the writer: the watchpoint exists to name the writer
+ * rather than to confirm a guess, and it catches a wild store from anywhere.
  *
  * Armed after registration, so the legitimate setup writes do not trip it.
  */
@@ -131,7 +132,19 @@ static void abi_watch_arm_this_core(void *unused)
      * Not one wide watchpoint over the whole region: the nearest power-of-two
      * window that would span it reaches back into g_espix_procs's last slot,
      * and ordinary writes there would fire it continuously. */
-    esp_cpu_set_watchpoint(0, &s_table_count, sizeof(s_table_count),
+    /*
+     * The word just past the process table -- not s_table_count.
+     *
+     * s_table_count was the word after that table when this was written, and on
+     * Xtensa it still is. On RISC-V it lands in .sbss, nowhere near, so a
+     * watchpoint aimed at it would never fire for the overrun it exists to
+     * catch. The guard is a member of the table's own struct, so this address is
+     * right on every target and stays right when .bss moves again.
+     */
+    /* The cast is the volatile: the debug register takes a plain address, and
+     * nothing here dereferences it. */
+    esp_cpu_set_watchpoint(0, (void *)&g_espix_proc_table.guard,
+                           sizeof(g_espix_proc_table.guard),
                            ESP_CPU_WATCHPOINT_STORE);
     esp_cpu_set_watchpoint(1, &s_tables[1], sizeof(s_tables[1].syms),
                            ESP_CPU_WATCHPOINT_STORE);

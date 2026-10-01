@@ -397,6 +397,16 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   the damage is permanent and why it surfaces an hour later as a missing symbol
   rather than as anything resembling its cause.
 
+  **Where that reach comes from, and what changed since.** The map quoted above
+  is the S3 build, and on Xtensa `s_table_count` really is the word after the
+  table — but that is a linker accident rather than a guarantee, and it stopped
+  being true on the S31: there the counter lands in `.sbss`, nowhere near the
+  table, so the watchpoint aimed at it was aimed at nothing. The word past the
+  table now belongs to the table's own struct (`espix_proc_table_t.guard`), so
+  the adjacency is the language's promise rather than the linker's whim and both
+  targets watch the same address. The guard is also checked in software at every
+  spawn, which is what covers a build with `ESPIX_PROC_ABI_WATCHPOINT` off.
+
   **This is a theory about the reach, not a finding about the writer.** Every
   `g_espix_procs[i]` loop in `proc.c` is correctly bounded, so it is not a
   visible off-by-one — a wild store, a bad `memcpy` size, or an overflow inside

@@ -242,7 +242,46 @@ void espix_proc_root_arm(void);
 /* Table access. The lock covers slot allocation and state transitions; readers
  * that must not block (the fault path) read without it and tolerate a torn
  * view, which is why `pid` is written last on allocation. */
-extern espix_proc_slot_t  g_espix_procs[ESPIX_PROC_MAX];
+/*
+ * The process table, and the guard word that follows it.
+ *
+ * The guard is not decoration. Something wrote one word past this table once
+ * and permanently disabled half the ABI resolver, and the only reason anyone
+ * could reason about it at all is that the damaged word happened to be
+ * s_table_count, which the map showed sitting immediately after the array.
+ *
+ * "Immediately after" was a linker accident, and it has since stopped being
+ * true on one target: on RISC-V s_table_count lands in .sbss, so it is nowhere
+ * near the table, and a watchpoint aimed at it would never fire. Putting the
+ * guard *inside a struct* makes the adjacency the language's promise instead of
+ * the linker's whim, on every target, and it gives the corruption a name to be
+ * checked against rather than a neighbour to be inferred from.
+ *
+ * The slots are still reached as g_espix_procs[...] because that is what the
+ * code says everywhere; only the declaration moved.
+ */
+#define ESPIX_PROC_GUARD_MAGIC 0x50524f43u   /* "PROC", and not a plausible slot */
+
+typedef struct {
+    espix_proc_slot_t slots[ESPIX_PROC_MAX];
+
+    /*
+     * The first word past the last slot. A run past the end of the table lands
+     * here, which is the point: it is watched by the debug unit (see
+     * abi_resolver.c) and checked in software, so the next occurrence is named
+     * rather than inferred an hour later from a missing symbol.
+     */
+    volatile uint32_t guard;
+} espix_proc_table_t;
+
+extern espix_proc_table_t g_espix_proc_table;
+
+/*
+ * Whether the guard still holds its magic. Logs once when it does not, and is
+ * cheap enough to ask on every spawn -- which is what makes it worth having on
+ * a board nobody is attached to.
+ */
+bool espix_proc_table_intact(void);
 extern SemaphoreHandle_t  g_espix_proc_lock;
 extern EventGroupHandle_t g_espix_proc_events;
 

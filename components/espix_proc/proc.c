@@ -18,7 +18,7 @@
 
 #define TAG "proc"
 
-espix_proc_slot_t  g_espix_procs[ESPIX_PROC_MAX];
+espix_proc_table_t  g_espix_proc_table;
 SemaphoreHandle_t  g_espix_proc_lock;
 EventGroupHandle_t g_espix_proc_events;
 
@@ -67,7 +67,10 @@ esp_err_t espix_proc_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    memset(g_espix_procs, 0, sizeof(g_espix_procs));
+    memset(g_espix_proc_table.slots, 0, sizeof(g_espix_proc_table.slots));
+
+    /* The canary, set once the table is clean. See espix_proc_table_t. */
+    g_espix_proc_table.guard = ESPIX_PROC_GUARD_MAGIC;
 
     /* The loader announces its version and entry address on every single load.
      * That is startup chatter, not something a user running an app wants to
@@ -127,16 +130,52 @@ esp_err_t espix_proc_init(void)
  */
 static void clear_finished_bit(const espix_proc_slot_t *slot)
 {
-    const int index = (int)(slot - g_espix_procs);
+    const int index = (int)(slot - g_espix_proc_table.slots);
     xEventGroupClearBits(g_espix_proc_events, (EventBits_t)1 << index);
+}
+
+/* Set when the guard has been reported, so a corrupt table says so once rather
+ * than on every spawn. Written without a lock: the worst a race does is print
+ * the same line twice. */
+static bool s_guard_reported;
+
+/*
+ * Is the word just past the table still the one put there? See
+ * espix_proc_table_t.
+ *
+ * This does not replace the watchpoint and cannot be reached while it is armed:
+ * a store to the guard traps in the debug unit first, which is the better of the
+ * two answers because it names the writer. What it covers is the build where the
+ * watchpoint is off -- CONFIG_ESPIX_PROC_ABI_WATCHPOINT is a Kconfig, and there
+ * are only two watchpoint registers to go round -- and a board nobody is
+ * attached to, where a log line is the whole of the evidence.
+ */
+bool espix_proc_table_intact(void)
+{
+    if (g_espix_proc_table.guard == ESPIX_PROC_GUARD_MAGIC) {
+        return true;
+    }
+
+    if (!s_guard_reported) {
+        s_guard_reported = true;
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "process table guard reads %08x, not %08x -- something wrote "
+                   "past the table",
+                   (unsigned)g_espix_proc_table.guard,
+                   (unsigned)ESPIX_PROC_GUARD_MAGIC);
+    }
+    return false;
 }
 
 espix_proc_slot_t *espix_proc_alloc_slot(void)
 {
+    /* Cheap, and this is the moment the table is about to be written. */
+    (void)espix_proc_table_intact();
+
     espix_proc_slot_t *oldest_done = NULL;
 
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        espix_proc_slot_t *s = &g_espix_procs[i];
+        espix_proc_slot_t *s = &g_espix_proc_table.slots[i];
 
         if (s->info.state == ESPIX_PROC_FREE) {
             clear_finished_bit(s);
@@ -217,7 +256,7 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
         return;
     }
 
-    const int index = (int)(slot - g_espix_procs);
+    const int index = (int)(slot - g_espix_proc_table.slots);
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     const espix_pid_t pid = slot->info.pid;
@@ -247,9 +286,9 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
 espix_proc_slot_t *espix_proc_find(espix_pid_t pid)
 {
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        if (g_espix_procs[i].info.state != ESPIX_PROC_FREE &&
-            g_espix_procs[i].info.pid == pid) {
-            return &g_espix_procs[i];
+        if (g_espix_proc_table.slots[i].info.state != ESPIX_PROC_FREE &&
+            g_espix_proc_table.slots[i].info.pid == pid) {
+            return &g_espix_proc_table.slots[i];
         }
     }
     return NULL;
@@ -271,9 +310,9 @@ espix_proc_slot_t *espix_proc_self(void)
      * app stall every other process by blocking inside a delivery point.
      */
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        if (g_espix_procs[i].info.task == self &&
-            g_espix_procs[i].info.state != ESPIX_PROC_FREE) {
-            return &g_espix_procs[i];
+        if (g_espix_proc_table.slots[i].info.task == self &&
+            g_espix_proc_table.slots[i].info.state != ESPIX_PROC_FREE) {
+            return &g_espix_proc_table.slots[i];
         }
     }
     return NULL;
@@ -288,7 +327,7 @@ esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeou
 {
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     espix_proc_slot_t *slot = find_by_pid(pid);
-    const int index = (slot != NULL) ? (int)(slot - g_espix_procs) : -1;
+    const int index = (slot != NULL) ? (int)(slot - g_espix_proc_table.slots) : -1;
     const espix_proc_state_t state = (slot != NULL) ? slot->info.state
                                                     : ESPIX_PROC_FREE;
     xSemaphoreGive(g_espix_proc_lock);
@@ -877,8 +916,8 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n)
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     for (int i = 0; i < ESPIX_PROC_MAX && count < n; i++) {
-        if (g_espix_procs[i].info.state != ESPIX_PROC_FREE) {
-            out[count++] = g_espix_procs[i].info;
+        if (g_espix_proc_table.slots[i].info.state != ESPIX_PROC_FREE) {
+            out[count++] = g_espix_proc_table.slots[i].info;
         }
     }
     xSemaphoreGive(g_espix_proc_lock);
@@ -906,8 +945,8 @@ espix_pid_t espix_proc_pid_of_task(TaskHandle_t task)
     /* Lock-free on purpose: the fault handler calls this from panic context,
      * where taking a mutex is not an option. */
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        if (g_espix_procs[i].info.task == task) {
-            return g_espix_procs[i].info.pid;
+        if (g_espix_proc_table.slots[i].info.task == task) {
+            return g_espix_proc_table.slots[i].info.pid;
         }
     }
     return ESPIX_PID_NONE;
@@ -921,7 +960,7 @@ bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
     }
 
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        const espix_proc_info_t *info = &g_espix_procs[i].info;
+        const espix_proc_info_t *info = &g_espix_proc_table.slots[i].info;
 
         if (info->task != task) {
             continue;
