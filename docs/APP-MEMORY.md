@@ -310,6 +310,13 @@ summed over the slot's regions, and `-` when there are none.
 - **R-P1.2** the arena: lazy creation, range-checked `free`, whole-arena
   reclamation on exit and on kill. **Done** (`6969357`) — see
   `abi_alloc.c`; proved by `tests/suites/30-proc.sh`.
+
+  One half of hazard 4 is still open, deliberately. A `free()` from an app's
+  thread now finds the region by address, which is the corruption case and is
+  tested. Its `malloc()` still goes to the global heap, because there is still
+  no task-to-process lookup to give it a slot — so memory an app *thread*
+  allocates is not reclaimed at exit. That is a leak, which is the status quo;
+  corruption was the regression, and that is why the free path came first.
 - **R-P1.6** the reaper as the single teardown point that calls it, which is also
   where R-P1.3 (fds) and R-P1.7 (the screen) attach.
 - **R-P1.5** the live table separated from the completed log, so a slot is
