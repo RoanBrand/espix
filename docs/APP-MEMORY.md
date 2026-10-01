@@ -230,6 +230,75 @@ a leak. Reserved belongs in the docs, not the table.
    by two runs and a subtract. The argument against is width, and that an app's
    memory is arguably its own business.
 
+## Implementation plan
+
+Concrete enough to be mechanical, in the order it has to happen.
+
+**Types** — in `espix_proc_priv.h`, beside the slot they live in:
+
+```c
+#define ESPIX_APP_REGIONS_MAX 4      /* normally 1-2; 4 x 12B x 12 slots = 576B */
+
+typedef struct {
+    multi_heap_handle_t heap;
+    void               *base;    /* for the range test, which is the whole trick */
+    size_t              size;
+} espix_app_region_t;
+```
+
+and on `espix_proc_slot_t`: `espix_app_region_t regions[ESPIX_APP_REGIONS_MAX];`
+plus `uint8_t nregions;`. Four regions rather than eight because the slot is
+already 720 bytes and this is internal RAM times twelve.
+
+**Functions** — all in `abi_alloc.c`, which already owns the seam:
+
+```c
+static espix_app_region_t *region_fit(slot, size_t n);     /* first that fits, else grow */
+static espix_app_region_t *region_owning(slot, void *p);   /* range test */
+void espix_proc_regions_release(espix_proc_slot_t *slot);  /* for teardown */
+```
+
+**Allocate**: `slot = espix_proc_self()`; NULL means the caller is not a process
+(the loader, a command task) and goes straight to the global heap. Otherwise
+`region_fit()` then `multi_heap_malloc(r->heap, n)`. Growth takes
+`heap_caps_aligned_alloc(8, size, SPIRAM)` — aligned, because
+`multi_heap_register` requires it — then `multi_heap_register`, then append. The
+region is sized from the request that failed, and refused when it would take free
+PSRAM below the 4 MB floor.
+
+**Free**: `region_owning()` and `multi_heap_free()`, else the global `free()` and
+a counter. **This is the one that must be right before anything is enabled**,
+because of the next paragraph.
+
+**The hazard this design has and the others do not.** `espix_proc_self()` keys on
+`info.task`, so an app's *pthread* finds no slot — and then a `free()` from that
+thread would take the global path on a pointer that lives in a region, which is
+heap corruption rather than a leak. So `region_owning()` must be reachable
+without `self()`: when there is no slot, walk all slots' regions before falling
+through. Forty-eight range checks on the foreign-pointer path is the right price;
+the alternative is a task->process lookup that does not exist yet (hazard 4).
+**Until that is written, do not enable the regions** — the current pass-through
+`free()` is correct precisely because nothing allocates from a region.
+
+**Release**: `heap_caps_free(r->base)` for each region, `nregions = 0`. Called
+from `espix_proc_release_resources()`, which both the clean-exit and the
+force-kill paths already reach — so this is the one place teardown attaches, and
+it takes the slot as an argument rather than using `self()`, because the killer
+is a different task.
+
+**`ps`**: a `HEAP` column, `multi_heap_get_info(...).total_allocated_bytes`
+summed over the slot's regions, and `-` when there are none.
+
+**What the tests have to show**, because none of this is provable by inspection:
+
+1. An app that allocates and holds memory shows it in `ps`, and **`kill -9` gives
+   the PSRAM back** — the Doom leak in miniature, and the first real proof.
+2. A request larger than the first region forces a second, and both are released.
+3. `45-throughput` is untouched: the `cat`/`sink` path allocates 64 KB per run,
+   so a fault there is immediate.
+4. A free from an app's own thread still finds the right region — the pthread case
+   above, and the only one that cannot be reasoned about from the main path.
+
 ## Staging
 
 - **R-P1.1** publish `malloc/calloc/realloc/free/strdup` through the resolver,
