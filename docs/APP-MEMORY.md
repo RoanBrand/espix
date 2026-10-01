@@ -4,6 +4,9 @@ Design sketch for **R-P1.2**, the per-app heap arena. It is written before the
 code because the decisions interact: the allocator, the ELF loader's teardown
 and the reaper all change together, and there is no way to try it halfway.
 
+**Implemented in `6969357`.** The plan below is what was built; the
+staging list at the end records what is done and what still is not.
+
 ## The problem, measured
 
 An app's `malloc()` is the firmware's. Nothing records what it allocated, so when
@@ -305,7 +308,8 @@ summed over the slot's regions, and `-` when there are none.
   PSRAM-first. No arena; this alone makes allocations visible and is the seam
   everything else needs.
 - **R-P1.2** the arena: lazy creation, range-checked `free`, whole-arena
-  reclamation on exit and on kill.
+  reclamation on exit and on kill. **Done** (`6969357`) — see
+  `abi_alloc.c`; proved by `tests/suites/30-proc.sh`.
 - **R-P1.6** the reaper as the single teardown point that calls it, which is also
   where R-P1.3 (fds) and R-P1.7 (the screen) attach.
 - **R-P1.5** the live table separated from the completed log, so a slot is
