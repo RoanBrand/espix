@@ -151,6 +151,26 @@ the whole reason to prefer them.
   kernel-side rather than app-side. An arena would make it *easier* to attribute,
   which is a reason to do this sooner.
 
+## Decisions taken
+
+- **Grow, sized from the request that failed.** A 6 MiB ask gets one 6 MiB
+  region, not twenty-four small ones.
+- **A global ceiling, not a per-process cap**: the sum of all app regions may not
+  take PSRAM past a reserved floor, so one app cannot take the pool and leave the
+  system unable to draw. Expressed as *free PSRAM stays above N* rather than a
+  flat reserve, because espix's own need varies with the display mode — the canvas
+  and the RFB staging buffer are 960 KB each at 800x600, 2 MB each at 1280x800, so
+  a flat "keep 1 MB" is too little exactly when a large canvas is live.
+- **Per-process regions**, so teardown on exit and kill is a few frees rather
+  than a walk, and an app's fragmentation is its own.
+- **Lazy**: no region until the first allocation. The cost is one
+  `heap_caps_malloc` and one `multi_heap_register` on that call, and again if a
+  later request outgrows every region — microseconds, not a policy.
+- **A foreign `free()` falls through and is counted, not logged.** Except one
+  source, which is a bug rather than a logging question: `abi_cxx.cpp` publishes
+  `operator new`/`delete` and those call the *firmware's* malloc internally, so a
+  C++ app's `new` bypasses the regions entirely and leaks on exit. Fix, not count.
+
 ## Open questions
 
 1. ~~**Exhaustion**: fall through to the global heap, or fail?~~ **Answered by
