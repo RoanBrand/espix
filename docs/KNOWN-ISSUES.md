@@ -1684,3 +1684,37 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   semver with a different build id, is offered; an older one never is. That is
   what a rolling pre-1.0 project wants and would be surprising for a frozen one
   -- see the note in [OTA.md](OTA.md).
+
+
+## The `coredump` command panics when there is a dump to read
+
+**Found** while chasing an unrelated panic. Once any crash leaves a dump in the
+coredump partition, running `coredump` over SSH takes the board down again:
+
+    assert failed: esp_cache_freeze_caches_disable_interrupts
+    (s_task_stack_is_sane_when_cache_frozen())
+
+crashed task `sshd:conn`, through `esp_core_dump_get_summary()` ->
+`elf_core_dump_image_mmap()` -> `esp_partition_mmap()` -> `mmu_map` ->
+`s_stop_cache()`.
+
+The assert is IDF's rule that the task which freezes the cache may not have its
+stack in PSRAM -- freezing the cache makes that stack unreachable. The
+connection tasks have had PSRAM stacks since they were moved there, and
+`esp_core_dump_get_summary()` reads the dump by memory-mapping flash, which
+freezes the cache. Every condition has to hold at once, which is why it went
+unnoticed: no dump, or an internal stack, and there is nothing to see.
+
+**It cascades.** The test runner's health check asks for the coredump, so the
+first panic makes the check itself panic, and `reset-reason-changed` then
+reports a panic on every later run until someone erases the dump with
+`coredump erase`.
+
+Not fixed. The shape of the fix is to read the dump from a task with an internal
+stack -- the boot-time report in `espix_fault_report_coredump()` already runs
+on one -- rather than from whoever asked. Recorded here because the first
+diagnosis of a panic after this lands is wrong: the coredump on the device is
+the *previous* fault, and asking about it is a second one.
+
+This is unrelated to the per-process arena (R-P1.2): it is the transport and
+IDF's cache rule.
