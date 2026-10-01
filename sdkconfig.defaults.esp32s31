@@ -206,3 +206,12 @@ CONFIG_LWIP_TCP_WND_DEFAULT=5760
 CONFIG_LWIP_WND_SCALE=y
 CONFIG_LWIP_TCP_RCV_SCALE=0
 
+
+# The task watchdog keeps its idle-task check, at the slowest interval IDF allows
+# (the Kconfig range is 1..60). On this target it is the Timer Group hardware
+# MWDT, not a software timer -- a down-counter with no periodic interrupt -- so a
+# long period costs nothing while it is not firing. What it still catches is the
+# one thing nothing else does: a task that stopped making progress, including one
+# wedged holding a lock, which is not a fault and so never reaches the panic path.
+# PANIC stays off, so this reports and never resets.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
