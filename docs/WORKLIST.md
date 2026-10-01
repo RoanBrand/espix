@@ -121,7 +121,7 @@ This file came out of a full review of the tree (first commit through
 
 | id | what | why | done when | status |
 |---|---|---|---|---|
-| R-P4.1 | Stop the TWDT watching idle tasks (or lengthen the timeout) | It is what stops a low-priority app spinning. Today: enabled, both cores' idle checked; `PANIC` is **off**, so confirm on hardware whether it warns or resets | a busy app at priority > idle is not a reset | todo |
+| R-P4.1 | Stop the TWDT watching idle tasks (or lengthen the timeout) | **Confirmed on hardware, and costly even without PANIC off:** three `testapp sig spin` processes (prio 3) pinned CPU 1 and starved IDLE1, so the watchdog fired every 5 s for minutes — 46 times. Each warning prints a **full register dump**, which is ~30 lines: the 96-line klog ring rolled 309 lines in one reading, so everything else is lost while it happens. `PANIC` is off, so it warns and the board stays up (it kept serving SSH, with occasional "version exchange failed"). A quiet warning would be cheap; this is not | `sdkconfig` + `docs/KNOWN-ISSUES.md` | an app at priority > idle can spin without a register dump per 5 s | todo |
 | R-P4.2 | Remove `espix_audio`'s twice-a-second yield | It exists only because idle starves and the watchdog trips | the yield is gone and audio is clean | todo |
 | R-P4.3 | Leave the idle task; keep it for CPU accounting | FreeRTOS requires it and it does termination cleanup; a bare replacement would leak every self-deleting task | no change, recorded | done |
 | R-P4.4 | Decide `CONFIG_FREERTOS_HZ` (100 -> 250) with measurement | 10 ms granularity is coarse for app authors; 250 gives 4 ms at modest cost. Check IDF's WiFi/lwIP tuning and whether tickless idle is available | `ps` CPU, `free`, throughput before/after | todo |
@@ -156,6 +156,7 @@ This file came out of a full review of the tree (first commit through
 | R-P7.2 | Short reads/writes and ignored error codes in SFTP and OTA | The user's own pitfall list; not yet audited | audited, findings fixed | todo |
 | R-P7.3 | `ESPIX_PROC_MAX` / `ESPIX_FS_FD_MAX` (32 system-wide) / `ESPIX_FS_DIRS` (8) sizing review | Sized for a shell; pipelines and services will need more | sized from measurement | parked |
 | R-P7.4 | `docs/KNOWN-ISSUES.md` "Polite, then forced" appears already implemented | `cmd_run.c:187-198` sends SIGINT per press then SIGKILL, one press per 50 ms slice | verified on hardware, entry struck | todo |
+| R-P7.6 | `ps` names a running app `app:testapp` (its FreeRTOS task) but a finished one `testapp` (its table entry), so the two cannot be matched by name | It made a live process look absent and a finished one look live while chasing the runaway above — for twenty minutes | `cmd_sys.c` `ps` | one name, consistently, with the task name separate if it is wanted | todo |
 | R-P7.5 | Decide the USB-storage role: data volume (works today), and later an eviction target for registered caches | Real swap/paging needs the MMU (R-P3.3) *and* would page-fault over USB at hundreds of microseconds — a poor fit for a 320 MHz core with no coherent DMA. Linux on S31 uses PSRAM as RAM and SD for rootfs, no swap. "Spill a registered cache to disk" is the useful, buildable version of the idea | `docs/ROADMAP.md` reclaimer entry | a decision is written down | parked |
 
 ---
