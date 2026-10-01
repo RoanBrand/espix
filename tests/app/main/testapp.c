@@ -874,6 +874,35 @@ static int cmd_holdthread(const char *bytes_s)
     return 0;
 }
 
+/*
+ * Allocate and return without freeing any of it.
+ *
+ * This is the case the arena exists for, and the one a test has to prove
+ * directly: an app that exits -- or is killed -- holding memory must not have
+ * to give it back itself. Before R-P1.2 nothing recorded what an app took, so
+ * two Doom runs left 571 KB of a 13.2 MB pool free and only a reboot returned
+ * it. This is that, in miniature and on purpose.
+ */
+static int cmd_leak(int argc, char **argv)
+{
+    size_t total = 0;
+
+    for (int i = 0; i < argc && i < TESTAPP_HOLD_MAX; i++) {
+        const size_t want = (size_t)strtoul(argv[i], NULL, 10);
+        void *const  p    = malloc(want);
+        if (p == NULL) {
+            printf("leak: malloc(%u) returned NULL\n", (unsigned)want);
+            return 1;
+        }
+        ((volatile char *)p)[0]        = 1;
+        ((volatile char *)p)[want - 1] = 1;
+        total += want;
+    }
+
+    printf("leaked %u bytes, returning without freeing\n", (unsigned)total);
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -901,6 +930,7 @@ static void usage(void)
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"
+           "  leak <bytes>...     allocate and return without freeing any of it\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -1018,6 +1048,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "holdthread") == 0 && argc > 2) {
         return cmd_holdthread(argv[2]);
+    }
+    if (strcmp(cmd, "leak") == 0 && argc > 2) {
+        return cmd_leak(argc - 2, argv + 2);
     }
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {

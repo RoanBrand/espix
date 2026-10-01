@@ -73,10 +73,6 @@
  * and is not worth a line per allocation. */
 static bool s_reported_fallback;
 
-/* Reported once too, and for a different reason: memory served this way is
- * live but unowned, so it is worth knowing the arena's list limit was reached. */
-static bool s_reported_spill;
-
 /*
  * Serialises every region operation, including multi_heap_* on a region: a
  * region is registered without a lock of its own, so concurrent allocation from
@@ -188,14 +184,55 @@ static espix_app_region_t *region_locate(const void *p, espix_proc_slot_t **out_
 }
 
 /*
+ * Make room in the process's region list for one more entry, growing the index
+ * when it is full. The index is espix's bookkeeping rather than the app's, so
+ * espix_proc_regions_release() frees it separately from the regions.
+ *
+ * PSRAM first, because a process with many regions should not be spending
+ * scarce internal RAM on their index; internal is the fallback, so the index
+ * cannot fail merely because the pool it prefers is full.
+ */
+static bool region_list_reserve(espix_proc_slot_t *slot)
+{
+    if (slot->nregions < slot->region_cap) {
+        return true;
+    }
+
+    const uint32_t want = (slot->region_cap == 0)
+                              ? 4u : (uint32_t)slot->region_cap * 2u;
+    if (want > 0xffffu) {
+        return false;
+    }
+
+    const size_t bytes = (size_t)want * sizeof(espix_app_region_t);
+    espix_app_region_t *grown = heap_caps_realloc(slot->regions, bytes,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (grown == NULL) {
+        grown = realloc(slot->regions, bytes);
+    }
+    if (grown == NULL) {
+        return false;
+    }
+
+    slot->regions    = grown;
+    slot->region_cap = (uint16_t)want;
+    return true;
+}
+
+/*
  * Carve one more region for 'slot', sized for the request that did not fit, and
- * append it. NULL when the process has no room left in its list, when the board
- * has no PSRAM, or when taking the memory would drop free PSRAM below the
- * floor -- the last of which is the only case a caller sees as "out of memory".
+ * append it. NULL when the board has no PSRAM, when the index cannot be grown,
+ * or when taking the memory would drop free PSRAM below the floor -- the last of
+ * which is the deliberate budget a caller sees as "out of memory".
+ *
+ * There is no cap on the number of regions. There was one, and it was the bug
+ * this list exists without: a request that will not fit beside an earlier block
+ * needs a region of its own, so five 1 MB blocks wanted five regions, and a
+ * fixed list of four failed the fifth malloc with 12 MB of PSRAM free.
  */
 static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
 {
-    if (slot->nregions >= ESPIX_APP_REGIONS_MAX || !regions_available()) {
+    if (!regions_available()) {
         return NULL;
     }
 
@@ -208,6 +245,11 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
                    (int)slot->info.pid, (unsigned)(want / 1024),
                    (unsigned)(free_psram / 1024),
                    (unsigned)(PSRAM_FLOOR_BYTES / 1024));
+        return NULL;
+    }
+
+    /* The index first, so a failure here does not leak the region below. */
+    if (!region_list_reserve(slot)) {
         return NULL;
     }
 
@@ -234,16 +276,10 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
 }
 
 /* Allocate n from the process's arena, registering a region if none fits.
- * Caller holds s_region_lock.
- *
- * *list_full distinguishes the two ways this can fail: the process's region
- * list is exhausted, which is a limit of the bookkeeping and must not reach the
- * app as an allocation failure, or a region was refused, which is the floor and
- * is deliberate. */
-static void *region_alloc(espix_proc_slot_t *slot, size_t n, bool *list_full)
+ * Caller holds s_region_lock. NULL only when a region was refused at the floor,
+ * or when the list's own index could not be grown -- both real memory limits. */
+static void *region_alloc(espix_proc_slot_t *slot, size_t n)
 {
-    *list_full = false;
-
     if (n == 0) {
         n = 1;
     }
@@ -253,11 +289,6 @@ static void *region_alloc(espix_proc_slot_t *slot, size_t n, bool *list_full)
         if (p != NULL) {
             return p;
         }
-    }
-
-    if (slot->nregions >= ESPIX_APP_REGIONS_MAX) {
-        *list_full = true;
-        return NULL;
     }
 
     espix_app_region_t *const r = region_grow(slot, n);
@@ -293,18 +324,6 @@ static void *region_realloc(espix_proc_slot_t *slot, espix_app_region_t *r,
         }
     }
 
-    if (slot->nregions >= ESPIX_APP_REGIONS_MAX) {
-        /* The list is full, so there is nowhere in the arena for it -- but the
-         * block still has to be grown, so move it out of the arena rather than
-         * fail. It will not be reclaimed at exit; see espix_abi_alloc(). */
-        void *const q = alloc_psram(n);
-        if (q != NULL) {
-            memcpy(q, p, (old < n) ? old : n);
-            multi_heap_free(r->heap, p);
-        }
-        return q;
-    }
-
     espix_app_region_t *const nr = region_grow(slot, n);
     if (nr != NULL) {
         void *const q = multi_heap_malloc(nr->heap, n);
@@ -332,36 +351,17 @@ void *espix_abi_alloc(size_t n)
     }
 
     xSemaphoreTake(s_region_lock, portMAX_DELAY);
-    bool list_full = false;
-    void *const p = region_alloc(slot, n, &list_full);
+    void *const p = region_alloc(slot, n);
     xSemaphoreGive(s_region_lock);
 
-    if (p != NULL) {
-        return p;
-    }
-
     /*
-     * The region list is full. That is a limit of the bookkeeping, not of the
-     * memory -- the pool has room -- so the app must not see an allocation
-     * failure because of it. Serve it globally and say so once: what is
-     * allocated this way is live but unowned, so it is not reclaimed at exit.
-     * That is the status quo rather than a regression, but it is worth a line.
+     * NULL is a region refused at the floor -- a deliberate budget, so the app
+     * sees the failure -- or the index itself failing to grow, which is PSRAM
+     * genuinely exhausted. There is no "the list is full" case: the list has no
+     * fixed size, and every allocation that succeeds lives in a region, so every
+     * allocation is given back at exit. See docs/APP-MEMORY.md.
      */
-    if (list_full) {
-        if (!s_reported_spill) {
-            s_reported_spill = true;
-            espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "pid %d: %d arena regions is the limit; later app "
-                       "allocations come from the global heap and will not be "
-                       "reclaimed at exit",
-                       (int)slot->info.pid, (int)ESPIX_APP_REGIONS_MAX);
-        }
-        return alloc_psram(n);
-    }
-
-    /* Otherwise a region was refused at the floor: a deliberate budget, so the
-     * app sees the failure. See docs/APP-MEMORY.md, "The ceiling". */
-    return NULL;
+    return p;
 }
 
 void *espix_abi_calloc(size_t n, size_t size)
@@ -461,7 +461,7 @@ static char *abi_strdup(const char *s)
 
 void espix_proc_regions_release(espix_proc_slot_t *slot)
 {
-    if (slot == NULL || slot->nregions == 0) {
+    if (slot == NULL || (slot->nregions == 0 && slot->regions == NULL)) {
         return;
     }
 
@@ -481,7 +481,13 @@ void espix_proc_regions_release(espix_proc_slot_t *slot)
         slot->regions[i].base = NULL;
         slot->regions[i].size = 0;
     }
-    slot->nregions     = 0;
+    /* The index is espix's, not the arena's, so it frees here rather than with
+     * the regions above -- and even when no region was ever made, a failed grow
+     * may have left one behind. */
+    free(slot->regions);
+    slot->regions    = NULL;
+    slot->nregions   = 0;
+    slot->region_cap = 0;
     slot->foreign_frees = 0;
 
     if (s_region_lock != NULL) {

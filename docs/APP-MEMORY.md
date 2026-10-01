@@ -160,8 +160,8 @@ the whole reason to prefer them.
   region, not twenty-four small ones. Four fifths of this question turned out to
   be already answered by the minimum and the 32 KB floor: eight 1000-byte
   allocations share the first region, because a failed request does not make a
-  new region until every existing one has been tried. What *was* wrong is the
-  next bullet.
+  new region until every existing one has been tried. What *was* wrong was the
+  size of the list it appends to.
 - **A global ceiling, not a per-process cap**: the sum of all app regions may not
   take PSRAM past a reserved floor, so one app cannot take the pool and leave the
   system unable to draw. Expressed as *free PSRAM stays above N* rather than a
@@ -173,14 +173,23 @@ the whole reason to prefer them.
 - **Lazy**: no region until the first allocation. The cost is one
   `heap_caps_malloc` and one `multi_heap_register` on that call, and again if a
   later request outgrows every region — microseconds, not a policy.
-- **A full region list spills to the global heap; it never fails the
-  allocation.** The array holds eight because a slot is 720 bytes of internal
-  RAM times twelve, and a request that will not fit beside an earlier block
-  takes a region of its own — five 1 MB blocks need five regions. That is
-  bookkeeping, not memory, and `malloc()` returning NULL with half the pool free
-  would be a lie. What spills is not reclaimed at exit (the status quo), is
-  logged once, and does not appear in the `HEAP` column, which sums
-  region usage only.
+- **The region list has no fixed size; it grows on demand.** It was an array —
+  eight in the plan, four in the code — and the fixed length was a bug rather
+  than a budget: a request that will not fit beside an earlier block takes a
+  region of its own, so five 1 MB blocks need five regions, and a fixed list
+  answers "out of memory" while the pool is mostly free. The index is 12 bytes a
+  region, lives in PSRAM, and PSRAM is the only limit — enforced by the floor
+  above. **Nothing spills**, so every allocation that succeeds lives in a region
+  and every one is therefore reclaimed at exit.
+
+  Measured, because the alternative — sometimes routing an allocation to the
+  global heap — was tried and rejected as a leak: ten 300 KB blocks each take a
+  region, all ten are served, and all ten are returned. Amortising them into a
+  few larger regions was also considered and does not pay: a region can only
+  hold a second block if it is at least twice the request plus overhead, so a
+  2 MB region holds one 1 MB block, not two, and the memory that buys fewer
+  regions is spent rather than saved. Amortisation is only worth it *per region
+  count*, and with the index unbounded the count is bounded by PSRAM itself.
 - **A foreign `free()` falls through and is counted, not logged.** Except one
   source, which is a bug rather than a logging question: `abi_cxx.cpp` publishes
   `operator new`/`delete` and those call the *firmware's* malloc internally, so a
@@ -252,8 +261,6 @@ Concrete enough to be mechanical, in the order it has to happen.
 **Types** — in `espix_proc_priv.h`, beside the slot they live in:
 
 ```c
-#define ESPIX_APP_REGIONS_MAX 8      /* 8 x 12B x 12 slots = 1.2 KB of internal RAM */
-
 typedef struct {
     multi_heap_handle_t heap;
     void               *base;    /* for the range test, which is the whole trick */
@@ -261,11 +268,11 @@ typedef struct {
 } espix_app_region_t;
 ```
 
-and on `espix_proc_slot_t`: `espix_app_region_t regions[ESPIX_APP_REGIONS_MAX];`
-plus `uint8_t nregions;`. The array is a *bookkeeping* limit, not a budget, and
-that distinction is the whole of the next paragraph: eight entries because the
-slot is already 720 bytes of internal RAM times twelve, and because repeated
-allocations of a similar size each need a region of their own.
+and on `espix_proc_slot_t`: `espix_app_region_t *regions;` with `uint16_t
+nregions, region_cap;`. The index grows on demand — the first four entries, then
+doubling — and `espix_proc_regions_release()` frees it along with the regions. It
+is deliberately not a fixed array: that is the shape that failed five 1 MB blocks
+with 12 MB free, and no list length is a property of the *process*.
 
 **Functions** — all in `abi_alloc.c`, which already owns the seam:
 

@@ -249,14 +249,14 @@ assert_contains "the device survives a thread free" "espix" \
     "$(dev_run uname)"
 
 
-# --- a fixed-size request list must not fail an ordinary allocation ---------
+# --- the request list must never fail an ordinary allocation ---------------
 #
 # Each region is one fixed-size heap, so a request that will not fit beside an
-# earlier block takes a region of its own. The list is bounded (a slot is 720
-# bytes of internal RAM times twelve), which is exactly the shape that produces
-# a bogus out-of-memory: the pool has room, the bookkeeping does not. Small
-# allocations must share a region, larger repeats must get the regions they
-# need, and past that the arena must spill rather than fail.
+# earlier block takes a region of its own. A fixed list therefore turns "the
+# process is busy" into malloc() returning NULL with megabytes free -- which it
+# did, at four entries: five 1 MB blocks failed the fifth. The list has no size
+# now, so small allocations share a region, larger repeats get the regions they
+# need, and all of it is still reclaimed at exit.
 
 out=$(dev_run "$APP hold 0 1000 1000 1000 1000 1000 1000 1000 1000")
 assert_contains "eight small allocations share one arena region" \
@@ -268,7 +268,7 @@ assert_contains "five 1 MB allocations all succeed" \
 
 base4=$(psram_free_kb)
 out=$(dev_run "$APP hold 0 300000 300000 300000 300000 300000 300000 300000 300000 300000 300000")
-assert_contains "past the region list, the arena spills instead of failing" \
+assert_contains "many regions are tracked, with no fixed list to exhaust" \
     "held 10 block(s), 3000000 bytes" "$out"
 
 sleep 2
@@ -276,7 +276,29 @@ back4=$(psram_free_kb)
 if [ -n "$back4" ] && [ $((base4 - back4)) -le 1024 ]; then
     espix_pass "and the arena's regions still come back (${base4}K -> ${back4}K)"
 else
-    espix_fail "the arena's regions come back after a spill" \
+    espix_fail "the arena's regions come back after many allocations" \
         "PSRAM free ${base4}K -> ${back4}K"
+fi
+
+
+
+# --- an app that never frees still gives everything back --------------------
+#
+# The case the arena exists for, and the one a test has to prove directly: the
+# app deliberately exits holding three blocks it never frees. Before R-P1.2
+# nothing recorded what an app took, so this memory was gone until a reboot.
+
+base5=$(psram_free_kb)
+out=$(dev_run "$APP leak 1048576 1048576 524288")
+assert_contains "an app can exit without freeing what it holds" \
+    "leaked 2621440 bytes" "$out"
+
+sleep 2
+back5=$(psram_free_kb)
+if [ -n "$back5" ] && [ $((base5 - back5)) -le 1024 ]; then
+    espix_pass "and the arena reclaims every byte (${base5}K -> ${back5}K)"
+else
+    espix_fail "the arena reclaims an app's leaked memory" \
+        "PSRAM free ${base5}K -> ${back5}K"
 fi
 

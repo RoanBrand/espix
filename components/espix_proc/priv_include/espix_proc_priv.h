@@ -34,19 +34,17 @@ extern "C" {
  * block. The whole design, and the hazards it carries, is in
  * docs/APP-MEMORY.md; the code is abi_alloc.c, which owns the seam.
  *
- * Eight rather than four, which is what this started at: four was enough for
- * the common case but not for repeated allocations of a similar size, where a
- * request that will not fit beside an earlier block takes a region of its own.
- * A slot is already 720 bytes of internal RAM and this is multiplied by
- * ESPIX_PROC_MAX, so the array cannot be large; what happens when it *is* full
- * therefore matters more than its size, and abi_alloc.c spills to the global
- * heap rather than failing an allocation the pool could serve.
+ * The list has no fixed size. It had one -- four, then eight -- and that was a
+ * bug: a request that will not fit beside an earlier block takes a region of
+ * its own, so repeated allocations of a similar size need one region each, and
+ * a fixed list turns "the process is busy" into malloc() returning NULL with
+ * megabytes free. PSRAM is the real limit; the index grows on demand, costs 12
+ * bytes a region, and is kept in PSRAM rather than internal. See abi_alloc.c.
  *
  * 'base' and 'size' exist for the range test alone: free() tells a region
  * pointer from a global one by asking whether the address is inside a region,
  * and that comparison is also the classification the whole design rests on.
  */
-#define ESPIX_APP_REGIONS_MAX 4
 
 typedef struct {
     multi_heap_handle_t heap;
@@ -242,8 +240,9 @@ typedef struct {
      * reached from espix_proc_release_resources(), so both the clean exit and
      * the force-kill path give the PSRAM back.
      */
-    espix_app_region_t regions[ESPIX_APP_REGIONS_MAX];
-    uint8_t            nregions;
+    espix_app_region_t *regions;      /* the index; grown on demand */
+    uint16_t            nregions;
+    uint16_t            region_cap;
 
     /*
      * free() calls that named memory outside every region, counted so the
