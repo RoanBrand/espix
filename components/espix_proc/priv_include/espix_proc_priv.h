@@ -384,6 +384,11 @@ void espix_proc_exit(int status) __attribute__((noreturn));
  * table answers for `exit` and is searched first. */
 void espix_proc_abi_exit_register(void);
 
+/* Publish the allocator an app gets, under libc's names. See abi_alloc.c: it is a
+ * resolver table because the loader's own answers for malloc and is searched
+ * first, and it is where the per-process regions (R-P1.2) will attach. */
+void espix_proc_abi_alloc_register(void);
+
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);
 

@@ -136,7 +136,9 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(strncasecmp),
     ESP_ELFSYM_EXPORT(strcat),
     ESP_ELFSYM_EXPORT(strstr),
-    ESP_ELFSYM_EXPORT(strdup),
+    /* strdup is not here: abi_alloc.c answers for it through the resolver, which
+     * is searched first, because an app's allocation has to be one espix can
+     * find again. The checker caught the duplicate this created. */
     ESP_ELFSYM_EXPORT(strnlen),
     ESP_ELFSYM_EXPORT(strndup),
     ESP_ELFSYM_EXPORT(memmove),
