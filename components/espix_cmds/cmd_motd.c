@@ -78,10 +78,8 @@ static const char *const ANTENNA[] = {
 
 #define ANSI_LOGO   "\033[36m"          /* cyan */
 #define ANSI_LABEL  "\033[1m"           /* bold */
-#define ANSI_WARN   "\033[33m"          /* yellow */
-#define ANSI_OK     "\033[32m"          /* green */
-#define ANSI_BAD    "\033[31m"          /* red */
-#define ANSI_RESET  "\033[0m"
+/* ANSI_WARN/OK/BAD/RESET live in espix_cmds_priv.h: `top` draws the same
+ * percentages, and the two must agree about what "nearly full" looks like. */
 
 /*
  * Gold, for the antenna: the ENIG plating a module's antenna is actually
@@ -194,7 +192,7 @@ static void size_h(uint64_t bytes, char *out, size_t len)
     snprintf(out, len, "%llu%s", (unsigned long long)bytes, unit[i]);
 }
 
-static unsigned pct_of(uint64_t used, uint64_t total)
+unsigned pct_of(uint64_t used, uint64_t total)
 {
     return total > 0 ? (unsigned)((used * 100) / total) : 0;
 }
@@ -205,7 +203,7 @@ static unsigned pct_of(uint64_t used, uint64_t total)
  * fits, so a row truncated elsewhere cannot swallow the reset and bleed
  * colour into the rest of the banner.
  */
-static void append_pct(char *out, size_t len, bool ansi, unsigned pct)
+void append_pct(char *out, size_t len, bool ansi, unsigned pct)
 {
     const size_t n = strlen(out);
     const char  *color = "";

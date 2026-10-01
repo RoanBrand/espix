@@ -26,6 +26,23 @@ void espix_cmds_register_bt(void);
 void espix_cmds_register_play(void);
 void espix_cmds_register_display(void);
 
+/*
+ * The palette the login banner and `top` share, and the helper that colours a
+ * "(NN%)" by how full it is: green while there is room, yellow past 75%, red
+ * past 90%. Shared rather than duplicated so the two cannot drift about what
+ * "nearly full" looks like.
+ */
+#define ANSI_WARN   "\033[33m"          /* yellow */
+#define ANSI_OK     "\033[32m"          /* green */
+#define ANSI_BAD    "\033[31m"          /* red */
+#define ANSI_RESET  "\033[0m"
+
+unsigned pct_of(uint64_t used, uint64_t total);
+
+/* Append " (NN%)" to `out`, coloured. Added only when the whole sequence fits,
+ * so a row truncated elsewhere cannot swallow the reset and bleed colour. */
+void append_pct(char *out, size_t len, bool ansi, unsigned pct);
+
 /* Resolves a non-builtin command name to a program in /bin or by path. */
 void espix_cmds_register_exec_fallback(void);
 

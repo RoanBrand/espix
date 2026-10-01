@@ -645,13 +645,22 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
     const size_t psr_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
 
     espix_printf(s, "top - %s\n", uptime);
-    espix_printf(s, "Mem:  internal %uK/%uK",
-                 (unsigned)(internal.total_allocated_bytes / 1024),
-                 (unsigned)(int_total / 1024));
+    char mem[96];
+    snprintf(mem, sizeof(mem), "Mem:  internal %uK/%uK",
+             (unsigned)(internal.total_allocated_bytes / 1024),
+             (unsigned)(int_total / 1024));
+    append_pct(mem, sizeof(mem), s->ansi,
+               pct_of(internal.total_allocated_bytes, int_total));
+    espix_printf(s, "%s", mem);
+
     if (psr_total > 0) {
-        espix_printf(s, "    psram %uK/%uK",
-                     (unsigned)(psram.total_allocated_bytes / 1024),
-                     (unsigned)(psr_total / 1024));
+        char psr[96];
+        snprintf(psr, sizeof(psr), "    psram %uK/%uK",
+                 (unsigned)(psram.total_allocated_bytes / 1024),
+                 (unsigned)(psr_total / 1024));
+        append_pct(psr, sizeof(psr), s->ansi,
+                   pct_of(psram.total_allocated_bytes, psr_total));
+        espix_printf(s, "%s", psr);
     }
     /*
      * The first frame has nothing to subtract from, so every task reads 0% --
@@ -669,8 +678,14 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
         return;
     }
 
-    espix_printf(s, "\nCpu:  %u%% busy across %u core%s",
-                 busy / cores, cores, cores == 1 ? "" : "s");
+    const unsigned busy_pct = busy / cores;
+    const char *const cpu_color =
+        !s->ansi ? "" : (busy_pct >= 90) ? ANSI_BAD
+                    : (busy_pct >= 75) ? ANSI_WARN : ANSI_OK;
+
+    espix_printf(s, "\nCpu:  %s%u%%%s busy across %u core%s",
+                 cpu_color, busy_pct, s->ansi ? ANSI_RESET : "",
+                 cores, cores == 1 ? "" : "s");
 
     /*
      * Per core, which costs nothing to work out: each idle task is pinned to
@@ -922,9 +937,6 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
 
         if (shown >= TOP_ROWS_MAX) {
             espix_printf(s, "...\n");
-        }
-        if (frames == 0) {
-            espix_printf(s, "\nCtrl-C to quit\n");
         }
         drawn++;
 
