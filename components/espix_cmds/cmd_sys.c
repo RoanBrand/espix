@@ -459,6 +459,21 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
                  "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
 
     for (UBaseType_t i = 0; i < count; i++) {
+        /*
+         * The idle tasks are left out, as `top` leaves them out and for the same
+         * reason: there is one per core, it soaks up whatever nothing else wants,
+         * so it is always present and always near 100%. In a list meant to be
+         * read, that is a row saying nothing -- and top's own comment says the
+         * rest: sorted by CPU they would occupy the top rows forever.
+         *
+         * They are not hidden from the system, only from this listing. top's
+         * busy figure is their complement, and `uptime` reports what the
+         * watchdog makes of them.
+         */
+        if (strncmp(tasks[i].pcTaskName, "IDLE", 4) == 0) {
+            continue;
+        }
+
         const espix_pid_t pid = espix_proc_pid_of_task(tasks[i].xHandle);
 
         char pid_str[12];
