@@ -1710,17 +1710,20 @@ first panic makes the check itself panic, and `reset-reason-changed` then
 reports a panic on every later run until someone erases the dump with
 `coredump erase`.
 
-Not fixed. The shape of the fix is to read the dump from a task with an internal
-stack -- the boot-time report in `espix_fault_report_coredump()` already runs
-on one -- rather than from whoever asked.
+**Fixed.** The shell already had the right mechanism and this command did not
+use it. `espix_cmd_t.internal_stack` runs a command on a task whose stack comes
+from `xTaskCreate` instead of `xTaskCreateWithCaps(MALLOC_CAP_SPIRAM)`
+(session.c), and `upgrade` has carried it since it panicked for exactly this
+reason. `coredump` was registered without it, so it ran on the connection
+task's PSRAM stack. It sets it now. The boot-time report was never affected:
+`espix_fault_report_coredump()` runs on the init task, whose stack is internal.
 
-**The obvious fix does not work, and is worth not trying:** running the command
-on its own task. `run_on_own_task()` gives a command its stack from PSRAM first
-(session.c, "PSRAM first: a command that asks for its own stack is doing
-something long"), so a `coredump` helpfully given its own task panics in exactly
-the same place. The read needs a task whose stack is *internal* -- a small
-worker created with `xTaskCreate` inside `espix_fault`, carrying the summary
-back to the caller.
+**The lesson is the audit, not the flag.** Everything a session runs has a PSRAM
+stack: the connection task, and `run_on_own_task()` too, which prefers PSRAM and
+only goes internal when a command asks for it (`cmd->internal_stack`). So "which
+commands rewrite the MMU" is a question someone has to keep asking. Today there
+are two answers -- `upgrade`, because `esp_image_verify()` maps the slot it is
+about to boot, and `coredump` -- and only the first had the flag.
 
 Recorded here because the first diagnosis of a panic after this lands is wrong:
 the coredump on the device is the *previous* fault, and asking about it is a

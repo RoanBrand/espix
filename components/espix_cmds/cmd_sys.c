@@ -1904,7 +1904,19 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "log <tag> [level]" },
     { .name = "coredump", .fn = cmd_coredump,
       .help = "show or erase the stored core dump",
-      .usage = "coredump [erase]" },
+      .usage = "coredump [erase]",
+
+      /*
+       * Reading the dump is not passive. esp_core_dump_get_summary() maps the
+       * partition to parse the ELF (elf_core_dump_image_mmap ->
+       * esp_partition_mmap), and mapping rewrites the MMU with the
+       * external-memory cache frozen. PSRAM is behind that same cache, so a
+       * PSRAM stack cannot survive it and esp_mm asserts on the stack pointer
+       * rather than faulting later. This is the flag upgrade already carries
+       * for esp_image_verify(); coredump maps too and did not. Erasing is a
+       * flash write and wants the same stack for the same reason.
+       */
+      .stack = 8192, .internal_stack = true },
     { .name = "passwd", .fn = cmd_passwd,
       .help = "set a user's password",
       .usage = "passwd [user] <new-password> | passwd -l <user>" },
