@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"   /* esp_stack_ptr_in_extram, esp_ptr_external_ram */
 #include "esp_timer.h"
 
 #include "espix_kernel.h"
@@ -237,6 +238,10 @@ static esp_err_t recv_kexinit(ssh_conn_t *c)
  * members means nothing if the base is off a line, and aligning the base means
  * nothing if the members sit at odd offsets from it.
  */
+/* Whether the one-time report of which pool connection state landed in has
+ * been made. See conn_alloc(). */
+static bool s_reported_pool;
+
 static ssh_conn_t *conn_alloc(void)
 {
     ssh_conn_t *c = NULL;
@@ -256,8 +261,49 @@ static ssh_conn_t *conn_alloc(void)
         /* No aligned calloc, so zero it here: the code below relies on a clean
          * struct, and a stale one would look like a half-open connection. */
         memset(c, 0, sizeof(*c));
+
+        /*
+         * Which pool it landed in, said once.
+         *
+         * It is the same 13.4 KB a connection either way, and the difference is
+         * whether it comes out of PSRAM or out of the internal pool that decides
+         * how many sessions fit at all -- so it is worth one line at the first
+         * connection rather than an inference from `free` before and after,
+         * which 13 KB moves too little to be read.
+         */
+        if (!s_reported_pool) {
+            s_reported_pool = true;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "connection state in %s",
+                       esp_ptr_external_ram(c)
+                           ? "PSRAM (DMA-capable, aligned)"
+                           : "internal RAM -- no PSRAM+DMA block was available");
+        }
     }
     return c;
+}
+
+/*
+ * End this connection task, giving its stack back to the pool it came from.
+ *
+ * A task created WithCaps must be deleted WithCaps, and one created the ordinary
+ * way must not be: the first leaks its stack otherwise, because the idle task
+ * only frees what FreeRTOS allocated itself, and the second double-frees. IDF
+ * makes that distinction explicit and offers no way to ask a task which it is --
+ * so the stack's own address is the answer. A local lives in this task's stack
+ * and this runs on that stack, so where the marker is says where the stack is.
+ *
+ * A flag in the connection struct would not do: the earliest way out of this
+ * task -- conn_alloc() failing -- has no struct to hold one.
+ */
+static void conn_task_exit(void)
+{
+    char marker;
+
+    if (esp_stack_ptr_in_extram((uint32_t)(uintptr_t)&marker)) {
+        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 /*
@@ -398,7 +444,7 @@ static void connection_task(void *arg)
 
         close_gracefully(fd);   /* or the reset discards the line just sent */
         sessions_release();
-        vTaskDelete(NULL);
+        conn_task_exit();
         return;
     }
     c->fd = fd;
@@ -492,7 +538,7 @@ static void connection_task(void *arg)
     sessions_release();
     espix_klog(ESPIX_KLOG_INFO, TAG, "connection closed");
 
-    vTaskDelete(NULL);
+    conn_task_exit();
 }
 
 static void accept_task(void *arg)
@@ -633,9 +679,32 @@ static void accept_task(void *arg)
         espix_klog(ESPIX_KLOG_INFO, TAG, "connection from %s",
                    inet_ntoa(peer.sin_addr));
 
-        if (xTaskCreate(connection_task, "sshd:conn",
-                        CONFIG_ESPIX_SSH_TASK_STACK, (void *)(intptr_t)fd,
-                        CONFIG_ESPIX_SSH_TASK_PRIO, NULL) != pdPASS) {
+        /*
+         * A PSRAM stack, with the internal fallback the rest of espix uses.
+         *
+         * 8192 bytes each and up to CONFIG_ESPIX_SSH_MAX_SESSIONS of them, so at
+         * eight this is 64 KB of the internal pool -- the largest single
+         * consumer in the tree, and the reason the sessions suite once drove
+         * internal RAM to zero. Nothing on this task's path needs the flash
+         * cache frozen (which is what keeps elfreloc's stack internal), and
+         * nothing here is DMA.
+         */
+        BaseType_t ok = xTaskCreateWithCaps(connection_task, "sshd:conn",
+                                            CONFIG_ESPIX_SSH_TASK_STACK,
+                                            (void *)(intptr_t)fd,
+                                            CONFIG_ESPIX_SSH_TASK_PRIO, NULL,
+                                            MALLOC_CAP_SPIRAM);
+        if (ok != pdPASS) {
+            /* Out of PSRAM, which is 13 MB and not the pool under pressure --
+             * so serve the connection from internal RAM rather than refusing it.
+             * conn_task_exit() gives that stack back the ordinary way. */
+            espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                       "no PSRAM for a connection stack; using internal");
+            ok = xTaskCreate(connection_task, "sshd:conn",
+                             CONFIG_ESPIX_SSH_TASK_STACK, (void *)(intptr_t)fd,
+                             CONFIG_ESPIX_SSH_TASK_PRIO, NULL);
+        }
+        if (ok != pdPASS) {
             espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start connection task");
             sessions_release();     /* the task that would have done this never ran */
             close(fd);
