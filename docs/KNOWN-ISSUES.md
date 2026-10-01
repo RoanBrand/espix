@@ -1712,9 +1712,22 @@ reports a panic on every later run until someone erases the dump with
 
 Not fixed. The shape of the fix is to read the dump from a task with an internal
 stack -- the boot-time report in `espix_fault_report_coredump()` already runs
-on one -- rather than from whoever asked. Recorded here because the first
-diagnosis of a panic after this lands is wrong: the coredump on the device is
-the *previous* fault, and asking about it is a second one.
+on one -- rather than from whoever asked.
+
+**The obvious fix does not work, and is worth not trying:** running the command
+on its own task. `run_on_own_task()` gives a command its stack from PSRAM first
+(session.c, "PSRAM first: a command that asks for its own stack is doing
+something long"), so a `coredump` helpfully given its own task panics in exactly
+the same place. The read needs a task whose stack is *internal* -- a small
+worker created with `xTaskCreate` inside `espix_fault`, carrying the summary
+back to the caller.
+
+Recorded here because the first diagnosis of a panic after this lands is wrong:
+the coredump on the device is the *previous* fault, and asking about it is a
+second one. **This happened twice in one session**, and the second panic
+overwrites the dump -- so the panic that actually mattered is unrecoverable and
+the board appears to reset at random. That is why this is worth more than its
+own severity: it destroys the evidence for everything else.
 
 This is unrelated to the per-process arena (R-P1.2): it is the transport and
 IDF's cache rule.
