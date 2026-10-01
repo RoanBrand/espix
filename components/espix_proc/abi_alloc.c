@@ -123,7 +123,7 @@ static bool regions_available(void)
  */
 static size_t region_size_for(size_t n)
 {
-    size_t want = n + (n / 16) + 8192u;
+    size_t want = n + (n / 16) + 1024u;
     if (want < REGION_MIN_BYTES) {
         want = REGION_MIN_BYTES;
     }
@@ -272,6 +272,15 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
     r->heap = heap;
     r->base = base;
     r->size = want;
+
+    /* Named as it happens, because "how many regions did that app take" is the
+     * first question any arena surprise raises and there is no other way to
+     * see it: a region is not individually visible in ps. One line per region
+     * created, and a process normally creates one or two. */
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "pid %d: arena region %u is %u KB, for a %u byte request",
+               (int)slot->info.pid, (unsigned)slot->nregions,
+               (unsigned)(want / 1024), (unsigned)n);
     return r;
 }
 

@@ -182,14 +182,28 @@ the whole reason to prefer them.
   above. **Nothing spills**, so every allocation that succeeds lives in a region
   and every one is therefore reclaimed at exit.
 
-  Measured, because the alternative — sometimes routing an allocation to the
-  global heap — was tried and rejected as a leak: ten 300 KB blocks each take a
-  region, all ten are served, and all ten are returned. Amortising them into a
-  few larger regions was also considered and does not pay: a region can only
-  hold a second block if it is at least twice the request plus overhead, so a
-  2 MB region holds one 1 MB block, not two, and the memory that buys fewer
-  regions is spent rather than saved. Amortisation is only worth it *per region
-  count*, and with the index unbounded the count is bounded by PSRAM itself.
+  Measured with the region log (abi_alloc.c logs each one as it is made,
+  because a region is not otherwise visible): eight 1000-byte allocations make
+  **one** 32 KB region — every existing region is tried before a new one is,
+  and the 32 KB floor is what makes that true for small requests. Ten 300 KB
+  blocks make **ten** regions of 316 KB each: a region sized to the request
+  holds one, because its spare is 1/16 of the request and cannot fit a second.
+  Five 1 MB blocks make five regions of 1092 KB.
+
+  So the honest answer to "is every allocation a region" is *no, but every
+  allocation above the floor's capacity is, once the same size keeps coming*.
+  What that costs is memory, and it is measured: 3.0 MB live reserves 3.16 MB
+  (1.05x), 5.0 MB reserves 5.46 MB (1.09x). Amortising those into fewer, larger
+  regions does **not** reduce that: a region holds a second block only if it is
+  at least twice the request *plus overhead*, so a 2 MB region holds one 1 MB
+  block, not two, and the regions saved are paid for in tail waste — for three
+  regions instead of five, the last one's unused remainder is the bill. The
+  count is bounded by PSRAM anyway (the app budget over the 32 KB floor is a few
+  hundred), the index is 12 bytes each, and a free walks it in microseconds.
+
+  The growth constant was 8 KB of slack and is now 1 KB. That is what made a
+  10 KB request reserve 18 KB — the slack, not the request, was the region. The
+  log is what showed it.
 - **A foreign `free()` falls through and is counted, not logged.** Except one
   source, which is a bug rather than a logging question: `abi_cxx.cpp` publishes
   `operator new`/`delete` and those call the *firmware's* malloc internally, so a
