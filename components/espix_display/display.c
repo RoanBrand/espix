@@ -1751,7 +1751,13 @@ void espix_display_input(const espix_input_event_t *ev)
         s_in_q.since = now;
     }
     if (now - s_in_q.since >= 1000000) {
-        espix_klog(ESPIX_KLOG_INFO, TAG, "queue: %u input events in the last "
+        /*
+         * DEBUG, and deliberately not a conditional INFO like the encoder's
+         * queue line: there is no value here that means "something is wrong".
+         * Any non-zero count is normal, so the only thing this can report is
+         * volume -- a question for a profiler, not for the ring.
+         */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "queue: %u input events in the last "
                    "second", (unsigned)s_in_q.n);
         s_in_q.n     = 0;
         s_in_q.since = now;

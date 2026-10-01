@@ -60,6 +60,22 @@
  */
 #define LISTEN_BACKLOG CONFIG_ESPIX_SSH_MAX_SESSIONS
 
+/*
+ * And the pool underneath has to hold both halves of that worst case at once:
+ * MAX_SESSIONS connections accepted, plus MAX_SESSIONS waiting to be accepted.
+ *
+ * Checked rather than commented, because the failure when it is violated is
+ * another refusal nobody can see -- tcp_alloc() returns NULL, and the connection
+ * is dropped before any application callback. It is also the reason the backlog
+ * is the session limit rather than the whole pool: CONFIG_LWIP_MAX_ACTIVE_TCP is
+ * shared with every other TCP connection the firmware makes -- an OTA check and
+ * a fetch both open one -- so a backlog of 16 would let sshd's waiting room
+ * consume the pool those need, and refuse nothing sooner than sessions_take()
+ * already would.
+ */
+_Static_assert(CONFIG_LWIP_MAX_ACTIVE_TCP >= 2 * CONFIG_ESPIX_SSH_MAX_SESSIONS,
+               "the lwIP TCP pool cannot hold the queued and accepted sessions at once");
+
 static int                s_listen_fd = -1;
 static espix_ssh_status_t s_status;
 

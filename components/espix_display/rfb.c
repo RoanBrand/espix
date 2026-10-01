@@ -1041,6 +1041,13 @@ static struct {
     int64_t  worst;
 } s_send_stat;
 
+/*
+ * How long spent waiting for the socket, in one second, is worth a line. When
+ * the encoder is keeping up this is zero; a millisecond is under a frame at any
+ * rate this runs at, and above it something is holding the send up.
+ */
+#define QUEUE_REPORT_US 1000
+
 static void send_stat(int64_t us, size_t rects)
 {
     const int64_t now = esp_timer_get_time();
@@ -1050,10 +1057,22 @@ static void send_stat(int64_t us, size_t rects)
         s_q.since = now;
     }
     if (now - s_q.since >= 1000000) {
-        espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "queue: %u updates out, %u socket stalls, %lld ms waiting",
-                   (unsigned)s_q.updates, (unsigned)s_q.stalls,
-                   (long long)(s_q.waited_us / 1000));
+        /*
+         * Only when the second was not clean.
+         *
+         * A stall, or time spent waiting for the socket, is something to fix;
+         * "17 updates out, 0 stalls, 0 ms waiting" is not. Printed every second
+         * it makes the reader work out which numbers are the boring ones, and it
+         * takes ring space from the line that does matter. The window is reset
+         * either way, so a line that does appear reports one second rather than
+         * a total that keeps growing.
+         */
+        if (s_q.stalls > 0 || s_q.waited_us >= QUEUE_REPORT_US) {
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "queue: %u updates out, %u socket stalls, %lld ms waiting",
+                       (unsigned)s_q.updates, (unsigned)s_q.stalls,
+                       (long long)(s_q.waited_us / 1000));
+        }
         s_q.updates   = 0;
         s_q.stalls    = 0;
         s_q.waited_us = 0;
