@@ -28,6 +28,7 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
+#include "esp_heap_caps.h"
 #include "esp_linenoise.h"
 
 #include "sdkconfig.h"
@@ -2185,7 +2186,16 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
      * this stack also runs every shell command, which needs the room far more
      * than a receive buffer does.
      */
-    ssh_chan_t *ch = calloc(1, sizeof(*ch));
+    /*
+     * PSRAM first, with the internal fallback the rest of espix uses. It is a
+     * receive buffer and control data -- not DMA, and not on a path that freezes
+     * the flash cache -- and at CONFIG_ESPIX_SSH_MAX_SESSIONS connections it is
+     * 2.2 KB each of the pool that decides how many sessions fit at all.
+     */
+    ssh_chan_t *ch = heap_caps_calloc(1, sizeof(*ch), MALLOC_CAP_SPIRAM);
+    if (ch == NULL) {
+        ch = calloc(1, sizeof(*ch));
+    }
     if (ch == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "out of memory for a channel");
         return ESP_ERR_NO_MEM;
