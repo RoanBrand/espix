@@ -214,6 +214,15 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n);
 espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);
 
 /*
+ * Bytes the process has *live* in its own memory arena (R-P1.2), summed over
+ * its regions, or 0 if it has none. This is used, not reserved: a region is
+ * sized to the request that failed, so reserved is often several times this,
+ * and a column that showed reserved would read as a leak. Best-effort -- it
+ * reads the table without the process lock -- which is what a listing wants.
+ */
+size_t espix_proc_heap_used(espix_pid_t pid);
+
+/*
  * The credentials of the process running on `task`, or false if that task is
  * not a process -- the console, an SSH connection task, SNTP, the WiFi driver.
  *

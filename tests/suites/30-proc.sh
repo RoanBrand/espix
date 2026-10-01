@@ -130,3 +130,121 @@ assert_contains "confine refuses a file"                          "not a directo
 
 dev_run "rm $JAIL/inside.txt" >/dev/null 2>&1
 dev_run "rm -r $JAIL"         >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# The app arena (R-P1.2). An app's malloc() now comes from PSRAM the process
+# owns, and both a clean exit and a hard kill give all of it back. This is the
+# Doom leak in miniature: two runs used to leave 571 KB of a 13.2 MB pool free,
+# and only a reboot returned the rest.
+#
+# The measurement is PSRAM free, not the table: a slot whose accounting was
+# zeroed would look identical after a kill however much memory it still held.
+# ---------------------------------------------------------------------------
+
+# PSRAM free in KB -- column 4 of the psram row of 'free'.
+psram_free_kb() { dev_run free | awk '$1 == "psram" { print $4 }'; }
+
+# The live arena bytes of the backgrounded test app, from the HEAP column of
+# 'ps'; empty if it is not listed.
+app_heap_bytes() { dev_run ps | awk '$2 == "app:testapp" { print $8; exit }'; }
+
+app_running() {
+    dev_run ps | sed -n '1,/^finished:/p' | grep -q "$1 app:testapp"
+}
+
+wait_app_gone() {
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        app_running "$1" || return 0
+        sleep 1
+    done
+    return 1
+}
+
+assert_contains "ps has an arena column" "HEAP" "$(dev_run ps | head -1)"
+
+base=$(psram_free_kb)
+if [ -z "$base" ]; then
+    espix_fail "free reports PSRAM" "no psram row"
+    return 0
+fi
+espix_pass "free reports PSRAM free ($base KB)"
+
+# --- a hard kill returns the arena -----------------------------------------
+
+pid=$(dev_run "$APP hold 300 2000000 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -z "$pid" ]; then
+    espix_fail "the hold app is backgrounded and reports its pid" "no [pid] line"
+    return 0
+fi
+
+sleep 3
+heap=$(app_heap_bytes)
+if [ -n "$heap" ] && [ "$heap" -ge 1000000 ] 2>/dev/null; then
+    espix_pass "ps shows the app's live arena (HEAP $heap bytes)"
+else
+    espix_fail "ps shows the app's live arena" "HEAP read '$heap'"
+fi
+
+held=$(psram_free_kb)
+if [ -n "$held" ] && [ $((base - held)) -ge 1000 ]; then
+    espix_pass "and PSRAM free fell with it ($base KB -> $held KB)"
+else
+    espix_fail "PSRAM free falls when an app holds memory" \
+        "base ${base}K, holding ${held}K"
+fi
+
+dev_run "kill -9 $pid" >/dev/null
+wait_app_gone "$pid" || espix_fail "the killed process leaves the table" \
+    "pid $pid still running"
+
+sleep 2
+back=$(psram_free_kb)
+if [ -n "$back" ] && [ $((base - back)) -le 1024 ]; then
+    espix_pass "kill -9 returns the arena to PSRAM ($held KB -> $back KB, base $base KB)"
+else
+    espix_fail "kill -9 returns the arena to PSRAM" \
+        "base ${base}K, holding ${held}K, after kill ${back}K"
+fi
+
+# --- a request too large for the first region makes a second ----------------
+
+base2=$(psram_free_kb)
+out=$(dev_run "$APP hold 0 524288 2097152")
+assert_contains "an app holds blocks that need two arena regions" \
+    "held 2 block(s)" "$out"
+
+sleep 2
+back2=$(psram_free_kb)
+if [ -n "$back2" ] && [ $((base2 - back2)) -le 1024 ]; then
+    espix_pass "both regions are returned on a clean exit (${base2}K -> ${back2}K)"
+else
+    espix_fail "both regions are returned on a clean exit" \
+        "PSRAM free fell from ${base2}K to ${back2}K"
+fi
+
+
+# --- a free from a thread that has no espix slot ---------------------------
+#
+# The one arena path that cannot be reasoned about from the main task. The
+# thread is not the process, so espix_proc_self() finds no slot and the region
+# has to be found by address alone; without that walk this free would reach the
+# global heap on a region pointer -- corruption, not a leak.
+
+base3=$(psram_free_kb)
+out=$(dev_run "$APP holdthread 1048576")
+assert_contains "a free from the app's own thread finds the arena" \
+    "freed in a thread" "$out"
+
+sleep 1
+back3=$(psram_free_kb)
+if [ -n "$back3" ] && [ $((base3 - back3)) -le 1024 ]; then
+    espix_pass "and the arena is still returned (${base3}K -> ${back3}K)"
+else
+    espix_fail "a thread free leaves the arena intact" \
+        "PSRAM free ${base3}K -> ${back3}K"
+fi
+
+assert_contains "the device survives a thread free" "espix" \
+    "$(dev_run uname)"
+

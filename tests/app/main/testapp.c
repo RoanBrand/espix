@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <utime.h>
 
@@ -404,6 +405,12 @@ static volatile sig_atomic_t s_stop;
 static volatile sig_atomic_t s_usr1;
 static volatile sig_atomic_t s_last;
 
+/* What 'hold' is holding, so the arena has something to give back when this
+ * process ends -- cleanly or at the point of a SIGKILL. */
+#define TESTAPP_HOLD_MAX 4
+static void *s_hold[TESTAPP_HOLD_MAX];
+static int   s_hold_count;
+
 /* espix's delivery point. Only `sig spin` needs it. */
 extern bool espix_sigcheck(void);
 
@@ -777,6 +784,96 @@ static int cmd_truncate(const char *path, const char *len_s)
     return 0;
 }
 
+/*
+ * Hold memory the arena gave us, so a test can watch it be returned.
+ *
+ * hold <secs> <bytes>... allocates one block per size and, when secs is not
+ * zero, sleeps with them held -- long enough for another connection to see the
+ * process in ps and kill it. A SIGKILL must return the PSRAM exactly as a
+ * clean exit does: that is the Doom leak, in miniature, and the whole point of
+ * R-P1.2. Each block is touched at both ends so nothing can be deferred.
+ *
+ * More than one size is how the test forces a second region: the first block
+ * sizes the first region, and a later, larger request cannot fit inside it.
+ */
+static int cmd_hold(int argc, char **argv)
+{
+    const unsigned secs = (unsigned)strtoul(argv[0], NULL, 10);
+
+    s_hold_count = 0;
+    size_t total = 0;
+
+    for (int i = 1; i < argc && s_hold_count < TESTAPP_HOLD_MAX; i++) {
+        const size_t want = (size_t)strtoul(argv[i], NULL, 10);
+        void *const  p    = malloc(want);
+        if (p == NULL) {
+            printf("hold: malloc(%u) returned NULL\n", (unsigned)want);
+            break;
+        }
+        ((volatile char *)p)[0]        = 1;
+        ((volatile char *)p)[want - 1] = 1;
+        s_hold[s_hold_count++] = p;
+        total += want;
+    }
+
+    printf("held %d block(s), %u bytes\n", s_hold_count, (unsigned)total);
+    fflush(stdout);
+
+    if (s_hold_count != argc - 1) {
+        return 1;
+    }
+
+    for (unsigned t = 0; t < secs; t++) {
+        sleep(1);
+    }
+
+    for (int i = 0; i < s_hold_count; i++) {
+        free(s_hold[i]);
+        s_hold[i] = NULL;
+    }
+    s_hold_count = 0;
+    printf("released\n");
+    return 0;
+}
+
+/*
+ * Free, from a thread the app made, memory its main task allocated.
+ *
+ * This is the one arena path that cannot be reasoned about from the main task.
+ * An espix process is identified by the task that entered app_main(), so a
+ * thread made with pthread_create() has no slot -- and a free() from it must
+ * still find the region, or it would hand a region pointer to the global heap:
+ * corruption rather than a leak. The lookup is by address alone.
+ */
+static void *free_in_thread(void *arg)
+{
+    free(arg);
+    return NULL;
+}
+
+static int cmd_holdthread(const char *bytes_s)
+{
+    const size_t want = (size_t)strtoul(bytes_s, NULL, 10);
+    void *const   p    = malloc(want);
+    if (p == NULL) {
+        printf("holdthread: malloc(%u) returned NULL\n", (unsigned)want);
+        return 1;
+    }
+    ((volatile char *)p)[0]        = 1;
+    ((volatile char *)p)[want - 1] = 1;
+
+    pthread_t t;
+    const int rc = pthread_create(&t, NULL, free_in_thread, p);
+    if (rc != 0) {
+        printf("holdthread: pthread_create failed (%d)\n", rc);
+        return 1;
+    }
+    pthread_join(t, NULL);
+
+    printf("freed in a thread\n");
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -802,6 +899,8 @@ static void usage(void)
            "  sink                read stdin, report the byte count only\n"
            "  sig [mode]          handlers (default) | ignore | spin\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
+           "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
+           "  holdthread <bytes>  free, in a new thread, what main allocated\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -912,6 +1011,13 @@ int main(int argc, char **argv)
         sleep((unsigned)strtol(argv[2], NULL, 10));
         printf("slept %s\n", argv[2]);
         return 0;
+    }
+
+    if (strcmp(cmd, "hold") == 0 && argc > 3) {
+        return cmd_hold(argc - 2, argv + 2);
+    }
+    if (strcmp(cmd, "holdthread") == 0 && argc > 2) {
+        return cmd_holdthread(argv[2]);
     }
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {

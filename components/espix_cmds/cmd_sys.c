@@ -455,8 +455,8 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
     const uint64_t    total_runtime = (uint64_t)esp_timer_get_time();
     const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
-    espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s\n",
-                 "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%");
+    espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s %9s\n",
+                 "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%", "HEAP");
 
     for (UBaseType_t i = 0; i < count; i++) {
         /*
@@ -524,14 +524,31 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
             st = 'T';
         }
 
-        espix_printf(s, "%5s %-16s %2c %4u %4s %6u %4u%%\n",
+        /*
+         * The app's own memory, and live rather than reserved: a region is
+         * sized to the request that failed, so reserved is commonly several
+         * times used and would read as a leak. '-' for a task that is not a
+         * process, or one that has not allocated; see docs/APP-MEMORY.md.
+         */
+        char heap_str[12];
+        const size_t heap_used = (pid != ESPIX_PID_NONE)
+                                     ? espix_proc_heap_used(pid)
+                                     : 0;
+        if (heap_used > 0) {
+            snprintf(heap_str, sizeof(heap_str), "%u", (unsigned)heap_used);
+        } else {
+            snprintf(heap_str, sizeof(heap_str), "-");
+        }
+
+        espix_printf(s, "%5s %-16s %2c %4u %4s %6u %4u%% %9s\n",
                      pid_str,
                      tasks[i].pcTaskName,
                      st,
                      (unsigned)tasks[i].uxCurrentPriority,
                      core_str,
                      (unsigned)tasks[i].usStackHighWaterMark,
-                     pct);
+                     pct,
+                     heap_str);
     }
 
     free(tasks);

@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_elf.h"
+#include "multi_heap.h"   /* the private heap an app's arena is carved into */
 
 #include "espix_proc.h"
 
@@ -21,6 +22,34 @@ extern "C" {
 
 /* Room for an app to add variables of its own beyond what it inherited. */
 #define ESPIX_PROC_ENV_ADDED_MAX 8
+
+/*
+ * An app's own memory: a small list of private heaps carved out of PSRAM.
+ *
+ * An app's malloc() used to be the firmware's, so nothing could say what the
+ * app had allocated and nothing could give it back when the app ended -- two
+ * Doom runs left 571 KB of a 13.2 MB pool free, and only a reboot returned it.
+ * A region is the answer: one heap per process, made on demand and sized to the
+ * request that failed, so teardown is a few frees rather than a walk of every
+ * block. The whole design, and the hazards it carries, is in
+ * docs/APP-MEMORY.md; the code is abi_alloc.c, which owns the seam.
+ *
+ * Four rather than more because a slot is already 720 bytes of internal RAM
+ * and this is multiplied by ESPIX_PROC_MAX; in practice a process has one or
+ * two (Doom's single 6 MB zone block is the large case). A fifth request is
+ * refused rather than served.
+ *
+ * 'base' and 'size' exist for the range test alone: free() tells a region
+ * pointer from a global one by asking whether the address is inside a region,
+ * and that comparison is also the classification the whole design rests on.
+ */
+#define ESPIX_APP_REGIONS_MAX 4
+
+typedef struct {
+    multi_heap_handle_t heap;
+    void               *base;
+    size_t              size;
+} espix_app_region_t;
 
 typedef struct {
     espix_proc_info_t info;
@@ -203,6 +232,24 @@ typedef struct {
      * closing one writes into the SSH channel. See espix_proc_detach_streams().
      */
     struct _reent *reent;
+
+    /*
+     * The app's arena; see espix_app_region_t above. Empty until the app
+     * allocates, and emptied again by espix_proc_regions_release() -- which is
+     * reached from espix_proc_release_resources(), so both the clean exit and
+     * the force-kill path give the PSRAM back.
+     */
+    espix_app_region_t regions[ESPIX_APP_REGIONS_MAX];
+    uint8_t            nregions;
+
+    /*
+     * free() calls that named memory outside every region, counted so the
+     * first one can be reported. A pointer from before the arena is legitimate
+     * and must free, so this is not an error path, but the first occurrence is
+     * worth a line: it is how a leak the arena cannot see announces itself.
+     * See abi_alloc.c.
+     */
+    uint32_t           foreign_frees;
 } espix_proc_slot_t;
 
 /* Bit for `sig`, or 0 if it is not a signal. Not sigaddset(): that macro is
@@ -293,6 +340,12 @@ espix_proc_slot_t *espix_proc_alloc_slot(void);
 /* Release everything a finished slot owns: ELF image, argv block. Caller must
  * NOT hold the lock. */
 void espix_proc_release_resources(espix_proc_slot_t *slot);
+
+/* Give back every PSRAM region the process's arena holds. Called from
+ * espix_proc_release_resources() above; takes the slot rather than using
+ * espix_proc_self() because the force-kill path runs on the killer's task.
+ * See abi_alloc.c. */
+void espix_proc_regions_release(espix_proc_slot_t *slot);
 
 /* Record a terminal state and wake anyone in espix_proc_wait(). */
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,

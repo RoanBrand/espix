@@ -248,6 +248,13 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->sig_stop_req = false;
     slot->sig_pending  = 0;
     slot->sig_blocked  = 0;
+
+    /*
+     * And the app's own memory. This is the point of the arena: one release per
+     * region rather than a walk of every block, so a hard kill returns exactly
+     * what a clean exit does -- and both paths already arrive here.
+     */
+    espix_proc_regions_release(slot);
 }
 
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
