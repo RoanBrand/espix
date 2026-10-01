@@ -407,7 +407,7 @@ static volatile sig_atomic_t s_last;
 
 /* What 'hold' is holding, so the arena has something to give back when this
  * process ends -- cleanly or at the point of a SIGKILL. */
-#define TESTAPP_HOLD_MAX 4
+#define TESTAPP_HOLD_MAX 12
 static void *s_hold[TESTAPP_HOLD_MAX];
 static int   s_hold_count;
 

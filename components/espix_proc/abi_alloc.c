@@ -73,6 +73,10 @@
  * and is not worth a line per allocation. */
 static bool s_reported_fallback;
 
+/* Reported once too, and for a different reason: memory served this way is
+ * live but unowned, so it is worth knowing the arena's list limit was reached. */
+static bool s_reported_spill;
+
 /*
  * Serialises every region operation, including multi_heap_* on a region: a
  * region is registered without a lock of its own, so concurrent allocation from
@@ -230,9 +234,16 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
 }
 
 /* Allocate n from the process's arena, registering a region if none fits.
- * Caller holds s_region_lock. */
-static void *region_alloc(espix_proc_slot_t *slot, size_t n)
+ * Caller holds s_region_lock.
+ *
+ * *list_full distinguishes the two ways this can fail: the process's region
+ * list is exhausted, which is a limit of the bookkeeping and must not reach the
+ * app as an allocation failure, or a region was refused, which is the floor and
+ * is deliberate. */
+static void *region_alloc(espix_proc_slot_t *slot, size_t n, bool *list_full)
 {
+    *list_full = false;
+
     if (n == 0) {
         n = 1;
     }
@@ -242,6 +253,11 @@ static void *region_alloc(espix_proc_slot_t *slot, size_t n)
         if (p != NULL) {
             return p;
         }
+    }
+
+    if (slot->nregions >= ESPIX_APP_REGIONS_MAX) {
+        *list_full = true;
+        return NULL;
     }
 
     espix_app_region_t *const r = region_grow(slot, n);
@@ -277,6 +293,18 @@ static void *region_realloc(espix_proc_slot_t *slot, espix_app_region_t *r,
         }
     }
 
+    if (slot->nregions >= ESPIX_APP_REGIONS_MAX) {
+        /* The list is full, so there is nowhere in the arena for it -- but the
+         * block still has to be grown, so move it out of the arena rather than
+         * fail. It will not be reclaimed at exit; see espix_abi_alloc(). */
+        void *const q = alloc_psram(n);
+        if (q != NULL) {
+            memcpy(q, p, (old < n) ? old : n);
+            multi_heap_free(r->heap, p);
+        }
+        return q;
+    }
+
     espix_app_region_t *const nr = region_grow(slot, n);
     if (nr != NULL) {
         void *const q = multi_heap_malloc(nr->heap, n);
@@ -304,12 +332,36 @@ void *espix_abi_alloc(size_t n)
     }
 
     xSemaphoreTake(s_region_lock, portMAX_DELAY);
-    void *const p = region_alloc(slot, n);
+    bool list_full = false;
+    void *const p = region_alloc(slot, n, &list_full);
     xSemaphoreGive(s_region_lock);
 
-    /* NULL is the floor being reached or the region list being full: the arena
-     * refused, and the app sees an allocation failure. See APP-MEMORY.md. */
-    return p;
+    if (p != NULL) {
+        return p;
+    }
+
+    /*
+     * The region list is full. That is a limit of the bookkeeping, not of the
+     * memory -- the pool has room -- so the app must not see an allocation
+     * failure because of it. Serve it globally and say so once: what is
+     * allocated this way is live but unowned, so it is not reclaimed at exit.
+     * That is the status quo rather than a regression, but it is worth a line.
+     */
+    if (list_full) {
+        if (!s_reported_spill) {
+            s_reported_spill = true;
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "pid %d: %d arena regions is the limit; later app "
+                       "allocations come from the global heap and will not be "
+                       "reclaimed at exit",
+                       (int)slot->info.pid, (int)ESPIX_APP_REGIONS_MAX);
+        }
+        return alloc_psram(n);
+    }
+
+    /* Otherwise a region was refused at the floor: a deliberate budget, so the
+     * app sees the failure. See docs/APP-MEMORY.md, "The ceiling". */
+    return NULL;
 }
 
 void *espix_abi_calloc(size_t n, size_t size)

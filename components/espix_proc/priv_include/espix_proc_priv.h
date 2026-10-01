@@ -34,10 +34,13 @@ extern "C" {
  * block. The whole design, and the hazards it carries, is in
  * docs/APP-MEMORY.md; the code is abi_alloc.c, which owns the seam.
  *
- * Four rather than more because a slot is already 720 bytes of internal RAM
- * and this is multiplied by ESPIX_PROC_MAX; in practice a process has one or
- * two (Doom's single 6 MB zone block is the large case). A fifth request is
- * refused rather than served.
+ * Eight rather than four, which is what this started at: four was enough for
+ * the common case but not for repeated allocations of a similar size, where a
+ * request that will not fit beside an earlier block takes a region of its own.
+ * A slot is already 720 bytes of internal RAM and this is multiplied by
+ * ESPIX_PROC_MAX, so the array cannot be large; what happens when it *is* full
+ * therefore matters more than its size, and abi_alloc.c spills to the global
+ * heap rather than failing an allocation the pool could serve.
  *
  * 'base' and 'size' exist for the range test alone: free() tells a region
  * pointer from a global one by asking whether the address is inside a region,

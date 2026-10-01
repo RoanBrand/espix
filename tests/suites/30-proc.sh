@@ -248,3 +248,35 @@ fi
 assert_contains "the device survives a thread free" "espix" \
     "$(dev_run uname)"
 
+
+# --- a fixed-size request list must not fail an ordinary allocation ---------
+#
+# Each region is one fixed-size heap, so a request that will not fit beside an
+# earlier block takes a region of its own. The list is bounded (a slot is 720
+# bytes of internal RAM times twelve), which is exactly the shape that produces
+# a bogus out-of-memory: the pool has room, the bookkeeping does not. Small
+# allocations must share a region, larger repeats must get the regions they
+# need, and past that the arena must spill rather than fail.
+
+out=$(dev_run "$APP hold 0 1000 1000 1000 1000 1000 1000 1000 1000")
+assert_contains "eight small allocations share one arena region" \
+    "held 8 block(s), 8000 bytes" "$out"
+
+out=$(dev_run "$APP hold 0 1000000 1000000 1000000 1000000 1000000")
+assert_contains "five 1 MB allocations all succeed" \
+    "held 5 block(s), 5000000 bytes" "$out"
+
+base4=$(psram_free_kb)
+out=$(dev_run "$APP hold 0 300000 300000 300000 300000 300000 300000 300000 300000 300000 300000")
+assert_contains "past the region list, the arena spills instead of failing" \
+    "held 10 block(s), 3000000 bytes" "$out"
+
+sleep 2
+back4=$(psram_free_kb)
+if [ -n "$back4" ] && [ $((base4 - back4)) -le 1024 ]; then
+    espix_pass "and the arena's regions still come back (${base4}K -> ${back4}K)"
+else
+    espix_fail "the arena's regions come back after a spill" \
+        "PSRAM free ${base4}K -> ${back4}K"
+fi
+

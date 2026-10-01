@@ -157,7 +157,11 @@ the whole reason to prefer them.
 ## Decisions taken
 
 - **Grow, sized from the request that failed.** A 6 MiB ask gets one 6 MiB
-  region, not twenty-four small ones.
+  region, not twenty-four small ones. Four fifths of this question turned out to
+  be already answered by the minimum and the 32 KB floor: eight 1000-byte
+  allocations share the first region, because a failed request does not make a
+  new region until every existing one has been tried. What *was* wrong is the
+  next bullet.
 - **A global ceiling, not a per-process cap**: the sum of all app regions may not
   take PSRAM past a reserved floor, so one app cannot take the pool and leave the
   system unable to draw. Expressed as *free PSRAM stays above N* rather than a
@@ -169,6 +173,14 @@ the whole reason to prefer them.
 - **Lazy**: no region until the first allocation. The cost is one
   `heap_caps_malloc` and one `multi_heap_register` on that call, and again if a
   later request outgrows every region — microseconds, not a policy.
+- **A full region list spills to the global heap; it never fails the
+  allocation.** The array holds eight because a slot is 720 bytes of internal
+  RAM times twelve, and a request that will not fit beside an earlier block
+  takes a region of its own — five 1 MB blocks need five regions. That is
+  bookkeeping, not memory, and `malloc()` returning NULL with half the pool free
+  would be a lie. What spills is not reclaimed at exit (the status quo), is
+  logged once, and does not appear in the `HEAP` column, which sums
+  region usage only.
 - **A foreign `free()` falls through and is counted, not logged.** Except one
   source, which is a bug rather than a logging question: `abi_cxx.cpp` publishes
   `operator new`/`delete` and those call the *firmware's* malloc internally, so a
@@ -240,7 +252,7 @@ Concrete enough to be mechanical, in the order it has to happen.
 **Types** — in `espix_proc_priv.h`, beside the slot they live in:
 
 ```c
-#define ESPIX_APP_REGIONS_MAX 4      /* normally 1-2; 4 x 12B x 12 slots = 576B */
+#define ESPIX_APP_REGIONS_MAX 8      /* 8 x 12B x 12 slots = 1.2 KB of internal RAM */
 
 typedef struct {
     multi_heap_handle_t heap;
@@ -250,8 +262,10 @@ typedef struct {
 ```
 
 and on `espix_proc_slot_t`: `espix_app_region_t regions[ESPIX_APP_REGIONS_MAX];`
-plus `uint8_t nregions;`. Four regions rather than eight because the slot is
-already 720 bytes and this is internal RAM times twelve.
+plus `uint8_t nregions;`. The array is a *bookkeeping* limit, not a budget, and
+that distinction is the whole of the next paragraph: eight entries because the
+slot is already 720 bytes of internal RAM times twelve, and because repeated
+allocations of a similar size each need a region of their own.
 
 **Functions** — all in `abi_alloc.c`, which already owns the seam:
 
