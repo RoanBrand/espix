@@ -55,9 +55,10 @@ it, and route the app's allocations there.
 - Reclamation becomes one operation — destroy the heap — rather than a walk.
 - An app's fragmentation is its own, and the region *is* the budget the roadmap
   asks for ("budgets before a reaper").
-- But `multi_heap_register` cannot grow: the size is chosen up front per
-  process. And `free()` needs a range check to tell an arena pointer from a
-  global one.
+- `multi_heap_register` gives one region and cannot grow *it* — but nothing
+  stops us registering more of them. A process keeps a **list** of regions, and
+  that turns a fixed size into a growable one; see below. `free()` still needs a
+  range check to tell a region pointer from a global one.
 
 **Recommendation: B.** The reclamation-is-one-operation property is the whole
 point, and the fixed size is not a defect if it is done the right way: **create
@@ -116,8 +117,11 @@ does not reserve twelve arenas.
 
 ## Open questions
 
-1. **Exhaustion**: fall through to the global heap, or fail? (Decides whether
-   this is a budget or a hint.)
+1. ~~**Exhaustion**: fall through to the global heap, or fail?~~ **Answered by
+   growing**: register another region. There is no budget to exceed, so there is
+   no policy to choose — a request fails only when PSRAM itself is full, which is
+   what happens today. What remains is whether to cap the *number* of regions per
+   process, so one app cannot take the whole pool before another starts.
 2. **Size**, and whether it is per-process or a shared pool with per-process
    accounting. A pool shares the fragmentation; per-process isolates it.
 3. Should `free()` on a foreign pointer be a quiet fall-through, or logged? It
