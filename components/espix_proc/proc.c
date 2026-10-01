@@ -493,7 +493,28 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot)
             continue;
         }
         if (!sig_default_ignores(sig)) {
-            slot->stop_requested = true;
+            /*
+             * POSIX's default action for this signal is "terminate", and a
+             * default action is defined by needing nothing from the process --
+             * which is why it may not be cooperative. It used to set
+             * stop_requested and wait for the app to notice at its next
+             * espix_sigcheck(), so a process that never asked to be stopped was
+             * left running until something escalated to SIGKILL.
+             *
+             * An app that wants to put its hardware back installs a handler and
+             * never arrives here. For an Arduino sketch that is the shim's job
+             * and not espix's: neopixel catches SIGTERM/SIGINT/SIGHUP precisely
+             * so that teardown() runs, and espix does not bend its semantics to
+             * give a sketch what the shim can give it.
+             *
+             * This runs on the process's own task, at a delivery point it
+             * reached itself, with no lock held (the table lock is released
+             * above the loop), so ending the process is the ordinary exit:
+             * streams closed, the ELF released, the slot marked EXITED with
+             * 128+sig, and that status reaches whoever ran it. The same door an
+             * app's own exit() uses.
+             */
+            espix_proc_exit(128 + sig);
         }
     }
 
