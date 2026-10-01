@@ -171,6 +171,45 @@ the whole reason to prefer them.
   `operator new`/`delete` and those call the *firmware's* malloc internally, so a
   C++ app's `new` bypasses the regions entirely and leaks on exit. Fix, not count.
 
+### Foreign pointers, settled
+
+**Nothing is tracked.** The range check *is* the classification, and it happens
+per call rather than being stored: "is this pointer inside one of my regions" is
+an address comparison, and there is nothing to maintain. Wanting to know what
+every foreign pointer *is* would mean per-allocation bookkeeping for the rare
+case, which is the cost this design exists to avoid.
+
+**Out of range falls through to the global `free`, and is counted.** Not refused:
+an app driving hardware directly — an Arduino sketch does, and one of espix's own
+example apps is exactly that — may well hold memory espix handed it, and the rule
+has to be "this succeeds", not "this is correct". So: free it globally, add it to
+a per-process count, and print **the first one only**, at WARN. First-only because
+a legitimate path that does this routinely must not flood the ring, and WARN
+because the first occurrence is genuinely worth seeing.
+
+**And `operator new`/`delete` move to the resolver with `malloc`.** Today
+`abi_cxx.cpp` maps them to the firmware's own, whose internals call the
+firmware's malloc — so a C++ app's `new` never reaches a region. They want the
+same treatment as `malloc`: espix's own definitions, published through the
+resolver, calling the region-aware allocator.
+
+### The ceiling
+
+**Free PSRAM must stay above 4 MB.** Not a flat reserve for espix in general, but
+the size of the largest thing espix asks for at once: at 1280x800 the canvas is
+2 MB and the RFB staging buffer beside it is another 2 MB, and the moment they are
+asked for is **an app's exit** — which is the known case where the allocation
+fails and the viewer is dropped (KNOWN-ISSUES). The floor exists so the way out
+stays affordable; below it, an app's request to grow is refused.
+
+### The `ps` column
+
+**One column, `HEAP`, showing bytes *used*** — the sum of
+`multi_heap_get_info().total_allocated_bytes` over the process's regions. Not
+*reserved*: a region is sized to the request that failed, so reserved is commonly
+several times used, and a number that looks like 10x what an app is using reads as
+a leak. Reserved belongs in the docs, not the table.
+
 ## Open questions
 
 1. ~~**Exhaustion**: fall through to the global heap, or fail?~~ **Answered by
