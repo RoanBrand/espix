@@ -167,10 +167,6 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(__ledf2),
     ESP_ELFSYM_EXPORT(__truncdfsf2),
 
-    /* What assert() lands on. An app built with NDEBUG never references it;
-     * one built without it fails to load unless this is here. */
-    ESP_ELFSYM_EXPORT(__assert_func),
-
     ESP_ELFSYM_END
 };
 

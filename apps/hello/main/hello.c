@@ -13,8 +13,10 @@
  * if it runs at all, every name below resolved.
  */
 
+#include <assert.h>
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -98,6 +100,41 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "fail") == 0) {
         printf("exiting with status 3\n");
         return 3;
+    }
+
+    /*
+     * And the other way out, which is the one a real program uses.
+     *
+     * exit() resolved to the firmware's until abi_exit.c claimed it, and the
+     * firmware's ends at IDF's _exit() == abort(): `hello exit 5` did not print
+     * [exit 5], it reset the board. Now the status reaches the shell exactly as
+     * a return does, and the device stays up -- which is what this case pins.
+     */
+    if (argc > 2 && strcmp(argv[1], "exit") == 0) {
+        const int n = atoi(argv[2]);
+        printf("calling exit(%d)\n", n);
+        exit(n);
+    }
+
+    /*
+     * abort() and a failing assert(). Both used to reboot the board, and the
+     * assert reached it by a route a symbol override cannot close on its own:
+     * the failing assert calls the *firmware's* __assert_func, which calls the
+     * firmware's abort at its own link time. abi_exit.c claims both names.
+     *
+     * 134 is 128 + SIGABRT, which is what a shell reports for a process killed
+     * by that signal.
+     */
+    if (argc > 1 && strcmp(argv[1], "abort") == 0) {
+        printf("calling abort()\n");
+        abort();
+    }
+
+    if (argc > 1 && strcmp(argv[1], "assert") == 0) {
+        printf("about to fail an assertion\n");
+        assert(argc < 0);
+        printf("assert did not fire, which is its own bug\n");
+        return 1;
     }
 
     return 0;

@@ -2,6 +2,7 @@
  * shared between proc.c (table, wait, kill) and exec.c (loading and running). */
 #pragma once
 
+#include <setjmp.h>     /* jmp_buf: how an app's exit() gets home */
 #include <stdio.h>      /* struct _reent, for the stdio a force-kill puts back */
 
 #include "freertos/FreeRTOS.h"
@@ -62,6 +63,25 @@ typedef struct {
      * false.
      */
     volatile bool stop_requested;
+
+    /*
+     * How exit() gets home.
+     *
+     * An app's exit()/_Exit()/abort() must run the same teardown a return from
+     * app_main() does -- streams closed, ELF released, the slot marked EXITED
+     * with the right status. Deleting the task right there instead is what used
+     * to leak the image and lose the exit status, so proc_task() arms a longjmp
+     * target across the call into the app and espix_proc_exit() jumps to it.
+     *
+     * The jmp_buf lives in proc_task()'s frame, not here: it is valid only
+     * while that frame is alive, and a jmp_buf per slot would be paid by every
+     * slot to hold a pointer that is NULL except while the app runs. exit_jmp
+     * being non-NULL is therefore also the test for "this slot's own task is
+     * running the app", which is what keeps exit() called from a thread the app
+     * created from longjmp'ing into a stack it does not own.
+     */
+    jmp_buf  *exit_jmp;
+    int       exit_status;
 
     /*
      * The process's working directory, so a relative path an app hands to
@@ -313,6 +333,17 @@ espix_proc_slot_t *espix_proc_find(espix_pid_t pid);
 /* The calling task's slot, or NULL if it is not a process. Takes no lock: the
  * caller is the process itself, so its slot cannot be recycled underneath it. */
 espix_proc_slot_t *espix_proc_self(void);
+
+/* End the calling process with `status`, running the same teardown a return
+ * from the app's entry point does. Never returns. Called by the override table
+ * in abi_exit.c; see the note there for why it is a longjmp rather than a
+ * vTaskDelete(). */
+void espix_proc_exit(int status) __attribute__((noreturn));
+
+/* Publish exit()/_Exit()/_exit()/abort()/__assert_func to apps. See abi_exit.c:
+ * this is a resolver table, not a symbol table, because the loader's own libc
+ * table answers for `exit` and is searched first. */
+void espix_proc_abi_exit_register(void);
 
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);

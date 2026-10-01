@@ -84,6 +84,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
     espix_proc_abi_env_register();
+    espix_proc_abi_exit_register();
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
     espix_proc_abi_libm_register();

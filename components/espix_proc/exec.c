@@ -10,6 +10,7 @@
  */
 
 #include <errno.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -333,6 +334,47 @@ static void relocate_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/*
+ * End the calling process, the way returning from its entry point would.
+ *
+ * Called by the exit()/_Exit()/_exit()/abort()/__assert_func overrides an app
+ * resolves to (abi_exit.c). It returns to proc_task()'s setjmp, and the normal
+ * teardown runs from there -- which is the whole point: an app's own exit must
+ * not skip releasing the image or lose the status.
+ *
+ * The slot lookup is not paranoia. A process is one espix process but may be
+ * several FreeRTOS tasks -- an app that called pthread_create() -- and
+ * espix_proc_self() keys on the *calling* task. So an exit() from a thread the
+ * app created finds no slot and takes the branch below: longjmp'ing there would
+ * land in the app's main frame from another task's stack.
+ */
+void espix_proc_exit(int status)
+{
+    espix_proc_slot_t *const slot = espix_proc_self();
+
+    if (slot != NULL && slot->exit_jmp != NULL) {
+        slot->exit_status = status;
+        longjmp(*slot->exit_jmp, 1);
+    }
+
+    /*
+     * POSIX says exit() from any thread ends the process. espix ends the calling
+     * thread instead and says so, because the alternative is undefined behaviour
+     * rather than a slower correct answer. Recorded in docs/KNOWN-ISSUES.md: an
+     * app that wants its process to end should exit from the task that entered
+     * app_main().
+     */
+    espix_klog(ESPIX_KLOG_WARN, TAG,
+               "exit(%d) from a task that is not the process's own; "
+               "ending that task only", status);
+    vTaskDelete(NULL);
+
+    /* Deleting the calling task does not return; this is for the compiler, which
+     * cannot know that vTaskDelete(NULL) is terminal. Reaching it would be a
+     * FreeRTOS bug, so it is unreachable rather than a spin. */
+    __builtin_unreachable();
+}
+
 static void proc_task(void *arg)
 {
     espix_proc_slot_t *slot = arg;
@@ -479,6 +521,9 @@ static void proc_task(void *arg)
     int  status = 126;
     bool ran    = false;
 
+    /* exit()'s landing site while the app runs; see the call below. */
+    jmp_buf exit_jb;
+
     esp_err_t err = load_image(slot->info.path, &slot->image,
                                &slot->info.image_bytes);
     if (err != ESP_OK) {
@@ -554,8 +599,31 @@ static void proc_task(void *arg)
      * away, so an exit status could never reach the shell. This replicates its
      * only other behaviour (the NULL check above). Do not "fix" this back.
      */
+    /*
+     * The app runs with a way out that is not "delete this task".
+     *
+     * exit(), _Exit(), _exit() and abort() from the app longjmp back here (see
+     * abi_exit.c), so they land on the same teardown a normal return from
+     * app_main() gets -- streams closed, the ELF released, the slot marked
+     * EXITED with the app's status. Before this, the firmware's exit() ended at
+     * IDF's _exit(), which is abort(): calling the most ordinary function in C
+     * reset the board.
+     *
+     * The jmp_buf is a local, so it is alive exactly as long as this frame is,
+     * and exit_jmp is cleared before the teardown so nothing can jump into a
+     * frame on its way out. status is assigned in both arms: the value the entry
+     * call would have written is indeterminate after a longjmp.
+     */
     ran = true;
-    status = slot->elf.entry(slot->argc, slot->argv);
+    slot->exit_jmp = &exit_jb;
+
+    if (setjmp(exit_jb) == 0) {
+        status = slot->elf.entry(slot->argc, slot->argv);
+    } else {
+        status = slot->exit_status;
+    }
+
+    slot->exit_jmp = NULL;
 
 done:
     /*

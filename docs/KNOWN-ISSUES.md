@@ -13,6 +13,19 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Processes
 
+- **`exit()` from a thread the app created ends the thread, not the process.**
+  POSIX says `exit()` in any thread terminates the whole process; espix ends the
+  calling thread and logs a warning. The reason is mechanical rather than a
+  choice: a process's exit path is a `longjmp` back to `proc_task()`, and
+  jumping there from another task's stack would land in a frame that task does
+  not own -- undefined behaviour, and it would corrupt the app's own stack.
+  An app that wants its process to end should call `exit()` from the task that
+  entered `app_main()`, which is where a normal `return` goes anyway.
+
+  `atexit()` is still unpublished, so no handler runs on the way out either.
+  Both are the same missing piece: a process that owns what it allocated, which
+  is the entry at the top of this file.
+
 - **A hard kill leaks whatever the app held.** SIGKILL deletes the task
   outright, so `teardown()` never runs. The neopixel app hands its RMT channel
   back there (`rmtDeinit()`), and without that the channel and its GPIO

@@ -165,20 +165,19 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(labs),
     ESP_ELFSYM_EXPORT(llabs),
     ESP_ELFSYM_EXPORT(qsort),
-    /* qsort's other half, and the two that need no explanation. `abort` is
-     * already reachable -- `__assert_func` is published and calls it -- so
-     * listing it adds the name, not the ability. */
+    /* qsort's other half, and the two that need no explanation. `abort` is not
+     * listed here: it is claimed by abi_exit.c through the resolver, because the
+     * firmware's abort() panics and reboots and an app's assert() reached it. A
+     * table entry would be dead anyway -- the resolver is searched first. */
     ESP_ELFSYM_EXPORT(bsearch),
     ESP_ELFSYM_EXPORT(rand),
     ESP_ELFSYM_EXPORT(srand),
-    ESP_ELFSYM_EXPORT(abort),
     ESP_ELFSYM_EXPORT(strtoul),
     ESP_ELFSYM_EXPORT(strtoll),
     ESP_ELFSYM_EXPORT(strtoull),
     ESP_ELFSYM_EXPORT(atof),
     ESP_ELFSYM_EXPORT(putenv),
     ESP_ELFSYM_EXPORT(vsprintf),
-    ESP_ELFSYM_EXPORT(_Exit),
 
     /*
      * Deliberately not here, and worth saying where the next person will look:
@@ -194,6 +193,11 @@ static const struct esp_elfsym s_libc_syms[] = {
      *
      * ctype.h needs nothing: newlib implements it as macros over `_ctype_`, and
      * the loader publishes that table.
+     *
+     * exit(), _Exit(), _exit(), abort() and __assert_func are not here either,
+     * and could not be: the loader's libc table answers for `exit` before any
+     * table of espix's is consulted. They are claimed by abi_exit.c through the
+     * resolver, which is the only seam that can shadow them.
      */
 
     ESP_ELFSYM_END
