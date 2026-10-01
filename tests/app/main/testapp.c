@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <utime.h>
 
@@ -940,6 +941,67 @@ static int cmd_leakthread(const char *bytes_s)
     return 0;
 }
 
+/*
+ * Threads that coordinate, and a thread that can talk.
+ *
+ * Four threads each add to one counter under a mutex, so the total checks
+ * mutual exclusion rather than arithmetic -- a broken lock loses updates. Each
+ * thread also prints, which before R-P1.10 went to the UART instead of the
+ * session: a new thread's reent carries the console's stdout, not the process's.
+ */
+static pthread_mutex_t s_bump_lock;
+static int             s_bumped;
+
+static void *bump_counter(void *arg)
+{
+    const int n = (int)(intptr_t)arg;
+
+    printf("thread running for %d\n", n);
+    for (int i = 0; i < n; i++) {
+        pthread_mutex_lock(&s_bump_lock);
+        s_bumped++;
+        pthread_mutex_unlock(&s_bump_lock);
+    }
+    return NULL;
+}
+
+static int cmd_threaded(const char *count_s)
+{
+    enum { THREADS = 4 };
+
+    const int n = (int)strtol(count_s, NULL, 10);
+    if (n <= 0) {
+        printf("threaded: count must be positive\n");
+        return 1;
+    }
+
+    pthread_t t[THREADS];
+    int made = 0;
+
+    s_bumped = 0;
+    if (pthread_mutex_init(&s_bump_lock, NULL) != 0) {
+        printf("threaded: pthread_mutex_init failed\n");
+        return 1;
+    }
+
+    for (int i = 0; i < THREADS; i++) {
+        const int rc = pthread_create(&t[i], NULL, bump_counter, (void *)(intptr_t)n);
+        if (rc != 0) {
+            printf("threaded: pthread_create failed (%d)\n", rc);
+            break;
+        }
+        made++;
+    }
+
+    for (int i = 0; i < made; i++) {
+        pthread_join(t[i], NULL);
+    }
+    pthread_mutex_destroy(&s_bump_lock);
+
+    printf("counter %d after %d thread(s) x %d\n", s_bumped, made, n);
+    return (made == THREADS && s_bumped == THREADS * n) ? 0 : 1;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -969,6 +1031,7 @@ static void usage(void)
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"
            "  leak <bytes>...     allocate and return without freeing any of it\n"
            "  leakthread <bytes> allocate in a new thread, never free it\n"
+           "  threaded <n>        four threads add n each under a mutex\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -1092,6 +1155,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "leakthread") == 0 && argc > 2) {
         return cmd_leakthread(argv[2]);
+    }
+    if (strcmp(cmd, "threaded") == 0 && argc > 2) {
+        return cmd_threaded(argv[2]);
     }
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {

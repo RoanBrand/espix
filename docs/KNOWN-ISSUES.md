@@ -1758,3 +1758,23 @@ PSRAM-stacked task is fine, and reading one is not.
 
 This is unrelated to the per-process arena (R-P1.2): it is the transport and
 IDF's cache rule.
+
+
+## A thread that exits holding the process's stdout closes it
+
+**Found** the first time app threads were given the process's streams. An app's
+stdout is a funopen() object over its session, held in the reent of the task
+that entered app_main(). Giving a *thread* that same FILE in its own reent makes
+it able to print -- and makes its death close the stream: FreeRTOS deletes a
+task by running _reclaim_reent() on its reent, which fcloses every stream in it
+that is not the global one. The next write from the process then asserts in
+puts() with "spinlock_acquire spinlock.h:142", because the FILE's lock was
+released from the deleting context.
+
+The fix is the one the kill path already used: put the globals back before the
+reent is reclaimed. abi_pthread.c does it on the trampoline's way out, and in a
+wrapper around pthread_exit, since a thread that ends that way never returns
+through the trampoline. See the R-P1.10 section of APP-MEMORY.md.
+
+Worth knowing because the symptom names puts() and a spinlock, and nothing in it
+says streams or threads.

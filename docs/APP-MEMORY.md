@@ -434,3 +434,48 @@ check cannot tell the difference. The real answer is that app threads do not
 outlive the process: stop them at teardown, which is R-P1.6's job. The same
 applies to a thread that ends through pthread_exit(), which the trampoline
 cannot clear up after.
+
+
+### The rest of the thread surface
+
+R-P1.10 made a thread's memory the process's. It did not make threads usable,
+and two things were missing.
+
+**Coordination did not exist.** The loader answers for exactly six pthread
+names -- create, join, detach, exit, and two attribute calls -- so an app could
+start a thread and wait for it and nothing else. A call to pthread_mutex_lock
+did not misbehave, it failed to *load*: the name resolved nowhere. espix now
+publishes the rest of the surface it can honestly support -- mutexes, condition
+variables, rwlocks, self/equal, the key/getspecific/setspecific trio,
+pthread_once, and the POSIX semaphores -- through esp_elf_register_symbol rather
+than the resolver, because they are additions and not overrides. The exception
+is pthread_exit, which is one of the six and therefore has to shadow.
+
+Referencing them is also what keeps them in the image. IDF force-links each
+pthread module with a -u on its pthread_include_*_impl marker, but the build
+garbage-collects unreferenced sections, so without a reference the marker
+survives and the functions do not.
+
+pthread_cancel is deliberately absent: IDF's implementation is a stub, and
+exporting it would advertise a guarantee that does not exist.
+
+**A thread could not talk.** An app's stdout and stderr are funopen() objects
+over its session, installed in the reent of the task that entered app_main(). A
+new thread gets a *fresh* reent whose streams are the console's, so its printf
+went to the UART and the user saw nothing. The trampoline now copies the
+process's three stream pointers in before the app's routine runs.
+
+**And that is where the trap was, so it is worth stating plainly.** FreeRTOS
+deletes a task by running _reclaim_reent() on its reent, and that fcloses every
+stream in it that is not the global one. A thread holding the process's stdout
+therefore makes the *thread's* death close the *process's* stream -- from the
+deleting context, possibly mid-write. The first version of this shipped without
+taking the pointers back and took the board down inside puts() with a spinlock
+assert. espix_proc_detach_streams() had already solved exactly this for the
+process's own task by restoring the globals before deletion; the trampoline now
+does the same on its way out, and pthread_exit is wrapped so a thread that never
+returns through the trampoline is covered too.
+
+Tested: four threads each add 5000 to one counter under a mutex and the total is
+20000, every thread prints and its output arrives at the session, and the device
+is up afterwards. 46/46 on the S31.

@@ -325,3 +325,19 @@ else
         "PSRAM free ${base6}K -> ${back6}K"
 fi
 
+
+
+# --- threads can coordinate, and a thread can talk -------------------------
+#
+# Four threads each add to one counter under a mutex, so the total checks
+# mutual exclusion rather than arithmetic. Before this, the mutex did not
+# resolve at all -- an app calling pthread_mutex_lock failed to *load* -- and a
+# thread's printf went to the UART instead of the session.
+
+out=$(dev_run "$APP threaded 5000")
+assert_contains "a thread's output reaches the session" \
+    "thread running for 5000" "$out"
+assert_contains "four threads share a counter under a mutex" \
+    "counter 20000 after 4 thread(s) x 5000" "$out"
+assert_contains "and the device is still up" "espix" "$(dev_run uname)"
+
