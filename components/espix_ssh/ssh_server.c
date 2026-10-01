@@ -1,9 +1,10 @@
 /*
  * SSH listener and connection lifecycle.
  *
- * One connection at a time by design for this milestone: the shell's dispatch
- * is already reentrant, but memory and failure isolation are worth proving with
- * a single session before multiplying them.
+ * The accept loop and each connection are separate tasks, so accepting and
+ * serving are already decoupled. What is not decoupled is the moment a TCP
+ * handshake completes and the moment accept() picks the connection up, and that
+ * gap is what the listen backlog bounds -- see LISTEN_BACKLOG.
  */
 
 #include <errno.h>
@@ -31,7 +32,33 @@
 
 #define TAG "sshd"
 
-#define LISTEN_BACKLOG 1
+/*
+ * How many connections may complete their TCP handshake and wait to be accepted.
+ *
+ * This is not the session limit, and the two bound different things.
+ * CONFIG_ESPIX_SSH_MAX_SESSIONS counts sessions espix has *accepted* and is
+ * running; the backlog bounds the queue of connections the stack has finished
+ * the handshake with but no accept() has claimed yet. Every TCP stack has that
+ * queue, because a client's connect() must be able to finish while the
+ * application is momentarily elsewhere -- here, between one accept() returning
+ * and the next being called, which is a window the loop walks through for every
+ * connection it starts.
+ *
+ * It was 1, left from when this server really was one session at a time, and
+ * that is a cliff rather than a queue: lwIP drops a SYN that arrives with the
+ * queue full (tcp_listen_input, "listen backlog exceeded") and returns without
+ * a reset and without telling the application, so the client sees a connection
+ * that never arrives and espix has nothing to log. That is the shape of a
+ * one-in-seventy failure seen under bursts of simultaneous logins.
+ *
+ * A queue entry costs nothing until it is used: the number lives in the
+ * listening pcb, and a waiting connection takes one tcp_pcb from lwIP's pool
+ * (CONFIG_LWIP_MAX_ACTIVE_TCP, 16 -- enough for eight queued and eight
+ * accepted, which is the worst legitimate case). So it is set to the session
+ * limit: a connection espix would have served is never refused for want of a
+ * place to wait.
+ */
+#define LISTEN_BACKLOG CONFIG_ESPIX_SSH_MAX_SESSIONS
 
 static int                s_listen_fd = -1;
 static espix_ssh_status_t s_status;
