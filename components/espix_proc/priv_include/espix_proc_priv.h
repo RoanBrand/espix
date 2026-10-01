@@ -389,6 +389,16 @@ void espix_proc_abi_exit_register(void);
  * first, and it is where the per-process regions (R-P1.2) will attach. */
 void espix_proc_abi_alloc_register(void);
 
+/*
+ * The allocator itself, so abi_cxx.cpp's operator new/delete reach the same one
+ * the C names do. An app's C++ and C allocations must come from the same place
+ * or only half of them are findable when the app ends.
+ */
+void  *espix_abi_alloc(size_t n);
+void  *espix_abi_calloc(size_t n, size_t size);
+void  *espix_abi_realloc(void *p, size_t n);
+void   espix_abi_free(void *p);
+
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);
 

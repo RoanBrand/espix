@@ -61,12 +61,12 @@ static void *alloc_psram(size_t n)
     return p;
 }
 
-static void *abi_malloc(size_t n)
+void *espix_abi_alloc(size_t n)
 {
     return alloc_psram(n);
 }
 
-static void *abi_calloc(size_t n, size_t size)
+void *espix_abi_calloc(size_t n, size_t size)
 {
     void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (p != NULL) {
@@ -82,7 +82,7 @@ static void *abi_calloc(size_t n, size_t size)
     return p;
 }
 
-static void *abi_realloc(void *p, size_t n)
+void *espix_abi_realloc(void *p, size_t n)
 {
     /* Grows into PSRAM from wherever the block was; heap_caps_realloc() moves
      * and copies when the caps differ, which is what we want here. */
@@ -90,7 +90,7 @@ static void *abi_realloc(void *p, size_t n)
     return (q != NULL) ? q : realloc(p, n);
 }
 
-static void abi_free(void *p)
+void espix_abi_free(void *p)
 {
     /* One call for every pool: espix's heap is one system with several regions,
      * so this is already correct for a pointer the app was given rather than
@@ -124,10 +124,10 @@ static char *abi_strdup(const char *s)
  * C++ translation unit to be spelled at all; see the note there.
  */
 static const abi_sym_t s_alloc_syms[] = {
-    ABI_SYM("malloc",  abi_malloc),
-    ABI_SYM("calloc",  abi_calloc),
-    ABI_SYM("realloc", abi_realloc),
-    ABI_SYM("free",    abi_free),
+    ABI_SYM("malloc",  espix_abi_alloc),
+    ABI_SYM("calloc",  espix_abi_calloc),
+    ABI_SYM("realloc", espix_abi_realloc),
+    ABI_SYM("free",    espix_abi_free),
     ABI_SYM("strdup",  abi_strdup),
 };
 

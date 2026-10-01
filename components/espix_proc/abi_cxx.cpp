@@ -30,6 +30,7 @@
 
 #include "espix_kernel.h"
 #include "espix_proc.h"
+#include "espix_proc_priv.h"   /* the allocator, and espix_proc_exit */
 
 #define TAG "abi"
 
@@ -134,18 +135,10 @@ extern "C" void _ZSt25__throw_bad_function_callv(void)
  * are written out.
  */
 static esp_elf_symbol_table_t s_cxx_syms[] = {
-    { "_Znwj",   reinterpret_cast<const void *>(
-                     static_cast<void *(*)(size_t)>(::operator new)) },
-    { "_Znaj",   reinterpret_cast<const void *>(
-                     static_cast<void *(*)(size_t)>(::operator new[])) },
-    { "_ZdlPv",  reinterpret_cast<const void *>(
-                     static_cast<void (*)(void *) noexcept>(::operator delete)) },
-    { "_ZdaPv",  reinterpret_cast<const void *>(
-                     static_cast<void (*)(void *) noexcept>(::operator delete[])) },
-    { "_ZdlPvj", reinterpret_cast<const void *>(
-                     static_cast<void (*)(void *, size_t) noexcept>(::operator delete)) },
-    { "_ZdaPvj", reinterpret_cast<const void *>(
-                     static_cast<void (*)(void *, size_t) noexcept>(::operator delete[])) },
+    /* The allocator is NOT here. It moved to the resolver (see s_cxx_alloc below),
+     * because these functions call the *firmware's* malloc internally -- so an
+     * app's `new` never reached espix's allocator at all, and a C++ app would
+     * have leaked its allocations however good the region design was. */
 
     { "__cxa_pure_virtual",  reinterpret_cast<const void *>(__cxa_pure_virtual) },
     { "__cxa_guard_acquire", reinterpret_cast<const void *>(__cxa_guard_acquire) },
@@ -171,6 +164,53 @@ static esp_elf_symbol_table_t s_cxx_syms[] = {
     ESP_ELFSYM_END
 };
 
+/*
+ * The C++ allocator, answered here because the mangled names need C++ to spell.
+ *
+ * These are espix's functions published *under* the mangled names, rather than
+ * espix defining `operator new` itself: libstdc++ already defines those, and a
+ * second definition is a duplicate symbol at link time. The resolver maps a name
+ * to an address, so an app's `new` can land anywhere -- which is how this goes
+ * through the same allocator the C names do.
+ *
+ * Failure ends the app rather than returning NULL: `operator new` is not allowed
+ * to return NULL, and this build has exceptions off, so there is no bad_alloc to
+ * throw. espix_proc_exit() is the firmware's own way to end a process -- calling
+ * abort() from here would reach the *firmware's* abort, which panics and reboots.
+ */
+extern "C" void *espix_abi_cxx_new(size_t n)
+{
+    void *p = espix_abi_alloc(n > 0 ? n : 1);
+    if (p == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG,
+                   "operator new(%u) failed; ending the app", (unsigned)n);
+        espix_proc_exit(134);       /* noreturn */
+    }
+    return p;
+}
+
+extern "C" void espix_abi_cxx_delete(void *p)
+{
+    espix_abi_free(p);
+}
+
+/* The sized forms exist so the compiler can hand a size back; the allocator does
+ * not need it, and ignoring it is what a non-tracking allocator does. */
+extern "C" void espix_abi_cxx_delete_sized(void *p, size_t n)
+{
+    (void)n;
+    espix_abi_free(p);
+}
+
+static const abi_sym_t s_cxx_alloc_syms[] = {
+    { "_Znwj",   reinterpret_cast<uintptr_t>(&espix_abi_cxx_new) },
+    { "_Znaj",   reinterpret_cast<uintptr_t>(&espix_abi_cxx_new) },
+    { "_ZdlPv",  reinterpret_cast<uintptr_t>(&espix_abi_cxx_delete) },
+    { "_ZdaPv",  reinterpret_cast<uintptr_t>(&espix_abi_cxx_delete) },
+    { "_ZdlPvj", reinterpret_cast<uintptr_t>(&espix_abi_cxx_delete_sized) },
+    { "_ZdaPvj", reinterpret_cast<uintptr_t>(&espix_abi_cxx_delete_sized) },
+};
+
 extern "C" void espix_proc_abi_cxx_register(void)
 {
     if (esp_elf_register_symbol(s_cxx_syms) != 0) {
@@ -178,6 +218,12 @@ extern "C" void espix_proc_abi_cxx_register(void)
                    "could not publish the C++ runtime to apps");
         return;
     }
+
+    /* The allocator goes through the resolver, not the table above: the table is
+     * searched after the loader's own, and after espix's other tables, while the
+     * resolver is searched before everything. */
+    espix_abi_resolver_add(s_cxx_alloc_syms,
+                           sizeof(s_cxx_alloc_syms) / sizeof(s_cxx_alloc_syms[0]));
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "C++ runtime published to apps");
 }
