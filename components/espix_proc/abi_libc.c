@@ -112,7 +112,9 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(vprintf),
     ESP_ELFSYM_EXPORT(setvbuf),
     ESP_ELFSYM_EXPORT(setbuf),
-    ESP_ELFSYM_EXPORT(fflush),
+    /* fflush is not here: abi_cxx.cpp publishes it, that table is registered
+     * first, and both names point at libc's -- so this entry was unreachable.
+     * The C++ side is where it earns its place (iostream flushing). */
     ESP_ELFSYM_EXPORT(clearerr),
     /* Input, and parsing what was read. `fgetc` and `getc` are the same call
      * under two names and both are listed because both are what code says; the
@@ -176,7 +178,6 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(strtoll),
     ESP_ELFSYM_EXPORT(strtoull),
     ESP_ELFSYM_EXPORT(atof),
-    ESP_ELFSYM_EXPORT(putenv),
     ESP_ELFSYM_EXPORT(vsprintf),
 
     /*
@@ -193,6 +194,11 @@ static const struct esp_elfsym s_libc_syms[] = {
      *
      * ctype.h needs nothing: newlib implements it as macros over `_ctype_`, and
      * the loader publishes that table.
+     *
+     * putenv() is not here either: abi_env.c claims it through the resolver,
+     * which is searched before any table, so the entry that used to be here was
+     * dead. A name published twice reads as a promise and resolves to whichever
+     * ran first -- which is the class of bug tools/check-abi.py cannot see yet.
      *
      * exit(), _Exit(), _exit(), abort() and __assert_func are not here either,
      * and could not be: the loader's libc table answers for `exit` before any
