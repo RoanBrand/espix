@@ -542,16 +542,23 @@ static void audio_task(void *arg)
         }
 
         /*
-         * Yield a little, a few times a second.
+         * Yield a little, once every few seconds.
          *
          * While the ring is filling, feed() returns immediately, so this loop
          * never blocks and core 1's idle task starves -- long enough to trip the
-         * task watchdog (seen as "IDLE1 (CPU 1) did not reset the watchdog").
-         * Once the ring is full feed() blocks on its own and this costs nothing.
-         * 1 tick twice a second is ~2% of the producer at worst.
+         * task watchdog. Once the ring is full feed() blocks on its own and this
+         * costs nothing.
+         *
+         * Twice a second was chosen against a five-second watchdog period. That
+         * is a minute now (R-P4.1), so five seconds keeps a 12x margin over the
+         * longest idle gap allowed and cuts what this costs the producer by ten
+         * -- one tick every five seconds is under 0.2% of it. It is kept rather
+         * than removed because audio still exercises the SMP tick, and a starved
+         * idle on a core that also runs WiFi is not a thing to discover on a
+         * user's board.
          */
         const int64_t ynow = esp_timer_get_time();
-        if (ynow - s_last_yield >= 500000) {
+        if (ynow - s_last_yield >= 5000000) {
             s_last_yield = ynow;
             vTaskDelay(1);
         }
