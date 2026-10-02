@@ -288,6 +288,16 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
      * what a clean exit does -- and both paths already arrive here.
      */
     espix_proc_regions_release(slot);
+
+    /*
+     * And the screen, if this process was the one holding it. It is not memory
+     * the slot owns, but it is a resource the process took and cannot give back
+     * once it is gone -- and the one such resource whose leak wedges the whole
+     * board rather than the process, because the desktop and the VNC encoder
+     * take the same lock. R-P1.7: reclaimed here with everything else, rather
+     * than by a hand call after the slot is already done.
+     */
+    espix_gfx_recover(slot->info.pid);
 }
 
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
@@ -298,7 +308,6 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     }
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-    const espix_pid_t pid = slot->info.pid;
 
     /*
      * Tell the parent, if it is still there. Found by walking the table rather
@@ -342,15 +351,6 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      */
     xEventGroupSetBits(g_espix_proc_events, ESPIX_PROC_EVENT_FINISH);
     xSemaphoreGive(g_espix_proc_lock);
-
-    /*
-     * Anything the process held and did not give back now belongs to nobody.
-     * The canvas is the one such lock that wedges the whole board rather than
-     * the process -- the desktop and the VNC encoder both take it -- so it is
-     * handed back here, keyed on the pid captured above rather than on a task
-     * handle that has just been freed.
-     */
-    espix_gfx_recover(pid);
 }
 
 void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,

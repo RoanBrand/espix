@@ -432,7 +432,8 @@ void espix_proc_abi_time_register(void);
 void espix_proc_abi_gfx_register(void);
 
 /* Orphan the canvas if `pid` died holding it, so a killed app cannot wedge
- * every later repaint. Called from espix_proc_finish(). See abi_gfx.c. */
+ * every later repaint. Called from espix_proc_release_resources(), with the
+ * rest of the process's resources; see abi_gfx.c. */
 void espix_gfx_recover(espix_pid_t pid);
 
 /* Publish the filesystem an app needs: fopen, open, stat, opendir and the rest,
