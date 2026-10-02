@@ -184,10 +184,15 @@ static const struct esp_elfsym s_libc_syms[] = {
 
     /*
      * Deliberately not here, and worth saying where the next person will look:
-     * isatty() and dup()/dup2() are unimplemented in IDF -- isatty is an alias
-     * for syscall_not_implemented -- and atexit() has nothing that runs a dying
-     * app's handlers. Each would load and then answer ENOSYS or silently do
-     * nothing, which is the case abi_fs.c's note on access() argues against.
+     * isatty() is unimplemented in IDF -- an alias for syscall_not_implemented
+     * -- and atexit() has nothing that runs a dying app's handlers. Each would
+     * load and then answer ENOSYS or silently do nothing, which is the case
+     * abi_fs.c's note on access() argues against.
+     *
+     * dup() and dup2() used to be on that list. They are still not in this
+     * table -- IDF answers for neither -- but abi_fs.c claims both, and fcntl,
+     * through the resolver, which is the only seam that can shadow a name the
+     * loader's libc table already defines.
      *
      * perror() was published here and then measured: it writes to the firmware's
      * own stderr stream, not the channel the app is writing to, so the line never

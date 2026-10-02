@@ -100,7 +100,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 | R-P1.5 | Separate the **live table** from a small **completed log**; recycle a slot on reap | Retaining finished slots is a debugging affordance, not POSIX — Linux keeps only unreaped zombies, and `ps` history is not a thing there. The live table then sizes to *concurrency*, not to history | `proc.c`, `espix_proc.h`, `cmd_sys.c` `ps` | `ps` shows history from the ring; slots recycle at once | **done** (`bf12f51`) — the slot is copied into an 8-entry static ring (pid, ppid, name, state, exit code, start and end times) and released under the lock with the memset last, so `espix_proc_find()` sees only live processes and the table sizes to *concurrency*: kill and signals answer "no such process" for a finished pid, and a slot is reusable the instant its process ends. `espix_proc_wait()` consumes the entry, as waitpid(2) does — the second call is ECHILD — while kill's own escalation and `espix_proc_hangup()` go through a new observe-only path, so they cannot take the status from whoever is the parent. One global finish bit replaces the per-slot bit, since a slot can now be reused immediately, and every waiter re-scans table-then-log. `ps` reads its "finished" section from the ring. Cost: 520 B of .bss, no dynamic memory; the table itself is unchanged at 8840 B. Verified on the S31: 30-proc 53/53, including the ring bounded to eight entries and a finished pid answering "no such process". |
 | R-P1.6 | Make `espix:reaper` the **single teardown point**: per-invocation tasks (command, ssh conn, app) stop calling `vTaskDelete(NULL)` and park instead, and the reaper deletes them — reclaiming the arena, fds and screen in the same pass | `prvCheckTasksWaitingTermination()` is a private static in FreeRTOS's `tasks.c` and cannot be called. But deleting *another* task frees its TCB in the caller, so if nothing self-deletes, the idle task stops being *required* for espix's cleanup. IDF components and app-created pthreads still self-delete, so this reduces the dependence rather than removing it. Also retires the `espix_gfx_recover()` special case | `reaper.c`, `exec.c:616`, `session.c:469`, `ssh_server.c:495` | a finished process is torn down entirely by the reaper | todo (deferred: needs physical access) |
 | R-P1.7 | Reclaim the screen through R-P1.6 instead of the `espix_gfx_recover()` special case | Today the canvas is the one resource that *is* reclaimed, by hand | `proc.c:236` | the special case is gone | todo |
-| R-P1.8 | `dup`/`dup2`/`fcntl(F_DUPFD)` in the VFS | Currently "left out" only because IDF stubs it. Prerequisite for pipes and redirection, and portable to all targets | `vfs.c` | `dup2` from an app works | todo |
+| R-P1.8 | `dup`/`dup2`/`fcntl(F_DUPFD)` in the VFS | Currently "left out" only because IDF stubs it. Prerequisite for pipes and redirection, and portable to all targets | `vfs.c`, `abi_fs.c`, `espix_fs.h` | `dup2` from an app works | **done** (`10d6306`) — a duplicate is a second IDF descriptor carrying the same espix key, so the two share an offset, and a new `refs` count on `fd_slot_t` makes the filesystem close on the last one: `vfs_close()` drops a reference instead of closing. `dup2`'s exact target and `F_DUPFD`'s floor are reached with transient placeholders, because `register_fd()` only hands out the lowest free number; the one race that remains -- another task taking the number first -- fails EMFILE rather than closing a descriptor espix does not own. `espix_fs_fds_close_owned()` now closes every IDF entry on a key, so a process that dies holding duplicates gives the pool back. Only espix file keys can be duplicated; a socket or device fd has no key and gets EBADF. The first attempt used `esp_vfs_register_fs_with_id()` to learn the VFS index and **panicked the boot** -- that call registers a path-less VFS which `get_vfs_for_path()` skips, so the root answered no path; the index comes from the descriptor's own table entry instead. Verified: 30-proc 57/57 on the S31. |
 | R-P1.9 | The C++ allocator path is unverified at runtime | `arduino-esp32` has **no S31 support at all** — zero files mention `ESP32S31`, against 35 for the P4 — so neopixel cannot be built for this target (its `apps/neopixel/targets` says `esp32s3` and `build-apps.sh` skips it correctly) and there is no C++ app to exercise `operator new`/`delete`. Compile, link and the resolver mapping are checked; the runtime path is not. Nothing to do here until an S31-capable C++ app exists — porting Arduino to the S31 is an upstream project, not an espix one. A whole half of the allocator ABI has no runtime coverage | — | revisit when a C++ app can run on the S31 | parked |
 | R-P1.10 | Give an app's **own threads** a slot, so their `malloc()` lands in the process's arena too | R-P1.2 gave a thread's `free()` the region, by address, because that was the corruption case. Its `malloc()` still has no task-to-process lookup, so a thread's allocations go to the global heap and are not reclaimed at exit -- the leak R-P1.2 exists to remove, just smaller. The fix is to publish `pthread_create` through the resolver and record the task it makes against the calling slot | `abi_alloc.c`, a pthread seam, `espix_proc.h` | memory an app thread allocates is returned at exit | **done** -- see the R-P1.10 section of APP-MEMORY.md. TLS, not the handle table the sketch first wanted; it changed what espix_proc_self() means, so espix_proc_exit() gained a guard; and it went on to publish the coordination surface and give a thread the process's stdio, without which threads were memory-correct but unusable |
 
@@ -290,4 +290,42 @@ and one thing it implements but no test yet observes:
   binary. The observable half -- the ring bounded to eight, and a finished pid
   answering "no such process" -- is tested. This is the same shape as R-P1.4's
   dormant half and closes the same way: when an app can wait.
+
+## R-P1.8 -- the design, as built
+
+IDF has no dup, and the work is about the two tables espix sits between: the
+number an app holds is IDF's descriptor table, the open file is espix's key.
+
+1. **A duplicate is the same key, counted.** `fd_slot_t` gained `refs`;
+   `dup`/`dup2`/`F_DUPFD` register a second IDF entry whose `local_fd` is the
+   *same* key, so the offset is shared as POSIX requires, and `vfs_close()`
+   drops one reference and only the last calls the filesystem.
+2. **The floor is reached with placeholders.** `register_fd()` only ever hands
+   out the lowest free number, so `dup2(newfd)` and `F_DUPFD(min)` briefly
+   register every free number below the wanted one, then release them. The
+   honest cost: another task allocating in that window can take the number
+   first, and `dup2` then fails EMFILE rather than close a descriptor espix
+   does not own.
+3. **The reaper closes every entry on a key.** `espix_fs_fds_close_owned()`
+   used to stop at the first descriptor matching a key; a process that died
+   holding duplicates would have leaked the rest of the pool.
+4. **Only espix file keys.** A socket or device descriptor travels through
+   another VFS and has no key to share, so it is refused with EBADF rather
+   than half-done.
+
+**The trap.** The first version used `esp_vfs_register_fs_with_id()` to learn
+the VFS index `register_fd()` needs. It registers a *path-less* VFS
+(`path_prefix_len = LEN_PATH_PREFIX_IGNORED`), and `get_vfs_for_path()` skips
+those entirely -- so the root VFS answered no path, a later boot step's
+`ESP_ERROR_CHECK` aborted, and the loader rolled the image back. The comment in
+`espix_vfs_register_root()` had warned about exactly this shape. The index now
+comes from the descriptor's own table entry (`get_fd_entry()`), which needs no
+registration change and works for any VFS.
+
+**Verified.** 30-proc is 57/57 on the S31. The app's command writes,
+duplicates, closes the original, reads the bytes back through the duplicate,
+`dup2`s onto 10 and reads again, takes `fcntl(F_DUPFD, 8)`, and reopens to show
+the first number came back -- so a leak fails it. A second mode exits holding
+three duplicates, and the descriptor capacity is unchanged afterwards.
+
 
