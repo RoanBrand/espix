@@ -1053,6 +1053,120 @@ static int cmd_fdprobe(const char *path, const char *hold_s)
     return 0;
 }
 
+/*
+ * dup(2), dup2(2) and fcntl(F_DUPFD).
+ *
+ * The properties POSIX gives a duplicate, and the only ones worth asserting:
+ * the two descriptors share the file offset, closing one does not close the
+ * file, and the file goes away when the last does. So this writes, duplicates,
+ * closes the original, and reads the bytes back through the duplicate -- which
+ * fails with EBADF if that close reached the file.
+ *
+ * dup2 has to land on the number asked for, and F_DUPFD on the lowest number at
+ * or above its argument. Finally everything is closed and the same number is
+ * reopened, which fails if a descriptor leaked out of the fixed pool.
+ */
+static int cmd_dup(const char *path, const char *mode)
+{
+    /*
+     * A mode that exists to be killed with descriptors open: the reaper has
+     * to close every IDF entry a dup left on one key, not just the first, or
+     * the pool leaks a descriptor per duplicate.
+     */
+    if (mode != NULL && strcmp(mode, "hold") == 0) {
+        const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            printf("dup: open: errno %d\n", errno);
+            return 1;
+        }
+        int made = 0;
+        while (made < 3) {
+            if (dup(fd) < 0) {
+                break;
+            }
+            made++;
+        }
+        printf("dupped %d\n", made);
+        fflush(stdout);
+        return (made == 3) ? 0 : 1;      /* exits holding all four */
+    }
+
+    char buf[32];
+    int  rc = 0;
+
+    const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        printf("dup: open: errno %d\n", errno);
+        return 1;
+    }
+
+    const char msg[] = "shared-offset";
+    if (write(fd, msg, sizeof(msg) - 1) != (ssize_t)(sizeof(msg) - 1)) {
+        printf("dup: write: errno %d\n", errno);
+        return 1;
+    }
+
+    const int d = dup(fd);
+    if (d < 0) {
+        printf("dup: dup: errno %d\n", errno);
+        return 1;
+    }
+
+    close(fd);                          /* the file must survive this */
+
+    if (lseek(d, 0, SEEK_SET) != 0) {
+        printf("dup: the duplicate did not share the offset\n");
+        rc = 1;
+    }
+    const ssize_t n = read(d, buf, sizeof(buf));
+    if (n != (ssize_t)(sizeof(msg) - 1) ||
+        memcmp(buf, msg, sizeof(msg) - 1) != 0) {
+        printf("dup: the file did not survive the original close\n");
+        rc = 1;
+    }
+
+    const int d2 = dup2(d, 10);         /* POSIX: land on exactly 10 */
+    close(d);
+    if (d2 != 10) {
+        printf("dup2: returned %d, not 10\n", d2);
+        rc = 1;
+    } else {
+        (void)lseek(d2, 0, SEEK_SET);
+        if (read(d2, buf, sizeof(buf)) < 0) {
+            printf("dup2: the file did not survive the source close\n");
+            rc = 1;
+        }
+        close(d2);
+    }
+
+    const int f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("dup: reopen: errno %d\n", errno);
+        return 1;
+    }
+    const int fd2 = fcntl(f, F_DUPFD, 8);
+    close(f);
+    if (fd2 < 8) {
+        printf("F_DUPFD: returned %d, below the floor 8\n", fd2);
+        rc = 1;
+    } else {
+        close(fd2);
+    }
+
+    const int again = open(path, O_RDONLY);
+    if (again != fd) {
+        printf("leak: reopened as %d, first open was %d\n", again, fd);
+        rc = 1;
+    }
+    close(again);
+
+    if (rc == 0) {
+        printf("dup ok: %d %d %d %d\n", fd, d, d2, fd2);
+    }
+    fflush(stdout);
+    return rc;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -1084,6 +1198,7 @@ static void usage(void)
            "  leakthread <bytes> allocate in a new thread, never free it\n"
            "  threaded <n>        four threads add n each under a mutex\n"
            "  fdprobe <path> <hold>  report fd capacity, then hold some\n"
+           "  dup <path> [hold]   dup/dup2/fcntl(F_DUPFD); hold exits holding them\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -1213,6 +1328,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "fdprobe") == 0 && argc > 3) {
         return cmd_fdprobe(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "dup") == 0 && argc > 2) {
+        return cmd_dup(argv[2], (argc > 3) ? argv[3] : NULL);
     }
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {

@@ -348,6 +348,19 @@ void espix_fs_priv_end(void);
 void espix_fs_fds_close_owned(int32_t pid);
 
 /*
+ * dup(2) and dup2(2) for app descriptors.
+ *
+ * Both are espix's rather than IDF's: IDF implements neither, and a duplicate
+ * is a second IDF descriptor carrying the same espix key, which only espix can
+ * arrange. They take and return the app's descriptor, and -1 with errno on
+ * failure. Only an espix file key can be duplicated -- a socket or a device fd
+ * has no key to share; see the note in vfs.c.
+ */
+int espix_fs_dup_fd(int fd);
+int espix_fs_dup_min_fd(int fd, int min);   /* fcntl(fd, F_DUPFD, min) */
+int espix_fs_dup2_fd(int oldfd, int newfd);
+
+/*
  * Whether `abs_path` may be executed: a regular file whose mode has S_IXUSR.
  *
  * This is what the shell gates on. It replaces sniffing the ELF magic at the

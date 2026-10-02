@@ -369,6 +369,33 @@ else
     assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 fi
 
+# --- dup/dup2/fcntl(F_DUPFD): a second descriptor for one open file --------
+#
+# R-P1.8. A duplicate is another descriptor for the same open file: the offset
+# is shared, closing one does not close the file, and the file goes when the
+# last does. The command checks all of that itself and reopens at the end, so
+# its exit status is the assertion and the summary line is the evidence.
+
+DUPFILE=/tmp/espix-dup-$ESPIX_WORKER.txt
+dev_run "rm $DUPFILE" >/dev/null 2>&1
+
+assert_status "dup/dup2/F_DUPFD share one open file correctly" 0 \
+    dev_status "$APP dup $DUPFILE"
+assert_contains "and the run leaves no descriptor behind" "dup ok:" \
+    "$(dev_run "$APP dup $DUPFILE")"
+
+# The reaper has to close every IDF entry a dup left on one key, not only the
+# first: a process that exits holding three duplicates must cost the pool
+# nothing. Same capacity, measured the same way as the fdprobe pair above.
+if [ -n "$n1" ] && [ "$n1" -ge 8 ] 2>/dev/null; then
+    out=$(dev_run "$APP dup $DUPFILE hold" 2>&1)
+    assert_contains "a process can end holding duplicated descriptors" \
+        "dupped 3" "$out"
+    n3=$(dev_run "$APP fdprobe $DUPFILE 0" | awk '/^capacity/ {print $2; exit}')
+    assert_eq "and every duplicate is given back" "$n1" "$n3"
+fi
+
+dev_run "rm $DUPFILE" >/dev/null 2>&1
 dev_run "rm $FDFILE" >/dev/null 2>&1
 
 # --- parentage is recorded, even when there is nothing to be a parent ------

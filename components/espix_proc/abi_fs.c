@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -185,6 +186,54 @@ static char *abi_getcwd(char *buf, size_t size)
 }
 
 /* ------------------------------------------------------------------ */
+/* dup, dup2 and fcntl(F_DUPFD)                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * These three go through the resolver rather than the table below, because
+ * newlib already defines dup() and dup2() (as ENOSYS stubs) and IDF defines
+ * fcntl(), and the loader consults its own libc table before any table espix
+ * adds. The resolver is the seam that runs first.
+ *
+ * espix_fs_dup* own the work; see vfs.c for why a duplicate is a second
+ * descriptor carrying the same key. fcntl is intercepted only for its two dup
+ * commands -- F_GETFL and the rest still reach IDF, which dispatches into
+ * espix's own VFS op.
+ */
+static int espix_abi_dup(int fd)
+{
+    return espix_fs_dup_fd(fd);
+}
+
+static int espix_abi_dup2(int oldfd, int newfd)
+{
+    return espix_fs_dup2_fd(oldfd, newfd);
+}
+
+static int espix_abi_fcntl(int fd, int cmd, ...)
+{
+    va_list ap;
+    va_start(ap, cmd);
+    const int arg = va_arg(ap, int);
+    va_end(ap);
+
+    if (cmd == F_DUPFD
+#ifdef F_DUPFD_CLOEXEC
+        || cmd == F_DUPFD_CLOEXEC
+#endif
+       ) {
+        return espix_fs_dup_min_fd(fd, arg);
+    }
+    return fcntl(fd, cmd, arg);
+}
+
+static const abi_sym_t s_fs_resolver_syms[] = {
+    ABI_SYM("dup",   espix_abi_dup),
+    ABI_SYM("dup2",  espix_abi_dup2),
+    ABI_SYM("fcntl", espix_abi_fcntl),
+};
+
+/* ------------------------------------------------------------------ */
 /* Export                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -284,6 +333,12 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
 
 void espix_proc_abi_fs_register(void)
 {
+    /* First, because a name here shadows the loader's own libc table. See
+     * abi_libc.c for why dup, dup2 and fcntl could not simply be exported. */
+    espix_abi_resolver_add(s_fs_resolver_syms,
+                           sizeof(s_fs_resolver_syms) /
+                               sizeof(s_fs_resolver_syms[0]));
+
     if (esp_elf_register_symbol(s_fs_syms) != 0) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "could not publish the filesystem to apps");

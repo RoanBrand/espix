@@ -76,6 +76,13 @@
 const void *get_vfs_for_fd(int fd);
 int get_local_fd(const void *vfs, int fd);
 
+/* The two the fd table itself is written through. register_fd() hands back
+ * the lowest free descriptor, which is what dup() wants and what dup2() has to
+ * work around; unregister_fd() releases a non-permanent entry without calling
+ * into the VFS at all. */
+int  register_fd(int vfs_index, int local_fd, bool permanent);
+void unregister_fd(int fd);
+
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_proc.h"
@@ -207,9 +214,39 @@ typedef struct {
      * recycled process cannot inherit a dead one's files.
      */
     espix_pid_t owner;
+
+    /*
+     * How many IDF descriptors share this one open file. dup()/dup2() give
+     * the second descriptor the *same* key, because the two must share the
+     * file offset -- and the layer below is closed only when the last of them
+     * goes away. Without this the first close() would close the file
+     * underneath the other descriptor, and the second would be EBADF on a
+     * slot already freed.
+     */
+    int         refs;
 } fd_slot_t;
 
 static fd_slot_t s_fds[ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX];
+
+/*
+ * IDF's descriptor-table entry, copied from vfs's private esp_vfs_private.h.
+ *
+ * dup()/dup2() install a second descriptor for a file espix already holds, and
+ * register_fd() needs the *index of the VFS that owns it*. No exported call
+ * turns a descriptor into its index, so this reads vfs_index straight out of
+ * the entry. The definition is copied verbatim rather than reconstructed so
+ * the layout cannot drift; the key itself still comes from get_local_fd().
+ */
+typedef struct {
+    bool    permanent          : 1;
+    bool    has_pending_close  : 1;
+    bool    has_pending_select : 1;
+    uint8_t _reserved          : 5;
+    int8_t  vfs_index;
+    uint8_t local_fd;
+} espix_fd_entry_t;
+
+const espix_fd_entry_t *get_fd_entry(int fd);
 
 /*
  * Every slot starts free, and the sentinel is -1 rather than 0: a zeroed table
@@ -407,6 +444,7 @@ static int fd_slot_alloc(int lower_fd, const lower_t *mount)
             s_fds[i].lower_fd = lower_fd;
             s_fds[i].mount    = (uint8_t)((mount - s_mounts) + 1);
             s_fds[i].owner    = owner;
+            s_fds[i].refs     = 1;
             fd = i;
             break;
         }
@@ -434,7 +472,38 @@ static void fd_slot_free(int fd)
     s_fds[fd].lower_fd = -1;
     s_fds[fd].mount    = 0;
     s_fds[fd].owner    = ESPIX_PID_NONE;
+    s_fds[fd].refs     = 0;
     portEXIT_CRITICAL(&s_mount_lock);
+}
+
+/*
+ * Take one reference off a key.
+ *
+ * Returns 1 when this was the last one -- the caller then owns the real close
+ * and must release the slot -- 0 when another descriptor still holds the file,
+ * and -1 when the number is not one of espix's keys at all.
+ */
+static int fd_slot_unref(int fd, fd_slot_t *out)
+{
+    if (!fd_ours(fd)) {
+        return -1;
+    }
+
+    int rc = -1;
+
+    portENTER_CRITICAL(&s_mount_lock);
+    if (s_fds[fd].lower_fd >= 0) {
+        *out = s_fds[fd];
+        if (s_fds[fd].refs > 1) {
+            s_fds[fd].refs--;
+            rc = 0;
+        } else {
+            rc = 1;
+        }
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    return rc;
 }
 
 /*
@@ -474,13 +543,164 @@ void espix_fs_fds_close_owned(int32_t pid)
             continue;
         }
 
+        /*
+         * Every descriptor, not just the first: dup()/dup2() leave more than
+         * one IDF entry pointing at a key, and all of them must be released
+         * for the pool to come back. vfs_close() refcounts the key, so the
+         * layer below is still closed exactly once.
+         */
         for (int fd = 0; fd < MAX_FDS; fd++) {
             if (get_local_fd(get_vfs_for_fd(fd), fd) == key) {
                 (void)close(fd);
-                break;
             }
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* dup(), dup2() and the F_DUPFD family                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Take a second reference to a key and install a descriptor for it, at the
+ * lowest free number that is at least `min`.
+ *
+ * IDF's register_fd() only ever hands out the lowest free number, so a floor
+ * is reached by briefly holding every free number below it -- placeholders
+ * registered and then released -- which forces the next allocation above the
+ * floor. The placeholders carry no key and are never handed to anyone, and
+ * unregister_fd() releases them without calling into the VFS, so they cannot
+ * close anything.
+ *
+ * The window is small but real: another task allocating a descriptor while the
+ * placeholders are held can take the number we wanted, and the caller then
+ * sees a larger one (dup2() fails; F_DUPFD is still within its contract). That
+ * is a race IDF's API does not let espix close, and it is written down rather
+ * than papered over.
+ */
+static int dup_place(int vfs_index, int key, int min)
+{
+    portENTER_CRITICAL(&s_mount_lock);
+    const bool live = (s_fds[key].lower_fd >= 0);
+    if (live) {
+        s_fds[key].refs++;
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+
+    if (!live) {
+        errno = EBADF;
+        return -1;
+    }
+
+    int ph[MAX_FDS];
+    int nph = 0;
+
+    for (int i = 0; i < MAX_FDS; i++) {
+        const int fd = register_fd(vfs_index, 0, false);
+        if (fd < 0) {
+            break;                          /* the table is full */
+        }
+        if (fd >= min) {
+            unregister_fd(fd);              /* this is the one we want next */
+            break;
+        }
+        ph[nph++] = fd;                     /* a free number below the floor */
+    }
+
+    const int nfd = register_fd(vfs_index, key, false);
+
+    for (int i = 0; i < nph; i++) {
+        unregister_fd(ph[i]);
+    }
+
+    if (nfd < 0) {
+        portENTER_CRITICAL(&s_mount_lock);
+        s_fds[key].refs--;
+        portEXIT_CRITICAL(&s_mount_lock);
+        errno = EMFILE;
+    }
+    return nfd;
+}
+
+/*
+ * dup(2). The number the app holds is IDF's; the open file is espix's key. A
+ * duplicate is a second IDF entry carrying the *same* key, which is what makes
+ * the two share an offset, and refs is what stops the first close from closing
+ * the file under the second.
+ *
+ * Only a key can be duplicated: a socket or device descriptor travels through
+ * another VFS and has no espix slot to reference, so it is refused with EBADF
+ * rather than half-done. Returns the new descriptor, or -1 with errno set.
+ */
+int espix_fs_dup_fd(int fd)
+{
+    const void *const             vfs = get_vfs_for_fd(fd);
+    const espix_fd_entry_t *const e   = get_fd_entry(fd);
+    const int                     key = get_local_fd(vfs, fd);
+
+    if (e == NULL || e->vfs_index < 0 || !fd_ours(key)) {
+        errno = EBADF;
+        return -1;
+    }
+    return dup_place(e->vfs_index, key, 0);
+}
+
+/* fcntl(fd, F_DUPFD, n): dup(2) with a floor on the number. */
+int espix_fs_dup_min_fd(int fd, int min)
+{
+    const void *const             vfs = get_vfs_for_fd(fd);
+    const espix_fd_entry_t *const e   = get_fd_entry(fd);
+    const int                     key = get_local_fd(vfs, fd);
+
+    if (e == NULL || e->vfs_index < 0 || !fd_ours(key)) {
+        errno = EBADF;
+        return -1;
+    }
+    if (min < 0 || min >= MAX_FDS) {
+        errno = EINVAL;
+        return -1;
+    }
+    return dup_place(e->vfs_index, key, min);
+}
+
+/*
+ * dup2(2): the same, but landing on a *named* number after closing whatever
+ * was already there.
+ *
+ * A number above newfd would satisfy the floor but not the call, so it is given
+ * back and reported EMFILE -- the only honest answer when the exact number was
+ * taken from under us.
+ */
+int espix_fs_dup2_fd(int oldfd, int newfd)
+{
+    const void *const             vfs = get_vfs_for_fd(oldfd);
+    const espix_fd_entry_t *const e   = get_fd_entry(oldfd);
+    const int                     key = get_local_fd(vfs, oldfd);
+
+    if (e == NULL || e->vfs_index < 0 || !fd_ours(key) ||
+        newfd < 0 || newfd >= MAX_FDS) {
+        errno = EBADF;
+        return -1;
+    }
+    if (oldfd == newfd) {
+        return newfd;
+    }
+
+    /* POSIX closes the target first; the duplicate then takes its number. */
+    if (get_vfs_for_fd(newfd) != NULL) {
+        (void)close(newfd);
+    }
+
+    const int nfd = dup_place(e->vfs_index, key, newfd);
+    if (nfd < 0) {
+        return -1;
+    }
+    if (nfd != newfd) {
+        (void)close(nfd);
+        errno = EMFILE;
+        return -1;
+    }
+    return nfd;
 }
 
 static const lower_t *mount_by_dir(DIR *pdir)
@@ -724,11 +944,17 @@ static int vfs_close(void *ctx, int fd)
         return espix_dev_close(fd);
     }
     fd_slot_t slot;
-    if (!fd_slot_get(fd, &slot)) {
+    const int unref = fd_slot_unref(fd, &slot);
+    if (unref < 0) {
         return ebadf();
     }
-    const lower_t *l = mount_of_slot(&slot);
+    if (unref == 0) {
+        /* Another descriptor still holds this open file, so this is not the
+         * close of the file. See refs in fd_slot_t. */
+        return 0;
+    }
 
+    const lower_t *l = mount_of_slot(&slot);
     const int rc = NO_LOWER(l->ops->close_p)
                        ? enosys() : l->ops->close_p(l->ctx, slot.lower_fd);
     /* Forgotten either way: a failed close still leaves the fd not ours. esp_vfs
@@ -1331,6 +1557,14 @@ esp_err_t espix_vfs_register_root(const esp_vfs_fs_ops_t *lower_ops,
      * answer. */
     fd_table_init();
 
+    /*
+     * Not esp_vfs_register_fs_with_id(), which looks like the way to learn the
+     * index dup() needs and is a trap: it registers a *path-less* VFS
+     * (path_prefix_len = LEN_PATH_PREFIX_IGNORED), and get_vfs_for_path()
+     * skips those entirely, so the root answers no path at all. dup() reads
+     * the index from the descriptor's own table entry instead; see
+     * espix_fd_entry_t.
+     */
     const esp_err_t err = esp_vfs_register_fs(
         "", &s_espix_vfs, ESP_VFS_FLAG_CONTEXT_PTR | ESP_VFS_FLAG_STATIC,
         &s_mounts[0]);
