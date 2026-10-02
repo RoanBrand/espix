@@ -3,11 +3,15 @@ menu "espix kernel"
     config ESPIX_KLOG_LINES
         int "Kernel log ring size (lines)"
         range 8 512
-        default 96
+        default 256
         help
             Number of lines retained by the kernel log ring that backs `dmesg`.
-            Each line costs ESPIX_KLOG_LINE_MAX + ~16 bytes of internal RAM,
-            allocated statically, so 96 lines is roughly 13 KB.
+
+            The ring is allocated in PSRAM at init, with an internal fallback,
+            and a line costs ESPIX_KLOG_LINE_MAX + ~16 bytes: 96 lines is about
+            12 kB and 256 about 34 kB. Nothing internal is spent on it, which is
+            the argument for having enough history to explain a boot -- a ring
+            that wraps loses exactly the lines that a fault would be read for.
 
     config ESPIX_KLOG_QUIET
         bool "Keep kernel log lines out of the console (dmesg only)"
