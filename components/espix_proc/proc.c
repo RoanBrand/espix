@@ -67,6 +67,10 @@ static void done_record(const espix_proc_slot_t *slot, espix_proc_state_t state,
     s_done_head = (s_done_head + 1u) % ESPIX_PROC_DONE_MAX;
     s_done_seq++;
 }
+/* The reaper's entry point, registered by espix_fault when its task starts.
+ * NULL until then, and the park path falls back to the self-delete it
+ * replaced. See espix_proc_reap_self(). */
+static void (*s_reap_task)(TaskHandle_t task);
 
 /* The log entry for this pid, reaped or not, or NULL. Called with the lock
  * held. */
@@ -347,6 +351,99 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      * handle that has just been freed.
      */
     espix_gfx_recover(pid);
+}
+
+void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,
+                          int exit_code)
+{
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const bool ours = (slot->info.task == self);
+    if (ours) {
+        slot->reaping     = true;
+        slot->term_state  = state;
+        slot->exit_status = exit_code;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+
+    if (ours && s_reap_task != NULL) {
+        s_reap_task(self);
+
+        /*
+         * The reaper owns the slot now and will delete this task. Suspend
+         * rather than block on something the reaper must hand back: a
+         * suspended task is provably off the ready list, so the reaper's
+         * delete cannot race this task still running. Nothing below may touch
+         * the slot again.
+         */
+        vTaskSuspend(NULL);
+        for (;;) {
+        }
+    }
+
+    if (ours) {
+        /*
+         * No reaper registered -- a board whose reaper did not start. Do what
+         * this path always did, so the process still ends and its resources
+         * come back.
+         */
+        espix_proc_release_resources(slot);
+        espix_proc_finish(slot, state, exit_code);
+        vTaskDeleteWithCaps(NULL);
+        __builtin_unreachable();
+    }
+
+    /*
+     * A killer already took the slot and the task: it nulls info.task under
+     * this lock before deleting, so seeing that here means the teardown is
+     * someone else's. Touch nothing; it will delete us.
+     */
+    vTaskSuspend(NULL);
+    for (;;) {
+    }
+}
+
+void espix_proc_set_reap_task(void (*fn)(TaskHandle_t task))
+{
+    s_reap_task = fn;
+}
+
+bool espix_proc_reaped(TaskHandle_t task)
+{
+    if (task == NULL) {
+        return false;
+    }
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+    espix_proc_slot_t *slot = NULL;
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        if (g_espix_proc_table.slots[i].info.task == task) {
+            slot = &g_espix_proc_table.slots[i];
+            break;
+        }
+    }
+
+    const bool               ours  = (slot != NULL && slot->reaping);
+    const espix_proc_state_t state = ours ? slot->term_state : ESPIX_PROC_FREE;
+    const int                code  = ours ? slot->exit_status : 0;
+
+    xSemaphoreGive(g_espix_proc_lock);
+
+    if (!ours) {
+        return false;
+    }
+
+    /*
+     * Outside the lock: release_resources() takes none itself but frees things
+     * that may, and finish() takes the lock. The slot cannot move underneath:
+     * the task is parked, `reaping` refuses a killer, and a spawn only ever
+     * takes a FREE slot.
+     */
+    espix_proc_release_resources(slot);
+    espix_proc_finish(slot, state, code);
+    return true;
 }
 
 /*
@@ -809,6 +906,15 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
         return ESP_ERR_NOT_FOUND;
     }
     if (state_is_finished(slot->info.state)) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Already handed to the reaper: the clean teardown owns the slot and the
+     * task, and a killer that proceeded would free the image under it.
+     */
+    if (slot->reaping) {
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_INVALID_STATE;
     }

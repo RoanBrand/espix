@@ -451,3 +451,15 @@ else
 fi
 
 assert_contains "and the device is still up" "espix" "$(dev_run uname)"
+
+# --- a finished process is torn down by the reaper -------------------------
+#
+# R-P1.6. A process no longer deletes itself: it hands the slot to the reaper,
+# which runs the teardown and deletes the task, so prvDeleteTCB -- the PSRAM
+# stack free and the newlib reent reclaim -- happens on a normal stack instead
+# of the idle task's small one. What it must not do is leave the task parked
+# in the scheduler's list, so after a run nothing named app:testapp is a task.
+
+dev_run "$APP exit 0" >/dev/null 2>&1
+left=$(dev_run ps | sed -n '1,/^finished:/p' | grep -c 'app:testapp')
+assert_eq "a finished process is deleted by the reaper" "0" "$left"

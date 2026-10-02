@@ -681,16 +681,22 @@ done:
         }
     }
 
-    /* Tear the ELF down before releasing the file buffer: the relocated image
-     * can still reference it until deinit. */
-    espix_proc_release_resources(slot);
-
-    espix_proc_finish(slot,
-                      ran ? ESPIX_PROC_EXITED : ESPIX_PROC_FAULTED,
-                      status);
-
     espix_shell_set_current(NULL);
-    vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
+
+    /*
+     * Hand the process to the reaper rather than tearing it down here. The
+     * reaper runs release_resources() and finish() and then deletes this task,
+     * so prvDeleteTCB -- the PSRAM stack free and _reclaim_reent -- happens on
+     * a normal task instead of on the idle task's small internal stack. This
+     * does not return. See R-P1.6.
+     *
+     * The streams were restored above, before this point, and deliberately so:
+     * closing a funopen stream writes into the session and can block, which is
+     * exactly what must not happen on the reaper.
+     */
+    espix_proc_reap_self(slot,
+                         ran ? ESPIX_PROC_EXITED : ESPIX_PROC_FAULTED,
+                         status);
 }
 
 /*

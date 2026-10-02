@@ -266,6 +266,22 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n);
  */
 size_t espix_proc_history(espix_proc_record_t *out, size_t n);
 
+/*
+ * R-P1.6: the reaper as the single teardown point.
+ *
+ * A process that finishes on its own stops deleting itself. It parks, and the
+ * reaper deletes it, which moves the newlib teardown and the PSRAM stack free
+ * off the idle task and onto a task with a real stack. espix_fault's reaper
+ * registers here at start; espix_proc must not depend on it, so the direction
+ * is a callback rather than a call.
+ */
+void espix_proc_set_reap_task(void (*fn)(TaskHandle_t task));
+
+/* On the reaper task: run the teardown of a process that parked itself (arena,
+ * fds, slot) and say whether `task` was one. False means it was not, and the
+ * caller should use the fault path. */
+bool espix_proc_reaped(TaskHandle_t task);
+
 /* Look up the process owning `task`, or ESPIX_PID_NONE. Safe to call from a
  * restricted context: it only reads the table. */
 espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);

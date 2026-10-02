@@ -269,6 +269,17 @@ typedef struct {
      * See abi_alloc.c.
      */
     uint32_t           foreign_frees;
+
+    /*
+     * True from the moment a process has handed itself to the reaper until its
+     * slot is released. A killer that finds this must stand off: the clean
+     * teardown already owns the slot and the task. See espix_proc_reap_self().
+     */
+    bool               reaping;
+
+    /* The terminal state espix_proc_finish() should be given when the reaper
+     * runs it, set with reaping. The exit code travels in exit_status. */
+    espix_proc_state_t term_state;
 } espix_proc_slot_t;
 
 /* Bit for `sig`, or 0 if it is not a signal. Not sigaddset(): that macro is
@@ -384,6 +395,19 @@ void espix_proc_regions_release(espix_proc_slot_t *slot);
  * under the lock and the next spawn may claim it immediately. */
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
                        int exit_code);
+
+/*
+ * Hand the calling process to the reaper instead of tearing it down here:
+ * mark the slot, hand it over, and never return. The reaper runs
+ * release_resources() and finish() and then deletes the task, so prvDeleteTCB
+ * -- the PSRAM stack free and _reclaim_reent -- happens on a normal task
+ * rather than on the idle task's small internal stack. R-P1.6.
+ *
+ * Falls back to the self-delete this replaced if no reaper has registered,
+ * so a board where the reaper did not start still ends its processes.
+ */
+void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,
+                          int exit_code) __attribute__((noreturn));
 
 /* Put the global stdio back into the process's reent, so that deleting its task
  * does not close espix's streams from the killer's -- or from IDLE's, which

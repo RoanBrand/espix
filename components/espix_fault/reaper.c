@@ -35,8 +35,13 @@
 
 #define TAG "reaper"
 
-#define REAPER_QUEUE_LEN   4
-#define REAPER_STACK_SIZE  3072
+#define REAPER_QUEUE_LEN   8
+/*
+ * 8 KB, and PSRAM: R-P1.6 made the reaper run a process's release_resources()
+ * -- esp_elf_deinit() among it -- which used to run on the process's own 8 KB
+ * stack. It is a background task, so PSRAM is where the stack belongs.
+ */
+#define REAPER_STACK_SIZE  8192
 #define REAPER_PRIORITY    (configMAX_PRIORITIES - 2)
 
 static QueueHandle_t s_queue;
@@ -53,6 +58,19 @@ void espix_fault_request_reap(TaskHandle_t task)
     xQueueSendFromISR(s_queue, &task, &yield);
 }
 
+/*
+ * The task-context half of the same queue. A process handing itself to the
+ * reaper must not lose the request, so this waits rather than dropping it --
+ * unlike the panic-path send above, which cannot wait and may.
+ */
+static void reap_request_task(TaskHandle_t task)
+{
+    if (s_queue == NULL || task == NULL) {
+        return;
+    }
+    (void)xQueueSend(s_queue, &task, portMAX_DELAY);
+}
+
 static void reaper_task(void *arg)
 {
     (void)arg;
@@ -61,6 +79,17 @@ static void reaper_task(void *arg)
         TaskHandle_t victim = NULL;
         if (xQueueReceive(s_queue, &victim, portMAX_DELAY) != pdTRUE ||
             victim == NULL) {
+            continue;
+        }
+
+        /*
+         * A process that handed itself over comes first: it has already asked
+         * for the clean teardown, so run that and delete it -- no kill, no
+         * fault log. Only a task espix_proc does not claim falls through to
+         * the fault path below.
+         */
+        if (espix_proc_reaped(victim)) {
+            vTaskDeleteWithCaps(victim);
             continue;
         }
 
@@ -104,6 +133,10 @@ esp_err_t espix_fault_reaper_start(void)
         s_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
+
+    /* The direction espix_proc cannot take itself: it must not depend on this
+     * component, so the reaper registers its entry point there instead. */
+    espix_proc_set_reap_task(reap_request_task);
 
     return ESP_OK;
 }
