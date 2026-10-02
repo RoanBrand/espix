@@ -218,3 +218,54 @@ only fall, and a run that does more (the whole suite, lwIP included) drives it
 lower than one that does less. The controlled comparison is the same suite
 across builds: at 96 and at 256 log lines the full suite reads the same 46K, so
 the ring is irrelevant, which is also what settled R-P0.8.
+
+## R-P1.5 -- the design, decided
+
+Linux-correct and resource-efficient agree on all of this; the choices are
+recorded as decisions so the implementation is mechanical.
+
+**Today the slot is the zombie.** A finished process keeps its slot -- state,
+exit code -- until espix_proc_alloc_slot() recycles the oldest finished one, so
+history competes with concurrency inside a fixed 12-slot table. That is the
+problem; everything below follows from fixing it.
+
+1. **The completed log is a small fixed ring, separate from the live table.**
+   Eight entries, statically allocated in espix_proc, holding what ps and wait
+   need: pid, name, state, exit code, ppid, start and end times. Fixed and
+   static because it is bookkeeping, not data: it must never be the reason a
+   spawn fails. Linux keeps only unreaped zombies, and even those are bounded
+   by the process table; eight is the same idea sized to what a person reads.
+
+2. **wait consumes the entry, as POSIX does.** espix_proc_wait() looks for the
+   pid in the live table first -- still running, so block -- and otherwise in
+   the completed log, takes the status and marks the entry reaped. A second
+   wait for the same pid then fails, which is ECHILD. This is the behaviour
+   waitpid(2) specifies and the reason a zombie exists at all.
+
+3. **An unwaited entry lives until it is reaped or the ring wraps.** Linux
+   would keep it forever, and that is a leak the parent owes; a fixed ring is
+   the resource-efficient compromise, and the honest divergence is that the
+   status of a process nobody waits for can be lost once eight more finish.
+   R-P1.6 is what makes it deterministic: the reaper is the thing that waits
+   for the processes nothing else will.
+
+4. **espix_proc_find() becomes live-only, so kill and signals reach only live
+   processes.** A zombie cannot be signalled in Linux either (kill(2) gives
+   ESRCH once it is reaped), and today find() includes finished slots, so a
+   finished process is still signallable. The log is consulted by ps and wait
+   and by nothing else.
+
+5. **The slot is released at finish**, after its contents are copied into the
+   ring, marked FREE last and under the lock. The one real rewiring this
+   forces is the wait path: it currently blocks on a per-slot event bit, and a
+   slot can now be reused immediately, so a waiter must be woken by the finish
+   itself. One global event bit or semaphore set at every finish, with the
+   waiter re-scanning the live table and then the log, is the simplest correct
+   equivalent of Linux's wait queue -- and it removes the index-tied event bit
+   that the current wait depends on.
+
+**Verification.** ps keeps showing history, from the ring instead of the
+table; a finished process no longer occupies a concurrency slot (spawn twelve,
+finish them, spawn twelve more); wait returns a status exactly once and fails
+the second time; kill on a finished pid reports not-found; and the existing
+exit-status tests in 30-proc.sh still pass unchanged.
