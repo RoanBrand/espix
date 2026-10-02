@@ -39,8 +39,11 @@ else
     # the behaviour change the host default brought, and the assertion that would
     # notice it being undone.
     assert_not_contains "a host build has no usb0" "usb0:" "$(dev_run 'ip link')"
-    assert_contains "usb status says USB-NCM is not in this image" \
-                    "not built into this image" "$(dev_run 'usb status')"
+
+    # There is no usb command to ask, and that is the decision rather than an
+    # omission: it is not a Unix command, and espix carries one only in a
+    # device-role NCM build (cmd_net.c), which is not the default. Which role
+    # this image has is what lsblk and blkid answer instead.
 
     # Both commands answer, and an operand that names nothing is refused rather
     # than silently matching nothing.
