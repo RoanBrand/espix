@@ -144,9 +144,25 @@ dev_run "rm -r $JAIL"         >/dev/null 2>&1
 # PSRAM free in KB -- column 4 of the psram row of 'free'.
 psram_free_kb() { dev_run free | awk '$1 == "psram" { print $4 }'; }
 
+# The 1-based index of a named column in ps's header, so a column that moves is
+# one edit here rather than a silent wrong read in several places. It was a
+# silent wrong read once already: CPU% moved to the last column (R-P4.5) and
+# these two hard-coded indices kept reading whatever had shifted into their
+# place.
+ps_col() {
+    dev_run ps | head -1 |
+        awk -v want="$1" '{ for (i = 1; i <= NF; i++) if ($i == want) { print i; exit } }'
+}
+
 # The live arena bytes of the backgrounded test app, from the HEAP column of
 # 'ps'; empty if it is not listed.
-app_heap_bytes() { dev_run ps | awk '$2 == "app:testapp" { print $8; exit }'; }
+app_heap_bytes() {
+    # The index first, on its own line: dev_run owns one shared session, and
+    # nesting one inside another's pipeline races them for the same FIFOs.
+    local c
+    c=$(ps_col HEAP)
+    dev_run ps | awk -v c="$c" '$2 == "app:testapp" { print $c; exit }'
+}
 
 app_running() {
     dev_run ps | sed -n '1,/^finished:/p' | grep -q "$1 app:testapp"
@@ -413,7 +429,8 @@ if [ -z "$pid" ]; then
     espix_fail "an app can be listed for its parent" "no [pid] line"
 else
     sleep 1
-    ppid_col=$(dev_run ps | awk -v p="$pid" '$1 == p { print $9; exit }')
+    ppid_idx=$(ps_col PPID)
+    ppid_col=$(dev_run ps | awk -v c="$ppid_idx" -v p="$pid" '$1 == p { print $c; exit }')
     assert_eq "a shell-spawned app has no parent" "-" "$ppid_col"
     dev_run "kill -9 $pid" >/dev/null
 fi

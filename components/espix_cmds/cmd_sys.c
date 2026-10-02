@@ -455,8 +455,15 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
     const uint64_t    total_runtime = (uint64_t)esp_timer_get_time();
     const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
-    espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s %9s %5s\n",
-                 "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%", "HEAP", "PPID");
+    /*
+     * CPU% is last, as in top. It used to sit between STACK and HEAP, which put
+     * it out of reach of the one reader that wants it by position --
+     * tests/suites/25-cpu.sh's max_cpu() takes $NF and needs it to end in '%',
+     * so on `ps` it silently matched nothing. Last is also where top puts it,
+     * so the two listings now agree.
+     */
+    espix_printf(s, "%5s %-16s %2s %4s %4s %6s %9s %5s %5s\n",
+                 "PID", "NAME", "ST", "PRI", "CORE", "STACK", "HEAP", "PPID", "CPU%");
 
     for (UBaseType_t i = 0; i < count; i++) {
         /*
@@ -562,16 +569,16 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
             snprintf(ppid_str, sizeof(ppid_str), "-");
         }
 
-        espix_printf(s, "%5s %-16s %2c %4u %4s %6u %4u%% %9s %5s\n",
+        espix_printf(s, "%5s %-16s %2c %4u %4s %6u %9s %5s %4u%%\n",
                      pid_str,
                      tasks[i].pcTaskName,
                      st,
                      (unsigned)tasks[i].uxCurrentPriority,
                      core_str,
                      (unsigned)tasks[i].usStackHighWaterMark,
-                     pct,
                      heap_str,
-                     ppid_str);
+                     ppid_str,
+                     pct);
     }
 
     free(tasks);
