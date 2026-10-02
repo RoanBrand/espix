@@ -29,6 +29,17 @@
 
 #include "espix_kernel.h"
 
+/*
+ * Background jobs one session remembers, for `jobs`, `fg` and `bg`.
+ *
+ * A job is a *process* -- a loaded app. A builtin is a task, and a task can be
+ * deleted but not stopped and resumed, so `fg`/`bg` have nothing to act on for
+ * one; backgrounding builtins needs a job task and a teardown rule, which is
+ * recorded against R-P2.6 rather than guessed at here.
+ */
+#define ESPIX_SESSION_JOBS  4
+#define ESPIX_JOB_NAME_MAX 24
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -224,6 +235,16 @@ struct espix_session {
 
     void       *transport;                 /* implementation-owned */
     espix_pid_t fg_pid;                    /* foreground process, or ESPIX_PID_NONE */
+
+    /*
+     * Background processes, in the order `&` started them, with the name the
+     * shell showed. A slot is free when its pid is <= 0, so a session that
+     * never backgrounds anything needs no initialisation. See
+     * espix_shell_job_add().
+     */
+    espix_pid_t job_pid[ESPIX_SESSION_JOBS];
+    char        job_name[ESPIX_SESSION_JOBS][ESPIX_JOB_NAME_MAX];
+
     int         last_status;               /* $? */
     bool        want_exit;
 
@@ -493,6 +514,15 @@ void espix_shell_foreach(espix_cmd_iter_fn cb, void *ctx);
  */
 typedef int (*espix_exec_fallback_fn)(espix_session_t *s, int argc, char **argv);
 void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn);
+
+/*
+ * Record a background process against the session, for `jobs`/`fg`/`bg`.
+ * Returns false when the table is full, which the caller reports rather than
+ * losing the job silently. Lives here and not with the `jobs` command because
+ * the table is the session's; the process lookups that prune it are in
+ * espix_cmds, which may depend on espix_proc and this header may not.
+ */
+bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name);
 
 /*
  * Run one command line in the context of `s`. Returns the command's status,

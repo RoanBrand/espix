@@ -530,6 +530,23 @@ static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
     return ctx.status;
 }
 
+bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name)
+{
+    if (s == NULL || pid <= 0) {
+        return false;
+    }
+
+    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
+        if (s->job_pid[i] <= 0) {
+            s->job_pid[i] = pid;
+            strlcpy(s->job_name[i], (name != NULL) ? name : "?",
+                    ESPIX_JOB_NAME_MAX);
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * One command, with no operators left in it: what espix_shell_exec() used to
  * be before `;`, `&&` and `||` were parsed. Split out so the sequencer below

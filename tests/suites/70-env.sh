@@ -224,3 +224,52 @@ if dev_testapp_present; then
 else
     espix_skip "backgrounding a program needs the test app"
 fi
+
+# ---------------------------------------------------------------------------
+# Background jobs: `jobs`, `bg`, `fg`. R-P2.6.
+#
+# The job table belongs to the session, so this needs one session across the
+# commands, which is what dev_run gives. A backgrounded app is a normal
+# process, so STOP and CONT are the same signals the process table already
+# has; `jobs` is the shell remembering what it started.
+# ---------------------------------------------------------------------------
+
+if ! dev_testapp_present; then
+    espix_skip "job control needs the test app"
+else
+    APP="/home/$ESPIX_USER/testapp"
+
+    j=$(dev_run "$APP hold 20 1000 &")
+    pid=$(printf '%s' "$j" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+    if [ -z "$pid" ]; then
+        espix_fail "a backgrounded app is listed as a job" "no [pid] line: $j"
+    else
+        assert_contains "a backgrounded app is listed as a job" "$pid" \
+            "$(dev_run 'jobs')"
+        assert_contains "and its name comes with it" "testapp" \
+            "$(dev_run 'jobs')"
+
+        dev_run "kill -STOP $pid" >/dev/null
+        sleep 1
+        assert_contains "a stopped job shows as stopped" "stop" \
+            "$(dev_run 'jobs')"
+
+        dev_run 'bg' >/dev/null
+        sleep 1
+        assert_not_contains "bg resumes it" "stop" "$(dev_run 'jobs')"
+
+        dev_run "kill -9 $pid" >/dev/null
+
+        # `fg` resumes it too, and waits: the job is the shell's again and it is
+        # gone from the table once it finishes. The assertion is on that effect
+        # rather than on the status, because dev_status opens its own connection
+        # -- an empty job table -- and there is no in-session status helper.
+        j=$(dev_run "$APP hold 2 1000 &")
+        pid=$(printf '%s' "$j" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+        dev_run "kill -STOP $pid" >/dev/null
+        sleep 1
+        dev_run 'fg' >/dev/null
+        assert_not_contains "fg resumes a stopped job and waits for it" "$pid" \
+            "$(dev_run 'jobs')"
+    fi
+fi
