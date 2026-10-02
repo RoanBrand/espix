@@ -206,7 +206,7 @@ dev_run() {
     fi
 
     # A framed error with a closed frame: the command itself was refused (an
-    # unsupported `;`, say). The session is still good.
+    # unsupported `|`, say). The session is still good.
     if [ -n "$why" ]; then
         printf '%s' "$DEV_DEAD"
         return 1

@@ -530,7 +530,12 @@ static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
     return ctx.status;
 }
 
-int espix_shell_exec(espix_session_t *s, const char *line)
+/*
+ * One command, with no operators left in it: what espix_shell_exec() used to
+ * be before `;`, `&&` and `||` were parsed. Split out so the sequencer below
+ * can run it once per segment.
+ */
+static int exec_one(espix_session_t *s, const char *line)
 {
     if (line == NULL) {
         return ESPIX_SHELL_EMPTY;
@@ -651,6 +656,93 @@ int espix_shell_exec(espix_session_t *s, const char *line)
      * including a spawned app, which copied what it needed at spawn. */
     espix_env_scope_end(s, &scope);
     return status;
+}
+
+/*
+ * `;`, `&&` and `||` as operators rather than words.
+ *
+ * A full shell parses the line into a tree before running anything; espix
+ * splits it into one flat sequence, which is all these three need and costs no
+ * objects. The split happens here, before expansion, because an operator is
+ * only an operator when it is unquoted -- `echo 'a;b'` is one command, and the
+ * `&` in `2>&1` is not `&&`.
+ *
+ * The result is a shell's: each segment runs in turn, `&&` skips the next when
+ * the last status was non-zero, `||` skips it when the status was zero, and the
+ * line's status is the last segment's. A blank segment is skipped, so `a ;; b`
+ * is `a` then `b`, and a line of nothing but separators runs nothing -- which
+ * leaves $? alone, as an empty line does.
+ */
+static bool blank_segment(const char *p)
+{
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return *p == '\0';
+}
+
+int espix_shell_exec(espix_session_t *s, const char *line)
+{
+    if (line == NULL) {
+        return ESPIX_SHELL_EMPTY;
+    }
+
+    /* The line is cut up in place: each operator becomes the terminator of the
+     * segment before it, so exec_one() is handed a plain command. */
+    char buf[ESPIX_LINE_MAX];
+    strlcpy(buf, line, sizeof(buf));
+
+    int  status  = ESPIX_SHELL_EMPTY;
+    bool ran     = false;
+    int  pending = 0;   /* 0 = run, 1 = run if last succeeded, 2 = if it failed */
+
+    char *seg = buf;
+    char *p   = buf;
+
+    for (;;) {
+        /* The next unquoted operator, or the end of the line. */
+        while (*p != '\0') {
+            if (*p == '\'' || *p == '"') {
+                const char quote = *p++;
+                while (*p != '\0' && *p != quote) {
+                    if (quote == '"' && *p == '\\' && p[1] != '\0') {
+                        p++;
+                    }
+                    p++;
+                }
+                if (*p == quote) {
+                    p++;
+                }
+                continue;
+            }
+            if (*p == ';' ||
+                (*p == '&' && p[1] == '&') ||
+                (*p == '|' && p[1] == '|')) {
+                break;
+            }
+            p++;
+        }
+
+        const char op = *p;
+        *p = '\0';
+
+        const bool skip = (pending == 1) ? (ran && status != 0)
+                                         : (pending == 2 ? (ran && status == 0)
+                                                         : false);
+        if (!skip && !blank_segment(seg)) {
+            status = exec_one(s, seg);
+            ran    = true;
+        }
+
+        if (op == '\0') {
+            break;
+        }
+        p += (op == ';') ? 1 : 2;
+        pending = (op == '&') ? 1 : ((op == '|') ? 2 : 0);
+        seg = p;
+    }
+
+    return ran ? status : ESPIX_SHELL_EMPTY;
 }
 
 /*

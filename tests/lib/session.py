@@ -135,11 +135,12 @@ class Session:
                 raise TimeoutError(f"no prompt; got: {self.buf[-400:]!r}")
 
     def run(self, command):
-        """Send one command, return its output with the echo and prompt gone."""
-        if ";" in command:
-            raise ValueError(
-                "espix's shell has no ';' -- send one command per call, "
-                "or the second half runs as an argument to the first")
+        """Send one command, return its output with the echo and prompt gone.
+
+        A line may carry `;`, `&&` and `||` now (R-P2.1); the shell parses
+        them. There used to be a guard here that refused `;` because it would
+        have run as an argument to the first word -- that is no longer true, so
+        the guard is gone rather than left to reject working syntax."""
         self.buf = b""
         os.write(self.fd, command.encode() + b"\r")
         self._wait_prompt()

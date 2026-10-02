@@ -46,6 +46,39 @@ dev_run 'uptime' >/dev/null
 assert_eq "\$? reports success"          "0"   "$(dev_run 'echo $?')"
 
 # ---------------------------------------------------------------------------
+# `;`, `&&` and `||` are operators, not words. R-P2.1.
+#
+# The status each acts on is a real one: `cd` into a missing directory is 1,
+# so `&&` must skip and `||` must run. `;` ends the chain, so a failure before
+# it does not decide what follows.
+# ---------------------------------------------------------------------------
+
+assert_eq "';' runs commands in sequence" "one two" \
+    "$(dev_run 'echo one; echo two' | tr '\n' ' ' | sed 's/ *$//')"
+
+assert_eq "'&&' runs the next command on success" "yes" \
+    "$(dev_run 'cd / && echo yes')"
+
+# The failing `cd` prints to stderr, which dev_run folds into the output, so
+# the assertion is on the marker the skipped command would have printed.
+assert_not_contains "'&&' skips the next command on failure" "SHOULD-NOT-PRINT" \
+    "$(dev_run 'cd /definitely-not-a-dir && echo SHOULD-NOT-PRINT')"
+
+assert_contains "'||' runs the next command on failure" "recovered" \
+    "$(dev_run 'cd /definitely-not-a-dir || echo recovered')"
+
+assert_not_contains "'||' skips the next command on success" "SHOULD-NOT-PRINT" \
+    "$(dev_run 'cd / || echo SHOULD-NOT-PRINT')"
+
+assert_contains "';' ends the chain a failure started" "after" \
+    "$(dev_run 'cd /definitely-not-a-dir && echo SHOULD-NOT-PRINT; echo after')"
+
+# An operator is only an operator unquoted. espix's tokenizer keeps the quotes
+# on the argument, so the assertion is that the `;` did not split the command.
+assert_contains "a quoted ';' is an argument, not an operator" "a;b" \
+    "$(dev_run "echo 'a;b'")"
+
+# ---------------------------------------------------------------------------
 # The defaults a login starts with
 # ---------------------------------------------------------------------------
 
