@@ -223,3 +223,14 @@ else
         *)       espix_pass "kill -9 on a writing app leaves the board up ($reason_after)" ;;
     esac
 fi
+
+# alarm() is the only source of SIGALRM, and its done-when is that it interrupts
+# sleep(). Run in the foreground, so the output is inside the frame. R-P6.5.
+alarm_out=$(dev_run "$APP sig alarm")
+assert_contains "alarm fires and interrupts sleep" "seen=1" "$alarm_out"
+alarm_ms=$(printf '%s' "$alarm_out" | sed -n 's/.*after \([0-9][0-9]*\) ms.*/\1/p')
+if [ -n "$alarm_ms" ] && [ "$alarm_ms" -lt 5000 ]; then
+    espix_pass "and the sleep was cut short ($alarm_ms ms, not 60 s)"
+else
+    espix_fail "and the sleep was cut short" "got: $alarm_out"
+fi

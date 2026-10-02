@@ -283,6 +283,19 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->sig_blocked  = 0;
 
     /*
+     * The alarm timer. Deleted here rather than left to the process, which may
+     * never have run again -- a force-kill does not. esp_timer_delete() waits
+     * for a callback already running, so the slot cannot be reused under one.
+     */
+    if (slot->alarm_timer != NULL) {
+        (void)esp_timer_stop((esp_timer_handle_t)slot->alarm_timer);
+        (void)esp_timer_delete((esp_timer_handle_t)slot->alarm_timer);
+        slot->alarm_timer = NULL;
+    }
+    slot->alarm_deadline_us = 0;
+    slot->alarm_interval_us = 0;
+
+    /*
      * And the app's own memory. This is the point of the arena: one release per
      * region rather than a walk of every block, so a hard kill returns exactly
      * what a clean exit does -- and both paths already arrive here.

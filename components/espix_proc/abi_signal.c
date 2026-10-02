@@ -47,6 +47,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -56,6 +57,8 @@
 
 #include "esp_elf.h"
 #include "private/elf_symbol.h"
+
+#include "esp_timer.h"
 
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
@@ -414,6 +417,142 @@ static int espix_abi_pause(void)
  * name. See the header of that file.
  */
 
+/* ------------------------------------------------------- the timer signal */
+/*
+ * SIGALRM, and the two calls that ask for it. Nothing else generates it: the
+ * delivery path -- the pending bit, the handler, the interruption of sleep()
+ * -- was already complete, but an app had no way to set a deadline, because
+ * alarm() and setitimer() are absent from the loader's tables now.
+ *
+ * One timer per process, because POSIX allows one alarm and one ITIMER_REAL.
+ * Created on first use, deleted with the slot's other resources, so a process
+ * that never asks for a timer costs one NULL pointer.
+ */
+static void alarm_fired(void *arg)
+{
+    espix_proc_slot_t *slot = arg;
+
+    /* A repeating timer's next deadline, so setitimer(..., old) stays
+     * meaningful. A one-shot leaves it; esp_timer_is_active() says it is over. */
+    if (slot->alarm_interval_us > 0) {
+        slot->alarm_deadline_us = esp_timer_get_time() + slot->alarm_interval_us;
+    }
+
+    (void)espix_proc_signal(slot->info.pid, SIGALRM);
+}
+
+static bool alarm_arm(espix_proc_slot_t *slot, int64_t value_us,
+                      int64_t interval_us)
+{
+    if (slot->alarm_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = alarm_fired,
+            .arg      = slot,
+            .name     = "sig:alrm",
+        };
+        esp_timer_handle_t timer = NULL;
+        if (esp_timer_create(&args, &timer) != ESP_OK) {
+            return false;
+        }
+        slot->alarm_timer = timer;
+    }
+
+    esp_timer_handle_t timer = slot->alarm_timer;
+    (void)esp_timer_stop(timer);
+    slot->alarm_deadline_us = 0;
+    slot->alarm_interval_us = 0;
+
+    if (value_us <= 0) {
+        return true;                    /* disarmed */
+    }
+
+    const esp_err_t err = (interval_us > 0)
+        ? esp_timer_start_periodic(timer, (uint64_t)interval_us)
+        : esp_timer_start_once(timer, (uint64_t)value_us);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    slot->alarm_deadline_us = esp_timer_get_time() + value_us;
+    slot->alarm_interval_us = interval_us;
+    return true;
+}
+
+/* Microseconds left on the timer, or 0 when it is not running. */
+static int64_t alarm_left_us(const espix_proc_slot_t *slot)
+{
+    if (slot->alarm_timer == NULL ||
+        !esp_timer_is_active((esp_timer_handle_t)slot->alarm_timer) ||
+        slot->alarm_deadline_us <= 0) {
+        return 0;
+    }
+
+    const int64_t left = slot->alarm_deadline_us - esp_timer_get_time();
+    return (left > 0) ? left : 0;
+}
+
+unsigned espix_abi_alarm(unsigned seconds)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+    if (slot == NULL) {
+        errno = EINVAL;                 /* not an espix process */
+        return 0;
+    }
+
+    /* POSIX: the seconds remaining on the previous alarm, rounded up. */
+    const int64_t left = alarm_left_us(slot);
+    const unsigned remaining =
+        (left > 0) ? (unsigned)((left + 999999) / 1000000) : 0;
+
+    if (!alarm_arm(slot, (int64_t)seconds * 1000000, 0)) {
+        errno = ENOMEM;
+        return 0;
+    }
+    return remaining;
+}
+
+int espix_abi_setitimer(int which, const struct itimerval *newv,
+                        struct itimerval *oldv)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+
+    /* The real-time timer is the one with a source here; there is no separate
+     * CPU time to account against for ITIMER_VIRTUAL or ITIMER_PROF. */
+    if (slot == NULL || which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (oldv != NULL) {
+        const int64_t left = alarm_left_us(slot);
+        const int64_t iv   = (slot->alarm_interval_us > 0)
+                                 ? slot->alarm_interval_us : 0;
+        oldv->it_value.tv_sec     = (time_t)(left / 1000000);
+        oldv->it_value.tv_usec    = (suseconds_t)(left % 1000000);
+        oldv->it_interval.tv_sec  = (time_t)(iv / 1000000);
+        oldv->it_interval.tv_usec = (suseconds_t)(iv % 1000000);
+    }
+
+    if (newv == NULL) {
+        return 0;                       /* a query only */
+    }
+
+    const int64_t value    = (int64_t)newv->it_value.tv_sec * 1000000 +
+                             (int64_t)newv->it_value.tv_usec;
+    const int64_t interval = (int64_t)newv->it_interval.tv_sec * 1000000 +
+                             (int64_t)newv->it_interval.tv_usec;
+
+    if (value <= 0) {
+        (void)alarm_arm(slot, 0, 0);    /* POSIX: a zero it_value disarms */
+        return 0;
+    }
+    if (!alarm_arm(slot, value, (interval > 0) ? interval : 0)) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}
+
 static const abi_sym_t s_signal_syms[] = {
     /* Dispositions. */
     ABI_SYM("signal",      espix_abi_signal),
@@ -424,6 +563,11 @@ static const abi_sym_t s_signal_syms[] = {
     ABI_SYM("kill",        espix_abi_kill),
     ABI_SYM("raise",       espix_abi_raise),
     ABI_SYM("getpid",      espix_abi_getpid),
+
+    /* The timer signal. There is no other source of SIGALRM, so without these
+     * an app cannot interrupt its own sleep() on a deadline. */
+    ABI_SYM("alarm",       espix_abi_alarm),
+    ABI_SYM("setitimer",   espix_abi_setitimer),
 
     /* Masks. sigemptyset and friends are macros in <signal.h>, so an app gets
      * them at compile time and there is nothing to publish. */

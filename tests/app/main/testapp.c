@@ -530,6 +530,40 @@ static int sig_handlers(void)
     }
 }
 
+/*
+ * alarm(): a SIGALRM the process asks for itself, and the only source of that
+ * signal. The done-when is that it interrupts sleep(), so this sleeps 60 and
+ * reports how long it actually took and whether the handler ran. R-P6.5.
+ */
+static volatile sig_atomic_t s_alarm_seen;
+
+static void on_alarm(int sig)
+{
+    (void)sig;
+    s_alarm_seen = 1;
+}
+
+static int sig_alarm(void)
+{
+    signal(SIGALRM, on_alarm);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    const unsigned prev = alarm(2);
+    sleep(60);                          /* the alarm must cut this short */
+    const unsigned left = alarm(0);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                           (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    printf("alarm: seen=%d after %ld ms (prev=%u, left=%u)\n",
+           (int)s_alarm_seen, ms, prev, left);
+    fflush(stdout);
+    return s_alarm_seen ? 0 : 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -540,6 +574,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "spin") == 0) {
         return sig_spin();
+    }
+    if (strcmp(mode, "alarm") == 0) {
+        return sig_alarm();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
@@ -1190,7 +1227,7 @@ static void usage(void)
            "  both                one line to stdout, one to stderr\n"
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
-           "  sig [mode]          handlers (default) | ignore | spin\n"
+           "  sig [mode]          handlers (default) | ignore | spin | alarm\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"

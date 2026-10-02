@@ -240,6 +240,16 @@ typedef struct {
     bool              foreground;
 
     /*
+     * The interval timer behind alarm() and setitimer(), and so the only source
+     * of SIGALRM. One per process, as POSIX allows, created on first use and
+     * deleted with the rest of the resources. void * rather than
+     * esp_timer_handle_t so this header stays out of esp_timer.h.
+     */
+    void             *alarm_timer;
+    int64_t           alarm_deadline_us;
+    int64_t           alarm_interval_us;
+
+    /*
      * The task's own struct _reent, published by the process itself before it
      * replaced any of its stdio.
      *
