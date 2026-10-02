@@ -98,7 +98,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 | R-P1.3 | Give `fd_slot_t` an owner and close a dead process's fds | `fd_slot_t` is `{lower_fd, mount}`, so a force-killed app leaks its descriptors | `vfs.c:182` | **done** -- the reaper finds IDF's descriptor for each reaped key (get_local_fd()) and closes **through IDF**, so esp_vfs_close() releases its entry *and* espix's own close runs. Closing the layer below directly, which is what the earlier attempts did, freed espix's slot and the filesystem's handle while IDF's entry stayed allocated for good: capacity 20 -> 12 for 8 held, and near-exhaustion of the MAX_FDS pool (== FD_SETSIZE, shared with sockets) then took the board down. Now 20 -> 20 across runs, 48/48 on the S31. The one-number-space idea in the history below was **wrong** -- IDF allocates the descriptor *after* the VFS's open returns, so espix cannot choose it; looking it up is the fix. |
 
 **The fix, and it is a single-number-space change.** Every open and close must be espix's, with nothing held by IDF that espix cannot release. Concretely: allocate the fd the way `dev.c` already does for *device* fds -- `espix_dev_fd()` / `ESPIX_DEV_FD_BASE` and the loop at vfs.c:1359 show the in-repo pattern -- so that `local_fd == fd` (`vfs.c:561`), keep that number in the slot, and release it from the reaper with `esp_vfs_unregister_fd()`. Then espix's `s_fds` is indexed by the one number everyone uses, the `128+` base and the key indirection disappear, and IDF holds no per-open state that outlives a dead process. This also retires the `ESPIX_DEV_FD_BASE` collision check at vfs.c:604, which exists only because two number spaces had to be kept apart. **Do it as one piece** -- it changes fd numbering for every file operation, so half of it is every app's I/O broken. Two things follow: find out whether `espix_proc_self_pid()` is stamping an owner at open time at all (the most likely failure -- the release then finds nothing to match), and treat *fd-table exhaustion taking the board down* as a bug in its own right, because it is reachable today by any app that leaks descriptors. |
-| R-P1.4 | `ppid`/children tracking + `SIGCHLD` | Nothing tracks parentage; ownership is "which session pointer you hold". Needed by services, job control and `waitpid` | `espix_proc.h:59` | a child exit notifies its parent | todo |
+| R-P1.4 | `ppid`/children tracking + `SIGCHLD` | Nothing tracks parentage; ownership is "which session pointer you hold". Needed by services, job control and `waitpid` | `espix_proc.h:59` | a child exit notifies its parent | **done, with a dormant half.** The mechanism is complete and correct: every slot records the process that spawned it, and espix_proc_finish() sets SIGCHLD pending on that parent (safe because SIGCHLD is already in espix's default-ignore list). But nothing that can be a parent exists -- the shell is a session task, not a process, and no app-visible call spawns -- so every process shows ppid NONE and the notification never fires. That is a truthful state rather than a gap: the shell spawning a process is the kthreadd case, and a kernel thread has no ppid either. The loop closes by itself the moment a *process* first spawns, which is services (R-P6.1) or whatever first gives an app a spawn call; no R-P1 item does. Not needed yet: the shell tracks children by session and pid, not by signal. ps grows a PPID column, appended rather than beside PID because other suites parse this listing's columns. |
 | R-P1.5 | Separate the **live table** from a small **completed log**; recycle a slot on reap | Retaining finished slots is a debugging affordance, not POSIX — Linux keeps only unreaped zombies, and `ps` history is not a thing there. The live table then sizes to *concurrency*, not to history | `proc.c:133`, `cmd_sys.c` `ps` | `ps` shows history from the ring; slots recycle at once | todo |
 | R-P1.6 | Make `espix:reaper` the **single teardown point**: per-invocation tasks (command, ssh conn, app) stop calling `vTaskDelete(NULL)` and park instead, and the reaper deletes them — reclaiming the arena, fds and screen in the same pass | `prvCheckTasksWaitingTermination()` is a private static in FreeRTOS's `tasks.c` and cannot be called. But deleting *another* task frees its TCB in the caller, so if nothing self-deletes, the idle task stops being *required* for espix's cleanup. IDF components and app-created pthreads still self-delete, so this reduces the dependence rather than removing it. Also retires the `espix_gfx_recover()` special case | `reaper.c`, `exec.c:616`, `session.c:469`, `ssh_server.c:495` | a finished process is torn down entirely by the reaper | todo |
 | R-P1.7 | Reclaim the screen through R-P1.6 instead of the `espix_gfx_recover()` special case | Today the canvas is the one resource that *is* reclaimed, by hand | `proc.c:236` | the special case is gone | todo |
@@ -201,19 +201,20 @@ decisions, and an **implementation plan in the order it has to happen**.
 - [GrieferPig/esp32-s31-linux](https://github.com/GrieferPig/esp32-s31-linux) — Sv32 MMU Linux 6.18, XIP.
 - [annoyedmilk/esp32-s31-linux](https://github.com/annoyedmilk/esp32-s31-linux) — its `docs/internals.md` documents the SoC quirks (no PLIC, no Zicbom, no coherent DMA, no uncached alias) and is the useful one for espix's cache/DMA work.
 
-## Open: 60-net and 75-usb fail, and it is not parentage
+## Expected: 60-net and 75-usb want a USB-NCM build
 
 The full suite reads 261 passed / 3 failed, and all three are one cause with
-nothing to do with R-P1.4: usb0 is absent and the usb command is not found, so
-this image has USB host (the MSC and HID tasks are up) but not USB-NCM, while
-those two suites assert an NCM build. That is the one open item here.
+nothing to do with parentage: usb0 is absent and the usb command is not found,
+so this image has USB host (the MSC and HID tasks are up) but not USB-NCM, while
+those two suites assert an NCM build. Per the project's own rule that suites
+skip according to config, hardware and attached peripherals, these should SKIP
+rather than FAIL -- a small test-side fix, not a kernel one. No kernel
+consequence, and not a reason to hold anything back.
 
-**The heap line is not an open item, and reading it as one cost time.** "fell to
+**The heap line is neither, and reading it as a regression cost time.** "fell to
 46K this run (was 93K)" compares the internal low-water mark before and after a
-run -- and that figure is cumulative since boot and never recovers (the note at
-device.sh:1081), so it can only fall, and a run that does more (the whole suite,
-lwIP included) drives it lower than one that does less. 46K for the full suite
-against 93K for a single suite says nothing about either. The controlled
-comparison is the same suite across builds: at 96 and at 256 log lines the full
-suite reads the same 46K, so the ring is irrelevant -- which is also what settled
-R-P0.8.
+run -- cumulative since boot and never recovering (device.sh:1081) -- so it can
+only fall, and a run that does more (the whole suite, lwIP included) drives it
+lower than one that does less. The controlled comparison is the same suite
+across builds: at 96 and at 256 log lines the full suite reads the same 46K, so
+the ring is irrelevant, which is also what settled R-P0.8.
