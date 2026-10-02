@@ -2151,6 +2151,16 @@ static void apply_account(espix_session_t *session, const char *user)
 static void finish_session(ssh_chan_t *ch, espix_session_t *session)
 {
     /*
+     * Backgrounded builtins first, and before the environment goes: a job runs
+     * against a copy of this session, so it must not outlive the table that
+     * copy shares. The REPL path has already drained by now -- the shell does
+     * it as espix_shell_session_run() returns -- and draining twice is a
+     * no-op, which is what makes the exec path below (which never reaches the
+     * REPL) safe without a second call site.
+     */
+    espix_shell_jobs_drain(session);
+
+    /*
      * The processes are no longer this function's business: the shell hangs up
      * whatever a session spawned as it returns, so every transport has that for
      * free instead of each one remembering. What is left here is the session's

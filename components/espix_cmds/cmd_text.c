@@ -83,14 +83,15 @@ typedef struct {
     unsigned long lines, words, bytes;
 } wc_t;
 
-static void wc_count(FILE *f, wc_t *out)
+static void wc_count(espix_session_t *s, FILE *f, wc_t *out)
 {
     wc_t  c = { 0, 0, 0 };
     char  buf[256];
     bool  in_word = false;
     size_t n;
 
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    while (!espix_shell_stopping(s) &&
+           (n = fread(buf, 1, sizeof(buf), f)) > 0) {
         c.bytes += n;
         for (size_t i = 0; i < n; i++) {
             const char ch = buf[i];
@@ -145,7 +146,7 @@ static int cmd_wc(espix_session_t *s, int argc, char **argv)
             return 1;
         }
         wc_t c;
-        wc_count(f, &c);
+        wc_count(s, f, &c);
         wc_print(s, &c, l, w, b, NULL);
         return 0;
     }
@@ -160,7 +161,7 @@ static int cmd_wc(espix_session_t *s, int argc, char **argv)
         if (f == NULL) { rc = 1; continue; }
 
         wc_t c;
-        wc_count(f, &c);
+        wc_count(s, f, &c);
         fclose(f);
 
         total.lines += c.lines;
@@ -211,7 +212,8 @@ static void head_stream(espix_session_t *s, FILE *f, long n)
     char line[TEXT_LINE_MAX];
     long shown = 0;
 
-    while (shown < n && fgets(line, sizeof(line), f) != NULL) {
+    while (shown < n && !espix_shell_stopping(s) &&
+           fgets(line, sizeof(line), f) != NULL) {
         espix_puts(s, line);
         shown++;
     }
@@ -261,7 +263,8 @@ static bool tail_stream(espix_session_t *s, FILE *f, long n)
     }
 
     char line[TEXT_LINE_MAX];
-    while (fgets(line, sizeof(line), f) != NULL) {
+    while (!espix_shell_stopping(s) &&
+           fgets(line, sizeof(line), f) != NULL) {
         if (n == 0) { continue; }
         char *copy = strdup(line);
         if (copy == NULL) { break; }
@@ -339,7 +342,8 @@ static bool grep_stream(espix_session_t *s, FILE *f, const char *name,
     char          line[TEXT_LINE_MAX];
     long          lineno  = 0;
 
-    while (fgets(line, sizeof(line), f) != NULL) {
+    while (!espix_shell_stopping(s) &&
+           fgets(line, sizeof(line), f) != NULL) {
         lineno++;
         const bool hit = (ign ? contains_case(line, pat)
                               : (strstr(line, pat) != NULL)) != inv;
@@ -459,7 +463,8 @@ static int cmp_num(const void *a, const void *b)
 static bool sort_read(espix_session_t *s, FILE *f, strlist_t *l)
 {
     char line[TEXT_LINE_MAX];
-    while (fgets(line, sizeof(line), f) != NULL) {
+    while (!espix_shell_stopping(s) &&
+           fgets(line, sizeof(line), f) != NULL) {
         char *copy = strdup(line);
         if (copy == NULL || !strlist_add(l, copy)) {
             free(copy);
@@ -547,6 +552,8 @@ static int cmd_sort(espix_session_t *s, int argc, char **argv)
 
 static void find_walk(espix_session_t *s, const char *path, int depth, bool *err)
 {
+    if (espix_shell_stopping(s)) { return; }
+
     espix_printf(s, "%s\n", path);
 
     if (depth >= FIND_DEPTH_MAX) { return; }
@@ -564,7 +571,7 @@ static void find_walk(espix_session_t *s, const char *path, int depth, bool *err
     }
 
     struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
+    while (!espix_shell_stopping(s) && (e = readdir(d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
             continue;
         }
@@ -706,7 +713,16 @@ static int cmd_sleep(espix_session_t *s, int argc, char **argv)
     const TickType_t end_tick = xTaskGetTickCount() + pdMS_TO_TICKS(secs * 1000);
 
     while ((int32_t)(end_tick - xTaskGetTickCount()) > 0) {
-        if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
+        /*
+         * A background job is asked to stop rather than interrupted, and it
+         * must not consume the terminal input doing it: that belongs to the
+         * shell, which is still reading.
+         */
+        if (espix_shell_stopping(s)) {
+            return 130;
+        }
+        if (s->stop == NULL && s->poll_interrupt != NULL &&
+            s->poll_interrupt(s)) {
             espix_printf(s, "^C\n");
             return 130;
         }

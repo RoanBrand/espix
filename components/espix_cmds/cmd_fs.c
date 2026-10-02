@@ -573,7 +573,8 @@ static int cmd_cat(espix_session_t *s, int argc, char **argv)
         }
         char   chunk[COPY_CHUNK + 1];
         size_t n;
-        while ((n = fread(chunk, 1, COPY_CHUNK, in)) > 0) {
+        while (!espix_shell_stopping(s) &&
+               (n = fread(chunk, 1, COPY_CHUNK, in)) > 0) {
             chunk[n] = '\0';
             espix_puts(s, chunk);
         }
@@ -598,7 +599,8 @@ static int cmd_cat(espix_session_t *s, int argc, char **argv)
 
         char   chunk[COPY_CHUNK + 1];
         size_t n;
-        while ((n = fread(chunk, 1, COPY_CHUNK, f)) > 0) {
+        while (!espix_shell_stopping(s) &&
+               (n = fread(chunk, 1, COPY_CHUNK, f)) > 0) {
             chunk[n] = '\0';
             espix_puts(s, chunk);
         }

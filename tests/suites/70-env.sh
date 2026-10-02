@@ -201,18 +201,41 @@ assert_contains "a full table is refused with the limit named" "is the limit" \
     "$(dev_run 'export LAST=x' 2>&1)"
 
 # ---------------------------------------------------------------------------
-# `&` is the shell's background operator, not an argument. R-P2.2.
+# `&` runs a builtin on a task of its own. R-P2.8.
 #
-# The shell strips a trailing `&` before dispatch, so no command sees it as an
-# argument -- `cat f &` used to open a file called `&`. A command that spawns
-# backgrounds; one that cannot is refused explicitly rather than silently run in
-# the foreground. Backgrounding a builtin on a task of its own is R-P2.6.
+# The shell strips a trailing `&` before dispatch, so no command ever sees it
+# as an argument -- `cat f &` used to open a file called `&`. A builtin cannot
+# be signalled, so it gets the cooperative equivalent: the loops that can block
+# poll a stop flag the session sets, and the session drains whatever is left
+# when it ends. The `; sleep 1` keeps the line open long enough that the job's
+# output lands inside the frame dev_run reads; output that arrives at an idle
+# prompt is a harness blind spot rather than a device one.
 # ---------------------------------------------------------------------------
 
-assert_contains "a builtin that cannot background says so" \
-    "cannot be backgrounded" "$(dev_run 'cat /etc/hostname &' 2>&1)"
-assert_not_contains "and it never reaches the command as a filename" \
-    "no such file" "$(dev_run 'cat /etc/hostname &' 2>&1)"
+assert_contains "a builtin backgrounds and reports a job" "[1] cat" \
+    "$(dev_run 'cat /etc/hostname & ; sleep 1' 2>&1)"
+assert_contains "and the job actually runs" "$(dev_run 'cat /etc/hostname')" \
+    "$(dev_run 'cat /etc/hostname & ; sleep 1' 2>&1)"
+assert_not_contains "the operator never becomes a filename" "no such file" \
+    "$(dev_run 'cat /etc/hostname & ; sleep 1' 2>&1)"
+
+assert_contains "a backgrounded builtin is listed as a job" "sleep" \
+    "$(dev_run 'sleep 5 & ; jobs')"
+assert_contains "and it shows as running" "Run" \
+    "$(dev_run 'sleep 5 & ; jobs')"
+assert_contains "fg declines a builtin, which cannot be resumed" \
+    "cannot be stopped or resumed" "$(dev_run 'sleep 5 & ; fg')"
+
+assert_contains "a redirection with & is refused" "redirection with &" \
+    "$(dev_run 'cat /etc/hostname 2>&1 &' 2>&1)"
+assert_contains "an assignment with & is refused" "assignments with &" \
+    "$(dev_run 'FOO=bar cat /etc/hostname &' 2>&1)"
+
+# The exec path ends the session the moment the line returns, so a
+# backgrounded builtin has to be drained there too: it writes through a
+# transport that is about to be freed.
+assert_status "a backgrounded builtin does not outlive an exec session" 0 \
+    dev_status 'sleep 30 &'
 
 if dev_testapp_present; then
     APP="/home/$ESPIX_USER/testapp"
@@ -231,7 +254,9 @@ fi
 # The job table belongs to the session, so this needs one session across the
 # commands, which is what dev_run gives. A backgrounded app is a normal
 # process, so STOP and CONT are the same signals the process table already
-# has; `jobs` is the shell remembering what it started.
+# has; `jobs` is the shell remembering what it started. A backgrounded builtin
+# shares the table but has no pid (R-P2.8), which is why fg and bg apply only
+# to the process kind.
 # ---------------------------------------------------------------------------
 
 if ! dev_testapp_present; then

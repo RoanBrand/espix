@@ -32,13 +32,43 @@
 /*
  * Background jobs one session remembers, for `jobs`, `fg` and `bg`.
  *
- * A job is a *process* -- a loaded app. A builtin is a task, and a task can be
- * deleted but not stopped and resumed, so `fg`/`bg` have nothing to act on for
- * one; backgrounding builtins needs a job task and a teardown rule, which is
- * recorded against R-P2.6 rather than guessed at here.
+ * Two kinds of job share one record. A *process* job is a loaded app: it has a
+ * pid, it can be signalled, and `fg`/`bg` resume it with SIGCONT. A *builtin*
+ * job is a task of the shell's own. espix can delete a task but not stop and
+ * resume one, so it has no pid and nothing for `fg`/`bg` to act on -- what it
+ * has instead is a stop flag its blocking loops poll, and one owner for its
+ * teardown. See espix_shell_stopping() and espix_shell_jobs_drain().
  */
 #define ESPIX_SESSION_JOBS  4
 #define ESPIX_JOB_NAME_MAX 24
+
+typedef struct espix_job {
+    espix_pid_t   pid;          /* >0 for a process job, 0 for a builtin task */
+
+    /*
+     * The builtin task and its context. `task` is a TaskHandle_t, typed void *
+     * because this header stays FreeRTOS-free; `ctx` is heap memory holding
+     * the task's session copy and its argv. `caps` remembers which allocator
+     * the stack came from, so it is deleted the matching way.
+     */
+    void         *task;
+    void         *ctx;
+    bool          caps;
+
+    /* Set to ask the task to return. espix_shell_stopping() reads it. */
+    volatile bool stop;
+
+    /*
+     * The teardown handshake. `finished` says the task has reached its end;
+     * `owner` says who frees the context and deletes the task -- 0 while
+     * nobody has claimed it, 1 when the task claimed it, 2 when the drain did.
+     * One critical section decides, so exactly one of them ever acts.
+     */
+    volatile bool finished;
+    volatile int  owner;
+
+    char          name[ESPIX_JOB_NAME_MAX];
+} espix_job_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -237,13 +267,20 @@ struct espix_session {
     espix_pid_t fg_pid;                    /* foreground process, or ESPIX_PID_NONE */
 
     /*
-     * Background processes, in the order `&` started them, with the name the
-     * shell showed. A slot is free when its pid is <= 0, so a session that
-     * never backgrounds anything needs no initialisation. See
+     * Background jobs, in the order `&` started them, with the name the shell
+     * showed. A slot is free when both pid and task are clear, so a session
+     * that never backgrounds anything needs no initialisation. See
      * espix_shell_job_add().
      */
-    espix_pid_t job_pid[ESPIX_SESSION_JOBS];
-    char        job_name[ESPIX_SESSION_JOBS][ESPIX_JOB_NAME_MAX];
+    espix_job_t jobs[ESPIX_SESSION_JOBS];
+
+    /*
+     * Non-NULL only in a background builtin's session copy, where it points at
+     * that job's stop flag. The loops that can block poll it; NULL everywhere
+     * else, which is what makes espix_shell_stopping() false in an ordinary
+     * session and leaves poll_interrupt the only way to cut a command short.
+     */
+    const volatile bool *stop;
 
     int         last_status;               /* $? */
     bool        want_exit;
@@ -351,12 +388,13 @@ typedef struct espix_cmd {
     bool             internal_stack;
 
     /*
-     * Whether this command knows what a trailing `&` means.
+     * Whether this command handles a trailing `&` itself.
      *
-     * The shell strips the operator before dispatch, so a command that spawns
-     * may run itself in the background; one that does not is refused rather
-     * than silently run in the foreground. The flag exists only until R-P2.6's
-     * job table lets any builtin be backgrounded on a task of its own.
+     * True only for a command that *spawns*: `confine` turns a program into a
+     * process and gives it a pid, so it does its own backgrounding. Every
+     * other builtin is now run on a job task by the shell when `&` is present
+     * (R-P2.8), so this flag is no longer a refusal -- without it a spawner
+     * would be quietly forked a second time.
      */
     bool             backgrounds;
 
@@ -524,13 +562,39 @@ typedef int (*espix_exec_fallback_fn)(espix_session_t *s, int argc, char **argv)
 void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn);
 
 /*
- * Record a background process against the session, for `jobs`/`fg`/`bg`.
+ * Record a background *process* against the session, for `jobs`/`fg`/`bg`.
  * Returns false when the table is full, which the caller reports rather than
  * losing the job silently. Lives here and not with the `jobs` command because
  * the table is the session's; the process lookups that prune it are in
  * espix_cmds, which may depend on espix_proc and this header may not.
  */
 bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name);
+
+/*
+ * Reclaim a finished job slot. Called by the `jobs` command when it finds a
+ * process gone or a builtin task finished; the task owns its own teardown, so
+ * this only forgets what the session remembered. Lives here because the
+ * teardown handshake is under a lock this component owns.
+ */
+void espix_shell_job_clear(espix_session_t *s, int slot);
+
+/*
+ * Has this session -- a background builtin's copy -- been asked to stop?
+ *
+ * The cooperative equivalent of a signal, and the only one a builtin can have:
+ * espix can delete a task but not signal it. A blocking loop polls this and
+ * returns early; false in every ordinary session, so it is free there.
+ */
+bool espix_shell_stopping(const espix_session_t *s);
+
+/*
+ * Stop every background builtin this session still has, before the session and
+ * its transport go away. Sets each job's stop flag, gives its loops a bounded
+ * moment to notice, then deletes only what ignored it. Called from
+ * espix_shell_session_run() before the session-end hook, and by SSH's
+ * finish_session() for the exec path, which never reaches the REPL.
+ */
+void espix_shell_jobs_drain(espix_session_t *s);
 
 /*
  * Run one command line in the context of `s`. Returns the command's status,

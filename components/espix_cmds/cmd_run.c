@@ -588,73 +588,101 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
 /* jobs, fg, bg                                                        */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* jobs, fg, bg                                                        */
+/* ------------------------------------------------------------------ */
+
 /*
- * Background jobs are processes, and this is the session's memory of them.
- * `fg` and `bg` resume with SIGCONT: stopping and continuing already work
- * through espix_proc_signal(), and the `T` state a stopped process shows is
- * what `jobs` prints. Ctrl-Z is not here because the transports do not yet
- * report *which* key arrived -- see R-P7.7 -- and backgrounding a builtin
- * needs a job task, which is R-P2.6's remainder.
+ * The session's job table holds two kinds of job (see espix_job_t): a
+ * *process*, which is a loaded app and can be signalled, and a *builtin task*,
+ * which cannot -- espix can delete a task but not stop and resume one. jobs
+ * lists both; fg and bg only mean anything for a process.
+ *
+ * Ctrl-Z is still missing, because the transports report only that a key
+ * arrived and not which one -- see R-P7.7.
  */
 
-/* Forget jobs whose process has finished. Live-only: espix_proc_state_of()
- * answers FREE once there is no live slot, and nobody reaps a backgrounded
- * app's status, so a finished job would otherwise be listed for ever. */
+static bool job_live(const espix_job_t *j)
+{
+    return j->pid > 0 || (j->task != NULL && !j->finished);
+}
+
+/* Forget jobs that have ended. A process is live until espix_proc_state_of()
+ * says FREE -- nobody reaps a backgrounded app's status, so without this a
+ * finished job would be listed for ever. A builtin task sets finished as it
+ * exits; the shell only has to forget it, since the task owns its own
+ * teardown. */
 static void job_prune(espix_session_t *s)
 {
     for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        if (s->job_pid[i] > 0 &&
-            espix_proc_state_of(s->job_pid[i]) == ESPIX_PROC_FREE) {
-            s->job_pid[i] = ESPIX_PID_NONE;
-            s->job_name[i][0] = '\0';
+        espix_job_t *j = &s->jobs[i];
+
+        if (j->pid > 0 && espix_proc_state_of(j->pid) == ESPIX_PROC_FREE) {
+            espix_shell_job_clear(s, i);
+        } else if (j->task != NULL && j->finished) {
+            espix_shell_job_clear(s, i);
         }
     }
 }
 
-static void job_forget(espix_session_t *s, espix_pid_t pid)
-{
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        if (s->job_pid[i] == pid) {
-            s->job_pid[i] = ESPIX_PID_NONE;
-            s->job_name[i][0] = '\0';
-            return;
-        }
-    }
-}
-
-/* The job `arg` names -- "%2" by number, or a pid -- or the most recent one for
- * NULL. ESPIX_PID_NONE when there is no such job. */
-static espix_pid_t job_pick(espix_session_t *s, const char *arg)
+/* The job arg names -- "%2" by number, or a pid -- or the most recent one for
+ * NULL. NULL when there is no such job. */
+static espix_job_t *job_pick(espix_session_t *s, const char *arg)
 {
     job_prune(s);
 
     if (arg == NULL || arg[0] == '\0') {
         for (int i = ESPIX_SESSION_JOBS - 1; i >= 0; i--) {
-            if (s->job_pid[i] > 0) {
-                return s->job_pid[i];
+            if (job_live(&s->jobs[i])) {
+                return &s->jobs[i];
             }
         }
-        return ESPIX_PID_NONE;
+        return NULL;
     }
 
     char *end = NULL;
     if (arg[0] == '%') {
         const long n = strtol(arg + 1, &end, 10);
         if (end == arg + 1 || *end != '\0' || n <= 0) {
-            return ESPIX_PID_NONE;
+            return NULL;
         }
         long seen = 0;
         for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-            if (s->job_pid[i] > 0 && ++seen == n) {
-                return s->job_pid[i];
+            if (job_live(&s->jobs[i]) && ++seen == n) {
+                return &s->jobs[i];
             }
         }
-        return ESPIX_PID_NONE;
+        return NULL;
     }
 
     const long pid = strtol(arg, &end, 10);
-    return (end != arg && *end == '\0' && pid > 0) ? (espix_pid_t)pid
-                                                    : ESPIX_PID_NONE;
+    if (end == arg || *end != '\0' || pid <= 0) {
+        return NULL;
+    }
+    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
+        if (s->jobs[i].pid == (espix_pid_t)pid) {
+            return &s->jobs[i];
+        }
+    }
+    return NULL;
+}
+
+/* fg and bg need a process to signal. Returns the job, or NULL with the message
+ * already printed. */
+static espix_job_t *job_pick_process(espix_session_t *s, const char *who,
+                                     const char *arg)
+{
+    espix_job_t *j = job_pick(s, arg);
+    if (j == NULL) {
+        espix_eprintf(s, "%s: no such job\n", who);
+        return NULL;
+    }
+    if (j->pid <= 0) {
+        espix_eprintf(s, "%s: %s is a builtin; it cannot be stopped or resumed\n",
+                      who, j->name);
+        return NULL;
+    }
+    return j;
 }
 
 static int cmd_jobs(espix_session_t *s, int argc, char **argv)
@@ -665,12 +693,19 @@ static int cmd_jobs(espix_session_t *s, int argc, char **argv)
 
     int n = 0;
     for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        if (s->job_pid[i] <= 0) {
+        espix_job_t *j = &s->jobs[i];
+        if (!job_live(j)) {
             continue;
         }
-        espix_printf(s, "[%d] %5d %-4s %s\n", ++n, (int)s->job_pid[i],
-                     espix_proc_state_str(espix_proc_state_of(s->job_pid[i])),
-                     s->job_name[i]);
+        if (j->pid > 0) {
+            espix_printf(s, "[%d] %5d %-4s %s\n", ++n, (int)j->pid,
+                         espix_proc_state_str(espix_proc_state_of(j->pid)),
+                         j->name);
+        } else {
+            /* A builtin task has no pid and no proc state; it is running
+             * whenever it is listed at all. */
+            espix_printf(s, "[%d]     - Run  %s\n", ++n, j->name);
+        }
     }
     if (n == 0) {
         espix_printf(s, "no jobs\n");
@@ -680,35 +715,36 @@ static int cmd_jobs(espix_session_t *s, int argc, char **argv)
 
 static int cmd_bg(espix_session_t *s, int argc, char **argv)
 {
-    const espix_pid_t pid = job_pick(s, (argc > 1) ? argv[1] : NULL);
-    if (pid <= 0) {
-        espix_eprintf(s, "bg: no such job\n");
+    espix_job_t *j = job_pick_process(s, "bg", (argc > 1) ? argv[1] : NULL);
+    if (j == NULL) {
         return 1;
     }
 
-    const esp_err_t err = espix_proc_signal(pid, SIGCONT);
+    const esp_err_t err = espix_proc_signal(j->pid, SIGCONT);
     if (err != ESP_OK) {
-        espix_eprintf(s, "bg: %d: %s\n", (int)pid, esp_err_to_name(err));
-        job_forget(s, pid);
+        espix_eprintf(s, "bg: %d: %s\n", (int)j->pid, esp_err_to_name(err));
+        espix_shell_job_clear(s, (int)(j - s->jobs));
         return 1;
     }
-    espix_printf(s, "[%d] resumed\n", (int)pid);
+    espix_printf(s, "[%d] resumed\n", (int)j->pid);
     return 0;
 }
 
 static int cmd_fg(espix_session_t *s, int argc, char **argv)
 {
-    const espix_pid_t pid = job_pick(s, (argc > 1) ? argv[1] : NULL);
-    if (pid <= 0) {
-        espix_eprintf(s, "fg: no such job\n");
+    espix_job_t *j = job_pick_process(s, "fg", (argc > 1) ? argv[1] : NULL);
+    if (j == NULL) {
         return 1;
     }
+
+    const espix_pid_t pid = j->pid;
+    const int         slot = (int)(j - s->jobs);
 
     (void)espix_proc_signal(pid, SIGCONT);
 
     int             code = 0;
     const esp_err_t err  = espix_proc_wait(pid, &code, portMAX_DELAY);
-    job_forget(s, pid);
+    espix_shell_job_clear(s, slot);
 
     if (err != ESP_OK) {
         espix_eprintf(s, "fg: %d: %s\n", (int)pid, esp_err_to_name(err));
