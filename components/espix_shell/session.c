@@ -53,6 +53,17 @@ void espix_shell_set_current(espix_session_t *s)
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_SESSION_IDX, s);
 }
 
+int espix_shell_term_size(int *cols, int *rows)
+{
+    espix_session_t *s = espix_shell_current();
+
+    if (s == NULL || s->term_size == NULL || cols == NULL || rows == NULL) {
+        return -1;
+    }
+    s->term_size(s, cols, rows);
+    return 0;
+}
+
 static int session_out(espix_session_t *s, const char *data, size_t len)
 {
     if (s != NULL && s->redirect != NULL) {

@@ -995,6 +995,15 @@ static int chan_stream_read(void *cookie, char *buf, int len)
  * runs esp_cleanup_r(), which fcloses a task's stdout and stderr when they are
  * not the global ones, so these must not be shared or closed here.
  */
+/* The pty's size, which espix_term_size() reports to an app that got SIGWINCH. */
+static void chan_term_size(espix_session_t *s, int *cols, int *rows)
+{
+    const ssh_chan_t *ch = s->transport;
+
+    *cols = ch->cols;
+    *rows = ch->rows;
+}
+
 static FILE *chan_open_stream(espix_session_t *s, espix_stream_t which)
 {
     if (which == ESPIX_STREAM_IN) {
@@ -1651,6 +1660,17 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
             const uint32_t cols = ssh_get_u32(in);
             const uint32_t rows = ssh_get_u32(in);
             set_term_size(ch, cols, rows);
+
+            /*
+             * Tell the foreground process, the way a terminal does. The session
+             * is on this task's TLS while a line is being read, and a resize
+             * arrives exactly there -- inside the packet read that read_line is
+             * blocked in. Nothing to tell when the shell is at the prompt.
+             */
+            espix_session_t *resized = espix_shell_current();
+            if (resized != NULL && resized->fg_pid != ESPIX_PID_NONE) {
+                (void)espix_proc_signal(resized->fg_pid, SIGWINCH);
+            }
         }
         /* Never carries want_reply per RFC 4254 §6.7. Load-bearing: this is
          * what ssh_edit_write() answers cursor-position queries with, so a
@@ -2414,6 +2434,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .write     = chan_write,
             .write_err = chan_write_err,
             .poll_interrupt = chan_poll_interrupt,
+            .term_size      = chan_term_size,
             .task_gone      = chan_task_gone,
             .transport = ch,
             /* Overwritten by apply_account(); nobody rather than 0 so that a
@@ -2512,6 +2533,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .write     = chan_write,
             .write_err = chan_write_err,
         .poll_interrupt = chan_poll_interrupt,
+        .term_size      = chan_term_size,
         .task_gone      = chan_task_gone,
         .transport = ch,
         /* Overwritten by apply_account(); nobody rather than 0 so that a

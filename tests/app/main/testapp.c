@@ -564,6 +564,62 @@ static int sig_alarm(void)
     return s_alarm_seen ? 0 : 1;
 }
 
+extern int espix_term_size(int *cols, int *rows);
+
+static int sig_size(void)
+{
+    int cols = 0, rows = 0;
+
+    if (espix_term_size(&cols, &rows) != 0) {
+        printf("size: no answer\n");
+        fflush(stdout);
+        return 1;
+    }
+    printf("size: cols=%d rows=%d\n", cols, rows);
+    fflush(stdout);
+    return 0;
+}
+
+static volatile sig_atomic_t s_winch_seen;
+static int s_winch_cols, s_winch_rows;
+
+static void on_winch(int sig)
+{
+    (void)sig;
+    s_winch_seen = 1;
+    (void)espix_term_size(&s_winch_cols, &s_winch_rows);
+}
+
+/* The handler path, made deterministic: raise it to yourself and reach a
+ * delivery point, rather than depend on someone resizing the terminal. */
+static int sig_winch(void)
+{
+    signal(SIGWINCH, on_winch);
+    raise(SIGWINCH);
+    espix_sigcheck();
+    printf("winch: seen=%d cols=%d rows=%d\n",
+           (int)s_winch_seen, s_winch_cols, s_winch_rows);
+    fflush(stdout);
+    return s_winch_seen ? 0 : 1;
+}
+
+/* The transport path: wait for a real resize. Resize the terminal while this
+ * runs and it prints a line. */
+static int sig_winch_wait(void)
+{
+    signal(SIGWINCH, on_winch);
+    printf("winch: waiting for a resize\n");
+    fflush(stdout);
+
+    for (int i = 0; i < 30 && !s_winch_seen; i++) {
+        sleep(1);
+    }
+    printf("winch: seen=%d cols=%d rows=%d\n",
+           (int)s_winch_seen, s_winch_cols, s_winch_rows);
+    fflush(stdout);
+    return s_winch_seen ? 0 : 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -577,6 +633,15 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "alarm") == 0) {
         return sig_alarm();
+    }
+    if (strcmp(mode, "size") == 0) {
+        return sig_size();
+    }
+    if (strcmp(mode, "winch") == 0) {
+        return sig_winch();
+    }
+    if (strcmp(mode, "winch-wait") == 0) {
+        return sig_winch_wait();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
@@ -1227,7 +1292,7 @@ static void usage(void)
            "  both                one line to stdout, one to stderr\n"
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
-           "  sig [mode]          handlers (default) | ignore | spin | alarm\n"
+           "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"

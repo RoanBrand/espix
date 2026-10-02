@@ -234,3 +234,12 @@ if [ -n "$alarm_ms" ] && [ "$alarm_ms" -lt 5000 ]; then
 else
     espix_fail "and the sleep was cut short" "got: $alarm_out"
 fi
+
+# The terminal size an app acts on, and SIGWINCH reaching a handler. The
+# transport half (a real resize) is winch-wait, which someone resizes a
+# terminal to exercise. R-P6.5.
+assert_contains "an app can ask for the terminal size" "cols=" \
+    "$(dev_run "$APP sig size")"
+winch_out=$(dev_run "$APP sig winch")
+assert_contains "SIGWINCH reaches a handler" "seen=1" "$winch_out"
+assert_contains "and the handler can read the size" "cols=" "$winch_out"

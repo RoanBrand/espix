@@ -531,6 +531,15 @@ static espix_term_t *term_of(espix_session_t *s)
     return (espix_term_t *)s->transport;
 }
 
+/* The canvas grid's size, for espix_term_size(). */
+static void term_term_size(espix_session_t *s, int *cols, int *rows)
+{
+    const espix_term_t *t = term_of(s);
+
+    *cols = t->cols;
+    *rows = t->rows;
+}
+
 static int term_write(espix_session_t *s, const char *data, size_t len)
 {
     espix_term_write(term_of(s), data, len);
@@ -735,6 +744,7 @@ espix_session_t *espix_term_session(espix_term_t *t)
         .poll_interrupt = term_poll_interrupt,
         .open_stream    = term_open_stream,
         .transport      = t,
+        .term_size      = term_term_size,
         .fg_pid         = ESPIX_PID_NONE,
         .login          = false,
         /*

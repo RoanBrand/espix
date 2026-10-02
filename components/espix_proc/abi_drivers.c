@@ -21,6 +21,7 @@
  * with readelf and checked against the firmware's own symbol table.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,7 @@
 #include "esp_elf.h"
 
 #include "espix_kernel.h"
+#include "espix_shell.h"
 #include "espix_proc_priv.h"
 
 #define TAG "abi"
@@ -67,6 +69,8 @@ extern double __divdf3(double a, double b);
 
 /* ROM printf. Arduino's logging macros reach for it directly. */
 extern int ets_printf(const char *fmt, ...);
+
+int espix_term_size(int *cols, int *rows);
 
 /*
  * libgcc's soft-double helpers. The S31 FPU is single precision, so double
@@ -183,8 +187,34 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
      * it stays reachable now that espix owns the name (R-P3.1). */
     ESP_ELFSYM_EXPORT(ets_printf),
 
+    /*
+     * The terminal's size, for an app that got SIGWINCH. Not ioctl(TIOCGWINSZ):
+     * an app's stdout is a stream over its session, not a tty descriptor, so
+     * there is nothing to ioctl -- this is the espix-specific call for it, the
+     * same shape as espix_sigcheck.
+     */
+    ESP_ELFSYM_EXPORT(espix_term_size),
+
     ESP_ELFSYM_END
 };
+
+/*
+ * The app-facing form: the same call as espix_shell_term_size(), with errno set
+ * the way a system call would, because that is what an app expects to see when
+ * the transport has no size to give.
+ */
+int espix_term_size(int *cols, int *rows)
+{
+    if (cols == NULL || rows == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (espix_shell_term_size(cols, rows) != 0) {
+        errno = ENOTTY;
+        return -1;
+    }
+    return 0;
+}
 
 void espix_proc_abi_drivers_register(void)
 {

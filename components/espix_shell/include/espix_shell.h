@@ -238,6 +238,14 @@ struct espix_session {
     bool (*poll_interrupt)(espix_session_t *s);
 
     /*
+     * The terminal's size, for an app that has just been sent SIGWINCH. NULL
+     * when the transport has no answer -- the serial console is the case -- and
+     * then espix_shell_term_size() fails rather than inventing a size, which is
+     * the same choice lsblk makes about a feature it cannot report.
+     */
+    void (*term_size)(espix_session_t *s, int *cols, int *rows);
+
+    /*
      * A process using this session was force-deleted, and here is its task.
      *
      * The transport is told so it can write off anything the dead task can
@@ -621,6 +629,13 @@ void espix_shell_session_run(espix_session_t *s);
 /* Per-task current session, so commands running in their own task can still
  * find their stdio and cwd. */
 espix_session_t *espix_shell_current(void);
+
+/*
+ * The current session's terminal size, for an app that got SIGWINCH. Returns 0
+ * with cols and rows filled, or -1 when there is no session or its transport
+ * cannot answer.
+ */
+int espix_shell_term_size(int *cols, int *rows);
 void espix_shell_set_current(espix_session_t *s);
 
 /* Output helpers — commands must use these rather than printf(), or their
