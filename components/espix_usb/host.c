@@ -47,16 +47,12 @@
 
 /*
  * The host library's task: it blocks in usb_host_lib_handle_events() and wakes
- * for port changes, which is the cheap half. The MSC driver's task is the one
- * that blocks on USB transfers and does the reading.
+ * for port changes, which is the cheap half. Since R-P5.2 it also pumps the MSC
+ * class driver, whose callbacks only queue and return; the half that blocks on
+ * USB transfers and does the reading is usb:work's, as it always was.
  */
 #define HOST_TASK_STACK 4096
 #define HOST_TASK_PRIO  4
-
-/* Above the console session so a slow stick cannot stall a prompt, and below
- * lwip so bulk transfers cannot crowd out the network. */
-#define MSC_TASK_STACK  4096
-#define MSC_TASK_PRIO   5
 
 /*
  * The largest sector this will read. Devices report 512 in practice; 4096 exists
@@ -163,6 +159,12 @@ static bool s_installed;
 static SemaphoreHandle_t s_attach_lock;
 
 /*
+ * Set once msc_host_install() has returned, because host_task() is created
+ * before it and must not pump a driver that is not there yet.
+ */
+static volatile bool s_msc_up;
+
+/*
  * The work queue, and why the device work does not happen where it is announced.
  *
  * A client's transfer completions are delivered only from inside
@@ -185,7 +187,7 @@ static SemaphoreHandle_t s_attach_lock;
  * attach, which with a stick left in means a boot loop.
  */
 #define WORK_TASK_STACK 6144
-#define WORK_TASK_PRIO  3           /* below usb:host(4) and USB MSC(5) */
+#define WORK_TASK_PRIO  3           /* below usb:host(4) */
 
 /* How often the worker sweeps the pool when nothing has been queued. Devices are
  * claimed by event; this is what covers the case where the event never came. */
@@ -2428,6 +2430,9 @@ static void on_monitor_event(const usb_host_client_event_msg_t *event, void *arg
  * library requires one caller of usb_host_lib_handle_events() and does not run
  * one itself. There is no terminal error to handle, because nothing in espix
  * uninstalls the stack.
+ *
+ * It is also where the MSC class driver is pumped, now that the driver has no
+ * task of its own (R-P5.2).
  */
 static void host_task(void *arg)
 {
@@ -2453,6 +2458,21 @@ static void host_task(void *arg)
 
         if (s_monitor != NULL) {
             (void)usb_host_client_handle_events(s_monitor, 0);
+        }
+
+        /*
+         * The MSC class driver asked to be pumped rather than given a task, and
+         * this is the task the library already requires. Zero timeout, so a
+         * driver's client can never hold the library's own events behind it;
+         * its callbacks (on_msc_event) only queue and return, which is what
+         * makes it safe to run them here.
+         *
+         * HID keeps its background task on purpose -- see espix_usb_hid_start():
+         * its attach callback blocks for seconds, and this loop is where the
+         * completions that would end that block are delivered.
+         */
+        if (s_msc_up) {
+            (void)msc_host_handle_events(0);
         }
         if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
             espix_klog(ESPIX_KLOG_DEBUG, TAG, "every device released");
@@ -2561,11 +2581,16 @@ esp_err_t espix_usb_host_init(void)
                    esp_err_to_name(err));
     }
 
+    /*
+     * No background task (R-P5.2): host_task() pumps msc_host_handle_events()
+     * instead, and this is the 4096-byte stack the task used to cost. Safe
+     * because everything the driver calls back into only queues and returns --
+     * the install that blocks on SCSI transfers is usb:work's job, and always
+     * was. task_priority, stack_size and core_id are left out because there is
+     * no task for them to describe.
+     */
     const msc_host_driver_config_t msc_config = {
-        .create_backround_task = true,
-        .task_priority = MSC_TASK_PRIO,
-        .stack_size = MSC_TASK_STACK,
-        .core_id = tskNO_AFFINITY,
+        .create_backround_task = false,
         .callback = on_msc_event,
         .callback_arg = NULL,
     };
@@ -2575,6 +2600,7 @@ esp_err_t espix_usb_host_init(void)
                    esp_err_to_name(err));
         return err;
     }
+    s_msc_up = true;
 
     /*
      * The keyboard and mouse, and deliberately not fatal: storage and the shell

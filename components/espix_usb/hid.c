@@ -432,8 +432,15 @@ static void hid_driver_cb(hid_host_device_handle_t dev,
 esp_err_t espix_usb_hid_start(void)
 {
     const hid_host_driver_config_t config = {
-        /* The driver's own task, so nothing above has to pump events. It owns
-         * the client and calls hid_host_handle_events() itself. */
+        /*
+         * Its own task, deliberately, and not for convenience. The attach
+         * callback below (hid_interface_cb) makes a boot-protocol control
+         * transfer that can sit out the library's whole five-second timeout on
+         * some receivers, twice over; running that inside usb:host would stall
+         * the event loop that delivers the completions it is waiting for. MSC
+         * is merged into usb:host because its callbacks only queue (R-P5.2);
+         * HID cannot be, and this is why.
+         */
         .create_background_task = true,
         .task_priority          = 4,
         .stack_size             = 4096,
