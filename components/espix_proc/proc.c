@@ -10,6 +10,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "espix_kernel.h"
 #include "espix_proc.h"
@@ -24,6 +25,60 @@ SemaphoreHandle_t  g_espix_proc_lock;
 EventGroupHandle_t g_espix_proc_events;
 
 static espix_pid_t s_next_pid = 1;
+
+/*
+ * The completed log: where a status lives once the slot is gone.
+ *
+ * Before R-P1.5 the slot *was* the zombie, so a finished process kept its
+ * table entry until a later spawn recycled it, and history competed with
+ * concurrency inside a fixed table. Now espix_proc_finish() copies what a
+ * listing or a wait needs in here and hands the slot straight back.
+ *
+ * Fixed and statically allocated because it is bookkeeping and must never be
+ * the reason a spawn fails, and eight entries because a bounded history is
+ * the resource-efficient version of what Linux keeps until a parent reaps.
+ * A pid is never reused, so 'pid > 0' is the test for an entry being live;
+ * before any finish every field is zero, and pid 1 is the first ever handed
+ * out.
+ *
+ * A reaped entry stays listed: this is a history as well as the zombie store,
+ * and 'reaped' only decides whether espix_proc_wait() will return it again.
+ * The whole design is recorded in docs/WORKLIST.md under R-P1.5.
+ */
+static espix_proc_record_t s_done[ESPIX_PROC_DONE_MAX];
+static unsigned            s_done_head;   /* next write; oldest once wrapped */
+static uint32_t            s_done_seq;    /* total finishes, for ordering */
+
+/* Write one completion into the ring. Called with the table lock held. */
+static void done_record(const espix_proc_slot_t *slot, espix_proc_state_t state,
+                        int exit_code)
+{
+    espix_proc_record_t *const r = &s_done[s_done_head];
+
+    r->pid        = slot->info.pid;
+    r->ppid       = slot->info.ppid;
+    r->state      = state;
+    r->exit_code  = exit_code;
+    r->started_us = slot->info.started_us;
+    r->ended_us   = esp_timer_get_time();
+    r->reaped     = false;
+    strlcpy(r->name, slot->info.name, sizeof(r->name));
+
+    s_done_head = (s_done_head + 1u) % ESPIX_PROC_DONE_MAX;
+    s_done_seq++;
+}
+
+/* The log entry for this pid, reaped or not, or NULL. Called with the lock
+ * held. */
+static espix_proc_record_t *done_find(espix_pid_t pid)
+{
+    for (unsigned i = 0; i < ESPIX_PROC_DONE_MAX; i++) {
+        if (s_done[i].pid > 0 && s_done[i].pid == pid) {
+            return &s_done[i];
+        }
+    }
+    return NULL;
+}
 
 const char *espix_proc_state_str(espix_proc_state_t state)
 {
@@ -107,36 +162,6 @@ esp_err_t espix_proc_init(void)
     return ESP_OK;
 }
 
-/*
- * Clear this slot's "finished" bit before anything waits on it.
- *
- * espix_proc_wait() calls xEventGroupWaitBits() with xClearOnExit false, so
- * that several waiters can all see one exit -- which means nothing ever cleared
- * the bit either. A slot reused by a later process therefore started life with
- * its predecessor's bit already set, and the first espix_proc_wait() on it
- * returned "finished" immediately.
- *
- * The pid re-check in espix_proc_wait() cannot catch that: the pid in the slot
- * *is* the one being waited on, because the process is real and just started.
- * So the shell believed a freshly spawned app had already exited, reported its
- * predecessor's exit code, and moved on while the app was still starting.
- *
- * Harmless-looking for a long time, because the shell simply returned to a
- * prompt a fraction early. It surfaced over `ssh host <cmd>`, where returning
- * early means finish_session() closes the channel underneath a still-running
- * app: output truncated at whatever had made it out, and no exit status, so the
- * client reported 255.
- *
- * Cleared at allocation rather than at exit because allocation is the point
- * where the slot changes identity, and it happens under the table lock with
- * the task not yet created -- so no one can be waiting on it yet.
- */
-static void clear_finished_bit(const espix_proc_slot_t *slot)
-{
-    const int index = (int)(slot - g_espix_proc_table.slots);
-    xEventGroupClearBits(g_espix_proc_events, (EventBits_t)1 << index);
-}
-
 /* Set when the guard has been reported, so a corrupt table says so once rather
  * than on every spawn. Written without a lock: the worst a race does is print
  * the same line twice. */
@@ -175,30 +200,22 @@ espix_proc_slot_t *espix_proc_alloc_slot(void)
     /* Cheap, and this is the moment the table is about to be written. */
     (void)espix_proc_table_intact();
 
-    espix_proc_slot_t *oldest_done = NULL;
-
+    /*
+     * A finished process releases its slot in espix_proc_finish(), so the only
+     * thing that can stand in a spawn's way is ESPIX_PROC_MAX processes
+     * genuinely alive at once -- which is exactly the number this table is
+     * sized for. There is no 'oldest finished' fallback any more: a terminal
+     * state is never observable outside espix_proc_finish()'s critical
+     * section, and a recycled slot arrives already zeroed.
+     */
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
         espix_proc_slot_t *s = &g_espix_proc_table.slots[i];
 
         if (s->info.state == ESPIX_PROC_FREE) {
-            clear_finished_bit(s);
             return s;
         }
-        if (state_is_finished(s->info.state)) {
-            if (oldest_done == NULL ||
-                s->info.started_us < oldest_done->info.started_us) {
-                oldest_done = s;
-            }
-        }
     }
-
-    if (oldest_done != NULL) {
-        /* Reclaiming a finished slot: its resources were released when it
-         * finished, so only the bookkeeping needs clearing. */
-        memset(oldest_done, 0, sizeof(*oldest_done));
-        clear_finished_bit(oldest_done);
-    }
-    return oldest_done;
+    return NULL;
 }
 
 void espix_proc_release_resources(espix_proc_slot_t *slot)
@@ -276,13 +293,8 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
         return;
     }
 
-    const int index = (int)(slot - g_espix_proc_table.slots);
-
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     const espix_pid_t pid = slot->info.pid;
-    slot->info.state     = state;
-    slot->info.exit_code = exit_code;
-    slot->info.task      = NULL;
 
     /*
      * Tell the parent, if it is still there. Found by walking the table rather
@@ -307,12 +319,24 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     }
 
     /*
-     * Under the lock, with the state it announces. Released first, as this used
-     * to be, a spawn can recycle this slot and clear its finished bit in the
-     * gap -- and the set then lands on a slot that already belongs to the next
-     * process, whose first espix_proc_wait() returns before it has started.
+     * Into the log, then the slot straight back. Under one lock, so no one can
+     * ever observe a slot in a terminal state: espix_proc_find() is live-only
+     * and the log is the only record from here on. The memset is last, and the
+     * slot pointer must not be used after this function returns -- the next
+     * spawn may claim it immediately.
      */
-    xEventGroupSetBits(g_espix_proc_events, (EventBits_t)1 << index);
+    done_record(slot, state, exit_code);
+    memset(slot, 0, sizeof(*slot));
+
+    /*
+     * Wake every waiter. One global bit rather than the old per-slot one: the
+     * slot above may already belong to the next process by the time a waiter
+     * looks, so a bit keyed to the slot index would be read by the wrong
+     * waiter. The bit stays set until a waiter clears it, and every waiter
+     * rescans the table and then the log, so a finish cannot be missed
+     * whatever the order of the set and the scan.
+     */
+    xEventGroupSetBits(g_espix_proc_events, ESPIX_PROC_EVENT_FINISH);
     xSemaphoreGive(g_espix_proc_lock);
 
     /*
@@ -325,20 +349,24 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     espix_gfx_recover(pid);
 }
 
+/*
+ * The live slot for this pid, or NULL. Live-only since R-P1.5: a finished
+ * process has no slot at all, so kill and every signal reach only running
+ * processes -- Linux gives ESRCH for a process that is gone, and this is the
+ * same answer for the same reason. The completed log is consulted by ps and
+ * by espix_proc_wait() and by nothing else.
+ */
 espix_proc_slot_t *espix_proc_find(espix_pid_t pid)
 {
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        if (g_espix_proc_table.slots[i].info.state != ESPIX_PROC_FREE &&
-            g_espix_proc_table.slots[i].info.pid == pid) {
-            return &g_espix_proc_table.slots[i];
+        espix_proc_slot_t *const s = &g_espix_proc_table.slots[i];
+
+        if (s->info.state != ESPIX_PROC_FREE &&
+            !state_is_finished(s->info.state) && s->info.pid == pid) {
+            return s;
         }
     }
     return NULL;
-}
-
-static espix_proc_slot_t *find_by_pid(espix_pid_t pid)
-{
-    return espix_proc_find(pid);
 }
 
 espix_proc_slot_t *espix_proc_self(void)
@@ -379,37 +407,90 @@ espix_pid_t espix_proc_next_pid(void)
     return s_next_pid++;
 }
 
+/*
+ * The wait itself, shared by the reaping public call and the observe-only
+ * internal one.
+ *
+ * `reap` decides whether a completed entry is consumed. POSIX's parent reaps;
+ * everything that merely needs the process gone -- kill's own escalation, a
+ * session hangup -- must not, or it would take the status away from whoever
+ * is the parent.
+ *
+ * Table first, then log. The scan happens before every sleep, so a finish is
+ * found by the scan or by the rescan after the wakeup, whatever the order.
+ */
+static esp_err_t proc_wait_common(espix_pid_t pid, int *out_exit_code,
+                                  TickType_t timeout, bool reap)
+{
+    const TickType_t start = xTaskGetTickCount();
+
+    for (;;) {
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+        if (espix_proc_find(pid) != NULL) {
+            /*
+             * Still running. Wait for any finish and rescan; the bit is
+             * global, so another process finishing first is a spurious
+             * wakeup and not an error.
+             */
+            xSemaphoreGive(g_espix_proc_lock);
+
+            TickType_t wait_ticks = portMAX_DELAY;
+
+            if (timeout != portMAX_DELAY) {
+                const TickType_t elapsed = xTaskGetTickCount() - start;
+
+                if (elapsed >= timeout) {
+                    return ESP_ERR_TIMEOUT;
+                }
+                wait_ticks = timeout - elapsed;
+            }
+
+            const EventBits_t got = xEventGroupWaitBits(
+                g_espix_proc_events, ESPIX_PROC_EVENT_FINISH, pdTRUE, pdTRUE,
+                wait_ticks);
+
+            if ((got & ESPIX_PROC_EVENT_FINISH) == 0) {
+                return ESP_ERR_TIMEOUT;
+            }
+            continue;
+        }
+
+        espix_proc_record_t *const rec = done_find(pid);
+
+        if (rec == NULL) {
+            xSemaphoreGive(g_espix_proc_lock);
+            return ESP_ERR_NOT_FOUND;   /* never existed, or already forgotten */
+        }
+        if (reap && rec->reaped) {
+            xSemaphoreGive(g_espix_proc_lock);
+            return ESP_ERR_NOT_FOUND;   /* ECHILD: this status was already taken */
+        }
+
+        const int code = rec->exit_code;
+
+        if (reap) {
+            rec->reaped = true;
+        }
+        xSemaphoreGive(g_espix_proc_lock);
+
+        if (out_exit_code != NULL) {
+            *out_exit_code = code;
+        }
+        return ESP_OK;
+    }
+}
+
 esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeout)
 {
-    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-    espix_proc_slot_t *slot = find_by_pid(pid);
-    const int index = (slot != NULL) ? (int)(slot - g_espix_proc_table.slots) : -1;
-    const espix_proc_state_t state = (slot != NULL) ? slot->info.state
-                                                    : ESPIX_PROC_FREE;
-    xSemaphoreGive(g_espix_proc_lock);
+    return proc_wait_common(pid, out_exit_code, timeout, true);
+}
 
-    if (slot == NULL) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    if (!state_is_finished(state)) {
-        const EventBits_t bit = (EventBits_t)1 << index;
-        const EventBits_t got = xEventGroupWaitBits(g_espix_proc_events, bit,
-                                                    pdFALSE, pdTRUE, timeout);
-        if ((got & bit) == 0) {
-            return ESP_ERR_TIMEOUT;
-        }
-    }
-
-    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-    /* Re-check identity: the slot could have been recycled while we waited. */
-    const bool same = (slot->info.pid == pid);
-    if (same && out_exit_code != NULL) {
-        *out_exit_code = slot->info.exit_code;
-    }
-    xSemaphoreGive(g_espix_proc_lock);
-
-    return same ? ESP_OK : ESP_ERR_NOT_FOUND;
+/* Wait for a process to be gone without taking its exit status. Used where
+ * espix is not the parent; see the note on proc_wait_common(). */
+static esp_err_t proc_wait_gone(espix_pid_t pid, TickType_t timeout)
+{
+    return proc_wait_common(pid, NULL, timeout, false);
 }
 
 /*
@@ -699,8 +780,12 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
      * than at the end of its slice. */
     (void)xTaskAbortDelay(task);
 
-    /* Finished on its own is the good outcome, and the common one. */
-    (void)espix_proc_wait(pid, NULL, pdMS_TO_TICKS(KILL_UNWIND_MS));
+    /*
+     * Finished on its own is the good outcome, and the common one. Observing
+     * only: the kill did not ask for the status and must not consume it, or
+     * the process's parent would get nothing from its own wait.
+     */
+    (void)proc_wait_gone(pid, pdMS_TO_TICKS(KILL_UNWIND_MS));
 }
 
 static esp_err_t proc_force_kill(espix_pid_t pid)
@@ -924,8 +1009,7 @@ esp_err_t espix_proc_kill(espix_pid_t pid)
         return asked;           /* no such pid, or already finished */
     }
 
-    int exit_code = -1;
-    if (espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(TERM_GRACE_MS)) == ESP_OK) {
+    if (proc_wait_gone(pid, pdMS_TO_TICKS(TERM_GRACE_MS)) == ESP_OK) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "pid %d stopped on request", (int)pid);
         return ESP_OK;
     }
@@ -973,7 +1057,7 @@ size_t espix_proc_hangup(const espix_session_t *session)
 
         const int32_t left = (int32_t)(deadline - xTaskGetTickCount());
 
-        if (espix_proc_wait(procs[i].pid, NULL, (left > 0) ? (TickType_t)left : 0)
+        if (proc_wait_gone(procs[i].pid, (left > 0) ? (TickType_t)left : 0)
             != ESP_OK) {
             (void)proc_force_kill(procs[i].pid);
         }
@@ -997,6 +1081,36 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n)
             out[count++] = g_espix_proc_table.slots[i].info;
         }
     }
+    xSemaphoreGive(g_espix_proc_lock);
+
+    return count;
+}
+
+/*
+ * The completed log, oldest first. s_done_head is the next write, which is the
+ * oldest entry once the ring has wrapped; before that the entries run from
+ * zero and the head is simply one past the newest.
+ */
+size_t espix_proc_history(espix_proc_record_t *out, size_t n)
+{
+    if (out == NULL || n == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+    const uint32_t wrapped = (s_done_seq >= (uint32_t)ESPIX_PROC_DONE_MAX);
+    const unsigned total   = wrapped ? (unsigned)ESPIX_PROC_DONE_MAX
+                                     : (unsigned)s_done_seq;
+    unsigned       idx     = wrapped ? s_done_head : 0u;
+
+    for (unsigned i = 0; i < total && count < n; i++) {
+        out[count++] = s_done[idx];
+        idx = (idx + 1u) % ESPIX_PROC_DONE_MAX;
+    }
+
     xSemaphoreGive(g_espix_proc_lock);
 
     return count;

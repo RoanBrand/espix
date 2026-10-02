@@ -927,9 +927,6 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     slot->info.started_us = esp_timer_get_time();
     slot->info.exit_code  = 0;
 
-    const int index = (int)(slot - g_espix_proc_table.slots);
-    xEventGroupClearBits(g_espix_proc_events, (EventBits_t)1 << index);
-
     /* FreeRTOS truncates task names to configMAX_TASK_NAME_LEN anyway; do it
      * explicitly so the app name, not the "app:" prefix, is what gets cut. */
     char task_name[configMAX_TASK_NAME_LEN];

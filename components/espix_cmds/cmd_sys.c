@@ -576,30 +576,26 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
     free(tasks);
 
-    /* Processes that have finished keep their table slot, so report them too:
-     * that is where a foreground command gets its exit status from. */
-    espix_proc_info_t procs[8];
-    const size_t n = espix_proc_snapshot(procs, sizeof(procs) / sizeof(procs[0]));
+    /*
+     * The completed log, which since R-P1.5 is the only record of a finished
+     * process: the slot is handed back the moment it finishes, so this is what
+     * keeps `ps` able to show what ran. A log as well as the zombie store --
+     * a reaped entry stays listed until the ring wraps, because seeing an exit
+     * status after the fact is the whole reason this section exists. There is
+     * no STOPPED entry here to filter: the log only ever holds finished ones.
+     */
+    espix_proc_record_t done[ESPIX_PROC_DONE_MAX];
+    const size_t n = espix_proc_history(done, ESPIX_PROC_DONE_MAX);
 
-    bool header = false;
-    for (size_t i = 0; i < n; i++) {
-        /* STOPPED belongs with the living: it is listed above with a 'T', and
-         * reporting it here as finished would claim an exit that has not
-         * happened and an exit_code that means nothing yet. */
-        if (procs[i].state == ESPIX_PROC_RUNNING ||
-            procs[i].state == ESPIX_PROC_READY ||
-            procs[i].state == ESPIX_PROC_STOPPED) {
-            continue;
+    if (n > 0) {
+        espix_printf(s, "\nfinished:\n%5s %-16s %-6s %s\n",
+                     "PID", "NAME", "STATE", "EXIT");
+        for (size_t i = 0; i < n; i++) {
+            espix_printf(s, "%5d %-16s %-6s %d\n",
+                         (int)done[i].pid, done[i].name,
+                         espix_proc_state_str(done[i].state),
+                         done[i].exit_code);
         }
-        if (!header) {
-            espix_printf(s, "\nfinished:\n%5s %-16s %-6s %s\n",
-                         "PID", "NAME", "STATE", "EXIT");
-            header = true;
-        }
-        espix_printf(s, "%5d %-16s %-6s %d\n",
-                     (int)procs[i].pid, procs[i].name,
-                     espix_proc_state_str(procs[i].state),
-                     procs[i].exit_code);
     }
 
     return 0;

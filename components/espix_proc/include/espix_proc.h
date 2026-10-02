@@ -31,6 +31,15 @@ extern "C" {
 #define ESPIX_PROC_NAME_MAX 24
 
 /*
+ * How many completed processes the process table remembers. See
+ * espix_proc_history() and docs/WORKLIST.md R-P1.5: this is the zombie store,
+ * sized to what a person reads rather than to concurrency, and separated from
+ * the live table so a finished process stops competing for a slot the moment
+ * it finishes.
+ */
+#define ESPIX_PROC_DONE_MAX 8
+
+/*
  * Signal numbers come from <signal.h> and espix defines none of its own.
  *
  * That is not just tidiness. The toolchain's numbering is the BSD set, so
@@ -55,6 +64,24 @@ typedef enum {
     ESPIX_PROC_FAULTED,     /* killed by the fault handler */
     ESPIX_PROC_KILLED,      /* killed by request */
 } espix_proc_state_t;
+
+/*
+ * One completed process, as the process table remembers it after the slot has
+ * been released. This is not espix_proc_info_t on purpose: the task handle and
+ * the session pointer are meaningless once the process is gone -- the session
+ * may already have been freed -- so the log keeps only what it can still
+ * answer honestly. See espix_proc_history().
+ */
+typedef struct {
+    espix_pid_t        pid;
+    espix_pid_t        ppid;
+    char               name[ESPIX_PROC_NAME_MAX];
+    espix_proc_state_t state;       /* EXITED, FAULTED or KILLED */
+    int                exit_code;
+    int64_t            started_us;
+    int64_t            ended_us;
+    bool               reaped;      /* wait() has already returned this status */
+} espix_proc_record_t;
 
 typedef struct {
     espix_pid_t        pid;
@@ -117,8 +144,17 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
                                bool foreground, espix_pid_t *out_pid);
 
 /*
- * Block until `pid` leaves the running state. Returns ESP_ERR_TIMEOUT if it is
- * still running when `timeout` expires.
+ * Block until `pid` leaves the running state, and reap its status.
+ *
+ * This consumes the completed-log entry, as waitpid(2) does: the first call
+ * returns the exit code, and a second call for the same pid fails with
+ * ESP_ERR_NOT_FOUND -- which is ECHILD. ESP_ERR_TIMEOUT if it is still running
+ * when `timeout` expires, and ESP_ERR_NOT_FOUND for a pid that never existed
+ * or has already been reaped.
+ *
+ * Callers that only need to know the process is gone -- kill's own escalation,
+ * a session hangup -- must use the internal observe-only path, or they would
+ * take the status away from whoever is the process's parent.
  */
 esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeout);
 
@@ -217,6 +253,18 @@ int espix_signal_from_name(const char *name);
 
 /* Copy up to `n` live entries into `out`. Returns how many were written. */
 size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n);
+
+/*
+ * The completed log, oldest first, up to ESPIX_PROC_DONE_MAX records. Returns
+ * how many were written. This is what `ps` lists under "finished:" once the
+ * live table stops retaining finished slots.
+ *
+ * A reaped record is still reported: the log is a bounded history and not only
+ * the zombie store, because seeing what an app exited with is a debugging
+ * affordance worth its fixed 8 slots. `reaped` says whether wait() has already
+ * consumed it.
+ */
+size_t espix_proc_history(espix_proc_record_t *out, size_t n);
 
 /* Look up the process owning `task`, or ESPIX_PID_NONE. Safe to call from a
  * restricted context: it only reads the table. */

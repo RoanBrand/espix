@@ -5,13 +5,13 @@ menu "espix processes"
         range 2 24
         default 12
         help
-            Size of the espix process table. Finished processes keep their slot
-            (so `ps` can show a recent exit status and `run` can collect it)
-            until the slot is needed for a new process, so this is the limit on
-            live plus recently-finished processes.
+            Size of the espix process table: the limit on processes alive at
+            once. A finished process copies what a listing needs into the
+            completed log (see espix_proc_history()) and releases its slot, so
+            this now bounds concurrency and nothing else.
 
-            Capped at 24 because wait() uses one FreeRTOS event group bit per
-            slot.
+            Capped at 24 because one slot is 736 bytes of static table, and two
+            dozen processes at once is already far past what this device runs.
 
     config ESPIX_PROC_STACK_SIZE
         int "Default stack size for a loaded app (bytes)"

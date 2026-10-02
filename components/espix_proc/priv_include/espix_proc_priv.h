@@ -351,9 +351,22 @@ bool espix_proc_table_intact(void);
 extern SemaphoreHandle_t  g_espix_proc_lock;
 extern EventGroupHandle_t g_espix_proc_events;
 
-/* Claim a free slot (preferring one never used, else the oldest finished one).
- * Returns NULL if the table is full of live processes. Caller must hold the
- * lock. */
+/*
+ * The one bit set at every process finish. A waiter scans the live table and
+ * then the completed log before it sleeps, so a finish that lands in any order
+ * relative to that scan cannot be missed: the bit stays set until a waiter
+ * clears it, and every waiter re-scans. See espix_proc_wait().
+ *
+ * It replaces the per-slot bit this used to be. A slot can now be reused the
+ * moment its process finishes, so a bit tied to the slot index would be set by
+ * one process and consumed by the next occupant's waiter.
+ */
+#define ESPIX_PROC_EVENT_FINISH ((EventBits_t)1)
+
+/* Claim a free slot. A finished process releases its slot in espix_proc_finish(),
+ * so the table now sizes to concurrency and the only reason this returns NULL is
+ * that the maximum number of processes really are alive at once. Caller must
+ * hold the lock. */
 espix_proc_slot_t *espix_proc_alloc_slot(void);
 
 /* Release everything a finished slot owns: ELF image, argv block. Caller must
@@ -366,7 +379,9 @@ void espix_proc_release_resources(espix_proc_slot_t *slot);
  * See abi_alloc.c. */
 void espix_proc_regions_release(espix_proc_slot_t *slot);
 
-/* Record a terminal state and wake anyone in espix_proc_wait(). */
+/* Copy the slot into the completed log, release it, and wake anyone in
+ * espix_proc_wait(). Must be the last thing that touches `slot`: it is zeroed
+ * under the lock and the next spawn may claim it immediately. */
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
                        int exit_code);
 
@@ -438,7 +453,9 @@ void espix_proc_abi_env_register(void);
 
 void espix_proc_abi_signal_register(void);
 
-/* The slot for `pid`, or NULL. Caller must hold the lock. */
+/* The live slot for `pid`, or NULL -- live-only since R-P1.5: a finished
+ * process has no slot, and its record is in the completed log instead. Caller
+ * must hold the lock. */
 espix_proc_slot_t *espix_proc_find(espix_pid_t pid);
 
 /* The calling task's slot, or NULL if it is not a process. Takes no lock: the

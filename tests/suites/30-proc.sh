@@ -390,3 +390,34 @@ else
     assert_eq "a shell-spawned app has no parent" "-" "$ppid_col"
     dev_run "kill -9 $pid" >/dev/null
 fi
+
+
+# --- a finished process leaves the table, and the log keeps the record ------
+#
+# R-P1.5. A finished process used to keep its slot, so history competed with
+# concurrency inside a 12-slot table, and espix_proc_find() still answered for
+# a process that was gone -- `kill` could signal it. Now the slot is released
+# the moment the process finishes and the completed log is the only record:
+# kill(2) answers ESRCH, and ps still shows what ran, from the log.
+
+# The log is bounded: eight entries, however many processes have finished.
+# tail skips both the 'finished:' banner and the column header beneath it.
+hist=$(dev_run ps | sed -n '/^finished:/,$p' | tail -n +3 | grep -c .)
+if [ "$hist" -ge 1 ] && [ "$hist" -le 8 ]; then
+    espix_pass "ps history is bounded by the completed log ($hist entries)"
+else
+    espix_fail "ps history is bounded by the completed log" "read '$hist' rows"
+fi
+
+# A process that has finished is not signallable -- its slot is gone.
+gone=$(dev_run "$APP hold 1 1000 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -z "$gone" ]; then
+    espix_fail "a finished process stops being signallable" "no [pid] line"
+else
+    wait_app_gone "$gone" || \
+        espix_fail "the finished app leaves the live table" "pid $gone still running"
+    out=$(dev_run "kill -9 $gone" 2>&1)
+    assert_contains "a finished process is not signallable" "no such process" "$out"
+fi
+
+assert_contains "and the device is still up" "espix" "$(dev_run uname)"
