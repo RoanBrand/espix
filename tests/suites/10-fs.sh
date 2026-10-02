@@ -292,3 +292,26 @@ dev_run "rm $TF" >/dev/null 2>&1
 assert_not_contains "the root carries no macOS metadata" ".DS_Store" \
     "$(dev_run 'ls -a /')"
 assert_not_contains "and none under /home" ".DS_Store" "$(dev_run 'ls -a /home')"
+
+# rm option handling: -r and -R recurse, -f ignores a missing path, flags
+# combine in any order, -- ends them. R-P2.9.
+rmroot=/tmp/rm-opt-$$
+dev_run "mkdir $rmroot" >/dev/null 2>&1
+dev_run "echo x > $rmroot/f" >/dev/null 2>&1
+dev_run "rm -rf $rmroot" >/dev/null 2>&1
+assert_status "rm -rf removes a tree" 1 dev_status "ls $rmroot"
+
+assert_status "rm -f on a missing path is not an error" 0     dev_status 'rm -f /tmp/no-such-rm-target'
+assert_status "rm on a missing path reports it" 1     dev_status 'rm /tmp/no-such-rm-target'
+assert_status "rm -f with no operands succeeds" 0 dev_status 'rm -f'
+assert_status "rm with no operands is a usage error" 1 dev_status 'rm'
+
+dev_run "mkdir $rmroot" >/dev/null 2>&1
+assert_status "rm -fr works" 0 dev_status "rm -fr $rmroot"
+dev_run "mkdir $rmroot" >/dev/null 2>&1
+assert_status "rm -Rf works" 0 dev_status "rm -Rf $rmroot"
+dev_run "mkdir $rmroot" >/dev/null 2>&1
+assert_status "rm -- accepts the path after it" 0 dev_status "rm -rf -- $rmroot"
+
+assert_status "rm refuses an unknown option" 1 dev_status 'rm -q /tmp'
+assert_status "rm -rf / is refused" 1 dev_status 'rm -rf /'

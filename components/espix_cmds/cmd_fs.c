@@ -666,26 +666,52 @@ static int cmd_rmdir(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+/*
+ * rm [-rRf] [--] <path>...
+ *
+ * The flags follow POSIX: -r and -R recurse (they are the same flag), -f
+ * ignores a path that is not there and never reports one, -- ends the options,
+ * and the flags combine in any order (-rf, -fr, -Rf). Before this only a
+ * leading -r or -rf was read and anything else was taken for a path, so
+ * rm -f missing tried to remove a file called -f.
+ *
+ * -f suppresses only ENOENT. A directory without -r is still an error, and / is
+ * still refused, because those are mistakes rather than a missing file.
+ */
 static int cmd_rm(espix_session_t *s, int argc, char **argv)
 {
-    bool recursive = false;
-    int  first     = 1;
+    bool recursive   = false;
+    bool force       = false;
+    bool no_more     = false;
+    bool saw_operand = false;
+    int  status      = 0;
 
-    if (argc > 1 && (strcmp(argv[1], "-r") == 0 || strcmp(argv[1], "-rf") == 0)) {
-        recursive = true;
-        first = 2;
-    }
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
 
-    if (first >= argc) {
-        espix_eprintf(s, "usage: rm [-r] <path>...\n");
-        return 1;
-    }
+        if (!no_more && a[0] == '-' && a[1] != '\0') {
+            if (strcmp(a, "--") == 0) {
+                no_more = true;
+                continue;
+            }
+            for (const char *p = a + 1; *p != '\0'; p++) {
+                switch (*p) {
+                case 'r':
+                case 'R': recursive = true; break;
+                case 'f': force     = true; break;
+                default:
+                    espix_eprintf(s, "rm: unknown option -%c\n", *p);
+                    espix_eprintf(s, "usage: rm [-rRf] [--] <path>...\n");
+                    return 1;
+                }
+            }
+            continue;
+        }
 
-    int status = 0;
+        saw_operand = true;
 
-    for (int i = first; i < argc; i++) {
         char abs[ESPIX_PATH_MAX];
-        if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
+        if (!espix_cmd_path(s, a, abs, sizeof(abs))) {
             status = 1;
             continue;
         }
@@ -706,17 +732,29 @@ static int cmd_rm(espix_session_t *s, int argc, char **argv)
             errno = 0;
             const esp_err_t err = espix_fs_rm_rf(abs);
             if (err != ESP_OK) {
+                if (force && (errno == ENOENT || err == ESP_ERR_NOT_FOUND)) {
+                    continue;
+                }
                 espix_eprintf(s, "rm: %s: %s\n", abs,
                               (errno != 0) ? strerror(errno)
                                            : esp_err_to_name(err));
                 status = 1;
             }
         } else if (unlink(abs) != 0) {
+            if (force && errno == ENOENT) {
+                continue;
+            }
             espix_eprintf(s, "rm: %s: %s\n", abs, strerror(errno));
             status = 1;
         }
     }
 
+    /* No operands is a usage error, except under -f, where POSIX says nothing
+     * to do is success. */
+    if (!saw_operand && !force) {
+        espix_eprintf(s, "usage: rm [-rRf] [--] <path>...\n");
+        return 1;
+    }
     return status;
 }
 
@@ -1409,7 +1447,7 @@ static espix_cmd_t s_fs_cmds[] = {
       .help = "remove empty directories",        .usage = "rmdir <dir>...",
       .stack = 8192 },
     { .name = "rm",    .fn = cmd_rm,
-      .help = "remove files or directories",     .usage = "rm [-r] <path>...",
+      .help = "remove files or directories",     .usage = "rm [-rRf] [--] <path>...",
       /* Traversal, and the filesystem underneath: 4096 is the same figure the
        * other commands that reach into a filesystem ask for. */
       .stack = 8192 },
