@@ -480,3 +480,18 @@ assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 dev_run "$APP exit 0" >/dev/null 2>&1
 left=$(dev_run ps | sed -n '1,/^finished:/p' | grep -c 'app:testapp')
 assert_eq "a finished process is deleted by the reaper" "0" "$left"
+
+# timeout: run a program with a limit, and reuse the foreground wait. R-P2.11.
+if dev_testapp_present; then
+    assert_status "timeout ends a command that overruns" 124 \
+        dev_status "timeout 1 $APP hold 60 1000"
+    assert_status "and passes a command that finishes through" 7 \
+        dev_status "timeout 5 $APP exit 7"
+    assert_status "timeout 0 means no limit" 0 \
+        dev_status "timeout 0 $APP exit 0"
+    assert_status "timeout reports an unknown program" 127 \
+        dev_status 'timeout 1 no-such-program-at-all'
+    assert_status "timeout refuses bad arguments" 125 dev_status 'timeout'
+else
+    espix_skip "timeout tests need the test app"
+fi

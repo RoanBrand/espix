@@ -19,6 +19,8 @@
 
 #include "freertos/FreeRTOS.h"
 
+#include "esp_timer.h"
+
 #include "espix_appdata.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
@@ -40,6 +42,13 @@
  * hatch, and it announces itself before it fires.
  */
 #define RUN_INTERRUPTS_TO_KILL 3
+
+/*
+ * How long timeout waits after SIGTERM before insisting with SIGKILL. The same
+ * shape as the Ctrl-C escalation above, and for the same reason: an app
+ * deserves the chance to put its hardware back, but not forever.
+ */
+#define RUN_KILL_GRACE_MS 2000
 
 /*
  * Whatever the program declared it needs, before it starts.
@@ -108,6 +117,97 @@ static void appdata_resolve(espix_session_t *s, const char *abs)
  * report its status. Shared by `confine` and by the fallback that resolves a
  * bare command name to a program.
  */
+/*
+ * Wait for pid, the shell's foreground process, and reap it. Returns its exit
+ * status, or -1 when the wait itself failed (already reported). limit_us is how
+ * long to allow, 0 for no limit, which is what a plain foreground command
+ * wants; timeout passes one, and *timed_out says whether it was reached. The
+ * deadline is built from the clock here, not taken from the caller: comparing
+ * an absolute uptime against a duration is how timeout first gave everything
+ * that started after its limit an instant 124.
+ *
+ * In 50ms slices rather than one long block, so Ctrl-C can be noticed. Nothing
+ * else reads input while a foreground process runs -- the editor is not running
+ * and this task is the one that would be reading -- so without this a program
+ * that ignores its own exit conditions cannot be stopped from the session that
+ * started it, and the presses surface as blank lines once it finally dies.
+ */
+static int wait_foreground(espix_session_t *s, espix_pid_t pid, const char *who,
+                           int64_t limit_us, bool *timed_out)
+{
+    int       exit_code  = -1;
+    esp_err_t wait_err   = ESP_ERR_TIMEOUT;
+    unsigned  interrupts = 0;
+    bool      overran    = false;
+    bool      killed     = false;
+    int64_t   term_at    = 0;
+
+    if (timed_out != NULL) {
+        *timed_out = false;
+    }
+    const int64_t deadline = (limit_us > 0) ? esp_timer_get_time() + limit_us : 0;
+
+    s->fg_pid = pid;
+
+    for (;;) {
+        const int64_t now = esp_timer_get_time();
+
+        if (deadline > 0 && !overran && now >= deadline) {
+            espix_eprintf(s, "%s: pid %d: time limit reached\n", who, (int)pid);
+            (void)espix_proc_signal(pid, SIGTERM);
+            overran = true;
+            term_at = now;
+        } else if (overran && !killed &&
+                   now >= term_at + (int64_t)RUN_KILL_GRACE_MS * 1000) {
+            espix_eprintf(s, "%s: pid %d: did not stop; killing it\n",
+                          who, (int)pid);
+            (void)espix_proc_signal(pid, SIGKILL);
+            killed = true;
+        }
+
+        wait_err = espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(RUN_POLL_MS));
+        if (wait_err != ESP_ERR_TIMEOUT) {
+            break;
+        }
+
+        if (s->poll_interrupt == NULL || !s->poll_interrupt(s)) {
+            continue;
+        }
+
+        espix_printf(s, "^C\n");
+        interrupts++;
+
+        if (interrupts < RUN_INTERRUPTS_TO_KILL) {
+            (void)espix_proc_signal(pid, SIGINT);
+
+            if (interrupts + 1 == RUN_INTERRUPTS_TO_KILL) {
+                espix_eprintf(s, "%s: pid %d is ignoring SIGINT; "
+                                 "press Ctrl-C again to force it\n",
+                              who, (int)pid);
+            }
+        } else if (interrupts == RUN_INTERRUPTS_TO_KILL) {
+            espix_eprintf(s, "%s: killing pid %d\n", who, (int)pid);
+            (void)espix_proc_signal(pid, SIGKILL);
+        }
+    }
+
+    if (s->poll_interrupt != NULL) {
+        (void)s->poll_interrupt(s);
+    }
+
+    s->fg_pid = ESPIX_PID_NONE;
+
+    if (timed_out != NULL) {
+        *timed_out = overran;
+    }
+    if (wait_err != ESP_OK) {
+        espix_eprintf(s, "%s: pid %d: %s\n", who, (int)pid,
+                      esp_err_to_name(wait_err));
+        return -1;
+    }
+    return exit_code;
+}
+
 static int run_program(espix_session_t *s, const char *abs, int argc,
                        char **argv, bool background, const char *root,
                        const char *who)
@@ -139,92 +239,14 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
         return 0;
     }
 
-    s->fg_pid = pid;
-
-    /*
-     * Wait in slices rather than one long block, so Ctrl-C can be noticed.
-     * Nothing else reads input while a foreground process runs -- the editor is
-     * not running and this task is the one that would be reading -- so without
-     * this a program that ignores its own exit conditions cannot be stopped
-     * from the session that started it, and the Ctrl-Cs surface as blank lines
-     * once it finally dies.
-     *
-     * 50ms is short enough to feel immediate and long enough that polling costs
-     * nothing measurable.
-     *
-     * And there is no deadline. A foreground program holds the shell until it
-     * exits, as on Unix; the escalation below is what makes that safe, since a
-     * third Ctrl-C kills an app that will not listen. There *was* a sixty
-     * second deadline here, from before espix had signals at all: it detached
-     * the app and gave the prompt back, which also silently stopped pumping its
-     * output and its input, and on a system where a background program dies
-     * with the session it was not backgrounded so much as abandoned.
-     */
-    int       exit_code  = -1;
-    esp_err_t wait_err   = ESP_ERR_TIMEOUT;
-    unsigned  interrupts = 0;
-
-    for (;;) {
-        wait_err = espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(RUN_POLL_MS));
-        if (wait_err != ESP_ERR_TIMEOUT) {
-            break;                      /* finished, one way or another */
-        }
-
-        /*
-         * Poll on every slice, even once the process has been asked to stop:
-         * the point is to keep *consuming* input, not just to notice the first
-         * Ctrl-C. Someone who presses it five times should not get five blank
-         * lines on the next prompt.
-         */
-        if (s->poll_interrupt == NULL || !s->poll_interrupt(s)) {
-            continue;
-        }
-
-        espix_printf(s, "^C\n");
-        interrupts++;
-
-        /*
-         * SIGINT, and only SIGINT. The app may have a handler; running it and
-         * letting the app decide is the whole point of having signals, and
-         * deleting the task from under a handler that was about to put the
-         * hardware back would undo the reason any of this exists.
-         *
-         * A press only counts once per 50ms slice, since poll_interrupt()
-         * reports "something arrived" rather than how many -- which suits a
-         * person pressing a key and means a held-down Ctrl-C does not race
-         * straight to the kill.
-         */
-        if (interrupts < RUN_INTERRUPTS_TO_KILL) {
-            (void)espix_proc_signal(pid, SIGINT);
-
-            if (interrupts + 1 == RUN_INTERRUPTS_TO_KILL) {
-                espix_eprintf(s, "%s: pid %d is ignoring SIGINT; "
-                                 "press Ctrl-C again to force it\n",
-                              who, (int)pid);
-            }
-        } else if (interrupts == RUN_INTERRUPTS_TO_KILL) {
-            espix_eprintf(s, "%s: killing pid %d\n", who, (int)pid);
-            (void)espix_proc_signal(pid, SIGKILL);
-        }
-    }
-
-    /* Whatever was typed between the last poll and the process exiting is still
-     * queued, and would otherwise arrive at the next prompt. */
-    if (s->poll_interrupt != NULL) {
-        (void)s->poll_interrupt(s);
-    }
-
-    s->fg_pid = ESPIX_PID_NONE;
-
-    if (wait_err != ESP_OK) {
-        espix_eprintf(s, "%s: pid %d: %s\n", who, (int)pid, esp_err_to_name(wait_err));
+    const int status = wait_foreground(s, pid, who, 0, NULL);
+    if (status < 0) {
         return 1;
     }
-
-    if (exit_code != 0) {
-        espix_printf(s, "[exit %d]\n", exit_code);
+    if (status != 0) {
+        espix_printf(s, "[exit %d]\n", status);
     }
-    return exit_code;
+    return status;
 }
 
 /*
@@ -380,13 +402,21 @@ static int cmd_confine(espix_session_t *s, int argc, char **argv)
  * `confine` so that naming a file explicitly cannot get past what a bare name
  * has to satisfy.
  */
-static int exec_fallback(espix_session_t *s, int argc, char **argv)
+/*
+ * Resolve a command word to an absolute path, the way a shell falls through to
+ * PATH, and apply the two gates. Returns 0 when the program may run, -1 when
+ * there is no such file (the caller decides what that means), or the status to
+ * return for a file that is there but cannot run (already reported).
+ *
+ * Shared by the exec fallback and timeout, so both answer the same way about
+ * what a command word names.
+ */
+static int resolve_program(espix_session_t *s, const char *word,
+                           char *abs, size_t len)
 {
-    char abs[ESPIX_PATH_MAX];
-
-    if (strchr(argv[0], '/') != NULL) {
-        if (!espix_cmd_path(s, argv[0], abs, sizeof(abs))) {
-            return 1;
+    if (strchr(word, '/') != NULL) {
+        if (!espix_cmd_path(s, word, abs, len)) {
+            return -1;
         }
     } else {
         const char *path = espix_env_get(s, "PATH");
@@ -396,23 +426,22 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
 
         /*
          * First hit wins, and "hit" means the file exists -- not that it is
-         * runnable. A directory earlier in PATH holding an unreadable `hello`
+         * runnable. A directory earlier in PATH holding an unreadable program
          * shadows a later one, which is what every shell does and what makes
          * the resulting "Permission denied" the truth rather than a puzzle.
          */
         bool found = false;
         for (const char *p = path; *p != '\0' && !found; ) {
             const char  *sep = strchr(p, ':');
-            const size_t len = (sep != NULL) ? (size_t)(sep - p) : strlen(p);
+            const size_t seg = (sep != NULL) ? (size_t)(sep - p) : strlen(p);
 
-            if (len > 0) {
+            if (seg > 0) {
                 char dir[ESPIX_PATH_MAX];
-                if (len < sizeof(dir)) {
-                    memcpy(dir, p, len);
-                    dir[len] = '\0';
+                if (seg < sizeof(dir)) {
+                    memcpy(dir, p, seg);
+                    dir[seg] = '\0';
 
-                    if ((size_t)snprintf(abs, sizeof(abs), "%s/%s", dir,
-                                         argv[0]) < sizeof(abs)) {
+                    if ((size_t)snprintf(abs, len, "%s/%s", dir, word) < len) {
                         struct stat st;
                         if (stat(abs, &st) == 0) {
                             found = true;
@@ -420,24 +449,36 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
                     }
                 }
             }
-            p = (sep != NULL) ? sep + 1 : p + len;
+            p = (sep != NULL) ? sep + 1 : p + seg;
         }
 
         if (!found) {
-            /* Nothing in PATH. Report against the first entry so the message
-             * names a real path rather than the bare word. */
-            return ESPIX_SHELL_ENOENT;
+            return -1;
         }
     }
 
-    /* Shown as the user typed it, not as resolved: `hello: Permission denied`
+    /* Shown as the user typed it, not as resolved: "hello: Permission denied"
      * is the answer they can act on. */
-    const int gate = program_gate(s, abs, argv[0]);
+    const int gate = program_gate(s, abs, word);
     if (gate != 0) {
-        return (gate < 0) ? ESPIX_SHELL_ENOENT : gate;
+        return (gate < 0) ? -1 : gate;
+    }
+    return 0;
+}
+
+static int exec_fallback(espix_session_t *s, int argc, char **argv)
+{
+    char abs[ESPIX_PATH_MAX];
+
+    const int resolved = resolve_program(s, argv[0], abs, sizeof(abs));
+    if (resolved < 0) {
+        return ESPIX_SHELL_ENOENT;
+    }
+    if (resolved > 0) {
+        return resolved;
     }
 
-    /* The shell stripped the trailing `&` and recorded the intent. */
+    /* The shell stripped the trailing & and recorded the intent. */
     const bool background = s->background;
 
     /* argv[0] becomes the resolved path, as execve() would leave it. */
@@ -450,6 +491,77 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
     }
 
     return run_program(s, abs, app_argc, app_argv, background, NULL, "espix");
+}
+
+
+/*
+ * timeout <seconds> <program> [args...]
+ *
+ * Run a program with a time limit: SIGTERM at the limit, SIGKILL a grace later,
+ * and 124 as the status, which is what coreutils uses. It is a shell command
+ * rather than something an app asks for -- there is no fork, so nothing else
+ * could supervise a child -- and it reuses the wait a foreground command
+ * already had. Zero seconds means no limit, as coreutils defines it, so a
+ * caller can pass a computed timeout without special-casing it.
+ */
+static int cmd_timeout(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 3) {
+        espix_eprintf(s, "usage: timeout <seconds> <program> [args...]\n");
+        return 125;
+    }
+
+    char *end  = NULL;
+    long  secs = strtol(argv[1], &end, 10);
+    if (end == argv[1] || *end != '\0' || secs < 0) {
+        espix_eprintf(s, "timeout: bad seconds '%s'\n", argv[1]);
+        return 125;
+    }
+    if (secs > 86400) {
+        secs = 86400;
+    }
+
+    char abs[ESPIX_PATH_MAX];
+    const int resolved = resolve_program(s, argv[2], abs, sizeof(abs));
+    if (resolved < 0) {
+        espix_eprintf(s, "timeout: %s: command not found\n", argv[2]);
+        return 127;
+    }
+    if (resolved > 0) {
+        return resolved;
+    }
+
+    char *app_argv[ESPIX_ARGS_MAX];
+    int   app_argc = 0;
+
+    app_argv[app_argc++] = abs;
+    for (int i = 3; i < argc && app_argc < ESPIX_ARGS_MAX; i++) {
+        app_argv[app_argc++] = argv[i];
+    }
+
+    appdata_resolve(s, abs);
+
+    espix_pid_t     pid = ESPIX_PID_NONE;
+    const esp_err_t err = espix_proc_spawn_elf(abs, app_argc, app_argv, s, NULL,
+                                               true, &pid);
+    if (err != ESP_OK) {
+        espix_eprintf(s, "timeout: %s: %s\n", abs, esp_err_to_name(err));
+        return 126;
+    }
+
+    bool      timed_out = false;
+    const int status = wait_foreground(s, pid, "timeout",
+                                       (int64_t)secs * 1000000, &timed_out);
+    if (timed_out) {
+        return 124;
+    }
+    if (status < 0) {
+        return 125;
+    }
+    if (status != 0) {
+        espix_printf(s, "[exit %d]\n", status);
+    }
+    return status;
 }
 
 void espix_cmds_register_exec_fallback(void)
@@ -757,6 +869,9 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_run_cmds[] = {
+    { .name = "timeout", .fn = cmd_timeout,
+      .help = "run a program, ending it if it overruns",
+      .usage = "timeout <seconds> <program> [args...]" },
     { .name = "confine", .fn = cmd_confine, .backgrounds = true,
       .help = "run a program that can name nothing outside <dir>",
       .usage = "confine <dir> <path> [args...] [&]" },
