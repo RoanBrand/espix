@@ -206,8 +206,14 @@ decisions, and an **implementation plan in the order it has to happen**.
 The full suite reads 261 passed / 3 failed, and all three are one cause with
 nothing to do with R-P1.4: usb0 is absent and the usb command is not found, so
 this image has USB host (the MSC and HID tasks are up) but not USB-NCM, while
-those two suites assert an NCM build. The internal low-water mark also reads
-46 kB for the full suite against ~93 kB for SUITE=proc alone, which is the
-network suites' own footprint and not the log ring -- established by running
-the whole suite with the ring at 96 and at 256 lines, where internal usage was
-identical. Both want their own look before the suite can be called green.
+those two suites assert an NCM build. That is the one open item here.
+
+**The heap line is not an open item, and reading it as one cost time.** "fell to
+46K this run (was 93K)" compares the internal low-water mark before and after a
+run -- and that figure is cumulative since boot and never recovers (the note at
+device.sh:1081), so it can only fall, and a run that does more (the whole suite,
+lwIP included) drives it lower than one that does less. 46K for the full suite
+against 93K for a single suite says nothing about either. The controlled
+comparison is the same suite across builds: at 96 and at 256 log lines the full
+suite reads the same 46K, so the ring is irrelevant -- which is also what settled
+R-P0.8.
