@@ -99,7 +99,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 
 **The fix, and it is a single-number-space change.** Every open and close must be espix's, with nothing held by IDF that espix cannot release. Concretely: allocate the fd the way `dev.c` already does for *device* fds -- `espix_dev_fd()` / `ESPIX_DEV_FD_BASE` and the loop at vfs.c:1359 show the in-repo pattern -- so that `local_fd == fd` (`vfs.c:561`), keep that number in the slot, and release it from the reaper with `esp_vfs_unregister_fd()`. Then espix's `s_fds` is indexed by the one number everyone uses, the `128+` base and the key indirection disappear, and IDF holds no per-open state that outlives a dead process. This also retires the `ESPIX_DEV_FD_BASE` collision check at vfs.c:604, which exists only because two number spaces had to be kept apart. **Do it as one piece** -- it changes fd numbering for every file operation, so half of it is every app's I/O broken. Two things follow: find out whether `espix_proc_self_pid()` is stamping an owner at open time at all (the most likely failure -- the release then finds nothing to match), and treat *fd-table exhaustion taking the board down* as a bug in its own right, because it is reachable today by any app that leaks descriptors. |
 | R-P1.4 | `ppid`/children tracking + `SIGCHLD` | Nothing tracks parentage; ownership is "which session pointer you hold". Needed by services, job control and `waitpid` | `espix_proc.h:59` | a child exit notifies its parent | **done, with a dormant half.** The mechanism is complete and correct: every slot records the process that spawned it, and espix_proc_finish() sets SIGCHLD pending on that parent (safe because SIGCHLD is already in espix's default-ignore list). But nothing that can be a parent exists -- the shell is a session task, not a process, and no app-visible call spawns -- so every process shows ppid NONE and the notification never fires. That is a truthful state rather than a gap: the shell spawning a process is the kthreadd case, and a kernel thread has no ppid either. The loop closes by itself the moment a *process* first spawns, which is services (R-P6.1) or whatever first gives an app a spawn call; no R-P1 item does. Not needed yet: the shell tracks children by session and pid, not by signal. ps grows a PPID column, appended rather than beside PID because other suites parse this listing's columns. |
-| R-P1.5 | Separate the **live table** from a small **completed log**; recycle a slot on reap | Retaining finished slots is a debugging affordance, not POSIX — Linux keeps only unreaped zombies, and `ps` history is not a thing there. The live table then sizes to *concurrency*, not to history | `proc.c:133`, `cmd_sys.c` `ps` | `ps` shows history from the ring; slots recycle at once | todo |
+| R-P1.5 | Separate the **live table** from a small **completed log**; recycle a slot on reap | Retaining finished slots is a debugging affordance, not POSIX — Linux keeps only unreaped zombies, and `ps` history is not a thing there. The live table then sizes to *concurrency*, not to history | `proc.c`, `espix_proc.h`, `cmd_sys.c` `ps` | `ps` shows history from the ring; slots recycle at once | **done** (`bf12f51`) — the slot is copied into an 8-entry static ring (pid, ppid, name, state, exit code, start and end times) and released under the lock with the memset last, so `espix_proc_find()` sees only live processes and the table sizes to *concurrency*: kill and signals answer "no such process" for a finished pid, and a slot is reusable the instant its process ends. `espix_proc_wait()` consumes the entry, as waitpid(2) does — the second call is ECHILD — while kill's own escalation and `espix_proc_hangup()` go through a new observe-only path, so they cannot take the status from whoever is the parent. One global finish bit replaces the per-slot bit, since a slot can now be reused immediately, and every waiter re-scans table-then-log. `ps` reads its "finished" section from the ring. Cost: 520 B of .bss, no dynamic memory; the table itself is unchanged at 8840 B. Verified on the S31: 30-proc 53/53, including the ring bounded to eight entries and a finished pid answering "no such process". |
 | R-P1.6 | Make `espix:reaper` the **single teardown point**: per-invocation tasks (command, ssh conn, app) stop calling `vTaskDelete(NULL)` and park instead, and the reaper deletes them — reclaiming the arena, fds and screen in the same pass | `prvCheckTasksWaitingTermination()` is a private static in FreeRTOS's `tasks.c` and cannot be called. But deleting *another* task frees its TCB in the caller, so if nothing self-deletes, the idle task stops being *required* for espix's cleanup. IDF components and app-created pthreads still self-delete, so this reduces the dependence rather than removing it. Also retires the `espix_gfx_recover()` special case | `reaper.c`, `exec.c:616`, `session.c:469`, `ssh_server.c:495` | a finished process is torn down entirely by the reaper | todo |
 | R-P1.7 | Reclaim the screen through R-P1.6 instead of the `espix_gfx_recover()` special case | Today the canvas is the one resource that *is* reclaimed, by hand | `proc.c:236` | the special case is gone | todo |
 | R-P1.8 | `dup`/`dup2`/`fcntl(F_DUPFD)` in the VFS | Currently "left out" only because IDF stubs it. Prerequisite for pipes and redirection, and portable to all targets | `vfs.c` | `dup2` from an app works | todo |
@@ -269,3 +269,26 @@ table; a finished process no longer occupies a concurrency slot (spawn twelve,
 finish them, spawn twelve more); wait returns a status exactly once and fails
 the second time; kill on a finished pid reports not-found; and the existing
 exit-status tests in 30-proc.sh still pass unchanged.
+
+**Built** (`bf12f51`). Two places the code decided something the sketch did not,
+and one thing it implements but no test yet observes:
+
+- **The ring shows reaped entries too.** It is a log as well as the zombie
+  store, and reaping only marks the record -- so a reaped exit leaves wait's
+  reach but stays readable in `ps` until the ring wraps. Linux drops it from
+  `ps` at once; the affordance was judged worth the divergence, and it is what
+  keeps `ps` useful once the shell has reaped everything it ran.
+- **`espix_proc_wait()` consumes, but espix's own non-parent waiters do not.**
+  `proc_wait_gone()` in `proc.c` is observe-only, and kill's escalation and
+  `espix_proc_hangup()` use it. Without the split, `kill -9` racing a
+  foreground app's own exit would collect the status, and the shell's `run`
+  would then report `pid N: ESP_ERR_NOT_FOUND` for a process that exited
+  normally.
+- **"wait fails the second time" and "spawn twelve, finish, spawn twelve
+  more" are properties of the code, not observed tests.** There is no
+  app-visible `waitpid` for a suite to call twice, and filling the table to
+  prove a slot came back risks a full table that cannot load the next app's
+  binary. The observable half -- the ring bounded to eight, and a finished pid
+  answering "no such process" -- is tested. This is the same shape as R-P1.4's
+  dormant half and closes the same way: when an app can wait.
+
