@@ -613,9 +613,31 @@ static int exec_one(espix_session_t *s, const char *line)
     }
     av[argc] = NULL;
 
+    /*
+     * A trailing `&` is the shell's background operator, recognised here so
+     * that no command ever sees it as an argument -- `cat f &` used to open a
+     * file called `&`. The intent travels on the session because one of the
+     * things it applies to is a builtin (`confine`), not only a program.
+     */
+    const bool prev_background = s->background;
+    s->background = false;
+    if (argc > 1 && strcmp(av[argc - 1], "&") == 0) {
+        av[--argc] = NULL;
+        s->background = true;
+    }
+
     const espix_cmd_t *cmd = espix_shell_find(av[0]);
 
+    if (s->background && cmd != NULL && !cmd->backgrounds) {
+        espix_eprintf(s, "espix: %s: cannot be backgrounded yet\n", av[0]);
+        s->background = prev_background;
+        redirects_release(s, &redir);
+        espix_env_scope_end(s, &scope);
+        return 1;
+    }
+
     if (cmd == NULL && s_exec_fallback == NULL) {
+        s->background = prev_background;
         redirects_release(s, &redir);
         espix_env_scope_end(s, &scope);
         return ESPIX_SHELL_ENOENT;
@@ -655,6 +677,7 @@ static int exec_one(espix_session_t *s, const char *line)
     /* After the command, so `FOO=bar cmd` leaves the session as it found it --
      * including a spawned app, which copied what it needed at spawn. */
     espix_env_scope_end(s, &scope);
+    s->background = prev_background;
     return status;
 }
 

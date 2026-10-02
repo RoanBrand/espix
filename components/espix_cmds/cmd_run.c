@@ -297,11 +297,9 @@ static int cmd_confine(espix_session_t *s, int argc, char **argv)
     static const char *const USAGE =
         "usage: confine <dir> <path> [args...] [&]\n";
 
-    bool background = false;
-    if (argc > 1 && strcmp(argv[argc - 1], "&") == 0) {
-        background = true;
-        argc--;
-    }
+    /* The shell stripped the trailing `&` and recorded the intent; see
+     * espix_cmd_t.backgrounds. */
+    const bool background = s->background;
 
     if (argc < 3) {
         espix_printf(s, "%s", USAGE);
@@ -429,11 +427,8 @@ static int exec_fallback(espix_session_t *s, int argc, char **argv)
         return (gate < 0) ? ESPIX_SHELL_ENOENT : gate;
     }
 
-    bool background = false;
-    if (argc > 1 && strcmp(argv[argc - 1], "&") == 0) {
-        background = true;
-        argc--;
-    }
+    /* The shell stripped the trailing `&` and recorded the intent. */
+    const bool background = s->background;
 
     /* argv[0] becomes the resolved path, as execve() would leave it. */
     char *app_argv[ESPIX_ARGS_MAX];
@@ -580,7 +575,7 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_run_cmds[] = {
-    { .name = "confine", .fn = cmd_confine,
+    { .name = "confine", .fn = cmd_confine, .backgrounds = true,
       .help = "run a program that can name nothing outside <dir>",
       .usage = "confine <dir> <path> [args...] [&]" },
     { .name = "kill",  .fn = cmd_kill,

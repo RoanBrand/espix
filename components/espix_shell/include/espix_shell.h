@@ -228,6 +228,14 @@ struct espix_session {
     bool        want_exit;
 
     /*
+     * Set for the duration of one command when the line ended in `&`, and read
+     * by a command that spawns (R-P2.2). The shell strips the operator before
+     * dispatch, so no command ever receives it as an argument -- `cat f &`
+     * used to open a file called `&`.
+     */
+    bool        background;
+
+    /*
      * Set for the duration of one command when its output was redirected with
      * `>` / `>>`. espix_puts()/espix_printf() honour it; a spawned app's own
      * stdout does not, so `app > file` still writes to the console.
@@ -312,6 +320,16 @@ typedef struct espix_cmd {
      * sets this; upgrade panicked once because it did not.
      */
     bool             internal_stack;
+
+    /*
+     * Whether this command knows what a trailing `&` means.
+     *
+     * The shell strips the operator before dispatch, so a command that spawns
+     * may run itself in the background; one that does not is refused rather
+     * than silently run in the foreground. The flag exists only until R-P2.6's
+     * job table lets any builtin be backgrounded on a task of its own.
+     */
+    bool             backgrounds;
 
     struct espix_cmd *next;                /* registry-owned; do not set */
 } espix_cmd_t;

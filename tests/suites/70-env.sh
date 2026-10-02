@@ -199,3 +199,28 @@ while [ "$i" -lt 26 ]; do
 done
 assert_contains "a full table is refused with the limit named" "is the limit" \
     "$(dev_run 'export LAST=x' 2>&1)"
+
+# ---------------------------------------------------------------------------
+# `&` is the shell's background operator, not an argument. R-P2.2.
+#
+# The shell strips a trailing `&` before dispatch, so no command sees it as an
+# argument -- `cat f &` used to open a file called `&`. A command that spawns
+# backgrounds; one that cannot is refused explicitly rather than silently run in
+# the foreground. Backgrounding a builtin on a task of its own is R-P2.6.
+# ---------------------------------------------------------------------------
+
+assert_contains "a builtin that cannot background says so" \
+    "cannot be backgrounded" "$(dev_run 'cat /etc/hostname &' 2>&1)"
+assert_not_contains "and it never reaches the command as a filename" \
+    "no such file" "$(dev_run 'cat /etc/hostname &' 2>&1)"
+
+if dev_testapp_present; then
+    APP="/home/$ESPIX_USER/testapp"
+
+    assert_contains "a program backgrounds and reports its pid" "$APP" \
+        "$(dev_run "$APP exit 0 &")"
+    assert_contains "and confine backgrounds the same way" "$APP" \
+        "$(dev_run "confine / $APP exit 0 &")"
+else
+    espix_skip "backgrounding a program needs the test app"
+fi
