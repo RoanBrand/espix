@@ -187,8 +187,8 @@ decisions, and an **implementation plan in the order it has to happen**.
 - `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384`, `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768`.
 - `CONFIG_FREERTOS_HZ=100`; `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536`.
 - TWDT enabled, idle checked on both cores, `PANIC` off, timeout 5 s.
-- `g_espix_procs` is **static .bss**, ~656 B x 12 = ~7.9 KB. `s_fds` is 0x500 = 1280 B.
-- klog ring is a heap pointer (PSRAM), 96 x ~132 B = 12.4 KB.
+- `g_espix_proc_table` is **static .bss**, 736 B x 12 slots + guard = 8840 B (8.6 KB); the completed log `s_done` adds 512 B (`ESPIX_PROC_DONE_MAX` 8 x 64 B), both measured from the ELF. `s_fds` is 0x500 = 1280 B.
+- klog ring is a heap pointer (PSRAM), 256 x ~132 B = ~33 KB (R-P0.8 raised it from 96).
 - App stack: 256 KB PSRAM, core 1 (PIE). Relocation runs on an 8 KB internal stack.
 - 71 commands registered; zero text utilities beyond `cat`/`ls`/`echo`/`df`/`sha256sum`.
 - 53 `ESPIX_KLOG_DEBUG` call sites; 494 `espix_klog` calls; 8 `ESP_LOGx` in espix's own code.
