@@ -459,16 +459,19 @@ decision with a reason rather than a convenience.
 | **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `isatty`, `dup`, `dup2`, `atexit`, `perror` — each with the reason written beside the table it is absent from |
 | **carried elsewhere** | the surface is large, or belongs to a runtime rather than to the kernel | an app's own libraries, or a loadable module: see the Arduino item under **Further out** |
 
-The layering matters as much as the list. elf_loader's own tables answer for 62
-standard names *before* espix's are consulted, so those need no entry — and where
-an entry does duplicate one, it resolves anyway and is dead weight that reads as a
-promise. Both cases are reported on every link now rather than left to be
-discovered, which is what caught `memset`, `strtol` and `ets_printf` sitting
-unreachable in a driver table. A table cannot shadow what is answered below it;
-that is what the resolver is for, and it runs first.
+The layering matters as much as the list. elf_loader's own tables used to answer
+for 62 standard names *before* espix's were consulted, which made the loader's
+example list part of the ABI. R-P3.1 turned them off — `Check_abi.py` fails the
+link if a name they answered for is not published by espix — so there is one
+definition now instead of two searched in order. Both mistakes are still reported
+on every link: an entry an earlier table answers for, and a name the loader's
+tables answered for that espix does not publish now that they are off. That is
+what caught `memset`, `strtol` and `ets_printf` sitting unreachable in a
+driver table. The resolver still runs before every table; that is the seam for a
+name espix must *own* rather than merely allow.
 
-`components/espix_proc/abi_libc.c` carries the full statement, the list of what is
-answered below, and why none of this can be a `_Static_assert`; `tools/check-abi.py`
+`components/espix_proc/abi_libc.c` carries the full statement, the list of
+which file owns which name, and why none of this can be a `_Static_assert`; `tools/check-abi.py`
 enforces it; `tests/suites/12-vfs.sh` calls the published names from an app, and
 checks that an app is refused what the shell is refused.
 

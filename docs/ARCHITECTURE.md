@@ -508,9 +508,10 @@ to run an ELF at any absolute path the shell hands it.
 
 IDF 6.1 defaults to picolibc. Under picolibc `stdin`/`stdout` are thread-local
 and linenoise depends on a TLS-stdio shim in `components/console/private_include`,
-which cannot be included from outside that component. Newlib also matches what
-elf_loader's libc symbol table — how a loaded app resolves `printf` against the
-firmware — was written against.
+which cannot be included from outside that component. Newlib is also what espix's
+app ABI names directly: `abi_libc.c` publishes newlib's own reent/ctype ABI
+(`__errno`, `__getreent`, `_ctype_`), and picolibc spells those differently.
+Switching libc means revisiting that table as well as the console's.
 
 ### The rootfs image is not flashed by `idf.py flash`
 
