@@ -2534,7 +2534,18 @@ esp_err_t espix_usb_host_init(void)
         return err;
     }
 
-    if (xTaskCreate(host_task, "usb:host", HOST_TASK_STACK, NULL, HOST_TASK_PRIO,
+    /*
+     * The stack in PSRAM (R-P5.3), with internal as the fallback: 4096 bytes of
+     * the scarce pool back for a task that blocks in the library's event loop.
+     * A task stack is not a DMA buffer -- what the peripheral reads and writes
+     * lives in the driver's own buffers and FatFs's, not on these frames --
+     * which is why both USB tasks are safe to move and no other change is
+     * needed to make transfers work.
+     */
+    if (xTaskCreateWithCaps(host_task, "usb:host", HOST_TASK_STACK, NULL,
+                            HOST_TASK_PRIO, NULL,
+                            MALLOC_CAP_SPIRAM) != pdPASS &&
+        xTaskCreate(host_task, "usb:host", HOST_TASK_STACK, NULL, HOST_TASK_PRIO,
                     NULL) != pdPASS) {
         usb_host_uninstall();
         return ESP_ERR_NO_MEM;
@@ -2554,7 +2565,12 @@ esp_err_t espix_usb_host_init(void)
         s_work = NULL;
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(work_task, "usb:work", WORK_TASK_STACK, NULL, WORK_TASK_PRIO,
+    /* PSRAM first, as above: this is the larger of the two stacks (6144) and
+     * the one that holds the mount applier's frames. */
+    if (xTaskCreateWithCaps(work_task, "usb:work", WORK_TASK_STACK, NULL,
+                            WORK_TASK_PRIO, NULL,
+                            MALLOC_CAP_SPIRAM) != pdPASS &&
+        xTaskCreate(work_task, "usb:work", WORK_TASK_STACK, NULL, WORK_TASK_PRIO,
                     NULL) != pdPASS) {
         vQueueDelete(s_work);
         s_work = NULL;
