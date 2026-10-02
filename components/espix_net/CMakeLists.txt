@@ -29,6 +29,8 @@ idf_component_register(
         esp_common
     PRIV_REQUIRES
         espix_kernel
+        # abi.c wraps lwip_send/sendto to raise SIGPIPE on the app's process.
+        espix_proc
         espix_fs
         esp_netif
         esp_wifi

@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
@@ -620,6 +623,90 @@ static int sig_winch_wait(void)
     return s_winch_seen ? 0 : 1;
 }
 
+static volatile sig_atomic_t s_pipe_seen;
+
+static void on_pipe(int sig)
+{
+    (void)sig;
+    s_pipe_seen = 1;
+}
+
+/*
+ * The trigger for SIGPIPE is a peer that goes away: a loopback client and
+ * server, the server closes, and the client keeps sending until the stack says
+ * the connection is gone. The send wrapper is what turns that into a signal.
+ */
+static int sig_pipe(void)
+{
+    signal(SIGPIPE, on_pipe);
+
+    const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        printf("pipe: no socket\n");
+        fflush(stdout);
+        return 2;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(lfd, 1) != 0) {
+        printf("pipe: cannot listen\n");
+        fflush(stdout);
+        close(lfd);
+        return 2;
+    }
+
+    socklen_t alen = sizeof(addr);
+    if (getsockname(lfd, (struct sockaddr *)&addr, &alen) != 0) {
+        printf("pipe: no port\n");
+        fflush(stdout);
+        close(lfd);
+        return 2;
+    }
+
+    const int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfd < 0 || connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        printf("pipe: cannot connect\n");
+        fflush(stdout);
+        close(lfd);
+        return 2;
+    }
+
+    const int afd = accept(lfd, NULL, NULL);
+    if (afd < 0) {
+        printf("pipe: cannot accept\n");
+        fflush(stdout);
+        close(cfd);
+        close(lfd);
+        return 2;
+    }
+
+    close(afd);                         /* the reading end is gone */
+    close(lfd);
+
+    int rc = 0, err = 0;
+    for (int i = 0; i < 20 && !s_pipe_seen; i++) {
+        const char b = 'x';
+        rc = send(cfd, &b, 1, 0);
+        if (rc < 0) {
+            err = errno;
+            break;
+        }
+        usleep(20000);
+    }
+
+    espix_sigcheck();                   /* the delivery point */
+    printf("pipe: rc=%d errno=%d seen=%d\n", rc, err, (int)s_pipe_seen);
+    fflush(stdout);
+    close(cfd);
+    return s_pipe_seen ? 0 : 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -642,6 +729,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "winch-wait") == 0) {
         return sig_winch_wait();
+    }
+    if (strcmp(mode, "pipe") == 0) {
+        return sig_pipe();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
@@ -1292,7 +1382,7 @@ static void usage(void)
            "  both                one line to stdout, one to stderr\n"
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
-           "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch\n"
+           "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch | pipe\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"

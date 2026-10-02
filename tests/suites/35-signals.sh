@@ -243,3 +243,9 @@ assert_contains "an app can ask for the terminal size" "cols=" \
 winch_out=$(dev_run "$APP sig winch")
 assert_contains "SIGWINCH reaches a handler" "seen=1" "$winch_out"
 assert_contains "and the handler can read the size" "cols=" "$winch_out"
+
+# SIGPIPE when a send finds the connection gone: the trigger is a loopback peer
+# that closes, and the send wrapper turns the stack's error into the signal.
+# R-P6.5.
+assert_contains "a send to a gone peer raises SIGPIPE" "seen=1" \
+    "$(dev_run "$APP sig pipe")"
