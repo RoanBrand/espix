@@ -108,7 +108,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 
 | id | what | why | where | done when | status |
 |---|---|---|---|---|---|
-| R-P2.1 | `;` and `&&`/`\|\|` as parsed operators | Nearly free: split before dispatch, run in sequence, read `s->last_status`. No new objects | `session.c:533` | `ssh host 'cd /bin && ls'` works | todo |
+| R-P2.1 | `;` and `&&`/`\|\|` as parsed operators | Nearly free: split before dispatch, run in sequence, read `s->last_status`. No new objects | `session.c` | `ssh host 'cd /bin && ls'` works | **done** (`fb237ff`) — the line is split into a flat sequence before expansion, so an operator is only an operator unquoted (`echo 'a;b'` is one command, and the `&` in `2>&1` is not `&&`). Each segment runs in turn; `&&` skips the next on a non-zero status, `\|\|` on a zero one, `;` ends the chain, and blank segments are skipped. One 256-byte buffer, no allocation. The test harness's guard that refused `;` outright -- correct before, rejecting working syntax now -- is removed. Verified: 70-env 42/42 with sequence, both short-circuits, chain reset and a quoted operator. |
 | R-P2.2 | Make `&` a parser-level token | It is understood only by `exec_fallback` and `confine`; a builtin sees it as a filename, so `cat f &` reads a file named `&` | `cmd_run.c:301,433` | builtins background correctly | todo |
 | R-P2.3 | Text utilities: `wc`, `head`, `tail`, `grep` (-F first), `sort`, `find`, `sleep`, `true`/`false`/`test` | `cat`, `ls`, `echo`, `df`, `sha256sum` are the entire text surface today | `espix_cmds/` | present and tested | todo |
 | R-P2.4 | `<` redirection + stdin for builtins | Cheap alone, only pays with pipes | `session.c` | a builtin reads stdin | todo |
