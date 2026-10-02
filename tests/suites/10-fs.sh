@@ -213,3 +213,40 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# Text utilities. R-P2.3.
+#
+# File arguments only, because reading standard input is R-P2.4 and a pipe is
+# R-P2.5. grep's exit status is the point as much as its output -- 0 when a line
+# matched, 1 when none did -- so it is asserted with the status helper.
+# ---------------------------------------------------------------------------
+
+TF=/tmp/espix-text-$ESPIX_WORKER.txt
+dev_run "rm $TF" >/dev/null 2>&1
+
+dev_run "echo one > $TF; echo two >> $TF; echo three >> $TF" >/dev/null
+
+assert_eq "wc counts lines, words and bytes" "3 3 14" \
+    "$(dev_run "wc $TF" | awk '{print $1, $2, $3}')"
+assert_eq "head prints the first lines" "$(printf 'one\ntwo')" \
+    "$(dev_run "head -n 2 $TF")"
+assert_eq "tail prints the last line" "three" "$(dev_run "tail -n 1 $TF")"
+assert_eq "sort orders the lines" "$(printf 'one\nthree\ntwo')" \
+    "$(dev_run "sort $TF")"
+assert_contains "grep prints the matching line" "two" "$(dev_run "grep two $TF")"
+assert_eq "grep -c counts the matching lines" "2" "$(dev_run "grep -c e $TF")"
+
+# grep's status is what a conditional hangs off, so it is checked directly
+# rather than through its output.
+assert_status "grep exits 0 when it matches" 0 dev_status "grep two $TF"
+assert_status "grep exits 1 when nothing matches" 1 dev_status "grep nope $TF"
+
+assert_status "true exits 0"  0 dev_status "true"
+assert_status "false exits 1" 1 dev_status "false"
+
+assert_status "test -f is true for a file" 0 dev_status "test -f $TF"
+assert_status "test -e is false for a missing file" 1 \
+    dev_status "test -e /tmp/espix-nope-$ESPIX_WORKER"
+
+dev_run "rm $TF" >/dev/null 2>&1
+

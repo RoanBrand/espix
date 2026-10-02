@@ -13,6 +13,7 @@ idf_component_register(
         "cmd_usbhost.c"
         "cmd_ota.c"
         "cmd_hash.c"
+        "cmd_text.c"
         "cmd_bt.c"
         "cmd_play.c"
         "cmd_display.c"

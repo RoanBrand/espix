@@ -25,6 +25,7 @@ void espix_cmds_register_hash(void);
 void espix_cmds_register_bt(void);
 void espix_cmds_register_play(void);
 void espix_cmds_register_display(void);
+void espix_cmds_register_text(void);
 
 /*
  * The palette the login banner and `top` share, and the helper that colours a
