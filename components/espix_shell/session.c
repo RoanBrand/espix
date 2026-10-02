@@ -140,9 +140,11 @@ int espix_session_write(espix_session_t *s, const char *data, size_t len,
 typedef struct {
     FILE *out;              /* `>` / `>>`, or NULL */
     FILE *err;              /* `2>` / `2>>`, or NULL */
+    FILE *in;               /* `<`, or NULL */
     bool  err_to_out;       /* `2>&1` */
     const char *out_name;   /* the target as typed, for a failed close */
     const char *err_name;
+    const char *in_name;
 } redirects_t;
 
 /*
@@ -176,9 +178,10 @@ static int take_redirects(espix_session_t *s, int argc, char **argv,
 
         const bool to_out = (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0);
         const bool to_err = (strcmp(tok, "2>") == 0 || strcmp(tok, "2>>") == 0);
+        const bool to_in  = (strcmp(tok, "<") == 0);
         const bool dup    = (strcmp(tok, "2>&1") == 0);
 
-        if (!to_out && !to_err && !dup) {
+        if (!to_out && !to_err && !to_in && !dup) {
             if (first != argc) {
                 espix_eprintf(s, "espix: %s: unexpected after a redirection\n",
                               tok);
@@ -201,14 +204,30 @@ static int take_redirects(espix_session_t *s, int argc, char **argv,
             return -1;
         }
 
-        const bool append = (strlen(tok) > 1 && tok[strlen(tok) - 2] == '>');
-
         char abs[ESPIX_PATH_MAX];
         if (espix_fs_resolve(s != NULL ? s->cwd : "/", argv[i + 1],
                              abs, sizeof(abs)) != ESP_OK) {
             espix_eprintf(s, "espix: %s: path too long\n", argv[i + 1]);
             return -1;
         }
+
+        if (to_in) {
+            if (r->in != NULL) {
+                espix_eprintf(s, "espix: %s: input redirected twice\n", tok);
+                return -1;
+            }
+            r->in = fopen(abs, "rb");
+            if (r->in == NULL) {
+                espix_eprintf(s, "espix: %s: cannot open for reading: %s\n", abs,
+                              strerror(errno));
+                return -1;
+            }
+            r->in_name = argv[i + 1];
+            i++;                        /* the target */
+            continue;
+        }
+
+        const bool append = (strlen(tok) > 1 && tok[strlen(tok) - 2] == '>');
 
         FILE **slot = to_out ? &r->out : &r->err;
         if (*slot != NULL) {
@@ -243,6 +262,7 @@ static void redirects_apply(espix_session_t *s, const redirects_t *r)
     }
     s->redirect     = r->out;
     s->redirect_err = r->err;
+    s->redirect_in  = r->in;
     s->err_to_out   = r->err_to_out;
 }
 
@@ -253,7 +273,12 @@ static void redirects_release(espix_session_t *s, redirects_t *r)
     if (s != NULL) {
         s->redirect     = NULL;
         s->redirect_err = NULL;
+        s->redirect_in  = NULL;
         s->err_to_out   = false;
+    }
+    if (r->in != NULL) {
+        fclose(r->in);
+        r->in = NULL;
     }
     if (r->out != NULL) {
         if (fclose(r->out) != 0) {

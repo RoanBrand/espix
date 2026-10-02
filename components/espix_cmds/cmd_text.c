@@ -48,6 +48,17 @@ static FILE *espix_cmd_open(espix_session_t *s, const char *who, const char *arg
     return f;
 }
 
+/*
+ * The stream a command with no file operands reads from: the shell's `<`
+ * target, or NULL when there is none. A builtin has no other standard input --
+ * it runs on the session task, not as a process -- so a command with neither a
+ * file nor a `<` says so rather than blocking. See R-P2.4.
+ */
+static FILE *stdin_stream(espix_session_t *s)
+{
+    return (s != NULL) ? s->redirect_in : NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* true, false                                                         */
 /* ------------------------------------------------------------------ */
@@ -128,8 +139,15 @@ static int cmd_wc(espix_session_t *s, int argc, char **argv)
     if (!l && !w && !b) { l = w = b = true; }
 
     if (first >= argc) {
-        espix_eprintf(s, "wc: reading standard input is not supported yet\n");
-        return 1;
+        FILE *f = stdin_stream(s);
+        if (f == NULL) {
+            espix_eprintf(s, "wc: no input; use <file>\n");
+            return 1;
+        }
+        wc_t c;
+        wc_count(f, &c);
+        wc_print(s, &c, l, w, b, NULL);
+        return 0;
     }
 
     wc_t       total = { 0, 0, 0 };
@@ -188,14 +206,31 @@ static int line_count(espix_session_t *s, const char *who, int argc,
     return first;
 }
 
+static void head_stream(espix_session_t *s, FILE *f, long n)
+{
+    char line[TEXT_LINE_MAX];
+    long shown = 0;
+
+    while (shown < n && fgets(line, sizeof(line), f) != NULL) {
+        espix_puts(s, line);
+        shown++;
+    }
+}
+
 static int cmd_head(espix_session_t *s, int argc, char **argv)
 {
     long      n     = 0;
     const int first = line_count(s, "head", argc, argv, &n);
     if (first < 0) { return 2; }
+
     if (first >= argc) {
-        espix_eprintf(s, "usage: head [-n N] <file>...\n");
-        return 1;
+        FILE *f = stdin_stream(s);
+        if (f == NULL) {
+            espix_eprintf(s, "head: no input; use <file>\n");
+            return 1;
+        }
+        head_stream(s, f, n);
+        return 0;
     }
 
     int rc = 0;
@@ -203,16 +238,46 @@ static int cmd_head(espix_session_t *s, int argc, char **argv)
         char  abs[ESPIX_PATH_MAX];
         FILE *f = espix_cmd_open(s, "head", argv[i], abs, sizeof(abs));
         if (f == NULL) { rc = 1; continue; }
-
-        char line[TEXT_LINE_MAX];
-        long shown = 0;
-        while (shown < n && fgets(line, sizeof(line), f) != NULL) {
-            espix_puts(s, line);
-            shown++;
-        }
+        head_stream(s, f, n);
         fclose(f);
     }
     return rc;
+}
+
+/* The last n lines of any stream: a ring, so the input is read once and no
+ * seek is needed -- which is what a pipe will require. */
+static bool tail_stream(espix_session_t *s, FILE *f, long n)
+{
+    char **ring  = NULL;
+    long   head  = 0;
+    long   count = 0;
+
+    if (n > 0) {
+        ring = calloc((size_t)n, sizeof(*ring));
+        if (ring == NULL) {
+            espix_eprintf(s, "tail: out of memory\n");
+            return false;
+        }
+    }
+
+    char line[TEXT_LINE_MAX];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (n == 0) { continue; }
+        char *copy = strdup(line);
+        if (copy == NULL) { break; }
+        free(ring[head]);
+        ring[head] = copy;
+        head = (head + 1) % n;
+        if (count < n) { count++; }
+    }
+
+    const long start = (count < n) ? 0 : head;
+    for (long k = 0; k < count; k++) {
+        espix_puts(s, ring[(start + k) % n]);
+    }
+    for (long k = 0; k < n; k++) { free(ring[k]); }
+    free(ring);
+    return true;
 }
 
 static int cmd_tail(espix_session_t *s, int argc, char **argv)
@@ -220,9 +285,14 @@ static int cmd_tail(espix_session_t *s, int argc, char **argv)
     long      n     = 0;
     const int first = line_count(s, "tail", argc, argv, &n);
     if (first < 0) { return 2; }
+
     if (first >= argc) {
-        espix_eprintf(s, "usage: tail [-n N] <file>...\n");
-        return 1;
+        FILE *f = stdin_stream(s);
+        if (f == NULL) {
+            espix_eprintf(s, "tail: no input; use <file>\n");
+            return 1;
+        }
+        return tail_stream(s, f, n) ? 0 : 1;
     }
 
     int rc = 0;
@@ -230,40 +300,8 @@ static int cmd_tail(espix_session_t *s, int argc, char **argv)
         char  abs[ESPIX_PATH_MAX];
         FILE *f = espix_cmd_open(s, "tail", argv[i], abs, sizeof(abs));
         if (f == NULL) { rc = 1; continue; }
-
-        /* A ring of the last n lines: the file is read once and no seek is
-         * needed, which matters because a pipe will not have one. */
-        char **ring  = NULL;
-        long   head  = 0;
-        long   count = 0;
-
-        if (n > 0) {
-            ring = calloc((size_t)n, sizeof(*ring));
-            if (ring == NULL) {
-                espix_eprintf(s, "tail: out of memory\n");
-                fclose(f);
-                return 1;
-            }
-        }
-
-        char line[TEXT_LINE_MAX];
-        while (fgets(line, sizeof(line), f) != NULL) {
-            if (n == 0) { continue; }
-            char *copy = strdup(line);
-            if (copy == NULL) { break; }
-            free(ring[head]);
-            ring[head] = copy;
-            head = (head + 1) % n;
-            if (count < n) { count++; }
-        }
+        if (!tail_stream(s, f, n)) { rc = 1; }
         fclose(f);
-
-        const long start = (count < n) ? 0 : head;
-        for (long k = 0; k < count; k++) {
-            espix_puts(s, ring[(start + k) % n]);
-        }
-        for (long k = 0; k < n; k++) { free(ring[k]); }
-        free(ring);
     }
     return rc;
 }
@@ -288,6 +326,41 @@ static bool contains_case(const char *hay, const char *needle)
         if (*n == '\0') { return true; }
     }
     return false;
+}
+
+/* One stream's matches. `name` is the operand as typed, or NULL for standard
+ * input; `many` says whether operands prefix the output. Returns whether any
+ * line was selected. */
+static bool grep_stream(espix_session_t *s, FILE *f, const char *name,
+                        const char *pat, bool ign, bool num, bool inv,
+                        bool cnt, bool lname, bool many)
+{
+    unsigned long matches = 0;
+    char          line[TEXT_LINE_MAX];
+    long          lineno  = 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        lineno++;
+        const bool hit = (ign ? contains_case(line, pat)
+                              : (strstr(line, pat) != NULL)) != inv;
+        if (!hit) { continue; }
+
+        matches++;
+        if (!cnt && !lname) {
+            if (many && name != NULL) { espix_printf(s, "%s:", name); }
+            if (num)  { espix_printf(s, "%ld:", lineno); }
+            espix_puts(s, line);
+        }
+    }
+
+    if (cnt) {
+        if (many && name != NULL) { espix_printf(s, "%s:", name); }
+        espix_printf(s, "%lu\n", matches);
+    }
+    if (lname && matches > 0) {
+        espix_printf(s, "%s\n", (name != NULL) ? name : "(standard input)");
+    }
+    return matches > 0;
 }
 
 static int cmd_grep(espix_session_t *s, int argc, char **argv)
@@ -317,9 +390,15 @@ static int cmd_grep(espix_session_t *s, int argc, char **argv)
     }
 
     const char *pat = argv[first++];
+
     if (first >= argc) {
-        espix_eprintf(s, "grep: reading standard input is not supported yet\n");
-        return 2;
+        FILE *f = stdin_stream(s);
+        if (f == NULL) {
+            espix_eprintf(s, "grep: no input; use <file>\n");
+            return 2;
+        }
+        return grep_stream(s, f, NULL, pat, ign, num, inv, cnt, lname, false)
+                   ? 0 : 1;
     }
 
     const bool many = (argc - first) > 1;
@@ -330,34 +409,10 @@ static int cmd_grep(espix_session_t *s, int argc, char **argv)
         char  abs[ESPIX_PATH_MAX];
         FILE *f = espix_cmd_open(s, "grep", argv[i], abs, sizeof(abs));
         if (f == NULL) { err = true; continue; }
-
-        unsigned long matches = 0;
-        char          line[TEXT_LINE_MAX];
-        long          lineno  = 0;
-
-        while (fgets(line, sizeof(line), f) != NULL) {
-            lineno++;
-            const bool hit = (ign ? contains_case(line, pat)
-                                  : (strstr(line, pat) != NULL)) != inv;
-            if (!hit) { continue; }
-
-            matches++;
+        if (grep_stream(s, f, argv[i], pat, ign, num, inv, cnt, lname, many)) {
             any = true;
-            if (!cnt && !lname) {
-                if (many) { espix_printf(s, "%s:", argv[i]); }
-                if (num)  { espix_printf(s, "%ld:", lineno); }
-                espix_puts(s, line);
-            }
         }
         fclose(f);
-
-        if (cnt) {
-            if (many) { espix_printf(s, "%s:", argv[i]); }
-            espix_printf(s, "%lu\n", matches);
-        }
-        if (lname && matches > 0) {
-            espix_printf(s, "%s\n", argv[i]);
-        }
     }
 
     if (any) { return 0; }
@@ -399,6 +454,43 @@ static int cmp_num(const void *a, const void *b)
     return (x > y) ? 1 : 0;
 }
 
+/* Whatever the operands were, one list. Separate from the reading loop so
+ * standard input can take the same path as a file. */
+static bool sort_read(espix_session_t *s, FILE *f, strlist_t *l)
+{
+    char line[TEXT_LINE_MAX];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *copy = strdup(line);
+        if (copy == NULL || !strlist_add(l, copy)) {
+            free(copy);
+            espix_eprintf(s, "sort: out of memory\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void sort_emit(espix_session_t *s, strlist_t *l, bool numeric, bool rev,
+                      bool uniq)
+{
+    int (*cmp)(const void *, const void *) = numeric ? cmp_num : cmp_str;
+    qsort(l->v, l->n, sizeof(*l->v), cmp);
+
+    long prev = -1;
+    for (size_t k = 0; k < l->n; k++) {
+        const size_t i = rev ? (l->n - 1 - k) : k;
+        if (uniq && prev >= 0 && cmp(&l->v[prev], &l->v[i]) == 0) { continue; }
+        espix_puts(s, l->v[i]);
+        prev = (long)i;
+    }
+}
+
+static void sort_free(strlist_t *l)
+{
+    for (size_t i = 0; i < l->n; i++) { free(l->v[i]); }
+    free(l->v);
+}
+
 static int cmd_sort(espix_session_t *s, int argc, char **argv)
 {
     bool rev = false, numeric = false, uniq = false;
@@ -417,9 +509,18 @@ static int cmd_sort(espix_session_t *s, int argc, char **argv)
         }
         first++;
     }
+
     if (first >= argc) {
-        espix_eprintf(s, "sort: reading standard input is not supported yet\n");
-        return 1;
+        FILE *f = stdin_stream(s);
+        if (f == NULL) {
+            espix_eprintf(s, "sort: no input; use <file>\n");
+            return 1;
+        }
+        strlist_t  l  = { 0 };
+        const bool ok = sort_read(s, f, &l);
+        sort_emit(s, &l, numeric, rev, uniq);
+        sort_free(&l);
+        return ok ? 0 : 1;
     }
 
     strlist_t l  = { 0 };
@@ -429,35 +530,12 @@ static int cmd_sort(espix_session_t *s, int argc, char **argv)
         char  abs[ESPIX_PATH_MAX];
         FILE *f = espix_cmd_open(s, "sort", argv[i], abs, sizeof(abs));
         if (f == NULL) { rc = 1; continue; }
-
-        char line[TEXT_LINE_MAX];
-        while (fgets(line, sizeof(line), f) != NULL) {
-            char *copy = strdup(line);
-            if (copy == NULL || !strlist_add(&l, copy)) {
-                free(copy);
-                espix_eprintf(s, "sort: out of memory\n");
-                rc = 1;
-                fclose(f);
-                goto done;
-            }
-        }
+        if (!sort_read(s, f, &l)) { rc = 1; }
         fclose(f);
     }
 
-    int (*cmp)(const void *, const void *) = numeric ? cmp_num : cmp_str;
-    qsort(l.v, l.n, sizeof(*l.v), cmp);
-
-    long prev = -1;
-    for (size_t k = 0; k < l.n; k++) {
-        const size_t i = rev ? (l.n - 1 - k) : k;
-        if (uniq && prev >= 0 && cmp(&l.v[prev], &l.v[i]) == 0) { continue; }
-        espix_puts(s, l.v[i]);
-        prev = (long)i;
-    }
-
-done:
-    for (size_t i = 0; i < l.n; i++) { free(l.v[i]); }
-    free(l.v);
+    sort_emit(s, &l, numeric, rev, uniq);
+    sort_free(&l);
     return rc;
 }
 

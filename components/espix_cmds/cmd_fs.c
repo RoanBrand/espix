@@ -560,9 +560,24 @@ static int cmd_ls(espix_session_t *s, int argc, char **argv)
 
 static int cmd_cat(espix_session_t *s, int argc, char **argv)
 {
+    /*
+     * No operand means standard input, which for a builtin is the shell's `<`
+     * target and nothing else: it runs on the session task, not as a process,
+     * so there is no descriptor to inherit. See R-P2.4.
+     */
     if (argc < 2) {
-        espix_eprintf(s, "usage: cat <file>...\n");
-        return 1;
+        FILE *in = s->redirect_in;
+        if (in == NULL) {
+            espix_eprintf(s, "usage: cat <file>...  (or cat < file)\n");
+            return 1;
+        }
+        char   chunk[COPY_CHUNK + 1];
+        size_t n;
+        while ((n = fread(chunk, 1, COPY_CHUNK, in)) > 0) {
+            chunk[n] = '\0';
+            espix_puts(s, chunk);
+        }
+        return 0;
     }
 
     int status = 0;

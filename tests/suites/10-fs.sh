@@ -248,5 +248,19 @@ assert_status "test -f is true for a file" 0 dev_status "test -f $TF"
 assert_status "test -e is false for a missing file" 1 \
     dev_status "test -e /tmp/espix-nope-$ESPIX_WORKER"
 
+# `<`: input redirection, which is how a builtin reads standard input at all --
+# it runs on the session task, not as a process, so there is no descriptor to
+# inherit. R-P2.4.
+assert_eq "wc reads standard input through <" "3 3 14" \
+    "$(dev_run "wc < $TF" | awk '{print $1, $2, $3}')"
+assert_eq "grep reads standard input through <" "two" \
+    "$(dev_run "grep two < $TF")"
+assert_eq "sort reads standard input through <" "$(printf 'one\nthree\ntwo')" \
+    "$(dev_run "sort < $TF")"
+assert_eq "cat reads standard input through <" "$(printf 'one\ntwo\nthree')" \
+    "$(dev_run "cat < $TF")"
+assert_status "a command with no input at all says so instead of blocking" 1 \
+    dev_status "wc"
+
 dev_run "rm $TF" >/dev/null 2>&1
 

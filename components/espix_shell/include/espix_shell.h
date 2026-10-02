@@ -284,6 +284,14 @@ struct espix_session {
     bool        err_to_out;
 
     /*
+     * Set for the duration of one command when its input was redirected with
+     * `<`, and NULL otherwise. A builtin that reads input takes it from here:
+     * it runs on the session task, not as a process, so there is no other
+     * standard input for it. See R-P2.4.
+     */
+    FILE       *redirect_in;
+
+    /*
      * Where espix_printf() formats, rather than on the stack of whoever called
      * it. 256 bytes is not much, but it is on *every* command's stack, and a
      * command task is sized for its own frames -- a line buffer it does not own
