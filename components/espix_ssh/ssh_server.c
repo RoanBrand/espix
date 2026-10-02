@@ -340,9 +340,16 @@ static ssh_conn_t *conn_alloc(void)
  */
 static void conn_task_exit(void)
 {
-    char marker;
+    char marker = 0;   /* only its address is read; see below */
 
-    if (esp_stack_ptr_in_extram((uint32_t)(uintptr_t)&marker)) {
+    /*
+     * Deliberately NOT esp_stack_ptr_in_extram(): that also demands the address
+     * be 16-byte aligned, and `marker` is a char, so it answered "internal" for
+     * every PSRAM-stacked connection -- which then took the plain vTaskDelete()
+     * and leaked its 8 KB stack, one per connection. esp_ptr_external_ram()
+     * asks only the range question that is wanted here.
+     */
+    if (esp_ptr_external_ram(&marker)) {
         vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
     } else {
         vTaskDelete(NULL);

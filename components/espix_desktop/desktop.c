@@ -2238,7 +2238,10 @@ static void launch_task(void *arg)
         (void)espix_desktop_start();    /* nothing was started after all */
         desk_unlock();
         s_launching = false;
-        vTaskDelete(NULL);
+        /* Created WithCaps on both attempts in launch_app(), so it must be
+         * deleted the same way or the 8 KB stack leaks -- the same shape as
+         * conn_task_exit() in ssh_server.c. */
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 
@@ -2248,7 +2251,7 @@ static void launch_task(void *arg)
     }
 
     s_launching = false;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void launch_app(const char *path)
