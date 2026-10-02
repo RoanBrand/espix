@@ -1403,6 +1403,17 @@ int espix_shell_exec(espix_session_t *s, const char *line)
         if (!skip && !blank_segment(seg)) {
             status = run_pipeline(s, seg);
             ran    = true;
+
+            /*
+             * POSIX updates $? after every command, not only at the end of the
+             * line, so a later segment of the same line sees this one's status
+             * -- false; echo $? prints 1. espix_shell_run_line() sets the
+             * final value again for the next line, which is why the cross-line
+             * case already worked.
+             */
+            if (s != NULL) {
+                s->last_status = status;
+            }
         }
 
         if (op == '\0') {

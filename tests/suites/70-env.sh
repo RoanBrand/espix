@@ -298,3 +298,11 @@ else
             "$(dev_run 'jobs')"
     fi
 fi
+
+# $? is per command, not per line: a later segment of one line sees the status
+# of the segment before it. R-P2.10.
+assert_eq "\$? updates between ; segments" "1" "$(dev_run 'false; echo $?')"
+assert_eq "\$? follows the last segment, not the first" "0" \
+    "$(dev_run 'false; true; echo $?')"
+assert_eq "\$? after an && skip and an || run" "1" \
+    "$(dev_run 'false && echo no || echo $?')"
