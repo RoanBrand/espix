@@ -401,21 +401,24 @@ fi
 # kill(2) answers ESRCH, and ps still shows what ran, from the log.
 
 # The log is bounded: eight entries, however many processes have finished.
-# tail skips both the 'finished:' banner and the column header beneath it.
-hist=$(dev_run ps | sed -n '/^finished:/,$p' | tail -n +3 | grep -c .)
+# Count only real finished rows -- column 3 is the state -- so a backgrounded
+# app's output arriving in the same session cannot inflate the count.
+hist=$(dev_run ps | sed -n '/^finished:/,$p' | awk '$3 ~ /^(exit|fault|kill)$/' | wc -l | tr -d ' ')
 if [ "$hist" -ge 1 ] && [ "$hist" -le 8 ]; then
     espix_pass "ps history is bounded by the completed log ($hist entries)"
 else
     espix_fail "ps history is bounded by the completed log" "read '$hist' rows"
 fi
 
-# A process that has finished is not signallable -- its slot is gone.
-gone=$(dev_run "$APP hold 1 1000 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+# A process that has finished is not signallable -- its slot is gone. The pid
+# comes from the completed log rather than from racing a backgrounded app: the
+# foreground run is reaped by the shell and stays listed in the log, so this is
+# deterministic and costs three round trips instead of a poll loop.
+dev_run "$APP exit 0" >/dev/null 2>&1
+gone=$(dev_run ps | sed -n '/^finished:/,$p' | awk '$2 == "testapp" { p = $1 } END { print p }')
 if [ -z "$gone" ]; then
-    espix_fail "a finished process stops being signallable" "no [pid] line"
+    espix_fail "a finished process stops being signallable" "no testapp pid in the log"
 else
-    wait_app_gone "$gone" || \
-        espix_fail "the finished app leaves the live table" "pid $gone still running"
     out=$(dev_run "kill -9 $gone" 2>&1)
     assert_contains "a finished process is not signallable" "no such process" "$out"
 fi

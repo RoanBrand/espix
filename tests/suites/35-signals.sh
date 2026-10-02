@@ -21,11 +21,12 @@ fi
 
 APP="/home/$ESPIX_USER/testapp"
 
-# `ps` prints running tasks, then a `finished:` section -- but that section
-# shows at most 8 entries (see KNOWN-ISSUES: cmd_ps stack-allocates procs[8]),
-# and by the time this suite runs the earlier ones have filled it. So how a
-# process *ended* is read from dmesg, which is a ring rather than a fixed
-# array, and whose wording is the exact discriminator wanted here:
+# `ps` prints running tasks, then a `finished:` section -- but that section is
+# the completed log the process table now keeps (WORKLIST R-P1.5) and holds at
+# most ESPIX_PROC_DONE_MAX (8) entries, so by the time this suite runs the
+# earlier ones have filled it. So how a process *ended* is read from dmesg,
+# which is a ring rather than a fixed array, and whose wording is the exact
+# discriminator wanted here:
 #
 #   "pid N stopped on request"      the handler ran and the app returned
 #   "pid N did not stop when asked" the grace expired
