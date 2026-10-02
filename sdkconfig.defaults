@@ -33,6 +33,13 @@ CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 # (see espix_shell_set_current / espix_shell_current).
 CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=4
 
+# 250 Hz rather than IDF's 100. It is the app-visible clock: pdMS_TO_TICKS(1) is
+# 4ms instead of 10, so a delay no longer rounds up to a 10ms step, and the
+# shell's 50ms interrupt poll is 12 ticks rather than 5. Tickless idle is not
+# available here -- it needs PM_ENABLE and IDF does not support it in SMP -- so
+# the price is 250 tick interrupts a second instead of 100, measured in R-P4.4.
+CONFIG_FREERTOS_HZ=250
+
 #
 # Main task — app_main runs the boot sequence and then the console session.
 #
