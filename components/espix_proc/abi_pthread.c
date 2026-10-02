@@ -14,9 +14,10 @@
  * corruption rather than a leak -- so the dangerous half was fixed first and
  * this is the remaining half.
  *
- * Why the resolver: espix does not own the pthread surface (see abi_libc.c);
- * pthread_create is answered below, and only the resolver is searched first.
- * Same seam malloc, sleep and exit already use.
+ * Why the resolver: pthread_create has to be espix's, not libc's, so that the
+ * thread it makes belongs to the process. The resolver is searched before every
+ * table; the rest of the pthread surface is in one (see abi_libc.c). Same seam
+ * malloc, sleep and exit use.
  *
  * Why a trampoline rather than recording the handle after the call: IDF creates
  * the task inside pthread_create and it can start running before that call
@@ -185,9 +186,9 @@ static const abi_sym_t s_pthread_syms[] = {
  * garbage-collects unreferenced sections, so the marker survives and the
  * functions do not. A name in this table is a reference.
  *
- * Not here: the six the loader already answers for (a duplicate would be a dead
- * entry, and check-abi says so), and pthread_cancel, whose IDF implementation
- * is a stub -- exporting one would advertise a guarantee that does not exist.
+ * pthread_create and pthread_exit are not here: they need the resolver, above.
+ * pthread_cancel is not either, because its IDF implementation is a stub --
+ * exporting one would advertise a guarantee that does not exist.
  */
 static const struct esp_elfsym s_pthread_syms_sync[] = {
     /* Identity. */
@@ -199,6 +200,12 @@ static const struct esp_elfsym s_pthread_syms_sync[] = {
     ESP_ELFSYM_EXPORT(pthread_attr_setdetachstate),
     ESP_ELFSYM_EXPORT(pthread_attr_getdetachstate),
     ESP_ELFSYM_EXPORT(pthread_attr_getstacksize),
+
+    /* The four the loader's table used to answer for (R-P3.1). */
+    ESP_ELFSYM_EXPORT(pthread_attr_init),
+    ESP_ELFSYM_EXPORT(pthread_attr_setstacksize),
+    ESP_ELFSYM_EXPORT(pthread_detach),
+    ESP_ELFSYM_EXPORT(pthread_join),
 
     /* Mutual exclusion. */
     ESP_ELFSYM_EXPORT(pthread_mutex_init),

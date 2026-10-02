@@ -272,6 +272,9 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
      * asks espix_fs_access_check() before touching the filesystem.
      */
     ESP_ELFSYM_EXPORT(open),
+    /* close() came from elf_loader's table until R-P3.1; it is libc's, and it
+     * enters the same VFS the calls below do. */
+    ESP_ELFSYM_EXPORT(close),
     ESP_ELFSYM_EXPORT(read),
     ESP_ELFSYM_EXPORT(write),
     ESP_ELFSYM_EXPORT(lseek),

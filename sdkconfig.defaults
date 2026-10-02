@@ -107,8 +107,13 @@ CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ELF_LOADER=y
 CONFIG_ELF_DYNAMIC_LOAD_SHARED_OBJECT=y
 CONFIG_ELF_FILE_SYSTEM_BASE_PATH="/bin"
-CONFIG_ELF_LOADER_LIBC_SYMBOLS=y
-CONFIG_ELF_LOADER_ESPIDF_SYMBOLS=y
+# elf_loader's own symbol tables are off: espix types every libc and IDF name
+# an app can resolve (R-P3.1), so there is one definition of the app ABI rather
+# than espix's plus an earlier-searched list written by the loader's examples.
+# tools/check-abi.py fails the build if a name one of these tables answered for
+# is not published by espix, so turning them off cannot silently drop a name.
+# CONFIG_ELF_LOADER_LIBC_SYMBOLS is not set
+# CONFIG_ELF_LOADER_ESPIDF_SYMBOLS is not set
 
 #
 # Memory protection must be off for the ELF loader to work: it writes a

@@ -58,6 +58,13 @@
  * Declared rather than included: there is no header for it. */
 extern unsigned long long __udivdi3(unsigned long long a, unsigned long long b);
 
+/* libgcc soft-double helpers elf_loader's table used to answer for (R-P3.1). */
+extern int __ltdf2(double a, double b);
+extern int __gtdf2(double a, double b);
+extern unsigned int __fixunsdfsi(double a);
+extern double __floatunsidf(unsigned int i);
+extern double __divdf3(double a, double b);
+
 /* ROM printf. Arduino's logging macros reach for it directly. */
 extern int ets_printf(const char *fmt, ...);
 
@@ -133,10 +140,10 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(esp_timer_get_time),
 
     /*
-     * Heap and libc the loader's own table happens not to cover. memset, strtol
-     * and ets_printf used to be listed here and are answered a layer below, so
-     * they were unreachable -- tools/check-abi.py compares the two name lists at
-     * build time now rather than leaving that to be noticed.
+     * Heap and libc espix owns outright. memset and strtol used to be listed
+     * here and were answered a layer below, so they were unreachable; with the
+     * loader's own tables off (R-P3.1) they live in abi_libc.c and these are the
+     * names that reach IDF's heap and logging.
      */
     ESP_ELFSYM_EXPORT(heap_caps_calloc),
     ESP_ELFSYM_EXPORT(heap_caps_malloc),
@@ -166,6 +173,15 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(__gedf2),
     ESP_ELFSYM_EXPORT(__ledf2),
     ESP_ELFSYM_EXPORT(__truncdfsf2),
+    ESP_ELFSYM_EXPORT(__divdf3),
+    ESP_ELFSYM_EXPORT(__ltdf2),
+    ESP_ELFSYM_EXPORT(__gtdf2),
+    ESP_ELFSYM_EXPORT(__fixunsdfsi),
+    ESP_ELFSYM_EXPORT(__floatunsidf),
+
+    /* ROM printf: Arduino's logging macros reach for it directly, which is why
+     * it stays reachable now that espix owns the name (R-P3.1). */
+    ESP_ELFSYM_EXPORT(ets_printf),
 
     ESP_ELFSYM_END
 };

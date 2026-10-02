@@ -12,12 +12,12 @@
  * customer; putting getenv() in a file called abi_signal.c to reuse its table
  * is exactly the drift abi_libc.c's header complains about.
  *
- * Why a resolver rather than another symbol table: elf_find_sym_default()
- * searches the loader's own libc table *first*, and a table registered with
- * esp_elf_register_symbol() is consulted after it -- so a registered entry can
- * never shadow anything the loader already answers for. The resolver runs
- * before all of it, which is the loader's documented hook for "symbol
- * interception and hooking".
+ * Why a resolver rather than another symbol table: the resolver runs before
+ * every table -- the loader's own and espix's registered ones alike -- which is
+ * the loader's documented hook for "symbol interception and hooking". That
+ * ordering is what lets one subsystem own a name another table also lists, and
+ * it is why tools/check-abi.py calls a table entry whose name an earlier table
+ * answers for dead while a resolver entry is exactly the point.
  */
 
 #include <string.h>

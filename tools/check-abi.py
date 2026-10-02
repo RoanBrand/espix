@@ -122,22 +122,31 @@ def strip_comments(text):
     return "".join(out)
 
 
-def export_names(text, include_conditional=False):
-    """The names a table exports.
+def table_names(text, var, include_conditional=False):
+    """The names one table of elf_loader's source exports.
 
-    The libc-conditional block in elf_loader's table chooses between newlib's own
-    ABI names and picolibc wrappers, and which set is in the image depends on
-    CONFIG_LIBC_PICOLIBC -- so the *presence* check reads only the unconditional
-    exports. The names are the same either way in the one place that matters for
-    the duplicate check, so that one asks for all of them.
+    Read table by table rather than whole-file because espix can take over one
+    table at a time: CONFIG_ELF_LOADER_LIBC_SYMBOLS and _ESPIDF_SYMBOLS decide
+    which is still walked, and only a table that is still on can shadow an espix
+    entry or promise a name. Both ESP_ELFSYM_EXPORT() and the written-out
+    {"name", &name} entries are read.
 
-    Nested #if is not expected here, but it is tracked rather than ignored so a
-    future one cannot quietly hide names from this check.
+    The libc table's conditional block chooses between newlib's own ABI names and
+    picolibc wrappers. The duplicate check wants both spellings, since either can
+    shadow; the absorbed-name check wants only the unconditional names, because
+    which spelling is live depends on the libc the firmware was built with.
+    Nested #if is tracked rather than ignored so a future one cannot hide names.
     """
+    code = strip_comments(text)
+    try:
+        start = code.index(var + "[]")
+    except ValueError:
+        die(f"{var} not found in {SOURCE}; the table moved or was renamed")
+    body = code[start:code.index("};", start)]
+
     names = []
     depth = 0
-
-    for line in strip_comments(text).splitlines():
+    for line in body.splitlines():
         stripped = line.strip()
         if re.match(r"#\s*(if|ifdef|ifndef)", stripped):
             depth += 1
@@ -149,10 +158,50 @@ def export_names(text, include_conditional=False):
             continue
 
         m = re.match(r"ESP_ELFSYM_EXPORT\((\w+)\)", stripped)
+        if m is None:
+            m = re.match(r'\{\s*"([A-Za-z_]\w*)"', stripped)
         if m:
             names.append(m.group(1))
 
     return names
+
+
+def read_config(elf):
+    """The CONFIG_ELF_LOADER_* options that are on, or None if there is no header.
+
+    The build writes config/sdkconfig.h beside the ELF, and check-abi has to know
+    whether elf_loader's own tables are still walked: with one off, an espix entry
+    for a name it answered is live rather than dead, and that name becomes
+    espix's to publish. A missing header reads as "assume on", which is the
+    conservative direction -- it reports duplicates rather than letting a dropped
+    name through.
+    """
+    hdr = elf.parent / "config" / "sdkconfig.h"
+    if not hdr.is_file():
+        return None
+
+    on = set()
+    for line in hdr.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"#define (CONFIG_ELF_LOADER_\w+) 1$", line.strip())
+        if m:
+            on.add(m.group(1))
+    return on
+
+
+def unabsorbed(option, names, found):
+    """Names a switched-off loader table answered for that espix does not publish.
+
+    Turning a table off is only safe if espix now answers for every name in it;
+    otherwise an app that used one fails to load with "undefined symbol", which is
+    the device-side failure this build-time check exists to preempt.
+    """
+    missing = [name for name in names if name not in found]
+    if not missing:
+        return None
+    return (f"{option} is off, so espix is the only definition -- but it does not\n"
+            "  publish these names, and an app that reached them through the loader\n"
+            "  now fails to load. Publish each one, or leave the table on:\n"
+            + "\n".join(f"    {name}" for name in missing))
 
 
 def elf_symbols(nm, elf):
@@ -328,9 +377,24 @@ def main():
         die(f"no ABI registrations found in {PROC}; it moved or changed shape")
 
     found = publications()
-    below_all = set(export_names(source, include_conditional=True))
 
-    dead = dead_entries(found, below_all, order)
+    on = read_config(elf)
+    if on is None:
+        libc_on = idf_on = True
+    else:
+        libc_on = "CONFIG_ELF_LOADER_LIBC_SYMBOLS" in on
+        idf_on = "CONFIG_ELF_LOADER_ESPIDF_SYMBOLS" in on
+
+    libc_names = table_names(source, "g_esp_libc_elfsyms")
+    idf_names = table_names(source, "g_esp_espidf_elfsyms")
+
+    below = set()
+    if libc_on:
+        below |= set(table_names(source, "g_esp_libc_elfsyms", True))
+    if idf_on:
+        below |= set(table_names(source, "g_esp_espidf_elfsyms", True))
+
+    dead = dead_entries(found, below, order)
     if dead:
         problems.append(
             "published by espix but unreachable, because something earlier in the\n"
@@ -355,26 +419,40 @@ def main():
             + '    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/espix-app.cmake")'
         )
 
-    promised = export_names(source)
-    if not promised:
+    if not libc_names and not idf_names:
         die(f"no exports found in {SOURCE}; the file moved or changed shape")
 
-    have = elf_symbols(nm, elf)
-    missing = [name for name in promised if name not in have]
-    if missing:
-        problems.append(
-            "published to apps but not in the image, so an app calling one fails to\n"
-            "  load with 'undefined symbol':\n    "
-            + "\n    ".join(missing)
-            + "\n  Check CONFIG_ELF_LOADER_LIBC_SYMBOLS / _ESPIDF_SYMBOLS, and the\n"
-            "  elf_loader pin in main/idf_component.yml."
-        )
+    if not libc_on:
+        gap = unabsorbed("CONFIG_ELF_LOADER_LIBC_SYMBOLS", libc_names, found)
+        if gap:
+            problems.append(gap)
+    if not idf_on:
+        gap = unabsorbed("CONFIG_ELF_LOADER_ESPIDF_SYMBOLS", idf_names, found)
+        if gap:
+            problems.append(gap)
+
+    promised = (libc_names if libc_on else []) + (idf_names if idf_on else [])
+    if promised:
+        have = elf_symbols(nm, elf)
+        missing = [name for name in promised if name not in have]
+        if missing:
+            problems.append(
+                "published to apps but not in the image, so an app calling one fails to\n"
+                "  load with 'undefined symbol':\n    "
+                + "\n    ".join(missing)
+                + "\n  Check CONFIG_ELF_LOADER_LIBC_SYMBOLS / _ESPIDF_SYMBOLS, and the\n"
+                "  elf_loader pin in main/idf_component.yml."
+            )
 
     if problems:
         die("\n".join(problems))
 
     published = sum(len(entries) for entries in found.values())
-    print(f"check-abi: {len(promised)} names promised a layer below are in the image;"
+    if promised:
+        layer = f"{len(promised)} names promised a layer below are in the image;"
+    else:
+        layer = "elf_loader's own tables are off, so espix is the only definition;"
+    print(f"check-abi: {layer}"
           f" {len(found)} names published by espix in {published} entries across"
           f" {len(abi_sources())} files, none of them shadowed;"
           f" and all {len(app_projects())} app projects agree about off_t")

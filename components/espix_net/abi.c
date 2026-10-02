@@ -1,15 +1,17 @@
 /*
  * Network syscall surface for loadable apps.
  *
- * The ELF loader ships a symbol table exporting some of lwip — socket, bind,
- * listen, accept, connect, send, recv, htons, htonl — which is why the whole
- * TCP/IP stack is linked whether or not espix uses it. What it does NOT export
- * is name resolution, so without this an app can only reach raw IP addresses.
+ * Until R-P3.1 the ELF loader's own IDF table exported half of lwip — socket,
+ * bind, listen, accept, connect, send, recv, htons, htonl — searched before
+ * anything espix registered. That table is off now, so this one is the whole
+ * lwIP surface: the socket half that used to be below, and the lifecycle and
+ * name-resolution half it never had.
  *
- * esp_elf_register_symbol() lets espix extend the table at runtime, so the app
- * ABI is something espix owns rather than inherits, with no fork of the
- * component. Everything added here should be considered part of the ABI: once
- * an app links against it, removing it breaks that app.
+ * esp_elf_register_symbol() lets espix publish the ABI itself, with no fork of
+ * the component. Everything here is part of it: once an app links against a
+ * name, removing it breaks that app. Referencing these names is also what keeps
+ * the stack linked -- nothing else in the firmware would have a reason to if
+ * espix does not use it.
  */
 
 #include <arpa/inet.h>
@@ -37,6 +39,20 @@ static esp_elf_symbol_table_t s_net_syms[] = {
     ESP_ELFSYM_EXPORT(lwip_freeaddrinfo),
     ESP_ELFSYM_EXPORT(lwip_gethostbyname),
 
+    /* The socket half the loader's own table used to answer for, absorbed so
+     * that espix owns the whole lwIP surface in one place (R-P3.1). Together
+     * with the lifecycle calls below these are every lwIP name an app reaches. */
+    ESP_ELFSYM_EXPORT(lwip_socket),
+    ESP_ELFSYM_EXPORT(lwip_bind),
+    ESP_ELFSYM_EXPORT(lwip_listen),
+    ESP_ELFSYM_EXPORT(lwip_accept),
+    ESP_ELFSYM_EXPORT(lwip_connect),
+    ESP_ELFSYM_EXPORT(lwip_send),
+    ESP_ELFSYM_EXPORT(lwip_sendto),
+    ESP_ELFSYM_EXPORT(lwip_recv),
+    ESP_ELFSYM_EXPORT(lwip_recvfrom),
+    ESP_ELFSYM_EXPORT(lwip_setsockopt),
+
     /* Socket lifecycle the loader's own table omits. */
     ESP_ELFSYM_EXPORT(lwip_close),
     ESP_ELFSYM_EXPORT(lwip_shutdown),
@@ -47,9 +63,15 @@ static esp_elf_symbol_table_t s_net_syms[] = {
     ESP_ELFSYM_EXPORT(lwip_fcntl),
 
     /* arpa/inet.h presentation conversion. ntohs/ntohl need nothing: they are
-     * macros onto lwip_htons/lwip_htonl, which the loader already exports. */
+     * macros onto lwip_htons/lwip_htonl, above. */
     ESP_ELFSYM_EXPORT(lwip_inet_ntop),
     ESP_ELFSYM_EXPORT(lwip_inet_pton),
+
+    /* Byte-order and address helpers the loader used to answer for. */
+    ESP_ELFSYM_EXPORT(ipaddr_addr),
+    ESP_ELFSYM_EXPORT(lwip_htons),
+    ESP_ELFSYM_EXPORT(lwip_htonl),
+    ESP_ELFSYM_EXPORT(ip4addr_ntoa),
 
     ESP_ELFSYM_END
 };

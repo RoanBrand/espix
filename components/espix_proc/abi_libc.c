@@ -43,35 +43,35 @@
  * with the reason written down. An app's fopen() used to reach the filesystem
  * without passing espix at all, which is the bug this rule exists to prevent.
  *
- * What is answered a layer below, and needs no entry here
- * ------------------------------------------------------
- * elf_loader's own table (esp_elf_symbol.c) is searched *before* this one, so
- * these are already reachable and listing them again is dead weight -- which
- * three entries were, until tools/check-abi.py started comparing the names below
- * with the names here. Grouped as that file groups them, and only the names an
- * app of espix's kind reaches for:
+ * One definition, and it is this one
+ * ----------------------------------
+ * Until R-P3.1 these names were answered a layer below, by elf_loader's own
+ * hand-written libc table, which is searched before anything espix registers.
+ * That made the loader's example list part of the app ABI without espix having
+ * chosen it, and a name in it could not be shadowed by a table entry here --
+ * only by the resolver. CONFIG_ELF_LOADER_LIBC_SYMBOLS and _ESPIDF_SYMBOLS are
+ * off now, and every name they answered for is published by espix, in the file
+ * that owns it:
  *
- *   string.h  strerror, memcpy, memset, strlen, strcmp, strchr, strrchr,
- *             strcspn, strncat, strtod, strtol
- *   stdio.h   printf, fprintf, vfprintf, puts, putchar, fputc, fputs, fwrite
- *   stdlib.h  malloc, calloc, realloc, free
- *   unistd.h  close, exit, sleep, usleep
- *   time.h    clock_gettime, strftime
- *   setjmp.h  setjmp, longjmp
- *   getopt.h  getopt_long and its four variables
- *   libc      __errno, __getreent and the ctype table -- `_ctype_` under newlib,
- *             its picolibc equivalent under picolibc. These are newlib's own ABI
- *             rather than a C API, and an app built against either libc needs
- *             the matching set.
- *   pthread.h pthread_create, join, detach, exit and two attribute calls, which
- *             an app that wants a second thread uses. espix does not own these:
- *             a thread created through them is a FreeRTOS task, not a process,
- *             so it has no espix identity and no signal delivery. Worth knowing
- *             before anything promises a thread the isolation an app gets.
+ *   this file    string.h, stdio.h, time.h, setjmp.h, getopt.h, and newlib's
+ *                own reent/ctype ABI (__errno, __getreent, _ctype_)
+ *   abi_fs.c     close, beside the other POSIX file calls
+ *   abi_alloc.c  malloc, calloc, realloc, free -- the arena, via the resolver
+ *   abi_signal.c sleep and usleep -- interruptible, via the resolver
+ *   abi_exit.c   exit and friends, via the resolver
+ *   abi_pthread.c  the thread surface, create/exit through the resolver so a
+ *                thread belongs to its process
+ *   abi_drivers.c  the libgcc soft-double helpers and ets_printf
+ *   espix_net/abi.c  the whole lwIP surface, socket through select
  *
- * sleep and usleep are the exception that proves the rule: espix does override
- * them, and it has to go through the resolver to do it, because a table cannot
- * shadow a name the loader's own is searched first for. See abi_signal.c.
+ * tools/check-abi.py enforces both directions: an entry here that something
+ * searched earlier already answers for fails the build, and so does a name the
+ * loader's tables answered for that espix does not publish now that they are
+ * off.
+ *
+ * sleep and usleep go through the resolver rather than a table: espix overrides
+ * them so a signal can cut a long one short, and the resolver is searched before
+ * every table, espix's included. See abi_signal.c.
  *
  * None of this can be a _Static_assert. `sizeof(&f)` proves the *declaration*
  * exists and costs nothing, but what matters is whether the *definition* is in
@@ -87,9 +87,15 @@
  * symbol. See docs/UPSTREAM.md.
  */
 
+#include <ctype.h>
+#include <errno.h>
+#include <getopt.h>
+#include <reent.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_elf.h"
 
@@ -197,21 +203,75 @@ static const struct esp_elfsym s_libc_syms[] = {
      * perror() was published here and then measured: it writes to the firmware's
      * own stderr stream, not the channel the app is writing to, so the line never
      * arrives. Removed on that evidence rather than kept for the name's sake --
-     * strerror() is the part an app needs, and the loader already publishes it.
+     * strerror() is the part an app needs, and this file publishes it.
      *
-     * ctype.h needs nothing: newlib implements it as macros over `_ctype_`, and
-     * the loader publishes that table.
+     * ctype.h needs nothing beyond `_ctype_` above: newlib implements it as
+     * macros over that table.
      *
      * putenv() is not here either: abi_env.c claims it through the resolver,
      * which is searched before any table, so the entry that used to be here was
      * dead. A name published twice reads as a promise and resolves to whichever
      * ran first -- which is the class of bug tools/check-abi.py cannot see yet.
      *
-     * exit(), _Exit(), _exit(), abort() and __assert_func are not here either,
-     * and could not be: the loader's libc table answers for `exit` before any
-     * table of espix's is consulted. They are claimed by abi_exit.c through the
-     * resolver, which is the only seam that can shadow them.
+     * exit(), _Exit(), _exit(), abort() and __assert_func are not here either:
+     * they are claimed by abi_exit.c through the resolver, which is searched
+     * before every table, because a dying app's streams and slot have to go
+     * through espix.
      */
+
+    /*
+     * What elf_loader's own libc table used to answer for, absorbed here so
+     * that espix is the single definition (R-P3.1). Every name below is one an
+     * app reached through that table, so dropping one turns a working app into
+     * "undefined symbol" at load; check-abi fails the build if one is missing.
+     * They pass the same allowlist test as the rest of this table -- pure
+     * computation, or libc that enters espix's own VFS -- and the few that
+     * espix owns more tightly (malloc/calloc/realloc/free, sleep/usleep, exit)
+     * are already claimed through the resolver and are not repeated.
+     */
+#if !CONFIG_LIBC_PICOLIBC
+    /* newlib's reent/ctype ABI rather than a C API: an app built against newlib
+     * references these directly, and the ctype macros index this table. The
+     * loader chose between this spelling and a picolibc one at compile time;
+     * picolibc is off in this tree, so this is the live set. */
+    ESP_ELFSYM_EXPORT(__errno),
+    ESP_ELFSYM_EXPORT(__getreent),
+    ESP_ELFSYM_EXPORT(_ctype_),
+#endif
+
+    /* string.h -- the half that came from below. */
+    ESP_ELFSYM_EXPORT(strerror),
+    ESP_ELFSYM_EXPORT(strlen),
+    ESP_ELFSYM_EXPORT(strcmp),
+    ESP_ELFSYM_EXPORT(strchr),
+    ESP_ELFSYM_EXPORT(strrchr),
+    ESP_ELFSYM_EXPORT(strcspn),
+    ESP_ELFSYM_EXPORT(strncat),
+    ESP_ELFSYM_EXPORT(memcpy),
+    ESP_ELFSYM_EXPORT(memset),
+    ESP_ELFSYM_EXPORT(strtol),
+    ESP_ELFSYM_EXPORT(strtod),
+
+    /* stdio.h -- the output half; the input half is already above. */
+    ESP_ELFSYM_EXPORT(printf),
+    ESP_ELFSYM_EXPORT(fprintf),
+    ESP_ELFSYM_EXPORT(vfprintf),
+    ESP_ELFSYM_EXPORT(puts),
+    ESP_ELFSYM_EXPORT(putchar),
+    ESP_ELFSYM_EXPORT(fputc),
+    ESP_ELFSYM_EXPORT(fputs),
+    ESP_ELFSYM_EXPORT(fwrite),
+
+    /* time.h, getopt.h and setjmp.h. */
+    ESP_ELFSYM_EXPORT(clock_gettime),
+    ESP_ELFSYM_EXPORT(strftime),
+    ESP_ELFSYM_EXPORT(getopt_long),
+    ESP_ELFSYM_EXPORT(optind),
+    ESP_ELFSYM_EXPORT(opterr),
+    ESP_ELFSYM_EXPORT(optarg),
+    ESP_ELFSYM_EXPORT(optopt),
+    ESP_ELFSYM_EXPORT(setjmp),
+    ESP_ELFSYM_EXPORT(longjmp),
 
     ESP_ELFSYM_END
 };
