@@ -524,7 +524,7 @@ static ssize_t ext_read(void *ctx, int fd, void *dst, size_t size)
  * for. Save, seek, read, restore -- under one lock hold, so another reader
  * cannot observe the position in between. The restore matters as much as the
  * seek: POSIX leaves the position alone across a pread, and espix's own
- * espix_dev_pread sets the same standard.
+ * espix_synth_pread sets the same standard.
  */
 static ssize_t ext_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
 {

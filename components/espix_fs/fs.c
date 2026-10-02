@@ -169,7 +169,7 @@ esp_err_t espix_fs_mount_root(void)
 
     /* Before the root is registered, so the first open cannot race the table's
      * mutex being created. */
-    espix_dev_init();
+    espix_synth_init();
 
     err = espix_vfs_register_root(lower_ops, lower_ctx);
     if (err != ESP_OK) {

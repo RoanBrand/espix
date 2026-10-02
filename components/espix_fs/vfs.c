@@ -854,15 +854,15 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
      * filesystem registered at "/dev" would be reached without the check, which
      * is precisely what fs.c warns about.
      */
-    const void *dev = espix_dev_lookup(p);
+    const void *dev = espix_synth_lookup(p);
     if (dev != NULL) {
-        return espix_dev_open(dev, flags);
+        return espix_synth_open(dev, flags);
     }
-    if (espix_dev_isdir(p)) {
+    if (espix_synth_isdir(p)) {
         errno = EISDIR;
         return -1;
     }
-    if (espix_dev_underdev(p)) {
+    if (espix_synth_under(p)) {
         /*
          * The subtree is espix's and answers to the table alone, so a name
          * that is not a node does not exist -- and no create can land on a
@@ -903,7 +903,7 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
      * is MEMP_NUM_NETCONN, so this is unreachable in practice -- which is why
      * it is worth a branch rather than a comment promising it cannot happen.
      */
-    if (fd >= ESPIX_DEV_FD_BASE) {
+    if (fd >= ESPIX_SYNTH_FD_BASE) {
         if (!NO_LOWER(l->ops->close_p)) {
             l->ops->close_p(l->ctx, fd);
         }
@@ -940,8 +940,8 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
 
 static int vfs_close(void *ctx, int fd)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_close(fd);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_close(fd);
     }
     fd_slot_t slot;
     const int unref = fd_slot_unref(fd, &slot);
@@ -965,8 +965,8 @@ static int vfs_close(void *ctx, int fd)
 
 static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_read(fd, dst, size);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_read(fd, dst, size);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -979,8 +979,8 @@ static ssize_t vfs_read(void *ctx, int fd, void *dst, size_t size)
 
 static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_write(fd, data, size);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_write(fd, data, size);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -993,8 +993,8 @@ static ssize_t vfs_write(void *ctx, int fd, const void *data, size_t size)
 
 static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_pread(fd, dst, size, off);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_pread(fd, dst, size, off);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -1008,11 +1008,11 @@ static ssize_t vfs_pread(void *ctx, int fd, void *dst, size_t size, off_t off)
 static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
                           off_t off)
 {
-    if (espix_dev_fd(fd)) {
+    if (espix_synth_fd(fd)) {
         /* Only /dev/null accepts writes, and it discards them, so the offset
          * changes nothing. */
         (void)off;
-        return espix_dev_write(fd, src, size);
+        return espix_synth_write(fd, src, size);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -1026,8 +1026,8 @@ static ssize_t vfs_pwrite(void *ctx, int fd, const void *src, size_t size,
 
 static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_lseek(fd, size, mode);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_lseek(fd, size, mode);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -1046,8 +1046,8 @@ static off_t vfs_lseek(void *ctx, int fd, off_t size, int mode)
  */
 static int vfs_fstat(void *ctx, int fd, struct stat *st)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_fstat(fd, st);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_fstat(fd, st);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -1076,8 +1076,8 @@ static int vfs_fstat(void *ctx, int fd, struct stat *st)
 
 static int vfs_fsync(void *ctx, int fd)
 {
-    if (espix_dev_fd(fd)) {
-        return espix_dev_fsync(fd);
+    if (espix_synth_fd(fd)) {
+        return espix_synth_fsync(fd);
     }
     fd_slot_t slot;
     if (!fd_slot_get(fd, &slot)) {
@@ -1090,7 +1090,7 @@ static int vfs_fsync(void *ctx, int fd)
 
 static int vfs_fcntl(void *ctx, int fd, int cmd, int arg)
 {
-    if (espix_dev_fd(fd)) {
+    if (espix_synth_fd(fd)) {
         /* Nothing here has flags worth reporting, and F_GETFL returning 0 is
          * more useful to a caller than ENOSYS. */
         (void)cmd; (void)arg;
@@ -1138,16 +1138,16 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
 {
     RESOLVE_OR_FAIL(path, -1);
 
-    const void *dev = espix_dev_lookup(p);
+    const void *dev = espix_synth_lookup(p);
     if (dev != NULL) {
-        espix_dev_stat(dev, st);
+        espix_synth_stat(dev, st);
         return 0;
     }
-    if (espix_dev_isdir(p)) {
-        espix_dev_dir_stat(st);
+    if (espix_synth_isdir(p)) {
+        espix_synth_dir_stat(st);
         return 0;
     }
-    if (espix_dev_underdev(p)) {
+    if (espix_synth_under(p)) {
         /* A name in /dev that is not a node is not there -- never littlefs. */
         errno = ENOENT;
         return -1;
@@ -1181,7 +1181,7 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
          * ownership POSIX-style was told root, and an app that chowned something
          * to the uid it read would have chowned it to root.
          *
-         * A device node is not this path: espix_dev_stat() above leaves them at 0,
+         * A device node is not this path: espix_synth_stat() above leaves them at 0,
          * which is right, because a device is the kernel's.
          */
         uint16_t uid = 0;
@@ -1197,7 +1197,7 @@ static int vfs_unlink(void *ctx, const char *path)
 {
     RESOLVE_OR_FAIL(path, -1);
 
-    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+    if (espix_synth_isdir(p) || espix_synth_under(p)) {
         /* Nothing in /dev is a name espix will edit. */
         errno = EROFS;
         return -1;
@@ -1227,8 +1227,8 @@ static int vfs_rename(void *ctx, const char *src, const char *dst)
 
     /* A rename edits two names; either one landing in /dev is refused, in
      * both directions, because nothing there is a littlefs name. */
-    if (espix_dev_isdir(abs_src) || espix_dev_underdev(abs_src) ||
-        espix_dev_isdir(abs_dst) || espix_dev_underdev(abs_dst)) {
+    if (espix_synth_isdir(abs_src) || espix_synth_under(abs_src) ||
+        espix_synth_isdir(abs_dst) || espix_synth_under(abs_dst)) {
         errno = EROFS;
         return -1;
     }
@@ -1266,10 +1266,10 @@ static DIR *vfs_opendir(void *ctx, const char *name)
         errno = err;
         return NULL;
     }
-    if (espix_dev_isdir(p)) {
-        return espix_dev_opendir();
+    if (espix_synth_isdir(p)) {
+        return espix_synth_opendir(p);
     }
-    if (espix_dev_underdev(p)) {
+    if (espix_synth_under(p)) {
         /* Only /dev itself is a directory here. */
         errno = ENOTDIR;
         return NULL;
@@ -1294,8 +1294,8 @@ static DIR *vfs_opendir(void *ctx, const char *name)
 
 static struct dirent *vfs_readdir(void *ctx, DIR *pdir)
 {
-    if (espix_dev_dirp(pdir)) {
-        return espix_dev_readdir(pdir);
+    if (espix_synth_dirp(pdir)) {
+        return espix_synth_readdir(pdir);
     }
     const lower_t *l = mount_by_dir(pdir);
     if (l == NULL) {
@@ -1312,8 +1312,8 @@ static struct dirent *vfs_readdir(void *ctx, DIR *pdir)
 static int vfs_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
                          struct dirent **out)
 {
-    if (espix_dev_dirp(pdir)) {
-        return espix_dev_readdir_r(pdir, entry, out);
+    if (espix_synth_dirp(pdir)) {
+        return espix_synth_readdir_r(pdir, entry, out);
     }
     const lower_t *l = mount_by_dir(pdir);
     if (l == NULL) {
@@ -1325,8 +1325,8 @@ static int vfs_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
 
 static long vfs_telldir(void *ctx, DIR *pdir)
 {
-    if (espix_dev_dirp(pdir)) {
-        return espix_dev_telldir(pdir);
+    if (espix_synth_dirp(pdir)) {
+        return espix_synth_telldir(pdir);
     }
     const lower_t *l = mount_by_dir(pdir);
     if (l == NULL) {
@@ -1338,8 +1338,8 @@ static long vfs_telldir(void *ctx, DIR *pdir)
 
 static void vfs_seekdir(void *ctx, DIR *pdir, long offset)
 {
-    if (espix_dev_dirp(pdir)) {
-        espix_dev_seekdir(pdir, offset);
+    if (espix_synth_dirp(pdir)) {
+        espix_synth_seekdir(pdir, offset);
         return;
     }
     const lower_t *l = mount_by_dir(pdir);
@@ -1350,8 +1350,8 @@ static void vfs_seekdir(void *ctx, DIR *pdir, long offset)
 
 static int vfs_closedir(void *ctx, DIR *pdir)
 {
-    if (espix_dev_dirp(pdir)) {
-        return espix_dev_closedir(pdir);
+    if (espix_synth_dirp(pdir)) {
+        return espix_synth_closedir(pdir);
     }
     const lower_t *l = mount_by_dir(pdir);
     if (l == NULL) {
@@ -1373,7 +1373,7 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
      * is not: the device table owns that space and it holds no creatable
      * entries.
      */
-    if (espix_dev_underdev(p)) {
+    if (espix_synth_under(p)) {
         errno = EROFS;
         return -1;
     }
@@ -1399,7 +1399,7 @@ static int vfs_rmdir(void *ctx, const char *name)
 {
     RESOLVE_OR_FAIL(name, -1);
 
-    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+    if (espix_synth_isdir(p) || espix_synth_under(p)) {
         /* The mount point stays, and nothing inside it is a real directory. */
         errno = EROFS;
         return -1;
@@ -1418,7 +1418,7 @@ static int vfs_truncate(void *ctx, const char *path, off_t length)
 {
     RESOLVE_OR_FAIL(path, -1);
 
-    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+    if (espix_synth_isdir(p) || espix_synth_under(p)) {
         errno = EROFS;
         return -1;
     }
@@ -1435,7 +1435,7 @@ static int vfs_truncate(void *ctx, const char *path, off_t length)
 
 static int vfs_ftruncate(void *ctx, int fd, off_t length)
 {
-    if (espix_dev_fd(fd)) {
+    if (espix_synth_fd(fd)) {
         /* /dev/null is already empty and /dev/factory is read-only. */
         (void)length;
         errno = EINVAL;
@@ -1454,7 +1454,7 @@ static int vfs_utime(void *ctx, const char *path, const struct utimbuf *times)
 {
     RESOLVE_OR_FAIL(path, -1);
 
-    if (espix_dev_isdir(p) || espix_dev_underdev(p)) {
+    if (espix_synth_isdir(p) || espix_synth_under(p)) {
         errno = EROFS;
         return -1;
     }
@@ -1672,7 +1672,7 @@ esp_err_t espix_vfs_del_mount(const char *prefix)
      * stays until the caller closes up; pulling the volume out from under a
      * reader is the one outcome worse than a failed umount.
      */
-    for (int fd = 0; fd < ESPIX_DEV_FD_BASE; fd++) {
+    for (int fd = 0; fd < ESPIX_SYNTH_FD_BASE; fd++) {
         if (s_fds[fd].lower_fd >= 0 &&
             s_fds[fd].mount == (uint8_t)((slot - s_mounts) + 1)) {
             portEXIT_CRITICAL(&s_mount_lock);

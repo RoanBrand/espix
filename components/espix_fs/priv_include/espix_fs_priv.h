@@ -185,48 +185,87 @@ bool espix_vfs_mount_dead(const char *path);
  * 0x1000. vfs_open() refuses a lower-filesystem fd that reaches the base, so
  * the reservation is enforced rather than assumed.
  */
-#define ESPIX_DEV_FD_BASE   240
-#define ESPIX_DEV_FD_COUNT  16
+/*
+ * One synthetic filesystem: a fixed node table, optionally with dynamic nodes
+ * (the /dev block-device pool). The engine that reads them is synth.c; the two
+ * trees are dev.c and proc.c.
+ */
+typedef enum {
+    SYNTH_NULL,     /* /dev/null: reads EOF, writes are swallowed */
+    SYNTH_APP,      /* an application partition: read-only raw image */
+    SYNTH_BLOCK,    /* a named block device: a name, open refuses */
+    SYNTH_TEXT,     /* generated on read by gen() */
+} synth_kind_t;
 
-void        espix_dev_init(void);
+typedef struct synth_node {
+    const char  *path;
+    synth_kind_t kind;
+    mode_t       mode;
+    uint64_t     size;      /* SYNTH_BLOCK only */
+    uint8_t      subtype;   /* SYNTH_APP only */
+    /* SYNTH_TEXT only: fill buf with up to cap bytes and return the length.
+     * Called on every read, which is what makes the file cost nothing at rest
+     * and report the value as of the read rather than of the mount. */
+    size_t     (*gen)(char *buf, size_t cap);
+} synth_node_t;
+
+typedef struct synth_tree {
+    const char         *prefix;      /* "/dev", "/proc" */
+    size_t              prefix_len;
+    const synth_node_t *nodes;
+    int                 count;
+    /* Optional dynamic nodes. Both set, or both NULL. */
+    const synth_node_t *(*dyn_at)(int nth);
+    const synth_node_t *(*dyn_lookup)(const char *abs_path);
+} synth_tree_t;
+
+#define ESPIX_SYNTH_FD_BASE   240
+#define ESPIX_SYNTH_FD_COUNT  16
+#define ESPIX_SYNTH_DIR_MAX    8
+#define ESPIX_SYNTH_TREES_MAX  4
+
+void        espix_synth_init(void);
+void        espix_synth_register_tree(const synth_tree_t *tree);
+const synth_tree_t *espix_fs_dev_tree(void);
+const synth_tree_t *espix_fs_proc_tree(void);
 
 /* NULL when the path is not a device. The handle is opaque to vfs.c. */
-const void *espix_dev_lookup(const char *abs_path);
-void        espix_dev_stat(const void *handle, struct stat *st);
-int         espix_dev_open(const void *handle, int flags);
+const void *espix_synth_lookup(const char *abs_path);
+void        espix_synth_stat(const void *handle, struct stat *st);
+int         espix_synth_open(const void *handle, int flags);
 
 /*
  * The virtual /dev directory. Its entries are the device table, and nothing
  * in it reaches littlefs, so whatever an older image left there is invisible.
  */
-bool        espix_dev_isdir(const char *abs_path);
-bool        espix_dev_underdev(const char *abs_path);
-bool        espix_dev_mode(const char *abs_path, mode_t *out);
-void        espix_dev_dir_stat(struct stat *st);
+bool        espix_synth_isdir(const char *abs_path);
+bool        espix_synth_under(const char *abs_path);
+bool        espix_synth_mode(const char *abs_path, mode_t *out);
+void        espix_synth_dir_stat(struct stat *st);
 
-DIR        *espix_dev_opendir(void);
-struct dirent *espix_dev_readdir(DIR *pdir);
-int         espix_dev_readdir_r(DIR *pdir, struct dirent *entry,
+DIR        *espix_synth_opendir(const char *abs_path);
+struct dirent *espix_synth_readdir(DIR *pdir);
+int         espix_synth_readdir_r(DIR *pdir, struct dirent *entry,
                                 struct dirent **out);
-long        espix_dev_telldir(DIR *pdir);
-void        espix_dev_seekdir(DIR *pdir, long offset);
-int         espix_dev_closedir(DIR *pdir);
+long        espix_synth_telldir(DIR *pdir);
+void        espix_synth_seekdir(DIR *pdir, long offset);
+int         espix_synth_closedir(DIR *pdir);
 
-/* True for a DIR that espix_dev_opendir() handed out, so vfs.c can route. */
-bool        espix_dev_dirp(DIR *pdir);
+/* True for a DIR that espix_synth_opendir() handed out, so vfs.c can route. */
+bool        espix_synth_dirp(DIR *pdir);
 
-static inline bool espix_dev_fd(int fd)
+static inline bool espix_synth_fd(int fd)
 {
-    return fd >= ESPIX_DEV_FD_BASE;
+    return fd >= ESPIX_SYNTH_FD_BASE;
 }
 
-int     espix_dev_close(int fd);
-ssize_t espix_dev_read(int fd, void *dst, size_t size);
-ssize_t espix_dev_pread(int fd, void *dst, size_t size, off_t off);
-ssize_t espix_dev_write(int fd, const void *data, size_t size);
-off_t   espix_dev_lseek(int fd, off_t off, int whence);
-int     espix_dev_fstat(int fd, struct stat *st);
-int     espix_dev_fsync(int fd);
+int     espix_synth_close(int fd);
+ssize_t espix_synth_read(int fd, void *dst, size_t size);
+ssize_t espix_synth_pread(int fd, void *dst, size_t size, off_t off);
+ssize_t espix_synth_write(int fd, const void *data, size_t size);
+off_t   espix_synth_lseek(int fd, off_t off, int whence);
+int     espix_synth_fstat(int fd, struct stat *st);
+int     espix_synth_fsync(int fd);
 
 #ifdef __cplusplus
 }

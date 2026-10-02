@@ -15,7 +15,9 @@ set(espix_fs_srcs
     "mode.c"
     "vfs.c"
     "access.c"
+    "synth.c"
     "dev.c"
+    "proc.c"
     "fat.c"
     "part.c"
 )
