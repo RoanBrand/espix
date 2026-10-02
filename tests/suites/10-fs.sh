@@ -262,5 +262,26 @@ assert_eq "cat reads standard input through <" "$(printf 'one\ntwo\nthree')" \
 assert_status "a command with no input at all says so instead of blocking" 1 \
     dev_status "wc"
 
+# `|`: a pipeline. Every stage but the last runs on a task of its own with a
+# copy of the session, and a StreamBuffer carries the bytes. R-P2.5. Builtins
+# only for now -- an app's stdout is its session stream, which a pipe cannot
+# reach without the descriptor plumbing -- and a program operand says so rather
+# than running into the terminal.
+assert_eq "a pipe feeds one command into the next" "two" \
+    "$(dev_run "cat $TF | grep two")"
+assert_eq "a three-stage pipeline works" "2" \
+    "$(dev_run "cat $TF | grep e | wc -l" | awk '{print $1}')"
+assert_eq "a pipe sorts what it is given" "$(printf 'two\nthree\none')" \
+    "$(dev_run "cat $TF | sort -r")"
+PPD=/tmp/espix-pipe-$ESPIX_WORKER
+dev_run "rm -r $PPD" >/dev/null 2>&1
+dev_run "mkdir $PPD; echo a > $PPD/a; echo b > $PPD/b; echo c > $PPD/c" >/dev/null
+assert_eq "ls into wc counts the lines" "3" \
+    "$(dev_run "ls $PPD | wc -l" | awk '{print $1}')"
+assert_contains "a program stage is refused, not run into the terminal" \
+    "pipes are for builtins" \
+    "$(dev_run "echo x | /home/$ESPIX_USER/testapp argv" 2>&1)"
+dev_run "rm -r $PPD" >/dev/null 2>&1
+
 dev_run "rm $TF" >/dev/null 2>&1
 

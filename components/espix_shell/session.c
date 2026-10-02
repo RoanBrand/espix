@@ -8,6 +8,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 
 #include "esp_console.h"
 #include "esp_log.h"
@@ -260,10 +261,15 @@ static void redirects_apply(espix_session_t *s, const redirects_t *r)
     if (s == NULL) {
         return;
     }
-    s->redirect     = r->out;
-    s->redirect_err = r->err;
-    s->redirect_in  = r->in;
-    s->err_to_out   = r->err_to_out;
+    /*
+     * Only what the line redirected. A pipeline stage inherits the pipe ends
+     * its caller put on the session copy, and a command that wrote no `>` of
+     * its own must not clear them -- see run_pipeline().
+     */
+    if (r->out != NULL) { s->redirect     = r->out; }
+    if (r->err != NULL) { s->redirect_err = r->err; }
+    if (r->in  != NULL) { s->redirect_in  = r->in;  }
+    s->err_to_out = r->err_to_out;
 }
 
 /* And take them away again, closing what was opened. Always paired with
@@ -271,10 +277,12 @@ static void redirects_apply(espix_session_t *s, const redirects_t *r)
 static void redirects_release(espix_session_t *s, redirects_t *r)
 {
     if (s != NULL) {
-        s->redirect     = NULL;
-        s->redirect_err = NULL;
-        s->redirect_in  = NULL;
-        s->err_to_out   = false;
+        /* Only what this line set: a stage's inherited ends are its caller's
+         * to clear. */
+        if (r->out != NULL) { s->redirect     = NULL; }
+        if (r->err != NULL) { s->redirect_err = NULL; }
+        if (r->in  != NULL) { s->redirect_in  = NULL; }
+        s->err_to_out = false;
     }
     if (r->in != NULL) {
         fclose(r->in);
@@ -746,6 +754,257 @@ static bool blank_segment(const char *p)
     return *p == '\0';
 }
 
+/* ------------------------------------------------------------------ */
+/* Pipes                                                               */
+/* ------------------------------------------------------------------ */
+
+#define PIPE_BUF_BYTES   1024
+#define PIPE_MAX_STAGES  4
+#define PIPE_STAGE_STACK 6144
+
+/*
+ * One pipe: a StreamBuffer with a FILE on each end, so a builtin's ordinary
+ * espix_printf() and fgets() reach it. A pipe is unidirectional with one
+ * reader and one writer, which is exactly a StreamBuffer's contract.
+ */
+typedef struct {
+    StreamBufferHandle_t sb;
+    FILE                *wr;
+    FILE                *rd;
+    volatile bool        wr_closed;
+} pipe_t;
+
+static int pipe_write(void *cookie, const char *buf, int len)
+{
+    pipe_t *p    = cookie;
+    int     sent = 0;
+
+    while (sent < len) {
+        const size_t n = xStreamBufferSend(p->sb, buf + sent,
+                                           (size_t)(len - sent), portMAX_DELAY);
+        if (n == 0) {
+            break;
+        }
+        sent += (int)n;
+    }
+    return sent;
+}
+
+static int pipe_read(void *cookie, char *buf, int len)
+{
+    pipe_t *p = cookie;
+
+    for (;;) {
+        const size_t n = xStreamBufferReceive(p->sb, buf, (size_t)len,
+                                              pdMS_TO_TICKS(100));
+        if (n > 0) {
+            return (int)n;
+        }
+        /* Empty: the writer is slow, or it has finished. */
+        if (p->wr_closed) {
+            return 0;
+        }
+    }
+}
+
+/* A producer stage. The session is a *copy*: its printf buffer and its
+ * redirects have to be its own, because the consumer is running on the session
+ * task at the same time. */
+typedef struct {
+    espix_session_t   s;
+    const char       *line;     /* into the caller's buffer, alive to the end */
+    FILE             *out;      /* this stage's end, closed from the task */
+    pipe_t           *pipe;
+    TaskHandle_t      task;
+    SemaphoreHandle_t done;
+} pipe_stage_t;
+
+static void pipe_stage_task(void *arg)
+{
+    pipe_stage_t *st = arg;
+
+    espix_shell_set_current(&st->s);
+    (void)exec_one(&st->s, st->line);
+
+    /*
+     * Flush and close the write end here, so the reader sees EOF as soon as
+     * this stage has nothing more to say. Closing it from the caller would
+     * deadlock: the caller is the reader.
+     */
+    if (st->out != NULL) {
+        fflush(st->out);
+        fclose(st->out);
+        st->s.redirect      = NULL;
+        st->pipe->wr_closed = true;
+    }
+
+    espix_shell_set_current(NULL);
+    xSemaphoreGive(st->done);
+    vTaskDeleteWithCaps(NULL);
+}
+
+/* The first word of a stage, so a pipe can refuse a program operand. */
+static void first_token(const char *line, char *out, size_t len)
+{
+    while (*line == ' ' || *line == '\t') {
+        line++;
+    }
+    size_t i = 0;
+    while (*line != '\0' && *line != ' ' && *line != '\t' && i + 1 < len) {
+        out[i++] = *line++;
+    }
+    out[i] = '\0';
+}
+
+/*
+ * A pipeline: `a | b | c`. Every stage but the last runs on a task of its own
+ * with a copy of the session, feeding the next through a pipe; the last runs
+ * here, on the session task, and the shell waits for the rest before returning.
+ * That is why these tasks need none of the ownership rule a background `&`
+ * would: nothing outlives the line.
+ *
+ * A program stage is refused rather than run. An app's stdout is its session
+ * stream, and pointing that at a pipe needs the descriptor plumbing R-P2.8
+ * covers; running it anyway would put its output on the terminal while the
+ * consumer waited for bytes that never came.
+ */
+static int run_pipeline(espix_session_t *s, char *line)
+{
+    char *stage[PIPE_MAX_STAGES];
+    int   n    = 0;
+    char *p    = line;
+
+    stage[n++] = line;
+
+    while (*p != '\0') {
+        if (*p == '\'' || *p == '"') {
+            const char quote = *p++;
+            while (*p != '\0' && *p != quote) {
+                if (quote == '"' && *p == '\\' && p[1] != '\0') {
+                    p++;
+                }
+                p++;
+            }
+            if (*p == quote) {
+                p++;
+            }
+            continue;
+        }
+        if (*p == '|') {
+            *p = '\0';
+            if (n >= PIPE_MAX_STAGES) {
+                espix_eprintf(s, "espix: too many pipes (max %d)\n",
+                              PIPE_MAX_STAGES - 1);
+                return 2;
+            }
+            stage[n++] = p + 1;
+        }
+        p++;
+    }
+
+    if (n == 1) {
+        return exec_one(s, line);
+    }
+
+    for (int i = 0; i < n; i++) {
+        char word[32];
+        first_token(stage[i], word, sizeof(word));
+        if (word[0] != '\0' && espix_shell_find(word) == NULL) {
+            espix_eprintf(s, "espix: %s: pipes are for builtins for now\n", word);
+            return 2;
+        }
+    }
+
+    pipe_t pipes[PIPE_MAX_STAGES - 1];
+    memset(pipes, 0, sizeof(pipes));
+
+    for (int i = 0; i < n - 1; i++) {
+        pipes[i].sb = xStreamBufferCreate(PIPE_BUF_BYTES, 1);
+        if (pipes[i].sb != NULL) {
+            pipes[i].wr = funopen(&pipes[i], NULL, pipe_write, NULL, NULL);
+            pipes[i].rd = funopen(&pipes[i], pipe_read, NULL, NULL, NULL);
+        }
+        if (pipes[i].sb == NULL || pipes[i].wr == NULL || pipes[i].rd == NULL) {
+            espix_eprintf(s, "espix: no memory for a pipe\n");
+            for (int k = 0; k <= i; k++) {
+                if (pipes[k].wr != NULL) { fclose(pipes[k].wr); }
+                if (pipes[k].rd != NULL) { fclose(pipes[k].rd); }
+                if (pipes[k].sb != NULL) { vStreamBufferDelete(pipes[k].sb); }
+            }
+            return 2;
+        }
+        /* Line buffered: a stage's output should reach the reader as it is
+         * produced, and not only when a kilobyte has accumulated. */
+        setvbuf(pipes[i].wr, NULL, _IOLBF, 128);
+    }
+
+    pipe_stage_t *st[PIPE_MAX_STAGES - 1];
+    memset(st, 0, sizeof(st));
+
+    int started = 0;
+    int status  = 2;
+
+    for (int i = 0; i < n - 1; i++) {
+        st[i] = calloc(1, sizeof(*st[i]));
+        if (st[i] == NULL) {
+            break;
+        }
+        st[i]->done = xSemaphoreCreateBinary();
+        st[i]->s             = *s;
+        st[i]->s.redirect    = pipes[i].wr;
+        st[i]->s.redirect_in = (i > 0) ? pipes[i - 1].rd : s->redirect_in;
+        st[i]->s.err_to_out  = false;
+        st[i]->line          = stage[i];
+        st[i]->out           = pipes[i].wr;
+        st[i]->pipe          = &pipes[i];
+
+        if (st[i]->done == NULL ||
+            xTaskCreateWithCaps(pipe_stage_task, "sh:pipe", PIPE_STAGE_STACK,
+                                st[i], uxTaskPriorityGet(NULL), &st[i]->task,
+                                MALLOC_CAP_SPIRAM) != pdPASS) {
+            if (st[i]->done != NULL) {
+                vSemaphoreDelete(st[i]->done);
+                st[i]->done = NULL;
+            }
+            break;
+        }
+        started++;
+    }
+
+    if (started == n - 1) {
+        FILE *const saved = s->redirect_in;
+        s->redirect_in = pipes[n - 2].rd;
+        status = exec_one(s, stage[n - 1]);
+        s->redirect_in = saved;
+    } else {
+        /* Out of memory for a task or a semaphore. The producers already
+         * started are blocked on pipes nothing will drain, so deleting them is
+         * the only way out -- and the only time it happens is here. */
+        espix_eprintf(s, "espix: cannot start a pipe stage\n");
+        for (int i = 0; i < started; i++) {
+            vTaskDeleteWithCaps(st[i]->task);
+            st[i]->task = NULL;
+        }
+        for (int i = 0; i < started; i++) {
+            if (pipes[i].wr != NULL) { fclose(pipes[i].wr); pipes[i].wr = NULL; }
+        }
+    }
+
+    for (int i = 0; i < n - 1; i++) {
+        if (st[i] != NULL) {
+            if (st[i]->done != NULL) {
+                xSemaphoreTake(st[i]->done, portMAX_DELAY);
+                vSemaphoreDelete(st[i]->done);
+            }
+            free(st[i]);
+        }
+        if (pipes[i].rd != NULL) { fclose(pipes[i].rd); }
+        if (pipes[i].sb != NULL) { vStreamBufferDelete(pipes[i].sb); }
+    }
+
+    return status;
+}
+
 int espix_shell_exec(espix_session_t *s, const char *line)
 {
     if (line == NULL) {
@@ -795,7 +1054,7 @@ int espix_shell_exec(espix_session_t *s, const char *line)
                                          : (pending == 2 ? (ran && status == 0)
                                                          : false);
         if (!skip && !blank_segment(seg)) {
-            status = exec_one(s, seg);
+            status = run_pipeline(s, seg);
             ran    = true;
         }
 
