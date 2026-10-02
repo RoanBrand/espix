@@ -225,6 +225,7 @@ typedef struct synth_tree {
 #define ESPIX_SYNTH_TREES_MAX  4
 
 void        espix_synth_init(void);
+void        espix_synth_ensure_mounts(void);
 void        espix_synth_register_tree(const synth_tree_t *tree);
 const synth_tree_t *espix_fs_dev_tree(void);
 const synth_tree_t *espix_fs_proc_tree(void);

@@ -37,3 +37,7 @@ assert_contains "a second read sees the same file" "$first" \
     "$(dev_run 'cat /proc/meminfo')"
 
 assert_status "a missing proc file is refused" 1 dev_status 'cat /proc/nosuch'
+
+# The tree has a mount point: a real directory in the root, the way /dev has
+# one, so the root listing shows it. R-P6.3.
+assert_contains "the root lists the proc mount point" "proc" "$(dev_run 'ls /')"

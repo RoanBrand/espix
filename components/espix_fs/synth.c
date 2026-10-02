@@ -88,6 +88,33 @@ void espix_synth_init(void)
     }
 }
 
+/*
+ * Give every registered tree its mount point: the real littlefs directory its
+ * prefix names. Without one a tree is reachable but invisible -- readdir("/")
+ * lists what littlefs holds, so a tree with no directory there is absent from
+ * the root listing even though /tree/file opens. That is exactly what happened
+ * to /proc beside /dev, whose directory the boot skeleton created.
+ *
+ * Called after the root VFS is registered, because the mkdir has to go through
+ * it. A mount point that already exists (a baked image, or the skeleton) is
+ * fine: EEXIST is the expected answer. vfs_mkdir() lets a mount point itself be
+ * created and refuses anything inside a tree, and vfs_rmdir() refuses the mount
+ * point, so this directory cannot be removed from under the tree.
+ */
+void espix_synth_ensure_mounts(void)
+{
+    for (int t = 0; t < s_tree_count; t++) {
+        const char *p = s_trees[t]->prefix;
+
+        if (mkdir(p, 0755) == 0) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "created %s", p);
+        } else if (errno != EEXIST) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "mkdir %s failed: %s", p,
+                       strerror(errno));
+        }
+    }
+}
+
 /* The partition behind an app node, or NULL when this image has no such slot.
  * Not cached: the answer cannot change, but the walk is over a handful of
  * entries and a cache would need a lock on every read. */

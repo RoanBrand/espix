@@ -285,3 +285,10 @@ dev_run "rm -r $PPD" >/dev/null 2>&1
 
 dev_run "rm $TF" >/dev/null 2>&1
 
+
+# The rootfs image must not carry macOS metadata. .DS_Store is gitignored and
+# never committed, but make-fs-image.sh packs the source directory verbatim, so
+# one used to ride in and show up in the root listing.
+assert_not_contains "the root carries no macOS metadata" ".DS_Store" \
+    "$(dev_run 'ls -a /')"
+assert_not_contains "and none under /home" ".DS_Store" "$(dev_run 'ls -a /home')"

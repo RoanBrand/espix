@@ -1368,10 +1368,11 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
     RESOLVE_OR_FAIL(name, -1);
 
     /*
-     * /dev itself is a real littlefs directory -- the mount point that keeps
-     * `ls /` listing it -- so mkdir("/dev") is let through. A name *inside* it
-     * is not: the device table owns that space and it holds no creatable
-     * entries.
+     * A synthetic tree's mount point (/dev, /proc) is a real littlefs
+     * directory -- created by the engine at init, and the thing that keeps the
+     * root listing showing it -- so mkdir of the mount point itself is let
+     * through. A name *inside* a tree is not: the tree owns that space and
+     * holds no creatable entries.
      */
     if (espix_synth_under(p)) {
         errno = EROFS;

@@ -39,7 +39,7 @@ _Static_assert(sizeof(((struct stat *)0)->st_size) == 8,
  * a removable filesystem, and having it there is what lets `mount sda1 /mnt`
  * work on a device whose image predates mounting. */
 static const char *const k_skeleton[] = {
-    "/bin", "/dev", "/etc", "/home", "/mnt", "/tmp", "/var", "/var/log",
+    "/bin", "/etc", "/home", "/mnt", "/tmp", "/var", "/var/log",
 };
 
 static bool s_mounted;
@@ -177,6 +177,9 @@ esp_err_t espix_fs_mount_root(void)
     }
 
     s_mounted = true;
+    /* The synthetic trees first, so /dev and /proc exist because their trees
+     * were registered rather than because a skeleton lists them. */
+    espix_synth_ensure_mounts();
     ensure_skeleton();
     clear_tmp();
 

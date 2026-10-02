@@ -30,6 +30,19 @@ if [ ! -d "$src" ]; then
     exit 1
 fi
 
+# macOS puts a .DS_Store in every folder Finder has shown and ._* resource forks
+# beside files from a Mac filesystem. They are gitignored and never committed,
+# but this tool packs the source directory verbatim, so they used to ride into
+# the image and turn up in the root listing on the device. Stage a filtered copy
+# rather than let the image depend on nobody having opened Finder.
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+tar -C "$src" \
+    --exclude='.DS_Store' --exclude='._*' --exclude='.Spotlight-V100' \
+    --exclude='.Trashes' --exclude='.fseventsd' \
+    -cf - . | tar -C "$stage" -xf -
+src="$stage"
+
 venv="$root/build/littlefs_py_venv"
 tool="$venv/bin/littlefs-python"
 req="$root/managed_components/joltwallet__littlefs/image-building-requirements.txt"
