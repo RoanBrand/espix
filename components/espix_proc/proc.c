@@ -285,6 +285,28 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
     slot->info.task      = NULL;
 
     /*
+     * Tell the parent, if it is still there. Found by walking the table rather
+     * than by espix_proc_find(), which is defined below this and would need a
+     * forward declaration to say the same thing.
+     *
+     * SIGCHLD is one of the signals espix's default action already ignores, so
+     * this is inert for a parent that does not handle it -- which is what stops
+     * a child's exit from ending the shell. The write is a single aligned word
+     * and the reader clears it under its own delivery point, so no lock beyond
+     * the one already held is needed.
+     */
+    if (slot->info.ppid != ESPIX_PID_NONE) {
+        for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+            espix_proc_slot_t *const p = &g_espix_proc_table.slots[i];
+            if (p != slot && p->info.state != ESPIX_PROC_FREE &&
+                p->info.pid == slot->info.ppid) {
+                p->sig_pending |= espix_sigbit(SIGCHLD);
+                break;
+            }
+        }
+    }
+
+    /*
      * Under the lock, with the state it announces. Released first, as this used
      * to be, a spawn can recycle this slot and clear its finished bit in the
      * gap -- and the set then lands on a slot that already belongs to the next
@@ -1072,6 +1094,20 @@ espix_pid_t espix_proc_self_pid(void)
 {
     const espix_proc_slot_t *const slot = espix_proc_self();
     return (slot != NULL) ? slot->info.pid : ESPIX_PID_NONE;
+}
+
+espix_pid_t espix_proc_parent_of(espix_pid_t pid)
+{
+    if (g_espix_proc_lock == NULL) {
+        return ESPIX_PID_NONE;
+    }
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *const slot = espix_proc_find(pid);
+    const espix_pid_t ppid = (slot != NULL) ? slot->info.ppid : ESPIX_PID_NONE;
+    xSemaphoreGive(g_espix_proc_lock);
+
+    return ppid;
 }
 
 const char *espix_proc_cwd(void)

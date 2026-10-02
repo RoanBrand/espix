@@ -58,6 +58,15 @@ typedef enum {
 
 typedef struct {
     espix_pid_t        pid;
+
+    /*
+     * The process that spawned this one, or ESPIX_PID_NONE when espix started
+     * it itself -- which today is every process, because the shell is a session
+     * task and not a process, and nothing an app can call spawns. Recorded
+     * anyway because it is what a child's exit is reported to (SIGCHLD), and
+     * because a listing should be able to say who asked for a process.
+     */
+    espix_pid_t        ppid;
     char               name[ESPIX_PROC_NAME_MAX];
     char               path[ESPIX_PATH_MAX];
     TaskHandle_t       task;
@@ -221,6 +230,13 @@ espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);
  * reads the table without the process lock -- which is what a listing wants.
  */
 size_t espix_proc_heap_used(espix_pid_t pid);
+
+/*
+ * The pid that spawned `pid`, or ESPIX_PID_NONE if it was espix itself or the
+ * pid is unknown. Takes the table lock, so it is a listing's call and not a
+ * delivery point's.
+ */
+espix_pid_t espix_proc_parent_of(espix_pid_t pid);
 
 /*
  * The credentials of the process running on `task`, or false if that task is

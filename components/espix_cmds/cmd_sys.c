@@ -455,8 +455,8 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
     const uint64_t    total_runtime = (uint64_t)esp_timer_get_time();
     const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
-    espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s %9s\n",
-                 "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%", "HEAP");
+    espix_printf(s, "%5s %-16s %2s %4s %4s %6s %5s %9s %5s\n",
+                 "PID", "NAME", "ST", "PRI", "CORE", "STACK", "CPU%", "HEAP", "PPID");
 
     for (UBaseType_t i = 0; i < count; i++) {
         /*
@@ -540,7 +540,29 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
             snprintf(heap_str, sizeof(heap_str), "-");
         }
 
-        espix_printf(s, "%5s %-16s %2c %4u %4s %6u %4u%% %9s\n",
+        /*
+         * Who started it. '-' for a task that is not a process, and also for a
+         * process espix started itself: the shell is a session task rather than
+         * a process, so today every app shows '-' here. The column is worth its
+         * width anyway -- it is the parent a child's exit is reported to, and a
+         * listing ought to be able to say who that is before it matters.
+         *
+         * Appended rather than placed beside PID, unlike ps(1): the PID-then-
+         * NAME adjacency and the column indices other suites parse are part of
+         * this listing's de facto interface, and a trailing column breaks
+         * neither. Inserting it broke two suites the first time.
+         */
+        char ppid_str[12];
+        const espix_pid_t ppid = (pid != ESPIX_PID_NONE)
+                                     ? espix_proc_parent_of(pid)
+                                     : ESPIX_PID_NONE;
+        if (ppid != ESPIX_PID_NONE) {
+            snprintf(ppid_str, sizeof(ppid_str), "%d", (int)ppid);
+        } else {
+            snprintf(ppid_str, sizeof(ppid_str), "-");
+        }
+
+        espix_printf(s, "%5s %-16s %2c %4u %4s %6u %4u%% %9s %5s\n",
                      pid_str,
                      tasks[i].pcTaskName,
                      st,
@@ -548,7 +570,8 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
                      core_str,
                      (unsigned)tasks[i].usStackHighWaterMark,
                      pct,
-                     heap_str);
+                     heap_str,
+                     ppid_str);
     }
 
     free(tasks);

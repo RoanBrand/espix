@@ -7,11 +7,15 @@ menu "espix kernel"
         help
             Number of lines retained by the kernel log ring that backs `dmesg`.
 
-            The ring is allocated in PSRAM at init, with an internal fallback,
-            and a line costs ESPIX_KLOG_LINE_MAX + ~16 bytes: 96 lines is about
-            12 kB and 256 about 34 kB. Nothing internal is spent on it, which is
-            the argument for having enough history to explain a boot -- a ring
-            that wraps loses exactly the lines that a fault would be read for.
+            A line costs ESPIX_KLOG_LINE_MAX + ~16 bytes: 96 lines is about
+            12 kB and 256 about 34 kB. It is PSRAM that pays -- klog.c asks for
+            MALLOC_CAP_SPIRAM with an internal fallback, and the measurement
+            agrees: raising this from 96 to 256 left internal usage unchanged
+            (247 kB used either way), so the extra 21 kB came from the pool with
+            13 MB in it rather than the one audio, lwIP and the USB host share.
+
+            A ring that wraps loses exactly the lines a fault is read for: at
+            96, dmesg reported "507 earlier lines dropped" during one hunt.
 
     config ESPIX_KLOG_QUIET
         bool "Keep kernel log lines out of the console (dmesg only)"

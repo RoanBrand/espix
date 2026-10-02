@@ -370,3 +370,23 @@ else
 fi
 
 dev_run "rm $FDFILE" >/dev/null 2>&1
+
+# --- parentage is recorded, even when there is nothing to be a parent ------
+#
+# The shell is a session task rather than a process, so an app it starts has no
+# parent and shows '-' in the last column. The field behind it is what a child's
+# exit is reported to (SIGCHLD), which needs something that is a process to
+# spawn -- so the column is checked now and the notification is written and
+# inert until then.
+
+assert_contains "ps has a parent column" "PPID" "$(dev_run ps | head -1)"
+
+pid=$(dev_run "$APP hold 60 1000 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -z "$pid" ]; then
+    espix_fail "an app can be listed for its parent" "no [pid] line"
+else
+    sleep 1
+    ppid_col=$(dev_run ps | awk -v p="$pid" '$1 == p { print $9; exit }')
+    assert_eq "a shell-spawned app has no parent" "-" "$ppid_col"
+    dev_run "kill -9 $pid" >/dev/null
+fi

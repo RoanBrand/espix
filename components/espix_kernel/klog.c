@@ -24,7 +24,12 @@
 #define KLOG_LINES CONFIG_ESPIX_KLOG_LINES
 
 /*
- * Allocated in PSRAM at init rather than a static array.
+ * Allocated in PSRAM at init rather than a static array, with an internal
+ * fallback that should never run: measured by raising the ring from 96 to 256
+ * lines, which left internal usage unchanged (247 kB either way) -- so the
+ * extra 21 kB came from PSRAM, not from the pool audio, lwIP and the USB host
+ * share. Worth stating because the fallback makes the opposite look plausible
+ * (docs/WORKLIST.md, R-P0.8).
  *
  * It is 12.4 kB (96 x ~132 B), and internal RAM is the pool the audio decoder
  * and Bluetooth both need; PSRAM is 13 MB. The file header's "usable before the
