@@ -341,3 +341,32 @@ assert_contains "four threads share a counter under a mutex" \
     "counter 20000 after 4 thread(s) x 5000" "$out"
 assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 
+
+# --- a process gives its files back when it ends ---------------------------
+#
+# The descriptor an app holds is IDF's, not espix's, and it comes from a fixed
+# MAX_FDS pool shared with sockets. A process killed with files open, whose
+# descriptors nothing released, could exhaust that pool and stop the whole
+# system opening a file -- which is what closing the layer below directly did,
+# while both that close and espix's own slot reported success.
+#
+# The probe measures the capacity itself and holds only half of it, so it can
+# never fill the table (a full table cannot load the next app's binary). Two
+# runs must therefore report the same capacity.
+
+FDFILE=/tmp/espix-fds-$ESPIX_WORKER.txt
+dev_run "rm $FDFILE" >/dev/null 2>&1
+
+first=$(dev_run "$APP fdprobe $FDFILE 8")
+n1=$(printf '%s' "$first" | awk '/^capacity/ {print $2; exit}')
+second=$(dev_run "$APP fdprobe $FDFILE 0")
+n2=$(printf '%s' "$second" | awk '/^capacity/ {print $2; exit}')
+
+if [ -z "$n1" ] || [ "$n1" -lt 8 ] 2>/dev/null; then
+    espix_fail "the descriptor pool reports its capacity" "got '$n1' from: $first"
+else
+    assert_eq "a process that ends holding files gives them back" "$n1" "$n2"
+    assert_contains "and the device is still up" "espix" "$(dev_run uname)"
+fi
+
+dev_run "rm $FDFILE" >/dev/null 2>&1

@@ -51,6 +51,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -59,6 +60,21 @@
 #include "esp_littlefs.h"
 #include "esp_vfs.h"
 #include "esp_vfs_ops.h"
+
+/*
+ * IDF's reverse lookup: given a descriptor, whose file it is. Declared here
+ * because the header they live in (vfs's private_include/esp_vfs_private.h) is
+ * not on a dependent component's include path -- PRIV_INCLUDE_DIRS are private
+ * to the component that names them -- and these two are how
+ * espix_fs_fds_close_owned() turns a reaped key back into the descriptor IDF
+ * allocated for it, which is the only way IDF's own entry is released.
+ *
+ * Both are non-static in vfs.c and exported by libvfs.a (its linker fragment
+ * restricts only two select-related symbols). The opaque pointer is IDF's
+ * vfs_entry_t, which only ever travels from one of these calls into the other.
+ */
+const void *get_vfs_for_fd(int fd);
+int get_local_fd(const void *vfs, int fd);
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -180,8 +196,17 @@ static portMUX_TYPE s_mount_lock = portMUX_INITIALIZER_UNLOCKED;
 #define ESPIX_FS_FD_MAX  32
 
 typedef struct {
-    int     lower_fd;   /* the number the layer below knows it by, -1 = free */
-    uint8_t mount;      /* index into s_mounts, +1 */
+    int         lower_fd;   /* the number the layer below knows it by, -1 = free */
+    uint8_t     mount;      /* index into s_mounts, +1 */
+
+    /*
+     * The process that opened it, or ESPIX_PID_NONE for the shell's own. A
+     * process that is killed never runs its own close(), and the descriptor
+     * IDF allocated for the file would never be released -- so this is what
+     * lets the reaper find what it left open. Pids are never reused, so a
+     * recycled process cannot inherit a dead one's files.
+     */
+    espix_pid_t owner;
 } fd_slot_t;
 
 static fd_slot_t s_fds[ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX];
@@ -196,6 +221,7 @@ static void fd_table_init(void)
 {
     for (size_t i = 0; i < sizeof(s_fds) / sizeof(s_fds[0]); i++) {
         s_fds[i].lower_fd = -1;
+        s_fds[i].owner    = ESPIX_PID_NONE;
     }
 }
 
@@ -367,11 +393,20 @@ static int fd_slot_alloc(int lower_fd, const lower_t *mount)
 
     int fd = -1;
 
+    /*
+     * Whose it is, asked once and before the lock: the answer walks the process
+     * table, and the loop below is a critical section. A caller that is not a
+     * process -- the console, a session's own redirect -- records none, and its
+     * files stay the shell's to close, as they always were.
+     */
+    const espix_pid_t owner = espix_proc_self_pid();
+
     portENTER_CRITICAL(&s_mount_lock);
     for (int i = ESPIX_FS_FD_BASE; i < ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX; i++) {
         if (s_fds[i].lower_fd < 0) {
             s_fds[i].lower_fd = lower_fd;
             s_fds[i].mount    = (uint8_t)((mount - s_mounts) + 1);
+            s_fds[i].owner    = owner;
             fd = i;
             break;
         }
@@ -398,7 +433,54 @@ static void fd_slot_free(int fd)
     portENTER_CRITICAL(&s_mount_lock);
     s_fds[fd].lower_fd = -1;
     s_fds[fd].mount    = 0;
+    s_fds[fd].owner    = ESPIX_PID_NONE;
     portEXIT_CRITICAL(&s_mount_lock);
+}
+
+/*
+ * Close everything a process left open.
+ *
+ * By finding IDF's descriptor for each of espix's keys and closing through
+ * IDF -- *not* by calling the layer below directly, which is what leaked.
+ *
+ * The descriptor the app holds is IDF's: esp_vfs_open() calls this VFS's open
+ * first (which returns espix's key) and only then allocates an entry from its
+ * own table, storing the key as that entry's local_fd. So espix is never told
+ * the number the app used, and only esp_vfs_close() releases the entry.
+ * Calling close_p directly, as this used to, freed espix's slot and the
+ * filesystem's handle and left IDF's entry allocated for the rest of the boot
+ * -- and the pool is MAX_FDS (== FD_SETSIZE, shared with sockets), so a few
+ * killed apps exhausted it and then nothing could open a file at all.
+ *
+ * The descriptor is looked up rather than remembered because there is nowhere
+ * to remember it: the key is all espix is given, and IDF allocates after the
+ * call returns. get_local_fd() is IDF's own lookup, and the scan runs over
+ * MAX_FDS entries once per dead process.
+ */
+void espix_fs_fds_close_owned(int32_t pid)
+{
+    if (pid < 0) {
+        return;
+    }
+
+    for (int key = ESPIX_FS_FD_BASE; key < ESPIX_FS_FD_BASE + ESPIX_FS_FD_MAX; key++) {
+        bool mine;
+
+        portENTER_CRITICAL(&s_mount_lock);
+        mine = (s_fds[key].lower_fd >= 0 && s_fds[key].owner == pid);
+        portEXIT_CRITICAL(&s_mount_lock);
+
+        if (!mine) {
+            continue;
+        }
+
+        for (int fd = 0; fd < MAX_FDS; fd++) {
+            if (get_local_fd(get_vfs_for_fd(fd), fd) == key) {
+                (void)close(fd);
+                break;
+            }
+        }
+    }
 }
 
 static const lower_t *mount_by_dir(DIR *pdir)

@@ -1002,6 +1002,57 @@ static int cmd_threaded(const char *count_s)
     return (made == THREADS && s_bumped == THREADS * n) ? 0 : 1;
 }
 
+/*
+ * Measure the descriptor table, then leave a fraction of it held.
+ *
+ * Two runs of this answer the only question that matters: does a process that
+ * ends holding files give them back? The first reports the table's free
+ * capacity and exits holding some of it; the second reports the capacity
+ * again, and equal means they came back.
+ *
+ * The first batch is closed before the fraction is taken, and the fraction is
+ * capped at half the capacity, so the table is never full -- a full table
+ * cannot load the next app's binary, so a probe that simply fills it takes the
+ * board down instead of failing a check.
+ */
+static int cmd_fdprobe(const char *path, const char *hold_s)
+{
+    enum { MAX_FDS = 256 };
+    static int fds[MAX_FDS];
+    int cap = 0;
+
+    while (cap < MAX_FDS) {
+        const int fd = open(path, O_WRONLY | O_CREAT, 0644);
+        if (fd < 0) {
+            break;
+        }
+        fds[cap++] = fd;
+    }
+
+    printf("capacity %d\n", cap);
+
+    for (int i = 0; i < cap; i++) {
+        close(fds[i]);
+    }
+
+    int hold = (int)strtol(hold_s, NULL, 10);
+    if (hold > cap / 2) {
+        hold = cap / 2;
+    }
+
+    int held = 0;
+    for (int i = 0; i < hold; i++) {
+        if (open(path, O_WRONLY | O_CREAT, 0644) < 0) {
+            break;
+        }
+        held++;
+    }
+
+    printf("held %d of %d\n", held, hold);
+    fflush(stdout);
+    return 0;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -1032,6 +1083,7 @@ static void usage(void)
            "  leak <bytes>...     allocate and return without freeing any of it\n"
            "  leakthread <bytes> allocate in a new thread, never free it\n"
            "  threaded <n>        four threads add n each under a mutex\n"
+           "  fdprobe <path> <hold>  report fd capacity, then hold some\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -1158,6 +1210,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "threaded") == 0 && argc > 2) {
         return cmd_threaded(argv[2]);
+    }
+    if (strcmp(cmd, "fdprobe") == 0 && argc > 3) {
+        return cmd_fdprobe(argv[2], argv[3]);
     }
 
     if (strcmp(cmd, "abi") == 0 && argc > 2) {

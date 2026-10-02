@@ -340,6 +340,14 @@ void espix_fs_priv_begin(void);
 void espix_fs_priv_end(void);
 
 /*
+ * Close every file still open on behalf of pid (an espix_pid_t; -1 for none).
+ * Called by the process reaper, so it takes the owner as an argument rather
+ * than asking who is calling, and it closes through IDF rather than the layer
+ * below -- see the note in vfs.c, which is the whole reason this exists.
+ */
+void espix_fs_fds_close_owned(int32_t pid);
+
+/*
  * Whether `abs_path` may be executed: a regular file whose mode has S_IXUSR.
  *
  * This is what the shell gates on. It replaces sniffing the ELF magic at the

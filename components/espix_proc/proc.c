@@ -14,6 +14,7 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
+#include "espix_fs.h"
 #include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
 
 #define TAG "proc"
@@ -205,6 +206,16 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     if (slot == NULL) {
         return;
     }
+
+    /*
+     * First, whatever it left open. A process killed with files open never
+     * runs its own close(), and the descriptors IDF allocated for them are a
+     * fixed MAX_FDS pool shared with sockets -- so enough kills stop the whole
+     * system opening a file. By pid rather than by slot because this runs on
+     * the reaper's task, which is not the process. Before the memory below,
+     * because the layer underneath may still need it in order to close.
+     */
+    espix_fs_fds_close_owned(slot->info.pid);
 
     if (slot->elf_valid) {
         esp_elf_deinit(&slot->elf);
@@ -1055,6 +1066,12 @@ void espix_proc_paths(const char **cwd, const char **root)
     if (root != NULL) {
         *root = (slot == NULL || !slot->root_active) ? "" : slot->root;
     }
+}
+
+espix_pid_t espix_proc_self_pid(void)
+{
+    const espix_proc_slot_t *const slot = espix_proc_self();
+    return (slot != NULL) ? slot->info.pid : ESPIX_PID_NONE;
 }
 
 const char *espix_proc_cwd(void)

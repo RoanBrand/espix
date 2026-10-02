@@ -274,6 +274,14 @@ const char *espix_proc_root(void);
 void espix_proc_paths(const char **cwd, const char **root);
 
 /*
+ * The calling process's pid, or ESPIX_PID_NONE if the caller is not one. The
+ * same lookup espix_proc_paths() does, for callers that want only the identity
+ * -- the VFS stamps it on every file it opens, so the reaper can find what a
+ * killed process left open.
+ */
+espix_pid_t espix_proc_self_pid(void);
+
+/*
  * Move the calling process's working directory. `abs_path` must be absolute
  * and must be a directory.
  *
