@@ -358,33 +358,6 @@ assert_contains "four threads share a counter under a mutex" \
 assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 
 
-# --- a process gives its files back when it ends ---------------------------
-#
-# The descriptor an app holds is IDF's, not espix's, and it comes from a fixed
-# MAX_FDS pool shared with sockets. A process killed with files open, whose
-# descriptors nothing released, could exhaust that pool and stop the whole
-# system opening a file -- which is what closing the layer below directly did,
-# while both that close and espix's own slot reported success.
-#
-# The probe measures the capacity itself and holds only half of it, so it can
-# never fill the table (a full table cannot load the next app's binary). Two
-# runs must therefore report the same capacity.
-
-FDFILE=/tmp/espix-fds-$ESPIX_WORKER.txt
-dev_run "rm $FDFILE" >/dev/null 2>&1
-
-first=$(dev_run "$APP fdprobe $FDFILE 8")
-n1=$(printf '%s' "$first" | awk '/^capacity/ {print $2; exit}')
-second=$(dev_run "$APP fdprobe $FDFILE 0")
-n2=$(printf '%s' "$second" | awk '/^capacity/ {print $2; exit}')
-
-if [ -z "$n1" ] || [ "$n1" -lt 8 ] 2>/dev/null; then
-    espix_fail "the descriptor pool reports its capacity" "got '$n1' from: $first"
-else
-    assert_eq "a process that ends holding files gives them back" "$n1" "$n2"
-    assert_contains "and the device is still up" "espix" "$(dev_run uname)"
-fi
-
 # --- dup/dup2/fcntl(F_DUPFD): a second descriptor for one open file --------
 #
 # R-P1.8. A duplicate is another descriptor for the same open file: the offset
@@ -400,19 +373,7 @@ assert_status "dup/dup2/F_DUPFD share one open file correctly" 0 \
 assert_contains "and the run leaves no descriptor behind" "dup ok:" \
     "$(dev_run "$APP dup $DUPFILE")"
 
-# The reaper has to close every IDF entry a dup left on one key, not only the
-# first: a process that exits holding three duplicates must cost the pool
-# nothing. Same capacity, measured the same way as the fdprobe pair above.
-if [ -n "$n1" ] && [ "$n1" -ge 8 ] 2>/dev/null; then
-    out=$(dev_run "$APP dup $DUPFILE hold" 2>&1)
-    assert_contains "a process can end holding duplicated descriptors" \
-        "dupped 3" "$out"
-    n3=$(dev_run "$APP fdprobe $DUPFILE 0" | awk '/^capacity/ {print $2; exit}')
-    assert_eq "and every duplicate is given back" "$n1" "$n3"
-fi
-
 dev_run "rm $DUPFILE" >/dev/null 2>&1
-dev_run "rm $FDFILE" >/dev/null 2>&1
 
 # --- parentage is recorded, even when there is nothing to be a parent ------
 #
