@@ -59,9 +59,10 @@ together.
 | Programs | A game as an app | **partial** | `apps/doom` runs the shareware's levels, launched from a desktop icon, keyboard only, with its WAD fetched on the first launch instead of shipped. Its frame rate is the RFB encoder's (hextile on game imagery is ~50x its desktop cost), not the engine's, and its ~7 MB per run is not reclaimed until a reboot — see [ROADMAP.md](docs/ROADMAP.md#app-data-the-program-does-not-ship) |
 | Programs | Fetching a file over HTTP(S) | **yes** | `fetch <url> <path>`, sharing `upgrade`'s HTTP and TLS stack and certificate bundle; checks room first and says where to get some back. An app declares its data in `/etc/apps/<name>.conf` and the launcher — desktop icon or command line — fetches anything missing before it starts, so no program holds a network handle of its own |
 | Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
-| Shell | Serial console and SSH, same commands | **yes** | 62 commands |
-| Shell | Redirection, quoting, exit status | **yes** | `2>` and `2>&1` separate over SSH too |
+| Shell | Serial console and SSH, same commands | **yes** | 87 commands |
+| Shell | Redirection, quoting, exit status | **yes** | fd-numbered and attached forms (`2>/dev/null`, `>file`), and `2>` separates over SSH too |
 | Shell | Line editing, history, TAB completion | **yes** | |
+| System | Services and timers that outlive a login | **yes** | `/etc/units`: `always`, `once` or `every <interval>` units (a program or a shell builtin), a supervisor task, safe mode after a fault, and a built-in default that runs the update check on a schedule |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
 | Networking | WiFi access point | **yes** | `wifi ap start` brings up `wlan1` beside the station and NATs clients out the uplink; one radio, one AP, shared channel |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
@@ -102,8 +103,8 @@ together.
 | ISA | Xtensa | RISC-V | RISC-V |
 | MMU | none | address translation and RISC-V PMP | a real one — a Linux BSP exists |
 | Process isolation | guardrail only | fault isolation between tasks, to confirm | **planned**, `fork()`-shaped |
-| USB | one OTG: host **or** device | two, so both at once | one OTG |
-| Radio | WiFi 4 / BLE 5.0 | none built in — companion chip needed | WiFi 6 / BT Classic / BT 5.4 LE / IEEE 802.15.4 |
+| USB | 1x USB1.1 | 1x USB1.1 / 1x USB2.0 | 1x USB2.0 |
+| Radio | WiFi 4 / BLE 5.0 | - | WiFi 6 / BT Classic / BT 5.4 LE / IEEE 802.15.4 |
 | Wired | — | 100M Ethernet | Gigabit Ethernet |
 | Display | parallel RGB and i8080, through `LCD_CAM` | MIPI DSI, plus RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; no MIPI, and weaker than the P4 |
 | Runs today | **yes** | no | **yes** |

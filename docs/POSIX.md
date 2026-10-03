@@ -15,13 +15,13 @@ merely missing.
 |---|---|---|
 | Interactive shell over serial and SSH | **yes** | same dispatch, same output on both |
 | Line editing, history, TAB completion | **yes** | history follows the user, not the connection |
-| Output redirection `>` `>>` | **yes** | |
-| Error redirection `2>` `2>>` `2>&1` | **yes** | diagnostics are their own stream; over SSH they arrive as `CHANNEL_EXTENDED_DATA`, so the client's `2>` separates them too |
+| Output redirection `>` `>>` | **yes** | attached too: `>file`, `1>file` |
+| Error redirection `2>` `2>>` `2>&1` | **yes** | attached or separated (`2>file`); diagnostics are their own stream, and over SSH they arrive as `CHANNEL_EXTENDED_DATA`, so the client's `2>` separates them too |
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
-| Background jobs `&` | **partial** | `cmd &` works, but dies at logout; no `jobs`, `fg`, `bg`, Ctrl-Z |
-| Pipes <code>&#124;</code> | **planned** | |
-| Input redirection `<` | **planned** | a loaded app has a real `stdin` (`ssh host 'prog' < file` works); no builtin reads it, and there is no `<` |
+| Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`/Ctrl-Z; a job still dies at logout by design |
+| Pipes <code>&#124;</code> | **yes** | one StreamBuffer per pipe, refcounted |
+| Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |
 | Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv` |
 | Globbing `*` | **planned** | |
 | Shell scripts, `#!`, control flow | **planned** | the executable bit is now real, so `#!` needs only the dispatch: a file that is executable but not an ELF is where the interpreter line would be read |
