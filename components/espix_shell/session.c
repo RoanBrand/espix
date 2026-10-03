@@ -201,14 +201,94 @@ typedef struct {
  * thing, and the rare one is not silently wrong -- it simply behaves as the
  * common one.
  */
+/*
+ * Split an attached redirection -- 2>/dev/null, >out, >>out, <in -- into the
+ * two words the separated form already uses.
+ *
+ * POSIX writes the descriptor against the operator with no space, and that is
+ * the form people type; the separated one (2> /dev/null) was all that was
+ * recognised, so the attached word became an argument and the command was told
+ * about a file called "2>/dev/null".
+ *
+ * The operator is replaced by one of the canonical literals take_redirects()
+ * matches, and the target is inserted after it, so no byte of the caller's
+ * buffer has to be overwritten to terminate the operator. Returns 1 when it
+ * split one, 0 when the word is not an attached redirection, and -1 on a
+ * descriptor espix does not redirect.
+ */
+static int take_attached(espix_session_t *s, char **argv, int *argc, int i)
+{
+    char *p = argv[i];
+    char *o = p;
+    int   fd = -1;
+
+    if (*o >= '0' && *o <= '9') {
+        fd = *o - '0';
+        o++;
+    }
+
+    const char *op;
+    char       *target;
+
+    if (o[0] == '<') {
+        if (fd > 0) {
+            goto bad_fd;
+        }
+        op     = "<";
+        target = o + 1;
+    } else if (o[0] == '>' && o[1] == '>') {
+        if (fd > 2 || fd == 0) {
+            goto bad_fd;
+        }
+        op     = (fd == 2) ? "2>>" : ">>";
+        target = o + 2;
+    } else if (o[0] == '>') {
+        if (o[1] == '&') {
+            return 0;                   /* 2>&1 is a word of its own */
+        }
+        if (fd > 2 || fd == 0) {
+            goto bad_fd;
+        }
+        op     = (fd == 2) ? "2>" : ">";
+        target = o + 1;
+    } else {
+        return 0;
+    }
+
+    if (*target == '\0') {
+        return 0;                       /* ">" alone: the separated form */
+    }
+    if (*argc + 1 >= ESPIX_ARGS_MAX) {
+        espix_eprintf(s, "espix: too many words for a redirection\n");
+        return -1;
+    }
+
+    for (int k = *argc; k > i + 1; k--) {
+        argv[k] = argv[k - 1];
+    }
+    argv[i]     = (char *)op;
+    argv[i + 1] = target;
+    (*argc)++;
+    return 1;
+
+bad_fd:
+    espix_eprintf(s, "espix: only descriptors 0, 1 and 2 can be redirected\n");
+    return -1;
+}
+
 static int take_redirects(espix_session_t *s, int argc, char **argv,
                           redirects_t *r)
 {
     memset(r, 0, sizeof(*r));
 
-    int first = argc;
+    int  first = argc;
+    bool seen  = false;
 
     for (int i = 0; i < argc; i++) {
+        if (take_attached(s, argv, &argc, i) < 0) {
+            return -1;
+        }
+
         const char *tok = argv[i];
 
         const bool to_out = (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0);
@@ -217,7 +297,7 @@ static int take_redirects(espix_session_t *s, int argc, char **argv,
         const bool dup    = (strcmp(tok, "2>&1") == 0);
 
         if (!to_out && !to_err && !to_in && !dup) {
-            if (first != argc) {
+            if (seen) {
                 /* The shell strips a trailing & after this, but a redirection
                  * is a FILE that this call would close when the line returns,
                  * so it cannot be lent to a job that outlives the line. Say so
@@ -235,8 +315,9 @@ static int take_redirects(espix_session_t *s, int argc, char **argv,
             continue;
         }
 
-        if (first == argc) {
+        if (!seen) {
             first = i;
+            seen  = true;
         }
 
         if (dup) {
