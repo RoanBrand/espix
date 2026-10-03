@@ -108,7 +108,7 @@ fi
 # for up to PARTIAL_READ_TIMEOUT_MS, so the previous poller is often still
 # present and the count never falls to 1 even after the peer is gone.
 #
-# Count `app:testapp` instead. The stalled session is the only thing running the
+# Count testapp instead. The stalled session is the only thing running the
 # app; pollers run `ps`. So it reads 1 while the peer is stranded and 0 the
 # moment its connection is reclaimed, with nothing else able to muddy it.
 #
@@ -170,7 +170,7 @@ else
         while [ "$elapsed" -lt "$RECLAIM_TIMEOUT" ]; do
             sleep 5
             elapsed=$((elapsed + 5))
-            tasks=$(dev_once 'ps' | grep -c 'app:testapp')
+            tasks=$(dev_once 'ps' | sed -n '1,/^finished:/p' | grep -c 'testapp')
             if [ "$tasks" -eq 0 ]; then
                 held=0
                 break
@@ -181,7 +181,7 @@ else
             espix_pass "a silent peer's connection was reclaimed (${elapsed}s)"
         else
             espix_fail "a silent peer held its connection for ${elapsed}s" \
-                       "app:testapp tasks still $tasks, expected 0" \
+                       "testapp tasks still $tasks, expected 0" \
                        "SO_SNDTIMEO missing, or write_all no longer gives up"
         fi
     fi

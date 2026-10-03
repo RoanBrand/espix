@@ -197,7 +197,7 @@ if dev_testapp_present; then
     pid=""
     wait_i=0
     while [ "$wait_i" -lt 20 ]; do
-        pid=$(dev_run 'ps' | sed -n 's/^ *\([0-9][0-9]*\) app:testapp.*/\1/p' | head -1)
+        pid=$(dev_run 'ps' | sed -n '1,/^finished:/p' | sed -n 's/^ *\([0-9][0-9]*\) testapp.*/\1/p' | head -1)
         [ -n "$pid" ] && break
         sleep 1
         wait_i=$((wait_i + 1))
@@ -205,7 +205,7 @@ if dev_testapp_present; then
 
     if [ -z "$pid" ]; then
         espix_fail "a redirected foreground app is running to be killed" \
-                   "no app:testapp in ps; nothing was killed, so the next" \
+                   "no testapp in ps; nothing was killed, so the next" \
                    "assertion would pass without testing anything"
     else
         dev_run "kill -9 $pid" >/dev/null

@@ -483,6 +483,20 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
         const espix_pid_t pid = espix_proc_pid_of_task(tasks[i].xHandle);
 
+        /*
+         * The process name, not the FreeRTOS task's. A spawned app's task is
+         * "app:testapp" while its process is "testapp", so the live table showed
+         * one process under two names, and the finished section printed the
+         * process name -- nothing could match an app by name across the two
+         * (R-P7.6). A kernel task has no pid and keeps its task name.
+         */
+        char        name[ESPIX_PROC_NAME_MAX];
+        const char *shown = tasks[i].pcTaskName;
+        if (pid != ESPIX_PID_NONE &&
+            espix_proc_name_of(pid, name, sizeof(name))) {
+            shown = name;
+        }
+
         char pid_str[12];
         if (pid != ESPIX_PID_NONE) {
             snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
@@ -571,7 +585,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
 
         espix_printf(s, "%5s %-16s %2c %4u %4s %6u %9s %5s %4u%%\n",
                      pid_str,
-                     tasks[i].pcTaskName,
+                     shown,
                      st,
                      (unsigned)tasks[i].uxCurrentPriority,
                      core_str,

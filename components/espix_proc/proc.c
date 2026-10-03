@@ -1281,6 +1281,23 @@ size_t espix_proc_history(espix_proc_record_t *out, size_t n)
     return count;
 }
 
+bool espix_proc_name_of(espix_pid_t pid, char *out, size_t len)
+{
+    if (out == NULL || len == 0) {
+        return false;
+    }
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *slot = espix_proc_find(pid);
+    const bool found = (slot != NULL);
+    if (found) {
+        strlcpy(out, slot->info.name, len);
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+
+    return found;
+}
+
 espix_proc_state_t espix_proc_state_of(espix_pid_t pid)
 {
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);

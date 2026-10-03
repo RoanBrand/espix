@@ -161,11 +161,11 @@ app_heap_bytes() {
     # nesting one inside another's pipeline races them for the same FIFOs.
     local c
     c=$(ps_col HEAP)
-    dev_run ps | awk -v c="$c" '$2 == "app:testapp" { print $c; exit }'
+    dev_run ps | awk -v c="$c" '$2 == "testapp" { print $c; exit }'
 }
 
 app_running() {
-    dev_run ps | sed -n '1,/^finished:/p' | grep -q "$1 app:testapp"
+    dev_run ps | sed -n '1,/^finished:/p' | grep -q "$1 testapp"
 }
 
 wait_app_gone() {
@@ -436,11 +436,26 @@ assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 # which runs the teardown and deletes the task, so prvDeleteTCB -- the PSRAM
 # stack free and the newlib reent reclaim -- happens on a normal stack instead
 # of the idle task's small one. What it must not do is leave the task parked
-# in the scheduler's list, so after a run nothing named app:testapp is a task.
+# in the scheduler's list, so after a run nothing named testapp is a task.
 
 dev_run "$APP exit 0" >/dev/null 2>&1
-left=$(dev_run ps | sed -n '1,/^finished:/p' | grep -c 'app:testapp')
+left=$(dev_run ps | sed -n '1,/^finished:/p' | grep -c 'testapp')
 assert_eq "a finished process is deleted by the reaper" "0" "$left"
+
+# One process, one name (R-P7.6): the live table prints the process name, so a
+# running app and its finished entry agree, and awk on the NAME column works
+# across both states.
+pid=$(dev_run "$APP hold 60 1000 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -z "$pid" ]; then
+    espix_fail "a live app and its finished entry share a name" "no pid"
+else
+    live=$(dev_run ps | sed -n '1,/^finished:/p' | awk -v p="$pid" '$1 == p { print $2; exit }')
+    dev_run "kill -9 $pid" >/dev/null 2>&1
+    sleep 1
+    ended=$(dev_run ps | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $2; exit }')
+    assert_eq "a live app reads as its process name" "testapp" "$live"
+    assert_eq "and its finished entry agrees" "testapp" "$ended"
+fi
 
 # timeout: run a program with a limit, and reuse the foreground wait. R-P2.11.
 if dev_testapp_present; then

@@ -41,7 +41,7 @@ bg_start() {
 
 is_running() {
     case "$(ps_running)" in
-        *"$1 app:testapp"*) return 0 ;;
+        *"$1 testapp"*) return 0 ;;
         *)                  return 1 ;;
     esac
 }

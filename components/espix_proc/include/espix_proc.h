@@ -394,6 +394,17 @@ esp_err_t espix_proc_chdir(const char *abs_path);
  */
 espix_proc_state_t espix_proc_state_of(espix_pid_t pid);
 
+/*
+ * The process name behind a pid -- the basename it was spawned as -- copied
+ * into out. False when no live process has that pid.
+ *
+ * This is what ps prints for a process, and not the FreeRTOS task name: an
+ * app's task is "app:testapp" while its process is "testapp", so the live
+ * listing and the finished one would otherwise show one process under two
+ * names (R-P7.6). A kernel task has no pid and no process name.
+ */
+bool espix_proc_name_of(espix_pid_t pid, char *out, size_t len);
+
 const char *espix_proc_state_str(espix_proc_state_t state);
 
 #if CONFIG_ESPIX_PROC_ABI_WATCHPOINT
