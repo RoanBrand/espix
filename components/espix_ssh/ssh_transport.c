@@ -344,6 +344,22 @@ esp_err_t ssh_rx_start(ssh_conn_t *c)
     return ESP_OK;
 }
 
+size_t ssh_rx_pending(const ssh_conn_t *c)
+{
+    return rx_used(c);
+}
+
+bool ssh_rx_wait(ssh_conn_t *c, uint32_t timeout_ms)
+{
+    if (rx_used(c) > 0) {
+        return true;
+    }
+
+    const TickType_t ticks = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
+    (void)xSemaphoreTake(c->rx_data, ticks);
+    return rx_used(c) > 0;
+}
+
 void ssh_rx_stop(ssh_conn_t *c)
 {
     if (c->rx_exit.task != NULL) {

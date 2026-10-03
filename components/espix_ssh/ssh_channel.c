@@ -385,11 +385,9 @@ static esp_err_t wait_for_window(ssh_chan_t *ch)
          * that lock forever and take every other writer with it. Bounding the
          * wait costs a spin of the loop above, which is already capped.
          */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(c->fd, &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = RX_WAIT_MS * 1000 };
-        if (select(c->fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+        /* The reader owns the socket, so select() would miss a packet already
+         * in the ring. Wait on the ring instead. */
+        if (!ssh_rx_wait(c, RX_WAIT_MS)) {
             xSemaphoreGive(ch->rx_lock);
             continue;
         }
@@ -770,17 +768,10 @@ static bool chan_poll_interrupt(espix_session_t *s)
          *
          * Never for a pty, for the same reason as the send above.
          */
-        fd_set         rfds;
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+        const uint32_t wire_wait =
+            (!ch->has_pty && ch->stdin_q != NULL) ? STDIN_WIRE_WAIT_MS : 0;
 
-        if (!ch->has_pty && ch->stdin_q != NULL) {
-            tv.tv_usec = STDIN_WIRE_WAIT_MS * 1000;
-        }
-
-        FD_ZERO(&rfds);
-        FD_SET(ch->conn->fd, &rfds);
-
-        if (select(ch->conn->fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+        if (!ssh_rx_wait(ch->conn, wire_wait)) {
             return hit;                 /* nothing on the wire */
         }
 
@@ -1458,13 +1449,7 @@ static ssize_t ssh_edit_write(int fd, const void *buf, size_t count)
 static void chan_drain_pending(ssh_chan_t *ch)
 {
     while (!ch->closed && ch->pending_pos >= ch->pending_len) {
-        fd_set         rfds;
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
-
-        FD_ZERO(&rfds);
-        FD_SET(ch->conn->fd, &rfds);
-
-        if (select(ch->conn->fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+        if (!ssh_rx_wait(ch->conn, 0)) {
             return;             /* nothing waiting */
         }
         if (chan_pump(ch) != ESP_OK) {
@@ -2006,6 +1991,15 @@ static esp_err_t forward_pump(ssh_chan_t *ch, int tcp_fd)
     uint8_t     buf[SSH_CHANNEL_MAX_PACKET];
 
     while (!ch->closed && !(tcp_eof && peer_eof)) {
+        /* The reader may hold a whole packet while the socket is quiet, so
+         * take that first; the select below then only waits for the rest. */
+        if (ssh_rx_pending(c) > 0) {
+            if (forward_packet(ch, tcp_fd, &peer_eof) != ESP_OK) {
+                break;
+            }
+            continue;
+        }
+
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(c->fd, &rfds);

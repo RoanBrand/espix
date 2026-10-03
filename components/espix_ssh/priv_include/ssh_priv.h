@@ -282,6 +282,16 @@ esp_err_t ssh_rx_start(ssh_conn_t *c);
 void      ssh_rx_stop(ssh_conn_t *c);
 
 /*
+ * Bytes already in the ring, and a bounded wait for some to arrive.
+ *
+ * A select() on the socket is not the test it looks like any more: the reader
+ * owns recv(), so it can have taken a whole packet into the ring while the
+ * socket is quiet. Every wait that used to select on the fd asks this instead.
+ */
+size_t ssh_rx_pending(const ssh_conn_t *c);
+bool   ssh_rx_wait(ssh_conn_t *c, uint32_t timeout_ms);
+
+/*
  * Prepare HMAC-SHA256's ipad/opad states from a raw key, once per key. The key
  * must not exceed the hash block; the only caller passes SSH_MAC_KEY_LEN.
  */
