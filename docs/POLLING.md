@@ -71,32 +71,33 @@ event-sourced). So: build the direct primitives now, and reach for esp_event
 when a third subsystem needs to observe the same state (power, services, a
 reclaimer), rather than to move these.
 
-## Order of work
+## Outcome
 
-1. ~~Task-exit notification helper, and the four callers.~~ Done (5be604c is
-   not this one; see the commit that introduced espix_task.h):
-   espix_task_exit_t in espix_kernel, and canvas_console, rfb and audio's two
-   waits block on it. Verified by three display start/stop cycles on the
-   board: no crash, and no "console task did not stop" warning, which is what
-   a missed wakeup prints after the 3 s timeout.
-2. Session key bit: cmd_run and top. **Deferred, not dropped** -- see the
-   keep-table row. Feasible via a shared event group or a select over the
-   socket plus a wake eventfd; it is a transport read-loop rework, so it
-   should be its own piece rather than part of this sweep.
-   the keep table. Doing it properly for SSH costs more than it saves, and
-   the VNC-only win is not worth the plumbing on its own.
-3. ~~Boot-settle signal.~~ Done: espix_kernel_boot_settled_wait() and
-   espix_klog_drained_wait(), with the cap kept as the backstop that the
-   barrier's own comment says it is. Verified on the board: the console's
-   debug line reads settled=1 drained=1 across a boot, so both waits were
-   woken by their events and not by the five-second cap.
-4. ~~Job-stop semaphore.~~ Done: each background job gives a counting
-   semaphore as it leaves, and the drain blocks on it with the deadline as
-   the backstop. Verified by 70-env, including "a backgrounded builtin does
-   not outlive an exec session" -- the path the drain exists for.
-5. ssh_transport poll() waits. **Read half done:** a per-connection reader
-   task owns recv() and feeds a ring; the connection task blocks on the
-   ring's semaphore, so the vTaskDelay(1) between recv() retries is gone.
-   The write half -- write_all()'s EAGAIN retry -- remains: it only fires
-   when a peer has stopped draining, and its 15 s bound is deliberate.
-6. Audio ring and the gfx blocking wait (larger; the gfx one is an ABI addition).
+**Converted:** item 1 (task-exit notification, three modules), item 3 (boot
+barrier and log flusher), item 4 (job-stop), and the read half of item 5 --
+the per-connection reader task, which is also the SSH task split the roadmap
+entry asked for.
+
+**Deferred, with the reason:**
+
+- **Item 2 (cmd_run's 50 ms and top's frame slice).** The wake object would be
+  the ring's semaphore, which packet reads also wait on, so a child-exit wake
+  can be swallowed by a partial read_exact. The fix is a second notification
+  (or a non-blocking packet peek), which is its own design.
+- **Item 6, the gfx wait.** espix_gfx_poll_event is poll-shaped and an
+  event-driven app would spin, but the two apps that exist (plasma, doom)
+  animate and must poll once per frame; a blocking wait is for the first app
+  that redraws only on input.
+
+**Kept, with the reason written down:**
+
+- **Item 6, the audio ring.** espix_bt_audio_write() already blocks in
+  xStreamBufferSend (20 ms); feed()'s 10 ms delay is the retry after that
+  timeout, not a poll of an idle resource.
+- **Item 5, the write half.** write_all()'s EAGAIN retry fires only when a peer
+  has stopped draining, and its 15 s bound is deliberate.
+- **term's 100 ms queue read.** The bound is what lets a stop be noticed while
+  the queue is being waited on.
+- klog and OTA (notify plus backstop), the USB library's own blocking call,
+  the error backoffs, the rate limit, pacing, and the sleep-family delivery
+  points -- as the keep table above says.
