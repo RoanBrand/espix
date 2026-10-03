@@ -82,7 +82,11 @@ reclaimer), rather than to move these.
 2. ~~Session key bit: cmd_run and top.~~ Reclassified: see the last row of
    the keep table. Doing it properly for SSH costs more than it saves, and
    the VNC-only win is not worth the plumbing on its own.
-3. Boot-settle signal (console start only, but it is a 5 s poll today).
+3. ~~Boot-settle signal.~~ Done: espix_kernel_boot_settled_wait() and
+   espix_klog_drained_wait(), with the cap kept as the backstop that the
+   barrier's own comment says it is. Verified on the board: the console's
+   debug line reads settled=1 drained=1 across a boot, so both waits were
+   woken by their events and not by the five-second cap.
 4. Job-stop semaphore.
 5. ssh_transport poll() waits.
 6. Audio ring and the gfx blocking wait (larger; the gfx one is an ABI addition).

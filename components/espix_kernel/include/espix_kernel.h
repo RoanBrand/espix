@@ -102,6 +102,13 @@ void     espix_kernel_boot_hold(void);
 void     espix_kernel_boot_release(void);
 unsigned espix_kernel_boot_pending(void);
 
+/*
+ * Block until every hold has been released, or timeout_ms passes. Zero waits
+ * without a limit. True when the count reached zero; the timeout is the
+ * backstop the console keeps, not the mechanism.
+ */
+bool espix_kernel_boot_settled_wait(uint32_t timeout_ms);
+
 const char *espix_version(void);        /* "0.3.0", from version.txt */
 const char *espix_target(void);         /* "esp32s3" */
 const char *espix_board(void);          /* "s3-n16r8": target + flash + PSRAM */
@@ -192,6 +199,13 @@ uint32_t espix_klog_dropped_debug(void);
  * on any particular subsystem keeps this self-limiting and subsystem-agnostic.
  */
 uint32_t espix_klog_last_echo_ms(void);
+
+/*
+ * Block until the klog flusher has caught up with the ring, or timeout_ms
+ * passes. True when there is nothing left to echo -- and when there is no ring
+ * or no flusher, which is not a wait at all.
+ */
+bool espix_klog_drained_wait(uint32_t timeout_ms);
 
 /*
  * Told after kernel output reaches the console, so a shell can put its prompt

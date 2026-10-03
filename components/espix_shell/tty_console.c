@@ -782,35 +782,28 @@ static int console_write(espix_session_t *s, const char *data, size_t len)
  */
 #define SETTLE_TAIL_MS 250
 #define SETTLE_CAP_MS  5000
-#define SETTLE_POLL_MS 50
 
 static void wait_for_boot_settled(void)
 {
-    const uint32_t start = esp_log_timestamp();
+    /*
+     * The kernel says when its boot work is done and the flusher says when
+     * the ring has reached the console. Both were polled every 50 ms for up
+     * to five seconds (R-P7.1); the cap is still there as a backstop,
+     * because a holder that never resolves must not keep the shell from
+     * starting.
+     */
+    const bool settled = espix_kernel_boot_settled_wait(SETTLE_CAP_MS);
+    const bool drained = espix_klog_drained_wait(SETTLE_CAP_MS);
 
-    for (;;) {
-        const uint32_t now = esp_log_timestamp();
+    /* In the ring rather than the console: it is only read when someone wonders
+     * whether the barrier settled or hit its cap. */
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "boot settle: settled=%d drained=%d",
+               (int)settled, (int)drained);
 
-        /* Backstop only. Reached when a holder never resolves — an AP that is
-         * powered off answers neither association nor disconnect promptly — and
-         * a shell that never starts is worse than a clobbered prompt. */
-        if ((now - start) >= SETTLE_CAP_MS) {
-            return;
-        }
-
-        if (espix_kernel_boot_pending() > 0) {
-            vTaskDelay(pdMS_TO_TICKS(SETTLE_POLL_MS));
-            continue;
-        }
-
-        /* Settled. Let the tail of the log drain so the banner starts clean. */
-        const uint32_t last = espix_klog_last_echo_ms();
-        if (last == 0 || (now - last) >= SETTLE_TAIL_MS) {
-            return;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(SETTLE_POLL_MS));
-    }
+    /* And the tail, once, so the banner does not race a line already on its
+     * way to the UART. A quiet period is what this is; there is no event
+     * for it. */
+    vTaskDelay(pdMS_TO_TICKS(SETTLE_TAIL_MS));
 }
 
 esp_err_t espix_console_session_start(void)

@@ -12,6 +12,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
@@ -111,6 +112,11 @@ static FILE *s_console_out;
  */
 static TaskHandle_t s_flusher;
 static uint32_t     s_flushed;      /* next seq this task will echo */
+
+/* Given when the flusher has caught up with the ring, so its one consumer
+ * (the console at boot) can wait for the log to land instead of polling
+ * the echo time. */
+static SemaphoreHandle_t s_drained;
 
 /* What reaches the console, as `dmesg -n` sets it; the ring keeps everything
  * regardless. See espix_klog_set_console_level(). */
@@ -324,6 +330,53 @@ static void klog_flusher_task(void *arg)
          * (an ISR, or a line queued in a race) still reaches the console. */
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
         klog_flush_pending();
+
+        portENTER_CRITICAL_SAFE(&s_lock);
+        const bool caught_up = (s_flushed == s_next);
+        portEXIT_CRITICAL_SAFE(&s_lock);
+
+        if (caught_up && s_drained != NULL) {
+            (void)xSemaphoreGive(s_drained);
+        }
+    }
+}
+
+bool espix_klog_drained_wait(uint32_t timeout_ms)
+{
+    if (s_ring == NULL || s_flusher == NULL) {
+        return true;                    /* nothing to drain */
+    }
+
+    const TickType_t start = xTaskGetTickCount();
+
+    for (;;) {
+        portENTER_CRITICAL_SAFE(&s_lock);
+        const bool caught_up = (s_flushed == s_next);
+        portEXIT_CRITICAL_SAFE(&s_lock);
+        if (caught_up) {
+            return true;
+        }
+
+        TickType_t wait = portMAX_DELAY;
+        if (timeout_ms != 0) {
+            const TickType_t limit   = pdMS_TO_TICKS(timeout_ms);
+            const TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= limit) {
+                return false;
+            }
+            wait = limit - elapsed;
+        }
+        if (s_drained == NULL && wait == portMAX_DELAY) {
+            return false;               /* no wakeup left to wait on */
+        }
+
+        if (s_drained != NULL) {
+            if (xSemaphoreTake(s_drained, wait) != pdTRUE) {
+                return false;
+            }
+        } else {
+            vTaskDelay(wait);
+        }
     }
 }
 
@@ -337,6 +390,10 @@ void espix_klog_start_flusher(void)
     portENTER_CRITICAL_SAFE(&s_lock);
     s_flushed = s_next;
     portEXIT_CRITICAL_SAFE(&s_lock);
+
+    if (s_drained == NULL) {
+        s_drained = xSemaphoreCreateBinary();
+    }
 
     /* PSRAM first, internal as a fallback: this task is not realtime, and
      * internal is the pool that has to stay spare for Bluetooth. */

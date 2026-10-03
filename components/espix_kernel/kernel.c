@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -226,6 +227,10 @@ size_t espix_uptime_str(char *buf, size_t len)
 static unsigned     s_boot_pending;
 static portMUX_TYPE s_boot_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* Given when the count reaches zero, so the console blocks instead of polling
+ * it every 50 ms. The cap remains a backstop, not the mechanism. */
+static SemaphoreHandle_t s_boot_done;
+
 void espix_kernel_boot_hold(void)
 {
     portENTER_CRITICAL_SAFE(&s_boot_lock);
@@ -235,11 +240,53 @@ void espix_kernel_boot_hold(void)
 
 void espix_kernel_boot_release(void)
 {
+    bool settled;
+
     portENTER_CRITICAL_SAFE(&s_boot_lock);
     if (s_boot_pending > 0) {
         s_boot_pending--;
     }
+    settled = (s_boot_pending == 0);
     portEXIT_CRITICAL_SAFE(&s_boot_lock);
+
+    /* Outside the critical section: a give is not allowed with interrupts
+     * masked. A waiter that has not arrived yet is not lost -- it re-checks the
+     * count before it blocks. */
+    if (settled && s_boot_done != NULL) {
+        (void)xSemaphoreGive(s_boot_done);
+    }
+}
+
+bool espix_kernel_boot_settled_wait(uint32_t timeout_ms)
+{
+    const TickType_t start = xTaskGetTickCount();
+
+    for (;;) {
+        if (espix_kernel_boot_pending() == 0) {
+            return true;
+        }
+
+        TickType_t wait = portMAX_DELAY;
+        if (timeout_ms != 0) {
+            const TickType_t limit   = pdMS_TO_TICKS(timeout_ms);
+            const TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= limit) {
+                return false;
+            }
+            wait = limit - elapsed;
+        }
+        if (s_boot_done == NULL && wait == portMAX_DELAY) {
+            wait = pdMS_TO_TICKS(20);      /* creation failed; coarse poll */
+        }
+
+        if (s_boot_done != NULL) {
+            if (xSemaphoreTake(s_boot_done, wait) != pdTRUE) {
+                return false;
+            }
+        } else {
+            vTaskDelay(wait);
+        }
+    }
 }
 
 unsigned espix_kernel_boot_pending(void)
@@ -255,6 +302,9 @@ unsigned espix_kernel_boot_pending(void)
 void espix_kernel_early_init(void)
 {
     espix_klog_init();
+
+    /* The boot barrier's wakeup, before anything can release a hold. */
+    s_boot_done = xSemaphoreCreateBinary();
     espix_klog_install_esp_log_hook();
     espix_klog(ESPIX_KLOG_INFO, TAG, "espix %s starting on %s",
                s_version, CONFIG_IDF_TARGET);
