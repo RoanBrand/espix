@@ -39,7 +39,7 @@ wants idle time -- so each case is judged on what it is actually waiting for.
 | cmd_text.c:729 (sleep), cmd_sys.c:371 (ps -d), desktop.c:2164 (appdata panel) | the sleep is the requested behaviour |
 | espix_audio.c:563 | the 5 s idle yield kept by R-P4.2 for the SMP tick |
 | wifi.c:318 | uses a timer rather than blocking the event loop -- the right shape already |
-| cmd_run.c:168 (foreground wait), cmd_sys.c:1049 (top frame) | **A task cannot wait on two sources at once.** The child half is already event-driven -- espix_proc_wait blocks on espix_proc's event group -- so the only thing polled is the key, and making that a push needs each transport to have an async producer. Only the VNC terminal has one (its key queue). Over SSH, chan_poll_interrupt *is* the connection task reading the wire, so a signal would need a second reader task per connection: a task and a wakeup per packet, to save the 20 Hz this costs while a command runs. The serial console is ready-but-unread rather than an event. Left as a bounded wait, documented, until a transport can push. |
+| cmd_run.c:168 (foreground wait), cmd_sys.c:1049 (top frame) | Deferred: **feasible, and its own piece.** A task *can* wait on two sources, if both can signal the same object: one event group with FINISH (set by the process-finish path, which knows the session) and KEY (set by the transport), or -- the better shape for SSH -- the connection task blocking in select() over {the ssh socket, a wake eventfd that the process-finish path writes}, which is the eventfd R-P6.6 already built. The cost is not the multiplexing: over SSH the connection task *is* the reader, so the event-group route needs a second reader task (a task plus a wakeup per packet) and the select route needs the transport read loop reworked -- mbedtls may hold bytes already read off the fd, and the app-stdin pump and the SO_RCVTIMEO logic sit in the same loop. Worth doing deliberately, not as a drive-by. |
 | reaper.c:80 | portMAX_DELAY -- the model to copy |
 
 ## Shared primitives worth building once
@@ -79,7 +79,10 @@ reclaimer), rather than to move these.
    waits block on it. Verified by three display start/stop cycles on the
    board: no crash, and no "console task did not stop" warning, which is what
    a missed wakeup prints after the 3 s timeout.
-2. ~~Session key bit: cmd_run and top.~~ Reclassified: see the last row of
+2. Session key bit: cmd_run and top. **Deferred, not dropped** -- see the
+   keep-table row. Feasible via a shared event group or a select over the
+   socket plus a wake eventfd; it is a transport read-loop rework, so it
+   should be its own piece rather than part of this sweep.
    the keep table. Doing it properly for SSH costs more than it saves, and
    the VNC-only win is not worth the plumbing on its own.
 3. ~~Boot-settle signal.~~ Done: espix_kernel_boot_settled_wait() and
