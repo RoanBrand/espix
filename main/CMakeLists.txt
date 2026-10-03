@@ -13,6 +13,7 @@ set(espix_main_requires
     espix_ssh
     espix_time
     espix_ota
+    espix_svc
 )
 
 # espix_main.c overrides esp_trace_get_user_params() to name the esp_sysview

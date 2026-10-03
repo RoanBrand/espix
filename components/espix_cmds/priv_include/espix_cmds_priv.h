@@ -15,6 +15,7 @@ void espix_cmds_register_env(void);
 void espix_cmds_register_fs(void);
 void espix_cmds_register_sys(void);
 void espix_cmds_register_run(void);
+void espix_cmds_register_svc(void);
 void espix_cmds_register_net(void);
 void espix_cmds_register_motd(void);
 void espix_cmds_register_time(void);

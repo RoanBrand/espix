@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "svc.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+        espix_proc
+    PRIV_REQUIRES
+        espix_kernel
+        espix_fs
+        espix_shell
+        freertos
+)

@@ -17,6 +17,7 @@ idf_component_register(
         "cmd_bt.c"
         "cmd_play.c"
         "cmd_display.c"
+        "cmd_svc.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -39,6 +40,7 @@ idf_component_register(
         espix_auth
         espix_time
         espix_ota
+        espix_svc
         app_update
         esp_http_client
         mbedtls

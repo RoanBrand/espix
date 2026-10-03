@@ -39,6 +39,7 @@
 #include "espix_net.h"
 #include "espix_ota.h"
 #include "espix_proc.h"
+#include "espix_svc.h"
 #include "espix_shell.h"
 #include "espix_ssh.h"
 #include "espix_time.h"
@@ -203,6 +204,15 @@ void app_main(void)
 #endif
 
     espix_cmds_register_all();
+
+    /*
+     * Units last: a unit may be anything the shell can run, so everything it
+     * might reach -- the filesystem, the network, the USB stack -- is already
+     * up. Not fatal: a board with no units file is the normal case.
+     */
+    if (espix_svc_init() != ESP_OK) {
+        ESP_LOGW(TAG, "service supervisor did not start");
+    }
 
     /*
      * Everything above is up, so this image is worth keeping: if the bootloader
