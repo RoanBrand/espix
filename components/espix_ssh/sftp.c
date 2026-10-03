@@ -208,15 +208,26 @@ static sftp_handle_t *handle_get(sftp_t *s, ssh_buf_t *in)
     return &s->handles[i];
 }
 
-static void handle_close(sftp_handle_t *h)
+/*
+ * Close whatever the handle holds, and say whether it worked.
+ *
+ * stdio buffers, so a write can be accepted here and fail only at the flush
+ * inside fclose() -- which is how a full filesystem used to answer SSH_FX_OK
+ * for a file that never landed (R-P7.2). Returns 0, or the errno to report.
+ * The open-error callers ignore it: they are already answering with an error.
+ */
+static int handle_close(sftp_handle_t *h)
 {
-    if (h->file != NULL) {
-        fclose(h->file);
+    int err = 0;
+
+    if (h->file != NULL && fclose(h->file) != 0) {
+        err = (errno != 0) ? errno : EIO;
     }
-    if (h->dir != NULL) {
-        closedir(h->dir);
+    if (h->dir != NULL && closedir(h->dir) != 0 && err == 0) {
+        err = (errno != 0) ? errno : EIO;
     }
     memset(h, 0, sizeof(*h));
+    return err;
 }
 
 /* ------------------------------------------------------------------ */
@@ -673,6 +684,12 @@ static esp_err_t do_read(sftp_t *s, uint32_t id, ssh_buf_t *in)
     const size_t got  = fread(data, 1, (want < room) ? want : room, h->file);
 
     if (got == 0) {
+        /* A read error and an end of file look the same in the count, and
+         * reporting the error as EOF hands the client a silently truncated
+         * file (R-P7.2). */
+        if (ferror(h->file)) {
+            return send_status(s, id, SSH_FX_FAILURE, "read failed");
+        }
         return send_status(s, id, SSH_FX_EOF, "end of file");
     }
 
@@ -782,7 +799,14 @@ static esp_err_t do_close(sftp_t *s, uint32_t id, ssh_buf_t *in)
     if (h == NULL) {
         return send_status(s, id, SSH_FX_FAILURE, "bad handle");
     }
-    handle_close(h);
+
+    const int err = handle_close(h);
+    if (err != 0) {
+        /* The last buffered write fails here rather than in write_feed(), so
+         * this is the only place the client can be told. */
+        espix_klog(ESPIX_KLOG_WARN, TAG, "close failed: %s", strerror(err));
+        return send_status(s, id, status_for(err), strerror(err));
+    }
     return send_status(s, id, SSH_FX_OK, "");
 }
 
