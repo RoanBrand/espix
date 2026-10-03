@@ -8,6 +8,7 @@ idf_component_register(
         espix_proc
     PRIV_REQUIRES
         espix_kernel
+        espix_fault
         espix_fs
         espix_shell
         freertos

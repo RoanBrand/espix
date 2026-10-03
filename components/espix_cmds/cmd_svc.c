@@ -15,7 +15,7 @@
 
 static const char *state_of(const espix_svc_info_t *u)
 {
-    if (u->pid != ESPIX_PID_NONE) {
+    if (u->pid != ESPIX_PID_NONE || u->running) {
         return "running";
     }
     return u->enabled ? "starting" : "stopped";
@@ -25,6 +25,10 @@ static int cmd_service(espix_session_t *s, int argc, char **argv)
 {
     if (argc == 1) {
         const int n = espix_svc_count();
+        if (espix_svc_safe_mode()) {
+            espix_printf(s, "safe mode: a core dump is stored; units are not "
+                            "started (coredump erase, then service reload)\n");
+        }
         if (n == 0) {
             espix_printf(s, "no units\n");
             return 0;
@@ -39,7 +43,9 @@ static int cmd_service(espix_session_t *s, int argc, char **argv)
             }
             espix_printf(s, "%-16s %-8d %-6s %s\n", u.name,
                          (u.pid == ESPIX_PID_NONE) ? -1 : (int)u.pid,
-                         u.always ? "always" : "once", state_of(&u));
+                         u.always ? "always"
+                                  : (u.every_s ? "every" : "once"),
+                         state_of(&u));
         }
         return 0;
     }

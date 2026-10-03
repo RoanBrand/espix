@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -18,6 +19,10 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+
+#include "espix_fault.h"
 #include "espix_svc.h"
 
 static const char *TAG = "espix:svc";
@@ -27,6 +32,17 @@ static const char *TAG = "espix:svc";
 #define SVC_LINE_MAX   256
 #define SVC_TICK_MS    1000
 #define SVC_PRIORITY   2
+/* Past this many restarts a unit is left stopped, and says so. A service
+ * that dies this often is not being restarted into health. */
+#define SVC_MAX_RESTARTS 5
+
+/* A scheduled unit is not run at boot but a moment after it -- long enough for
+ * the network and the clock to be up. A failed run retries sooner, a few
+ * times, so "the route is not there yet" is not a six-hour wait. */
+#define SVC_FIRST_DUE_US  (30LL * 1000000)
+#define SVC_RETRY_US      (60LL * 1000000)
+#define SVC_MAX_RETRIES   3
+#define SVC_BUILTIN_STACK 8192
 /* espix_proc_spawn_elf() runs on this task, and it copies the image, the
  * argv and the environment before handing relocation to its own task --
  * the same work the session task does for a foreground command, so it gets
@@ -40,12 +56,25 @@ typedef struct {
     bool        enabled;
     espix_pid_t pid;
     uint32_t    restarts;
+
+    /* A scheduled unit: run once every every_s seconds. 0 means it is not
+     * scheduled, and the restart policy above governs instead. */
+    uint32_t    every_s;
+    int64_t     next_due_us;
+    uint32_t    fails;
+
+    /* A builtin unit runs on a task, not as a process, so there is no pid to
+     * watch. The task owns its context and only the supervisor frees it, so
+     * the unit itself is never written from another task. */
+    void       *task;         /* the builtin task, or NULL */
+    void       *builtin;      /* svc_builtin_t while it runs */
 } svc_unit_t;
 
 static svc_unit_t        s_units[SVC_MAX];
 static int               s_count;
 static SemaphoreHandle_t s_lock;
 static bool              s_started;
+static bool              s_safe_mode;
 
 /* ------------------------------------------------------------ the stdio --- */
 
@@ -107,6 +136,61 @@ static svc_unit_t *unit_find(const char *name)
     return NULL;
 }
 
+/* 30s, 5m, 6h, 1d; 0 on anything else. */
+static uint32_t parse_duration(const char *s)
+{
+    char      *end = NULL;
+    const long v   = strtol(s, &end, 10);
+    if (end == s || v <= 0) {
+        return 0;
+    }
+
+    uint32_t mult = 1;
+    switch (*end) {
+    case 0: case 's': case 'S': mult = 1;     break;
+    case 'm': case 'M':          mult = 60;    break;
+    case 'h': case 'H':          mult = 3600;  break;
+    case 'd': case 'D':          mult = 86400; break;
+    default: return 0;
+    }
+
+    const uint64_t total = (uint64_t)v * mult;
+    return (total > 0xFFFFFFFFull) ? 0 : (uint32_t)total;
+}
+
+/* A builtin unit: the command runs on a task of its own, under the unit
+ * session, because that is all a process would have given it -- and it means
+ * upgrade --check is a unit without anything becoming an ELF. */
+typedef struct {
+    svc_unit_t        *u;
+    const espix_cmd_t *cmd;
+    espix_session_t   *s;
+    int                argc;
+    char             **argv;
+    bool               caps;      /* which allocator the stack came from */
+    volatile bool      done;      /* read by the supervisor, set by the task */
+    int                code;
+} svc_builtin_t;
+
+static void builtin_unit_task(void *arg)
+{
+    svc_builtin_t *c = arg;
+
+    espix_shell_set_current(c->s);
+    c->code = c->cmd->fn(c->s, c->argc, c->argv);
+    espix_shell_set_current(NULL);
+
+    /* Hand the result to the supervisor, which frees the context: a task
+     * that freed it could do so while the supervisor is reading it. */
+    c->done = true;
+
+    if (c->caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
+}
+
 static void unit_start(svc_unit_t *u)
 {
     char  buf[ESPIX_PATH_MAX];
@@ -121,24 +205,108 @@ static void unit_start(svc_unit_t *u)
         argv[argc++] = t;
     }
 
-    if (argc == 0 || argv[0][0] != '/') {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: needs an absolute program path",
-                   u->name);
+    if (argc == 0) {
         u->enabled = false;
         return;
     }
 
-    const esp_err_t err = espix_proc_spawn_elf(argv[0], argc, argv,
-                                               &s_svc_session, NULL, false,
-                                               &u->pid);
-    if (err != ESP_OK) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot start: %s", u->name,
-                   esp_err_to_name(err));
-        u->pid = ESPIX_PID_NONE;
+    if (argv[0][0] == '/') {
+        const esp_err_t err = espix_proc_spawn_elf(argv[0], argc, argv,
+                                                   &s_svc_session, NULL, false,
+                                                   &u->pid);
+        if (err != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot start: %s", u->name,
+                       esp_err_to_name(err));
+            u->pid = ESPIX_PID_NONE;
+            u->enabled = false;
+            return;
+        }
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started pid %d", u->name,
+                   (int)u->pid);
+        return;
+    }
+
+    /* Not a program: a builtin of the shell, run under this unit's session. */
+    const espix_cmd_t *cmd = espix_shell_find(argv[0]);
+    if (cmd == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%s: %s is neither a program nor a command", u->name,
+                   argv[0]);
         u->enabled = false;
         return;
     }
-    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started pid %d", u->name, (int)u->pid);
+
+    size_t bytes = 0;
+    for (int i = 0; i < argc; i++) {
+        bytes += strlen(argv[i]) + 1;
+    }
+
+    svc_builtin_t *c = calloc(1, sizeof(*c));
+    char          *block = malloc(bytes);
+    if (c != NULL) {
+        c->argv = calloc((size_t)argc + 1, sizeof(*c->argv));
+    }
+    if (c == NULL || c->argv == NULL || block == NULL) {
+        if (c != NULL) {
+            free(c->argv);
+        }
+        free(block);
+        free(c);
+        u->enabled = false;
+        return;
+    }
+
+    char *w = block;
+    for (int i = 0; i < argc; i++) {
+        const size_t n = strlen(argv[i]) + 1;
+        memcpy(w, argv[i], n);
+        c->argv[i] = w;
+        w += n;
+    }
+    c->argv[argc] = NULL;
+    c->argc = argc;
+    c->cmd  = cmd;
+    c->u    = u;
+    c->s    = &s_svc_session;
+
+    /* strlcpy, not snprintf: -Wformat-truncation is right that a 32-byte unit
+     * name does not fit a 16-byte task name, and FreeRTOS truncates anyway. */
+    char           name[configMAX_TASK_NAME_LEN];
+    const uint32_t stack = (cmd->stack != 0) ? cmd->stack : SVC_BUILTIN_STACK;
+    strlcpy(name, "svc:", sizeof(name));
+    strlcat(name, u->name, sizeof(name));
+
+    TaskHandle_t task = NULL;
+    bool         caps = false;
+    BaseType_t   ok;
+    if (cmd->internal_stack) {
+        /* It maps or writes flash, which cannot be done from a PSRAM stack. */
+        ok = xTaskCreatePinnedToCore(builtin_unit_task, name, stack, c,
+                                     SVC_PRIORITY, &task, 1);
+    } else {
+        ok = xTaskCreatePinnedToCoreWithCaps(builtin_unit_task, name, stack, c,
+                                             SVC_PRIORITY, &task, 1,
+                                             MALLOC_CAP_SPIRAM);
+        if (ok == pdPASS) {
+            caps = true;
+        } else {
+            ok = xTaskCreatePinnedToCore(builtin_unit_task, name, stack, c,
+                                         SVC_PRIORITY, &task, 1);
+        }
+    }
+    if (ok != pdPASS) {
+        free(c->argv);
+        free(block);
+        free(c);
+        u->enabled = false;
+        return;
+    }
+
+    c->caps    = caps;
+    u->builtin = c;
+    u->task    = task;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started (builtin %s)", u->name,
+               cmd->name);
 }
 
 /*
@@ -167,12 +335,27 @@ static void units_load(void)
                 continue;
             }
 
-            char *save = NULL;
+            char *save    = NULL;
             char *name    = strtok_r(p, " \t\n", &save);
             char *restart = strtok_r(NULL, " \t\n", &save);
-            char *cmd     = strtok_r(NULL, "\n", &save);
+            char *cmd     = NULL;
+            uint32_t every_s = 0;
 
-            if (name == NULL || restart == NULL || cmd == NULL) {
+            if (name == NULL || restart == NULL) {
+                continue;
+            }
+
+            if (strcmp(restart, "every") == 0) {
+                /* name every <interval> command: a scheduled, oneshot unit. */
+                char *interval = strtok_r(NULL, " \t\n", &save);
+                every_s = (interval != NULL) ? parse_duration(interval) : 0;
+                if (every_s == 0) {
+                    continue;
+                }
+            }
+
+            cmd = strtok_r(NULL, "\n", &save);
+            if (cmd == NULL) {
                 continue;
             }
             while (*cmd == ' ' || *cmd == '\t') {
@@ -187,8 +370,10 @@ static void units_load(void)
             strlcpy(u->name, name, sizeof(u->name));
             strlcpy(u->cmdline, cmd, sizeof(u->cmdline));
             u->always  = (strcmp(restart, "always") == 0);
-            u->enabled = true;
+            u->enabled = !s_safe_mode;
             u->pid     = ESPIX_PID_NONE;
+            u->every_s = every_s;
+            u->next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
         }
         fclose(f);
     }
@@ -196,9 +381,15 @@ static void units_load(void)
     for (int i = 0; i < n; i++) {
         svc_unit_t *old = unit_find(fresh[i].name);
         if (old != NULL) {
-            fresh[i].pid      = old->pid;
-            fresh[i].enabled  = old->enabled;
-            fresh[i].restarts = old->restarts;
+            fresh[i].pid         = old->pid;
+            fresh[i].restarts    = old->restarts;
+            fresh[i].next_due_us = old->next_due_us;
+            fresh[i].fails       = old->fails;
+            fresh[i].task        = old->task;
+            fresh[i].builtin     = old->builtin;
+            if (!s_safe_mode) {
+                fresh[i].enabled = old->enabled;
+            }
         }
     }
 
@@ -218,6 +409,41 @@ static void units_load(void)
     s_count = n;
 }
 
+/*
+ * What happens after a unit exits, whoever it was. A scheduled unit is
+ * oneshot and re-armed; a failure retries sooner a few times, so a network
+ * that is not up yet costs a minute and not a whole interval.
+ */
+static void unit_exited(svc_unit_t *u, int code)
+{
+    if (u->every_s > 0) {
+        const int64_t now = esp_timer_get_time();
+        if (code != 0 && u->fails < SVC_MAX_RETRIES) {
+            u->fails++;
+            u->next_due_us = now + SVC_RETRY_US;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: exit %d; retrying in %d s",
+                       u->name, code, (int)(SVC_RETRY_US / 1000000));
+        } else {
+            u->fails       = 0;
+            u->next_due_us = now + (int64_t)u->every_s * 1000000;
+        }
+        return;
+    }
+
+    if (u->always && u->enabled) {
+        u->restarts++;
+        if (u->restarts > SVC_MAX_RESTARTS) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: %u restarts; leaving it stopped "
+                       "(service start %s to retry)",
+                       u->name, (unsigned)u->restarts, u->name);
+            u->enabled = false;
+        }
+    } else {
+        u->enabled = false;
+    }
+}
+
 /* ------------------------------------------------------------- the task --- */
 
 static void supervisor_task(void *arg)
@@ -226,6 +452,8 @@ static void supervisor_task(void *arg)
 
     for (;;) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
+
+        const int64_t now = esp_timer_get_time();
 
         for (int i = 0; i < s_count; i++) {
             svc_unit_t *u = &s_units[i];
@@ -237,15 +465,24 @@ static void supervisor_task(void *arg)
                     u->pid = ESPIX_PID_NONE;
                     espix_klog(ESPIX_KLOG_INFO, TAG, "%s: pid %d exited (%d)",
                                u->name, (int)gone, code);
-                    if (u->always && u->enabled) {
-                        u->restarts++;      /* the start below is the restart */
-                    } else {
-                        u->enabled = false;
-                    }
+                    unit_exited(u, code);
                 }
             }
 
-            if (u->enabled && u->pid == ESPIX_PID_NONE) {
+            svc_builtin_t *b = u->builtin;
+            if (b != NULL && b->done) {
+                const int code = b->code;
+                free(b->argv);
+                u->builtin = NULL;
+                u->task    = NULL;
+                espix_klog(ESPIX_KLOG_INFO, TAG, "%s: finished (%d)", u->name,
+                           code);
+                unit_exited(u, code);
+            }
+
+            const bool busy = (u->pid != ESPIX_PID_NONE) || (u->task != NULL);
+            if (u->enabled && !busy &&
+                (u->every_s == 0 || now >= u->next_due_us)) {
                 unit_start(u);
             }
         }
@@ -268,6 +505,35 @@ esp_err_t espix_svc_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /*
+     * Safe mode. A core dump means the previous boot faulted, and starting
+     * unattended work again is exactly how one bad unit turns into a boot
+     * loop. The units are read but left stopped; a manual "service start"
+     * still starts one, and "coredump erase" clears the state.
+     */
+    espix_coredump_info_t dump;
+    const bool have_dump =
+        (espix_fault_coredump_status(&dump) == ESP_OK && dump.present);
+
+    /*
+     * Two signals, because the interesting fault defeats the first one. A core
+     * dump says the last run faulted. A panic reset reason says the same even
+     * when no dump could be written -- which is what a cache fault during a
+     * flash operation does (exccause 0x47, Cache_WriteBack_Addr), and that is
+     * precisely the fault that boot-loops a unit.
+     */
+    const esp_reset_reason_t why = esp_reset_reason();
+    const bool crashed = (why == ESP_RST_PANIC || why == ESP_RST_TASK_WDT ||
+                          why == ESP_RST_INT_WDT || why == ESP_RST_WDT);
+
+    if (have_dump || crashed) {
+        s_safe_mode = true;
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "safe mode: %s; units are not started",
+                   have_dump ? "a core dump is stored"
+                             : "the last boot panicked");
+    }
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
     units_load();
     xSemaphoreGive(s_lock);
@@ -287,6 +553,11 @@ esp_err_t espix_svc_init(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+bool espix_svc_safe_mode(void)
+{
+    return s_safe_mode;
 }
 
 int espix_svc_count(void)
@@ -315,6 +586,8 @@ bool espix_svc_info(int index, espix_svc_info_t *out)
         out->pid      = s_units[index].pid;
         out->always   = s_units[index].always;
         out->enabled  = s_units[index].enabled;
+        out->running  = (s_units[index].task != NULL);
+        out->every_s  = s_units[index].every_s;
         out->restarts = s_units[index].restarts;
         ok = true;
     }
@@ -332,7 +605,8 @@ esp_err_t espix_svc_start(const char *name)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     svc_unit_t *u = unit_find(name);
     if (u != NULL) {
-        u->enabled = true;              /* the supervisor does the starting */
+        u->enabled  = true;             /* the supervisor does the starting */
+        u->restarts = 0;                /* and a manual start gets a fresh run */
         err = ESP_OK;
     }
     xSemaphoreGive(s_lock);
@@ -365,8 +639,22 @@ esp_err_t espix_svc_reload(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /*
+     * An explicit reload is the operator saying they have dealt with whatever
+     * faulted, so it is also what leaves safe mode -- otherwise the message
+     * that says "coredump erase, then service reload" would be a lie.
+     */
+    const bool was_safe = s_safe_mode;
+    s_safe_mode = false;
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
     units_load();
+    if (was_safe) {
+        for (int i = 0; i < s_count; i++) {
+            s_units[i].enabled = true;
+        }
+        espix_klog(ESPIX_KLOG_INFO, TAG, "safe mode cleared; units resume");
+    }
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }
