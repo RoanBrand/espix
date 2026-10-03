@@ -249,3 +249,16 @@ assert_contains "and the handler can read the size" "cols=" "$winch_out"
 # R-P6.5.
 assert_contains "a send to a gone peer raises SIGPIPE" "seen=1" \
     "$(dev_run "$APP sig pipe")"
+
+# A signal must interrupt a process blocked in select(), which is R-P6.6's whole
+# point. The alarm is the signal; the elapsed time is how we know select() did
+# not run its full 60 seconds.
+sel_out=$(dev_run "$APP sig select")
+assert_contains "a signal interrupts select" "seen=1" "$sel_out"
+assert_contains "and select reports EINTR" "errno=4" "$sel_out"
+sel_ms=$(printf '%s' "$sel_out" | sed -n 's/.*after \([0-9][0-9]*\) ms.*/\1/p')
+if [ -n "$sel_ms" ] && [ "$sel_ms" -lt 5000 ]; then
+    espix_pass "and it returned at the alarm ($sel_ms ms, not 60 s)"
+else
+    espix_fail "and it returned at the alarm" "got: $sel_out"
+fi

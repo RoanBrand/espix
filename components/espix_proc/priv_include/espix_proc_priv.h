@@ -240,6 +240,17 @@ typedef struct {
     bool              foreground;
 
     /*
+     * The wake eventfd (R-P6.6): a signal writes it so a process blocked in
+     * select() returns. -1 when the process has none -- creation failed, or the
+     * caller is not a process. in_select is set by espix_proc_select_begin() so
+     * a signal only bothers to write the fd while someone is waiting on it;
+     * without that, a signal delivered to a running process would leave the
+     * counter armed and the next select() would return spuriously.
+     */
+    int               wake_fd;
+    volatile bool     in_select;
+
+    /*
      * The interval timer behind alarm() and setitimer(), and so the only source
      * of SIGALRM. One per process, as POSIX allows, created on first use and
      * deleted with the rest of the resources. void * rather than

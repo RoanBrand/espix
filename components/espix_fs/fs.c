@@ -176,6 +176,11 @@ esp_err_t espix_fs_mount_root(void)
         return err;
     }
 
+    /* IDF's eventfd VFS, for the per-process wake descriptor. Its fds are
+     * found by index rather than by path, so it sits beside the root rather
+     * than inside it. */
+    (void)espix_fs_wake_init();
+
     s_mounted = true;
     /* The synthetic trees first, so /dev and /proc exist because their trees
      * were registered rather than because a skeleton lists them. */

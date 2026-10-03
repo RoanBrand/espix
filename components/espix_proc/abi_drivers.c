@@ -50,7 +50,12 @@
 
 #include "esp_elf.h"
 
+#include "esp_vfs.h"
+#include "esp_vfs_eventfd.h"
+
+#include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_shell.h"
 #include "espix_proc_priv.h"
 
@@ -89,6 +94,61 @@ extern double    __floatsidf(int);
 extern int       __gedf2(double, double);
 extern int       __ledf2(double, double);
 extern float     __truncdfsf2(double);
+
+/*
+ * select() with the process's wake eventfd folded in.
+ *
+ * A process blocked in lwip_select() cannot be reached: the only thing lwIP's
+ * select waits on is its own sockets, so a signal has nothing to disturb. The
+ * VFS select waits on sockets and VFS fds alike, so this wrapper adds the
+ * process's wake eventfd (R-P6.6) to the caller's read set, calls
+ * esp_vfs_select(), and on return delivers whatever wrote it and reports EINTR,
+ * which is what POSIX says a signal does to select().
+ *
+ * The eventfd stays internal: it is in the set this call builds, and the bit is
+ * cleared again before the caller sees it.
+ */
+static int espix_select(int nfds, fd_set *readfds, fd_set *writefds,
+                        fd_set *errorfds, struct timeval *timeout)
+{
+    const int wake = espix_proc_select_begin();
+
+    /* Only a read set can be watched this way. A caller that waits on writes
+     * alone still blocks uninterruptibly, which is the old behaviour. */
+    if (wake >= 0 && readfds != NULL && wake < FD_SETSIZE) {
+        FD_SET(wake, readfds);
+        if (nfds <= wake) {
+            nfds = wake + 1;
+        }
+    }
+
+    const int rc = esp_vfs_select(nfds, readfds, writefds, errorfds, timeout);
+
+    bool woken = false;
+    if (wake >= 0 && readfds != NULL && wake < FD_SETSIZE &&
+        FD_ISSET(wake, readfds)) {
+        FD_CLR(wake, readfds);
+        (void)espix_fs_wake_drain(wake);
+        woken = true;
+    }
+
+    /* Cleared before delivery: a handler may call select() again. */
+    espix_proc_select_end();
+
+    if (woken) {
+        /*
+         * Deliver here, on the app's own task. This is the point of the whole
+         * exercise: a default-terminating signal ends the process now instead
+         * of waiting for a espix_sigcheck() that a program blocked in select()
+         * would never make.
+         */
+        (void)espix_sigcheck();
+        errno = EINTR;
+        return -1;
+    }
+
+    return rc;
+}
 
 static esp_elf_symbol_table_t s_driver_syms[] = {
 
@@ -156,7 +216,10 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(esp_log),
     ESP_ELFSYM_EXPORT(esp_log_timestamp),
     ESP_ELFSYM_EXPORT(ioctl),
-    ESP_ELFSYM_EXPORT(select),
+    /* Wrapped, so a signal can interrupt it (R-P6.6). */
+    { "select", (void *)espix_select },
+    /* The eventfd behind that wake, for an app that wants one of its own. */
+    ESP_ELFSYM_EXPORT(eventfd),
     ESP_ELFSYM_EXPORT(__udivdi3),
     ESP_ELFSYM_EXPORT(vsnprintf),
 

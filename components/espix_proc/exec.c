@@ -846,6 +846,10 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
 
     slot->info.state      = ESPIX_PROC_READY;
     slot->info.session    = session;
+
+    /* The wake eventfd, before the task exists so a signal cannot arrive at a
+     * process that has none. A failure only costs interruptible select(). */
+    slot->wake_fd = espix_fs_wake_create();
     slot->foreground      = foreground;
 
     /*

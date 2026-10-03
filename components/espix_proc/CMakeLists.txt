@@ -34,6 +34,9 @@ idf_component_register(
         # process's slot.
         pthread
         esp_timer
+        # abi_drivers.c wraps select() around esp_vfs_select() and names
+        # eventfd().
+        vfs
         heap
         esp_driver_rmt
         esp_driver_gpio

@@ -18,6 +18,7 @@ set(espix_fs_srcs
     "synth.c"
     "dev.c"
     "proc.c"
+    "wake.c"
     "fat.c"
     "part.c"
 )

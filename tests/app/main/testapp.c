@@ -25,6 +25,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -707,6 +708,60 @@ static int sig_pipe(void)
     return s_pipe_seen ? 0 : 1;
 }
 
+/*
+ * A signal must reach a process blocked in select(), which is the one thing it
+ * cannot do through lwIP's own select. The alarm drives it: 60 seconds of
+ * select, cut short at 2.
+ */
+static int sig_select(void)
+{
+    signal(SIGALRM, on_alarm);
+
+    const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        printf("select: no socket\n");
+        fflush(stdout);
+        return 2;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(lfd, 1) != 0) {
+        printf("select: cannot listen\n");
+        fflush(stdout);
+        close(lfd);
+        return 2;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Nothing will connect, so the listen socket never becomes readable. */
+    alarm(2);
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(lfd, &rfds);
+    struct timeval tv = { 60, 0 };
+
+    const int rc = select(lfd + 1, &rfds, NULL, NULL, &tv);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                           (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    printf("select: rc=%d errno=%d seen=%d after %ld ms\n",
+           rc, errno, (int)s_alarm_seen, ms);
+    fflush(stdout);
+    close(lfd);
+    return (rc < 0 && s_alarm_seen) ? 0 : 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -732,6 +787,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "pipe") == 0) {
         return sig_pipe();
+    }
+    if (strcmp(mode, "select") == 0) {
+        return sig_select();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
@@ -1382,7 +1440,7 @@ static void usage(void)
            "  both                one line to stdout, one to stderr\n"
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
-           "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch | pipe\n"
+           "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch | pipe | select\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"

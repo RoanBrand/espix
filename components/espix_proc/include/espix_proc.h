@@ -362,6 +362,16 @@ void espix_proc_paths(const char **cwd, const char **root);
 espix_pid_t espix_proc_self_pid(void);
 
 /*
+ * A process about to block in select(): arms the wake path and returns the
+ * wake fd to fold into the read set, or -1 for a caller with none. The pair
+ * exists so a signal can reach a process that is waiting on a socket, which is
+ * otherwise unreachable (R-P6.6). Pending signals are delivered by begin(),
+ * before the block, so nothing is left unhandled. select_end() clears it.
+ */
+int  espix_proc_select_begin(void);
+void espix_proc_select_end(void);
+
+/*
  * Move the calling process's working directory. `abs_path` must be absolute
  * and must be a directory.
  *

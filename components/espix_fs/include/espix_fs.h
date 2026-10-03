@@ -189,6 +189,18 @@ esp_err_t espix_fs_partition_view(esp_blockdev_handle_t parent, uint64_t start,
  * task: the pool is locked because a session can be listing /dev meanwhile.
  */
 esp_err_t espix_dev_register_block(const char *name, uint64_t size);
+
+/*
+ * The per-process wake descriptor (R-P6.6): an eventfd that a signal writes so
+ * a process blocked in select() returns. espix_fs_wake_init() registers IDF's
+ * eventfd VFS and must run once, at mount; the rest are the lifecycle a process
+ * needs -- create at spawn, notify on a signal, drain and close.
+ */
+esp_err_t espix_fs_wake_init(void);
+int       espix_fs_wake_create(void);
+int       espix_fs_wake_notify(int fd);
+int       espix_fs_wake_drain(int fd);
+void      espix_fs_wake_close(int fd);
 void espix_dev_unregister_block(const char *name);
 
 /*

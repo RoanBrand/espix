@@ -238,6 +238,12 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
      */
     espix_fs_fds_close_owned(slot->info.pid);
 
+    /* The wake eventfd is espix's, not one the app opened, so the owned-fd
+     * sweep above does not know about it. */
+    espix_fs_wake_close(slot->wake_fd);
+    slot->wake_fd  = -1;
+    slot->in_select = false;
+
     if (slot->elf_valid) {
         esp_elf_deinit(&slot->elf);
         slot->elf_valid = false;
@@ -1085,8 +1091,10 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         slot->sig_stop_req = false;
     }
 
-    TaskHandle_t      task = slot->info.task;
-    SemaphoreHandle_t cont = slot->sig_cont;
+    TaskHandle_t      task      = slot->info.task;
+    SemaphoreHandle_t cont      = slot->sig_cont;
+    const int         wake_fd   = slot->wake_fd;
+    const bool        in_select = slot->in_select;
 
     xSemaphoreGive(g_espix_proc_lock);
 
@@ -1107,7 +1115,45 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         (void)xTaskAbortDelay(task);
     }
 
+    /*
+     * And the wake fd, when the target is waiting on one. A process blocked in
+     * esp_vfs_select() is waiting on a semaphore that xTaskAbortDelay cannot
+     * touch, so the eventfd is the only way in. Written only while in_select is
+     * set, so a signal to a running process does not arm the counter and make
+     * its next select() return for no reason.
+     */
+    if (sig != SIGSTOP && in_select && wake_fd >= 0) {
+        (void)espix_fs_wake_notify(wake_fd);
+    }
+
     return ESP_OK;
+}
+
+int espix_proc_select_begin(void)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+    if (slot == NULL) {
+        return -1;
+    }
+
+    slot->in_select = true;
+
+    /*
+     * Deliver whatever is pending before blocking. A signal that arrives after
+     * this line finds in_select set and writes the fd, so there is no window in
+     * which a signal is set but nobody is coming to write it.
+     */
+    (void)espix_sigcheck();
+
+    return slot->wake_fd;
+}
+
+void espix_proc_select_end(void)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+    if (slot != NULL) {
+        slot->in_select = false;
+    }
 }
 
 esp_err_t espix_proc_request_stop(espix_pid_t pid)
