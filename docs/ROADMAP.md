@@ -44,12 +44,11 @@ things are as they are.
   ordering, and `systemctl`-shaped commands to inspect it. But the alternative
   is that espix stays a device you log into rather than one that runs something.
 
-- **Job control.** `jobs`, `fg`, `bg`, Ctrl-Z. SIGSTOP and SIGCONT landed with
-  signals, which is the hard half — a stopped process parks itself at a delivery
-  point and `ps` reports `T`. What is missing is the shell side: a job table, and
-  a session that knows which job is in the foreground. `session->fg_pid` already
-  exists and is written on every foreground run; job control would give it its
-  first reader.
+- ~~**Job control.**~~ Done for jobs, fg and bg (R-P2.6): a background app is
+  a job with a state and a name, a stopped one reports T in ps, and fg waits
+  and reaps the status. Ctrl-Z is the part still missing, and for a reason
+  that is not the shell's: the transports report only that a key arrived, not
+  which one (R-P7.7).
 - **Reap a faulted task and keep running.** `espix_fault_request_reap()` is
   defined and has no callers, and `CONFIG_ESPIX_FAULT_REAP` is off — the reaper
   task and its queue exist, but nothing feeds them. Skipping the reboot is the
@@ -1244,28 +1243,13 @@ both are the sort of thing that is cheaper to know now.
   runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
   other way.
 
-- **Pipes, `<` redirection, and stdin for builtins.** The three streams
-  themselves are done: `espix_eprintf()` sits beside `espix_printf()`, `2>`,
-  `2>>` and `2>&1` work, SSH carries diagnostics as `CHANNEL_EXTENDED_DATA`,
-  and a loaded app gets a real `stdin`, `stdout` and `stderr` — see
-  `tests/suites/15-streams.sh`.
-
-  What is missing is the plumbing between commands. A builtin cannot read
-  standard input, and there is no `<`; both are cheap on their own and neither
-  is worth much without the other, because with no pipes there is nothing for
-  a builtin to read *from*. So they go together, and `|` is the one that makes
-  them pay: it needs a command's output to become another's input, which means
-  a pipe object with two ends and a lifetime that outlives neither.
-
-  Two known constraints from the stream work. `chan_poll_interrupt()` is the
-  only consumer of the SSH channel's receive buffer and `chan_pump()`
-  overwrites that buffer rather than appending, so a second reader needs it to
-  become a ring first — which is also what a backgrounded process would need
-  to read stdin at all. And the shell's redirect `FILE` is owned by the
-  command, not the process, which is why only a foreground app can be pointed
-  at one; pipes will want that ownership reference-counted.
-
-  Job control wants the same objects, so the two are worth designing together.
+- ~~**Pipes, < redirection, and stdin for builtins.**~~ Done for builtins
+  (R-P2.4, R-P2.5): < is parsed with the other redirections, cat, wc, head,
+  tail, grep and sort read it when they have no operand, and a pipeline is
+  one StreamBuffer per stage with a funopen FILE on each end. Two things
+  remain, both in WORKLIST.md: a program stage in a pipeline is refused,
+  because an app's stdout is its session stream (R-P2.5), and a job stage
+  that owns a redirection is not built (R-P2.8).
 
 ## Audio
 
