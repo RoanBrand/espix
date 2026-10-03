@@ -964,6 +964,11 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
         proc_task, task_name, CONFIG_ESPIX_PROC_STACK_SIZE, slot,
         CONFIG_ESPIX_PROC_PRIORITY, &task, 1, MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
+        /* The wake eventfd is live by now, and the memset below would shed the
+         * only record of it. Under the load that makes task creation fail in
+         * the first place, leaking one fd per attempt is how a long run runs the
+         * system fd table dry. */
+        espix_fs_wake_close(slot->wake_fd);
         free(slot->argv_block);
         free(slot->env_block);
         memset(slot, 0, sizeof(*slot));
