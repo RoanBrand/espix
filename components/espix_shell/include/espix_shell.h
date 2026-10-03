@@ -300,6 +300,17 @@ struct espix_session {
      */
     const volatile bool *stop;
 
+    /*
+     * The last key a transport saw while polling, or 0.
+     *
+     * poll_interrupt() answers only *whether* something arrived, and the
+     * transport drains what it read looking for Ctrl-C -- so a q typed at top
+     * was seen and thrown away. A transport sets this for a key it is not
+     * turning into a signal, and espix_shell_take_key() reads and clears it
+     * (R-P7.7).
+     */
+    volatile int last_key;
+
     int         last_status;               /* $? */
     bool        want_exit;
 
@@ -613,6 +624,10 @@ bool espix_shell_stopping(const espix_session_t *s);
  * finish_session() for the exec path, which never reaches the REPL.
  */
 void espix_shell_jobs_drain(espix_session_t *s);
+
+/* The last key a transport reported while polling, and clear it. 0 when there
+ * was none. The transport sets it, the command reads it. */
+int espix_shell_take_key(espix_session_t *s);
 
 /*
  * Run one command line in the context of `s`. Returns the command's status,

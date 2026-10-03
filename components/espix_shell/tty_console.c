@@ -716,8 +716,6 @@ static int console_read_line(espix_session_t *s, const char *prompt,
  */
 static bool console_poll_interrupt(espix_session_t *s)
 {
-    (void)s;
-
     const int fd  = fileno(stdin);
     bool      hit = false;
 
@@ -740,6 +738,8 @@ static bool console_poll_interrupt(espix_session_t *s)
         for (ssize_t i = 0; i < n; i++) {
             if (buf[i] == 0x03) {       /* ETX, which is what Ctrl-C sends */
                 hit = true;
+            } else {
+                s->last_key = (int)buf[i];
             }
         }
     }

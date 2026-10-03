@@ -1051,6 +1051,12 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
                 interrupted = true;
                 break;
             }
+            /* Ctrl-C ends it from the transport's side; q is the key the
+             * command itself reads (R-P7.7). */
+            if (espix_shell_take_key(s) == 'q') {
+                interrupted = true;
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(TOP_SLICE_MS));
         }
     }
@@ -1935,7 +1941,8 @@ static espix_cmd_t s_sys_cmds[] = {
       .help = "list tasks and processes",
       .usage = "ps [-d [seconds]]" },
     { .name = "top",    .fn = cmd_top,
-      .help = "live view of tasks and memory",  .usage = "top [-b] [-n <frames>]" },
+      .help = "live view of tasks and memory (q quits)",
+      .usage = "top [-b] [-n <frames>]" },
     { .name = "dmesg",  .fn = cmd_dmesg,
       .help = "print the kernel log",
       .usage = "dmesg [-T] [-n <level>]" },

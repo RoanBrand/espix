@@ -728,6 +728,8 @@ static bool term_poll_interrupt(espix_session_t *s)
     while (xQueueReceive(t->keys, &ch, 0) == pdTRUE) {
         if (ch == 0x03) {
             interrupted = true;
+        } else {
+            s->last_key = ch;           /* q at top, and the like (R-P7.7) */
         }
     }
     return interrupted;

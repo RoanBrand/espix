@@ -202,6 +202,8 @@ typedef struct {
      */
     uint8_t     pending[SSH_CHANNEL_MAX_PACKET];
     size_t      pending_len;
+    /* The last key drained by the poll, for the command that reads it. */
+    volatile int last_key;
     size_t      pending_pos;
     bool        last_was_cr;    /* for collapsing CR LF into one newline */
 
@@ -616,6 +618,12 @@ static bool drain_pending_to_stdin(ssh_chan_t *ch, bool *hit)
 
         const size_t span = run - ch->pending_pos;
 
+        /* On a terminal, the last byte of the run is the last key the poll
+         * saw; Ctrl-C is the exception and is reported separately below. */
+        if (span > 0 && ch->has_pty) {
+            ch->last_key = ch->pending[run - 1];
+        }
+
         if (span > 0) {
             if (ch->stdin_q == NULL) {
                 /* Nobody can read it: discard, exactly as this did before
@@ -718,6 +726,12 @@ static bool chan_poll_interrupt(espix_session_t *s)
              * cap this whole arrangement exists to avoid.
              */
             continue;
+        }
+
+        /* Hand up the last key that was not a Ctrl-C (R-P7.7). */
+        if (ch->last_key != 0) {
+            s->last_key = ch->last_key;
+            ch->last_key = 0;
         }
 
         /*

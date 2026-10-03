@@ -842,6 +842,17 @@ static int start_background_job(espix_session_t *s, const espix_cmd_t *cmd,
     return 0;
 }
 
+int espix_shell_take_key(espix_session_t *s)
+{
+    if (s == NULL) {
+        return 0;
+    }
+
+    const int key = s->last_key;
+    s->last_key = 0;
+    return key;
+}
+
 void espix_shell_jobs_drain(espix_session_t *s)
 {
     if (s == NULL) {
