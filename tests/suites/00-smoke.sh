@@ -32,3 +32,12 @@ assert_contains "/tmp is sticky and world-writable" "drwxrwxrwt" "$(dev_run 'ls 
 # Exit status has to come from its own connection: the shell has no $?.
 assert_status "a good command exits 0" 0 dev_status 'uptime'
 assert_status "an unknown command exits 127" 127 dev_status 'definitelynotacommand'
+
+# An over-long exec command is answered inside the channel, not refused
+# (R-P7.10). Refusing made the client say only "exec request failed on channel
+# 0", which it cannot tell from a login failure; accepting, printing the reason
+# and exiting 130 puts it where the user is looking.
+long_cmd=$(printf 'x%.0s' $(seq 1 300))
+assert_contains "an over-long exec names the limit" "limit is" \
+    "$(dev_once "$long_cmd" 2>&1)"
+assert_status "and it exits 130" 130 dev_status "$long_cmd"

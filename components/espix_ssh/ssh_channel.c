@@ -165,6 +165,16 @@ typedef struct {
     bool        want_exec;
     char       *exec_cmd;
 
+    /*
+     * The command was longer than ESPIX_LINE_MAX. It is still *answered*
+     * rather than refused -- refusing shows up at the client as "exec request
+     * failed on channel 0", indistinguishable from a login failure -- so the
+     * run path prints the limit and exits 130 instead of dispatching it
+     * (R-P7.10). exec_len is only used for that message.
+     */
+    bool        exec_too_long;
+    size_t      exec_len;
+
     /* Whether the client asked for a terminal. Decides whether output is
      * cooked and whether the session claims ANSI; see chan_write(). */
     bool        has_pty;
@@ -1629,6 +1639,10 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
             espix_klog(ESPIX_KLOG_WARN, TAG,
                        "exec command of %u bytes exceeds the %d-byte limit",
                        (unsigned)cmd_len, ESPIX_LINE_MAX - 1);
+            ch->exec_too_long = true;
+            ch->exec_len      = cmd_len;
+            ch->want_exec     = true;
+            ok                = true;
         }
 
         if (want_reply) {
@@ -2451,8 +2465,14 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         /* Without a terminal the client is a pipe, so newlines stay bare. */
         ch->raw_out = !ch->has_pty;
 
-        espix_klog(ESPIX_KLOG_INFO, TAG, "exec for %s: %s", c->user,
-                   ch->exec_cmd);
+        if (ch->exec_too_long) {
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "exec for %s: %u bytes, over the %d-byte limit",
+                       c->user, (unsigned)ch->exec_len, ESPIX_LINE_MAX - 1);
+        } else {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "exec for %s: %s", c->user,
+                       ch->exec_cmd);
+        }
 
         /*
          * scp's pre-9.0 protocol arrives as `scp -t <path>` on an exec channel,
@@ -2462,8 +2482,18 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
          * found", which points at the wrong problem. Say what is actually
          * wrong instead.
          */
-        if (strncmp(ch->exec_cmd, "scp ", 4) == 0 ||
-            strcmp(ch->exec_cmd, "scp") == 0) {
+        if (ch->exec_too_long) {
+            /*
+             * Inside the channel, where the user is looking, and with a status
+             * of its own: 130 is what a shell reports for a job ended by a
+             * signal, and this is the closest thing to "I could not read it".
+             */
+            espix_printf(&session,
+                         "espix: command line is %u bytes; the limit is %d\n",
+                         (unsigned)ch->exec_len, ESPIX_LINE_MAX - 1);
+            session.last_status = 130;
+        } else if (strncmp(ch->exec_cmd, "scp ", 4) == 0 ||
+                   strcmp(ch->exec_cmd, "scp") == 0) {
             espix_printf(&session,
                          "espix: the scp protocol is not implemented; "
                          "espix serves scp over SFTP, so drop -O\n");
