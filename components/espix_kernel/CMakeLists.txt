@@ -83,6 +83,7 @@ idf_component_register(
     SRCS
         "kernel.c"
         "klog.c"
+        "task_exit.c"
     INCLUDE_DIRS
         "include"
         "${CMAKE_CURRENT_BINARY_DIR}"

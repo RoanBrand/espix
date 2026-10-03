@@ -28,6 +28,7 @@
 
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_shell.h"
 #include "espix_term.h"
 
@@ -48,7 +49,6 @@
 
 typedef struct {
     espix_term_t *term;
-    TaskHandle_t  task;
     bool          up;
     /* Set while the console is shutting down, so that a release -- which asks
      * the display for its fallback -- does not start this console again. */
@@ -57,6 +57,7 @@ typedef struct {
 } canvas_console_t;
 
 static canvas_console_t s_con;
+static espix_task_exit_t s_exit;   /* the console task's exit, announced */
 
 /* Bumped for each console, so a task that outlives its own can tell. */
 static uint32_t s_gen;
@@ -247,7 +248,7 @@ static void con_task(void *arg)
 
     s_con.term = NULL;
     s_con.up   = false;
-    s_con.task = NULL;
+    espix_task_exited(&s_exit);
 
     espix_display_release(&s_console_screen);
     vTaskDeleteWithCaps(NULL);          /* frees the PSRAM stack it was given */
@@ -287,6 +288,14 @@ esp_err_t espix_console_canvas_start(void)
 
     void *const gen = (void *)(uintptr_t)++s_gen;
 
+    if (!espix_task_exit_init(&s_exit)) {
+        s_con.up = false;
+        espix_display_release(&s_console_screen);
+        espix_term_free(s_con.term);
+        s_con.term = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     /*
      * 8192, not 4096: this task runs commands *inline*, exactly as the SSH
      * connection task does, and that task's stack is sized for the same reason.
@@ -297,13 +306,13 @@ esp_err_t espix_console_canvas_start(void)
      * A command that needs more still declares its own stack in the command
      * table, where it costs one command rather than every console.
      */
-    if (xTaskCreateWithCaps(con_task, "espix:vnc0", 8192, gen, 4, &s_con.task,
+    if (xTaskCreateWithCaps(con_task, "espix:vnc0", 8192, gen, 4, &s_exit.task,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
         (void)xTaskCreateWithCaps(con_task, "espix:vnc0", 8192, gen, 4,
-                                  &s_con.task,
+                                  &s_exit.task,
                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    if (s_con.task == NULL) {
+    if (s_exit.task == NULL) {
         espix_display_release(&s_console_screen);
         espix_term_free(s_con.term);
         s_con.term = NULL;
@@ -331,11 +340,9 @@ void espix_console_canvas_stop(void)
     s_con.leaving = true;
     espix_term_stop(s_con.term);
 
-    for (int i = 0; i < 300 && s_con.task != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    (void)espix_task_exit_wait(&s_exit, 3000);
 
-    if (s_con.task != NULL) {
+    if (s_exit.task != NULL) {
         /*
          * Better a leaked terminal than a freed one under a live task, so the
          * task keeps its own -- but the screen is released here regardless. A

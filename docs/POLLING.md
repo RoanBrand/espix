@@ -74,7 +74,12 @@ reclaimer), rather than to move these.
 
 ## Order of work
 
-1. Task-exit notification helper, and the four callers (cheap, self-contained).
+1. ~~Task-exit notification helper, and the four callers.~~ Done (5be604c is
+   not this one; see the commit that introduced espix_task.h):
+   espix_task_exit_t in espix_kernel, and canvas_console, rfb and audio's two
+   waits block on it. Verified by three display start/stop cycles on the
+   board: no crash, and no "console task did not stop" warning, which is what
+   a missed wakeup prints after the 3 s timeout.
 2. Session key bit: cmd_run and top (removes the two 50 ms loops on the hot path).
 3. Boot-settle signal (console start only, but it is a 5 s poll today).
 4. Job-stop semaphore.

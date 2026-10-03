@@ -42,6 +42,7 @@
 
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_net.h"
 
 #include "vnc_des.h"
@@ -122,7 +123,7 @@
  */
 static volatile bool s_run;
 static int           s_listen_fd = -1;
-static TaskHandle_t  s_task;
+static espix_task_exit_t s_exit;
 static uint16_t      s_port;
 static int           s_clients;
 static char          s_peer[32];
@@ -2068,7 +2069,7 @@ static void rfb_task(void *arg)
 
     close(s_listen_fd);
     s_listen_fd = -1;
-    s_task = NULL;
+    espix_task_exited(&s_exit);
     vTaskDeleteWithCaps(NULL);              /* frees the PSRAM stack it was given */
 }
 
@@ -2142,6 +2143,13 @@ esp_err_t espix_display_rfb_listen(uint16_t port)
     s_port = port;
     s_run = true;
 
+    if (!espix_task_exit_init(&s_exit)) {
+        s_run = false;
+        close(fd);
+        s_listen_fd = -1;
+        return ESP_ERR_NO_MEM;
+    }
+
     /*
      * Core 1.
      *
@@ -2163,13 +2171,13 @@ esp_err_t espix_display_rfb_listen(uint16_t port)
      * next to a core that is a third idle.
      */
     if (xTaskCreatePinnedToCoreWithCaps(rfb_task, "espix:vnc", 8192, NULL, 4,
-                            &s_task, 1,
+                            &s_exit.task, 1,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
         (void)xTaskCreatePinnedToCoreWithCaps(rfb_task, "espix:vnc", 8192, NULL,
-                                  4, &s_task, 1,
+                                  4, &s_exit.task, 1,
                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    if (s_task == NULL) {
+    if (s_exit.task == NULL) {
         s_run = false;
         close(fd);
         s_listen_fd = -1;
@@ -2191,9 +2199,7 @@ void espix_display_rfb_stop(void)
      * or recv timeout, and deletes itself with the matching vTaskDeleteWithCaps
      * -- deleting it from here would leak the PSRAM stack it was given.
      */
-    for (int i = 0; i < 300 && s_task != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    (void)espix_task_exit_wait(&s_exit, 3000);
     s_port = 0;
 }
 

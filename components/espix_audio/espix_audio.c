@@ -24,6 +24,7 @@
 #include "esp_audio_simple_dec_default.h"
 
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_bt.h"
 #include "espix_audio.h"
 
@@ -48,7 +49,7 @@
 #define OUT_CHUNK  (6 * 1024)
 #define TASK_STACK (6 * 1024)
 
-static TaskHandle_t  s_task;
+static espix_task_exit_t s_exit;
 static volatile bool s_stop;
 static volatile bool s_running;
 
@@ -145,14 +146,12 @@ __attribute__((used)) void media_lib_free(void *buf)
  */
 void espix_audio_stop_wait(void)
 {
-    if (s_task == NULL) {
+    if (s_exit.task == NULL) {
         return;
     }
 
     s_stop = true;
-    while (s_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    (void)espix_task_exit_wait(&s_exit, 0);
 }
 
 static esp_audio_simple_dec_type_t type_from_uri(const char *uri)
@@ -596,7 +595,7 @@ out:
     espix_bt_audio_suspend();
 
     s_running = false;
-    s_task = NULL;
+    espix_task_exited(&s_exit);
     espix_klog(ESPIX_KLOG_INFO, TAG, "finished");
 
     if (s_task_caps) {
@@ -643,11 +642,9 @@ static esp_err_t play_common(const char *uri, bool wait)
         registered = true;
     }
 
-    if (s_task != NULL) {
+    if (s_exit.task != NULL) {
         s_stop = true;
-        while (s_task != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+        (void)espix_task_exit_wait(&s_exit, 0);
     }
     s_stop = false;
     strlcpy(s_uri, uri, sizeof(s_uri));
@@ -671,14 +668,18 @@ static esp_err_t play_common(const char *uri, bool wait)
      * s_task_caps is set before each attempt, and the fallback only runs when
      * the caps attempt failed -- so no task is alive to race the flag.
      */
+    if (!espix_task_exit_init(&s_exit)) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_task_caps = true;
     if (xTaskCreatePinnedToCoreWithCaps(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
-                                        &s_task, 1,
+                                        &s_exit.task, 1,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_task_caps = false;
         if (xTaskCreatePinnedToCore(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
-                                    &s_task, 1) != pdPASS) {
-            s_task = NULL;
+                                    &s_exit.task, 1) != pdPASS) {
+            s_exit.task = NULL;
             return ESP_FAIL;
         }
     }
@@ -698,7 +699,7 @@ esp_err_t espix_audio_play_wait(const char *uri)
 
 esp_err_t espix_audio_stop(void)
 {
-    if (s_task == NULL) {
+    if (s_exit.task == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     s_stop = true;
