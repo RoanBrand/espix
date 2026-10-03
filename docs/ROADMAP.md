@@ -778,6 +778,20 @@ both are the sort of thing that is cheaper to know now.
   there is one, and per-channel windows. The blocking I/O the shell depends on
   (`chan_read_line`, the editor's own callbacks) makes that more than a
   refactor -- today the connection task *is* the channel.
+- **Split the connection task from the session task.** Today one task reads
+  the wire, runs the shell, runs a foreground command and pumps a program's
+  stdin, and it is the only reader of the socket -- which is why a foreground
+  command has to poll for Ctrl-C rather than block on it (R-P7.1 item 2). A
+  reader task feeding a queue turns that into a push, and several other things
+  with it: the foreground wait could block on an event group instead of a 50 ms
+  loop; chan_poll_interrupt's bounded drains could become a real recv or
+  select; the transport's vTaskDelay(1) retries in ssh_transport.c would have
+  somewhere to block (R-P7.1 item 5); Ctrl-Z and q need the key reported rather
+  than consumed (R-P7.7); and the orphaned transmit lock a force-killed writer
+  leaves behind (R-P7.9) is the same task doing the writing while being
+  deletable. It is also what the multi-channel bullet above runs into from the
+  other side. Not scheduled: the reasons are piling up, and this is where they
+  land if one more arrives.
 - **`ssh -R`, and `ssh -D`.** The other two directions. `-R` is a client
   asking espix to *listen*: the global `tcpip-forward` request plus
   `forwarded-tcpip`, and the listener side has no equivalent here at all. `-D`
