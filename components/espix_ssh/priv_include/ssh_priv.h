@@ -9,6 +9,7 @@
 #include "psa/crypto.h"
 
 #include "espix_shell.h"
+#include "espix_task.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -247,7 +248,38 @@ typedef struct {
      */
     uint8_t  tx_frame[SSH_MAX_PACKET + SSH_MAC_LEN + 8]
         __attribute__((aligned(SSH_DMA_ALIGN)));
+
+    /*
+     * The receive ring, and the task that fills it (R-P7.1).
+     *
+     * One task does nothing but recv() and put the bytes here, so the
+     * connection task can block on them arriving instead of polling recv()
+     * with vTaskDelay(1) between tries. The ring carries ciphertext exactly as
+     * it came off the socket: the wire protocol, and therefore every cipher,
+     * stays on the connection task, which is what keeps the crypto single
+     * threaded.
+     *
+     * head and tail are monotonic byte counts, so wrap needs no special case;
+     * the difference is always less than the ring.
+     */
+    uint8_t          *rx_buf;       /* SSH_RX_RING bytes, PSRAM if it can */
+    uint32_t          rx_head;      /* read off the socket */
+    uint32_t          rx_tail;      /* handed to the connection task */
+    SemaphoreHandle_t rx_data;      /* given on bytes, on eof, on error */
+    bool              rx_eof;
+    bool              rx_err;
+    espix_task_exit_t rx_exit;      /* the reader, announced as it leaves */
 } ssh_conn_t;
+
+/* The reader's ring and stack. 3072 is what a recv() loop and its memcpy need;
+ * the connection task keeps the 8192 because commands run inline on it. */
+#define SSH_RX_RING   4096
+#define SSH_RX_STACK  3072
+
+/* Start and stop the connection's reader task. ssh_rx_start() is called once
+ * the fd is known; ssh_rx_stop() before the fd is drained and closed. */
+esp_err_t ssh_rx_start(ssh_conn_t *c);
+void      ssh_rx_stop(ssh_conn_t *c);
 
 /*
  * Prepare HMAC-SHA256's ipad/opad states from a raw key, once per key. The key

@@ -94,5 +94,9 @@ reclaimer), rather than to move these.
    semaphore as it leaves, and the drain blocks on it with the deadline as
    the backstop. Verified by 70-env, including "a backgrounded builtin does
    not outlive an exec session" -- the path the drain exists for.
-5. ssh_transport poll() waits.
+5. ssh_transport poll() waits. **Read half done:** a per-connection reader
+   task owns recv() and feeds a ring; the connection task blocks on the
+   ring's semaphore, so the vTaskDelay(1) between recv() retries is gone.
+   The write half -- write_all()'s EAGAIN retry -- remains: it only fires
+   when a peer has stopped draining, and its 15 s bound is deliberate.
 6. Audio ring and the gfx blocking wait (larger; the gfx one is an ABI addition).

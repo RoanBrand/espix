@@ -792,6 +792,12 @@ both are the sort of thing that is cheaper to know now.
   deletable. It is also what the multi-channel bullet above runs into from the
   other side. Not scheduled: the reasons are piling up, and this is where they
   land if one more arrives.
+
+  **First stage landed.** A per-connection reader task now owns recv() and
+  fills a ring; the connection task blocks on it. That removes the read
+  half of R-P7.1 item 5. What item 2 still needs is not the task but the
+  event plumbing: one object the reader (bytes) and the process finish
+  (the child) can both set, so cmd_run() can block on either.
 - **`ssh -R`, and `ssh -D`.** The other two directions. `-R` is a client
   asking espix to *listen*: the global `tcpip-forward` request plus
   `forwarded-tcpip`, and the listener side has no equivalent here at all. `-D`

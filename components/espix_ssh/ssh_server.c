@@ -499,6 +499,16 @@ static void connection_task(void *arg)
     }
     c->fd = fd;
 
+    /* The reader owns recv() from here; everything else reads the ring. */
+    if (ssh_rx_start(c) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start the connection reader");
+        close_gracefully(fd);
+        free(c);
+        sessions_release();
+        conn_task_exit();
+        return;
+    }
+
     s_status.accepted++;
 
     /*
@@ -580,6 +590,7 @@ static void connection_task(void *arg)
         ssh_channel_run(c);
     } while (0);
 
+    ssh_rx_stop(c);
     close_gracefully(c->fd);
     kexinit_c_release(c);   /* no-op on the happy path, which released earlier */
     ssh_kex_release_keys(c);/* the PSA slots free(c) cannot reach */

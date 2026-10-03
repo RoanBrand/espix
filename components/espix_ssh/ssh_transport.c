@@ -13,12 +13,15 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include "esp_timer.h"
 #include "mbedtls/platform_util.h"   /* mbedtls_platform_zeroize */
 #include "sha/sha_core.h"            /* the HMAC key schedule, prepared below */
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "espix_kernel.h"
 #include "espix_proc.h"   /* espix_proc_stopping(), so a writing app can be signalled */
@@ -209,67 +212,199 @@ void ssh_skip(ssh_buf_t *b, size_t len)
  */
 #define BLOCKED_WRITE_TIMEOUT_MS 15000
 
-static esp_err_t read_exact(int fd, void *dst, size_t len)
+/*
+ * The receive ring and the task that fills it (R-P7.1).
+ *
+ * One task does nothing but recv() and put the bytes here, so the connection
+ * task can block on them arriving instead of polling recv() with vTaskDelay(1)
+ * between tries. The ring carries ciphertext exactly as it came off the
+ * socket: the wire protocol, and so every cipher, stays on the connection
+ * task, which is what keeps the crypto single threaded.
+ */
+
+static size_t rx_used(const ssh_conn_t *c)
 {
-    uint8_t *p = dst;
+    return (size_t)(c->rx_head - c->rx_tail);
+}
+
+static void rx_push(ssh_conn_t *c, const uint8_t *src, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        c->rx_buf[(c->rx_head + (uint32_t)i) % SSH_RX_RING] = src[i];
+    }
+    c->rx_head += (uint32_t)n;
+}
+
+static size_t rx_pop(ssh_conn_t *c, uint8_t *dst, size_t n)
+{
+    const size_t have = rx_used(c);
+    if (n > have) {
+        n = have;
+    }
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = c->rx_buf[(c->rx_tail + (uint32_t)i) % SSH_RX_RING];
+    }
+    c->rx_tail += (uint32_t)n;
+    return n;
+}
+
+static void ssh_reader_task(void *arg)
+{
+    ssh_conn_t *c = arg;
+    uint8_t     tmp[512];
+
+    for (;;) {
+        /* A full ring is the connection task not having taken bytes yet. */
+        if (rx_used(c) >= SSH_RX_RING) {
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
+        size_t want = SSH_RX_RING - rx_used(c);
+        if (want > sizeof(tmp)) {
+            want = sizeof(tmp);
+        }
+
+        const ssize_t n = recv(c->fd, tmp, want, 0);
+        if (n > 0) {
+            rx_push(c, tmp, (size_t)n);
+            (void)xSemaphoreGive(c->rx_data);
+            continue;
+        }
+        if (n == 0) {
+            c->rx_eof = true;
+            (void)xSemaphoreGive(c->rx_data);
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Only possible before SO_RCVTIMEO is cleared below, or if
+             * something set O_NONBLOCK on the descriptor. */
+            vTaskDelay(1);
+            continue;
+        }
+        c->rx_err = true;
+        (void)xSemaphoreGive(c->rx_data);
+        break;
+    }
+
+    espix_task_exited(&c->rx_exit);
+    vTaskDeleteWithCaps(NULL);
+}
+
+esp_err_t ssh_rx_start(ssh_conn_t *c)
+{
+    if (c->rx_exit.task != NULL) {
+        return ESP_OK;
+    }
+
+    c->rx_buf = heap_caps_malloc(SSH_RX_RING, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (c->rx_buf == NULL) {
+        c->rx_buf = heap_caps_malloc(SSH_RX_RING,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (c->rx_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    c->rx_data = xSemaphoreCreateBinary();
+    if (c->rx_data == NULL || !espix_task_exit_init(&c->rx_exit)) {
+        if (c->rx_data != NULL) {
+            vSemaphoreDelete(c->rx_data);
+            c->rx_data = NULL;
+        }
+        heap_caps_free(c->rx_buf);
+        c->rx_buf = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreateWithCaps(ssh_reader_task, "sshd:rx", SSH_RX_STACK, c,
+                            CONFIG_ESPIX_SSH_TASK_PRIO, &c->rx_exit.task,
+                            MALLOC_CAP_SPIRAM) != pdPASS) {
+        if (xTaskCreate(ssh_reader_task, "sshd:rx", SSH_RX_STACK, c,
+                        CONFIG_ESPIX_SSH_TASK_PRIO,
+                        &c->rx_exit.task) != pdPASS) {
+            vSemaphoreDelete(c->rx_data);
+            c->rx_data = NULL;
+            heap_caps_free(c->rx_buf);
+            c->rx_buf = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    /*
+     * From here the reader blocks in recv() rather than waking on
+     * SO_RCVTIMEO; the teardown's shutdown(SHUT_RD) is what ends it.
+     */
+    const struct timeval none = { .tv_sec = 0, .tv_usec = 0 };
+    (void)setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
+
+    return ESP_OK;
+}
+
+void ssh_rx_stop(ssh_conn_t *c)
+{
+    if (c->rx_exit.task != NULL) {
+        (void)shutdown(c->fd, SHUT_RD);     /* the reader's recv() returns 0 */
+
+        if (!espix_task_exit_wait(&c->rx_exit, 2000)) {
+            /* It did not come back. Leaking the ring is better than freeing
+             * memory a live task is still reading from. */
+            espix_klog(ESPIX_KLOG_WARN, TAG, "connection reader did not stop");
+            return;
+        }
+    }
+
+    if (c->rx_data != NULL) {
+        vSemaphoreDelete(c->rx_data);
+        c->rx_data = NULL;
+    }
+    if (c->rx_buf != NULL) {
+        heap_caps_free(c->rx_buf);
+        c->rx_buf = NULL;
+    }
+}
+
+static esp_err_t read_exact(ssh_conn_t *c, void *dst, size_t len)
+{
+    uint8_t *p   = dst;
     size_t   got = 0;
-    int64_t  stalled_since = 0;     /* us; 0 until a packet is part-read */
 
     while (got < len) {
-        const ssize_t n = recv(fd, p + got, len - got, 0);
-        if (n == 0) {
+        const size_t n = rx_pop(c, p + got, len - got);
+        if (n > 0) {
+            got += n;
+            /* Room again: wake the reader if it is waiting on space. */
+            if (c->rx_exit.task != NULL) {
+                (void)xTaskNotifyGive(c->rx_exit.task);
+            }
+            continue;
+        }
+
+        if (c->rx_eof) {
             return ESP_ERR_INVALID_STATE;   /* peer closed */
         }
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            /*
-             * Two different waits arrive here as EAGAIN, and telling them apart
-             * is the whole point of this branch.
-             *
-             * The socket carries SO_RCVTIMEO (see ssh_server.c), and it is also
-             * briefly O_NONBLOCK whenever esp_linenoise's terminal probe runs
-             * on this same descriptor. So EAGAIN means "nothing right now",
-             * never "the peer is gone".
-             *
-             * With `got == 0` nothing of a packet has arrived, which is an idle
-             * session waiting on a keystroke and may legitimately last hours.
-             * Wait indefinitely.
-             *
-             * With `got > 0` a packet is half-delivered and the peer has stopped
-             * mid-message. That is broken or vanished, and waiting forever is
-             * what parked connection tasks permanently: the task never exited,
-             * so the server's session count never came back down, and after
-             * CONFIG_ESPIX_SSH_MAX_SESSIONS of them every new connection was
-             * refused. Bound it.
-             */
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (got > 0) {
-                    /*
-                     * Measure the stall with a clock, not by counting turns of
-                     * this loop: each turn blocks for SO_RCVTIMEO and then
-                     * delays again, so a per-iteration tally bears no relation
-                     * to elapsed time.
-                     */
-                    const int64_t now = esp_timer_get_time();
-                    if (stalled_since == 0) {
-                        stalled_since = now;
-                    } else if (now - stalled_since >=
-                               (int64_t)PARTIAL_READ_TIMEOUT_MS * 1000) {
-                        espix_klog(ESPIX_KLOG_WARN, TAG,
-                                   "peer stopped %u bytes into a %u-byte packet",
-                                   (unsigned)got, (unsigned)len);
-                        return ESP_ERR_TIMEOUT;
-                    }
-                }
-                vTaskDelay(1);
-                continue;
-            }
+        if (c->rx_err) {
             return ESP_FAIL;
         }
-        got += (size_t)n;
-        stalled_since = 0;          /* progress resets the patience */
+
+        /*
+         * Nothing buffered. No byte of a packet yet is an idle session, which
+         * may legitimately wait hours; a half-read packet is bounded, because a
+         * peer that stopped mid-message is broken or gone. Progress resets the
+         * patience on the next time round.
+         */
+        const TickType_t wait = (got == 0)
+                                    ? portMAX_DELAY
+                                    : pdMS_TO_TICKS(PARTIAL_READ_TIMEOUT_MS);
+        if (xSemaphoreTake(c->rx_data, wait) != pdTRUE) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "peer stopped %u bytes into a %u-byte packet",
+                       (unsigned)got, (unsigned)len);
+            return ESP_ERR_TIMEOUT;
+        }
     }
     return ESP_OK;
 }
@@ -403,7 +538,7 @@ esp_err_t ssh_transport_banner(ssh_conn_t *c)
 
         for (;;) {
             char ch;
-            if (read_exact(c->fd, &ch, 1) != ESP_OK) {
+            if (read_exact(c, &ch, 1) != ESP_OK) {
                 return ESP_FAIL;
             }
             if (ch == '\n') {
@@ -710,7 +845,7 @@ static bool mac_equal(const uint8_t *a, const uint8_t *b, size_t len)
 esp_err_t ssh_packet_read(ssh_conn_t *c)
 {
     uint8_t header[4];
-    if (read_exact(c->fd, header, sizeof(header)) != ESP_OK) {
+    if (read_exact(c, header, sizeof(header)) != ESP_OK) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -729,13 +864,13 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    if (read_exact(c->fd, c->in_buf, packet_len) != ESP_OK) {
+    if (read_exact(c, c->in_buf, packet_len) != ESP_OK) {
         return ESP_ERR_INVALID_STATE;
     }
 
     if (c->rx.active) {
         uint8_t mac[SSH_MAC_LEN];
-        if (read_exact(c->fd, mac, sizeof(mac)) != ESP_OK) {
+        if (read_exact(c, mac, sizeof(mac)) != ESP_OK) {
             return ESP_ERR_INVALID_STATE;
         }
 
