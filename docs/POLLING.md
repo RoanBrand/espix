@@ -13,8 +13,6 @@ wants idle time -- so each case is judged on what it is actually waiting for.
 
 | where | waits for | now | replacement |
 |---|---|---|---|
-| cmd_run.c:168 (foreground wait) | the child to exit, or a key | 50 ms poll of espix_proc_wait + poll_interrupt | a per-session event group with FINISH and KEY bits: the process-finish path already sets a global event group bit, and the transports can set KEY. Wait with portMAX_DELAY. |
-| cmd_sys.c:1049 (top frame) | a key, or the frame interval | slices of TOP_SLICE_MS | wait on the session KEY bit with the frame interval as the timeout |
 | tty_console.c:791 (boot settle) | boot work to finish, then the log to drain | 50 ms poll of espix_kernel_boot_pending + klog echo time | the kernel signals when pending reaches zero, and the flusher signals when it has drained; wait on those |
 | session.c:853 (job stop) | background job tasks to leave | 10 ms poll of the job table | each job task gives a counting semaphore as its last act; wait with the existing deadline |
 | canvas_console.c:334 | the console task to exit | 10 ms poll of s_con.task | the task notifies the waiter before it deletes itself |
@@ -41,6 +39,7 @@ wants idle time -- so each case is judged on what it is actually waiting for.
 | cmd_text.c:729 (sleep), cmd_sys.c:371 (ps -d), desktop.c:2164 (appdata panel) | the sleep is the requested behaviour |
 | espix_audio.c:563 | the 5 s idle yield kept by R-P4.2 for the SMP tick |
 | wifi.c:318 | uses a timer rather than blocking the event loop -- the right shape already |
+| cmd_run.c:168 (foreground wait), cmd_sys.c:1049 (top frame) | **A task cannot wait on two sources at once.** The child half is already event-driven -- espix_proc_wait blocks on espix_proc's event group -- so the only thing polled is the key, and making that a push needs each transport to have an async producer. Only the VNC terminal has one (its key queue). Over SSH, chan_poll_interrupt *is* the connection task reading the wire, so a signal would need a second reader task per connection: a task and a wakeup per packet, to save the 20 Hz this costs while a command runs. The serial console is ready-but-unread rather than an event. Left as a bounded wait, documented, until a transport can push. |
 | reaper.c:80 | portMAX_DELAY -- the model to copy |
 
 ## Shared primitives worth building once
@@ -80,7 +79,9 @@ reclaimer), rather than to move these.
    waits block on it. Verified by three display start/stop cycles on the
    board: no crash, and no "console task did not stop" warning, which is what
    a missed wakeup prints after the 3 s timeout.
-2. Session key bit: cmd_run and top (removes the two 50 ms loops on the hot path).
+2. ~~Session key bit: cmd_run and top.~~ Reclassified: see the last row of
+   the keep table. Doing it properly for SSH costs more than it saves, and
+   the VNC-only win is not worth the plumbing on its own.
 3. Boot-settle signal (console start only, but it is a 5 s poll today).
 4. Job-stop semaphore.
 5. ssh_transport poll() waits.
