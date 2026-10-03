@@ -51,5 +51,8 @@ fi
 # Held. Name the holders when we can, and fail either way -- a missing lsof
 # (minimal installs) must not turn a busy port into a free one.
 # shellcheck disable=SC2009
-lsof 2>/dev/null | grep -i "$(basename "$port")" | sed 's/^/  /'
+# stderr, always: this script's stdout is read by port.sh, whose own stdout is
+# the port and nothing else. A holder list on stdout became the "port", and
+# make test then passed the lsof row to run.sh -- which died on the pid in it.
+lsof 2>/dev/null | grep -i "$(basename "$port")" | sed 's/^/  /' >&2
 exit 1
