@@ -8,8 +8,10 @@
  * espix does NOT use esp_console_run() / esp_console_cmd_register(): the
  * console component copies every command line through a single shared static
  * buffer (s_tmp_line_buf in components/console/commands.c), so two concurrent
- * sessions would corrupt each other. We keep our own registry and reuse only
- * esp_console_split_argv(), which is reentrant.
+ * sessions would corrupt each other. We keep our own registry and our own word
+ * splitter, which is reentrant and honours both quotes (R-P2.12);
+ * esp_console_split_argv() knew only a double quote, and only when one started
+ * a word.
  *
  * Line editing is espressif/esp_linenoise, one instance per session. IDF's own
  * linenoise keeps its history and callbacks in file-scope statics and reads raw

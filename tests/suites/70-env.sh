@@ -25,17 +25,21 @@ assert_eq "\${VAR} expands"      "bar" "$(dev_run 'echo ${FOO}')"
 assert_eq "it expands mid-word"  "pre-bar-post" "$(dev_run 'echo pre-$FOO-post')"
 assert_eq "an unset name expands to nothing" "." "$(dev_run 'echo $NOPE.')"
 
-# A value with a space in it. Note the quoting: esp_console_split_argv() honours
-# a quote that *starts* an argument, so `export "SP=a b"` works and
-# `export SP="a b"` does not -- the latter sets SP to the two characters `"a`.
-# Worth asserting because it is the form that looks right and is not.
+# A value with a space in it. Either quote groups and is removed, wherever it
+# appears in the word (R-P2.12), so both spellings set the value the way they
+# look like they should -- the second did not before, and set SPACED2 to the
+# two characters quote-a.
 dev_run 'export "SPACED=a b"' >/dev/null
 assert_eq "a quoted assignment keeps the space" "a b" \
     "$(dev_run 'echo $SPACED')"
 dev_run 'export SPACED2="a b"' >/dev/null 2>&1
-assert_eq "an unquoted one does not, and splits at the space" '"a' \
+assert_eq "and the other spelling does too now" "a b" \
     "$(dev_run 'echo $SPACED2')"
 
+assert_eq "single quotes group a word" "x y" "$(dev_run "echo 'x y'")"
+assert_eq "and concatenate within one" "abc" "$(dev_run "echo a'b'c")"
+assert_eq "and a dollar inside them stays literal" '$HOME' \
+    "$(dev_run "echo '\$HOME'")"
 # ---------------------------------------------------------------------------
 # $? -- tracked by the session since before there was any way to read it
 # ---------------------------------------------------------------------------
@@ -73,8 +77,8 @@ assert_not_contains "'||' skips the next command on success" "SHOULD-NOT-PRINT" 
 assert_contains "';' ends the chain a failure started" "after" \
     "$(dev_run 'cd /definitely-not-a-dir && echo SHOULD-NOT-PRINT; echo after')"
 
-# An operator is only an operator unquoted. espix's tokenizer keeps the quotes
-# on the argument, so the assertion is that the `;` did not split the command.
+# An operator is only an operator unquoted. The quotes are removed and the word
+# kept whole, so the assertion is that the semicolon did not split the command.
 assert_contains "a quoted ';' is an argument, not an operator" "a;b" \
     "$(dev_run "echo 'a;b'")"
 

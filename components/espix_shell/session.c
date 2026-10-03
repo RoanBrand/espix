@@ -909,6 +909,79 @@ void espix_shell_jobs_drain(espix_session_t *s)
 }
 
 /*
+ * Split a command line into words the way a shell does.
+ *
+ * esp_console_split_argv() -- what this replaced -- knows only a double quote,
+ * and only when one starts a word: echo "a b" gave one word, but echo 'a b'
+ * gave two words with the quotes still on them, and echo a'b'c was three
+ * literals. Here either quote groups and is removed, a quote may appear
+ * anywhere in a word (a'b'c is abc), and a single-quoted $ stays literal -- it
+ * is written out as backslash-dollar for expand_token(), which already knows
+ * that spelling. Double quotes still expand, as sh does.
+ *
+ * Words are written back over the input, which is what keeps this reentrant on
+ * the caller's scratch buffer: the write pointer never overtakes the read
+ * pointer, because every byte written was consumed first.
+ */
+static int espix_split_argv(char *line, char **argv, int argv_size)
+{
+    int   argc = 0;
+    char *out  = line;
+
+    for (char *p = line; *p != '\0' && argc < argv_size; ) {
+        while (*p == ' ' || *p == '\t' || *p == '\n') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        argv[argc++] = out;
+
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') {
+            if (*p == '\'') {
+                p++;
+                while (*p != '\0' && *p != '\'') {
+                    if (*p == '$') {
+                        *out++ = '\\';      /* keep it literal below */
+                    }
+                    *out++ = *p++;
+                }
+                if (*p == '\'') {
+                    p++;
+                }
+            } else if (*p == '"') {
+                p++;
+                while (*p != '\0' && *p != '"') {
+                    if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) {
+                        p++;
+                    }
+                    *out++ = *p++;
+                }
+                if (*p == '"') {
+                    p++;
+                }
+            } else {
+                *out++ = *p++;
+            }
+        }
+
+        /*
+         * The separator is consumed *before* the terminator is written. When
+         * nothing was quoted out == p, so writing the NUL first would erase the
+         * separator and the scan below would read it as the end of the line --
+         * which is what it did the first time.
+         */
+        if (*p != '\0') {
+            p++;
+        }
+        *out++ = '\0';
+    }
+
+    return argc;
+}
+
+/*
  * One command, with no operators left in it: what espix_shell_exec() used to
  * be before `;`, `&&` and `||` were parsed. Split out so the sequencer below
  * can run it once per segment.
@@ -926,7 +999,7 @@ static int exec_one(espix_session_t *s, const char *line)
 
     strlcpy(scratch, line, sizeof(scratch));
 
-    int argc = (int)esp_console_split_argv(scratch, argv, ESPIX_ARGS_MAX);
+    int argc = espix_split_argv(scratch, argv, ESPIX_ARGS_MAX);
     if (argc == 0) {
         return ESPIX_SHELL_EMPTY;
     }
