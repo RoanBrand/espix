@@ -380,8 +380,18 @@ static void units_parse(svc_unit_t *fresh, int *n, char *line)
 
 static void units_load(void)
 {
-    svc_unit_t fresh[SVC_MAX];
-    int        n = 0;
+    /*
+     * Static, and therefore off the caller's stack. Every caller holds
+     * s_lock, so one copy is safe -- and it has to be one copy the caller can
+     * afford: service reload runs on the SSH connection task, whose 8 KB
+     * stack could not hold this 2.6 KB array plus the session, and the task
+     * died of a stack protection fault (SP below its own bounds) before the
+     * array ever came off it.
+     */
+    static svc_unit_t fresh[SVC_MAX];
+    int n = 0;
+
+    memset(fresh, 0, sizeof(fresh));
 
     FILE *f = fopen(SVC_UNITS_FILE, "r");
     if (f != NULL) {
