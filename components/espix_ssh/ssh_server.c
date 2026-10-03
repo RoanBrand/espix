@@ -733,11 +733,12 @@ static void accept_task(void *arg)
          * A PSRAM stack, with the internal fallback the rest of espix uses.
          *
          * 8192 bytes each and up to CONFIG_ESPIX_SSH_MAX_SESSIONS of them, so at
-         * eight this is 64 KB of the internal pool -- the largest single
-         * consumer in the tree, and the reason the sessions suite once drove
-         * internal RAM to zero. Nothing on this task's path needs the flash
-         * cache frozen (which is what keeps elfreloc's stack internal), and
-         * nothing here is DMA.
+         * eight this is 64 KB -- of PSRAM, not of the internal pool. The
+         * fallback below is what once drove internal RAM to zero at eight
+         * sessions; with PSRAM available, what a connection costs internally is
+         * its channel receive buffer. Nothing on this task's path needs the
+         * flash cache frozen (which is what keeps elfreloc's stack internal),
+         * and nothing here is DMA.
          */
         BaseType_t ok = xTaskCreateWithCaps(connection_task, "sshd:conn",
                                             CONFIG_ESPIX_SSH_TASK_STACK,

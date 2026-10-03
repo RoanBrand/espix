@@ -119,9 +119,10 @@ menu "espix SSH"
         help
             Moves the 14760 bytes of packet buffers, cipher state and stored
             key-exchange material per connection out of internal RAM, which is
-            what limits how many sessions fit. A connection then costs 12392
-            bytes of internal RAM: its task stack, which can never leave
-            internal RAM, and the channel receive buffer.
+            what limits how many sessions fit. A connection then costs the
+            channel receive buffer in internal RAM; its task stack is allocated
+            from PSRAM too (ssh_server.c), with an internal fallback when PSRAM
+            is full.
 
             This holds the cipher state and both packet buffers, and the AES
             driver bounces external memory through an internal buffer before
