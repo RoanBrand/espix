@@ -115,15 +115,22 @@ class Session:
         return True
 
     def _expect(self, needle, timeout=None):
-        deadline = time.time() + (self.timeout if timeout is None else timeout)
+        limit = self.timeout if timeout is None else timeout
+        deadline = time.time() + limit
         while needle not in self.buf:
             if not self._read_some(deadline):
                 raise TimeoutError(
-                    f"never saw {needle!r}; got: {self.buf[-400:]!r}")
+                    f"never saw {needle!r} within {limit}s; "
+                    f"got: {self.buf[-400:]!r}")
         return True
 
     def _wait_prompt(self, timeout=None):
-        deadline = time.time() + (self.timeout if timeout is None else timeout)
+        # The budget goes in the message. A timeout is the one failure whose
+        # *size* is the diagnosis -- 26 seconds is a slow command under load,
+        # and ten minutes is a device that has stopped -- and the old message
+        # said only "no prompt", leaving the reader to guess which.
+        limit = self.timeout if timeout is None else timeout
+        deadline = time.time() + limit
         while True:
             tail = strip_ansi(self.buf).rstrip(b"\x00")
             # Trailing CR/LF before the prompt is normal; only the very end
@@ -132,7 +139,8 @@ class Session:
                PROMPT.search(tail[-120:]):
                 return
             if not self._read_some(deadline):
-                raise TimeoutError(f"no prompt; got: {self.buf[-400:]!r}")
+                raise TimeoutError(
+                    f"no prompt within {limit}s; got: {self.buf[-400:]!r}")
 
     def run(self, command):
         """Send one command, return its output with the echo and prompt gone.

@@ -95,6 +95,7 @@ dev_session_start() {
     "$ESPIX_PYTHON" "$ESPIX_LIB_DIR/session.py" \
         --host "$ESPIX_HOST" --user "$ESPIX_USER" --password "$ESPIX_PASS" \
         --login-timeout "$ESPIX_LOGIN_TIMEOUT" \
+        --timeout "$ESPIX_CMD_TIMEOUT" \
         < "$DEV_SESSION_DIR/in" > "$DEV_SESSION_DIR/out" \
         2> "$DEV_SESSION_DIR/err" &
     DEV_SESSION_PID=$!
@@ -267,6 +268,18 @@ DEV_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Con
 # it was already being used on the ordinary path, not because doing so fixed
 # that.
 : "${ESPIX_LOGIN_TIMEOUT:=60}"
+
+# The command budget for a long-lived session, as against the login budget
+# above. It was session.py's default of 25 and was never set here, which left
+# a command with less patience than a login -- and under a four-worker pool a
+# filesystem command can take well over 25 seconds while the other three
+# workers hammer the same flash (an ext4 write goes through its backing file
+# on littlefs, so it queues behind everything else). The session then died
+# mid-suite and every later dev_run answered DEV_DEAD, so one slow command
+# read as twenty assertion failures and the pool reported a suite that
+# "passes alone". Sixty matches the login budget, and for the same reason:
+# the ordinary path was already using half of twenty-five.
+: "${ESPIX_CMD_TIMEOUT:=60}"
 
 # ConnectTimeout bounds the *connect* and nothing after it, so a device that
 # accepts a connection and then never answers held a run open indefinitely --
