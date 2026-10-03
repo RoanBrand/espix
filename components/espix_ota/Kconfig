@@ -11,14 +11,19 @@ menu "espix OTA"
             this on and no loader slot refuses to update and says so.
 
     config ESPIX_OTA_AUTO_CHECK
-        bool "Check for updates in the background"
+        bool "Check for updates from a resident background task (deprecated)"
         depends on ESPIX_OTA_ENABLED
-        default y
+        default n
         help
-            A low-priority task checks at most once per
-            ESPIX_OTA_CHECK_PERIOD_S, woken by the network getting an address,
-            and never in the boot path. It never installs anything: the result
-            only makes the greeting mention that an update exists.
+            A low-priority task that checks at most once per
+            ESPIX_OTA_CHECK_PERIOD_S, woken by the network getting an address.
+            It never installs anything.
+
+            This is off by default because the task is resident for the sake of
+            a check that runs rarely. The scheduled unit in /etc/units does the
+            same work and exists only while it runs:
+
+                poll every 6h upgrade --check
 
     config ESPIX_OTA_CHECK_PERIOD_S
         int "Minimum seconds between background checks"

@@ -314,68 +314,97 @@ static void unit_start(svc_unit_t *u)
  * running: a unit that is still declared keeps its pid, its policy and its
  * count; one that is gone is asked to stop. Called under the lock.
  */
+/*
+ * The default when /etc/units is absent, in the same syntax the file uses.
+ *
+ * The system provides it the way it provides /etc itself and every other
+ * default: a device whose filesystem is bare still checks for updates. A units
+ * file replaces this outright -- there is no merge, so there is one place to
+ * read the answer.
+ */
+static const char *const SVC_DEFAULT_UNITS =
+    "# built-in default; create /etc/units to replace it\n"
+    "poll every 6h upgrade --check\n";
+
+/* One line, file or built-in. Mutates the line, as strtok_r does. */
+static void units_parse(svc_unit_t *fresh, int *n, char *line)
+{
+    char *p = line;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '#' || *p == '\n' || *p == '\0') {
+        return;
+    }
+
+    char *save    = NULL;
+    char *name    = strtok_r(p, " \t\n", &save);
+    char *restart = strtok_r(NULL, " \t\n", &save);
+    char *cmd     = NULL;
+    uint32_t every_s = 0;
+
+    if (name == NULL || restart == NULL) {
+        return;
+    }
+
+    if (strcmp(restart, "every") == 0) {
+        /* name every <interval> command: a scheduled, oneshot unit. */
+        char *interval = strtok_r(NULL, " \t\n", &save);
+        every_s = (interval != NULL) ? parse_duration(interval) : 0;
+        if (every_s == 0) {
+            return;
+        }
+    }
+
+    cmd = strtok_r(NULL, "\n", &save);
+    if (cmd == NULL) {
+        return;
+    }
+    while (*cmd == ' ' || *cmd == '\t') {
+        cmd++;
+    }
+    if (*cmd == '\0' || strlen(name) >= ESPIX_SVC_NAME_MAX) {
+        return;
+    }
+
+    svc_unit_t *u = &fresh[(*n)++];
+    memset(u, 0, sizeof(*u));
+    strlcpy(u->name, name, sizeof(u->name));
+    strlcpy(u->cmdline, cmd, sizeof(u->cmdline));
+    u->always  = (strcmp(restart, "always") == 0);
+    u->enabled = !s_safe_mode;
+    u->pid     = ESPIX_PID_NONE;
+    u->every_s = every_s;
+    u->next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
+}
+
 static void units_load(void)
 {
     svc_unit_t fresh[SVC_MAX];
     int        n = 0;
 
     FILE *f = fopen(SVC_UNITS_FILE, "r");
-    if (f == NULL) {
-        espix_klog(ESPIX_KLOG_INFO, TAG, "no %s; nothing to supervise",
-                   SVC_UNITS_FILE);
-    } else {
+    if (f != NULL) {
         char line[SVC_LINE_MAX];
-
         while (n < SVC_MAX && fgets(line, sizeof(line), f) != NULL) {
-            char *p = line;
-            while (*p == ' ' || *p == '\t') {
-                p++;
-            }
-            if (*p == '#' || *p == '\n' || *p == '\0') {
-                continue;
-            }
-
-            char *save    = NULL;
-            char *name    = strtok_r(p, " \t\n", &save);
-            char *restart = strtok_r(NULL, " \t\n", &save);
-            char *cmd     = NULL;
-            uint32_t every_s = 0;
-
-            if (name == NULL || restart == NULL) {
-                continue;
-            }
-
-            if (strcmp(restart, "every") == 0) {
-                /* name every <interval> command: a scheduled, oneshot unit. */
-                char *interval = strtok_r(NULL, " \t\n", &save);
-                every_s = (interval != NULL) ? parse_duration(interval) : 0;
-                if (every_s == 0) {
-                    continue;
-                }
-            }
-
-            cmd = strtok_r(NULL, "\n", &save);
-            if (cmd == NULL) {
-                continue;
-            }
-            while (*cmd == ' ' || *cmd == '\t') {
-                cmd++;
-            }
-            if (*cmd == '\0' || strlen(name) >= ESPIX_SVC_NAME_MAX) {
-                continue;
-            }
-
-            svc_unit_t *u = &fresh[n++];
-            memset(u, 0, sizeof(*u));
-            strlcpy(u->name, name, sizeof(u->name));
-            strlcpy(u->cmdline, cmd, sizeof(u->cmdline));
-            u->always  = (strcmp(restart, "always") == 0);
-            u->enabled = !s_safe_mode;
-            u->pid     = ESPIX_PID_NONE;
-            u->every_s = every_s;
-            u->next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
+            units_parse(fresh, &n, line);
         }
         fclose(f);
+    } else {
+        /* Said out loud: "no units file" and "no units" are different states,
+         * and this one still runs the update check. */
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "no %s; using the built-in unit (poll every 6h "
+                   "upgrade --check)", SVC_UNITS_FILE);
+
+        char *copy = strdup(SVC_DEFAULT_UNITS);
+        if (copy != NULL) {
+            for (char *l = strtok(copy, "\n"); l != NULL && n < SVC_MAX;
+                 l = strtok(NULL, "\n")) {
+                units_parse(fresh, &n, l);
+            }
+            free(copy);
+        }
     }
 
     for (int i = 0; i < n; i++) {

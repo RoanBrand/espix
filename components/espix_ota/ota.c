@@ -1024,6 +1024,8 @@ bool espix_ota_known_update(char *version, size_t len)
     return true;
 }
 
+#if CONFIG_ESPIX_OTA_AUTO_CHECK
+
 static bool auto_check_enabled(void)
 {
     char v[8] = {0};
@@ -1110,6 +1112,8 @@ static void check_task(void *arg)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(OTA_WAKE_MS));
     }
 }
+
+#endif /* CONFIG_ESPIX_OTA_AUTO_CHECK */
 
 esp_err_t espix_ota_init(void)
 {
