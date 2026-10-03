@@ -285,6 +285,14 @@ struct espix_session {
     espix_job_t jobs[ESPIX_SESSION_JOBS];
 
     /*
+     * One token per job that leaves, so espix_shell_jobs_drain() blocks on an
+     * event instead of re-reading the table every 10 ms (R-P7.1). Typed void *
+     * to keep this header FreeRTOS-free; created when the first job starts and
+     * deleted with the session.
+     */
+    void       *jobs_done;
+
+    /*
      * Non-NULL only in a background builtin's session copy, where it points at
      * that job's stop flag. The loops that can block poll it; NULL everywhere
      * else, which is what makes espix_shell_stopping() false in an ordinary

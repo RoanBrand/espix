@@ -90,6 +90,9 @@ reclaimer), rather than to move these.
    barrier's own comment says it is. Verified on the board: the console's
    debug line reads settled=1 drained=1 across a boot, so both waits were
    woken by their events and not by the five-second cap.
-4. Job-stop semaphore.
+4. ~~Job-stop semaphore.~~ Done: each background job gives a counting
+   semaphore as it leaves, and the drain blocks on it with the deadline as
+   the backstop. Verified by 70-env, including "a backgrounded builtin does
+   not outlive an exec session" -- the path the drain exists for.
 5. ssh_transport poll() waits.
 6. Audio ring and the gfx blocking wait (larger; the gfx one is an ABI addition).

@@ -695,6 +695,12 @@ static void bg_task(void *arg)
     }
     portEXIT_CRITICAL(&s_job_lock);
 
+    /* Tell the session's drain this one is gone. Before the suspend below, so a
+     * drain already waiting is woken even when it owns the deletion. */
+    if (c->s.jobs_done != NULL) {
+        (void)xSemaphoreGive((SemaphoreHandle_t)c->s.jobs_done);
+    }
+
     if (!mine) {
         /* The drain owns this and will delete the task. All this one may do is
          * stop touching memory that is about to be freed. Never returns. */
@@ -741,6 +747,16 @@ static int start_background_job(espix_session_t *s, const espix_cmd_t *cmd,
     if (j == NULL) {
         espix_eprintf(s, "espix: too many background jobs\n");
         return 1;
+    }
+
+    /* Before the context copies the session below, so the job's own copy
+     * carries the handle. Counting: every job gives once. */
+    if (s->jobs_done == NULL) {
+        s->jobs_done = (void *)xSemaphoreCreateCounting(ESPIX_SESSION_JOBS, 0);
+        if (s->jobs_done == NULL) {
+            espix_eprintf(s, "espix: %s: no memory for a job\n", argv[0]);
+            return 1;
+        }
     }
 
     size_t bytes = 0;
@@ -851,17 +867,33 @@ void espix_shell_jobs_drain(espix_session_t *s)
      * iteration, and one that never will must not hold the session open.
      */
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(JOB_STOP_MS);
-    while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
-        bool left = false;
+
+    for (;;) {
+        int left_jobs = 0;
         for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
             if (s->jobs[i].task != NULL && !s->jobs[i].finished) {
-                left = true;
+                left_jobs++;
             }
         }
-        if (!left) {
+        if (left_jobs == 0) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        const TickType_t left = (int32_t)(deadline - xTaskGetTickCount());
+        if ((int32_t)left <= 0) {
+            break;
+        }
+
+        /* Re-counts after every wake, so a token from a job that finished
+         * earlier only costs one extra pass. */
+        SemaphoreHandle_t done = (SemaphoreHandle_t)s->jobs_done;
+        if (done == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(10));      /* creation failed; coarse */
+            break;
+        }
+        if (xSemaphoreTake(done, left) != pdTRUE) {
+            break;
+        }
     }
 
     for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
@@ -905,6 +937,13 @@ void espix_shell_jobs_drain(espix_session_t *s)
         portENTER_CRITICAL(&s_job_lock);
         memset(j, 0, sizeof(*j));
         portEXIT_CRITICAL(&s_job_lock);
+    }
+
+    /* The session is ending; the token semaphore goes with it. A second drain
+     * finds no jobs and no semaphore. */
+    if (s->jobs_done != NULL) {
+        vSemaphoreDelete((SemaphoreHandle_t)s->jobs_done);
+        s->jobs_done = NULL;
     }
 }
 
