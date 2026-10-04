@@ -33,6 +33,7 @@
 
 #define VPN_CONF_PATH "/etc/vpn.conf"
 #define VPN_CLIENTS_DIR "/etc/vpn/clients/"
+#define VPN_GROUP        "esp"   /* the login user: root writes, this group reads */
 #define VPN_ADDR      "10.6.0.1"
 #define VPN_MASK      "255.255.255.0"
 #define VPN_PORT      WIREGUARDIF_DEFAULT_PORT
@@ -108,9 +109,51 @@ static size_t base64_decode(const char *in, uint8_t *out, size_t outlen)
  * flashed before this existed carries no mode and would stay 0644 forever,
  * which is what espix_fs_ensure_mode() makes cheap to correct.
  */
+/* The gid of the login group, from /etc/group, or 0 when there is no such
+ * group -- in which case the files stay root-only rather than becoming
+ * readable by everyone on a device whose groups are not what we expect. */
+static uint16_t vpn_gid(void)
+{
+    const size_t key = strlen(VPN_GROUP);
+
+    FILE *f = fopen("/etc/group", "r");
+    if (f == NULL) {
+        return 0;
+    }
+
+    char   line[160];
+    uint16_t gid = 0;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, VPN_GROUP ":", key + 1) != 0) {
+            continue;
+        }
+        gid = (uint16_t)atoi(line + key + 1);
+        break;
+    }
+    fclose(f);
+    return gid;
+}
+
+/*
+ * The private key is the server's identity, and a file anyone can read is a key
+ * anyone has -- but a key only root can read is a command nobody can run. 0640
+ * with the login group: the shell user can read it, nobody else can, and root
+ * writes it. On every write and again at the boot read, so a device flashed
+ * before this does not keep 0644 files for the rest of its life.
+ */
+static void secure_path(const char *path, uint16_t gid)
+{
+    if (gid != 0) {
+        (void)espix_fs_chown(path, 0, gid);
+        (void)espix_fs_ensure_mode(path, 0640);
+    } else {
+        (void)espix_fs_ensure_mode(path, 0600);
+    }
+}
+
 static void secure_conf(void)
 {
-    (void)espix_fs_ensure_mode(VPN_CONF_PATH, 0600);
+    secure_path(VPN_CONF_PATH, vpn_gid());
 }
 
 /*
@@ -133,7 +176,7 @@ static void secure_clients(void)
         char path[160];
         strlcpy(path, VPN_CLIENTS_DIR, sizeof(path));
         strlcat(path, e->d_name, sizeof(path));
-        (void)espix_fs_ensure_mode(path, 0600);
+        secure_path(path, vpn_gid());
     }
     closedir(d);
 }
