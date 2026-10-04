@@ -13,7 +13,9 @@
 
 #include "lwip/ip.h"            /* ip_input */
 #include "lwip/ip_addr.h"
+#include "lwip/mem.h"
 #include "lwip/netif.h"
+#include "lwip/udp.h"
 
 #include "wireguard.h"
 #include "wireguardif.h"
@@ -196,7 +198,24 @@ esp_err_t espix_net_vpn_down(void)
 
     (void)espix_net_napt_netif(&s_wg, false);
     espix_net_unregister_netif(&s_wg);
-    wireguardif_shutdown(&s_wg);        /* cancels its timers first, as it asks */
+    wireguardif_shutdown(&s_wg);        /* cancels its timer, and only that */
+
+    /*
+     * The component stops its timer and leaves everything else behind: the UDP
+     * socket still holds the port, and the device it allocated is still ours.
+     * Without this the next vpn up cannot bind 51820, netif_add fails with no
+     * clue why, and a down/up pair needs a reboot -- which is exactly what it
+     * used to do.
+     */
+    struct wireguard_device *dev = (struct wireguard_device *)s_wg.state;
+    if (dev != NULL) {
+        if (dev->udp_pcb != NULL) {
+            udp_remove(dev->udp_pcb);
+        }
+        mem_free(dev);
+        s_wg.state = NULL;
+    }
+
     netif_remove(&s_wg);
     s_up = false;
     espix_klog(ESPIX_KLOG_INFO, TAG, "wg0 down");
@@ -305,6 +324,8 @@ static bool peer_admit(const char *pub, const char *addr, u8_t *idx_out)
 
 static void peers_load(void)
 {
+    s_peer_count = 0;                  /* a fresh device: admit them again */
+
     FILE *f = fopen(VPN_PEERS_PATH, "r");
     if (f == NULL) {
         return;

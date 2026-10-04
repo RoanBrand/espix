@@ -68,7 +68,13 @@ int cmd_fetch(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    espix_printf(s, "fetch: %s\n", argv[1]);
+    {
+    /* The URL can carry a password, and this line goes to the console: log
+     * through the redactor, as the klog does. */
+    char safe[256];
+    espix_net_redact_url(argv[1], safe, sizeof(safe));
+    espix_printf(s, "fetch: %s\n", safe);
+}
 
     espix_fetch_progress_t progress = { .s = s };
     espix_fetch_info_t     info     = { 0 };

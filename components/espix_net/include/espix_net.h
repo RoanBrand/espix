@@ -79,6 +79,12 @@ esp_err_t espix_net_ifinfo(const char *name, espix_ifinfo_t *out);
 /* Default route, i.e. whichever interface esp_netif considers default. */
 bool      espix_net_default_route(char *ifname, size_t len, uint32_t *gw);
 
+/*
+ * A URL as it is safe to log: any password, token or key in it is masked. A
+ * ddns update URL carries one in its query, and a log is not a secret store.
+ */
+size_t espix_net_redact_url(const char *url, char *out, size_t len);
+
 /* Nameservers of the default interface, as DHCP supplied them. */
 size_t    espix_net_dns(uint32_t *out, size_t n);
 

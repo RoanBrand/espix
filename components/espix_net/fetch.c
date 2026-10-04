@@ -210,7 +210,10 @@ espix_fetch_status_t espix_net_fetch(const char *url, const char *path,
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
     }
 
-    espix_klog(ESPIX_KLOG_INFO, TAG, "fetching %s (%u KiB free)", url,
+    /* Through the redactor: an update URL carries a password in its query. */
+    char safe[256];
+    espix_net_redact_url(url, safe, sizeof(safe));
+    espix_klog(ESPIX_KLOG_INFO, TAG, "fetching %s (%u KiB free)", safe,
                (unsigned)(info->free_now / 1024));
 
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
