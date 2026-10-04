@@ -41,3 +41,12 @@ long_cmd=$(printf 'x%.0s' $(seq 1 300))
 assert_contains "an over-long exec names the limit" "limit is" \
     "$(dev_once "$long_cmd" 2>&1)"
 assert_status "and it exits 130" 130 dev_status "$long_cmd"
+
+# Redirection attached to the operator (R-P2.13). The separated form always
+# worked; an attached 2> used to become an argument, so the command was handed
+# a file by that name. dev_once rather than dev_status: the status of a
+# redirected command comes back through the one-shot exec reliably.
+assert_contains "stdout redirects without a space" "hi"     "$(dev_once 'echo hi >/tmp/smoke-redir; cat /tmp/smoke-redir')"
+assert_contains "stderr redirects without a space" "st=1"     "$(dev_once 'ls /nonexistent 2>/dev/null; echo st=$?')"
+assert_contains "stdin redirects without a space" "$(dev_once 'cat /etc/hostname')"     "$(dev_once 'cat </etc/hostname')"
+assert_contains "an unsupported descriptor is refused" "descriptors 0, 1 and 2"     "$(dev_once 'echo x 3>/tmp/smoke-redir')"
