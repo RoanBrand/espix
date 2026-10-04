@@ -19,6 +19,8 @@
 #include "espix_kernel.h"
 #include "espix_nfsd.h"
 
+#include "nfs3.h"
+#include "nfsd_internal.h"
 #include "rpc.h"
 
 #define TAG "espix:nfsd"
@@ -27,6 +29,8 @@
 #define PORTMAP_VERS 2u
 #define MOUNT_PROG   100005u
 #define MOUNT_VERS   3u
+#define NFS_PROG     100003u
+#define NFS_VERS     3u
 
 #define PORTMAP_PORT 111
 #define MOUNT_PORT   20048          /* ours to choose: mountd has no default */
@@ -35,20 +39,9 @@
 #define MAX_EXPORTS 8
 #define MAX_CLIENTS 8
 
-#define BUFCAP 8192
-
-typedef struct {
-    uint32_t addr;                  /* network order, as sin_addr is */
-    uint32_t mask;
-} nfs_client_t;
-
-typedef struct {
-    char         path[192];
-    bool         ro;
-    bool         all;               /* "*" */
-    nfs_client_t clients[MAX_CLIENTS];
-    int          nclients;
-} nfs_export_t;
+#define BUFCAP   NFSD_BUFCAP   /* 16 KB: a read reply has to fit */
+#define IOCAP    NFSD_IOCAP
+#define MAX_CONNS 4
 
 static nfs_export_t *s_exports;          /* PSRAM, like the buffers */
 static int           s_nexports;
@@ -63,6 +56,14 @@ static uint8_t *s_req;
 static uint8_t *s_rep;
 static uint8_t *s_frame;   /* TCP: on the heap, not 8 KB of task stack */
 static uint8_t *s_out;
+static uint8_t *s_io;                       /* a read fills this */
+
+/* A client keeps its TCP connection open for as long as it likes, so one
+ * connection cannot be served to the exclusion of everything else. */
+static struct {
+    int      fd;
+    uint32_t src;
+} s_conns[MAX_CONNS];
 
 /* ------------------------------------------------------------- exports --- */
 
@@ -184,6 +185,26 @@ static const nfs_export_t *export_for(const char *dir)
     return NULL;
 }
 
+int nfsd_exports_count(void)
+{
+    return s_nexports;
+}
+
+const nfs_export_t *nfsd_export(int i)
+{
+    return (i >= 0 && i < s_nexports) ? &s_exports[i] : NULL;
+}
+
+const nfs_export_t *nfsd_export_for_dir(const char *dir)
+{
+    return export_for(dir);
+}
+
+bool nfsd_client_allowed(const nfs_export_t *e, uint32_t src)
+{
+    return client_allowed(e, src);
+}
+
 /* --------------------------------------------------------------- the RPC --- */
 
 static void reg_add(uint32_t prog, uint32_t vers, uint16_t port)
@@ -253,6 +274,40 @@ static size_t handle_mount(const rpc_call_t *c, xdrw_t *w, uint32_t src)
         xdrw_accept(w, RPC_SUCCESS);
         return w->len;
 
+    case 1: {                                   /* MNT */
+        rpc_call_t args = *c;
+        char       dir[256];
+        if (!rpc_get_string(&args, dir, sizeof(dir))) {
+            xdrw_accept(w, RPC_GARBAGE_ARGS);
+            return w->len;
+        }
+        xdrw_accept(w, RPC_SUCCESS);
+
+        const nfs_export_t *e = export_for(dir);
+        if (e == NULL) {
+            xdrw_u32(w, 2);                     /* MNT3ERR_NOENT */
+            return w->len;
+        }
+        if (!client_allowed(e, src)) {
+            xdrw_u32(w, 13);                    /* MNT3ERR_ACCES */
+            return w->len;
+        }
+
+        uint8_t fh[16];
+        size_t  fhlen = 0;
+        if (!nfs3_fh_for_export((int)(e - s_exports), fh, &fhlen)) {
+            xdrw_u32(w, 10006);                 /* MNT3ERR_SERVERFAULT */
+            return w->len;
+        }
+
+        xdrw_u32(w, 0);                         /* MNT3_OK */
+        xdrw_u32(w, (uint32_t)fhlen);
+        xdrw_opaque(w, fh, fhlen);
+        xdrw_u32(w, 1);                         /* auth flavours: AUTH_SYS */
+        xdrw_u32(w, 1);
+        return w->len;
+    }
+
     case 3: {                                   /* UMNT */
         xdrw_accept(w, RPC_SUCCESS);
         return w->len;
@@ -302,26 +357,32 @@ static size_t handle_mount(const rpc_call_t *c, xdrw_t *w, uint32_t src)
 static size_t dispatch(const rpc_call_t *c, uint8_t *rep, size_t cap, uint32_t src)
 {
     xdrw_t w;
+    size_t out;
 
     xdrw_init(&w, rep, cap, c->xid);
 
     if (c->prog == PORTMAP_PROG && c->vers == PORTMAP_VERS) {
-        return handle_portmap(c, &w);
-    }
-    if (c->prog == MOUNT_PROG &&
-        (c->vers == 1 || c->vers == 2 || c->vers == MOUNT_VERS)) {
-        return handle_mount(c, &w, src);
-    }
-
-    /* Unknown program: say so, with the version range we do have. */
-    if (c->prog == PORTMAP_PROG || c->prog == MOUNT_PROG) {
+        out = handle_portmap(c, &w);
+    } else if (c->prog == MOUNT_PROG &&
+               (c->vers == 1 || c->vers == 2 || c->vers == MOUNT_VERS)) {
+        out = handle_mount(c, &w, src);
+    } else if (c->prog == NFS_PROG && c->vers == NFS_VERS) {
+        out = nfs3_handle(c, &w, s_io, IOCAP);
+    } else if (c->prog == PORTMAP_PROG || c->prog == MOUNT_PROG ||
+               c->prog == NFS_PROG) {
         xdrw_accept(&w, RPC_PROG_MISMATCH);
         xdrw_u32(&w, 1);
         xdrw_u32(&w, 3);
+        out = w.len;
     } else {
         xdrw_accept(&w, RPC_PROG_UNAVAIL);
+        out = w.len;
     }
-    return w.len;
+
+    espix_klog(ESPIX_KLOG_INFO, TAG, "prog %u vers %u proc %u -> %u bytes",
+               (unsigned)c->prog, (unsigned)c->vers, (unsigned)c->proc,
+               (unsigned)out);
+    return out;
 }
 
 static void serve_udp(int fd)
@@ -367,34 +428,60 @@ static bool recv_all(int fd, uint8_t *buf, size_t n)
     return true;
 }
 
-static void serve_tcp_conn(int fd, uint32_t src)
+static void conn_close(int i)
 {
-    for (;;) {
-        uint8_t mark[4];
+    close(s_conns[i].fd);
+    s_conns[i].fd = -1;
+}
 
-        if (!recv_all(fd, mark, 4)) {
-            break;
-        }
-        const uint32_t m   = ((uint32_t)mark[0] << 24) | ((uint32_t)mark[1] << 16) |
-                             ((uint32_t)mark[2] << 8) | mark[3];
-        const size_t   len = m & 0x7FFFFFFFu;
-        if (len == 0 || len > BUFCAP || !recv_all(fd, s_frame, len)) {
-            break;
-        }
+static void conn_service(int i)
+{
+    uint8_t mark[4];
 
-        rpc_call_t c;
-        if (!rpc_parse_call(&c, s_frame, len)) {
-            break;
-        }
-        const size_t rlen = dispatch(&c, s_rep, BUFCAP, src);
-        if (rlen > 0) {
-            const size_t fl = rpc_tcp_frame(s_rep, rlen, s_out, BUFCAP + 4);
-            if (fl == 0 || send(fd, s_out, fl, 0) < 0) {
-                break;
-            }
+    if (!recv_all(s_conns[i].fd, mark, 4)) {
+        conn_close(i);
+        return;
+    }
+    const uint32_t m   = ((uint32_t)mark[0] << 24) | ((uint32_t)mark[1] << 16) |
+                         ((uint32_t)mark[2] << 8) | mark[3];
+    const size_t   len = m & 0x7FFFFFFFu;
+    if (len == 0 || len > BUFCAP || !recv_all(s_conns[i].fd, s_frame, len)) {
+        conn_close(i);
+        return;
+    }
+
+    rpc_call_t c;
+    if (!rpc_parse_call(&c, s_frame, len)) {
+        conn_close(i);
+        return;
+    }
+
+    const size_t rlen = dispatch(&c, s_rep, BUFCAP, s_conns[i].src);
+    if (rlen > 0) {
+        const size_t fl = rpc_tcp_frame(s_rep, rlen, s_out, BUFCAP + 4);
+        if (fl == 0 || send(s_conns[i].fd, s_out, fl, 0) < 0) {
+            conn_close(i);
         }
     }
-    close(fd);
+}
+
+static void conn_accept(int lfd)
+{
+    struct sockaddr_in from;
+    socklen_t          flen = sizeof(from);
+    const int          cfd  = accept(lfd, (struct sockaddr *)&from, &flen);
+    if (cfd < 0) {
+        return;
+    }
+
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (s_conns[i].fd < 0) {
+            s_conns[i].fd  = cfd;
+            s_conns[i].src = from.sin_addr.s_addr;
+            return;
+        }
+    }
+    close(cfd);                         /* no room: the client will ask again */
 }
 
 static int bind_udp(uint16_t port)
@@ -443,13 +530,17 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
         s_rep   = heap_caps_malloc(BUFCAP, MALLOC_CAP_SPIRAM);
         s_frame = heap_caps_malloc(BUFCAP, MALLOC_CAP_SPIRAM);
         s_out   = heap_caps_malloc(BUFCAP + 4, MALLOC_CAP_SPIRAM);
-        if (s_req == NULL || s_rep == NULL || s_frame == NULL || s_out == NULL) {
+        s_io    = heap_caps_malloc(IOCAP, MALLOC_CAP_SPIRAM);
+        if (s_req == NULL || s_rep == NULL || s_frame == NULL ||
+            s_out == NULL || s_io == NULL) {
             s_req   = heap_caps_malloc(BUFCAP, MALLOC_CAP_8BIT);
             s_rep   = heap_caps_malloc(BUFCAP, MALLOC_CAP_8BIT);
             s_frame = heap_caps_malloc(BUFCAP, MALLOC_CAP_8BIT);
             s_out   = heap_caps_malloc(BUFCAP + 4, MALLOC_CAP_8BIT);
+            s_io    = heap_caps_malloc(IOCAP, MALLOC_CAP_8BIT);
         }
-        if (s_req == NULL || s_rep == NULL || s_frame == NULL || s_out == NULL) {
+        if (s_req == NULL || s_rep == NULL || s_frame == NULL ||
+            s_out == NULL || s_io == NULL) {
             espix_klog(ESPIX_KLOG_ERROR, TAG, "no buffers");
             return ESP_ERR_NO_MEM;
         }
@@ -463,19 +554,28 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     const int pm_tcp = bind_tcp(PORTMAP_PORT);
     const int mt_udp = bind_udp(MOUNT_PORT);
     const int mt_tcp = bind_tcp(MOUNT_PORT);
-    if (pm_udp < 0 || pm_tcp < 0 || mt_udp < 0 || mt_tcp < 0) {
+    const int nf_udp = bind_udp(NFS_PORT);
+    const int nf_tcp = bind_tcp(NFS_PORT);
+    if (pm_udp < 0 || pm_tcp < 0 || mt_udp < 0 || mt_tcp < 0 ||
+        nf_udp < 0 || nf_tcp < 0) {
         espix_klog(ESPIX_KLOG_ERROR, TAG,
-                   "cannot bind 111/20048 (already running?)");
+                   "cannot bind 111, %d or %d (already running?)",
+                   MOUNT_PORT, NFS_PORT);
         return ESP_FAIL;
+    }
+
+    for (int i = 0; i < MAX_CONNS; i++) {
+        s_conns[i].fd = -1;
     }
 
     reg_add(PORTMAP_PROG, PORTMAP_VERS, PORTMAP_PORT);
     reg_add(MOUNT_PROG, 1, MOUNT_PORT);
     reg_add(MOUNT_PROG, 2, MOUNT_PORT);
     reg_add(MOUNT_PROG, MOUNT_VERS, MOUNT_PORT);
+    reg_add(NFS_PROG, NFS_VERS, NFS_PORT);
 
     espix_klog(ESPIX_KLOG_INFO, TAG,
-               "serving: portmap 111, mountd %d, nfsd %d not yet",
+               "serving: portmap 111, mountd %d, nfsd %d",
                MOUNT_PORT, NFS_PORT);
 
     for (;;) {
@@ -493,10 +593,24 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
         FD_SET(pm_tcp, &r);
         FD_SET(mt_udp, &r);
         FD_SET(mt_tcp, &r);
+        FD_SET(nf_udp, &r);
+        FD_SET(nf_tcp, &r);
+
         int max = pm_udp;
-        if (pm_tcp > max) max = pm_tcp;
-        if (mt_udp > max) max = mt_udp;
-        if (mt_tcp > max) max = mt_tcp;
+        const int lfds[] = { pm_tcp, mt_udp, mt_tcp, nf_udp, nf_tcp };
+        for (size_t i = 0; i < sizeof(lfds) / sizeof(lfds[0]); i++) {
+            if (lfds[i] > max) {
+                max = lfds[i];
+            }
+        }
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (s_conns[i].fd >= 0) {
+                FD_SET(s_conns[i].fd, &r);
+                if (s_conns[i].fd > max) {
+                    max = s_conns[i].fd;
+                }
+            }
+        }
 
         if (select(max + 1, &r, NULL, NULL, &tv) <= 0) {
             continue;
@@ -504,17 +618,15 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
 
         if (FD_ISSET(pm_udp, &r)) serve_udp(pm_udp);
         if (FD_ISSET(mt_udp, &r)) serve_udp(mt_udp);
+        if (FD_ISSET(nf_udp, &r)) serve_udp(nf_udp);
 
-        for (int i = 0; i < 2; i++) {
-            const int lfd = (i == 0) ? pm_tcp : mt_tcp;
-            if (!FD_ISSET(lfd, &r)) {
-                continue;
-            }
-            struct sockaddr_in from;
-            socklen_t          flen = sizeof(from);
-            const int cfd = accept(lfd, (struct sockaddr *)&from, &flen);
-            if (cfd >= 0) {
-                serve_tcp_conn(cfd, from.sin_addr.s_addr);
+        if (FD_ISSET(pm_tcp, &r)) conn_accept(pm_tcp);
+        if (FD_ISSET(mt_tcp, &r)) conn_accept(mt_tcp);
+        if (FD_ISSET(nf_tcp, &r)) conn_accept(nf_tcp);
+
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (s_conns[i].fd >= 0 && FD_ISSET(s_conns[i].fd, &r)) {
+                conn_service(i);
             }
         }
     }
@@ -523,6 +635,14 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     close(pm_tcp);
     close(mt_udp);
     close(mt_tcp);
+    close(nf_udp);
+    close(nf_tcp);
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (s_conns[i].fd >= 0) {
+            close(s_conns[i].fd);
+            s_conns[i].fd = -1;
+        }
+    }
 
     /* Stopped means stopped: the buffers and the export table go back, so a
      * daemon that is not running costs nothing but the four pointers. A
@@ -531,6 +651,7 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     free(s_rep);     s_rep = NULL;
     free(s_frame);   s_frame = NULL;
     free(s_out);     s_out = NULL;
+    free(s_io);      s_io = NULL;
     free(s_exports); s_exports = NULL;
     s_nexports = 0;
     return ESP_OK;

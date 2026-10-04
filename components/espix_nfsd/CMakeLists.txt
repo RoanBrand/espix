@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "nfsd.c"
+        "nfs3.c"
         "rpc.c"
     INCLUDE_DIRS
         "include"
