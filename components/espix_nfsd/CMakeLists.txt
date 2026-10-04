@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "nfsd.c"
+        "rpc.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "."
+    PRIV_REQUIRES
+        espix_fs
+        espix_kernel
+        lwip
+)

@@ -8,6 +8,7 @@ idf_component_register(
         "cmd_fetch.c"
         "cmd_net.c"
         "cmd_vpn.c"
+        "cmd_nfsd.c"
         "cmd_motd.c"
         "cmd_time.c"
         "cmd_blk.c"
@@ -33,6 +34,7 @@ idf_component_register(
         espix_fault
         espix_appdata
         espix_net
+        espix_nfsd
         espressif__qrcode
         espix_bt
         espix_audio
