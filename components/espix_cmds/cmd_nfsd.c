@@ -18,6 +18,22 @@ static bool keep_going(void)
 
 static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "trace") == 0) {
+        if (argc > 2 && strcmp(argv[2], "on") == 0) {
+            espix_nfsd_trace(true);
+            espix_printf(s, "nfsd: tracing to /tmp/nfsd.trace\n");
+            return 0;
+        }
+        if (argc > 2 && strcmp(argv[2], "off") == 0) {
+            espix_nfsd_trace(false);
+            espix_printf(s, "nfsd: tracing off\n");
+            return 0;
+        }
+        espix_printf(s, "nfsd: tracing %s\n",
+                     espix_nfsd_tracing() ? "on" : "off");
+        return 0;
+    }
+
     if (argc > 1 && strcmp(argv[1], "exports") == 0) {
         const int n = espix_nfsd_export_count();
         for (int i = 0; i < n; i++) {
@@ -51,7 +67,7 @@ static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_nfsd_cmds[] = {
     { .name = "nfsd", .fn = cmd_nfsd,
       .help = "serve /etc/exports over NFSv3",
-      .usage = "nfsd [start|exports]" },
+      .usage = "nfsd [start|exports|trace [on|off]]" },
 };
 
 void espix_cmds_register_nfsd(void)

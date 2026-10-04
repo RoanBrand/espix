@@ -57,6 +57,51 @@ static uint8_t *s_rep;
 static uint8_t *s_frame;   /* TCP: on the heap, not 8 KB of task stack */
 static uint8_t *s_out;
 static uint8_t *s_io;                       /* a read fills this */
+static bool     s_trace;                    /* append every RPC to /tmp/nfsd.trace */
+
+void espix_nfsd_trace(bool on)
+{
+    s_trace = on;
+}
+
+bool espix_nfsd_tracing(void)
+{
+    return s_trace;
+}
+
+/*
+ * A trace on the filesystem rather than in the ring: a protocol conversation
+ * has to survive the reader being slow, and the ring is a rolling window. The
+ * reply bytes are what matter -- a decode failure on the other end is a
+ * disagreement about the shape of these.
+ */
+static void trace_rpc(const rpc_call_t *c, const uint8_t *rep, size_t len)
+{
+    if (!s_trace) {
+        return;
+    }
+
+    FILE *f = fopen("/tmp/nfsd.trace", "a");
+    if (f == NULL) {
+        return;
+    }
+
+    uint32_t status = 0;
+    if (c->prog == NFS_PROG && len >= 28) {
+        status = ((uint32_t)rep[24] << 24) | ((uint32_t)rep[25] << 16) |
+                 ((uint32_t)rep[26] << 8) | rep[27];
+    }
+
+    fprintf(f, "prog %u vers %u proc %u xid %u status %u -> %u bytes\n",
+            (unsigned)c->prog, (unsigned)c->vers, (unsigned)c->proc,
+            (unsigned)c->xid, (unsigned)status, (unsigned)len);
+    fprintf(f, "  rep:");
+    for (size_t i = 0; i < len && i < 160; i++) {
+        fprintf(f, " %02x", rep[i]);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+}
 
 /* A client keeps its TCP connection open for as long as it likes, so one
  * connection cannot be served to the exclusion of everything else. */
@@ -379,9 +424,9 @@ static size_t dispatch(const rpc_call_t *c, uint8_t *rep, size_t cap, uint32_t s
         out = w.len;
     }
 
-    espix_klog(ESPIX_KLOG_INFO, TAG, "prog %u vers %u proc %u -> %u bytes",
-               (unsigned)c->prog, (unsigned)c->vers, (unsigned)c->proc,
-               (unsigned)out);
+    if (s_trace) {
+        trace_rpc(c, rep, out);
+    }
     return out;
 }
 

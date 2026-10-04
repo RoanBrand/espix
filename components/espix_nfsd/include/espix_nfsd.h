@@ -16,6 +16,10 @@
  */
 esp_err_t espix_nfsd_run(bool (*keep_going)(void));
 
+/* Append every RPC and the first bytes of its reply to /tmp/nfsd.trace. */
+void espix_nfsd_trace(bool on);
+bool espix_nfsd_tracing(void);
+
 /* For the command: what /etc/exports gave us. */
 int  espix_nfsd_export_count(void);
 bool espix_nfsd_export_info(int i, const char **path, bool *ro, const char **who);
