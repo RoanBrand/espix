@@ -18,7 +18,19 @@ static const char *state_of(const espix_svc_info_t *u)
     if (u->pid != ESPIX_PID_NONE || u->running) {
         return "running";
     }
-    return u->enabled ? "starting" : "stopped";
+    if (u->every_s > 0) {
+        /* Between runs: waiting for its next due time, not starting. */
+        return u->enabled ? "scheduled" : "stopped";
+    }
+    if (u->always) {
+        return u->enabled ? "starting" : "stopped";
+    }
+    if (u->ran) {
+        /* A oneshot that has run. It exited; its effect did not -- wg0 is up
+         * after "vpn once vpn up" leaves, and that is not a failure. */
+        return (u->last_code == 0) ? "done" : "failed";
+    }
+    return "stopped";
 }
 
 static int cmd_service(espix_session_t *s, int argc, char **argv)

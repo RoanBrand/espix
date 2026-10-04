@@ -56,6 +56,8 @@ typedef struct {
     bool        enabled;
     espix_pid_t pid;
     uint32_t    restarts;
+    bool        ran;             /* has started at least once */
+    int         last_code;       /* what it exited with, once it has */
 
     /* A scheduled unit: run once every every_s seconds. 0 means it is not
      * scheduled, and the restart policy above governs instead. */
@@ -223,6 +225,7 @@ static void unit_start(svc_unit_t *u)
         }
         espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started pid %d", u->name,
                    (int)u->pid);
+        u->ran = true;
         return;
     }
 
@@ -305,6 +308,7 @@ static void unit_start(svc_unit_t *u)
     c->caps    = caps;
     u->builtin = c;
     u->task    = task;
+    u->ran     = true;
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started (builtin %s)", u->name,
                cmd->name);
 }
@@ -455,6 +459,7 @@ static void units_load(void)
  */
 static void unit_exited(svc_unit_t *u, int code)
 {
+    u->last_code = code;
     if (u->every_s > 0) {
         const int64_t now = esp_timer_get_time();
         if (code != 0 && u->fails < SVC_MAX_RETRIES) {
@@ -628,6 +633,8 @@ bool espix_svc_info(int index, espix_svc_info_t *out)
         out->running  = (s_units[index].task != NULL);
         out->every_s  = s_units[index].every_s;
         out->restarts = s_units[index].restarts;
+        out->ran      = s_units[index].ran;
+        out->last_code = s_units[index].last_code;
         ok = true;
     }
     xSemaphoreGive(s_lock);

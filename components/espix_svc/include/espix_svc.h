@@ -43,6 +43,8 @@ typedef struct {
     bool        running;         /* a builtin task, which has no pid */
     uint32_t    every_s;         /* 0 unless scheduled */
     uint32_t    restarts;
+    bool        ran;             /* has started at least once */
+    int         last_code;       /* what it exited with, once it has */
 } espix_svc_info_t;
 
 /* Read the units file and start the supervisor. Safe to call twice. */
