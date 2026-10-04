@@ -7,6 +7,7 @@ idf_component_register(
         "cmd_run.c"
         "cmd_fetch.c"
         "cmd_net.c"
+        "cmd_vpn.c"
         "cmd_motd.c"
         "cmd_time.c"
         "cmd_blk.c"
