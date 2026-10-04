@@ -96,78 +96,39 @@ static int vpn_add(espix_session_t *s, const char *name)
  */
 static espix_session_t *s_qr_sess;
 
-static size_t qr_app(char *row, size_t o, size_t cap, const char *txt)
-{
-    while (*txt != 0 && o + 1 < cap) {
-        row[o++] = *txt++;
-    }
-    row[o] = 0;
-    return o;
-}
-
-static size_t qr_color(char *row, size_t o, size_t cap, int fg, int bg)
-{
-    if (o + 10 >= cap) {
-        return o;
-    }
-    row[o++] = 27;                      /* ESC, without an escape sequence in C */
-    row[o++] = '[';
-    row[o++] = (char)('0' + fg / 10);
-    row[o++] = (char)('0' + fg % 10);
-    row[o++] = ';';
-    row[o++] = (char)('0' + bg / 10);
-    row[o++] = (char)('0' + bg % 10);
-    row[o++] = 'm';
-    row[o]   = 0;
-    return o;
-}
-
 static void qr_display(esp_qrcode_handle_t q)
 {
-    const int n = esp_qrcode_get_size(q);
+    const int n     = esp_qrcode_get_size(q);
     const int quiet = 2;
 
+    /* Characters only, two rows per line: the upper half block, the lower, the
+     * full block, or a space -- what qrencode -t UTF8 does. No colours and no
+     * escape sequences, because a terminal that mishandles them turns a QR into
+     * a solid block, and because a row then fits one espix_printf() call and
+     * there is no chunking to leave anything behind. */
     for (int y = -quiet; y < n + quiet; y += 2) {
-        char   row[1600];
-        size_t o = 0;
+        char row[512];
+        int  o = 0;
 
         for (int x = -quiet; x < n + quiet; x++) {
             const bool up = esp_qrcode_get_module(q, x, y);
             const bool lo = esp_qrcode_get_module(q, x, y + 1);
 
             if (up && lo) {
-                o = qr_color(row, o, sizeof(row), 30, 40);
+                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x88;
             } else if (up) {
-                o = qr_color(row, o, sizeof(row), 30, 47);
+                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x80;
             } else if (lo) {
-                o = qr_color(row, o, sizeof(row), 37, 40);
+                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x84;
             } else {
-                o = qr_color(row, o, sizeof(row), 37, 47);
+                row[o++] = ' ';
             }
-            if (o + 3 < sizeof(row)) {
-                row[o++] = (char)0xE2;      /* U+2580, upper half block */
-                row[o++] = (char)0x96;
-                row[o++] = (char)0x80;
-                row[o]   = 0;
+            if (o > (int)sizeof(row) - 4) {
+                break;
             }
         }
-        o = qr_app(row, o, sizeof(row), "\033[0m");
-
-        /* espix_printf formats into a bounded buffer, and a row of a 57-module
-         * code is far longer than it: print the row in pieces, and the newline
-         * on its own, or the rows run together and nothing can scan it. */
-        for (size_t i = 0; row[i] != 0; i += 100) {
-            char   piece[128];
-            size_t k = 0;
-
-            while (k < 100 && row[i + k] != 0) {
-                piece[k] = row[i + k];
-                k++;
-            }
-            piece[k] = 0;
-            espix_printf(s_qr_sess, "%s", piece);
-        }
-        espix_printf(s_qr_sess, "\n");
+        row[o] = 0;
+        espix_printf(s_qr_sess, "%s\n", row);
     }
 }
 
