@@ -447,10 +447,7 @@ esp_err_t espix_net_vpn_peer_add(const char *name, const char *pub_b64,
 
 esp_err_t espix_net_vpn_endpoint_get(char *out, size_t len)
 {
-    if (!espix_fs_conf_get(VPN_CONF_PATH, "endpoint", out, len)) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    return ESP_OK;
+    return espix_net_vpn_conf_get("endpoint", out, len);
 }
 
 /* Rewrites /etc/vpn.conf, keeping whatever it is not asked to change: setting
@@ -463,6 +460,19 @@ esp_err_t espix_net_vpn_conf_get(const char *key, char *out, size_t len)
     if (espix_fs_conf_get(VPN_CONF_PATH, key, out, len)) {
         return ESP_OK;
     }
+
+    /*
+     * "No such setting" and "cannot read the file" are not the same answer, and
+     * the defaults below are only right for the first. The config holds a
+     * private key, so it is 0600 and a command that does not run as root cannot
+     * read it: answering with defaults there is how vpn endpoint came to deny
+     * an endpoint the file plainly had.
+     */
+    FILE *probe = fopen(VPN_CONF_PATH, "r");
+    if (probe == NULL) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    fclose(probe);
 
     /* A config written before a key existed still answers. */
     if (strcmp(key, "dns") == 0) {

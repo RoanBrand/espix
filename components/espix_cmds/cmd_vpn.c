@@ -435,10 +435,17 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 
     if (strcmp(argv[1], "endpoint") == 0) {
         if (argc < 3) {
-            char ep[128];
-            if (espix_net_vpn_endpoint_get(ep, sizeof(ep)) == ESP_OK) {
+            char            ep[128];
+            const esp_err_t e = espix_net_vpn_endpoint_get(ep, sizeof(ep));
+            if (e == ESP_OK) {
                 espix_printf(s, "vpn: endpoint %s\n", ep);
                 return 0;
+            }
+            if (e != ESP_ERR_NOT_FOUND) {
+                /* It holds a private key, so it is 0600: not being able to read
+                 * it is not the same as it being unset. */
+                espix_eprintf(s, "vpn: cannot read /etc/vpn.conf (try sudo)\n");
+                return 1;
             }
             espix_eprintf(s, "vpn: no endpoint yet; "
                              "vpn endpoint <name or address>\n");
