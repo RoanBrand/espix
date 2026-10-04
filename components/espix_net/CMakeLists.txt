@@ -19,6 +19,7 @@ if(CONFIG_ESPIX_ETH_ENABLED)
 endif()
 if(CONFIG_ESPIX_MDNS)
     list(APPEND espix_net_srcs "mdns.c")
+list(APPEND espix_net_srcs "vpn/vpn.c")
 endif()
 
 idf_component_register(
@@ -49,4 +50,5 @@ idf_component_register(
         espressif__elf_loader
         espressif__esp_tinyusb
         espressif__mdns
+        fugo101__wireguard_lwip
 )
