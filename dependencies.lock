@@ -197,6 +197,16 @@ dependencies:
     - esp32s31
     - linux
     version: 1.3.0
+  fugo101/wireguard_lwip:
+    component_hash: 50b83368a3014f906477db2d09574cfce88a666b1c5c31d088c768f1ebf286f6
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=6.0,<7.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.3
   idf:
     source:
       type: idf
@@ -224,8 +234,9 @@ direct_dependencies:
 - espressif/usb
 - espressif/usb_host_hid
 - espressif/usb_host_msc
+- fugo101/wireguard_lwip
 - idf
 - joltwallet/littlefs
-manifest_hash: 8b2d5d99593a15a5548716786501aabaa26a126ee92c03abc4dc89b13672b067
+manifest_hash: f1fea11ef3dabd8740623a0f0664a0b30338f96a7403db186d680965e0bf8eea
 target: esp32s31
 version: 3.0.0

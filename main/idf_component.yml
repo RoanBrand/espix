@@ -124,3 +124,8 @@ dependencies:
   # Local discovery: <hostname>.local and _ssh._tcp, so a client reaches
   # the board without an address. See components/espix_mdns.
   espressif/mdns: "^1.14.0"
+
+  # The WireGuard core for the VPN server (R-P8.1). Vendored into
+  # components/espix_net/vpn/wireguard so the server delta can change it -- a
+  # registry dependency would be forked on day one.
+  fugo101/wireguard_lwip: "^1.0.3"
