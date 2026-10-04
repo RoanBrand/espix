@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "lwip/lwip_napt.h"
 #include "lwip/netdb.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -203,6 +204,22 @@ esp_err_t espix_net_napt(const char *name, bool enable)
     return ESP_ERR_NOT_FOUND;
 #else
     (void)name;
+    (void)enable;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t espix_net_napt_netif(struct netif *netif, bool enable)
+{
+#if CONFIG_LWIP_IPV4_NAPT
+    if (netif == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ip_napt_enable_netif(netif, enable ? 1 : 0);
+    return ESP_OK;
+#else
+    (void)netif;
     (void)enable;
     return ESP_ERR_NOT_SUPPORTED;
 #endif

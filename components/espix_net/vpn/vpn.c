@@ -21,6 +21,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
+#include "espix_net_priv.h"
 #include "espix_net_vpn.h"
 
 #define VPN_CONF_PATH "/etc/vpn.conf"
@@ -70,7 +71,7 @@ static esp_err_t server_key(void)
     FILE *f = fopen(VPN_CONF_PATH, "w");
     if (f != NULL) {
         fprintf(f, "# espix VPN server. The private key is the server's identity.\n");
-        fprintf(f, "private_key = %s\n", s_priv);
+        fprintf(f, "private_key=%s\n", s_priv);
         fclose(f);
         espix_klog(ESPIX_KLOG_INFO, TAG, "generated a server key in %s",
                    VPN_CONF_PATH);
@@ -118,7 +119,7 @@ esp_err_t espix_net_vpn_up(void)
 
     /* Masqueraded out the default route, like the AP's uplink: this is what
      * lets a client reach the internet and the house. */
-    if (espix_net_napt("wg0", true) != ESP_OK) {
+    if (espix_net_napt_netif(&s_wg, true) != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "wg0 is up but not masqueraded");
     }
 
@@ -134,7 +135,7 @@ esp_err_t espix_net_vpn_down(void)
         return ESP_OK;
     }
 
-    (void)espix_net_napt("wg0", false);
+    (void)espix_net_napt_netif(&s_wg, false);
     wireguardif_shutdown(&s_wg);        /* cancels its timers first, as it asks */
     netif_remove(&s_wg);
     s_up = false;

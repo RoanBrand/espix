@@ -2,6 +2,7 @@
 #pragma once
 
 #include "esp_netif.h"
+#include "lwip/netif.h"
 
 #include "espix_net.h"
 
@@ -70,3 +71,10 @@ esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk);
 #ifdef __cplusplus
 }
 #endif
+
+/*
+ * NAPT for a netif espix did not create through esp_netif -- a VPN or a PPP
+ * tunnel. The name table cannot see those, so this takes the netif itself;
+ * it is the same switch espix_net_napt() throws for a name.
+ */
+esp_err_t espix_net_napt_netif(struct netif *netif, bool enable);
