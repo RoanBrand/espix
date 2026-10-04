@@ -99,7 +99,7 @@ static espix_session_t *s_qr_sess;
 static void qr_display(esp_qrcode_handle_t q)
 {
     const int n     = esp_qrcode_get_size(q);
-    const int quiet = 2;
+    const int quiet = 4;          /* the spec's quiet zone, which scanners need */
 
     /* Characters only, two rows per line: the upper half block, the lower, the
      * full block, or a space -- what qrencode -t UTF8 does. No colours and no
@@ -107,21 +107,24 @@ static void qr_display(esp_qrcode_handle_t q)
      * a solid block, and because a row then fits one espix_printf() call and
      * there is no chunking to leave anything behind. */
     for (int y = -quiet; y < n + quiet; y += 2) {
-        char row[512];
+        char row[768];
         int  o = 0;
 
         for (int x = -quiet; x < n + quiet; x++) {
             const bool up = esp_qrcode_get_module(q, x, y);
             const bool lo = esp_qrcode_get_module(q, x, y + 1);
 
+            /* The glyph is the LIGHT module and the dark ones are left as the
+             * terminal's background: a screen is dark by default, so drawing
+             * the dark modules is what inverts the code. */
             if (up && lo) {
-                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x88;
+                row[o++] = ' ';                                             /* both dark */
             } else if (up) {
-                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x80;
+                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x84;   /* lower light */
             } else if (lo) {
-                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x84;
+                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x80;   /* upper light */
             } else {
-                row[o++] = ' ';
+                row[o++] = (char)0xE2; row[o++] = (char)0x96; row[o++] = (char)0x88;   /* both light */
             }
             if (o > (int)sizeof(row) - 4) {
                 break;
