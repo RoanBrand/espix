@@ -137,6 +137,8 @@ static esp_err_t server_key(void)
     return ESP_OK;
 }
 
+static void peers_load(void);        /* defined below, with the peer table */
+
 esp_err_t espix_net_vpn_up(void)
 {
     if (s_up) {
@@ -175,6 +177,8 @@ esp_err_t espix_net_vpn_up(void)
     if (espix_net_napt_netif(&s_wg, true) != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "wg0 is up but not masqueraded");
     }
+
+    peers_load();
 
     s_up = true;
     espix_klog(ESPIX_KLOG_INFO, TAG, "wg0 %s/24 on port %d",
@@ -230,27 +234,115 @@ esp_err_t espix_net_vpn_keypair(char *priv_b64, size_t plen,
     return ESP_OK;
 }
 
-esp_err_t espix_net_vpn_peer_add(const char *pub_b64, const char *allowed_ip)
+/*
+ * The peer table lives in the interface, which is memory: a reboot takes every
+ * client with it. /etc/vpn/peers keeps the one thing a client config cannot
+ * supply -- the client's own public key, since that file holds the client's
+ * private key and the server's public key and nothing else -- and wg0 admits
+ * them again as it comes up.
+ */
+#define VPN_PEERS_PATH "/etc/vpn/peers"
+#define VPN_MAX_PEERS  16
+
+typedef struct {
+    char name[24];
+    char pub[48];
+    char addr[20];
+    u8_t idx;
+} vpn_peer_t;
+
+static vpn_peer_t s_peers[VPN_MAX_PEERS];
+static int        s_peer_count;
+
+static void peers_save(void)
+{
+    FILE *f = fopen(VPN_PEERS_PATH, "w");
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot write %s", VPN_PEERS_PATH);
+        return;
+    }
+    fprintf(f, "# name public_key address\n");
+    for (int i = 0; i < s_peer_count; i++) {
+        fprintf(f, "%s %s %s\n", s_peers[i].name, s_peers[i].pub, s_peers[i].addr);
+    }
+    fclose(f);
+}
+
+static void peers_store(const char *name, const char *pub, const char *addr, u8_t idx)
+{
+    if (s_peer_count >= VPN_MAX_PEERS) {
+        return;
+    }
+    vpn_peer_t *p = &s_peers[s_peer_count++];
+    strlcpy(p->name, name, sizeof(p->name));
+    strlcpy(p->pub, pub, sizeof(p->pub));
+    strlcpy(p->addr, addr, sizeof(p->addr));
+    p->idx = idx;
+}
+
+/* One peer into the interface. No endpoint: the client dials us. */
+static bool peer_admit(const char *pub, const char *addr, u8_t *idx_out)
+{
+    struct wireguardif_peer p;
+    wireguardif_peer_init(&p);
+    p.public_key    = pub;
+    p.preshared_key = NULL;
+    p.keep_alive    = 25;
+    ipaddr_aton(addr, &p.allowed_ip);
+    ipaddr_aton("255.255.255.255", &p.allowed_mask);
+
+    u8_t idx = WIREGUARDIF_INVALID_INDEX;
+    if (wireguardif_add_peer(&s_wg, &p, &idx) != ERR_OK ||
+        idx == WIREGUARDIF_INVALID_INDEX) {
+        return false;
+    }
+    *idx_out = idx;
+    return true;
+}
+
+static void peers_load(void)
+{
+    FILE *f = fopen(VPN_PEERS_PATH, "r");
+    if (f == NULL) {
+        return;
+    }
+
+    char line[128];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char name[24], pub[48], addr[20];
+        if (line[0] == '#') {
+            continue;
+        }
+        if (sscanf(line, "%23s %47s %19s", name, pub, addr) == 3) {
+            u8_t idx;
+            if (peer_admit(pub, addr, &idx)) {
+                peers_store(name, pub, addr, idx);
+            }
+        }
+    }
+    fclose(f);
+
+    if (s_peer_count > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%d peer(s) admitted", s_peer_count);
+    }
+}
+
+esp_err_t espix_net_vpn_peer_add(const char *name, const char *pub_b64,
+                                 const char *allowed_ip)
 {
     if (!s_up) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    struct wireguardif_peer p;
-    wireguardif_peer_init(&p);
-    p.public_key    = pub_b64;
-    p.preshared_key = NULL;
-    p.keep_alive    = 25;               /* a phone behind NAT stays reachable */
-    ipaddr_aton(allowed_ip, &p.allowed_ip);
-    ipaddr_aton("255.255.255.255", &p.allowed_mask);
-    /* No endpoint: the client dials us, and we learn where it is. */
-
-    u8_t idx = WIREGUARDIF_INVALID_INDEX;
-    if (wireguardif_add_peer(&s_wg, &p, &idx) != ERR_OK ||
-        idx == WIREGUARDIF_INVALID_INDEX) {
+    u8_t idx;
+    if (!peer_admit(pub_b64, allowed_ip, &idx)) {
         return ESP_FAIL;
     }
-    espix_klog(ESPIX_KLOG_INFO, TAG, "peer %s at %s", allowed_ip, pub_b64);
+
+    peers_store(name, pub_b64, allowed_ip, idx);
+    peers_save();
+    espix_klog(ESPIX_KLOG_INFO, TAG, "peer %s at %s (%s)", name, allowed_ip,
+               pub_b64);
     return ESP_OK;
 }
 
@@ -284,4 +376,37 @@ esp_err_t espix_net_vpn_endpoint_set(const char *host)
     fprintf(f, "endpoint=%s\n", host);
     fclose(f);
     return ESP_OK;
+}
+
+int espix_net_vpn_peer_count(void)
+{
+    return s_peer_count;
+}
+
+const char *espix_net_vpn_peer_name(int i)
+{
+    return (i >= 0 && i < s_peer_count) ? s_peers[i].name : "";
+}
+
+const char *espix_net_vpn_peer_addr(int i)
+{
+    return (i >= 0 && i < s_peer_count) ? s_peers[i].addr : "";
+}
+
+bool espix_net_vpn_peer_session(int i, char *endpoint, size_t len)
+{
+    if (i < 0 || i >= s_peer_count || !s_up) {
+        return false;
+    }
+
+    ip_addr_t ip;
+    u16_t     port = 0;
+    if (wireguardif_peer_is_up(&s_wg, s_peers[i].idx, &ip, &port) != ERR_OK) {
+        return false;
+    }
+
+    if (endpoint != NULL && len > 0) {
+        snprintf(endpoint, len, "%s:%u", ipaddr_ntoa(&ip), (unsigned)port);
+    }
+    return true;
 }

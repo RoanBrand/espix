@@ -79,7 +79,7 @@ static int vpn_add(espix_session_t *s, const char *name)
     fprintf(f, "PersistentKeepalive = 25\n");
     fclose(f);
 
-    if (espix_net_vpn_peer_add(pub, addr) != ESP_OK) {
+    if (espix_net_vpn_peer_add(name, pub, addr) != ESP_OK) {
         espix_eprintf(s, "vpn: wrote %s but did not admit the peer\n", path);
         return 1;
     }
@@ -179,8 +179,26 @@ static int vpn_qr(espix_session_t *s, const char *name)
 static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 {
     if (argc == 1 || strcmp(argv[1], "status") == 0) {
-        espix_printf(s, "vpn: wg0 is %s\n",
-                     espix_net_vpn_is_up() ? "up" : "down");
+        if (!espix_net_vpn_is_up()) {
+            espix_printf(s, "vpn: wg0 is down\n");
+            return 0;
+        }
+
+        espix_printf(s, "vpn: wg0 is up\n");
+        const int n = espix_net_vpn_peer_count();
+        for (int i = 0; i < n; i++) {
+            char       endpoint[48] = {0};
+            const bool live = espix_net_vpn_peer_session(i, endpoint,
+                                                         sizeof(endpoint));
+            espix_printf(s, "vpn:   %s %s %s%s\n",
+                         espix_net_vpn_peer_name(i),
+                         espix_net_vpn_peer_addr(i),
+                         live ? "up " : "no session ",
+                         live ? endpoint : "");
+        }
+        if (n == 0) {
+            espix_printf(s, "vpn:   no peers\n");
+        }
         return 0;
     }
 

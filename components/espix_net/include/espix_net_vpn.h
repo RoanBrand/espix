@@ -31,7 +31,16 @@ esp_err_t espix_net_vpn_keypair(char *priv_b64, size_t plen,
 
 /* Admit a client: a peer with this public key, allowed only this address, and
  * no endpoint -- so the client initiates, from wherever it roams. */
-esp_err_t espix_net_vpn_peer_add(const char *pub_b64, const char *allowed_ip);
+esp_err_t espix_net_vpn_peer_add(const char *name, const char *pub_b64,
+                                const char *allowed_ip);
+
+/* The peers this interface knows, for the vpn status command. peer_session()
+ * reports whether that peer has a live session and, if so, the endpoint it has
+ * roamed to -- the only place a server learns where a phone actually is. */
+int         espix_net_vpn_peer_count(void);
+const char *espix_net_vpn_peer_name(int i);
+const char *espix_net_vpn_peer_addr(int i);
+bool        espix_net_vpn_peer_session(int i, char *endpoint, size_t len);
 
 /* What clients dial: your public name or address. */
 esp_err_t espix_net_vpn_endpoint_get(char *out, size_t len);
