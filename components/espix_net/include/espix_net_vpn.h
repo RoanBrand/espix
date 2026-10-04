@@ -45,3 +45,11 @@ bool        espix_net_vpn_peer_session(int i, char *endpoint, size_t len);
 /* What clients dial: your public name or address. */
 esp_err_t espix_net_vpn_endpoint_get(char *out, size_t len);
 esp_err_t espix_net_vpn_endpoint_set(const char *host);
+
+/* What clients are told to resolve with: the public pair unless set. The home
+ * router's address is the one that resolves the house's names. */
+esp_err_t espix_net_vpn_dns_get(char *out, size_t len);
+esp_err_t espix_net_vpn_dns_set(const char *list);
+esp_err_t   espix_net_vpn_peer_del(const char *name);
+esp_err_t   espix_net_vpn_peer_addr_by_name(const char *name, char *out,
+                                            size_t len);

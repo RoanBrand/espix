@@ -32,6 +32,7 @@
 #define VPN_ADDR      "10.6.0.1"
 #define VPN_MASK      "255.255.255.0"
 #define VPN_PORT      WIREGUARDIF_DEFAULT_PORT
+#define VPN_DNS_DEFAULT "1.1.1.1, 8.8.8.8"
 
 static const char *TAG = "espix:vpn";
 
@@ -170,6 +171,7 @@ esp_err_t espix_net_vpn_up(void)
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot add wg0");
         return ESP_FAIL;
     }
+    espix_net_register_netif("wg0", &s_wg);
     netif_set_up(&s_wg);
 
     /* Masqueraded out the default route, like the AP's uplink: this is what
@@ -193,6 +195,7 @@ esp_err_t espix_net_vpn_down(void)
     }
 
     (void)espix_net_napt_netif(&s_wg, false);
+    espix_net_unregister_netif(&s_wg);
     wireguardif_shutdown(&s_wg);        /* cancels its timers first, as it asks */
     netif_remove(&s_wg);
     s_up = false;
@@ -354,13 +357,23 @@ esp_err_t espix_net_vpn_endpoint_get(char *out, size_t len)
     return ESP_OK;
 }
 
-esp_err_t espix_net_vpn_endpoint_set(const char *host)
+/* Rewrites /etc/vpn.conf, keeping whatever it is not asked to change: setting
+ * the endpoint must not drop the DNS or the keys, and the other way round. */
+static esp_err_t conf_write(const char *endpoint, const char *dns)
 {
-    char priv[48] = {0};
-    char pub[48]  = {0};
+    char priv[48] = {0}, pub[48] = {0}, ep[128] = {0}, dn[128] = {0};
 
     (void)espix_fs_conf_get(VPN_CONF_PATH, "private_key", priv, sizeof(priv));
     (void)espix_fs_conf_get(VPN_CONF_PATH, "public_key", pub, sizeof(pub));
+    (void)espix_fs_conf_get(VPN_CONF_PATH, "endpoint", ep, sizeof(ep));
+    (void)espix_fs_conf_get(VPN_CONF_PATH, "dns", dn, sizeof(dn));
+
+    if (endpoint != NULL) {
+        strlcpy(ep, endpoint, sizeof(ep));
+    }
+    if (dns != NULL) {
+        strlcpy(dn, dns, sizeof(dn));
+    }
 
     FILE *f = fopen(VPN_CONF_PATH, "w");
     if (f == NULL) {
@@ -373,9 +386,35 @@ esp_err_t espix_net_vpn_endpoint_set(const char *host)
     if (pub[0] != 0) {
         fprintf(f, "public_key=%s\n", pub);
     }
-    fprintf(f, "endpoint=%s\n", host);
+    if (ep[0] != 0) {
+        fprintf(f, "endpoint=%s\n", ep);
+    }
+    if (dn[0] != 0) {
+        fprintf(f, "dns=%s\n", dn);
+    }
     fclose(f);
     return ESP_OK;
+}
+
+esp_err_t espix_net_vpn_endpoint_set(const char *host)
+{
+    return conf_write(host, NULL);
+}
+
+esp_err_t espix_net_vpn_dns_get(char *out, size_t len)
+{
+    if (out == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!espix_fs_conf_get(VPN_CONF_PATH, "dns", out, len)) {
+        strlcpy(out, VPN_DNS_DEFAULT, len);
+    }
+    return ESP_OK;
+}
+
+esp_err_t espix_net_vpn_dns_set(const char *list)
+{
+    return conf_write(NULL, list);
 }
 
 int espix_net_vpn_peer_count(void)
@@ -409,4 +448,33 @@ bool espix_net_vpn_peer_session(int i, char *endpoint, size_t len)
         snprintf(endpoint, len, "%s:%u", ipaddr_ntoa(&ip), (unsigned)port);
     }
     return true;
+}
+
+esp_err_t espix_net_vpn_peer_del(const char *name)
+{
+    for (int i = 0; i < s_peer_count; i++) {
+        if (strcmp(s_peers[i].name, name) != 0) {
+            continue;
+        }
+
+        if (s_up) {
+            (void)wireguardif_remove_peer(&s_wg, s_peers[i].idx);
+        }
+        s_peers[i] = s_peers[--s_peer_count];
+        peers_save();
+        espix_klog(ESPIX_KLOG_INFO, TAG, "peer %s removed", name);
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t espix_net_vpn_peer_addr_by_name(const char *name, char *out, size_t len)
+{
+    for (int i = 0; i < s_peer_count; i++) {
+        if (strcmp(s_peers[i].name, name) == 0) {
+            strlcpy(out, s_peers[i].addr, len);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
 }

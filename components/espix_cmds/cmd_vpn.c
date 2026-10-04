@@ -11,10 +11,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "qrcode.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_net.h"
 #include "espix_net_vpn.h"
 
 /* A client is a keypair, a config file, and a peer with no endpoint. The
@@ -42,26 +44,36 @@ static int vpn_add(espix_session_t *s, const char *name)
     }
 
     /* One level at a time: mkdir wants the parent to exist. */
+    char dns[128];
+    (void)espix_net_vpn_dns_get(dns, sizeof(dns));
+
     (void)mkdir("/etc/vpn", 0755);
     (void)mkdir("/etc/vpn/clients", 0755);
 
-    int n = 0;
-    DIR *d = opendir("/etc/vpn/clients");
-    if (d != NULL) {
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            if (strstr(e->d_name, ".conf") != NULL) {
-                n++;
-            }
-        }
-        closedir(d);
-    }
-
-    char path[160], addr[32];
+    char path[160];
     strlcpy(path, "/etc/vpn/clients/", sizeof(path));
     strlcat(path, name, sizeof(path));
     strlcat(path, ".conf", sizeof(path));
-    snprintf(addr, sizeof(addr), "10.6.0.%d", n + 2);
+
+    /* A name that already has an address keeps it, so replacing a lost phone
+     * does not move it; a new one takes the next free address. */
+    char addr[32] = {0};
+    if (espix_net_vpn_peer_addr_by_name(name, addr, sizeof(addr)) != ESP_OK) {
+        int n = 0;
+        DIR *d = opendir("/etc/vpn/clients");
+        if (d != NULL) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strstr(e->d_name, ".conf") != NULL) {
+                    n++;
+                }
+            }
+            closedir(d);
+        }
+        snprintf(addr, sizeof(addr), "10.6.0.%d", n + 2);
+    }
+
+    (void)espix_net_vpn_peer_del(name);      /* the old key, if any */
 
     FILE *f = fopen(path, "w");
     if (f == NULL) {
@@ -71,7 +83,7 @@ static int vpn_add(espix_session_t *s, const char *name)
     fprintf(f, "[Interface]\n");
     fprintf(f, "Address = %s/32\n", addr);
     fprintf(f, "PrivateKey = %s\n", priv);
-    fprintf(f, "DNS = 1.1.1.1, 8.8.8.8\n");
+    fprintf(f, "DNS = %s\n", dns);
     fprintf(f, "\n[Peer]\n");
     fprintf(f, "PublicKey = %s\n", spub);
     fprintf(f, "Endpoint = %s:51820\n", endpoint);
@@ -249,6 +261,89 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
         return vpn_qr(s, argv[2]);
     }
 
+    if (strcmp(argv[1], "dns") == 0) {
+        if (argc < 3) {
+            char dns[128];
+            (void)espix_net_vpn_dns_get(dns, sizeof(dns));
+            espix_printf(s, "vpn: dns %s\n", dns);
+            return 0;
+        }
+        if (strcmp(argv[2], "public") == 0) {
+            (void)espix_net_vpn_dns_set("1.1.1.1, 8.8.8.8");
+            espix_printf(s, "vpn: dns 1.1.1.1, 8.8.8.8\n");
+            return 0;
+        }
+        if (strcmp(argv[2], "router") == 0) {
+            uint32_t gw = 0;
+            if (!espix_net_default_route(NULL, 0, &gw) || gw == 0) {
+                espix_eprintf(s, "vpn: no default route to take an address from\n");
+                return 1;
+            }
+            char addr[32];
+            snprintf(addr, sizeof(addr), "%u.%u.%u.%u",
+                     (unsigned)(gw & 0xff), (unsigned)((gw >> 8) & 0xff),
+                     (unsigned)((gw >> 16) & 0xff), (unsigned)((gw >> 24) & 0xff));
+            (void)espix_net_vpn_dns_set(addr);
+            espix_printf(s, "vpn: dns %s\n", addr);
+            return 0;
+        }
+        if (espix_net_vpn_dns_set(argv[2]) != ESP_OK) {
+            espix_eprintf(s, "vpn: cannot write the config (try sudo)\n");
+            return 1;
+        }
+        espix_printf(s, "vpn: dns %s\n", argv[2]);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        DIR *d = opendir("/etc/vpn/clients");
+        int  n = 0;
+        if (d != NULL) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                char *dot = strstr(e->d_name, ".conf");
+                if (dot == NULL) {
+                    continue;
+                }
+                *dot = 0;
+
+                char       addr[32] = {0};
+                const bool known =
+                    espix_net_vpn_peer_addr_by_name(e->d_name, addr,
+                                                    sizeof(addr)) == ESP_OK;
+                espix_printf(s, "vpn:   %s %s\n", e->d_name,
+                             known ? addr : "(not admitted)");
+                n++;
+            }
+            closedir(d);
+        }
+        if (n == 0) {
+            espix_printf(s, "vpn:   no clients\n");
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "remove") == 0) {
+        if (argc < 3) {
+            espix_eprintf(s, "usage: vpn remove <name>\n");
+            return 1;
+        }
+
+        char path[160];
+        strlcpy(path, "/etc/vpn/clients/", sizeof(path));
+        strlcat(path, argv[2], sizeof(path));
+        strlcat(path, ".conf", sizeof(path));
+
+        const esp_err_t e = espix_net_vpn_peer_del(argv[2]);
+        const int       gone = unlink(path);
+        if (e != ESP_OK && gone != 0) {
+            espix_eprintf(s, "vpn: no client named %s\n", argv[2]);
+            return 1;
+        }
+        espix_printf(s, "vpn: removed %s\n", argv[2]);
+        return 0;
+    }
+
     if (strcmp(argv[1], "add") == 0) {
         if (argc < 3) {
             espix_eprintf(s, "usage: vpn add <name>\n");
@@ -264,7 +359,7 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_vpn_cmds[] = {
     { .name = "vpn", .fn = cmd_vpn,
       .help = "the WireGuard server",
-      .usage = "vpn [up|down|status|add <name>|qr <name>|endpoint [host]]" },
+      .usage = "vpn [up|down|status|list|remove <name>|add <name>|qr <name>|endpoint [host]|dns [public|router|list]]" },
 };
 
 void espix_cmds_register_vpn(void)

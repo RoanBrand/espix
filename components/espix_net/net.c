@@ -109,6 +109,68 @@ const char *espix_net_name_of(esp_netif_t *netif)
     return NULL;
 }
 
+#define ESPIX_RAW_MAX 4
+
+static struct {
+    char         name[ESPIX_IF_NAME_MAX];
+    struct netif *netif;
+} s_raw[ESPIX_RAW_MAX];
+static size_t s_raw_count;
+
+void espix_net_register_netif(const char *name, struct netif *netif)
+{
+    for (size_t i = 0; i < s_raw_count; i++) {
+        if (s_raw[i].netif == netif || strcmp(s_raw[i].name, name) == 0) {
+            strlcpy(s_raw[i].name, name, sizeof(s_raw[i].name));
+            s_raw[i].netif = netif;
+            return;
+        }
+    }
+    if (s_raw_count < ESPIX_RAW_MAX) {
+        strlcpy(s_raw[s_raw_count].name, name, sizeof(s_raw[s_raw_count].name));
+        s_raw[s_raw_count].netif = netif;
+        s_raw_count++;
+    }
+}
+
+void espix_net_unregister_netif(struct netif *netif)
+{
+    for (size_t i = 0; i < s_raw_count; i++) {
+        if (s_raw[i].netif == netif) {
+            s_raw[i] = s_raw[--s_raw_count];
+            return;
+        }
+    }
+}
+
+/*
+ * A registered raw netif: no esp_netif to ask, so its state comes from lwIP,
+ * which is where its routing and its packets actually live.
+ */
+static void fill_raw_ifinfo(const char *name, struct netif *n, espix_ifinfo_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    strlcpy(out->name, name, sizeof(out->name));
+
+    out->kind  = ESPIX_IF_TUN;
+    out->index = n->num;
+    out->mtu   = n->mtu;
+    out->up    = netif_is_up(n);      /* a tunnel has no link to come up */
+
+    if (n->hwaddr_len == 6) {
+        memcpy(out->mac, n->hwaddr, 6);
+        out->has_mac = true;
+    }
+
+    const ip4_addr_t *ip = netif_ip4_addr(n);
+    if (ip != NULL && !ip4_addr_isany_val(*ip)) {
+        out->has_addr = true;
+        out->ip       = ip4_addr_get_u32(ip);
+        out->netmask  = ip4_addr_get_u32(netif_ip4_netmask(n));
+        out->gw       = ip4_addr_get_u32(netif_ip4_gw(n));
+    }
+}
+
 static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -166,17 +228,34 @@ size_t espix_net_iflist(espix_ifinfo_t *out, size_t n)
     for (size_t i = 0; i < s_if_count && count < n; i++) {
         fill_ifinfo(&s_ifs[i], &out[count++]);
     }
+
+    /* Then the ones espix made itself and registered, so a tunnel shows up
+     * beside the interfaces it runs over. */
+    for (size_t i = 0; i < s_raw_count && count < n; i++) {
+        fill_raw_ifinfo(s_raw[i].name, s_raw[i].netif, &out[count++]);
+    }
     return count;
 }
 
 esp_err_t espix_net_ifinfo(const char *name, espix_ifinfo_t *out)
 {
-    const espix_if_entry_t *e = espix_net_find_if(name);
-    if (e == NULL || out == NULL) {
-        return ESP_ERR_NOT_FOUND;
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
-    fill_ifinfo(e, out);
-    return ESP_OK;
+
+    const espix_if_entry_t *e = espix_net_find_if(name);
+    if (e != NULL) {
+        fill_ifinfo(e, out);
+        return ESP_OK;
+    }
+
+    for (size_t i = 0; i < s_raw_count; i++) {
+        if (strcmp(s_raw[i].name, name) == 0) {
+            fill_raw_ifinfo(s_raw[i].name, s_raw[i].netif, out);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
 }
 
 /*

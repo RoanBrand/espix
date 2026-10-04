@@ -36,6 +36,7 @@ typedef enum {
     ESPIX_IF_ETH,
     ESPIX_IF_USB,
     ESPIX_IF_BRIDGE,
+    ESPIX_IF_TUN,        /* a raw lwIP netif: a VPN or PPP tunnel */
 } espix_if_kind_t;
 
 typedef struct {

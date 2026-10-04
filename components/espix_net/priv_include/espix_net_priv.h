@@ -78,3 +78,12 @@ esp_err_t espix_net_conf_write_wifi(const char *ssid, const char *psk);
  * it is the same switch espix_net_napt() throws for a name.
  */
 esp_err_t espix_net_napt_netif(struct netif *netif, bool enable);
+
+/*
+ * A raw lwIP netif has no esp_netif behind it and no place in the interface
+ * table, so ip and ifconfig would never show it, and its lwIP number is not
+ * the name anyone uses. Whoever creates one registers it here, under the name
+ * it answers to.
+ */
+void espix_net_register_netif(const char *name, struct netif *netif);
+void espix_net_unregister_netif(struct netif *netif);
