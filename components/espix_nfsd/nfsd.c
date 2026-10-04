@@ -523,6 +523,16 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     close(pm_tcp);
     close(mt_udp);
     close(mt_tcp);
+
+    /* Stopped means stopped: the buffers and the export table go back, so a
+     * daemon that is not running costs nothing but the four pointers. A
+     * restart allocates them again. */
+    free(s_req);     s_req = NULL;
+    free(s_rep);     s_rep = NULL;
+    free(s_frame);   s_frame = NULL;
+    free(s_out);     s_out = NULL;
+    free(s_exports); s_exports = NULL;
+    s_nexports = 0;
     return ESP_OK;
 }
 
