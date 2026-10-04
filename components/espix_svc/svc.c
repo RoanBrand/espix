@@ -430,6 +430,8 @@ static void units_load(void)
             fresh[i].fails       = old->fails;
             fresh[i].task        = old->task;
             fresh[i].builtin     = old->builtin;
+            fresh[i].ran         = old->ran;
+            fresh[i].last_code   = old->last_code;
             if (!s_safe_mode) {
                 fresh[i].enabled = old->enabled;
             }
