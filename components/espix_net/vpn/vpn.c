@@ -37,6 +37,8 @@
 #define VPN_MASK      "255.255.255.0"
 #define VPN_PORT      WIREGUARDIF_DEFAULT_PORT
 #define VPN_DNS_DEFAULT "1.1.1.1, 8.8.8.8"
+#define VPN_SUBNET_DEFAULT "10.6.0.0/24"
+#define VPN_ACCESS_DEFAULT "all"
 
 static const char *TAG = "espix:vpn";
 
@@ -162,12 +164,10 @@ static esp_err_t server_key(void)
     base64_key(raw, sizeof(raw), s_priv);
     base64_key(pub, sizeof(pub), s_pub);
 
-    FILE *f = fopen(VPN_CONF_PATH, "w");
-    if (f != NULL) {
-        fprintf(f, "# espix VPN server. The private key is the server's identity.\n");
-        fprintf(f, "private_key=%s\n", s_priv);
-        fprintf(f, "public_key=%s\n", s_pub);
-        fclose(f);
+    /* Through conf_set, not a fresh fopen: making a key must not drop the
+     * endpoint, the dns or the network that are already configured. */
+    if (espix_net_vpn_conf_set("private_key", s_priv) == ESP_OK) {
+        (void)espix_net_vpn_conf_set("public_key", s_pub);
         espix_klog(ESPIX_KLOG_INFO, TAG, "generated a server key in %s",
                    VPN_CONF_PATH);
     } else {
@@ -193,13 +193,18 @@ esp_err_t espix_net_vpn_up(void)
         return e;
     }
 
+    char addr[24], maskstr[24], portstr[16];
+    (void)espix_net_vpn_server_addr(addr, sizeof(addr));
+    espix_net_vpn_mask(maskstr, sizeof(maskstr));
+    (void)espix_net_vpn_conf_get("port", portstr, sizeof(portstr));
+
     ip4_addr_t ip, mask, gw;
-    ip4addr_aton(VPN_ADDR, &ip);
-    ip4addr_aton(VPN_MASK, &mask);
+    ip4addr_aton(addr, &ip);
+    ip4addr_aton(maskstr, &mask);
     gw = ip;                            /* the tunnel's own address is its gateway */
 
     s_init.private_key = s_priv;
-    s_init.listen_port = VPN_PORT;
+    s_init.listen_port = (u16_t)atoi(portstr);
     s_init.bind_netif  = NULL;          /* every interface, by the routing table */
 
     /* A raw lwIP netif, not an esp_netif: the component's input function is
@@ -227,7 +232,7 @@ esp_err_t espix_net_vpn_up(void)
 
     s_up = true;
     espix_klog(ESPIX_KLOG_INFO, TAG, "wg0 %s/24 on port %d",
-               VPN_ADDR, VPN_PORT);
+               addr, (int)s_init.listen_port);
     return ESP_OK;
 }
 
@@ -311,6 +316,8 @@ typedef struct {
     char name[24];
     char pub[48];
     char addr[20];
+    char psk[48];               /* base64, empty when the client has none */
+    char access[16];            /* all | home | clients | espix */
     u8_t idx;
 } vpn_peer_t;
 
@@ -324,14 +331,18 @@ static void peers_save(void)
         espix_klog(ESPIX_KLOG_WARN, TAG, "cannot write %s", VPN_PEERS_PATH);
         return;
     }
-    fprintf(f, "# name public_key address\n");
+    fprintf(f, "# name public_key address preshared_key access\n");
     for (int i = 0; i < s_peer_count; i++) {
-        fprintf(f, "%s %s %s\n", s_peers[i].name, s_peers[i].pub, s_peers[i].addr);
+        fprintf(f, "%s %s %s %s %s\n", s_peers[i].name, s_peers[i].pub,
+                s_peers[i].addr,
+                (s_peers[i].psk[0] != 0) ? s_peers[i].psk : "-",
+                (s_peers[i].access[0] != 0) ? s_peers[i].access : "-");
     }
     fclose(f);
 }
 
-static void peers_store(const char *name, const char *pub, const char *addr, u8_t idx)
+static void peers_store(const char *name, const char *pub, const char *addr,
+                        const char *psk, const char *access, u8_t idx)
 {
     if (s_peer_count >= VPN_MAX_PEERS) {
         return;
@@ -340,16 +351,27 @@ static void peers_store(const char *name, const char *pub, const char *addr, u8_
     strlcpy(p->name, name, sizeof(p->name));
     strlcpy(p->pub, pub, sizeof(p->pub));
     strlcpy(p->addr, addr, sizeof(p->addr));
+    strlcpy(p->psk, (psk != NULL) ? psk : "", sizeof(p->psk));
+    strlcpy(p->access, (access != NULL) ? access : "", sizeof(p->access));
     p->idx = idx;
 }
 
 /* One peer into the interface. No endpoint: the client dials us. */
-static bool peer_admit(const char *pub, const char *addr, u8_t *idx_out)
+static bool peer_admit(const char *pub, const char *psk_b64, const char *addr,
+                       u8_t *idx_out)
 {
+    uint8_t raw[32];
+    const uint8_t *psk = NULL;
+
+    if (psk_b64 != NULL && psk_b64[0] != 0 && psk_b64[0] != '-' &&
+        base64_decode(psk_b64, raw, sizeof(raw)) == sizeof(raw)) {
+        psk = raw;                      /* peer_init copies it */
+    }
+
     struct wireguardif_peer p;
     wireguardif_peer_init(&p);
     p.public_key    = pub;
-    p.preshared_key = NULL;
+    p.preshared_key = psk;
     p.keep_alive    = 25;
     ipaddr_aton(addr, &p.allowed_ip);
     ipaddr_aton("255.255.255.255", &p.allowed_mask);
@@ -378,11 +400,22 @@ static void peers_load(void)
         if (line[0] == '#') {
             continue;
         }
-        if (sscanf(line, "%23s %47s %19s", name, pub, addr) == 3) {
-            u8_t idx;
-            if (peer_admit(pub, addr, &idx)) {
-                peers_store(name, pub, addr, idx);
-            }
+        char psk[48] = {0}, access[16] = {0};
+        int  got = sscanf(line, "%23s %47s %19s %47s %15s", name, pub, addr,
+                          psk, access);
+        if (got < 3) {
+            continue;
+        }
+        if (got < 4 || strcmp(psk, "-") == 0) {
+            psk[0] = 0;
+        }
+        if (got < 5 || strcmp(access, "-") == 0) {
+            access[0] = 0;
+        }
+
+        u8_t idx;
+        if (peer_admit(pub, psk, addr, &idx)) {
+            peers_store(name, pub, addr, psk, access, idx);
         }
     }
     fclose(f);
@@ -393,18 +426,19 @@ static void peers_load(void)
 }
 
 esp_err_t espix_net_vpn_peer_add(const char *name, const char *pub_b64,
-                                 const char *allowed_ip)
+                                 const char *allowed_ip, const char *psk_b64,
+                                 const char *access)
 {
     if (!s_up) {
         return ESP_ERR_INVALID_STATE;
     }
 
     u8_t idx;
-    if (!peer_admit(pub_b64, allowed_ip, &idx)) {
+    if (!peer_admit(pub_b64, psk_b64, allowed_ip, &idx)) {
         return ESP_FAIL;
     }
 
-    peers_store(name, pub_b64, allowed_ip, idx);
+    peers_store(name, pub_b64, allowed_ip, psk_b64, access, idx);
     peers_save();
     espix_klog(ESPIX_KLOG_INFO, TAG, "peer %s at %s (%s)", name, allowed_ip,
                pub_b64);
@@ -421,63 +455,153 @@ esp_err_t espix_net_vpn_endpoint_get(char *out, size_t len)
 
 /* Rewrites /etc/vpn.conf, keeping whatever it is not asked to change: setting
  * the endpoint must not drop the DNS or the keys, and the other way round. */
-static esp_err_t conf_write(const char *endpoint, const char *dns)
+esp_err_t espix_net_vpn_conf_get(const char *key, char *out, size_t len)
+{
+    if (key == NULL || out == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (espix_fs_conf_get(VPN_CONF_PATH, key, out, len)) {
+        return ESP_OK;
+    }
+
+    /* A config written before a key existed still answers. */
+    if (strcmp(key, "dns") == 0) {
+        strlcpy(out, VPN_DNS_DEFAULT, len);
+        return ESP_OK;
+    }
+    if (strcmp(key, "subnet") == 0) {
+        strlcpy(out, VPN_SUBNET_DEFAULT, len);
+        return ESP_OK;
+    }
+    if (strcmp(key, "access") == 0) {
+        strlcpy(out, VPN_ACCESS_DEFAULT, len);
+        return ESP_OK;
+    }
+    if (strcmp(key, "port") == 0) {
+        snprintf(out, len, "%d", WIREGUARDIF_DEFAULT_PORT);
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t espix_net_vpn_conf_set(const char *key, const char *value)
 {
     char priv[48] = {0}, pub[48] = {0}, ep[128] = {0}, dn[128] = {0};
+    char port[16] = {0}, subnet[24] = {0}, access[16] = {0};
 
-    (void)espix_fs_conf_get(VPN_CONF_PATH, "private_key", priv, sizeof(priv));
-    (void)espix_fs_conf_get(VPN_CONF_PATH, "public_key", pub, sizeof(pub));
-    (void)espix_fs_conf_get(VPN_CONF_PATH, "endpoint", ep, sizeof(ep));
-    (void)espix_fs_conf_get(VPN_CONF_PATH, "dns", dn, sizeof(dn));
+    struct { const char *k; char *v; size_t n; } f[] = {
+        { "private_key", priv, sizeof(priv) },
+        { "public_key",  pub,  sizeof(pub)  },
+        { "endpoint",    ep,   sizeof(ep)   },
+        { "dns",         dn,   sizeof(dn)   },
+        { "port",        port, sizeof(port) },
+        { "subnet",      subnet, sizeof(subnet) },
+        { "access",      access, sizeof(access) },
+    };
+    const size_t nf = sizeof(f) / sizeof(f[0]);
 
-    if (endpoint != NULL) {
-        strlcpy(ep, endpoint, sizeof(ep));
+    for (size_t i = 0; i < nf; i++) {
+        (void)espix_fs_conf_get(VPN_CONF_PATH, f[i].k, f[i].v, f[i].n);
     }
-    if (dns != NULL) {
-        strlcpy(dn, dns, sizeof(dn));
+    for (size_t i = 0; i < nf && key != NULL && value != NULL; i++) {
+        if (strcmp(f[i].k, key) == 0) {
+            strlcpy(f[i].v, value, f[i].n);
+        }
     }
 
-    FILE *f = fopen(VPN_CONF_PATH, "w");
-    if (f == NULL) {
+    FILE *fp = fopen(VPN_CONF_PATH, "w");
+    if (fp == NULL) {
         return ESP_FAIL;
     }
-    fprintf(f, "# espix VPN server. The private key is the server's identity.\n");
-    if (priv[0] != 0) {
-        fprintf(f, "private_key=%s\n", priv);
+    fprintf(fp, "# espix VPN server. The private key is the server's identity.\n");
+    for (size_t i = 0; i < nf; i++) {
+        if (f[i].v[0] != 0) {
+            fprintf(fp, "%s=%s\n", f[i].k, f[i].v);
+        }
     }
-    if (pub[0] != 0) {
-        fprintf(f, "public_key=%s\n", pub);
-    }
-    if (ep[0] != 0) {
-        fprintf(f, "endpoint=%s\n", ep);
-    }
-    if (dn[0] != 0) {
-        fprintf(f, "dns=%s\n", dn);
-    }
-    fclose(f);
+    fclose(fp);
     secure_conf();
     return ESP_OK;
 }
 
 esp_err_t espix_net_vpn_endpoint_set(const char *host)
 {
-    return conf_write(host, NULL);
+    return espix_net_vpn_conf_set("endpoint", host);
 }
 
 esp_err_t espix_net_vpn_dns_get(char *out, size_t len)
 {
-    if (out == NULL || len == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!espix_fs_conf_get(VPN_CONF_PATH, "dns", out, len)) {
-        strlcpy(out, VPN_DNS_DEFAULT, len);
-    }
-    return ESP_OK;
+    return espix_net_vpn_conf_get("dns", out, len);
 }
 
 esp_err_t espix_net_vpn_dns_set(const char *list)
 {
-    return conf_write(NULL, list);
+    return espix_net_vpn_conf_set("dns", list);
+}
+
+/*
+ * The tunnel subnet, as the first address and a /24 mask. A random one is
+ * chosen at setup so two espix boxes do not both claim 10.6.0.0/24 -- a client
+ * that talks to both would otherwise have two routes for one network -- and a
+ * person can type one instead.
+ */
+static void subnet_parts(const char *subnet, unsigned *a, unsigned *b, unsigned *c)
+{
+    *a = 10; *b = 6; *c = 0;
+    (void)sscanf(subnet, "%u.%u.%u", a, b, c);
+}
+
+esp_err_t espix_net_vpn_server_addr(char *out, size_t len)
+{
+    char subnet[24] = {0};
+    unsigned a, b, c;
+
+    (void)espix_net_vpn_conf_get("subnet", subnet, sizeof(subnet));
+    subnet_parts(subnet, &a, &b, &c);
+    snprintf(out, len, "%u.%u.%u.1", a, b, c);
+    return ESP_OK;
+}
+
+void espix_net_vpn_mask(char *out, size_t len)
+{
+    strlcpy(out, "255.255.255.0", len);
+}
+
+esp_err_t espix_net_vpn_next_addr(char *out, size_t len)
+{
+    char subnet[24] = {0};
+    unsigned a, b, c;
+
+    (void)espix_net_vpn_conf_get("subnet", subnet, sizeof(subnet));
+    subnet_parts(subnet, &a, &b, &c);
+
+    for (unsigned host = 2; host < 255; host++) {
+        char candidate[24];
+        bool used = false;
+
+        snprintf(candidate, sizeof(candidate), "%u.%u.%u.%u", a, b, c, host);
+        for (int i = 0; i < s_peer_count; i++) {
+            if (strcmp(s_peers[i].addr, candidate) == 0) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) {
+            strlcpy(out, candidate, len);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t espix_net_vpn_psk(char *out, size_t len)
+{
+    uint8_t raw[32];
+
+    esp_fill_random(raw, sizeof(raw));
+    base64_key(raw, sizeof(raw), out);
+    (void)len;
+    return ESP_OK;
 }
 
 int espix_net_vpn_peer_count(void)
@@ -540,4 +664,60 @@ esp_err_t espix_net_vpn_peer_addr_by_name(const char *name, char *out, size_t le
         }
     }
     return ESP_ERR_NOT_FOUND;
+}
+
+const char *espix_net_vpn_peer_access(int i)
+{
+    return (i >= 0 && i < s_peer_count && s_peers[i].access[0] != 0)
+               ? s_peers[i].access
+               : "-";
+}
+
+const char *espix_net_vpn_peer_psk(int i)
+{
+    return (i >= 0 && i < s_peer_count) ? s_peers[i].psk : "";
+}
+
+esp_err_t espix_net_vpn_ensure_keys(void)
+{
+    return server_key();
+}
+
+/*
+ * A tunnel network that is not the one the device is already on, so two espix
+ * boxes do not both claim 10.6.0.0/24 -- a client that talks to both would
+ * otherwise have two routes for one network, and one of them would be wrong.
+ */
+esp_err_t espix_net_vpn_random_subnet(char *out, size_t len)
+{
+    for (int tries = 0; tries < 16; tries++) {
+        const unsigned a = 10;
+        const unsigned b = 6 + (esp_random() % 240);
+        const unsigned c = esp_random() % 256;
+
+        char candidate[24], head[24];
+        snprintf(candidate, sizeof(candidate), "%u.%u.%u.0/24", a, b, c);
+        snprintf(head, sizeof(head), "%u.%u.%u", a, b, c);
+
+        espix_ifinfo_t ifs[8];
+        const size_t   n = espix_net_iflist(ifs, 8);
+        bool           clash = false;
+        for (size_t i = 0; i < n && !clash; i++) {
+            if (!ifs[i].has_addr) {
+                continue;
+            }
+            char ip[24];
+            snprintf(ip, sizeof(ip), "%u.%u.%u",
+                     (unsigned)(ifs[i].ip & 0xff),
+                     (unsigned)((ifs[i].ip >> 8) & 0xff),
+                     (unsigned)((ifs[i].ip >> 16) & 0xff));
+            clash = (strcmp(ip, head) == 0);
+        }
+        if (!clash) {
+            strlcpy(out, candidate, len);
+            return ESP_OK;
+        }
+    }
+    strlcpy(out, VPN_SUBNET_DEFAULT, len);
+    return ESP_OK;
 }

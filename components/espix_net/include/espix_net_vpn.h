@@ -32,7 +32,8 @@ esp_err_t espix_net_vpn_keypair(char *priv_b64, size_t plen,
 /* Admit a client: a peer with this public key, allowed only this address, and
  * no endpoint -- so the client initiates, from wherever it roams. */
 esp_err_t espix_net_vpn_peer_add(const char *name, const char *pub_b64,
-                                const char *allowed_ip);
+                                const char *allowed_ip, const char *psk_b64,
+                                const char *access);
 
 /* The peers this interface knows, for the vpn status command. peer_session()
  * reports whether that peer has a live session and, if so, the endpoint it has
@@ -53,3 +54,18 @@ esp_err_t espix_net_vpn_dns_set(const char *list);
 esp_err_t   espix_net_vpn_peer_del(const char *name);
 esp_err_t   espix_net_vpn_peer_addr_by_name(const char *name, char *out,
                                             size_t len);
+
+/* The config as key=value, with a default when the key is absent. */
+esp_err_t espix_net_vpn_conf_get(const char *key, char *out, size_t len);
+esp_err_t espix_net_vpn_conf_set(const char *key, const char *value);
+
+/* The tunnel network: the server's address, a /24 mask, the next free client
+ * address, and a fresh pre-shared key. */
+esp_err_t   espix_net_vpn_server_addr(char *out, size_t len);
+void        espix_net_vpn_mask(char *out, size_t len);
+esp_err_t   espix_net_vpn_next_addr(char *out, size_t len);
+esp_err_t   espix_net_vpn_psk(char *out, size_t len);
+const char *espix_net_vpn_peer_access(int i);
+const char *espix_net_vpn_peer_psk(int i);
+esp_err_t   espix_net_vpn_random_subnet(char *out, size_t len);
+esp_err_t   espix_net_vpn_ensure_keys(void);

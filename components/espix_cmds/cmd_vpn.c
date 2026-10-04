@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_random.h"
+
 #include "qrcode.h"
 
 #include "espix_cmds_priv.h"
@@ -20,14 +22,204 @@
 #include "espix_net.h"
 #include "espix_net_vpn.h"
 
+/* The network the device sits on, for the "home" level. */
+static void lan_network(char *out, size_t len)
+{
+    espix_ifinfo_t ifs[8];
+    const size_t   n = espix_net_iflist(ifs, 8);
+
+    out[0] = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!ifs[i].has_addr || ifs[i].kind == ESPIX_IF_LO) {
+            continue;
+        }
+        const uint32_t net = ifs[i].ip & ifs[i].netmask;
+        int            bits = 0;
+        for (uint32_t m = ifs[i].netmask; m != 0; m >>= 1) {
+            bits += (int)(m & 1);
+        }
+        snprintf(out, len, "%u.%u.%u.%u/%d",
+                 (unsigned)(net & 0xff), (unsigned)((net >> 8) & 0xff),
+                 (unsigned)((net >> 16) & 0xff), (unsigned)((net >> 24) & 0xff),
+                 bits);
+        return;
+    }
+}
+
+/*
+ * What a client sends into the tunnel, which is what it will reach. What it is
+ * really allowed to reach is the firewall that is not there yet; this is the
+ * client's side of the agreement, recorded per peer so the firewall has
+ * something to enforce.
+ */
+static void allowed_ips(const char *access, char *out, size_t len)
+{
+    char subnet[24], srv[24];
+
+    (void)espix_net_vpn_conf_get("subnet", subnet, sizeof(subnet));
+    (void)espix_net_vpn_server_addr(srv, sizeof(srv));
+
+    if (strcmp(access, "espix") == 0) {
+        snprintf(out, len, "%s/32", srv);
+    } else if (strcmp(access, "clients") == 0) {
+        snprintf(out, len, "%s", subnet);
+    } else if (strcmp(access, "home") == 0) {
+        char lan[40] = {0};
+        lan_network(lan, sizeof(lan));
+        if (lan[0] != 0) {
+            snprintf(out, len, "%s, %s", lan, subnet);
+        } else {
+            snprintf(out, len, "%s", subnet);
+        }
+    } else {
+        snprintf(out, len, "0.0.0.0/0, ::/0");
+    }
+}
+
 /* A client is a keypair, a config file, and a peer with no endpoint. The
  * address is the next free one in 10.6.0.0/24; the peer is what makes the
  * server accept that key. */
-static int vpn_add(espix_session_t *s, const char *name)
+/* The home router's address, which is what resolves the house's names. */
+static bool router_dns(char *out, size_t len)
+{
+    uint32_t gw = 0;
+
+    if (!espix_net_default_route(NULL, 0, &gw) || gw == 0) {
+        return false;
+    }
+    snprintf(out, len, "%u.%u.%u.%u",
+             (unsigned)(gw & 0xff), (unsigned)((gw >> 8) & 0xff),
+             (unsigned)((gw >> 16) & 0xff), (unsigned)((gw >> 24) & 0xff));
+    return true;
+}
+
+/*
+ * The server's settings, once. Asked for when there is nothing yet -- no
+ * server key means no server section, which is what a client-only config looks
+ * like -- or given as key=value for a script.
+ */
+static int vpn_setup(espix_session_t *s, int argc, char **argv)
+{
+    char port[16], endpoint[128], dns[128], subnet[24], access[16];
+    char line[128];
+
+    (void)espix_net_vpn_conf_get("port", port, sizeof(port));
+    (void)espix_net_vpn_conf_get("endpoint", endpoint, sizeof(endpoint));
+    (void)espix_net_vpn_conf_get("dns", dns, sizeof(dns));
+    (void)espix_net_vpn_conf_get("access", access, sizeof(access));
+
+    /* A network the device is not already on, unless one is already set. */
+    if (espix_fs_conf_get("/etc/vpn.conf", "subnet", subnet, sizeof(subnet))) {
+        /* keep it */
+    } else {
+        (void)espix_net_vpn_random_subnet(subnet, sizeof(subnet));
+    }
+
+    if (argc > 2) {
+        for (int i = 2; i < argc; i++) {      /* argv[1] is "setup" */
+            char *eq = strchr(argv[i], '=');
+            if (eq == NULL) {
+                espix_eprintf(s, "usage: vpn setup [port=|endpoint=|dns=|subnet=|access=]\n");
+                return 1;
+            }
+            *eq = 0;
+            const char *k = argv[i];
+            const char *v = eq + 1;
+
+            if (strcmp(k, "port") == 0)          strlcpy(port, v, sizeof(port));
+            else if (strcmp(k, "endpoint") == 0) strlcpy(endpoint, v, sizeof(endpoint));
+            else if (strcmp(k, "dns") == 0)      strlcpy(dns, v, sizeof(dns));
+            else if (strcmp(k, "subnet") == 0)   strlcpy(subnet, v, sizeof(subnet));
+            else if (strcmp(k, "access") == 0)   strlcpy(access, v, sizeof(access));
+            else {
+                espix_eprintf(s, "vpn: unknown setting %s\n", k);
+                return 1;
+            }
+        }
+    } else {
+        espix_printf(s, "Setting up the VPN server; enter accepts what is in brackets.\n");
+
+        espix_printf(s, "port [%s]: ", port);
+        if (s->read_line(s, "", line, sizeof(line)) > 0 && line[0] != 0) {
+            strlcpy(port, line, sizeof(port));
+        }
+
+        espix_printf(s, "public name or address [%s]: ", endpoint);
+        if (s->read_line(s, "", line, sizeof(line)) > 0 && line[0] != 0) {
+            strlcpy(endpoint, line, sizeof(endpoint));
+        }
+
+        espix_printf(s, "dns for clients (public|router|an address) [%s]: ", dns);
+        if (s->read_line(s, "", line, sizeof(line)) > 0 && line[0] != 0) {
+            char gw[24];
+            if (strcmp(line, "public") == 0) {
+                strlcpy(dns, "1.1.1.1, 8.8.8.8", sizeof(dns));
+            } else if (strcmp(line, "router") == 0 && router_dns(gw, sizeof(gw))) {
+                strlcpy(dns, gw, sizeof(dns));
+            } else {
+                strlcpy(dns, line, sizeof(dns));
+            }
+        }
+
+        espix_printf(s, "tunnel network (random|an address) [%s]: ", subnet);
+        if (s->read_line(s, "", line, sizeof(line)) > 0 && line[0] != 0) {
+            if (strcmp(line, "random") == 0) {
+                (void)espix_net_vpn_random_subnet(subnet, sizeof(subnet));
+            } else {
+                strlcpy(subnet, line, sizeof(subnet));
+            }
+        }
+
+        espix_printf(s, "access for new clients (all|home|clients|espix) [%s]: ", access);
+        if (s->read_line(s, "", line, sizeof(line)) > 0 && line[0] != 0) {
+            strlcpy(access, line, sizeof(access));
+        }
+    }
+
+    if (endpoint[0] == 0) {
+        espix_eprintf(s, "vpn: clients dial an endpoint; set one with vpn setup endpoint=<name>\n");
+        return 1;
+    }
+
+    (void)espix_net_vpn_conf_set("port", port);
+    (void)espix_net_vpn_conf_set("endpoint", endpoint);
+    (void)espix_net_vpn_conf_set("dns", dns);
+    (void)espix_net_vpn_conf_set("subnet", subnet);
+    (void)espix_net_vpn_conf_set("access", access);
+
+    if (espix_net_vpn_ensure_keys() != ESP_OK) {
+        espix_eprintf(s, "vpn: cannot keep a server key (try sudo)\n");
+        return 1;
+    }
+
+    espix_printf(s, "vpn: port %s, endpoint %s, dns %s, network %s, access %s\n",
+                 port, endpoint, dns, subnet, access);
+    espix_printf(s, "vpn: now 'vpn up', then 'vpn add <name>'\n");
+    return 0;
+}
+
+static int vpn_add(espix_session_t *s, const char *name, const char *access_arg)
 {
     if (!espix_net_vpn_is_up()) {
         espix_eprintf(s, "vpn: wg0 is down; run vpn up first\n");
         return 1;
+    }
+
+    char access[16] = {0};
+    if (access_arg != NULL && access_arg[0] != 0) {
+        strlcpy(access, access_arg, sizeof(access));
+    } else {
+        char line[32];
+        if (s->read_line(s, "access (all|home|clients|espix) [all]: ", line,
+                         sizeof(line)) > 0 && line[0] != 0) {
+            strlcpy(access, line, sizeof(access));
+        }
+    }
+    if (access[0] == 0) {
+        (void)espix_net_vpn_conf_get("access", access, sizeof(access));
+    }
+    if (access[0] == 0) {
+        strlcpy(access, "all", sizeof(access));
     }
 
     char endpoint[128];
@@ -57,22 +249,20 @@ static int vpn_add(espix_session_t *s, const char *name)
     strlcat(path, ".conf", sizeof(path));
 
     /* A name that already has an address keeps it, so replacing a lost phone
-     * does not move it; a new one takes the next free address. */
+     * does not move it; a new one takes the next free address in the tunnel
+     * network. */
     char addr[32] = {0};
     if (espix_net_vpn_peer_addr_by_name(name, addr, sizeof(addr)) != ESP_OK) {
-        int n = 0;
-        DIR *d = opendir("/etc/vpn/clients");
-        if (d != NULL) {
-            struct dirent *e;
-            while ((e = readdir(d)) != NULL) {
-                if (strstr(e->d_name, ".conf") != NULL) {
-                    n++;
-                }
-            }
-            closedir(d);
+        if (espix_net_vpn_next_addr(addr, sizeof(addr)) != ESP_OK) {
+            espix_eprintf(s, "vpn: the tunnel network is full\n");
+            return 1;
         }
-        snprintf(addr, sizeof(addr), "10.6.0.%d", n + 2);
     }
+
+    /* Every client gets one, as PiVPN does: it costs a second secret to carry
+     * and it is what keeps a recording safe if Curve25519 ever falls. */
+    char psk[48] = {0};
+    (void)espix_net_vpn_psk(psk, sizeof(psk));
 
     (void)espix_net_vpn_peer_del(name);      /* the old key, if any */
 
@@ -81,24 +271,31 @@ static int vpn_add(espix_session_t *s, const char *name)
         espix_eprintf(s, "vpn: cannot write %s (try sudo)\n", path);
         return 1;
     }
+    char allowed[80], port[16];
+    allowed_ips(access, allowed, sizeof(allowed));
+    (void)espix_net_vpn_conf_get("port", port, sizeof(port));
+
     fprintf(f, "[Interface]\n");
     fprintf(f, "Address = %s/32\n", addr);
     fprintf(f, "PrivateKey = %s\n", priv);
+    if (psk[0] != 0) {
+        fprintf(f, "PresharedKey = %s\n", psk);
+    }
     fprintf(f, "DNS = %s\n", dns);
     fprintf(f, "\n[Peer]\n");
     fprintf(f, "PublicKey = %s\n", spub);
-    fprintf(f, "Endpoint = %s:51820\n", endpoint);
-    fprintf(f, "AllowedIPs = 0.0.0.0/0, ::/0\n");
+    fprintf(f, "Endpoint = %s:%s\n", endpoint, port);
+    fprintf(f, "AllowedIPs = %s\n", allowed);
     fprintf(f, "PersistentKeepalive = 25\n");
     fclose(f);
     (void)espix_fs_ensure_mode(path, 0600);   /* it holds a private key */
 
-    if (espix_net_vpn_peer_add(name, pub, addr) != ESP_OK) {
+    if (espix_net_vpn_peer_add(name, pub, addr, psk, access) != ESP_OK) {
         espix_eprintf(s, "vpn: wrote %s but did not admit the peer\n", path);
         return 1;
     }
 
-    espix_printf(s, "vpn: %s is %s, in %s\n", name, addr, path);
+    espix_printf(s, "vpn: %s is %s (%s), in %s\n", name, addr, access, path);
     return 0;
 }
 
@@ -276,15 +473,11 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
             return 0;
         }
         if (strcmp(argv[2], "router") == 0) {
-            uint32_t gw = 0;
-            if (!espix_net_default_route(NULL, 0, &gw) || gw == 0) {
+            char addr[24];
+            if (!router_dns(addr, sizeof(addr))) {
                 espix_eprintf(s, "vpn: no default route to take an address from\n");
                 return 1;
             }
-            char addr[32];
-            snprintf(addr, sizeof(addr), "%u.%u.%u.%u",
-                     (unsigned)(gw & 0xff), (unsigned)((gw >> 8) & 0xff),
-                     (unsigned)((gw >> 16) & 0xff), (unsigned)((gw >> 24) & 0xff));
             (void)espix_net_vpn_dns_set(addr);
             espix_printf(s, "vpn: dns %s\n", addr);
             return 0;
@@ -346,12 +539,16 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "setup") == 0) {
+        return vpn_setup(s, argc, argv);
+    }
+
     if (strcmp(argv[1], "add") == 0) {
         if (argc < 3) {
-            espix_eprintf(s, "usage: vpn add <name>\n");
+            espix_eprintf(s, "usage: vpn add <name> [all|home|clients|espix]\n");
             return 1;
         }
-        return vpn_add(s, argv[2]);
+        return vpn_add(s, argv[2], (argc >= 4) ? argv[3] : NULL);
     }
 
     espix_eprintf(s, "usage: vpn [up|down|status|add <name>|endpoint [host]]\n");
@@ -361,7 +558,7 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_vpn_cmds[] = {
     { .name = "vpn", .fn = cmd_vpn,
       .help = "the WireGuard server",
-      .usage = "vpn [up|down|status|list|remove <name>|add <name>|qr <name>|endpoint [host]|dns [public|router|list]]" },
+      .usage = "vpn [setup|up|down|status|list|remove <name>|add <name> [access]|qr <name>|endpoint [host]|dns [public|router|list]]" },
 };
 
 void espix_cmds_register_vpn(void)
