@@ -14,7 +14,7 @@
  * service manager runs it as a unit, the way a Unix daemon runs in the
  * foreground under its supervisor.
  */
-esp_err_t espix_nfsd_run(void);
+esp_err_t espix_nfsd_run(bool (*keep_going)(void));
 
 /* For the command: what /etc/exports gave us. */
 int  espix_nfsd_export_count(void);

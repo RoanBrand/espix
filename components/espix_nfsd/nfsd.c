@@ -50,8 +50,8 @@ typedef struct {
     int          nclients;
 } nfs_export_t;
 
-static nfs_export_t s_exports[MAX_EXPORTS];
-static int          s_nexports;
+static nfs_export_t *s_exports;          /* PSRAM, like the buffers */
+static int           s_nexports;
 
 static struct {
     uint32_t prog, vers;
@@ -105,6 +105,19 @@ static int load_exports(void)
     if (f == NULL) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no /etc/exports; nothing to serve");
         return 0;
+    }
+
+    if (s_exports == NULL) {
+        s_exports = heap_caps_malloc(MAX_EXPORTS * sizeof(*s_exports),
+                                     MALLOC_CAP_SPIRAM);
+        if (s_exports == NULL) {
+            s_exports = heap_caps_malloc(MAX_EXPORTS * sizeof(*s_exports),
+                                         MALLOC_CAP_8BIT);
+        }
+        if (s_exports == NULL) {
+            fclose(f);
+            return 0;
+        }
     }
 
     char line[256];
@@ -423,7 +436,7 @@ static int bind_tcp(uint16_t port)
     return fd;
 }
 
-esp_err_t espix_nfsd_run(void)
+esp_err_t espix_nfsd_run(bool (*keep_going)(void))
 {
     if (s_req == NULL) {
         s_req   = heap_caps_malloc(BUFCAP, MALLOC_CAP_SPIRAM);
@@ -466,6 +479,12 @@ esp_err_t espix_nfsd_run(void)
                MOUNT_PORT, NFS_PORT);
 
     for (;;) {
+        /* Asked to stop: the sockets go with us, so a restart can bind them. */
+        if (keep_going != NULL && !keep_going()) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "stopping");
+            break;
+        }
+
         fd_set         r;
         struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
 
@@ -499,6 +518,11 @@ esp_err_t espix_nfsd_run(void)
             }
         }
     }
+
+    close(pm_udp);
+    close(pm_tcp);
+    close(mt_udp);
+    close(mt_tcp);
     return ESP_OK;
 }
 

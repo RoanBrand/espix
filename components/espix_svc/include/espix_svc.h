@@ -43,6 +43,7 @@ typedef struct {
     bool        running;         /* a builtin task, which has no pid */
     uint32_t    every_s;         /* 0 unless scheduled */
     uint32_t    restarts;
+    bool        stopping;        /* a builtin has been asked to stop */
     bool        ran;             /* has started at least once */
     int         last_code;       /* what it exited with, once it has */
 } espix_svc_info_t;
@@ -55,6 +56,13 @@ int       espix_svc_count(void);
 bool      espix_svc_info(int index, espix_svc_info_t *out);
 esp_err_t espix_svc_start(const char *name);
 esp_err_t espix_svc_stop(const char *name);
+
+/*
+ * For a unit that runs on a task rather than as a process: true once its stop
+ * has been asked for, so the loop it runs can finish and let the supervisor
+ * see it end. False outside a unit, so the same command runs by hand.
+ */
+bool      espix_svc_stopping(void);
 esp_err_t espix_svc_reload(void);
 
 /*

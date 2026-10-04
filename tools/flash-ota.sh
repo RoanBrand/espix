@@ -69,7 +69,7 @@ if [ -n "$before" ]; then
     keep="${before#\#}"
     # One rm per file, because tools/esp.sh execs a path rather than a shell:
     # a remote `for` is "for: command not found".
-    dev_once 'ls /boot' 2>/dev/null | while read -r f; do
+    dev_once 'ls /boot' 2>/dev/null | tr -d '\r' | while read -r f; do
         case "$f" in
             *"$keep"*) ;;
             espix-*.bin) dev_once "sudo rm /boot/$f" >/dev/null 2>&1 || true ;;

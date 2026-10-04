@@ -56,6 +56,7 @@ typedef struct {
     bool        enabled;
     espix_pid_t pid;
     uint32_t    restarts;
+    bool        stop;            /* a builtin has been asked to stop */
     bool        ran;             /* has started at least once */
     int         last_code;       /* what it exited with, once it has */
 
@@ -521,6 +522,7 @@ static void supervisor_task(void *arg)
                 free(b->argv);
                 u->builtin = NULL;
                 u->task    = NULL;
+                u->stop    = false;
                 espix_klog(ESPIX_KLOG_INFO, TAG, "%s: finished (%d)", u->name,
                            code);
                 unit_exited(u, code);
@@ -635,12 +637,35 @@ bool espix_svc_info(int index, espix_svc_info_t *out)
         out->running  = (s_units[index].task != NULL);
         out->every_s  = s_units[index].every_s;
         out->restarts = s_units[index].restarts;
+        out->stopping = s_units[index].stop;
         out->ran      = s_units[index].ran;
         out->last_code = s_units[index].last_code;
         ok = true;
     }
     xSemaphoreGive(s_lock);
     return ok;
+}
+
+bool espix_svc_stopping(void)
+{
+    if (!s_started) {
+        return false;
+    }
+
+    /* Whoever is asking is the builtin, so it is this task's unit that is
+     * being asked to stop -- and no unit of its own means no. */
+    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    bool               stopping = false;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_count; i++) {
+        if (s_units[i].task != NULL && s_units[i].task == (void *)me) {
+            stopping = s_units[i].stop;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return stopping;
 }
 
 esp_err_t espix_svc_start(const char *name)
@@ -655,6 +680,7 @@ esp_err_t espix_svc_start(const char *name)
     if (u != NULL) {
         u->enabled  = true;             /* the supervisor does the starting */
         u->restarts = 0;                /* and a manual start gets a fresh run */
+        u->stop     = false;
         err = ESP_OK;
     }
     xSemaphoreGive(s_lock);
@@ -674,6 +700,11 @@ esp_err_t espix_svc_stop(const char *name)
         u->enabled = false;
         if (u->pid != ESPIX_PID_NONE) {
             (void)espix_proc_signal(u->pid, SIGTERM);
+        } else if (u->task != NULL) {
+            /* A builtin has no pid to signal: it is asked, and its own loop
+             * says when it has finished. The same arrangement an app gets
+             * from espix_proc_stopping(). */
+            u->stop = true;
         }
         err = ESP_OK;
     }

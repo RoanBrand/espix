@@ -8,6 +8,13 @@
 
 #include "espix_cmds_priv.h"
 #include "espix_nfsd.h"
+#include "espix_svc.h"
+
+/* Run by a unit, stop when the unit is asked to; run by hand, never. */
+static bool keep_going(void)
+{
+    return !espix_svc_stopping();
+}
 
 static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
 {
@@ -33,7 +40,7 @@ static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
     }
 
     espix_printf(s, "nfsd: serving; stop the unit or close the session to end it\n");
-    const esp_err_t e = espix_nfsd_run();
+    const esp_err_t e = espix_nfsd_run(keep_going);
     if (e != ESP_OK) {
         espix_eprintf(s, "nfsd: %s\n", esp_err_to_name(e));
         return 1;
