@@ -16,6 +16,7 @@
 #include "qrcode.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_fs.h"
 #include "espix_net.h"
 #include "espix_net_vpn.h"
 
@@ -90,6 +91,7 @@ static int vpn_add(espix_session_t *s, const char *name)
     fprintf(f, "AllowedIPs = 0.0.0.0/0, ::/0\n");
     fprintf(f, "PersistentKeepalive = 25\n");
     fclose(f);
+    (void)espix_fs_ensure_mode(path, 0600);   /* it holds a private key */
 
     if (espix_net_vpn_peer_add(name, pub, addr) != ESP_OK) {
         espix_eprintf(s, "vpn: wrote %s but did not admit the peer\n", path);

@@ -6,6 +6,7 @@
  * boots, and -- next -- the peer list.
  */
 
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +32,7 @@
 #include "espix_net_vpn.h"
 
 #define VPN_CONF_PATH "/etc/vpn.conf"
+#define VPN_CLIENTS_DIR "/etc/vpn/clients/"
 #define VPN_ADDR      "10.6.0.1"
 #define VPN_MASK      "255.255.255.0"
 #define VPN_PORT      WIREGUARDIF_DEFAULT_PORT
@@ -98,6 +100,42 @@ static size_t base64_decode(const char *in, uint8_t *out, size_t outlen)
     return o;
 }
 
+/*
+ * The private key is the server's identity, and a file anyone can read is a
+ * key anyone has. 0600, on every write and again at the boot read -- a device
+ * flashed before this existed carries no mode and would stay 0644 forever,
+ * which is what espix_fs_ensure_mode() makes cheap to correct.
+ */
+static void secure_conf(void)
+{
+    (void)espix_fs_ensure_mode(VPN_CONF_PATH, 0600);
+}
+
+/*
+ * The same for every client config, which each hold a private key: the mode is
+ * set when one is written, and swept again at the boot read so a device that
+ * predates the check does not keep 0644 files for the rest of its life.
+ */
+static void secure_clients(void)
+{
+    DIR *d = opendir(VPN_CLIENTS_DIR);
+    if (d == NULL) {
+        return;
+    }
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strstr(e->d_name, ".conf") == NULL) {
+            continue;
+        }
+        char path[160];
+        strlcpy(path, VPN_CLIENTS_DIR, sizeof(path));
+        strlcat(path, e->d_name, sizeof(path));
+        (void)espix_fs_ensure_mode(path, 0600);
+    }
+    closedir(d);
+}
+
 /* The key is the server's identity: it has to outlive a reboot or every client
  * stops working, so it is read from /etc/vpn.conf and written there once. */
 static esp_err_t server_key(void)
@@ -110,6 +148,7 @@ static esp_err_t server_key(void)
             x25519_base(pub, raw, 1) == 0) {
             base64_key(pub, sizeof(pub), s_pub);
         }
+        secure_conf();
         return ESP_OK;
     }
 
@@ -137,6 +176,7 @@ static esp_err_t server_key(void)
                    "cannot write %s; this key lasts until the next boot",
                    VPN_CONF_PATH);
     }
+    secure_conf();
     return ESP_OK;
 }
 
@@ -182,6 +222,7 @@ esp_err_t espix_net_vpn_up(void)
         espix_klog(ESPIX_KLOG_WARN, TAG, "wg0 is up but not masqueraded");
     }
 
+    secure_clients();
     peers_load();
 
     s_up = true;
@@ -414,6 +455,7 @@ static esp_err_t conf_write(const char *endpoint, const char *dns)
         fprintf(f, "dns=%s\n", dn);
     }
     fclose(f);
+    secure_conf();
     return ESP_OK;
 }
 
