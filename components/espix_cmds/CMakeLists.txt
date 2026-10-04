@@ -33,6 +33,7 @@ idf_component_register(
         espix_fault
         espix_appdata
         espix_net
+        espressif__qrcode
         espix_bt
         espix_audio
         espix_display

@@ -116,6 +116,13 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.14.0
+  espressif/qrcode:
+    component_hash: 31e70991ce22f28d73a4386417fc9c0993f61e1aab1832474fd9e3db8da9dcbd
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.0
   espressif/tinyusb:
     component_hash: a72b7d67472914ab76309340fd50d578b31e310963d45ad0f81144bde3314752
     dependencies:
@@ -231,12 +238,13 @@ direct_dependencies:
 - espressif/esp_sysview
 - espressif/esp_tinyusb
 - espressif/mdns
+- espressif/qrcode
 - espressif/usb
 - espressif/usb_host_hid
 - espressif/usb_host_msc
 - fugo101/wireguard_lwip
 - idf
 - joltwallet/littlefs
-manifest_hash: f1fea11ef3dabd8740623a0f0664a0b30338f96a7403db186d680965e0bf8eea
+manifest_hash: 2f6c5386a549c59fcf9796b6c42c31026a815aa4cbdacb89e0c7442f12fec42a
 target: esp32s31
 version: 3.0.0

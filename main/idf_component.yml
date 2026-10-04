@@ -129,3 +129,6 @@ dependencies:
   # components/espix_net/vpn/wireguard so the server delta can change it -- a
   # registry dependency would be forked on day one.
   fugo101/wireguard_lwip: "^1.0.3"
+
+  # vpn qr: the client config as a QR for the phone app to scan.
+  espressif/qrcode: "^0.2.0"

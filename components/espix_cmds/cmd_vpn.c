@@ -12,6 +12,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "qrcode.h"
+
 #include "espix_cmds_priv.h"
 #include "espix_net_vpn.h"
 
@@ -86,6 +88,130 @@ static int vpn_add(espix_session_t *s, const char *name)
     return 0;
 }
 
+/*
+ * The QR goes through the session, not printf: the command runs on a session
+ * task over SSH or the console, and the only writer that knows where that is
+ * is espix_printf. Two modules per cell with the upper half block, so a 57x57
+ * code fits an 80-column terminal.
+ */
+static espix_session_t *s_qr_sess;
+
+static size_t qr_app(char *row, size_t o, size_t cap, const char *txt)
+{
+    while (*txt != 0 && o + 1 < cap) {
+        row[o++] = *txt++;
+    }
+    row[o] = 0;
+    return o;
+}
+
+static size_t qr_color(char *row, size_t o, size_t cap, int fg, int bg)
+{
+    if (o + 10 >= cap) {
+        return o;
+    }
+    row[o++] = 27;                      /* ESC, without an escape sequence in C */
+    row[o++] = '[';
+    row[o++] = (char)('0' + fg / 10);
+    row[o++] = (char)('0' + fg % 10);
+    row[o++] = ';';
+    row[o++] = (char)('0' + bg / 10);
+    row[o++] = (char)('0' + bg % 10);
+    row[o++] = 'm';
+    row[o]   = 0;
+    return o;
+}
+
+static void qr_display(esp_qrcode_handle_t q)
+{
+    const int n = esp_qrcode_get_size(q);
+    const int quiet = 2;
+
+    for (int y = -quiet; y < n + quiet; y += 2) {
+        char   row[1600];
+        size_t o = 0;
+
+        for (int x = -quiet; x < n + quiet; x++) {
+            const bool up = esp_qrcode_get_module(q, x, y);
+            const bool lo = esp_qrcode_get_module(q, x, y + 1);
+
+            if (up && lo) {
+                o = qr_color(row, o, sizeof(row), 30, 40);
+            } else if (up) {
+                o = qr_color(row, o, sizeof(row), 30, 47);
+            } else if (lo) {
+                o = qr_color(row, o, sizeof(row), 37, 40);
+            } else {
+                o = qr_color(row, o, sizeof(row), 37, 47);
+            }
+            if (o + 3 < sizeof(row)) {
+                row[o++] = (char)0xE2;      /* U+2580, upper half block */
+                row[o++] = (char)0x96;
+                row[o++] = (char)0x80;
+                row[o]   = 0;
+            }
+        }
+        o = qr_app(row, o, sizeof(row), "\033[0m");
+
+        /* espix_printf formats into a bounded buffer, and a row of a 57-module
+         * code is far longer than it: print the row in pieces, and the newline
+         * on its own, or the rows run together and nothing can scan it. */
+        for (size_t i = 0; row[i] != 0; i += 100) {
+            char   piece[128];
+            size_t k = 0;
+
+            while (k < 100 && row[i + k] != 0) {
+                piece[k] = row[i + k];
+                k++;
+            }
+            piece[k] = 0;
+            espix_printf(s_qr_sess, "%s", piece);
+        }
+        espix_printf(s_qr_sess, "\n");
+    }
+}
+
+static int vpn_qr(espix_session_t *s, const char *name)
+{
+    char path[160];
+    strlcpy(path, "/etc/vpn/clients/", sizeof(path));
+    strlcat(path, name, sizeof(path));
+    strlcat(path, ".conf", sizeof(path));
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        espix_eprintf(s, "vpn: no %s\n", path);
+        return 1;
+    }
+
+    char text[512];
+    const size_t n = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    text[n] = 0;
+    if (n == 0) {
+        espix_eprintf(s, "vpn: %s is empty\n", path);
+        return 1;
+    }
+
+    esp_qrcode_config_t cfg = {
+        .display_func      = qr_display,
+        .max_qrcode_version = 20,
+        .qrcode_ecc_level  = ESP_QRCODE_ECC_LOW,
+    };
+
+    s_qr_sess = s;
+    const esp_err_t e = esp_qrcode_generate(&cfg, text);
+    s_qr_sess = NULL;
+
+    if (e != ESP_OK) {
+        espix_eprintf(s, "vpn: cannot encode %s (%s)\n", path,
+                      esp_err_to_name(e));
+        return 1;
+    }
+    espix_printf(s, "vpn: scan that with the WireGuard app\n");
+    return 0;
+}
+
 static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 {
     if (argc == 1 || strcmp(argv[1], "status") == 0) {
@@ -133,6 +259,14 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "qr") == 0) {
+        if (argc < 3) {
+            espix_eprintf(s, "usage: vpn qr <name>\n");
+            return 1;
+        }
+        return vpn_qr(s, argv[2]);
+    }
+
     if (strcmp(argv[1], "add") == 0) {
         if (argc < 3) {
             espix_eprintf(s, "usage: vpn add <name>\n");
@@ -148,7 +282,7 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_vpn_cmds[] = {
     { .name = "vpn", .fn = cmd_vpn,
       .help = "the WireGuard server",
-      .usage = "vpn [up|down|status|add <name>|endpoint [host]]" },
+      .usage = "vpn [up|down|status|add <name>|qr <name>|endpoint [host]]" },
 };
 
 void espix_cmds_register_vpn(void)
