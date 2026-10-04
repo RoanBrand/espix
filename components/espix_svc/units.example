@@ -1,0 +1,31 @@
+# What espix runs at boot: one unit per line, in the order given.
+#
+#   <name> [always | once | every <interval>] [arguments...]
+#
+# The name is looked up among the shell's commands and its builtin services.
+# With no policy the unit is started once at boot; "always" starts it and
+# restarts it if it exits; "every 6h" runs it again on that schedule. A unit
+# is started by the system rather than by anyone who authenticated, so it runs
+# as root -- there is no sudo in this file, and a unit that needs privilege
+# simply has it.
+#
+# This is the example. /etc/units is what the system actually reads, and it is
+# created on the first boot; copy this file over it to change what runs.
+
+# --- WireGuard -------------------------------------------------------------
+# Bring the VPN server up at boot. Until this line runs, nothing of the VPN
+# exists -- no wg0, no peer table, no task, no memory -- so leaving it
+# commented costs nothing at all. The clients in /etc/vpn/clients are admitted
+# from /etc/vpn/peers as wg0 comes up, so after a reboot this one line is all
+# the VPN needs.
+#
+# vpn up
+
+# --- The shape of the other policies ---------------------------------------
+# A builtin service, restarted whenever it exits:
+#
+#   sshd always
+#
+# A oneshot on a schedule:
+#
+#   poll every 6h upgrade --check
