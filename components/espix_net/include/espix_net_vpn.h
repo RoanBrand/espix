@@ -20,3 +20,19 @@
 esp_err_t espix_net_vpn_up(void);
 esp_err_t espix_net_vpn_down(void);
 bool      espix_net_vpn_is_up(void);
+
+/* The server's public key, base64, for a client's [Peer] section. */
+esp_err_t espix_net_vpn_server_pubkey(char *out, size_t len);
+
+/* A fresh client keypair, both base64. WireGuard clamps the private key; this
+ * does the same, so the app deriving the public key from it agrees. */
+esp_err_t espix_net_vpn_keypair(char *priv_b64, size_t plen,
+                                char *pub_b64, size_t publen);
+
+/* Admit a client: a peer with this public key, allowed only this address, and
+ * no endpoint -- so the client initiates, from wherever it roams. */
+esp_err_t espix_net_vpn_peer_add(const char *pub_b64, const char *allowed_ip);
+
+/* What clients dial: your public name or address. */
+esp_err_t espix_net_vpn_endpoint_get(char *out, size_t len);
+esp_err_t espix_net_vpn_endpoint_set(const char *host);
