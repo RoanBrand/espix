@@ -215,3 +215,6 @@ CONFIG_LWIP_TCP_RCV_SCALE=0
 # wedged holding a lock, which is not a fault and so never reaches the panic path.
 # PANIC stays off, so this reports and never resets.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y

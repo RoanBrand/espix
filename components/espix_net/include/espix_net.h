@@ -107,6 +107,14 @@ esp_err_t espix_net_bridge_conf_addr(bool server);
 const char *espix_net_hostname(void);
 
 /*
+ * mDNS/DNS-SD, when CONFIG_ESPIX_MDNS is on: register for the address event
+ * and, on the first address an interface gets, advertise <hostname>.local
+ * plus _ssh and _sftp-ssh. Safe to call twice.
+ */
+esp_err_t espix_net_mdns_init(void);
+esp_err_t espix_net_mdns_start(void);
+
+/*
  * Apply `name` to every interface — the hostname is per-netif in lwip, so
  * setting it once globally is not a thing. `persist` also rewrites
  * /etc/hostname.

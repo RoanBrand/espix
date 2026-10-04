@@ -261,4 +261,18 @@ menu "espix networking"
             addresses across the link. A station uplink uses the L2
             forwarder instead.
 
+    config ESPIX_MDNS
+        bool "Advertise <hostname>.local with mDNS/DNS-SD"
+        default y
+        help
+            Answers <hostname>.local on the local link and advertises _ssh and
+            _sftp-ssh, so a client reaches the board without knowing its
+            address -- see components/espix_net/mdns.c.
+
+            On by default, as Raspberry Pi OS is: the hostname carries a
+            MAC-derived suffix, so two boards do not claim one name, and
+            /etc/mdns.conf with enabled=no turns the announcement off without a
+            rebuild. Turn the option itself off to leave mDNS out of the image
+            entirely.
+
 endmenu

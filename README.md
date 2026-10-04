@@ -67,6 +67,7 @@ together.
 | Networking | WiFi access point | **yes** | `wifi ap start` brings up `wlan1` beside the station and NATs clients out the uplink; one radio, one AP, shared channel |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
 | Networking | SSH port forwarding, `ssh -L` | **yes** | `direct-tcpip`, so `ssh -N -L 5900:127.0.0.1:5900 esp@<board>` reaches a service on the board over an encrypted, authenticated connection; destinations default to the device itself, and `ssh -R` is not implemented |
+| Networking | mDNS/DNS-SD: <hostname>.local | **yes** | advertises the hostname and _ssh/_sftp-ssh, so ssh esp@esp32s31-d0762a.local works without knowing the address; on by default like a Raspberry Pi image, and enabled=no in /etc/mdns.conf turns the announcement off without a rebuild (CONFIG_ESPIX_MDNS=n leaves it out of the image) |
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
 | Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
 | Networking | IPv4 routing and NAT | **yes** | `nat on <dev>` masquerades an inside interface out the default route; `ESPIX_NET_ROUTER` is on by default |

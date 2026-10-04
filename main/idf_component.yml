@@ -120,3 +120,7 @@ dependencies:
   # is no adapter for the linker to pull in, so the encoder is compiled but not
   # linked. See docs/PROFILING.md, "SystemView".
   espressif/esp_sysview: "^1"
+
+  # Local discovery: <hostname>.local and _ssh._tcp, so a client reaches
+  # the board without an address. See components/espix_mdns.
+  espressif/mdns: "^1.14.0"

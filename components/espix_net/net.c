@@ -364,6 +364,13 @@ esp_err_t espix_net_set_hostname(const char *name, bool persist)
 
 esp_err_t espix_net_init(void)
 {
+#if CONFIG_ESPIX_MDNS
+    if (espix_net_mdns_init() != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "mDNS did not register for the address event");
+    }
+#endif
+
     if (s_inited) {
         return ESP_OK;
     }

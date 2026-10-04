@@ -17,6 +17,9 @@ endif()
 if(CONFIG_ESPIX_ETH_ENABLED)
     list(APPEND espix_net_srcs "eth.c")
 endif()
+if(CONFIG_ESPIX_MDNS)
+    list(APPEND espix_net_srcs "mdns.c")
+endif()
 
 idf_component_register(
     SRCS
@@ -45,4 +48,5 @@ idf_component_register(
         mbedtls
         espressif__elf_loader
         espressif__esp_tinyusb
+        espressif__mdns
 )
