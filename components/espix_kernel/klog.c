@@ -459,6 +459,54 @@ void espix_klog_foreach(espix_klog_iter_fn cb, void *ctx)
     }
 }
 
+size_t espix_klog_since(uint32_t *seq, espix_klog_entry_t *out, size_t n,
+                        uint32_t *lost)
+{
+    if (s_ring == NULL || seq == NULL || out == NULL || n == 0) {
+        return 0;
+    }
+
+    portENTER_CRITICAL_SAFE(&s_lock);
+    const uint32_t next = s_next;
+    portEXIT_CRITICAL_SAFE(&s_lock);
+
+    const uint32_t first = (next > KLOG_LINES) ? next - KLOG_LINES : 0;
+    if (*seq < first) {
+        if (lost != NULL) {
+            *lost += first - *seq;
+        }
+        *seq = first;                   /* those are gone; start at the oldest */
+    }
+
+    size_t count = 0;
+    for (uint32_t i = *seq; i < next && count < n; i++) {
+        espix_klog_entry_t copy;
+
+        portENTER_CRITICAL_SAFE(&s_lock);
+        copy = s_ring[i % KLOG_LINES];
+        portEXIT_CRITICAL_SAFE(&s_lock);
+
+        if (copy.seq != i) {
+            continue;                   /* overwritten while we read */
+        }
+        out[count++] = copy;
+        *seq = i + 1;
+    }
+    return count;
+}
+
+uint32_t espix_klog_next_seq(void)
+{
+    if (s_ring == NULL) {
+        return 0;
+    }
+
+    portENTER_CRITICAL_SAFE(&s_lock);
+    const uint32_t next = s_next;
+    portEXIT_CRITICAL_SAFE(&s_lock);
+    return next;
+}
+
 size_t espix_klog_count(void)
 {
     return (s_next < KLOG_LINES) ? s_next : KLOG_LINES;

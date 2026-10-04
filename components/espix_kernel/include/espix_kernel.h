@@ -180,6 +180,16 @@ void espix_klog_foreach(espix_klog_iter_fn cb, void *ctx);
 
 /* Number of lines currently retained, and how many were dropped by wraparound. */
 size_t   espix_klog_count(void);
+
+/*
+ * The log as a stream: everything newer than *seq, at most n entries, with *seq
+ * left past what was handed over. *lost counts lines the ring dropped before
+ * the reader got to them, so falling behind is reported rather than silent.
+ * espix_klog_next_seq() is where a reader that wants only new lines starts.
+ */
+size_t   espix_klog_since(uint32_t *seq, espix_klog_entry_t *out, size_t n,
+                          uint32_t *lost);
+uint32_t espix_klog_next_seq(void);
 uint32_t espix_klog_dropped(void);
 
 /*

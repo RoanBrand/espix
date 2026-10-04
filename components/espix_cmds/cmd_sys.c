@@ -1113,6 +1113,7 @@ static const char *klog_level_char(uint8_t level)
 typedef struct {
     espix_session_t *s;
     bool             ctime;         /* -T */
+    uint32_t         next_seq;      /* one past the last line printed */
     time_t           wall_at_zero;  /* wall clock at monotonic ms == 0 */
 } dmesg_ctx_t;
 
@@ -1120,6 +1121,7 @@ static bool dmesg_visit(void *ctx, const espix_klog_entry_t *e)
 {
     dmesg_ctx_t *d = ctx;
 
+    d->next_seq = e->seq + 1;
     if (d->ctime) {
         const time_t t = d->wall_at_zero + (time_t)(e->ts_ms / 1000);
         struct tm    tm;
@@ -1195,13 +1197,68 @@ static int dmesg_level(espix_session_t *s, const char *arg)
     return 0;
 }
 
+/*
+ * Follow: print what arrives, one batch at a time, until Ctrl-C or q. This is
+ * what a rolling ring wants -- a reader that keeps up never has to see a line
+ * dropped, and one that falls behind is told how many it missed.
+ */
+static int dmesg_follow(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
+{
+    /*
+     * One line at a time, deliberately: an entry carries its text, so a batch of
+     * them is kilobytes -- and this runs on the SSH connection's task, whose
+     * stack a batch overflowed the first time it ran. A line per call is a few
+     * more calls and no stack at all.
+     */
+    espix_klog_entry_t one;
+    uint32_t           lost = 0;
+
+    for (;;) {
+        if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
+            break;
+        }
+        if (espix_shell_take_key(s) == 'q') {
+            break;
+        }
+
+        const size_t n = espix_klog_since(&seq, &one, 1, &lost);
+        if (lost > 0) {
+            espix_printf(s, "[%u earlier line%s dropped]\n", (unsigned)lost,
+                         lost == 1 ? "" : "s");
+            lost = 0;
+        }
+        if (n > 0) {
+            dmesg_visit(ctx, &one);
+        }
+
+        if (n == 0) {
+            /* In slices, so Ctrl-C is felt at once rather than up to 200 ms
+             * later. */
+            for (unsigned waited = 0; waited < 200; waited += 50) {
+                if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
+                    return 0;
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+    }
+    return 0;
+}
+
 static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
 {
     dmesg_ctx_t ctx = { .s = s };
+    bool        follow = false, follow_new = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--ctime") == 0) {
             ctx.ctime = true;
+        } else if (strcmp(argv[i], "-w") == 0 ||
+                   strcmp(argv[i], "--follow") == 0) {
+            follow = true;
+        } else if (strcmp(argv[i], "-W") == 0 ||
+                   strcmp(argv[i], "--follow-new") == 0) {
+            follow = follow_new = true;
         } else if (strcmp(argv[i], "-n") == 0 ||
                    strcmp(argv[i], "--console-level") == 0) {
             /* Consumes the next argument if there is one, and reports
@@ -1220,12 +1277,20 @@ static int cmd_dmesg(espix_session_t *s, int argc, char **argv)
         ctx.wall_at_zero = time(NULL) - (time_t)(esp_log_timestamp() / 1000);
     }
 
-    espix_klog_foreach(dmesg_visit, &ctx);
+    if (follow_new) {
+        ctx.next_seq = espix_klog_next_seq();   /* -W: not what is already here */
+    } else {
+        espix_klog_foreach(dmesg_visit, &ctx);
+    }
 
     const uint32_t dropped = espix_klog_dropped();
-    if (dropped > 0) {
+    if (dropped > 0 && !follow_new) {
         espix_printf(s, "[%u earlier line%s dropped]\n",
                      (unsigned)dropped, dropped == 1 ? "" : "s");
+    }
+
+    if (follow) {
+        return dmesg_follow(s, &ctx, ctx.next_seq);
     }
     return 0;
 }
