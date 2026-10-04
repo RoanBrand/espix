@@ -278,17 +278,19 @@ static int vpn_add(espix_session_t *s, const char *name, const char *access_arg)
     fprintf(f, "[Interface]\n");
     fprintf(f, "Address = %s/32\n", addr);
     fprintf(f, "PrivateKey = %s\n", priv);
-    if (psk[0] != 0) {
-        fprintf(f, "PresharedKey = %s\n", psk);
-    }
     fprintf(f, "DNS = %s\n", dns);
     fprintf(f, "\n[Peer]\n");
     fprintf(f, "PublicKey = %s\n", spub);
+    if (psk[0] != 0) {
+        /* A peer attribute: in [Interface] the app refuses the whole file as
+         * an unknown attribute, which is exactly what it did. */
+        fprintf(f, "PresharedKey = %s\n", psk);
+    }
     fprintf(f, "Endpoint = %s:%s\n", endpoint, port);
     fprintf(f, "AllowedIPs = %s\n", allowed);
     fprintf(f, "PersistentKeepalive = 25\n");
     fclose(f);
-    (void)espix_fs_ensure_mode(path, 0600);   /* it holds a private key */
+    espix_net_vpn_secure(path);                /* it holds a private key */
 
     if (espix_net_vpn_peer_add(name, pub, addr, psk, access) != ESP_OK) {
         espix_eprintf(s, "vpn: wrote %s but did not admit the peer\n", path);

@@ -69,3 +69,5 @@ const char *espix_net_vpn_peer_access(int i);
 const char *espix_net_vpn_peer_psk(int i);
 esp_err_t   espix_net_vpn_random_subnet(char *out, size_t len);
 esp_err_t   espix_net_vpn_ensure_keys(void);
+/* 0640 with the login group: readable by the shell user, by nobody else. */
+void        espix_net_vpn_secure(const char *path);

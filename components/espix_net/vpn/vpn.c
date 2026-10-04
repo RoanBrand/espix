@@ -774,3 +774,9 @@ esp_err_t espix_net_vpn_random_subnet(char *out, size_t len)
     strlcpy(out, VPN_SUBNET_DEFAULT, len);
     return ESP_OK;
 }
+
+/* The mode and owner for anything holding a key, for whoever writes one. */
+void espix_net_vpn_secure(const char *path)
+{
+    secure_path(path, vpn_gid());
+}
