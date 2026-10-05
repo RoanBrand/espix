@@ -321,6 +321,19 @@ void espix_fs_owner(const char *abs_path, const struct stat *st,
                     uint16_t *uid, uint16_t *gid);
 
 /*
+ * The owner a mount that keeps no ownership of its own answers with: everything
+ * a FAT volume holds belongs to whoever mounted it, so uid= and gid= are a
+ * property of the mount and not of any name on it.
+ *
+ * False for a filesystem that stores its own ownership -- ext, and the rootfs
+ * through the rule -- where the owner has to come from a stat. Unlike
+ * espix_fs_owner() this never touches the filesystem: it is a lookup in the
+ * mount table, so a caller listing a directory can ask once for the whole page
+ * instead of once per entry.
+ */
+bool espix_fs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid);
+
+/*
  * Set the owner of an existing path and persist it.
  *
  * Pass ESPIX_FS_KEEP_ID for either field to leave it alone, which is what

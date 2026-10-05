@@ -69,6 +69,9 @@ typedef struct {
     char                    prefix[ESPIX_FS_PREFIX_MAX];
     size_t                  len;
     bool                    used;
+    /* Everything on the volume, because FatFs keeps no owner of its own. */
+    uint16_t                owner_uid;
+    uint16_t                owner_gid;
 } fat_mount_t;
 
 static fat_mount_t s_mounts[ESPIX_FS_MAX_MOUNTS];
@@ -189,10 +192,28 @@ static int fat_open(void *ctx, const char *path, int flags, int mode)
     return m->ops->open_p(m->fat_ctx, fat_relative(m, path), flags, mode);
 }
 
+/*
+ * The one thing FatFs does not report is who owns what, and it has no owner to
+ * report: on a volume that keeps none, everything belongs to whoever mounted it.
+ * Filling it here is what makes stat(), the access check and a listing agree --
+ * and it is why META_LOWER is the honest class for a FAT mount, since the lower
+ * stat now says everything there is to say.
+ */
+static void fat_owner(const fat_mount_t *m, struct stat *st)
+{
+    st->st_uid = m->owner_uid;
+    st->st_gid = m->owner_gid;
+}
+
 static int fat_stat(void *ctx, const char *path, struct stat *st)
 {
     fat_mount_t *m = ctx;
-    return m->ops->dir->stat_p(m->fat_ctx, fat_relative(m, path), st);
+    const int r = m->ops->dir->stat_p(m->fat_ctx, fat_relative(m, path), st);
+
+    if (r == 0) {
+        fat_owner(m, st);
+    }
+    return r;
 }
 
 static int fat_unlink(void *ctx, const char *path)
@@ -291,7 +312,12 @@ static off_t fat_lseek(void *ctx, int fd, off_t off, int mode)
 static int fat_fstat(void *ctx, int fd, struct stat *st)
 {
     fat_mount_t *m = ctx;
-    return m->ops->fstat_p(m->fat_ctx, fd, st);
+    const int r = m->ops->fstat_p(m->fat_ctx, fd, st);
+
+    if (r == 0) {
+        fat_owner(m, st);
+    }
+    return r;
 }
 
 static int fat_fcntl(void *ctx, int fd, int cmd, int arg)
@@ -446,7 +472,9 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
                    path, esp_err_to_name(err));
         goto fail_slot;
     }
-    m->pdrv = pdrv;
+    m->pdrv      = pdrv;
+    m->owner_uid = owner_uid;
+    m->owner_gid = owner_gid;
     /* Built the way IDF builds it: a drive number is one digit because FatFs
      * numbers volumes from "0:", and ff_diskio_get_drive() fails rather than
      * handing out a bigger one. */
@@ -486,8 +514,9 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
 
     /* Published last: until this returns, no path can reach the mount. FatFs
      * keeps no modes or owners, so what it holds is owned by whoever mounted it
-     * -- which is what META_LOWER says, and what the stat already carries, since
-     * IDF builds it from this mount owner. It was META_NONE, which sent every
+     * -- which is what META_LOWER says, and what fat_stat() fills in from this
+     * mount owner, since IDF's own stat leaves both fields zero. It was
+     * META_NONE, which sent every
      * path here through the rule matcher instead: a per-path, per-rule, per-
      * component match to arrive at the answer the mount already holds. That was
      * 68ms per entry, so ls -l over 500 entries took 34 seconds where plain ls

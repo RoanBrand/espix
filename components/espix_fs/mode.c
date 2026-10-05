@@ -368,6 +368,14 @@ void espix_fs_owner(const char *abs_path, const struct stat *st,
     }
 }
 
+bool espix_fs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid)
+{
+    if (abs_path == NULL) {
+        return false;
+    }
+    return espix_vfs_mount_owner(abs_path, uid, gid);
+}
+
 bool espix_fs_is_executable(const char *abs_path)
 {
     struct stat st;
