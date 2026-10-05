@@ -269,21 +269,6 @@ static void put_post_attr(xdrw_t *w, bool have, int exp, const struct stat *st)
     }
 }
 
-static bool path_of(int exp, const char *rel, char *out, size_t cap,
-                    const char **why)
-{
-    const nfs_export_t *e = nfsd_export(exp);
-    if (e == NULL) {
-        *why = "no export";
-        return false;
-    }
-    if (rel == NULL || rel[0] == 0) {
-        strlcpy(out, e->path, cap);
-    } else {
-        snprintf(out, cap, "%s%s", e->path, rel);
-    }
-    return true;
-}
 
 /* One component, so a client cannot climb out of the export with ../ */
 static bool name_ok(const char *name)
