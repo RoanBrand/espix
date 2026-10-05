@@ -20,6 +20,8 @@
 #include <unistd.h>
 
 #include "espix_fs.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "espix_kernel.h"
 
 #include "nfs3.h"
@@ -47,15 +49,51 @@
 #define NFS3ERR_SERVERFAULT 10006
 
 #define FH_LEN     28      /* the size nfsd hands out; 8 was unusual enough to be a variable */
-#define PATH_SLOTS 128
+#define PATH_SLOTS 1024      /* a listing looks up every entry it lists */
 #define PATH_CAP   256
 
-static struct {
+typedef struct {
     uint16_t id;
     char     path[PATH_CAP];
-} s_slots[PATH_SLOTS];
-static uint16_t s_next_id = 1;
-static int      s_cursor;
+} nfs_slot_t;
+
+/*
+ * The handle table: PSRAM, allocated on first use, freed once nobody has asked
+ * for a handle for a while. A client looks up every entry it lists, so a
+ * 500-entry directory needs about 500 handles alive at once. The old fixed
+ * 128-slot array wrapped during that and evicted the directory own handle; the
+ * next page came back NFS3ERR_BADHANDLE, which macOS abandons the listing
+ * over -- that was the stop at exactly 127 entries.
+ */
+static nfs_slot_t *s_slots;
+static uint16_t    s_next_id = 1;
+static int         s_cursor;
+static uint32_t    s_last_ms;
+#define SLOTS_IDLE_MS 30000
+
+void nfs3_slots_cleanup(void)
+{
+    free(s_slots);
+    s_slots = NULL;
+}
+
+static bool slots_ensure(void)
+{
+    if (s_slots == NULL) {
+        s_slots = heap_caps_calloc(PATH_SLOTS, sizeof(*s_slots), MALLOC_CAP_SPIRAM);
+        if (s_slots == NULL) {
+            s_slots = heap_caps_calloc(PATH_SLOTS, sizeof(*s_slots), MALLOC_CAP_8BIT);
+        }
+        s_last_ms = (uint32_t)esp_log_timestamp();
+    }
+    if (s_slots != NULL && s_last_ms != 0 &&
+        (uint32_t)((uint32_t)esp_log_timestamp() - s_last_ms) > SLOTS_IDLE_MS) {
+        free(s_slots);              /* nobody is holding a handle any more */
+        s_slots = NULL;
+        return slots_ensure();
+    }
+    return s_slots != NULL;
+}
 
 static uint32_t nfserr(int err)
 {
@@ -88,7 +126,7 @@ static bool fh_resolve(const uint8_t *fh, size_t len, int *exp,
 
     const int      e  = fh[4];
     const uint16_t id = (uint16_t)(fh[5] | (fh[6] << 8));
-    if (e < 0 || e >= nfsd_exports_count()) {
+    if (e < 0 || e >= nfsd_exports_count() || s_slots == NULL) {
         return false;
     }
     for (int i = 0; i < PATH_SLOTS; i++) {
@@ -103,6 +141,10 @@ static bool fh_resolve(const uint8_t *fh, size_t len, int *exp,
 
 static bool fh_make(int exp, const char *path, uint8_t *fh, size_t *len)
 {
+    if (!slots_ensure()) {
+        return false;
+    }
+    s_last_ms = (uint32_t)esp_log_timestamp();
     int slot = -1;
 
     for (int i = 0; i < PATH_SLOTS; i++) {
