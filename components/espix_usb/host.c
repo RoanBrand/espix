@@ -212,7 +212,19 @@ typedef struct {
 
 static attach_backoff_t s_backoff[ESPIX_USB_LSUSB_MAX];
 
-static QueueHandle_t s_work;
+/*
+ * The device lifecycle as one queue: an arrival carries an address, a departure
+ * the handle the driver gave us to close. It was two queues -- arrivals, and
+ * departures checked first so one never waited behind the other -- and one FIFO
+ * says the same thing, in the order the events happened, for one queue's memory.
+ */
+typedef struct {
+    uint8_t                  address;   /* set for an arrival */
+    bool                     present;   /* arrived, or left */
+    msc_host_device_handle_t handle;    /* set for a departure */
+} dev_event_t;
+
+static QueueHandle_t s_dev;
 /*
  * Removals, queued rather than performed. The MSC disconnect callback runs
  * inside the host library's own event loop, and the work below blocks -- it
@@ -220,7 +232,6 @@ static QueueHandle_t s_work;
  * calls into the class driver. Doing it there waits for the loop that would
  * deliver those transfers, so the callback only queues the handle.
  */
-static QueueHandle_t s_gone;
 
 /*
  * Serialises every open/close pair on the monitor client.
@@ -2170,7 +2181,9 @@ static void on_connected(uint8_t address)
      * above: an install started from here waits on completions that only this
      * call stack could deliver, and stalls for minutes per device.
      */
-    if (s_work == NULL || xQueueSend(s_work, &address, 0) != pdTRUE) {
+    const dev_event_t ev = { .address = address, .present = true };
+
+    if (s_dev == NULL || xQueueSend(s_dev, &ev, 0) != pdTRUE) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "addr %u: no room to queue it", address);
     }
 }
@@ -2180,23 +2193,20 @@ static void dev_task(void *arg)
     (void)arg;
 
     for (;;) {
-        uint8_t address = 0;
-
         /*
-         * A removal first, without waiting: it is cheap, it takes the same lock
-         * an attach does, and doing it here -- rather than in the callback that
-         * queued it -- is what keeps the host library's event loop free.
+         * One event at a time, in the order they happened: the callbacks that
+         * queue these cannot block, and doing the work here -- rather than where
+         * it was announced -- is what keeps the host library's event loop free.
+         * The driver's loop is free here too, so an install's transfers complete
+         * at device speed rather than at their timeouts.
          */
-        msc_host_device_handle_t gone = NULL;
-        if (s_gone != NULL && xQueueReceive(s_gone, &gone, 0) == pdTRUE) {
-            detach_device(gone);
-            continue;
-        }
-
-        if (xQueueReceive(s_work, &address, SCAN_PERIOD_TICKS) == pdTRUE) {
-            /* The driver's event loop is free here, so its transfers complete
-             * and the install runs at device speed rather than at its timeouts. */
-            (void)attach_device(address);
+        dev_event_t ev;
+        if (xQueueReceive(s_dev, &ev, SCAN_PERIOD_TICKS) == pdTRUE) {
+            if (ev.present) {
+                (void)attach_device(ev.address);
+            } else {
+                detach_device(ev.handle);
+            }
             continue;
         }
 
@@ -2278,7 +2288,9 @@ static void detach_device(msc_host_device_handle_t device)
  */
 static void on_disconnected(msc_host_device_handle_t device)
 {
-    if (s_gone == NULL || xQueueSend(s_gone, &device, 0) != pdTRUE) {
+    const dev_event_t ev = { .present = false, .handle = device };
+
+    if (s_dev == NULL || xQueueSend(s_dev, &ev, 0) != pdTRUE) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "no room to queue a removal; it is released on the next sweep");
     }
@@ -2569,14 +2581,8 @@ esp_err_t espix_usb_host_init(void)
      * The worker before the class driver, so a device that arrives during boot
      * is queued rather than lost.
      */
-    s_work = xQueueCreate(WORK_QUEUE_LEN, sizeof(uint8_t));
-    if (s_work == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    s_gone = xQueueCreate(WORK_QUEUE_LEN, sizeof(msc_host_device_handle_t));
-    if (s_gone == NULL) {
-        vQueueDelete(s_work);
-        s_work = NULL;
+    s_dev = xQueueCreate(WORK_QUEUE_LEN, sizeof(dev_event_t));
+    if (s_dev == NULL) {
         return ESP_ERR_NO_MEM;
     }
     /* PSRAM first, as above: this is the larger of the two stacks (6144) and
@@ -2586,8 +2592,8 @@ esp_err_t espix_usb_host_init(void)
                             MALLOC_CAP_SPIRAM) != pdPASS &&
         xTaskCreate(dev_task, "usb:dev", DEV_TASK_STACK, NULL, DEV_TASK_PRIO,
                     NULL) != pdPASS) {
-        vQueueDelete(s_work);
-        s_work = NULL;
+        vQueueDelete(s_dev);
+        s_dev = NULL;
         return ESP_ERR_NO_MEM;
     }
 
