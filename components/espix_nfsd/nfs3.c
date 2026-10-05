@@ -483,6 +483,23 @@ static size_t proc_read(rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap)
  * have already gone. That costs a re-read of the directory per page and needs
  * no seekdir, which the VFS may not have.
  */
+/* FatFs date/time to Unix seconds, the arithmetic IDF uses for stat. Without
+ * it a listing would date every entry 1970. */
+static time_t fat_info_time(uint16_t date, uint16_t time)
+{
+    struct tm tm;
+
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_mday = date & 0x1F;
+    tm.tm_mon  = ((date >> 5) & 0x0F) - 1;
+    tm.tm_year = ((date >> 9) & 0x7F) + 80;
+    tm.tm_sec  = (time & 0x1F) * 2;
+    tm.tm_min  = (time >> 5) & 0x3F;
+    tm.tm_hour = (time >> 11) & 0x1F;
+    tm.tm_isdst = -1;
+    return mktime(&tm);
+}
+
 static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
 {
     uint8_t  fh[64];
@@ -552,7 +569,7 @@ static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
          * every time -- a mount that hung with the disk light on.
          */
         const size_t name_cost = strlen(de->d_name) + 4;
-        const size_t entry_cost = plus ? (128 + name_cost) : (28 + name_cost);
+        const size_t entry_cost = plus ? (200 + name_cost) : (28 + name_cost);
         if (wrote && (w->len - reply_at) + entry_cost + 16 > maxcount) {
             eof = false;
             break;
@@ -569,9 +586,41 @@ static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
         xdrw_string(w, de->d_name);
         xdrw_u64(w, seen);
         if (plus) {
+            /*
+             * Attributes and a handle, both from what the walk already read.
+             * A stat here would scan the directory, and a missing handle makes
+             * the client look every name up itself -- 500 lookups, 500 scans.
+             * Supplying both is what makes a listing one walk and nothing else.
+             */
+            espix_fs_entry_info_t ei;
             struct stat st;
-            put_post_attr(w, false, exp, &st);
-            xdrw_bool(w, false);        /* and no handle either */
+            const bool  have = espix_fs_last_entry(&ei);
+            char        child[PATH_CAP];
+            uint8_t     cfh[FH_LEN];
+            size_t      clen = 0;
+
+            memset(&st, 0, sizeof(st));
+            if (have) {
+                st.st_mode  = (ei.attr & 0x10) ? (S_IFDIR | 0777)
+                                               : (S_IFREG | 0777);
+                st.st_size  = ei.size;
+                st.st_mtime = fat_info_time(ei.date, ei.time);
+            }
+            put_post_attr(w, have, exp, &st);
+
+            strlcpy(child, path, sizeof(child));
+            if (child[0] == 0 || child[strlen(child) - 1] != '/') {
+                strlcat(child, "/", sizeof(child));
+            }
+            strlcat(child, de->d_name, sizeof(child));
+
+            if (fh_make(exp, child, cfh, &clen)) {
+                xdrw_bool(w, true);
+                xdrw_u32(w, (uint32_t)clen);
+                xdrw_opaque(w, cfh, clen);
+            } else {
+                xdrw_bool(w, false);
+            }
         }
         wrote = true;
     }

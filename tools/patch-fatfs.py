@@ -757,6 +757,56 @@ VFS_READDIR_CACHE_NEW = chr(10).join([
 ])
 MARK_VFS_READDIR_CACHE = "espix: fill the stat cache on the readdir_r path"
 
+# The metadata of the entry the last readdir returned.
+#
+# A caller that gets only a name cannot answer with attributes without a stat, and
+# a stat on an exFAT volume scans the directory. An NFS READDIRPLUS that wanted to
+# return attributes would therefore pay a scan per entry -- 34 seconds for a page of
+# 500 -- and without a handle per entry the client looks every name up anyway. The
+# walk already read all of it; this hands it over.
+EXPOSE_ANCHOR = 'static bool vfs_fat_consume_stat_cache(vfs_fat_ctx_t *fat_ctx, const char *path, struct stat *st)'
+EXPOSE_ADD = chr(10).join([
+    'static FILINFO s_vfs_fat_last_info;',
+    'static bool    s_vfs_fat_last_valid;',
+    '',
+    '/* espix: the metadata of the entry the last readdir returned */',
+    'bool vfs_fat_last_entry_info(FILINFO *out)',
+    '{',
+    '    if (out == NULL || !s_vfs_fat_last_valid) {',
+    '        return false;',
+    '    }',
+    '    *out = s_vfs_fat_last_info;',
+    '    return true;',
+    '}',
+    '',
+    EXPOSE_ANCHOR,
+])
+MARK_VFS_LAST_ENTRY = "espix: the metadata of the entry the last readdir returned"
+
+LAST_FILL_OLD = chr(10).join([
+    '    fat_dir->offset++;',
+    '    /* espix: fill the stat cache on the readdir_r path -- every readdir',
+])
+LAST_FILL_NEW = chr(10).join([
+    '    fat_dir->offset++;',
+    '    /* espix: the metadata of the entry the last readdir returned */',
+    '    s_vfs_fat_last_info  = fat_dir->filinfo;',
+    '    s_vfs_fat_last_valid = true;',
+    '    /* espix: fill the stat cache on the readdir_r path -- every readdir',
+])
+MARK_VFS_LAST_FILL = "s_vfs_fat_last_info  = fat_dir->filinfo;"
+
+LAST_EOF_OLD = chr(10).join([
+    '    if (fat_dir->filinfo.fname[0] == 0) {',
+    '        // end of directory',
+])
+LAST_EOF_NEW = chr(10).join([
+    '    if (fat_dir->filinfo.fname[0] == 0) {',
+    '        // end of directory',
+    '        s_vfs_fat_last_valid = false;   /* espix: nothing more to describe */',
+])
+MARK_VFS_LAST_EOF = "espix: nothing more to describe"
+
 def main() -> int:
     args = sys.argv[1:]
     if args:
@@ -810,6 +860,15 @@ def main() -> int:
         source_new = replace_once(source_new, VFS_READDIR_CACHE_OLD,
                                   VFS_READDIR_CACHE_NEW, MARK_VFS_READDIR_CACHE,
                                   str(source.name) + " readdir stat cache")
+        source_new = insert_before(source_new, EXPOSE_ANCHOR, EXPOSE_ADD,
+                                   MARK_VFS_LAST_ENTRY,
+                                   str(source.name) + " last entry info")
+        source_new = replace_once(source_new, LAST_FILL_OLD, LAST_FILL_NEW,
+                                  MARK_VFS_LAST_FILL,
+                                  str(source.name) + " last entry fill")
+        source_new = replace_once(source_new, LAST_EOF_OLD, LAST_EOF_NEW,
+                                  MARK_VFS_LAST_EOF,
+                                  str(source.name) + " last entry eof")
         source_new = replace_once(source_new, FRESULT_ERRNO_OLD,
                                   FRESULT_ERRNO_NEW, MARK_FRESULT_ERRNO,
                                   str(source.name) + " FR_INT_ERR errno")

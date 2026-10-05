@@ -41,6 +41,22 @@ typedef struct {
  */
 esp_err_t espix_fs_mount_root(void);
 
+/*
+ * The metadata of the entry the last readdir returned on a mounted volume.
+ *
+ * A caller that gets only a name from readdir() would need a stat to describe
+ * it, and a stat on an exFAT volume scans the directory -- so a listing that
+ * wanted attributes would pay a scan per entry. The walk already read them.
+ */
+typedef struct {
+    uint32_t size;
+    uint16_t date;      /* FatFs form: see the conversion in fat.c */
+    uint16_t time;
+    uint8_t  attr;
+} espix_fs_entry_info_t;
+
+bool espix_fs_last_entry(espix_fs_entry_info_t *out);
+
 esp_err_t espix_fs_stat_root(espix_fs_info_t *out);
 
 bool espix_fs_is_mounted(void);

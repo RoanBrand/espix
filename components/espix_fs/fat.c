@@ -165,6 +165,24 @@ static const char *fresult_name(FRESULT fr)
  * see the top of this file.
  */
 
+/* Declared here rather than in IDF header: espix patches the definition in
+ * vfs_fat.c, and this is the only caller. See tools/patch-fatfs.py. */
+extern bool vfs_fat_last_entry_info(FILINFO *out);
+
+bool espix_fs_last_entry(espix_fs_entry_info_t *out)
+{
+    FILINFO fi;
+
+    if (out == NULL || !vfs_fat_last_entry_info(&fi)) {
+        return false;
+    }
+    out->size = fi.fsize;
+    out->date = fi.fdate;
+    out->time = fi.ftime;
+    out->attr = fi.fattrib;
+    return true;
+}
+
 static int fat_open(void *ctx, const char *path, int flags, int mode)
 {
     fat_mount_t *m = ctx;
