@@ -467,8 +467,15 @@ esp_err_t espix_fs_mount_fat(const char *path, esp_blockdev_handle_t dev,
     m->ops = esp_vfs_fat_get_ops();
 
     /* Published last: until this returns, no path can reach the mount. FatFs
-     * keeps no modes or owners, so what it holds is owned by whoever mounted it. */
-    err = espix_vfs_add_mount(path, &s_fat_ops, m, ESPIX_FS_META_NONE, NULL,
+     * keeps no modes or owners, so what it holds is owned by whoever mounted it
+     * -- which is what META_LOWER says, and what the stat already carries, since
+     * IDF builds it from this mount owner. It was META_NONE, which sent every
+     * path here through the rule matcher instead: a per-path, per-rule, per-
+     * component match to arrive at the answer the mount already holds. That was
+     * 68ms per entry, so ls -l over 500 entries took 34 seconds where plain ls
+     * takes two -- and NFS paid the same on every lookup. FAT has no per-path
+     * attributes to match; the rules are for the rootfs, which espix owns. */
+    err = espix_vfs_add_mount(path, &s_fat_ops, m, ESPIX_FS_META_LOWER, NULL,
                               owner_uid, owner_gid);
     if (err != ESP_OK) {
         f_mount(NULL, m->drive, 0);
