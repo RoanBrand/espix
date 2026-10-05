@@ -19,6 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
 
 #include "nfs3.h"
@@ -557,23 +558,49 @@ static size_t proc_fsstat(rpc_call_t *c, xdrw_t *w)
      * an error here failed the whole mount, because FSSTAT is part of looking
      * a filesystem up. Say so in the log and report an empty filesystem.
      */
-    struct statvfs vfs;
-    memset(&vfs, 0, sizeof(vfs));
-    if (statvfs(path, &vfs) != 0) {
-        espix_klog(ESPIX_KLOG_WARN, "nfs3", "fsstat '%s': statvfs failed: %d",
-                   path, errno);
+    /*
+     * espix's own space API rather than POSIX statvfs(): statvfs is registered
+     * per filesystem and only the ext side registers it, so the FAT volume the
+     * stick is on answers nothing. FSSTAT is part of looking a filesystem up --
+     * failing it fails the mount -- and df reads the same way.
+     */
+    uint64_t total = 0, avail = 0;
+    if (espix_fs_stat_fat(path, &total, &avail) != ESP_OK) {
+        bool got = false;
+#if CONFIG_ESPIX_FS_EXT4
+        got = (espix_fs_stat_ext(path, &total, &avail) == ESP_OK);
+#endif
+        if (!got) {
+            struct statvfs vfs;
+            if (statvfs(path, &vfs) == 0) {
+                const uint64_t bs = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+                total = (uint64_t)vfs.f_blocks * bs;
+                avail = (uint64_t)vfs.f_bavail * bs;
+                got = true;
+            }
+        }
+        if (!got) {
+            espix_fs_info_t root;
+            if (espix_fs_stat_root(&root) == ESP_OK) {
+                total = root.total_bytes;
+                avail = root.used_bytes <= root.total_bytes
+                            ? root.total_bytes - root.used_bytes : 0;
+            } else {
+                espix_klog(ESPIX_KLOG_WARN, "nfs3",
+                           "fsstat '%s': no volume answered", path);
+            }
+        }
     }
 
-    const uint64_t bsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
-    struct stat    st;
+    struct stat st;
     xdrw_u32(w, NFS3_OK);
     put_post_attr(w, stat(path, &st) == 0, exp, &st);
-    xdrw_u64(w, (uint64_t)vfs.f_blocks * bsize);
-    xdrw_u64(w, (uint64_t)vfs.f_bfree * bsize);
-    xdrw_u64(w, (uint64_t)vfs.f_bavail * bsize);
-    xdrw_u64(w, (uint64_t)vfs.f_files);
-    xdrw_u64(w, (uint64_t)vfs.f_ffree);
-    xdrw_u64(w, (uint64_t)vfs.f_ffree);
+    xdrw_u64(w, total);
+    xdrw_u64(w, avail);
+    xdrw_u64(w, avail);
+    xdrw_u64(w, 0);                     /* the API counts bytes, not inodes */
+    xdrw_u64(w, 0);
+    xdrw_u64(w, 0);
     xdrw_u32(w, 0);                     /* invarsec */
     return w->len;
 }

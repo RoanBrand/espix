@@ -286,6 +286,26 @@ static uint16_t reg_find(uint32_t prog, uint32_t vers)
     return 0;
 }
 
+/*
+ * A stream socket may accept fewer bytes than it was handed, so a reply is
+ * written in a loop -- ssh_transport.c keeps a write_all() for the same reason.
+ * A datagram cannot be partial, which is why the UDP path only checks.
+ */
+static bool send_all(int fd, const void *src, size_t len)
+{
+    const uint8_t *p = src;
+
+    while (len > 0) {
+        const ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) {
+            return false;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return true;
+}
+
 static size_t handle_portmap(const rpc_call_t *c, xdrw_t *w)
 {
     switch (c->proc) {
@@ -467,7 +487,12 @@ static void serve_udp(int fd)
 
     const size_t rlen = dispatch(&c, s_rep, BUFCAP, from.sin_addr.s_addr);
     if (rlen > 0) {
-        sendto(fd, s_rep, rlen, 0, (struct sockaddr *)&from, flen);
+        const ssize_t sent = sendto(fd, s_rep, rlen, 0,
+                                    (struct sockaddr *)&from, flen);
+        if (sent != (ssize_t)rlen) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "udp reply: %d of %u bytes",
+                       (int)sent, (unsigned)rlen);
+        }
     }
 }
 
@@ -524,7 +549,7 @@ static void conn_service(int i)
     const size_t rlen = dispatch(&c, s_rep, BUFCAP, s_conns[i].src);
     if (rlen > 0) {
         const size_t fl = rpc_tcp_frame(s_rep, rlen, s_out, BUFCAP + 4);
-        if (fl == 0 || send(s_conns[i].fd, s_out, fl, 0) < 0) {
+        if (fl == 0 || !send_all(s_conns[i].fd, s_out, fl)) {
             conn_close(i);
         }
     }
