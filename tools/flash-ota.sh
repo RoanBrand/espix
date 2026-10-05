@@ -77,6 +77,23 @@ if [ -n "$before" ]; then
     done
 fi
 
+# Two more things live on the rootfs and are worth reclaiming before the copy:
+# a stored core dump, which also keeps every unit in safe mode until it is
+# erased, and the image from the previous install, still in /tmp because the
+# loader needs it until the reboot that reclaims it. Both are the difference
+# between a copy that fits and "could not copy the image to the board".
+if [ -n "$before" ]; then
+    dev_once 'sudo coredump erase' >/dev/null 2>&1 || true
+    # One rm per file, for the same reason as /boot above: tools/esp.sh execs a
+    # path, so a remote glob is not expanded.
+    dev_once 'ls /tmp' 2>/dev/null | tr -d '\r' | while read -r f; do
+        case "$f" in
+            espix.bin) ;;                   # the one this run replaces
+            *) dev_once "sudo rm /tmp/$f" >/dev/null 2>&1 || true ;;
+        esac
+    done
+fi
+
 printf 'flash-ota: %s -> %s (%s)\n' "$bin" "$ESPIX_HOST" "$ESPIX_TARGET"
 if ! dev_push "$bin" /tmp/espix.bin >/dev/null 2>&1; then
     printf 'flash-ota: could not copy the image to the board\n' >&2
