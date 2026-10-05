@@ -32,6 +32,40 @@ For a focused question, `esp_cpu_get_cycle_count()` around a region is exact and
 cheap; the audio engine already carries a version of this (the read/decode/feed
 milliseconds). It is the fallback when the question is narrower than a profiler.
 
+### Transfer throughput: `scp` and the filesystem
+
+A 1MB `scp` upload runs at about 78KB/s on a filesystem that has been used, and
+about 195KB/s when the storage partition has just been erased. Downloads never
+erase a block and stayed flat at ~355KB/s across the same runs, which is what
+made the cause clear: LittleFS frees a block when a file is deleted but does not
+erase it, so every later write to that block pays an erase first — and `df`
+reporting 0% used says nothing about how many blocks are dirty. Moving code into
+PSRAM (`CONFIG_SPIRAM_XIP_FROM_PSRAM`) raised upload to about 122KB/s by taking
+the system-wide stall out of the erase; the mechanism is in
+[GOTCHAS.md](GOTCHAS.md#what-a-flash-write-actually-stops-and-what-xip-gives-back).
+
+| storage partition | upload KB/s | download KB/s | when |
+|---|---|---|---|
+| used | 78.3 | 356.0 | before XIP |
+| freshly erased (`make flash-fs`) | 195.5 | 354.0 | before XIP |
+| used again, after writing 12MB | 78.2 | 357.9 | before XIP |
+| used | 121, 124 | 173, 179 | after XIP, -54 dBm |
+
+There is **no defrag and no TRIM**: `lfs_fs_gc()` compacts metadata and populates
+the block allocator, but erasing free blocks is not one of the three things its
+header lists, and `esp_littlefs.h` does not expose it anyway. The only thing that
+re-erases the partition is `make flash-fs`, which destroys the filesystem.
+
+Two traps for anyone benchmarking this. **Signal strength moves downloads and not
+uploads**: going from -66dBm to -49dBm took downloads from 172 to 356KB/s and left
+uploads at 78KB/s either side, so upload is device-bound and download is
+link-bound, and a figure without the RSSI beside it is not a measurement. And
+**upload is a flash benchmark, not a crypto or protocol one**. What the XIP move
+did *not* explain is why downloads then halved, 356 → ~176KB/s; a 4MB partition
+read at the same -54 dBm measured 594KB/s, so the link is not the limit and the
+leading candidate is read-side dirt or fragmentation. The honest answer is that
+it is not understood.
+
 ## Ports on this board
 
 Two USB ports, and which one is which matters:

@@ -36,12 +36,11 @@ merely missing.
 | Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names; delivered when the app calls in, not asynchronously |
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
-| `grep`, `sed`, `head`, `tail`, `wc`, `sort`, `find` | **planned** | |
-| `sleep` | **planned** | |
+| `sed` | **planned** | |
 | Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`; `stat` reports the same mode and owner `ls -l` shows |
 | Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |
 | `fork()` / `exec()` | **no** on S3, **planned** on S31 | needs an MMU for copy-on-write; the S31 has one |
-| MMU-backed process isolation | **no** on S3, **planned** on S31 | see [hardware targets](../README.md#hardware-targets) and [crash handling](#crash-handling-and-isolation) |
+| MMU-backed process isolation | **no** on S3, **planned** on S31 | see [hardware targets](../README.md#hardware-targets) and [crash handling](../README.md#crash-handling-and-isolation) |
 | setuid / setgid / sticky | **yes** | all three consulted; setuid is a guardrail on S3 and a boundary on S31 |
 
 ### Filesystem
@@ -53,10 +52,10 @@ merely missing.
 | `ls -1adhiltr` | **yes** | sorted by name, or by mtime with `-t`; `-d` describes an entry instead of listing it; `-R` is not implemented |
 | `ls -i`, inode numbers | **no** | esp_littlefs reports `d_ino = 0` for every entry, and LittleFS exposes no file id |
 | Per-session working directory | **yes** | your `cd` is not someone else's |
-| File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none |
-| `/proc` | **planned** | the one part of espix's own mount table still missing; a second mount now exists |
+| File timestamps | **yes** | `ls -l` and `sftp ls -l` show mtime; files from the flashed image have none; a FAT volume reports the time it stores — two-second resolution, no access time — and an NFS client's SETATTR sets a file's time |
+| `/proc` | **yes** | `meminfo`, `cpuinfo`, `uptime` and `version`, generated on every read and stored nowhere; no per-process files |
 | `mount`, `umount` | **yes** | `mount sda1 /mnt` puts a FAT32/FAT16 volume from a USB device into the namespace, reached through espix's own VFS so the permission check applies to it. Root only; nothing is ever formatted; unplug while mounted is a gap; `mount -o uid=,gid=` hands the volume to a user without root, and `-o ro` mounts it read-only — [USB-HOST](USB-HOST.md#stage-2--mounting) |
-| `/etc/fstab` | **yes** | applied on attach and undone on removal: the device column takes a name, a wildcard, or an identity from `blkid` (`LABEL=`, `UUID=`, `PARTUUID=`), and the owner named becomes the volume's owner — [USB-HOST](USB-HOST.md) |
+| `/etc/fstab` | **yes** | applied on attach and undone on removal: the device column takes a name, a wildcard, or an identity from `blkid` (`LABEL=`, `UUID=`, `PARTUUID=`); the owner column — or `uid=`/`gid=` in the Linux-style options column, which also takes `noauto` and `ro` — becomes the volume's owner, and an entry naming none mounts as `esp` — [USB-HOST](USB-HOST.md) |
 | `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). **Four device slots**, which is what a hub needs; two FAT volumes at once — [USB-HOST](USB-HOST.md) |
 | Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
@@ -71,9 +70,10 @@ merely missing.
 |---|---|---|
 | WiFi station, DHCP lease, default route | **yes** | `wlan0`, reconnects on boot |
 | `ip`, `ifconfig`, `route`, `ping` | **yes** | `ping` resolves names |
-| SSH server | **yes** | password auth — [read this first](#a-word-on-the-ssh-server) |
+| SSH server | **yes** | password auth — [read this first](../README.md#a-word-on-the-ssh-server) |
 | `scp` / `sftp` | **yes** | SFTP subsystem, permission-checked like the shell; starts in your home |
-| Ethernet | **planned** | P4 and S31 (Original ESP32 also has) |
+| NFSv3 server | **yes** | the stick is a mount on a Linux or macOS client: the portmapper, mountd, nfsd and statd, an export writable unless it says `ro`, and an enforced squash that governs access rather than ownership — [NFS](NFS.md) |
+| Ethernet | **yes** on S31 | `eth0` over RGMII, DHCP and the Ethernet-first route; the S3 has no wired peripheral |
 | USB-NCM | **yes** | device role only: `usb0`, plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](USB-NETWORKING.md) |
 | USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `mount sda1 /mnt` mounts its FAT volume, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. Four device slots, for a hub; two FAT volumes at once, bounded by `CONFIG_FATFS_VOLUME_COUNT` — [USB-HOST](USB-HOST.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
@@ -87,7 +87,7 @@ merely missing.
 | Password authentication | **yes** | PBKDF2-SHA256, per-user salt, `/etc/passwd` |
 | `passwd`, `whoami`, `id` | **yes** | `passwd` refuses to change another account's, unless root |
 | More than one account | **yes** | `useradd` allocates a free uid; 8 accounts and 12 groups |
-| uid/gid and file ownership | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |
+| uid/gid and file ownership | **yes** | stored per file on the rootfs, plus a rule so an unstamped rootfs still answers; a volume that keeps none — FAT — reports the owner it was mounted as |
 | Enforced read/write/execute | **yes** | in espix's VFS, for builtins and loaded apps alike |
 | `chown`, `chgrp` | **yes** | changing an owner is root's, as in chown(2) |
 | `sudo`, `sudo -u <user>` | **yes** | gated by `/etc/sudoers`, which takes names or `%group`; does not re-prompt, see below |

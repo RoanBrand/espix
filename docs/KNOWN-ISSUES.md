@@ -23,8 +23,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   entered `app_main()`, which is where a normal `return` goes anyway.
 
   `atexit()` is still unpublished, so no handler runs on the way out either.
-  Both are the same missing piece: a process that owns what it allocated, which
-  is the entry at the top of this file.
 
 - **A hard kill leaks whatever the app held.** SIGKILL deletes the task
   outright, so `teardown()` never runs. The neopixel app hands its RMT channel
@@ -36,47 +34,15 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   way once `TERM_GRACE_MS` runs out. SIG_IGN buys the grace period, not
   survival, which is itself a divergence from POSIX worth knowing —
   `kill -TERM` on Unix leaves such a process running indefinitely.
-  There is no address space to tear down and no per-process ownership of heap
-  or fds, so nothing can reclaim it for the app. `tests/suites/35-signals.sh`
-  pins both halves.
+  There is no address space to tear down, and although a process's heap and
+  files are given back now, the peripherals its own `teardown()` would release
+  — an RMT channel, a GPIO reservation — are not something espix can reclaim
+  for it. `tests/suites/35-signals.sh` pins both halves.
 
-- **A clean exit did not give all of the app's PSRAM back either, and the game
-  showed it. Fixed** (6969357, R-P1.2): an app's allocations are a list of regions
-  of its own now, released whole when the process ends, so a clean exit and a
-  `kill -9` return the same memory -- what follows is the shape of the bug rather
-  than the state of the code. Measured before that: from a fresh boot with 13.2 MB
-  of PSRAM free, two Doom runs -- both exiting through the app's own `doom: quit`
-  path, no kill -- left **571 KB**, roughly 7.7 MB a run, and only a reboot
-  returned it. The exit path did not hand back what the app allocated, and the
-  loader had no per-process ownership to reclaim it with.
-
-  What it looks like is a game leaving the screen on a large canvas. The mode
-  switch back asks for a 1280x800 canvas and then an RFB staging buffer of the
-  same size, 2 MB each, and with the game's memory still held the allocation
-  fails -- which drops the viewer rather than merely leaving the screen small:
-
-      doom: quit
-      display: screen owner: app -> desktop
-      display: desktop takes the canvas back at 1280x800
-      display: display resized to 1280x800
-      vnc0: console down
-      vnc: client disconnected
-      vnc: radio back to its own sleep setting
-
-  Nothing here is display-specific: the desktop at 1280x800 is simply the
-  largest thing that asks for its memory back at once. Until the exit path
-  returns it, a reboot is the only reclaimer, and a game run on a large canvas
-  is the case that runs out first.
-
-- **`ps` shows at most 8 finished processes.** `cmd_ps` stack-allocates
-  `espix_proc_info_t procs[8]` while `ESPIX_PROC_MAX` is 12, so on a busy table
-  some exits are silently missing from the `finished:` list. The array is on the
-  session task's stack, which is why it is not simply `ESPIX_PROC_MAX` — each
-  entry is ~184 bytes.
-
-- **`session->fg_pid` is written and never read.** It is set on every foreground
-  run and cleared afterwards, but nothing consults it. Scaffolding for job
-  control; it does not mean anything yet, so do not build on it.
+- **`ps` shows only the last eight exits.** The finished list is a fixed
+  eight-entry ring (`ESPIX_PROC_DONE_MAX`), separate from the 12-slot live
+  table, so a ninth exit pushes the oldest out of the `finished:` list. A ring
+  because it is bookkeeping, and a spawn must never fail for it.
 
 - **A compute loop never sees a signal.** Delivery happens at the points where
   an app calls into espix — `sleep`, `usleep`, `nanosleep`, `pause`. A loop that
@@ -98,6 +64,14 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `espix_sigcheck()`. The residue is what remains: a process that ignores the
   hint *and* sits inside libc is still deleted at the end of that grace, and
   that case is unsafe. Nothing in espix does it today, and an app could.
+
+  A third mechanism of the same defect is recorded here rather than in an entry
+  of its own, because this is the entry that would explain it: a task deleted
+  while it sits inside lwIP's send() loses the completion the connection is
+  waiting on (conn->op_completed), and that socket is then stuck. Nothing
+  structurally prevents it -- write_all() and chan_write() check
+  espix_proc_stopping() so an ssh write leaves when it is asked to, which is a
+  courtesy and not a guarantee. It has not been seen live.
 
   The control worth keeping, because it is what identified this: the same
   `kill -9` on a process blocked in `sleep()` was harmless, and SIGTERM on the
@@ -199,165 +173,18 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   leg of `45-throughput`, in the quiet phase, with the suite running alone. So
   concurrency across suites is not required to trigger it.
 
-- ~~**Every sftp session leaks about 440 bytes of internal heap.**~~ **Found and
-  fixed:** the sftp channel built a login environment and never freed it.
-  Roughly 9 TLSF blocks per session, and they never came back.
+- **About 28 net heap blocks per run in the two file-moving suites are still
+  unexplained.** The sftp session itself measures clean now, downloads and
+  uploads included; this is the residue `40-transfer` and `45-throughput`
+  still leave, down from +45 blocks before. Both suites also write files and
+  run `sftp -b`, which is where to look next.
 
-  Found because the per-suite heap attribution put `40-transfer` and
-  `45-throughput` at `+2K / +45 blocks` twice running while every other suite sat
-  at ±1K with zero net blocks. Both are the file-moving suites, and OpenSSH 10.3
-  drives `scp` over SFTP.
+- **A force-killed process leaks its `funopen` streams.** They are the
+  victim's stdout and stderr, `funopen()` objects over the SSH channel, and a
+  hard kill detaches them rather than closing them, because closing them is
+  the very call that blocks. Measured at ~2.5K per kill over 20. It is
+  bounded, and only a hard kill pays it; a process that exits closes them.
 
-  **Measured on an idle board, outside the suite entirely** (`used K`, `blocks`):
-
-  ```
-  A idle baseline                    177  337
-  B after 6 scp downloads            180  392     +3K  +55
-  C after 150s idle                  180  392     unchanged -- it does not come back
-  ```
-
-  Then bisected, 8 operations at a time:
-
-  ```
-  plain ssh, tiny command            +0K   +0     clean
-  plain ssh, bulk output (dmesg)     +0K   +0     clean -- so not data volume
-  sftp fetch of a MISSING file       +3K  +72     leaks
-  sftp fetch that succeeds           +3K  +72     leaks the same
-  ```
-
-  So it is the sftp **session**, not the transfer: a fetch that opens no file at
-  all leaks identically to one that moves bytes. Thirty sessions during this
-  investigation took internal from 177K to 190K. PSRAM stayed flat at 98K, which
-  matters because `sftp_t` is the one big allocation and it is PSRAM-backed
-  (`CONFIG_ESPIX_SSH_SFTP_IN_PSRAM`) -- whatever leaks is internal and small.
-
-  **Ruled out by measurement, not by reading:** TIME_WAIT. IDF's lwIP is built
-  `MEM_LIBC_MALLOC`/`MEMP_MEM_MALLOC`, so PCBs come from the C heap, and
-  `CONFIG_LWIP_TCP_MSL=60000` holds a closed connection for ~120s -- which fits
-  "many small blocks, few bytes" so well that it was the working theory. Reading
-  C above is what killed it.
-
-  **Ruled out by reading:** `sftp.c` allocates in exactly two places and frees in
-  one, and its teardown closes every handle (`fclose`/`closedir`) before the
-  free; handles live in a fixed array inside `sftp_t`. The `subsystem` request
-  branch in `ssh_channel.c` allocates nothing, the sftp branch builds its
-  `espix_session_t` on the stack, and the shared `out:` path frees the locks,
-  the stdin queue, `exec_cmd` and the channel. None of the obvious paths holds
-  anything.
-
-  **Instrumentation found it in one run, after reading had failed.**
-  `CONFIG_HEAP_TRACING_STANDALONE` with `heap_trace_start(HEAP_TRACE_LEAKS)`
-  around the whole sftp channel, cleanup included, dumped nine unfreed
-  allocations totalling 336 bytes and named the allocator outright:
-
-  ```
-  ssh_channel_run          ssh_channel.c   <- the sftp branch
-    apply_account          ssh_channel.c:1583
-      espix_env_set_login_defaults  env.c:359
-        espix_env_set               env.c:111/117/134
-  ```
-
-  292 bytes for the table plus 4/5/10/5/5/5/5/5 for the names and values. With
-  TLSF's per-block overhead that is ~444 bytes, against the ~440 measured.
-
-  **The bug:** `finish_session()` frees the session's environment
-  (`espix_env_free()`), and the exec and shell paths both call it. The sftp
-  branch went straight to `out:` instead, so the environment `apply_account()`
-  had just built was never released -- and sftp never reads it in the first
-  place, since `base_dir()` works from `session->cwd`.
-
-  Fixed by freeing it on that branch. Not by calling `finish_session()`: that
-  also hangs up processes and sends the channel close, and the sftp path has no
-  processes and has already sent its own.
-
-  **After:** sixteen transfers, downloads and uploads, move the internal heap by
-  0 bytes and 0 blocks, against +72 blocks per eight before.
-
-  A residue remains in those two suites -- about +28 blocks each, down from +45
-  -- which is not scp: measured directly, downloads and uploads are now clean.
-  The suites also write files and run `sftp -b`, and that is where to look next.
-
-- **`kill -9` on a writing app took the board down, and stranded the session
-  that killed it. Both fixed.** Filed for months as two bugs; they were one, and
-  the difference was only which task ran the victim's teardown.
-
-  Reproducer, which is still the valuable part:
-
-  ```
-  pid=$(dev_run "$APP out 200000 40 &" | sed -n 's/^\[\([0-9]*\)\].*/\1/p')
-  dev_run "kill -9 $pid"
-  ```
-
-  **The mechanism, read out of the sources this build actually compiles.**
-  `vTaskDelete()` of a task that is not running calls `prvDeleteTCB()` **on the
-  caller**; if the victim *was* running it goes to `xTasksWaitingTermination` and
-  **IDLE** does it instead (`FreeRTOS-Kernel/tasks.c` — note it is that tree, not
-  `FreeRTOS-Kernel-SMP/`, which is a different kernel selected by
-  `CONFIG_FREERTOS_SMP` and is not what espix builds). Either way
-  `configDEINIT_TLS_BLOCK` runs `_reclaim_reent()` -> `esp_cleanup_r()`, which
-  fcloses each std stream that differs from the global one. A process's stdout is
-  a `funopen()` object over the SSH channel, so that fclose enters the send path
-  and blocks on a lock the dead task still holds.
-
-  On the killer that stranded the connection task. On IDLE it killed the board:
-  IDLE tasks are pinned per core and `prvSelectHighestPriorityTaskSMP()` assumes
-  it can always fall back to them, so blocking IDLE1 leaves core 1 with nothing
-  to schedule and trips `configASSERT(xTaskScheduled == pdTRUE)` at
-  `tasks.c:3642` — which is the reported assert, exactly. The faulting task
-  varied (`IDLE1`, `tcpip`) because an assert during a context switch is
-  attributed to whoever triggered the switch.
-
-  **Three defects, found in order, each hidden behind the one before it.**
-
-  1. *The killer ran the victim's newlib teardown.* Fixed by
-     `espix_proc_detach_streams()`: put the global streams back into the victim's
-     reent, under the lock, before deleting. `esp_cleanup_r()` then finds nothing
-     of espix's to close. The kill log says `[stdio detached]` when this fires,
-     so the dangerous path is observed rather than inferred from an absence of
-     panics.
-  2. *`tx_lock` was orphaned.* Only a mutex's owner may release it, so a task
-     deleted mid-write held it forever. Worse, it is not merely unavailable:
-     `xQueueSemaphoreTake()` walks the recorded holder's TCB for priority
-     inheritance, and that TCB is freed — so **every** later take is a
-     use-after-free, bounded or not. Bounding the waits made this loud rather
-     than safe: it turned silent corruption into
-     `assert failed: vTaskPriorityDisinheritAfterTimeout tasks.c:5243`, on the
-     first kill, every time. Fixed by never asking: `chan_task_gone()` checks
-     whether the dead task was the holder and, if so, marks the lock orphaned;
-     `chan_tx_take()` tests that before it calls take at all.
-  3. *The victim was deleted inside lwIP.* Exposed only once the hang was gone —
-     the strand had been masking it. A task blocked in `send()` is waiting on
-     `conn->op_completed`; delete it, then close the socket, and the `tcpip`
-     thread signals a freed semaphore:
-     `assert failed: spinlock_acquire spinlock.h:142`, through
-     `lwip_netconn_do_writemore -> sys_sem_signal`. Pre-existing, and invisible
-     while the connection task was wedged.
-
-  **The general rule this settles.** espix cannot have a true SIGKILL and should
-  not pretend to. Real Unix can delete a process because the kernel owns
-  everything it holds; here the FILE objects belong to newlib, the netconn to
-  lwIP and `tx_lock` to espix's own SSH layer, and FreeRTOS owns none of it. So
-  termination is cooperative at the syscall boundary, with `vTaskDelete()` as a
-  last resort for a task that demonstrably holds nothing.
-
-  That is what `espix_proc_stopping()` is for: a stop check with no handler
-  dispatch and no SIGSTOP parking, safe to call inside a transport write.
-  `write_all()` tests it in its EAGAIN loop and `chan_write()` before taking the
-  lock, so a process on its way out is neither inside lwIP nor holding anything
-  when the grace expires. The send path was the only blocking point in espix with
-  no delivery point at all, which is why `kill` could never touch a writing app.
-
-  **Measured after the fix:** 20 consecutive kills, no panic, and the killing
-  session survived all 20. `35-signals` 16/16 with the `--stress` gate removed,
-  `30-proc` 18/18, `15-streams` 34/34, `55-sessions` 9/9, health "all good" each
-  time. Throughput unchanged: scp download 662 KB/s and ssh stdin 243 KB/s,
-  against 674-720 and 236-237 recorded before.
-
-  **What is still open:** a force-killed process leaks its `funopen` streams,
-  because closing them is the very call that blocks. Measured at ~2.5K per kill
-  over 20. It is bounded and only a hard kill pays it; see the SIGKILL entry at
-  the top of this file. Closing it needs the app to unwind far enough to close
-  its own streams, which is a further step on the same road.
 - **Something writes past the process table and silently disables half the ABI
   resolver. Open, and now watched for.** A `-j4` run failed 21 assertions across
   `15-streams`, `70-env` and `45-throughput`, every one of them:
@@ -460,8 +287,7 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `tcpip` is the **finder, not the culprit**. lwip freed an ordinary pbuf and
   TLSF tripped over damage already done to `control` at the base of the PSRAM
   heap. `pbuf_free` in the TCP/IP thread is simply the most frequent `free()` on
-  the box, so it gets there first — the same reason the entry below surfaced as
-  four panics in four unrelated places.
+  the box, so it gets there first.
 
   Reading the run that found it: 51 assertions failed, all but three of them
   `<<<dead-session>>>`. That is **one** event, not 51 — the reboot killed four
@@ -470,9 +296,9 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   that was still coming up, not findings.
 
   What is ruled out, and it is the tempting one: this is *not* the PSRAM/DMA
-  cache-line spill. The entry below records that theory being tested and
-  disproved — taking the SSH buffers out of PSRAM entirely only changed which
-  heap the corruption landed on.
+  cache-line spill. That theory was tested and disproved — taking the SSH
+  buffers out of PSRAM entirely only changed which heap the corruption landed
+  on.
 
   Hunting it since with `CONFIG_HEAP_POISONING_COMPREHENSIVE`: four full runs,
   no catch. Note when you try: the poisoned build's per-allocation canaries cost
@@ -482,55 +308,11 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `tests/run.sh` now prints that low-water mark every run so it cannot be missed
   a second time.
 
-- ~~**One earlier heap corruption remains unexplained.**~~ **Fixed.** It was a
-  double free in espix's own command history, and the whole shape of it is worth
-  keeping, because almost nothing about the way it presented pointed at the
-  cause.
-
-  Command history is owned by the *user* rather than the session, so two
-  sessions logged in as the same account are handed the same `espix_history_t`.
-  The module had a mutex and it covered only `espix_history_for()`, the slot
-  lookup. Every mutation after that ran unlocked, and two sessions arriving at a
-  full list together both ran `free(h->entries[h->count - 1]); h->count--;` on
-  the same pointer.
-
-  It surfaced as four different panics, none of them in `history.c`:
-  `tlsf_free` inside `esp_vfs_select` from `chan_poll_interrupt()` on the PSRAM
-  heap, a `CacheError` on IDLE0, a `free(0x15)` inside `esp_linenoise`'s own
-  history, and only once as the double free itself. A corrupted heap is noticed
-  by whoever frees next, and `chan_poll_interrupt()` polls `select()` every
-  50ms, so it usually got there first.
-
-  Reading the code did not find it. The leading theory for most of a day was a
-  cache-line spill from DMA over the PSRAM crypto buffers -- plausible,
-  documented as a real hazard, and wrong. `tools/soak.sh` found it in four runs
-  by separating two knobs: **209 logins with no commands ran clean for ten
-  minutes**, while **three sessions typing commands panicked in 99 seconds**.
-  History is pushed per command. Taking the SSH buffers out of PSRAM entirely
-  then changed nothing except which heap the corruption landed on, which
-  finished the PSRAM theory off in a single run.
-
-  The fix is the whole table under one lock. Confirmed on an uninstrumented
-  build with PSRAM restored: the arm that panicked in 99s ran clean for 900s.
-
-- **`esp_linenoise` was handed a garbage pointer under load -- and it was ours.**
-  Seen once, on the serial console, during a four-worker run: faulting task
-  `main`, `free(0x15)` inside `esp_linenoise_history_free()` from
-  `espix_history_apply()`, tripping heap_caps_base.c's "free() target pointer is
-  outside heap areas".
-
-  Written up here as a probable defect in the component. It was not.
-  `espix_history_apply()` walks the shared list and hands each entry to
-  `esp_linenoise_history_add()`, and the entry above is why that list could hold
-  a pointer another session had already freed. The editor stored it and freed it
-  again later. Kept as an entry because "the crash is inside the library" was
-  the wrong first instinct, and the correction is the useful part.
-
-  One genuine gap does remain in the component, worth reporting rather than
-  working around: `esp_linenoise_edit()`'s ENTER case does
-  `state->history_length--; free(config->history[state->history_length]);` with
-  no check that the length is above zero. Nothing espix does reaches it, and
-  nothing stops it either.
+- **`esp_linenoise_edit()` can free history that is not there.** Its ENTER
+  case does `state->history_length--; free(config->history[state->history_length]);`
+  with no check that the length is above zero, so an empty history underflows.
+  Nothing espix does reaches it, and nothing stops it either; it is the
+  component's, not espix's use of it.
 
 - **Loading an app can fault the cache — latent since XIP, not fixed.**
   Faulting task `app:testapp`, `exccause 0x47 (CacheError)` in
@@ -563,88 +345,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
     place to put it, at the cost of a lock across all filesystem I/O.
   - Wait for the component, and pin the version when it is fixed.
 
-- ~~**A gone SSH client left its command running, holding the session slot.**~~
-  **Fixed.** `chan_poll_interrupt()` is the poll a foreground command runs every
-  slice to notice Ctrl-C, and it answered "no interrupt" for a dead peer:
-
-  ```c
-  if (ch->closed)              { return hit; }   /* hit is false here */
-  ...
-  if (chan_pump(ch) != ESP_OK) { return hit; }
-  ```
-
-  FIN makes the socket readable, so `select()` fires and `chan_pump()` fails on
-  EOF -- and the command is told nothing happened. It carried on writing into a
-  socket nobody would read, each write blocking until TCP gave up.
-
-  **Never a `top` bug**, though that is what exposed it. The poll has two
-  callers and the other matters more: `cmd_run.c:100`, the foreground-app wait.
-  Any app run in the foreground kept running after its client vanished, with the
-  connection task waiting on it. `top` is simply what `55-sessions.sh` holds its
-  connections with.
-
-  **Present since `bca0fd2` (2026-08-25)**, the commit that introduced Ctrl-C.
-  It hid because drain time depends on how many writes the held command has
-  left, which varies: the same suite recorded "back to 2 after 4s" one morning
-  and over 30s the same evening. Slots now return in **1s**, and `55-sessions`
-  went from 50s with two failures to 14s green.
-
-  Found while chasing what looked like a 25K memory regression from
-  `MBEDTLS_ECP_FIXED_POINT_OPTIM`. That was wrong: with teardown fixed the same
-  measurement reads 45K with the option on and 44K off, and the missing 24K was
-  connections not yet gone being counted as live. **A number measured on a
-  broken system is not a baseline.**
-
-- ~~**An ordinary account cannot write `/dev/null`.**~~ **Never true of any
-  committed build, and the way it got recorded is the part worth keeping.**
-
-  What was seen was real: `scp` to `/dev/null` failed with `Permission denied`
-  as `esp` while the same write from root succeeded, and it made
-  `45-throughput`'s upload floor meaningless -- every upload failed, both
-  failures cost the same handshake, and the rate (a difference between a 512KB
-  and a 2MB transfer) was computed from noise. It read
-  `scp upload: 307200 KB/s (floor 200)` and passed.
-
-  **The diagnosis was wrong twice, and both mistakes are the same mistake.**
-
-  First: "the node is espix's own, not IDF's -- IDF's null VFS is registered
-  nowhere". It is registered, by ESP-IDF itself, under
-  `CONFIG_VFS_INITIALIZE_DEV_NULL` (default `y`) in `vfs/nullfs.c`. The grep
-  that produced "nowhere" was scoped to espix's tree and could not have found an
-  IDF-internal `ESP_SYSTEM_INIT_FN`. **A conclusion drawn from a gap the search
-  itself made.** Because IDF's prefix `/dev/null` is longer than espix's `""`,
-  it outranked espix's node and bypassed `espix_fs_access_check()` entirely --
-  which is why writes worked, for everyone, on every build that had it.
-
-  Second: "other runs read 666, 556 and 922 KB/s ... the same noise". Those were
-  real measurements, taken before the condition existed.
-
-  **How the condition existed at all: `sdkconfig` is gitignored and carries
-  settings across branches.** A build of the `/dev` feature branch wrote
-  `CONFIG_VFS_INITIALIZE_DEV_NULL=n` into it. Checking out `main` and rebuilding
-  did not revert that -- `sdkconfig.defaults` only overrides a value still at its
-  Kconfig default -- so `main` was being built with the branch's config and
-  without the branch's fix. espix owned `/dev/null`, and `mode_from_rule()`
-  answered `0644` for a node the table declares `0666`. Exactly the broken
-  middle state that branch's commit message predicts.
-
-  So `build/` was not a build of the tree in front of it, which is the same
-  class of error the stale-firmware guard exists for -- and it was invisible
-  because the guard compares the *board* against `build/`, and both agreed.
-  `sdkconfig.defaults` now warns about it.
-
-  **Fixed for real** by the `/dev` work: espix owns the whole subtree, and
-  `espix_fs_mode()` answers from the device table, so the check, `stat()` and
-  `ls -l` agree on `0666`. `tests/suites/10-fs.sh` asserts an ordinary account
-  may write the sink, and `45-throughput`'s upload leg measures again
-  (616 KB/s, beside the 666/556/922 above).
-
-  **What survives, and earned its place.** `rate_kbs()` refuses to answer when
-  the two transfers finish within 100ms of each other, and the upload leg checks
-  the destination accepts a write before timing writes to it. A suite whose
-  header says it exists because "a process's stdin came to run at 5 KB/s without
-  anyone noticing" had reported 300 MB/s over WiFi and called it a pass.
-
 - **A session occasionally dies under parallel load, and nothing explains it
   yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
   session partway through and the harness reported seven failures that were one
@@ -652,16 +352,11 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   against the dead-session sentinel. The device was fine throughout: no reboot,
   no core dump, and the very next run was 149 assertions green.
 
-  **It recurred, so the teardown fix was not it.** The entry above — a gone
-  client leaving its foreground command running with the slot held — was fixed
-  2026-09-08, and this said "if this does not recur, that was it". On
-  2026-09-14 a `-j 4` run reproduced the signature exactly: `35-signals`, seven
-  failures, `session gone before: ps` first, and the suite green on its own
-  re-run seconds later (15 ok). Device healthy throughout — no reboot, no core
-  dump, 178 of 185 assertions passing around it.
-
-  So that hypothesis is closed off rather than left hanging. Whatever this is,
-  it survives the teardown fix.
+  **It recurred on 2026-09-14.** A `-j 4` run reproduced the signature
+  exactly: `35-signals`, seven failures, `session gone before: ps` first, and
+  the suite green on its own re-run seconds later (15 ok). Device healthy
+  throughout — no reboot, no core dump, 178 of 185 assertions passing around
+  it.
 
   It is not new and it is not the panics. The same shape turned up early in the
   parallel work, before any of the fixes: one login failure in nine rounds of
@@ -681,111 +376,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `espix_fault_request_reap()` exists with no callers.
 
 ## Filesystem
-
-- ~~**A directory made outside every user's home is owned by root, so its own
-  creator cannot write into it.**~~ **Fixed** (`d1e761e`), by giving a command's
-  own task its session. `run_on_own_task()` spawns a task for any command with a
-  non-zero stack and never set the session thread-local, so every reader of "who
-  is asking" saw no session and took the caller for espix itself: the permission
-  check returned early without checking, and `espix_fs_claim()` did not stamp an
-  owner, leaving the location rule to answer root. Two symptoms, one cause.
-
-  The directory was the visible one. `mkdir /tmp/d1` recorded root -- the rule
-  answers root for anything not inside a home -- and the next thing the same
-  user did inside it was refused:
-
-  ```
-  $ whoami
-  esp
-  $ mkdir /tmp/d1
-  $ echo hi > /tmp/d1/f
-  espix: /tmp/d1/f: cannot open for writing: Permission denied
-  $ echo hi > /tmp/f9          # no directory in the way
-  $ cat /tmp/f9
-  hi
-  ```
-
-  The file case worked because the shell sets a redirect up on the *session*
-  task, whose thread-local is set, while `mkdir`, `touch` and the rest run on a
-  task of their own -- not because `open()` recorded the caller, which was the
-  reading that made this look like a rule about directories.
-
-  The other symptom was quieter and worse: any command with a stack of its own
-  was exempt from the permission check entirely. That is why it is not merely an
-  ownership rule to be argued about.
-
-  `tests/suites/15-streams.sh` failed fifteen assertions on the directory half
-  (`mkdir $T`, then `> $T/app-out`) and passes 34/34 after; 00-smoke, 10-fs,
-  12-vfs, 20-users, 30-proc and 40-transfer pass too.
-
-- ~~**A write into a mounted FAT volume is lost for the first two copies after a
-  boot.**~~ **Fixed**, by the fd packing (`86bc6bd`) and by releasing the entry it
-  allocates (`c016e00`). The cause was the fd collision described below and not
-  the write path at all, which is why every check added to the write path stayed
-  silent: nothing was wrong with the write, it was aimed at the wrong file. Ten
-  sequential copies with `cp`'s read-back now pass on hardware. The reproduction
-  is kept below as the record of how it looked, since that is what the next
-  person will see if this class of bug returns.
-
-  Reproduced twice, on two builds, matching to the byte: after a reset,
-  `sudo mount /dev/sda1 /mnt/sd1` and then two `sudo cp /etc/hostname` runs.
-  The first answers `close failed: Bad file number` (`EBADF`) and leaves a
-  0-byte file; the second leaves a 0-byte file with every call — `fwrite`,
-  `fflush`, `fclose` — returning success. The third and every later copy writes
-  its fifteen bytes, until the next boot. Nothing else distinguishes them: not
-  the filename, not whether the file existed, not an intervening read.
-
-  It is an fd collision. espix calls FatFs's *inner* ops — the ones
-  `tools/patch-fatfs.py` exposes so that `esp_vfs` is bypassed and espix's
-  permission check is not — and those hand out FatFs's own
-  `fat_ctx->files[]` slots: 0, 1, 2, … Meanwhile IDF's global fd table and the
-  console are handing out those same numbers. So `s_fd_mount[2]` can be written
-  by a rootfs open and by a FAT open, and `vfs_close` can find nothing at all
-  for a fd that is ours: `mount_by_fd()` answers `NULL` and the close returns
-  `EBADF`, or — worse — the operation reaches the right mount and the transfer
-  for a file whose slot number was reused goes nowhere. That the failures stop
-  after two is what local fd slots being cycled looks like from outside.
-
-  The fix is to **pack the fds**: `open` returns a number from espix's own space,
-  every op maps it back to the lower fd, and the routing map is keyed on espix's
-  number rather than one it shares with the console and the rootfs. The 256-byte
-  array in `vfs.c` becomes a small table of open files, which also drops the
-  assumption that a fd fits in a byte — an assumption the comment there states
-  as fact today. Until then `cp` reads every copy back and reports one that did
-  not arrive, which is how this was caught.
-
-  Related, and separate: ~~`off_t` is 32 bits here, so a device or file larger
-  than 4 GB reports a truncated size — `/dev/sda4`, 23 GiB, lists as `0`,
-  which is exactly its low 32 bits.~~ **Fixed** — `off_t` is 64 bits now, from
-  `cmake/offt64.h`, with `_lseek_r` held at its old width where the prebuilt libc
-  and the ROM call into it; [UPSTREAM.md](UPSTREAM.md) has the mechanism, the
-  declarations that surfaced, and what it cost. SFTP's *transfer* path is the one
-  thing it did not fix: see the note under **SSH**.
-
-- ~~**Unplugging a mounted stick is a use-after-free.**~~ **Fixed**, by the detach
-  hook, the dead-mount sentinel and the skipped volume sync (`ffc1029` onward,
-  plus three follow-ups the pull tests found). Measured: an idle pull
-  auto-unmounts and the shell survives; a pull with a file open leaves the mount
-  marked, reads answering `ENOSYS` and `df` declining the row; `umount` works once
-  the handle is gone. The one case espix cannot fix — a transfer already in flight
-  — is in UPSTREAM.md. The text below is kept as the shape of the problem.
-
-  Stage 2 mounts FAT from a
-  USB device, and the block device it mounts is *borrowed* from `espix_usb`: the
-  slot owns it, and when the device is unplugged the slot hands it back to the MSC
-  driver and uninstalls the device. FatFs knows none of that, so a volume whose
-  device has gone reads through a freed block device and a freed device object.
-  The only safe move today is to unmount first — which the docs say, and which
-  nobody will remember at the moment they pull a stick out.
-
-  The fix is a removal hook: `espix_usb` calls it *before* tearing a device down,
-  and the mount layer unmounts. Two things make it more than a callback. The hook
-  runs on the USB task, so it must not block on a transfer that same task
-  delivers; and an unmount with a file still open cannot free the context under
-  the reader's fd. The shape that satisfies both is to mark the device gone — so
-  I/O fails instead of reading freed memory — and free the block device when the
-  last reference to it goes, rather than on the removal path.
-
 
 - **An ext listing cannot tell its end from a failure.** lwext4's
   `ext4_dir_entry_next()` returns `NULL` for both — `ext4.c:3180`, where the same
@@ -812,8 +402,9 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   where the call is made.
 
 - **An ext mount whose device is pulled leaves lwext4's mount point behind.**
-  The same shape as the FAT dead-mount entry above, and a bigger loss, because
-  everything that would give lwext4's side back touches the device:
+  The FAT pull is handled with a dead-mount sentinel; this one leaves the mount
+  point behind, and the loss is bigger, because everything that would give
+  lwext4's side back touches the device:
   `ext4_umount()` writes the superblock back and flushes the block cache, and
   `lwext4_port_bdl_destroy()` syncs the lower BDL. On a pulled device both would
   run through a block device `espix_usb` has already released, so both are
@@ -827,66 +418,10 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   and would still leave the superblock un-written-back at the point where it
   cannot be written back anyway.
 
-- ~~**A modern ext4 volume will not mount at all.**~~ **Fixed**, by teaching the
-  vendored lwext4 to honour the metadata checksum seed. e2fsprogs 1.47 and later
-  turn on `metadata_csum_seed` by default, which sets `INCOMPAT_CSUM_SEED`
-  (`0x2000`) in the superblock, and lwext4 refused that bit — two incompatible
-  bits in the way, `0x2000` and nothing else, and the volume was otherwise
-  readable (`64bit`, extents, flex_bg and filetype are all supported).
-
-  The refusal was right on its own terms, which is why the fix had to be to
-  honour the feature rather than tolerate the bit: on such a volume every
-  metadata checksum is seeded from the superblock's `s_checksum_seed` instead of
-  from the filesystem UUID, while lwext4's verification code always seeded from
-  the UUID — `ext4_balloc_bitmap_csum()` and its siblings in `ext4_dir.c`,
-  `ext4_dir_idx.c`, `ext4_extent.c` and `ext4_ialloc.c`. Tolerating it would have
-  produced a mount that failed the first bitmap, directory or extent read, which
-  is worse than a refusal because it looks like a broken device.
-
-  So the seed is now read from the superblock when the feature is set, which is
-  what the kernel's `s_csum_seed` is: one helper and eight call sites. It is not a
-  fork — `tools/patch-lwext4.py` applies `tools/lwext4-csum-seed.patch` to the copy
-  the component manager fetches, so the change is one reviewable file that
-  upstream can take as it stands.
-
-  Verified on the 29G Sandisk, against a volume KDE Partition Manager made with
-  stock `mkfs.ext4`: `mount`, `ls -l` (which verifies directory-block checksums),
-  `cat` (extent-tree checksums), `df`, `EROFS` from a write as root, and
-  `umount`. A wrong seed could only ever have produced read failures and never
-  wrong contents, because the mount is read-only and lwext4 never writes a
-  checksum on that path — which is why this was worth doing rather than
-  reformatting the volume.
-
-  Found by the diagnostic it left behind: `mount` answered only `ENOTSUP`, so the
-  driver now reads the superblock on that failure and logs its fields, its
-  feature words and whether the checksum it computes matches the stored one
-  (`log_why_not_mounted()` in `components/espix_fs/ext.c`). That turned "cannot
-  mount" into "incompat 000022c2, unsupported 00002000" in one line. It is also
-  the only tool for the job: `/dev/sda3` cannot be read from userland at all,
-  because dev.c refuses to open a block node on purpose — the test app grew a
-  `hexdump` while chasing this, and all it can report on a device node is
-  `EOPNOTSUPP`.
-
-- ~~**A read-only ext mount is owned by whoever mounted it, not by its inodes.**~~
-  **Fixed.** The precedence is now the filesystem first: an ext mount registers as
-  `ESPIX_FS_META_LOWER`, so what its inodes say is what the permission check
-  enforces, and `-o uid=`/`gid=` are ignored there the way Linux ignores them for
-  ext4. A volume's permissions are its own: `ls -l` and the check read the same
-  source, which is what makes them agree by construction.
-
-  Two consequences worth knowing, and both follow from that rather than from a
-  defect. A stick made on a PC carries whatever uid that PC's user had — usually
-  1000, which is what `esp` is here — so a file owned by some other account is that
-  account's to read, and only root (the console, or `sudo`) sees everything on the
-  volume. And `chmod` and `chown` refuse on an ext mount: ext has somewhere to put a
-  mode, but writing an inode needs a writable mount, which is the milestone after
-  this one in [ROADMAP.md](ROADMAP.md).
-
-  The uid model is 16 bits throughout (`espix_fs_posix_attr_t`) where an ext inode
-  carries 32, so an owner above 65535 is attributed to its low 16 bits. Nothing in
-  espix has an account up there and a removable volume is unlikely to, but it is a
-  truncation rather than a refusal, which is worth knowing before it matters.
-
+- **A uid above 65535 on an ext volume is truncated to its low 16 bits.**
+  espix's uid model is 16 bits throughout (`espix_fs_posix_attr_t`) where an
+  ext inode carries 32. Nothing here has an account up there and a removable
+  volume is unlikely to, but it is a truncation rather than a refusal.
 
 - **A directory's mode does not hide what is inside it.** Unix requires search
   (`x`) permission on every component of a path; espix checks the final
@@ -941,12 +476,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   Membership beyond the eighth group is silently not carried, which is the one
   place these tables fail quietly rather than loudly.
 
-- **The shell drops an empty quoted argument.** `usermod -G "" esp` — the usual
-  way to clear somebody's supplementary groups — arrives as `usermod -G esp`,
-  so `-G` eats the username and the command prints its usage. Name a group you
-  do want instead, or use `userdel`. It is a shell limitation rather than a
-  usermod one.
-
 - **`su` does not exist.** `sudo` covers the need, and `su` is the command that
   most wants the password prompt espix cannot yet give.
 
@@ -980,24 +509,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   serial console rather than a general device tree. The listing shows only what
   espix owns.
 
-- **Only the root filesystem gets espix's permission check.** Anything
-  registered at its own prefix is routed by ESP-IDF before espix sees it, so
-  mounting FAT on an SD card at `/mnt/sd` would leave
-  `espix_fs_access_check()` uncalled for every file on it. Harmless for
-  devices, which have no mode to check; the problem is a second *filesystem*.
-  See [ROADMAP.md](ROADMAP.md#filesystem) for what closing it costs.
-
-- **USB storage is enumerated but not mounted, and the second half is
-  deliberate.** `lsblk` and `blkid` name a stick, its partitions, its filesystems
-  and its labels, and no path under it exists: there is no `/mnt`, and
-  `cat /mnt/sda1/anything` cannot work. This is not unfinished work — it is the
-  reverse. The quick way to mount (registering FatFs at its own prefix) would
-  skip `espix_fs_access_check()` for every file on the stick, and `chmod` on a FAT
-  file would store littlefs attributes for a path that is not on littlefs
-  (`components/espix_fs/mode.c` hardcodes `ESPIX_FS_ROOT_PARTITION`). Both defects
-  are described in [USB-HOST.md](USB-HOST.md), with the design that avoids them in
-  [ROADMAP.md](ROADMAP.md#filesystem).
-
 - **One USB storage device at a time, and a hub spends channels before you get
   there.** The S3's USB core has a fixed pool of host-controller channels: the
   root port takes one, an open hub two more (its control pipe plus an interrupt
@@ -1015,13 +526,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   bits, so a 4 TB disk prints `2199023255040` bytes (`2³² × 512`) — a plausible
   number that is wrong by half. `READ CAPACITY(16)` would fix it and the class
   driver does not use it.
-
-- **Unmounting is two steps now, and `esp_vfs_littlefs_unregister()` is not one
-  of them.** espix mounts through `esp_littlefs_mount()` and never registers
-  LittleFS with the VFS, so the port's unregister has no registration to tear
-  down and would fail. Nothing calls it — espix has no `umount` — but whoever
-  adds one needs to unregister espix's VFS and unmount LittleFS separately,
-  mirroring the two halves that mounting became.
 
 - **`fcntl(F_GETPATH)` is untested.** `CONFIG_LITTLEFS_FCNTL_GET_PATH` is on and
   the port answers by concatenating its `base_path` with the file's path; espix
@@ -1072,55 +576,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   - **Sessions are not confined, only processes.** There is no restricted login
     shell; `-R` applies to a program you run, not to whoever runs it.
 
-- **A *backgrounded* app's output is not redirected.** `app > file &` writes to
-  the terminal and leaves `file` empty; `2>` likewise. A foreground app
-  redirects correctly, as do builtins, an app's exit status, and espix's own
-  diagnostics about it.
+- **A backgrounded app's output cannot be redirected.** `app > file &` is
+  refused (`redirection with & is not supported yet`), and `2>` likewise; a
+  foreground app redirects correctly, as do builtins.
 
-  The reason is lifetime, and it is why the two cases differ at all: the
-  redirect `FILE` belongs to the shell and `redirects_release()` closes it when
-  the command returns. `run_program()` blocks in `espix_proc_wait()` for a
-  foreground process, so the `FILE` outlives it; a backgrounded one outlives
-  the `FILE`, and pointing its streams at one would be a use-after-free the
-  moment somebody typed `&`. See the stream note in `espix_proc/exec.c`, which
-  also records the one narrow hazard that remains — an app force-killed inside
-  an `fwrite` to a redirect leaves that `FILE`'s lock held.
-
+  The reason is lifetime: the redirect `FILE` belongs to the shell and
+  `redirects_release()` closes it when the command returns. `run_program()`
+  blocks in `espix_proc_wait()` for a foreground process, so the `FILE`
+  outlives it; a backgrounded one outlives the `FILE`, and pointing its
+  streams at one would be a use-after-free the moment somebody typed `&`.
   Closing it properly needs the redirect to be reference-counted or handed to
-  the process outright, which is job-control territory.
+  the process outright. See the stream note in `espix_proc/exec.c`, which also
+  records the one narrow hazard that remains — an app force-killed inside an
+  `fwrite` to a redirect leaves that `FILE`'s lock held.
 
-  Exit statuses *are* right: 127 when the file cannot be read, 126 when it is
-  there and will not run, and the app's own status otherwise.
-
-- ~~**An exFAT volume's label is not read.**~~ **Implemented**, by following the boot
-  sector's own geometry to the root directory and reading the Volume Label entry
-  (type `0x83`) there — exFAT keeps its label in a directory entry rather than in
-  sector 0, which is why it is not a field read the way FAT's is.
-
-  One sector of the root directory is scanned, which is where a formatter writes
-  that entry; a label further in, or a geometry that does not add up, gives no label
-  rather than a guess. Every field is checked before it is used and the result is
-  checked for control characters, because both mistakes this reader has already made
-  produced plausible-looking values: offset `0x60` of the boot sector taken for a
-  label field is `FirstClusterOfRootDirectory`, so a volume printed a control
-  character as its name, and the serial read from `0x40` is `PartitionOffset`, so it
-  printed the partition's start LBA as the volume's serial. The serial is at `0x64`.
-
-  The third mistake was the most instructive, because every number in it was right.
-  What the boot sector holds is relative to the *volume*, and the block device being
-  read is the *disk*, so the address needed the partition's start added to it;
-  without that the read landed two megabytes into the disk — inside the FAT
-  partition before it — and found no label there. `base` was a parameter the
-  function never used, which `-Wno-unused-parameter` is content to leave alone.
-
-  The geometry is logged at DEBUG for exactly that reason: `log usb debug`, then
-  `dmesg` on the next enumeration, prints the sector size, transfer unit, heap
-  offset, root cluster and computed address. Note that enumeration happens when the
-  drive is plugged in, not when `lsblk` runs — `lsblk` reads the cached table — so
-  the line is only in the ring for a while after a plug-in.
-
-  An NTFS label is still unread, and unreachable the same way it always was: NTFS
-  keeps it in its `$Volume` metadata file, not in sector 0, so `lsblk` leaves that
+- **An NTFS volume's label is not read.** exFAT's is now, by following the
+  boot sector's geometry to its root directory; NTFS keeps its label in the
+  `$Volume` metadata file rather than in sector 0, so `lsblk` leaves that
   column empty where Linux fills it.
 
 ## Shell and console
@@ -1181,63 +653,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Writing to an ext volume
 
-- **What a failed write did before `tools/lwext4-fwrite-error.patch`.** Observed
-  on hardware rather than argued. With the vendored core's `ext4_fwrite()` error
-  clobber in place, a fault injected into the block device -- writes from the
-  twelfth onward refused -- had `cp` of a **15-byte** file report `write failed:
-  I/O error` while the volume listed the file as **4096 bytes**, the right fifteen
-  bytes followed by a block of garbage. The data writes were refused and the
-  metadata went to the journal anyway, which is what the patch prevents: the
-  abort decision had been made on the result of releasing the inode reference
-  rather than on the error that got there first.
-
-  **It was not durable damage, and that is worth as much as the finding.**
-  Mounting the volume again replayed the journal, the phantom file was gone, and
-  the volume was consistent -- the transaction had never been committed, so the
-  replay discarded it. What the clobber cost, on that fault shape, was a corrupt
-  file visible to whoever looked at the volume before it was next mounted.
-
-  Two things to know before repeating it. A fault that *persists* masks the
-  clobber: the release fails too, and that error reaches the abort decision on its
-  own, so the caller is told even though the metadata went to the journal.
-
-  **And the injection cannot isolate the call it is aimed at, which is why three
-  attempts produced three different failure modes instead of a comparison.** The
-  journal is a *file*: its blocks are allocated in the data region like any other
-  data, so neither a count of writes nor an address threshold separates a journal
-  write from the file-data write the test wants. Measured: an armed address above
-  2 GiB was first hit by write 5, inside `ext4_journal_start()`, at 0x88000000 --
-  a journal block, not the copy's data. Every attempt lands in the journal, and
-  lwext4 either reissues those writes or, with espix's fail-closed mount, refuses
-  to mount writable at all.
-
-  To isolate it the fault has to be *inside* `ext4_fwrite()`: a test-only patch of
-  the vendored core that fails one block write at that call and nowhere else. A
-  patch rather than a knob, because the layer underneath genuinely cannot tell the
-  two apart.
-
-  A third thing that fell out of trying it: a write refused *during* recovery did
-  not stop recovery, and the mount completed with the volume consistent. Whether
-  that is recovery being resilient or an error path that does not check itself is
-  exactly what `doc/CAVEATS.md` says has not been established, and it is on the
-  list of things this harness exists to answer.
-
-  **What the comparison did not establish, so nobody repeats the effort.** The
-  fixed core was never made to fail *visibly*: with one write refused inside a
-  3 KB copy, the copy completed, the file was exactly the right size, and nothing
-  was reported to the caller -- plausibly because the refused write was a journal
-  block lwext4 reissued, which is not a failed operation. So a single refused
-  *block* is not a sharp enough instrument for this; what it needs is a failure
-  aimed at the write that matters, or a host `e2fsck` to look at the metadata
-  afterwards, which is the port's own method and needs a Linux box.
-
-  The harness is otherwise fitted for it: `fail_bd_arm()` restarts the count as
-  the mount returns, so the number means "the Nth write of whatever the mount is
-  used for next" rather than of the mount and its recovery together -- which is
-  how an earlier attempt put its one refusal inside a journal replay (about 160
-  writes on a volume the previous run left unclean) and tested nothing.
-
-
 - **Writes on an ext4 volume go through the port's experimental extent
   implementation.** An ext4 volume's files are extent-mapped, so allocating a
   block means mutating an extent tree, and the implementation espix compiles is the
@@ -1277,68 +692,7 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `doc/CAVEATS.md` asks for -- that a failed operation on this path is not safely
   rolled back -- produced by an experiment meant to test something else.
 
-- ~~**`chmod` and `chown` refuse on an ext mount, even a writable one.**~~
-  **Fixed.** The mount record carries a setter now (`espix_fs_meta_ops_t`), which a
-  filesystem that keeps its own metadata hands to the VFS at mount, and mode.c
-  asks it before falling back to espix's attribute store or refusing. ext writes
-  its inodes through `ext4_mode_set()` and `ext4_owner_set()`, so on a writable
-  volume both work: `chmod 0755` gives `-rwxr-xr-x`, and a changed group lands in
-  the inode. Everything else is unchanged — the rootfs still uses the store, and
-  FatFs still has nothing to write and says so.
-
-  The message is right as well. `esp_err` cannot carry an errno, so these
-  commands read errno first and fall back on `esp_err_to_name()` -- the idiom
-  `rm` already used, for the same reason -- `chmod` and `chown` clear it before
-  the call, and mode.c names `EPERM` where a refusal has no errno of its own.
-  A read-only ext mount therefore says "Read-only file system", and a FatFs one
-  says what EPERM says. (`chown` was also printing its errors to stdout, where
-  a redirection would have swallowed them; that is stderr now, like `chmod`.)
-
 ## SSH
-
-- ~~**A connection whose peer vanishes keeps its session slot until the command
-  ends, which can be minutes.**~~ **Fixed** (`f2463cf`), by TCP keepalive with
-  short timers on every accepted connection: `SO_KEEPALIVE` plus
-  `TCP_KEEPIDLE` 10s / `TCP_KEEPINTVL` 5s / `TCP_KEEPCNT` 3 in `ssh_server.c`.
-
-  Found by chasing `tests/suites/55-sessions.sh`, which failed about one run in
-  ten: "closing them frees the slots" and "and the memory with them" together,
-  with `device health after the run` reporting two `sshd:conn` tasks held in
-  states `R` and `B`. The suite is not at fault -- 30 seconds is generous.
-
-  What the holding task was doing, from probes on the device: running
-  `top -b -n 200` **to the last frame**. `cmd_top` polls `poll_interrupt()`
-  every 50ms, so a peer it could detect would have stopped it within a frame.
-  It never did, and the pump's read-failure -- the one place a close becomes
-  `ch->closed` -- never fired either. A zero-length `recv(MSG_PEEK|MSG_DONTWAIT)`
-  added to `chan_poll_interrupt()` to look past `select()` also never fired:
-  there was nothing to see. The peer had gone; the socket never said so.
-
-  The client side is not at fault either. At the moment of failure the host had
-  no leftover `ssh` processes for the eight sessions, so every client had exited
-  and every socket had been closed. The FIN simply was not arriving, and a
-  connection with no FIN looks exactly like an idle one -- which is why the two
-  existing timeouts did not cover it. `SO_RCVTIMEO` turns a silent socket into
-  "nothing right now", and idle is legitimate for hours. `SO_SNDTIMEO` gives
-  `write_all()` a stall clock, but a half-open connection still *accepts* bytes,
-  so progress keeps resetting that clock.
-
-  Two things were ruled out along the way and are worth keeping: `TX_DEAD_MS` is
-  exactly 30000, so a task parked on the transmit lock would have warned, and it
-  never did; and `read_exact()` handles `recv() == 0` correctly, so it is not
-  swallowing EOF.
-
-  Keepalive is the mechanism for exactly this, and `LWIP_TCP_KEEPALIVE` is
-  already on in IDF's `lwipopts.h`, so the timers can be shortened from their
-  two-hour default. Ten seconds of silence, a probe every five, three of them: a
-  dead peer is reaped in about twenty-five seconds, and one that is merely quiet
-  is probed and left alone. `TCP_KEEPCNT` is the load-bearing option -- without
-  it lwIP probes forever and the session is never given up.
-
-  Forty consecutive `55-sessions` runs passed after the change, against roughly
-  two failures in the twenty-four before it. The reproduction is cheap if this
-  returns: run the suite in a loop and watch `ps` at the failure -- the held
-  tasks' states and stack sizes are the fingerprint.
 
 - **SFTP transfers cannot reach past 4 GiB, and say so.** The read and write
   handlers seek with `fseek()`, which takes a `long`; `off_t` is 64 bits now, so
@@ -1360,17 +714,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   not the protocol. Everything that does not transfer works today over SFTP: a
   file over 4 GiB reports its real size in `stat` and in the long listing, because
   those read the same widened `struct stat`.
-
-- **Only a *process* reads stdin, not a builtin.** `ssh host 'testapp cat'
-  < file` works: a loaded app gets a real `stdin` over the channel, and
-  `fgets`/`fread`/`read` are in its ABI. But no espix builtin reads standard
-  input, and there is no `<` redirection, so `ssh host 'cat' < file` still will
-  not do what you mean — the builtin `cat` takes paths and nothing else.
-
-  Not much of a gap in practice: with no pipes and no `<`, a builtin has
-  nothing to read *from* except the network, which is the case an app already
-  covers. It becomes worth doing alongside pipes — see
-  [ROADMAP.md](ROADMAP.md).
 
 - **Only a foreground process reads stdin.** `chan_poll_interrupt()` is the
   single consumer of the channel's receive buffer and the thing that fills a
@@ -1394,11 +737,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   One transfer at a time is the working configuration, which is what the test
   suite does and probably what anyone does by hand.
 
-- **One command per `exec`.** The shell has no `;`, `&&` or pipes, so
-  `ssh host 'cd /bin && ls'` fails in the parser rather than in the channel.
-  `scp -O` — the pre-9.0 protocol — is answered with a message pointing at
-  SFTP, because espix implements no `scp` command for it to run.
-
 - **A client that decides to rekey hangs the session.** espix reads
   `SSH_MSG_KEXINIT` exactly once, during the handshake; one arriving mid-session
   falls through to the channel loop's `default:` case and is ignored. The client
@@ -1407,14 +745,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   harmless: OpenSSH's default is 2^32 blocks, which for `aes256-ctr` is 64 GiB,
   with no time-based limit — but `RekeyLimit 1G 1h` in a client's config gets
   there in an hour. See [ROADMAP.md](ROADMAP.md#ssh).
-
-- **Client algorithm lists are not a stable surface.** OpenSSH 10.3 added
-  post-quantum key exchange and pushed its KEXINIT to 1656 bytes, which outgrew
-  a fixed 1600-byte buffer, and every connection was refused — with a message
-  claiming "no common algorithm", because one string was sent for every
-  negotiation failure. Both are fixed. The lesson generalises: a client release
-  can break a working server without either side being wrong, and a single
-  catch-all error string will misdirect the diagnosis when it does.
 
 - **Only one host key algorithm is offered**, `ecdsa-sha2-nistp256`. It works
   with current OpenSSH. See [ROADMAP.md](ROADMAP.md#ssh) for why that is worth
@@ -1621,15 +951,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   across that reported the whole distance since the last click as one delta, and
   a click after a turn snapped the view to a new direction.
 
-- **A file a program left open cannot be removed until the next boot.** With no
-  per-process ownership of fds, an app that is killed — or that exits without
-  closing, which is what the game's quit path does: it `longjmp`s out of
-  `I_Quit()` precisely to skip the engine's teardown — leaves its open file
-  behind, and LittleFS answers `Device or resource busy` to `rm` on it even as
-  root. For the game that is `/var/lib/doom/doom1.wad`, which it opens at
-  startup and holds for the session, so "delete the WAD and watch it fetch it
-  again" needs a reboot first.
-
 - **Nothing releases the screen when a process exits.** `espix_display_release()`
   is reached only through `espix_gfx_close()`, and an app that exits without
   calling it -- the game does, deliberately: its quit path `longjmp`s out of the
@@ -1688,95 +1009,14 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   -- see the note in [OTA.md](OTA.md).
 
 
-## The `coredump` command panics when there is a dump to read
+## A crash's dump is overwritten by the next one
 
-**Found** while chasing an unrelated panic. Once any crash leaves a dump in the
-coredump partition, running `coredump` over SSH takes the board down again:
+ESP-IDF erases the sectors a new dump needs before writing it, and there is a
+single `coredump` partition, so a second crash destroys the evidence for the
+first. `CONFIG_ESP_COREDUMP_FLASH_NO_OVERWRITE` is unset, which is that
+behaviour; turning it on keeps the first dump until `coredump erase`, at the
+cost of erasing the partition before the next dump can be written.
 
-    assert failed: esp_cache_freeze_caches_disable_interrupts
-    (s_task_stack_is_sane_when_cache_frozen())
+Anything that maps the MMU while reading a dump — `coredump`, `upgrade` — must
+run on an internal stack, which is what `espix_cmd_t.internal_stack` is for.
 
-crashed task `sshd:conn`, through `esp_core_dump_get_summary()` ->
-`elf_core_dump_image_mmap()` -> `esp_partition_mmap()` -> `mmu_map` ->
-`s_stop_cache()`.
-
-The assert is IDF's rule that the task which freezes the cache may not have its
-stack in PSRAM -- freezing the cache makes that stack unreachable. The
-connection tasks have had PSRAM stacks since they were moved there, and
-`esp_core_dump_get_summary()` reads the dump by memory-mapping flash, which
-freezes the cache. Every condition has to hold at once, which is why it went
-unnoticed: no dump, or an internal stack, and there is nothing to see.
-
-**It cascades.** The test runner's health check asks for the coredump, so the
-first panic makes the check itself panic, and `reset-reason-changed` then
-reports a panic on every later run until someone erases the dump with
-`coredump erase`.
-
-**Fixed.** The shell already had the right mechanism and this command did not
-use it. `espix_cmd_t.internal_stack` runs a command on a task whose stack comes
-from `xTaskCreate` instead of `xTaskCreateWithCaps(MALLOC_CAP_SPIRAM)`
-(session.c), and `upgrade` has carried it since it panicked for exactly this
-reason. `coredump` was registered without it, so it ran on the connection
-task's PSRAM stack. It sets it now. The boot-time report was never affected:
-`espix_fault_report_coredump()` runs on the init task, whose stack is internal.
-
-**The lesson is the audit, not the flag.** Everything a session runs has a PSRAM
-stack: the connection task, and `run_on_own_task()` too, which prefers PSRAM and
-only goes internal when a command asks for it (`cmd->internal_stack`). So "which
-commands rewrite the MMU" is a question someone has to keep asking. Today there
-are two answers -- `upgrade`, because `esp_image_verify()` maps the slot it is
-about to boot, and `coredump` -- and only the first had the flag.
-
-Recorded here because the first diagnosis of a panic after this lands is wrong:
-the coredump on the device is the *previous* fault, and asking about it is a
-second one. **This happened twice in one session**, and the second panic
-overwrites the dump -- so the panic that actually mattered is unrecoverable and
-the board appears to reset at random. That is why this is worth more than its
-own severity: it destroys the evidence for everything else.
-
-**Why overwriting happens, since it is not obvious and is a choice.** ESP-IDF
-offers both behaviours and defaults to this one:
-
-    config ESP_COREDUMP_FLASH_NO_OVERWRITE
-        bool "Don't overwrite existing core dump"
-        default n
-        help
-            ... Enable this option to only keep the first of multiple core dumps.
-            If enabled, the core dump partition must be erased before the first
-            core dump can be written.
-
-and espix leaves it unset (`# CONFIG_ESP_COREDUMP_FLASH_NO_OVERWRITE is not
-set`). With it off, `esp_core_dump_flash_write_prepare()` erases the sectors the
-*new* dump needs at `core_dump_flash.c:239` before writing, with no test for an
-existing one. There is a single `coredump` partition (0x12000, 0xE000 on the
-S31), so it is strictly last-crash-wins.
-
-Turning it on keeps the **first** dump until someone runs `coredump erase`,
-which is the behaviour wanted while this whole class of panic is being chased --
-at the stated cost that the partition must be erased before the next dump can be
-written. `CONFIG_ESP_COREDUMP_USE_STACK_SIZE=y` is already set and is unrelated:
-it gives the coredump *writer* a DRAM stack, which is why writing a dump from a
-PSRAM-stacked task is fine, and reading one is not.
-
-This is unrelated to the per-process arena (R-P1.2): it is the transport and
-IDF's cache rule.
-
-
-## A thread that exits holding the process's stdout closes it
-
-**Found** the first time app threads were given the process's streams. An app's
-stdout is a funopen() object over its session, held in the reent of the task
-that entered app_main(). Giving a *thread* that same FILE in its own reent makes
-it able to print -- and makes its death close the stream: FreeRTOS deletes a
-task by running _reclaim_reent() on its reent, which fcloses every stream in it
-that is not the global one. The next write from the process then asserts in
-puts() with "spinlock_acquire spinlock.h:142", because the FILE's lock was
-released from the deleting context.
-
-The fix is the one the kill path already used: put the globals back before the
-reent is reclaimed. abi_pthread.c does it on the trampoline's way out, and in a
-wrapper around pthread_exit, since a thread that ends that way never returns
-through the trampoline. See the R-P1.10 section of APP-MEMORY.md.
-
-Worth knowing because the symptom names puts() and a spinlock, and nothing in it
-says streams or threads.

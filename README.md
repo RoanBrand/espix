@@ -51,7 +51,6 @@ together.
 | Storage | Serve the stick over the network | **yes** | NFSv3: the portmapper, mountd and nfsd, statd so a client needs no lock option, and a write path (writable unless the export says `ro`); a Linux or macOS client mounts it with no options, a 500-entry listing is one directory walk, and 4 MiB copies at ~410 KB/s — [NFS.md](docs/NFS.md) |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
 | Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` — an allowlist in `components/espix_proc/abi_*.c`, so a name espix does not publish stops an app loading rather than loading and answering ENOSYS |
-| Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |
 | Programs | Serve a web UI or an API | **planned** | an app behind `confine`, serving out of its own view of the filesystem |
 | Programs | USB keyboard and mouse | **yes** | boot-protocol HID on the host port, decoded to X11 keysyms and fed to the same input path a viewer's events use; a keyboard and a wireless receiver's mouse both verified — [USB-HOST.md](docs/USB-HOST.md) |
@@ -59,23 +58,19 @@ together.
 | Programs | Fetching a file over HTTP(S) | **yes** | `fetch <url> <path>`, sharing `upgrade`'s HTTP and TLS stack and certificate bundle; checks room first and says where to get some back. An app declares its data in `/etc/apps/<name>.conf` and the launcher — desktop icon or command line — fetches anything missing before it starts, so no program holds a network handle of its own |
 | Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
 | Shell | Serial console and SSH, same commands | **yes** | 87 commands |
-| Shell | Redirection, quoting, exit status | **yes** | fd-numbered and attached forms (`2>/dev/null`, `>file`), and `2>` separates over SSH too |
-| Shell | Line editing, history, TAB completion | **yes** | |
-| System | Services and timers that outlive a login | **yes** | `/etc/units`: `always`, `once` or `every <interval>` units (a program or a shell builtin), a supervisor task, safe mode after a fault, and a built-in default that runs the update check on a schedule |
+| System | Services and timers that outlive a login | **yes** | `/etc/units` is written on the first boot from a self-documenting template at 0600: `always`, `once` or `every <interval>` units (a program or a shell builtin), a supervisor task, `service` to manage them, and safe mode after a fault; the update check `autoupdate` is on by default |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
 | Networking | WiFi access point | **yes** | `wifi ap start` brings up `wlan1` beside the station and NATs clients out the uplink; one radio, one AP, shared channel |
 | Networking | SSH server, `scp`/`sftp` | **yes** | permission-checked like the shell |
 | Networking | SSH port forwarding, `ssh -L` | **yes** | `direct-tcpip`, so `ssh -N -L 5900:127.0.0.1:5900 esp@<board>` reaches a service on the board over an encrypted, authenticated connection; destinations default to the device itself, and `ssh -R` is not implemented |
 | Networking | mDNS/DNS-SD: <hostname>.local | **yes** | advertises the hostname and _ssh/_sftp-ssh, so ssh esp@esp32s31-d0762a.local works without knowing the address; on by default like a Raspberry Pi image, and enabled=no in /etc/mdns.conf turns the announcement off without a rebuild (CONFIG_ESPIX_MDNS=n leaves it out of the image) |
-| Networking | WireGuard VPN server | **yes** | a WireGuard server for the house: vpn add makes a client and vpn qr shows it as a QR to scan, clients reach the LAN and the internet through wg0, vpn dns router hands them the home resolver, and a vpn unit brings it all back at boot |
+| Networking | WireGuard VPN server | **yes** | the lwip port as a server for the house: `vpn setup` then `up`/`down`/`status`, peers added by name with a QR code for a phone, clients reach the LAN and the internet through `wg0`, `vpn dns router` hands them the home resolver, and a `vpn` unit brings it all back at boot |
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
 | Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
 | Networking | IPv4 routing and NAT | **yes** | `nat on <dev>` masquerades an inside interface out the default route; `ESPIX_NET_ROUTER` is on by default |
 | Networking | L2 bridging | **yes** | `bridge add <port>` then reboot: `br0` owns the address, ports have none; AP↔Ethernet, never a station (802.11 three-address frames) |
 | Networking | DHCP server for the LAN | **partial** | the AP and `usb0` both serve; DNS is the uplink's resolver passed through, not a local one |
 | Networking | Isolation and firewall | **planned** | NAT is not a firewall; guest zones and port-forwards are later |
-| Networking | A VPN endpoint | **yes** | WireGuard (the lwip port) as a server: `vpn setup`, then `up`/`down`/`status`, peers added by name with a QR code for a phone, `list` and `remove`, and the endpoint and DNS it hands out; a unit brings `wg0` up at boot |
-| Faults | Permissions enforced in espix's own VFS | **yes** | builtins, loaded apps and SFTP alike |
 | Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
 | Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
 | Audio | Play an MP3 or WAV to a Bluetooth speaker | **yes** | S31 only: `bluetoothctl` pairs/connects the sink, then `play <file|url>` streams to it — a real 64 kbps stereo MP3 plays clean at ~16% of one core, ring full, no underruns; [AUDIO.md](docs/AUDIO.md) |
@@ -94,8 +89,7 @@ together.
 | Display | Fitting a picture to a window | **yes** | `espix_surface_scale` — PPA SRM with the scale factors set, and a nearest-neighbour loop where there is no PPA at all, which is the S3 |
 | Display | A system tray, beyond the clock | **no** | one item is the look; radio status, volume and the rest wait for something to report them |
 | Display | A terminal you can work in | **yes** | the desktop's terminal window runs a real shell session — the same `espix_term` as the on-screen console, so the motd, the prompt, history, arrows, Ctrl-C and every command work there; a close button sits in the title bar |
-| Services | Something that starts at boot and stays up | **yes** | `/etc/units`: `always`, `once` and `every <interval>` units run by a supervisor task, with safe mode after a fault and `service` to start, stop, restart and list them |
-| Services | Scheduled work: a `cron` | **partial** | units with `every <interval>` — the update check is one, every 6h; crontab syntax, per-user jobs and `at` are not there |
+| Services | Scheduled work: a `cron` | **partial** | units with `every <interval>` — `autoupdate` is one, every 6h; crontab syntax, per-user jobs and `at` are not there |
 
 ## Targets
 
@@ -359,8 +353,8 @@ than of the filesystem. See [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 
 Downloads run at about 355KB/s over 2.4GHz WiFi. Uploads are much slower, and
 bounded by LittleFS erasing a block per write rather than by the network — see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the measurements and for where
-the per-connection buffers live.
+[docs/PROFILING.md](docs/PROFILING.md#transfer-throughput-scp-and-the-filesystem)
+for the measurements.
 
 Eight connections may be open at once (`ESPIX_SSH_MAX_SESSIONS`), so a transfer
 can run while you are logged in. The serial console stays independent, and `dmesg`

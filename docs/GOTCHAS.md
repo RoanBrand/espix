@@ -387,6 +387,31 @@ IDF exposes no Kconfig for it, and there is no supported hook for adding an
 mbedtls define — so reaching it means patching a vendored config, and it is
 unverified whether PSA's `psa_raw_key_agreement()` would route to it even then.
 
+### A PSA key id is an id, and `free()` is not `psa_destroy_key()`
+
+`ssh_conn_t` holds `mbedtls_svc_key_id_t` fields (`ssh_priv.h:181`)
+— a cipher key and a MAC key per direction. Those are *identifiers* into
+mbedTLS's PSA key store, not the key material, so `free(conn)` releases the
+struct and leaves four key slots and two cipher operations live. Measured:
+roughly **200-400 bytes of internal heap per connection**, never recovered,
+about 4000 connections from exhausting RAM. It stayed quiet because
+`MBEDTLS_PSA_KEY_STORE_DYNAMIC` is on by default in tf-psa-crypto, so slots
+are heap-allocated with no fixed count; under the static store the same bug
+would have failed a key exchange after `MBEDTLS_PSA_KEY_SLOT_COUNT / 4`
+connections instead — a much easier symptom to chase than a slow drain.
+
+`ssh_kex_release_keys()` (`ssh_kex.c:450`) aborts the operations and
+destroys the keys, and is called from the connection teardown
+(`ssh_server.c:596`) on every exit path, the ones where the handshake never
+finished included, because missing the failure paths is how this class of leak
+survives. It is safe on a zeroed connection: `ssh_conn_t` is calloc'd and
+`psa_destroy_key(0)` is a documented no-op. The host key is deliberately not
+touched — it is imported once in `ssh_hostkey.c:39` and belongs to the
+process, not to a connection.
+
+The general rule, for anything else that reaches for PSA: if a struct holds a
+PSA identifier, freeing the struct is not releasing the resource.
+
 ### Flash auto-suspend is the tidier fix, and depends on your flash chip
 
 `CONFIG_SPI_FLASH_AUTO_SUSPEND` is the option that makes the machine behave the
@@ -636,6 +661,34 @@ Worth knowing on top of those: a path-based open costs **two** entries for one
 file — IDF's own, for the number the driver returned (`vfs_calls.c:56`), and
 whatever the driver allocated itself — and IDF's close releases only its own.
 
+### IDF's own `/dev/null` outranks a root VFS, and a synthetic `DIR` starts with a real one
+
+espix registers its VFS at `""`, IDF's fallback for any path no other VFS
+claims. A *longer* prefix therefore wins, and IDF registers a nullfs at
+`/dev/null` by default (`CONFIG_VFS_INITIALIZE_DEV_NULL`,
+`vfs/Kconfig:107`). Three characters beat zero, so `/dev/null` reaches
+IDF's node before espix sees the path: it shadows espix's own node and bypasses
+`espix_fs_access_check()` on the way. espix owns the whole of `/dev`,
+so that copy must not be registered, and `CONFIG_VFS_INITIALIZE_DEV_NULL=n`
+is set with that reason beside it in `sdkconfig.defaults`.
+
+What replaces it is a synthetic tree inside espix's own VFS
+(`espix_fs/synth.c`). The wrinkle is the handle: `esp_vfs_opendir()`
+stamps `dd_vfs_idx` into whatever `DIR *` comes back
+(`vfs_calls.c:324`) and every later `readdir`/`seekdir`/
+`closedir` routes on that field (`vfs_calls.c:331` onward). The
+synthetic handle is a `synth_dir_t` whose first member is a real `DIR`,
+out of a fixed pool rather than a `malloc` per call, so the field IDF reads
+is genuinely there. The same stamp is harmless on a forwarded littlefs handle
+only because that forwarding is a direct call and the port never reads it.
+
+The modes come from the table, not from the mode rule. `espix_synth_mode()`
+(`synth.c:222`) returns the node's own mode, and the check reads it
+(`mode.c:330`). That is load-bearing for `/dev/null`: the table says
+`0666`, while the rule would find an empty file, no ELF magic, and answer
+`0644` — leaving a non-root shell unable to redirect into the sink that
+exists to accept anything.
+
 ## Build and configuration
 
 ### `sdkconfig` wins, and it is usually not in version control
@@ -665,12 +718,63 @@ Which makes it invisible to a `make` recipe's subshell, and `IDF_PATH` alone is
 not enough to reconstruct it. espix shells out to `tools/idf.sh`, which finds an
 SDK for itself.
 
+### An undefined bool is `n`, and the log maximum is DEBUG though the comment says INFO
+
+Kconfig cannot say "this bool was never set". An unset bool is `n`, so a
+`default y` option that fails to regenerate — the `sdkconfig` trap
+above — turns itself off silently, and its off path is the one nobody tested.
+espix names the boolean as the opt-*out* where it can: `ESPIX_KLOG_QUIET`
+(`components/espix_kernel/Kconfig`), default `n`, rather than an
+`ESPIX_KLOG_ECHO_CONSOLE` default `y`. A missing symbol then yields
+the behaviour that was wanted anyway.
+
+The compile-time log maximum is the same class of surprise, and here the tree
+contradicts its own comment. `sdkconfig.defaults` says "leave the
+compile-time maximum at INFO" beside `CONFIG_LOG_DEFAULT_LEVEL_INFO=y`, but
+further down it sets `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y` for the USB stack:
+the stack logs enumeration at DEBUG, and with the maximum at INFO those messages
+are not compiled into the image at all, so "no output" means nothing rather than
+"nothing happened". The effective value is DEBUG, which also compiles in
+espcoredump's `ESP_COREDUMP_LOG` calls (`esp_core_dump_types.h`:
+`if (LOG_LOCAL_LEVEL >= level) { esp_rom_printf(...) }`) — the cost
+described under *A DEBUG log level buries crash reports* below.
+`CONFIG_LOG_DEFAULT_LEVEL` stays INFO, so nothing is noisier unless a tag
+is raised.
+
 ### A DEBUG log level buries crash reports
 
-`CONFIG_LOG_DEFAULT_LEVEL` at DEBUG does not merely allow debug output:
-espcoredump's macros gate on `LOG_LOCAL_LEVEL` at compile time and write
-straight to `esp_rom_printf`, bypassing the runtime level — so every crash
-arrives under a page of core-dump tracing.
+Not the runtime level: `CONFIG_LOG_DEFAULT_LEVEL` is INFO in this tree. It
+is the compile-time maximum. `LOG_LOCAL_LEVEL` defaults to
+`CONFIG_LOG_MAXIMUM_LEVEL` (`esp_log_level.h:57`), which espix sets
+to DEBUG so the USB stack's enumeration logging exists in the image at all.
+espcoredump's `ESP_COREDUMP_LOG` then compiles to an
+`if (LOG_LOCAL_LEVEL >= level)` guard around `esp_rom_printf(...)`
+(`esp_core_dump_types.h:22`), so every `LOGD` call is compiled in
+and writes straight to the console, bypassing the runtime level — and with
+`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH` the per-segment, per-task and
+per-register trace lines are `LOGD` too. A crash arrives under a page of
+core-dump tracing.
+
+### The panic wrap is dropped without `WHOLE_ARCHIVE`, and its handler cannot run from IRAM
+
+espix routes every panic through `__wrap_esp_panic_handler`
+(`-Wl,--wrap=esp_panic_handler`, from `espix_fault/CMakeLists.txt`), the
+same seam IDF's own test suite uses. Two build facts hold that arrangement up,
+and each fails silently if ignored.
+
+The wrap symbol is referenced **only by the linker**, so without `WHOLE_ARCHIVE`
+on `espix_fault` the object holding it is dropped from the static library
+and the wrap does nothing at all: panics take the stock path and the fault
+record is never written. There is no error and no warning — the only symptom is
+a post-mortem that never appears.
+
+The handler is also not IRAM-safe. It reads task names and the process table
+from the panic path, which needs the flash cache to be available, so
+`CONFIG_ESP_PANIC_HANDLER_IRAM` must stay off. IDF's option exists for the
+opposite case — crashing with the cache already disabled — and its own Kconfig
+help says so. `fault.c` carries an `#error` for the combination rather
+than build a handler that faults while reporting a fault. Every checked-in
+`sdkconfig.*` has it unset.
 
 ### A write that "succeeded" has not been written yet
 
@@ -686,9 +790,8 @@ Found here by doing exactly that: `cp` into a freshly mounted FAT volume checked
 the empty file turned out *not* to be this bug. Six of seven copies wrote their
 fifteen bytes; one arrived as an empty file, and the `fclose()` that would have
 reported a failure returned success. What is left is in
-[KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem), and
-[UPSTREAM.md](UPSTREAM.md) explains why the reporting had to come first: the
-layer below throws away the sense data that would have named the cause.
+[UPSTREAM.md](UPSTREAM.md), which explains why the reporting had to come first:
+the layer below throws away the sense data that would have named the cause.
 
 ### A configure-time hook is not a build-time guarantee
 

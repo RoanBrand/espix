@@ -395,7 +395,7 @@ that exists.
    `exfat/ntfs is not supported`, an installer stick's ISO partition says
    `iso9660 is not supported`; `umount /mnt` while a file is open says `busy`;
    and **do not pull the stick while it is mounted** — that is the gap in
-   [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem), not a test.
+   [KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host), not a test.
 5. **Pull it out:** `dmesg` says `sda: removed`, `lsblk` no longer lists it, and
    the *name* is immediately reusable — a second device took `sda` again.
    `free` before and after is the check that the slot and its buffers went back.
@@ -474,8 +474,8 @@ espix sees the path: no `resolve()`, no `espix_fs_root_permits()`, no cwd. A
   not the rule's default would have stored littlefs attributes for a path that is
   not on littlefs.
 
-So espix routes it itself, which is what [ROADMAP.md](ROADMAP.md#filesystem)
-planned: `components/espix_fs/vfs.c` holds a table of mounts, picks one by
+So espix routes it itself, which is what the plan called for and what is now
+built: `components/espix_fs/vfs.c` holds a table of mounts, picks one by
 longest matching prefix, and reaches the filesystem below by a direct call to its
 ops. `/mnt/photo.jpg` passes through the same code and the same check as
 `/etc/passwd`.
@@ -484,7 +484,7 @@ ops. `/mnt/photo.jpg` passes through the same code and the same check as
 |---|---|
 | `lower_t s_mounts[ESPIX_FS_MAX_MOUNTS]` | the single `lower_t` that was always described as "an array when mounting lands" |
 | `espix_vfs_add_mount()` / `_del_mount()` | publish and remove a filesystem at a prefix; the root is slot 0 |
-| `espix_fs_meta_t` | where a mount's modes and owners come from: `LOWER` for ext, which reads its inodes, `ESPIX` for littlefs (a user attribute), `NONE` for FAT — whoever mounted it, then the rule |
+| `espix_fs_meta_t` | where a mount's modes and owners come from: `LOWER` for a filesystem that keeps its own -- ext's inodes, and FAT's, which is to say the mount owner -- `ESPIX` for littlefs (a user attribute), `NONE` for a path no mount claims, which falls through to the rule |
 | `components/espix_fs/fat.c` | the FAT driver: IDF's ops behind 24 shims that strip the mount prefix and hand IDF its own context back |
 | `tools/patch-fatfs.py` | gives IDF's FatFs a mount-without-registering split; see below |
 
@@ -575,11 +575,11 @@ records it.
 - **`umount` refuses while something is open on the mount.** It answers `busy` and
   says why, rather than pulling a volume out from under a reader who is halfway
   through a file.
-- **Unplugging a mounted stick is not handled yet.** The block device is borrowed
-  from espix_usb, which gives it back when the device goes, and a filesystem still
-  holding it would be reading memory that was freed. Unmount first —
-  [KNOWN-ISSUES.md](KNOWN-ISSUES.md#filesystem) has the mechanism and the fix
-  that is next.
+- **Unplugging a mounted stick is handled, except mid-write.** An idle pull
+  auto-unmounts, and a mount with a file open is marked dead so I/O fails rather
+  than following a freed device; what is left is a transfer already in flight.
+  Unmount first — [KNOWN-ISSUES.md](KNOWN-ISSUES.md#usb-host) has the mechanism
+  and that gap.
 - **`df` still reports the rootfs.** Per-mount free space is one `f_getfree()`
   away and not yet wired to a command.
 - **Two volumes at a time, for now.** `CONFIG_FATFS_VOLUME_COUNT` is 2 — IDF's
@@ -764,13 +764,10 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
   ships with the bundled FatFs — so check Microsoft's own terms before shipping
   it on by default.** NTFS is still named and still unsupported: FatFs has no
   NTFS, and `lsblk`/`blkid` naming it is the honest half.
-- **lwext4** for ext2/3/4, and a much later `lwntfs`. Until then, `lsblk` naming
-  them as recognised-but-unsupported is the honest position, and it is what this
-  stage delivers. ext2/3/4 is now planned rather than merely named — a
-  third-party ESP-IDF port, vendored and pinned, read-only first — and
-  [ROADMAP.md](ROADMAP.md#ext234-via-a-port-rather-than-a-library) carries the
-  cost, the licence fork and the three things that would otherwise surface as
-  surprises.
+- **lwext4** for ext2/3/4, and a much later `lwntfs`. ext2/3/4 is built now:
+  `components/espix_fs/ext.c` mounts ext2, ext3 and ext4 through espix's VFS,
+  read-only by default and writable with `mount -o rw`, so `lsblk` no longer
+  marks those types unsupported.
 - **Whether VBUS needs board-side control: it does not, here.** Answered for one
   hub on one board — a PD hub that powers the board *and* enumerates devices
   works, with the board taking its power through the same socket the host

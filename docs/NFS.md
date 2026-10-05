@@ -225,10 +225,12 @@ the bugs in this file were found by exactly that.
   `NFS3ERR_ROFS` to every writing procedure; with no option the export is
   writable, as espix's mounts are.
 - **NFSv3 only.** No v4, and no NFS over RDMA, obviously.
-- **No squashing.** A file is reported with the uid and gid of the mount's owner
-  and no client identity is rewritten: root on the client is root on the wire.
-  Exports are meant for a private LAN, which is also why `/etc/exports` is not
-  narrowed by default.
+- **A squash decides access, not ownership.** What a client may do is the
+  export's to say, and `root_squash` is the default: a client's uid 0 becomes
+  nobody for the permission check that follows. What it does not change is who
+  owns a file -- espix decides that from the path (the rootfs) or from the mount
+  (FAT), never from who created it. Exports are meant for a private LAN, which is
+  also why `/etc/exports` is not narrowed by default.
 - **No advisory locking.** statd answers so that a client will mount; there is no
   lock manager behind it, so `flock`/POSIX locks between clients are not
   arbitrated and a lock is local to the client that took it.
