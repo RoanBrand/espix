@@ -39,9 +39,11 @@ macOS, the same way:
 $ sudo mount -t nfs 192.168.110.203:/mnt/sda1 /tmp/stick
 ```
 
-A macOS client asks the server for statd before it will mount with locking
-enabled, which is why that program is served; `-o nolocks` remains the option
-that turns locking off entirely.
+Verified with no options on both: Linux mounts it as `vers=3` with
+`local_lock=none`, and macOS mounts it and lists the same ownership. A macOS
+client asks the server for statd before it will mount with locking enabled, which
+is why that program is served; `-o nolocks` remains the option that turns
+locking off entirely.
 
 ## What is served, and where
 
@@ -92,11 +94,20 @@ for is not.
 
 A file handle is 28 bytes and names a slot in a table of paths rather than
 carrying a path: a 64-byte handle cannot hold one, and a path changes when a
-directory is renamed. The table is 1024 slots in PSRAM, allocated on first use
-and freed once nobody has asked for a handle for 30 seconds, so a 500-entry
-listing -- which looks up every entry -- has room. A handle whose slot is gone or
-whose client has lost its permission answers `NFS3ERR_BADHANDLE`, which clients
-are built to recover from.
+directory is renamed. The table is 1024 slots in PSRAM -- 258 KB, because a slot
+holds a path of the 256 bytes espix allows anywhere, and most paths are thirty --
+allocated on the first handle a client asks for.
+
+It is given back the moment no client can be holding one: mountd's UMNT, which a
+client sends when it unmounts, or the daemon stopping. That signal and not a
+timer, because a client using the handles it has mints none, so its silence says
+nothing, and a table that aged out would take with it handles the client is still
+holding. Measured on the board, PSRAM in use: 291 KB with nothing mounted, 557 KB
+while a client has the export mounted, 297 KB once the client unmounts -- macOS
+included. A client that never unmounts -- it crashed, or the cable went -- keeps
+the table, which is the safe direction of that trade. A handle whose slot has been
+reused, or whose client has lost its permission, answers `NFS3ERR_BADHANDLE`,
+which clients are built to recover from.
 
 A listing is **one** directory walk. `READDIRPLUS` carries each entry's
 attributes and a ready-made handle, both taken from the walk rather than from a

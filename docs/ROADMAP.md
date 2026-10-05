@@ -1271,6 +1271,25 @@ both are the sort of thing that is cheaper to know now.
   because an app's stdout is its session stream (R-P2.5), and a job stage
   that owns a redirection is not built (R-P2.8).
 
+- **An NFS handle table that does not pay a path per handle.** A handle names a
+  slot in a table of paths, because 28 bytes cannot hold a path and a path is not
+  what stays still when a directory is renamed -- [NFS.md](NFS.md) has the shape.
+  Each slot is a fixed 256 bytes, the longest path espix allows anywhere, so 1024
+  slots is 264 KB of PSRAM and the paths on a stick are 30 bytes. The table is
+  now given back when the last client unmounts, so the idle cost is zero; the
+  *mounted* cost is still a path's worst case multiplied by a directory's worth
+  of entries.
+
+  Keeping the paths in one pool and the slots as (offset, length) is eight bytes
+  rather than 258: an 8 KB index and a 64 KB pool holding about two thousand short
+  paths, so ~72 KB for more capacity than today. What makes it more than a
+  rewrite is eviction, and it has to be decided rather than discovered: a path
+  overwritten while a client still holds its handle resolves to the *wrong* file,
+  which is worse than failing. Either the pool is never reclaimed until the table
+  is released -- a full pool then means what a full table means today -- or the
+  oldest slot goes first and the client recovers from `NFS3ERR_BADHANDLE` as it
+  already does. Worth measuring which of the two a real stick reaches first.
+
 ## Audio
 
 Phase 1 (Bluetooth speaker playback) is built; [AUDIO.md](AUDIO.md) has what it

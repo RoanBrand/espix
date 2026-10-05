@@ -58,18 +58,26 @@ typedef struct {
 } nfs_slot_t;
 
 /*
- * The handle table: PSRAM, allocated on first use, freed once nobody has asked
- * for a handle for a while. A client looks up every entry it lists, so a
- * 500-entry directory needs about 500 handles alive at once. The old fixed
- * 128-slot array wrapped during that and evicted the directory own handle; the
- * next page came back NFS3ERR_BADHANDLE, which macOS abandons the listing
- * over -- that was the stop at exactly 127 entries.
+ * The handle table: PSRAM, allocated on first use and kept for as long as the
+ * daemon runs. A client looks up every entry it lists, so a 500-entry directory
+ * needs about 500 handles alive at once. The old fixed 128-slot array wrapped
+ * during that and evicted the directory's own handle; the next page came back
+ * NFS3ERR_BADHANDLE, which macOS abandons the listing over -- that was the stop
+ * at exactly 127 entries.
+ *
+ * It is never freed while the daemon lives, and that is not an optimisation
+ * left undone. A table that ages out would take with it handles the client is
+ * still holding: macOS mounted, listed, went quiet for a minute, listed again,
+ * and every request came back BADHANDLE -- because the free was timed from the
+ * last handle *minted*, and a client using the handles it already has mints
+ * none. There is no signal that a client is finished with a handle, so the
+ * only safe lifetime is the daemon's. 1024 slots of a 256-byte path is 258 KB
+ * of PSRAM (2% of the 13 MB free), and none of it is touched until a client
+ * asks for its first handle.
  */
 static nfs_slot_t *s_slots;
-static uint16_t    s_next_id = 1;
+static uint32_t    s_next_id = 1;
 static int         s_cursor;
-static uint32_t    s_last_ms;
-#define SLOTS_IDLE_MS 30000
 
 /*
  * The address the current request came from. The daemon serves one request at a
@@ -96,13 +104,6 @@ static bool slots_ensure(void)
         if (s_slots == NULL) {
             s_slots = heap_caps_calloc(PATH_SLOTS, sizeof(*s_slots), MALLOC_CAP_8BIT);
         }
-        s_last_ms = (uint32_t)esp_log_timestamp();
-    }
-    if (s_slots != NULL && s_last_ms != 0 &&
-        (uint32_t)((uint32_t)esp_log_timestamp() - s_last_ms) > SLOTS_IDLE_MS) {
-        free(s_slots);              /* nobody is holding a handle any more */
-        s_slots = NULL;
-        return slots_ensure();
     }
     return s_slots != NULL;
 }
@@ -137,7 +138,8 @@ static bool fh_resolve(const uint8_t *fh, size_t len, int *exp,
     }
 
     const int      e  = fh[4];
-    const uint16_t id = (uint16_t)(fh[5] | (fh[6] << 8));
+    const uint32_t id = (uint32_t)fh[5] | ((uint32_t)fh[6] << 8) |
+                        ((uint32_t)fh[7] << 16) | ((uint32_t)fh[8] << 24);
     if (e < 0 || e >= nfsd_exports_count() || s_slots == NULL) {
         return false;
     }
@@ -167,7 +169,6 @@ static bool fh_make(int exp, const char *path, uint8_t *fh, size_t *len)
     if (!slots_ensure()) {
         return false;
     }
-    s_last_ms = (uint32_t)esp_log_timestamp();
     int slot = -1;
 
     for (int i = 0; i < PATH_SLOTS; i++) {
@@ -189,8 +190,9 @@ static bool fh_make(int exp, const char *path, uint8_t *fh, size_t *len)
     fh[0] = 'E'; fh[1] = 'S'; fh[2] = 'P'; fh[3] = 'X';
     fh[4] = (uint8_t)exp;
     fh[5] = (uint8_t)(s_slots[slot].id & 0xFF);
-    fh[6] = (uint8_t)(s_slots[slot].id >> 8);
-    fh[7] = 0;
+    fh[6] = (uint8_t)((s_slots[slot].id >> 8) & 0xFF);
+    fh[7] = (uint8_t)((s_slots[slot].id >> 16) & 0xFF);
+    fh[8] = (uint8_t)((s_slots[slot].id >> 24) & 0xFF);
 
     /* The rest is a hash of the path rather than padding: a handle the client
      * carries around should look like the opaque bytes a server hands out, and
@@ -199,7 +201,7 @@ static bool fh_make(int exp, const char *path, uint8_t *fh, size_t *len)
     for (const char *p = path; p != NULL && *p != '\0'; p++) {
         h = (h ^ (uint8_t)*p) * 16777619u;
     }
-    for (size_t i = 8; i < FH_LEN; i++) {
+    for (size_t i = 9; i < FH_LEN; i++) {
         fh[i] = (uint8_t)(h >> ((i % 4) * 8));
         h = h * 16777619u + 0x9e3779b9u;
     }

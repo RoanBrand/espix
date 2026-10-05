@@ -392,6 +392,77 @@ static size_t handle_nsm(const rpc_call_t *c, xdrw_t *w)
     }
 }
 
+/*
+ * Which client has which export mounted, so the handle table can be given back
+ * the moment nobody holds a handle. That moment is only ever known because a
+ * client said so: mountd's UMNT, which clients send when they unmount. An entry
+ * is twelve bytes and there are eight, the same ceiling the export client lists
+ * have.
+ *
+ * A client that never unmounts -- it crashed, or the cable went -- keeps its
+ * entry, and the table is kept for it. That is the safe direction: a handle
+ * still held has to resolve, and one we have forgotten cannot.
+ */
+#define MAX_MOUNTED 8
+
+static struct {
+    uint32_t addr;                  /* network order, as sin_addr is */
+    int      exp;                   /* index into the export table */
+    int      n;                     /* mounts of it by this address */
+} s_mounted[MAX_MOUNTED];
+
+static void mount_add(uint32_t src, int exp)
+{
+    for (int i = 0; i < MAX_MOUNTED; i++) {
+        if (s_mounted[i].n > 0 && s_mounted[i].addr == src &&
+            s_mounted[i].exp == exp) {
+            s_mounted[i].n++;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_MOUNTED; i++) {
+        if (s_mounted[i].n == 0) {
+            s_mounted[i].addr = src;
+            s_mounted[i].exp  = exp;
+            s_mounted[i].n    = 1;
+            return;
+        }
+    }
+}
+
+static bool nothing_mounted(void)
+{
+    for (int i = 0; i < MAX_MOUNTED; i++) {
+        if (s_mounted[i].n > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* True when that was the last one anywhere, so the handles can go back. */
+static bool mount_remove(uint32_t src, int exp)
+{
+    for (int i = 0; i < MAX_MOUNTED; i++) {
+        if (s_mounted[i].n > 0 && s_mounted[i].addr == src &&
+            s_mounted[i].exp == exp) {
+            s_mounted[i].n--;
+            break;
+        }
+    }
+    return nothing_mounted();
+}
+
+static bool mount_remove_all(uint32_t src)
+{
+    for (int i = 0; i < MAX_MOUNTED; i++) {
+        if (s_mounted[i].addr == src) {
+            s_mounted[i].n = 0;
+        }
+    }
+    return nothing_mounted();
+}
+
 static size_t handle_mount(const rpc_call_t *c, xdrw_t *w, uint32_t src)
 {
     switch (c->proc) {
@@ -425,6 +496,8 @@ static size_t handle_mount(const rpc_call_t *c, xdrw_t *w, uint32_t src)
             return w->len;
         }
 
+        mount_add(src, (int)(e - s_exports));
+
         xdrw_u32(w, 0);                         /* MNT3_OK */
         xdrw_u32(w, (uint32_t)fhlen);
         xdrw_opaque(w, fh, fhlen);
@@ -433,12 +506,25 @@ static size_t handle_mount(const rpc_call_t *c, xdrw_t *w, uint32_t src)
         return w->len;
     }
 
-    case 3: {                                   /* UMNT */
+    case 3: {                                   /* UMNT: this client is done */
+        rpc_call_t args = *c;
+        char       dir[256];
+        if (!rpc_get_string(&args, dir, sizeof(dir))) {
+            xdrw_accept(w, RPC_GARBAGE_ARGS);
+            return w->len;
+        }
+        const nfs_export_t *e = export_for(dir);
+        if (e != NULL && mount_remove(src, (int)(e - s_exports))) {
+            nfs3_slots_cleanup();               /* nobody holds a handle now */
+        }
         xdrw_accept(w, RPC_SUCCESS);
         return w->len;
     }
 
     case 4:                                     /* UMNTALL */
+        if (mount_remove_all(src)) {
+            nfs3_slots_cleanup();
+        }
         xdrw_accept(w, RPC_SUCCESS);
         return w->len;
 
@@ -795,6 +881,9 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     free(s_io);      s_io = NULL;
     free(s_exports); s_exports = NULL;
     s_nexports = 0;
+    /* Nothing can be holding a handle: no daemon is left to resolve one. */
+    nfs3_slots_cleanup();
+    memset(s_mounted, 0, sizeof(s_mounted));
     return ESP_OK;
 }
 
