@@ -8,15 +8,20 @@ has to be installed on the other side.
 ```sh
 $ cat /etc/exports
 # espix NFS exports: <path> <client>[(options)], as Linux writes them.
-# Read-only unless a line says rw.
+# Read-write unless a line says ro.
 /mnt/sda1  *(ro)
 ```
 
-**What this is not** is writable by default, or NFSv4. An export is read-only
-unless its line says `rw`, which is espix's default rather than Linux's: a stick
-that becomes writable over the network because nobody wrote `ro` is the wrong way
-round. With `rw` a client creates, writes, renames and removes, and every one of
-those is the filesystem underneath answering -- a read-only mount refuses with
+**What this is not** is NFSv4. An export is read-write unless its line says
+`ro`, which is espix's own convention rather than Linux's: Linux's exports(5)
+has the opposite default -- "the default is to disallow any request which
+changes the filesystem" -- while BSD and macOS export files default to
+read-write. espix follows its *mounts*, which are read-write unless told `ro`,
+so an export with no option is writable as well: the two should not disagree
+about what an unconfigured volume is.
+
+A client with write access creates, writes, renames and removes, and every one
+of those is the filesystem underneath answering: a read-only mount refuses with
 EROFS, a full volume with ENOSPC, and the client gets the errno it was given.
 
 NFSv4 is a different protocol rather than a later version of this one, and is not
@@ -145,11 +150,11 @@ On the ESP32-S31 board, over WiFi:
 | 500-entry directory, Linux client, `ls` | 1.3 s (client startup included) |
 | `ls -l` of the export root | 0.04 s |
 | A file read over NFS | line rate of the link |
-| 2 MiB written, Linux client, `cp` | 8 s (~260 KB/s), sha256 identical |
+| 4 MiB written, Linux client, `cp` | 10 s (~410 KB/s), sha256 identical |
 
 ## Writing
 
-An export that says `rw` is a filesystem a client can change:
+An export is a filesystem a client can change unless it says `ro`:
 
 ```sh
 $ sudo mount -t nfs 192.168.110.203:/mnt/sda1 /mnt/x
@@ -173,9 +178,10 @@ Three things are worth knowing before trusting it with something:
 - **Hard links and symlinks are refused** with `NFS3ERR_NOTSUPP`, which is what
   they are: this filesystem has not got them.
 
-Measured, 2 MiB written over WiFi from a Linux client in a container on the same
-LAN: 8 seconds, about 260 KB/s, with the sha256 of the copy identical to the
-source. Reads are unchanged by the write path existing.
+Measured, 4 MiB written over WiFi from a Linux client in a container on the same
+LAN: 10 seconds, about 410 KB/s, with the sha256 of the copy identical to the
+source. The read and write sizes are both 8192 now; at 4096 the same link
+measured about 260 KB/s, which is what halving the round trips buys.
 
 Two host-side tools live in the tree for the times a kernel client is not enough:
 
@@ -191,9 +197,9 @@ the bugs in this file were found by exactly that.
 
 ## Limits
 
-- **Writes need `rw`.** Without it every writing procedure answers
-  `NFS3ERR_ROFS`; the default is deliberate, and one word in `/etc/exports`
-  changes it.
+- **Writes can be turned off per export.** A line that says `ro` answers
+  `NFS3ERR_ROFS` to every writing procedure; with no option the export is
+  writable, as espix's mounts are.
 - **NFSv3 only.** No v4, and no NFS over RDMA, obviously.
 - **No squashing.** A file is reported with the uid and gid of the mount's owner
   and no client identity is rewritten: root on the client is root on the wire.

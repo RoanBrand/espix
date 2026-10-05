@@ -204,7 +204,14 @@ static int load_exports(void)
         nfs_export_t *e = &s_exports[s_nexports];
         memset(e, 0, sizeof(*e));
         strlcpy(e->path, path, sizeof(e->path));
-        e->ro = true;               /* read-only unless it says otherwise */
+        /*
+         * Read-write unless the line says ro: that is what exports(5) calls
+         * the default, and what espix's own mounts do -- a volume mounted with
+         * no option is writable, so an export with no option is too. The
+         * opposite default was for as long as there was no write path at all,
+         * and it outlived its reason by a release.
+         */
+        e->ro = false;
 
         bool any = false;
         for (char *tok = strtok_r(NULL, " \t\r\n", &save); tok != NULL;
@@ -212,8 +219,27 @@ static int load_exports(void)
             char *opts = strchr(tok, '(');
             if (opts != NULL) {
                 *opts++ = 0;
-                if (strstr(opts, "rw") != NULL) {
-                    e->ro = false;
+                char *close = strchr(opts, ')');
+                if (close != NULL) {
+                    *close = 0;
+                }
+                /*
+                 * Whole words, because the options are a comma-separated list
+                 * and a substring test for "ro" also finds it inside crossmnt
+                 * and in no_root_squash -- which is how an option nobody meant
+                 * to write ends up obeyed.
+                 */
+                for (char *o = opts; *o != 0; ) {
+                    char *comma = strchr(o, ',');
+                    if (comma != NULL) {
+                        *comma = 0;
+                    }
+                    if (strcmp(o, "ro") == 0) {
+                        e->ro = true;
+                    } else if (strcmp(o, "rw") == 0) {
+                        e->ro = false;
+                    }
+                    o = (comma != NULL) ? comma + 1 : o + strlen(o);
                 }
             }
             any |= parse_client(e, tok);

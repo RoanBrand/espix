@@ -45,11 +45,10 @@ together.
 | Storage | `/etc/fstab`, applied on attach | **yes** | device column takes a name, a wildcard, or `LABEL=`/`UUID=`/`PARTUUID=`; the options column takes `noauto`, `ro`, `uid=` and `gid=`, and an entry naming no owner mounts as `esp` |
 | Storage | `mount -o uid=,gid=` | **yes** | root hands a volume to a user without giving them root |
 | Storage | `mount -o ro` | **yes** | refused by FatFs at the block device, not by policy; `/etc/fstab` takes `ro` too |
-| Storage | Volumes mounted at once | **partial** | two FAT or exFAT volumes (`CONFIG_FATFS_VOLUME_COUNT`), two ext (`EXT_MAX_MOUNTS`), plus the rootfs |
 | Storage | exFAT volumes | **yes** | on by default (`ESPIX_FS_EXFAT`, +7.0KB ROM, no static RAM); `FF_LBA64` and the 64-bit diskio fix come with it, so a volume past 2TiB is readable too |
 | Storage | ext2/3/4 volumes | **yes** | read-only by default, writable with `mount -o rw`; a driver of espix's own, two mount slots. Writes go through the port's experimental extent implementation, and a volume without a journal cannot be mounted writable at all — see [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) |
 | Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
-| Storage | Serve the stick over the network | **yes** | NFSv3: the portmapper, mountd and nfsd, statd so a client needs no lock option, and a write path (read-only unless the export says `rw`); a Linux or macOS client mounts it with no options, a 500-entry listing is one directory walk, and 2 MiB copies at ~260 KB/s — [NFS.md](docs/NFS.md) |
+| Storage | Serve the stick over the network | **yes** | NFSv3: the portmapper, mountd and nfsd, statd so a client needs no lock option, and a write path (writable unless the export says `ro`); a Linux or macOS client mounts it with no options, a 500-entry listing is one directory walk, and 4 MiB copies at ~410 KB/s — [NFS.md](docs/NFS.md) |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
 | Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` — an allowlist in `components/espix_proc/abi_*.c`, so a name espix does not publish stops an app loading rather than loading and answering ENOSYS |
 | Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
@@ -90,7 +89,7 @@ together.
 | Display | PPA and JPEG acceleration | **yes** | the reason the virtual screen exists: a fill/blit/scale path and a JPEG codec, each measured against the CPU path it replaces and kept, because the S3 has neither — [DISPLAY.md](docs/DISPLAY.md#what-it-costs) |
 | Display | Dragging a window | **yes** | CopyRect, so a four-pixel motion costs 8 KB rather than 301 KB — 37x, and the difference between a drag and a slideshow |
 | Display | 2D-DMA for moves and colour conversion | **no** | PPA SRM already does what the desktop needs, so it is unwritten until something needs it |
-| Display | A console on a panel | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
+| Display | Testing a physical display | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag, minimise, maximise and close, and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |
 | Display | Fitting a picture to a window | **yes** | `espix_surface_scale` — PPA SRM with the scale factors set, and a nearest-neighbour loop where there is no PPA at all, which is the S3 |
 | Display | A system tray, beyond the clock | **no** | one item is the look; radio status, volume and the rest wait for something to report them |

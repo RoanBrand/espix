@@ -1290,6 +1290,44 @@ both are the sort of thing that is cheaper to know now.
   oldest slot goes first and the client recovers from `NFS3ERR_BADHANDLE` as it
   already does. Worth measuring which of the two a real stick reaches first.
 
+- **Per-client export options, and squashing.** An export's options are one list
+  for every client, and its identity is whatever the client claims: AUTH_SYS
+  carries a uid and a gid in the clear and [nfsd](../components/espix_nfsd/nfsd.c)
+  reads them already, but nothing acts on them. What that buys is the shape
+  `/etc/exports` is actually for -- `ro` for a guest and `rw` for one host,
+  `root_squash` so a client's root is nobody here, `all_squash` for a share
+  nobody should own. It costs little on this side of the wire; it is only
+  meaningful once an export is a filesystem that *has* owners, which FAT has
+  not, so it belongs with an ext or rootfs export rather than before one.
+
+- **NFSv4.** The version a client asks for first, and every distribution's
+  `mount.nfs` tries it before being told `vers=3`. It is a different protocol
+  rather than a later revision: COMPOUND, a pseudo-filesystem to walk, state and
+  leases, a delegation model, and its own id-mapping. Weeks, not hours, and the
+  reason to do it is that "mount it with no options at all" then means no
+  options on any client -- worth knowing it is a project, not a patch.
+
+- **Advisory locking, which is currently a lie told politely.** statd answers
+  SM_MON so that a client will mount, and nothing arbitrates: two clients
+  locking the same file both succeed and neither is told. What it costs is the
+  NLM protocol -- LOCK, TEST, UNLOCK, the GRANTED callbacks, and a state table
+  that has to survive a client vanishing -- plus the decision of what a lock
+  means when the lock holder is the board and the file is on a stick somebody
+  can pull. It buys correctness for the case the NAS is for: two people writing
+  the same directory.
+
+- **More than one request at a time.** The daemon serves one RPC per loop, so a
+  slow directory scan is every other client's latency. A second worker task
+  would need the handle table and the export table to be safe under concurrency,
+  which they are not today -- they are single-threaded by construction and say
+  so. Moderate, and only worth it when there are several busy clients.
+
+- **`nfsd reload`.** Editing `/etc/exports` today means stopping the unit,
+  waiting for the daemon to notice, and starting it again, because a
+  `service restart` sets both intents at once and the daemon only looks at its
+  stop flag between requests. A reload verb that re-read the file in place would
+  be an hour's work and removes a foot-gun from the documentation.
+
 ## Audio
 
 Phase 1 (Bluetooth speaker playback) is built; [AUDIO.md](AUDIO.md) has what it

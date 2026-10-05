@@ -817,11 +817,16 @@ static size_t proc_fsinfo(rpc_call_t *c, xdrw_t *w, size_t iocap)
     /* Also without attributes, as nfsd sends it: 80 bytes, not 164. */
     put_post_attr(w, false, exp, &st);
     (void)st;
+    /*
+     * A write is what an export is for now, so the write sizes are the read
+     * sizes: at 4096 a 2 MiB copy is 512 round trips where 8192 makes it 256,
+     * and the request buffer holds both with room to spare.
+     */
     xdrw_u32(w, rt);                    /* rtmax */
     xdrw_u32(w, rt);                    /* rtpref */
     xdrw_u32(w, 4096);                  /* rtmult */
-    xdrw_u32(w, 4096);                  /* wtmax */
-    xdrw_u32(w, 4096);                  /* wtpref */
+    xdrw_u32(w, rt);                    /* wtmax */
+    xdrw_u32(w, rt);                    /* wtpref */
     xdrw_u32(w, 4096);                  /* wtmult */
     xdrw_u32(w, 4096);                  /* dtpref */
     xdrw_u64(w, 0x7FFFFFFF);            /* maxfilesize */
