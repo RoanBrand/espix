@@ -570,7 +570,7 @@ records it.
   `FR_WRITE_PROTECTED` (`ff.c:3508`) before the disk is touched at all, rather
   than writing and failing at the driver. That matters for a device under
   investigation: a read that goes wrong is recoverable, a *write* that goes
-  wrong puts the bad copy back. `/etc/fstab` takes `ro` in its flags column, and
+  wrong puts the bad copy back. `/etc/fstab` takes `ro` in its options, and
   `mount` prints `(ro)` so a listing says which it is.
 - **`umount` refuses while something is open on the mount.** It answers `busy` and
   says why, rather than pulling a volume out from under a reader who is halfway
@@ -822,12 +822,21 @@ not Linux's -- three fields doing the jobs theirs do, and the file documents
 itself: it is created with every example commented out the first time an attach
 looks for it.
 
-    <device>       <mount point>   <owner>   [flags]
+    <device>       <mount point>   [owner]   [options]
 
     device       what lsblk prints: sda1, or sd*1 for partition 1 of any disk
     mount point  a template; %s becomes the device name
-    owner        an account name, a uid, or - for root
-    flags        noauto
+    owner        an account name, a uid, or - for root; esp if left out
+    options      comma-separated: noauto, ro, uid=, gid=
+
+The options are Linux's, parsed the same way: split on commas, each either bare
+(`noauto`, `ro`) or `name=value` (`uid=1000`, `gid=1000`), and one espix does
+not know is skipped rather than refused -- nothing in the list is needed to
+mount. `uid=` and `gid=` name the owner exactly as the owner column does and win
+over it, since that is the column a line written for Linux will have used. An
+entry with no owner column mounts as esp, not root: a volume that is going to be
+served over NFS has no session to inherit an owner from, and root's is the one
+answer nobody wants.
 
 Applied when a device is attached and unmounted when it goes. The device column is a name, a
 wildcard, or an identity.

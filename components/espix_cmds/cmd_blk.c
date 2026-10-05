@@ -1165,15 +1165,20 @@ void espix_blk_device_gone(const char *dev)
  * uncommenting a line is the opt-in, and CONFIG_FATFS_VOLUME_COUNT is 2, so a
  * policy enabled by default would be a default failure.
  */
+/* The owner an entry that names none gets. A stick that is served over NFS is
+ * not root's, and nobody is logged in to be asked, so this is the account to
+ * fall back to -- the same one the template's examples name. */
+#define FSTAB_DEFAULT_OWNER "esp"
+
 static const char FSTAB_TEMPLATE[] =
     "# espix fstab -- not Linux's.\n"
     "#\n"
-    "#   <device>       <mount point>   <owner>   [flags]\n"
+    "#   <device>       <mount point>   [owner]   [options]\n"
     "#\n"
     "# device       sda1, sd*1, or an identity blkid prints: LABEL=, UUID=, PARTUUID=\n"
     "# mount point  %s becomes the device name\n"
-    "# owner        an account name, a uid, or - for root\n"
-    "# flags        noauto, ro\n"
+    "# owner        an account name, a uid, or - for root; " FSTAB_DEFAULT_OWNER " if left out\n"
+    "# options      comma-separated, as Linux writes them: noauto, ro, uid=, gid=\n"
     "#\n"
     "# An identity must match exactly one volume.\n"
     "#\n"
@@ -1251,6 +1256,18 @@ static bool fstab_match(const char *field, const espix_usb_dev_t *disk,
     }
 }
 
+/* A decimal 16-bit number and nothing else: an id, not a prefix of one. */
+static bool fstab_u16(const char *s, uint16_t *out)
+{
+    char *end = NULL;
+    const unsigned long n = strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || n > UINT16_MAX) {
+        return false;
+    }
+    *out = (uint16_t)n;
+    return true;
+}
+
 /* `uid`/`gid` from an owner field: an account name, a number, or `-` for root. */
 static bool fstab_owner(const char *word, uint16_t *uid, uint16_t *gid)
 {
@@ -1260,14 +1277,8 @@ static bool fstab_owner(const char *word, uint16_t *uid, uint16_t *gid)
         return true;
     }
 
-    char *end = NULL;
-    const unsigned long n = strtoul(word, &end, 10);
-    if (end != word && *end == '\0') {
-        if (n > UINT16_MAX) {
-            return false;
-        }
-        *uid = (uint16_t)n;
-        *gid = (uint16_t)n;
+    if (fstab_u16(word, uid)) {
+        *gid = *uid;
         return true;
     }
 
@@ -1456,28 +1467,59 @@ static void fstab_apply(const espix_usb_dev_t *devs, size_t n, const char *dev)
 
         char field[FSTAB_FIELD_MAX];
         char point[ESPIX_PATH_MAX];
-        char owner[ESPIX_USER_MAX];
-        char flags[32] = "";
+        char owner[ESPIX_USER_MAX] = FSTAB_DEFAULT_OWNER;
+        char opts[64] = "";
 
         /* The widths are the buffers' sizes minus one, and no more: an account
          * name is 16 bytes in espix, which is exactly what a 17-byte buffer
-         * holds, and a wider conversion would write past it. */
-        if (sscanf(line, "%23s %127s %16s %31s", field, point, owner, flags) < 3) {
+         * holds, and a wider conversion would write past it. Two fields are
+         * enough -- the owner stays the default one -- because an entry that
+         * says nothing about ownership should not mount as root. */
+        const int nf = sscanf(line, "%23s %127s %16s %63s", field, point,
+                              owner, opts);
+        if (nf < 2) {
             continue;
         }
-        if (strstr(flags, "noauto") != NULL) {
-            continue;
-        }
-        /* `ro` is passed down to the mount, not acted on here: the enforcement
-         * is the block device's, and this only decides what the mount is made
-         * read-only *as*. */
-        const bool ro = (strstr(flags, "ro") != NULL);
 
         uint16_t uid = 0;
         uint16_t gid = 0;
         if (!fstab_owner(owner, &uid, &gid)) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no such account: %s",
                        FSTAB_PATH, owner);
+            continue;
+        }
+
+        /* The options are Linux's list: comma-separated, each bare or
+         * name=value, and one we do not know is skipped rather than refused --
+         * nothing in it is needed to mount. uid=/gid= name the owner the way the
+         * owner column does and win over it, because a Linux-minded line will
+         * have written them there. */
+        bool ro = false;
+        bool noauto = false;
+
+        for (char *o = opts; *o != '\0'; ) {
+            char *comma = strchr(o, ',');
+            if (comma != NULL) {
+                *comma = '\0';
+            }
+
+            if (strcmp(o, "noauto") == 0) {
+                noauto = true;
+            } else if (strcmp(o, "ro") == 0) {
+                /* Passed down to the mount, not acted on here: the enforcement
+                 * is the block device's, and this only decides what the mount is
+                 * made read-only as. */
+                ro = true;
+            } else if (strncmp(o, "uid=", 4) == 0) {
+                (void)fstab_u16(o + 4, &uid);
+            } else if (strncmp(o, "gid=", 4) == 0) {
+                (void)fstab_u16(o + 4, &gid);
+            }
+
+            o = (comma != NULL) ? comma + 1 : o + strlen(o);
+        }
+
+        if (noauto) {
             continue;
         }
 
