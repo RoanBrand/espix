@@ -20,6 +20,9 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void));
 void espix_nfsd_trace(bool on);
 bool espix_nfsd_tracing(void);
 
+/* Re-read /etc/exports, in the daemon's own task, on its next time round. */
+void espix_nfsd_reload(void);
+
 /* For the command: what /etc/exports gave us. */
 int  espix_nfsd_export_count(void);
-bool espix_nfsd_export_info(int i, const char **path, bool *ro, const char **who);
+bool espix_nfsd_export_info(int i, const char **path, const char **who);

@@ -14,8 +14,9 @@ size_t nfs3_handle(const rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap);
 /* The handle for an export's root, which is what MNT returns. */
 bool   nfs3_fh_for_export(int exp, uint8_t *fh, size_t *len);
 
-/* The address the current request came from, set once per request. */
-void   nfs3_set_source(uint32_t src);
+/* Who is asking, set once per request: where it came from, and the AUTH_SYS
+ * credential if the call carried one -- which is what a squash rewrites. */
+void   nfs3_set_peer(uint32_t src, bool have_cred, uint16_t uid, uint16_t gid);
 
 /*
  * Give the handle table back. Valid to call exactly when no client can hold a

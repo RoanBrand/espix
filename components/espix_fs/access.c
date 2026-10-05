@@ -127,9 +127,41 @@ typedef struct {
     uint8_t  ngroups;
 } subject_t;
 
+/*
+ * A caller that is not the task it runs in. The NFS server has no session of
+ * its own and has to answer as the client on the other end -- including for a
+ * permission check, which is the whole point of root_squash. Cross-task rather
+ * than per-task because there is one daemon and it serves one request at a
+ * time; see espix_fs_act_as().
+ */
+static bool     s_act_as;
+static uint16_t s_act_uid, s_act_gid;
+
+void espix_fs_act_as(uint16_t uid, uint16_t gid)
+{
+    s_act_as  = true;
+    s_act_uid = uid;
+    s_act_gid = gid;
+}
+
+void espix_fs_act_as_none(void)
+{
+    s_act_as = false;
+}
+
 static bool subject(subject_t *out)
 {
     memset(out, 0, sizeof(*out));
+
+    if (s_act_as) {
+        /*
+         * No supplementary groups: an AUTH_SYS call carries its own and nothing
+         * reads them yet, so a group-only permission is one this cannot grant.
+         */
+        out->uid = s_act_uid;
+        out->gid = s_act_gid;
+        return true;
+    }
 
     if (espix_proc_cred_of_task(xTaskGetCurrentTaskHandle(), &out->uid,
                                 &out->gid, out->groups, &out->ngroups)) {

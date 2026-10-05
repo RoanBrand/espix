@@ -79,27 +79,50 @@ words is what abandons a mount.
 ## Exports, and who may mount
 
 `/etc/exports` is Linux's syntax, less the hostnames: `<path> <client>[(options)]`,
-where a client is `*` or an IPv4 address with an optional `/bits`, and `rw` would
-clear the read-only default if there were a write path to allow.
-
-The client list is checked on **every request**, not only at mount: a file handle
-lives for as long as the client likes, so narrowing the file has to reach the
-requests that follow a mount as well as the mount itself. A request from an
-address the export does not list is answered `NFS3ERR_BADHANDLE`, which a client
-recovers from by mounting again; mountd answers `MNT3ERR_ACCES`.
-
-Exports are read when the daemon starts. After editing the file:
+where a client is `*` or an IPv4 address with an optional `/bits`. Each client
+carries its own options, and **the most specific match wins**, so a wildcard and a
+host can sit together and the host gets what it says:
 
 ```sh
-$ sudo service stop nfsd     # wait for the unit to leave
-$ sudo service start nfsd
-$ nfsd exports
+$ cat /etc/exports
+/mnt/sda1  *(ro)                everyone reads it
+/mnt/sda1  192.168.1.5(rw)      one host may write
 ```
 
-`service restart nfsd` sets both intents at once, and the daemon only looks at
-its stop flag between requests, so a restart can be missed where a stop waited
-for is not.
+The options are Linux's: `ro` and `rw`, and the three squashes -- `root_squash`
+(the default: a client's uid 0 becomes "nobody", 65534), `no_root_squash`, and
+`all_squash` for a share nobody should own -- with `anonuid=`/`anongid=` to say
+what nobody is. Anything else is ignored rather than refused, which is the only
+way one file can serve two servers.
 
+**A squash is enforced, not decorative.** Every request is answered as the client
+it came from: espix's filesystem asks who is calling, and the NFS server has no
+session of its own, so it supplies the client's identity rewritten by the rule.
+That is what makes a permission check mean anything over there -- with the
+default `root_squash` a client cannot write into a root-owned directory, and
+`no_root_squash` lets it. What a squash does *not* change is ownership: espix
+decides who owns a file from its path (the rootfs) or from the mount (FAT), never
+from who created it.
+
+The client list is checked on **every request**, not only at mount: a handle lives
+for as long as the client likes, so a narrower export has to reach the requests
+that follow a mount as well as the mount itself. A request from an address the
+export does not list is answered `NFS3ERR_BADHANDLE`, which clients recover from;
+mountd answers `MNT3ERR_ACCES`.
+
+Editing the file does not need a restart:
+
+```sh
+$ sudo vi /etc/exports
+$ nfsd reload            # the daemon re-reads it on its next pass, within 5 s
+$ nfsd exports           # what it understood, options and all
+```
+
+`nfsd exports` prints each rule as the parser read it, which is the only way to
+see that an option was taken as written -- a `ro` inside `crossmnt` is not a
+`ro`. When the file is missing entirely, the daemon writes a template with every
+example commented out, `0644` and root's, and serves nothing until a line names a
+client.
 ## Handles, listings, and ownership
 
 A file handle is 28 bytes and names a slot in a table of paths rather than
@@ -132,7 +155,8 @@ mounted it. `uid=`/`gid=` on the mount are therefore what a client sees.
 
 ```sh
 $ nfsd                   # is it running, and on what
-$ nfsd exports           # what the loaded export table holds
+$ nfsd exports           # what the loaded export table holds, options and all
+$ nfsd reload            # re-read /etc/exports without stopping the unit
 $ nfsd trace on          # append every RPC to /tmp/nfsd.trace
 $ nfsd start             # run it in this session instead of as a unit
 ```

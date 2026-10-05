@@ -40,13 +40,15 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   or fds, so nothing can reclaim it for the app. `tests/suites/35-signals.sh`
   pins both halves.
 
-- **A clean exit does not give all of the app's PSRAM back either, and the game
-  shows it.** Measured: from a fresh boot with 13.2 MB of PSRAM free, two Doom
-  runs -- both exiting through the app's own `doom: quit` path, no kill -- left
-  **571 KB**, roughly 7.7 MB a run. Only a reboot returns it. This is the same
-  gap as above with a different trigger: the exit path does not hand back what
-  the app allocated, and the loader has no per-process heap ownership to reclaim
-  it with.
+- **A clean exit did not give all of the app's PSRAM back either, and the game
+  showed it. Fixed** (6969357, R-P1.2): an app's allocations are a list of regions
+  of its own now, released whole when the process ends, so a clean exit and a
+  `kill -9` return the same memory -- what follows is the shape of the bug rather
+  than the state of the code. Measured before that: from a fresh boot with 13.2 MB
+  of PSRAM free, two Doom runs -- both exiting through the app's own `doom: quit`
+  path, no kill -- left **571 KB**, roughly 7.7 MB a run, and only a reboot
+  returned it. The exit path did not hand back what the app allocated, and the
+  loader had no per-process ownership to reclaim it with.
 
   What it looks like is a game leaving the screen on a large canvas. The mode
   switch back asks for a 1280x800 canvas and then an RFB staging buffer of the

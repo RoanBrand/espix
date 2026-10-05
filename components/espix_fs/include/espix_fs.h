@@ -381,6 +381,19 @@ void espix_fs_priv_begin(void);
 void espix_fs_priv_end(void);
 
 /*
+ * Answer as another identity for the operations that follow, or stop doing so.
+ *
+ * espix's own tasks have a session or a process to be asked who they are, and
+ * the NFS server has neither: it is answering as the client on the other end of
+ * the wire, which is what makes a chmod, an anonuid and a permission check mean
+ * anything over there. One pair is enough because it serves one request at a
+ * time; a second caller would have to make this per-task, as the privileged
+ * counter above already is.
+ */
+void espix_fs_act_as(uint16_t uid, uint16_t gid);
+void espix_fs_act_as_none(void);
+
+/*
  * Close every file still open on behalf of pid (an espix_pid_t; -1 for none).
  * Called by the process reaper, so it takes the owner as an argument rather
  * than asking who is calling, and it closes through IDF rather than the layer

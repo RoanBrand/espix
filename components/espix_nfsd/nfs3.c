@@ -100,15 +100,39 @@ static uint32_t    s_next_id = 1;
 static int         s_cursor;
 
 /*
- * The address the current request came from. The daemon serves one request at a
- * time, so a static holds it exactly, and it costs nothing to check: four bytes
- * against the export's client list, and no I/O.
+ * Who is asking. The daemon serves one request at a time, so statics hold the
+ * source address and the credential exactly, and they cost nothing to check:
+ * four bytes against the export's client list, and no I/O.
+ *
+ * The credential is here rather than in nfsd.c because it is what a squash
+ * rewrites -- uid 0 becomes nobody, or everyone does -- and the result is what
+ * the filesystem below is asked as.
  */
 static uint32_t s_src;
+static bool     s_have_cred;
+static uint16_t s_cred_uid, s_cred_gid;
 
-void nfs3_set_source(uint32_t src)
+void nfs3_set_peer(uint32_t src, bool have_cred, uint16_t uid, uint16_t gid)
 {
-    s_src = src;
+    s_src      = src;
+    s_have_cred = have_cred;
+    s_cred_uid = uid;
+    s_cred_gid = gid;
+}
+
+/* The identity a rule turns this client into, and the answer for a call that
+ * carried no AUTH_SYS at all: nobody. */
+static void act_as(const nfs_client_t *rule)
+{
+    uint16_t uid = s_have_cred ? s_cred_uid : NFS_ANON_UID;
+    uint16_t gid = s_have_cred ? s_cred_gid : NFS_ANON_GID;
+
+    if (rule->squash == NFS_SQUASH_ALL ||
+        (rule->squash == NFS_SQUASH_ROOT && uid == 0)) {
+        uid = rule->anon_uid;
+        gid = rule->anon_gid;
+    }
+    espix_fs_act_as(uid, gid);
 }
 
 void nfs3_slots_cleanup(void)
@@ -173,10 +197,14 @@ static bool fh_resolve(const uint8_t *fh, size_t len, int *exp,
      * handle for as long as it likes and reuses it for every request that
      * follows, so the permission is checked on each of them, not once at mount.
      */
-    const nfs_export_t *x = nfsd_export(e);
-    if (x == NULL || !nfsd_client_allowed(x, s_src)) {
+    const nfs_export_t *x    = nfsd_export(e);
+    const nfs_client_t *rule = nfsd_client_rule(x, s_src);
+    if (rule == NULL) {
         return false;
     }
+    /* Every request answers as the client it came from, so a squash and a mode
+     * check below see who is really asking. */
+    act_as(rule);
 
     for (int i = 0; i < PATH_SLOTS; i++) {
         if (s_slots[i].id == id) {
@@ -336,9 +364,11 @@ static bool name_ok(const char *name)
 
 /* ---------------------------------------------------------- procedures --- */
 
-/* Declared here rather than with the write path below, because LOOKUP uses it
- * too: a path that does not fit is an error, not a name cut short. */
+/* Declared here rather than with the write path below, because the read path
+ * uses them too: a path that does not fit is an error rather than a name cut
+ * short, and ACCESS has to answer for a client that may not write. */
 static bool join_path(char *out, size_t cap, const char *dir, const char *name);
+static bool may_write(int exp);
 
 static size_t proc_getattr(rpc_call_t *c, xdrw_t *w)
 {
@@ -452,8 +482,7 @@ static size_t proc_access(rpc_call_t *c, xdrw_t *w)
     const uint32_t READ = 0x1, LOOKUP = 0x2, MODIFY = 0x4, EXTEND = 0x8,
                    DELETE = 0x10, EXECUTE = 0x20;
     uint32_t granted = asked & (READ | LOOKUP);
-    const nfs_export_t *e = nfsd_export(exp);
-    if (e != NULL && !e->ro) {
+    if (may_write(exp)) {
         if (st.st_mode & S_IWUSR) granted |= asked & (MODIFY | EXTEND | DELETE);
         if (st.st_mode & S_IXUSR) granted |= asked & EXECUTE;
     }
@@ -888,8 +917,7 @@ static size_t proc_pathconf(rpc_call_t *c, xdrw_t *w)
  */
 static bool may_write(int exp)
 {
-    const nfs_export_t *e = nfsd_export(exp);
-    return (e != NULL) && !e->ro;
+    return nfsd_may_write(nfsd_export(exp), s_src);
 }
 
 /* XDR's boolean is a 32-bit word, nonzero for true. */

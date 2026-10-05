@@ -34,14 +34,18 @@ static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    if (argc > 1 && strcmp(argv[1], "reload") == 0) {
+        espix_nfsd_reload();
+        espix_printf(s, "nfsd: rereading /etc/exports (within five seconds)\n");
+        return 0;
+    }
+
     if (argc > 1 && strcmp(argv[1], "exports") == 0) {
         const int n = espix_nfsd_export_count();
         for (int i = 0; i < n; i++) {
             const char *path, *who;
-            bool        ro;
-            if (espix_nfsd_export_info(i, &path, &ro, &who)) {
-                espix_printf(s, "nfsd:   %s  %s  %s\n", path, who,
-                             ro ? "ro" : "rw");
+            if (espix_nfsd_export_info(i, &path, &who)) {
+                espix_printf(s, "nfsd:   %s  %s\n", path, who);
             }
         }
         if (n == 0) {
@@ -51,7 +55,7 @@ static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
     }
 
     if (argc > 1 && (strcmp(argv[1], "start") != 0)) {
-        espix_eprintf(s, "usage: nfsd [start|exports]\n");
+        espix_eprintf(s, "usage: nfsd [start|exports|reload]\n");
         return 1;
     }
 
@@ -67,7 +71,7 @@ static int cmd_nfsd(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_nfsd_cmds[] = {
     { .name = "nfsd", .fn = cmd_nfsd,
       .help = "serve /etc/exports over NFSv3",
-      .usage = "nfsd [start|exports|trace [on|off]]" },
+      .usage = "nfsd [start|exports|reload|trace [on|off]]" },
 };
 
 void espix_cmds_register_nfsd(void)

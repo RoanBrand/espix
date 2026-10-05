@@ -1263,6 +1263,15 @@ both are the sort of thing that is cheaper to know now.
   runs `fake-hwclock` and does not sit at the epoch. The comparison argues the
   other way.
 
+  **NFS is already a user of this, from outside the device.** A client asks for
+  a file's times and prints whatever the volume holds, so a stick written before
+  the first NTP sync reads 1970 on a machine whose own clock is perfectly good --
+  and the client cannot correct it, because the timestamp is the server's to
+  keep. `SETATTR` lets a client set a time it knows, but not the time a local
+  write should have; only a floored clock does that. Nothing else in the
+  ROADMAP's clock item has a user waiting on it, which is the argument for doing
+  it sooner rather than when the RTC work happens.
+
 - ~~**Pipes, < redirection, and stdin for builtins.**~~ Done for builtins
   (R-P2.4, R-P2.5): < is parsed with the other redirections, cat, wc, head,
   tail, grep and sort read it when they have no operand, and a pipeline is
@@ -1290,15 +1299,6 @@ both are the sort of thing that is cheaper to know now.
   oldest slot goes first and the client recovers from `NFS3ERR_BADHANDLE` as it
   already does. Worth measuring which of the two a real stick reaches first.
 
-- **Per-client export options, and squashing.** An export's options are one list
-  for every client, and its identity is whatever the client claims: AUTH_SYS
-  carries a uid and a gid in the clear and [nfsd](../components/espix_nfsd/nfsd.c)
-  reads them already, but nothing acts on them. What that buys is the shape
-  `/etc/exports` is actually for -- `ro` for a guest and `rw` for one host,
-  `root_squash` so a client's root is nobody here, `all_squash` for a share
-  nobody should own. It costs little on this side of the wire; it is only
-  meaningful once an export is a filesystem that *has* owners, which FAT has
-  not, so it belongs with an ext or rootfs export rather than before one.
 
 - **NFSv4.** The version a client asks for first, and every distribution's
   `mount.nfs` tries it before being told `vers=3`. It is a different protocol
@@ -1322,11 +1322,6 @@ both are the sort of thing that is cheaper to know now.
   which they are not today -- they are single-threaded by construction and say
   so. Moderate, and only worth it when there are several busy clients.
 
-- **`nfsd reload`.** Editing `/etc/exports` today means stopping the unit,
-  waiting for the daemon to notice, and starting it again, because a
-  `service restart` sets both intents at once and the daemon only looks at its
-  stop flag between requests. A reload verb that re-read the file in place would
-  be an hour's work and removes a foot-gun from the documentation.
 
 ## Audio
 

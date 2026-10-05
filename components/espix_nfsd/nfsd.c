@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "lwip/sockets.h"
 
@@ -24,6 +25,53 @@
 #include "rpc.h"
 
 #define TAG "espix:nfsd"
+
+#define EXPORTS_PATH "/etc/exports"
+
+/*
+ * Written when there is none. Everything in it is commented out: a policy that
+ * enables itself is how a device ends up serving a filesystem nobody meant to
+ * share, and the unit is always running, so the file has to say what it is for
+ * without doing anything.
+ */
+static const char EXPORTS_TEMPLATE[] =
+    "# espix NFS exports: <path> <client>[(options)], as Linux writes them.\n"
+    "#\n"
+    "#   /mnt/sda1  *(ro)          anyone may read it\n"
+    "#   /mnt/sda1  10.0.0.5(rw)   one host may write\n"
+    "#\n"
+    "# A client is * or an address with an optional /bits. Options: ro, rw,\n"
+    "# root_squash, no_root_squash, all_squash, anonuid=, anongid=.\n"
+    "# Nothing is exported until a line names a client.\n";
+
+/*
+ * The mode the rest of /etc has: anyone may read what is being served, only
+ * root may change it. A fresh file's mode comes from the rule for its path,
+ * which is not this, so it is asked for and then read back -- the difference
+ * between knowing what was granted and assuming it.
+ */
+static void write_exports_template(void)
+{
+    FILE *f = fopen(EXPORTS_PATH, "w");
+
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot create it", EXPORTS_PATH);
+        return;
+    }
+    fputs(EXPORTS_TEMPLATE, f);
+    fclose(f);
+
+    struct stat st;
+    if (stat(EXPORTS_PATH, &st) != 0 || (st.st_mode & 0777) != 0644) {
+        (void)espix_fs_chmod(EXPORTS_PATH, 0644);
+        if (stat(EXPORTS_PATH, &st) == 0) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: mode 0%o", EXPORTS_PATH,
+                       (unsigned)(st.st_mode & 0777));
+        }
+    }
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "%s: written, with the examples commented out", EXPORTS_PATH);
+}
 
 #define PORTMAP_PROG 100000u
 #define PORTMAP_VERS 2u
@@ -73,6 +121,19 @@ static uint8_t *s_frame;   /* TCP: on the heap, not 8 KB of task stack */
 static uint8_t *s_out;
 static uint8_t *s_io;                       /* a read fills this */
 static bool     s_trace;                    /* append every RPC to /tmp/nfsd.trace */
+static volatile bool s_reload;              /* re-read /etc/exports, in the loop */
+
+/*
+ * Asked for by the command and done by the daemon, in the task that owns the
+ * table. Both run in one address space, so a command that re-read the file
+ * itself would be rewriting the exports underneath a request being answered
+ * from them -- and the failure that produces is a path from the wrong export,
+ * which is the one kind of mistake here that is worse than refusing.
+ */
+void espix_nfsd_reload(void)
+{
+    s_reload = true;
+}
 
 void espix_nfsd_trace(bool on)
 {
@@ -133,44 +194,128 @@ static struct {
 
 /* ------------------------------------------------------------- exports --- */
 
-static bool parse_client(nfs_export_t *e, const char *tok)
+/*
+ * One rule from one token: an address, or "*", and the options that follow it
+ * in parentheses. Linux's default is read-write and root_squash, and anything
+ * espix does not know is ignored rather than refused -- Linux ignores what it
+ * does not know too, and that is the only way one export file can be shared
+ * between two servers.
+ */
+static bool add_client(nfs_export_t *e, const char *spec, char *opts)
 {
-    if (strcmp(tok, "*") == 0) {
-        e->all = true;
-        return true;
-    }
+    uint32_t addr = 0, mask = 0;
 
-    unsigned a, b, c, d, bits = 32;
-    char     host[64];
-    strlcpy(host, tok, sizeof(host));
+    if (strcmp(spec, "*") != 0) {
+        unsigned a, b, c, d, bits = 32;
+        char     host[64];
 
-    char *slash = strchr(host, '/');
-    if (slash != NULL) {
-        *slash = 0;
-        bits = (unsigned)atoi(slash + 1);
-        if (bits == 0 || bits > 32) {
-            bits = 32;
+        strlcpy(host, spec, sizeof(host));
+        char *slash = strchr(host, '/');
+        if (slash != NULL) {
+            *slash = 0;
+            bits = (unsigned)atoi(slash + 1);
+            if (bits == 0 || bits > 32) {
+                bits = 32;
+            }
         }
+        if (sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+            return false;           /* hostnames are not resolved yet */
+        }
+        addr = htonl((a << 24) | (b << 16) | (c << 8) | d);
+        mask = (bits == 0) ? 0 : htonl(0xFFFFFFFFu << (32 - bits));
     }
-    if (sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-        return false;               /* hostnames are not resolved yet */
-    }
-    if (e->nclients >= MAX_CLIENTS) {
+    if (e->nclients >= NFS_CLIENT_MAX) {
         return false;
     }
 
     nfs_client_t *cl = &e->clients[e->nclients++];
-    cl->addr = htonl((a << 24) | (b << 16) | (c << 8) | d);
-    cl->mask = (bits == 0) ? 0 : htonl(0xFFFFFFFFu << (32 - bits));
+
+    memset(cl, 0, sizeof(*cl));
+    cl->addr     = addr;
+    cl->mask     = mask;
+    cl->ro       = false;               /* a mount is writable unless told ro */
+    cl->squash   = NFS_SQUASH_ROOT;     /* and a client's root is nobody */
+    cl->anon_uid = NFS_ANON_UID;
+    cl->anon_gid = NFS_ANON_GID;
+
+    for (char *o = opts; o != NULL && *o != 0; ) {
+        char *comma = strchr(o, ',');
+        if (comma != NULL) {
+            *comma = 0;
+        }
+
+        if (strcmp(o, "ro") == 0) {
+            cl->ro = true;
+        } else if (strcmp(o, "rw") == 0) {
+            cl->ro = false;
+        } else if (strcmp(o, "no_root_squash") == 0) {
+            cl->squash = NFS_SQUASH_NONE;
+        } else if (strcmp(o, "all_squash") == 0) {
+            cl->squash = NFS_SQUASH_ALL;
+        } else if (strcmp(o, "root_squash") == 0) {
+            cl->squash = NFS_SQUASH_ROOT;
+        } else if (strncmp(o, "anonuid=", 8) == 0) {
+            cl->anon_uid = (uint16_t)strtoul(o + 8, NULL, 10);
+        } else if (strncmp(o, "anongid=", 8) == 0) {
+            cl->anon_gid = (uint16_t)strtoul(o + 8, NULL, 10);
+        }
+        o = (comma != NULL) ? comma + 1 : o + strlen(o);
+    }
     return true;
+}
+
+/* How many bits of the address a mask holds: the more, the closer the match. */
+static int mask_bits(uint32_t mask)
+{
+    int n = 0;
+
+    for (; mask != 0; mask >>= 1) {
+        n += (int)(mask & 1u);
+    }
+    return n;
+}
+
+static const nfs_client_t *rule_for(const nfs_export_t *e, uint32_t src)
+{
+    const nfs_client_t *best = NULL;
+    int                 best_bits = -1;
+
+    if (e == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < e->nclients; i++) {
+        const nfs_client_t *c = &e->clients[i];
+
+        if ((src & c->mask) != (c->addr & c->mask)) {
+            continue;
+        }
+        const int bits = mask_bits(c->mask);
+        if (bits > best_bits) {
+            best      = c;
+            best_bits = bits;
+        }
+    }
+    return best;
+}
+
+const nfs_client_t *nfsd_client_rule(const nfs_export_t *e, uint32_t src)
+{
+    return rule_for(e, src);
+}
+
+bool nfsd_may_write(const nfs_export_t *e, uint32_t src)
+{
+    const nfs_client_t *c = rule_for(e, src);
+
+    return (c != NULL) && !c->ro;
 }
 
 /* <path> <client>[(opts)] ...  -- the Linux syntax, less the hostnames. */
 static int load_exports(void)
 {
-    FILE *f = fopen("/etc/exports", "r");
+    FILE *f = fopen(EXPORTS_PATH, "r");
     if (f == NULL) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "no /etc/exports; nothing to serve");
+        write_exports_template();
         return 0;
     }
 
@@ -204,45 +349,19 @@ static int load_exports(void)
         nfs_export_t *e = &s_exports[s_nexports];
         memset(e, 0, sizeof(*e));
         strlcpy(e->path, path, sizeof(e->path));
-        /*
-         * Read-write unless the line says ro: that is what exports(5) calls
-         * the default, and what espix's own mounts do -- a volume mounted with
-         * no option is writable, so an export with no option is too. The
-         * opposite default was for as long as there was no write path at all,
-         * and it outlived its reason by a release.
-         */
-        e->ro = false;
-
         bool any = false;
         for (char *tok = strtok_r(NULL, " \t\r\n", &save); tok != NULL;
              tok = strtok_r(NULL, " \t\r\n", &save)) {
             char *opts = strchr(tok, '(');
+
             if (opts != NULL) {
                 *opts++ = 0;
                 char *close = strchr(opts, ')');
                 if (close != NULL) {
                     *close = 0;
                 }
-                /*
-                 * Whole words, because the options are a comma-separated list
-                 * and a substring test for "ro" also finds it inside crossmnt
-                 * and in no_root_squash -- which is how an option nobody meant
-                 * to write ends up obeyed.
-                 */
-                for (char *o = opts; *o != 0; ) {
-                    char *comma = strchr(o, ',');
-                    if (comma != NULL) {
-                        *comma = 0;
-                    }
-                    if (strcmp(o, "ro") == 0) {
-                        e->ro = true;
-                    } else if (strcmp(o, "rw") == 0) {
-                        e->ro = false;
-                    }
-                    o = (comma != NULL) ? comma + 1 : o + strlen(o);
-                }
             }
-            any |= parse_client(e, tok);
+            any |= add_client(e, tok, opts);
         }
         if (any) {
             s_nexports++;
@@ -254,17 +373,10 @@ static int load_exports(void)
     return s_nexports;
 }
 
+/* Kept as a name because the mount path reads better with it. */
 static bool client_allowed(const nfs_export_t *e, uint32_t src)
 {
-    if (e->all) {
-        return true;
-    }
-    for (int i = 0; i < e->nclients; i++) {
-        if ((src & e->clients[i].mask) == (e->clients[i].addr & e->clients[i].mask)) {
-            return true;
-        }
-    }
-    return false;
+    return rule_for(e, src) != NULL;
 }
 
 static const nfs_export_t *export_for(const char *dir)
@@ -296,6 +408,8 @@ bool nfsd_client_allowed(const nfs_export_t *e, uint32_t src)
 {
     return client_allowed(e, src);
 }
+
+bool nfsd_may_write(const nfs_export_t *e, uint32_t src);
 
 /* --------------------------------------------------------------- the RPC --- */
 
@@ -606,8 +720,12 @@ static size_t dispatch(const rpc_call_t *c, uint8_t *rep, size_t cap, uint32_t s
                (c->vers == 1 || c->vers == 2 || c->vers == MOUNT_VERS)) {
         out = handle_mount(c, &w, src);
     } else if (c->prog == NFS_PROG && c->vers == NFS_VERS) {
-        nfs3_set_source(src);
+        nfs3_set_peer(src, c->have_auth_sys, (uint16_t)c->uid,
+                      (uint16_t)c->gid);
         out = nfs3_handle(c, &w, s_io, IOCAP);
+        /* Back to espix for everything after this: the trace below writes a
+         * file, and it is not the client's to write. */
+        espix_fs_act_as_none();
     } else if (c->prog == NSM_PROG && c->vers == NSM_VERS) {
         out = handle_nsm(c, &w);
     } else if (c->prog == NFS_PING_PROG && c->vers == NFS_PING_VERS) {
@@ -799,8 +917,16 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
         }
     }
 
-    if (load_exports() <= 0) {
-        return ESP_ERR_NOT_FOUND;
+    /*
+     * Nothing exported is a state, not a failure. A device whose /etc/exports
+     * has just been created names no client yet, and this unit is "always":
+     * refusing to run would have the supervisor start it forever. So it serves
+     * nothing and says so, and the portmapper still answers -- which is also
+     * how a user learns the daemon is there.
+     */
+    if (load_exports() == 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "nothing exported; %s says what to write",
+                   EXPORTS_PATH);
     }
 
     const int pm_udp = bind_udp(PORTMAP_PORT);
@@ -838,6 +964,13 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
         if (keep_going != NULL && !keep_going()) {
             espix_klog(ESPIX_KLOG_INFO, TAG, "stopping");
             break;
+        }
+
+        /* At most one select timeout after the command asks: five seconds. */
+        if (s_reload) {
+            s_reload = false;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "reloaded: %d export(s)",
+                       load_exports());
         }
 
         fd_set         r;
@@ -899,9 +1032,16 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
         }
     }
 
-    /* Stopped means stopped: the buffers and the export table go back, so a
-     * daemon that is not running costs nothing but the four pointers. A
-     * restart allocates them again. */
+    /*
+     * Stopped means stopped for the buffers and the export table: a daemon that
+     * is not running costs nothing but the four pointers, and a restart
+     * allocates them again.
+     *
+     * The handle table and the mount bookkeeping stay, and that is the point of
+     * them being kept: a client on the other end of a restart never noticed
+     * anything, so its handles have to go on resolving and the mounts it is
+     * holding have to go on being counted -- clearing the count here would let
+     * a later UMNT free handles another client is still holding. */
     free(s_req);     s_req = NULL;
     free(s_rep);     s_rep = NULL;
     free(s_frame);   s_frame = NULL;
@@ -909,9 +1049,6 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     free(s_io);      s_io = NULL;
     free(s_exports); s_exports = NULL;
     s_nexports = 0;
-    /* Nothing can be holding a handle: no daemon is left to resolve one. */
-    nfs3_slots_cleanup();
-    memset(s_mounted, 0, sizeof(s_mounted));
     return ESP_OK;
 }
 
@@ -920,13 +1057,45 @@ int espix_nfsd_export_count(void)
     return s_nexports;
 }
 
-bool espix_nfsd_export_info(int i, const char **path, bool *ro, const char **who)
+static const char *squash_name(nfs_squash_t s)
 {
+    switch (s) {
+    case NFS_SQUASH_NONE: return "no_root_squash";
+    case NFS_SQUASH_ALL:  return "all_squash";
+    default:              return "root_squash";
+    }
+}
+
+/* "nfsd exports": the rules as they were understood, which is the only way to
+ * see that an option was read the way it was written. */
+bool espix_nfsd_export_info(int i, const char **path, const char **who)
+{
+    static char buf[256];
+
     if (i < 0 || i >= s_nexports) {
         return false;
     }
     *path = s_exports[i].path;
-    *ro   = s_exports[i].ro;
-    *who  = s_exports[i].all ? "*" : "listed clients";
+
+    buf[0] = 0;
+    for (int k = 0; k < s_exports[i].nclients; k++) {
+        const nfs_client_t *c = &s_exports[i].clients[k];
+        char                one[96];
+
+        if (c->mask == 0) {
+            snprintf(one, sizeof(one), "%s* (%s,%s)", k ? " " : "",
+                     c->ro ? "ro" : "rw", squash_name(c->squash));
+        } else {
+            const uint32_t a = ntohl(c->addr);
+            snprintf(one, sizeof(one), "%s%u.%u.%u.%u/%d (%s,%s)",
+                     k ? " " : "",
+                     (unsigned)((a >> 24) & 0xFF), (unsigned)((a >> 16) & 0xFF),
+                     (unsigned)((a >> 8) & 0xFF), (unsigned)(a & 0xFF),
+                     mask_bits(c->mask), c->ro ? "ro" : "rw",
+                     squash_name(c->squash));
+        }
+        strlcat(buf, one, sizeof(buf));
+    }
+    *who = buf;
     return true;
 }

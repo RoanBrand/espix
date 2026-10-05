@@ -13,7 +13,13 @@ An app's `malloc()` is the firmware's. Nothing records what it allocated, so whe
 the app ends there is nothing to give back — the exit path can free the ELF image
 and the argv block because espix allocated those *itself*, and can free nothing
 else. From a fresh boot with 13.2 MB of PSRAM free, **two Doom runs left 571 KB** —
-about 7.7 MB a run, and only a reboot returns it (KNOWN-ISSUES).
+about 7.7 MB a run, and only a reboot returned it.
+
+R-P1.2 is what fixed it: an app's allocations are a list of regions of its own,
+sized from the request that failed and released whole when the process ends, so a
+clean exit and a `kill -9` both return the PSRAM (commit 6969357). With the
+display up, Doom held about 7 MB and `kill -9` returned it to 12.3 MB (723147a),
+where before only a reboot did.
 
 Two more consequences of the same gap:
 
