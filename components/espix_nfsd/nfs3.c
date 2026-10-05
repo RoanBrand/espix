@@ -501,31 +501,35 @@ static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
             continue;                   /* already sent, in a previous page */
         }
 
-        /* Budget: each entry costs roughly this much. */
-        if (wrote && (w->len - reply_at) + 256 > maxcount) {
+        /*
+         * Reserve what this entry will really cost before writing it, not a
+         * guess: a READDIRPLUS entry carries fileid, name, cookie, attributes
+         * and a handle slot, so 256 bytes was often short and the reply could
+         * pass the maxcount the client sized its buffer for. It then could not
+         * decode the page, asked again, and the server re-read the directory
+         * every time -- a mount that hung with the disk light on.
+         */
+        const size_t name_cost = strlen(de->d_name) + 4;
+        const size_t entry_cost = plus ? (128 + name_cost) : (28 + name_cost);
+        if (wrote && (w->len - reply_at) + entry_cost + 16 > maxcount) {
             eof = false;
             break;
         }
 
-        char child[PATH_CAP];
-        strlcpy(child, path, sizeof(child));
-        strlcat(child, "/", sizeof(child));
-        strlcat(child, de->d_name, sizeof(child));
-        struct stat st;
-        const bool  have = (stat(child, &st) == 0);
-
+        /*
+         * No stat() per entry. A stat on this exFAT volume costs a second or
+         * more, so attributes for every name made a listing take minutes and
+         * left the client timing out. The client looks up what it needs, and
+         * the plus form is allowed to say the attributes are not here.
+         */
         xdrw_bool(w, true);             /* this entry exists */
-        xdrw_u64(w, (uint64_t)(have && st.st_ino != 0 ? st.st_ino : seen));
+        xdrw_u64(w, (uint64_t)(de->d_ino != 0 ? de->d_ino : seen));
         xdrw_string(w, de->d_name);
         xdrw_u64(w, seen);
         if (plus) {
-            put_post_attr(w, have, exp, &st);
-            uint8_t cfh[FH_LEN];
-            size_t  clen = 0;
-            /* No handle per entry: the client looks up what it wants. */
-            (void)cfh;
-            (void)clen;
-            xdrw_bool(w, false);
+            struct stat st;
+            put_post_attr(w, false, exp, &st);
+            xdrw_bool(w, false);        /* and no handle either */
         }
         wrote = true;
     }
