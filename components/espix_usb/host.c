@@ -52,7 +52,11 @@
  * USB transfers and does the reading is usb:work's, as it always was.
  */
 #define HOST_TASK_STACK 4096
-#define HOST_TASK_PRIO  4
+#define HOST_TASK_PRIO  5           /* usb:lib -- the library's one caller */
+#define MON_TASK_PRIO   4           /* usb:mon -- hotplug, human timescale */
+#define MON_TASK_STACK  3072
+#define MSC_TASK_PRIO   5           /* USB MSC -- transfer completions */
+#define MSC_TASK_STACK  4096        /* the driver's own task, re-enabled */
 
 /*
  * The largest sector this will read. Devices report 512 in practice; 4096 exists
@@ -186,8 +190,8 @@ static volatile bool s_msc_up;
  * copies is another couple of KB. The old size overflowed -- a panic on every
  * attach, which with a stick left in means a boot loop.
  */
-#define WORK_TASK_STACK 6144
-#define WORK_TASK_PRIO  3           /* below usb:host(4) */
+#define DEV_TASK_STACK 6144
+#define DEV_TASK_PRIO  3           /* below usb:host(4) */
 
 /* How often the worker sweeps the pool when nothing has been queued. Devices are
  * claimed by event; this is what covers the case where the event never came. */
@@ -2171,7 +2175,7 @@ static void on_connected(uint8_t address)
     }
 }
 
-static void work_task(void *arg)
+static void dev_task(void *arg)
 {
     (void)arg;
 
@@ -2442,40 +2446,50 @@ static void host_task(void *arg)
         uint32_t flags = 0;
 
         /*
-         * A short block rather than portMAX_DELAY, and the monitor drained
-         * unconditionally: its events are posted after the library's own, and a
-         * client drained only when the library happens to wake would leave a
-         * hotplug line waiting for the next port change. Twenty idle wakeups a
-         * second buy a log that arrives when the device does.
+         * Block until the library has something, and do nothing else.
+         *
+         * A client's events -- and a transfer completion is one -- are delivered
+         * only from that client's own usb_host_client_handle_events() call, so
+         * while the monitor and the MSC driver were drained from here, whatever
+         * timeout this wait carried was paid in full by every sector of every
+         * read: 48ms per transfer at the 50ms it was set to, a second for one
+         * small file, a second per stat behind ls -l. Each client has its own
+         * task now, so this one can block with no deadline at all.
          */
-        const esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
+        const esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &flags);
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-            /* A timeout is the idle case. Anything else means the library is not
-             * in a state to be serviced, and spinning on it at priority 4 would
-             * starve the shell while it stayed broken. */
+            /* With no deadline a timeout cannot happen, but a library in no
+             * state to be serviced would spin here at priority 5 and starve the
+             * shell while it stayed broken. */
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
-        if (s_monitor != NULL) {
-            (void)usb_host_client_handle_events(s_monitor, 0);
-        }
-
-        /*
-         * The MSC class driver asked to be pumped rather than given a task, and
-         * this is the task the library already requires. Zero timeout, so a
-         * driver's client can never hold the library's own events behind it;
-         * its callbacks (on_msc_event) only queue and return, which is what
-         * makes it safe to run them here.
-         *
-         * HID keeps its background task on purpose -- see espix_usb_hid_start():
-         * its attach callback blocks for seconds, and this loop is where the
-         * completions that would end that block are delivered.
-         */
-        if (s_msc_up) {
-            (void)msc_host_handle_events(0);
-        }
+        /* HID keeps its background task on purpose -- see espix_usb_hid_start():
+         * its attach callback blocks for seconds, and that task is where the
+         * completions which would end that block are delivered. */
         if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
             espix_klog(ESPIX_KLOG_DEBUG, TAG, "every device released");
+        }
+    }
+}
+
+/*
+ * The monitor client's task: hotplug, attach and detach, and the log lines.
+ *
+ * Its events are posted after the library's own, so it cannot be drained from
+ * the library's task without that task waking for it -- which is what the old
+ * poll was really for. Its callbacks only queue and return, so blocking here
+ * costs nothing; the work that can block is usb:dev's.
+ */
+static void mon_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        if (s_monitor != NULL) {
+            (void)usb_host_client_handle_events(s_monitor, portMAX_DELAY);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1000));    /* registration failed */
         }
     }
 }
@@ -2542,10 +2556,10 @@ esp_err_t espix_usb_host_init(void)
      * which is why both USB tasks are safe to move and no other change is
      * needed to make transfers work.
      */
-    if (xTaskCreateWithCaps(host_task, "usb:host", HOST_TASK_STACK, NULL,
+    if (xTaskCreateWithCaps(host_task, "usb:lib", HOST_TASK_STACK, NULL,
                             HOST_TASK_PRIO, NULL,
                             MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreate(host_task, "usb:host", HOST_TASK_STACK, NULL, HOST_TASK_PRIO,
+        xTaskCreate(host_task, "usb:lib", HOST_TASK_STACK, NULL, HOST_TASK_PRIO,
                     NULL) != pdPASS) {
         usb_host_uninstall();
         return ESP_ERR_NO_MEM;
@@ -2567,10 +2581,10 @@ esp_err_t espix_usb_host_init(void)
     }
     /* PSRAM first, as above: this is the larger of the two stacks (6144) and
      * the one that holds the mount applier's frames. */
-    if (xTaskCreateWithCaps(work_task, "usb:work", WORK_TASK_STACK, NULL,
-                            WORK_TASK_PRIO, NULL,
+    if (xTaskCreateWithCaps(dev_task, "usb:dev", DEV_TASK_STACK, NULL,
+                            DEV_TASK_PRIO, NULL,
                             MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreate(work_task, "usb:work", WORK_TASK_STACK, NULL, WORK_TASK_PRIO,
+        xTaskCreate(dev_task, "usb:dev", DEV_TASK_STACK, NULL, DEV_TASK_PRIO,
                     NULL) != pdPASS) {
         vQueueDelete(s_work);
         s_work = NULL;
@@ -2595,20 +2609,26 @@ esp_err_t espix_usb_host_init(void)
         s_monitor = NULL;
         espix_klog(ESPIX_KLOG_WARN, TAG, "no device monitor: %s",
                    esp_err_to_name(err));
+    } else if (xTaskCreate(mon_task, "usb:mon", MON_TASK_STACK, NULL,
+                           MON_TASK_PRIO, NULL) != pdPASS) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no monitor task");
     }
 
     /*
-     * No background task (R-P5.2): host_task() pumps msc_host_handle_events()
-     * instead, and this is the 4096-byte stack the task used to cost. Safe
-     * because everything the driver calls back into only queues and returns --
-     * the install that blocks on SCSI transfers is usb:work's job, and always
-     * was. task_priority, stack_size and core_id are left out because there is
-     * no task for them to describe.
+     * The driver's own task, which is where its transfer completions are
+     * delivered. It used to be pumped from the library's task with a zero
+     * timeout, which meant a completion waited for that task's poll to expire.
+     * Everything the driver calls back into only queues and returns, so
+     * blocking in its own task costs nothing; the install that blocks on SCSI
+     * transfers is usb:dev's job, and always was.
      */
     const msc_host_driver_config_t msc_config = {
-        .create_backround_task = false,
+        .create_backround_task = true,
         .callback = on_msc_event,
         .callback_arg = NULL,
+        .task_priority = MSC_TASK_PRIO,
+        .stack_size = MSC_TASK_STACK,
+        .core_id = tskNO_AFFINITY,
     };
     err = msc_host_install(&msc_config);
     if (err != ESP_OK) {
