@@ -730,6 +730,33 @@ esp_err_t esp_vfs_fat_register(const esp_vfs_fat_conf_t* conf, FATFS** out_fs)
 '''
 
 
+# A listing costs one walk of the directory, not one per entry.
+#
+# IDF's FAT VFS caches the FILINFO of the entry readdir just returned, and
+# vfs_fat_stat() consumes it -- so readdir() followed by stat(), which is what a
+# listing does, needs no directory walk at all. But the fill lived only in
+# vfs_fat_readdir(), and every readdir ends up in vfs_fat_readdir_r(): the wrapper
+# calls it. newlib's readdir() reaches the _r form directly, so the cache was
+# never filled on the path espix uses, and each stat re-walked the directory --
+# a listing of N entries doing N walks. Measured on an exFAT stick: 500 entries,
+# ls -l 31 seconds, where one walk is one second.
+VFS_READDIR_CACHE_OLD = chr(10).join([
+    "    strlcpy(entry->d_name, fat_dir->filinfo.fname,",
+    "            sizeof(entry->d_name));",
+    "    fat_dir->offset++;",
+    "    *out_dirent = entry;",
+])
+VFS_READDIR_CACHE_NEW = chr(10).join([
+    "    strlcpy(entry->d_name, fat_dir->filinfo.fname,",
+    "            sizeof(entry->d_name));",
+    "    fat_dir->offset++;",
+    "    /* espix: fill the stat cache on the readdir_r path -- every readdir",
+    "     * passes through here, not only vfs_fat_readdir(). */",
+    "    vfs_fat_cache_readdir_entry(fat_dir);",
+    "    *out_dirent = entry;",
+])
+MARK_VFS_READDIR_CACHE = "espix: fill the stat cache on the readdir_r path"
+
 def main() -> int:
     args = sys.argv[1:]
     if args:
@@ -780,6 +807,9 @@ def main() -> int:
         source_new = replace_once(source_new, VFS_READDIR_OLD, VFS_READDIR_NEW,
                                   MARK_VFS_READDIR,
                                   str(source.name) + " readdir diagnostic")
+        source_new = replace_once(source_new, VFS_READDIR_CACHE_OLD,
+                                  VFS_READDIR_CACHE_NEW, MARK_VFS_READDIR_CACHE,
+                                  str(source.name) + " readdir stat cache")
         source_new = replace_once(source_new, FRESULT_ERRNO_OLD,
                                   FRESULT_ERRNO_NEW, MARK_FRESULT_ERRNO,
                                   str(source.name) + " FR_INT_ERR errno")

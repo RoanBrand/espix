@@ -304,7 +304,26 @@ static int fat_readdir_r(void *ctx, DIR *pdir, struct dirent *entry,
                          struct dirent **out)
 {
     fat_mount_t *m = ctx;
-    return m->ops->dir->readdir_r_p(m->fat_ctx, pdir, entry, out);
+    /*
+     * Through readdir_p, not readdir_r_p, and that is the whole point.
+     *
+     * IDF's FAT VFS caches the FILINFO of the entry readdir just returned and
+     * consumes it in the next stat() of that path -- so an entry that is read
+     * and then statted, which is exactly what a listing does, costs no
+     * directory walk at all. The cache is filled in vfs_fat_readdir() only, and
+     * readdir_r goes straight to f_readdir, so this going to the _r form threw
+     * it away: every stat re-walked the directory, a listing of N entries did N
+     * walks, and 500 of them took 31 seconds where one walk takes one.
+     */
+    errno = 0;
+    struct dirent *e = m->ops->dir->readdir_p(m->fat_ctx, pdir);
+    if (e == NULL) {
+        *out = NULL;
+        return errno;               /* 0 at the end of the directory */
+    }
+    *entry = *e;
+    *out = entry;
+    return 0;
 }
 
 static long fat_telldir(void *ctx, DIR *pdir)
