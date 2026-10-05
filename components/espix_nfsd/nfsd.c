@@ -32,6 +32,16 @@
 #define NFS_PROG     100003u
 #define NFS_VERS     3u
 
+/*
+ * A client pings this with a NULL before it will mount, and a real nfsd answers
+ * that ping successfully -- answering PROG_UNAVAIL is what made the mount fail
+ * after MNT, GETATTR and PATHCONF had all been answered correctly. The number is
+ * in no registry and the probe carries no data, but every server on the wire
+ * answers it, so this does too.
+ */
+#define NFS_PING_PROG   400122u
+#define NFS_PING_VERS   1u
+
 #define PORTMAP_PORT 111
 #define MOUNT_PORT   20048          /* ours to choose: mountd has no default */
 #define NFS_PORT     2049
@@ -95,7 +105,11 @@ static void trace_rpc(const rpc_call_t *c, const uint8_t *rep, size_t len)
     fprintf(f, "prog %u vers %u proc %u xid %u status %u -> %u bytes\n",
             (unsigned)c->prog, (unsigned)c->vers, (unsigned)c->proc,
             (unsigned)c->xid, (unsigned)status, (unsigned)len);
-    fprintf(f, "  rep:");
+    fprintf(f, "  req:");
+    for (size_t i = 0; i < c->len && i < 96; i++) {
+        fprintf(f, " %02x", c->buf[i]);
+    }
+    fprintf(f, "\n  rep:");
     for (size_t i = 0; i < len && i < 160; i++) {
         fprintf(f, " %02x", rep[i]);
     }
@@ -413,6 +427,12 @@ static size_t dispatch(const rpc_call_t *c, uint8_t *rep, size_t cap, uint32_t s
         out = handle_mount(c, &w, src);
     } else if (c->prog == NFS_PROG && c->vers == NFS_VERS) {
         out = nfs3_handle(c, &w, s_io, IOCAP);
+    } else if (c->prog == NFS_PING_PROG && c->vers == NFS_PING_VERS) {
+        /* Every procedure of it, not just the NULL: nfsd answers proc 1 with a
+         * void success too, and answering PROG_UNAVAIL is what the client is
+         * left holding when the mount stops. */
+        xdrw_accept(&w, RPC_SUCCESS);
+        out = w.len;
     } else if (c->prog == PORTMAP_PROG || c->prog == MOUNT_PROG ||
                c->prog == NFS_PROG) {
         xdrw_accept(&w, RPC_PROG_MISMATCH);

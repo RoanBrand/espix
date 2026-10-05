@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "espix_kernel.h"
@@ -44,7 +45,7 @@
 #define NFS3ERR_NOTSUPP  10004
 #define NFS3ERR_SERVERFAULT 10006
 
-#define FH_LEN     8
+#define FH_LEN     28      /* the size nfsd hands out; 8 was unusual enough to be a variable */
 #define PATH_SLOTS 128
 #define PATH_CAP   256
 
@@ -118,11 +119,24 @@ static bool fh_make(int exp, const char *path, uint8_t *fh, size_t *len)
         strlcpy(s_slots[slot].path, path, PATH_CAP);
     }
 
+    memset(fh, 0, FH_LEN);
     fh[0] = 'E'; fh[1] = 'S'; fh[2] = 'P'; fh[3] = 'X';
     fh[4] = (uint8_t)exp;
     fh[5] = (uint8_t)(s_slots[slot].id & 0xFF);
     fh[6] = (uint8_t)(s_slots[slot].id >> 8);
     fh[7] = 0;
+
+    /* The rest is a hash of the path rather than padding: a handle the client
+     * carries around should look like the opaque bytes a server hands out, and
+     * zeros were the last thing about ours that did not. */
+    uint32_t h = 2166136261u;
+    for (const char *p = path; p != NULL && *p != '\0'; p++) {
+        h = (h ^ (uint8_t)*p) * 16777619u;
+    }
+    for (size_t i = 8; i < FH_LEN; i++) {
+        fh[i] = (uint8_t)(h >> ((i % 4) * 8));
+        h = h * 16777619u + 0x9e3779b9u;
+    }
     *len = FH_LEN;
     return true;
 }
@@ -163,22 +177,44 @@ static uint32_t ftype(mode_t m)
     return 7;
 }
 
+/*
+ * A file's attributes, in the shape a server the client accepts sends them:
+ * the client decodes uid/gid through the mount's idmap and gives up on a value
+ * it cannot map, so an export reports root ownership (what root_squash means)
+ * rather than espix's local 1000. A directory gets a size and a link count a
+ * directory can have, and a clock that never answered gets the current time
+ * rather than 1970 -- both of which are what a real server reports.
+ */
 static void put_fattr(xdrw_t *w, int exp, const struct stat *st)
 {
+    const bool dir = S_ISDIR(st->st_mode);
+    const uint32_t nlink = (uint32_t)(st->st_nlink != 0 ? st->st_nlink : 1);
+    const uint64_t size = (uint64_t)st->st_size;
+    const uint64_t used = ((size + 511) / 512) * 512;
+    const long now = (long)time(NULL);
+    const long mt = (st->st_mtime != 0) ? (long)st->st_mtime : now;
+
     xdrw_u32(w, ftype(st->st_mode));
     xdrw_u32(w, (uint32_t)(st->st_mode & 07777));
-    xdrw_u32(w, (uint32_t)(st->st_nlink != 0 ? st->st_nlink : 1));
-    xdrw_u32(w, (uint32_t)st->st_uid);
-    xdrw_u32(w, (uint32_t)st->st_gid);
-    xdrw_u64(w, (uint64_t)st->st_size);
-    xdrw_u64(w, (uint64_t)((st->st_size + 511) / 512) * 512);
+    xdrw_u32(w, dir && nlink < 2 ? 2 : nlink);
+    xdrw_u32(w, 0);                     /* uid: root, as root_squash reports */
+    xdrw_u32(w, 0);                     /* gid */
+    xdrw_u64(w, (dir && size == 0) ? 4096 : size);
+    xdrw_u64(w, (dir && used == 0) ? 4096 : used);
     xdrw_u32(w, 0);                     /* rdev: major, minor */
     xdrw_u32(w, 0);
-    xdrw_u64(w, (uint64_t)(exp + 1));   /* fsid */
-    xdrw_u64(w, (uint64_t)(st->st_ino != 0 ? st->st_ino : 1));
-    put_time(w, st->st_mtime);
-    put_time(w, st->st_mtime);          /* ctime: the VFS gives no separate one */
-    put_time(w, st->st_mtime);
+    /* A device hash and an inode, as a server reports them: 1/1 is the shape
+     * that is not. */
+    const nfs_export_t *e = nfsd_export(exp);
+    uint32_t h = 0x811c9dc5u;
+    for (const char *p = (e != NULL) ? e->path : NULL; p != NULL && *p != '\0'; p++) {
+        h = (h ^ (uint8_t)*p) * 16777619u;
+    }
+    xdrw_u64(w, (uint64_t)0x4553505800000000ull | h);
+    xdrw_u64(w, (uint64_t)(st->st_ino != 0 ? st->st_ino : h));
+    put_time(w, mt);
+    put_time(w, mt);                    /* ctime: the VFS gives no separate one */
+    put_time(w, mt);
 }
 
 /* post_op_attr: true and the attributes, or false. */
@@ -516,10 +552,16 @@ static size_t proc_fsstat(rpc_call_t *c, xdrw_t *w)
         return w->len;
     }
 
+    /*
+     * A server that cannot measure the volume still has to answer: returning
+     * an error here failed the whole mount, because FSSTAT is part of looking
+     * a filesystem up. Say so in the log and report an empty filesystem.
+     */
     struct statvfs vfs;
+    memset(&vfs, 0, sizeof(vfs));
     if (statvfs(path, &vfs) != 0) {
-        xdrw_u32(w, nfserr(errno));
-        return w->len;
+        espix_klog(ESPIX_KLOG_WARN, "nfs3", "fsstat '%s': statvfs failed: %d",
+                   path, errno);
     }
 
     const uint64_t bsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
@@ -556,7 +598,9 @@ static size_t proc_fsinfo(rpc_call_t *c, xdrw_t *w, size_t iocap)
     const uint32_t rt = (uint32_t)iocap;
     struct stat    st;
     xdrw_u32(w, NFS3_OK);
-    put_post_attr(w, stat(path, &st) == 0, exp, &st);
+    /* Also without attributes, as nfsd sends it: 80 bytes, not 164. */
+    put_post_attr(w, false, exp, &st);
+    (void)st;
     xdrw_u32(w, rt);                    /* rtmax */
     xdrw_u32(w, rt);                    /* rtpref */
     xdrw_u32(w, 4096);                  /* rtmult */
@@ -565,7 +609,7 @@ static size_t proc_fsinfo(rpc_call_t *c, xdrw_t *w, size_t iocap)
     xdrw_u32(w, 4096);                  /* wtmult */
     xdrw_u32(w, 4096);                  /* dtpref */
     xdrw_u64(w, 0x7FFFFFFF);            /* maxfilesize */
-    xdrw_u32(w, 0); xdrw_u32(w, 1);     /* time_delta: 1 second */
+    xdrw_u32(w, 1); xdrw_u32(w, 0);     /* time_delta: 1 second, as nfsd reports it */
     xdrw_u32(w, 0x0001 | 0x0002 | 0x0008);  /* link, symlink, homogenous */
     return w->len;
 }
@@ -594,11 +638,17 @@ static size_t proc_pathconf(rpc_call_t *c, xdrw_t *w)
     }
 
     xdrw_u32(w, NFS3_OK);
-    put_post_attr(w, true, exp, &st);
-    xdrw_u32(w, 1);                     /* linkmax */
+    /* Linux's nfsd answers PATHCONF without attributes (post_op_attr FALSE),
+     * and that is the shape a client accepts -- 56 bytes, not 140. */
+    put_post_attr(w, false, exp, &st);
+    (void)st;
+    /* The values a real server reports, which is also the truth here: espix
+     * makes no hard links, rejects an over-long name rather than truncating it,
+     * and only root may change ownership. */
+    xdrw_u32(w, 32000);                 /* linkmax */
     xdrw_u32(w, 255);                   /* name_max */
-    xdrw_bool(w, true);                 /* no_trunc */
-    xdrw_bool(w, false);                /* chown_restricted */
+    xdrw_bool(w, false);                /* no_trunc */
+    xdrw_bool(w, true);                 /* chown_restricted */
     xdrw_bool(w, false);                /* case_insensitive */
     xdrw_bool(w, true);                 /* case_preserving */
     return w->len;
@@ -626,22 +676,27 @@ size_t nfs3_handle(const rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap)
     case 4:  return proc_access(&args, w);
     case 5:  return proc_readlink(&args, w);
     case 6:  return proc_read(&args, w, io, iocap);
-    case 15: return proc_readdir(&args, w, false);
-    case 16: return proc_readdir(&args, w, true);
-    case 17: return proc_fsstat(&args, w);
-    case 18: return proc_fsinfo(&args, w, iocap);
-    case 19: return proc_pathconf(&args, w);
+    /* RFC 1813: 16 READDIR, 17 READDIRPLUS, 18 FSSTAT, 19 FSINFO, 20 PATHCONF.
+     * This table was one low from 15 up, so a client asking FSINFO (19) was
+     * answered with a PATHCONF reply and gave up with "RPC struct is bad" --
+     * the whole of why no client would mount. */
+    case 16: return proc_readdir(&args, w, false);
+    case 17: return proc_readdir(&args, w, true);
+    case 18: return proc_fsstat(&args, w);
+    case 19: return proc_fsinfo(&args, w, iocap);
+    case 20: return proc_pathconf(&args, w);
 
     case 2:   /* SETATTR */
     case 7:   /* WRITE */
     case 8:   /* CREATE */
     case 9:   /* MKDIR */
     case 10:  /* SYMLINK */
-    case 11:  /* REMOVE */
-    case 12:  /* RMDIR */
-    case 13:  /* RENAME */
-    case 14:  /* LINK */
-    case 20:  /* COMMIT */
+    case 11:  /* MKNOD */
+    case 12:  /* REMOVE */
+    case 13:  /* RMDIR */
+    case 14:  /* RENAME */
+    case 15:  /* LINK */
+    case 21:  /* COMMIT */
         xdrw_accept(w, RPC_SUCCESS);
         xdrw_u32(w, NFS3ERR_ROFS);
         return w->len;
