@@ -13,3 +13,6 @@ size_t nfs3_handle(const rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap);
 
 /* The handle for an export's root, which is what MNT returns. */
 bool   nfs3_fh_for_export(int exp, uint8_t *fh, size_t *len);
+
+/* The address the current request came from, set once per request. */
+void   nfs3_set_source(uint32_t src);

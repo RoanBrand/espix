@@ -71,6 +71,18 @@ static int         s_cursor;
 static uint32_t    s_last_ms;
 #define SLOTS_IDLE_MS 30000
 
+/*
+ * The address the current request came from. The daemon serves one request at a
+ * time, so a static holds it exactly, and it costs nothing to check: four bytes
+ * against the export's client list, and no I/O.
+ */
+static uint32_t s_src;
+
+void nfs3_set_source(uint32_t src)
+{
+    s_src = src;
+}
+
 void nfs3_slots_cleanup(void)
 {
     free(s_slots);
@@ -129,6 +141,17 @@ static bool fh_resolve(const uint8_t *fh, size_t len, int *exp,
     if (e < 0 || e >= nfsd_exports_count() || s_slots == NULL) {
         return false;
     }
+
+    /*
+     * The handle was minted for a client this export allowed. A client keeps a
+     * handle for as long as it likes and reuses it for every request that
+     * follows, so the permission is checked on each of them, not once at mount.
+     */
+    const nfs_export_t *x = nfsd_export(e);
+    if (x == NULL || !nfsd_client_allowed(x, s_src)) {
+        return false;
+    }
+
     for (int i = 0; i < PATH_SLOTS; i++) {
         if (s_slots[i].id == id) {
             *exp = e;
@@ -240,8 +263,13 @@ static void put_fattr(xdrw_t *w, int exp, const struct stat *st)
     xdrw_u32(w, ftype(st->st_mode));
     xdrw_u32(w, (uint32_t)(st->st_mode & 07777));
     xdrw_u32(w, dir && nlink < 2 ? 2 : nlink);
-    xdrw_u32(w, 0);                     /* uid: root, as root_squash reports */
-    xdrw_u32(w, 0);                     /* gid */
+    /*
+     * The file's own owner. On a FAT mount that is whoever the mount was made
+     * as -- there is no squash here, so this is the same owner a Linux client
+     * would be shown by a Linux server holding the same files.
+     */
+    xdrw_u32(w, (uint32_t)st->st_uid);
+    xdrw_u32(w, (uint32_t)st->st_gid);
     xdrw_u64(w, (dir && size == 0) ? 4096 : size);
     xdrw_u64(w, (dir && used == 0) ? 4096 : used);
     xdrw_u32(w, 0);                     /* rdev: major, minor */
@@ -538,6 +566,17 @@ static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
     bool         wrote    = false;
     bool         eof      = true;
 
+    /*
+     * A mount that keeps no ownership of its own owns everything on it as the
+     * one who mounted it, and a worklist entry cannot report that per name.
+     * Asked once for the page it is a lookup in the mount table -- asking per
+     * entry would be the stat this walk exists to avoid. Zero for a filesystem
+     * that stores its own ownership, which is what the entries then report.
+     */
+    uint16_t ouid = 0;
+    uint16_t ogid = 0;
+    (void)espix_fs_mount_owner(path, &ouid, &ogid);
+
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         seen++;
@@ -590,6 +629,8 @@ static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
                                                : (S_IFREG | 0777);
                 st.st_size  = ei.size;
                 st.st_mtime = fat_info_time(ei.date, ei.time);
+                st.st_uid   = ouid;
+                st.st_gid   = ogid;
             }
             put_post_attr(w, have, exp, &st);
 

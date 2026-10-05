@@ -42,6 +42,11 @@
 #define NFS_PING_PROG   400122u
 #define NFS_PING_VERS   1u
 
+/* statd, the Network Status Monitor, which a client asks the portmapper for
+ * before it will mount without a lock option. See handle_nsm(). */
+#define NSM_PROG     100024u
+#define NSM_VERS     1u
+
 #define PORTMAP_PORT 111
 #define MOUNT_PORT   20048          /* ours to choose: mountd has no default */
 #define NFS_PORT     2049
@@ -346,6 +351,47 @@ static size_t handle_portmap(const rpc_call_t *c, xdrw_t *w)
     }
 }
 
+/*
+ * statd: program 100024, version 1, served on the nfsd port. The program number
+ * is what tells an RPC apart, so it needs no socket of its own.
+ *
+ * A client finds statd through the portmapper and then registers the peers whose
+ * crash it would want to know about. There is nothing to remember here: this
+ * server cannot restart on its own in a way that leaves a client holding locks,
+ * so a monitor is accepted and forgotten, which is what a statd with no state to
+ * restore does. The replies still carry the shape a client reads -- an
+ * sm_stat_res with a success status, an sm_stat with the state number -- because
+ * a client that gets a short reply where it expects two words abandons the
+ * mount, and answering at all is what makes a plain mount work with no options.
+ */
+static size_t handle_nsm(const rpc_call_t *c, xdrw_t *w)
+{
+    switch (c->proc) {
+    case 1:                                     /* SM_STAT */
+    case 2:                                     /* SM_MON */
+        xdrw_accept(w, RPC_SUCCESS);
+        xdrw_u32(w, 0);                         /* STAT_SUCC */
+        xdrw_u32(w, 1);                         /* state */
+        return w->len;
+
+    case 3:                                     /* SM_UNMON */
+    case 4:                                     /* SM_UNMON_ALL */
+        xdrw_accept(w, RPC_SUCCESS);
+        xdrw_u32(w, 1);                         /* state; sm_stat is one word */
+        return w->len;
+
+    case 0:                                     /* SM_NULL */
+    case 5:                                     /* SM_SIMU_CRASH: nothing to do */
+    case 6:                                     /* SM_NOTIFY: nobody to tell */
+        xdrw_accept(w, RPC_SUCCESS);
+        return w->len;
+
+    default:
+        xdrw_accept(w, RPC_PROC_UNAVAIL);
+        return w->len;
+    }
+}
+
 static size_t handle_mount(const rpc_call_t *c, xdrw_t *w, uint32_t src)
 {
     switch (c->proc) {
@@ -446,7 +492,10 @@ static size_t dispatch(const rpc_call_t *c, uint8_t *rep, size_t cap, uint32_t s
                (c->vers == 1 || c->vers == 2 || c->vers == MOUNT_VERS)) {
         out = handle_mount(c, &w, src);
     } else if (c->prog == NFS_PROG && c->vers == NFS_VERS) {
+        nfs3_set_source(src);
         out = nfs3_handle(c, &w, s_io, IOCAP);
+    } else if (c->prog == NSM_PROG && c->vers == NSM_VERS) {
+        out = handle_nsm(c, &w);
     } else if (c->prog == NFS_PING_PROG && c->vers == NFS_PING_VERS) {
         /* Every procedure of it, not just the NULL: nfsd answers proc 1 with a
          * void success too, and answering PROG_UNAVAIL is what the client is
@@ -454,7 +503,7 @@ static size_t dispatch(const rpc_call_t *c, uint8_t *rep, size_t cap, uint32_t s
         xdrw_accept(&w, RPC_SUCCESS);
         out = w.len;
     } else if (c->prog == PORTMAP_PROG || c->prog == MOUNT_PROG ||
-               c->prog == NFS_PROG) {
+               c->prog == NFS_PROG || c->prog == NSM_PROG) {
         xdrw_accept(&w, RPC_PROG_MISMATCH);
         xdrw_u32(&w, 1);
         xdrw_u32(&w, 3);
@@ -663,6 +712,8 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
     reg_add(MOUNT_PROG, 2, MOUNT_PORT);
     reg_add(MOUNT_PROG, MOUNT_VERS, MOUNT_PORT);
     reg_add(NFS_PROG, NFS_VERS, NFS_PORT);
+    /* statd shares the nfsd port: the program number separates them. */
+    reg_add(NSM_PROG, NSM_VERS, NFS_PORT);
 
     espix_klog(ESPIX_KLOG_INFO, TAG,
                "serving: portmap 111, mountd %d, nfsd %d",
