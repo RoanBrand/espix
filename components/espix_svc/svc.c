@@ -19,10 +19,15 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "esp_system.h"
 #include "esp_timer.h"
 
 #include "espix_fault.h"
+#include "espix_fs.h"
 #include "espix_svc.h"
 
 static const char *TAG = "espix:svc";
@@ -320,16 +325,112 @@ static void unit_start(svc_unit_t *u)
  * count; one that is gone is asked to stop. Called under the lock.
  */
 /*
- * The default when /etc/units is absent, in the same syntax the file uses.
+ * The file when there is none, and the text the supervisor falls back to when
+ * it cannot be written. Everything in it is commented out but the update
+ * check: a unit enables itself because somebody uncommented a line.
  *
- * The system provides it the way it provides /etc itself and every other
- * default: a device whose filesystem is bare still checks for updates. A units
- * file replaces this outright -- there is no merge, so there is one place to
- * read the answer.
+ * It is a file rather than only a compiled-in default so the format and the
+ * options are in front of whoever edits it. The useful part is the list of
+ * what espix can start at boot, and a manual is a worse place for it than the
+ * file itself.
  */
 static const char *const SVC_DEFAULT_UNITS =
-    "# built-in default; create /etc/units to replace it\n"
-    "poll every 6h upgrade --check\n";
+    "# What espix runs at boot, and keeps running: one unit per line, in order.\n"
+    "#\n"
+    "#   <name>   <restart>          <command> [args...]\n"
+    "#\n"
+    "#   name     a label, and only a label: what service lists and what the klog\n"
+    "#            calls it. It need not be a program, but it must be unique.\n"
+    "#   restart  always   start it, and start it again if it exits\n"
+    "#            once     run it once and leave it stopped\n"
+    "#            every N  run it again on that schedule (s, m, h, d)\n"
+    "#   command  a program if it starts with /, otherwise a builtin of the shell\n"
+    "#            and its services. A unit runs as root with no terminal, so its\n"
+    "#            output goes to the klog.\n"
+    "#\n"
+    "# This file is the whole set: there is no file per job, so copying one in\n"
+    "# replaces everything. service lists what is running, service start <name>\n"
+    "# starts one now, and an edit takes effect with service reload.\n"
+    "#\n"
+    "# Everything below is commented out but the update check, and that is on\n"
+    "# purpose: a unit enables itself because somebody uncommented the line.\n"
+    "\n"
+    "# --- espix's own update check (on by default) -----------------------------\n"
+    "# Every six hours, ask whether there is a newer build and log the answer.\n"
+    "# It installs nothing by itself; that is what upgrade without --check does.\n"
+    "autoupdate  every 6h  upgrade --check\n"
+    "\n"
+    "# --- SSH -----------------------------------------------------------------\n"
+    "# Started by espix itself rather than by this file, so there is nothing to\n"
+    "# uncomment here and no way to switch it off from here. It is the one thing\n"
+    "# that wants thinking about before it becomes a unit: turning it off leaves\n"
+    "# the serial console as the only way in.\n"
+    "\n"
+    "# --- NFS -----------------------------------------------------------------\n"
+    "# Serves what /etc/exports lists, read-only unless a line there says rw.\n"
+    "#\n"
+    "# nfsd  always  nfsd\n"
+    "\n"
+    "# --- The VPN server ------------------------------------------------------\n"
+    "# Brings wg0 up with the peers in /etc/vpn. None of it exists until this\n"
+    "# runs -- no interface, no task, no memory -- so leaving it out costs nothing.\n"
+    "#\n"
+    "# vpn  once  vpn up\n"
+    "\n"
+    "# --- Remote desktop ------------------------------------------------------\n"
+    "# One line, because units start as tasks of their own: a second line here\n"
+    "# would race the first rather than wait for it, and the viewer needs the\n"
+    "# desktop to be up. Until the pair is one command, start the desktop here\n"
+    "# and the viewer by hand.\n"
+    "#\n"
+    "# desktop  once  desktop start\n"
+    "\n"
+    "# --- A dynamic DNS client ------------------------------------------------\n"
+    "# Small and self-contained: dynu's IP-update is an HTTP GET and fetch\n"
+    "# already does HTTP, so this runs the builtin every fifteen minutes and the\n"
+    "# answer lands in /tmp/ddns.out (good <ip>, nochg <ip>, badauth, nohost).\n"
+    "# There is no dynu or ddns command -- the name is a label.\n"
+    "#\n"
+    "# Put your own host and dynu IP-update password in the URL, not the account\n"
+    "# password: fetch logs the URL it fetches, so it reaches the klog.\n"
+    "#\n"
+    "# dynu  every 15m  fetch https://api.dynu.com/nic/update?hostname=YOURHOST&password=YOURPASSWORD /tmp/ddns.out\n";
+
+/*
+ * Write the file the first time, so the format and the options are where
+ * somebody will read them. 0600, like /etc/sudoers: a unit line is a root
+ * command line, and this is where it is written down.
+ */
+static void units_seed(void)
+{
+    const int fd = open(SVC_UNITS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot create it", SVC_UNITS_FILE);
+        return;
+    }
+    FILE *f = fdopen(fd, "w");
+    if (f == NULL) {
+        close(fd);
+        return;
+    }
+    fputs(SVC_DEFAULT_UNITS, f);
+    fclose(f);
+
+    /*
+     * Asked for explicitly, because a file's mode comes from the rule for its
+     * path and not from what open() was given: a fresh /etc/units arrived 0644.
+     * That is the wrong answer here -- this file can hold a ddns URL with a
+     * password in it, and a unit line is a root command line, which is why
+     * /etc/sudoers is 0600 for the same reason.
+     */
+    (void)espix_fs_chmod(SVC_UNITS_FILE, 0600);
+
+    struct stat st;
+    if (stat(SVC_UNITS_FILE, &st) == 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: written, mode 0%o",
+                   SVC_UNITS_FILE, (unsigned)(st.st_mode & 0777));
+    }
+}
 
 /* One line, file or built-in. Mutates the line, as strtok_r does. */
 static void units_parse(svc_unit_t *fresh, int *n, char *line)
@@ -406,11 +507,11 @@ static void units_load(void)
         }
         fclose(f);
     } else {
-        /* Said out loud: "no units file" and "no units" are different states,
-         * and this one still runs the update check. */
-        espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "no %s; using the built-in unit (poll every 6h "
-                   "upgrade --check)", SVC_UNITS_FILE);
+        /* Written rather than only defaulted: the format belongs in front of
+         * whoever edits it, and a file that appears on the first boot is how
+         * they get there. The default is still parsed below, so a filesystem
+         * that cannot be written behaves exactly as it did. */
+        units_seed();
 
         char *copy = strdup(SVC_DEFAULT_UNITS);
         if (copy != NULL) {

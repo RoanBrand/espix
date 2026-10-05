@@ -770,6 +770,17 @@ both are the sort of thing that is cheaper to know now.
 
 ## SSH
 
+- **`sshd` as a unit, so it can be turned off from /etc/units.** The server is
+  started by espix itself today -- `ssh_server.c` creates its accept task at
+  boot -- and there is no `sshd` builtin, so a line in the units file would do
+  nothing (which is what the example file used to imply). What it costs is a
+  builtin that starts the server and then blocks, which a unit with `always`
+  keeps up, plus removing the boot-time start. What it buys is the control every
+  other daemon already has. The decision to settle first is the way back in: a
+  device whose SSH is off is reached over the serial console, so the default has
+  to stay on, and turning it off has to be a deliberate edit rather than an
+  uncommented line somebody copied.
+
 - **More than one channel per connection.** `direct-tcpip` landed, so
   `ssh -N -L` works -- but the server carries exactly one channel for the life
   of a connection, which is why `ssh -L` (a shell *and* a forward) is refused.
