@@ -8,15 +8,20 @@ has to be installed on the other side.
 ```sh
 $ cat /etc/exports
 # espix NFS exports: <path> <client>[(options)], as Linux writes them.
-# Read-only until the write path exists.
+# Read-only unless a line says rw.
 /mnt/sda1  *(ro)
 ```
 
-**What this is not** is a writable server, or NFSv4. Every procedure that would
-write answers `NFS3ERR_ROFS` -- the honest answer rather than a half-working one,
-and the one the export already claims. NFSv4 is a different protocol rather than
-a later version of this one, and is not implemented; a client that insists on it
-is told "Protocol not supported", which is true.
+**What this is not** is writable by default, or NFSv4. An export is read-only
+unless its line says `rw`, which is espix's default rather than Linux's: a stick
+that becomes writable over the network because nobody wrote `ro` is the wrong way
+round. With `rw` a client creates, writes, renames and removes, and every one of
+those is the filesystem underneath answering -- a read-only mount refuses with
+EROFS, a full volume with ENOSPC, and the client gets the errno it was given.
+
+NFSv4 is a different protocol rather than a later version of this one, and is not
+implemented; a client that insists on it is told "Protocol not supported", which
+is true.
 
 ## Mounting it
 
@@ -140,11 +145,55 @@ On the ESP32-S31 board, over WiFi:
 | 500-entry directory, Linux client, `ls` | 1.3 s (client startup included) |
 | `ls -l` of the export root | 0.04 s |
 | A file read over NFS | line rate of the link |
+| 2 MiB written, Linux client, `cp` | 8 s (~260 KB/s), sha256 identical |
+
+## Writing
+
+An export that says `rw` is a filesystem a client can change:
+
+```sh
+$ sudo mount -t nfs 192.168.110.203:/mnt/sda1 /mnt/x
+$ cp big.bin /mnt/x/ && sha256sum big.bin /mnt/x/big.bin
+$ mkdir /mnt/x/here && mv /mnt/x/big.bin /mnt/x/here/ && rm /mnt/x/here/big.bin
+```
+
+Three things are worth knowing before trusting it with something:
+
+- **A mode or an owner is accepted and forgotten.** FAT has neither, so a chmod
+  over the wire is not something the volume can honour -- but *refusing* it fails
+  the create-then-setattr sequence every `cp` is made of, because the client asks
+  for the mode it opened the file with. A Linux server exporting a vfat directory
+  behaves the same way. Through the shell on the device, `chmod` still answers
+  EPERM: that is espix's own filesystem surface, not this one.
+- **A write is as durable as the client asked for.** With `stable` UNSTABLE the
+  data sits in the filesystem's cache until the client's COMMIT; FILE_SYNC and
+  DATA_SYNC are flushed before the reply. An ordinary `cp`, `dd` or editor does
+  commit, and a file written that way survives a reboot -- which is how it was
+  checked, by writing 2 MiB, rebooting the board and reading it back.
+- **Hard links and symlinks are refused** with `NFS3ERR_NOTSUPP`, which is what
+  they are: this filesystem has not got them.
+
+Measured, 2 MiB written over WiFi from a Linux client in a container on the same
+LAN: 8 seconds, about 260 KB/s, with the sha256 of the copy identical to the
+source. Reads are unchanged by the write path existing.
+
+Two host-side tools live in the tree for the times a kernel client is not enough:
+
+    tools/nfs/rpc.py nsm|own|read|lull|release|create|write|setattr|...
+    tools/nfs/linux-mount.sh [rw]
+
+`rpc.py` speaks the protocol itself, so a disagreement is a number rather than
+"RPC struct is bad" -- it is how the handle lifetime and the table release are
+checked, and it can send a verb no client would. `linux-mount.sh` mounts the
+export from a real Linux client in a container, which is the test that matters
+for compatibility: a kernel client decodes replies with its own XDR, and two of
+the bugs in this file were found by exactly that.
 
 ## Limits
 
-- **Read-only.** `SETATTR`, `WRITE`, `CREATE`, `MKDIR`, `REMOVE`, `RMDIR`,
-  `RENAME`, `LINK` and `COMMIT` all answer `NFS3ERR_ROFS`.
+- **Writes need `rw`.** Without it every writing procedure answers
+  `NFS3ERR_ROFS`; the default is deliberate, and one word in `/etc/exports`
+  changes it.
 - **NFSv3 only.** No v4, and no NFS over RDMA, obviously.
 - **No squashing.** A file is reported with the uid and gid of the mount's owner
   and no client identity is rewritten: root on the client is root on the wire.

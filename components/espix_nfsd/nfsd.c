@@ -111,7 +111,9 @@ static void trace_rpc(const rpc_call_t *c, const uint8_t *rep, size_t len)
             (unsigned)c->prog, (unsigned)c->vers, (unsigned)c->proc,
             (unsigned)c->xid, (unsigned)status, (unsigned)len);
     fprintf(f, "  req:");
-    for (size_t i = 0; i < c->len && i < 96; i++) {
+    /* 256 rather than 96: an AUTH_SYS credential is 84 bytes on its own, and a
+     * request cut off before its arguments says nothing about a disagreement. */
+    for (size_t i = 0; i < c->len && i < 256; i++) {
         fprintf(f, " %02x", c->buf[i]);
     }
     fprintf(f, "\n  rep:");

@@ -1,7 +1,9 @@
 /*
- * NFS version 3, read-only: LOOKUP, GETATTR, ACCESS, READ, READDIR, READDIRPLUS,
- * READLINK, FSSTAT, FSINFO, PATHCONF. Everything that would write returns
- * NFS3ERR_ROFS rather than half-working, which is what the export says it is.
+ * NFS version 3: LOOKUP, GETATTR, ACCESS, READ, WRITE, CREATE, MKDIR, REMOVE,
+ * RMDIR, RENAME, SETATTR, READDIR, READDIRPLUS, READLINK, FSSTAT, FSINFO,
+ * PATHCONF, COMMIT. What a volume can hold is the volume's business: a write to
+ * a FAT export works, a chmod to one is refused by the filesystem, and an export
+ * that does not say rw refuses both with NFS3ERR_ROFS.
  *
  * File handles do not carry the path: a 64-byte handle cannot hold one, and a
  * path changes when a directory is renamed. They name a slot in a small table
@@ -16,12 +18,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <utime.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "espix_fs.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "espix_kernel.h"
 
 #include "nfs3.h"
@@ -44,9 +48,25 @@
 #define NFS3ERR_NAMETOOLONG 63
 #define NFS3ERR_NOTEMPTY 66
 #define NFS3ERR_STALE    70
+#define NFS3ERR_XDEV     18
+#define NFS3ERR_MLINK    31
+#define NFS3ERR_LOOP     62
 #define NFS3ERR_BADHANDLE 10001
+#define NFS3ERR_NOT_SYNC 10002
 #define NFS3ERR_NOTSUPP  10004
+#define NFS3ERR_TOOSMALL 10005
 #define NFS3ERR_SERVERFAULT 10006
+#define NFS3ERR_BADTYPE  10007
+
+/* stable_how: what the client wants done with its data before we answer. */
+#define STABLE_UNSTABLE  0
+#define STABLE_DATA      1
+#define STABLE_FILE      2
+
+/* createmode3 */
+#define CREATE_UNCHECKED 0
+#define CREATE_GUARDED   1
+#define CREATE_EXCLUSIVE 2
 
 #define FH_LEN     28      /* the size nfsd hands out; 8 was unusual enough to be a variable */
 #define PATH_SLOTS 1024      /* a listing looks up every entry it lists */
@@ -123,6 +143,10 @@ static uint32_t nfserr(int err)
     case EROFS:      return NFS3ERR_ROFS;
     case ENAMETOOLONG: return NFS3ERR_NAMETOOLONG;
     case ENOTEMPTY:  return NFS3ERR_NOTEMPTY;
+    case EXDEV:      return NFS3ERR_XDEV;
+    case EMLINK:     return NFS3ERR_MLINK;
+    case ELOOP:      return NFS3ERR_LOOP;
+    case ENOSYS:     return NFS3ERR_NOTSUPP;
     default:         return NFS3ERR_IO;
     }
 }
@@ -312,6 +336,10 @@ static bool name_ok(const char *name)
 
 /* ---------------------------------------------------------- procedures --- */
 
+/* Declared here rather than with the write path below, because LOOKUP uses it
+ * too: a path that does not fit is an error, not a name cut short. */
+static bool join_path(char *out, size_t cap, const char *dir, const char *name);
+
 static size_t proc_getattr(rpc_call_t *c, xdrw_t *w)
 {
     uint8_t fh[64];
@@ -352,17 +380,29 @@ static size_t proc_lookup(rpc_call_t *c, xdrw_t *w)
     }
     xdrw_accept(w, RPC_SUCCESS);
 
+    /*
+     * LOOKUP's failure arm carries the directory's attributes, and the client
+     * decodes that arm whenever the status is not OK. Answering with the status
+     * alone reaches it as an I/O error -- and the first stat of a file that is
+     * not there yet is how every create begins, so leaving this out made writes
+     * impossible in a way that looked like a disk fault.
+     */
     if (!fh_resolve(fh, fhlen, &exp, dir, sizeof(dir)) || !name_ok(name)) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
-    strlcpy(path, dir, sizeof(path));
-    strlcat(path, "/", sizeof(path));
-    strlcat(path, name, sizeof(path));
+    if (!join_path(path, sizeof(path), dir, name)) {
+        xdrw_u32(w, NFS3ERR_NAMETOOLONG);
+        put_post_attr(w, false, exp, NULL);
+        return w->len;
+    }
 
     struct stat st;
     if (stat(path, &st) != 0) {
+        struct stat dst;
         xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, stat(dir, &dst) == 0, exp, &dst);
         return w->len;
     }
 
@@ -397,12 +437,14 @@ static size_t proc_access(rpc_call_t *c, xdrw_t *w)
     xdrw_accept(w, RPC_SUCCESS);
     if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
     struct stat st;
     if (stat(path, &st) != 0) {
         xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
@@ -429,6 +471,8 @@ static size_t proc_readlink(rpc_call_t *c, xdrw_t *w)
 {
     uint8_t fh[64];
     size_t  fhlen = 0;
+    char    path[PATH_CAP];
+    int     exp = 0;
 
     if (!get_fh(c, fh, &fhlen)) {
         xdrw_accept(w, RPC_GARBAGE_ARGS);
@@ -436,9 +480,23 @@ static size_t proc_readlink(rpc_call_t *c, xdrw_t *w)
     }
     xdrw_accept(w, RPC_SUCCESS);
 
-    /* espix's VFS has no symlink to read, and says so rather than pretending
-     * the path is not there. */
-    xdrw_u32(w, NFS3ERR_NOTSUPP);
+    if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
+        return w->len;
+    }
+
+    /* espix's VFS has no symlink, so a path that exists is not one -- which is
+     * INVAL, the answer a Linux server gives for readlink on anything else --
+     * and a path that is not there says so. */
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, false, exp, NULL);
+        return w->len;
+    }
+    xdrw_u32(w, NFS3ERR_INVAL);
+    put_post_attr(w, true, exp, &st);
     return w->len;
 }
 
@@ -459,17 +517,20 @@ static size_t proc_read(rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap)
     xdrw_accept(w, RPC_SUCCESS);
     if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
     const int fd = open(path, O_RDONLY);
     if (fd < 0) {
         xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
     if (off != 0 && lseek(fd, (off_t)off, SEEK_SET) < 0) {
         close(fd);
         xdrw_u32(w, NFS3ERR_INVAL);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
@@ -481,6 +542,7 @@ static size_t proc_read(rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap)
 
     if (got < 0) {
         xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, have, exp, &st);
         return w->len;
     }
 
@@ -548,12 +610,14 @@ static size_t proc_readdir(rpc_call_t *c, xdrw_t *w, bool plus)
 
     if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
     DIR *d = opendir(path);
     if (d == NULL) {
         xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
@@ -673,6 +737,7 @@ static size_t proc_fsstat(rpc_call_t *c, xdrw_t *w)
     xdrw_accept(w, RPC_SUCCESS);
     if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
@@ -742,6 +807,7 @@ static size_t proc_fsinfo(rpc_call_t *c, xdrw_t *w, size_t iocap)
     xdrw_accept(w, RPC_SUCCESS);
     if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
@@ -778,12 +844,14 @@ static size_t proc_pathconf(rpc_call_t *c, xdrw_t *w)
     xdrw_accept(w, RPC_SUCCESS);
     if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
         xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
     struct stat st;
     if (stat(path, &st) != 0) {
         xdrw_u32(w, nfserr(errno));
+        put_post_attr(w, false, exp, NULL);
         return w->len;
     }
 
@@ -801,6 +869,824 @@ static size_t proc_pathconf(rpc_call_t *c, xdrw_t *w)
     xdrw_bool(w, true);                 /* chown_restricted */
     xdrw_bool(w, false);                /* case_insensitive */
     xdrw_bool(w, true);                 /* case_preserving */
+    return w->len;
+}
+
+/* -------------------------------------------------------------- writes --- */
+
+/*
+ * Everything below changes something. An export is read-only unless
+ * /etc/exports says rw -- "ro" is espix's default rather than its exception,
+ * because a stick that becomes writable over the network by omission is the
+ * wrong way round -- and a mount made read-only answers EROFS from the
+ * filesystem underneath whatever this says, so both gates are real.
+ */
+static bool may_write(int exp)
+{
+    const nfs_export_t *e = nfsd_export(exp);
+    return (e != NULL) && !e->ro;
+}
+
+/* XDR's boolean is a 32-bit word, nonzero for true. */
+static bool get_bool(rpc_call_t *c, bool *out)
+{
+    uint32_t v;
+
+    if (!rpc_get_u32(c, &v)) {
+        return false;
+    }
+    *out = (v != 0);
+    return true;
+}
+
+/*
+ * A name under a directory, or false when it does not fit. The refusal is the
+ * point: a path silently cut short names a *different* file, which is worse
+ * than an error the client can act on.
+ */
+static bool join_path(char *out, size_t cap, const char *dir, const char *name)
+{
+    if (strlcpy(out, dir, cap) >= cap || strlcat(out, "/", cap) >= cap) {
+        return false;
+    }
+    return strlcat(out, name, cap) < cap;
+}
+
+/* wcc_attr: the size and the timestamps a client checks before it trusts what
+ * it has cached. espix has no separate ctime, so it reports mtime twice, as it
+ * does everywhere else. */
+static void put_wcc_attr(xdrw_t *w, const struct stat *st)
+{
+    xdrw_u64(w, (uint64_t)st->st_size);
+    put_time(w, (long)st->st_mtime);
+    put_time(w, (long)st->st_mtime);
+}
+
+/*
+ * wcc_data: what an object looked like before a change and after it. Both
+ * sides are optional in XDR, and neither is optional in the reply -- the client
+ * decodes the arm its status chose, so a failure that stops after the status
+ * reaches it as an I/O error instead of the errno it was sent.
+ */
+static void put_wcc(xdrw_t *w, int exp, bool have_before,
+                    const struct stat *before, bool have_after,
+                    const struct stat *after)
+{
+    xdrw_bool(w, have_before);
+    if (have_before) {
+        put_wcc_attr(w, before);
+    }
+    put_post_attr(w, have_after, exp, after);
+}
+
+/* Nothing to say about the object: legal, and what an error raised before the
+ * path is even known uses. */
+static void put_wcc_none(xdrw_t *w)
+{
+    xdrw_bool(w, false);
+    xdrw_bool(w, false);
+}
+
+static void put_wcc_fail(xdrw_t *w, bool have_before,
+                         const struct stat *before)
+{
+    xdrw_bool(w, have_before);
+    if (have_before) {
+        put_wcc_attr(w, before);
+    }
+    xdrw_bool(w, false);                /* the operation failed: nothing moved */
+}
+
+/* The same, for the directory a name was added to or taken out of. */
+static void put_dir_wcc(xdrw_t *w, int exp, const char *dir,
+                        bool have_before, const struct stat *before)
+{
+    struct stat after;
+    const bool  have_after = (stat(dir, &after) == 0);
+
+    put_wcc(w, exp, have_before, before, have_after, &after);
+}
+
+/*
+ * writeverf3: eight bytes that identify this boot. A client holding data it has
+ * not committed compares this after a reconnect and sends the data again if it
+ * changed, so it has to be one value within a boot and a different one after --
+ * which is why it comes from the random source rather than from a fixed tag.
+ */
+static void put_verf(xdrw_t *w)
+{
+    static uint32_t s_verf[2];
+
+    if (s_verf[0] == 0 && s_verf[1] == 0) {
+        s_verf[0] = esp_random() ^ 0x45535058u;         /* ESPX */
+        s_verf[1] = esp_random() ^ 0x4e465333u;         /* NFS3 */
+    }
+    xdrw_u32(w, s_verf[0]);
+    xdrw_u32(w, s_verf[1]);
+}
+
+/* sattr3, which every creating and setting procedure carries. */
+typedef struct {
+    bool     set_mode, set_uid, set_gid, set_size;
+    uint16_t mode, uid, gid;
+    uint64_t size;
+    uint32_t atime_kind, mtime_kind;    /* 0 dont change, 1 server, 2 client */
+    long     atime_sec, mtime_sec;
+} sattr3_t;
+
+static bool get_sattr(rpc_call_t *c, sattr3_t *a)
+{
+    bool     has = false;
+    uint32_t v = 0;
+
+    memset(a, 0, sizeof(*a));
+
+    if (!get_bool(c, &has)) {
+        return false;
+    }
+    if (has) {
+        if (!rpc_get_u32(c, &v)) {
+            return false;
+        }
+        a->set_mode = true;
+        a->mode = (uint16_t)(v & 07777);
+    }
+    if (!get_bool(c, &has)) {
+        return false;
+    }
+    if (has) {
+        if (!rpc_get_u32(c, &v)) {
+            return false;
+        }
+        a->set_uid = true;
+        a->uid = (uint16_t)v;
+    }
+    if (!get_bool(c, &has)) {
+        return false;
+    }
+    if (has) {
+        if (!rpc_get_u32(c, &v)) {
+            return false;
+        }
+        a->set_gid = true;
+        a->gid = (uint16_t)v;
+    }
+    if (!get_bool(c, &has)) {
+        return false;
+    }
+    if (has) {
+        if (!rpc_get_u64(c, &a->size)) {
+            return false;
+        }
+        a->set_size = true;
+    }
+    /*
+     * The two times are not optionals like the four above: sattr3 carries a
+     * set_time, which is a discriminant on its own -- 0 leave it, 1 set it to
+     * the server's clock, 2 take the time that follows -- so reading a bool
+     * here shifts the rest of the request by a word. A client that asks for
+     * SET_TO_SERVER_TIME, which is what an ordinary write followed by a
+     * setattr does, then fails to parse at all.
+     */
+    if (!rpc_get_u32(c, &a->atime_kind)) {
+        return false;
+    }
+    if (a->atime_kind == 2) {
+        uint32_t sec = 0, nsec = 0;
+        if (!rpc_get_u32(c, &sec) || !rpc_get_u32(c, &nsec)) {
+            return false;
+        }
+        a->atime_sec = (long)sec;
+    }
+    if (!rpc_get_u32(c, &a->mtime_kind)) {
+        return false;
+    }
+    if (a->mtime_kind == 2) {
+        uint32_t sec = 0, nsec = 0;
+        if (!rpc_get_u32(c, &sec) || !rpc_get_u32(c, &nsec)) {
+            return false;
+        }
+        a->mtime_sec = (long)sec;
+    }
+    return true;
+}
+
+/*
+ * Apply what the volume can hold. FAT keeps no modes and no owners, so the two
+ * fields it has not got are applied and forgotten: the filesystem refuses them
+ * and the refusal stops here, because a client asking for a mode it opened with
+ * is doing nothing wrong and must not have its create fail over it.
+ *
+ * SET_TO_SERVER_TIME needs nothing on its own: the write it accompanies is what
+ * sets the time, which is what that mode means.
+ *
+ * Note that this is the NFS view of a volume, not espix's own: a chmod through
+ * the shell or an app still answers EPERM on a filesystem that keeps no modes,
+ * while the same chmod over the wire is accepted and forgotten, as it is on a
+ * Linux server exporting the same kind of directory.
+ */
+static int apply_sattr(const char *path, const sattr3_t *a)
+{
+    int err = 0;
+
+    if (a->set_size && truncate(path, (off_t)a->size) != 0) {
+        err = errno;
+    }
+    /*
+     * A mode or an owner is not something a FAT volume has, and a refusal is
+     * not the client's business: a Linux server exporting a vfat directory
+     * accepts a chmod and forgets it, and refusing one fails the
+     * create-then-setattr sequence an ordinary "cp" is made of -- the client
+     * asks for the mode it opened with, is told no, and reports the open as
+     * failed while the file it created sits there empty. What the volume can
+     * genuinely answer -- a size, a time, a read-only mount -- is still
+     * reported; this is only about the two fields FAT does not have.
+     */
+    if (a->set_mode) {
+        (void)espix_fs_chmod(path, (mode_t)a->mode);
+    }
+    if (a->set_uid || a->set_gid) {
+        (void)espix_fs_chown(path, a->set_uid ? a->uid : ESPIX_FS_KEEP_ID,
+                             a->set_gid ? a->gid : ESPIX_FS_KEEP_ID);
+    }
+    if (a->atime_kind == 2 || a->mtime_kind == 2) {
+        struct stat    st;
+        struct utimbuf ut;
+
+        /*
+         * utime() names two times and sets both, so a field the client did not
+         * ask for is filled in from the file as it stands: the alternative is
+         * leaving it to become "now", which is a change nobody requested. FAT
+         * keeps no access time, so on a stick only the modification lands.
+         */
+        if (stat(path, &st) == 0) {
+            ut.actime  = (a->atime_kind == 2) ? (time_t)a->atime_sec
+                                              : st.st_atime;
+            ut.modtime = (a->mtime_kind == 2) ? (time_t)a->mtime_sec
+                                              : st.st_mtime;
+            if (utime(path, &ut) != 0) {
+                err = errno;
+            }
+        }
+    }
+    return err;
+}
+
+/* The failure half of the replies that report a directory unchanged. */
+static void put_dir_wcc_fail(xdrw_t *w, bool have_before,
+                             const struct stat *before)
+{
+    xdrw_bool(w, have_before);
+    if (have_before) {
+        put_wcc_attr(w, before);
+    }
+    xdrw_bool(w, false);
+}
+
+/* ---------------------------------------------------------- procedures --- */
+
+static size_t proc_setattr(rpc_call_t *c, xdrw_t *w)
+{
+    uint8_t  fh[64];
+    size_t   fhlen = 0;
+    char     path[PATH_CAP];
+    int      exp = 0;
+    sattr3_t attr;
+    bool     guard = false;
+    uint32_t gsec = 0, gnsec = 0;
+
+    if (!get_fh(c, fh, &fhlen) || !get_sattr(c, &attr) ||
+        !get_bool(c, &guard)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    if (guard && (!rpc_get_u32(c, &gsec) || !rpc_get_u32(c, &gnsec))) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat before;
+    const bool  have_before = (stat(path, &before) == 0);
+
+    if (!may_write(exp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_fail(w, have_before, &before);
+        return w->len;
+    }
+    if (!have_before) {
+        xdrw_u32(w, nfserr(errno));
+        put_wcc_fail(w, false, &before);
+        return w->len;
+    }
+    /* A guard the file has already moved past is not a failure of the request
+     * but of its precondition: the client re-reads and asks again. */
+    if (guard && (uint32_t)before.st_mtime != gsec) {
+        xdrw_u32(w, NFS3ERR_NOT_SYNC);
+        put_wcc_fail(w, true, &before);
+        return w->len;
+    }
+
+    const int err = apply_sattr(path, &attr);
+    if (err != 0) {
+        xdrw_u32(w, nfserr(err));
+        put_wcc_fail(w, true, &before);
+        return w->len;
+    }
+
+    struct stat after;
+    const bool  have_after = (stat(path, &after) == 0);
+
+    xdrw_u32(w, NFS3_OK);
+    put_wcc(w, exp, true, &before, have_after, &after);
+    return w->len;
+}
+
+static size_t proc_write(rpc_call_t *c, xdrw_t *w)
+{
+    uint8_t  fh[64];
+    size_t   fhlen = 0;
+    uint64_t off = 0;
+    uint32_t count = 0, stable = 0, dlen = 0;
+    char     path[PATH_CAP];
+    int      exp = 0;
+
+    if (!get_fh(c, fh, &fhlen) || !rpc_get_u64(c, &off) ||
+        !rpc_get_u32(c, &count) || !rpc_get_u32(c, &stable) ||
+        !rpc_get_u32(c, &dlen)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    /*
+     * The data is the rest of the request and it is written from where it
+     * already is: copying it would be another 4 KB of RAM and a second pass
+     * over bytes that are already in the buffer.
+     */
+    if (dlen > count || c->pos + dlen > c->len) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    const uint8_t *data = c->buf + c->pos;
+
+    xdrw_accept(w, RPC_SUCCESS);
+    if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!may_write(exp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    const int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat before;
+    const bool  have_before = (fstat(fd, &before) == 0);
+
+    if (off != 0 && lseek(fd, (off_t)off, SEEK_SET) < 0) {
+        close(fd);
+        xdrw_u32(w, NFS3ERR_INVAL);
+        put_wcc_fail(w, have_before, &before);
+        return w->len;
+    }
+
+    size_t done = 0;
+    while (done < dlen) {
+        const ssize_t n = write(fd, data + done, dlen - done);
+        if (n <= 0) {
+            break;
+        }
+        done += (size_t)n;
+    }
+    int err = (done < dlen) ? (errno ? errno : EIO) : 0;
+
+    /*
+     * FILE_SYNC and DATA_SYNC are flushed here; UNSTABLE is left in the
+     * filesystem's cache and the client's COMMIT is what flushes it. That is
+     * what the mode means, and doing it the other way round would make every
+     * few KB of a copy pay for a FAT and directory sync of its own.
+     */
+    if (err == 0 && stable != STABLE_UNSTABLE && fsync(fd) != 0) {
+        err = errno ? errno : EIO;
+    }
+
+    struct stat after;
+    const bool  have_after = (fstat(fd, &after) == 0);
+    close(fd);
+
+    if (err != 0) {
+        xdrw_u32(w, nfserr(err));
+        put_wcc_fail(w, have_before, &before);
+        return w->len;
+    }
+
+    xdrw_u32(w, NFS3_OK);
+    put_wcc(w, exp, have_before, &before, have_after, &after);
+    xdrw_u32(w, (uint32_t)done);
+    xdrw_u32(w, (stable == STABLE_UNSTABLE) ? STABLE_UNSTABLE : STABLE_FILE);
+    put_verf(w);
+    return w->len;
+}
+
+static size_t proc_create(rpc_call_t *c, xdrw_t *w)
+{
+    uint8_t  fh[64];
+    size_t   fhlen = 0;
+    char     dir[PATH_CAP], name[256], path[PATH_CAP];
+    int      exp = 0;
+    uint32_t how = 0;
+    sattr3_t attr;
+    uint8_t  verifier[8];
+
+    if (!get_fh(c, fh, &fhlen) || !rpc_get_string(c, name, sizeof(name)) ||
+        !rpc_get_u32(c, &how)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    memset(&attr, 0, sizeof(attr));
+    if (how == CREATE_EXCLUSIVE) {
+        /* A verifier the client would have us remember, so that a create it
+         * sends twice is recognised. Nothing here is replayed -- the transport
+         * is not a retry loop -- so it is read to keep the request in step and
+         * then dropped. */
+        if (!rpc_get_opaque(c, verifier, sizeof(verifier))) {
+            xdrw_accept(w, RPC_GARBAGE_ARGS);
+            return w->len;
+        }
+    } else if (!get_sattr(c, &attr)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(fh, fhlen, &exp, dir, sizeof(dir)) || !name_ok(name)) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!join_path(path, sizeof(path), dir, name)) {
+        xdrw_u32(w, NFS3ERR_NAMETOOLONG);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!may_write(exp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat dbefore;
+    const bool  have_dbefore = (stat(dir, &dbefore) == 0);
+
+    /* UNCHECKED creates or truncates; GUARDED and EXCLUSIVE only create. */
+    const int flags = O_WRONLY | O_CREAT |
+                      ((how == CREATE_UNCHECKED) ? O_TRUNC : O_EXCL);
+    const int fd = open(path, flags, 0666);
+    if (fd < 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_dir_wcc_fail(w, have_dbefore, &dbefore);
+        return w->len;
+    }
+    close(fd);
+
+    /* The mode and the times are the volume's business on FAT; failing the
+     * create over them would fail a copy that has nothing wrong with it. */
+    if (how != CREATE_EXCLUSIVE) {
+        (void)apply_sattr(path, &attr);
+    }
+
+    struct stat st;
+    const bool  have_st = (stat(path, &st) == 0);
+    uint8_t     cfh[FH_LEN];
+    size_t      clen = 0;
+    const bool  have_fh = fh_make(exp, path, cfh, &clen);
+
+    xdrw_u32(w, NFS3_OK);
+    xdrw_bool(w, have_fh);
+    if (have_fh) {
+        xdrw_u32(w, (uint32_t)clen);
+        xdrw_opaque(w, cfh, clen);
+    }
+    put_post_attr(w, have_st, exp, &st);
+    put_dir_wcc(w, exp, dir, have_dbefore, &dbefore);
+    return w->len;
+}
+
+static size_t proc_mkdir(rpc_call_t *c, xdrw_t *w)
+{
+    uint8_t  fh[64];
+    size_t   fhlen = 0;
+    char     dir[PATH_CAP], name[256], path[PATH_CAP];
+    int      exp = 0;
+    sattr3_t attr;
+
+    if (!get_fh(c, fh, &fhlen) || !rpc_get_string(c, name, sizeof(name)) ||
+        !get_sattr(c, &attr)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(fh, fhlen, &exp, dir, sizeof(dir)) || !name_ok(name)) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!join_path(path, sizeof(path), dir, name)) {
+        xdrw_u32(w, NFS3ERR_NAMETOOLONG);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!may_write(exp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat dbefore;
+    const bool  have_dbefore = (stat(dir, &dbefore) == 0);
+
+    if (mkdir(path, attr.set_mode ? (mode_t)attr.mode : 0755) != 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_dir_wcc_fail(w, have_dbefore, &dbefore);
+        return w->len;
+    }
+    if (attr.set_uid || attr.set_gid || attr.atime_kind == 2 ||
+        attr.mtime_kind == 2) {
+        (void)apply_sattr(path, &attr);
+    }
+
+    struct stat st;
+    const bool  have_st = (stat(path, &st) == 0);
+    uint8_t     cfh[FH_LEN];
+    size_t      clen = 0;
+    const bool  have_fh = fh_make(exp, path, cfh, &clen);
+
+    xdrw_u32(w, NFS3_OK);
+    xdrw_bool(w, have_fh);
+    if (have_fh) {
+        xdrw_u32(w, (uint32_t)clen);
+        xdrw_opaque(w, cfh, clen);
+    }
+    put_post_attr(w, have_st, exp, &st);
+    put_dir_wcc(w, exp, dir, have_dbefore, &dbefore);
+    return w->len;
+}
+
+/* Is the directory empty, apart from the two names every one has? */
+static bool dir_is_empty(const char *path)
+{
+    DIR *d = opendir(path);
+    if (d == NULL) {
+        return false;
+    }
+    bool          empty = true;
+    struct dirent *de;
+
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) {
+            empty = false;
+            break;
+        }
+    }
+    closedir(d);
+    return empty;
+}
+
+static size_t proc_remove(rpc_call_t *c, xdrw_t *w, bool is_dir)
+{
+    uint8_t fh[64];
+    size_t  fhlen = 0;
+    char    dir[PATH_CAP], name[256], path[PATH_CAP];
+    int     exp = 0;
+
+    if (!get_fh(c, fh, &fhlen) || !rpc_get_string(c, name, sizeof(name))) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(fh, fhlen, &exp, dir, sizeof(dir)) || !name_ok(name)) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!join_path(path, sizeof(path), dir, name)) {
+        xdrw_u32(w, NFS3ERR_NAMETOOLONG);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!may_write(exp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat dbefore;
+    const bool  have_dbefore = (stat(dir, &dbefore) == 0);
+
+    /*
+     * FatFs answers FR_DENIED for a directory that still has names in it, and
+     * IDF turns that into EACCES -- so a client would be told "permission
+     * denied" where the truth is "not empty". Asked here instead, where the
+     * answer is the one POSIX defines.
+     */
+    if (is_dir && !dir_is_empty(path)) {
+        xdrw_u32(w, NFS3ERR_NOTEMPTY);
+        put_dir_wcc_fail(w, have_dbefore, &dbefore);
+        return w->len;
+    }
+
+    const int rc = is_dir ? rmdir(path) : unlink(path);
+    if (rc != 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_dir_wcc_fail(w, have_dbefore, &dbefore);
+        return w->len;
+    }
+
+    xdrw_u32(w, NFS3_OK);
+    put_dir_wcc(w, exp, dir, have_dbefore, &dbefore);
+    return w->len;
+}
+
+static size_t proc_rename(rpc_call_t *c, xdrw_t *w)
+{
+    uint8_t ffh[64], tfh[64];
+    size_t  ffhlen = 0, tfhlen = 0;
+    char    fdir[PATH_CAP], fname[256], fpath[PATH_CAP];
+    char    tdir[PATH_CAP], tname[256], tpath[PATH_CAP];
+    int     fexp = 0, texp = 0;
+
+    if (!get_fh(c, ffh, &ffhlen) || !rpc_get_string(c, fname, sizeof(fname)) ||
+        !get_fh(c, tfh, &tfhlen) || !rpc_get_string(c, tname, sizeof(tname))) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(ffh, ffhlen, &fexp, fdir, sizeof(fdir)) ||
+        !fh_resolve(tfh, tfhlen, &texp, tdir, sizeof(tdir)) ||
+        !name_ok(fname) || !name_ok(tname)) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!join_path(fpath, sizeof(fpath), fdir, fname) ||
+        !join_path(tpath, sizeof(tpath), tdir, tname)) {
+        xdrw_u32(w, NFS3ERR_NAMETOOLONG);
+        put_wcc_none(w);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!may_write(fexp) || !may_write(texp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_none(w);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat fbefore, tbefore;
+    const bool  have_f = (stat(fdir, &fbefore) == 0);
+    const bool  have_t = (stat(tdir, &tbefore) == 0);
+
+    if (rename(fpath, tpath) != 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_wcc_fail(w, have_f, &fbefore);
+        put_wcc_fail(w, have_t, &tbefore);
+        return w->len;
+    }
+
+    xdrw_u32(w, NFS3_OK);
+    put_dir_wcc(w, fexp, fdir, have_f, &fbefore);
+    put_dir_wcc(w, texp, tdir, have_t, &tbefore);
+    return w->len;
+}
+
+static size_t proc_commit(rpc_call_t *c, xdrw_t *w)
+{
+    uint8_t  fh[64];
+    size_t   fhlen = 0;
+    uint64_t off = 0;
+    uint32_t count = 0;
+    char     path[PATH_CAP];
+    int      exp = 0;
+
+    if (!get_fh(c, fh, &fhlen) || !rpc_get_u64(c, &off) ||
+        !rpc_get_u32(c, &count)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(fh, fhlen, &exp, path, sizeof(path))) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        put_wcc_none(w);
+        return w->len;
+    }
+    if (!may_write(exp)) {
+        xdrw_u32(w, NFS3ERR_ROFS);
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    /*
+     * A commit is a flush of the volume's cache, because that is what f_sync
+     * does and the volume is what has to reach the stick. The range in the
+     * arguments is a hint a server may narrow; this one keeps no per-range
+     * cache to narrow it with.
+     */
+    const int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        xdrw_u32(w, nfserr(errno));
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    struct stat before, after;
+    const bool  have_before = (fstat(fd, &before) == 0);
+    const int   rc = fsync(fd);
+    const bool  have_after = (fstat(fd, &after) == 0);
+    const int   err = (rc == 0) ? 0 : (errno ? errno : EIO);
+
+    close(fd);
+
+    if (err != 0) {
+        xdrw_u32(w, nfserr(err));
+        put_wcc_fail(w, have_before, &before);
+        return w->len;
+    }
+
+    xdrw_u32(w, NFS3_OK);
+    put_wcc(w, exp, have_before, &before, have_after, &after);
+    put_verf(w);
+    return w->len;
+}
+
+/*
+ * LINK, SYMLINK and MKNOD name things this filesystem has not got: FAT keeps no
+ * hard links, and espix's VFS has no symlink to make. Each still answers in the
+ * shape its own procedure defines, because the client decodes the arm its
+ * status chose -- and a name that was to be created leaves its directory
+ * unchanged, which is what the wcc says.
+ */
+static size_t proc_notsupp(rpc_call_t *c, xdrw_t *w, bool link)
+{
+    uint8_t fh[64];
+    size_t  fhlen = 0;
+    char    name[256];
+    char    dir[PATH_CAP];
+    int     exp = 0;
+
+    if (!get_fh(c, fh, &fhlen)) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    if (link) {
+        /* LINK carries the file handle first, then the name to link it to. */
+        uint8_t lfh[64];
+        size_t  lfhlen = 0;
+
+        if (!get_fh(c, lfh, &lfhlen)) {
+            xdrw_accept(w, RPC_GARBAGE_ARGS);
+            return w->len;
+        }
+        fhlen = lfhlen;
+        memcpy(fh, lfh, sizeof(fh));
+    }
+    if (!rpc_get_string(c, name, sizeof(name))) {
+        xdrw_accept(w, RPC_GARBAGE_ARGS);
+        return w->len;
+    }
+    xdrw_accept(w, RPC_SUCCESS);
+
+    if (!fh_resolve(fh, fhlen, &exp, dir, sizeof(dir))) {
+        xdrw_u32(w, NFS3ERR_BADHANDLE);
+        if (link) {
+            put_post_attr(w, false, exp, NULL);
+        }
+        put_wcc_none(w);
+        return w->len;
+    }
+
+    xdrw_u32(w, NFS3ERR_NOTSUPP);
+    if (link) {
+        put_post_attr(w, false, exp, NULL);         /* the file side */
+    }
+    put_dir_wcc(w, exp, dir, false, NULL);
     return w->len;
 }
 
@@ -836,20 +1722,19 @@ size_t nfs3_handle(const rpc_call_t *c, xdrw_t *w, uint8_t *io, size_t iocap)
     case 19: return proc_fsinfo(&args, w, iocap);
     case 20: return proc_pathconf(&args, w);
 
-    case 2:   /* SETATTR */
-    case 7:   /* WRITE */
-    case 8:   /* CREATE */
-    case 9:   /* MKDIR */
-    case 10:  /* SYMLINK */
-    case 11:  /* MKNOD */
-    case 12:  /* REMOVE */
-    case 13:  /* RMDIR */
-    case 14:  /* RENAME */
-    case 15:  /* LINK */
-    case 21:  /* COMMIT */
-        xdrw_accept(w, RPC_SUCCESS);
-        xdrw_u32(w, NFS3ERR_ROFS);
-        return w->len;
+    case 2:  return proc_setattr(&args, w);
+    case 7:  return proc_write(&args, w);
+    case 8:  return proc_create(&args, w);
+    case 9:  return proc_mkdir(&args, w);
+    case 10:                                    /* SYMLINK */
+    case 11: /* MKNOD */
+        return proc_notsupp(&args, w, false);
+    case 12: return proc_remove(&args, w, false);
+    case 13: return proc_remove(&args, w, true);
+    case 14: return proc_rename(&args, w);
+    case 15:                                    /* LINK */
+        return proc_notsupp(&args, w, true);
+    case 21: return proc_commit(&args, w);
 
     default:
         xdrw_accept(w, RPC_PROC_UNAVAIL);

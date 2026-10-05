@@ -49,7 +49,7 @@ together.
 | Storage | exFAT volumes | **yes** | on by default (`ESPIX_FS_EXFAT`, +7.0KB ROM, no static RAM); `FF_LBA64` and the 64-bit diskio fix come with it, so a volume past 2TiB is readable too |
 | Storage | ext2/3/4 volumes | **yes** | read-only by default, writable with `mount -o rw`; a driver of espix's own, two mount slots. Writes go through the port's experimental extent implementation, and a volume without a journal cannot be mounted writable at all — see [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) |
 | Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
-| Storage | Serve the stick over the network | **partial** | NFSv3, read-only: the portmapper, mountd and nfsd, and statd so a client needs no lock option; a Linux client mounts it with no options at all, a 500-entry listing is one directory walk — [NFS.md](docs/NFS.md) |
+| Storage | Serve the stick over the network | **yes** | NFSv3: the portmapper, mountd and nfsd, statd so a client needs no lock option, and a write path (read-only unless the export says `rw`); a Linux or macOS client mounts it with no options, a 500-entry listing is one directory walk, and 2 MiB copies at ~260 KB/s — [NFS.md](docs/NFS.md) |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
 | Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` — an allowlist in `components/espix_proc/abi_*.c`, so a name espix does not publish stops an app loading rather than loading and answering ENOSYS |
 | Programs | Signals and handlers | **yes** | delivered when the app calls in, not asynchronously |
