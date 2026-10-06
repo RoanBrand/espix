@@ -144,7 +144,23 @@ static bool regions_available(void)
  */
 static size_t region_size_for(size_t n)
 {
-    size_t want = n + (n / 16) + 1024u;
+    /*
+     * The padding is capped, and that is not a micro-optimisation: it is what
+     * makes the largest free block an honest answer to "how big an allocation
+     * can I get".
+     *
+     * The region has to be bigger than the request -- a heap needs its own
+     * bookkeeping, which is the 1 KB base -- but the proportional part is only
+     * ever room for *subsequent* allocations, and room that is not there costs
+     * nothing: a later allocation that will not fit gets a region of its own,
+     * which is the arrangement this list exists to allow. Unbounded, that 6.25%
+     * meant a 4 MiB request needed a 4.25 MB region, so a board with a 4.1 MiB
+     * block answered "largest block: 4 MiB" and then failed to allocate 4 MiB --
+     * the query and the allocator disagreeing by exactly the padding.
+     */
+    const size_t slack = n / 16;
+
+    size_t want = n + ((slack < 1024u) ? slack : 1024u) + 1024u;
     if (want < REGION_MIN_BYTES) {
         want = REGION_MIN_BYTES;
     }

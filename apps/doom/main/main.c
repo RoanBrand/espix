@@ -115,14 +115,23 @@ void app_main(int app_argc, char **app_argv)
      * left once the app is loaded -- so it succeeds some boots and aborts
      * others. Report what is actually available before asking.
      */
-    int avail = 0;
-    for (int mb = 6; mb >= 1; mb--) {
-        void *probe = malloc((size_t)mb * 1024 * 1024);
-        if (probe != NULL) {
-            free(probe);
-            avail = mb;
-            break;
-        }
+    /*
+     * Ask, do not probe.
+     *
+     * The probe used to malloc 6, 5, 4 ... MiB until one succeeded: answering
+     * the question by *taking* the biggest block and handing it back. Under the
+     * arena that is not free -- the successful probe makes the arena carve a
+     * region for it, and that region is exactly the size of the probe, so the
+     * engine's own zone then neither fits in it nor can see the block it split.
+     * espix's heap_caps_get_largest_free_block() answers for this process now
+     * (its arenas plus the global pool), so the question can be asked without
+     * disturbing the answer.
+     */
+    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    int          avail   = (int)(largest / (1024 * 1024));
+
+    if (avail > 6) {
+        avail = 6;      /* the engine's own default; more is not useful here */
     }
     printf("doom: psram free %u KB, largest block %d MiB\n",
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), avail);
@@ -134,9 +143,18 @@ void app_main(int app_argc, char **app_argv)
      * check happens here, before any of that. Below 4 MiB the shareware's levels
      * do not fit anyway; between 4 and 6, ask the engine for a zone it can have.
      */
-    if (avail < 4) {
-        printf("doom: not enough PSRAM (need 4 MiB, have %d) -- not starting\n",
-               avail);
+    /*
+     * The floor is a judgement, not a fact -- 4 MiB was our port's reading of
+     * what a shareware level needs -- so it can be overridden per run:
+     * DOOM_MIN_MB=3 doom. The engine's zone is whole MiB (-mb is atoi'd as MiB),
+     * so a fractional value here does not reach it.
+     */
+    const char *min_env = getenv("DOOM_MIN_MB");
+    const int   min_mb  = (min_env != NULL && atoi(min_env) > 0) ? atoi(min_env) : 4;
+
+    if (avail < min_mb) {
+        printf("doom: not enough PSRAM (need %d MiB, have %d) -- not starting\n",
+               min_mb, avail);
         fflush(stdout);
         return;
     }
