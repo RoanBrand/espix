@@ -368,6 +368,13 @@ if [ "$espix_project" = main ]; then
 
     if [ -f "$espix_sdkconfig" ] \
        && [ "$espix_hash" != "$(cat "$espix_stamp" 2>/dev/null || true)" ]; then
+        # Kept, not just deleted. A generated sdkconfig is authoritative for
+        # every value written into it, and some of those may not be expressed in
+        # the defaults at all -- so regenerating can lose a setting that the
+        # build needs, and a value nobody wrote down is a value nobody can put
+        # back. The copy is what makes that recoverable, and what to diff when a
+        # build that worked stops compiling after a defaults change.
+        cp -f "$espix_sdkconfig" "$espix_sdkconfig.prev"
         rm -f "$espix_sdkconfig"
         printf 'espix: the defaults changed; regenerating %s\n' \
                "$(basename "$espix_sdkconfig")" >&2
