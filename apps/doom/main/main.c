@@ -160,8 +160,25 @@ void app_main(int app_argc, char **app_argv)
     }
 
     char  mb_arg[8];
-    char *argv[16] = { "doom", "-iwad", (char *)wad, NULL, NULL, NULL };
-    int   argc    = 3;
+
+    /*
+     * No sound and no music: nothing on this platform has an audio backend yet.
+     * Without these, Doom initialises a Sound Blaster it will never have --
+     * i_sound.c's snd_musicdevice defaults to SNDDEVICE_SB -- and S_ChangeMusic
+     * then asks the WAD for the OPL intro lump, d_introa, which the shareware
+     * file does not contain. The result is "W_GetNumForName: d_introa not
+     * found!" and a clean exit through I_Error, which is the last thing that
+     * stopped Doom on the S3 and would have stopped the S31 too on a build that
+     * enabled the engine's sound module.
+     *
+     * Declared here rather than by patching the fetched engine, because it is a
+     * statement about espix -- and it is two words to remove when the engine has
+     * somewhere to send samples (the plan for the S31 is A2DP, and the engine's
+     * backends are pluggable).
+     */
+    char *argv[16] = { "doom", "-iwad", (char *)wad,
+                       "-nosound", "-nomusic", NULL, NULL, NULL };
+    int   argc    = 5;
 
     if (avail < 6) {
         snprintf(mb_arg, sizeof(mb_arg), "%d", avail);

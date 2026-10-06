@@ -21,12 +21,17 @@
 #include "doomgeneric.h"
 #include "doomkeys.h"
 #include "i_video.h"    /* struct color, colors[256] -- global under CMAP256 */
+#include "i_sound.h"    /* snd_musicdevice, SNDDEVICE_NONE */
 
 #define DOOM_W 320
 #define DOOM_H 200
 
 extern espix_gfx_t         *doom_gfx;
 extern espix_gfx_surface_t *doom_surface;
+
+/* The engine's music device, which it defaults to Sound Blaster. Declared here
+ * because there is no audio backend on this platform yet. */
+extern int snd_musicdevice;
 
 /*
  * Everything the engine's own update path depends on, checked once, here.
@@ -43,6 +48,19 @@ extern espix_gfx_surface_t *doom_surface;
  */
 void DG_Init(void)
 {
+    /*
+     * No music device, because there is no audio backend here to play through.
+     *
+     * This is not a nicety. snd_musicdevice defaults to SNDDEVICE_SB
+     * (i_sound.c), and S_ChangeMusic swaps the intro for its OPL variant when
+     * the device is SB or ADLIB: mus_introa, which the shareware WAD does not
+     * contain, so the engine exits with "W_GetNumForName: d_introa not found!".
+     * -nomusic does not prevent that -- the substitution does not consult it --
+     * so the device itself is what has to say none, and this hook runs before
+     * D_DoomMain, which is early enough to matter.
+     */
+    snd_musicdevice = SNDDEVICE_NONE;
+
     if (DG_ScreenBuffer == NULL) {
         printf("doom: the engine's screen buffer is NULL (%u bytes asked for) "
                "-- not starting\n",
