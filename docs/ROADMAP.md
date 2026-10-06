@@ -20,6 +20,60 @@ things are as they are.
   reaches the fault handler at all. Shipping the easy half alone produces a
   system that limps rather than one that recovers.
 
+- **Kernel services as processes, so one table can stop them all.** espix runs
+  things on tasks of their own in two ways today: an app, which is a process
+  with a pid, a state and an exit status, and a *builtin unit*, which is a
+  `svc_unit_t` holding a bare `task` handle and a cooperative `stop` flag. The
+  second is invisible to everything that makes the first useful: `kill` cannot
+  reach it, the shutdown sequence stops it by a separate path, and
+  `units_load()` cannot stop one at all when its line is removed -- it signals
+  only units that have a pid, so deleting an `nfsd` line leaves the daemon
+  running untracked, which is how it was noticed (the reload logged "cannot
+  bind 111, 20048 or 2049 (already running?)").
+
+  The table was built for both already: `espix_proc_info_t.image_bytes` is zero
+  for a kernel task, and the ELF image and the private arena are optional
+  fields. `ps` even lists kernel tasks today -- it walks the FreeRTOS task
+  list and prints `-` for their pid. What is missing is a way for a task the
+  kernel created to *join* the table, and a `kind` in the record so teardown
+  can differ: an app's image and arena are freed, a service's stack belongs to
+  whoever made it. Then `svc_unit_t` keeps only policy -- restart and schedule
+  -- keyed by pid, `espix_svc_stopping()` becomes `espix_proc_stopping()`, the
+  shutdown sequence's UNITS and APPS phases become one, and `kill nfsd` works
+  because `service stop nfsd` is the same call underneath.
+
+  They get a pid from the same allocator as an app's, in the same space and
+  never reused -- that is what makes the rest work, and it is how the table
+  already behaves: a pid is never recycled, so `pid > 0` is the test for an
+  entry being live. A `kind` in the record tells them apart, not the number; a
+  reserved range would be a second namespace to keep in step. Their parent
+  stays `ESPIX_PID_NONE`, which the header already defines as "espix started it
+  itself": the kernel is the parent and the kernel has no pid, so there is
+  nothing to invent.
+
+  A pid is identity and not authority: it is a name `kill` and `wait` can
+  reach, and the same rule has to survive the move -- a service with no delivery
+  point is asked and waited for, never deleted, because the pid now makes it
+  *reachable*, and reachable is not the same as safe.
+
+  **The exceptions are the design, not an afterthought.** Four kinds of task
+  stay out, each for a reason no better bookkeeping fixes: the reaper, which
+  tears processes down and so cannot be one; the klog flusher and the
+  supervisor, whose death is the system's (Linux's PID 1 is special for the
+  same reason); anything on the panic path, which runs with the scheduler
+  frozen and cannot touch the table; and the tasks ESP-IDF owns -- `wifi`,
+  `tcpip`, `esp_timer`, `ipc0`, `emac_rx`, `mdns`, the USB host's -- which
+  espix did not create and cannot outlive. Listing those and leaving them
+  uncontrollable is the honest state, and it should say so in the code.
+
+  It also does not make a service killable. A task with no delivery point --
+  blocked in a driver call -- cannot be SIGKILLed safely, and that stays true
+  however the table is arranged; the stop path would still ask and wait. What
+  it buys is one identity and one control plane, not a licence to delete
+  kernel tasks. What would show it worked: `ps` gives `nfsd` a pid and a
+  state, `kill nfsd` stops it and it is reaped, and the shutdown sequence has
+  one process phase instead of two.
+
 - **Ctrl-Z.** Job control is done for jobs, fg and bg (R-P2.6), but nothing
   stops a foreground process. The transports now report which key arrived
   rather than only that one did (R-P7.7), so the field a handler needs exists;
