@@ -21,15 +21,11 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s31-8mb.csv"
 # DIO, IDF's own default for this target (the S3 uses QIO).
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 
-CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 #
 # PSRAM — apps are loaded here, so it is not optional on this target.
 #
-CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_250M=y
-CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # XIP-from-PSRAM is inherited from the target-independent defaults (it is what
 # closes the flash-cache crash documented there).
@@ -37,7 +33,7 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # There is no bus-address mirror to rely on as on the S3; the component
 # handles the target itself.
 #
-CONFIG_ELF_LOADER_LOAD_PSRAM=y
+# CONFIG_ELF_LOADER_LOAD_PSRAM is in sdkconfig.defaults.
 
 #
 # CPU
@@ -194,13 +190,6 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # much a peer may have in flight. Against LWIP_TCP_RECVMBOX_SIZE=6 and a 1440-byte
 # MSS that is marginal, and an overflowing receive mailbox drops packets rather
 # than back-pressuring.
-# A loaded app's stack, and it is PSRAM-backed now (xTaskCreateWithCaps in
-# exec.c). 256 KB because that is what the Quake 2 port runs the engine on; the
-# 8 KB default fits a small program and nothing else, and internal RAM could
-# never hold a game's. Every app pays it while it runs, which is a knob to make
-# per-app later.
-CONFIG_ESPIX_PROC_STACK_SIZE=262144
-
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=114688
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
 CONFIG_LWIP_WND_SCALE=y

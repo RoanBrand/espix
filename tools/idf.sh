@@ -343,6 +343,38 @@ if [ "$espix_project" = main ]; then
         espix_defaults="$espix_defaults;profiles/$ESPIX_PROFILE.conf"
     fi
 
+    # A generated sdkconfig is authoritative over the defaults: a value already
+    # written there wins, so editing sdkconfig.defaults -- or a board, or a
+    # profile -- changes nothing until the sdkconfig is regenerated. Remember
+    # what the defaults said when this one was made and delete it when they
+    # change, so a build is always the config the files describe.
+    #
+    # Both bugs this exists for looked like something else. A stale
+    # CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS in the S3's sdkconfig was a
+    # fault in espix_proc_paths(), on the hottest path in the system; a stale
+    # CONFIG_ESPIX_PROC_STACK_SIZE was every S3 app started with an 8 KB stack.
+    # In neither case is the file that must change the file that is wrong.
+    espix_stamp="$espix_root_dir/.espix/defaults-$(basename "$espix_sdkconfig")"
+    espix_hash=""
+    espix_old_ifs="$IFS"
+    IFS=';'
+    for espix_entry in $espix_defaults; do
+        for espix_dep in "$espix_root_dir/$espix_entry" \
+                         "$espix_root_dir/$espix_entry.$espix_target"; do
+            [ -f "$espix_dep" ] && espix_hash="$espix_hash$(cksum < "$espix_dep")"
+        done
+    done
+    IFS="$espix_old_ifs"
+
+    if [ -f "$espix_sdkconfig" ] \
+       && [ "$espix_hash" != "$(cat "$espix_stamp" 2>/dev/null || true)" ]; then
+        rm -f "$espix_sdkconfig"
+        printf 'espix: the defaults changed; regenerating %s\n' \
+               "$(basename "$espix_sdkconfig")" >&2
+    fi
+    mkdir -p "$(dirname "$espix_stamp")"
+    printf '%s' "$espix_hash" > "$espix_stamp"
+
     # Left unset when it names only sdkconfig.defaults, so a plain build keeps
     # exactly the defaults resolution it had before profiles existed.
     if [ "$espix_defaults" != "sdkconfig.defaults" ]; then

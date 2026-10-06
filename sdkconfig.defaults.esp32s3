@@ -19,24 +19,21 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s3-8mb.csv"
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 #
 # PSRAM — apps get loaded here, so it is not optional on this target.
 #
-CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_ESPIX_PSRAM_MB=8
 CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 #
 # Load relocated ELF text/data into PSRAM rather than internal SRAM. On S3 this
 # relies on the ibus/dbus address mirror (ELF_LOADER_BUS_ADDRESS_MIRROR, which
 # the component selects automatically for this target).
 #
-CONFIG_ELF_LOADER_LOAD_PSRAM=y
+# CONFIG_ELF_LOADER_LOAD_PSRAM is in sdkconfig.defaults; what is here is the
+# mirror this target needs for it.
 
 #
 # CPU

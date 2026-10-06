@@ -224,6 +224,32 @@ CONFIG_LWIP_MAX_SOCKETS=40
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 
 #
+# Both targets load app code into PSRAM and execute it there, and neither has a
+# choice about it, so the switches that say so are here rather than once in each
+# target's file -- where one could be changed without the other and the split
+# would be a lie. What is genuinely the target's own -- the PSRAM mode, speed
+# and size, the flash mode, the partition table -- stays there, as does the
+# bus-address mirror the S3's loading needs.
+#
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ELF_LOADER_LOAD_PSRAM=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+#
+# A loaded app's stack, PSRAM-backed (xTaskCreateWithCaps in exec.c). 256 KB
+# because that is what the Quake 2 port runs the engine on; the 8 KB default
+# fits a small program and nothing else, and internal RAM could never hold a
+# game's. Every app pays it while it runs, which is a knob to make per-app
+# later.
+#
+# Here rather than in a target's file: it is what an espix app is given, not
+# something a target decides. The S3, which read the 8 KB default because this
+# lived in the S31's file, is where that showed.
+CONFIG_ESPIX_PROC_STACK_SIZE=262144
+
+#
 # Console
 #
 CONFIG_VFS_SUPPORT_DIR=y
