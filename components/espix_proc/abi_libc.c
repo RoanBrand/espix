@@ -88,6 +88,9 @@
  */
 
 #include <ctype.h>
+
+#define _MB_EXTENDED_CHARSETS_ISO  /* the functions, not the macros: docs/UPSTREAM.md */
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <reent.h>
@@ -237,6 +240,8 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(__errno),
     ESP_ELFSYM_EXPORT(__getreent),
     ESP_ELFSYM_EXPORT(_ctype_),
+    ESP_ELFSYM_EXPORT(toupper),
+    ESP_ELFSYM_EXPORT(tolower),
 #endif
 
     /* string.h -- the half that came from below. */

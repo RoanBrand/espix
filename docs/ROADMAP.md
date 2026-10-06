@@ -978,3 +978,12 @@ allocation sizes up to the board's maximum, record where a fresh region falls
 short and by how much, and derive the formula from that. A region would then be
 the right size the first time on every target, with the verify loop kept as an
 assertion rather than as the mechanism.
+
+## The ctype functions, owned by espix
+
+Build apps with  so the ctype names are real calls, and publish our
+own // through the ABI -- newlib's implementations can sit
+behind them. See docs/UPSTREAM.md for the Xtensa macro bug that forces it. The
+same audit belongs on the kernel, which the same backend builds, and on any
+runtime character classification in it ( uses, such as the OTA
+build-id comparison, are the first candidates).

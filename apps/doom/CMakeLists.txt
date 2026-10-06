@@ -16,6 +16,14 @@ if(NOT doom_fetch_rc EQUAL 0)
 endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+# _MB_EXTENDED_CHARSETS_ISO: the ctype names must be calls, not macros. The Xtensa backend's
+# islower/toupper macro answers wrong for a runtime argument (docs/UPSTREAM.md),
+# which is what broke Doom's lump-name lookup; espix publishes the functions.
+# The builtins are disabled too, so the compiler cannot fold the calls back.
+idf_build_set_property(COMPILE_DEFINITIONS "_MB_EXTENDED_CHARSETS_ISO" APPEND)
+idf_build_set_property(COMPILE_OPTIONS
+    "-fno-builtin-toupper;-fno-builtin-tolower" APPEND)
+
 project(doom)
 
 # An espix app: this one line is what says so, and what makes the app agree with

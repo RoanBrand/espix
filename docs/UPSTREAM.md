@@ -1174,3 +1174,26 @@ further in; espix registers none of them.
 Upstream, the fix is to declare the struct's sector parameter as `LBA_t` — and,
 with it, to widen every backend's error of omission into the build error espix's
 patch makes it.
+## Xtensa: islower/toupper misread the ctype table for a runtime argument
+
+Found 2026-10-06 while chasing "W_GetNumForName: d_introa not found!" on the S3.
+
+Reproduction, in an app built for esp32s3 with the v6.1 toolchain
+(xtensa-esp-elf 15.2.0_20251204):
+
+    extern const char _ctype_[];
+    volatile char v = 'a';
+    printf("%u %d %d\n", (unsigned char)_ctype_['a' + 1], islower(v), toupper(v));
+
+    S31 (riscv32-esp-elf, same release): 66 1 65
+    S3  (xtensa-esp-elf,  same release): 66 0 97
+
+The table is right -- 66 is 0x42, the lowercase bit is set -- and the macro still
+answers no, so toupper() is the identity. The observable damage: doomgeneric's
+W_LumpNameHash() uppercases through toupper(), so on the S3 a lowercase query
+hashes 32 higher than the uppercase name it was filed under, and
+W_CheckNumForName() -- which has no linear fallback once its hash table exists --
+reports a lump that is present as missing. The game dies in I_Error at the title.
+
+espix's workaround: build apps with __NO_CTYPE, so the ctype names become calls,
+and publish our own toupper/tolower/is* through the ABI.
