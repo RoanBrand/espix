@@ -28,8 +28,39 @@
 extern espix_gfx_t         *doom_gfx;
 extern espix_gfx_surface_t *doom_surface;
 
+/*
+ * Everything the engine's own update path depends on, checked once, here.
+ *
+ * I_FinishUpdate() walks line_out = DG_ScreenBuffer + x_offset and memcpy's
+ * SCREENWIDTH bytes a row, without looking at either -- so a NULL screen buffer
+ * (an unchecked malloc) or a bogus offset (s_Fb never filled) arrives as a fault
+ * inside memcpy with nothing to say which it was. Upstream calls this hook
+ * immediately after allocating that buffer and before D_DoomMain, so it is the
+ * one place that can say.
+ *
+ * Startup only, deliberately: the frame path is DG_DrawFrame(), and a per-frame
+ * check or log there would be paid for on every frame of the game.
+ */
 void DG_Init(void)
 {
+    if (DG_ScreenBuffer == NULL) {
+        printf("doom: the engine's screen buffer is NULL (%u bytes asked for) "
+               "-- not starting\n",
+               (unsigned)(DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4));
+        fflush(stdout);
+        exit(1);
+    }
+
+    if (doom_gfx == NULL || doom_surface == NULL) {
+        printf("doom: no graphics surface (gfx %p, surface %p) -- not starting\n",
+               (void *)doom_gfx, (void *)doom_surface);
+        fflush(stdout);
+        exit(1);
+    }
+
+    printf("doom: screen buffer %p, surface %p\n",
+           (void *)DG_ScreenBuffer, (void *)doom_surface);
+    fflush(stdout);
 }
 
 /*

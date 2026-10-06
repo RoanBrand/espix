@@ -88,6 +88,16 @@ static size_t psram_floor_bytes(void)
 /* No region smaller than this, so a first small malloc does not carve a
  * straw-sized heap; and a granule to round the request to. */
 #define REGION_MIN_BYTES  (32u * 1024u)
+
+/*
+ * What registering a region costs before it can serve anything: the pool's own
+ * header, tlsf's control structure, and a block header. Measured rather than
+ * guessed -- a 4 MiB request succeeded with 4096 bytes of slack and a 256000
+ * byte one failed with 2048 -- so it is a few kilobytes and does not scale with
+ * the request. This is the term that makes a request servable, so it is
+ * generous; the tuning below is the term that is merely nice to have.
+ */
+#define REGION_METADATA_BYTES (8u * 1024u)
 #define REGION_GRANULE    (4u * 1024u)
 
 /* Reported once, because an app pushed into internal RAM is worth knowing about
@@ -142,29 +152,34 @@ static bool regions_available(void)
  * from being created one allocation too small. Proportional above the granular
  * base because a large request has proportionally more blocks.
  */
-static size_t region_size_for(size_t n)
+static size_t round_to_granule(size_t n)
 {
-    /*
-     * The padding is capped, and that is not a micro-optimisation: it is what
-     * makes the largest free block an honest answer to "how big an allocation
-     * can I get".
-     *
-     * The region has to be bigger than the request -- a heap needs its own
-     * bookkeeping, which is the 1 KB base -- but the proportional part is only
-     * ever room for *subsequent* allocations, and room that is not there costs
-     * nothing: a later allocation that will not fit gets a region of its own,
-     * which is the arrangement this list exists to allow. Unbounded, that 6.25%
-     * meant a 4 MiB request needed a 4.25 MB region, so a board with a 4.1 MiB
-     * block answered "largest block: 4 MiB" and then failed to allocate 4 MiB --
-     * the query and the allocator disagreeing by exactly the padding.
-     */
-    const size_t slack = n / 16;
+    return (n + (REGION_GRANULE - 1)) & ~(size_t)(REGION_GRANULE - 1);
+}
 
-    size_t want = n + ((slack < 1024u) ? slack : 1024u) + 1024u;
-    if (want < REGION_MIN_BYTES) {
-        want = REGION_MIN_BYTES;
+/* The size that makes 'n' servable: the request plus what a heap needs before it
+ * can hand anything out. Never optional -- this is the term whose absence was
+ * "region created, request refused", where an app asked for 256000 bytes, got a
+ * 252 KB region, and no allocation in it. */
+static size_t region_need_for(size_t n)
+{
+    size_t need = n + REGION_METADATA_BYTES;
+
+    if (need < REGION_MIN_BYTES) {
+        need = REGION_MIN_BYTES;
     }
-    return (want + (REGION_GRANULE - 1)) & ~(size_t)(REGION_GRANULE - 1);
+    return round_to_granule(need);
+}
+
+/* The room asked for on top, so later small allocations land in this region
+ * instead of each growing another. Purely opportunistic: dropped when the pool
+ * cannot afford it, and nothing depends on it. Uncapped, its 6.25% meant a 4 MiB
+ * request wanted a 4.25 MB carve on a board with a 4.1 MiB block. */
+static size_t region_tuning_for(size_t n)
+{
+    const size_t proportional = n / 16;
+
+    return ((proportional < 1024u) ? proportional : 1024u) + 1024u;
 }
 
 /* The region of 'slot' that contains p, or NULL. This is the classification the
@@ -273,9 +288,16 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
         return NULL;
     }
 
-    const size_t want       = region_size_for(n);
+    const size_t need       = region_need_for(n);
+    size_t       want       = need + region_tuning_for(n);
     const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     const size_t floor      = psram_floor_bytes();
+
+    /* Drop the tuning before the request. The tuning is room for later
+     * allocations, and one that will not fit gets a region of its own. */
+    if (free_psram < want + floor) {
+        want = need;
+    }
 
     if (free_psram < want + floor) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
@@ -298,6 +320,19 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
     void *const base = heap_caps_aligned_alloc(8, want,
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (base == NULL) {
+        /*
+         * The floor above is a policy; this is the pool saying no, and it used
+         * to say nothing -- which made "the app could not get its memory" and
+         * "the app never asked" the same entry in the log. Failure path only,
+         * so nothing here is paid for by an allocation that succeeds.
+         */
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "pid %d: no %u KB contiguous PSRAM for a region "
+                   "(free %u KB, largest %u KB)",
+                   (int)slot->info.pid, (unsigned)(want / 1024),
+                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                   (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)
+                              / 1024));
         return NULL;
     }
 
@@ -400,6 +435,45 @@ void *espix_abi_alloc(size_t n)
 
     xSemaphoreTake(s_region_lock, portMAX_DELAY);
     void *const p = region_alloc(slot, n);
+
+    /*
+     * The arena could not hold it: the request sits within the region
+     * bookkeeping's worth of the pool's largest block, the one case where no
+     * region can be carved for a request the pool can still serve. Take it from
+     * the global heap and *record it*, because the record is what lets the exit
+     * and kill paths return it -- an unrecorded block is the one way an app's
+     * memory could outlive the app.
+     *
+     * Four per process; a fifth is refused with the reason rather than leaked.
+     * Cold path by construction: a region was tried and failed first.
+     */
+    if (p == NULL && n > 0) {
+        if (slot->nescaped < ESPIX_PROC_MAX_ESCAPED) {
+            void *const e = alloc_psram(n);
+
+            if (e != NULL) {
+                slot->escaped[slot->nescaped]      = e;
+                slot->escaped_size[slot->nescaped] = n;
+                slot->nescaped++;
+
+                espix_klog(ESPIX_KLOG_INFO, TAG,
+                           "pid %d: %u KB from the global heap (no region could "
+                           "hold it); %u of %u escaped",
+                           (int)slot->info.pid, (unsigned)(n / 1024),
+                           (unsigned)slot->nescaped,
+                           (unsigned)ESPIX_PROC_MAX_ESCAPED);
+                xSemaphoreGive(s_region_lock);
+                return e;
+            }
+        } else {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "pid %d: no %u KB allocation: no region could hold it and "
+                       "all %u escapes are in use",
+                       (int)slot->info.pid, (unsigned)(n / 1024),
+                       (unsigned)ESPIX_PROC_MAX_ESCAPED);
+        }
+    }
+
     xSemaphoreGive(s_region_lock);
 
     /*
@@ -476,6 +550,25 @@ void espix_abi_free(void *p)
         xSemaphoreGive(s_region_lock);
     }
 
+    /* An escaped block is this process's as much as a region is: drop the record
+     * so the release does not free it twice, and give it back to the heap it came
+     * from. Rare by construction, so the scan costs nothing that matters. */
+    espix_proc_slot_t *const owner = espix_proc_self();
+
+    if (owner != NULL && s_region_lock != NULL) {
+        xSemaphoreTake(s_region_lock, portMAX_DELAY);
+        for (int i = 0; i < owner->nescaped; i++) {
+            if (owner->escaped[i] == p) {
+                owner->escaped[i] = owner->escaped[--owner->nescaped];
+                owner->escaped_size[owner->nescaped] = 0;
+                xSemaphoreGive(s_region_lock);
+                free(p);
+                return;
+            }
+        }
+        xSemaphoreGive(s_region_lock);
+    }
+
     /* Not from any arena: memory from before the regions existed, or memory
      * espix itself handed the app. It has to free -- the rule is "this
      * succeeds", not "this is correct" -- and a foreign pointer is not an
@@ -532,6 +625,20 @@ void espix_proc_regions_release(espix_proc_slot_t *slot)
     /* The index is espix's, not the arena's, so it frees here rather than with
      * the regions above -- and even when no region was ever made, a failed grow
      * may have left one behind. */
+    /* The blocks no region could hold. This runs on the kill path as well as the
+     * exit path, which is the entire reason they are recorded. */
+    const int escaped_count = slot->nescaped;
+
+    for (int i = 0; i < slot->nescaped; i++) {
+        if (slot->escaped[i] != NULL) {
+            free(slot->escaped[i]);
+            released += slot->escaped_size[i];
+        }
+        slot->escaped[i]      = NULL;
+        slot->escaped_size[i] = 0;
+    }
+    slot->nescaped = 0;
+
     free(slot->regions);
     slot->regions    = NULL;
     slot->nregions   = 0;
@@ -543,8 +650,9 @@ void espix_proc_regions_release(espix_proc_slot_t *slot)
     }
 
     espix_klog(ESPIX_KLOG_DEBUG, TAG,
-               "pid %d: %d arena region(s) released, %u KB of PSRAM returned",
-               (int)slot->info.pid, count, (unsigned)(released / 1024));
+               "pid %d: %d arena region(s) released, %u KB of PSRAM returned%s",
+               (int)slot->info.pid, count, (unsigned)(released / 1024),
+               (escaped_count > 0) ? ", escaped blocks included" : "");
 }
 
 size_t espix_proc_heap_used(espix_pid_t pid)

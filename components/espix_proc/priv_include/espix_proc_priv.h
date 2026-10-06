@@ -41,6 +41,15 @@ extern "C" {
 #define ESPIX_TLS_PROC_IDX 3
 
 /*
+ * How many blocks one process may have escape its arena. A request that cannot
+ * be carved a region for -- it sits within the region bookkeeping's worth of the
+ * pool's largest block -- is taken from the global heap instead and recorded, so
+ * that the exit and kill paths can return it. Four, and a fifth is refused with
+ * the reason.
+ */
+#define ESPIX_PROC_MAX_ESCAPED 4
+
+/*
  * And the count has to hold it.
  *
  * espix_proc_self() reads this slot out of the calling task's TLS, and reading
@@ -307,6 +316,17 @@ typedef struct {
      * See abi_alloc.c.
      */
     uint32_t           foreign_frees;
+
+    /*
+     * Blocks this process holds in the global heap because no region could be
+     * carved for them, with their sizes. Recorded so that espix_proc's release
+     * -- which runs on the exit path and the kill path alike -- returns them
+     * with the regions: an unrecorded block is the one way an app's memory could
+     * outlive the app. See abi_alloc.c, ESPIX_PROC_MAX_ESCAPED.
+     */
+    void              *escaped[ESPIX_PROC_MAX_ESCAPED];
+    size_t             escaped_size[ESPIX_PROC_MAX_ESCAPED];
+    uint8_t            nescaped;
 
     /*
      * True from the moment a process has handed itself to the reaper until its
