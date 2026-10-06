@@ -371,7 +371,14 @@ CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 # canary at 6368 bytes used. 8192 covers the protocol and the inline commands
 # that do real work; anything deeper declares its own stack in the command
 # table, where it costs one command instead of every session.
-CONFIG_ESPIX_SSH_TASK_STACK=8192
+# The session task, and the app-spawning path runs on it: the ELF's sections
+# are copied and relocated here before the new task exists. The 8192 default was
+# measured against a handshake, a prompt and a simple command (4056 bytes), which
+# is not that path -- on S3 an app of Doom's size overflows it and the board
+# panics, while an S3 build of the 1 KB hello app is fine. 16 KB is the top of
+# the Kconfig range; whether the spawn belongs on this task at all is a separate
+# question.
+CONFIG_ESPIX_SSH_TASK_STACK=16384
 
 # exFAT, for the 3.1TB exFAT partition a Samsung T9 carries. This is the one
 # option here that is off for a reason other than a preference -- see
