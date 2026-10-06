@@ -63,8 +63,21 @@ static int cmd_service(espix_session_t *s, int argc, char **argv)
     }
 
     if (strcmp(argv[1], "reload") == 0) {
-        if (espix_svc_reload() != ESP_OK) {
-            espix_eprintf(s, "service: no supervisor\n");
+        /*
+         * Root's, because the file is: /etc/units is 0600 -- a unit line is a
+         * root command line and can carry a password -- and a reload is what
+         * reads it. The split systemctl draws: daemon-reload is root,
+         * list-units is not. Listing here stays open to everyone.
+         */
+        if (s != NULL && s->uid != 0) {
+            espix_eprintf(s, "service: only root may reload the units\n");
+            return 1;
+        }
+
+        const esp_err_t err = espix_svc_reload();
+        if (err != ESP_OK) {
+            espix_eprintf(s, "service: reload failed: %s\n",
+                          esp_err_to_name(err));
             return 1;
         }
         espix_printf(s, "reloaded\n");

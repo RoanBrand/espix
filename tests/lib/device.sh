@@ -516,15 +516,22 @@ dev_status() {
     _dev_ssh "$1" >/dev/null 2>&1
 }
 
-# Everything below prints the command's output with ssh's host-key notice
-# filtered out, and returns the *command's* status.
+# Everything below prints the command's output with the transport's own two
+# notices filtered out, and returns the *command's* status. The second one --
+# "Connection to <host> closed by remote host." -- is the client's, printed when
+# the server closes the channel rather than the client finishing with it, and it
+# arrives on stderr, which dev_once merges. It is not the command's output: a
+# "service | grep -c svcprobe" came back as "1\nConnection to ... closed by
+# remote host." and failed an assertion on a value that was right.
 #
 # Not a pipeline into grep, which is how the first version was written: a
 # transfer that succeeds silently produces no output, grep finds nothing and
 # exits 1, and the helper reports failure for a copy that worked perfectly.
 # Under `set -o pipefail` it is worse still.
 _dev_filter() {
-    printf '%s' "$1" | grep -v '^Warning: Permanently added' || true
+    printf '%s' "$1" \
+        | grep -v -e '^Warning: Permanently added' \
+        | grep -v -e '^Connection to .* closed by remote host\.' || true
 }
 
 # dev_once <command> -- own connection, echo output, discard status.

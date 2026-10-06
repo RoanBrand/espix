@@ -8,6 +8,7 @@
  * usually the reason it is worth having.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -484,7 +485,7 @@ static void units_parse(svc_unit_t *fresh, int *n, char *line)
     u->next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
 }
 
-static void units_load(void)
+static bool units_load(void)
 {
     /*
      * Static, and therefore off the caller's stack. Every caller holds
@@ -499,6 +500,7 @@ static void units_load(void)
 
     memset(fresh, 0, sizeof(fresh));
 
+    errno = 0;                      /* so the branch below is about this open */
     FILE *f = fopen(SVC_UNITS_FILE, "r");
     if (f != NULL) {
         char line[SVC_LINE_MAX];
@@ -506,6 +508,18 @@ static void units_load(void)
             units_parse(fresh, &n, line);
         }
         fclose(f);
+    } else if (errno != ENOENT) {
+        /*
+         * There and unreadable -- 0600 root, read as somebody else, which is
+         * what a non-root "service reload" used to be. Substituting the
+         * built-in default here was a real and silent bug: the table became
+         * the stock autoupdate-only set, the operator's units disappeared from
+         * it, and nothing said so. The file is left alone and the caller is
+         * told instead.
+         */
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: cannot be read: %s",
+                   SVC_UNITS_FILE, strerror(errno));
+        return false;
     } else {
         /* Written rather than only defaulted: the format belongs in front of
          * whoever edits it, and a file that appears on the first boot is how
@@ -554,6 +568,7 @@ static void units_load(void)
 
     memcpy(s_units, fresh, sizeof(fresh));
     s_count = n;
+    return true;
 }
 
 /*
@@ -684,7 +699,9 @@ esp_err_t espix_svc_init(void)
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    units_load();
+    /* False means the file was there and could not be read; it has logged why,
+     * and an empty table is the honest state rather than the built-in default. */
+    (void)units_load();
     xSemaphoreGive(s_lock);
 
     s_started = true;
@@ -825,18 +842,26 @@ esp_err_t espix_svc_reload(void)
      * that says "coredump erase, then service reload" would be a lie.
      */
     const bool was_safe = s_safe_mode;
+
+    /* Cleared before the load, because units_load() decides whether to carry a
+     * unit's enabled state over by asking it; put back on failure, so a reload
+     * that could not read the file changes nothing at all. */
     s_safe_mode = false;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    units_load();
-    if (was_safe) {
+    const bool loaded = units_load();
+    if (loaded && was_safe) {
         for (int i = 0; i < s_count; i++) {
             s_units[i].enabled = true;
         }
         espix_klog(ESPIX_KLOG_INFO, TAG, "safe mode cleared; units resume");
     }
+    if (!loaded) {
+        s_safe_mode = was_safe;
+    }
     xSemaphoreGive(s_lock);
-    return ESP_OK;
+
+    return loaded ? ESP_OK : ESP_FAIL;
 }
 
 int espix_svc_quiesce(int64_t deadline_us)

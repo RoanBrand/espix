@@ -8,6 +8,7 @@
  * server is willing to talk about. nfsd's own procedures come next.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -313,9 +314,22 @@ bool nfsd_may_write(const nfs_export_t *e, uint32_t src)
 /* <path> <client>[(opts)] ...  -- the Linux syntax, less the hostnames. */
 static int load_exports(void)
 {
+    errno = 0;                      /* so the branch below is about this open */
     FILE *f = fopen(EXPORTS_PATH, "r");
     if (f == NULL) {
-        write_exports_template();
+        /*
+         * Only an absent file gets the template written. One that is there and
+         * could not be read must not be overwritten with it -- a transient read
+         * failure would become data loss -- and serving nothing is the safe
+         * answer either way. The same shape as the units file, where getting it
+         * wrong was not hypothetical.
+         */
+        if (errno == ENOENT) {
+            write_exports_template();
+        } else {
+            espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: cannot be read: %s",
+                       EXPORTS_PATH, strerror(errno));
+        }
         return 0;
     }
 

@@ -28,8 +28,17 @@ assert_contains "wlan0 has an address" "inet " "$(dev_run 'ip addr show wlan0')"
 
 usb_out=$(dev_run 'usb status')
 
-case "$usb_out" in
-    *"not built into this image"*)
+# Whether USB-NCM is in this image is the command's own status, not its text.
+# The command is compiled out entirely when CONFIG_ESPIX_USB_NCM_ENABLED is off
+# -- the shell then says "command not found" and exits 127 -- and a build that
+# has the command with no NCM behind it prints "not built into this image" and
+# exits 1. Both are the not-built case, and matching on the message alone missed
+# the first, which is what a host-role S31 build is.
+usb_built=no
+dev_status 'usb status' >/dev/null 2>&1 && usb_built=yes
+
+case "$usb_built" in
+    no)
         # This is a host-role build: the one OTG peripheral is driving storage
         # instead of presenting usb0, so usb0 must genuinely be absent rather
         # than merely unconfigured. The skip below records what is not being
@@ -40,7 +49,7 @@ case "$usb_out" in
                             "usb host is not running" "$(dev_run 'lsblk')"
         espix_skip "usb-ncm is not in this build (the OTG port is the USB host)"
         ;;
-    *)
+    yes)
         assert_contains "usb0 is listed whenever it is built in" "usb0:" "$link_out"
 
         attached=no

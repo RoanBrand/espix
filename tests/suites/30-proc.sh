@@ -439,7 +439,17 @@ assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 # in the scheduler's list, so after a run nothing named testapp is a task.
 
 dev_run "$APP exit 0" >/dev/null 2>&1
-left=$(dev_run ps | sed -n '1,/^finished:/p' | grep -c 'testapp')
+
+# Waiting rather than asking once. The process parks itself and the reaper
+# deletes the task, which is asynchronous by design (R-P1.6) and later still
+# when the device is occupied. A single read measured the reaper's scheduling
+# rather than whether it ever ran, and under a parallel run it read as a leak.
+left=1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    left=$(dev_run ps | sed -n '1,/^finished:/p' | grep -c 'testapp')
+    [ "$left" = 0 ] && break
+    sleep 1
+done
 assert_eq "a finished process is deleted by the reaper" "0" "$left"
 
 # One process, one name (R-P7.6): the live table prints the process name, so a
