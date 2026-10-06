@@ -249,6 +249,20 @@ CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 # lived in the S31's file, is where that showed.
 CONFIG_ESPIX_PROC_STACK_SIZE=262144
 
+# Put .bss in PSRAM where a symbol asks for it (EXT_RAM_BSS_ATTR), and move the
+# lwip/net80211/libpp/wpa_supplicant/bluedroid .bss there. IDF's docs name those
+# libraries explicitly: it is a supported feature that frees ~63 kB of internal
+# RAM, and internal is the scarce pool on both targets -- which is why this is
+# not in either target's file. The S3 is where leaving it out showed: it read the
+# default, kept every one of those buffers internal, and ran the whole test suite
+# with ~40 kB less heap than the S31 has (free: 292K against 332K).
+#
+# Caveats, both link-time and both real: PSRAM data is NOT in a core dump, so a
+# fault in one of those libraries is blind; and there is no runtime fallback if
+# PSRAM init fails.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+
 #
 # Console
 #

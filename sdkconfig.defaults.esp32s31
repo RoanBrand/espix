@@ -142,16 +142,6 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # and a core-affinity constraint not worth taking on yet. Revisit for LE Audio.
 # CONFIG_ESP_AUDIO_CODEC_S31_USE_ASM is not set
 
-# Put .bss in PSRAM where a symbol asks for it (EXT_RAM_BSS_ATTR). Internal RAM
-# is the scarce pool -- Bluetooth Classic needs it -- and PSRAM is 13 MB, so a
-# large static buffer that need not be internal belongs there.
-# Move the lwip/net80211/libpp/wpa_supplicant/bluedroid .bss to PSRAM. The
-# IDF docs name those libraries explicitly: it is a supported feature, and it
-# frees ~63 kB of internal RAM, which is what the audio decoder needs. Caveats
-# to remember: PSRAM data is NOT in a core dump (so a BT fault there is blind),
-# and there is no runtime fallback if PSRAM init fails (link-time assignment).
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
-
 # A TCP send buffer that can hold a frame.
 #
 # lwIP defaults to 5760 bytes, which is smaller than one incremental VNC frame,
