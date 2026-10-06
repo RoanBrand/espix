@@ -88,6 +88,19 @@ extern double    __subdf3(double, double);
 extern double    __muldf3(double, double);
 extern long long __divdi3(long long, long long);
 extern int       __eqdf2(double, double);
+extern float     __addsf3(float, float);
+extern float     __subsf3(float, float);
+extern float     __mulsf3(float, float);
+extern float     __divsf3(float, float);
+extern int       __eqsf2(float, float);
+extern int       __nesf2(float, float);
+extern int       __ltsf2(float, float);
+extern int       __lesf2(float, float);
+extern int       __gtsf2(float, float);
+extern int       __gesf2(float, float);
+extern int       __unordsf2(float, float);
+extern int       __fixsfsi(float);
+extern float     __floatsisf(int);
 extern double    __extendsfdf2(float);
 extern int       __fixdfsi(double);
 extern double    __floatsidf(int);
@@ -240,6 +253,33 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(__gedf2),
     ESP_ELFSYM_EXPORT(__ledf2),
     ESP_ELFSYM_EXPORT(__truncdfsf2),
+
+    /*
+     * The single-precision arithmetic, which is what an Xtensa app build
+     * reaches for and a RISC-V one inlines. espix had the double set and the
+     * sf<->df conversions, but nothing that did arithmetic on a float -- so
+     * Doom, whose engine divides floats, failed to load on the S3 with
+     * "undefined symbol: __divsf3" while the same program on the S31
+     * references none of these at all.
+     *
+     * Exporting them cannot shadow hardware: what an app calls is decided when
+     * the app is compiled, so a build with an FPU never asks. The cost is the
+     * libgcc code linked into the kernel, which these entries are also what
+     * makes it link at all -- nothing else here calls them.
+     */
+    ESP_ELFSYM_EXPORT(__addsf3),
+    ESP_ELFSYM_EXPORT(__subsf3),
+    ESP_ELFSYM_EXPORT(__mulsf3),
+    ESP_ELFSYM_EXPORT(__divsf3),
+    ESP_ELFSYM_EXPORT(__eqsf2),
+    ESP_ELFSYM_EXPORT(__nesf2),
+    ESP_ELFSYM_EXPORT(__ltsf2),
+    ESP_ELFSYM_EXPORT(__lesf2),
+    ESP_ELFSYM_EXPORT(__gtsf2),
+    ESP_ELFSYM_EXPORT(__gesf2),
+    ESP_ELFSYM_EXPORT(__unordsf2),
+    ESP_ELFSYM_EXPORT(__fixsfsi),
+    ESP_ELFSYM_EXPORT(__floatsisf),
     ESP_ELFSYM_EXPORT(__divdf3),
     ESP_ELFSYM_EXPORT(__ltdf2),
     ESP_ELFSYM_EXPORT(__gtdf2),

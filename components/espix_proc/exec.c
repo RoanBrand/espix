@@ -953,6 +953,40 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
              (int)(sizeof(task_name) - sizeof("app:")), slot->info.name);
 
     TaskHandle_t task = NULL;
+
+    /*
+     * How much stack the app gets.
+     *
+     * One default for every app, and a name-keyed override for the one that
+     * needs a quarter of a megabyte. The default used to *be* the quarter
+     * megabyte, so hello and neopixel each committed 256 KB of PSRAM for their
+     * whole life to run a few hundred bytes of work.
+     *
+     * The honest shape is an app declaring its own requirement -- an exported
+     * symbol the loader reads, or a line in the manifest that already ships
+     * beside it -- and this table is where that goes once it exists. A basename
+     * is at least the thing a person edits.
+     */
+    static const struct {
+        const char *name;
+        uint32_t    stack;
+    } app_stacks[] = {
+        { "doom", 262144 },     /* the engine's zone allocator and the WAD walk */
+    };
+
+    uint32_t app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;
+    {
+        const char *slash = strrchr(abs_path, '/');
+        const char *base  = (slash != NULL) ? slash + 1 : abs_path;
+
+        for (size_t i = 0; i < sizeof(app_stacks) / sizeof(app_stacks[0]); i++) {
+            if (strcmp(app_stacks[i].name, base) == 0) {
+                app_stack = app_stacks[i].stack;
+                break;
+            }
+        }
+    }
+
     /*
      * Pinned to core 1, with a PSRAM stack.
      *
@@ -970,7 +1004,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      * on both the self-exit and kill paths.
      */
     const BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
-        proc_task, task_name, CONFIG_ESPIX_PROC_STACK_SIZE, slot,
+        proc_task, task_name, app_stack, slot,
         CONFIG_ESPIX_PROC_PRIORITY, &task, 1, MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         /* The wake eventfd is live by now, and the memset below would shed the

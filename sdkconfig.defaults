@@ -238,16 +238,14 @@ CONFIG_ELF_LOADER_LOAD_PSRAM=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 #
-# A loaded app's stack, PSRAM-backed (xTaskCreateWithCaps in exec.c). 256 KB
-# because that is what the Quake 2 port runs the engine on; the 8 KB default
-# fits a small program and nothing else, and internal RAM could never hold a
-# game's. Every app pays it while it runs, which is a knob to make per-app
-# later.
+# An app's stack unless it is named in exec.c's table, PSRAM-backed. 16 KB is
+# an ordinary app's worth; the quarter megabyte this used to be for everyone was
+# Doom's and Quake 2's, and every other app paid it for as long as it ran.
 #
 # Here rather than in a target's file: it is what an espix app is given, not
-# something a target decides. The S3, which read the 8 KB default because this
-# lived in the S31's file, is where that showed.
-CONFIG_ESPIX_PROC_STACK_SIZE=262144
+# something a target decides -- and both targets read the same 16 KB and the
+# same override.
+CONFIG_ESPIX_PROC_STACK_SIZE=16384
 
 # Put .bss in PSRAM where a symbol asks for it (EXT_RAM_BSS_ATTR), and move the
 # lwip/net80211/libpp/wpa_supplicant/bluedroid .bss there. IDF's docs name those
@@ -385,14 +383,13 @@ CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 # canary at 6368 bytes used. 8192 covers the protocol and the inline commands
 # that do real work; anything deeper declares its own stack in the command
 # table, where it costs one command instead of every session.
-# The session task, and the app-spawning path runs on it: the ELF's sections
-# are copied and relocated here before the new task exists. The 8192 default was
-# measured against a handshake, a prompt and a simple command (4056 bytes), which
-# is not that path -- on S3 an app of Doom's size overflows it and the board
-# panics, while an S3 build of the 1 KB hello app is fine. 16 KB is the top of
-# the Kconfig range; whether the spawn belongs on this task at all is a separate
-# question.
-CONFIG_ESPIX_SSH_TASK_STACK=16384
+# The session task, which is also the app-spawning path: the ELF's sections are
+# copied and relocated here before the new task exists. Measured against a
+# handshake, a prompt and a simple command it is 4056 bytes, so 8192 is the
+# default -- and the S31 loads Doom in that. The S3 needs more for the same load
+# because its frames are bigger; the measurement and the value are in
+# sdkconfig.defaults.esp32s3, where a per-target number belongs.
+CONFIG_ESPIX_SSH_TASK_STACK=8192
 
 # exFAT, for the 3.1TB exFAT partition a Samsung T9 carries. This is the one
 # option here that is off for a reason other than a preference -- see

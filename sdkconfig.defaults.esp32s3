@@ -28,6 +28,20 @@ CONFIG_ESPIX_PSRAM_MB=8
 CONFIG_SPIRAM_SPEED_80M=y
 
 #
+# The session task needs a little more here than the common default, and this is
+# the one target where that was measured rather than guessed. Spawning an app
+# runs on the session task -- the ELF is copied and relocated there -- and with
+# the 8 KB default an S3 build panicked in sshd:conn loading Doom: "a stack
+# overflow in task sshd:conn". With 16 KB the same load leaves 7956 bytes free,
+# so it uses about 8.4 KB and 8 KB was short by a few hundred. 12 KB keeps ~1.8
+# of margin for an app bigger than Doom's 343 KB. The S31 loads the same binary
+# in 8 KB (its frames are smaller), so its file does not set this.
+#
+# The real fix is that the load should not be charged to whoever ran the
+# command at all -- see the note in sdkconfig.defaults.
+CONFIG_ESPIX_SSH_TASK_STACK=12288
+
+#
 # Load relocated ELF text/data into PSRAM rather than internal SRAM. On S3 this
 # relies on the ibus/dbus address mirror (ELF_LOADER_BUS_ADDRESS_MIRROR, which
 # the component selects automatically for this target).
