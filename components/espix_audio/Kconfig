@@ -2,10 +2,16 @@ menu "espix audio"
 
     config ESPIX_AUDIO
         bool "Audio playback (play)"
+        depends on ESPIX_BT
         default y
         help
-            The play command: a GMF-based player (esp_audio_simple_player) that
-            reads a URI -- a local file or an HTTP(S) stream -- decodes it, and
-            hands PCM to the A2DP source. It is on by default where Bluetooth is.
+            The play command: esp_audio_simple_dec reads a URI -- a local file
+            or an HTTP(S) stream -- decodes it, and hands PCM to the A2DP
+            source. On by default where Bluetooth is, and it cannot be anywhere
+            else: the engine decodes straight into the A2DP ring, so without
+            Bluedroid Classic there is no sink to decode into. The dependency is
+            what keeps an S3 -- BLE only -- from linking a decoder it can never
+            use, and a stale CONFIG_ESPIX_AUDIO=y in an S3 sdkconfig from
+            compiling it anyway.
 
 endmenu

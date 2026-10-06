@@ -41,6 +41,23 @@ extern "C" {
 #define ESPIX_TLS_PROC_IDX 3
 
 /*
+ * And the count has to hold it.
+ *
+ * espix_proc_self() reads this slot out of the calling task's TLS, and reading
+ * past the end of FreeRTOS's array does not fail: it returns whatever is next
+ * in the block, as a pointer, and the first dereference faults. That is how an
+ * S3 build panicked in espix_proc_paths() on the first fopen -- at boot, in the
+ * WiFi configuration read -- because sdkconfig.esp32s3 had been generated when
+ * the tree kept three TLS pointers and a generated sdkconfig keeps the value it
+ * was first written with, whatever a later sdkconfig.defaults says.
+ *
+ * A build is where that belongs, not the hottest path in the system.
+ */
+#if CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS <= ESPIX_TLS_PROC_IDX
+#error "CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS must be greater than ESPIX_TLS_PROC_IDX (the proc TLS slot). Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
+#endif
+
+/*
  * An app's own memory: a small list of private heaps carved out of PSRAM.
  *
  * An app's malloc() used to be the firmware's, so nothing could say what the

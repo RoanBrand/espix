@@ -976,6 +976,22 @@ size_t    espix_bt_audio_write(const void *p, size_t n)       { (void)p; (void)n
 esp_err_t espix_bt_set_pin(const char *p)     { (void)p; return ESP_ERR_NOT_SUPPORTED; }
 const char *espix_bt_pin(void)                { return ""; }
 
+/*
+ * The rest of the header, and it has to be all of it. This section is what a
+ * target without Bluetooth links against, and a function declared there but
+ * missing here fails the *link* rather than the call -- which is how an S3 build
+ * broke on espix_bt_shutdown, espix_bt_audio_start and espix_bt_audio_suspend at
+ * once: the last by the shutdown sequence, the first two by the audio engine,
+ * which an S3 build should not have had either.
+ */
+void      espix_bt_audio_start(void)          { }
+void      espix_bt_audio_suspend(void)        { }
+void      espix_bt_set_sbc_quality(int q)     { (void)q; }
+int       espix_bt_sbc_quality(void)          { return 0; }
+esp_err_t espix_bt_set_volume(uint8_t v)      { (void)v; return ESP_ERR_NOT_SUPPORTED; }
+int       espix_bt_volume(void)               { return -1; }
+esp_err_t espix_bt_shutdown(void)             { return ESP_ERR_NOT_SUPPORTED; }
+
 #endif /* CONFIG_ESPIX_BT */
 
 const char *espix_bt_bdastr(const uint8_t bda[ESPIX_BDA_LEN], char *buf, size_t len)

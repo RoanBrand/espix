@@ -190,11 +190,12 @@ two.
 
 | | 32x32 | 64x64 | 128x128 | 256x256 | 800x600 |
 |---|---|---|---|---|---|
-| **S31 fill, software** | 26.4 | 27.6 | 27.8 | 21.9 | 22.0 |
-| **S31 fill, PPA FILL** | 15.1 | 43.1 | 76.9 | 97.0 | **105.1** |
-| **S31 blit, software** | 13.2 | 13.5 | 13.6 | 10.7 | 10.6 |
-| **S31 blit, PPA SRM** | 7.2 | 18.9 | 36.2 | 47.2 | **49.1** |
-| **S3, every row above** | — | — | — | — | — |
+| **S31 fill, software** | 59.9 | 62.0 | 62.5 | 37.8 | 37.8 |
+| **S31 fill, PPA FILL** | 14.9 | 42.8 | 76.5 | 96.0 | **105.1** |
+| **S3 fill, software** | 98 | 108 | 106 | 17.5 | 17.3 |
+| **S31 blit, software** | 25.3 | 25.9 | 26.1 | 17.2 | 17.2 |
+| **S31 blit, PPA SRM** | 7.9 | 20.0 | 37.1 | 47.6 | **49.2** |
+| **S3 blit, software** | 18.3 | 20.8 | 10.5 | 10.4 | 10.4 |
 
 Mpx/s, higher is better. A dash is a row that has not been measured yet rather
 than one that is slow.
@@ -202,11 +203,18 @@ than one that is slow.
 Three more rows are not primitives at all, but the work the desktop actually
 does, so they are quoted in milliseconds rather than in rates:
 
-| | size | software | accelerated | |
-|---|---|---|---|---|
-| **repaint** -- background, then both windows | 800x600 | 31.6 ms | **7.1 ms** | 4.4x |
-| **window content** -- frame, title, 20x56 of text | 456x186 | 11.2 ms | **8.3 ms** | 1.3x |
-| **jpeg decode** -- the viewer's 23 KB test.jpg | 480x330 | 116.7 ms | **12.4 ms** | 9.4x |
+| | size | S31 software | S31 accelerated | | S3 software |
+|---|---|---|---|---|---|
+| **repaint** -- background, then both windows | 800x600 | 19.1 ms | **7.1 ms** | 2.7x | 37.8 ms |
+| **window content** -- frame, title, 20x56 of text | 456x186 | 7.3 ms | **6.3 ms** | 1.2x | 12.3 ms |
+| **jpeg decode** -- the viewer's 23 KB test.jpg | 480x330 | 116.7 ms | **12.4 ms** | 9.4x | 123 ms |
+
+The S3 has no accelerated column to compare with, so its figures are what its
+software path costs: a full repaint is 37.8 ms against the S31's 7.1 ms, and a
+window 12.3 ms against 6.3. That is the whole of what a PPA buys on this
+workload -- roughly 5x on the repaint, 2x on a window -- and it is why the S3
+desktop moves at about 26 frames a second on a full redraw where the S31's does
+140.
 
 There is one more operation, neither a fill nor a blit, because it is what the
 encoder does once per emitted pixel: **RGB565 to ARGB8888**, the conversion an
@@ -214,8 +222,11 @@ RFB update pays when the client asks for 32bpp.
 
 | | 32x32 | 128x128 | 456x186 | 800x600 |
 |---|---|---|---|---|
-| **S31 convert, software** | 10.9 | 7.9 | 7.8 | 7.8 |
-| **S31 convert, PPA SRM** | 5.9 | 31.5 | 38.0 | **41.9** |
+| **S31 convert, software** | 12.2 | 8.5 | 8.5 | 8.5 |
+| **S31 convert, PPA SRM** | 9.2 | 35.9 | 39.0 | **42.1** |
+
+The S3 has no convert row: that operation exists to compare the two paths,
+and there is only one on a chip with neither accelerator.
 
 Mpx/s. PPA loses below about 64x64 -- its per-transaction cost is fixed -- and
 wins 4-5x above it. It is **not** a drop-in: PPA expands 565 as `v << 3` where the

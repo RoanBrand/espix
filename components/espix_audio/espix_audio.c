@@ -28,6 +28,26 @@
 #include "espix_bt.h"
 #include "espix_audio.h"
 
+#if !CONFIG_ESPIX_AUDIO
+
+/*
+ * The API without the engine.
+ *
+ * `play` is behind the same option (cmd_play.c) and nothing else needs a
+ * decoder -- but the shutdown sequence asks playback to stop and a Bluetooth
+ * power-off does too, and a target that has neither should still link. Whole
+ * functions rather than a broken engine: nothing here is ever called on such a
+ * target, and with every reference gone the codec libraries drop out of the
+ * link entirely, which is most of what the option is for.
+ */
+bool espix_audio_stop_wait(uint32_t timeout_ms)  { (void)timeout_ms; return true; }
+esp_err_t espix_audio_play(const char *uri)      { (void)uri; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_audio_play_wait(const char *uri) { (void)uri; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_audio_stop(void)                 { return ESP_ERR_NOT_SUPPORTED; }
+const char *espix_audio_state(void)              { return "not built"; }
+
+#else
+
 #define TAG "audio"
 
 /*
@@ -710,3 +730,5 @@ const char *espix_audio_state(void)
 {
     return s_running ? "playing" : "idle";
 }
+
+#endif /* CONFIG_ESPIX_AUDIO */
