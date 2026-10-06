@@ -784,6 +784,15 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     }
 
     /*
+     * Nothing starts while the system is leaving. The service supervisor, the
+     * accept loops and this all read one flag, so no door is left open by
+     * remembering two of the three.
+     */
+    if (espix_shutdown_started()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
      * A root only ever narrows. If the caller is itself confined, the root it
      * asks for must be inside its own -- otherwise a process could escape by
      * spawning a child with a wider view and talking to it.

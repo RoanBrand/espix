@@ -7,13 +7,15 @@
 #include <string.h>
 
 #include "espix_cmds_priv.h"
+#include "espix_kernel.h"
 #include "espix_nfsd.h"
 #include "espix_svc.h"
 
-/* Run by a unit, stop when the unit is asked to; run by hand, never. */
+/* Run by a unit, stop when the unit is asked to; run by hand, stop when the
+ * system is going down. Either way the daemon is what learns it, and returns. */
 static bool keep_going(void)
 {
-    return !espix_svc_stopping();
+    return !espix_svc_stopping() && !espix_shutdown_started();
 }
 
 static int cmd_nfsd(espix_session_t *s, int argc, char **argv)

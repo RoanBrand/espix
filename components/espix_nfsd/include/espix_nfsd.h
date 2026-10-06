@@ -7,8 +7,8 @@
 
 /*
  * An NFSv3 server: the portmapper, mountd and nfsd, which is what "serve the
- * stick over the network" means to a Linux or macOS client. It is read-only
- * until the write path exists, and an export is what /etc/exports says it is.
+ * stick over the network" means to a Linux or macOS client. An export is what
+ * /etc/exports says it is: writable unless a line there says ro.
  *
  * espix_nfsd_run() is the daemon and does not return while it is serving: the
  * service manager runs it as a unit, the way a Unix daemon runs in the

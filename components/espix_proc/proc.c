@@ -610,6 +610,94 @@ static esp_err_t proc_wait_gone(espix_pid_t pid, TickType_t timeout)
 }
 
 /*
+ * The shutdown path: SIGTERM every live process but the caller, then wait for
+ * the table to empty or the deadline to pass. Returns how many were still alive
+ * when it gave up.
+ *
+ * No escalation, deliberately. espix_proc_kill()'s forced half is unsafe on a
+ * shared address space -- a task deleted while holding the VFS lock or a
+ * volume's is how a clean stop becomes a corrupt volume -- and a reset takes the
+ * task anyway, so the force would buy nothing here.
+ *
+ * The wait is the process table's own finish event, so it ends when the last
+ * process does rather than after a fixed grace.
+ *
+ * The caller is skipped. In the ordinary case that skips nothing -- the sequence
+ * runs on a task that is not a process -- but the fallback when no stack can be
+ * had for that task runs it on the caller's, and then signalling itself would
+ * only make it wait for itself.
+ */
+size_t espix_proc_stop_all(int64_t deadline_us)
+{
+    /*
+     * Heap, not stack: this is a whole process table, and the caller is whichever
+     * task asked for the shutdown -- a session, the desktop, a unit. None of
+     * those stacks is guaranteed to have room for it on top of what it is doing.
+     */
+    espix_proc_info_t *live = calloc(ESPIX_PROC_MAX, sizeof(*live));
+    if (live == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot list processes to stop them");
+        return 0;
+    }
+
+    const espix_pid_t self = espix_proc_self_pid();
+
+    size_t n     = espix_proc_snapshot(live, ESPIX_PROC_MAX);
+    size_t asked = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (live[i].pid == self) {
+            continue;
+        }
+        if (espix_proc_signal(live[i].pid, SIGTERM) == ESP_OK) {
+            asked++;
+        }
+    }
+
+    if (asked > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "SIGTERM to %u process%s; waiting",
+                   (unsigned)asked, (asked == 1) ? "" : "es");
+    }
+
+    size_t left = 0;
+
+    for (;;) {
+        n = espix_proc_snapshot(live, ESPIX_PROC_MAX);
+
+        left = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (live[i].pid != self) {
+                left++;
+            }
+        }
+        if (left == 0) {
+            break;
+        }
+
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us >= deadline_us) {
+            break;
+        }
+
+        TickType_t wait = pdMS_TO_TICKS((uint32_t)((deadline_us - now_us) / 1000));
+        if (wait == 0) {
+            wait = 1;
+        }
+        (void)xEventGroupWaitBits(g_espix_proc_events, ESPIX_PROC_EVENT_FINISH,
+                                  pdTRUE, pdTRUE, wait);
+    }
+
+    if (left > 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%u process%s did not stop in time; the reset will take them",
+                   (unsigned)left, (left == 1) ? "" : "es");
+    }
+
+    free(live);
+    return left;
+}
+
+/*
  * How long a process gets to leave on its own after SIGTERM.
  *
  * Longer than the 400ms this used to be, and the reason is that a signal now

@@ -42,6 +42,8 @@ merely missing.
 | `fork()` / `exec()` | **no** on S3, **planned** on S31 | needs an MMU for copy-on-write; the S31 has one |
 | MMU-backed process isolation | **no** on S3, **planned** on S31 | see [hardware targets](../README.md#hardware-targets) and [crash handling](../README.md#crash-handling-and-isolation) |
 | setuid / setgid / sticky | **yes** | all three consulted; setuid is a guardrail on S3 and a boundary on S31 |
+| `reboot`, `poweroff` | **yes** | one sequence for both: the units are asked to stop, every process is SIGTERM'd and waited for — with no forced kill, because a task deleted while holding a lock is how a clean stop becomes a corrupt volume — every volume is flushed and unmounted, and then the reset. `poweroff` is deep sleep with a 10-minute timer, because the chip cannot cut its own power; both are root only |
+| `shutdown(8)`, `wall`, a scheduled shutdown | **no** | `poweroff [minutes]` is the whole surface. Nothing broadcasts, and no protocol is told: an NFS hard mount just waits for the server to come back — [NFS](NFS.md#limits) |
 
 ### Filesystem
 

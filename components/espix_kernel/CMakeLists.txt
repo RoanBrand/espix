@@ -83,6 +83,7 @@ idf_component_register(
     SRCS
         "kernel.c"
         "klog.c"
+        "shutdown.c"
         "task_exit.c"
     INCLUDE_DIRS
         "include"
@@ -94,6 +95,7 @@ idf_component_register(
     PRIV_REQUIRES
         esp_timer
         esp_hw_support
+        esp_system
         esp_app_format
         log
         freertos

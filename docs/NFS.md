@@ -236,3 +236,4 @@ the bugs in this file were found by exactly that.
   arbitrated and a lock is local to the client that took it.
 - **No hostname clients.** A name in `/etc/exports` is not resolved; write the
   address.
+- **A shutdown is not announced.** NFSv3 has no message for it, so a client is told nothing and an NFS hard mount simply waits for the server to come back — seconds for a reboot, the whole timer for a `poweroff`. Nothing in flight is lost: the unmount flushes what the client had not committed, and the next boot's changed `writeverf3` is the protocol's own signal to re-send it.

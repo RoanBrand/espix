@@ -33,6 +33,7 @@
 #include "espix_proc.h"
 #include "espix_shell.h"
 #include "espix_term.h"
+#include "espix_widgets.h"
 
 #define TAG "desktop"
 
@@ -1764,15 +1765,65 @@ static espix_rect_t tray_rect(void)
     return (espix_rect_t){ w - TRAY_W, b.y, TRAY_W, TASKBAR_H };
 }
 
+/*
+ * The start menu. NULL is the divider: the desktop's own things above it, and
+ * the two that end the session below -- where every desktop keeps them, and what
+ * stops a mis-click on "about" from being a mis-click on "poweroff".
+ */
+#define MENU_DIVIDER_H 7
+
 static const char *const s_menu_items[] = { "plasma", "photo", "terminal",
-                                           "settings", "about" };
+                                            "settings", "about",
+                                            NULL,
+                                            "reboot", "poweroff" };
 #define MENU_N ((int)(sizeof(s_menu_items) / sizeof(s_menu_items[0])))
+#define MENU_ROW_H(i) ((s_menu_items[i] == NULL) ? MENU_DIVIDER_H : ITEM_H)
+
+/* Which of the two the confirmation is asking about. */
+typedef enum {
+    CONFIRM_RESTART = 0,
+    CONFIRM_POWEROFF,
+} confirm_kind_t;
+
+static void confirm_open(confirm_kind_t kind);
+
+/* Where row i starts, measured from the top of the menu. */
+static int menu_row_top(int i)
+{
+    int y = 3;
+
+    for (int k = 0; k < i; k++) {
+        y += MENU_ROW_H(k);
+    }
+    return y;
+}
 
 static espix_rect_t menu_rect(void)
 {
     const espix_rect_t b = bar_rect();
-    const int          h = MENU_N * ITEM_H + 6;
+    const int          h = menu_row_top(MENU_N) + 3;
     return (espix_rect_t){ START_X, b.y - h, 132, h };
+}
+
+/*
+ * The row under a y, or -1 -- for the divider, and for anywhere outside. One
+ * function rather than the two copies of the arithmetic this used to have: the
+ * hit test and the paint have to agree about a layout that is no longer uniform.
+ */
+static int menu_row_at(int y)
+{
+    const espix_rect_t m   = menu_rect();
+    int                top = m.y + 3;
+
+    for (int i = 0; i < MENU_N; i++) {
+        const int h = MENU_ROW_H(i);
+
+        if (y >= top && y < top + h) {
+            return (s_menu_items[i] == NULL) ? -1 : i;
+        }
+        top += h;
+    }
+    return -1;
 }
 
 /*
@@ -1957,12 +2008,10 @@ static int menu_hot(void)
     if (!s_menu || s_buttons != 0) {
         return -1;
     }
-    const espix_rect_t m = menu_rect();
-    if (!in_rect(m, s_cx, s_cy)) {
+    if (!in_rect(menu_rect(), s_cx, s_cy)) {
         return -1;
     }
-    const int i = (s_cy - (m.y + 3)) / ITEM_H;
-    return (i >= 0 && i < MENU_N) ? i : -1;
+    return menu_row_at(s_cy);
 }
 
 static void menu_paint(espix_canvas_t *c, espix_rect_t r)
@@ -1979,12 +2028,21 @@ static void menu_paint(espix_canvas_t *c, espix_rect_t r)
     espix_canvas_outline(c, m, COL_BAR_EDGE);
 
     for (int i = 0; i < MENU_N; i++) {
-        const espix_rect_t it = { m.x + 1, m.y + 3 + i * ITEM_H,
-                                  m.w - 2, ITEM_H };
+        const int top = m.y + menu_row_top(i);
+        const int h   = MENU_ROW_H(i);
+
+        if (s_menu_items[i] == NULL) {
+            /* The divider: a rule, with the gap it sits in as the padding. */
+            espix_canvas_fill(c, (espix_rect_t){ m.x + 6, top + 3, m.w - 12, 1 },
+                              COL_BAR_EDGE);
+            continue;
+        }
+
+        const espix_rect_t it = { m.x + 1, top, m.w - 2, h };
         const espix_px_t   bg = (i == s_menu_hot) ? COL_MENU_HOT : COL_MENU;
 
         espix_canvas_fill(c, it, bg);
-        espix_canvas_text(c, it.x + 10, it.y + (ITEM_H - CELL_H) / 2,
+        espix_canvas_text(c, it.x + 10, it.y + (h - CELL_H) / 2,
                           s_menu_items[i], COL_TITLE_FG, bg);
     }
 }
@@ -2345,6 +2403,10 @@ static void menu_activate(int i)
         term_open();
     } else if (strcmp(s_menu_items[i], "settings") == 0) {
         window_present(espix_settings_open());
+    } else if (strcmp(s_menu_items[i], "reboot") == 0) {
+        confirm_open(CONFIRM_RESTART);
+    } else if (strcmp(s_menu_items[i], "poweroff") == 0) {
+        confirm_open(CONFIRM_POWEROFF);
     }
     bar_damage();
 }
@@ -2491,6 +2553,13 @@ static void window_present(espix_window_t *w)
 }
 
 /*
+ * The confirmation window, and which question it is asking. Created for one
+ * question and freed with it, because the title says which question that is.
+ */
+static espix_window_t *s_confirm;
+static confirm_kind_t  s_confirm_kind;
+
+/*
  * Close a window. Everything that holds a pointer to one has to forget it here,
  * or the next thing that looks it up -- a task button, the menu, a repaint --
  * is looking at freed memory. The terminal is the awkward case: its window is
@@ -2515,7 +2584,125 @@ static void window_close(espix_window_t *w)
     if (w == espix_settings_window()) {
         espix_settings_forget();
     }
+    if (w == s_confirm) {
+        s_confirm = NULL;
+    }
     espix_window_free(w);
+}
+
+/* ------------------------------------------------------------------ */
+/* The confirmation                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Geometry from one place, as the window buttons taught: a button that is drawn
+ * in one spot and pressed in another is worse than no button at all. The action
+ * is the right-hand one, away from where the pointer usually rests.
+ */
+#define CONFIRM_BTN_W 88
+#define CONFIRM_BTN_H 24
+
+static espix_rect_t confirm_btn(const espix_window_t *w, int which)
+{
+    const espix_rect_t c     = espix_window_content(w);
+    const int          right = c.x + c.w - 8;
+    const int          y     = c.y + c.h - CONFIRM_BTN_H - 8;
+
+    if (which == 0) {
+        return (espix_rect_t){ right - 2 * CONFIRM_BTN_W - 8, y,
+                               CONFIRM_BTN_W, CONFIRM_BTN_H };
+    }
+    return (espix_rect_t){ right - CONFIRM_BTN_W, y, CONFIRM_BTN_W,
+                           CONFIRM_BTN_H };
+}
+
+static void confirm_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
+                         void *ctx)
+{
+    (void)ctx;
+    (void)r;
+
+    const espix_rect_t c   = espix_window_content(w);
+    const bool         off = (s_confirm_kind == CONFIRM_POWEROFF);
+
+    espix_wgt_panel(s, c, WGT_BG);
+    espix_wgt_heading(s, (espix_rect_t){ c.x + 8, c.y + 6, c.w - 16, WGT_ROW_H },
+                      off ? "Power off" : "Restart");
+    espix_wgt_label(s, (espix_rect_t){ c.x + 8, c.y + WGT_ROW_H + 6,
+                                       c.w - 16, WGT_ROW_H },
+                    off ? "Stops, and comes back by itself."
+                        : "The system restarts now.",
+                    true);
+
+    espix_wgt_button(s, confirm_btn(w, 0), "Cancel", true, false);
+    espix_wgt_button(s, confirm_btn(w, 1), off ? "Power off" : "Restart",
+                     true, false);
+}
+
+static void confirm_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
+                            void *ctx)
+{
+    (void)ctx;
+
+    if (buttons == 0) {
+        return;                     /* act on the press, not the release */
+    }
+
+    if (espix_wgt_hit(confirm_btn(w, 0), x, y)) {
+        window_close(w);
+        return;
+    }
+
+    if (!espix_wgt_hit(confirm_btn(w, 1), x, y)) {
+        return;
+    }
+
+    const confirm_kind_t kind = s_confirm_kind;
+
+    /*
+     * The window goes before the system does. What is left of this callback may
+     * not touch w afterwards, and the sequence starts by stopping the very task
+     * this is running on -- so the less there is left to do, the better.
+     */
+    window_close(w);
+
+    if (kind == CONFIRM_POWEROFF) {
+        espix_shutdown_poweroff(ESPIX_POWEROFF_MINUTES);
+    } else {
+        espix_shutdown_reboot();
+    }
+}
+
+static void confirm_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
+{
+    (void)ctx;
+
+    /* Escape closes it, as it closes any dialog. There is deliberately no
+     * Enter: a default answer would be a way to power the board off with one
+     * keystroke, which is the thing the confirmation exists to prevent. */
+    if (down && keysym == 0xFF1B) {
+        window_close(w);
+    }
+}
+
+static void confirm_open(confirm_kind_t kind)
+{
+    s_confirm_kind = kind;
+
+    if (s_confirm == NULL) {
+        s_confirm = espix_window_new(280, 150, 260, 140,
+                                     (kind == CONFIRM_POWEROFF) ? "power off"
+                                                                : "restart");
+        if (s_confirm == NULL) {
+            return;
+        }
+        espix_window_set_draw(s_confirm, confirm_draw);
+        espix_window_set_pointer(s_confirm, confirm_pointer);
+        espix_window_set_key(s_confirm, confirm_key);
+    }
+
+    espix_window_repaint(s_confirm);
+    window_present(s_confirm);
 }
 
 static void windows_create(void)
@@ -2716,8 +2903,8 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                 const espix_rect_t m = menu_rect();
 
                 if (in_rect(m, ev->x, ev->y)) {
-                    const int i = (ev->y - (m.y + 3)) / ITEM_H;
-                    if (i >= 0 && i < MENU_N) {
+                    const int i = menu_row_at(ev->y);
+                    if (i >= 0) {
                         menu_activate(i);
                     }
                 } else {

@@ -66,6 +66,18 @@ bool      espix_svc_stopping(void);
 esp_err_t espix_svc_reload(void);
 
 /*
+ * The shutdown path: ask every unit to stop, and wait for them to go, up to
+ * deadline_us. Returns how many were still running when it gave up.
+ *
+ * Disabling comes first, under the supervisor's lock, so that a unit which
+ * exits promptly is not started again before the phase is over. The wait then
+ * ends as soon as the last unit is gone: a builtin that has set its done flag
+ * counts as gone even though the supervisor has not collected it yet, so the
+ * one-second tick is not what a shutdown costs.
+ */
+int espix_svc_quiesce(int64_t deadline_us);
+
+/*
  * True when the last boot left a core dump, so units are being held stopped.
  * A fault on the previous boot is the one signal that says "do not start
  * unattended work again yet": one bad unit otherwise becomes a boot loop.

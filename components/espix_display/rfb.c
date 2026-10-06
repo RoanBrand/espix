@@ -2031,6 +2031,13 @@ static void rfb_task(void *arg)
             continue;
         }
 
+        if (espix_shutdown_started()) {
+            /* RFB has no "the server is leaving" message -- the protocol has no
+             * such notion -- so a close is the whole goodbye. */
+            close(fd);
+            continue;
+        }
+
         /* Interactive: coalescing pointer moves makes the cursor feel broken. */
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));

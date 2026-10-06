@@ -26,8 +26,12 @@ extern "C" {
  * Stop the current playback and wait for its task to go. Used when the sink is
  * going away, so the task does not keep the decoder and its buffers alive with
  * nowhere to play.
+ *
+ * timeout_ms is how long to give the task to notice; zero waits without a limit,
+ * as everywhere else here. False when it was still running when the time ran
+ * out, in which case it has still been asked and is on its way.
  */
-void espix_audio_stop_wait(void);
+bool espix_audio_stop_wait(uint32_t timeout_ms);
 
 esp_err_t espix_audio_play(const char *uri);
 

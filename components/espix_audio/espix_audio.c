@@ -144,14 +144,14 @@ __attribute__((used)) void media_lib_free(void *buf)
  * contiguous internal to open the decoder at `play` time, and measurement
  * showed the reservation no longer buying anything. Simpler wins.
  */
-void espix_audio_stop_wait(void)
+bool espix_audio_stop_wait(uint32_t timeout_ms)
 {
     if (s_exit.task == NULL) {
-        return;
+        return true;                    /* nothing was playing: not a wait */
     }
 
     s_stop = true;
-    (void)espix_task_exit_wait(&s_exit, 0);
+    return espix_task_exit_wait(&s_exit, timeout_ms);
 }
 
 static esp_audio_simple_dec_type_t type_from_uri(const char *uri)

@@ -194,6 +194,19 @@ esp_err_t espix_proc_kill(espix_pid_t pid);
 esp_err_t espix_proc_request_stop(espix_pid_t pid);
 
 /*
+ * The shutdown path: SIGTERM every live process except the caller, then wait for
+ * the table to empty or deadline_us to pass. Returns how many were still alive
+ * when it gave up.
+ *
+ * No escalation, deliberately: espix_proc_kill()'s forced half is unsafe on a
+ * shared address space, and a reset takes the task anyway, so a force would buy
+ * nothing here and could leave a volume lock held. The wait is the process
+ * table's own finish event, so it ends when the last process does rather than
+ * after a fixed grace. Called from the kernel's shutdown sequence.
+ */
+size_t espix_proc_stop_all(int64_t deadline_us);
+
+/*
  * Run any pending handlers for the calling process, park it if it has been sent
  * SIGSTOP, and report whether it has been asked to terminate.
  *

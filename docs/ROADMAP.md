@@ -316,6 +316,18 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## Platform
 
+- **A power-off that stays off, and a goodbye to whoever is connected.** The
+  shutdown sequence refuses new work and stops everything espix controls, but
+  it tells nobody: there is no `wall`, and NFSv3 has no message for it. Both
+  are deliberate — the first wants a registry of SSH connections and the second
+  wants a protocol that does not exist — and neither is worth doing before the
+  sequence itself is.
+
+  `poweroff` always arms the wake timer, too. Staying asleep until the power is
+  cycled is the obvious option to add and is deliberately absent: on a headless
+  board it is a one-way door, and the timer is what stops a device nobody
+  remembers to unplug from being gone.
+
 - **Let a loaded app have real IRAM.** `IRAM_ATTR` in an app compiles, links,
   loads, runs and does nothing: espix's ELF loader has one allocator for every
   section and, with `CONFIG_ELF_LOADER_LOAD_PSRAM`, hands out PSRAM regardless

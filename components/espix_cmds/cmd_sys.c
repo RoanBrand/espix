@@ -181,16 +181,79 @@ static int cmd_clear(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * Both of these go through the kernel's shutdown sequence, and neither returns:
+ * the sequence runs and the caller is parked until the reset takes it. The
+ * privilege check is here rather than in the kernel because a session is what
+ * has a uid, and the kernel below has no notion of a caller.
+ */
 static int cmd_reboot(espix_session_t *s, int argc, char **argv)
 {
     (void)argc;
     (void)argv;
 
-    espix_puts(s, "rebooting\n");
-    espix_klog(ESPIX_KLOG_WARN, "sys", "reboot requested from %s",
+    if (s != NULL && s->uid != 0) {
+        espix_eprintf(s, "reboot: only root may restart the system\n");
+        return 1;
+    }
+
+    espix_puts(s, "rebooting now\n");
+    espix_klog(ESPIX_KLOG_WARN, "sys", "reboot requested by %s",
                (s != NULL && s->name != NULL) ? s->name : "?");
-    fflush(stdout);
-    esp_restart();
+    espix_shutdown_reboot();
+
+    /* The sequence runs on its own task; this one waits for the reset. */
+    vTaskDelay(portMAX_DELAY);
+    return 0;   /* not reached */
+}
+
+/*
+ * Power off, and come back on a timer.
+ *
+ * The delay is not decoration. The chip cannot cut its own power, so this is
+ * deep sleep, and the timer is what keeps a device nobody remembers to unplug
+ * from being a device that is gone. Ten minutes by default; zero is the test
+ * value, and wakes after a second.
+ */
+static int cmd_poweroff(espix_session_t *s, int argc, char **argv)
+{
+    unsigned minutes = ESPIX_POWEROFF_MINUTES;
+
+    if (argc > 2) {
+        espix_eprintf(s, "usage: poweroff [minutes]\n");
+        return 1;
+    }
+
+    if (argc == 2) {
+        char      *end = NULL;
+        const long v   = strtol(argv[1], &end, 10);
+
+        if (end == argv[1] || *end != '\0' || v < 0 || v > 600) {
+            espix_eprintf(s, "poweroff: bad minutes '%s'\n", argv[1]);
+            return 1;
+        }
+        minutes = (unsigned)v;
+    }
+
+    if (s != NULL && s->uid != 0) {
+        espix_eprintf(s, "poweroff: only root may power off the system\n");
+        return 1;
+    }
+
+    if (minutes == 0) {
+        espix_puts(s, "powering off; back in a second (the sleep path is "
+                      "being tested)\n");
+    } else {
+        espix_printf(s, "powering off; back in %u minute%s unless the power "
+                        "goes first\n", minutes, (minutes == 1) ? "" : "s");
+    }
+
+    espix_klog(ESPIX_KLOG_WARN, "sys", "poweroff (%u min) requested by %s",
+               minutes, (s != NULL && s->name != NULL) ? s->name : "?");
+    espix_shutdown_poweroff(minutes);
+
+    /* The sequence runs on its own task; this one waits for the sleep. */
+    vTaskDelay(portMAX_DELAY);
     return 0;   /* not reached */
 }
 
@@ -2074,6 +2137,9 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "logout" },
     { .name = "reboot", .fn = cmd_reboot,
       .help = "restart the system",             .usage = "reboot" },
+    { .name = "poweroff", .fn = cmd_poweroff,
+      .help = "power off, and come back after a delay",
+      .usage = "poweroff [minutes]" },
 };
 
 void espix_cmds_register_sys(void)

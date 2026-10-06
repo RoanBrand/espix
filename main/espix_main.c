@@ -31,6 +31,7 @@
 
 #include "espix_audio.h"
 #include "espix_auth.h"
+#include "espix_bt.h"
 #include "espix_cmds.h"
 #include "espix_display.h"
 #include "espix_fault.h"
@@ -132,6 +133,73 @@ static void usb_dev_nodes(const espix_usb_dev_t *dev, bool attached)
     }
 }
 
+/*
+ * The shutdown sequence's hooks.
+ *
+ * This file is the one place that knows every component, which is why the wiring
+ * is here and not in the kernel: the kernel's table knows the phases and must
+ * know nothing about ssh, nfsd or the display. The phase decides the order, and
+ * inside a phase it is the list below.
+ *
+ * Unlike the USB device hook and the session-end hook above, these are not the
+ * only way to reach the feature -- espix_shutdown_reboot() is a call any command
+ * can make -- but they are the only place the parts are named.
+ *
+ * There is no USB-host stop to call: a reset powers the port down with
+ * everything else, and the volume on it was already flushed by the storage
+ * phase, which is the part that mattered.
+ */
+static void shutdown_units(int64_t deadline_us)
+{
+    (void)espix_svc_quiesce(deadline_us);
+}
+
+static void shutdown_processes(int64_t deadline_us)
+{
+    (void)espix_proc_stop_all(deadline_us);
+}
+
+static void shutdown_storage(int64_t deadline_us)
+{
+    (void)espix_fs_unmount_all(deadline_us);
+}
+
+static void shutdown_display(int64_t deadline_us)
+{
+    (void)deadline_us;
+    /* The viewer only. The canvas outlives the backend by design, and the
+     * desktop may be the thing that asked for this. */
+    espix_display_vnc_stop();
+}
+
+static void shutdown_audio(int64_t deadline_us)
+{
+    /* Bounded by what is left of the sequence's budget rather than waiting
+     * forever: the decoder answers in a frame's time, and a stop that cannot
+     * finish is the one thing that would hang the shutdown instead. */
+    (void)espix_audio_stop_wait(espix_shutdown_remaining_ms(deadline_us));
+}
+
+static void shutdown_bluetooth(int64_t deadline_us)
+{
+    (void)deadline_us;
+    /* After the audio, not before. An A2DP stream torn down underneath the
+     * decoder is the crash this pairing exists to avoid -- the same order
+     * bluetoothctl power off uses. */
+    (void)espix_bt_shutdown();
+}
+
+static void shutdown_wiring(void)
+{
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_UNITS, shutdown_units, "units");
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_APPS, shutdown_processes, "processes");
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_STORAGE, shutdown_storage, "storage");
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_display, "display");
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_audio, "audio");
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_bluetooth,
+                             "bluetooth");
+}
+
 void app_main(void)
 {
     espix_kernel_early_init();
@@ -213,6 +281,10 @@ void app_main(void)
     if (espix_svc_init() != ESP_OK) {
         ESP_LOGW(TAG, "service supervisor did not start");
     }
+
+    /* After the supervisor: stopping the units is the sequence's first act, and
+     * it can stop nothing that is not there yet. */
+    shutdown_wiring();
 
     /*
      * Everything above is up, so this image is worth keeping: if the bootloader

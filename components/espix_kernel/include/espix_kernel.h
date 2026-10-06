@@ -259,6 +259,110 @@ void espix_klog_set_console_hooks(const espix_klog_console_hooks_t *hooks);
 void               espix_klog_set_console_level(espix_klog_level_t level);
 espix_klog_level_t espix_klog_console_level(void);
 
+/* ------------------------------------------------------------------ */
+/* Shutdown                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * What espix does before it stops being espix.
+ *
+ * A reset here is total -- tasks, sockets, drivers and RAM all go with it -- so
+ * a Linux-sized shutdown would be mostly ceremony. The three things that do
+ * survive are what this sequence is for:
+ *
+ *   - storage that stays powered across the reset (a USB volume), which has to
+ *     be flushed and unmounted or its FAT is left dirty;
+ *   - the peers on the network, which should be refused rather than half-served;
+ *   - the hardware an app switched on, which a reset does not switch off.
+ *
+ * Hence the phases, which are the order and not a ranking: each is what the one
+ * after it depends on. A subsystem registers what it has to do rather than being
+ * called by name, because this is the bottom of the component graph and must not
+ * learn what ssh or nfsd is. espix_main.c does the wiring.
+ */
+typedef enum {
+    /* Stop supervised units, and anything serving that a unit started. */
+    ESPIX_SHUTDOWN_UNITS = 0,
+    /* SIGTERM every process and wait for the table to empty. */
+    ESPIX_SHUTDOWN_APPS,
+    /* Flush and unmount every volume. */
+    ESPIX_SHUTDOWN_STORAGE,
+    /* Park what a reset would otherwise leave running: radios, audio, display. */
+    ESPIX_SHUTDOWN_HARDWARE,
+    ESPIX_SHUTDOWN_PHASE_COUNT,
+} espix_shutdown_phase_t;
+
+/*
+ * How long the whole sequence may spend waiting for things to stop. Long enough
+ * for an app to put its own hardware back, short enough that nobody concludes
+ * the board has hung. A phase that finishes early does not use it: every wait in
+ * here ends when the last thing it is waiting for does.
+ */
+#define ESPIX_SHUTDOWN_GRACE_US (5LL * 1000000)
+
+/* How long a power-off stays asleep by default, before the timer wakes it. */
+#define ESPIX_POWEROFF_MINUTES 10
+
+/*
+ * What a handler is given: an absolute esp_timer value, shared by the whole
+ * sequence, so a handler that waits gives up when the system's budget is gone
+ * rather than when its own is.
+ */
+typedef void (*espix_shutdown_fn)(int64_t deadline_us);
+
+/*
+ * What is left of the sequence's budget, in milliseconds, for a handler that has
+ * a blocking call to make with a timeout.
+ *
+ * Never zero: zero means "no limit" to the like of espix_task_exit_wait(), which
+ * is the opposite of what a handler past its deadline wants. Once the budget is
+ * gone this returns 1, so the call still comes back.
+ */
+uint32_t espix_shutdown_remaining_ms(int64_t deadline_us);
+
+/*
+ * Register one, in the phase it belongs to. Handlers run in the order they were
+ * added, and the name is for the log.
+ *
+ * ESP_ERR_INVALID_STATE once a shutdown has begun -- a table filled after the
+ * fact would be a phase that silently did not run -- and ESP_ERR_NO_MEM when
+ * that phase's table is full.
+ */
+esp_err_t espix_shutdown_add(espix_shutdown_phase_t phase, espix_shutdown_fn fn,
+                             const char *name);
+
+/*
+ * Whether a shutdown is under way.
+ *
+ * This is what makes "no new connections" real rather than a race: an accept
+ * loop asks it and refuses, the service supervisor asks it and starts nothing,
+ * espix_proc_spawn_elf() asks it and loads nothing. It is set before the first
+ * handler runs, so the moment between the request and the sequence is not a hole
+ * for something new to arrive through.
+ */
+bool espix_shutdown_started(void);
+
+/*
+ * Reboot, or power off, after the sequence. Each returns once the sequence is
+ * under way -- the work is on its own task -- and whether to wait is the
+ * caller's:
+ *
+ * A command parks itself afterwards, because a prompt that comes back while the
+ * system is leaving is a lie. The desktop does not, and must not: a pointer
+ * event is dispatched in the task serving the screen, and that is one of the
+ * tasks the sequence stops, so parking it here would leave the sequence waiting
+ * for a task that is waiting for the sequence.
+ *
+ * Power off is deep sleep, because the ESP32-S3 cannot cut its own power: the
+ * chip drops to microamps and everything but the RTC domain goes. The minutes
+ * argument is how long to stay there before the RTC timer wakes it into an
+ * ordinary boot. Zero is the test value -- a second, which exercises the sleep
+ * path without a ten-minute wait. There is deliberately no "stay off": a device
+ * nobody remembers to power-cycle is a device that is gone.
+ */
+void espix_shutdown_reboot(void);
+void espix_shutdown_poweroff(unsigned minutes);
+
 #ifdef __cplusplus
 }
 #endif

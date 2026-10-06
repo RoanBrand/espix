@@ -75,8 +75,9 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
     if (strcmp(sub, "power") == 0) {
         const char *arg = (argc > 2) ? argv[2] : "on";
         if (strcmp(arg, "off") == 0) {
-            /* Stop playback with the controller: nothing left to play to. */
-            espix_audio_stop_wait();
+            /* Stop playback with the controller: nothing left to play to.
+             * Unbounded here, because this is a person waiting for an answer. */
+            (void)espix_audio_stop_wait(0);
             const esp_err_t err = espix_bt_shutdown();
             if (err != ESP_OK) {
                 espix_eprintf(s, "bluetoothctl: %s\n", esp_err_to_name(err));

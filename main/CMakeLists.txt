@@ -1,6 +1,7 @@
 set(espix_main_requires
     espix_kernel
     espix_audio
+    espix_bt
     espix_fault
     espix_fs
     espix_proc

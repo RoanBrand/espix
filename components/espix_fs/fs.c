@@ -425,3 +425,37 @@ bool espix_fs_conf_get(const char *path, const char *key,
     fclose(f);
     return found;
 }
+
+size_t espix_fs_unmount_all(int64_t deadline_us)
+{
+    (void)deadline_us;      /* an unmount either succeeds or refuses at once */
+
+    char   path[ESPIX_PATH_MAX];
+    size_t left = 0;
+
+    /*
+     * Index 0 every time: a successful unmount removes the entry, so the next
+     * mount moves down into it. A refusal is not retried -- nothing about it is
+     * going to change between here and the reset, and retrying would spin on the
+     * same volume forever.
+     */
+    while (espix_fs_mount_at(0, path, sizeof(path)) == ESP_OK) {
+        esp_err_t err = espix_fs_unmount_fat(path);
+
+#if CONFIG_ESPIX_FS_EXT4
+        if (err == ESP_ERR_NOT_FOUND) {
+            err = espix_fs_unmount_ext(path);
+        }
+#endif
+
+        if (err != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "%s: not flushed (%s); it may need a filesystem check",
+                       path, esp_err_to_name(err));
+            left++;
+            break;
+        }
+    }
+
+    return left;
+}

@@ -700,6 +700,21 @@ static void accept_task(void *arg)
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
 
+        /*
+         * Going down: refuse with a line rather than a bare close, for the same
+         * reason the session limit does. RFC 4253 4.2 lets a server send
+         * CRLF-terminated text before its version string and requires clients to
+         * cope, which is how OpenSSH reports its own refusals -- so this reads
+         * as a reason rather than as a truncated command.
+         */
+        if (espix_shutdown_started()) {
+            static const char going_down[] =
+                "espix: system is going down\r\n";
+            (void)send(fd, going_down, sizeof(going_down) - 1, 0);
+            close(fd);
+            continue;
+        }
+
         if (!sessions_take()) {
             /*
              * Refusing cleanly beats letting a connection half-work. The limit

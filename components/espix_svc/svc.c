@@ -367,7 +367,7 @@ static const char *const SVC_DEFAULT_UNITS =
     "# the serial console as the only way in.\n"
     "\n"
     "# --- NFS -----------------------------------------------------------------\n"
-    "# Serves what /etc/exports lists, read-only unless a line there says rw.\n"
+    "# Serves what /etc/exports lists, writable unless a line there says ro.\n"
     "#\n"
     "# nfsd  always  nfsd\n"
     "\n"
@@ -630,7 +630,7 @@ static void supervisor_task(void *arg)
             }
 
             const bool busy = (u->pid != ESPIX_PID_NONE) || (u->task != NULL);
-            if (u->enabled && !busy &&
+            if (u->enabled && !busy && !espix_shutdown_started() &&
                 (u->every_s == 0 || now >= u->next_due_us)) {
                 unit_start(u);
             }
@@ -838,3 +838,69 @@ esp_err_t espix_svc_reload(void)
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }
+
+int espix_svc_quiesce(int64_t deadline_us)
+{
+    if (!s_started) {
+        return 0;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_count; i++) {
+        svc_unit_t *u = &s_units[i];
+
+        /*
+         * Disabled first, in the same critical section: a unit that exits
+         * promptly must not be started again by the tick that notices.
+         */
+        u->enabled = false;
+
+        if (u->pid != ESPIX_PID_NONE) {
+            (void)espix_proc_signal(u->pid, SIGTERM);
+        } else if (u->task != NULL) {
+            /* A builtin has no pid to signal: it is asked, the same way
+             * espix_svc_stop() asks one, and its own loop says when it is done. */
+            u->stop = true;
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    int left = 0;
+
+    for (;;) {
+        left = 0;
+
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        for (int i = 0; i < s_count; i++) {
+            const svc_unit_t *u = &s_units[i];
+
+            /* A builtin that has finished has set its own done flag; the
+             * supervisor is only waiting for a tick to collect the context. */
+            const bool done = (u->builtin != NULL) &&
+                              ((const svc_builtin_t *)u->builtin)->done;
+
+            if ((u->pid != ESPIX_PID_NONE || u->task != NULL) && !done) {
+                left++;
+            }
+        }
+        xSemaphoreGive(s_lock);
+
+        if (left == 0 || esp_timer_get_time() >= deadline_us) {
+            break;
+        }
+
+        /* A poll, because a builtin has no event to wait on. 20ms keeps the
+         * shutdown responsive without the supervisor's one-second tick being
+         * what it costs. */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    if (left > 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%d unit%s did not stop in time; the reset will take them",
+                   left, (left == 1) ? "" : "s");
+    }
+
+    return left;
+}
+

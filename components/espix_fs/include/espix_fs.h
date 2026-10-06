@@ -168,6 +168,20 @@ esp_err_t espix_fs_stat_ext(const char *path, uint64_t *total,
 esp_err_t espix_fs_mount_at(size_t index, char *out, size_t out_len);
 
 /*
+ * The shutdown path: flush and unmount every volume that is not the root.
+ *
+ * The root is littlefs, which is power-loss-safe by design and is mounted again
+ * by the next boot. A FAT or ext volume is not: a reset in the middle of a write
+ * is what leaves one needing a check, and unmounting is the flush, since FatFs
+ * has no volume-wide sync to call instead.
+ *
+ * For shutdown only. The shell's record of who mounted what is not updated,
+ * which is true at the end of the world and would not be anywhere else.
+ * Returns how many are still mounted because they could not be flushed.
+ */
+size_t espix_fs_unmount_all(int64_t deadline_us);
+
+/*
  * A block device view over a partition of `parent`, for mounting `sda1` rather
  * than `sda`. Released with its own ops->release, which frees the view and
  * leaves the parent alone -- the parent belongs to whoever made it.
