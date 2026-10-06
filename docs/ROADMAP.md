@@ -967,3 +967,14 @@ other way round.
 
 These arrived with the project and predate almost everything in this file; they
 are recorded here rather than in a separate note so there is one place to look.
+
+## The arena's sizing, derived rather than estimated
+
+ sizes a region from an estimate of the heap's own bookkeeping and then
+verifies the fit, growing the carve by whatever it was short when the estimate
+missed. That is correct, but it is a measurement made one request at a time. The
+bookkeeping is a function of the pool size, so it could be measured once: sweep
+allocation sizes up to the board's maximum, record where a fresh region falls
+short and by how much, and derive the formula from that. A region would then be
+the right size the first time on every target, with the verify loop kept as an
+assertion rather than as the mechanism.
