@@ -556,6 +556,66 @@ size_t espix_proc_heap_used(espix_pid_t pid)
     return total;
 }
 
+/*
+ * The heap queries, answered for the process that asks them.
+ *
+ * A process's memory is not all in the global pool once its arena has carved a
+ * region: the region is memory the process holds and can allocate from, but
+ * heap_caps_get_free_size() is IDF's and knows nothing about it. So a process
+ * looks poorer the more it has been given -- Doom printed "psram free 1443 KB"
+ * while holding a 3268 KB region it could allocate from -- and any app that
+ * gates on the number gates on the wrong one.
+ *
+ * 'free' is the global pool plus the free space in this process's regions.
+ * 'largest' is the largest of the contiguous blocks on offer, not their sum: a
+ * span that crosses from the global pool into a region does not exist, so the
+ * honest answer to "what is the biggest block I could get" is the biggest of the
+ * candidates. Both are read under the region lock, like every other view of the
+ * arena, and both fall back to the global numbers for a caller with no arena
+ * (the loader, a command task, an app thread that has no slot).
+ */
+size_t espix_abi_heap_free(size_t caps)
+{
+    size_t total = heap_caps_get_free_size(caps);
+
+    espix_proc_slot_t *const slot = espix_proc_self();
+    if (slot == NULL || s_region_lock == NULL) {
+        return total;
+    }
+
+    xSemaphoreTake(s_region_lock, portMAX_DELAY);
+    for (int i = 0; i < slot->nregions; i++) {
+        multi_heap_info_t info;
+        multi_heap_get_info(slot->regions[i].heap, &info);
+        total += info.total_free_bytes;
+    }
+    xSemaphoreGive(s_region_lock);
+
+    return total;
+}
+
+size_t espix_abi_heap_largest(size_t caps)
+{
+    size_t best = heap_caps_get_largest_free_block(caps);
+
+    espix_proc_slot_t *const slot = espix_proc_self();
+    if (slot == NULL || s_region_lock == NULL) {
+        return best;
+    }
+
+    xSemaphoreTake(s_region_lock, portMAX_DELAY);
+    for (int i = 0; i < slot->nregions; i++) {
+        multi_heap_info_t info;
+        multi_heap_get_info(slot->regions[i].heap, &info);
+        if (info.largest_free_block > best) {
+            best = info.largest_free_block;
+        }
+    }
+    xSemaphoreGive(s_region_lock);
+
+    return best;
+}
+
 /* ------------------------------------------------------------------ */
 /* Publication                                                         */
 /* ------------------------------------------------------------------ */
@@ -577,6 +637,14 @@ static const abi_sym_t s_alloc_syms[] = {
     ABI_SYM("realloc", espix_abi_realloc),
     ABI_SYM("free",    espix_abi_free),
     ABI_SYM("strdup",  abi_strdup),
+
+    /*
+     * The heap queries, so that "how much can I still allocate" is answered for
+     * the process asking it rather than for the board as a whole. See the
+     * wrappers above for why that is not the same number.
+     */
+    ABI_SYM("heap_caps_get_free_size",          espix_abi_heap_free),
+    ABI_SYM("heap_caps_get_largest_free_block", espix_abi_heap_largest),
 };
 
 void espix_proc_abi_alloc_register(void)

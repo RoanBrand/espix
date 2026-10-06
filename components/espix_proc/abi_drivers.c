@@ -225,7 +225,9 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(heap_caps_calloc),
     ESP_ELFSYM_EXPORT(heap_caps_malloc),
     ESP_ELFSYM_EXPORT(heap_caps_free),
-    ESP_ELFSYM_EXPORT(heap_caps_get_free_size),
+    /* heap_caps_get_free_size is published from abi_alloc.c instead: that is
+     * where the process's own arena is, and the number an app should see is the
+     * global pool *plus* what its arena can still serve. */
     ESP_ELFSYM_EXPORT(esp_log),
     ESP_ELFSYM_EXPORT(esp_log_timestamp),
     ESP_ELFSYM_EXPORT(ioctl),
