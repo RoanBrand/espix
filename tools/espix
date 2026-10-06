@@ -74,9 +74,28 @@ def active_target():
 
 
 def set_active(t):
+    # Switching a target regenerates its config, every time. A generated
+    # sdkconfig is authoritative for every value in it, and those values are not
+    # all derivable from the defaults -- so one made before a defaults change, or
+    # whose options were only ever accumulated by hand, is a different build from
+    # the one the files describe, and nothing about the switch would say so.
+    # Deleting it is what makes "select the target, then build" mean the same
+    # thing every time; the cost is a reconfigure.
+    previous = None
+    try:
+        with open(os.path.join(STATE, "active")) as f:
+            previous = f.read().strip()
+    except OSError:
+        pass
+
     os.makedirs(STATE, exist_ok=True)
     with open(os.path.join(STATE, "active"), "w") as f:
         f.write(t.idf + "\n")
+
+    # Re-selecting the current target changes nothing, as re-selecting the board
+    # does, so opening the menu and leaving it alone is not a rebuild.
+    if previous != t.idf:
+        forget_sdkconfig(t)
 
 
 def board_file(t):
