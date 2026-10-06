@@ -51,18 +51,39 @@
 #include "esp_heap_caps.h"
 #include "multi_heap.h"
 
+#include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
 
 #define TAG "abi"
 
 /*
- * Free PSRAM must stay above this, because the largest thing espix asks for at
- * once is 4 MB -- the 1280x800 canvas and the RFB staging buffer beside it --
- * and the moment it is asked for is an app's exit. Below the floor an app's
- * request to grow is refused; see docs/APP-MEMORY.md, "The ceiling".
+ * Free PSRAM must stay above what the display would need to rebuild itself,
+ * because that is the largest thing espix asks for at once and the moment it is
+ * asked for is an app's exit: the app owned the screen, and the display comes
+ * back when it leaves. Below the floor an app's request to grow is refused; see
+ * docs/APP-MEMORY.md, "The ceiling".
+ *
+ * The canvas and the RFB staging buffer beside it, each w*h*2 bytes. At 1280x800
+ * that is the 4 MB the entry above describes; at 320x240 it is 300 KB. It was
+ * the 1280x800 figure whatever the canvas was, so a small one reserved 4 MB it
+ * would never ask for -- and on an S3 with 4.7 MB free, Doom's 4.35 MB arena
+ * request was refused for the sake of 3.7 MB nothing wanted.
  */
-#define PSRAM_FLOOR_BYTES (4u * 1024u * 1024u)
+#define PSRAM_FLOOR_MIN_BYTES (256u * 1024u)
+
+static size_t psram_floor_bytes(void)
+{
+    const espix_canvas_t *c = espix_display_canvas();
+    size_t                frame = (size_t)ESPIX_DISPLAY_W * ESPIX_DISPLAY_H * 2;
+
+    if (c != NULL) {
+        frame = (size_t)espix_canvas_width(c) * (size_t)espix_canvas_height(c) * 2;
+    }
+
+    const size_t need = 2 * frame;      /* the canvas and the staging beside it */
+    return (need < PSRAM_FLOOR_MIN_BYTES) ? PSRAM_FLOOR_MIN_BYTES : need;
+}
 
 /* No region smaller than this, so a first small malloc does not carve a
  * straw-sized heap; and a granule to round the request to. */
@@ -238,13 +259,15 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
 
     const size_t want       = region_size_for(n);
     const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    if (free_psram < want + PSRAM_FLOOR_BYTES) {
+    const size_t floor      = psram_floor_bytes();
+
+    if (free_psram < want + floor) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "pid %d: refusing a %u KB arena region -- PSRAM free is "
                    "%u KB and the floor is %u KB",
                    (int)slot->info.pid, (unsigned)(want / 1024),
                    (unsigned)(free_psram / 1024),
-                   (unsigned)(PSRAM_FLOOR_BYTES / 1024));
+                   (unsigned)(floor / 1024));
         return NULL;
     }
 

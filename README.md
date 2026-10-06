@@ -97,12 +97,12 @@ together.
 | | **S3** — verified | **P4** — planned | **S31** — verified |
 |---|---|---|---|
 | ISA | Xtensa | RISC-V | RISC-V |
-| MMU | none | address translation and RISC-V PMP | a real one — a Linux BSP exists |
+| MMU | - | simple: address translation and RISC-V PMP | compliant **Sv32 MMU** |
 | Process isolation | guardrail only | fault isolation between tasks, to confirm | **planned**, `fork()`-shaped |
-| USB | 1x USB1.1 | 1x USB1.1 / 1x USB2.0 | 1x USB2.0 |
-| Radio | WiFi 4 / BLE 5.0 | - | WiFi 6 / BT Classic / BT 5.4 LE / IEEE 802.15.4 |
-| Wired | — | 100M Ethernet | Gigabit Ethernet |
-| Display | parallel RGB and i8080, through `LCD_CAM` | MIPI DSI, plus RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; no MIPI, and weaker than the P4 |
+| USB | 1x USB1.1 | 1x USB1.1 / 1x **USB2.0** | 1x **USB2.0** |
+| Radio | WiFi 4 / BLE 5.0 | - | WiFi **6** / BT **Classic** / BT 5.4 LE / IEEE 802.15.4 |
+| Ethernet | — | 100M | **1000M** |
+| Display | parallel RGB and i8080 (`LCD_CAM`) | **MIPI DSI (1080p/30)**, RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; **no** MIPI (**weaker than P4**) |
 | Runs today | **yes** | no | **yes** |
 
 The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),

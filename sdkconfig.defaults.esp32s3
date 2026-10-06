@@ -39,7 +39,7 @@ CONFIG_SPIRAM_SPEED_80M=y
 #
 # The real fix is that the load should not be charged to whoever ran the
 # command at all -- see the note in sdkconfig.defaults.
-CONFIG_ESPIX_SSH_TASK_STACK=12288
+CONFIG_ESPIX_SSH_TASK_STACK=9216
 
 #
 # Load relocated ELF text/data into PSRAM rather than internal SRAM. On S3 this
