@@ -391,6 +391,22 @@ CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 # sdkconfig.defaults.esp32s3, where a per-target number belongs.
 CONFIG_ESPIX_SSH_TASK_STACK=8192
 
+#
+# The task watchdog keeps its idle-task check, at the slowest interval IDF
+# allows (the Kconfig range is 1..60). That is a policy about this system, not a
+# property of a board: the check is about a task that never yields, and the same
+# app does the same thing on either target. It lived in the S31's file only,
+# which is why the S3 ran IDF's 5 second default and reported a CPU-bound game
+# as a watchdog failure five seconds apart.
+#
+# It is not the whole answer for that report, though. Doom on the S3 scales
+# every frame in software (espix_canvas_scale_surface, sw_scale) on the core the
+# app is pinned to, so IDLE1 never runs and the check is *correct* -- the honest
+# fix is for the present path to yield, and this only keeps a legitimate long
+# frame from being reported as a hang. Note the dependency: this option exists
+# only when CONFIG_ESP_TASK_WDT_INIT is set.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+
 # exFAT, for the 3.1TB exFAT partition a Samsung T9 carries. This is the one
 # option here that is off for a reason other than a preference -- see
 # components/espix_fs/Kconfig for what it patches in IDF and the licensing note
@@ -424,3 +440,15 @@ CONFIG_ESPIX_FS_EXT4=y
 # through the generic ECP path, and the agreement half is a variable-point
 # multiplication that no amount of base-point precomputation helps.
 CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
+
+#
+# Moved out of the S31's file: all of these describe how espix uses memory
+# and network buffers, not what the silicon is. The S3 wants every one of them.
+#
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=114688
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+CONFIG_LWIP_WND_SCALE=y
+CONFIG_LWIP_TCP_RCV_SCALE=0
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y

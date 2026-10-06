@@ -132,6 +132,16 @@ for name in "${names[@]}"; do
     echo "build-apps: building $name"
     (
         cd "$app"
+
+        # 'force' means the staged binary was built for another target, and a
+        # target change invalidates every object in the build dir -- not just the
+        # sdkconfig. A build dir configured for one target with a sdkconfig for
+        # another configures into something that loads on neither: the S31 was
+        # handed exactly that, and the loader said "relocation failed". Start
+        # from nothing, the same rule the kernel's config follows now.
+        if [ "$force" = 1 ]; then
+            rm -rf build sdkconfig
+        fi
         # `idf.py elf` is only available under the Makefiles generator, and
         # set-target is what creates the generator and sdkconfig in the first
         # place, so it runs once per app rather than on every build.

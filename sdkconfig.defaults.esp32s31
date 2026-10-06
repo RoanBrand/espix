@@ -180,10 +180,6 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # much a peer may have in flight. Against LWIP_TCP_RECVMBOX_SIZE=6 and a 1440-byte
 # MSS that is marginal, and an overflowing receive mailbox drops packets rather
 # than back-pressuring.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=114688
-CONFIG_LWIP_TCP_WND_DEFAULT=5760
-CONFIG_LWIP_WND_SCALE=y
-CONFIG_LWIP_TCP_RCV_SCALE=0
 
 
 # The task watchdog keeps its idle-task check, at the slowest interval IDF allows
@@ -193,7 +189,4 @@ CONFIG_LWIP_TCP_RCV_SCALE=0
 # one thing nothing else does: a task that stopped making progress, including one
 # wedged holding a lock, which is not a fault and so never reaches the panic path.
 # PANIC stays off, so this reports and never resets.
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 
-CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
-CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y

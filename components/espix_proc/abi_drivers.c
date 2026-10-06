@@ -256,6 +256,7 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(__ledf2),
     ESP_ELFSYM_EXPORT(__truncdfsf2),
 
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
     /*
      * The single-precision arithmetic, which is what an Xtensa app build
      * reaches for and a RISC-V one inlines. espix had the double set and the
@@ -282,6 +283,7 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(__unordsf2),
     ESP_ELFSYM_EXPORT(__fixsfsi),
     ESP_ELFSYM_EXPORT(__floatsisf),
+#endif
     ESP_ELFSYM_EXPORT(__divdf3),
     ESP_ELFSYM_EXPORT(__ltdf2),
     ESP_ELFSYM_EXPORT(__gtdf2),
