@@ -160,10 +160,21 @@ static size_t round_to_granule(size_t n)
 /* The size that makes 'n' servable: the request plus what a heap needs before it
  * can hand anything out. Never optional -- this is the term whose absence was
  * "region created, request refused", where an app asked for 256000 bytes, got a
- * 252 KB region, and no allocation in it. */
+ * 252 KB region, and no allocation in it.
+ *
+ * Proportional, not fixed. A heap's bookkeeping grows with the pool -- tlsf's
+ * control structure is sized by the block count -- so an allowance that fits a
+ * 4 MiB region does not fit a 6 MiB one, and a request the board has plenty of
+ * room for fails *inside* a region carved exactly for it. That is a 6 MiB zone
+ * failing on a board with 13 MB of PSRAM, which is what a fixed 8 KB did here.
+ *
+ * The cost of being generous is that a request as large as the pool's biggest
+ * contiguous block may not be carvable at all; that case is the escape in
+ * espix_abi_alloc(), which serves it from the global heap and still returns it
+ * when the process ends. */
 static size_t region_need_for(size_t n)
 {
-    size_t need = n + REGION_METADATA_BYTES;
+    size_t need = n + (n / 16) + REGION_METADATA_BYTES;
 
     if (need < REGION_MIN_BYTES) {
         need = REGION_MIN_BYTES;
@@ -288,25 +299,15 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
         return NULL;
     }
 
-    const size_t need       = region_need_for(n);
-    size_t       want       = need + region_tuning_for(n);
-    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t floor      = psram_floor_bytes();
+    const size_t floor = psram_floor_bytes();
+    size_t       want  = region_need_for(n);
 
-    /* Drop the tuning before the request. The tuning is room for later
-     * allocations, and one that will not fit gets a region of its own. */
-    if (free_psram < want + floor) {
-        want = need;
-    }
-
-    if (free_psram < want + floor) {
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "pid %d: refusing a %u KB arena region -- PSRAM free is "
-                   "%u KB and the floor is %u KB",
-                   (int)slot->info.pid, (unsigned)(want / 1024),
-                   (unsigned)(free_psram / 1024),
-                   (unsigned)(floor / 1024));
-        return NULL;
+    /* The tuning is optional: prefer it, drop it before the request itself. The
+     * tuning is room for later allocations, and one that will not fit gets a
+     * region of its own. */
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >=
+        want + region_tuning_for(n) + floor) {
+        want += region_tuning_for(n);
     }
 
     /* The index first, so a failure here does not leak the region below. */
@@ -314,31 +315,81 @@ static espix_app_region_t *region_grow(espix_proc_slot_t *slot, size_t n)
         return NULL;
     }
 
-    /* multi_heap_register() aligns the pool it makes from the address it is
-     * given, but tlsf wants it aligned to a pointer -- ask for 8 and let the
-     * caps allocator refuse only if it cannot. */
-    void *const base = heap_caps_aligned_alloc(8, want,
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (base == NULL) {
-        /*
-         * The floor above is a policy; this is the pool saying no, and it used
-         * to say nothing -- which made "the app could not get its memory" and
-         * "the app never asked" the same entry in the log. Failure path only,
-         * so nothing here is paid for by an allocation that succeeds.
-         */
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "pid %d: no %u KB contiguous PSRAM for a region "
-                   "(free %u KB, largest %u KB)",
-                   (int)slot->info.pid, (unsigned)(want / 1024),
-                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
-                   (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)
-                              / 1024));
-        return NULL;
+    /*
+     * Bring back a pool and let *it* say whether the request fits.
+     *
+     * Estimating the bookkeeping is what a fixed allowance got wrong: it grows
+     * with the pool, so a 6 MiB zone failed on a board with 13 MB of PSRAM
+     * because the region carved for it was a few KB short -- and a region that
+     * cannot serve the request it was carved for is never acceptable. The heap
+     * knows its own overhead, so the estimate is only a starting point: ask the
+     * largest block it can hand out, and when that is short of the request, hand
+     * the pool back and ask again for exactly the deficit. Bounded, and on the
+     * path that creates a region rather than on every allocation.
+     */
+    void                *base = NULL;
+    multi_heap_handle_t  heap = NULL;
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+        if (free_psram < want + floor) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "pid %d: refusing a %u KB arena region -- PSRAM free is "
+                       "%u KB and the floor is %u KB",
+                       (int)slot->info.pid, (unsigned)(want / 1024),
+                       (unsigned)(free_psram / 1024),
+                       (unsigned)(floor / 1024));
+            return NULL;
+        }
+
+        /* multi_heap_register() aligns the pool it makes from the address it is
+         * given, but tlsf wants it aligned to a pointer -- ask for 8 and let the
+         * caps allocator refuse only if it cannot. */
+        base = heap_caps_aligned_alloc(8, want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (base == NULL) {
+            /*
+             * The floor above is a policy; this is the pool saying no, and it
+             * used to say nothing -- which made "the app could not get its
+             * memory" and "the app never asked" the same entry in the log.
+             * Failure path only.
+             */
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "pid %d: no %u KB contiguous PSRAM for a region "
+                       "(free %u KB, largest %u KB)",
+                       (int)slot->info.pid, (unsigned)(want / 1024),
+                       (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                       (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)
+                                  / 1024));
+            return NULL;
+        }
+
+        heap = multi_heap_register(base, want);
+        if (heap == NULL) {
+            heap_caps_free(base);
+            return NULL;
+        }
+
+        multi_heap_info_t info;
+        multi_heap_get_info(heap, &info);
+        if (info.largest_free_block >= n) {
+            break;                  /* the block fits: that is the invariant */
+        }
+
+        /* Short by this much. Ask for the deficit back and register again; one
+         * retry converges in practice. */
+        const size_t deficit = n - info.largest_free_block;
+        heap_caps_free(base);
+        base = NULL;
+        heap = NULL;
+        want = round_to_granule(want + deficit + REGION_GRANULE);
     }
 
-    multi_heap_handle_t const heap = multi_heap_register(base, want);
-    if (heap == NULL) {
-        heap_caps_free(base);
+    if (heap == NULL || base == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "pid %d: no region could be sized to hold %u KB (tried %u KB)",
+                   (int)slot->info.pid, (unsigned)(n / 1024),
+                   (unsigned)(want / 1024));
         return NULL;
     }
 
