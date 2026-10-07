@@ -153,10 +153,16 @@ typedef struct {
     volatile bool closed;
 
     /*
-     * tx_lock was held by a task that has been deleted, so nobody can ever give
+     * A lock was held by a task that has been deleted, so nobody can ever give
      * it back -- and nobody may even ask for it again. See chan_task_gone().
+     *
+     * Both locks need one. A process can be killed inside a write, holding
+     * tx_lock, or inside chan_pump()'s blocking packet read, holding rx_lock;
+     * the read side is the one that was left out, which is what made its timed
+     * take the asserting one.
      */
     volatile bool tx_orphaned;
+    volatile bool rx_orphaned;
 
     /*
      * `ssh host <cmd>`: the command the client asked to run, on the heap
@@ -318,6 +324,25 @@ static bool chan_tx_take(ssh_chan_t *ch)
 }
 
 /*
+ * The same check for the read side, which is a plain mutex rather than a
+ * recursive one. chan_pump() takes it around a packet read that blocks, so a
+ * process parked on stdin holds it for as long as the client stays quiet --
+ * long enough for the grace in proc_force_kill() to expire and leave a deleted
+ * task recorded as its holder.
+ *
+ * No spin here: what this protects is a socket read whose own timeout belongs
+ * to the transport, so all this decides is whether asking is safe at all. False
+ * means not safe, or not available; the callers set closed and leave.
+ */
+static bool chan_rx_take(ssh_chan_t *ch, TickType_t ticks)
+{
+    if (ch->rx_orphaned) {
+        return false;
+    }
+    return xSemaphoreTake(ch->rx_lock, ticks) == pdTRUE;
+}
+
+/*
  * A process on this session has been force-deleted; write off what it held.
  *
  * Only the owner of a FreeRTOS mutex can give it back, so a task deleted inside
@@ -339,19 +364,32 @@ static void chan_task_gone(espix_session_t *s, void *task)
 {
     ssh_chan_t *ch = s->transport;
 
-    if (ch == NULL || ch->tx_lock == NULL || task == NULL) {
-        return;
-    }
-    if (xSemaphoreGetMutexHolder(ch->tx_lock) != (TaskHandle_t)task) {
+    if (ch == NULL || task == NULL) {
         return;
     }
 
-    espix_klog(ESPIX_KLOG_WARN, TAG,
-               "a killed process still held the transmit lock; closing the "
-               "channel rather than waiting on a lock nobody can release");
+    /*
+     * Both locks, independently. A killed process holds at most one of them --
+     * a write takes tx_lock, a read takes rx_lock -- and finding out which is a
+     * pointer comparison, not a dereference.
+     */
+    if (ch->tx_lock != NULL
+        && xSemaphoreGetMutexHolder(ch->tx_lock) == (TaskHandle_t)task) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "a killed process still held the transmit lock; closing the "
+                   "channel rather than waiting on a lock nobody can release");
+        ch->tx_orphaned = true;
+        ch->closed      = true;
+    }
 
-    ch->tx_orphaned = true;
-    ch->closed      = true;
+    if (ch->rx_lock != NULL
+        && xSemaphoreGetMutexHolder(ch->rx_lock) == (TaskHandle_t)task) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "a killed process still held the receive lock; closing the "
+                   "channel rather than waiting on a lock nobody can release");
+        ch->rx_orphaned = true;
+        ch->closed      = true;
+    }
 }
 
 /*
@@ -365,7 +403,7 @@ static esp_err_t wait_for_window(ssh_chan_t *ch)
     for (unsigned waited = 0;
          ch->peer_window == 0 && waited < WINDOW_WAIT_PACKETS; waited++) {
 
-        if (xSemaphoreTake(ch->rx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) != pdTRUE) {
+        if (!chan_rx_take(ch, pdMS_TO_TICKS(RX_WAIT_MS))) {
             /*
              * The shell task is parked in a read waiting for a keystroke, so
              * only a backgrounded app reaches this. Racing it for the socket
@@ -1187,7 +1225,15 @@ static esp_err_t chan_pump(ssh_chan_t *ch)
 {
     ssh_conn_t *c = ch->conn;
 
-    xSemaphoreTake(ch->rx_lock, portMAX_DELAY);
+    /*
+     * False is the orphaned case: the process that was holding this died in the
+     * read, so the lock can never be given back. Asking for it anyway is the
+     * use-after-free chan_tx_take() describes.
+     */
+    if (!chan_rx_take(ch, portMAX_DELAY)) {
+        ch->closed = true;
+        return ESP_FAIL;
+    }
     const esp_err_t rd = ssh_packet_read(c);
     xSemaphoreGive(ch->rx_lock);
 
@@ -1911,7 +1957,11 @@ static esp_err_t forward_packet(ssh_chan_t *ch, int tcp_fd, bool *peer_eof)
 {
     ssh_conn_t *c = ch->conn;
 
-    xSemaphoreTake(ch->rx_lock, portMAX_DELAY);
+    /* As in chan_pump(): a false here is an orphaned read lock, not a timeout. */
+    if (!chan_rx_take(ch, portMAX_DELAY)) {
+        ch->closed = true;
+        return ESP_FAIL;
+    }
     const esp_err_t rd = ssh_packet_read(c);
     xSemaphoreGive(ch->rx_lock);
 
@@ -2210,7 +2260,8 @@ static void finish_session(ssh_chan_t *ch, espix_session_t *session)
      */
     espix_env_free(session);
 
-    if (xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
+    if (!ch->tx_orphaned
+        && xSemaphoreTakeRecursive(ch->tx_lock, pdMS_TO_TICKS(RX_WAIT_MS)) == pdTRUE) {
         /*
          * Held across the send, not released before it. Taking the lock and
          * giving it straight back only proved the lock had been free a moment
