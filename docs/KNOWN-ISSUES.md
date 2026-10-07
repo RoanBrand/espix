@@ -308,6 +308,72 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   `tests/run.sh` now prints that low-water mark every run so it cannot be missed
   a second time.
 
+  **Re-measured on the S3 and narrowed (2026-10-07).** It is a wild store, and
+  it needs neither a force-kill nor unusual load:
+
+  | | |
+  | --- | --- |
+  | reproducer | `tests/run.sh -j 2 --seed 36501` -- two concurrent suites |
+  | time to abort | ~120s, repeatable |
+  | serial (`-j 1`) | 20 suites, 374 assertions, no abort |
+  | `80-svc` alone | passes (8/8, 32s) |
+
+  Force-killing is **not** the mechanism: with both `kill -9` calls removed from
+  15-streams the run still died, so "the kill tests are in every aborting run"
+  was correlation and not cause.
+
+  The panic site is whichever task is hot, and it is a victim rather than a
+  writer. It has been, across runs: a ROM `mem*` called from an app task
+  (`StoreProhibited` with `0xffffffff` operands), lwIP's `netif` inside
+  `ip4_addr_isbroadcast_u32`, littlefs's `crc` pointer inside `lfs_bd_crc`
+  (read as `4`), mbedTLS bignum during the SSH key exchange, and FreeRTOS's own
+  `uxMutexesHeld` and `lock->count`. Every one is a pointer or a count that
+  must be valid and is garbage.
+
+  Ruled out since, each by measurement on a clean kernel:
+
+  - **Stack exhaustion.** A per-task stack watchpoint, correctly armed, never
+    fired -- and arming it correctly required disabling
+    `CONFIG_ESPIX_PROC_ABI_WATCHPOINT` first, because espix uses both hardware
+    watchpoint registers and IDF's stack watchpoint is overwritten on every task
+    switch, which silently invalidated a first attempt. Sampling `ps`'s STACK
+    column through a reproducing run leaves the tightest espix task ~1 KB.
+  - **A process killed holding the arena lock.** `s_region_lock` is a plain
+    mutex with no orphan treatment, so this was worth testing; an instrument in
+    `espix_proc_regions_release()` never reported a foreign holder.
+  - **The victim's stream teardown re-entering the channel.** Already fixed: the
+    kill path prints `[stdio detached]` and the teardown does not reach it.
+  - **PSRAM task stacks with the cache disabled.** Routine flash I/O on the S3
+    never calls `spi_flash_disable_interrupts_caches_and_other_cpu()`, and
+    relocation already runs on an internal-stacked task for this reason. IDF's
+    guard never fired.
+  - **`free()` of a pointer outside an arena.** The hits in the captures were
+    internal-RAM pointers, which is the handled case.
+
+  Why it is still open: a hardware watchpoint needs a *stable* victim and the
+  victims move every run, so there is nothing to aim one at. Do not hunt it with
+  `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK` while the ABI watchpoint is on:
+  they contend for the same registers and the resulting debug exception panics
+  with no JTAG attached. That is an instrument artefact, not the bug, and it
+  cost a run to learn.
+
+- **A killed app's threads are not reaped, and the arena lock is not orphaned.**
+  Two holes found while hunting the above, each real on its own.
+
+  `abi_pthread.c` publishes `pthread_create` so a thread's allocations land in
+  its process's arena, but nothing walks the threads when the process is
+  force-killed: only `slot->info.task` is deleted. A surviving thread keeps
+  running with thread-local storage still naming the slot, allocating from
+  regions that were just released -- and from a slot that may already belong to
+  another process.
+
+  `s_region_lock` is taken with `portMAX_DELAY` on every allocation and on the
+  release path itself, and unlike `tx_lock` and `rx_lock` nothing orphans it,
+  so a process killed inside an allocation leaves it recorded against a freed
+  TCB and the next taker walks that memory for priority inheritance. Neither is
+  the writer being hunted above (the instrument for the second one never fired),
+  and both are the same class of bug the ssh locks were fixed for.
+
 - **`esp_linenoise_edit()` can free history that is not there.** Its ENTER
   case does `state->history_length--; free(config->history[state->history_length]);`
   with no check that the length is above zero, so an empty history underflows.
