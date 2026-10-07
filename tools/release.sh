@@ -4,7 +4,7 @@
 # kernel, the OTA manifest, the loader and one-file flash images to GitHub.
 #
 #   make release
-#   tools/release.sh --dry-run     # everything except push and gh
+#   tools/release.sh --dry-run     # everything except push, gh and the tag
 #
 # The tag is made *before* the build because espix calls a build a release only
 # when the built commit is exactly tagged and clean (espix_kernel's CMakeLists).
@@ -200,7 +200,21 @@ if [ "$dry" = 1 ]; then
     for a in $assets; do printf '  %10s  %s\n' "$(wc -c < "$a")" "$a"; done
     printf 'release: notes:\n\n'
     cat "$notes"
-    printf '\nrelease: local tag %s is left in place; delete it to retry\n' "$tag"
+    # The tag is what makes this a *release* build -- espix_kernel reads
+    # `git describe --exact-match` plus a clean tree -- so a dry run cannot
+    # skip making one. It can skip *keeping* it: a dry run leaves nothing
+    # behind, including the tag it just made. A tag that was already there is
+    # not ours to delete and stays.
+    #
+    # The build tree keeps the release build these files came from, which is
+    # the point of a dry run -- but the tree itself says "dev" again now, so
+    # reconfigure before building anything else from it.
+    if [ "$created" = 1 ]; then
+        git -C "$root" tag -d "$tag" >/dev/null
+        printf '\nrelease: dry run; the tag %s it made has been removed again\n' "$tag"
+    else
+        printf '\nrelease: dry run; %s already existed and is untouched\n' "$tag"
+    fi
     exit 0
 fi
 

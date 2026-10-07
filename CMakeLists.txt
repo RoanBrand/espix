@@ -180,13 +180,22 @@ endif()
 # prefers internal, and on the S31 a full GMF pipeline there starves Bluedroid's
 # BTU task, which aborts in fixed_queue_new the moment a sink connects.
 # See tools/patch-gmf.py, and docs/AUDIO.md.
-execute_process(
-    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-gmf.py"
-            --components-path "${CMAKE_CURRENT_SOURCE_DIR}/managed_components"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE espix_gmf_patch_result)
-if(NOT espix_gmf_patch_result EQUAL 0)
-    message(FATAL_ERROR "tools/patch-gmf.py failed; see the message above")
+#
+# Only the targets that use Bluetooth audio pull espressif__gmf_core in, so on
+# an S3 with no Bluedroid there is nothing here to patch -- and a hook that
+# insisted on it made a fresh clone unable to configure for that target at all,
+# which is what it did until this guard. The component being absent is the one
+# legitimate reason to skip; when it is present, patch-gmf.py still refuses to
+# do nothing quietly, because an anchor that moved is a real failure.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/managed_components/espressif__gmf_core")
+    execute_process(
+        COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-gmf.py"
+                --components-path "${CMAKE_CURRENT_SOURCE_DIR}/managed_components"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE espix_gmf_patch_result)
+    if(NOT espix_gmf_patch_result EQUAL 0)
+        message(FATAL_ERROR "tools/patch-gmf.py failed; see the message above")
+    endif()
 endif()
 
 # fsroot/ is the tree the dev rootfs is packaged from. It is gitignored and a

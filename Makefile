@@ -324,7 +324,13 @@ stress: test-app
 	ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh --suite stress --stress \
 	    $(if $(N),--stress-n $(N),)
 
+# `idf.py fullclean` also asks the component manager to remove
+# managed_components/, and it refuses to touch a tree it considers modified --
+# which this one always is, because the top-level CMakeLists patches littlefs,
+# lwext4, fatfs and the rest from a hook after project() has downloaded them.
+# So remove what fullclean removes and leave the components to their hooks,
+# which are idempotent. Prepend
+#   rm -rf managed_components loader/managed_components
+# when the configure itself, not just the build, should start from nothing.
 clean:
-	$(IDF) fullclean
-	$(IDF) -C loader fullclean
-	rm -rf apps/*/build apps/*/sdkconfig tests/app/build tests/app/sdkconfig
+	rm -rf $(BUILD) $(LOADER_BUILD) $(SDKCONF) $(SDKCONF).old loader/sdkconfig loader/sdkconfig.old loader/sdkconfig.$(TARGET) apps/*/build apps/*/sdkconfig tests/app/build tests/app/sdkconfig
