@@ -5,8 +5,12 @@
 
 One set of notes for a release that serves several boards, so the body does not
 describe whichever target happened to be published first. Deliberately short:
-each board gets the one line that flashes it and attaches the monitor, and
-nothing else is said twice.
+set the port once, then one line per board that flashes it and attaches the
+monitor, and nothing else is said twice.
+
+The blank line after each bold label is not cosmetic. Without it the indented
+command is a lazy continuation of the paragraph rather than a code block, and
+markdown then reads the port placeholder as an unknown HTML tag and eats it.
 """
 
 import json
@@ -22,13 +26,21 @@ def main(argv):
         boards = json.load(f)["boards"]
 
     out = ["espix %s" % ver, ""]
+    out.append("Set the port once -- macOS /dev/cu.usbserial-*, Linux")
+    out.append("/dev/ttyUSB* or /dev/ttyACM*, Windows COM3:")
+    out.append("")
+    out.append("    PORT=/dev/cu.usbserial-110")
+    out.append("")
+
     for board, entry in sorted(boards.items()):
         model = board.split("-")[0]
         chip = entry.get("chip", "?")
         out.append("**%s**:" % model.upper())
-        out.append("    esptool --chip %s -p <port> -b 460800 --after no-reset "
-                   "write-flash 0x0 espix-%s-full.bin && python -m "
-                   "esp_idf_monitor -p <port>" % (chip, model))
+        out.append("")
+        out.append("    python -m esptool --chip %s -p \"$PORT\" -b 460800 "
+                   "--after no-reset write-flash 0x0 espix-%s-full.bin && "
+                   "python -m esp_idf_monitor -p \"$PORT\""
+                   % (chip, model))
         out.append("")
 
     out.append("Assets")
