@@ -15,10 +15,10 @@
 
 # espix
 
-A Unix(-like) kernel/runtime environment for ESP32, built on ESP-IDF.
+A Unix/Linux(-like) kernel/runtime environment for ESP32, on top of the ESP-IDF.
 
-espix brings the parts of the Unix operational model that are useful on
-a microcontroller — a real shell, filesystem, networking, and the
+Replace Raspberry Pi for smaller use cases, that can fit in memory.
+With a familiar, linux-like environment. A real shell, filesystem, networking, and the
 ability to cross-compile a native app on a PC and load it at runtime — while
 leaving enough flash and RAM for those apps to do something. It is deliberately
 not a Linux-compatible kernel; the target is closer to a nommu-Linux-style
@@ -33,7 +33,34 @@ it: [ROADMAP.md](docs/ROADMAP.md) for work espix might take on,
 differs from what a POSIX or FreeRTOS habit expects, and what may not be used
 together.
 
-## Capabilities
+## Features
+- USB hosting: Mass storage devices, hubs, keyboard, mouse.
+- Networking:
+  - IP routing, NAT, bridging. Firewall planned.
+  - With wifi, eth, USB-NCM, and virtual interfaces.
+  - File sharing with NFS v3 (NFSv4, SMB planned)
+- File systems:
+  - VFAT, exFAT, ext4 (via lwext4) for USB disks, LittleFS for `/` on internal flash.
+  - MBR and GPT partition tables.
+  - \>4GB files, and \>2TB partitions. (exFAT & ext4)
+- Simple graphical desktop:
+  - Showcase, mostly. very lacking.
+  - Simple windows, dragging, min/max/close btns. Taskbar, start btn/menu, and systray.
+  - Accelerated with PPA/2D-DMA/JPEG hardware, where present (only P4/S31)
+- Remote desktop with VNC(RFB):
+  - Access desktop or console, remotely.
+  - Showcase desktop, and gfx things, without an actual screen.
+- Audio:
+  - Play mp3 or wav files.
+  - Stream to BT speakers or headphones (S31)
+  - Planned:
+    - General audio backend system planned for apps
+    - More sinks: BLE devices, dac/amps on core/korvo boards, i2s in/out through gpio, etc.
+
+Use cases:
+- Router, NAS, Audio streaming/server, "nano" server/PC.
+
+## Long list
 
 <sub>Run on ESP32-S3N16R8 and ESP32-S31 (WROOM-3) with ESP-IDF v6.1; the ESP32-P4 is planned</sub>
 
