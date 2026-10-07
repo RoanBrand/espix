@@ -31,11 +31,22 @@ def main(argv):
     out.append("Each board has its own image. Write the one for your chip at offset 0:")
     out.append("")
     for model, chip in entries:
-        out.append("    esptool.py --chip %s -p <port> write_flash 0x0 espix-%s-minimal.bin"
+        out.append("    esptool.py --chip %s -p <port> write-flash 0x0 espix-%s-minimal.bin"
                    % (chip, model))
     out.append("")
-    out.append("Offset 0 is right for every board: the image carries its own bootloader")
-    out.append("at the offset that chip expects.")
+    out.append("Run that in the directory you downloaded the images into, and take the")
+    out.append("-full image instead if you want the stock applications. Offset 0 is")
+    out.append("right for every board: the image carries its own bootloader at the")
+    out.append("offset that chip expects.")
+    out.append("")
+    out.append("None of these images writes NVS, so a board that has run espix before")
+    out.append("keeps its saved network settings. To have it come up as new, erase")
+    out.append("first -- which is also what a board out of the box looks like:")
+    out.append("")
+    for model, chip in entries:
+        out.append("    esptool.py --chip %s -p <port> erase-flash" % chip)
+    out.append("")
+    out.append("then write the image as above.")
     out.append("")
     out.append("That is the whole system, and it makes its own filesystem on first boot.")
     out.append("It has no stock apps in /bin; take the -full image instead if you want")
