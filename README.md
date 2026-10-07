@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.png" alt="espix login greeting" width="60%" max-width="600px">
+  <img width="486" height="239" alt="espix login greeting" src="https://github.com/user-attachments/assets/457b6049-acb2-4080-8ad2-40222d47d782" />
 </p>
 
 <table align="center">
