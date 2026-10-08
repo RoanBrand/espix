@@ -54,6 +54,37 @@ menu "espix i2s"
             electret is quiet, so the maximum is the default; lower it if a
             capture clips.
 
+    config ESPIX_I2S_ADC_ALC
+        bool "Automatic level control on the microphone"
+        default n
+        help
+            The ES8311's ALC: a quiet input is lifted toward the max level and a
+            loud one is held back. Measured on the S31 coreboard's microphone it
+            costs more than it gives -- its gain ramps at startup, so the first
+            second clipped while the same second was the quietest without it,
+            and its release is slow enough to duck everything after a burst
+            below the no-ALC level. Off by default; a close-talking voice case
+            may suit it, and a fixed gain in software is the predictable
+            alternative. The values below are the codec's own fields.
+
+    config ESPIX_I2S_ADC_ALC_WINSIZE
+        int "ALC window size (0-15, longer is slower)"
+        depends on ESPIX_I2S_ADC_ALC
+        range 0 15
+        default 6
+
+    config ESPIX_I2S_ADC_ALC_MAXLEVEL
+        int "ALC max level index (0 = -30.1 dBFS, 15 = -6.0 dBFS)"
+        depends on ESPIX_I2S_ADC_ALC
+        range 0 15
+        default 9
+
+    config ESPIX_I2S_ADC_ALC_MINLEVEL
+        int "ALC min level index (0 = -30.1 dBFS, 15 = -6.0 dBFS)"
+        depends on ESPIX_I2S_ADC_ALC
+        range 0 15
+        default 0
+
     endif
 
 endmenu

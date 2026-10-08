@@ -251,6 +251,24 @@ static bool adc_open(void)
         return false;
     }
     esp_codec_dev_set_in_gain(s_adc, (float)CONFIG_ESPIX_I2S_INPUT_GAIN_DB);
+
+#if CONFIG_ESPIX_I2S_ADC_ALC
+    /*
+     * The ES8311's ALC, which esp_codec_dev does not expose. Register 0x18 is
+     * the enable (bit 7) and the window size (bits 3:0); 0x19 is the max level
+     * (bits 7:4) and the min level (bits 3:0), each a 4-bit index into -30.1 dB
+     * .. -6.0 dB. A quiet, distant source is the normal case here and the PGA
+     * is already at its 42 dB maximum, so this is what lifts it.
+     */
+    esp_codec_dev_write_reg(s_adc, 0x18,
+                            0x80 | (CONFIG_ESPIX_I2S_ADC_ALC_WINSIZE & 0x0F));
+    esp_codec_dev_write_reg(s_adc, 0x19,
+                            ((CONFIG_ESPIX_I2S_ADC_ALC_MAXLEVEL & 0x0F) << 4) |
+                             (CONFIG_ESPIX_I2S_ADC_ALC_MINLEVEL & 0x0F));
+    ESP_LOGI(TAG, "es8311 alc: win %d, max %d, min %d",
+             CONFIG_ESPIX_I2S_ADC_ALC_WINSIZE, CONFIG_ESPIX_I2S_ADC_ALC_MAXLEVEL,
+             CONFIG_ESPIX_I2S_ADC_ALC_MINLEVEL);
+#endif
     ESP_LOGI(TAG, "es8311 adc: %u Hz, %u ch", (unsigned)s_in_fmt.rate,
              (unsigned)s_in_fmt.channels);
     return true;

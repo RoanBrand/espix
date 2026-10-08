@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -793,8 +794,8 @@ static bool copy_arrived(espix_session_t *s, const char *src, const char *dst)
         return false;
     }
 
-    char *ca = malloc(COPY_CHUNK);
-    char *cb = malloc(COPY_CHUNK);
+    char *ca = malloc(CP_CHUNK);
+    char *cb = malloc(CP_CHUNK);
     if (ca == NULL || cb == NULL) {
         free(ca);
         free(cb);
@@ -806,12 +807,12 @@ static bool copy_arrived(espix_session_t *s, const char *src, const char *dst)
 
     bool same = true;
     while (same) {
-        const size_t na = fread(ca, 1, COPY_CHUNK, a);
-        const size_t nb = fread(cb, 1, COPY_CHUNK, b);
+        const size_t na = fread(ca, 1, CP_CHUNK, a);
+        const size_t nb = fread(cb, 1, CP_CHUNK, b);
 
         if (na != nb || (na > 0 && memcmp(ca, cb, na) != 0)) {
             same = false;
-        } else if (na < COPY_CHUNK) {
+        } else if (na < CP_CHUNK) {
             break;                      /* both ended, at the same place */
         }
     }
@@ -837,59 +838,70 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    FILE *in = fopen(src, "rb");
-    if (in == NULL) {
+    /*
+     * Raw open/read/write, not stdio. A bulk copy is one direction, huge
+     * sequential blocks and no formatting -- the one case a FILE buys nothing
+     * for, and every byte would cross an extra buffer. The SFTP server, which
+     * writes the bytes a copy is usually racing, does exactly this and measures
+     * about twice as fast. The chunk is the syscall size, so it is large.
+     */
+    const int in = open(src, O_RDONLY);
+    if (in < 0) {
         espix_eprintf(s, "cp: %s: %s\n", src, strerror(errno));
         return 1;
     }
 
-    FILE *out = fopen(dst, "wb");
-    if (out == NULL) {
+    const int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) {
         espix_eprintf(s, "cp: %s: %s\n", dst, strerror(errno));
-        fclose(in);
+        close(in);
         return 1;
     }
 
-    char  *chunk = malloc(CP_CHUNK);
-    size_t n;
-    int    status = 0;
+    char *chunk = malloc(CP_CHUNK);
+    int   status = 0;
 
-    if (chunk == NULL) {
-        espix_eprintf(s, "cp: no memory\n");
-        fclose(in);
-        fclose(out);
-        return 1;
-    }
-
-    while ((n = fread(chunk, 1, CP_CHUNK, in)) > 0) {
-        if (fwrite(chunk, 1, n, out) != n) {
-            espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
+    while (chunk != NULL) {
+        const ssize_t n = read(in, chunk, CP_CHUNK);
+        if (n < 0) {
+            espix_eprintf(s, "cp: %s: read failed: %s\n", src, strerror(errno));
             status = 1;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        /* write() may take less than it was given; the rest goes next time. */
+        size_t off = 0;
+        while (off < (size_t)n) {
+            const ssize_t w = write(out, chunk + off, (size_t)n - off);
+            if (w < 0) {
+                espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
+                status = 1;
+                break;
+            }
+            off += (size_t)w;
+        }
+        if (status != 0) {
             break;
         }
     }
 
-    free(chunk);
-    fclose(in);
-
-    /*
-     * The flush is where the bytes actually go: stdio buffers them, so on a
-     * mounted volume the real write happens here and not in fwrite(). Checking
-     * fwrite() alone therefore reports success for a copy that fails on close --
-     * which is how fifteen bytes became a 0-byte file with nothing said.
-     */
-    if (status == 0 && fflush(out) != 0) {
-        espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
+    if (chunk == NULL) {
+        espix_eprintf(s, "cp: no memory\n");
         status = 1;
     }
+    free(chunk);
+    close(in);
+
     /*
      * Closed whatever happened; the failure is reported only when there is not
-     * one already. That `fclose` is not tidiness: it is the only thing that gives
+     * one already. That close is not tidiness: it is the only thing that gives
      * the destination's fd back, and short-circuiting it meant one failed copy
      * left the volume answering "busy -- a file is open on it" for good -- which
      * is exactly what a pull mid-copy produces, and how this was found.
      */
-    if (fclose(out) != 0 && status == 0) {
+    if (close(out) != 0 && status == 0) {
         espix_eprintf(s, "cp: %s: close failed: %s\n", dst, strerror(errno));
         status = 1;
     }
