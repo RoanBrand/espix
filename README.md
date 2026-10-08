@@ -55,7 +55,7 @@ together.
   - Stream to BT speakers or headphones (S31)
   - Planned:
     - General audio backend system planned for apps
-    - More sinks: BLE devices, dac/amps on core/korvo boards, i2s in/out through gpio, etc.
+    - More sinks: BLE Audio, dac/amps on core/korvo boards, i2s in/out through gpio, etc.
 
 Use cases:
 - Router, NAS, Audio streaming/server, "nano" server/PC.
