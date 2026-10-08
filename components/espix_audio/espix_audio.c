@@ -351,8 +351,45 @@ static esp_audio_simple_dec_type_t type_from_uri(const char *uri)
  * blocks (yielding) and the decode falls behind the link rather than running
  * ahead of it or dropping samples.
  */
-static void feed(const uint8_t *p, size_t n)
+/*
+ * The master output volume, 0-100. It is a PCM gain applied here so that it is
+ * the same for every sink; 100 is a pass-through and skips the multiply. A
+ * sink's own hardware volume -- the ES8311 register, an A2DP link's absolute
+ * volume -- is a per-sink control on top of this, not a replacement for it.
+ */
+static int s_volume = 100;
+
+esp_err_t espix_audio_set_volume(int percent)
 {
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    s_volume = percent;
+    return ESP_OK;
+}
+
+int espix_audio_get_volume(void)
+{
+    return s_volume;
+}
+
+static void feed(uint8_t *p, size_t n)
+{
+    if (s_volume < 100) {
+        int16_t *smp = (int16_t *)p;
+        for (size_t i = 0; i < n / 2; i++) {
+            int32_t v = (int32_t)smp[i] * s_volume / 100;
+            if (v > 32767) {
+                v = 32767;
+            } else if (v < -32768) {
+                v = -32768;
+            }
+            smp[i] = (int16_t)v;
+        }
+    }
+
     size_t off = 0;
     while (off < n && !s_stop) {
         const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
@@ -875,7 +912,7 @@ static void audio_task(void *arg)
                             dst[2 * i]     = src[done + i];
                             dst[2 * i + 1] = src[done + i];
                         }
-                        feed((const uint8_t *)dst, n * 4);
+                        feed((uint8_t *)dst, n * 4);
                         produce += (uint32_t)(n * 4);
                         done += n;
                     }

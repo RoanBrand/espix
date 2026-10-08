@@ -134,7 +134,8 @@ stereo WAV, and no more.
 ### Phase 2 (roadmap)
 
 - Resampling: negotiate the sink's rate first, then the hardware ASRC.
-- A PCM gain and per-sink volume; per-app streams and mixing.
+- A master PCM gain is in (`volume [0-100]`, applied once in the engine);
+  per-sink volume and per-app streams are next.
 - The `espix_audio` app ABI, and `/dev/dsp`.
 - I2S **source**: built. `espix_i2s` provides the ES8311's ADC, `record` drives
   it, and the on-board microphone works; a source registry mirrors the sink one.

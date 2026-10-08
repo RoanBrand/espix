@@ -2,6 +2,7 @@
  * play: a file or a stream, through the GMF-based player, out the A2DP sink.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -80,10 +81,27 @@ static int cmd_play(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+static int cmd_volume(espix_session_t *s, int argc, char **argv)
+{
+    if (argc > 1) {
+        const int pct = atoi(argv[1]);
+        if (pct < 0 || pct > 100) {
+            espix_eprintf(s, "volume: 0-100\n");
+            return 1;
+        }
+        espix_audio_set_volume(pct);
+    }
+    espix_printf(s, "volume: %d%%\n", espix_audio_get_volume());
+    return 0;
+}
+
 static espix_cmd_t s_play_cmds[] = {
     { .name = "play", .fn = cmd_play,
       .help = "play an audio file or stream to the connected A2DP sink",
       .usage = "play [--wait] <file|url> | play {stop|status}" },
+    { .name = "volume", .fn = cmd_volume,
+      .help = "get or set the master output volume (0-100)",
+      .usage = "volume [0-100]" },
 };
 
 #endif /* CONFIG_ESPIX_AUDIO */

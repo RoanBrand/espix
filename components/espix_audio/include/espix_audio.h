@@ -64,6 +64,14 @@ esp_err_t espix_audio_stop(void);
 const char *espix_audio_state(void);
 
 /*
+ * The master output volume, 0-100, applied as a PCM gain by the engine so that
+ * it is the same whatever the sink is. 100 is a pass-through. This is the
+ * global level; a sink's own hardware volume is separate and on top.
+ */
+esp_err_t espix_audio_set_volume(int percent);
+int       espix_audio_get_volume(void);
+
+/*
  * Register the benchmark sink (CONFIG_ESPIX_AUDIO_NULL_SINK). It accepts PCM as
  * fast as it arrives and discards it, so a "play" measures the source and the
  * decoder alone. Built only for that measurement; see the Kconfig.
