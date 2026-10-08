@@ -50,6 +50,23 @@ CONFIG_ESPIX_SSH_TASK_STACK=9216
 # mirror this target needs for it.
 
 #
+# Audio, without Bluetooth.
+#
+# The S3 has no Bluetooth Classic and no LE Audio, so there is no A2DP sink
+# here. The audio system still builds and links, and a future I2S codec (the
+# Korvo boards) or the RF transmitter becomes its sink; today play reports that
+# no sink is available rather than the build failing. This is the decoupling's
+# reason to exist.
+#
+CONFIG_ESPIX_AUDIO=y
+
+# The S3's codec uses its LX7 DSP instructions, so its state may live in PSRAM
+# where the S31's cannot (there the portable C path measured ~1200 ms/s in
+# PSRAM against 161 ms internal). Confirm on the bench: this is a hope, not a
+# measurement, and the S31 keeps internal.
+CONFIG_ESPIX_AUDIO_CODEC_PSRAM=y
+
+#
 # CPU
 #
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

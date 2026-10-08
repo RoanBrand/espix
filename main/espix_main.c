@@ -233,6 +233,26 @@ void app_main(void)
         ESP_LOGW(TAG, "system time unavailable; the clock stays at the epoch");
     }
 
+#if CONFIG_ESPIX_AUDIO_SINK_BT_A2DP
+    /*
+     * Publish the A2DP source to the audio engine. Registration only -- the
+     * sink allocates nothing and reports itself disconnected until a link is
+     * up, so this brings neither Bluetooth nor memory up. It lives here rather
+     * than in espix_bt_init() because the engine must see the sink before the
+     * first play, which is not when Bluetooth is started.
+     */
+    (void)espix_bt_audio_sink_register();
+#endif
+
+#if CONFIG_ESPIX_AUDIO_NULL_SINK
+    /*
+     * The benchmark sink, for measuring the decoder with no other sink in the
+     * picture. Registered after the A2DP sink so that, if both are built, the
+     * real one is default and this has to be selected.
+     */
+    (void)espix_audio_null_sink_register();
+#endif
+
     /*
      * Audio is not reserved here on purpose: everything is loaded on demand.
      * `play` opens the decoder and allocates its buffers, and the task frees

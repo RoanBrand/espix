@@ -1,11 +1,14 @@
 /*
- * The playback engine: decode a file straight into the A2DP ring.
+ * The playback engine: decode a file into the registered sink.
  *
  * No GMF on the data path. esp_audio_simple_dec parses and decodes, and a task
- * of ours reads, decodes and writes PCM into the PCM ring; the ring's
+ * of ours reads, decodes and writes PCM to the sink's write(); the sink's
  * backpressure is what paces playback to the link. The GMF pipeline was tried
  * and put the task's CPU into gmf_core's job/IO/event loop rather than the
  * decoder, which is why it sits this one out.
+ *
+ * The sink itself is chosen through espix_audio_sink.h, so this file names no
+ * Bluetooth and links with none.
  */
 #include <fcntl.h>
 #include <stdio.h>
@@ -25,8 +28,83 @@
 
 #include "espix_kernel.h"
 #include "espix_task.h"
-#include "espix_bt.h"
 #include "espix_audio.h"
+#include "espix_audio_sink.h"
+
+#define TAG "audio"
+
+/*
+ * The sink registry.
+ *
+ * Registration happens once, at boot, before the console takes over (see
+ * main/espix_main.c), so a plain array and no lock are enough. The first sink
+ * registered is the default that "play" uses; choosing among several is a
+ * later piece.
+ */
+#define ESPIX_AUDIO_SINKS_MAX 4
+
+static const espix_audio_sink_ops_t *s_sinks[ESPIX_AUDIO_SINKS_MAX];
+static size_t                        s_sink_count;
+
+esp_err_t espix_audio_sink_register(const espix_audio_sink_ops_t *ops)
+{
+    if (ops == NULL || ops->name == NULL || ops->write == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < s_sink_count; i++) {
+        if (s_sinks[i] == ops || strcmp(s_sinks[i]->name, ops->name) == 0) {
+            return ESP_OK;          /* already published; idempotent */
+        }
+    }
+
+    if (s_sink_count >= ESPIX_AUDIO_SINKS_MAX) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "no room for sink '%s'", ops->name);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_sinks[s_sink_count++] = ops;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "sink '%s' registered", ops->name);
+    return ESP_OK;
+}
+
+const espix_audio_sink_ops_t *espix_audio_sink_default(void)
+{
+    return s_sink_count > 0 ? s_sinks[0] : NULL;
+}
+
+#if CONFIG_ESPIX_AUDIO_NULL_SINK
+/*
+ * The benchmark sink. "write" takes everything at once, so the decoder is never
+ * paced by a consumer and the telemetry reports the source's and decoder's own
+ * rate. Nothing here is for a release -- it is how the decoder is measured with
+ * Bluetooth, I2S and the radio out of the picture.
+ */
+static bool null_connected(void) { return true; }
+
+static espix_audio_format_t null_format(void)
+{
+    return (espix_audio_format_t){ .rate = 44100, .channels = 2, .bits = 16 };
+}
+
+static size_t null_write(const void *pcm, size_t len) { (void)pcm; return len; }
+static void   null_start(void)     { }
+static void   null_suspend(void)   { }
+
+static const espix_audio_sink_ops_t s_null_sink = {
+    .name      = "null",
+    .connected = null_connected,
+    .format    = null_format,
+    .write     = null_write,
+    .start     = null_start,
+    .suspend   = null_suspend,
+};
+
+esp_err_t espix_audio_null_sink_register(void)
+{
+    return espix_audio_sink_register(&s_null_sink);
+}
+#endif /* CONFIG_ESPIX_AUDIO_NULL_SINK */
 
 #if !CONFIG_ESPIX_AUDIO
 
@@ -48,8 +126,6 @@ const char *espix_audio_state(void)              { return "not built"; }
 
 #else
 
-#define TAG "audio"
-
 /*
  * The decoder's input buffer lives in internal RAM, not PSRAM, even though it
  * is the read() target: the codec walks it bit by bit per frame, so its access
@@ -67,6 +143,13 @@ const char *espix_audio_state(void)              { return "not built"; }
  * WAV will fall back to whatever the heap can give.
  */
 #define OUT_CHUNK  (6 * 1024)
+/*
+ * The mono->stereo scratch. The upmix is stateless and in order, so it runs in
+ * pieces this size rather than in one buffer the size of a whole frame: a mono
+ * frame is at most 4608 B, and 12 kB held to double it is 12 kB the codec's own
+ * state wants.
+ */
+#define UP_CHUNK   (2 * 1024)
 #define TASK_STACK (6 * 1024)
 
 static espix_task_exit_t s_exit;
@@ -96,33 +179,46 @@ static char          s_uri[200];
 /* nothing names.                                                       */
 /* ------------------------------------------------------------------ */
 /*
- * The decoder's own memory goes to internal RAM. Its state and tables are
- * random-access, and PSRAM random access is many times slower: with these in
- * PSRAM the MP3 decode measured ~2900 ms per second of audio (about 2.9x
- * realtime) while read and the ring write were negligible. espix's own chunk
- * buffers are sequential, so those stay in PSRAM below.
+ * Where the codec's own allocations come from.
+ *
+ * Internal first by default. The decoder's state is random-access and PSRAM
+ * random access is many times slower: with it in PSRAM the S31 -- whose codec
+ * library has no DSP path -- measured ~1200 ms per second of audio against
+ * 161 ms with it internal. The S3's codec uses its LX7 DSP/MAC instructions,
+ * which is why it is fast there, so PSRAM may be affordable and gives the
+ * internal pool back; ESPIX_AUDIO_CODEC_PSRAM picks that. It is a measurement
+ * to confirm, not a default to trust. espix's own chunk buffers are sequential
+ * and stay in PSRAM either way.
  */
-#define MEDIA_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
-#define IO_CAPS    (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define MEDIA_CAPS_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define IO_CAPS             (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+
+#if CONFIG_ESPIX_AUDIO_CODEC_PSRAM
+#define MEDIA_CAPS     IO_CAPS
+#define MEDIA_ALT_CAPS MEDIA_CAPS_INTERNAL
+#define MEDIA_ALT_NAME "internal"
+#else
+#define MEDIA_CAPS     MEDIA_CAPS_INTERNAL
+#define MEDIA_ALT_CAPS IO_CAPS
+#define MEDIA_ALT_NAME "PSRAM"
+#endif
 
 /*
- * The codec's memory must be internal -- its tables are random-access and PSRAM
- * there measured ~3x slower -- but returning NULL when internal refuses turns a
- * slow decode into no decode. So take PSRAM as a last resort and say so: that
- * line is the signal that something else has fragmented internal, which is
- * exactly what was invisible before.
+ * A refusal from the preferred pool must not turn a slow decode into no
+ * decode, so take the other pool and say so: which pool a decode degraded to
+ * is exactly what used to be invisible.
  */
 static void *media_fallback(size_t size, bool zeroed)
 {
     void *p = zeroed ? heap_caps_calloc(1, size, MEDIA_CAPS)
                      : heap_caps_malloc(size, MEDIA_CAPS);
     if (p == NULL) {
-        p = zeroed ? heap_caps_calloc(1, size, IO_CAPS)
-                   : heap_caps_malloc(size, IO_CAPS);
+        p = zeroed ? heap_caps_calloc(1, size, MEDIA_ALT_CAPS)
+                   : heap_caps_malloc(size, MEDIA_ALT_CAPS);
         if (p != NULL) {
             espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "decoder memory: internal refused %u bytes, using PSRAM "
-                       "(decode will be slower)", (unsigned)size);
+                       "decoder memory: preferred pool refused %u bytes, using "
+                       "%s (decode may be slower)", (unsigned)size, MEDIA_ALT_NAME);
         }
     }
     return p;
@@ -204,7 +300,17 @@ static void feed(const uint8_t *p, size_t n)
 {
     size_t off = 0;
     while (off < n && !s_stop) {
-        const size_t sent = espix_bt_audio_write(p + off, n - off);
+        const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
+        if (sink == NULL) {
+            /*
+             * No sink registered yet. Block rather than spin, and rather than
+             * consume the source: a "play --wait" on a build whose sink appears
+             * later must not race the decoder through the whole file.
+             */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        const size_t sent = sink->write(p + off, n - off);
         if (sent == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -364,21 +470,41 @@ __attribute__((unused)) static void play_mp3(int fd, uint8_t *in, uint8_t *out)
  * about 7x slower -- but PSRAM is far better than refusing to play, and which
  * buffer degraded is logged so a slow decode is explained rather than a mystery.
  */
+#if CONFIG_ESPIX_AUDIO_IO_PSRAM
+#define AUDIO_IO_FROM_PSRAM 1
+#else
+#define AUDIO_IO_FROM_PSRAM 0
+#endif
+
 static uint8_t *audio_buf_alloc(const char *name, size_t len, bool *from_psram)
 {
     *from_psram = false;
 
+    /*
+     * Internal first by default: the decoder walks these per sample, and PSRAM
+     * costs there. ESPIX_AUDIO_IO_PSRAM moves them out deliberately, to leave
+     * internal for the codec's own random-access state -- measure before
+     * trusting it, because the point is realtime rather than fitting.
+     */
+#if CONFIG_ESPIX_AUDIO_IO_PSRAM
+    uint8_t *p = heap_caps_malloc(len, IO_CAPS);
+    *from_psram = (p != NULL);
+    if (p == NULL) {
+        p = heap_caps_malloc(len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+#else
     uint8_t *p = heap_caps_malloc(len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (p == NULL) {
         p = heap_caps_malloc(len, IO_CAPS);
         *from_psram = (p != NULL);
     }
+#endif
 
     if (p == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "%s buffer: no memory for %u bytes; internal and PSRAM both refused",
                    name, (unsigned)len);
-    } else if (*from_psram) {
+    } else if (*from_psram && !AUDIO_IO_FROM_PSRAM) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "%s buffer: internal exhausted, using PSRAM (%u bytes); decode will be slower",
                    name, (unsigned)len);
@@ -421,23 +547,25 @@ static void audio_task(void *arg)
     }
 
     /*
-     * Most important first: `in` is what the decoder reads and what the source
-     * read fills, `out` is what it decodes into, and `up` only matters for a
-     * mono source. Each degrades to PSRAM on its own, so one tight pool does
-     * not fail the whole playback.
+     * `in` is what the source read fills and the decoder reads; `out` is what
+     * it decodes into. Both want internal RAM where the pool allows it, and each
+     * degrades to PSRAM on its own rather than failing the playback.
+     *
+     * `up`, the mono-to-stereo copy, is allocated on the first mono frame
+     * instead of here: most sources are stereo and never touch it, and 12 kB of
+     * internal RAM held for a case that does not arise is exactly the pressure
+     * that makes a stereo MP3 spill.
      */
     bool in_ps = false, out_ps = false, up_ps = false;
-    in  = audio_buf_alloc("in",  IN_CHUNK,      &in_ps);
-    out = audio_buf_alloc("out", OUT_CHUNK,     &out_ps);
-    up  = audio_buf_alloc("up",  OUT_CHUNK * 2, &up_ps);
+    in  = audio_buf_alloc("in",  IN_CHUNK,  &in_ps);
+    out = audio_buf_alloc("out", OUT_CHUNK, &out_ps);
 
-    if (in == NULL || out == NULL || up == NULL) {
+    if (in == NULL || out == NULL) {
         char missing[16] = "";
         if (in == NULL)  { strlcat(missing, " in",  sizeof(missing)); }
         if (out == NULL) { strlcat(missing, " out", sizeof(missing)); }
-        if (up == NULL)  { strlcat(missing, " up",  sizeof(missing)); }
 
-        /* Nothing is left half-allocated: the label below frees all three. */
+        /* Nothing is left half-allocated: the label below frees both. */
         espix_klog(ESPIX_KLOG_ERROR, TAG,
                    "cannot play %s: not enough memory for the%s audio buffer(s)",
                    uri, missing);
@@ -529,24 +657,43 @@ static void audio_task(void *arg)
                     }
                     info_logged = true;
                 }
+                /*
+                 * A mono source into a stereo sink is duplicated, not passed
+                 * through: the sink's data callback reads two bytes per sample,
+                 * so a mono stream drains its ring at twice the rate and
+                 * underruns. The sink names the width it wants.
+                 */
+                const espix_audio_sink_ops_t *const sink = espix_audio_sink_default();
+                const unsigned out_ch = sink != NULL ? sink->format().channels : 2u;
                 const int64_t f0 = esp_timer_get_time();
-                if (src_channels == 1) {
-                    /*
-                     * The ring is stereo by contract: the A2DP data callback
-                     * downmixes stereo to the sink's (mono) SBC frame. Feeding
-                     * a mono file through unchanged made that callback read two
-                     * bytes per sample and drain the ring at twice the rate, so
-                     * a mono source underran. Duplicate each sample instead.
-                     */
+                if (src_channels == 1 && out_ch > 1) {
+                    if (up == NULL) {
+                        up = audio_buf_alloc("up", UP_CHUNK, &up_ps);
+                        if (up == NULL) {
+                            espix_klog(ESPIX_KLOG_ERROR, TAG,
+                                       "cannot play %s: no memory for the mono "
+                                       "upmix buffer", uri);
+                            goto out;
+                        }
+                    }
                     const int16_t *src = (const int16_t *)frame.buffer;
                     int16_t       *dst = (int16_t *)up;
-                    const size_t   n = frame.decoded_size / 2;
-                    for (size_t i = 0; i < n; i++) {
-                        dst[2 * i]     = src[i];
-                        dst[2 * i + 1] = src[i];
+                    const size_t   total = frame.decoded_size / 2;
+                    const size_t   per   = UP_CHUNK / 4;   /* stereo frames */
+                    size_t         done  = 0;
+                    while (done < total && !s_stop) {
+                        size_t n = total - done;
+                        if (n > per) {
+                            n = per;
+                        }
+                        for (size_t i = 0; i < n; i++) {
+                            dst[2 * i]     = src[done + i];
+                            dst[2 * i + 1] = src[done + i];
+                        }
+                        feed((const uint8_t *)dst, n * 4);
+                        produce += (uint32_t)(n * 4);
+                        done += n;
                     }
-                    feed(up, n * 4);
-                    produce += (uint32_t)(n * 4);
                 } else {
                     feed(frame.buffer, frame.decoded_size);
                     produce += frame.decoded_size;
@@ -612,7 +759,10 @@ out:
         close(fd);
     }
     /* Nothing left to send: suspend the stream rather than encode silence. */
-    espix_bt_audio_suspend();
+    const espix_audio_sink_ops_t *const end_sink = espix_audio_sink_default();
+    if (end_sink != NULL) {
+        end_sink->suspend();
+    }
 
     s_running = false;
     espix_task_exited(&s_exit);
@@ -644,12 +794,13 @@ static esp_err_t play_common(const char *uri, bool wait)
      * The controller is not brought up here either: Bluetooth starts from
      * bluetoothctl, and a connected sink is a precondition for playing to it.
      */
-    if (!espix_bt_a2d_connected()) {
+    const espix_audio_sink_ops_t *const sink = espix_audio_sink_default();
+    if (sink == NULL || !sink->connected()) {
         if (!wait) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "no audio sink; not starting %s", uri);
             return ESP_ERR_INVALID_STATE;
         }
-        espix_klog(ESPIX_KLOG_INFO, TAG, "no sink yet; playback waits for A2DP");
+        espix_klog(ESPIX_KLOG_INFO, TAG, "no sink yet; playback waits for one");
     }
 
     static bool registered;
@@ -671,7 +822,9 @@ static esp_err_t play_common(const char *uri, bool wait)
 
     /* New stream: drop the last one's PCM and re-arm the sink's pre-roll, so
      * this one starts with a cushion instead of underrunning. */
-    espix_bt_audio_start();
+    if (sink != NULL) {
+        sink->start();
+    }
 
     /*
      * PSRAM first, internal as a fallback.

@@ -18,7 +18,6 @@ idf_component_register(
         "include"
     PRIV_REQUIRES
         espix_kernel
-        espix_bt
         esp_audio_codec
         micro-mp3
 )

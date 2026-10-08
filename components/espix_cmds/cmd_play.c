@@ -67,8 +67,8 @@ static int cmd_play(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t err = wait ? espix_audio_play_wait(uri) : espix_audio_play(uri);
     if (err == ESP_ERR_INVALID_STATE) {
-        espix_eprintf(s, "play: no audio sink: connect one first "
-                        "(bluetoothctl connect <addr>), or use --wait\n");
+        espix_eprintf(s, "play: no audio sink available "
+                        "(connect one, or use --wait)\n");
         return 1;
     }
     if (err != ESP_OK) {

@@ -48,23 +48,13 @@ esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN]);
 bool      espix_bt_a2d_connected(void);
 
 /*
- * PCM for the source to send: 44.1 kHz, stereo, signed 16-bit, as A2DP's SBC
- * encoder expects. `play` decodes into this; the stack pulls it on its own
- * callback. Short writes are the caller's to retry.
+ * Publish the A2DP source as an audio sink (components/espix_audio). Called
+ * once at boot; registration allocates nothing and does not put the stream on
+ * the air. The engine sees the sink as disconnected until an A2DP link is up.
+ *
+ * Returns ESP_ERR_NOT_SUPPORTED when the audio sink is not built.
  */
-/* Accepts as much PCM as the ring has room for and returns that count. The
- * caller must advance by it; a full ring is normal while the sink pulls. */
-size_t espix_bt_audio_write(const void *pcm, size_t len);
-
-/*
- * Begin a new stream: drop any PCM left from the last one and re-arm the
- * pre-roll, so the new stream starts with a cushion rather than underrunning.
- */
-void espix_bt_audio_start(void);
-
-/* Suspend the A2DP stream again: called when playback finishes, so an idle
- * connection stops encoding silence. */
-void espix_bt_audio_suspend(void);
+esp_err_t espix_bt_audio_sink_register(void);
 
 /*
  * SBC quality dial: 0 = mono, bitpool <= 35 (the measured-reliable point on this

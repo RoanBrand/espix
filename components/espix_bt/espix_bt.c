@@ -907,6 +907,25 @@ esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN])
     return err;
 }
 
+#if CONFIG_ESPIX_AUDIO_SINK_BT_A2DP
+
+#include "espix_audio_sink.h"
+
+/*
+ * The A2DP sink, published to the audio engine.
+ *
+ * Registration -- espix_bt_audio_sink_register(), called once at boot -- only
+ * points the engine here. Nothing is allocated and the stream is not on the air
+ * until "play" starts one; connected() is the gate, because registering does
+ * not mean a sink is attached.
+ */
+static espix_audio_format_t a2dp_format(void)
+{
+    /* The SBC source is 44.1 kHz, stereo, 16-bit, and its ring is stereo by
+     * contract: see the mono upmix in espix_audio.c. */
+    return (espix_audio_format_t){ .rate = 44100, .channels = 2, .bits = 16 };
+}
+
 /*
  * Returns the number of bytes the ring accepted, not an error code.
  *
@@ -917,7 +936,15 @@ esp_err_t espix_bt_remove(const uint8_t bda[ESPIX_BDA_LEN])
  * moment, then harsh noise. The caller must advance by exactly this count.
  * The short blocking timeout waits for space; the caller paces on it.
  */
-void espix_bt_audio_start(void)
+static size_t a2dp_write(const void *pcm, size_t len)
+{
+    if (!s_inited || s_pcm == NULL) {
+        return 0;
+    }
+    return xStreamBufferSend(s_pcm, pcm, len, pdMS_TO_TICKS(20));
+}
+
+static void a2dp_start(void)
 {
     s_prerolled = false;
     if (s_pcm != NULL) {
@@ -931,7 +958,7 @@ void espix_bt_audio_start(void)
     }
 }
 
-void espix_bt_audio_suspend(void)
+static void a2dp_suspend(void)
 {
     if (s_a2d_connected && s_streaming) {
         (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
@@ -939,13 +966,28 @@ void espix_bt_audio_suspend(void)
     }
 }
 
-size_t espix_bt_audio_write(const void *pcm, size_t len)
+static const espix_audio_sink_ops_t s_a2dp_sink = {
+    .name      = "a2dp",
+    .connected = espix_bt_a2d_connected,
+    .format    = a2dp_format,
+    .write     = a2dp_write,
+    .start     = a2dp_start,
+    .suspend   = a2dp_suspend,
+};
+
+esp_err_t espix_bt_audio_sink_register(void)
 {
-    if (!s_inited || s_pcm == NULL) {
-        return 0;
-    }
-    return xStreamBufferSend(s_pcm, pcm, len, pdMS_TO_TICKS(20));
+    return espix_audio_sink_register(&s_a2dp_sink);
 }
+
+#else  /* !CONFIG_ESPIX_AUDIO_SINK_BT_A2DP */
+
+esp_err_t espix_bt_audio_sink_register(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#endif /* CONFIG_ESPIX_AUDIO_SINK_BT_A2DP */
 
 esp_err_t espix_bt_set_pin(const char *pin)
 {
@@ -972,7 +1014,7 @@ esp_err_t espix_bt_pair(const uint8_t b[ESPIX_BDA_LEN])       { (void)b; return 
 esp_err_t espix_bt_connect(const uint8_t b[ESPIX_BDA_LEN])    { (void)b; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_disconnect(const uint8_t b[ESPIX_BDA_LEN]) { (void)b; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_remove(const uint8_t b[ESPIX_BDA_LEN])     { (void)b; return ESP_ERR_NOT_SUPPORTED; }
-size_t    espix_bt_audio_write(const void *p, size_t n)       { (void)p; (void)n; return 0; }
+esp_err_t espix_bt_audio_sink_register(void)  { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_set_pin(const char *p)     { (void)p; return ESP_ERR_NOT_SUPPORTED; }
 const char *espix_bt_pin(void)                { return ""; }
 
@@ -980,12 +1022,11 @@ const char *espix_bt_pin(void)                { return ""; }
  * The rest of the header, and it has to be all of it. This section is what a
  * target without Bluetooth links against, and a function declared there but
  * missing here fails the *link* rather than the call -- which is how an S3 build
- * broke on espix_bt_shutdown, espix_bt_audio_start and espix_bt_audio_suspend at
- * once: the last by the shutdown sequence, the first two by the audio engine,
- * which an S3 build should not have had either.
+ * once broke on espix_bt_shutdown and the two A2DP stream calls at once. Only
+ * the sink registration is left of those: the engine no longer names espix_bt,
+ * so a build with audio and no Bluetooth links the audio system and no
+ * Bluetooth, and this stub is for a caller that names it anyway.
  */
-void      espix_bt_audio_start(void)          { }
-void      espix_bt_audio_suspend(void)        { }
 void      espix_bt_set_sbc_quality(int q)     { (void)q; }
 int       espix_bt_sbc_quality(void)          { return 0; }
 esp_err_t espix_bt_set_volume(uint8_t v)      { (void)v; return ESP_ERR_NOT_SUPPORTED; }

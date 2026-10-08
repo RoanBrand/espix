@@ -1,17 +1,225 @@
 menu "espix audio"
 
     config ESPIX_AUDIO
-        bool "Audio playback (play)"
-        depends on ESPIX_BT
+        bool "Audio system"
         default y
         help
-            The play command: esp_audio_simple_dec reads a URI -- a local file
-            or an HTTP(S) stream -- decodes it, and hands PCM to the A2DP
-            source. On by default where Bluetooth is, and it cannot be anywhere
-            else: the engine decodes straight into the A2DP ring, so without
-            Bluedroid Classic there is no sink to decode into. The dependency is
-            what keeps an S3 -- BLE only -- from linking a decoder it can never
-            use, and a stale CONFIG_ESPIX_AUDIO=y in an S3 sdkconfig from
-            compiling it anyway.
+            The audio engine and the "play" command: a URI or a file is
+            decoded and its PCM is fed to a registered sink.
+
+            Independent of Bluetooth on purpose. A sink is registered by
+            whatever provides it (A2DP today, an I2S codec or the RF
+            transmitters next), and a build with no sink still compiles and
+            links -- "play" reports that none is available. This is what lets
+            an S3 build carry audio without the Bluetooth stack.
+
+    config ESPIX_AUDIO_SINK_BT_A2DP
+        bool "Bluetooth A2DP sink"
+        depends on ESPIX_AUDIO && ESPIX_BT
+        default y
+        help
+            The A2DP source, published to the engine as the "a2dp" sink. It
+            needs a Bluetooth host that supports Classic (Bluedroid), so it is
+            off wherever ESPIX_BT is; the engine itself is not.
+
+    config ESPIX_AUDIO_NULL_SINK
+        bool "Null sink (benchmark; discards PCM)"
+        depends on ESPIX_AUDIO
+        default n
+        help
+            A sink that accepts PCM as fast as it is produced and throws it
+            away. It exists to measure the source and decoder with no
+            Bluetooth, no I2S and no radio in the picture: build with
+            ESPIX_AUDIO_SINK_BT_A2DP off and this is the default sink. Not for
+            a release -- "play" finishes as fast as the decoder can run, and
+            only the telemetry is meaningful.
+
+    config ESPIX_AUDIO_IO_PSRAM
+        bool "Reader and decoder chunk buffers from PSRAM"
+        depends on ESPIX_AUDIO
+        default y
+        help
+            Allocate the source read buffer, the decoder output buffer and the
+            mono upmix scratch from PSRAM instead of internal RAM. They are
+            streamed rather than walked at random, and measured on the S31 with
+            an A2DP link up they are *faster* there: freeing the ~14 kB let the
+            codec's random-access state stay internal, and the decode went from
+            ~0.6x realtime (spilling) to ~11% of a core with the ring full.
+            Internal first is the fallback when PSRAM refuses.
+
+    config ESPIX_AUDIO_CODEC_PSRAM
+        bool "Allocate the codec's working memory from PSRAM first"
+        depends on ESPIX_AUDIO
+        default n
+        help
+            The MP3 decoder's state is random-access, so on the S31 -- whose
+            codec library has no DSP path -- internal RAM is load-bearing: with
+            the state in PSRAM the decode measured ~1200 ms per second of audio
+            against 161 ms with it internal. The S3's codec uses its LX7
+            DSP/MAC instructions, which is why it is fast there, so PSRAM may
+            be affordable and gives the internal pool back. Set it where it has
+            been measured; the default is the S31 behaviour everywhere.
+
+    menu "Codecs"
+
+        # What "play" can decode. Each option selects the esp_audio_codec
+        # symbol beneath it, so this menu is the interface and the component's
+        # own "Audio Codec Configuration" menu is the escape hatch. The
+        # underlying symbols default to y in that component, so every one is
+        # set off in sdkconfig.defaults -- otherwise an unselected format links
+        # anyway. Re-enabling a format here is what turns it back on.
+
+        menu "Decoders"
+
+            config ESPIX_AUDIO_DEC_MP3
+                bool "MP3"
+                default y
+                select AUDIO_DECODER_MP3_SUPPORT
+                help
+                    The format "play" is built around, and the only one with a
+                    measured decode budget (S31 ~16% of a core, ring full).
+
+            config ESPIX_AUDIO_DEC_WAV
+                bool "WAV"
+                default y
+                select AUDIO_SIMPLE_DEC_WAV_SUPPORT
+                help
+                    The WAV container, read straight through. No PCM decoder
+                    element is needed for it.
+
+            config ESPIX_AUDIO_DEC_AAC
+                bool "AAC / M4A (MP4 container)"
+                select AUDIO_DECODER_AAC_SUPPORT
+                select AUDIO_SIMPLE_DEC_M4A_SUPPORT
+                help
+                    The second-most-common lossy format, and what most radio
+                    streams use. ~120 KiB of image when on.
+
+            config ESPIX_AUDIO_DEC_FLAC
+                bool "FLAC"
+                select AUDIO_DECODER_FLAC_SUPPORT
+                help
+                    Lossless, and the cheapest of the extras at ~37 KiB.
+
+            config ESPIX_AUDIO_DEC_OPUS
+                bool "Opus (OGG container)"
+                select AUDIO_DECODER_OPUS_SUPPORT
+                select AUDIO_SIMPLE_DEC_OGG_SUPPORT
+                help
+                    Modern streaming and WebRTC. On the S31 this is one of the
+                    two formats the assembly codec library actually has a PIE
+                    path for (LC3 is the other), so it is worth revisiting
+                    ESP_AUDIO_CODEC_S31_USE_ASM if this is enabled.
+
+            config ESPIX_AUDIO_DEC_VORBIS
+                bool "Vorbis (OGG container)"
+                select AUDIO_DECODER_VORBIS_SUPPORT
+                select AUDIO_SIMPLE_DEC_OGG_SUPPORT
+                help
+                    The other OGG radio codec.
+
+            config ESPIX_AUDIO_DEC_TS
+                bool "TS (transport stream, HLS)"
+                select AUDIO_SIMPLE_DEC_TS_SUPPORT
+
+            config ESPIX_AUDIO_DEC_SBC
+                bool "SBC (A2DP sink)"
+                select AUDIO_DECODER_SBC_SUPPORT
+                help
+                    For receiving audio from a phone (A2DP sink), which espix
+                    does not implement yet. A2DP *source* uses Bluedroid's own
+                    SBC encoder and needs nothing from this menu.
+
+            config ESPIX_AUDIO_DEC_LC3
+                bool "LC3 (LE Audio)"
+                select AUDIO_DECODER_LC3_SUPPORT
+                help
+                    LE Audio, phase 3. The other format with an S31 PIE path.
+
+            config ESPIX_AUDIO_DEC_G711
+                bool "G.711"
+                select AUDIO_DECODER_G711_SUPPORT
+
+            config ESPIX_AUDIO_DEC_G722
+                bool "G.722"
+                select AUDIO_DECODER_G722_SUPPORT
+
+            config ESPIX_AUDIO_DEC_AMRNB
+                bool "AMR-NB"
+                select AUDIO_DECODER_AMRNB_SUPPORT
+
+            config ESPIX_AUDIO_DEC_AMRWB
+                bool "AMR-WB"
+                select AUDIO_DECODER_AMRWB_SUPPORT
+
+            config ESPIX_AUDIO_DEC_ADPCM
+                bool "IMA-ADPCM"
+                select AUDIO_DECODER_ADPCM_SUPPORT
+
+            config ESPIX_AUDIO_DEC_ALAC
+                bool "ALAC"
+                select AUDIO_DECODER_ALAC_SUPPORT
+
+            config ESPIX_AUDIO_DEC_PCM
+                bool "PCM"
+                select AUDIO_DECODER_PCM_SUPPORT
+
+        endmenu
+
+        menu "Encoders"
+
+            # Nothing in espix encodes today. The A2DP source uses Bluedroid's
+            # own SBC encoder (BT_A2DP_USE_EXTERNAL_CODEC is off), and the file
+            # and network sources only read. An encoder is needed only when
+            # espix becomes the source of compressed audio -- an Icecast
+            # broadcaster, or an LE Audio source -- so these all default off.
+
+            config ESPIX_AUDIO_ENC_AAC
+                bool "AAC"
+                select AUDIO_ENCODER_AAC_SUPPORT
+
+            config ESPIX_AUDIO_ENC_OPUS
+                bool "Opus"
+                select AUDIO_ENCODER_OPUS_SUPPORT
+
+            config ESPIX_AUDIO_ENC_SBC
+                bool "SBC"
+                select AUDIO_ENCODER_SBC_SUPPORT
+
+            config ESPIX_AUDIO_ENC_LC3
+                bool "LC3"
+                select AUDIO_ENCODER_LC3_SUPPORT
+
+            config ESPIX_AUDIO_ENC_G711
+                bool "G.711"
+                select AUDIO_ENCODER_G711_SUPPORT
+
+            config ESPIX_AUDIO_ENC_G722
+                bool "G.722"
+                select AUDIO_ENCODER_G722_SUPPORT
+
+            config ESPIX_AUDIO_ENC_AMRNB
+                bool "AMR-NB"
+                select AUDIO_ENCODER_AMRNB_SUPPORT
+
+            config ESPIX_AUDIO_ENC_AMRWB
+                bool "AMR-WB"
+                select AUDIO_ENCODER_AMRWB_SUPPORT
+
+            config ESPIX_AUDIO_ENC_ADPCM
+                bool "IMA-ADPCM"
+                select AUDIO_ENCODER_ADPCM_SUPPORT
+
+            config ESPIX_AUDIO_ENC_ALAC
+                bool "ALAC"
+                select AUDIO_ENCODER_ALAC_SUPPORT
+
+            config ESPIX_AUDIO_ENC_PCM
+                bool "PCM"
+                select AUDIO_ENCODER_PCM_SUPPORT
+
+        endmenu
+
+    endmenu
 
 endmenu
