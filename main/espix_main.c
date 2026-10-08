@@ -32,6 +32,9 @@
 #include "espix_audio.h"
 #include "espix_auth.h"
 #include "espix_bt.h"
+#if CONFIG_ESPIX_I2S
+#include "espix_i2s.h"
+#endif
 #include "espix_cmds.h"
 #include "espix_display.h"
 #include "espix_fault.h"
@@ -251,6 +254,15 @@ void app_main(void)
      * real one is default and this has to be selected.
      */
     (void)espix_audio_null_sink_register();
+#endif
+
+#if CONFIG_ESPIX_I2S
+    /*
+     * The board's own codec. Registered after the A2DP sink, but the engine
+     * prefers a connected sink, so this is what plays when no link is up --
+     * and the only sink at all with Bluetooth off.
+     */
+    (void)espix_i2s_sink_register();
 #endif
 
     /*

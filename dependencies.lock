@@ -81,6 +81,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.4.3
+  espressif/esp_codec_dev:
+    component_hash: 4779f31a3ba3f9b38aee1afe6ccb9ba8f6108dc3a6e77d39d7d714e9a215371b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.6.2
   espressif/esp_ext_part_tables:
     component_hash: f8e8d86b2a883a6490b579d89e4114c9f05bbc101fed6e41e48941c1adaf25d3
     dependencies:
@@ -263,6 +273,7 @@ direct_dependencies:
 - espressif/elf_loader
 - espressif/esp_asrc
 - espressif/esp_audio_codec
+- espressif/esp_codec_dev
 - espressif/esp_ext_part_tables
 - espressif/esp_linenoise
 - espressif/esp_sysview
@@ -275,6 +286,6 @@ direct_dependencies:
 - fugo101/wireguard_lwip
 - idf
 - joltwallet/littlefs
-manifest_hash: a19d6f18b07b2d07f54736310c5eb0723a1319fe9b9e019b4fcc8709ce21cc4a
+manifest_hash: 4188ae52d733b0afc2b8a54c45cc457da03f6cb667a82a7c2e48e61df1808f04
 target: esp32s31
 version: 3.0.0

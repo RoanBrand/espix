@@ -71,6 +71,17 @@ esp_err_t espix_audio_sink_register(const espix_audio_sink_ops_t *ops)
 
 const espix_audio_sink_ops_t *espix_audio_sink_default(void)
 {
+    /*
+     * The first *connected* sink, not simply the first registered. The A2DP
+     * sink exists from boot but only reports connected once a link is up, and
+     * a local codec is always there -- so a board with both plays to Bluetooth
+     * when it is linked and to the speaker when it is not, with no selection.
+     */
+    for (size_t i = 0; i < s_sink_count; i++) {
+        if (s_sinks[i]->connected == NULL || s_sinks[i]->connected()) {
+            return s_sinks[i];
+        }
+    }
     return s_sink_count > 0 ? s_sinks[0] : NULL;
 }
 

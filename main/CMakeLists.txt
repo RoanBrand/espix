@@ -24,6 +24,11 @@ if(CONFIG_ESP_TRACE_LIB_EXTERNAL)
     list(APPEND espix_main_requires esp_trace)
 endif()
 
+# The board's own codec component is required unconditionally, so its header is
+# always reachable. espix_i2s registers real source, and pulls esp_codec_dev and
+# the I2S driver, only when its Kconfig is on.
+list(APPEND espix_main_requires espix_i2s)
+
 idf_component_register(
     SRCS
         "espix_main.c"

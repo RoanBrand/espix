@@ -52,6 +52,10 @@ CONFIG_ESPIX_ETH_ENABLED=y
 #
 CONFIG_ESPIX_BT=y
 
+# The board's ES8311: a speaker that needs no Bluetooth. Pins are the S31
+# function coreboard's, from the board manager's config.
+CONFIG_ESPIX_I2S=y
+
 # NB: CONFIG_ESP_SYSTEM_USE_FRAME_POINTER would make watchdog dumps readable,
 # but it adds ~152 KB of code -- enough to overflow the 3.5 MB kernel slot. Not
 # on this part; the coredump backtrace is the tool for real faults.

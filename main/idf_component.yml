@@ -109,6 +109,11 @@ dependencies:
   # so this is not the GMF pipeline coming back.
   espressif/esp_asrc: "^1.1.0"
 
+  # The I2S codec devices (ES8311 on the S31 coreboard) behind the I2S sink and
+  # source. This is the codec-level library, not ADF: it owns the register
+  # sequencing and the data interface, and nothing above it.
+  espressif/esp_codec_dev: "^1.6.2"
+
   # MP3 decoding, used directly by espix_audio's engine.
   #
   # The same OpenCore/Helix fixed-point decoder esp_audio_codec ships, but built

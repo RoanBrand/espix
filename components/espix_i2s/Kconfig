@@ -1,0 +1,50 @@
+menu "espix i2s"
+
+    config ESPIX_I2S
+        bool "I2S codec sink (ES8311)"
+        default n
+        help
+            The ES8311 on the S31 function coreboard, over I2S and I2C, with the
+            NS4150B PA. Registers an "es8311" sink at boot, which gives the board
+            a speaker that does not need Bluetooth -- and, because the engine
+            prefers a connected sink, the speaker is used whenever no A2DP link
+            is up. The codec is opened lazily on the first stream.
+
+    if ESPIX_I2S
+
+    config ESPIX_I2S_I2C_PORT
+        int "I2C port"
+        default 0
+    config ESPIX_I2S_I2C_SDA
+        int "I2C SDA GPIO"
+        default 51
+    config ESPIX_I2S_I2C_SCL
+        int "I2C SCL GPIO"
+        default 50
+
+    config ESPIX_I2S_MCLK
+        int "I2S MCLK GPIO"
+        default 52
+    config ESPIX_I2S_BCLK
+        int "I2S BCLK GPIO"
+        default 53
+    config ESPIX_I2S_WS
+        int "I2S WS GPIO"
+        default 55
+    config ESPIX_I2S_DOUT
+        int "I2S DOUT GPIO (ESP -> codec)"
+        default 56
+    config ESPIX_I2S_DIN
+        int "I2S DIN GPIO (codec -> ESP)"
+        default 54
+    config ESPIX_I2S_PA
+        int "PA enable GPIO (active high)"
+        default 57
+
+    config ESPIX_I2S_DEFAULT_VOL
+        int "Startup output volume (0-100)"
+        default 70
+
+    endif
+
+endmenu

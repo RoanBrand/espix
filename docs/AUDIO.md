@@ -47,17 +47,21 @@ A small audio server, not an ALSA/PipeWire port. The parts that matter:
 
 - **Sinks and sources are registered**, not compiled in. The engine knows only
   `espix_audio_sink_ops_t` (`components/espix_audio/include/espix_audio_sink.h`):
-  a name, a format, and write/start/suspend. The A2DP source is one sink; an
-  I2S codec or the RF transmitters are next. The dependency points provider ->
-  engine, so **audio does not depend on Bluetooth**: a target with no sink
-  still builds and links, and `play` says none is available.
+  a name, a format, and write/start/suspend. The A2DP source and the S31's
+  ES8311 (`espix_i2s`) are the sinks today; the RF transmitters are next. The
+  dependency points provider -> engine, so **audio does not depend on
+  Bluetooth**: a target with no sink still builds and links, and `play` says
+  none is available. `play` uses the first *connected* sink, so the board plays
+  to Bluetooth when a link is up and to its own speaker when it is not, with no
+  selector.
 - **Streams** carry PCM to a sink; volume, mixing and routing are the next layer.
 - **App interface:** a native `espix_audio` API and app ABI, plus optionally
   an OSS-style `/dev/dsp`.
 
-### Phase 1 (built now): Bluetooth speaker playback
+### Phase 1 (built now): Bluetooth and local speaker playback
 
-S31 only, with a connected A2DP sink:
+S31 only. With a connected A2DP sink, or the board's own ES8311 when nothing is
+linked:
 
     play <file|url>
     play --wait <file|url>
@@ -117,7 +121,8 @@ stereo WAV, and no more.
 - Resampling: negotiate the sink's rate first, then the hardware ASRC.
 - A PCM gain and per-sink volume; per-app streams and mixing.
 - The `espix_audio` app ABI, and `/dev/dsp`.
-- I2S sink and source (`esp_codec_dev`), as named sinks/sources.
+- I2S **source** (the ES8311's ADC and the on-board mic). The sink half --
+  `espix_i2s`, the ES8311 DAC and NS4150B PA -- is built and audible.
 - Network roles: HTTP/Icecast source, UPnP/DLNA, Snapcast, AirPlay, MPD.
 - LE Audio on S31 (phase 3).
 
