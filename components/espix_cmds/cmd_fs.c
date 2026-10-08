@@ -21,6 +21,15 @@
 
 #define COPY_CHUNK 512
 
+/*
+ * cp's own chunk, and a large one. Each write is then one or more whole FAT
+ * clusters instead of a sector, which is where the throughput comes from: the
+ * same copy at COPY_CHUNK's 512 bytes pays the VFS, FatFs and USB per-call
+ * costs once per 512 bytes. It is on the heap because 32 kB does not belong on
+ * a task stack; the COPY_CHUNK users below keep their small stack arrays.
+ */
+#define CP_CHUNK (32 * 1024)
+
 static int cmd_pwd(espix_session_t *s, int argc, char **argv)
 {
     (void)argc;
@@ -841,11 +850,18 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    char   chunk[COPY_CHUNK];
+    char  *chunk = malloc(CP_CHUNK);
     size_t n;
     int    status = 0;
 
-    while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0) {
+    if (chunk == NULL) {
+        espix_eprintf(s, "cp: no memory\n");
+        fclose(in);
+        fclose(out);
+        return 1;
+    }
+
+    while ((n = fread(chunk, 1, CP_CHUNK, in)) > 0) {
         if (fwrite(chunk, 1, n, out) != n) {
             espix_eprintf(s, "cp: %s: write failed: %s\n", dst, strerror(errno));
             status = 1;
@@ -853,6 +869,7 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
         }
     }
 
+    free(chunk);
     fclose(in);
 
     /*

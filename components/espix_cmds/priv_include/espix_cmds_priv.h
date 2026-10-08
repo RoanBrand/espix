@@ -27,6 +27,7 @@ void espix_cmds_register_ota(void);
 void espix_cmds_register_hash(void);
 void espix_cmds_register_bt(void);
 void espix_cmds_register_play(void);
+void espix_cmds_register_record(void);
 void espix_cmds_register_display(void);
 void espix_cmds_register_text(void);
 

@@ -58,7 +58,7 @@ A small audio server, not an ALSA/PipeWire port. The parts that matter:
 - **App interface:** a native `espix_audio` API and app ABI, plus optionally
   an OSS-style `/dev/dsp`.
 
-### Phase 1 (built now): Bluetooth and local speaker playback
+### Phase 1 (built now): playback and capture
 
 S31 only. With a connected A2DP sink, or the board's own ES8311 when nothing is
 linked:
@@ -100,6 +100,21 @@ Negotiating the sink's rate for a matching source (so no conversion happens at
 all) is still worth doing and is the cheaper path when the source is known
 before the link is opened.
 
+**Capture is `record`.** The same ES8311, the other direction:
+
+    record <file.wav> [seconds]
+
+It drives the registered source (the ES8311's ADC, the on-board microphone) and
+writes a 16-bit PCM WAV. Capture and the disk are decoupled by a ring in PSRAM
+and a writer task, and that is the difference between capturing and dropping:
+the I2S has no backpressure, so a write that stalls -- the first ones, while the
+FAT and directory are built, are the worst, and one measured 336 ms against a
+21 ms average -- would otherwise cost samples. Measured on an old USB stick: a
+serial read/write loop lost ~2.5% of a 20 s take, all at the start; with the
+ring it captures the full 20 s with no ring stalls. The capture *level* is the
+source's: the PGA is already at its 42 dB maximum, so a quiet, distant input
+stays quiet.
+
 **Reading:** `open()`/`read()` into a PSRAM chunk, not stdio. littlefs/FAT
 through newlib's 1 kB `BUFSIZ` tops out near 180 kB/s -- exactly a 44.1 kHz
 stereo WAV, and no more.
@@ -121,8 +136,8 @@ stereo WAV, and no more.
 - Resampling: negotiate the sink's rate first, then the hardware ASRC.
 - A PCM gain and per-sink volume; per-app streams and mixing.
 - The `espix_audio` app ABI, and `/dev/dsp`.
-- I2S **source** (the ES8311's ADC and the on-board mic). The sink half --
-  `espix_i2s`, the ES8311 DAC and NS4150B PA -- is built and audible.
+- I2S **source**: built. `espix_i2s` provides the ES8311's ADC, `record` drives
+  it, and the on-board microphone works; a source registry mirrors the sink one.
 - Network roles: HTTP/Icecast source, UPnP/DLNA, Snapcast, AirPlay, MPD.
 - LE Audio on S31 (phase 3).
 

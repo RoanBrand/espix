@@ -263,6 +263,7 @@ void app_main(void)
      * and the only sink at all with Bluetooth off.
      */
     (void)espix_i2s_sink_register();
+    (void)espix_i2s_source_register();
 #endif
 
     /*

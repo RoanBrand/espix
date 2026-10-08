@@ -45,6 +45,15 @@ menu "espix i2s"
         int "Startup output volume (0-100)"
         default 70
 
+    config ESPIX_I2S_INPUT_GAIN_DB
+        int "Microphone gain (dB)"
+        range 0 42
+        default 42
+        help
+            The ES8311 ADC's programmable gain, in 6 dB steps. The on-board
+            electret is quiet, so the maximum is the default; lower it if a
+            capture clips.
+
     endif
 
 endmenu

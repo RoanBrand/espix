@@ -18,6 +18,7 @@ idf_component_register(
         "cmd_text.c"
         "cmd_bt.c"
         "cmd_play.c"
+        "cmd_record.c"
         "cmd_display.c"
         "cmd_svc.c"
     INCLUDE_DIRS

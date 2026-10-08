@@ -14,6 +14,10 @@ extern "C" {
  * sink registry is full. The codec itself is opened on the first stream. */
 esp_err_t espix_i2s_sink_register(void);
 
+/* Publish the "es8311" source (the on-board microphone). Idempotent; the codec
+ * is opened on the first capture. */
+esp_err_t espix_i2s_source_register(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -31,6 +31,7 @@
 #include "espix_task.h"
 #include "espix_audio.h"
 #include "espix_audio_sink.h"
+#include "espix_audio_source.h"
 
 #define TAG "audio"
 
@@ -83,6 +84,48 @@ const espix_audio_sink_ops_t *espix_audio_sink_default(void)
         }
     }
     return s_sink_count > 0 ? s_sinks[0] : NULL;
+}
+
+/*
+ * The source registry, the mirror of the sink one and for the same reason: a
+ * recorder drives whatever is registered, and the providers are components that
+ * depend on this one, never the other way round.
+ */
+#define ESPIX_AUDIO_SOURCES_MAX 2
+
+static const espix_audio_source_ops_t *s_sources[ESPIX_AUDIO_SOURCES_MAX];
+static size_t                          s_source_count;
+
+esp_err_t espix_audio_source_register(const espix_audio_source_ops_t *ops)
+{
+    if (ops == NULL || ops->name == NULL || ops->read == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < s_source_count; i++) {
+        if (s_sources[i] == ops || strcmp(s_sources[i]->name, ops->name) == 0) {
+            return ESP_OK;          /* already published; idempotent */
+        }
+    }
+
+    if (s_source_count >= ESPIX_AUDIO_SOURCES_MAX) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "no room for source '%s'", ops->name);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_sources[s_source_count++] = ops;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "source '%s' registered", ops->name);
+    return ESP_OK;
+}
+
+const espix_audio_source_ops_t *espix_audio_source_default(void)
+{
+    for (size_t i = 0; i < s_source_count; i++) {
+        if (s_sources[i]->connected == NULL || s_sources[i]->connected()) {
+            return s_sources[i];
+        }
+    }
+    return s_source_count > 0 ? s_sources[0] : NULL;
 }
 
 #if CONFIG_ESPIX_AUDIO_NULL_SINK
