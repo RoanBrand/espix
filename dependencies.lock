@@ -49,6 +49,17 @@ dependencies:
     - esp32c61
     - esp32p4
     version: 1.3.3
+  espressif/esp_asrc:
+    component_hash: 20da57976f191b60399b6c2ea46e33c121e08ad03c11e269f690c80e7eb7f7b5
+    dependencies:
+    - name: espressif/esp_audio_effects
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~1.4
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.0
   espressif/esp_audio_codec:
     component_hash: a5b9275af74247e3ce536d16a7080e4d77207a185b63e1bea368eb4d57176c2b
     dependencies:
@@ -59,6 +70,17 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 2.6.2
+  espressif/esp_audio_effects:
+    component_hash: a7f3625a9a49849afe5c98a9469da58ec3176c8901c908086cb4d8d7886e54e1
+    dependencies:
+    - name: espressif/gmf_fft
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~1.1
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.4.3
   espressif/esp_ext_part_tables:
     component_hash: f8e8d86b2a883a6490b579d89e4114c9f05bbc101fed6e41e48941c1adaf25d3
     dependencies:
@@ -106,6 +128,13 @@ dependencies:
     - esp32h4
     - esp32s31
     version: 2.2.1
+  espressif/gmf_fft:
+    component_hash: de42f5953b90989ca6588bacd69b0908c7265f4f1eaea8b1d3f163e705661bd4
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.1.0
   espressif/mdns:
     component_hash: b5b30022c46302eab89c1d2e3b6fb5918a627563a7462f0ee284b22b9a934967
     dependencies:
@@ -232,6 +261,7 @@ direct_dependencies:
 - esp_lwext4
 - esphome/micro-mp3
 - espressif/elf_loader
+- espressif/esp_asrc
 - espressif/esp_audio_codec
 - espressif/esp_ext_part_tables
 - espressif/esp_linenoise
@@ -245,6 +275,6 @@ direct_dependencies:
 - fugo101/wireguard_lwip
 - idf
 - joltwallet/littlefs
-manifest_hash: 2f6c5386a549c59fcf9796b6c42c31026a815aa4cbdacb89e0c7442f12fec42a
+manifest_hash: a19d6f18b07b2d07f54736310c5eb0723a1319fe9b9e019b4fcc8709ce21cc4a
 target: esp32s31
 version: 3.0.0

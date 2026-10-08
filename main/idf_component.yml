@@ -102,6 +102,13 @@ dependencies:
   # pinned us to, predates both.
   espressif/esp_audio_codec: "^2.6.2"
 
+  # The sample-rate/channel converter. The engine has no resampler of its own:
+  # when a source does not match the sink's rate, the decoded frame goes
+  # through esp_asrc, which is the S31's hardware ASRC and an optimized
+  # software path where there is none. It depends only on esp_audio_effects,
+  # so this is not the GMF pipeline coming back.
+  espressif/esp_asrc: "^1.1.0"
+
   # MP3 decoding, used directly by espix_audio's engine.
   #
   # The same OpenCore/Helix fixed-point decoder esp_audio_codec ships, but built

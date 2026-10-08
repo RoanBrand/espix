@@ -83,13 +83,18 @@ heap's largest block at ~3 kB, the codec spilled to PSRAM, and playback ran at
 ~0.6x realtime; with them in PSRAM the decoder is ~11% of a core and the ring
 stays full. See `ESPIX_AUDIO_IO_PSRAM` and `ESPIX_AUDIO_CODEC_PSRAM`.
 
-**Resampling: none yet.** The engine converts neither rate nor channels, so a
-source must match the rate the sink negotiated. A 48 kHz file into a 44.1 kHz
-SBC stream plays at the wrong speed, and sounding wrong is its only symptom.
-The order should be: (1) if the sink advertises the source's rate, ask for it
-in the preferred codec config and pass the PCM through untouched; (2) only if
-it does not, convert -- with the S31's hardware ASRC (`esp_asrc`) rather than
-a software converter. SBC sinks generally advertise 48 kHz as well as 44.1.
+**Resampling is `esp_asrc`.** When a source's rate differs from the sink's, the
+decoded frame goes through esp_asrc -- the S31's hardware ASRC, and an
+optimized software path where there is none -- before the sink sees it. It
+depends only on `esp_audio_effects`, so this is not the GMF pipeline returning.
+A channel-only difference (mono into a stereo sink) stays the engine's own
+duplication, which is cheaper than the ASRC's channel matrix, and a source
+already at the sink's rate never opens it. Measured: a 48 kHz WAV into the
+44.1 kHz Q45 link resamples at realtime, with the ASRC cost in the noise.
+
+Negotiating the sink's rate for a matching source (so no conversion happens at
+all) is still worth doing and is the cheaper path when the source is known
+before the link is opened.
 
 **Reading:** `open()`/`read()` into a PSRAM chunk, not stdio. littlefs/FAT
 through newlib's 1 kB `BUFSIZ` tops out near 180 kB/s -- exactly a 44.1 kHz
@@ -102,7 +107,6 @@ stereo WAV, and no more.
   controller asserts (`r_co_assert_info`) and the `btdm` task faults. Same
   family as the recorded `opcode:54` interop trouble, and upstream. The
   soundcore Q45 connects and streams.
-- **No resampling**, so a source at the sink's rate is required.
 - **littlefs read throughput** (~176 kB/s) -- too slow for raw PCM; the USB
   path is no better.
 - **PSRAM is not in a core dump**, which matters because the BT/Wi-Fi `.bss`

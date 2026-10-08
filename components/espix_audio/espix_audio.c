@@ -22,6 +22,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
+#include "esp_asrc.h"
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
@@ -513,6 +514,91 @@ static uint8_t *audio_buf_alloc(const char *name, size_t len, bool *from_psram)
     return p;
 }
 
+/*
+ * Sample-rate conversion, for when a source does not match the sink's rate.
+ *
+ * The engine has no resampler of its own; this is esp_asrc, which is the S31's
+ * hardware ASRC and an optimized software path where there is none. It can
+ * convert channels too, but the engine's own mono duplication already covers
+ * the channel-only case, so this opens only when the rate differs.
+ *
+ * The decoded frame is copied into the ASRC's own input buffer because the
+ * hardware path asks for cache-line alignment and the codec's decode target is
+ * not required to meet it. One audio task runs at a time, so this is file
+ * scope rather than passed around.
+ */
+typedef struct {
+    esp_asrc_handle_t handle;
+    uint8_t  *in;
+    uint8_t  *out;
+    uint32_t  in_size;
+    uint32_t  out_size;
+    uint32_t  out_max_samples;
+    uint16_t  in_frame_bytes;
+    uint16_t  out_frame_bytes;
+} audio_asrc_t;
+
+static audio_asrc_t s_asrc;
+
+static void asrc_close(audio_asrc_t *a)
+{
+    if (a->handle != NULL) {
+        esp_asrc_close(a->handle);
+        a->handle = NULL;
+    }
+    heap_caps_free(a->in);
+    heap_caps_free(a->out);
+    a->in = a->out = NULL;
+}
+
+static bool asrc_open(audio_asrc_t *a, const esp_asrc_aud_info_t *src,
+                      const esp_asrc_aud_info_t *dst, size_t in_bytes_max)
+{
+    audio_asrc_t fresh = { 0 };
+    esp_asrc_buffer_alignment_t al = { 0 };
+    esp_asrc_cfg_t cfg = {
+        .src_info   = *src,
+        .dest_info  = *dst,
+        .perf_type  = ESP_ASRC_PERF_TYPE_AUTO,
+        .complexity = 3,
+        .timeout_ms = -1,
+    };
+
+    if (esp_asrc_open(&cfg, &fresh.handle) != ESP_ASRC_ERR_OK) {
+        return false;
+    }
+    esp_asrc_get_bytes_per_sample(fresh.handle, &fresh.in_frame_bytes,
+                                  &fresh.out_frame_bytes);
+    if (fresh.in_frame_bytes == 0 || fresh.out_frame_bytes == 0) {
+        asrc_close(&fresh);
+        return false;
+    }
+
+    /*
+     * Output for one input chunk: the input's sample count times the rate
+     * ratio, plus margin for the ASRC's fractional residual. A non-integer
+     * ratio gives a slightly varying count per call, and the actual one comes
+     * back from esp_asrc_process.
+     */
+    const uint64_t in_samples  = in_bytes_max / fresh.in_frame_bytes;
+    const uint64_t out_samples = (in_samples * dst->sample_rate) / src->sample_rate + 64;
+    const uint32_t out_bytes   = (uint32_t)out_samples * fresh.out_frame_bytes;
+
+    esp_asrc_get_buffer_alignment(&al);
+    fresh.in  = esp_asrc_align_alloc(in_bytes_max, al.inbuf_addr_align,
+                                     al.inbuf_size_align, &fresh.in_size);
+    fresh.out = esp_asrc_align_alloc(out_bytes, al.outbuf_addr_align,
+                                     al.outbuf_size_align, &fresh.out_size);
+    if (fresh.in == NULL || fresh.out == NULL) {
+        asrc_close(&fresh);
+        return false;
+    }
+    fresh.out_max_samples = fresh.out_size / fresh.out_frame_bytes;
+
+    *a = fresh;
+    return true;
+}
+
 static void audio_task(void *arg)
 {
     const char *uri = (const char *)arg;
@@ -611,6 +697,8 @@ static void audio_task(void *arg)
      * separately and reported once a second; guessing from watchdog symbols
      * has not worked. */
     uint32_t t_read = 0, t_dec = 0, t_feed = 0, produce = 0;
+    unsigned src_rate = 0;
+    bool     asrc_tried = false;
     int64_t  mark = esp_timer_get_time();
 
     while (!s_stop) {
@@ -654,19 +742,62 @@ static void audio_task(void *arg)
                                    (unsigned)info.sample_rate, (unsigned)info.channel,
                                    (unsigned)info.bits_per_sample);
                         src_channels = info.channel;
+                        src_rate     = info.sample_rate;
                     }
                     info_logged = true;
                 }
-                /*
-                 * A mono source into a stereo sink is duplicated, not passed
-                 * through: the sink's data callback reads two bytes per sample,
-                 * so a mono stream drains its ring at twice the rate and
-                 * underruns. The sink names the width it wants.
-                 */
                 const espix_audio_sink_ops_t *const sink = espix_audio_sink_default();
-                const unsigned out_ch = sink != NULL ? sink->format().channels : 2u;
+                const espix_audio_format_t sf = sink != NULL ? sink->format()
+                                                             : (espix_audio_format_t){ 44100, 2, 16 };
+
+                /*
+                 * Open the rate converter once, on the first frame whose format
+                 * is known. A source already at the sink's rate never opens it,
+                 * and one that cannot open plays as-is rather than failing.
+                 */
+                if (!asrc_tried && src_rate != 0) {
+                    asrc_tried = true;
+                    if (src_rate != sf.rate) {
+                        const esp_asrc_aud_info_t si = {
+                            .sample_rate     = src_rate,
+                            .channel         = src_channels,
+                            .bits_per_sample = 16,
+                        };
+                        const esp_asrc_aud_info_t di = {
+                            .sample_rate     = sf.rate,
+                            .channel         = sf.channels,
+                            .bits_per_sample = 16,
+                        };
+                        if (asrc_open(&s_asrc, &si, &di, OUT_CHUNK)) {
+                            espix_klog(ESPIX_KLOG_INFO, TAG,
+                                       "resampling %u -> %u Hz, %u -> %u ch",
+                                       (unsigned)src_rate, (unsigned)sf.rate,
+                                       (unsigned)src_channels, (unsigned)sf.channels);
+                        } else {
+                            espix_klog(ESPIX_KLOG_WARN, TAG,
+                                       "cannot resample %u -> %u Hz; playing as-is",
+                                       (unsigned)src_rate, (unsigned)sf.rate);
+                        }
+                    }
+                }
+
                 const int64_t f0 = esp_timer_get_time();
-                if (src_channels == 1 && out_ch > 1) {
+                if (s_asrc.handle != NULL) {
+                    memcpy(s_asrc.in, frame.buffer, frame.decoded_size);
+                    const uint32_t in_samples = frame.decoded_size / s_asrc.in_frame_bytes;
+                    uint32_t out_samples = s_asrc.out_max_samples;
+                    if (esp_asrc_process(s_asrc.handle, s_asrc.in, in_samples,
+                                         s_asrc.out, &out_samples) == ESP_ASRC_ERR_OK) {
+                        feed(s_asrc.out, out_samples * s_asrc.out_frame_bytes);
+                        produce += out_samples * s_asrc.out_frame_bytes;
+                    }
+                } else if (src_channels == 1 && sf.channels > 1) {
+                    /*
+                     * A mono source into a stereo sink is duplicated, not
+                     * passed through: the sink's data callback reads two bytes
+                     * per sample, so a mono stream drains its ring at twice the
+                     * rate and underruns.
+                     */
                     if (up == NULL) {
                         up = audio_buf_alloc("up", UP_CHUNK, &up_ps);
                         if (up == NULL) {
@@ -752,6 +883,7 @@ out:
     if (owns_dec && dec != NULL) {
         esp_audio_simple_dec_close(dec);
     }
+    asrc_close(&s_asrc);
     heap_caps_free(in);
     heap_caps_free(out);
     heap_caps_free(up);
