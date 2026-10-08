@@ -771,14 +771,13 @@ they block.
   is internal RAM, the scarce pool, so this waits for the memory work below
   rather than taking another kilobyte today.
 
-- **Resampling, and when not to.** The engine converts neither rate nor
-  channels, so a source must match the rate the sink negotiated; a 48 kHz file
-  into a 44.1 kHz SBC stream is wrong. The order should be: (1) if the sink
-  advertises the source's rate in its codec capabilities, ask for it in the
-  preferred codec config and pass the PCM through untouched; (2) only if it does
-  not, convert -- and then with the **hardware ASRC** (`esp_asrc`,
-  `CONFIG_SOC_ASRC_SUPPORTED`) rather than a software converter. (1) is free and
-  is the common case: the Q45 advertises every SBC sample rate.
+- **Negotiate the sink's rate before resampling.** The ASRC now covers a
+  mismatch (`esp_asrc`, hardware on the S31), but conversion is the fallback.
+  When the source is known before the link is opened, and the sink advertises
+  the source's rate in its codec capabilities, ask for it in the preferred
+  codec config and pass the PCM through untouched. That is free and is the
+  common case -- the Q45 advertises every SBC sample rate -- so it is the path
+  the ASRC should not be needed for.
 
 - **The codec and quality choice should be our policy over the library's API.**
   `esp_a2d_source_set_pref_mcc()` is the right call and is in use, but its values
@@ -790,10 +789,11 @@ they block.
   joint stereo and bitpool 52 and the link cannot hold it. Keeping capability and
   measured-reliable separate is what lets testing raise it later.
 
-- **MP3 decode is the blocker for the phase-1 goal.** WAV decodes in 10-27 ms per
-  second of audio; `esp_audio_simple_dec`'s MP3 path measures ~2900 ms, so the
-  ring never stays fed. Next measurement: decode with Bluetooth off, to tell a
-  slow library from CPU throttling under coexistence.
+- **Internal RAM is what blocked MP3, not the decoder.** Measured: with the
+  chunk buffers in PSRAM the MP3 decoder is ~11% of a core and the ring stays
+  full; the earlier "~2900 ms per second" was the decoder spilling to PSRAM
+  after Bluetooth had fragmented internal. The fix was the buffer placement, not
+  a faster decoder -- see AUDIO.md.
 
 ## Memory
 
