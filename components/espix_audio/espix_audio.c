@@ -711,10 +711,21 @@ static void tone_play(espix_audio_stream_t *st, int frames, tone_osc_t *osc,
         size_t off = 0;
         const size_t bytes = (size_t)n * 4;
         while (off < bytes) {
+            if (st->stop || s_stop_requested) {
+                return;                 /* stopped: the owner closes it */
+            }
             const size_t w = espix_audio_stream_write(st, (uint8_t *)buf + off,
                                                       bytes - off);
             if (w == 0) {
-                return;                 /* closed under us */
+                /*
+                 * A full ring, not a stop. stream_write's wait timed out because
+                 * the sink has not made room yet -- which is what an A2DP link
+                 * still waking out of sniff looks like, and it takes about a
+                 * second and a half. Give up the write, never the tone: reading
+                 * this as "closed under us" is why a test tone was silent.
+                 */
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
             }
             off += w;
         }

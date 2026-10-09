@@ -105,6 +105,14 @@ fi
 # ("the known-good image is missing from /boot"), so the running kernel stays.
 # It is pruned properly after the reboot below, which is what keeps /boot from
 # settling at two kernels and filling the rootfs.
+# Staged on the rootfs, and it has to be: "upgrade --file" only records the
+# path, and the loader reads it before any filesystem but the rootfs is mounted.
+# The USB stick, with its gigabytes, was tried and silently does nothing -- the
+# board comes back on the old build. This is the constraint that keeps the copy
+# tight: 12 MB rootfs, 9 MB of system, 3.2 MB of image, and the running kernel's
+# known-good copy shares it.
+staging=/tmp/espix.bin
+
 # Not gated on $before: the case that matters is exactly the one where the last
 # attempt failed and the board is now tight, and that is also when the version
 # query is most likely to have come back empty.
@@ -125,19 +133,20 @@ case "$avail_kb" in
         ;;
 esac
 
-printf 'flash-ota: %s -> %s (%s)\n' "$bin" "$ESPIX_HOST" "$ESPIX_TARGET"
-if ! dev_push "$bin" /tmp/espix.bin >/dev/null 2>&1; then
-    # The partial is worse than nothing: it fills the rootfs and makes every
-    # retry fail the same way.
-    dev_once 'sudo rm -f /tmp/espix.bin' >/dev/null 2>&1 || true
+printf 'flash-ota: %s -> %s:%s (%s)\n' "$bin" "$ESPIX_HOST" "$staging" "$ESPIX_TARGET"
+if ! dev_push "$bin" "$staging" >/dev/null 2>&1; then
+    # The partial is worse than nothing: on the rootfs it fills it and makes
+    # every retry fail the same way.
+    dev_once "sudo rm -f $staging" >/dev/null 2>&1 || true
     printf 'flash-ota: could not copy the image to the board\n' >&2
     exit 1
 fi
 
 rc=0
-dev_ssh_raw 'sudo upgrade --file /tmp/espix.bin' || rc=$?
-# No rm here: the loader installs the image from /tmp, so it has to survive
-# until the reboot. The kernel clears /tmp on boot, which is what reclaims it.
+dev_ssh_raw "sudo upgrade --file $staging" || rc=$?
+# No rm here: the loader installs the image from where it was staged, so it has
+# to survive until the reboot. /tmp is cleared on boot, which is what reclaims
+# it; the stick keeps a copy, which the next push overwrites.
 
 if [ "$rc" -ne 0 ]; then
     printf 'flash-ota: the install failed; the board is still running what it was\n' >&2
