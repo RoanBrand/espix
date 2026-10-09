@@ -42,6 +42,10 @@ static esp_codec_dev_handle_t s_adc;
 static espix_audio_format_t s_out_fmt = { 44100, 2, 16 };
 static espix_audio_format_t s_in_fmt  = { 44100, 2, 16 };
 
+/* The codec's own output volume, remembered so a set before the first stream
+ * still applies when the DAC opens. */
+static int s_out_vol = CONFIG_ESPIX_I2S_DEFAULT_VOL;
+
 static bool hw_ensure(void)
 {
     if (s_hw) {
@@ -158,7 +162,7 @@ static bool dac_open(void)
         ESP_LOGE(TAG, "dac open");
         return false;
     }
-    esp_codec_dev_set_out_vol(s_dac, CONFIG_ESPIX_I2S_DEFAULT_VOL);
+    esp_codec_dev_set_out_vol(s_dac, s_out_vol);
     ESP_LOGI(TAG, "es8311 dac: %u Hz, %u ch", (unsigned)s_out_fmt.rate,
              (unsigned)s_out_fmt.channels);
     return true;
@@ -192,13 +196,34 @@ static void sink_suspend(void)
     }
 }
 
+static esp_err_t sink_set_volume(int percent)
+{
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    s_out_vol = percent;
+    if (s_dac != NULL) {
+        esp_codec_dev_set_out_vol(s_dac, percent);
+    }
+    return ESP_OK;
+}
+
+static int sink_get_volume(void)
+{
+    return s_out_vol;
+}
+
 static const espix_audio_sink_ops_t s_es8311_sink = {
-    .name      = "es8311",
-    .connected = sink_connected,
-    .format    = sink_format,
-    .write     = i2s_write,
-    .start     = sink_start,
-    .suspend   = sink_suspend,
+    .name       = "es8311",
+    .connected  = sink_connected,
+    .format     = sink_format,
+    .write      = i2s_write,
+    .start      = sink_start,
+    .suspend    = sink_suspend,
+    .set_volume = sink_set_volume,
+    .get_volume = sink_get_volume,
 };
 
 /* ---------------------------------------------------------------- source -- */

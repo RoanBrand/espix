@@ -966,13 +966,37 @@ static void a2dp_suspend(void)
     }
 }
 
+/*
+ * The link's volume is the AVRCP absolute volume, 0..127: the sink applies it
+ * itself, so this is the one control that costs no CPU and survives a master
+ * gain of 100. The sink may never have reported one, in which case the getter
+ * says so with -1 rather than inventing a level.
+ */
+static esp_err_t a2dp_set_volume(int percent)
+{
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    return espix_bt_set_volume((uint8_t)(percent * 127 / 100));
+}
+
+static int a2dp_get_volume(void)
+{
+    const int v = espix_bt_volume();        /* 0..127, or -1 */
+    return v < 0 ? -1 : (v * 100 + 63) / 127;
+}
+
 static const espix_audio_sink_ops_t s_a2dp_sink = {
-    .name      = "a2dp",
-    .connected = espix_bt_a2d_connected,
-    .format    = a2dp_format,
-    .write     = a2dp_write,
-    .start     = a2dp_start,
-    .suspend   = a2dp_suspend,
+    .name       = "a2dp",
+    .connected  = espix_bt_a2d_connected,
+    .format     = a2dp_format,
+    .write      = a2dp_write,
+    .start      = a2dp_start,
+    .suspend    = a2dp_suspend,
+    .set_volume = a2dp_set_volume,
+    .get_volume = a2dp_get_volume,
 };
 
 esp_err_t espix_bt_audio_sink_register(void)

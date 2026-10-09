@@ -45,6 +45,15 @@ typedef struct {
 
     /* End a stream: stop the consumer rather than let it run on silence. */
     void (*suspend)(void);
+
+    /*
+     * The sink's own volume, 0-100, or NULL when it has none. This is the
+     * device's control -- the ES8311's register, an A2DP link's absolute
+     * volume -- and is separate from the engine's master PCM gain: this one
+     * costs nothing when it is the device doing the attenuation.
+     */
+    esp_err_t (*set_volume)(int percent);
+    int       (*get_volume)(void);
 } espix_audio_sink_ops_t;
 
 /*

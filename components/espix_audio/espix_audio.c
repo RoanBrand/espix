@@ -11,6 +11,7 @@
  * Bluetooth and links with none.
  */
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +104,21 @@ esp_err_t espix_audio_sink_select(const char *name)
 const char *espix_audio_sink_selected(void)
 {
     return s_sink_want;
+}
+
+esp_err_t espix_audio_sink_volume(int percent)
+{
+    const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
+    if (sink == NULL || sink->set_volume == NULL) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return sink->set_volume(percent);
+}
+
+int espix_audio_sink_volume_get(void)
+{
+    const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
+    return (sink != NULL && sink->get_volume != NULL) ? sink->get_volume() : -1;
 }
 
 const espix_audio_sink_ops_t *espix_audio_sink_default(void)
@@ -475,6 +491,11 @@ static void feed(uint8_t *p, size_t n)
 #define STREAM_CHUNK (4 * 1024)
 #define STREAM_STACK (4 * 1024)
 
+/* Frames per generated-tone block; 512 is ~12 ms at 44.1 kHz. */
+#define TONE_FRAMES  512
+#define TONE_HZ      440
+#define TONE_LEVEL   12000
+
 struct espix_audio_stream {
     StreamBufferHandle_t sb;
     espix_task_exit_t    exit;
@@ -587,6 +608,110 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
         s_stream = NULL;
     }
     free(st);
+    return ESP_OK;
+}
+
+/*
+ * A generated tone, written through the stream API above. `ch` is which
+ * channel carries it: 0 left, 1 right, 2 both. That is what makes a stereo
+ * check possible -- one second each way says more than a level meter.
+ */
+static void tone_play(espix_audio_stream_t *st, int frames, double step,
+                      double *phase, int ch, int16_t *buf)
+{
+    while (frames > 0) {
+        int n = frames > TONE_FRAMES ? TONE_FRAMES : frames;
+
+        for (int i = 0; i < n; i++) {
+            const int16_t v = (int16_t)(sin(*phase) * (double)TONE_LEVEL);
+            buf[2 * i]     = (ch == 1) ? 0 : v;
+            buf[2 * i + 1] = (ch == 0) ? 0 : v;
+            *phase += step;
+            if (*phase >= 2.0 * M_PI) {
+                *phase -= 2.0 * M_PI;
+            }
+        }
+        size_t off = 0;
+        const size_t bytes = (size_t)n * 4;
+        while (off < bytes) {
+            const size_t w = espix_audio_stream_write(st, (uint8_t *)buf + off,
+                                                      bytes - off);
+            if (w == 0) {
+                return;                 /* closed under us */
+            }
+            off += w;
+        }
+        frames -= n;
+    }
+}
+
+esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
+{
+    if (freq_hz <= 0 || freq_hz > 20000) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const espix_audio_format_t fmt = { 44100, 2, 16 };
+    espix_audio_stream_t *st = espix_audio_stream_open(&fmt);
+    if (st == NULL) {
+        return ESP_ERR_INVALID_STATE;       /* no sink, or one is busy */
+    }
+
+    int16_t *buf = malloc(TONE_FRAMES * 2 * sizeof(int16_t));
+    if (buf == NULL) {
+        (void)espix_audio_stream_close(st);
+        return ESP_ERR_NO_MEM;
+    }
+
+    const double step = 2.0 * M_PI * (double)freq_hz / (double)fmt.rate;
+    double       phase = 0.0;
+    const int    one_s = (int)fmt.rate;
+
+    if (left_right) {
+        tone_play(st, one_s, step, &phase, 0, buf);     /* left  */
+        tone_play(st, one_s, step, &phase, 1, buf);     /* right */
+        tone_play(st, one_s, step, &phase, 2, buf);     /* both  */
+    } else {
+        tone_play(st, seconds * one_s, step, &phase, 2, buf);
+    }
+
+    free(buf);
+    return espix_audio_stream_close(st);
+}
+
+/*
+ * The same, without blocking the caller -- for a UI, whose input handler cannot
+ * stand still for three seconds while a tone plays. A task of its own, on a
+ * PSRAM stack, announcing nothing because there is nobody waiting.
+ */
+typedef struct {
+    int  freq_hz;
+    int  seconds;
+    bool left_right;
+} tone_args_t;
+
+static void tone_task(void *arg)
+{
+    tone_args_t a = *(tone_args_t *)arg;
+    free(arg);
+    (void)espix_audio_tone(a.freq_hz, a.seconds, a.left_right);
+    vTaskDeleteWithCaps(NULL);
+}
+
+esp_err_t espix_audio_tone_async(int freq_hz, int seconds, bool left_right)
+{
+    tone_args_t *a = malloc(sizeof(*a));
+    if (a == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    a->freq_hz     = freq_hz;
+    a->seconds     = seconds;
+    a->left_right  = left_right;
+
+    if (xTaskCreateWithCaps(tone_task, "espix:tone", STREAM_STACK, a, 4,
+                            NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        free(a);
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }
 

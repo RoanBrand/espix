@@ -66,7 +66,10 @@ typedef enum {
     ACT_SINK,
     ACT_VOL_UP,
     ACT_VOL_DOWN,
+    ACT_SINK_VOL_UP,
+    ACT_SINK_VOL_DOWN,
     ACT_STOP,
+    ACT_TONE_LR,
 } action_t;
 
 typedef enum {
@@ -424,6 +427,8 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         const size_t ns = espix_audio_sink_list(sinks,
                                                 sizeof(sinks) / sizeof(sinks[0]));
         const espix_audio_sink_ops_t *cur = espix_audio_sink_default();
+        const int  sv   = espix_audio_sink_volume_get();
+        const bool svok = sv >= 0;
 
         rows[n++] = (row_t){ ROW_HEAD, "Audio", NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Output",
@@ -432,16 +437,29 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         rows[n++] = (row_t){ ROW_FIELD, "Playback", espix_audio_state(), true,
                              false, ACT_NONE, 0 };
 
+        /* Master: a PCM gain, so the same for every sink. */
         const int vv = n;
         snprintf(s_val[vv], sizeof(s_val[vv]), "%d%%", espix_audio_get_volume());
-        rows[n++] = (row_t){ ROW_FIELD, "Volume", s_val[vv], true, false,
+        rows[n++] = (row_t){ ROW_FIELD, "Volume (master)", s_val[vv], true, false,
                              ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_BUTTON, "Quieter   (-10)", NULL,
+        rows[n++] = (row_t){ ROW_BUTTON, "  quieter   (-10)", NULL,
                              espix_audio_get_volume() > 0, false, ACT_VOL_DOWN, 0 };
-        rows[n++] = (row_t){ ROW_BUTTON, "Louder   (+10)", NULL,
+        rows[n++] = (row_t){ ROW_BUTTON, "  louder   (+10)", NULL,
                              espix_audio_get_volume() < 100, false, ACT_VOL_UP, 0 };
-        rows[n++] = (row_t){ ROW_BUTTON, "Stop playback", NULL, true, false,
-                             ACT_STOP, 0 };
+
+        /* The device's own: the codec register, or the link's AVRCP volume. */
+        const int vsv = n;
+        if (svok) {
+            snprintf(s_val[vsv], sizeof(s_val[vsv]), "%d%%", sv);
+        } else {
+            snprintf(s_val[vsv], sizeof(s_val[vsv]), "%s", "n/a");
+        }
+        rows[n++] = (row_t){ ROW_FIELD, "Volume (device)", s_val[vsv], svok, false,
+                             ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "  quieter   (-10)", NULL, sv > 0, false,
+                             ACT_SINK_VOL_DOWN, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "  louder   (+10)", NULL,
+                             svok && sv < 100, false, ACT_SINK_VOL_UP, 0 };
 
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_TEXT, "Output device", NULL, true, false,
@@ -451,7 +469,7 @@ static int section_rows(const espix_window_t *w, row_t *rows)
             rows[n++] = (row_t){ ROW_TEXT, "  none registered", NULL, false,
                                  false, ACT_NONE, 0 };
         }
-        for (size_t i = 0; i < ns && n < ROW_MAX - 2; i++) {
+        for (size_t i = 0; i < ns && n < ROW_MAX - 3; i++) {
             const bool conn = sinks[i]->connected == NULL || sinks[i]->connected();
             const int  vi   = n;
             snprintf(s_val[vi], sizeof(s_val[vi]), "%s",
@@ -460,10 +478,9 @@ static int section_rows(const espix_window_t *w, row_t *rows)
                                  sinks[i] == cur, ACT_SINK, (int)i };
         }
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_TEXT, "A chosen device wins while it is registered;",
-                             NULL, false, false, ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_TEXT, "otherwise the connected one plays.",
-                             NULL, false, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Stop", NULL, true, false, ACT_STOP, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Test left / right", NULL, true, false,
+                             ACT_TONE_LR, 0 };
         break;
     }
 
@@ -647,8 +664,21 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
         case ACT_VOL_DOWN:
             (void)espix_audio_set_volume(espix_audio_get_volume() - 10);
             break;
+        case ACT_SINK_VOL_UP: {
+            const int v0 = espix_audio_sink_volume_get();
+            (void)espix_audio_sink_volume((v0 < 0 ? 0 : v0) + 10);
+            break;
+        }
+        case ACT_SINK_VOL_DOWN: {
+            const int v0 = espix_audio_sink_volume_get();
+            (void)espix_audio_sink_volume((v0 < 0 ? 0 : v0) - 10);
+            break;
+        }
         case ACT_STOP:
             (void)espix_audio_stop();
+            break;
+        case ACT_TONE_LR:
+            (void)espix_audio_tone_async(440, 3, true);
             break;
         default:
             return;                     /* a disabled row: nothing happened */

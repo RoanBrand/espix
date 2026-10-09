@@ -72,6 +72,27 @@ esp_err_t espix_audio_set_volume(int percent);
 int       espix_audio_get_volume(void);
 
 /*
+ * The default sink's own volume, 0-100, as against the master PCM gain above.
+ * This is the device's control -- the ES8311's register, an A2DP link's
+ * absolute volume -- so it is the one that costs no CPU and works when the
+ * master is a pass-through. ESP_ERR_NOT_SUPPORTED when the sink has none, and
+ * -1 from the getter.
+ */
+esp_err_t espix_audio_sink_volume(int percent);
+int       espix_audio_sink_volume_get(void);
+
+/*
+ * A generated tone through the stream API: a test signal, and the shortest
+ * end-to-end exercise of the stream. With left_right, one second goes to the
+ * left channel, one to the right and one to both -- which is how a listener
+ * confirms stereo rather than guessing from a level. `seconds` is otherwise
+ * the length. The _async form returns at once and plays on its own task, for a
+ * UI whose input handler cannot block.
+ */
+esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right);
+esp_err_t espix_audio_tone_async(int freq_hz, int seconds, bool left_right);
+
+/*
  * A PCM stream the app writes itself, for audio it generates rather than
  * decodes -- a game's sound effects, a synthesiser. The app blocks in
  * stream_write only while the engine's ring is full; the engine drains it to

@@ -1,7 +1,6 @@
 /*
  * play: a file or a stream, through the GMF-based player, out the A2DP sink.
  */
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,72 +96,29 @@ static int cmd_volume(espix_session_t *s, int argc, char **argv)
 }
 
 /*
- * A generated tone, through the app stream API -- the shortest end-to-end test
- * of it, and a useful thing to have for setting a level or finding a speaker.
- * The stream's own write blocks when the engine's ring is full, so this loop
- * paces itself to the sink with no timing of its own.
+ * A generated tone through the app stream API -- the shortest end-to-end test
+ * of it, and useful for setting a level or finding a speaker. The "lr" form
+ * plays one second on the left, one on the right and one on both, which is how
+ * stereo is actually confirmed rather than assumed.
  */
-#define TONE_FRAMES 512
-
 static int cmd_tone(espix_session_t *s, int argc, char **argv)
 {
-    const int freq = argc > 1 ? atoi(argv[1]) : 440;
-    const int secs = argc > 2 ? atoi(argv[2]) : 3;
+    const int  freq = argc > 1 ? atoi(argv[1]) : 440;
+    const int  secs = argc > 2 ? atoi(argv[2]) : 3;
+    const bool lr   = argc > 3 && strcmp(argv[3], "lr") == 0;
 
     if (freq <= 0 || freq > 20000 || secs <= 0 || secs > 60) {
-        espix_eprintf(s, "usage: tone [freq 20-20000] [seconds 1-60]\n");
+        espix_eprintf(s, "usage: tone [freq 20-20000] [seconds 1-60] [lr]\n");
         return 1;
     }
 
-    const espix_audio_format_t fmt = { .rate = 44100, .channels = 2, .bits = 16 };
-    espix_audio_stream_t *st = espix_audio_stream_open(&fmt);
-    if (st == NULL) {
-        espix_eprintf(s, "tone: no sink available (or one is playing)\n");
+    const esp_err_t err = espix_audio_tone(freq, secs, lr);
+    if (err != ESP_OK) {
+        espix_eprintf(s, "tone: %s\n", esp_err_to_name(err));
         return 1;
     }
-
-    int16_t *buf = malloc(TONE_FRAMES * 2 * sizeof(int16_t));
-    if (buf == NULL) {
-        espix_audio_stream_close(st);
-        espix_eprintf(s, "tone: no memory\n");
-        return 1;
-    }
-
-    const double step  = 2.0 * M_PI * (double)freq / (double)fmt.rate;
-    const int    total = secs * (int)fmt.rate;
-    double       phase = 0.0;
-    int          done  = 0;
-
-    while (done < total) {
-        int n = total - done;
-        if (n > TONE_FRAMES) {
-            n = TONE_FRAMES;
-        }
-        for (int i = 0; i < n; i++) {
-            const int16_t v = (int16_t)(sin(phase) * 12000.0);
-            buf[2 * i]     = v;
-            buf[2 * i + 1] = v;
-            phase += step;
-            if (phase >= 2.0 * M_PI) {
-                phase -= 2.0 * M_PI;
-            }
-        }
-        const size_t bytes = (size_t)n * 4;
-        size_t off = 0;
-        while (off < bytes) {
-            const size_t w = espix_audio_stream_write(st, (const uint8_t *)buf + off,
-                                                      bytes - off);
-            if (w == 0) {
-                break;
-            }
-            off += w;
-        }
-        done += n;
-    }
-
-    free(buf);
-    espix_audio_stream_close(st);
-    espix_printf(s, "tone: %d Hz for %d s\n", freq, secs);
+    espix_printf(s, "tone: %d Hz, %s\n", freq,
+                 lr ? "left, right, both" : "both channels");
     return 0;
 }
 
@@ -175,7 +131,7 @@ static espix_cmd_t s_play_cmds[] = {
       .usage = "volume [0-100]" },
     { .name = "tone", .fn = cmd_tone,
       .help = "play a generated tone through the app stream API",
-      .usage = "tone [freq] [seconds]" },
+      .usage = "tone [freq] [seconds] [lr]   (lr: left, right, both)" },
 };
 
 #endif /* CONFIG_ESPIX_AUDIO */
