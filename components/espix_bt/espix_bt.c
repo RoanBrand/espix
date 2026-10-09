@@ -32,6 +32,9 @@
 #include "esp_timer.h"
 
 #include "esp_bt.h"
+#if CONFIG_ESP_COEX_ENABLED
+#include "esp_coexist.h"
+#endif
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
@@ -634,11 +637,21 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             memcpy(s_connected_bda, param->conn_stat.remote_bda, ESPIX_BDA_LEN);
             s_want_connect = false;
             s_retries = 0;
+            /*
+             * Audio is the latency-sensitive half of the one radio. While a
+             * sink is connected the coex arbiter is told to favour Bluetooth,
+             * which is what stops Wi-Fi's time slices landing in the middle of
+             * an SBC frame -- the "morse code" of an L2CAP that keeps
+             * congesting. Balanced again on disconnect, so Wi-Fi gets its share
+             * back when nothing is playing.
+             */
+            (void)esp_coex_preference_set(ESP_COEX_PREFER_BT);
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connected; checking source");
             (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_a2d_connected = false;
             s_streaming     = false;
+            (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp disconnected");
             if (s_want_connect && s_retry != NULL) {
                 (void)esp_timer_start_once(s_retry, 2 * 1000 * 1000);

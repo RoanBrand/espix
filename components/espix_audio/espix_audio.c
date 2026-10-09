@@ -1474,6 +1474,8 @@ esp_err_t espix_audio_stop(void)
 {
     bool did = false;
 
+    espix_klog(ESPIX_KLOG_INFO, TAG, "stop: stream %p task %p requested %d",
+               (void *)s_stream, (void *)s_exit.task, (int)s_stop_requested);
     s_stop_requested = true;
 
     /*

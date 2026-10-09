@@ -18,4 +18,7 @@ idf_component_register(
         bt
         nvs_flash
         esp_timer
+        # The coexistence arbiter, for telling it to favour Bluetooth while a
+        # sink is connected. Present because the radio is shared with Wi-Fi.
+        esp_coex
 )
