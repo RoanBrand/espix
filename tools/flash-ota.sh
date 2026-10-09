@@ -94,6 +94,33 @@ if [ -n "$before" ]; then
     done
 fi
 
+# Now that the space has been reclaimed, say whether it is enough *before*
+# pushing 3 MB at a board that cannot hold it -- a copy that fails for want of
+# space reports the same thing as a dropped connection, and telling them apart
+# afterwards has cost more than this check does.
+#
+# /boot cannot simply be wiped: the loader stalls on a missing known-good image
+# ("the known-good image is missing from /boot"), so the running kernel stays.
+# It is pruned properly after the reboot below, which is what keeps /boot from
+# settling at two kernels and filling the rootfs.
+if [ -n "$before" ]; then
+    img_bytes=$(wc -c < "$bin" | tr -d ' ')
+    avail_kb="$(dev_once 'df' 2>/dev/null | tr -d '\r' |
+                awk '$NF == "/" { print $(NF - 2); exit }')"
+    if [ -z "$avail_kb" ]; then
+        printf 'flash-ota: could not read the free space on the board\n' >&2
+        exit 1
+    fi
+    avail_bytes=$((avail_kb * 1024))
+    if [ "$avail_bytes" -lt $((img_bytes + 65536)) ]; then
+        printf 'flash-ota: not enough space on the board for the image\n' >&2
+        printf '  image %s bytes, free %s bytes (%s kB)\n' \
+               "$img_bytes" "$avail_bytes" "$avail_kb" >&2
+        printf '  /boot and /tmp were just pruned, so this is the rootfs itself\n' >&2
+        exit 1
+    fi
+fi
+
 printf 'flash-ota: %s -> %s (%s)\n' "$bin" "$ESPIX_HOST" "$ESPIX_TARGET"
 if ! dev_push "$bin" /tmp/espix.bin >/dev/null 2>&1; then
     printf 'flash-ota: could not copy the image to the board\n' >&2
@@ -142,4 +169,19 @@ if [ -n "$before" ] && [ "$before" = "$after" ]; then
     printf 'flash-ota: back, running the same build (%s)\n' "$after"
 else
     printf 'flash-ota: installed and running %s\n' "${after:-an unknown build}"
+fi
+
+# The installed kernel is now the running one, so the kernel it replaced is
+# dead weight in /boot -- and the pre-push prune could not remove it, because at
+# that point it *was* the running one. Pruning here is what keeps /boot at one
+# kernel rather than oscillating between one and two. The running image stays:
+# the loader needs a known-good one.
+if [ -n "$after" ]; then
+    keep="${after#\#}"
+    dev_once 'ls /boot' 2>/dev/null | tr -d '\r' | while read -r f; do
+        case "$f" in
+            *"$keep"*) ;;
+            espix-*.bin) dev_once "sudo rm /boot/$f" >/dev/null 2>&1 || true ;;
+        esac
+    done
 fi
