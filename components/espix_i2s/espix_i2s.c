@@ -26,6 +26,24 @@
 
 #define TAG "i2s"
 
+/*
+ * The board decides the codec and the address; everything above it is the same.
+ * Both `esp_codec_dev_defaults.h` codec headers are present (each is behind a
+ * Kconfig of its own, both on by default), so this is a compile-time choice and
+ * not a dependency question.
+ */
+#if CONFIG_ESPIX_I2S_BOARD_KORVO_1
+#define CODEC_ADDR   ES8389_CODEC_DEFAULT_ADDR
+#define SINK_LABEL   "S31 Korvo-1 speaker"
+#define SOURCE_LABEL "S31 Korvo-1 microphone"
+#define CODEC_MCLK   ((CONFIG_ESPIX_I2S_MCLK) >= 0)
+#else
+#define CODEC_ADDR   ES8311_CODEC_DEFAULT_ADDR
+#define SINK_LABEL   "S31 coreboard speaker"
+#define SOURCE_LABEL "S31 coreboard microphone"
+#define CODEC_MCLK   true
+#endif
+
 /* One chip: one bus, one pair of I2S channels, one control and data interface,
  * shared by both directions. */
 static i2c_master_bus_handle_t      s_bus;
@@ -45,6 +63,44 @@ static espix_audio_format_t s_in_fmt  = { 44100, 2, 16 };
 /* The codec's own output volume, remembered so a set before the first stream
  * still applies when the DAC opens. */
 static int s_out_vol = CONFIG_ESPIX_I2S_DEFAULT_VOL;
+
+/*
+ * One codec, whichever it is. `dac` says whether the PA pin belongs to this
+ * direction (the DAC's does; the ADC's must not be given it), and no_dac_ref
+ * silences the reference the right channel would otherwise carry into a
+ * capture.
+ */
+static const audio_codec_if_t *codec_new(esp_codec_dec_work_mode_t mode,
+                                         bool dac, bool no_dac_ref)
+{
+#if CONFIG_ESPIX_I2S_BOARD_KORVO_1
+    es8389_codec_cfg_t cfg = {
+        .ctrl_if     = s_ctrl,
+        .gpio_if     = s_gpio,
+        .codec_mode  = mode,
+        .pa_pin      = dac ? CONFIG_ESPIX_I2S_PA : -1,
+        .pa_reverted = false,
+        .master_mode = false,
+        .use_mclk    = CODEC_MCLK,
+        .no_dac_ref  = no_dac_ref,
+        .mclk_div    = 256,
+    };
+    return es8389_codec_new(&cfg);
+#else
+    es8311_codec_cfg_t cfg = {
+        .ctrl_if     = s_ctrl,
+        .gpio_if     = s_gpio,
+        .codec_mode  = mode,
+        .pa_pin      = dac ? CONFIG_ESPIX_I2S_PA : -1,
+        .pa_reverted = false,
+        .master_mode = false,
+        .use_mclk    = CODEC_MCLK,
+        .no_dac_ref  = no_dac_ref,
+        .mclk_div    = 256,
+    };
+    return es8311_codec_new(&cfg);
+#endif
+}
 
 static bool hw_ensure(void)
 {
@@ -93,7 +149,7 @@ static bool hw_ensure(void)
 
     audio_codec_i2c_cfg_t i2c_cfg = {
         .port       = CONFIG_ESPIX_I2S_I2C_PORT,
-        .addr       = ES8311_CODEC_DEFAULT_ADDR,
+        .addr       = CODEC_ADDR,
         .bus_handle = s_bus,
     };
     s_ctrl = audio_codec_new_i2c_ctrl(&i2c_cfg);
@@ -125,17 +181,7 @@ static bool dac_open(void)
         return false;
     }
 
-    es8311_codec_cfg_t codec_cfg = {
-        .ctrl_if     = s_ctrl,
-        .gpio_if     = s_gpio,
-        .codec_mode  = ESP_CODEC_DEV_WORK_MODE_DAC,
-        .pa_pin      = CONFIG_ESPIX_I2S_PA,
-        .pa_reverted = false,
-        .master_mode = false,       /* the ESP is the I2S master */
-        .use_mclk    = true,
-        .mclk_div    = 256,
-    };
-    const audio_codec_if_t *codec = es8311_codec_new(&codec_cfg);
+    const audio_codec_if_t *codec = codec_new(ESP_CODEC_DEV_WORK_MODE_DAC, true, false);
     if (codec == NULL) {
         ESP_LOGE(TAG, "dac codec");
         return false;
@@ -217,6 +263,7 @@ static int sink_get_volume(void)
 
 static const espix_audio_sink_ops_t s_es8311_sink = {
     .name       = "es8311",
+    .label      = SINK_LABEL,
     .connected  = sink_connected,
     .format     = sink_format,
     .write      = i2s_write,
@@ -237,18 +284,7 @@ static bool adc_open(void)
         return false;
     }
 
-    es8311_codec_cfg_t codec_cfg = {
-        .ctrl_if     = s_ctrl,
-        .gpio_if     = s_gpio,
-        .codec_mode  = ESP_CODEC_DEV_WORK_MODE_ADC,
-        .master_mode = false,
-        .use_mclk    = true,
-        /* Without this the right channel carries the DAC output as a
-         * reference rather than staying silent. */
-        .no_dac_ref  = true,
-        .mclk_div    = 256,
-    };
-    const audio_codec_if_t *codec = es8311_codec_new(&codec_cfg);
+    const audio_codec_if_t *codec = codec_new(ESP_CODEC_DEV_WORK_MODE_ADC, false, true);
     if (codec == NULL) {
         ESP_LOGE(TAG, "adc codec");
         return false;
@@ -329,6 +365,7 @@ static void source_stop(void)
 
 static const espix_audio_source_ops_t s_es8311_source = {
     .name      = "es8311",
+    .label     = SOURCE_LABEL,
     .connected = source_connected,
     .format    = source_format,
     .read      = i2s_read,

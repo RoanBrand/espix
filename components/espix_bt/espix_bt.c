@@ -103,6 +103,21 @@ static void dev_upsert(const uint8_t bda[ESPIX_BDA_LEN], const char *name)
     }
 }
 
+/*
+ * A bonded device's name is not always in the inquiry response, and not in the
+ * pairing result either for one paired before the name was asked for -- which
+ * is how this board's bonded sinks both show as "(unnamed)". The stack can be
+ * asked directly; the answer arrives as ESP_BT_GAP_READ_REMOTE_NAME_EVT.
+ */
+static void request_names(void)
+{
+    for (size_t i = 0; i < s_dev_count; i++) {
+        if (s_devs[i].name[0] == '\0' && bda_valid(s_devs[i].bda)) {
+            (void)esp_bt_gap_read_remote_name(s_devs[i].bda);
+        }
+    }
+}
+
 static void mark_bonded(void)
 {
     esp_bd_addr_t list[DEV_MAX];
@@ -124,6 +139,7 @@ static void mark_bonded(void)
             s_devs[j].bonded = true;
         }
     }
+    request_names();
 }
 
 /* ---- GAP: discovery, pairing ---- */
@@ -166,6 +182,15 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     case ESP_BT_GAP_KEY_REQ_EVT:
         (void)esp_bt_gap_ssp_passkey_reply(param->key_req.bda, true, 0);
         break;
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT: {
+        const int i = dev_find((const uint8_t *)param->read_rmt_name.bda);
+        if (i >= 0 && param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS &&
+            param->read_rmt_name.rmt_name[0] != '\0') {
+            strlcpy(s_devs[i].name, (const char *)param->read_rmt_name.rmt_name,
+                    sizeof(s_devs[i].name));
+        }
+        break;
+    }
     case ESP_BT_GAP_AUTH_CMPL_EVT: {
         const int i = dev_find((const uint8_t *)param->auth_cmpl.bda);
         if (i >= 0 && param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
@@ -990,6 +1015,7 @@ static int a2dp_get_volume(void)
 
 static const espix_audio_sink_ops_t s_a2dp_sink = {
     .name       = "a2dp",
+    .label      = "Bluetooth",
     .connected  = espix_bt_a2d_connected,
     .format     = a2dp_format,
     .write      = a2dp_write,

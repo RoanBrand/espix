@@ -63,6 +63,8 @@ typedef enum {
     ACT_UNPAIR,
     ACT_DEVICE,
     ACT_BT_POWER,
+    ACT_CONNECT,
+    ACT_DISCONNECT,
     ACT_SINK,
     ACT_VOL_UP,
     ACT_VOL_DOWN,
@@ -413,6 +415,10 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         }
 
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Connect", NULL, s_dev_sel >= 0, false,
+                             ACT_CONNECT, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Disconnect", NULL, s_dev_sel >= 0, false,
+                             ACT_DISCONNECT, 0 };
         rows[n++] = (row_t){ ROW_BUTTON, "Unpair", NULL, s_dev_sel >= 0, false,
                              ACT_UNPAIR, 0 };
         rows[n++] = (row_t){ ROW_TEXT, "Scan, pair and unpair here; output and",
@@ -432,8 +438,10 @@ static int section_rows(const espix_window_t *w, row_t *rows)
 
         rows[n++] = (row_t){ ROW_HEAD, "Audio", NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Output",
-                             cur != NULL ? cur->name : "none", cur != NULL, false,
-                             ACT_NONE, 0 };
+                             cur != NULL ? (cur->label != NULL ? cur->label
+                                                               : cur->name)
+                                         : "none",
+                             cur != NULL, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Playback", espix_audio_state(), true,
                              false, ACT_NONE, 0 };
 
@@ -474,8 +482,11 @@ static int section_rows(const espix_window_t *w, row_t *rows)
             const int  vi   = n;
             snprintf(s_val[vi], sizeof(s_val[vi]), "%s",
                      conn ? "connected" : "not connected");
-            rows[n++] = (row_t){ ROW_RADIO, sinks[i]->name, s_val[vi], true,
-                                 sinks[i] == cur, ACT_SINK, (int)i };
+            rows[n++] = (row_t){ ROW_RADIO,
+                                 sinks[i]->label != NULL ? sinks[i]->label
+                                                         : sinks[i]->name,
+                                 s_val[vi], true, sinks[i] == cur, ACT_SINK,
+                                 (int)i };
         }
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_BUTTON, "Stop", NULL, true, false, ACT_STOP, 0 };
@@ -641,6 +652,18 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
                 (void)espix_bt_init();
             }
             refresh_bluetooth();
+            break;
+        case ACT_CONNECT:
+            if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
+                (void)espix_bt_connect(s_devs[s_dev_sel].bda);
+                refresh_bluetooth();
+            }
+            break;
+        case ACT_DISCONNECT:
+            if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
+                (void)espix_bt_disconnect(s_devs[s_dev_sel].bda);
+                refresh_bluetooth();
+            }
             break;
         case ACT_UNPAIR:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {

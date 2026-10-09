@@ -1,45 +1,74 @@
 menu "espix i2s"
 
     config ESPIX_I2S
-        bool "I2S codec sink (ES8311)"
+        bool "I2S codec sink and source (S31 function coreboard's ES8311)"
         default n
         help
             The ES8311 on the S31 function coreboard, over I2S and I2C, with the
-            NS4150B PA. Registers an "es8311" sink at boot, which gives the board
-            a speaker that does not need Bluetooth -- and, because the engine
-            prefers a connected sink, the speaker is used whenever no A2DP link
-            is up. The codec is opened lazily on the first stream.
+            NS4150B PA and the on-board electret. Registers an "es8311" sink at
+            boot, so the board has a speaker that does not need Bluetooth, and an
+            "es8311" source for `record`. The codec is opened lazily, on the
+            first stream in its direction.
+
+            The defaults below are that board's, and they are not shared: the
+            S31 Korvo-1 has an ES8389 with two amplifiers (stereo), its I2C on
+            GPIO 0/1, its I2S on 3/4/5/6, no MCLK at all, and its PA on GPIO 7.
+            A second board means a second set of these values, not a tweak to
+            this one.
 
     if ESPIX_I2S
+
+    choice ESPIX_I2S_BOARD
+        prompt "Board"
+        default ESPIX_I2S_BOARD_COREBOARD
+        help
+            The audio wiring is per board, not per chip: these two share an
+            ESP32-S31 and agree about nothing else on the path. Selecting the
+            wrong one drives the codec's bus at some other pin.
+
+    config ESPIX_I2S_BOARD_COREBOARD
+        bool "S31 function coreboard (ES8311, mono)"
+    config ESPIX_I2S_BOARD_KORVO_1
+        bool "S31 Korvo-1 (ES8389, stereo)"
+    endchoice
 
     config ESPIX_I2S_I2C_PORT
         int "I2C port"
         default 0
     config ESPIX_I2S_I2C_SDA
         int "I2C SDA GPIO"
-        default 51
+        default 51 if ESPIX_I2S_BOARD_COREBOARD
+        default 0  if ESPIX_I2S_BOARD_KORVO_1
     config ESPIX_I2S_I2C_SCL
         int "I2C SCL GPIO"
-        default 50
+        default 50 if ESPIX_I2S_BOARD_COREBOARD
+        default 1  if ESPIX_I2S_BOARD_KORVO_1
 
+    # -1 means the board has no MCLK net, which the Korvo does not.
     config ESPIX_I2S_MCLK
-        int "I2S MCLK GPIO"
-        default 52
+        int "I2S MCLK GPIO (-1 for none)"
+        default 52 if ESPIX_I2S_BOARD_COREBOARD
+        default -1 if ESPIX_I2S_BOARD_KORVO_1
     config ESPIX_I2S_BCLK
         int "I2S BCLK GPIO"
-        default 53
+        default 53 if ESPIX_I2S_BOARD_COREBOARD
+        default 3  if ESPIX_I2S_BOARD_KORVO_1
     config ESPIX_I2S_WS
         int "I2S WS GPIO"
-        default 55
+        default 55 if ESPIX_I2S_BOARD_COREBOARD
+        default 4  if ESPIX_I2S_BOARD_KORVO_1
     config ESPIX_I2S_DOUT
         int "I2S DOUT GPIO (ESP -> codec)"
-        default 56
+        default 56 if ESPIX_I2S_BOARD_COREBOARD
+        default 5  if ESPIX_I2S_BOARD_KORVO_1
     config ESPIX_I2S_DIN
         int "I2S DIN GPIO (codec -> ESP)"
-        default 54
+        default 54 if ESPIX_I2S_BOARD_COREBOARD
+        default 6  if ESPIX_I2S_BOARD_KORVO_1
     config ESPIX_I2S_PA
         int "PA enable GPIO (active high)"
-        default 57
+        default 57 if ESPIX_I2S_BOARD_COREBOARD
+        default 7  if ESPIX_I2S_BOARD_KORVO_1
 
     config ESPIX_I2S_DEFAULT_VOL
         int "Startup output volume (0-100)"

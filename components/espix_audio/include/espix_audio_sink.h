@@ -23,7 +23,11 @@ extern "C" {
 #endif
 
 typedef struct {
-    const char *name;                       /* "a2dp", "i2s0", "fm" */
+    const char *name;                       /* "a2dp", "es8311": the stable id */
+
+    /* What a person should see -- "Bluetooth", "Speaker". The name above is
+     * what code selects on, so it does not have to be readable. */
+    const char *label;
 
     /* Is a consumer attached right now? Registering does not mean connected:
      * the A2DP sink exists from boot but reports false until a link is up. */

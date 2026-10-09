@@ -20,7 +20,10 @@ extern "C" {
 #endif
 
 typedef struct {
-    const char *name;                       /* "es8311", "http", ... */
+    const char *name;                       /* "es8311", "http": the stable id */
+
+    /* What a person should see -- "S31 coreboard microphone". */
+    const char *label;
 
     /* Is a producer attached right now? Registering is not connecting. */
     bool (*connected)(void);

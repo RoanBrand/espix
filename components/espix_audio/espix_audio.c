@@ -132,10 +132,16 @@ const espix_audio_sink_ops_t *espix_audio_sink_default(void)
      */
     if (s_sink_want[0] != '\0') {
         for (size_t i = 0; i < s_sink_count; i++) {
-            if (strcmp(s_sinks[i]->name, s_sink_want) == 0) {
+            if (strcmp(s_sinks[i]->name, s_sink_want) == 0 &&
+                (s_sinks[i]->connected == NULL || s_sinks[i]->connected())) {
                 return s_sinks[i];
             }
         }
+        /*
+         * Chosen but not connected: fall through rather than return it. A
+         * selection that silences the board reads as a broken player, and the
+         * list already says which sink is connected.
+         */
     }
     for (size_t i = 0; i < s_sink_count; i++) {
         if (s_sinks[i]->connected == NULL || s_sinks[i]->connected()) {
@@ -207,6 +213,7 @@ static void   null_suspend(void)   { }
 
 static const espix_audio_sink_ops_t s_null_sink = {
     .name      = "null",
+    .label     = "Benchmark (discard)",
     .connected = null_connected,
     .format    = null_format,
     .write     = null_write,
