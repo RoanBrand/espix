@@ -552,19 +552,19 @@ static void retry_connect(void *arg)
  * negotiation, so reconnect (or re-run `bluetoothctl connect`) after changing.
  */
 /*
- * Default q2: joint stereo, bitpool <= 52 -- the full budget the sink offers,
- * and the setting that sounded right on the Q45.
+ * Default q1: joint stereo, bitpool <= 35.
  *
- * It was q0/q1 out of caution, after one measurement showed the audio task at
- * 77% with q2. A repeat measurement over many intervals showed ~43%, the same as
- * q1 (decode ~430 ms per ~1020 ms), so that 77% was a transient -- the first
- * sample after a codec change, or SSH traffic in that window -- and not a
- * property of q2. The link is the only thing it really spends.
+ * q2 (the sink's full bitpool of 52) does sound better on a quiet link, and was
+ * the default after a CPU measurement cleared it. What that measurement could
+ * not show is the *radio*: with Wi-Fi coexisting on the one antenna -- and the
+ * desktop's VNC load on top -- q2 does not fit, and the link says so with a
+ * flood of L2CAP congestion. Stereo is kept; the bitpool is what gives way,
+ * which is the trade the two settings are for.
  *
  * A mono source is still sent as two channels (the ring is stereo by contract,
  * so the difference channel is empty); this dial is about the link, not the file.
  */
-static int s_sbc_quality = 2;
+static int s_sbc_quality = 1;
 
 void espix_bt_set_sbc_quality(int q)
 {

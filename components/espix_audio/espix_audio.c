@@ -590,7 +590,13 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
         return NULL;
     }
     const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
-    if (sink == NULL || !sink->connected()) {
+    if (sink == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "stream: no sink registered");
+        return NULL;
+    }
+    if (!sink->connected()) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "stream: sink '%s' is not connected",
+                   sink->name);
         return NULL;
     }
 
@@ -666,6 +672,19 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
     st->stop = true;
     (void)espix_task_exit_wait(&st->exit, 0);   /* blocks until the task is gone */
     vStreamBufferDeleteWithCaps(st->sb);
+
+    /*
+     * The matching stop for the start stream_open() did. Without it an A2DP
+     * link stays STREAMING after the audio ends, pulling the full rate out of
+     * an empty ring -- silence -- and saturating itself: the sink reported
+     * "drain 180224 B/s, ring 0 B" while nothing was playing, and the L2CAP
+     * congested for as long as that lasted.
+     */
+    const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
+    if (sink != NULL) {
+        sink->suspend();
+    }
+
     if (s_stream == st) {
         s_stream = NULL;
     }
@@ -712,8 +731,11 @@ esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
     const espix_audio_format_t fmt = { 44100, 2, 16 };
     espix_audio_stream_t *st = espix_audio_stream_open(&fmt);
     if (st == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "tone: no stream (no sink, or busy)");
         return ESP_ERR_INVALID_STATE;       /* no sink, or one is busy */
     }
+    espix_klog(ESPIX_KLOG_INFO, TAG, "tone: %d Hz, %d s, %s", freq_hz, seconds,
+               left_right ? "left/right/both" : "both");
 
     int16_t *buf = malloc(TONE_FRAMES * 2 * sizeof(int16_t));
     if (buf == NULL) {
@@ -735,7 +757,10 @@ esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
     }
 
     free(buf);
-    return espix_audio_stream_close(st);
+    const esp_err_t err = espix_audio_stream_close(st);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "tone: done (%s) requested %d",
+               esp_err_to_name(err), (int)s_stop_requested);
+    return err;
 }
 
 /*

@@ -87,10 +87,12 @@ if [ -n "$before" ]; then
     # One rm per file, for the same reason as /boot above: tools/esp.sh execs a
     # path, so a remote glob is not expanded.
     dev_once 'ls /tmp' 2>/dev/null | tr -d '\r' | while read -r f; do
-        case "$f" in
-            espix.bin) ;;                   # the one this run replaces
-            *) dev_once "sudo rm /tmp/$f" >/dev/null 2>&1 || true ;;
-        esac
+        # Including espix.bin, which used to be kept: a push that fails part way
+        # leaves a *partial* one, and a partial 3 MB file on a 12 MB rootfs
+        # blocks every retry with the same unhelpful "could not copy". The image
+        # this run pushes replaces it anyway, and the loader only needs it across
+        # the reboot, which has not happened yet.
+        dev_once "sudo rm /tmp/$f" >/dev/null 2>&1 || true
     done
 fi
 
@@ -103,26 +105,31 @@ fi
 # ("the known-good image is missing from /boot"), so the running kernel stays.
 # It is pruned properly after the reboot below, which is what keeps /boot from
 # settling at two kernels and filling the rootfs.
-if [ -n "$before" ]; then
-    img_bytes=$(wc -c < "$bin" | tr -d ' ')
-    avail_kb="$(dev_once 'df' 2>/dev/null | tr -d '\r' |
-                awk '$NF == "/" { print $(NF - 2); exit }')"
-    if [ -z "$avail_kb" ]; then
-        printf 'flash-ota: could not read the free space on the board\n' >&2
-        exit 1
-    fi
-    avail_bytes=$((avail_kb * 1024))
-    if [ "$avail_bytes" -lt $((img_bytes + 65536)) ]; then
-        printf 'flash-ota: not enough space on the board for the image\n' >&2
-        printf '  image %s bytes, free %s bytes (%s kB)\n' \
-               "$img_bytes" "$avail_bytes" "$avail_kb" >&2
-        printf '  /boot and /tmp were just pruned, so this is the rootfs itself\n' >&2
-        exit 1
-    fi
-fi
+# Not gated on $before: the case that matters is exactly the one where the last
+# attempt failed and the board is now tight, and that is also when the version
+# query is most likely to have come back empty.
+img_bytes=$(wc -c < "$bin" | tr -d ' ')
+avail_kb="$(dev_once 'df' 2>/dev/null | tr -d '\r' |
+            awk '$NF == "/" { print $(NF - 2); exit }')"
+case "$avail_kb" in
+    ''|*[!0-9]*) ;;                     # unknown: let the push report it
+    *)
+        avail_bytes=$((avail_kb * 1024))
+        if [ "$avail_bytes" -lt $((img_bytes + 65536)) ]; then
+            printf 'flash-ota: not enough space on the board for the image\n' >&2
+            printf '  image %s bytes, free %s bytes (%s kB)\n' \
+                   "$img_bytes" "$avail_bytes" "$avail_kb" >&2
+            printf '  /boot and /tmp were just pruned, so this is the rootfs itself\n' >&2
+            exit 1
+        fi
+        ;;
+esac
 
 printf 'flash-ota: %s -> %s (%s)\n' "$bin" "$ESPIX_HOST" "$ESPIX_TARGET"
 if ! dev_push "$bin" /tmp/espix.bin >/dev/null 2>&1; then
+    # The partial is worse than nothing: it fills the rootfs and makes every
+    # retry fail the same way.
+    dev_once 'sudo rm -f /tmp/espix.bin' >/dev/null 2>&1 || true
     printf 'flash-ota: could not copy the image to the board\n' >&2
     exit 1
 fi
