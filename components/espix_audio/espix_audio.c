@@ -278,6 +278,15 @@ static volatile bool s_stop;
 static volatile bool s_running;
 
 /*
+ * A stop pressed while a stream is still opening. stream_open() spends tens of
+ * milliseconds in the codec's own open before s_stream exists, and a Stop
+ * landing in that window used to find nothing and be lost -- which is exactly
+ * "I click Test, then Stop, and it does not stop". The flag is cleared by
+ * whatever starts a tone, not by the stop, so it cannot be lost.
+ */
+static volatile bool s_stop_requested;
+
+/*
  * Whether the running task's stack came from xTaskCreatePinnedToCoreWithCaps
  * (PSRAM) or the plain xTaskCreatePinnedToCore fallback (internal). It decides
  * how it must be deleted: a WithCaps task deleted with vTaskDelete() leaks its
@@ -599,6 +608,13 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
         return NULL;
     }
 
+    /*
+     * Published before the sink starts: sink->start() is the codec's own open
+     * (an I2C register sequence, tens of milliseconds) and a Stop landing
+     * inside it must be able to find this.
+     */
+    s_stream = st;
+
     sink->start();
 
     st->task_caps = true;
@@ -609,13 +625,12 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
         if (xTaskCreatePinnedToCore(stream_task, "espix:stream", STREAM_STACK, st, 20,
                                     &st->exit.task, 1) != pdPASS) {
             st->exit.task = NULL;
+            s_stream = NULL;
             vStreamBufferDeleteWithCaps(st->sb);
             free(st);
             return NULL;
         }
     }
-
-    s_stream = st;
     return st;
 }
 
@@ -666,7 +681,7 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
 static void tone_play(espix_audio_stream_t *st, int frames, tone_osc_t *osc,
                       int ch, int16_t *buf)
 {
-    while (frames > 0) {
+    while (frames > 0 && !s_stop_requested) {
         int n = frames > TONE_FRAMES ? TONE_FRAMES : frames;
 
         for (int i = 0; i < n; i++) {
@@ -693,6 +708,7 @@ esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
     if (freq_hz <= 0 || freq_hz > 20000) {
         return ESP_ERR_INVALID_ARG;
     }
+    s_stop_requested = false;       /* a new tone is not a stopped one */
     const espix_audio_format_t fmt = { 44100, 2, 16 };
     espix_audio_stream_t *st = espix_audio_stream_open(&fmt);
     if (st == NULL) {
@@ -737,7 +753,15 @@ static void tone_task(void *arg)
 {
     tone_args_t a = *(tone_args_t *)arg;
     free(arg);
-    (void)espix_audio_tone(a.freq_hz, a.seconds, a.left_right);
+
+    /*
+     * Checked before the tone starts, because a Stop can land between this task
+     * being created and it getting here -- the same race the stream's early
+     * publication covers further in.
+     */
+    if (!s_stop_requested) {
+        (void)espix_audio_tone(a.freq_hz, a.seconds, a.left_right);
+    }
     vTaskDeleteWithCaps(NULL);
 }
 
@@ -747,6 +771,7 @@ esp_err_t espix_audio_tone_async(int freq_hz, int seconds, bool left_right)
     if (a == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_stop_requested = false;
     a->freq_hz     = freq_hz;
     a->seconds     = seconds;
     a->left_right  = left_right;
@@ -1448,6 +1473,8 @@ esp_err_t espix_audio_play_wait(const char *uri)
 esp_err_t espix_audio_stop(void)
 {
     bool did = false;
+
+    s_stop_requested = true;
 
     /*
      * An app's stream is not the decoder, so it does not see s_stop -- the
