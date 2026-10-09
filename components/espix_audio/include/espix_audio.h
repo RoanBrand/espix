@@ -72,6 +72,25 @@ esp_err_t espix_audio_set_volume(int percent);
 int       espix_audio_get_volume(void);
 
 /*
+ * A PCM stream the app writes itself, for audio it generates rather than
+ * decodes -- a game's sound effects, a synthesiser. The app blocks in
+ * stream_write only while the engine's ring is full; the engine drains it to
+ * the sink on its own PSRAM task, so neither side waits on the other. One
+ * stream at a time for now, and mutually exclusive with play().
+ */
+typedef struct espix_audio_stream espix_audio_stream_t;
+
+/* NULL when there is no connected sink, or one is already playing/streaming. */
+espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt);
+
+/* Blocks while the ring is full. Returns the bytes taken; a short write is the
+ * caller's to loop on. */
+size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_t len);
+
+/* Flush, stop the drain task, and free the ring. Blocks until the task is gone. */
+esp_err_t espix_audio_stream_close(espix_audio_stream_t *st);
+
+/*
  * Register the benchmark sink (CONFIG_ESPIX_AUDIO_NULL_SINK). It accepts PCM as
  * fast as it arrives and discards it, so a "play" measures the source and the
  * decoder alone. Built only for that measurement; see the Kconfig.

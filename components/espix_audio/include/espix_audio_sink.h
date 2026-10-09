@@ -56,6 +56,19 @@ esp_err_t espix_audio_sink_register(const espix_audio_sink_ops_t *ops);
 /* The sink `play` uses, or NULL when nothing is registered (S3 with no codec). */
 const espix_audio_sink_ops_t *espix_audio_sink_default(void);
 
+/* The registered sinks, for a UI to list. Returns how many were written. */
+size_t espix_audio_sink_list(const espix_audio_sink_ops_t **out, size_t max);
+
+/*
+ * Prefer a sink by name, or clear the preference with NULL (or ""). The
+ * preference is honoured while that sink is registered; without one the engine
+ * keeps picking the first connected sink on its own.
+ */
+esp_err_t espix_audio_sink_select(const char *name);
+
+/* The preferred sink's name, or "" when there is none. */
+const char *espix_audio_sink_selected(void);
+
 #ifdef __cplusplus
 }
 #endif

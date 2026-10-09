@@ -12,6 +12,7 @@
  */
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
@@ -26,6 +27,8 @@
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
+
+#include "freertos/stream_buffer.h"
 
 #include "espix_kernel.h"
 #include "espix_task.h"
@@ -70,14 +73,54 @@ esp_err_t espix_audio_sink_register(const espix_audio_sink_ops_t *ops)
     return ESP_OK;
 }
 
+/* A UI's choice, honoured while that sink is registered. */
+static char s_sink_want[32];
+
+size_t espix_audio_sink_list(const espix_audio_sink_ops_t **out, size_t max)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < s_sink_count && n < max; i++) {
+        out[n++] = s_sinks[i];
+    }
+    return n;
+}
+
+esp_err_t espix_audio_sink_select(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        s_sink_want[0] = '\0';
+        return ESP_OK;
+    }
+    for (size_t i = 0; i < s_sink_count; i++) {
+        if (strcmp(s_sinks[i]->name, name) == 0) {
+            strlcpy(s_sink_want, name, sizeof(s_sink_want));
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+const char *espix_audio_sink_selected(void)
+{
+    return s_sink_want;
+}
+
 const espix_audio_sink_ops_t *espix_audio_sink_default(void)
 {
     /*
-     * The first *connected* sink, not simply the first registered. The A2DP
-     * sink exists from boot but only reports connected once a link is up, and
-     * a local codec is always there -- so a board with both plays to Bluetooth
-     * when it is linked and to the speaker when it is not, with no selection.
+     * A chosen sink wins while it is registered -- the point of choosing. With
+     * no choice, the first *connected* sink rather than simply the first: the
+     * A2DP sink exists from boot but is only connected once a link is up, and a
+     * local codec is always there, so a board with both plays to Bluetooth when
+     * it is linked and to the speaker when it is not, with nothing set.
      */
+    if (s_sink_want[0] != '\0') {
+        for (size_t i = 0; i < s_sink_count; i++) {
+            if (strcmp(s_sinks[i]->name, s_sink_want) == 0) {
+                return s_sinks[i];
+            }
+        }
+    }
     for (size_t i = 0; i < s_sink_count; i++) {
         if (s_sinks[i]->connected == NULL || s_sinks[i]->connected()) {
             return s_sinks[i];
@@ -375,7 +418,7 @@ int espix_audio_get_volume(void)
     return s_volume;
 }
 
-static void feed(uint8_t *p, size_t n)
+static void feed_ex(uint8_t *p, size_t n, volatile bool *stop)
 {
     if (s_volume < 100) {
         int16_t *smp = (int16_t *)p;
@@ -391,7 +434,7 @@ static void feed(uint8_t *p, size_t n)
     }
 
     size_t off = 0;
-    while (off < n && !s_stop) {
+    while (off < n && !*stop) {
         const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
         if (sink == NULL) {
             /*
@@ -408,6 +451,143 @@ static void feed(uint8_t *p, size_t n)
         }
         off += sent;
     }
+}
+
+/* The engine's own feed: the decoder's stop flag. */
+static void feed(uint8_t *p, size_t n)
+{
+    feed_ex(p, n, &s_stop);
+}
+
+/*
+ * An app's PCM stream: a ring in PSRAM and a task that drains it.
+ *
+ * The point is that the app and the sink never wait on each other. The app
+ * blocks in stream_write only while the ring is full; the task blocks in
+ * xStreamBufferReceive only while it is empty. Neither spins. The task carries
+ * a PSRAM stack like `play`'s and announces its exit through espix_task_exit,
+ * so close() blocks on that rather than watching a handle.
+ *
+ * One producer at a time for now: a stream and `play` are mutually exclusive,
+ * because there is one default sink and no mixer yet.
+ */
+#define STREAM_RING  (256 * 1024)
+#define STREAM_CHUNK (4 * 1024)
+#define STREAM_STACK (4 * 1024)
+
+struct espix_audio_stream {
+    StreamBufferHandle_t sb;
+    espix_task_exit_t    exit;
+    espix_audio_format_t fmt;
+    volatile bool        stop;
+    bool                 task_caps;
+};
+
+static espix_audio_stream_t *s_stream;
+
+static void stream_task(void *arg)
+{
+    espix_audio_stream_t *st = arg;
+    uint8_t *buf = malloc(STREAM_CHUNK);
+
+    while (buf != NULL) {
+        /*
+         * Block on the ring. The timeout is the only way to notice `stop`,
+         * because FreeRTOS cannot abort a blocked stream-buffer receive -- so
+         * this is one wake every 100 ms while idle, not a busy poll.
+         */
+        const size_t n = xStreamBufferReceive(st->sb, buf, STREAM_CHUNK,
+                                              pdMS_TO_TICKS(100));
+        if (n > 0) {
+            feed_ex(buf, n, &st->stop);
+        } else if (st->stop && xStreamBufferIsEmpty(st->sb)) {
+            break;
+        }
+    }
+
+    free(buf);
+    espix_task_exited(&st->exit);
+    if (st->task_caps) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
+}
+
+espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
+{
+    if (fmt == NULL || fmt->channels == 0 || fmt->bits != 16) {
+        return NULL;
+    }
+    if (s_stream != NULL || s_running) {
+        return NULL;
+    }
+    const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
+    if (sink == NULL || !sink->connected()) {
+        return NULL;
+    }
+
+    espix_audio_stream_t *st = calloc(1, sizeof(*st));
+    if (st == NULL) {
+        return NULL;
+    }
+    st->fmt = *fmt;
+    st->sb  = xStreamBufferCreateWithCaps(STREAM_RING, STREAM_CHUNK, MALLOC_CAP_SPIRAM);
+    if (st->sb == NULL || !espix_task_exit_init(&st->exit)) {
+        if (st->sb != NULL) {
+            vStreamBufferDeleteWithCaps(st->sb);
+        }
+        free(st);
+        return NULL;
+    }
+
+    sink->start();
+
+    st->task_caps = true;
+    if (xTaskCreatePinnedToCoreWithCaps(stream_task, "espix:stream", STREAM_STACK, st, 20,
+                                        &st->exit.task, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        st->task_caps = false;
+        if (xTaskCreatePinnedToCore(stream_task, "espix:stream", STREAM_STACK, st, 20,
+                                    &st->exit.task, 1) != pdPASS) {
+            st->exit.task = NULL;
+            vStreamBufferDeleteWithCaps(st->sb);
+            free(st);
+            return NULL;
+        }
+    }
+
+    s_stream = st;
+    return st;
+}
+
+size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_t len)
+{
+    if (st == NULL || pcm == NULL || len == 0) {
+        return 0;
+    }
+    /*
+     * Blocks while the ring is full -- that is the backpressure, and how an app
+     * paces itself to the sink. A timeout rather than portMAX_DELAY so a close
+     * cannot wedge it; the count actually taken comes back either way, and
+     * looping on a short write is the caller's.
+     */
+    return xStreamBufferSend(st->sb, pcm, len, pdMS_TO_TICKS(1000));
+}
+
+esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
+{
+    if (st == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    st->stop = true;
+    (void)espix_task_exit_wait(&st->exit, 0);   /* blocks until the task is gone */
+    vStreamBufferDeleteWithCaps(st->sb);
+    if (s_stream == st) {
+        s_stream = NULL;
+    }
+    free(st);
+    return ESP_OK;
 }
 
 /*
@@ -1002,6 +1182,9 @@ static esp_err_t play_common(const char *uri, bool wait)
 {
     if (uri == NULL || uri[0] == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_stream != NULL) {
+        return ESP_ERR_INVALID_STATE;   /* an app's stream already owns the sink */
     }
 
     /*

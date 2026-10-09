@@ -14,5 +14,6 @@ idf_component_register(
         espix_appdata
         espix_net
         espix_bt
+        espix_audio
         freertos
 )

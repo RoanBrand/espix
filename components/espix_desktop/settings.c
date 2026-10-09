@@ -23,6 +23,8 @@
 
 #include "esp_timer.h"
 
+#include "espix_audio.h"
+#include "espix_audio_sink.h"
 #include "espix_bt.h"
 #include "espix_desktop.h"
 #include "espix_display.h"
@@ -39,12 +41,13 @@
 typedef enum {
     SEC_SCREEN = 0,
     SEC_NETWORK,
+    SEC_BLUETOOTH,
     SEC_AUDIO,
     SEC_COUNT,
 } section_t;
 
 static const char *const s_section_names[SEC_COUNT] = {
-    "Screen", "Network", "Audio",
+    "Screen", "Network", "Bluetooth", "Audio",
 };
 
 /* What pressing a row does. Rows that do nothing still say so, by ACT_NONE. */
@@ -60,6 +63,10 @@ typedef enum {
     ACT_UNPAIR,
     ACT_DEVICE,
     ACT_BT_POWER,
+    ACT_SINK,
+    ACT_VOL_UP,
+    ACT_VOL_DOWN,
+    ACT_STOP,
 } action_t;
 
 typedef enum {
@@ -239,7 +246,7 @@ static void refresh_network(void)
     }
 }
 
-static void refresh_audio(void)
+static void refresh_bluetooth(void)
 {
     s_ndev = espix_bt_ready()
            ? (int)espix_bt_devices(s_devs, sizeof(s_devs) / sizeof(s_devs[0]))
@@ -369,7 +376,7 @@ static int section_rows(const espix_window_t *w, row_t *rows)
                              false, ACT_NONE, 0 };
         break;
 
-    case SEC_AUDIO: {
+    case SEC_BLUETOOTH: {
         const bool ready = espix_bt_ready();
 
         rows[n++] = (row_t){ ROW_HEAD, "Audio", NULL, true, false, ACT_NONE, 0 };
@@ -405,9 +412,57 @@ static int section_rows(const espix_window_t *w, row_t *rows)
         rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_BUTTON, "Unpair", NULL, s_dev_sel >= 0, false,
                              ACT_UNPAIR, 0 };
-        rows[n++] = (row_t){ ROW_TEXT, "Turning the adapter on and off, and the",
+        rows[n++] = (row_t){ ROW_TEXT, "Scan, pair and unpair here; output and",
                              NULL, false, false, ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_TEXT, "codec and volume, come next.",
+        rows[n++] = (row_t){ ROW_TEXT, "level live in the Audio section.",
+                             NULL, false, false, ACT_NONE, 0 };
+        break;
+    }
+
+    case SEC_AUDIO: {
+        const espix_audio_sink_ops_t *sinks[8];
+        const size_t ns = espix_audio_sink_list(sinks,
+                                                sizeof(sinks) / sizeof(sinks[0]));
+        const espix_audio_sink_ops_t *cur = espix_audio_sink_default();
+
+        rows[n++] = (row_t){ ROW_HEAD, "Audio", NULL, true, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_FIELD, "Output",
+                             cur != NULL ? cur->name : "none", cur != NULL, false,
+                             ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_FIELD, "Playback", espix_audio_state(), true,
+                             false, ACT_NONE, 0 };
+
+        const int vv = n;
+        snprintf(s_val[vv], sizeof(s_val[vv]), "%d%%", espix_audio_get_volume());
+        rows[n++] = (row_t){ ROW_FIELD, "Volume", s_val[vv], true, false,
+                             ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Quieter   (-10)", NULL,
+                             espix_audio_get_volume() > 0, false, ACT_VOL_DOWN, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Louder   (+10)", NULL,
+                             espix_audio_get_volume() < 100, false, ACT_VOL_UP, 0 };
+        rows[n++] = (row_t){ ROW_BUTTON, "Stop playback", NULL, true, false,
+                             ACT_STOP, 0 };
+
+        rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_TEXT, "Output device", NULL, true, false,
+                             ACT_NONE, 0 };
+
+        if (ns == 0) {
+            rows[n++] = (row_t){ ROW_TEXT, "  none registered", NULL, false,
+                                 false, ACT_NONE, 0 };
+        }
+        for (size_t i = 0; i < ns && n < ROW_MAX - 2; i++) {
+            const bool conn = sinks[i]->connected == NULL || sinks[i]->connected();
+            const int  vi   = n;
+            snprintf(s_val[vi], sizeof(s_val[vi]), "%s",
+                     conn ? "connected" : "not connected");
+            rows[n++] = (row_t){ ROW_RADIO, sinks[i]->name, s_val[vi], true,
+                                 sinks[i] == cur, ACT_SINK, (int)i };
+        }
+        rows[n++] = (row_t){ ROW_GAP, NULL, NULL, true, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_TEXT, "A chosen device wins while it is registered;",
+                             NULL, false, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_TEXT, "otherwise the connected one plays.",
                              NULL, false, false, ACT_NONE, 0 };
         break;
     }
@@ -488,8 +543,8 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             s_sec = (section_t)i;
             if (s_sec == SEC_NETWORK) {
                 refresh_network();
-            } else if (s_sec == SEC_AUDIO) {
-                refresh_audio();
+            } else if (s_sec == SEC_BLUETOOTH) {
+                refresh_bluetooth();
             }
             espix_window_repaint(w);
             return;
@@ -560,7 +615,7 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             break;
         case ACT_SCAN:
             (void)espix_bt_scan(!espix_bt_scanning());
-            refresh_audio();
+            refresh_bluetooth();
             break;
         case ACT_BT_POWER:
             if (espix_bt_ready()) {
@@ -568,14 +623,32 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             } else {
                 (void)espix_bt_init();
             }
-            refresh_audio();
+            refresh_bluetooth();
             break;
         case ACT_UNPAIR:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
                 (void)espix_bt_remove(s_devs[s_dev_sel].bda);
                 s_dev_sel = -1;
-                refresh_audio();
+                refresh_bluetooth();
             }
+            break;
+        case ACT_SINK: {
+            const espix_audio_sink_ops_t *sinks[8];
+            const size_t ns = espix_audio_sink_list(sinks,
+                                                    sizeof(sinks) / sizeof(sinks[0]));
+            if (rows[i].arg >= 0 && (size_t)rows[i].arg < ns) {
+                (void)espix_audio_sink_select(sinks[rows[i].arg]->name);
+            }
+            break;
+        }
+        case ACT_VOL_UP:
+            (void)espix_audio_set_volume(espix_audio_get_volume() + 10);
+            break;
+        case ACT_VOL_DOWN:
+            (void)espix_audio_set_volume(espix_audio_get_volume() - 10);
+            break;
+        case ACT_STOP:
+            (void)espix_audio_stop();
             break;
         default:
             return;                     /* a disabled row: nothing happened */
@@ -602,7 +675,7 @@ static void settings_key(espix_window_t *w, uint32_t keysym, bool down, void *ct
     if (s_sec == SEC_NETWORK) {
         refresh_network();
     } else if (s_sec == SEC_AUDIO) {
-        refresh_audio();
+        refresh_bluetooth();
     }
     espix_window_repaint(w);
 }
@@ -626,7 +699,7 @@ espix_window_t *espix_settings_open(void)
         espix_window_set_pointer(s_win, settings_pointer);
 
         refresh_network();
-        refresh_audio();
+        refresh_bluetooth();
         espix_window_repaint(s_win);
     }
     return s_win;
