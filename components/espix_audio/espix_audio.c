@@ -444,9 +444,11 @@ int espix_audio_get_volume(void)
 static void feed_ex(uint8_t *p, size_t n, volatile bool *stop)
 {
     if (s_volume < 100) {
+        /* Q15: the naive form divides per sample, which is per-sample CPU. */
+        const int32_t g = (int32_t)s_volume * 32768 / 100;
         int16_t *smp = (int16_t *)p;
         for (size_t i = 0; i < n / 2; i++) {
-            int32_t v = (int32_t)smp[i] * s_volume / 100;
+            int32_t v = ((int32_t)smp[i] * g) >> 15;
             if (v > 32767) {
                 v = 32767;
             } else if (v < -32768) {
@@ -502,6 +504,34 @@ static void feed(uint8_t *p, size_t n)
 #define TONE_FRAMES  512
 #define TONE_HZ      440
 #define TONE_LEVEL   12000
+/*
+ * A sine from the "magic circle": a quadrature pair rotated once per sample by
+ * k = 2 sin(pi f / fs). Two multiplies and two adds, no table and no trig --
+ * which matters here, because the obvious table costs a kilobyte of the RAM
+ * this board is always short of, and sin() per sample costs tens of cycles of
+ * soft double math 44100 times a second. There is a CORDIC peripheral, but it
+ * computes trig of an angle you have rather than running one: the angle update
+ * is the cheap part, and a register round-trip per sample is not.
+ */
+typedef struct {
+    int32_t x;          /* in phase  */
+    int32_t y;          /* quadrature */
+    int32_t k;          /* 2 sin(pi f / fs), Q15 */
+} tone_osc_t;
+
+static void tone_osc_init(tone_osc_t *o, int freq_hz, int rate)
+{
+    o->x = TONE_LEVEL;
+    o->y = 0;
+    o->k = (int32_t)(2.0 * sin(M_PI * (double)freq_hz / (double)rate) * 32768.0);
+}
+
+static inline int16_t tone_osc_next(tone_osc_t *o)
+{
+    o->x -= (o->y * o->k) >> 15;
+    o->y += (o->x * o->k) >> 15;
+    return (int16_t)o->x;
+}
 
 struct espix_audio_stream {
     StreamBufferHandle_t sb;
@@ -595,10 +625,20 @@ size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_
         return 0;
     }
     /*
+     * Stopped from elsewhere: say so with a zero rather than accept more. The
+     * writer's loop ends on it, which is what lets the *owner* close the
+     * stream -- closing it here instead would free it while this call is still
+     * inside, and that use-after-free is exactly how a stopped tone kept
+     * playing.
+     */
+    if (st->stop) {
+        return 0;
+    }
+    /*
      * Blocks while the ring is full -- that is the backpressure, and how an app
-     * paces itself to the sink. A timeout rather than portMAX_DELAY so a close
-     * cannot wedge it; the count actually taken comes back either way, and
-     * looping on a short write is the caller's.
+     * paces itself to the sink. A timeout rather than portMAX_DELAY so the stop
+     * above is noticed within it; the count actually taken comes back either
+     * way, and looping on a short write is the caller's.
      */
     return xStreamBufferSend(st->sb, pcm, len, pdMS_TO_TICKS(1000));
 }
@@ -623,20 +663,16 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
  * channel carries it: 0 left, 1 right, 2 both. That is what makes a stereo
  * check possible -- one second each way says more than a level meter.
  */
-static void tone_play(espix_audio_stream_t *st, int frames, double step,
-                      double *phase, int ch, int16_t *buf)
+static void tone_play(espix_audio_stream_t *st, int frames, tone_osc_t *osc,
+                      int ch, int16_t *buf)
 {
     while (frames > 0) {
         int n = frames > TONE_FRAMES ? TONE_FRAMES : frames;
 
         for (int i = 0; i < n; i++) {
-            const int16_t v = (int16_t)(sin(*phase) * (double)TONE_LEVEL);
+            const int16_t v = tone_osc_next(osc);
             buf[2 * i]     = (ch == 1) ? 0 : v;
             buf[2 * i + 1] = (ch == 0) ? 0 : v;
-            *phase += step;
-            if (*phase >= 2.0 * M_PI) {
-                *phase -= 2.0 * M_PI;
-            }
         }
         size_t off = 0;
         const size_t bytes = (size_t)n * 4;
@@ -669,16 +705,17 @@ esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
         return ESP_ERR_NO_MEM;
     }
 
-    const double step = 2.0 * M_PI * (double)freq_hz / (double)fmt.rate;
-    double       phase = 0.0;
-    const int    one_s = (int)fmt.rate;
+    tone_osc_t  osc;
+    const int   one_s = (int)fmt.rate;
+
+    tone_osc_init(&osc, freq_hz, (int)fmt.rate);
 
     if (left_right) {
-        tone_play(st, one_s, step, &phase, 0, buf);     /* left  */
-        tone_play(st, one_s, step, &phase, 1, buf);     /* right */
-        tone_play(st, one_s, step, &phase, 2, buf);     /* both  */
+        tone_play(st, one_s, &osc, 0, buf);     /* left  */
+        tone_play(st, one_s, &osc, 1, buf);     /* right */
+        tone_play(st, one_s, &osc, 2, buf);     /* both  */
     } else {
-        tone_play(st, seconds * one_s, step, &phase, 2, buf);
+        tone_play(st, seconds * one_s, &osc, 2, buf);
     }
 
     free(buf);
@@ -1410,16 +1447,33 @@ esp_err_t espix_audio_play_wait(const char *uri)
 
 esp_err_t espix_audio_stop(void)
 {
-    if (s_exit.task == NULL) {
-        return ESP_ERR_INVALID_STATE;
+    bool did = false;
+
+    /*
+     * An app's stream is not the decoder, so it does not see s_stop -- the
+     * desktop's Stop button did nothing to a tone for exactly that reason.
+     * This *asks* the stream to stop rather than closing it: whoever opened it
+     * is the one inside stream_write, and freeing it from here would be a
+     * use-after-free. The writer's loop ends on the zero that write() then
+     * returns, and its owner closes it.
+     */
+    if (s_stream != NULL) {
+        s_stream->stop = true;
+        did = true;
     }
-    s_stop = true;
-    return ESP_OK;
+    if (s_exit.task != NULL) {
+        s_stop = true;
+        did = true;
+    }
+    return did ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 const char *espix_audio_state(void)
 {
-    return s_running ? "playing" : "idle";
+    if (s_running) {
+        return "playing";
+    }
+    return s_stream != NULL ? "streaming" : "idle";
 }
 
 #endif /* CONFIG_ESPIX_AUDIO */

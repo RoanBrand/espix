@@ -55,6 +55,15 @@ static bool                 s_a2d_connected;
 static uint8_t              s_connected_bda[ESPIX_BDA_LEN];
 
 /*
+ * What was connected when the stack last went down, so `power on` can bring it
+ * back. It is the one device known to work with this board -- re-paging a
+ * bonded sink that has never been tried here is how the Audioengine HD3 took
+ * the controller down.
+ */
+static uint8_t              s_last_bda[ESPIX_BDA_LEN];
+static bool                 s_have_last;
+
+/*
  * Whether the A2DP stream is on the air. START and SUSPEND are sent only on
  * transitions: two `play`s in quick succession otherwise had the first one's
  * SUSPEND and the second one's START cross, and Bluedroid logged "un-acked
@@ -502,10 +511,18 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 static void retry_connect(void *arg)
 {
     (void)arg;
-    if (s_want_connect && s_retries < 40) {
-        s_retries++;
-        espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connect retry %u", s_retries);
-        (void)esp_a2d_source_connect(s_target);
+    if (!s_want_connect || s_retries >= 40) {
+        return;
+    }
+    s_retries++;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connect retry %u", s_retries);
+    if (esp_a2d_source_connect(s_target) != ESP_OK) {
+        /*
+         * The request was refused outright, so no disconnect event is coming to
+         * re-arm this -- which is why a reconnect after `power on` could sit
+         * there doing nothing. Keep the timer going ourselves.
+         */
+        (void)esp_timer_start_once(s_retry, 3 * 1000 * 1000);
     }
 }
 
@@ -787,6 +804,28 @@ esp_err_t espix_bt_init(void)
     (void)esp_a2d_source_register_data_callback(a2d_data_cb);
 
     s_inited = true;
+
+    /*
+     * Bring back whatever was connected last time, which is what "turn
+     * Bluetooth on again and the Q45 comes back after a few seconds" asks for.
+     * The connect-retry timer covers the first attempt landing before the
+     * controller can page.
+     */
+    if (s_have_last) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "will reconnect the last sink");
+        memcpy(s_target, s_last_bda, ESPIX_BDA_LEN);
+        s_want_connect = true;
+        s_retries      = 0;
+        /*
+         * Through the timer, not a direct call: the controller has only just
+         * been enabled and a connect request issued here is refused before the
+         * stack can page anything.
+         */
+        if (s_retry != NULL) {
+            (void)esp_timer_start_once(s_retry, 3 * 1000 * 1000);
+        }
+    }
+
     espix_klog(ESPIX_KLOG_INFO, TAG, "up as '%s' (a2dp source)", CONFIG_ESPIX_BT_NAME);
     return ESP_OK;
 }
@@ -808,6 +847,21 @@ esp_err_t espix_bt_shutdown(void)
     s_want_connect = false;
     if (s_retry != NULL) {
         (void)esp_timer_stop(s_retry);
+    }
+
+    /*
+     * Tell the sink before the stack goes. Deinitialising without this leaves
+     * the speaker believing the source is still there -- it says nothing, which
+     * is what "turning Bluetooth off does not make the Q45 announce the source
+     * disconnected" was. The wait gives the AVDTP close a chance to reach the
+     * air; it is remembered first, so power-on can bring it back.
+     */
+    if (s_a2d_connected) {
+        memcpy(s_last_bda, s_connected_bda, ESPIX_BDA_LEN);
+        s_have_last = true;
+        espix_klog(ESPIX_KLOG_INFO, TAG, "remembering the sink for next power-on");
+        (void)esp_a2d_source_disconnect(s_connected_bda);
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
 
     (void)esp_a2d_source_deinit();
