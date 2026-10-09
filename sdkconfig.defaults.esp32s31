@@ -81,6 +81,11 @@ CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
 # Cover art is the AVRCP controller fetching artwork from the sink. We consume
 # none, and it is not on the playback path, so it is off.
 # CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED is not set
+# The L2CAP congestion guard logs at ERROR and fires for a normal recursion
+# guard -- thousands of lines a second while the radio is already behind, and
+# paying to print that is its own small part of the problem. Turn it back on
+# when diagnosing congestion, and expect the flood.
+CONFIG_BT_LOG_L2CAP_TRACE_LEVEL_NONE=y
 # Classic only: the controller must be in BR/EDR mode for A2DP (IDF's own
 # a2dp_source example sets these three for exactly this reason).
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=n
