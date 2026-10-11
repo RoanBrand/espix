@@ -7,9 +7,13 @@
 # link error. It would fail on the device, at load time. Listing the platform
 # after the engine is what puts its symbols in front of the engine's
 # references.
-idf_component_register(SRCS "doom_espix.c"
+# doom_sound.c is the other half of the seam. The engine asks for a sound module
+# when FEATURE_SOUND is set, and this is one, over espix's audio stream API --
+# which is also why espix_audio's app-facing header is on the include path here.
+idf_component_register(SRCS "doom_espix.c" "doom_sound.c"
                        INCLUDE_DIRS
                            "."
                            "${CMAKE_SOURCE_DIR}/../../components/espix_proc/include"
                            "${CMAKE_SOURCE_DIR}/../../components/espix_display/include"
+                           "${CMAKE_SOURCE_DIR}/../../components/espix_audio/include"
                        REQUIRES doomgeneric esp_timer)

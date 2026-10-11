@@ -262,13 +262,12 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
      * reaches for and a RISC-V one inlines. espix had the double set and the
      * sf<->df conversions, but nothing that did arithmetic on a float -- so
      * Doom, whose engine divides floats, failed to load on the S3 with
-     * "undefined symbol: __divsf3" while the same program on the S31
-     * references none of these at all.
+     * "undefined symbol: __divsf3".
      *
-     * Exporting them cannot shadow hardware: what an app calls is decided when
-     * the app is compiled, so a build with an FPU never asks. The cost is the
-     * libgcc code linked into the kernel, which these entries are also what
-     * makes it link at all -- nothing else here calls them.
+     * Still guarded, and not out of tidiness: RISC-V libgcc for this target
+     * does not contain these at all, so naming them there is a link error
+     * against the firmware itself. An app that needs one has been built for a
+     * different FPU than the board has.
      */
     ESP_ELFSYM_EXPORT(__addsf3),
     ESP_ELFSYM_EXPORT(__subsf3),

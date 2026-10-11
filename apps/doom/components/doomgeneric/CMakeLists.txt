@@ -8,8 +8,12 @@ file(GLOB DG_SRCS "${DG_DIR}/*.c")
 list(FILTER DG_SRCS EXCLUDE REGEX "/doomgeneric_(allegro|emscripten|linuxvt|sdl|soso|sosox|win|xlib)\\.c$")
 list(FILTER DG_SRCS EXCLUDE REGEX "/i_(allegromusic|allegrosound|sdlsound|sdlmusic)\\.c$")
 
+# compat/ holds one empty SDL_mixer.h. FEATURE_SOUND makes i_sound.c include it
+# and use nothing from it -- the mixing it would have asked SDL_mixer for is the
+# platform module's job here -- so satisfying the include is cheaper than
+# patching the engine, and third_party/ stays exactly as fetched.
 idf_component_register(SRCS ${DG_SRCS}
-                       INCLUDE_DIRS "${DG_DIR}")
+                       INCLUDE_DIRS "${DG_DIR}" "compat")
 
 # 320x200, and CMAP256 for an 8-bit framebuffer: the engine hands us palette
 # indices and the platform converts, which is less memory than the 32-bit path
@@ -20,7 +24,12 @@ idf_component_register(SRCS ${DG_SRCS}
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
     DOOMGENERIC_RESX=320
     DOOMGENERIC_RESY=200
-    CMAP256)
+    CMAP256
+    # Sound effects, mixed by the platform module (doom_sound.c) over espix's
+    # audio stream API. This is the switch that makes i_sound.c want both
+    # DG_sound_module and DG_music_module -- so music exists as a stub, and
+    # doom_espix.c keeps snd_musicdevice = SNDDEVICE_NONE until it is real.
+    FEATURE_SOUND)
 
 # Doom is 1993 C: it compiles with warnings on, so they are turned off here
 # rather than patched, keeping the checkout exactly upstream.
