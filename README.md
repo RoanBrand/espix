@@ -52,10 +52,13 @@ together.
   - Showcase desktop, and gfx things, without an actual screen.
 - Audio:
   - Play mp3 or wav files.
-  - Stream to BT speakers or headphones (S31)
+  - Stream to BT speakers or headphones, or the onboard ES8311 speaker (S31).
+  - Record from the onboard microphone; pipe a source to a sink.
+  - Mix several apps into one output, with per-app volume.
   - Planned:
-    - General audio backend system planned for apps
-    - More sinks: BLE Audio, dac/amps on core/korvo boards, i2s in/out through gpio, etc.
+    - Per-stream sink selection.
+    - More sinks: BLE Audio, dac/amps on the Korvo board, i2s in/out through gpio, etc.
+    - More sources: HTTP/Icecast, UPnP/DLNA.
 
 Use cases:
 - Router, NAS, Audio streaming/server, "nano" server/PC.
