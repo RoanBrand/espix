@@ -1,0 +1,18 @@
+# The constants an app must agree with the kernel on.
+#
+# An app is a separate ESP-IDF project and so is configured separately -- but it
+# is loaded into the kernel's FreeRTOS and calls into it, so the two have to
+# agree on everything the app hands across that boundary as a TickType_t.
+#
+# CONFIG_FREERTOS_HZ is the one that bit. pdMS_TO_TICKS() is a macro, expanded
+# in the app's own build against the app's CONFIG_FREERTOS_HZ, but the tick it
+# computes a count for is the kernel's -- so a mismatch makes every delay the
+# app asks for wrong in a way that is invisible until it runs. At 100 against
+# the kernel's 250, a nominal 20 ms becomes 8, and anything under 10 ms becomes
+# zero ticks, which vTaskDelay() treats as a yield and not a sleep. Measured:
+# Doom's mixer ran 256 idle iterations in 45 ms and produced audio at 169206
+# frames a second where 44100 was wanted, which is heard as distortion.
+#
+# The kernel's value is in sdkconfig.defaults at the top of the tree, and
+# tools/build-apps.sh refuses to stage an app whose value differs.
+CONFIG_FREERTOS_HZ=250

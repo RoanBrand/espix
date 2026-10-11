@@ -129,9 +129,26 @@ for name in "${names[@]}"; do
         set -a; . "$app/build.env"; set +a
     fi
 
+    # The app must be configured with the kernel's ABI constants, not its own
+    # project defaults; see tools/app-abi.defaults. Checked here rather than
+    # after the build so it fails in a second instead of after a full compile.
+    fw_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' "$root/sdkconfig.defaults" 2>/dev/null | cut -d= -f2)
+    app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' "$app/sdkconfig" 2>/dev/null | cut -d= -f2)
+    if [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; then
+        echo "build-apps: $name: CONFIG_FREERTOS_HZ is ${app_hz:-unset}; the kernel's is $fw_hz" >&2
+        echo "build-apps: an app runs inside the kernel's FreeRTOS, so pdMS_TO_TICKS()" >&2
+        echo "build-apps: in the app must use the kernel's rate -- otherwise every delay" >&2
+        echo "build-apps: it computes is wrong, and anything under one tick does not" >&2
+        echo "build-apps: sleep at all. See tools/app-abi.defaults." >&2
+        exit 1
+    fi
+
     echo "build-apps: building $name"
     (
         cd "$app"
+
+        # Applied to the app's own defaults rather than replacing them.
+        export SDKCONFIG_DEFAULTS="$root/tools/app-abi.defaults;$app/sdkconfig.defaults"
 
         # 'force' means the staged binary was built for another target, and a
         # target change invalidates every object in the build dir -- not just the
