@@ -232,6 +232,21 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     }
 
     /*
+     * First of all, end any thread the process still has running.
+     *
+     * First, not last, because a thread is *running*: it can be inside the
+     * process's memory, its descriptors or its stream at the moment the rest of
+     * this takes them away.
+     *
+     * And here, not in the task-gone hook where the first version put it. A
+     * graceful exit does not go through that hook -- proven on the board, where
+     * Doom quitting to the desktop returned its arena (this function ran) and
+     * still left a pthread at 98% of a core. This is the function both exits
+     * run, so this is where the threads have to be ended. See abi_pthread.c.
+     */
+    espix_pthread_reap(slot);
+
+    /*
      * First, whatever it left open. A process killed with files open never
      * runs its own close(), and the descriptors IDF allocated for them are a
      * fixed MAX_FDS pool shared with sockets -- so enough kills stop the whole
@@ -1136,13 +1151,6 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
          * again -- and the sink never suspends while it is "open".
          */
         espix_audio_streams_recover((void *)task);
-
-        /*
-         * And the threads it started, if this is the process's main task going
-         * away. A thread that outlives its process keeps a stack and a slot
-         * pointer nobody owns -- and goes on running. See abi_pthread.c.
-         */
-        espix_pthread_reap(slot);
     }
 
     /* Said out loud, and only once the lock is down. "stdio detached" means this

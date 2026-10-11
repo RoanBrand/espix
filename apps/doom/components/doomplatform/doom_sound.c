@@ -170,8 +170,8 @@ static void *sfx_thread(void *arg)
      * The credit is the same shape Bluedroid's A2DP source uses for the same
      * reason: count the frames owed at OUT_RATE and sleep until they are due.
      */
-    const int64_t start_us = esp_timer_get_time();
-    uint64_t      produced = 0;
+    int64_t  start_us = esp_timer_get_time();
+    uint64_t produced = 0;
 
     /* Instrumentation while the cost is unexplained: where the thread's time
      * actually goes, per block, rather than where it ought to. */
@@ -193,6 +193,24 @@ static void *sfx_thread(void *arg)
          */
         const int64_t  elapsed_us = esp_timer_get_time() - start_us;
         const uint64_t owed = (uint64_t)(elapsed_us * (int64_t)OUT_RATE / 1000000);
+
+        /*
+         * Never chase a debt older than a few blocks.
+         *
+         * "Produce what is owed" is an instruction to spin for ever if the owed
+         * figure can outrun the mixer -- and it can, because the write only
+         * paces us while something is draining the stream. Doom exiting left
+         * this thread at 98% of a core with no consumer at all: the stream had
+         * nobody reading it, the write never blocked, and the debt grew without
+         * limit. Re-origining costs at most a few blocks of audio and bounds
+         * the loop. A pacer that depends on another subsystem's backpressure is
+         * not a pacer.
+         */
+        if (owed > produced + MIX_FRAMES * 4) {
+            start_us = esp_timer_get_time();
+            produced = 0;
+            continue;
+        }
 
         if (produced >= owed) {
             const int64_t next_us = (int64_t)((produced + MIX_FRAMES) * 1000000ULL
