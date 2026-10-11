@@ -24,10 +24,30 @@ static int cmd_play(espix_session_t *s, int argc, char **argv)
      */
     bool wait = false;
     int  argi = 1;
+    const char *sink = NULL;
 
-    if (argc > 1 && strcmp(argv[1], "--wait") == 0) {
-        wait = true;
-        argi = 2;
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--wait") == 0) {
+            wait = true;
+            argi += 1;
+        } else if (strcmp(argv[argi], "--sink") == 0 && argi + 1 < argc) {
+            sink = argv[argi + 1];
+            argi += 2;
+        } else {
+            break;
+        }
+    }
+
+    /*
+     * Which sink, for this playback. It sets the system's chosen sink rather
+     * than attaching the request to the stream, because one producer at a time
+     * is what this can express today: per-stream sinks need the mixer to stop
+     * assuming a single output. The distinction is real and this is the honest
+     * half of it -- the other half is a mixer that groups streams by sink.
+     */
+    if (sink != NULL && espix_audio_sink_select(sink) != ESP_OK) {
+        espix_eprintf(s, "play: no sink called '%s'\n", sink);
+        return 1;
     }
 
     if (argc <= argi) {
@@ -169,7 +189,7 @@ static espix_cmd_t s_play_cmds[] = {
       .usage = "sink [name]" },
     { .name = "play", .fn = cmd_play,
       .help = "play an audio file or stream to the connected A2DP sink",
-      .usage = "play [--wait] <file|url> | play {stop|status}" },
+      .usage = "play [--wait] [--sink <name>] <file|url> | play {stop|status}" },
     { .name = "volume", .fn = cmd_volume,
       .help = "get or set the master output volume (0-100)",
       .usage = "volume [0-100]" },

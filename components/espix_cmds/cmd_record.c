@@ -98,11 +98,32 @@ static void writer_task(void *arg)
 
 static int cmd_record(espix_session_t *s, int argc, char **argv)
 {
-    if (argc < 2) {
-        espix_eprintf(s, "usage: record <file.wav> [seconds]\n");
+    int argi = 1;
+    const char *want_src = NULL;
+
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--source") == 0 && argi + 1 < argc) {
+            want_src = argv[argi + 1];
+            argi += 2;
+        } else {
+            break;
+        }
+    }
+    if (argi >= argc) {
+        espix_eprintf(s, "usage: record [--source <name>] <file.wav> [seconds]\n");
         return 1;
     }
-    int seconds = argc > 2 ? atoi(argv[2]) : 5;
+    /*
+     * Which source, for this capture. Like play's --sink this sets the system's
+     * choice rather than binding the request to the stream, because the capture
+     * API is one client at a time today; the name is checked here so a typo says
+     * so instead of quietly recording from the wrong microphone.
+     */
+    if (want_src != NULL && espix_audio_source_select(want_src) != ESP_OK) {
+        espix_eprintf(s, "record: no source called '%s'\n", want_src);
+        return 1;
+    }
+    int seconds = argc > argi + 1 ? atoi(argv[argi + 1]) : 5;
     if (seconds <= 0) {
         seconds = 5;
     }
@@ -119,13 +140,13 @@ static int cmd_record(espix_session_t *s, int argc, char **argv)
     }
 
     char path[320];
-    if (!espix_cmd_path(s, argv[1], path, sizeof(path))) {
+    if (!espix_cmd_path(s, argv[argi], path, sizeof(path))) {
         return 1;
     }
 
     const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        espix_eprintf(s, "record: %s: cannot create\n", argv[1]);
+        espix_eprintf(s, "record: %s: cannot create\n", argv[argi]);
         return 1;
     }
 

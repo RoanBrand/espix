@@ -161,6 +161,10 @@ const espix_audio_sink_ops_t *espix_audio_sink_default(void)
 static const espix_audio_source_ops_t *s_sources[ESPIX_AUDIO_SOURCES_MAX];
 static size_t                          s_source_count;
 
+/* The chosen source, by name; empty means "first connected". Same shape as
+ * s_sink_want, and read by espix_audio_source_default() below. */
+static char s_source_want[32];
+
 esp_err_t espix_audio_source_register(const espix_audio_source_ops_t *ops)
 {
     if (ops == NULL || ops->name == NULL || ops->read == NULL) {
@@ -185,12 +189,54 @@ esp_err_t espix_audio_source_register(const espix_audio_source_ops_t *ops)
 
 const espix_audio_source_ops_t *espix_audio_source_default(void)
 {
+    /*
+     * A chosen source wins while it is connected, and falls through when it is
+     * not -- a selection that captures nothing reads as a broken recorder, and
+     * the list already says which source is connected. Same rule as the sink.
+     */
+    if (s_source_want[0] != 0) {
+        for (size_t i = 0; i < s_source_count; i++) {
+            if (strcmp(s_sources[i]->name, s_source_want) == 0 &&
+                (s_sources[i]->connected == NULL || s_sources[i]->connected())) {
+                return s_sources[i];
+            }
+        }
+    }
     for (size_t i = 0; i < s_source_count; i++) {
         if (s_sources[i]->connected == NULL || s_sources[i]->connected()) {
             return s_sources[i];
         }
     }
     return s_source_count > 0 ? s_sources[0] : NULL;
+}
+
+esp_err_t espix_audio_source_select(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        s_source_want[0] = '\0';
+        return ESP_OK;
+    }
+    for (size_t i = 0; i < s_source_count; i++) {
+        if (strcmp(s_sources[i]->name, name) == 0) {
+            strlcpy(s_source_want, name, sizeof(s_source_want));
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+const char *espix_audio_source_selected(void)
+{
+    return s_source_want;
+}
+
+size_t espix_audio_source_list(const espix_audio_source_ops_t **out, size_t max)
+{
+    const size_t n = (s_source_count < max) ? s_source_count : max;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = s_sources[i];
+    }
+    return n;
 }
 
 #if CONFIG_ESPIX_AUDIO_NULL_SINK

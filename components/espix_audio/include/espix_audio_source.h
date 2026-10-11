@@ -53,6 +53,18 @@ esp_err_t espix_audio_source_register(const espix_audio_source_ops_t *ops);
 /* The source a recorder uses, or NULL when nothing is registered. */
 const espix_audio_source_ops_t *espix_audio_source_default(void);
 
+/*
+ * Choose which source a recorder uses, by its stable name, and report it back.
+ * The sink side has had this since there was more than one sink; this is the
+ * same thing for the same reason, and an empty name returns to "the first
+ * connected one". ESP_ERR_NOT_FOUND if nothing is registered under that name.
+ */
+esp_err_t espix_audio_source_select(const char *name);
+const char *espix_audio_source_selected(void);
+
+/* The registered sources, for a command that has to list them. */
+size_t espix_audio_source_list(const espix_audio_source_ops_t **out, size_t max);
+
 #ifdef __cplusplus
 }
 #endif
