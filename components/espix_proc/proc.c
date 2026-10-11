@@ -18,6 +18,7 @@
 #include "espix_fs.h"
 #include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
 #include "espix_pm.h"       /* ...and espix_pm_task_gone(), for the same reason */
+#include "espix_audio.h"    /* ...and espix_audio_streams_recover(), likewise */
 
 #define TAG "proc"
 
@@ -1128,6 +1129,13 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
          * is the WifiLock bug, and it is silent and permanent.
          */
         espix_pm_task_gone((void *)task);
+
+        /*
+         * And any audio stream it was holding. A killed player that keeps its
+         * stream goes on being mixed -- as a producer that will never write
+         * again -- and the sink never suspends while it is "open".
+         */
+        espix_audio_streams_recover((void *)task);
     }
 
     /* Said out loud, and only once the lock is down. "stdio detached" means this

@@ -131,6 +131,14 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st);
  */
 esp_err_t espix_audio_null_sink_register(void);
 
+/*
+ * Close every stream a dying task still holds. Called by the process reaper
+ * with the task handle, not by apps: a killed player must not keep its ring,
+ * its mixer slot or the sink alive behind it. See espix_gfx_recover for the
+ * same idea applied to the canvas lock.
+ */
+void espix_audio_streams_recover(void *task);
+
 #ifdef __cplusplus
 }
 #endif

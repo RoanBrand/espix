@@ -596,6 +596,7 @@ struct espix_audio_stream {
     int                  volume;      /* 0-100, this stream's own level */
     bool                 mute;        /* kept apart from volume, so unmute restores */
     volatile bool        stop;        /* no further writes; the owner will close */
+    void                *owner;       /* the task that opened it; see the reaper */
 };
 
 /*
@@ -741,6 +742,12 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
     }
     st->fmt    = *fmt;
     st->volume = 100;
+    /*
+     * Whose it is, by task handle rather than by pid: the engine has no
+     * business knowing what a pid is, and the reaper already hands the dying
+     * task to whoever needs it -- see espix_pm_task_gone for the same shape.
+     */
+    st->owner  = (void *)xTaskGetCurrentTaskHandle();
     st->sb     = xStreamBufferCreateWithCaps(STREAM_RING, STREAM_CHUNK, MALLOC_CAP_SPIRAM);
     if (st->sb == NULL) {
         free(st);
@@ -890,6 +897,30 @@ esp_err_t espix_audio_stream_mute(espix_audio_stream_t *st, bool on)
     }
     st->mute = on;
     return ESP_OK;
+}
+
+/*
+ * Close whatever a dying task left open.
+ *
+ * Without this a killed player keeps its stream, its ring and its slot for
+ * good: the mixer goes on mixing a producer that will never write again, the
+ * sink never suspends because "a stream is open", and four kills exhaust the
+ * table. It is the same failure espix_gfx_recover() exists to prevent for the
+ * canvas lock, and it is called from the same place.
+ */
+void espix_audio_streams_recover(void *task)
+{
+    if (task == NULL) {
+        return;
+    }
+    for (int i = 0; i < STREAM_MAX; i++) {
+        espix_audio_stream_t *st = s_streams[i];
+        if (st != NULL && st->owner == task) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "closing a stream its owner died holding");
+            (void)espix_audio_stream_close(st);
+        }
+    }
 }
 
 /*
