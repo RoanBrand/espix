@@ -130,25 +130,18 @@ for name in "${names[@]}"; do
     fi
 
     # The app must be configured with the kernel's ABI constants, not its own
-    # project defaults; see tools/app-abi.defaults. Checked here rather than
-    # after the build so it fails in a second instead of after a full compile.
+    # project defaults; see tools/app-abi.defaults.
     fw_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' "$root/sdkconfig.defaults" 2>/dev/null | cut -d= -f2)
-    app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' "$app/sdkconfig" 2>/dev/null | cut -d= -f2)
-    if [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; then
-        echo "build-apps: $name: CONFIG_FREERTOS_HZ is ${app_hz:-unset}; the kernel's is $fw_hz" >&2
-        echo "build-apps: an app runs inside the kernel's FreeRTOS, so pdMS_TO_TICKS()" >&2
-        echo "build-apps: in the app must use the kernel's rate -- otherwise every delay" >&2
-        echo "build-apps: it computes is wrong, and anything under one tick does not" >&2
-        echo "build-apps: sleep at all. See tools/app-abi.defaults." >&2
-        exit 1
-    fi
 
     echo "build-apps: building $name"
     (
         cd "$app"
 
-        # Applied to the app's own defaults rather than replacing them.
-        export SDKCONFIG_DEFAULTS="$root/tools/app-abi.defaults;$app/sdkconfig.defaults"
+        # Applied after the app's own defaults, so the kernel's constants win
+        # over a stale copy there. Named for idf.sh, which clears
+        # SDKCONFIG_DEFAULTS for any project but the firmware's and passes this
+        # through in its place.
+        export ESPIX_APP_DEFAULTS="$app/sdkconfig.defaults;$root/tools/app-abi.defaults"
 
         # 'force' means the staged binary was built for another target, and a
         # target change invalidates every object in the build dir -- not just the
@@ -162,15 +155,29 @@ for name in "${names[@]}"; do
         # `idf.py elf` is only available under the Makefiles generator, and
         # set-target is what creates the generator and sdkconfig in the first
         # place, so it runs once per app rather than on every build.
-        have=""
-        [ -f "sdkconfig" ] && have=$(grep '^CONFIG_IDF_TARGET=' sdkconfig 2>/dev/null | head -1 | cut -d'"' -f2)
-        if [ "$have" != "$target" ]; then
-            # A different target's sdkconfig is stale, and set-target's implicit
-            # fullclean refuses a build dir left by a failed configure, so start
-            # from nothing.
-            rm -rf build
+        have="" app_hz=""
+        if [ -f "sdkconfig" ]; then
+            have=$(grep '^CONFIG_IDF_TARGET=' sdkconfig 2>/dev/null | head -1 | cut -d'"' -f2)
+            app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' sdkconfig 2>/dev/null | cut -d= -f2)
+        fi
+        if [ "$have" != "$target" ] || { [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; }; then
+            # Another target's sdkconfig is stale, and so is one with the wrong
+            # ABI constants; set-target's implicit fullclean refuses a build dir
+            # left by a failed configure, so start from nothing.
+            rm -rf build sdkconfig
             "${idf[@]}" -G 'Unix Makefiles' set-target "$target" > build-apps.log 2>&1 \
                 || { echo "build-apps: $name: set-target failed; see $app/build-apps.log" >&2; exit 1; }
+        fi
+
+        # Checked before the compile, so it fails in a second rather than after.
+        app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' sdkconfig 2>/dev/null | cut -d= -f2)
+        if [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; then
+            echo "build-apps: $name: CONFIG_FREERTOS_HZ is ${app_hz:-unset}; the kernel's is $fw_hz" >&2
+            echo "build-apps: an app runs inside the kernel's FreeRTOS, so pdMS_TO_TICKS()" >&2
+            echo "build-apps: in the app must use the kernel's rate -- otherwise every delay" >&2
+            echo "build-apps: it computes is wrong, and anything under one tick does not" >&2
+            echo "build-apps: sleep at all. See tools/app-abi.defaults." >&2
+            exit 1
         fi
         "${idf[@]}" elf >> build-apps.log 2>&1 \
             || { echo "build-apps: $name: build failed; see $app/build-apps.log" >&2; exit 1; }

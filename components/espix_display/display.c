@@ -1291,6 +1291,7 @@ static uint64_t bench_pixels(int op, int w, int h)
  * before it is timed, on the same buffers, and the answer is reported rather
  * than assumed.
  */
+#if SOC_PPA_SUPPORTED
 static bool bench_verify(int w, int h)
 {
     espix_surface_t *dst = espix_surface_new(w, h);
@@ -1404,6 +1405,7 @@ static bool bench_verify(int w, int h)
     espix_surface_free(src);
     return ok;
 }
+#endif
 
 static uint32_t bench_run(int op, int w, int h, uint32_t iters)
 {

@@ -7,11 +7,9 @@ CONFIG_LIBC_NEWLIB=y
 # Arduino is a library here, never the OS: espix owns app_main.
 CONFIG_AUTOSTART_ARDUINO=n
 
-# Must match the firmware. Arduino ships 1000 and its CMakeLists checks for it
-# (bypassed with ARDUINO_SKIP_TICK_CHECK=1), but the tick rate is compiled into
-# pdMS_TO_TICKS on both sides, so disagreeing here would make every delay wrong
-# by 10x. See the note in main/neopixel.cpp about delay() granularity.
-CONFIG_FREERTOS_HZ=100
+# The tick rate comes from tools/app-abi.defaults, which build-apps.sh applies
+# after this file. Arduino ships 1000 and its CMakeLists checks for it (bypassed
+# with ARDUINO_SKIP_TICK_CHECK=1). See main/neopixel.cpp on delay() granularity.
 
 # Compile only the Arduino core, not its whole bundled library set. Without
 # this, arduino-esp32 builds BLE, NetworkClientSecure, Matter and the rest --

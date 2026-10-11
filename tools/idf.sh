@@ -392,8 +392,13 @@ elif [ "$espix_project" = loader ]; then
     espix_sdkconfig="$espix_root_dir/loader/sdkconfig.$espix_target"
 else
     # An app or the test app: it has its own defaults. Do not leak the
-    # firmware's board selection into a different project's defaults search.
-    unset SDKCONFIG_DEFAULTS
+    # firmware's board selection into a different project's defaults search;
+    # build-apps.sh names an app's own list in ESPIX_APP_DEFAULTS.
+    if [ -n "${ESPIX_APP_DEFAULTS:-}" ]; then
+        export SDKCONFIG_DEFAULTS="$ESPIX_APP_DEFAULTS"
+    else
+        unset SDKCONFIG_DEFAULTS
+    fi
 fi
 
 if [ "$espix_project" = main ] || [ "$espix_project" = loader ]; then

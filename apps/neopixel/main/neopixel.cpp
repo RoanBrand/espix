@@ -79,8 +79,8 @@ void loop()
     hue += 65536 / (SWEEP_MS / FRAME_MS);
 
     /*
-     * Keep delays to multiples of 10ms. espix runs a 100Hz FreeRTOS tick and
-     * Arduino's delay() is vTaskDelay(ms / portTICK_PERIOD_MS), so delay(5)
+     * Keep delays to multiples of 4ms. espix runs a 250Hz FreeRTOS tick and
+     * Arduino's delay() is vTaskDelay(ms / portTICK_PERIOD_MS), so delay(3)
      * truncates to zero and does not yield at all. The WS2812 waveform is
      * unaffected either way: it comes from the RMT peripheral, not from ticks.
      */

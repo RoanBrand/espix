@@ -940,7 +940,6 @@ void espix_window_move(espix_window_t *w, int x, int y)
      * whole-window copy an ordinary VNC server sends.
      */
     const int cw = (c != NULL) ? espix_canvas_width(c)  : 0;
-    const int ch = (c != NULL) ? espix_canvas_height(c) : 0;
     /*
      * The taskbar is painted over every window, so the canvas pixels it covers
      * are the taskbar's, not the window's. Neither end of the copy may cross
