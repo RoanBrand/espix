@@ -1173,8 +1173,10 @@ static espix_audio_format_t a2dp_format(void)
  * *offers* and how much of it the ring would accept. When they disagree, the
  * ring level says which end is wrong.
  */
+#if CONFIG_ESPIX_AUDIO_TRACE
 static uint32_t s_wr_calls, s_wr_asked, s_wr_sent, s_wr_partial, s_wr_us;
 static int64_t  s_wr_mark_us;
+#endif
 
 static size_t a2dp_write(const void *pcm, size_t len)
 {
@@ -1182,8 +1184,11 @@ static size_t a2dp_write(const void *pcm, size_t len)
         return 0;
     }
 
+#if CONFIG_ESPIX_AUDIO_TRACE
     const int64_t t0   = esp_timer_get_time();
+#endif
     const size_t  sent = xStreamBufferSend(s_pcm, pcm, len, pdMS_TO_TICKS(20));
+#if CONFIG_ESPIX_AUDIO_TRACE
     const int64_t now  = esp_timer_get_time();
 
     s_wr_us += (uint32_t)(now - t0);
@@ -1207,6 +1212,7 @@ static size_t a2dp_write(const void *pcm, size_t len)
         s_wr_partial = 0; s_wr_us = 0;
         s_wr_mark_us = now;
     }
+#endif
 
     return sent;
 }

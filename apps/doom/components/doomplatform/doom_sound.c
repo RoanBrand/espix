@@ -199,24 +199,24 @@ static void *sfx_thread(void *arg)
      * If the rate is wrong now, the fault is in the backpressure and belongs
      * there, not in a second clock here to paper over it.
      */
+#if ESPIX_SFX_TRACE
+    /*
+     * Behind a flag, off by default. These are wall-clock timestamps in a
+     * realtime loop: cheap, but not free, and this file has no business paying
+     * for them in a release. They are what found the mixer producing 169206
+     * frames a second where 44100 was wanted, so they stay reachable.
+     */
     int64_t  stat_mix_us = 0, stat_wr_us = 0, stat_sleep_us = 0;
     int64_t  stat_win = esp_timer_get_time();
     uint32_t stat_blocks = 0, stat_short = 0;
+#endif
 
     while (s_running) {
-        /*
-         * Produce what the elapsed time owes, not one block per wake.
-         *
-         * The first version slept for the time to the next block, which loses
-         * whatever the delay rounds away: the tick is 4 ms, so an 11.6 ms block
-         * became 12 ms and every block arrived a little late, for good. A sink
-         * fed a few percent short does not play a few percent slower -- it runs
-         * dry and the engine fills the gap with silence, which is heard as
-         * distortion. Owing by elapsed time means a late wake is paid back by
-         * producing the extra blocks in a row, and the average is realtime
-         * however the tick falls. The ring absorbs the catch-up.
-         */
+        /* Mix a block, then hand it to the stream and block on it. The block
+         * itself is the loop; there is no pacing here by design, see above. */
+#if ESPIX_SFX_TRACE
         const int64_t t_a = esp_timer_get_time();
+#endif
 
         memset(s_acc, 0, sizeof(s_acc));
         bool any = false;
@@ -246,12 +246,15 @@ static void *sfx_thread(void *arg)
             s_mix[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
+#if ESPIX_SFX_TRACE
         const int64_t t_b = esp_timer_get_time();
+#endif
 
         if (!any) {
             /* Nothing sounding. Do not feed the sink -- the same reasoning as
              * the engine's mixer -- and wake soon enough that the next shot is
              * not late. */
+#if ESPIX_SFX_TRACE
             stat_mix_us += (t_b - t_a);
             if (++stat_blocks >= 256) {
                 const int64_t wall = esp_timer_get_time() - stat_win;
@@ -263,6 +266,7 @@ static void *sfx_thread(void *arg)
                 stat_blocks = 0; stat_mix_us = 0;
                 stat_wr_us = 0; stat_sleep_us = 0; stat_short = 0;
             }
+#endif
             sfx_delay_ms(5);
             continue;
         }
@@ -273,13 +277,16 @@ static void *sfx_thread(void *arg)
                                                       (uint8_t *)s_mix + off,
                                                       sizeof(s_mix) - off);
             if (w == 0) {
+#if ESPIX_SFX_TRACE
                 stat_short++;                   /* ring full, not a stop */
+#endif
                 sfx_delay_ms(10);
                 continue;
             }
             off += w;
         }
 
+#if ESPIX_SFX_TRACE
         const int64_t t_c = esp_timer_get_time();
         stat_mix_us += (t_b - t_a);
         stat_wr_us  += (t_c - t_b);
@@ -303,6 +310,7 @@ static void *sfx_thread(void *arg)
             stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0;
             stat_sleep_us = 0; stat_short = 0;
         }
+#endif
     }
 
     s_thread_up   = false;

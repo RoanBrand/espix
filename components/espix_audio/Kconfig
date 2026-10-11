@@ -223,3 +223,14 @@ menu "espix audio"
     endmenu
 
 endmenu
+
+config ESPIX_AUDIO_TRACE
+    bool "Trace the audio path"
+    default n
+    help
+        Per-second counters from the mixer: wall clock, receive and feed time,
+        the bytes fed and their rate, and how many reads were full blocks against
+        partial ones. Off by default, because these are esp_timer_get_time()
+        calls in the realtime path and they cost CPU -- which is the whole reason
+        they are not always on. It is what found the audio running at 169206
+        frames a second where 44100 was wanted, so it is worth keeping reachable.

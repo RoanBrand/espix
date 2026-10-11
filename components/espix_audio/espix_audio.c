@@ -687,11 +687,13 @@ static void mixer_task(void *arg)
      * sink is being fed silence it did not ask for -- heard as the audio
      * stretching and doubling over itself.
      */
+#if CONFIG_ESPIX_AUDIO_TRACE
     int64_t  t_win  = esp_timer_get_time();
     int64_t  t_recv = 0;
     int64_t  t_feed = 0;
     uint64_t fed    = 0;
     uint32_t iters  = 0, full = 0, part = 0;
+#endif
 
     while (out != NULL && in != NULL && !s_mixer_stop) {
         memset(out, 0, MIX_BYTES);
@@ -702,7 +704,9 @@ static void mixer_task(void *arg)
          * back by one app that is between sounds, and the sink wants a steady
          * block size either way.
          */
+#if CONFIG_ESPIX_AUDIO_TRACE
         const int64_t t_r0 = esp_timer_get_time();
+#endif
         bool any = false;
         for (int i = 0; i < STREAM_MAX; i++) {
             espix_audio_stream_t *st = s_streams[i];
@@ -735,14 +739,18 @@ static void mixer_task(void *arg)
                 continue;
             }
             any = true;
+#if CONFIG_ESPIX_AUDIO_TRACE
             if (n < MIX_BYTES) {
                 part++;
             } else {
                 full++;
             }
+#endif
             mix_add(out, in, n / 4, st->mute ? 0 : st->volume);
         }
+#if CONFIG_ESPIX_AUDIO_TRACE
         t_recv += esp_timer_get_time() - t_r0;
+#endif
 
         if (!any) {
             /*
@@ -754,10 +762,15 @@ static void mixer_task(void *arg)
             continue;
         }
 
+#if CONFIG_ESPIX_AUDIO_TRACE
         const int64_t t_f0 = esp_timer_get_time();
+#endif
         feed_ex((uint8_t *)out, MIX_BYTES, &s_mixer_stop);
+#if CONFIG_ESPIX_AUDIO_TRACE
         t_feed += esp_timer_get_time() - t_f0;
+#endif
 
+#if CONFIG_ESPIX_AUDIO_TRACE
         fed += MIX_BYTES;
         if (++iters >= 64) {
             const int64_t  wall = esp_timer_get_time() - t_win;
@@ -777,6 +790,7 @@ static void mixer_task(void *arg)
             full   = 0;
             part   = 0;
         }
+#endif
     }
 
     free(out);
