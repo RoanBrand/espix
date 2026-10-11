@@ -198,12 +198,25 @@ static void *sfx_thread(void *arg)
             const int64_t next_us = (int64_t)((produced + MIX_FRAMES) * 1000000ULL
                                               / OUT_RATE);
             int64_t wait_ms = (next_us - elapsed_us) / 1000;
-            if (wait_ms < 1) {
-                wait_ms = 1;
-            } else if (wait_ms > 20) {
+            if (wait_ms > 20) {
                 wait_ms = 20;               /* wake often enough to see a stop */
             }
-            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+
+            /*
+             * Never a bare yield. The tick here is 4 ms, so pdMS_TO_TICKS(1),
+             * (2) and (3) are all zero -- and vTaskDelay(0) does not sleep, it
+             * yields, which on a task above the game's priority is a hot spin
+             * that starves it: measured as this thread at 97% of a core with
+             * Doom crawling, while the audio stayed correct because the spin
+             * still produced it. Rounding up to one tick is coarse, and that is
+             * fine: the credit is by elapsed time, so a late wake pays itself
+             * back by producing the blocks it owes.
+             */
+            TickType_t ticks = pdMS_TO_TICKS(wait_ms > 0 ? wait_ms : 1);
+            if (ticks == 0) {
+                ticks = 1;
+            }
+            vTaskDelay(ticks);
             continue;
         }
         const int64_t t_a = esp_timer_get_time();
