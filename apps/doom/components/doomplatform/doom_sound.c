@@ -20,6 +20,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 
 #include "deh_str.h"
 #include "i_sound.h"
@@ -63,6 +64,7 @@ static espix_audio_stream_t *s_stream;
 static pthread_t             s_thread;
 static volatile bool         s_running;
 static volatile bool         s_thread_up;
+static volatile bool         s_thread_done;   /* the thread sets this as it leaves */
 static bool                  s_initialised;
 static bool                  s_sfx_prefix;
 
@@ -158,7 +160,31 @@ static void *sfx_thread(void *arg)
 {
     (void)arg;
 
+    /*
+     * Paced to realtime, and it has to be: writing to the stream only blocks
+     * while the ring is full, and the ring is large enough that the producer
+     * can otherwise run far ahead of the sink. Left unpaced this thread
+     * generated audio as fast as the CPU allowed -- measured at 96% of a core,
+     * above the game's own priority, which is what made Doom crawl.
+     *
+     * The credit is the same shape Bluedroid's A2DP source uses for the same
+     * reason: count the frames owed at OUT_RATE and sleep until they are due.
+     */
+    const int64_t start_us = esp_timer_get_time();
+    uint64_t      produced = 0;
+
     while (s_running) {
+        const int64_t due_us = (int64_t)(produced * 1000000ULL / OUT_RATE);
+        int64_t       wait_ms = (due_us - (esp_timer_get_time() - start_us)) / 1000;
+        if (wait_ms > 0) {
+            if (wait_ms > 20) {
+                wait_ms = 20;               /* wake often enough to see a stop */
+            }
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            continue;
+        }
+        produced += MIX_FRAMES;
+
         memset(s_acc, 0, sizeof(s_acc));
         bool any = false;
 
@@ -208,7 +234,8 @@ static void *sfx_thread(void *arg)
         }
     }
 
-    s_thread_up = false;
+    s_thread_up   = false;
+    s_thread_done = true;
     return NULL;
 }
 
@@ -246,9 +273,22 @@ static void I_Espix_ShutdownSound(void)
     if (!s_initialised) {
         return;
     }
+    /*
+     * Wait for the thread to say it has left, and only then touch the stream.
+     *
+     * This was a fault in the thread on exit: pthread_join alone was not enough
+     * of a guarantee, and closing the stream while the mixer was still inside
+     * stream_write freed the ring under it -- the coredump named the faulting
+     * task as this one. The flag is set as the thread's last act, so once it is
+     * seen nothing here can be reached by it.
+     */
     s_running = false;
+    for (int i = 0; i < 200 && !s_thread_done; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     if (s_thread_up) {
         pthread_join(s_thread, NULL);
+        s_thread_up = false;
     }
     /*
      * In this order: the thread is gone, so nothing is writing, and close()
