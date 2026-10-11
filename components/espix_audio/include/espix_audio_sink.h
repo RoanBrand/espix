@@ -37,6 +37,16 @@ typedef struct {
     espix_audio_format_t (*format)(void);
 
     /*
+     * Ask the sink to consume a different format rather than be converted to.
+     * Optional, and the answer that costs nothing when it can be given: an I2S
+     * codec's clock is ours to set, so a 32 kHz source is forwarded rather than
+     * resampled. Returning false, or leaving this NULL, means no -- and then a
+     * stream converts at its own edge. Most efficient first: forward, adopt,
+     * convert.
+     */
+    bool (*set_format)(const espix_audio_format_t *fmt);
+
+    /*
      * Accept up to len bytes and return the count taken. A partial write is the
      * normal backpressure, not an error: the caller advances by the count. (An
      * earlier version retried the whole chunk, re-sending bytes the ring had

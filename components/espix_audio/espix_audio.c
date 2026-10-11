@@ -599,9 +599,49 @@ static inline int16_t tone_osc_next(tone_osc_t *o)
     return (int16_t)o->x;
 }
 
+/*
+ * Defined below, beside the converter they wrap. Declared here because a stream
+ * may own one and the stream functions come first.
+ */
+struct audio_asrc;
+static struct audio_asrc *audio_asrc_new(const espix_audio_format_t *src,
+                                         const espix_audio_format_t *dst);
+static void audio_asrc_free(struct audio_asrc *a);
+static bool audio_asrc_run(struct audio_asrc *a, uint32_t in_samples,
+                           uint32_t *out_samples);
+
+/*
+ * The rates the ASRC converts between, from the datasheet: 8, 16, 32, 44.1 and
+ * 48 kHz, and nothing else. It is not a general resampler -- Doom's DMX effects
+ * are 11 kHz and can never go through it -- so this is what the negotiation
+ * checks before promising a conversion, rather than opening one that cannot
+ * work and failing with no reason attached.
+ */
+static bool asrc_rate_supported(uint32_t hz)
+{
+    return hz == 8000 || hz == 16000 || hz == 32000 || hz == 44100 || hz == 48000;
+}
+
+/* The converter itself, complete here because a stream writes through its
+ * members; the functions that open one are defined below. */
+typedef struct audio_asrc {
+    esp_asrc_handle_t handle;
+    uint8_t  *in;
+    uint8_t  *out;
+    uint32_t  in_size;
+    uint32_t  out_size;
+    uint32_t  out_max_samples;
+    uint16_t  in_frame_bytes;
+    uint16_t  out_frame_bytes;
+} audio_asrc_t;
+
 struct espix_audio_stream {
     StreamBufferHandle_t sb;
-    espix_audio_format_t fmt;
+    espix_audio_format_t fmt;         /* what the owner asked for */
+    espix_audio_format_t ring_fmt;    /* what the ring holds: the sink's */
+    struct audio_asrc   *asrc;        /* non-NULL when those two differ */
+    size_t               out_pending; /* converted, not yet taken by the ring */
+    size_t               out_off;
     int                  volume;      /* 0-100, this stream's own level */
     bool                 mute;        /* kept apart from volume, so unmute restores */
     volatile bool        stop;        /* no further writes; the owner will close */
@@ -829,8 +869,50 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
     if (st == NULL) {
         return NULL;
     }
-    st->fmt    = *fmt;
-    st->volume = 100;
+    st->fmt      = *fmt;
+    st->ring_fmt = sink->format();
+    st->volume   = 100;
+
+    /*
+     * Rate negotiation, cheapest answer first.
+     *
+     * Same format: nothing to do. Different, but the sink can adopt it: ask,
+     * because forwarding is free and resampling is not -- which is the whole
+     * reason a sink is allowed to say it can. Otherwise the stream converts,
+     * and it converts at its own edge: the ring still holds the sink's format,
+     * so the mixer is untouched and one stream's rate never reaches another's.
+     */
+    if (fmt->rate != st->ring_fmt.rate || fmt->channels != st->ring_fmt.channels) {
+        if (sink->set_format != NULL && sink->set_format(fmt)) {
+            st->ring_fmt = *fmt;
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "stream: sink '%s' adopts %u Hz, %u ch",
+                       sink->name, (unsigned)fmt->rate, (unsigned)fmt->channels);
+        } else if (!asrc_rate_supported(fmt->rate) ||
+                   !asrc_rate_supported(st->ring_fmt.rate)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "stream: cannot convert %u Hz to %u Hz; the ASRC does "
+                       "8/16/32/44.1/48 kHz only, so the producer must match "
+                       "the sink",
+                       (unsigned)fmt->rate, (unsigned)st->ring_fmt.rate);
+            vStreamBufferDeleteWithCaps(st->sb);
+            free(st);
+            return NULL;
+        } else {
+            st->asrc = audio_asrc_new(fmt, &st->ring_fmt);
+            if (st->asrc == NULL) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "stream: cannot convert %u Hz to %u Hz",
+                           (unsigned)fmt->rate, (unsigned)st->ring_fmt.rate);
+                vStreamBufferDeleteWithCaps(st->sb);
+                free(st);
+                return NULL;
+            }
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "stream: converting %u Hz -> %u Hz for sink '%s'",
+                       (unsigned)fmt->rate, (unsigned)st->ring_fmt.rate, sink->name);
+        }
+    }
     /*
      * Whose it is, by task handle rather than by pid: the engine has no
      * business knowing what a pid is, and the reaper already hands the dying
@@ -906,7 +988,55 @@ size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_
      * above is noticed within it; the count actually taken comes back either
      * way, and looping on a short write is the caller's.
      */
-    return xStreamBufferSend(st->sb, pcm, len, pdMS_TO_TICKS(1000));
+    if (st->asrc == NULL) {
+        return xStreamBufferSend(st->sb, pcm, len, pdMS_TO_TICKS(1000));
+    }
+
+    /*
+     * Converting. The ring holds the sink's rate, so what goes into it is not
+     * what the owner passed in.
+     *
+     * Converted-but-untaken bytes are pushed before anything else: the ASRC's
+     * output buffer is the only place they exist, so converting more would
+     * overwrite them, and telling the caller to retry would convert its input
+     * twice. A zero there is the ordinary backpressure -- nothing was consumed,
+     * so the same bytes come back and are converted once.
+     */
+    struct audio_asrc *const a = st->asrc;
+
+    while (st->out_pending > 0) {
+        const size_t w = xStreamBufferSend(st->sb, (uint8_t *)a->out + st->out_off,
+                                           st->out_pending, pdMS_TO_TICKS(1000));
+        if (w == 0) {
+            return 0;
+        }
+        st->out_off     += w;
+        st->out_pending -= w;
+    }
+
+    size_t chunk = (len > a->in_size) ? a->in_size : len;
+    chunk -= chunk % a->in_frame_bytes;             /* whole frames only */
+    if (chunk == 0) {
+        return 0;
+    }
+
+    memcpy(a->in, pcm, chunk);
+
+    uint32_t out_samples = a->out_max_samples;
+    if (!audio_asrc_run(a, (uint32_t)(chunk / a->in_frame_bytes), &out_samples)) {
+        return 0;
+    }
+
+    st->out_off     = 0;
+    st->out_pending = (size_t)out_samples * a->out_frame_bytes;
+
+    const size_t w = xStreamBufferSend(st->sb, a->out, st->out_pending,
+                                       pdMS_TO_TICKS(1000));
+    st->out_off     = w;
+    st->out_pending -= w;
+
+    /* The caller counts in its own bytes: this much in, whatever it became. */
+    return chunk;
 }
 
 esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
@@ -932,6 +1062,7 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
         }
     }
     vStreamBufferDeleteWithCaps(st->sb);
+    audio_asrc_free(st->asrc);
     free(st);
 
     if (stream_any_open()) {
@@ -1424,16 +1555,7 @@ static uint8_t *audio_buf_alloc(const char *name, size_t len, bool *from_psram)
  * not required to meet it. One audio task runs at a time, so this is file
  * scope rather than passed around.
  */
-typedef struct {
-    esp_asrc_handle_t handle;
-    uint8_t  *in;
-    uint8_t  *out;
-    uint32_t  in_size;
-    uint32_t  out_size;
-    uint32_t  out_max_samples;
-    uint16_t  in_frame_bytes;
-    uint16_t  out_frame_bytes;
-} audio_asrc_t;
+
 
 static audio_asrc_t s_asrc;
 
@@ -1494,6 +1616,65 @@ static bool asrc_open(audio_asrc_t *a, const esp_asrc_aud_info_t *src,
 
     *a = fresh;
     return true;
+}
+
+/*
+ * A converter a stream owns, and the lock that lets several of them exist.
+ *
+ * The file-scoped instance above was enough while the decoder was the only user;
+ * streams made the peripheral shared, because each can convert at its own edge
+ * on its own thread. The lock is held across esp_asrc_process and nothing else
+ * -- the conversion is short and the call is what must not interleave.
+ */
+static SemaphoreHandle_t s_asrc_lock;
+
+struct audio_asrc *audio_asrc_new(const espix_audio_format_t *src,
+                                  const espix_audio_format_t *dst)
+{
+    const esp_asrc_aud_info_t si = { .sample_rate = src->rate,
+                                     .bits_per_sample = src->bits,
+                                     .channel = src->channels };
+    const esp_asrc_aud_info_t di = { .sample_rate = dst->rate,
+                                     .bits_per_sample = dst->bits,
+                                     .channel = dst->channels };
+    audio_asrc_t *a = calloc(1, sizeof(*a));
+
+    if (a == NULL) {
+        return NULL;
+    }
+    if (!asrc_open(a, &si, &di, STREAM_CHUNK)) {
+        free(a);
+        return NULL;
+    }
+    return (struct audio_asrc *)a;
+}
+
+static void audio_asrc_free(struct audio_asrc *a)
+{
+    if (a != NULL) {
+        asrc_close((audio_asrc_t *)a);
+        free(a);
+    }
+}
+
+static bool audio_asrc_run(struct audio_asrc *a, uint32_t in_samples,
+                           uint32_t *out_samples)
+{
+    audio_asrc_t *const c = (audio_asrc_t *)a;
+
+    if (s_asrc_lock == NULL) {
+        s_asrc_lock = xSemaphoreCreateMutex();
+        if (s_asrc_lock == NULL) {
+            return false;
+        }
+    }
+    if (xSemaphoreTake(s_asrc_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    const esp_err_t e = esp_asrc_process(c->handle, c->in, in_samples,
+                                         c->out, out_samples);
+    xSemaphoreGive(s_asrc_lock);
+    return e == ESP_ASRC_ERR_OK;
 }
 
 static void audio_task(void *arg)
@@ -1683,8 +1864,8 @@ static void audio_task(void *arg)
                     memcpy(s_asrc.in, frame.buffer, frame.decoded_size);
                     const uint32_t in_samples = frame.decoded_size / s_asrc.in_frame_bytes;
                     uint32_t out_samples = s_asrc.out_max_samples;
-                    if (esp_asrc_process(s_asrc.handle, s_asrc.in, in_samples,
-                                         s_asrc.out, &out_samples) == ESP_ASRC_ERR_OK) {
+                    if (audio_asrc_run((struct audio_asrc *)&s_asrc, in_samples,
+                                       &out_samples)) {
                         feed(s_asrc.out, out_samples * s_asrc.out_frame_bytes);
                         produce += out_samples * s_asrc.out_frame_bytes;
                     }
