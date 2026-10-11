@@ -144,6 +144,53 @@ static int cmd_tone(espix_session_t *s, int argc, char **argv)
 }
 
 /*
+ * A pipe: a source connected to a sink and left connected -- microphone to
+ * headset, radio to speaker.
+ *
+ * "add" takes the source and, optionally, the sink. The sink has to be the one
+ * the engine would use, because the mixer still has a single output: naming a
+ * different one is refused with that reason rather than quietly sending the
+ * microphone to the wrong place.
+ */
+static int cmd_pipe(espix_session_t *s, int argc, char **argv)
+{
+    if (argc == 1 || strcmp(argv[1], "list") == 0) {
+        espix_audio_pipe_info_t p[ESPIX_AUDIO_PIPES_MAX];
+        const size_t n = espix_audio_pipe_list(p, ESPIX_AUDIO_PIPES_MAX);
+        if (n == 0) {
+            espix_printf(s, "no pipes\n");
+            return 0;
+        }
+        for (size_t i = 0; i < n; i++) {
+            espix_printf(s, "%d  %s -> %s  %s\n", p[i].id, p[i].source, p[i].sink,
+                         p[i].running ? "running" : "stopping");
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "add") == 0) {
+        const char *const src = argc > 2 ? argv[2] : NULL;
+        const char *const snk = argc > 3 ? argv[3] : NULL;
+        const int id = espix_audio_pipe_add(src, snk);
+        if (id < 0) {
+            espix_eprintf(s, "pipe: could not open it; see dmesg for why\n");
+            return 1;
+        }
+        espix_printf(s, "pipe %d: %s -> %s\n", id,
+                     src != NULL ? src : "default", snk != NULL ? snk : "default");
+        return 0;
+    }
+    if (strcmp(argv[1], "del") == 0 && argc > 2) {
+        if (espix_audio_pipe_del(atoi(argv[2])) != ESP_OK) {
+            espix_eprintf(s, "pipe: no pipe %s\n", argv[2]);
+            return 1;
+        }
+        return 0;
+    }
+    espix_eprintf(s, "usage: pipe [list | add <source> [sink] | del <id>]\n");
+    return 1;
+}
+
+/*
  * Which sink the engine would use, and why.
  *
  * "Preferred while connected, otherwise the first connected one" is a rule you
@@ -193,6 +240,9 @@ static espix_cmd_t s_play_cmds[] = {
     { .name = "volume", .fn = cmd_volume,
       .help = "get or set the master output volume (0-100)",
       .usage = "volume [0-100]" },
+    { .name = "pipe", .fn = cmd_pipe,
+      .help = "connect a source to a sink and leave it connected",
+      .usage = "pipe [list | add <source> [sink] | del <id>]" },
     { .name = "tone", .fn = cmd_tone,
       .help = "play a generated tone through the app stream API",
       .usage = "tone [freq] [seconds] [lr]   (lr: left, right, both)" },

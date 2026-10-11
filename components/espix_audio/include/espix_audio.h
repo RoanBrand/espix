@@ -151,6 +151,38 @@ size_t espix_audio_capture_read(espix_audio_capture_t *cap, void *pcm, size_t le
 
 esp_err_t espix_audio_capture_close(espix_audio_capture_t *cap);
 
+/* ----------------------------------------------------------------- pipes -- */
+
+/*
+ * A pipe is a source connected to a sink and left connected: microphone to
+ * headset, radio to speaker. Internally it is nothing new -- the task behind it
+ * is a capture client and a stream, which is what a recorder and a player are --
+ * but it is a thing the system can be asked to hold open, which neither of those
+ * is.
+ */
+#define ESPIX_AUDIO_PIPES_MAX 2
+
+typedef struct {
+    int         id;
+    const char *source;
+    const char *sink;
+    bool        running;
+} espix_audio_pipe_info_t;
+
+/*
+ * Open a pipe from a named source to a named sink, either of which may be NULL
+ * for the current default. Returns its id, or -1 with the reason logged. The
+ * sink has to be the one the engine would use: the mixer still has a single
+ * output, so a pipe to a different one is refused rather than silently sent to
+ * the wrong place.
+ */
+int espix_audio_pipe_add(const char *source, const char *sink);
+
+/* Close a pipe by id. Blocks until its task has stopped. */
+esp_err_t espix_audio_pipe_del(int id);
+
+size_t espix_audio_pipe_list(espix_audio_pipe_info_t *out, size_t max);
+
 /*
  * Register the benchmark sink (CONFIG_ESPIX_AUDIO_NULL_SINK). It accepts PCM as
  * fast as it arrives and discards it, so a "play" measures the source and the

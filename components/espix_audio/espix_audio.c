@@ -1874,6 +1874,171 @@ esp_err_t espix_audio_capture_close(espix_audio_capture_t *cap)
     return ESP_OK;
 }
 
+/* ----------------------------------------------------------------- pipes -- */
+
+typedef struct {
+    int                             id;
+    const espix_audio_source_ops_t *src;
+    const espix_audio_sink_ops_t   *snk;
+    volatile bool                   stop;
+    volatile bool                   done;
+    TaskHandle_t                    task;
+} espix_audio_pipe_t;
+
+static espix_audio_pipe_t s_pipes[ESPIX_AUDIO_PIPES_MAX];
+static int                 s_pipe_next_id = 1;
+
+#define PIPE_CHUNK 2048
+
+static void pipe_task(void *arg)
+{
+    espix_audio_pipe_t *const p = arg;
+
+    uint8_t *buf = malloc(PIPE_CHUNK);
+    if (buf == NULL) {
+        p->done = true;
+        p->task = NULL;
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
+
+    /*
+     * The capture's format, not one of our choosing. One end states the format
+     * and the stream's edge reconciles it with the sink, so a pipe carries no
+     * conversion of its own: a 16 kHz microphone into a 44.1 kHz codec takes
+     * exactly the negotiation every other producer gets.
+     */
+    espix_audio_format_t got = { 0, 0, 0 };
+    espix_audio_capture_t *cap = espix_audio_capture_open(NULL, &got);
+    if (cap == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "pipe %d: cannot capture", p->id);
+        goto out;
+    }
+
+    espix_audio_stream_t *st = espix_audio_stream_open(&got);
+    if (st == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "pipe %d: cannot play", p->id);
+        (void)espix_audio_capture_close(cap);
+        goto out;
+    }
+    espix_klog(ESPIX_KLOG_INFO, TAG, "pipe %d: %s -> %s, %u Hz",
+               p->id, p->src->name, p->snk->name, (unsigned)got.rate);
+
+    while (!p->stop) {
+        const size_t n = espix_audio_capture_read(cap, buf, PIPE_CHUNK);
+        if (n == 0) {
+            continue;                   /* capture_read paces; nothing yet */
+        }
+        size_t off = 0;
+        while (off < n && !p->stop) {
+            const size_t w = espix_audio_stream_write(st, buf + off, n - off);
+            if (w == 0) {
+                break;                  /* stopped, or the ring is closing */
+            }
+            off += w;
+        }
+    }
+
+    (void)espix_audio_stream_close(st);
+    (void)espix_audio_capture_close(cap);
+
+out:
+    free(buf);
+    p->done = true;
+    p->task = NULL;
+    vTaskDeleteWithCaps(NULL);
+}
+
+int espix_audio_pipe_add(const char *source, const char *sink)
+{
+    const espix_audio_source_ops_t *src = espix_audio_source_default();
+
+    if (source != NULL && source[0] != 0) {
+        const espix_audio_source_ops_t *list[ESPIX_AUDIO_SOURCES_MAX];
+        const size_t n = espix_audio_source_list(list, ESPIX_AUDIO_SOURCES_MAX);
+        src = NULL;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(list[i]->name, source) == 0) {
+                src = list[i];
+            }
+        }
+    }
+    if (src == NULL || (src->connected != NULL && !src->connected())) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "pipe: no source '%s'",
+                   source != NULL ? source : "(default)");
+        return -1;
+    }
+
+    const espix_audio_sink_ops_t *snk = espix_audio_sink_default();
+    if (snk == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "pipe: no sink");
+        return -1;
+    }
+    if (sink != NULL && sink[0] != 0 && strcmp(snk->name, sink) != 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "pipe: the mixer has one output and it is '%s', not '%s' -- "
+                   "select it with 'sink %s' first", snk->name, sink, sink);
+        return -1;
+    }
+
+    for (int i = 0; i < ESPIX_AUDIO_PIPES_MAX; i++) {
+        espix_audio_pipe_t *const p = &s_pipes[i];
+        if (p->id != 0) {
+            continue;
+        }
+        memset(p, 0, sizeof(*p));
+        p->id  = s_pipe_next_id++;
+        p->src = src;
+        p->snk = snk;
+
+        if (xTaskCreatePinnedToCoreWithCaps(pipe_task, "espix:pipe", STREAM_STACK,
+                                            p, 20, &p->task, 1,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS &&
+            xTaskCreatePinnedToCore(pipe_task, "espix:pipe", STREAM_STACK,
+                                    p, 20, &p->task, 1) != pdPASS) {
+            p->id = 0;
+            espix_klog(ESPIX_KLOG_WARN, TAG, "pipe: no task");
+            return -1;
+        }
+        return p->id;
+    }
+    espix_klog(ESPIX_KLOG_WARN, TAG, "pipe: all %d in use", ESPIX_AUDIO_PIPES_MAX);
+    return -1;
+}
+
+esp_err_t espix_audio_pipe_del(int id)
+{
+    for (int i = 0; i < ESPIX_AUDIO_PIPES_MAX; i++) {
+        espix_audio_pipe_t *const p = &s_pipes[i];
+        if (p->id != id) {
+            continue;
+        }
+        p->stop = true;
+        for (int t = 0; t < 400 && !p->done; t++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        p->id = 0;
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+size_t espix_audio_pipe_list(espix_audio_pipe_info_t *out, size_t max)
+{
+    size_t n = 0;
+    for (int i = 0; i < ESPIX_AUDIO_PIPES_MAX && n < max; i++) {
+        if (s_pipes[i].id == 0) {
+            continue;
+        }
+        out[n].id      = s_pipes[i].id;
+        out[n].source  = s_pipes[i].src->name;
+        out[n].sink    = s_pipes[i].snk->name;
+        out[n].running = !s_pipes[i].done;
+        n++;
+    }
+    return n;
+}
+
 static void audio_task(void *arg)
 {
     bool in_ps = false, out_ps = false;
