@@ -253,10 +253,20 @@ static void ssh_reader_task(void *arg)
     ssh_conn_t *c = arg;
     uint8_t     tmp[512];
 
-    for (;;) {
-        /* A full ring is the connection task not having taken bytes yet. */
+    while (!c->rx_stop) {
+        /*
+         * A full ring is the connection task not having taken bytes yet.
+         *
+         * Timed, not forever. Teardown shuts the socket down, which ends
+         * recv(), but nothing reaches a task waiting here -- so a client that
+         * stopped reading pinned this task, its stack and its receive buffer
+         * for the life of the board, and the teardown then had to abandon them
+         * rather than free memory a live task was reading. That is the leak
+         * that filled internal RAM and stopped transfers completing. Waking on
+         * room is the notification or this timeout, whichever comes first.
+         */
         if (rx_used(c) >= SSH_RX_RING) {
-            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
             continue;
         }
 
@@ -363,6 +373,13 @@ bool ssh_rx_wait(ssh_conn_t *c, uint32_t timeout_ms)
 void ssh_rx_stop(ssh_conn_t *c)
 {
     if (c->rx_exit.task != NULL) {
+        /*
+         * Both ways out of the reader: the shutdown ends recv(), and the flag
+         * with a notify ends a wait for room in a full ring, which the shutdown
+         * cannot reach.
+         */
+        c->rx_stop = true;
+        (void)xTaskNotifyGive(c->rx_exit.task);
         (void)shutdown(c->fd, SHUT_RD);     /* the reader's recv() returns 0 */
 
         if (!espix_task_exit_wait(&c->rx_exit, 2000)) {

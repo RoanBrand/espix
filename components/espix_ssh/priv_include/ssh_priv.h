@@ -268,6 +268,7 @@ typedef struct {
     SemaphoreHandle_t rx_data;      /* given on bytes, on eof, on error */
     bool              rx_eof;
     bool              rx_err;
+    volatile bool     rx_stop;      /* teardown asked the reader to finish */
     espix_task_exit_t rx_exit;      /* the reader, announced as it leaves */
 } ssh_conn_t;
 
