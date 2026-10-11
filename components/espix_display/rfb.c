@@ -42,6 +42,7 @@
 
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_pm.h"
 #include "espix_task.h"
 #include "espix_net.h"
 
@@ -145,24 +146,19 @@ static char          s_encodings[48];
  * last viewer goes. That is the shape ROADMAP.md asks for -- a component says
  * it wants a low-latency link, and the network decides what that means.
  */
-static espix_wifi_ps_t s_ps_saved = ESPIX_WIFI_PS_UNKNOWN;
-
+/*
+ * This used to hold the mode itself, save and restore it, and know about
+ * espix_wifi_ps_t -- which worked exactly once, for exactly one holder. It is
+ * now a request: the count is the facility's problem, the setting is the
+ * network's, and this file no longer needs to know what either one does. A
+ * viewer is one hold, and the last viewer to leave is what puts the radio back.
+ */
 static void latency_want(bool on)
 {
     if (on) {
-        espix_wifi_status_t st;
-        if (s_ps_saved == ESPIX_WIFI_PS_UNKNOWN &&
-            espix_net_wifi_status(&st) == ESP_OK &&
-            st.ps != ESPIX_WIFI_PS_UNKNOWN && st.ps != ESPIX_WIFI_PS_NONE) {
-            s_ps_saved = st.ps;
-            (void)espix_wifi_set_ps(ESPIX_WIFI_PS_NONE);
-            espix_klog(ESPIX_KLOG_INFO, TAG,
-                       "radio kept awake while a viewer is attached");
-        }
-    } else if (s_ps_saved != ESPIX_WIFI_PS_UNKNOWN) {
-        (void)espix_wifi_set_ps(s_ps_saved);
-        espix_klog(ESPIX_KLOG_INFO, TAG, "radio back to its own sleep setting");
-        s_ps_saved = ESPIX_WIFI_PS_UNKNOWN;
+        (void)espix_pm_acquire(ESPIX_PM_LATENCY);
+    } else {
+        (void)espix_pm_release(ESPIX_PM_LATENCY);
     }
 }
 

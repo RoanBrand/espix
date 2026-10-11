@@ -17,6 +17,7 @@
 #include "espix_proc_priv.h"
 #include "espix_fs.h"
 #include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
+#include "espix_pm.h"       /* ...and espix_pm_task_gone(), for the same reason */
 
 #define TAG "proc"
 
@@ -1119,6 +1120,13 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
         if (session != NULL && session->task_gone != NULL) {
             session->task_gone(session, (void *)task);
         }
+        /*
+         * And the same for any power-management request it was holding. They
+         * are counted rather than flagged so that they *can* be released by
+         * name like this: a radio kept awake by a session that no longer exists
+         * is the WifiLock bug, and it is silent and permanent.
+         */
+        espix_pm_task_gone((void *)task);
     }
 
     /* Said out loud, and only once the lock is down. "stdio detached" means this

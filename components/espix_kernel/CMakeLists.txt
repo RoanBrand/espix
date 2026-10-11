@@ -83,6 +83,7 @@ idf_component_register(
     SRCS
         "kernel.c"
         "klog.c"
+        "espix_pm.c"
         "shutdown.c"
         "task_exit.c"
     INCLUDE_DIRS

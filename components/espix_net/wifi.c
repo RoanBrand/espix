@@ -24,6 +24,10 @@
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_pm.h"
+
+/* Installed as the applier at init, defined with the policy further down. */
+static void pm_apply(espix_pm_need_t need, bool active);
 #include "espix_net.h"
 #include "espix_net_priv.h"
 
@@ -442,6 +446,9 @@ static esp_err_t driver_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* The station owns the radio, so it owns what a request for it means. */
+    espix_pm_set_applier(pm_apply);
+
     return ESP_OK;
 }
 
@@ -698,6 +705,80 @@ void espix_net_wifi_ap_status(espix_wifi_ap_status_t *out)
         out->clients = stas.num;
     }
     out->napt = espix_net_napt_enabled("wlan1");
+}
+
+/*
+ * What a power-management request means to this station.
+ *
+ * Two needs, and they want opposite things from one radio, which is the whole
+ * reason the vocabulary in espix_pm.h is the quality rather than the mode:
+ *
+ *   LATENCY    the radio must not sleep. A beacon interval of sleep is paid on
+ *              every round trip, and vnc and ssh are made of round trips.
+ *              Measured here: 76 ms mean ping asleep, 4.9 ms awake.
+ *   AUDIO_AIR  Bluetooth must keep the antenna, so Wi-Fi gives it up: deepest
+ *              modem sleep, and the channel narrowed to HT20. The ESP32 station
+ *              defaults to HT40, which is twice the spectrum to lose to, and
+ *              AMPDU on top of that holds the radio for a whole aggregate.
+ *              Measured by ear before either change: associated, the tone
+ *              pulsed; disconnected, it was continuous.
+ *
+ * When both are held -- someone watching a film over vnc -- audio wins, because
+ * a torn SBC frame is heard and a slow drag is only felt, and no setting gives
+ * both. Whatever the user had is remembered once, before the first override,
+ * and put back when the last request goes: this is a trade they did not ask
+ * for and should not have to undo by hand.
+ */
+static espix_wifi_ps_t  s_pm_ps_before;
+static wifi_bandwidth_t s_pm_bw_before;
+static bool             s_pm_saved;
+
+static void pm_update(void)
+{
+    const bool audio  = espix_pm_holds(ESPIX_PM_AUDIO_AIR) > 0;
+    const bool lowlat = espix_pm_holds(ESPIX_PM_LATENCY) > 0;
+
+    if (!audio && !lowlat) {
+        if (s_pm_saved) {
+            (void)espix_wifi_set_ps(s_pm_ps_before);
+            (void)esp_wifi_set_bandwidth(WIFI_IF_STA, s_pm_bw_before);
+            s_pm_saved = false;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "radio back to its own settings");
+        }
+        return;
+    }
+
+    if (!s_pm_saved) {
+        espix_wifi_status_t st;
+        if (espix_net_wifi_status(&st) == ESP_OK) {
+            s_pm_ps_before = st.ps;
+        } else {
+            s_pm_ps_before = ESPIX_WIFI_PS_MIN_MODEM;
+        }
+        if (esp_wifi_get_bandwidth(WIFI_IF_STA, &s_pm_bw_before) != ESP_OK) {
+            s_pm_bw_before = WIFI_BW40;
+        }
+        s_pm_saved = true;
+    }
+
+    if (audio) {
+        (void)espix_wifi_set_ps(ESPIX_WIFI_PS_MAX_MODEM);
+        (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20);
+        espix_klog(ESPIX_KLOG_INFO, TAG, "radio yielded to Bluetooth (audio)");
+    } else {
+        (void)espix_wifi_set_ps(ESPIX_WIFI_PS_NONE);
+        (void)esp_wifi_set_bandwidth(WIFI_IF_STA, s_pm_bw_before);
+        espix_klog(ESPIX_KLOG_INFO, TAG, "radio kept awake (low latency)");
+    }
+}
+
+static void pm_apply(espix_pm_need_t need, bool active)
+{
+    (void)need;
+    (void)active;
+    /* Recomputed from the counts, not from this one edge: what to do depends on
+     * every outstanding request, not on which one just changed. */
+    pm_update();
 }
 
 esp_err_t espix_wifi_set_ps(espix_wifi_ps_t mode)

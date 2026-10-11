@@ -35,9 +35,7 @@
 #if CONFIG_ESP_COEX_ENABLED
 #include "esp_coexist.h"
 #endif
-#if CONFIG_ESP_WIFI_ENABLED
-#include "esp_wifi.h"
-#endif
+#include "espix_pm.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
@@ -68,38 +66,17 @@ static uint8_t              s_connected_bda[ESPIX_BDA_LEN];
  * continuous -- measured by ear, repeatedly, with the link otherwise healthy
  * (realtime drain, good signal, valid config). Asking the arbiter to prefer
  * Bluetooth is not enough on its own; a Wi-Fi radio that is awake by default
- * keeps taking its turn regardless. Preference is still set, because the two
- * do different jobs: one wins the arbitration, this one removes the demand.
+ * keeps taking its turn regardless. Preference is still set here, because the
+ * two do different jobs: one wins the arbitration, the other removes the
+ * demand.
  *
- * The user's own setting is saved and put back on disconnect: this is a trade,
- * and they should get it back when they are not playing audio.
+ * The demand is a request, not a setting this file makes: espix_pm counts it,
+ * espix_net decides what it means -- today the deepest modem sleep and a
+ * channel narrowed to HT20 -- and the user's own setting comes back when it is
+ * released. That is also what keeps esp_wifi out of this component: a
+ * Bluetooth stack reaching into the Wi-Fi driver is precisely the coupling the
+ * request exists to avoid, and this file did it first.
  */
-#if CONFIG_ESP_WIFI_ENABLED
-static wifi_ps_type_t s_wifi_ps_saved;
-static bool           s_wifi_ps_saved_ok;
-
-static void wifi_yield_to_bt(void)
-{
-    wifi_ps_type_t cur;
-    if (esp_wifi_get_ps(&cur) == ESP_OK) {
-        s_wifi_ps_saved    = cur;
-        s_wifi_ps_saved_ok = true;
-    }
-    (void)esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-}
-
-static void wifi_yield_restore(void)
-{
-    if (s_wifi_ps_saved_ok) {
-        (void)esp_wifi_set_ps(s_wifi_ps_saved);
-        s_wifi_ps_saved_ok = false;
-    }
-}
-#else
-static void wifi_yield_to_bt(void)  { }
-static void wifi_yield_restore(void) { }
-#endif
-
 /* The link's own report of how loudly it hears a sink, filled from GAP. */
 static volatile bool s_rssi_got;
 static int8_t        s_rssi_value;
@@ -728,14 +705,14 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
              * back when nothing is playing.
              */
             (void)esp_coex_preference_set(ESP_COEX_PREFER_BT);
-            wifi_yield_to_bt();
+            (void)espix_pm_acquire(ESPIX_PM_AUDIO_AIR);
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connected; checking source");
             (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_a2d_connected = false;
             s_streaming     = false;
             (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-            wifi_yield_restore();
+            (void)espix_pm_release(ESPIX_PM_AUDIO_AIR);
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp disconnected");
             if (s_want_connect && s_retry != NULL) {
                 (void)esp_timer_start_once(s_retry, 2 * 1000 * 1000);
@@ -1231,6 +1208,8 @@ static int a2dp_get_volume(void)
  * must not wedge the caller -- and the caller is closing a stream, which has to
  * finish.
  */
+#define A2DP_PLAYOUT_MS 250
+
 static void a2dp_drain(void)
 {
     if (s_pcm == NULL) {
@@ -1250,14 +1229,18 @@ static void a2dp_drain(void)
 
     /*
      * That was handoff, not playout. Every frame the callback has taken is
-     * still in Bluedroid's transmit queue and the controller's ACL buffers --
-     * bounded at 27 frames, but with the link's own latency on top -- and
-     * suspending flushes all of it. Cutting a waveform off mid-cycle is a step,
-     * and a step is the pop at the end of every short sound. A margin covers
-     * what we cannot see; it costs a quarter second at the end of a stream and
-     * nothing while audio is playing.
+     * still in Bluedroid's transmit queue and the controller's ACL buffers, and
+     * suspending flushes all of it -- cutting a waveform off mid-cycle, which
+     * is a step, and a step is the pop at the end of every short sound.
+     *
+     * The margin is derived rather than guessed: Bluedroid's transmit queue is
+     * bounded at 27 SBC frames, and a frame is 128 samples -- 2.9 ms at
+     * 44.1 kHz -- so about 80 ms is still in its hands when ours are empty,
+     * with the L2CAP layer and the controller's buffers on top of that. 250 ms
+     * covers it with room, is paid once per stream by the task doing the
+     * closing, and costs nothing while audio is playing.
      */
-    vTaskDelay(pdMS_TO_TICKS(250));
+    vTaskDelay(pdMS_TO_TICKS(A2DP_PLAYOUT_MS));
 }
 
 static const espix_audio_sink_ops_t s_a2dp_sink = {

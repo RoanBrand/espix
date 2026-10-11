@@ -511,6 +511,9 @@ static void feed(uint8_t *p, size_t n)
 
 /* Frames per generated-tone block; 512 is ~12 ms at 44.1 kHz. */
 #define TONE_FRAMES  512
+
+/* Silence between the left/right test's segments; see where it is used. */
+#define TONE_GAP_MS  150
 #define TONE_HZ      440
 #define TONE_LEVEL   12000
 /*
@@ -707,6 +710,30 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
  * channel carries it: 0 left, 1 right, 2 both. That is what makes a stereo
  * check possible -- one second each way says more than a level meter.
  */
+/* Frames of silence, written the same way a segment is. */
+static void tone_silence(espix_audio_stream_t *st, int frames, int16_t *buf)
+{
+    memset(buf, 0, (size_t)TONE_FRAMES * 4);
+    while (frames > 0 && !s_stop_requested) {
+        const int    n     = frames > TONE_FRAMES ? TONE_FRAMES : frames;
+        const size_t bytes = (size_t)n * 4;
+        size_t       off   = 0;
+        while (off < bytes) {
+            if (st->stop || s_stop_requested) {
+                return;
+            }
+            const size_t w = espix_audio_stream_write(st, (uint8_t *)buf + off,
+                                                      bytes - off);
+            if (w == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            off += w;
+        }
+        frames -= n;
+    }
+}
+
 static void tone_play(espix_audio_stream_t *st, int frames, tone_osc_t *osc,
                       int ch, int16_t *buf)
 {
@@ -798,12 +825,32 @@ esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
          * audibly shorter the number that proves it belongs here, not in a
          * guess about SBC joint stereo or the far end's rendering.
          */
-        static const char *const seg[3] = { "left", "right", "both" };
-        for (int ch = 0; ch < 3; ch++) {
+        /*
+         * The order is left, right, both, and the channel is what each segment
+         * drives. (This was swapped once, deliberately, to place a fault: the
+         * short segment turned out to follow the *position* and not the
+         * channel, which ruled out the sink's rendering and put it here.)
+         */
+        static const char *const seg[3] = {
+            "left channel", "right channel", "both channels"
+        };
+        static const int seg_ch[3] = { 0, 1, 2 };
+        /*
+         * A gap between them, and it is a diagnostic as much as a courtesy:
+         * without one the three run into each other and the boundary is a guess
+         * by ear. With one, "the middle tone is short" is a statement about the
+         * audio rather than about a transition nobody can hear where it lands.
+         */
+        const int gap = (int)fmt.rate * TONE_GAP_MS / 1000;
+        for (int i = 0; i < 3; i++) {
+            const int ch = seg_ch[i];
             const int64_t t0 = esp_timer_get_time();
             tone_play(st, one_s, &osc, ch, buf);
-            espix_klog(ESPIX_KLOG_INFO, TAG, "tone: %s segment %lld ms",
-                       seg[ch], (long long)((esp_timer_get_time() - t0) / 1000));
+            espix_klog(ESPIX_KLOG_INFO, TAG, "tone: %s, %lld ms",
+                       seg[i], (long long)((esp_timer_get_time() - t0) / 1000));
+            if (i < 2) {
+                tone_silence(st, gap, buf);
+            }
         }
     } else {
         tone_play(st, seconds * one_s, &osc, 2, buf);

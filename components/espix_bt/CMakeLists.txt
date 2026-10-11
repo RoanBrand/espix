@@ -21,9 +21,4 @@ idf_component_register(
         # The coexistence arbiter, for telling it to favour Bluetooth while a
         # sink is connected. Present because the radio is shared with Wi-Fi.
         esp_coex
-        # And the station itself, so a connected sink can put Wi-Fi to sleep
-        # rather than merely out-rank it. Guarded in the source by
-        # CONFIG_ESP_WIFI_ENABLED, because a board without Wi-Fi still gets the
-        # component named and links fine.
-        esp_wifi
 )
