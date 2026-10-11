@@ -1201,20 +1201,52 @@ static int a2dp_get_volume(void)
 }
 
 /*
- * Wait for the link to take everything it has been handed.
+ * How much silence to hand the link before suspending it.
  *
- * The PCM ring is the only thing between the writer and the air, so an empty
- * one means the sink has it all. Bounded, because a link that has gone away
- * must not wedge the caller -- and the caller is closing a stream, which has to
- * finish.
+ * Bluedroid's transmit queue is bounded at 27 SBC frames of 128 samples (2.9 ms
+ * each at 44.1 kHz), so ~80 ms is still in its hands when ours are empty, with
+ * the L2CAP layer and the controller's buffers on top. 250 ms covers that with
+ * room, and the number matters less than what it is for: see below.
  */
-#define A2DP_PLAYOUT_MS 250
+#define A2DP_TAIL_MS 250
 
+/*
+ * Let the link finish, by giving it something it can afford to lose.
+ *
+ * Emptying our ring is handoff, not playout: every frame the callback has taken
+ * is still queued downstream, and suspending flushes all of it -- cutting a
+ * waveform off mid-cycle, which is a step, and a step is the pop at the end of
+ * every short sound.
+ *
+ * The first version of this slept for a margin long enough to cover that. It
+ * worked, but it was a reading of the link dressed up as a measurement: a link
+ * holding longer than the margin still had real audio cut, and one holding less
+ * charged the delay anyway. So hand it silence instead. Whatever depth the
+ * queue turns out to be, what the flush discards is padding rather than audio,
+ * and the tail survives regardless of how the link has been behaving.
+ *
+ * Bounded, because a link that has gone away must not wedge the caller -- and
+ * the caller is closing a stream, which has to finish.
+ */
 static void a2dp_drain(void)
 {
     if (s_pcm == NULL) {
         return;
     }
+
+    const espix_audio_format_t f = a2dp_format();
+    size_t left = (size_t)f.rate * A2DP_TAIL_MS / 1000 * f.channels * (f.bits / 8);
+    static const int16_t zero[128];             /* zero, by being static */
+    while (left > 0) {
+        const size_t n = left > sizeof(zero) ? sizeof(zero) : left;
+        const size_t w = xStreamBufferSend(s_pcm, zero, n, pdMS_TO_TICKS(100));
+        if (w == 0) {
+            break;
+        }
+        left -= w;
+    }
+
+    /* And wait for it all to leave our hands, padding included. */
     bool emptied = false;
     for (int i = 0; i < 500; i++) {             /* up to ~5 s */
         if (xStreamBufferIsEmpty(s_pcm)) {
@@ -1224,23 +1256,12 @@ static void a2dp_drain(void)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (!emptied) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "drain: the link did not take it all");
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "drain: the link did not take it all (%u B left, "
+                   "%u B/s last)",
+                   (unsigned)xStreamBufferBytesAvailable(s_pcm),
+                   (unsigned)s_drain_bytes);
     }
-
-    /*
-     * That was handoff, not playout. Every frame the callback has taken is
-     * still in Bluedroid's transmit queue and the controller's ACL buffers, and
-     * suspending flushes all of it -- cutting a waveform off mid-cycle, which
-     * is a step, and a step is the pop at the end of every short sound.
-     *
-     * The margin is derived rather than guessed: Bluedroid's transmit queue is
-     * bounded at 27 SBC frames, and a frame is 128 samples -- 2.9 ms at
-     * 44.1 kHz -- so about 80 ms is still in its hands when ours are empty,
-     * with the L2CAP layer and the controller's buffers on top of that. 250 ms
-     * covers it with room, is paid once per stream by the task doing the
-     * closing, and costs nothing while audio is playing.
-     */
-    vTaskDelay(pdMS_TO_TICKS(A2DP_PLAYOUT_MS));
 }
 
 static const espix_audio_sink_ops_t s_a2dp_sink = {

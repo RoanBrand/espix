@@ -500,6 +500,10 @@ void espix_gfx_recover(espix_pid_t pid);
  * espix's own VFS. */
 void espix_proc_abi_fs_register(void);
 
+/* Publish the audio engine's stream API: open, write, close, volume. See
+ * abi_audio.c -- the sinks and the registry stay firmware-side. */
+void espix_proc_abi_audio_register(void);
+
 /* The app identity calls: getuid/geteuid, getgid/getegid. */
 void espix_proc_abi_ident_register(void);
 void espix_proc_abi_libc_register(void);

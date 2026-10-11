@@ -101,14 +101,27 @@ esp_err_t espix_audio_tone_async(int freq_hz, int seconds, bool left_right);
  */
 typedef struct espix_audio_stream espix_audio_stream_t;
 
-/* NULL when there is no connected sink, or one is already playing/streaming. */
+/* NULL when there is no connected sink, or every slot is taken. Several streams
+ * may be open at once and are mixed together; the decoder (play) is still
+ * exclusive with them, because it drives the sink itself. */
 espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt);
 
 /* Blocks while the ring is full. Returns the bytes taken; a short write is the
  * caller's to loop on. */
 size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_t len);
 
-/* Flush, stop the drain task, and free the ring. Blocks until the task is gone. */
+/*
+ * This stream's own level, 0-100, and its mute.
+ *
+ * Separate from the engine's master volume so an app's mix cannot change the
+ * system volume, and the two multiply. Mute is a bit rather than volume 0, so
+ * unmuting restores what the app had asked for instead of guessing at it.
+ */
+esp_err_t espix_audio_stream_volume(espix_audio_stream_t *st, int percent);
+esp_err_t espix_audio_stream_mute(espix_audio_stream_t *st, bool on);
+
+/* Let the mixer finish what is queued, then free the ring. The sink is drained
+ * and suspended only when the last stream closes. Blocks while it waits. */
 esp_err_t espix_audio_stream_close(espix_audio_stream_t *st);
 
 /*

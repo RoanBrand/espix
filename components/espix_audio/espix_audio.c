@@ -488,9 +488,33 @@ static void feed_ex(uint8_t *p, size_t n, volatile bool *stop)
 }
 
 /* The engine's own feed: the decoder's stop flag. */
+static espix_audio_stream_t *s_play_stream;
+
+/*
+ * The decoder's PCM goes into a stream, like every other producer's.
+ *
+ * It used to call the sink directly, which is the whole reason a stream and a
+ * play could not coexist: two things drove one sink and neither knew about the
+ * other. Now play is a client of the server exactly as an app is, and the
+ * mixing, the master gain and the sink's lifecycle are the mixer's business.
+ */
 static void feed(uint8_t *p, size_t n)
 {
-    feed_ex(p, n, &s_stop);
+    size_t off = 0;
+
+    while (off < n && !s_stop && s_play_stream != NULL) {
+        const size_t w = espix_audio_stream_write(s_play_stream, p + off,
+                                                  n - off);
+        if (w == 0) {
+            /*
+             * A full ring is not a stop: the mixer has not made room yet. The
+             * same zero-means-stop confusion silenced the test tone once.
+             */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        off += w;
+    }
 }
 
 /*
@@ -508,6 +532,27 @@ static void feed(uint8_t *p, size_t n)
 #define STREAM_RING  (256 * 1024)
 #define STREAM_CHUNK (4 * 1024)
 #define STREAM_STACK (4 * 1024)
+
+/*
+ * The mixer.
+ *
+ * One task for every stream rather than one per stream: N apps writing PCM,
+ * each summed at its own gain into one block, clipped once, into the one sink.
+ * That is the whole of the "server" -- Linux calls it PipeWire's graph, and the
+ * deliberate simplification (AUDIO.md) is that there is no graph: every stream
+ * routes to the default sink, and the only conversion is whatever the sink
+ * negotiated.
+ *
+ * Lazy like the rest of the engine: the task exists only while at least one
+ * stream is open, and the sink is started by the first and suspended by the
+ * last. An idle mixer does not feed the sink at all -- "drain 180224 B/s,
+ * ring 0 B" while nothing was playing was measured once already, and it is the
+ * shape of a link saturating itself on its own silence.
+ */
+#define STREAM_MAX   4
+#define MIX_FRAMES   1024               /* ~23 ms at 44.1 kHz */
+#define MIX_BYTES    (MIX_FRAMES * 4)   /* S16 stereo */
+#define MIX_GAIN_ONE 32768              /* per-stream gain is Q15 of 0..100 */
 
 /* Frames per generated-tone block; 512 is ~12 ms at 44.1 kHz. */
 #define TONE_FRAMES  512
@@ -547,41 +592,121 @@ static inline int16_t tone_osc_next(tone_osc_t *o)
 
 struct espix_audio_stream {
     StreamBufferHandle_t sb;
-    espix_task_exit_t    exit;
     espix_audio_format_t fmt;
-    volatile bool        stop;
-    bool                 task_caps;
+    int                  volume;      /* 0-100, this stream's own level */
+    bool                 mute;        /* kept apart from volume, so unmute restores */
+    volatile bool        stop;        /* no further writes; the owner will close */
 };
 
-static espix_audio_stream_t *s_stream;
+/*
+ * The open streams, and the one task that mixes them. A fixed table rather than
+ * a list: the number is small, the lookup is a scan of four, and a stream that
+ * cannot be opened is a clear answer instead of an allocation that might fail
+ * later.
+ */
+static espix_audio_stream_t *s_streams[STREAM_MAX];
+static espix_task_exit_t     s_mixer_exit;
+static volatile bool         s_mixer_stop;
+static volatile bool         s_mixer_up;
 
-static void stream_task(void *arg)
+static int stream_slot_free(void)
 {
-    espix_audio_stream_t *st = arg;
-    uint8_t *buf = malloc(STREAM_CHUNK);
-
-    while (buf != NULL) {
-        /*
-         * Block on the ring. The timeout is the only way to notice `stop`,
-         * because FreeRTOS cannot abort a blocked stream-buffer receive -- so
-         * this is one wake every 100 ms while idle, not a busy poll.
-         */
-        const size_t n = xStreamBufferReceive(st->sb, buf, STREAM_CHUNK,
-                                              pdMS_TO_TICKS(100));
-        if (n > 0) {
-            feed_ex(buf, n, &st->stop);
-        } else if (st->stop && xStreamBufferIsEmpty(st->sb)) {
-            break;
+    for (int i = 0; i < STREAM_MAX; i++) {
+        if (s_streams[i] == NULL) {
+            return i;
         }
     }
+    return -1;
+}
 
-    free(buf);
-    espix_task_exited(&st->exit);
-    if (st->task_caps) {
-        vTaskDeleteWithCaps(NULL);
-    } else {
-        vTaskDelete(NULL);
+static bool stream_any_open(void)
+{
+    for (int i = 0; i < STREAM_MAX; i++) {
+        if (s_streams[i] != NULL) {
+            return true;
+        }
     }
+    return false;
+}
+
+static size_t stream_count(void)
+{
+    size_t n = 0;
+    for (int i = 0; i < STREAM_MAX; i++) {
+        if (s_streams[i] != NULL) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/*
+ * Sum one stream into the mix, at its own gain, clipping as we go.
+ *
+ * Clipped here rather than at the end on purpose: a stream that is too loud
+ * should distort itself, not everything else in the mix. The master gain is
+ * applied later, in feed_ex(), where it stays a single multiply over the sum.
+ */
+static void mix_add(int16_t *out, const int16_t *in, size_t frames, int volume)
+{
+    const int32_t g = (int32_t)volume * MIX_GAIN_ONE / 100;
+
+    for (size_t i = 0; i < frames * 2; i++) {
+        int32_t v = in[i];
+        if (g != MIX_GAIN_ONE) {
+            v = (v * g) >> 15;
+        }
+        v += out[i];
+        out[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+    }
+}
+
+static void mixer_task(void *arg)
+{
+    (void)arg;
+    int16_t *out = malloc(MIX_BYTES);
+    int16_t *in  = malloc(MIX_BYTES);
+
+    while (out != NULL && in != NULL && !s_mixer_stop) {
+        memset(out, 0, MIX_BYTES);
+
+        /*
+         * A full block, always. A stream with nothing ready contributes silence
+         * for this block rather than shrinking it: the others must not be held
+         * back by one app that is between sounds, and the sink wants a steady
+         * block size either way.
+         */
+        bool any = false;
+        for (int i = 0; i < STREAM_MAX; i++) {
+            espix_audio_stream_t *st = s_streams[i];
+            if (st == NULL) {
+                continue;
+            }
+            const size_t n = xStreamBufferReceive(st->sb, in, MIX_BYTES, 0);
+            if (n == 0) {
+                continue;
+            }
+            any = true;
+            mix_add(out, in, n / 4, st->mute ? 0 : st->volume);
+        }
+
+        if (!any) {
+            /*
+             * Nothing to play. Do not feed the sink -- that is what keeps an
+             * idle link from streaming silence -- and wake soon enough that the
+             * first write after a lull is not held up by the poll.
+             */
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        feed_ex((uint8_t *)out, MIX_BYTES, &s_mixer_stop);
+    }
+
+    free(out);
+    free(in);
+    espix_task_exited(&s_mixer_exit);
+    vTaskDeleteWithCaps(NULL);
 }
 
 espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
@@ -589,7 +714,14 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
     if (fmt == NULL || fmt->channels == 0 || fmt->bits != 16) {
         return NULL;
     }
-    if (s_stream != NULL || s_running) {
+    /*
+     * `play` still feeds the sink itself rather than opening a stream, so the
+     * two cannot run at once: they would both drive the same sink and neither
+     * would know. Moving play onto this API is what removes the check.
+     */
+    const int slot = stream_slot_free();
+    if (slot < 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "stream: all %d are open", STREAM_MAX);
         return NULL;
     }
     const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
@@ -607,34 +739,48 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
     if (st == NULL) {
         return NULL;
     }
-    st->fmt = *fmt;
-    st->sb  = xStreamBufferCreateWithCaps(STREAM_RING, STREAM_CHUNK, MALLOC_CAP_SPIRAM);
-    if (st->sb == NULL || !espix_task_exit_init(&st->exit)) {
-        if (st->sb != NULL) {
-            vStreamBufferDeleteWithCaps(st->sb);
-        }
+    st->fmt    = *fmt;
+    st->volume = 100;
+    st->sb     = xStreamBufferCreateWithCaps(STREAM_RING, STREAM_CHUNK, MALLOC_CAP_SPIRAM);
+    if (st->sb == NULL) {
         free(st);
         return NULL;
     }
 
     /*
-     * Published before the sink starts: sink->start() is the codec's own open
-     * (an I2C register sequence, tens of milliseconds) and a Stop landing
-     * inside it must be able to find this.
+     * In the table before anything can see it, and before the sink starts: a
+     * Stop landing inside the sink's own open has to find this stream, which is
+     * the race that made the desktop's Stop button do nothing.
      */
-    s_stream = st;
+    s_streams[slot] = st;
 
+    if (s_mixer_up) {
+        return st;                      /* already mixing; nothing else to do */
+    }
+
+    /*
+     * First stream: the sink starts, then the mixer. In that order, so the
+     * codec's own open (an I2C register sequence, tens of milliseconds) is not
+     * inside the mixer's first block.
+     */
+    if (!espix_task_exit_init(&s_mixer_exit)) {
+        s_streams[slot] = NULL;
+        vStreamBufferDeleteWithCaps(st->sb);
+        free(st);
+        return NULL;
+    }
+    s_mixer_stop = false;
+    s_mixer_up   = true;
     sink->start();
 
-    st->task_caps = true;
-    if (xTaskCreatePinnedToCoreWithCaps(stream_task, "espix:stream", STREAM_STACK, st, 20,
-                                        &st->exit.task, 1,
+    if (xTaskCreatePinnedToCoreWithCaps(mixer_task, "espix:mix", STREAM_STACK, NULL, 20,
+                                        &s_mixer_exit.task, 1,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-        st->task_caps = false;
-        if (xTaskCreatePinnedToCore(stream_task, "espix:stream", STREAM_STACK, st, 20,
-                                    &st->exit.task, 1) != pdPASS) {
-            st->exit.task = NULL;
-            s_stream = NULL;
+        if (xTaskCreatePinnedToCore(mixer_task, "espix:mix", STREAM_STACK, NULL, 20,
+                                    &s_mixer_exit.task, 1) != pdPASS) {
+            s_mixer_exit.task = NULL;
+            s_mixer_up        = false;
+            s_streams[slot]   = NULL;
             vStreamBufferDeleteWithCaps(st->sb);
             free(st);
             return NULL;
@@ -672,36 +818,77 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
     if (st == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    st->stop = true;
-    (void)espix_task_exit_wait(&st->exit, 0);   /* blocks until the task is gone */
-    vStreamBufferDeleteWithCaps(st->sb);
+    st->stop = true;                    /* no further writes from the owner */
 
     /*
-     * The matching stop for the start stream_open() did. Without it an A2DP
-     * link stays STREAMING after the audio ends, pulling the full rate out of
-     * an empty ring -- silence -- and saturating itself: the sink reported
-     * "drain 180224 B/s, ring 0 B" while nothing was playing, and the L2CAP
-     * congested for as long as that lasted.
+     * Let the mixer finish what is queued before the row goes. The ring holds
+     * up to a second and a half of audio, and dropping it cuts the tail off
+     * everything short -- the bug fixed once already as "a 3-second tone that
+     * finishes in one second and is never heard".
      */
+    for (int i = 0; i < 500 && s_mixer_up && !xStreamBufferIsEmpty(st->sb); i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    for (int i = 0; i < STREAM_MAX; i++) {
+        if (s_streams[i] == st) {
+            s_streams[i] = NULL;
+        }
+    }
+    vStreamBufferDeleteWithCaps(st->sb);
+    free(st);
+
+    if (stream_any_open()) {
+        return ESP_OK;                  /* other apps are still playing */
+    }
+
+    /*
+     * Last one out. The mixer goes first, then the sink is allowed to finish:
+     * an A2DP link left STREAMING with nothing behind it pulls the full rate
+     * out of an empty ring -- "drain 180224 B/s, ring 0 B" while nothing was
+     * playing -- and suspending it flushes whatever it still holds, so the
+     * drain comes before the suspend for the same reason it always did.
+     */
+    s_mixer_stop = true;
+    if (s_mixer_up) {
+        (void)espix_task_exit_wait(&s_mixer_exit, 0);
+        s_mixer_up = false;
+    }
+
     const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
     if (sink != NULL) {
-        /*
-         * Let it finish first. Suspend flushes whatever the sink still holds,
-         * and between the writer and the link there are seconds of PCM -- so
-         * suspending on the writer's exit throws away the tail of everything
-         * shorter than the buffering. That is the tone that "finishes" in a
-         * third of its length and is never heard.
-         */
         if (sink->drain != NULL) {
             sink->drain();
         }
         sink->suspend();
     }
+    return ESP_OK;
+}
 
-    if (s_stream == st) {
-        s_stream = NULL;
+/*
+ * A stream's own level. Master is the engine's; this is the app's, and they
+ * multiply -- which is what keeps an app's mix from changing the system volume.
+ */
+esp_err_t espix_audio_stream_volume(espix_audio_stream_t *st, int percent)
+{
+    if (st == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
-    free(st);
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    st->volume = percent;
+    return ESP_OK;
+}
+
+esp_err_t espix_audio_stream_mute(espix_audio_stream_t *st, bool on)
+{
+    if (st == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    st->mute = on;
     return ESP_OK;
 }
 
@@ -1487,6 +1674,16 @@ out:
     }
 
     s_running = false;
+    /*
+     * Closed by the decoder's own task, which is what lets it drain: everything
+     * this play wrote is still in the ring, and the mixer needs to consume it
+     * before the sink is suspended. Freeing the stream any earlier throws the
+     * tail away.
+     */
+    if (s_play_stream != NULL) {
+        (void)espix_audio_stream_close(s_play_stream);
+        s_play_stream = NULL;
+    }
     espix_task_exited(&s_exit);
     espix_klog(ESPIX_KLOG_INFO, TAG, "finished");
 
@@ -1502,9 +1699,7 @@ static esp_err_t play_common(const char *uri, bool wait)
     if (uri == NULL || uri[0] == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_stream != NULL) {
-        return ESP_ERR_INVALID_STATE;   /* an app's stream already owns the sink */
-    }
+
 
     /*
      * No sink, no playback.
@@ -1545,10 +1740,29 @@ static esp_err_t play_common(const char *uri, bool wait)
     s_stop = false;
     strlcpy(s_uri, uri, sizeof(s_uri));
 
-    /* New stream: drop the last one's PCM and re-arm the sink's pre-roll, so
-     * this one starts with a cushion instead of underrunning. */
-    if (sink != NULL) {
-        sink->start();
+    /*
+     * The decoder gets a stream like any other producer. Opening it is what
+     * starts the sink and the mixer, so there is deliberately no start() here --
+     * and no "an app is already streaming" check either, because two producers
+     * into one sink is now the mixer's ordinary case rather than a conflict.
+     *
+     * The format is the sink's, because the decoder's output has already been
+     * converted to it (the ASRC path) by the time feed() sees it.
+     */
+    const espix_audio_sink_ops_t *const sk = espix_audio_sink_default();
+    const espix_audio_format_t fmt = (sk != NULL && sk->format != NULL)
+        ? sk->format() : (espix_audio_format_t){ 44100, 2, 16 };
+
+    for (int tries = 0; ; tries++) {
+        s_play_stream = espix_audio_stream_open(&fmt);
+        if (s_play_stream != NULL || !wait || tries >= 100) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));     /* --wait: up to ~10 s for a sink */
+    }
+    if (s_play_stream == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "play: no stream (no sink, or busy)");
+        return ESP_ERR_INVALID_STATE;
     }
 
     /*
@@ -1567,6 +1781,8 @@ static esp_err_t play_common(const char *uri, bool wait)
      * the caps attempt failed -- so no task is alive to race the flag.
      */
     if (!espix_task_exit_init(&s_exit)) {
+        (void)espix_audio_stream_close(s_play_stream);
+        s_play_stream = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1578,6 +1794,8 @@ static esp_err_t play_common(const char *uri, bool wait)
         if (xTaskCreatePinnedToCore(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
                                     &s_exit.task, 1) != pdPASS) {
             s_exit.task = NULL;
+            (void)espix_audio_stream_close(s_play_stream);
+            s_play_stream = NULL;
             return ESP_FAIL;
         }
     }
@@ -1599,8 +1817,8 @@ esp_err_t espix_audio_stop(void)
 {
     bool did = false;
 
-    espix_klog(ESPIX_KLOG_INFO, TAG, "stop: stream %p task %p requested %d",
-               (void *)s_stream, (void *)s_exit.task, (int)s_stop_requested);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "stop: streams %d task %p requested %d",
+               (int)stream_count(), (void *)s_exit.task, (int)s_stop_requested);
     s_stop_requested = true;
 
     /*
@@ -1611,9 +1829,11 @@ esp_err_t espix_audio_stop(void)
      * use-after-free. The writer's loop ends on the zero that write() then
      * returns, and its owner closes it.
      */
-    if (s_stream != NULL) {
-        s_stream->stop = true;
-        did = true;
+    for (int i = 0; i < STREAM_MAX; i++) {
+        if (s_streams[i] != NULL) {
+            s_streams[i]->stop = true;
+            did = true;
+        }
     }
     if (s_exit.task != NULL) {
         s_stop = true;
@@ -1627,7 +1847,7 @@ const char *espix_audio_state(void)
     if (s_running) {
         return "playing";
     }
-    return s_stream != NULL ? "streaming" : "idle";
+    return stream_any_open() ? "streaming" : "idle";
 }
 
 #endif /* CONFIG_ESPIX_AUDIO */

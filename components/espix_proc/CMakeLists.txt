@@ -16,6 +16,7 @@ idf_component_register(
         "abi_signal.c"
         "abi_time.c"
         "abi_gfx.c"
+        "abi_audio.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -29,6 +30,9 @@ idf_component_register(
         espix_shell
         # abi_gfx.c publishes the screen and its input queue to apps.
         espix_display
+        # abi_audio.c publishes the engine's stream API to apps. The header it
+        # needs with it is espix_audio.h, which is app-facing by design.
+        espix_audio
         espressif__elf_loader
         # abi_pthread.c wraps pthread_create, to give an app's threads the
         # process's slot.
