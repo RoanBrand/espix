@@ -489,6 +489,7 @@ static void feed_ex(uint8_t *p, size_t n, volatile bool *stop)
 
 /* The engine's own feed: the decoder's stop flag. */
 static espix_audio_stream_t *s_play_stream;
+static bool                  s_wait;   /* play --wait; the open happens later now */
 
 /*
  * The decoder's PCM goes into a stream, like every other producer's.
@@ -883,7 +884,13 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
      * so the mixer is untouched and one stream's rate never reaches another's.
      */
     if (fmt->rate != st->ring_fmt.rate || fmt->channels != st->ring_fmt.channels) {
-        if (sink->set_format != NULL && sink->set_format(fmt)) {
+        /*
+         * Adopting is only safe while nothing else is playing. The mixer sums
+         * every stream at one rate -- the sink's -- so changing it under a
+         * stream that is already open would reinterpret that stream's samples.
+         * With none open the change is free; with any, this stream converts.
+         */
+        if (sink->set_format != NULL && stream_count() == 0 && sink->set_format(fmt)) {
             st->ring_fmt = *fmt;
             espix_klog(ESPIX_KLOG_INFO, TAG,
                        "stream: sink '%s' adopts %u Hz, %u ch",
@@ -1679,6 +1686,7 @@ static bool audio_asrc_run(struct audio_asrc *a, uint32_t in_samples,
 
 static void audio_task(void *arg)
 {
+    bool in_ps = false, out_ps = false;
     const char *uri = (const char *)arg;
     int fd = -1;
     uint8_t *in = NULL;
@@ -1720,7 +1728,6 @@ static void audio_task(void *arg)
      * internal RAM held for a case that does not arise is exactly the pressure
      * that makes a stereo MP3 spill.
      */
-    bool in_ps = false, out_ps = false, up_ps = false;
     in  = audio_buf_alloc("in",  IN_CHUNK,  &in_ps);
     out = audio_buf_alloc("out", OUT_CHUNK, &out_ps);
 
@@ -1776,7 +1783,6 @@ static void audio_task(void *arg)
      * has not worked. */
     uint32_t t_read = 0, t_dec = 0, t_feed = 0, produce = 0;
     unsigned src_rate = 0;
-    bool     asrc_tried = false;
     int64_t  mark = esp_timer_get_time();
 
     while (!s_stop) {
@@ -1823,90 +1829,40 @@ static void audio_task(void *arg)
                         src_rate     = info.sample_rate;
                     }
                     info_logged = true;
-                }
-                const espix_audio_sink_ops_t *const sink = espix_audio_sink_default();
-                const espix_audio_format_t sf = sink != NULL ? sink->format()
-                                                             : (espix_audio_format_t){ 44100, 2, 16 };
 
-                /*
-                 * Open the rate converter once, on the first frame whose format
-                 * is known. A source already at the sink's rate never opens it,
-                 * and one that cannot open plays as-is rather than failing.
-                 */
-                if (!asrc_tried && src_rate != 0) {
-                    asrc_tried = true;
-                    if (src_rate != sf.rate) {
-                        const esp_asrc_aud_info_t si = {
-                            .sample_rate     = src_rate,
-                            .channel         = src_channels,
-                            .bits_per_sample = 16,
-                        };
-                        const esp_asrc_aud_info_t di = {
-                            .sample_rate     = sf.rate,
-                            .channel         = sf.channels,
-                            .bits_per_sample = 16,
-                        };
-                        if (asrc_open(&s_asrc, &si, &di, OUT_CHUNK)) {
-                            espix_klog(ESPIX_KLOG_INFO, TAG,
-                                       "resampling %u -> %u Hz, %u -> %u ch",
-                                       (unsigned)src_rate, (unsigned)sf.rate,
-                                       (unsigned)src_channels, (unsigned)sf.channels);
-                        } else {
-                            espix_klog(ESPIX_KLOG_WARN, TAG,
-                                       "cannot resample %u -> %u Hz; playing as-is",
-                                       (unsigned)src_rate, (unsigned)sf.rate);
-                        }
-                    }
-                }
-
-                const int64_t f0 = esp_timer_get_time();
-                if (s_asrc.handle != NULL) {
-                    memcpy(s_asrc.in, frame.buffer, frame.decoded_size);
-                    const uint32_t in_samples = frame.decoded_size / s_asrc.in_frame_bytes;
-                    uint32_t out_samples = s_asrc.out_max_samples;
-                    if (audio_asrc_run((struct audio_asrc *)&s_asrc, in_samples,
-                                       &out_samples)) {
-                        feed(s_asrc.out, out_samples * s_asrc.out_frame_bytes);
-                        produce += out_samples * s_asrc.out_frame_bytes;
-                    }
-                } else if (src_channels == 1 && sf.channels > 1) {
                     /*
-                     * A mono source into a stereo sink is duplicated, not
-                     * passed through: the sink's data callback reads two bytes
-                     * per sample, so a mono stream drains its ring at twice the
-                     * rate and underruns.
+                     * The stream, at the source's own format. The engine
+                     * converts it to the sink's at this stream's edge, or the
+                     * sink adopts it, or it is refused with a reason -- which is
+                     * the negotiation's business, not this decoder's.
                      */
-                    if (up == NULL) {
-                        up = audio_buf_alloc("up", UP_CHUNK, &up_ps);
-                        if (up == NULL) {
-                            espix_klog(ESPIX_KLOG_ERROR, TAG,
-                                       "cannot play %s: no memory for the mono "
-                                       "upmix buffer", uri);
-                            goto out;
+                    const espix_audio_format_t src_fmt = {
+                        src_rate, (uint8_t)src_channels, 16
+                    };
+                    for (int tries = 0; s_play_stream == NULL; tries++) {
+                        s_play_stream = espix_audio_stream_open(&src_fmt);
+                        if (s_play_stream != NULL || !s_wait || tries >= 100) {
+                            break;
                         }
+                        vTaskDelay(pdMS_TO_TICKS(100));  /* --wait: ~10 s */
                     }
-                    const int16_t *src = (const int16_t *)frame.buffer;
-                    int16_t       *dst = (int16_t *)up;
-                    const size_t   total = frame.decoded_size / 2;
-                    const size_t   per   = UP_CHUNK / 4;   /* stereo frames */
-                    size_t         done  = 0;
-                    while (done < total && !s_stop) {
-                        size_t n = total - done;
-                        if (n > per) {
-                            n = per;
-                        }
-                        for (size_t i = 0; i < n; i++) {
-                            dst[2 * i]     = src[done + i];
-                            dst[2 * i + 1] = src[done + i];
-                        }
-                        feed((uint8_t *)dst, n * 4);
-                        produce += (uint32_t)(n * 4);
-                        done += n;
+                    if (s_play_stream == NULL) {
+                        espix_klog(ESPIX_KLOG_WARN, TAG,
+                                   "play: no stream (no sink, busy, or a rate "
+                                   "nothing can convert)");
+                        goto out;
                     }
-                } else {
-                    feed(frame.buffer, frame.decoded_size);
-                    produce += frame.decoded_size;
                 }
+                /*
+                 * Straight to the stream: whatever rate and channel count the
+                 * file turns out to be, this is what is written, and the
+                 * stream's edge is where it becomes the sink's. The resample
+                 * and the mono upmix that used to be here were that same job
+                 * done a second time, in the wrong layer.
+                 */
+                const int64_t f0 = esp_timer_get_time();
+                feed(frame.buffer, frame.decoded_size);
+                produce += frame.decoded_size;
                 t_feed += (uint32_t)(esp_timer_get_time() - f0);
             }
             raw.len -= raw.consumed;
@@ -2042,29 +1998,17 @@ static esp_err_t play_common(const char *uri, bool wait)
     strlcpy(s_uri, uri, sizeof(s_uri));
 
     /*
-     * The decoder gets a stream like any other producer. Opening it is what
-     * starts the sink and the mixer, so there is deliberately no start() here --
-     * and no "an app is already streaming" check either, because two producers
-     * into one sink is now the mixer's ordinary case rather than a conflict.
+     * The stream is opened by audio_task, once the decoder has said what the
+     * file's format actually is -- not here, and not at the sink's rate.
      *
-     * The format is the sink's, because the decoder's output has already been
-     * converted to it (the ASRC path) by the time feed() sees it.
+     * That is the arrangement Linux settled on, and it keeps conversion in one
+     * place: aplay writes at the file's rate and lets ALSA's plug convert,
+     * pw-play does the same and lets the graph insert a resampler. The producer
+     * streams what it has; the layer below reconciles it with the hardware. The
+     * engine's stream edge does that now, so this no longer resamples anything
+     * itself, and the upmix that used to live here is gone with it.
      */
-    const espix_audio_sink_ops_t *const sk = espix_audio_sink_default();
-    const espix_audio_format_t fmt = (sk != NULL && sk->format != NULL)
-        ? sk->format() : (espix_audio_format_t){ 44100, 2, 16 };
-
-    for (int tries = 0; ; tries++) {
-        s_play_stream = espix_audio_stream_open(&fmt);
-        if (s_play_stream != NULL || !wait || tries >= 100) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));     /* --wait: up to ~10 s for a sink */
-    }
-    if (s_play_stream == NULL) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "play: no stream (no sink, or busy)");
-        return ESP_ERR_INVALID_STATE;
-    }
+    s_wait = wait;
 
     /*
      * PSRAM first, internal as a fallback.
