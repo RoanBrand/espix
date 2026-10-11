@@ -545,6 +545,42 @@ static void proc_task(void *arg)
         goto done;
     }
 
+    /*
+     * Refuse an image built for another architecture, and say which.
+     *
+     * This is the S3-versus-S31 trap that cost a session: an Xtensa app staged
+     * by a hand-run build, pushed to an S31 board, loads, gets as far as
+     * relocation, and fails with "undefined symbol: __divsf3". That is true and
+     * it points at the architecture -- but only if you already suspect it.
+     *
+     * The machine field in the ELF header says it outright, and reading it
+     * costs two bytes. e_machine is at 18 in both ELF32 and ELF64, little
+     * endian here, which is also why this does not need the header typedef.
+     */
+    {
+        const uint16_t machine = (uint16_t)(slot->image[18] |
+                                            ((uint16_t)slot->image[19] << 8));
+#if CONFIG_IDF_TARGET_ARCH_RISCV
+        const uint16_t mine      = 243;         /* EM_RISCV */
+        const char    *mine_name = "RISC-V";
+#else
+        const uint16_t mine      = 94;          /* EM_XTENSA */
+        const char    *mine_name = "Xtensa";
+#endif
+        if (machine != mine) {
+            const char *theirs = (machine == 94)  ? "Xtensa"
+                               : (machine == 243) ? "RISC-V"
+                               : "another architecture";
+            espix_klog(ESPIX_KLOG_ERROR, TAG,
+                       "pid %d: %s is a %s binary; this kernel runs %s apps",
+                       (int)slot->info.pid, slot->info.path, theirs, mine_name);
+            espix_eprintf(slot->info.session,
+                          "espix: %s: built for %s; this kernel runs %s apps\n",
+                          slot->info.path, theirs, mine_name);
+            goto done;                          /* status stays 126 */
+        }
+    }
+
     if (esp_elf_init(&slot->elf) != 0) {
         espix_eprintf(slot->info.session, "espix: %s: ELF init failed\n",
                      slot->info.path);
