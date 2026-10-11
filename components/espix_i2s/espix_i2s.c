@@ -261,11 +261,50 @@ static int sink_get_volume(void)
     return s_out_vol;
 }
 
+/*
+ * Run at the producer's rate instead of converting to ours.
+ *
+ * This is the cheapest of the three answers the engine can give -- forward,
+ * adopt, convert -- and the one an onboard codec can actually offer: the ES8311
+ * and the I2S clock are both ours to set, where an A2DP link's rate is fixed
+ * when the phone connects. 16-bit stereo is what this path can carry; the rates
+ * are the ones the codec and the ASRC both accept.
+ *
+ * The mechanism is just the re-open: esp_codec_dev_open() is handed the sample
+ * info and reconfigures the I2S standard clock from it, and the engine calls
+ * start() immediately after negotiating -- so closing the device here is enough
+ * for the next start to bring it up at the new rate.
+ */
+static bool sink_set_format(const espix_audio_format_t *fmt)
+{
+    if (fmt->bits != 16 || fmt->channels != 2) {
+        return false;
+    }
+    switch (fmt->rate) {
+    case 8000: case 16000: case 32000: case 44100: case 48000:
+        break;
+    default:
+        return false;
+    }
+    if (fmt->rate == s_out_fmt.rate) {
+        return true;
+    }
+    if (s_dac != NULL) {
+        esp_codec_dev_close(s_dac);
+        esp_codec_dev_delete(s_dac);
+        s_dac = NULL;
+    }
+    s_out_fmt = *fmt;                   /* reopened at this rate by start() */
+    ESP_LOGI(TAG, "sink adopts %u Hz", (unsigned)fmt->rate);
+    return true;
+}
+
 static const espix_audio_sink_ops_t s_es8311_sink = {
     .name       = "es8311",
     .label      = SINK_LABEL,
     .connected  = sink_connected,
     .format     = sink_format,
+    .set_format = sink_set_format,
     .write      = i2s_write,
     .start      = sink_start,
     .suspend    = sink_suspend,
