@@ -1148,12 +1148,48 @@ static espix_audio_format_t a2dp_format(void)
  * moment, then harsh noise. The caller must advance by exactly this count.
  * The short blocking timeout waits for space; the caller paces on it.
  */
+/*
+ * The producer's side of the same link, so the two ends can be compared: the
+ * callback below reports what the link *takes*, and this reports what the mixer
+ * *offers* and how much of it the ring would accept. When they disagree, the
+ * ring level says which end is wrong.
+ */
+static uint32_t s_wr_calls, s_wr_asked, s_wr_sent, s_wr_partial, s_wr_us;
+static int64_t  s_wr_mark_us;
+
 static size_t a2dp_write(const void *pcm, size_t len)
 {
     if (!s_inited || s_pcm == NULL) {
         return 0;
     }
-    return xStreamBufferSend(s_pcm, pcm, len, pdMS_TO_TICKS(20));
+
+    const int64_t t0   = esp_timer_get_time();
+    const size_t  sent = xStreamBufferSend(s_pcm, pcm, len, pdMS_TO_TICKS(20));
+    const int64_t now  = esp_timer_get_time();
+
+    s_wr_us += (uint32_t)(now - t0);
+    s_wr_asked += (uint32_t)len;
+    s_wr_sent  += (uint32_t)sent;
+    if (sent < len) {
+        s_wr_partial++;
+    }
+
+    if (++s_wr_calls >= 128) {
+        const uint32_t ms = (uint32_t)((now - s_wr_mark_us) / 1000);
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                   "write %u calls: asked %u B, took %u B in %u ms (%u B/s), "
+                   "partial %u, ring %u B",
+                   (unsigned)s_wr_calls, (unsigned)s_wr_asked, (unsigned)s_wr_sent,
+                   (unsigned)(s_wr_us / 1000),
+                   ms ? (unsigned)((uint64_t)s_wr_sent * 1000 / ms) : 0,
+                   (unsigned)s_wr_partial,
+                   (unsigned)xStreamBufferBytesAvailable(s_pcm));
+        s_wr_calls = 0; s_wr_asked = 0; s_wr_sent = 0;
+        s_wr_partial = 0; s_wr_us = 0;
+        s_wr_mark_us = now;
+    }
+
+    return sent;
 }
 
 static void a2dp_start(void)

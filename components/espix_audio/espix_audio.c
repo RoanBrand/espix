@@ -529,7 +529,16 @@ static void feed(uint8_t *p, size_t n)
  * One producer at a time for now: a stream and `play` are mutually exclusive,
  * because there is one default sink and no mixer yet.
  */
-#define STREAM_RING  (256 * 1024)
+/*
+ * Eight blocks, not sixty-four. 256 KB is 1.5 seconds of audio at 44.1 kHz
+ * stereo, and a buffer that size cannot pace its producer: it absorbs a second
+ * and a half of overproduction before the writer ever blocks, so the only brake
+ * on an app is whatever it does to pace itself -- and when that is wrong, as it
+ * was, the audio simply runs fast. It also puts the latency of anything played
+ * through it at up to that figure. Sized for the jitter a realtime path needs
+ * rather than for throughput, the ring itself becomes the clock.
+ */
+#define STREAM_RING  (8 * 4 * 1024)
 #define STREAM_CHUNK (4 * 1024)
 #define STREAM_STACK (4 * 1024)
 
@@ -668,6 +677,22 @@ static void mixer_task(void *arg)
     int16_t *out = malloc(MIX_BYTES);
     int16_t *in  = malloc(MIX_BYTES);
 
+    /*
+     * End to end instrumentation, and it is the wall clock or it is nothing.
+     * A loop that sleeps correctly and a loop that spins report the same *work*,
+     * which is what made the last two rounds guesswork.
+     *
+     * full/part is the number that matters here: "A full block, always" below
+     * pads with silence, and if the producers hand over less than MIX_BYTES the
+     * sink is being fed silence it did not ask for -- heard as the audio
+     * stretching and doubling over itself.
+     */
+    int64_t  t_win  = esp_timer_get_time();
+    int64_t  t_recv = 0;
+    int64_t  t_feed = 0;
+    uint64_t fed    = 0;
+    uint32_t iters  = 0, full = 0, part = 0;
+
     while (out != NULL && in != NULL && !s_mixer_stop) {
         memset(out, 0, MIX_BYTES);
 
@@ -677,19 +702,47 @@ static void mixer_task(void *arg)
          * back by one app that is between sounds, and the sink wants a steady
          * block size either way.
          */
+        const int64_t t_r0 = esp_timer_get_time();
         bool any = false;
         for (int i = 0; i < STREAM_MAX; i++) {
             espix_audio_stream_t *st = s_streams[i];
             if (st == NULL) {
                 continue;
             }
-            const size_t n = xStreamBufferReceive(st->sb, in, MIX_BYTES, 0);
+            /*
+             * A timeout, and it is the fix, not a tweak.
+             *
+             * The ring is created with STREAM_CHUNK as its trigger level --
+             * which is what unblocks a *waiting* receiver -- and 0 as the
+             * timeout means never waiting, so the level never applied and this
+             * read whatever happened to be there. A producer writing blocks
+             * smaller than MIX_BYTES then had its audio laid into the front of
+             * each output block with silence behind it: half of every block was
+             * gap, which is heard as the sound stretching and doubling over
+             * itself, and it is why the sink's callback reported the ring dry
+             * on a third of its calls while the link itself ran at exactly
+             * realtime.
+             *
+             * Waiting for the level is what makes the producer's block size its
+             * own business. The timeout is what keeps a genuine gap a gap: four
+             * ticks is comfortably longer than the block period of anything
+             * here, and a stream that really has nothing still contributes
+             * silence rather than holding the others back.
+             */
+            const size_t n = xStreamBufferReceive(st->sb, in, MIX_BYTES,
+                                                  pdMS_TO_TICKS(4));
             if (n == 0) {
                 continue;
             }
             any = true;
+            if (n < MIX_BYTES) {
+                part++;
+            } else {
+                full++;
+            }
             mix_add(out, in, n / 4, st->mute ? 0 : st->volume);
         }
+        t_recv += esp_timer_get_time() - t_r0;
 
         if (!any) {
             /*
@@ -701,7 +754,29 @@ static void mixer_task(void *arg)
             continue;
         }
 
+        const int64_t t_f0 = esp_timer_get_time();
         feed_ex((uint8_t *)out, MIX_BYTES, &s_mixer_stop);
+        t_feed += esp_timer_get_time() - t_f0;
+
+        fed += MIX_BYTES;
+        if (++iters >= 64) {
+            const int64_t  wall = esp_timer_get_time() - t_win;
+            const uint64_t rate = (wall > 0) ? fed * 1000000ULL / (uint64_t)wall : 0;
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "mix %u blk: %lld ms wall, recv %lld feed %lld, "
+                       "%llu B (%llu B/s), full %u part %u",
+                       (unsigned)iters, (long long)(wall / 1000),
+                       (long long)(t_recv / 1000), (long long)(t_feed / 1000),
+                       (unsigned long long)fed, (unsigned long long)rate,
+                       (unsigned)full, (unsigned)part);
+            t_win  = esp_timer_get_time();
+            t_recv = 0;
+            t_feed = 0;
+            fed    = 0;
+            iters  = 0;
+            full   = 0;
+            part   = 0;
+        }
     }
 
     free(out);

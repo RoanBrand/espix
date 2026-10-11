@@ -39,7 +39,13 @@
 #define SFX_RATE     11025
 #define OUT_RATE     44100
 #define NUM_CHANNELS 16
-#define MIX_FRAMES   512                    /* ~12 ms at 44.1 kHz */
+/*
+ * A block of MIX_FRAMES, and it is the engine's own block size, not the app's
+ * choice: the engine's ring unblocks a waiting receiver at a full STREAM_CHUNK
+ * (4 KB), so a producer that writes that much at a time keeps the two ends in
+ * step. Writing half of it left the engine padding the rest with silence.
+ */
+#define MIX_FRAMES   1024                   /* one STREAM_CHUNK; 23 ms */
 
 typedef struct {
     uint8_t *samples;                       /* after the header, tail trimmed */
@@ -132,6 +138,21 @@ static sfx_cache_t *sfx_cache(sfxinfo_t *sfx)
     return c;
 }
 
+/*
+ * Every wait in this file goes through here, because pdMS_TO_TICKS() floors and
+ * this app's tick is 10 ms (CONFIG_FREERTOS_HZ=100, where the firmware's is
+ * 250). A wait of one millisecond therefore converts to *zero* ticks, and
+ * vTaskDelay(0) does not sleep -- it yields -- which on a task above the game's
+ * priority is a hot spin. That is what made the mixer produce at 169206 frames
+ * a second where 44100 was wanted: the audio ran nearly four times too fast,
+ * heard as distortion, and the game along with it.
+ */
+static void sfx_delay_ms(int ms)
+{
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    vTaskDelay(ticks == 0 ? 1 : ticks);
+}
+
 static void sfx_set_params(int channel, int vol, int sep)
 {
     if (channel < 0 || channel >= NUM_CHANNELS) {
@@ -175,8 +196,9 @@ static void *sfx_thread(void *arg)
 
     /* Instrumentation while the cost is unexplained: where the thread's time
      * actually goes, per block, rather than where it ought to. */
-    int64_t  stat_mix_us = 0, stat_wr_us = 0, stat_blk_us = 0;
-    uint32_t stat_blocks = 0;
+    int64_t  stat_mix_us = 0, stat_wr_us = 0, stat_sleep_us = 0;
+    int64_t  stat_win = esp_timer_get_time();
+    uint32_t stat_blocks = 0, stat_short = 0;
 
     while (s_running) {
         /*
@@ -234,7 +256,9 @@ static void *sfx_thread(void *arg)
             if (ticks == 0) {
                 ticks = 1;
             }
+            const int64_t t_s0 = esp_timer_get_time();
             vTaskDelay(ticks);
+            stat_sleep_us += esp_timer_get_time() - t_s0;
             continue;
         }
         const int64_t t_a = esp_timer_get_time();
@@ -275,11 +299,16 @@ static void *sfx_thread(void *arg)
              * not late. */
             stat_mix_us += (t_b - t_a);
             if (++stat_blocks >= 256) {
-                printf("sfx idle: %u blocks, mix %lld us total\n",
-                       (unsigned)stat_blocks, (long long)stat_mix_us);
-                stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0;
+                const int64_t wall = esp_timer_get_time() - stat_win;
+                printf("sfx idle %u blk: %lld ms wall, mix %lld sleep %lld ms\n",
+                       (unsigned)stat_blocks, (long long)(wall / 1000),
+                       (long long)(stat_mix_us / 1000),
+                       (long long)(stat_sleep_us / 1000));
+                stat_win = esp_timer_get_time();
+                stat_blocks = 0; stat_mix_us = 0;
+                stat_wr_us = 0; stat_sleep_us = 0; stat_short = 0;
             }
-            vTaskDelay(pdMS_TO_TICKS(5));
+            sfx_delay_ms(5);
             continue;
         }
 
@@ -289,7 +318,8 @@ static void *sfx_thread(void *arg)
                                                       (uint8_t *)s_mix + off,
                                                       sizeof(s_mix) - off);
             if (w == 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));  /* ring full, not a stop */
+                stat_short++;                   /* ring full, not a stop */
+                sfx_delay_ms(10);
                 continue;
             }
             off += w;
@@ -300,12 +330,25 @@ static void *sfx_thread(void *arg)
         const int64_t t_c = esp_timer_get_time();
         stat_mix_us += (t_b - t_a);
         stat_wr_us  += (t_c - t_b);
-        stat_blk_us += (t_c - t_a);
         if (++stat_blocks >= 256) {
-            printf("sfx: %u blocks, mix %lld us, write %lld us, loop %lld us\n",
-                   (unsigned)stat_blocks, (long long)stat_mix_us,
-                   (long long)stat_wr_us, (long long)stat_blk_us);
-            stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0; stat_blk_us = 0;
+            /*
+             * The wall clock, which is the whole point: the previous version
+             * timed the work and so could not tell a spin from correct pacing.
+             * The rate is what a listener hears -- 44100 frames a second is
+             * right, more is the audio running fast, less is it starving.
+             */
+            const int64_t  wall   = esp_timer_get_time() - stat_win;
+            const uint64_t frames = (uint64_t)stat_blocks * MIX_FRAMES;
+            const uint64_t rate   = (wall > 0) ? frames * 1000000ULL / (uint64_t)wall : 0;
+            printf("sfx %u blk: %lld ms wall, mix %lld write %lld sleep %lld ms, "
+                   "%llu fps (want %d), w=0 %u\n",
+                   (unsigned)stat_blocks, (long long)(wall / 1000),
+                   (long long)(stat_mix_us / 1000), (long long)(stat_wr_us / 1000),
+                   (long long)(stat_sleep_us / 1000),
+                   (unsigned long long)rate, OUT_RATE, (unsigned)stat_short);
+            stat_win = esp_timer_get_time();
+            stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0;
+            stat_sleep_us = 0; stat_short = 0;
         }
     }
 
