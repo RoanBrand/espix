@@ -1023,23 +1023,17 @@ esp_err_t espix_bt_rssi(const uint8_t bda[ESPIX_BDA_LEN], int *dbm)
     if (!s_inited || dbm == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    s_rssi_got = false;
+    (void)bda;
     /*
-     * The real dBm first -- it is the useful number -- but it needs a
-     * controller that answers Espressif's vendor HCI, and this one returns
-     * zero without complaint. The golden-range delta is standard and always
-     * answers, so it is the fallback rather than an afterthought.
+     * Not available here, and not because the controller declines to answer:
+     * this target's closed BT library does not define
+     * esp_bt_gap_read_acl_real_rssi at all, so merely naming it fails the link
+     * -- which is how it was found, as an undefined reference rather than as a
+     * runtime zero. What can be asked for on this platform is the delta, and
+     * it is a different unit, so espix_bt_rssi_delta() below reports that
+     * under its own name rather than this one returning something that is not
+     * dBm.
      */
-    esp_err_t err = esp_bt_gap_read_acl_real_rssi((uint8_t *)bda);
-    if (err == ESP_OK) {
-        int8_t v = 0;
-        err = rssi_wait(&v);
-        if (err == ESP_OK && v != 0) {
-            *dbm = v;
-            return ESP_OK;
-        }
-    }
-
     return ESP_ERR_NOT_SUPPORTED;
 }
 
