@@ -22,7 +22,21 @@
  * be seen dipping to zero whenever the producer paused for a read or a decode
  * burst -- audible as padded-silence artefacts. PSRAM is the free pool here.
  */
-#define PCM_BUF  (256 * 1024)
+/*
+ * Sized for jitter, not for throughput.
+ *
+ * A quarter of a megabyte is 1.45 seconds of 44.1 kHz stereo, and a buffer that
+ * can swallow a second and a half of overproduction cannot pace its producer:
+ * the mixer writing into it never blocks, so nothing upstream is ever held to
+ * the link's real rate -- measured, Doom's mixer produced 161287 frames a
+ * second where 44100 was wanted, with the ring reporting 225280 B queued while
+ * the callback asked for 513 bytes a call.
+ *
+ * 16 KB is a little over 90 ms: enough that a mixer late by several blocks is
+ * absorbed, small enough that the link's consumption is what everything
+ * upstream feels. The ring is the clock; see espix_audio.c's STREAM_RING.
+ */
+#define PCM_BUF  (16 * 1024)
 
 #if CONFIG_ESPIX_BT
 
@@ -339,7 +353,12 @@ static int16_t  s_dm[1024];   /* stereo samples for up to 512 mono samples */
  * silence rather than a partly-filled frame -- it is already playing, so
  * silence is inaudible where a gap is not. Reset for each play.
  */
-#define PREROLL_BYTES (64 * 1024)
+/*
+ * How much to hold before the stream goes on the air. 64 KB was 370 ms of
+ * silence queued at every connect; a couple of blocks is enough to cover the
+ * first callback arriving before the mixer has settled.
+ */
+#define PREROLL_BYTES (8 * 1024)
 static bool     s_prerolled;
 
 static int32_t a2d_data_cb(uint8_t *data, int32_t len)

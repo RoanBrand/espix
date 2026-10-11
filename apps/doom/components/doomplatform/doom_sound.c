@@ -182,20 +182,23 @@ static void *sfx_thread(void *arg)
     (void)arg;
 
     /*
-     * Paced to realtime, and it has to be: writing to the stream only blocks
-     * while the ring is full, and the ring is large enough that the producer
-     * can otherwise run far ahead of the sink. Left unpaced this thread
-     * generated audio as fast as the CPU allowed -- measured at 96% of a core,
-     * above the game's own priority, which is what made Doom crawl.
+     * No credit model here, and that is the design rather than an omission.
      *
-     * The credit is the same shape Bluedroid's A2DP source uses for the same
-     * reason: count the frames owed at OUT_RATE and sleep until they are due.
+     * The ring is the clock. Writing to the stream blocks while the ring is
+     * full, and the engine takes from it only as fast as the sink consumes, so
+     * a producer that writes when it has something is paced by the hardware.
+     * That is what the ring is for, and it is why it was cut from 256 KB to 32:
+     * a buffer able to swallow a second and a half of overproduction is a
+     * buffer able to hide a producer that has lost its clock.
+     *
+     * Which is exactly what happened. Three things kept time here -- this
+     * thread's credit, the engine's feed, and the link itself -- and they
+     * disagreed: measured, this thread produced 169206 frames a second where
+     * 44100 was wanted. One clock, and it is the sink's consumption.
+     *
+     * If the rate is wrong now, the fault is in the backpressure and belongs
+     * there, not in a second clock here to paper over it.
      */
-    int64_t  start_us = esp_timer_get_time();
-    uint64_t produced = 0;
-
-    /* Instrumentation while the cost is unexplained: where the thread's time
-     * actually goes, per block, rather than where it ought to. */
     int64_t  stat_mix_us = 0, stat_wr_us = 0, stat_sleep_us = 0;
     int64_t  stat_win = esp_timer_get_time();
     uint32_t stat_blocks = 0, stat_short = 0;
@@ -213,54 +216,6 @@ static void *sfx_thread(void *arg)
          * producing the extra blocks in a row, and the average is realtime
          * however the tick falls. The ring absorbs the catch-up.
          */
-        const int64_t  elapsed_us = esp_timer_get_time() - start_us;
-        const uint64_t owed = (uint64_t)(elapsed_us * (int64_t)OUT_RATE / 1000000);
-
-        /*
-         * Never chase a debt older than a few blocks.
-         *
-         * "Produce what is owed" is an instruction to spin for ever if the owed
-         * figure can outrun the mixer -- and it can, because the write only
-         * paces us while something is draining the stream. Doom exiting left
-         * this thread at 98% of a core with no consumer at all: the stream had
-         * nobody reading it, the write never blocked, and the debt grew without
-         * limit. Re-origining costs at most a few blocks of audio and bounds
-         * the loop. A pacer that depends on another subsystem's backpressure is
-         * not a pacer.
-         */
-        if (owed > produced + MIX_FRAMES * 4) {
-            start_us = esp_timer_get_time();
-            produced = 0;
-            continue;
-        }
-
-        if (produced >= owed) {
-            const int64_t next_us = (int64_t)((produced + MIX_FRAMES) * 1000000ULL
-                                              / OUT_RATE);
-            int64_t wait_ms = (next_us - elapsed_us) / 1000;
-            if (wait_ms > 20) {
-                wait_ms = 20;               /* wake often enough to see a stop */
-            }
-
-            /*
-             * Never a bare yield. The tick here is 4 ms, so pdMS_TO_TICKS(1),
-             * (2) and (3) are all zero -- and vTaskDelay(0) does not sleep, it
-             * yields, which on a task above the game's priority is a hot spin
-             * that starves it: measured as this thread at 97% of a core with
-             * Doom crawling, while the audio stayed correct because the spin
-             * still produced it. Rounding up to one tick is coarse, and that is
-             * fine: the credit is by elapsed time, so a late wake pays itself
-             * back by producing the blocks it owes.
-             */
-            TickType_t ticks = pdMS_TO_TICKS(wait_ms > 0 ? wait_ms : 1);
-            if (ticks == 0) {
-                ticks = 1;
-            }
-            const int64_t t_s0 = esp_timer_get_time();
-            vTaskDelay(ticks);
-            stat_sleep_us += esp_timer_get_time() - t_s0;
-            continue;
-        }
         const int64_t t_a = esp_timer_get_time();
 
         memset(s_acc, 0, sizeof(s_acc));
@@ -324,8 +279,6 @@ static void *sfx_thread(void *arg)
             }
             off += w;
         }
-
-        produced += MIX_FRAMES;
 
         const int64_t t_c = esp_timer_get_time();
         stat_mix_us += (t_b - t_a);
