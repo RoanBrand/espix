@@ -124,6 +124,33 @@ esp_err_t espix_audio_stream_mute(espix_audio_stream_t *st, bool on);
  * and suspended only when the last stream closes. Blocks while it waits. */
 esp_err_t espix_audio_stream_close(espix_audio_stream_t *st);
 
+/* ------------------------------------------------------------- capture -- */
+
+/*
+ * Reading a source, the mirror of a stream: open, read, close.
+ *
+ * No task and no ring behind it, deliberately. A capture client reads on its own
+ * thread and the source paces it -- read() returns zero when the producer has
+ * nothing yet -- which is what ALSA's capture read() does and what keeps this
+ * the size it is. One client at a time: with no fan-out there is no way to give
+ * two readers the same samples, so the second is refused rather than quietly
+ * handed half of them.
+ */
+typedef struct espix_audio_capture espix_audio_capture_t;
+
+/*
+ * Open the default source. want may be NULL for whatever the source produces; a
+ * different rate or channel count is converted with the ASRC when the pair is
+ * one it supports. *got, when not NULL, says what read() will actually return.
+ */
+espix_audio_capture_t *espix_audio_capture_open(const espix_audio_format_t *want,
+                                                espix_audio_format_t *got);
+
+/* Up to len bytes. Zero means nothing ready yet, not end of stream. */
+size_t espix_audio_capture_read(espix_audio_capture_t *cap, void *pcm, size_t len);
+
+esp_err_t espix_audio_capture_close(espix_audio_capture_t *cap);
+
 /*
  * Register the benchmark sink (CONFIG_ESPIX_AUDIO_NULL_SINK). It accepts PCM as
  * fast as it arrives and discards it, so a "play" measures the source and the

@@ -28,6 +28,11 @@ static const struct esp_elfsym s_audio_syms[] = {
     ESP_ELFSYM_EXPORT(espix_audio_stream_volume),
     ESP_ELFSYM_EXPORT(espix_audio_stream_mute),
     ESP_ELFSYM_EXPORT(espix_audio_stream_close),
+
+    /* The other direction: an app reading the microphone. */
+    ESP_ELFSYM_EXPORT(espix_audio_capture_open),
+    ESP_ELFSYM_EXPORT(espix_audio_capture_read),
+    ESP_ELFSYM_EXPORT(espix_audio_capture_close),
     ESP_ELFSYM_EXPORT(espix_audio_set_volume),
     ESP_ELFSYM_EXPORT(espix_audio_get_volume),
     ESP_ELFSYM_EXPORT(espix_audio_state),

@@ -1684,6 +1684,150 @@ static bool audio_asrc_run(struct audio_asrc *a, uint32_t in_samples,
     return e == ESP_ASRC_ERR_OK;
 }
 
+/* ------------------------------------------------------------- capture -- */
+
+typedef struct espix_audio_capture {
+    const espix_audio_source_ops_t *src;
+    espix_audio_format_t            got;         /* what read() returns */
+    struct audio_asrc              *asrc;        /* when that is not the source's */
+    size_t                          out_pending; /* converted, not yet taken */
+    size_t                          out_off;
+} espix_audio_capture_t;
+
+static espix_audio_capture_t *s_capture;
+
+espix_audio_capture_t *espix_audio_capture_open(const espix_audio_format_t *want,
+                                                espix_audio_format_t *got)
+{
+    if (s_capture != NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "capture: already open");
+        return NULL;
+    }
+    const espix_audio_source_ops_t *src = espix_audio_source_default();
+    if (src == NULL || !src->connected()) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "capture: no source");
+        return NULL;
+    }
+    const espix_audio_format_t src_fmt = src->format();
+    if (src_fmt.rate == 0 || src_fmt.channels == 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "capture: '%s' reports no format", src->name);
+        return NULL;
+    }
+
+    espix_audio_capture_t *cap = calloc(1, sizeof(*cap));
+    if (cap == NULL) {
+        return NULL;
+    }
+    cap->src = src;
+    cap->got = src_fmt;
+
+    if (want != NULL &&
+        (want->rate != src_fmt.rate || want->channels != src_fmt.channels)) {
+        if (!asrc_rate_supported(want->rate) || !asrc_rate_supported(src_fmt.rate)) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "capture: cannot convert %u Hz to %u Hz; the ASRC does "
+                       "8/16/32/44.1/48 kHz only",
+                       (unsigned)src_fmt.rate, (unsigned)want->rate);
+            free(cap);
+            return NULL;
+        }
+        cap->asrc = audio_asrc_new(&src_fmt, want);
+        if (cap->asrc == NULL) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "capture: cannot convert");
+            free(cap);
+            return NULL;
+        }
+        cap->got = *want;
+    }
+
+    src->start();
+    s_capture = cap;
+    if (got != NULL) {
+        *got = cap->got;
+    }
+    espix_klog(ESPIX_KLOG_INFO, TAG, "capture: %s at %u Hz, %u ch",
+               src->name, (unsigned)cap->got.rate, (unsigned)cap->got.channels);
+    return cap;
+}
+
+size_t espix_audio_capture_read(espix_audio_capture_t *cap, void *pcm, size_t len)
+{
+    if (cap == NULL || pcm == NULL || len == 0) {
+        return 0;
+    }
+
+    /* The source's own format: the caller's buffer is handed straight over. */
+    if (cap->asrc == NULL) {
+        for (int tries = 0; tries < 20; tries++) {
+            const size_t n = cap->src->read(pcm, len);
+            if (n > 0) {
+                return n;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));       /* pace, do not spin */
+        }
+        return 0;
+    }
+
+    /*
+     * Converting, with the same care the write path takes in the other
+     * direction: one conversion fills the ASRC's output buffer, and the caller
+     * may ask for less than that, so what is left over is kept rather than
+     * recomputed or dropped.
+     */
+    struct audio_asrc *const a = cap->asrc;
+
+    if (cap->out_pending == 0) {
+        size_t in_bytes = 0;
+        for (int tries = 0; tries < 20 && in_bytes < a->in_size; tries++) {
+            const size_t n = cap->src->read(a->in + in_bytes, a->in_size - in_bytes);
+            if (n == 0) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            in_bytes += n;
+        }
+        in_bytes -= in_bytes % a->in_frame_bytes;
+        if (in_bytes == 0) {
+            return 0;
+        }
+
+        uint32_t out_samples = a->out_max_samples;
+        if (!audio_asrc_run(a, (uint32_t)(in_bytes / a->in_frame_bytes), &out_samples)) {
+            return 0;
+        }
+        if (out_samples == 0) {
+            return 0;
+        }
+        cap->out_off     = 0;
+        cap->out_pending = (size_t)out_samples * a->out_frame_bytes;
+    }
+
+    size_t take = cap->out_pending;
+    if (take > len) {
+        take = len;
+    }
+    memcpy(pcm, a->out + cap->out_off, take);
+    cap->out_off     += take;
+    cap->out_pending -= take;
+    return take;
+}
+
+esp_err_t espix_audio_capture_close(espix_audio_capture_t *cap)
+{
+    if (cap == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cap->src != NULL) {
+        cap->src->stop();
+    }
+    audio_asrc_free(cap->asrc);
+    if (s_capture == cap) {
+        s_capture = NULL;
+    }
+    free(cap);
+    return ESP_OK;
+}
+
 static void audio_task(void *arg)
 {
     bool in_ps = false, out_ps = false;
