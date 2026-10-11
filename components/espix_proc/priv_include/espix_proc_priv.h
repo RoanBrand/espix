@@ -442,6 +442,10 @@ espix_proc_slot_t *espix_proc_alloc_slot(void);
  * NOT hold the lock. */
 void espix_proc_release_resources(espix_proc_slot_t *slot);
 
+/* End any thread this process still has running. See abi_pthread.c: a thread
+ * outliving its process is the one resource the reaper used to leave behind. */
+void espix_pthread_reap(espix_proc_slot_t *slot);
+
 /* Give back every PSRAM region the process's arena holds. Called from
  * espix_proc_release_resources() above; takes the slot rather than using
  * espix_proc_self() because the force-kill path runs on the killer's task.

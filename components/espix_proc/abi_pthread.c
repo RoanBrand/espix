@@ -46,6 +46,102 @@
 #define TAG "abi"
 
 /*
+ * The threads an app has made, so that its process can end them.
+ *
+ * A thread outlives its process otherwise. Every other resource an app holds is
+ * released by espix_proc_release_resources() -- its memory, its descriptors,
+ * its audio streams, its power-management holds -- and a thread is the one that
+ * was left out: measured, after Doom exited, as a pthread still at 55% of a core
+ * with a pointer to a stream the reaper had already closed for it.
+ *
+ * Registered by the thread itself, in the trampoline, rather than by
+ * pthread_create: the handle is the thread's own, and the trampoline is already
+ * the one place every app thread passes through.
+ *
+ * Fixed and small, like the process table: an app that wants more than this is
+ * told no when it asks, rather than silently untracked. The entry is removed by
+ * the thread as it leaves, so a thread that ends normally never needs reaping.
+ */
+#define ESPIX_PTHREAD_MAX 4
+
+typedef struct {
+    espix_proc_slot_t *slot;
+    TaskHandle_t       task;
+} espix_pthread_entry_t;
+
+static espix_pthread_entry_t s_threads[ESPIX_PTHREAD_MAX];
+static portMUX_TYPE          s_threads_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* Called by the thread. Returns false when the table is full. */
+static bool espix_pthread_register(espix_proc_slot_t *slot)
+{
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    bool ok = false;
+
+    portENTER_CRITICAL(&s_threads_lock);
+    for (int i = 0; i < ESPIX_PTHREAD_MAX; i++) {
+        if (s_threads[i].task == NULL) {
+            s_threads[i].slot = slot;
+            s_threads[i].task = self;
+            ok = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_threads_lock);
+    return ok;
+}
+
+static void espix_pthread_unregister(void)
+{
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+
+    portENTER_CRITICAL(&s_threads_lock);
+    for (int i = 0; i < ESPIX_PTHREAD_MAX; i++) {
+        if (s_threads[i].task == self) {
+            s_threads[i].slot = NULL;
+            s_threads[i].task = NULL;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_threads_lock);
+}
+
+/*
+ * End any thread this process left running. Called from
+ * espix_proc_release_resources(), which runs on both the clean exit and the
+ * kill path.
+ *
+ * vTaskDelete() from another task is what FreeRTOS offers, and the reclaim of
+ * the victim's reent is IDF's business -- it runs in the task's own cleanup
+ * context, which is why nothing here tries to reach into it. By this point the
+ * process's own streams have already been detached by the exit path, so what a
+ * stale reent would close is no longer the live stdio.
+ */
+void espix_pthread_reap(espix_proc_slot_t *slot)
+{
+    if (slot == NULL) {
+        return;
+    }
+    for (int i = 0; i < ESPIX_PTHREAD_MAX; i++) {
+        TaskHandle_t victim = NULL;
+
+        portENTER_CRITICAL(&s_threads_lock);
+        if (s_threads[i].slot == slot && s_threads[i].task != NULL) {
+            victim = s_threads[i].task;
+            s_threads[i].slot = NULL;
+            s_threads[i].task = NULL;
+        }
+        portEXIT_CRITICAL(&s_threads_lock);
+
+        if (victim != NULL) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "ending a thread its process left behind");
+            vTaskDelete(victim);
+        }
+    }
+}
+
+/*
  * What the trampoline needs to know, handed to it as its argument and freed by
  * it before the app's routine is called -- so there is exactly one owner from
  * the moment pthread_create accepts the thread.
@@ -108,6 +204,11 @@ static void *espix_pthread_trampoline(void *arg)
     /* The thread's first act, before the app's routine can allocate. */
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, slot);
 
+    /* And its first act in the process's books, so a process that dies before
+     * this thread does can end it. A refusal is not fatal: the thread runs, and
+     * the reaper simply will not know about it. */
+    espix_pthread_register(slot);
+
     espix_pthread_take_streams(slot);
 
     void *const ret = fn(user_arg);
@@ -121,6 +222,7 @@ static void *espix_pthread_trampoline(void *arg)
      * that espix_proc_release_resources() will have cleared the state of -- the
      * caller checks that before trusting it. */
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
+    espix_pthread_unregister();
     return ret;
 }
 
@@ -162,6 +264,9 @@ static int espix_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 static void espix_pthread_exit(void *retval)
 {
     espix_pthread_drop_streams();
+    /* Unwinding this way skips the trampoline's tail, so the process's books
+     * have to be cleared here or the entry names a task that is gone. */
+    espix_pthread_unregister();
     pthread_exit(retval);
 }
 

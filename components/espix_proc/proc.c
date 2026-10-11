@@ -1136,6 +1136,13 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
          * again -- and the sink never suspends while it is "open".
          */
         espix_audio_streams_recover((void *)task);
+
+        /*
+         * And the threads it started, if this is the process's main task going
+         * away. A thread that outlives its process keeps a stack and a slot
+         * pointer nobody owns -- and goes on running. See abi_pthread.c.
+         */
+        espix_pthread_reap(slot);
     }
 
     /* Said out loud, and only once the lock is down. "stdio detached" means this

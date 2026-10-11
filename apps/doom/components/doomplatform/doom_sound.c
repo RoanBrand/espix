@@ -173,17 +173,40 @@ static void *sfx_thread(void *arg)
     const int64_t start_us = esp_timer_get_time();
     uint64_t      produced = 0;
 
+    /* Instrumentation while the cost is unexplained: where the thread's time
+     * actually goes, per block, rather than where it ought to. */
+    int64_t  stat_mix_us = 0, stat_wr_us = 0, stat_blk_us = 0;
+    uint32_t stat_blocks = 0;
+
     while (s_running) {
-        const int64_t due_us = (int64_t)(produced * 1000000ULL / OUT_RATE);
-        int64_t       wait_ms = (due_us - (esp_timer_get_time() - start_us)) / 1000;
-        if (wait_ms > 0) {
-            if (wait_ms > 20) {
+        /*
+         * Produce what the elapsed time owes, not one block per wake.
+         *
+         * The first version slept for the time to the next block, which loses
+         * whatever the delay rounds away: the tick is 4 ms, so an 11.6 ms block
+         * became 12 ms and every block arrived a little late, for good. A sink
+         * fed a few percent short does not play a few percent slower -- it runs
+         * dry and the engine fills the gap with silence, which is heard as
+         * distortion. Owing by elapsed time means a late wake is paid back by
+         * producing the extra blocks in a row, and the average is realtime
+         * however the tick falls. The ring absorbs the catch-up.
+         */
+        const int64_t  elapsed_us = esp_timer_get_time() - start_us;
+        const uint64_t owed = (uint64_t)(elapsed_us * (int64_t)OUT_RATE / 1000000);
+
+        if (produced >= owed) {
+            const int64_t next_us = (int64_t)((produced + MIX_FRAMES) * 1000000ULL
+                                              / OUT_RATE);
+            int64_t wait_ms = (next_us - elapsed_us) / 1000;
+            if (wait_ms < 1) {
+                wait_ms = 1;
+            } else if (wait_ms > 20) {
                 wait_ms = 20;               /* wake often enough to see a stop */
             }
             vTaskDelay(pdMS_TO_TICKS(wait_ms));
             continue;
         }
-        produced += MIX_FRAMES;
+        const int64_t t_a = esp_timer_get_time();
 
         memset(s_acc, 0, sizeof(s_acc));
         bool any = false;
@@ -213,10 +236,18 @@ static void *sfx_thread(void *arg)
             s_mix[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
+        const int64_t t_b = esp_timer_get_time();
+
         if (!any) {
             /* Nothing sounding. Do not feed the sink -- the same reasoning as
              * the engine's mixer -- and wake soon enough that the next shot is
              * not late. */
+            stat_mix_us += (t_b - t_a);
+            if (++stat_blocks >= 256) {
+                printf("sfx idle: %u blocks, mix %lld us total\n",
+                       (unsigned)stat_blocks, (long long)stat_mix_us);
+                stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0;
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
@@ -231,6 +262,19 @@ static void *sfx_thread(void *arg)
                 continue;
             }
             off += w;
+        }
+
+        produced += MIX_FRAMES;
+
+        const int64_t t_c = esp_timer_get_time();
+        stat_mix_us += (t_b - t_a);
+        stat_wr_us  += (t_c - t_b);
+        stat_blk_us += (t_c - t_a);
+        if (++stat_blocks >= 256) {
+            printf("sfx: %u blocks, mix %lld us, write %lld us, loop %lld us\n",
+                   (unsigned)stat_blocks, (long long)stat_mix_us,
+                   (long long)stat_wr_us, (long long)stat_blk_us);
+            stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0; stat_blk_us = 0;
         }
     }
 
