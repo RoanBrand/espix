@@ -278,6 +278,16 @@ dev_run "rm -r $PPD" >/dev/null 2>&1
 dev_run "mkdir $PPD; echo a > $PPD/a; echo b > $PPD/b; echo c > $PPD/c" >/dev/null
 assert_eq "ls into wc counts the lines" "3" \
     "$(dev_run "ls $PPD | wc -l" | awk '{print $1}')"
+# A reader that stops early. The file is larger than the pipe's 1 KB plus
+# stdio's buffers, so the writer is still blocked on a full pipe when head
+# returns -- which once left cat, and the whole line, waiting for good.
+big_dir=$(espix_mktemp_dir)
+seq 1 800 > "$big_dir/lines"
+dev_push "$big_dir/lines" "$PPD/lines" >/dev/null
+rm -rf "$big_dir"
+assert_eq "a pipe ends when its reader stops early" "1" \
+    "$(dev_run "cat $PPD/lines | head -n 1")"
+assert_eq "and the session goes on" "ok" "$(dev_run "echo ok")"
 assert_contains "a program stage is refused, not run into the terminal" \
     "pipes are for builtins" \
     "$(dev_run "echo x | /home/$ESPIX_USER/testapp argv" 2>&1)"

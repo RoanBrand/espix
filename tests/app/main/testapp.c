@@ -762,6 +762,118 @@ static int sig_select(void)
     return (rc < 0 && s_alarm_seen) ? 0 : 1;
 }
 
+static int ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (int)((t1.tv_sec - t0->tv_sec) * 1000 +
+                 (t1.tv_nsec - t0->tv_nsec) / 1000000);
+}
+
+/* Sleep until ms have passed, however often a signal cuts a sleep short. */
+static void hold_for_ms(int ms)
+{
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (ms_since(&t0) < ms) {
+        usleep(50000);
+    }
+}
+
+/*
+ * A signal must not break a lock wait. One thread holds a mutex for three
+ * seconds and signals the process after one; the main task is waiting for that
+ * mutex the whole time. The signal is only allowed to end waits that are
+ * waiting for one, so the lock must arrive -- rc 0, after the holder lets go.
+ */
+static pthread_mutex_t     s_held_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int        s_held;
+
+static void *hold_and_signal(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&s_held_lock);
+    s_held = 1;
+    hold_for_ms(1000);
+    kill(getpid(), SIGUSR1);
+    hold_for_ms(2000);
+    pthread_mutex_unlock(&s_held_lock);
+    return NULL;
+}
+
+static int sig_mutex(void)
+{
+    signal(SIGUSR1, on_signal);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, hold_and_signal, NULL) != 0) {
+        printf("sig: pthread_create failed\n");
+        return 1;
+    }
+    while (!s_held) {
+        usleep(10000);
+    }
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const int rc = pthread_mutex_lock(&s_held_lock);
+    printf("sig: mutex rc=%d after %d ms\n", rc, ms_since(&t0));
+    fflush(stdout);
+    if (rc == 0) {
+        pthread_mutex_unlock(&s_held_lock);
+    }
+    pthread_join(t, NULL);
+    return rc == 0 ? 0 : 1;
+}
+
+/*
+ * A signal reaches a thread asleep in sleep(), and a join is not a place a
+ * signal may end. The thread sleeps 5s; an alarm fires after 1s while the main
+ * task waits in pthread_join. The thread's sleep is cut short with its handler
+ * run, and the join returns once the thread has, with what it recorded.
+ */
+static volatile sig_atomic_t s_ts_alarm;
+static volatile int          s_ts_ms = -1;
+static volatile unsigned     s_ts_left;
+
+static void on_ts_alarm(int sig)
+{
+    (void)sig;
+    s_ts_alarm = 1;
+}
+
+static void *sleep_in_thread(void *arg)
+{
+    (void)arg;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    s_ts_left = sleep(5);
+    s_ts_ms   = ms_since(&t0);
+    return NULL;
+}
+
+static int sig_threadsleep(void)
+{
+    signal(SIGALRM, on_ts_alarm);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, sleep_in_thread, NULL) != 0) {
+        printf("sig: pthread_create failed\n");
+        return 1;
+    }
+    alarm(1);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_join(t, NULL);
+    const int joined = ms_since(&t0);
+
+    printf("sig: thread slept %d ms, %u left, handler %s, join %d ms\n",
+           s_ts_ms, s_ts_left, s_ts_alarm ? "ran" : "did not run", joined);
+    fflush(stdout);
+    return (s_ts_ms >= 0 && s_ts_ms < 4000 && s_ts_alarm) ? 0 : 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -790,6 +902,12 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "select") == 0) {
         return sig_select();
+    }
+    if (strcmp(mode, "mutex") == 0) {
+        return sig_mutex();
+    }
+    if (strcmp(mode, "threadsleep") == 0) {
+        return sig_threadsleep();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
@@ -1441,6 +1559,7 @@ static void usage(void)
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
            "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch | pipe | select\n"
+           "                      | mutex | threadsleep\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"

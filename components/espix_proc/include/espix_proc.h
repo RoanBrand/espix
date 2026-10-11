@@ -230,6 +230,14 @@ size_t espix_proc_stop_all(int64_t deadline_us);
 bool espix_sigcheck(void);
 
 /*
+ * espix_sigcheck() for a stdio read callback, which runs inside fgets() with
+ * the FILE's lock held: handlers run, but a signal that would terminate is left
+ * pending for the next delivery point. True when the read should end, as at
+ * EOF: the process was asked to stop, or such a signal is waiting.
+ */
+bool espix_sigcheck_io(void);
+
+/*
  * Has this process been asked to stop? Reads the flag and nothing else.
  *
  * The difference from espix_sigcheck() is what it does NOT do: no handler
@@ -298,6 +306,15 @@ bool espix_proc_reaped(TaskHandle_t task);
 /* Look up the process owning `task`, or ESPIX_PID_NONE. Safe to call from a
  * restricted context: it only reads the table. */
 espix_pid_t espix_proc_pid_of_task(TaskHandle_t task);
+
+/* For a task that is one of an app's threads: its process and its tid. False
+ * for any other task. Takes the table lock. */
+bool espix_proc_thread_of_task(TaskHandle_t task, espix_pid_t *pid,
+                               espix_pid_t *tid);
+
+/* Run time, in the run-time counter's units, of `pid`'s threads that have
+ * already ended -- the part of its CPU no live task carries any more. */
+uint64_t espix_proc_cpu_threads_done(espix_pid_t pid);
 
 /*
  * Bytes the process has *live* in its own memory arena (R-P1.2), summed over

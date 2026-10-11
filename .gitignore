@@ -24,6 +24,12 @@ tests/app/sdkconfig.old
 tests/app/managed_components/
 tests/app/build-test-app.log
 
+# Host unit-test apps (make unit) are separate IDF projects too.
+components/*/test_apps/*/build/
+components/*/test_apps/*/sdkconfig
+components/*/test_apps/*/sdkconfig.old
+components/*/test_apps/*/unit.log
+
 # Cross-compiled apps under apps/ are separate IDF projects
 apps/*/build/
 apps/*/sdkconfig

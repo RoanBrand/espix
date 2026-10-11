@@ -20,7 +20,7 @@ merely missing.
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
 | Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`/Ctrl-Z; a job still dies at logout by design |
-| Pipes <code>&#124;</code> | **yes** | one StreamBuffer per pipe, refcounted |
+| Pipes <code>&#124;</code> | **yes** | builtins only; one StreamBuffer per pipe, and a writer fails once its reader is done (`cat f \| head -1`) |
 | Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |
 | Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv` |
 | Globbing `*` | **planned** | |

@@ -148,6 +148,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_drivers_register();
     espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
+    espix_shell_set_sigcheck_hook(espix_sigcheck_io);
     espix_proc_abi_env_register();
     espix_proc_abi_exit_register();
     espix_proc_abi_alloc_register();
@@ -223,6 +224,22 @@ espix_proc_slot_t *espix_proc_alloc_slot(void)
         }
     }
     return NULL;
+}
+
+/*
+ * Wake every task of `slot` that is waiting for a signal: its main task and its
+ * threads. Caller holds the lock, which is what keeps them alive to be woken --
+ * a live slot's tasks cannot finish without taking it. Only waits on
+ * ESPIX_NOTIFY_SIG_IDX end; a lock or a join the target is waiting on does not.
+ */
+static void sig_wake_locked(espix_proc_slot_t *slot)
+{
+    const TaskHandle_t task = slot->info.task;
+
+    if (task != NULL && task != xTaskGetCurrentTaskHandle()) {
+        (void)xTaskNotifyGiveIndexed(task, ESPIX_NOTIFY_SIG_IDX);
+    }
+    espix_pthread_wake_locked(slot);
 }
 
 void espix_proc_release_resources(espix_proc_slot_t *slot)
@@ -363,6 +380,7 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
             if (p != slot && p->info.state != ESPIX_PROC_FREE &&
                 p->info.pid == slot->info.ppid) {
                 p->sig_pending |= espix_sigbit(SIGCHLD);
+                sig_wake_locked(p);
                 break;
             }
         }
@@ -813,20 +831,53 @@ static void set_state(espix_proc_slot_t *slot, espix_proc_state_t st)
  * picked up at the next delivery point instead, which is a delay of microseconds
  * in an app that blocks and no worse than the alternative in one that does not.
  */
-static uint32_t sig_dispatch(espix_proc_slot_t *slot)
+/* The signals whose action now would be to terminate the process. */
+static uint32_t sig_terminating(const espix_proc_slot_t *slot)
 {
+    uint32_t mask = 0;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        const bool dfl = slot->sig_handlers == NULL ||
+                         slot->sig_handlers[sig] == SIG_DFL;
+        if (dfl && !sig_default_ignores(sig)) {
+            mask |= espix_sigbit(sig);
+        }
+    }
+    return mask;
+}
+
+static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
+{
+    /*
+     * Terminating is the process's own task's to do, and only where it holds
+     * nothing: the default action is a longjmp out of whatever called in. So a
+     * thread runs handlers and leaves such a signal pending for the main task,
+     * which the sender has already woken; and so does a stdio read callback
+     * (espix_sigcheck_io()), which runs inside fgets() with the FILE's lock
+     * held -- jumping out of it left that lock taken, and the exit path's
+     * fclose() asserted.
+     *
+     * Decided before the lock, so a thread that has nothing it may deliver
+     * returns without taking it. One that retries an EINTR in a loop otherwise
+     * takes the table lock on every pass and starves everyone else of it.
+     */
+    uint32_t mine = ~slot->sig_blocked;
+    if (!may_terminate || slot->info.task != xTaskGetCurrentTaskHandle()) {
+        mine &= ~sig_terminating(slot);
+    }
+
     /*
      * Fast path, unlocked. espix_app_stopping() sits in apps' inner loops and
      * used to cost two linear scans of the table; it must not now cost a mutex
      * on every iteration. Two volatile loads, and a reader one iteration behind
      * is harmless.
      */
-    if ((slot->sig_pending & ~slot->sig_blocked) == 0) {
+    if ((slot->sig_pending & mine) == 0) {
         return 0;
     }
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-    const uint32_t deliver = slot->sig_pending & ~slot->sig_blocked;
+    const uint32_t deliver = slot->sig_pending & mine;
     slot->sig_pending &= ~deliver;
     xSemaphoreGive(g_espix_proc_lock);
 
@@ -866,8 +917,8 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot)
              * so that teardown() runs, and espix does not bend its semantics to
              * give a sketch what the shim can give it.
              *
-             * This runs on the process's own task, at a delivery point it
-             * reached itself, with no lock held (the table lock is released
+             * This runs on the process's own task (a thread left it pending,
+             * above), at a delivery point it reached itself, with no lock held (the table lock is released
              * above the loop), so ending the process is the ordinary exit:
              * streams closed, the ELF released, the slot marked EXITED with
              * 128+sig, and that status reaches whoever ran it. The same door an
@@ -890,7 +941,7 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot)
  * wedges every other task that touches it -- the same hazard the fault reaper
  * refuses to accept, and worse here because both cores are live.
  */
-static void sig_park(espix_proc_slot_t *slot)
+static void sig_park(espix_proc_slot_t *slot, bool may_terminate)
 {
     while (slot->sig_stop_req) {
         if (slot->sig_cont == NULL) {
@@ -915,8 +966,15 @@ static void sig_park(espix_proc_slot_t *slot)
         (void)xSemaphoreTake(slot->sig_cont, portMAX_DELAY);
         set_state(slot, ESPIX_PROC_RUNNING);
 
+        /* Pass the continue on: the process's threads may be parked here too,
+         * and one give wakes one taker. A token nobody takes is discarded by
+         * the next stop, above. */
+        if (!slot->sig_stop_req) {
+            (void)xSemaphoreGive(slot->sig_cont);
+        }
+
         /* Whatever woke us may have been a signal rather than SIGCONT. */
-        (void)sig_dispatch(slot);
+        (void)sig_dispatch(slot, may_terminate);
     }
 }
 
@@ -928,9 +986,9 @@ uint32_t espix_sigcheck_mask(void)
         return 0;           /* not a process; nobody is signalling it */
     }
 
-    uint32_t got = sig_dispatch(slot);
+    uint32_t got = sig_dispatch(slot, true);
 
-    sig_park(slot);
+    sig_park(slot, true);
 
     if (slot->stop_requested) {
         got |= ESPIX_SIG_STOPPING;
@@ -941,6 +999,33 @@ uint32_t espix_sigcheck_mask(void)
 bool espix_sigcheck(void)
 {
     return (espix_sigcheck_mask() & ESPIX_SIG_STOPPING) != 0;
+}
+
+bool espix_sigcheck_io(void)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+
+    if (slot == NULL) {
+        return false;
+    }
+
+    (void)sig_dispatch(slot, false);
+    sig_park(slot, false);
+
+    return slot->stop_requested || espix_proc_termsig(slot) != 0;
+}
+
+int espix_proc_termsig(const espix_proc_slot_t *slot)
+{
+    const uint32_t due = slot->sig_pending & ~slot->sig_blocked &
+                         sig_terminating(slot);
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (due & espix_sigbit(sig)) {
+            return sig;
+        }
+    }
+    return 0;
 }
 
 bool espix_proc_stopping(void)
@@ -993,14 +1078,13 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
         return;
     }
 
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     espix_proc_slot_t *slot = espix_proc_find(pid);
     if (slot != NULL) {
         slot->stop_requested = true;
+        sig_wake_locked(slot);
     }
-
-    /* Cut short whatever delay it is in, so it reaches the check now rather
-     * than at the end of its slice. */
-    (void)xTaskAbortDelay(task);
+    xSemaphoreGive(g_espix_proc_lock);
 
     /*
      * Finished on its own is the good outcome, and the common one. Observing
@@ -1211,34 +1295,29 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         slot->sig_stop_req = false;
     }
 
-    TaskHandle_t      task      = slot->info.task;
     SemaphoreHandle_t cont      = slot->sig_cont;
     const int         wake_fd   = slot->wake_fd;
     const bool        in_select = slot->in_select;
 
+    /*
+     * Wake it, and its threads. The pending bits are already set and a notify
+     * is remembered, so a target racing us into a wait returns from it at once.
+     * Only a wait for a signal ends: never a lock or a join, which is what
+     * xTaskAbortDelay() used to break. Signalling yourself skips your own task
+     * -- you are not waiting -- and raise() calls espix_sigcheck() directly.
+     */
+    sig_wake_locked(slot);
+
     xSemaphoreGive(g_espix_proc_lock);
 
-    /*
-     * Wake it. The pending bits are already set, so a target racing us into a
-     * blocking call sees them rather than sleeping through them -- which is why
-     * this is after the unlock and not before the write.
-     *
-     * xTaskAbortDelay returns pdFAIL for a task that was not blocked, and that
-     * is fine: it means the target is running and will reach a delivery point
-     * on its own. Signalling yourself skips it -- you are, definitionally, not
-     * blocked -- and raise() calls espix_sigcheck() directly instead.
-     */
     if (sig != SIGSTOP && was_stopped && cont != NULL) {
         (void)xSemaphoreGive(cont);
-    }
-    if (task != NULL && task != xTaskGetCurrentTaskHandle()) {
-        (void)xTaskAbortDelay(task);
     }
 
     /*
      * And the wake fd, when the target is waiting on one. A process blocked in
-     * esp_vfs_select() is waiting on a semaphore that xTaskAbortDelay cannot
-     * touch, so the eventfd is the only way in. Written only while in_select is
+     * esp_vfs_select() is waiting on a semaphore no notify reaches, so the
+     * eventfd is the only way in. Written only while in_select is
      * set, so a signal to a running process does not arm the counter and make
      * its next select() return for no reason.
      */

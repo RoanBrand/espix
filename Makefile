@@ -25,6 +25,7 @@
 #   make test-panic       same, with the UART captured to serial.log --
 #                         use when hunting a panic; console suites skip
 #   make stress           transport regression check, expects zero failures [N=30]
+#   make unit             host unit tests: no board, seconds (tools/unit.sh)
 #   make clean            fullclean, firmware and apps
 #
 # PROFILE=sysview builds the SystemView profiling variant, into its own
@@ -92,7 +93,7 @@ port-check:
 
 .PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release release-all monitor monitor-reset coredump apps test-app test test-panic \
-        stress clean help
+        stress unit clean help
 
 all: build
 
@@ -266,6 +267,9 @@ apps:
 
 test-app:
 	./tools/build-test-app.sh
+
+unit:
+	./tools/unit.sh
 
 # ESPIX_PYTHON comes from the SDK: the serial console driver needs pyserial,
 # which the IDF virtualenv always has and the system python usually does not.

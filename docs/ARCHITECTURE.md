@@ -82,8 +82,12 @@ Two Unix mechanisms are reshaped by having no scheduler you can stop:
   handler runs at a delivery point — the blocking calls espix publishes — in the
   process's own task. A pure compute loop that never calls in never sees one;
   `espix_sigcheck()` exists for it and `kill -9` is the answer for somebody
-  else's binary. SIGSTOP parks a process *in itself*, because suspending it from
-  outside would freeze whatever mutex it held.
+  else's binary. A signal wakes only a wait that is waiting for one (task
+  notification index 1), never a lock or a join: IDF's lock calls do not check
+  that the take succeeded, so a woken lock wait runs on without the lock.
+  A thread runs handlers; a default action is the main task's. SIGSTOP parks a
+  process *in itself*, because suspending it from outside would freeze whatever
+  mutex it held.
 - **`kill <pid>` escalates** — SIGTERM, a two-second grace, then SIGKILL —
   because there is no job control and no `fg` to deliver a later signal, and the
   only console may be the one you are typing into. Any signal but SIGSTOP lifts
@@ -136,8 +140,8 @@ boundary only where an MMU exists.
 
 The serial console and an SSH session are the same shell: one command registry
 and dispatch, with a session supplying `{read_line, write, cwd}`. Redirection is
-handled once in dispatch rather than per command, and pipes are refcounted
-StreamBuffers. ESP-IDF's `esp_console_run()` is not used because it copies every
+handled once in dispatch rather than per command, and a pipe is a
+StreamBuffer whose writer fails once its reader's command has returned. ESP-IDF's `esp_console_run()` is not used because it copies every
 line through one shared static buffer and is not reentrant — invisible with one
 console, corruption with two; only its reentrant pieces are reused.
 

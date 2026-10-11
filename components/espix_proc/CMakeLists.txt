@@ -7,6 +7,7 @@ idf_component_register(
         "abi_env.c"
         "abi_alloc.c"
         "abi_pthread.c"
+        "proc_threads.c"
         "abi_exit.c"
         "abi_resolver.c"
         "abi_fs.c"

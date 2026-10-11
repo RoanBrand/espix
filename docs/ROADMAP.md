@@ -269,14 +269,12 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## Signals
 
-- **Delivery during `select()` and `read()`.** The sleep family and `pause()`
-  are delivery points, and `xTaskAbortDelay()` wakes a target blocked in any of
-  them — including a `select()` over UART and eventfd, because IDF blocks that
-  on a single semaphore. It cannot reach a task inside lwIP's `socket_select`.
-  A per-process eventfd, always in the app's read set, is the mechanism that
-  would; `tty_console.c` already has the pattern. Deferred deliberately: no app
-  does socket `select()` yet, and building it before there is one to test
-  against would be guessing.
+- **A blocking call that is not a delivery point.** A signal ends the sleep
+  family, `pause()`, `select()` (through the per-process wake eventfd) and a
+  read of stdin. A blocking socket `recv()` or `accept()` waits on in lwIP until
+  data comes; the fix is the same eventfd, behind the socket calls espix already
+  wraps. Asynchronous delivery itself needs the U-mode boundary: see the process
+  model in [WORKLIST.md](WORKLIST.md) (R-P8).
 
 ## SSH
 

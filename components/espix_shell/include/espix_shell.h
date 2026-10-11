@@ -719,6 +719,16 @@ int espix_session_write(espix_session_t *s, const char *data, size_t len,
  */
 void espix_shell_set_session_end_hook(size_t (*fn)(const espix_session_t *s));
 
+/*
+ * Ask whether the calling process has a signal to act on, running its handlers:
+ * espix_sigcheck(), reached through a hook for the same reason as the one
+ * above. A stream a process reads through the shell -- the desktop terminal's
+ * stdin -- asks this while it waits. False until espix_proc registers it, and
+ * for a task that is not a process.
+ */
+void espix_shell_set_sigcheck_hook(bool (*fn)(void));
+bool espix_shell_sigcheck(void);
+
 esp_err_t espix_console_session_start(void);
 
 /*

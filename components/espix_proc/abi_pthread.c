@@ -42,11 +42,13 @@
 
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
+#include "proc_threads.h"
 
 #define TAG "abi"
 
 /*
- * The threads an app has made, so that its process can end them.
+ * The threads an app has made, so that its process can signal them and end
+ * them.
  *
  * A thread outlives its process otherwise. Every other resource an app holds is
  * released by espix_proc_release_resources() -- its memory, its descriptors,
@@ -54,56 +56,97 @@
  * was left out: measured, after Doom exited, as a pthread still at 55% of a core
  * with a pointer to a stream the reaper had already closed for it.
  *
- * Registered by the thread itself, in the trampoline, rather than by
- * pthread_create: the handle is the thread's own, and the trampoline is already
- * the one place every app thread passes through.
- *
- * Fixed and small, like the process table: an app that wants more than this is
- * told no when it asks, rather than silently untracked. The entry is removed by
- * the thread as it leaves, so a thread that ends normally never needs reaping.
+ * Reserved by pthread_create, so a full table is EAGAIN rather than a thread
+ * nobody can reach, and given its task by the thread in the trampoline. Every
+ * change is under the proc lock, and that is the guarantee the signal path
+ * leans on: while the lock is held, a registered task has not yet left, so it
+ * is safe to notify. See proc_threads.h.
  */
-#define ESPIX_PTHREAD_MAX 4
+static espix_thread_t  s_thread_v[CONFIG_ESPIX_PTHREAD_MAX];
+static espix_threads_t s_threads = { s_thread_v, CONFIG_ESPIX_PTHREAD_MAX };
 
-typedef struct {
-    espix_proc_slot_t *slot;
-    TaskHandle_t       task;
-} espix_pthread_entry_t;
-
-static espix_pthread_entry_t s_threads[ESPIX_PTHREAD_MAX];
-static portMUX_TYPE          s_threads_lock = portMUX_INITIALIZER_UNLOCKED;
-
-/* Called by the thread. Returns false when the table is full. */
-static bool espix_pthread_register(espix_proc_slot_t *slot)
+/* The calling thread leaves the books, and its CPU time joins its process's. */
+static void espix_pthread_unregister(espix_proc_slot_t *slot)
 {
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
-    bool ok = false;
 
-    portENTER_CRITICAL(&s_threads_lock);
-    for (int i = 0; i < ESPIX_PTHREAD_MAX; i++) {
-        if (s_threads[i].task == NULL) {
-            s_threads[i].slot = slot;
-            s_threads[i].task = self;
-            ok = true;
-            break;
-        }
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const int32_t tid = espix_threads_tid_of(&s_threads, self);
+    if (tid >= 0 && espix_threads_remove(&s_threads, tid, NULL) && slot != NULL) {
+        TaskStatus_t st;
+        vTaskGetInfo(self, &st, pdFALSE, eRunning);
+        slot->cpu_threads_done += st.ulRunTimeCounter;
     }
-    portEXIT_CRITICAL(&s_threads_lock);
-    return ok;
+    xSemaphoreGive(g_espix_proc_lock);
 }
 
-static void espix_pthread_unregister(void)
+void espix_pthread_wake_locked(espix_proc_slot_t *slot)
 {
+    espix_thread_t th[CONFIG_ESPIX_PTHREAD_MAX];
+    const size_t n = espix_threads_of(&s_threads, slot, th,
+                                      CONFIG_ESPIX_PTHREAD_MAX);
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
 
-    portENTER_CRITICAL(&s_threads_lock);
-    for (int i = 0; i < ESPIX_PTHREAD_MAX; i++) {
-        if (s_threads[i].task == self) {
-            s_threads[i].slot = NULL;
-            s_threads[i].task = NULL;
-            break;
+    for (size_t i = 0; i < n && i < CONFIG_ESPIX_PTHREAD_MAX; i++) {
+        if (th[i].task != NULL && th[i].task != self) {
+            (void)xTaskNotifyGiveIndexed((TaskHandle_t)th[i].task,
+                                         ESPIX_NOTIFY_SIG_IDX);
         }
     }
-    portEXIT_CRITICAL(&s_threads_lock);
+}
+
+size_t espix_pthread_list_locked(const espix_proc_slot_t *slot,
+                                 espix_pid_t *tids, TaskHandle_t *tasks,
+                                 size_t max)
+{
+    espix_thread_t th[CONFIG_ESPIX_PTHREAD_MAX];
+    const size_t n = espix_threads_of(&s_threads, slot, th,
+                                      CONFIG_ESPIX_PTHREAD_MAX);
+    size_t out = 0;
+
+    for (size_t i = 0; i < n && i < CONFIG_ESPIX_PTHREAD_MAX && out < max; i++) {
+        if (th[i].task != NULL) {
+            tids[out]  = (espix_pid_t)th[i].tid;
+            tasks[out] = (TaskHandle_t)th[i].task;
+            out++;
+        }
+    }
+    return out;
+}
+
+bool espix_proc_thread_of_task(TaskHandle_t task, espix_pid_t *pid,
+                               espix_pid_t *tid)
+{
+    bool found = false;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const int32_t t = espix_threads_tid_of(&s_threads, task);
+    if (t >= 0) {
+        for (size_t i = 0; i < s_threads.cap; i++) {
+            if (s_threads.v[i].tid == t && s_threads.v[i].slot != NULL) {
+                const espix_proc_slot_t *const slot = s_threads.v[i].slot;
+                *pid  = slot->info.pid;
+                *tid  = (espix_pid_t)t;
+                found = true;
+                break;
+            }
+        }
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return found;
+}
+
+uint64_t espix_proc_cpu_threads_done(espix_pid_t pid)
+{
+    uint64_t done = 0;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *const slot = espix_proc_find(pid);
+    if (slot != NULL) {
+        done = slot->cpu_threads_done;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return done;
 }
 
 /*
@@ -111,32 +154,48 @@ static void espix_pthread_unregister(void)
  * espix_proc_release_resources(), which runs on both the clean exit and the
  * kill path.
  *
- * vTaskDelete() from another task is what FreeRTOS offers, and the reclaim of
- * the victim's reent is IDF's business -- it runs in the task's own cleanup
- * context, which is why nothing here tries to reach into it. By this point the
- * process's own streams have already been detached by the exit path, so what a
- * stale reent would close is no longer the live stdio.
+ * vTaskDelete() from another task is what FreeRTOS offers. It reclaims the
+ * victim's reent, which is why the process's streams are taken out of it first.
  */
 void espix_pthread_reap(espix_proc_slot_t *slot)
 {
     if (slot == NULL) {
         return;
     }
-    for (int i = 0; i < ESPIX_PTHREAD_MAX; i++) {
-        TaskHandle_t victim = NULL;
+    for (;;) {
+        espix_thread_t victim;
 
-        portENTER_CRITICAL(&s_threads_lock);
-        if (s_threads[i].slot == slot && s_threads[i].task != NULL) {
-            victim = s_threads[i].task;
-            s_threads[i].slot = NULL;
-            s_threads[i].task = NULL;
+        /* Suspended under the lock, as proc_force_kill() does: a thread on its
+         * way out takes this lock to unregister, and one deleted holding it
+         * would wedge every process. */
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        const bool got = espix_threads_take(&s_threads, slot, &victim);
+        if (got && victim.task != NULL) {
+            vTaskSuspend((TaskHandle_t)victim.task);
+
+            /* Its reent holds the process's stdio, and deleting it fcloses
+             * whatever is there -- a write into the session. Give it the
+             * globals first, as espix_proc_detach_streams() does for the
+             * process's own task. */
+            struct _reent *const r = victim.reent;
+            if (r != NULL) {
+                _REENT_STDIN(r)  = _REENT_STDIN(_GLOBAL_REENT);
+                _REENT_STDOUT(r) = _REENT_STDOUT(_GLOBAL_REENT);
+                _REENT_STDERR(r) = _REENT_STDERR(_GLOBAL_REENT);
+            }
         }
-        portEXIT_CRITICAL(&s_threads_lock);
+        xSemaphoreGive(g_espix_proc_lock);
 
-        if (victim != NULL) {
+        if (!got) {
+            return;
+        }
+        /* A reservation whose thread never started finds its entry gone and
+         * returns without running anything. */
+        if (victim.task != NULL) {
             espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "ending a thread its process left behind");
-            vTaskDelete(victim);
+                       "ending thread %d, which its process left behind",
+                       (int)victim.tid);
+            vTaskDelete((TaskHandle_t)victim.task);
         }
     }
 }
@@ -150,6 +209,7 @@ typedef struct {
     void              *(*fn)(void *);
     void               *arg;
     espix_proc_slot_t  *slot;
+    espix_pid_t         tid;
 } espix_pthread_start_t;
 
 /*
@@ -199,15 +259,23 @@ static void *espix_pthread_trampoline(void *arg)
     void *(*const fn)(void *) = st->fn;
     void *const user_arg      = st->arg;
     espix_proc_slot_t *const slot = st->slot;
+    const espix_pid_t tid     = st->tid;
     free(st);
 
-    /* The thread's first act, before the app's routine can allocate. */
-    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, slot);
+    /* Into the process's books before anything else, so a signal can reach it
+     * and the process's end can end it. Gone already means the process ended
+     * while this thread was being made: there is nothing to run for. */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const bool live = espix_threads_set_task(&s_threads, tid,
+                                             xTaskGetCurrentTaskHandle(),
+                                             _REENT);
+    xSemaphoreGive(g_espix_proc_lock);
+    if (!live) {
+        return NULL;
+    }
 
-    /* And its first act in the process's books, so a process that dies before
-     * this thread does can end it. A refusal is not fatal: the thread runs, and
-     * the reaper simply will not know about it. */
-    espix_pthread_register(slot);
+    /* Before the app's routine can allocate. */
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, slot);
 
     espix_pthread_take_streams(slot);
 
@@ -217,12 +285,9 @@ static void *espix_pthread_trampoline(void *arg)
      * see the note on the pair above. */
     espix_pthread_drop_streams();
 
-    /* And its last, so a slot pointer does not outlive the thread. A thread that
-     * ends through pthread_exit() skips this, which leaves a pointer to a slot
-     * that espix_proc_release_resources() will have cleared the state of -- the
-     * caller checks that before trusting it. */
+    /* And its last, so a slot pointer does not outlive the thread. */
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
-    espix_pthread_unregister();
+    espix_pthread_unregister(slot);
     return ret;
 }
 
@@ -246,9 +311,23 @@ static int espix_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     st->arg  = arg;
     st->slot = slot;
 
+    /* The tid comes from the pid space, so it names exactly one thing. */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    st->tid = espix_proc_next_pid();
+    const bool room = espix_threads_add(&s_threads, slot, st->tid);
+    xSemaphoreGive(g_espix_proc_lock);
+    if (!room) {
+        free(st);
+        return EAGAIN;
+    }
+
+    const espix_pid_t tid = st->tid;
     const int rc = pthread_create(thread, attr, espix_pthread_trampoline, st);
     if (rc != 0) {
         free(st);       /* the trampoline will never run to free it */
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        (void)espix_threads_remove(&s_threads, tid, NULL);
+        xSemaphoreGive(g_espix_proc_lock);
     }
     return rc;
 }
@@ -261,12 +340,29 @@ static int espix_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
  * entry rather than a table one, and it is the only pthread name espix
  * shadows.
  */
+static void espix_pthread_exit(void *retval);
+
+void espix_pthread_exit_self(void)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const bool registered =
+        espix_threads_tid_of(&s_threads, xTaskGetCurrentTaskHandle()) >= 0;
+    xSemaphoreGive(g_espix_proc_lock);
+
+    if (registered) {
+        espix_pthread_exit(NULL);
+    }
+}
+
 static void espix_pthread_exit(void *retval)
 {
+    espix_proc_slot_t *const slot = espix_proc_self();
+
     espix_pthread_drop_streams();
     /* Unwinding this way skips the trampoline's tail, so the process's books
      * have to be cleared here or the entry names a task that is gone. */
-    espix_pthread_unregister();
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
+    espix_pthread_unregister(slot);
     pthread_exit(retval);
 }
 

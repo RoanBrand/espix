@@ -195,10 +195,10 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
 
     /*
      * FreeRTOS. The loader's built-in table covers almost none of it, and any
-     * app that sleeps, takes a mutex or waits on an event group needs these.
-     * Arduino's RMT HAL uses all three.
+     * app that takes a mutex or waits on an event group needs these. Arduino's
+     * RMT HAL uses both. vTaskDelay is the resolver's, in abi_signal.c, so a
+     * signal can end it.
      */
-    ESP_ELFSYM_EXPORT(vTaskDelay),
     ESP_ELFSYM_EXPORT(xTimerPendFunctionCallFromISR),
 
     ESP_ELFSYM_EXPORT(xEventGroupCreate),

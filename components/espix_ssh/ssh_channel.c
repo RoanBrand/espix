@@ -1035,9 +1035,10 @@ static int chan_stream_read(void *cookie, char *buf, int len)
          * We are on the process's own task, so this runs its handlers here and
          * now -- and if it has been asked to stop, ending the read is the only
          * way to say so: there is no EINTR to hand back through fgets(). An
-         * app blocked on input would otherwise be unsignallable.
+         * app blocked on input would otherwise be unsignallable. The _io form,
+         * because fgets() holds the FILE's lock around this call.
          */
-        if (espix_sigcheck()) {
+        if (espix_sigcheck_io()) {
             return 0;
         }
     }

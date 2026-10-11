@@ -103,7 +103,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 
 | id | what | why | done when | status |
 |---|---|---|---|---|
-| R-P5.4 | Move the process table's string fields out of the slot | ~656 B/slot is mostly `cwd[128]`+`root[128]`+`path[128]`; shrinking the table makes raising `ESPIX_PROC_MAX` cheap | slot noticeably smaller | parked |
+| R-P5.4 | Move the process table's string fields out of the slot | ~656 B/slot is mostly `cwd[128]`+`root[128]`+`path[128]`; shrinking the table makes raising `ESPIX_PROC_MAX` cheap | slot noticeably smaller | todo -- before R-P8.1, which adds kinds of process |
 
 ## R-P6 — services and filesystem views
 
@@ -118,7 +118,24 @@ decisions, and an **implementation plan in the order it has to happen**.
 | R-P7.3 | `ESPIX_PROC_MAX` / `ESPIX_FS_FD_MAX` (32 system-wide) / `ESPIX_FS_DIRS` (8) sizing review | Sized for a shell; pipelines and services will need more | sized from measurement | parked |
 | R-P7.5 | Decide the USB-storage role: data volume (works today), and later an eviction target for registered caches | Real swap/paging needs the MMU (R-P3.3) *and* would page-fault over USB at hundreds of microseconds — a poor fit for a 320 MHz core with no coherent DMA. Linux on S31 uses PSRAM as RAM and SD for rootfs, no swap. "Spill a registered cache to disk" is the useful, buildable version of the idea (`docs/ROADMAP.md` reclaimer entry)| a decision is written down | parked |
 | R-P7.8 | Audit every espix task that is **not** reaper-managed for cleanup on every exit path: the matching WithCaps/plain delete, every fd it opened, every block it allocated | R-P1.6 moved process teardown to the reaper and left internal tasks to FreeRTOS idle cleanup, so their correctness is entirely their own responsibility. The first pass found two stack-pool mismatches -- `sshd:conn` used an alignment-sensitive check that always said "internal", and `espix:appstart` simply used the wrong call, so both deleted PSRAM stacks with plain `vTaskDelete` and leaked ~19 KB per connection (fixed, `e12376f`). ~0.9 KB per SSH connection is still unexplained, and fds and heap are not yet audited (files: `ssh_server.c`, `session.c`, `desktop.c`, `rfb.c`, `canvas_console.c`, `espix_audio.c`, `ota.c`)| each self-deleting task has every path checked and a leak test | doing -- also found: two orphaned `sh:pipe` stage tasks left blocked (waiting on a pipe nobody will close) after a malformed pipeline whose client went away. A clean pipeline does not leak -- a dmesg-into-wc-l pipeline left the count unchanged -- because `run_pipeline()` waits for its stages; a session deleted mid-pipeline has nobody left to do that wait. |
-| R-P7.11 | Full-suite load-only dead-sessions: 10-fs, 35-signals and 30-proc fail with dead-session under four-way load and pass alone | The runner says so itself. A long-running boot's internal low-water falls (105 K to 56 K) and a lost SSH connection cannot be told from a device fault, so a red full run says less than it should | a full run is green with only the known 60-net failures | **parked** -- stopped after the investigation. The dead-sessions are not a command timeout (60s did not stop them; every failure is 'session gone before' with no error frame), they need the full four-way pool (the pair alone passes 84/84 twice), and they cluster in 35-signals after a kill; one run also left two finished tasks live. Root cause not found -- the next step would be the serial console and a task dump, watching espix:reaper. Several of the assertions involved also read asynchronous or system-wide state without polling, so the tests themselves are fragile and as likely to be what needs fixing. Landed independently, and kept: the eventfd spawn-failure leak, the session-error surfacing, and the fd probe moved to 95-fdpool (exclusive). |
+| R-P7.11 | Full-suite load-only dead-sessions: 10-fs, 35-signals and 30-proc fail with dead-session under four-way load and pass alone | The runner says so itself. A long-running boot's internal low-water falls (105 K to 56 K) and a lost SSH connection cannot be told from a device fault, so a red full run says less than it should | a full run is green with only the known 60-net failures | **done** with R-P8.0, measured rather than traced: on c2603a9 seed 47288 failed 16 assertions in 35-signals (session gone, passes alone); on R-P8.0 the same seed and three other full runs pass 411-414 with none failed. Most likely a signal aborting a wait it was not for -- a lock or a join on the session path -- but no single abort was caught doing it. |
+
+## R-P8 — the process model
+
+Every task espix starts gets a pid, and one stop mechanism replaces three
+(`espix_proc_stopping`, `espix_svc_stopping`, `espix_shell_stopping`). Phases
+0-3 are the same on S3 and S31; R-P8.6 is where D2/D4 are revisited, for the
+trap boundary rather than for `fork`.
+
+| id | what | why | done when | status |
+|---|---|---|---|---|
+| R-P8.0 | A signal wakes only a wait for one (notify index 1); app threads in a table with tids, reached by signals and listed by `ps`; a default action only on the main task and never inside a stdio read; 64-bit run-time counter; host unit tests (`make unit`) | `xTaskAbortDelay()` broke lock waits and joins (EBUSY, a panic); Ctrl-C on an app reading stdin panicked the board (`_lock_close` assert); threads were invisible and unsignalled | `testapp sig mutex`/`threadsleep` and the stdin SIGINT case in 35-signals pass; `make unit` green | done |
+| R-P8.1 | A `kind` per process (APP, BUILTIN, DAEMON, KTHREAD) and `espix_proc_spawn_fn()`; only an APP may be force-deleted | The other kinds hold kernel locks by design | a kernel task can be given a pid | todo |
+| R-P8.2 | svc builtin units become DAEMON processes | Removes `espix_svc_stopping()` and the separate UNITS shutdown phase; a deleted unit line stops leaving nfsd untracked | `ps` shows nfsd with a pid | todo |
+| R-P8.3 | Own-stack and background builtins and pipe stages become BUILTIN processes, with pgid/sid and Ctrl-C to the foreground group | Removes `espix_shell_stopping()`; `ping` need not stop at 4 | Ctrl-C ends a pipeline | todo |
+| R-P8.4 | Sessions (console, sshd:conn, vnc0, desktop term) become shell processes | `$$` and a real ppid tree | every app has a ppid | todo |
+| R-P8.5 | Daemons: sshd → per-connection child; desktop drops appwait for SIGCHLD; audio, usb as KTHREADs; svc as pid 1; `/proc/<pid>/{status,task}` | The rest of the ~20 pidless tasks | `ps` shows `-` only for IDF's own tasks | todo |
+| R-P8.6 | S31 spike: a 2-page Sv32 table, `mret` to U-mode, a load, an `ecall`, a page fault back | Answers ASID, A/D bits and TLB cost before R-P3.2/R-P3.3 are committed to | a yes/no with numbers | todo |
 
 ---
 

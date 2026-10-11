@@ -20,7 +20,10 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   jumping there from another task's stack would land in a frame that task does
   not own -- undefined behaviour, and it would corrupt the app's own stack.
   An app that wants its process to end should call `exit()` from the task that
-  entered `app_main()`, which is where a normal `return` goes anyway.
+  entered `app_main()`, which is where a normal `return` goes anyway. The thread
+  leaves as `pthread_exit()` would, so a join on it returns. A signal's default
+  action is never taken on a thread: it waits for the main task's next delivery
+  point.
 
   `atexit()` is still unpublished, so no handler runs on the way out either.
 
@@ -45,8 +48,10 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   because it is bookkeeping, and a spawn must never fail for it.
 
 - **A compute loop never sees a signal.** Delivery happens at the points where
-  an app calls into espix — `sleep`, `usleep`, `nanosleep`, `pause`. A loop that
-  blocks on nothing has no delivery point and will not run a handler, which is
+  an app calls into espix — the sleep family, `pause`, `select` and a read of
+  stdin. A wait on a lock or a join is deliberately not one, so a signal sent
+  then is delivered after it. A loop that blocks on nothing has no delivery
+  point and will not run a handler, which is
   exactly what `espix_sigcheck()` is exported for. `testapp sig spin` is the
   case in the flesh, and `tests/suites/35-signals.sh` covers it. SIGKILL is the answer when it is somebody else's binary.
 
@@ -357,22 +362,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   with no JTAG attached. That is an instrument artefact, not the bug, and it
   cost a run to learn.
 
-- **A killed app's threads are not reaped, and the arena lock is not orphaned.**
-  Two holes found while hunting the above, each real on its own.
-
-  `abi_pthread.c` publishes `pthread_create` so a thread's allocations land in
-  its process's arena, but nothing walks the threads when the process is
-  force-killed: only `slot->info.task` is deleted. A surviving thread keeps
-  running with thread-local storage still naming the slot, allocating from
-  regions that were just released -- and from a slot that may already belong to
-  another process.
-
-  `s_region_lock` is taken with `portMAX_DELAY` on every allocation and on the
+- **A process killed inside an allocation orphans the arena lock.** Found while
+  hunting the above. `s_region_lock` is taken with `portMAX_DELAY` on every allocation and on the
   release path itself, and unlike `tx_lock` and `rx_lock` nothing orphans it,
   so a process killed inside an allocation leaves it recorded against a freed
-  TCB and the next taker walks that memory for priority inheritance. Neither is
-  the writer being hunted above (the instrument for the second one never fired),
-  and both are the same class of bug the ssh locks were fixed for.
+  TCB and the next taker walks that memory for priority inheritance. It is not
+  the writer being hunted above (its instrument never fired), and it is the same
+  class of bug the ssh locks were fixed for.
 
 - **`esp_linenoise_edit()` can free history that is not there.** Its ENTER
   case does `state->history_length--; free(config->history[state->history_length]);`

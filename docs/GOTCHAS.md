@@ -580,12 +580,29 @@ means lwIP's descriptors start *lower*, in the range the VFS was using — not
 that new ones appear on top. Harmless when everything is recompiled together,
 and confusing the moment an fd number is stored or logged.
 
-### The FreeRTOS run-time counter is 32-bit microseconds
+### The FreeRTOS run-time counter is 32-bit microseconds by default
 
 `xPortGetRunTimeCounterValue()` is `(configRUN_TIME_COUNTER_TYPE)
-esp_timer_get_time()`, and the type is 32 bits — so it wraps every **71.6
-minutes**. Anything computing a lifetime CPU share has to be wrap-aware, or it
-reports nonsense once an hour.
+esp_timer_get_time()`, and IDF's default type is 32 bits — so it wraps every
+**71.6 minutes**. espix sets `CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64`.
+
+### `xTaskAbortDelay()` ends any wait, and IDF does not check
+
+It wakes a task from *whatever* it is blocked on, a mutex included, and IDF's
+own waits mostly assume a `portMAX_DELAY` take cannot fail. `_lock_acquire()`
+(every libc and stdio lock) ignores the result and carries on without the
+lock; `sem_wait()` returns 0 without the count; `pthread_mutex_lock()` returns
+EBUSY; `pthread_join()` returns and deletes a thread that is still running.
+Wake a task with a notification on an index of its own instead
+(`ESPIX_NOTIFY_SIG_IDX`).
+
+### Never longjmp out of a stdio callback
+
+A `funopen()` read or write function runs with the `FILE`'s recursive lock
+held. Jumping out of it -- an app's `exit()` reached from a signal check -- leaves
+that lock taken, and the `fclose()` on the way out asserts in `_lock_close`.
+Return a short count instead and act at the next real delivery point
+(`espix_sigcheck_io()`).
 
 ### `TaskHandle_t` is an address, and addresses get reused
 

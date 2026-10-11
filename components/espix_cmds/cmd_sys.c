@@ -403,9 +403,9 @@ static char task_state_char(eTaskState state)
  * other.
  */
 typedef struct {
-    TaskHandle_t handle;
-    UBaseType_t  number;
-    uint32_t     runtime;
+    TaskHandle_t                handle;
+    UBaseType_t                 number;
+    configRUN_TIME_COUNTER_TYPE runtime;
 } ps_sample_t;
 
 static int ps_delta(espix_session_t *s, unsigned secs)
@@ -428,7 +428,7 @@ static int ps_delta(espix_session_t *s, unsigned secs)
     for (UBaseType_t i = 0; i < na; i++) {
         seen[i].handle  = a[i].xHandle;
         seen[i].number  = a[i].xTaskNumber;
-        seen[i].runtime = (uint32_t)a[i].ulRunTimeCounter;
+        seen[i].runtime = a[i].ulRunTimeCounter;
     }
 
     vTaskDelay(pdMS_TO_TICKS(secs * 1000));
@@ -440,8 +440,8 @@ static int ps_delta(espix_session_t *s, unsigned secs)
     espix_printf(s, "%5s %-16s %4s %10s\n", "PID", "NAME", "CORE", "CPU(us)");
 
     for (UBaseType_t i = 0; i < nb; i++) {
-        uint32_t before = 0;
-        bool     known  = false;
+        configRUN_TIME_COUNTER_TYPE before = 0;
+        bool                        known  = false;
 
         for (UBaseType_t k = 0; k < na; k++) {
             if (seen[k].handle == b[i].xHandle &&
@@ -452,9 +452,7 @@ static int ps_delta(espix_session_t *s, unsigned secs)
             }
         }
 
-        /* Unsigned throughout, so a counter that wrapped inside the window
-         * still differences correctly. */
-        const uint32_t used = (uint32_t)b[i].ulRunTimeCounter - before;
+        const uint64_t used = (uint64_t)(b[i].ulRunTimeCounter - before);
 
         const espix_pid_t pid = espix_proc_pid_of_task(b[i].xHandle);
         char pid_str[12];
@@ -475,8 +473,8 @@ static int ps_delta(espix_session_t *s, unsigned secs)
         snprintf(core_str, sizeof(core_str), "-");
 #endif
 
-        espix_printf(s, "%5s %-16s %4s %10u%s\n",
-                     pid_str, b[i].pcTaskName, core_str, (unsigned)used,
+        espix_printf(s, "%5s %-16s %4s %10llu%s\n",
+                     pid_str, b[i].pcTaskName, core_str, (unsigned long long)used,
                      known ? "" : "  (appeared during the window)");
     }
 
@@ -508,13 +506,8 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    /*
-     * The denominator is esp_timer's 64-bit microsecond clock, not
-     * uxTaskGetSystemState()'s total. That total is the same clock truncated
-     * to 32 bits, which wraps every 71.6 minutes -- and once it has wrapped
-     * below a task's own accumulated counter this ratio stays wrong for a long
-     * stretch, not for one reading.
-     */
+    /* The denominator is esp_timer's microsecond clock, the one the run-time
+     * counters count in. */
     const uint64_t    total_runtime = (uint64_t)esp_timer_get_time();
     const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
@@ -547,6 +540,15 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         const espix_pid_t pid = espix_proc_pid_of_task(tasks[i].xHandle);
 
         /*
+         * An app's thread is listed as pstree lists one: its tid in the PID
+         * column, its process's name in braces, and its process as the parent.
+         */
+        espix_pid_t th_pid = ESPIX_PID_NONE, th_tid = ESPIX_PID_NONE;
+        const bool  thread = pid == ESPIX_PID_NONE &&
+                             espix_proc_thread_of_task(tasks[i].xHandle,
+                                                       &th_pid, &th_tid);
+
+        /*
          * The process name, not the FreeRTOS task's. A spawned app's task is
          * "app:testapp" while its process is "testapp", so the live table showed
          * one process under two names, and the finished section printed the
@@ -555,14 +557,20 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
          */
         char        name[ESPIX_PROC_NAME_MAX];
         const char *shown = tasks[i].pcTaskName;
+        char        thread_name[ESPIX_PROC_NAME_MAX + 2];
         if (pid != ESPIX_PID_NONE &&
             espix_proc_name_of(pid, name, sizeof(name))) {
             shown = name;
+        } else if (thread && espix_proc_name_of(th_pid, name, sizeof(name))) {
+            snprintf(thread_name, sizeof(thread_name), "{%s}", name);
+            shown = thread_name;
         }
 
         char pid_str[12];
         if (pid != ESPIX_PID_NONE) {
             snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+        } else if (thread) {
+            snprintf(pid_str, sizeof(pid_str), "%d", (int)th_tid);
         } else {
             snprintf(pid_str, sizeof(pid_str), "-");
         }
@@ -581,17 +589,16 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         /*
          * Cumulative share of run time since boot, not an instantaneous
          * reading — a real `top` needs two samples, and `top` is where they
-         * are.
-         *
-         * Approximate at the top end: the per-task counter is still 32-bit and
-         * wraps after 71.6 minutes of *that task's* CPU, roughly a day for
-         * something 5% busy, and `ps` keeps no history to notice it. The clamp
-         * keeps the impossible out of the column; `top` is the honest reading.
+         * are. A process row also carries its threads that have ended; its
+         * live threads have rows of their own.
          */
+        uint64_t used = (uint64_t)tasks[i].ulRunTimeCounter;
+        if (pid != ESPIX_PID_NONE) {
+            used += espix_proc_cpu_threads_done(pid);
+        }
         unsigned pct = 0;
         if (total_runtime > 0) {
-            const uint64_t share = (uint64_t)tasks[i].ulRunTimeCounter * 100 /
-                                   total_runtime;
+            const uint64_t share = used * 100 / total_runtime;
             pct = (share > 100) ? 100 : (unsigned)share;
         }
 
@@ -639,7 +646,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
         char ppid_str[12];
         const espix_pid_t ppid = (pid != ESPIX_PID_NONE)
                                      ? espix_proc_parent_of(pid)
-                                     : ESPIX_PID_NONE;
+                                     : thread ? th_pid : ESPIX_PID_NONE;
         if (ppid != ESPIX_PID_NONE) {
             snprintf(ppid_str, sizeof(ppid_str), "%d", (int)ppid);
         } else {
@@ -916,20 +923,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
     while (!interrupted && (frames == 0 || drawn < frames)) {
         const UBaseType_t count = uxTaskGetSystemState(tasks, capacity, NULL);
 
-        /*
-         * The window comes from esp_timer rather than from
-         * uxTaskGetSystemState()'s total, and the reason is that the total is
-         * the same clock already thrown away:
-         *
-         *     configRUN_TIME_COUNTER_TYPE xPortGetRunTimeCounterValue(void)
-         *     { return (configRUN_TIME_COUNTER_TYPE) esp_timer_get_time(); }
-         *
-         * With a 32-bit counter that truncation wraps every 71.6 minutes of
-         * uptime, and `total - prev_total` then underflowed to something
-         * enormous, so one frame an hour reported every task at 0%. Reading
-         * the 64-bit clock ourselves costs one call and cannot wrap in any
-         * uptime this hardware will see.
-         */
+        /* The window, from the clock the run-time counters count. */
         const int64_t  now_us = esp_timer_get_time();
         const uint64_t window = have_prev && now_us > prev_us
                                     ? (uint64_t)(now_us - prev_us) : 0;
@@ -954,7 +948,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
              * ~390ms on its key exchange, disconnects, its control block is
              * freed, the next connection is handed the same address, and the
              * new task's counter of ~0 minus the dead one's 390000 wrapped in
-             * unsigned 32-bit arithmetic to nearly 2^32. Sorted by CPU, it took
+             * unsigned arithmetic to nearly 2^32. Sorted by CPU, it took
              * first place in the table. A comment here used to guess the cost
              * at "one wrong reading"; this is what it measured.
              */
@@ -964,19 +958,8 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
                     continue;
                 }
 
-                const configRUN_TIME_COUNTER_TYPE now = tasks[i].ulRunTimeCounter;
-                const configRUN_TIME_COUNTER_TYPE was = prev[j].runtime;
-
-                /*
-                 * Per-task counters are 32-bit microseconds, so one wraps after
-                 * 71.6 minutes of that task's *own* CPU -- about a day for
-                 * something 5% busy. Now that the entry is known to belong to
-                 * the same task, `now < was` can only mean exactly one wrap,
-                 * and the delta across it is recoverable.
-                 */
-                const uint64_t used = (now < was)
-                                          ? (uint64_t)(UINT32_MAX - was) + now + 1
-                                          : (uint64_t)(now - was);
+                const uint64_t used =
+                    (uint64_t)(tasks[i].ulRunTimeCounter - prev[j].runtime);
 
                 unsigned pct = (unsigned)(used * 100 / window);
 
@@ -1045,9 +1028,20 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             const TaskStatus_t *t   = rows[i].task;
             const espix_pid_t   pid = espix_proc_pid_of_task(t->xHandle);
 
+            /* An app's thread as ps shows it: tid, and {process}. */
+            espix_pid_t th_pid = ESPIX_PID_NONE, th_tid = ESPIX_PID_NONE;
+            char        name[ESPIX_PROC_NAME_MAX];
+            char        thread_name[ESPIX_PROC_NAME_MAX + 2];
+            const char *shown = t->pcTaskName;
+
             char pid_str[12];
             if (pid != ESPIX_PID_NONE) {
                 snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+            } else if (espix_proc_thread_of_task(t->xHandle, &th_pid, &th_tid) &&
+                       espix_proc_name_of(th_pid, name, sizeof(name))) {
+                snprintf(pid_str, sizeof(pid_str), "%d", (int)th_tid);
+                snprintf(thread_name, sizeof(thread_name), "{%s}", name);
+                shown = thread_name;
             } else {
                 snprintf(pid_str, sizeof(pid_str), "-");
             }
@@ -1074,7 +1068,7 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             }
 
             espix_printf(s, "%5s %-16s %2c %4u %4s %6u %5s\n",
-                         pid_str, t->pcTaskName,
+                         pid_str, shown,
                          task_state_char(t->eCurrentState),
                          (unsigned)t->uxCurrentPriority,
                          core_str,

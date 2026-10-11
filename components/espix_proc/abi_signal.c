@@ -65,19 +65,23 @@
 
 #define TAG "abi"
 
-/* Below this, a sleep is shorter than the interruption is worth: one tick is
- * 10ms at CONFIG_FREERTOS_HZ=100, and IDF's usleep busy-waits under a tick
+/* Below this, a sleep is shorter than the interruption is worth: a few ticks
+ * at CONFIG_FREERTOS_HZ, and IDF's usleep busy-waits under a tick
  * rather than yielding, which is behaviour worth keeping rather than
  * reimplementing. */
 #define SHORT_SLEEP_US 20000
 
 static TickType_t ticks_from_us(uint64_t us)
 {
-    const uint64_t t = (us * configTICK_RATE_HZ) / 1000000ULL;
+    return (TickType_t)espix_ticks_from_us(us, configTICK_RATE_HZ, portMAX_DELAY);
+}
 
-    /* Saturate rather than wrap: sleep(UINT_MAX) is silly but must not become
-     * a short nap. portMAX_DELAY itself means "forever" to vTaskDelay. */
-    return (t >= (uint64_t)portMAX_DELAY) ? (portMAX_DELAY - 1) : (TickType_t)t;
+/* Block until `ticks` pass or a signal is sent. Never ends any other wait: see
+ * ESPIX_NOTIFY_SIG_IDX. A token left from a signal already delivered just ends
+ * one wait early, and every caller loops on its own deadline. */
+static void sig_wait(TickType_t ticks)
+{
+    (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE, ticks);
 }
 
 /* ------------------------------------------------------------------ handlers */
@@ -279,12 +283,10 @@ static int espix_abi_sigpending(sigset_t *set)
 /*
  * The point of interposing these.
  *
- * espix_proc_signal() calls xTaskAbortDelay() on the target, which cuts a
- * vTaskDelay() short. Without that a process sitting in sleep(60) would not
- * reach a delivery point for a minute -- long past the grace period, so it
- * would be deleted mid-sleep with its handler never run and its cleanup never
- * done. Waking it is what makes a handler useful to an app that sleeps, which
- * is most of them.
+ * espix_proc_signal() notifies the target on ESPIX_NOTIFY_SIG_IDX, and these
+ * wait on it. Without that a process sitting in sleep(60) would not reach a
+ * delivery point for a minute -- long past the grace period, so it would be
+ * deleted mid-sleep with its handler never run and its cleanup never done.
  *
  * The return values follow POSIX: sleep() reports the seconds it did not sleep,
  * nanosleep() fails with EINTR and fills in the remainder. An app whose handler
@@ -303,16 +305,14 @@ static unsigned espix_abi_sleep(unsigned seconds)
             if (left <= 0) {
                 return 0;
             }
-            /* Round up: POSIX wants whole seconds, and reporting 0 from an
-             * interrupted sleep would look like it ran to completion. */
-            return (unsigned)((pdTICKS_TO_MS((TickType_t)left) + 999) / 1000);
+            return espix_sleep_secs_left(pdTICKS_TO_MS((TickType_t)left));
         }
 
         const int32_t left = (int32_t)(deadline - xTaskGetTickCount());
         if (left <= 0) {
             return 0;
         }
-        vTaskDelay((TickType_t)left);
+        sig_wait((TickType_t)left);
     }
 }
 
@@ -335,7 +335,7 @@ static int espix_abi_usleep(useconds_t usec)
         if (left <= 0) {
             return 0;
         }
-        vTaskDelay((TickType_t)left);
+        sig_wait((TickType_t)left);
     }
 }
 
@@ -390,7 +390,7 @@ static int espix_abi_nanosleep(const struct timespec *req, struct timespec *rem)
             }
             return 0;
         }
-        vTaskDelay((TickType_t)left);
+        sig_wait((TickType_t)left);
     }
 }
 
@@ -402,11 +402,22 @@ static int espix_abi_pause(void)
             return -1;         /* pause() has no success case */
         }
 
-        /* Woken by xTaskAbortDelay() when a signal arrives. portMAX_DELAY - 1
-         * is roughly 497 days at a 100Hz tick, so the loop is the mechanism and
-         * not a timeout. */
-        vTaskDelay(portMAX_DELAY - 1);
+        sig_wait(portMAX_DELAY);
     }
+}
+
+/*
+ * An app's raw vTaskDelay(), which Arduino's delay() and Doom both use. Not a
+ * delivery point -- no handler runs here -- but a signal ends it early, so the
+ * app reaches its next check now rather than when the delay runs out.
+ */
+static void espix_abi_vTaskDelay(TickType_t ticks)
+{
+    if (ticks == 0 || espix_proc_self() == NULL) {
+        vTaskDelay(ticks);
+        return;
+    }
+    sig_wait(ticks);
 }
 
 /* --------------------------------------------------------------- the overrides */
@@ -583,6 +594,7 @@ static const abi_sym_t s_signal_syms[] = {
     ABI_SYM("usleep",      espix_abi_usleep),
     ABI_SYM("nanosleep",   espix_abi_nanosleep),
     ABI_SYM("pause",       espix_abi_pause),
+    ABI_SYM("vTaskDelay",  espix_abi_vTaskDelay),
 
     /* For an app that blocks on nothing and would otherwise never be reachable.
      * espix_app_stopping() is published by abi_cxx.cpp and is the older, simpler

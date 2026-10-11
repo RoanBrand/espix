@@ -13,6 +13,7 @@
 #include "multi_heap.h"   /* the private heap an app's arena is carved into */
 
 #include "espix_proc.h"
+#include "espix_sigset.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,20 @@ extern "C" {
  */
 #if CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS <= ESPIX_TLS_PROC_IDX
 #error "CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS must be greater than ESPIX_TLS_PROC_IDX (the proc TLS slot). Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
+#endif
+
+/*
+ * The task-notification index a process waits on for signals, and the only one
+ * a signal ever touches. Index 0 belongs to stream buffers, pthread_join and
+ * espix's own hand-offs; a signal that woke those waits -- xTaskAbortDelay did --
+ * let a task carry on without the lock or the join it was waiting for. A wait
+ * on this index is woken only by a notify on it, so a signal ends exactly the
+ * waits that are waiting for one, and a notify sent first is remembered.
+ */
+#define ESPIX_NOTIFY_SIG_IDX 1
+
+#if CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES <= ESPIX_NOTIFY_SIG_IDX
+#error "CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES must be greater than ESPIX_NOTIFY_SIG_IDX. Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
 #endif
 
 /*
@@ -338,24 +353,11 @@ typedef struct {
     /* The terminal state espix_proc_finish() should be given when the reaper
      * runs it, set with reaping. The exit code travels in exit_status. */
     espix_proc_state_t term_state;
+
+    /* Run time of this process's threads that have already ended, so `ps`
+     * charges a process for all of its CPU and not just its live tasks'. */
+    uint64_t           cpu_threads_done;
 } espix_proc_slot_t;
-
-/* Bit for `sig`, or 0 if it is not a signal. Not sigaddset(): that macro is
- * `1 << sig` on a signed int, and SIGUSR2 is 31. */
-static inline uint32_t espix_sigbit(int sig)
-{
-    return (sig > 0 && sig < NSIG) ? ((uint32_t)1u << sig) : 0u;
-}
-
-/* Signals that cannot be caught, blocked or ignored, as POSIX requires. */
-#define ESPIX_SIG_UNCATCHABLE (espix_sigbit(SIGKILL) | espix_sigbit(SIGSTOP))
-
-/*
- * Not a signal: bit 0, which no signal uses because they start at 1. Set in the
- * mask espix_sigcheck_mask() returns to mean "this process has been asked to
- * terminate", so one call answers both questions a blocking call needs to ask.
- */
-#define ESPIX_SIG_STOPPING ((uint32_t)1u << 0)
 
 /*
  * The delivery point, reporting what it delivered.
@@ -367,6 +369,9 @@ static inline uint32_t espix_sigbit(int sig)
  * act -- the sleep would resume and the flag go unread until it expired.
  */
 uint32_t espix_sigcheck_mask(void);
+
+/* A pending signal that would terminate the process now, or 0. */
+int espix_proc_termsig(const espix_proc_slot_t *slot);
 
 /*
  * Begin enforcing the calling process's root. Called once by proc_task(), after
@@ -445,6 +450,20 @@ void espix_proc_release_resources(espix_proc_slot_t *slot);
 /* End any thread this process still has running. See abi_pthread.c: a thread
  * outliving its process is the one resource the reaper used to leave behind. */
 void espix_pthread_reap(espix_proc_slot_t *slot);
+
+/* If the caller is an app's thread, end it as pthread_exit() would; otherwise
+ * return. For exit() reached on a thread. */
+void espix_pthread_exit_self(void);
+
+/* Notify every thread of `slot` on ESPIX_NOTIFY_SIG_IDX. Caller must hold the
+ * lock, which is what keeps each registered thread alive while it is notified. */
+void espix_pthread_wake_locked(espix_proc_slot_t *slot);
+
+/* Copy out `slot`'s threads as tid and task, at most `max`. Caller must hold the
+ * lock. */
+size_t espix_pthread_list_locked(const espix_proc_slot_t *slot,
+                                 espix_pid_t *tids, TaskHandle_t *tasks,
+                                 size_t max);
 
 /* Give back every PSRAM region the process's arena holds. Called from
  * espix_proc_release_resources() above; takes the slot rather than using

@@ -66,6 +66,10 @@ struct espix_term {
     int    row, col;
     QueueHandle_t keys;         /* chars from the input callback */
     volatile bool quit;
+    /* A process has the terminal open as stdin, so the keys are its; and a
+     * Ctrl-C it read, which is the shell's to act on rather than data. */
+    volatile int  stdin_readers;
+    volatile bool intr;
     int    esc;                 /* 0 outside an escape, 1 after ESC, 2 inside CSI */
 
     uint16_t params[4];
@@ -567,28 +571,49 @@ static int term_stream_read(void *cookie, char *buf, int len)
     espix_term_t *t = term_of((espix_session_t *)cookie);
 
     /*
-     * Blocks only until there is something, then takes whatever else is already
+     * Blocks until there is something, then takes whatever else is already
      * queued: waiting for a full request would leave an interactive reader
-     * stuck behind a buffer that will not fill.
+     * stuck behind a buffer that will not fill. End of input only when the
+     * viewer has gone or the process is asked to stop -- an idle keyboard is
+     * not EOF.
      */
     int n = 0;
     while (n < len) {
         char ch;
         if (xQueueReceive(t->keys, &ch,
                           n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
-            break;
+            if (n > 0 || t->quit || espix_shell_sigcheck()) {
+                break;
+            }
+            continue;
         }
-        buf[n++] = ch;
+        /* ISIG: Ctrl-C is an interrupt for term_poll_interrupt(), not input,
+         * as SSH's transport treats it. */
+        if (ch == 0x03) {
+            t->intr = true;
+            continue;
+        }
+        /* ICRNL, as term_edit_read() does: Enter arrives as CR. */
+        buf[n++] = (ch == '\r') ? '\n' : ch;
     }
     return n;
+}
+
+static int term_stream_close(void *cookie)
+{
+    espix_term_t *t = term_of((espix_session_t *)cookie);
+
+    __atomic_fetch_sub(&t->stdin_readers, 1, __ATOMIC_RELAXED);
+    return 0;
 }
 
 static FILE *term_open_stream(espix_session_t *s, espix_stream_t which)
 {
     if (which == ESPIX_STREAM_IN) {
-        FILE *f = funopen(s, term_stream_read, NULL, NULL, NULL);
+        FILE *f = funopen(s, term_stream_read, NULL, NULL, term_stream_close);
         if (f != NULL) {
             setvbuf(f, NULL, _IOFBF, 512);
+            __atomic_fetch_add(&term_of(s)->stdin_readers, 1, __ATOMIC_RELAXED);
         }
         return f;
     }
@@ -722,10 +747,13 @@ static bool term_poll_interrupt(espix_session_t *s)
         return true;
     }
 
-    bool interrupted = false;
+    bool interrupted = t->intr;
+    t->intr = false;
     char ch;
 
-    while (xQueueReceive(t->keys, &ch, 0) == pdTRUE) {
+    /* A process reading stdin owns the keys; draining them here would steal
+     * its input. It passes a Ctrl-C on through t->intr instead. */
+    while (t->stdin_readers == 0 && xQueueReceive(t->keys, &ch, 0) == pdTRUE) {
         if (ch == 0x03) {
             interrupted = true;
         } else {

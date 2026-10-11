@@ -262,3 +262,67 @@ if [ -n "$sel_ms" ] && [ "$sel_ms" -lt 5000 ]; then
 else
     espix_fail "and it returned at the alarm" "got: $sel_out"
 fi
+
+# A signal ends only a wait that is waiting for one. A lock wait and a join are
+# not: before notify index 1, a signal woke them anyway, so IDF's
+# pthread_mutex_lock returned EBUSY without the lock (rc=16, measured), and
+# pthread_join deleted a thread that was still running -- a panic.
+assert_contains "a signal does not break a lock wait" "mutex rc=0" \
+    "$(dev_run "$APP sig mutex")"
+ts_out=$(dev_run "$APP sig threadsleep")
+assert_contains "a signal reaches a thread asleep in sleep()" "handler ran" "$ts_out"
+assert_contains "and cuts its sleep short, while the join waits" "4 left" "$ts_out"
+
+# An app's thread is listed under its process: tid in the PID column, the
+# process's name in braces, the process as its parent.
+pid=$(bg_start mutex)
+if [ -n "$pid" ]; then
+    rows=$(ps_running | awk -v p="$pid" '$2 == "{testapp}" && $8 == p')
+    if [ -n "$rows" ]; then
+        espix_pass "ps lists the app's thread under its process"
+    else
+        espix_fail "ps lists the app's thread under its process" "$(ps_running)"
+    fi
+
+    # Killed while its thread retries an interrupted usleep() in a loop. That
+    # thread once took the table lock on every pass, and ps stopped answering.
+    dev_run "kill $pid" >/dev/null
+    assert_contains "ps still answers while it is being killed" "PID" \
+        "$(dev_run 'ps')"
+    if wait_gone "$pid"; then
+        espix_pass "and it goes"
+    else
+        espix_fail "and it goes" "still running: $(ps_running)"
+    fi
+else
+    espix_fail "backgrounding sig mutex reports its pid" "no [pid] line"
+fi
+
+# A signal that would end a process blocked reading stdin. The read's signal
+# check runs inside fgets(), with the FILE's lock held, and the default action
+# used to be a longjmp out of it: the exit path's fclose() then asserted on the
+# held lock, and the board went down. Ctrl-C did that to any app waiting for
+# input. The signal now ends the read as EOF and the app exits with 128+sig.
+( sleep 15 | _dev_ssh_once "$APP cat" >/dev/null 2>&1 ) &
+reader=$!
+pid=""
+for i in 1 2 3 4 5 6; do
+    sleep 1
+    pid=$(ps_running | awk '$2 == "testapp" {print $1}' | tail -1)
+    [ -n "$pid" ] && break
+done
+if [ -n "$pid" ]; then
+    dev_run "kill -INT $pid" >/dev/null
+    if wait_gone "$pid"; then
+        espix_pass "SIGINT ends an app blocked reading stdin"
+    else
+        espix_fail "SIGINT ends an app blocked reading stdin" "$(ps_running)"
+    fi
+    assert_eq "and the board stayed up" "ok" "$(dev_run 'echo ok')"
+    assert_eq "and it exited as SIGINT does" "exit 130" \
+        "$(dev_run 'ps' | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p {print $3, $4}')"
+else
+    espix_fail "an app reading stdin over its own connection starts" "$(ps_running)"
+fi
+kill "$reader" 2>/dev/null
+wait "$reader" 2>/dev/null

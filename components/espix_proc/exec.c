@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/reent.h>      /* _REENT and the stdio a force-kill has to put back */
 
 #include "freertos/FreeRTOS.h"
@@ -335,6 +337,42 @@ static void relocate_task(void *arg)
 }
 
 /*
+ * An app's stdin on the serial console. The global stream blocks in the UART
+ * driver with portMAX_DELAY, holding the driver's read lock and the FILE's, so
+ * nothing could get a process out of it but deletion -- and deleted there, it
+ * leaves both locks held by a dead task. Waiting in select() instead holds
+ * neither, and gives a signal somewhere to land.
+ */
+#define CONSOLE_STDIN_POLL_MS 50
+
+static int console_stdin_read(void *cookie, char *buf, int len)
+{
+    const int fd = (int)(intptr_t)cookie;
+
+    for (;;) {
+        fd_set         rfds;
+        struct timeval tv = { .tv_sec = 0,
+                              .tv_usec = CONSOLE_STDIN_POLL_MS * 1000 };
+
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        const int ready = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (ready > 0) {
+            const ssize_t n = read(fd, buf, (size_t)len);
+            return (n < 0) ? -1 : (int)n;
+        }
+        if (ready < 0 && errno != EINTR) {
+            return -1;
+        }
+        /* No EINTR through fgets(), so a signal ends the read as EOF would. */
+        if (espix_sigcheck_io()) {
+            return 0;
+        }
+    }
+}
+
+/*
  * End the calling process, the way returning from its entry point would.
  *
  * Called by the exit()/_Exit()/_exit()/abort()/__assert_func overrides an app
@@ -372,10 +410,15 @@ void espix_proc_exit(int status)
      * rather than a slower correct answer. Recorded in docs/KNOWN-ISSUES.md: an
      * app that wants its process to end should exit from the task that entered
      * app_main().
+     *
+     * An app's thread leaves as pthread_exit() would, so it is out of the
+     * process's books and a join on it returns. Deleting it bare left an entry
+     * naming a freed task, which the process's own end then deleted again.
      */
     espix_klog(ESPIX_KLOG_WARN, TAG,
                "exit(%d) from a task that is not the process's own; "
                "ending that task only", status);
+    espix_pthread_exit_self();
     vTaskDelete(NULL);
 
     /* Deleting the calling task does not return; this is for the compiler, which
@@ -513,6 +556,15 @@ static void proc_task(void *arg)
         }
 
         FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
+        if (in != NULL) {
+            stdin  = in;
+            own_in = true;
+        }
+    } else if (session != NULL) {
+        /* The console: output stays on the UART, but stdin is read in short
+         * waits, so a signal ends a read. */
+        FILE *const in = funopen((void *)(intptr_t)fileno(stdin),
+                                 console_stdin_read, NULL, NULL, NULL);
         if (in != NULL) {
             stdin  = in;
             own_in = true;
@@ -664,6 +716,13 @@ static void proc_task(void *arg)
 
     if (setjmp(exit_jb) == 0) {
         status = slot->elf.entry(slot->argc, slot->argv);
+
+        /* Returned with a terminating signal still pending -- one that ended a
+         * read as EOF rather than jump out of it. It is what ended the app. */
+        const int sig = espix_proc_termsig(slot);
+        if (sig != 0) {
+            status = 128 + sig;
+        }
     } else {
         status = slot->exit_status;
     }

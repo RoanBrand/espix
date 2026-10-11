@@ -1313,19 +1313,36 @@ typedef struct {
     FILE                *wr;
     FILE                *rd;
     volatile bool        wr_closed;
+    volatile bool        rd_closed;     /* the reader's command has returned */
 } pipe_t;
 
+/* Waits are bounded so both ends can notice the other has gone, or that the
+ * command was asked to stop. */
+#define PIPE_WAIT_MS 100
+
+static bool pipe_stopping(void)
+{
+    return espix_shell_stopping(espix_shell_current());
+}
+
+/*
+ * A full pipe whose reader has finished will never drain: `cat big | head -1`
+ * left cat blocked here for good, and the line waiting on it with it. So the
+ * write fails instead, which is what SIGPIPE/EPIPE would make of it.
+ */
 static int pipe_write(void *cookie, const char *buf, int len)
 {
     pipe_t *p    = cookie;
     int     sent = 0;
 
     while (sent < len) {
-        const size_t n = xStreamBufferSend(p->sb, buf + sent,
-                                           (size_t)(len - sent), portMAX_DELAY);
-        if (n == 0) {
-            break;
+        if (p->rd_closed || pipe_stopping()) {
+            errno = EPIPE;
+            return -1;
         }
+        const size_t n = xStreamBufferSend(p->sb, buf + sent,
+                                           (size_t)(len - sent),
+                                           pdMS_TO_TICKS(PIPE_WAIT_MS));
         sent += (int)n;
     }
     return sent;
@@ -1337,12 +1354,12 @@ static int pipe_read(void *cookie, char *buf, int len)
 
     for (;;) {
         const size_t n = xStreamBufferReceive(p->sb, buf, (size_t)len,
-                                              pdMS_TO_TICKS(100));
+                                              pdMS_TO_TICKS(PIPE_WAIT_MS));
         if (n > 0) {
             return (int)n;
         }
         /* Empty: the writer is slow, or it has finished. */
-        if (p->wr_closed) {
+        if (p->wr_closed || pipe_stopping()) {
             return 0;
         }
     }
@@ -1356,6 +1373,7 @@ typedef struct {
     const char       *line;     /* into the caller's buffer, alive to the end */
     FILE             *out;      /* this stage's end, closed from the task */
     pipe_t           *pipe;
+    pipe_t           *in_pipe;  /* the pipe it reads, or NULL for the first */
     TaskHandle_t      task;
     SemaphoreHandle_t done;
 } pipe_stage_t;
@@ -1366,6 +1384,12 @@ static void pipe_stage_task(void *arg)
 
     espix_shell_set_current(&st->s);
     (void)exec_one(&st->s, st->line);
+
+    /* This stage read the pipe before it; that pipe's writer must not wait on
+     * a reader that is gone. */
+    if (st->in_pipe != NULL) {
+        st->in_pipe->rd_closed = true;
+    }
 
     /*
      * Flush and close the write end here, so the reader sees EOF as soon as
@@ -1519,6 +1543,7 @@ static int run_pipeline(espix_session_t *s, char *line)
         st[i]->line          = stage[i];
         st[i]->out           = pipes[i].wr;
         st[i]->pipe          = &pipes[i];
+        st[i]->in_pipe       = (i > 0) ? &pipes[i - 1] : NULL;
 
         if (st[i]->done == NULL ||
             xTaskCreateWithCaps(pipe_stage_task, "sh:pipe", PIPE_STAGE_STACK,
@@ -1538,6 +1563,7 @@ static int run_pipeline(espix_session_t *s, char *line)
         s->redirect_in = pipes[n - 2].rd;
         status = exec_one(s, stage[n - 1]);
         s->redirect_in = saved;
+        pipes[n - 2].rd_closed = true;
     } else {
         /* Out of memory for a task or a semaphore. The producers already
          * started are blocked on pipes nothing will drain, so deleting them is
@@ -1720,6 +1746,18 @@ int espix_shell_run_line(espix_session_t *s, const char *line)
 
 /* See espix_shell_set_session_end_hook(). */
 static size_t (*s_end_hook)(const espix_session_t *s);
+
+static bool (*s_sigcheck_hook)(void);
+
+void espix_shell_set_sigcheck_hook(bool (*fn)(void))
+{
+    s_sigcheck_hook = fn;
+}
+
+bool espix_shell_sigcheck(void)
+{
+    return s_sigcheck_hook != NULL && s_sigcheck_hook();
+}
 
 void espix_shell_set_session_end_hook(size_t (*fn)(const espix_session_t *s))
 {
