@@ -192,6 +192,24 @@ static int cmd_bt(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "  Name:   %s\n", d.name[0] ? d.name : "(unknown)");
         espix_printf(s, "  Bonded: %s\n", d.bonded ? "yes" : "no");
         espix_printf(s, "  A2DP:   %s\n", d.connected ? "connected" : "no");
+        if (d.connected) {
+            /*
+             * Only a live ACL has a signal to report, and this controller
+             * answers the standard golden-range delta rather than the vendor
+             * commands that would give real dBm (it returns zero for those
+             * without complaining, which is worse than refusing).
+             */
+            int v = 0;
+            if (espix_bt_rssi(d.bda, &v) == ESP_OK) {
+                espix_printf(s, "  Signal: %d dBm (%s)\n", v,
+                             v >= -60 ? "strong" : v >= -75 ? "fair" : "weak");
+            } else if (espix_bt_rssi_delta(d.bda, &v) == ESP_OK) {
+                espix_printf(s, "  Signal: %+d vs the golden range (%s)\n", v,
+                             v >= 0 ? "at or above it" : "below it");
+            } else {
+                espix_printf(s, "  Signal: (the controller would not say)\n");
+            }
+        }
         return 0;
     }
 

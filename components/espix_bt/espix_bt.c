@@ -35,6 +35,9 @@
 #if CONFIG_ESP_COEX_ENABLED
 #include "esp_coexist.h"
 #endif
+#if CONFIG_ESP_WIFI_ENABLED
+#include "esp_wifi.h"
+#endif
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
@@ -56,6 +59,67 @@ static StaticStreamBuffer_t s_pcm_cb;     /* its control block (internal RAM) */
 static uint8_t             *s_pcm_storage;/* its storage (PSRAM) */
 static bool                 s_a2d_connected;
 static uint8_t              s_connected_bda[ESPIX_BDA_LEN];
+
+/*
+ * While a sink is connected, Wi-Fi is told to sleep as deeply as it can.
+ *
+ * The antenna is shared, and that is the whole problem: with Wi-Fi associated,
+ * an SBC stream arrives as bursts with gaps, and disconnecting Wi-Fi makes it
+ * continuous -- measured by ear, repeatedly, with the link otherwise healthy
+ * (realtime drain, good signal, valid config). Asking the arbiter to prefer
+ * Bluetooth is not enough on its own; a Wi-Fi radio that is awake by default
+ * keeps taking its turn regardless. Preference is still set, because the two
+ * do different jobs: one wins the arbitration, this one removes the demand.
+ *
+ * The user's own setting is saved and put back on disconnect: this is a trade,
+ * and they should get it back when they are not playing audio.
+ */
+#if CONFIG_ESP_WIFI_ENABLED
+static wifi_ps_type_t s_wifi_ps_saved;
+static bool           s_wifi_ps_saved_ok;
+
+static void wifi_yield_to_bt(void)
+{
+    wifi_ps_type_t cur;
+    if (esp_wifi_get_ps(&cur) == ESP_OK) {
+        s_wifi_ps_saved    = cur;
+        s_wifi_ps_saved_ok = true;
+    }
+    (void)esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+}
+
+static void wifi_yield_restore(void)
+{
+    if (s_wifi_ps_saved_ok) {
+        (void)esp_wifi_set_ps(s_wifi_ps_saved);
+        s_wifi_ps_saved_ok = false;
+    }
+}
+#else
+static void wifi_yield_to_bt(void)  { }
+static void wifi_yield_restore(void) { }
+#endif
+
+/* The link's own report of how loudly it hears a sink, filled from GAP. */
+static volatile bool s_rssi_got;
+static int8_t        s_rssi_value;
+static uint8_t       s_rssi_stat;
+
+/* Both requests answer on the GAP callback; wait for whichever was asked. */
+static esp_err_t rssi_wait(int8_t *out)
+{
+    for (int i = 0; i < 100 && !s_rssi_got; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!s_rssi_got) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_rssi_stat != ESP_BT_STATUS_SUCCESS) {
+        return ESP_ERR_NOT_SUPPORTED;       /* the controller would not answer */
+    }
+    *out = s_rssi_value;
+    return ESP_OK;
+}
 
 /*
  * What was connected when the stack last went down, so `power on` can bring it
@@ -169,6 +233,16 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         dev_upsert((const uint8_t *)param->disc_res.bda, name);
         break;
     }
+    case ESP_BT_GAP_READ_ACL_REAL_RSSI_EVT:
+        s_rssi_value = param->read_acl_real_rssi.rssi;
+        s_rssi_stat  = param->read_acl_real_rssi.stat;
+        s_rssi_got   = true;
+        break;
+    case ESP_BT_GAP_READ_RSSI_DELTA_EVT:
+        s_rssi_value = param->read_rssi_delta.rssi_delta;
+        s_rssi_stat  = param->read_rssi_delta.stat;
+        s_rssi_got   = true;
+        break;
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
         s_scanning = (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED);
         espix_klog(ESPIX_KLOG_INFO, TAG, "discovery %s",
@@ -339,6 +413,13 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
         s_drain_mark_us = now;
     } else if (now - s_drain_mark_us >= 1000000) {
         /*
+         * Normalised, and it was not: the counters were printed raw as if the
+         * window were exactly one second, so any longer window understated the
+         * rate -- which is how a healthy link can read as a starving one. The
+         * consumer's real rate is the only number worth trusting here.
+         */
+        const uint32_t ms = (uint32_t)((now - s_drain_mark_us) / 1000);
+        /*
          * DEBUG, not INFO. The comment said so while the call said INFO, which is
          * why this spammed the console once a second: klog's ring is asynchronous
          * but its console echo is not, and this line has no business on the
@@ -347,7 +428,8 @@ static int32_t a2d_data_cb(uint8_t *data, int32_t len)
          */
         espix_klog(ESPIX_KLOG_DEBUG, TAG,
                    "drain %u B/s, %u calls/s, ring %u B, short %u calls/%u B",
-                   (unsigned)s_drain_bytes, (unsigned)s_drain_calls,
+                   ms ? (unsigned)((uint64_t)s_drain_bytes * 1000 / ms) : 0,
+                   ms ? (unsigned)((uint64_t)s_drain_calls * 1000 / ms) : 0,
                    (unsigned)xStreamBufferBytesAvailable(s_pcm),
                    (unsigned)s_short_calls, (unsigned)s_short_bytes);
         s_drain_bytes = 0;
@@ -646,12 +728,14 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
              * back when nothing is playing.
              */
             (void)esp_coex_preference_set(ESP_COEX_PREFER_BT);
+            wifi_yield_to_bt();
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp connected; checking source");
             (void)esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_a2d_connected = false;
             s_streaming     = false;
             (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+            wifi_yield_restore();
             espix_klog(ESPIX_KLOG_INFO, TAG, "a2dp disconnected");
             if (s_want_connect && s_retry != NULL) {
                 (void)esp_timer_start_once(s_retry, 2 * 1000 * 1000);
@@ -929,6 +1013,65 @@ size_t espix_bt_devices(espix_bt_dev_t *out, size_t n)
     return count;
 }
 
+/*
+ * How loudly the link hears the far end, in dBm.
+ *
+ * This is the number that answers "is it the distance?": a marginal ACL is a
+ * link that cannot hold realtime, and that shows up on the audio side as a
+ * drain rate under 176400 B/s -- the sink is handed less than it needs and
+ * plays nothing. Only a live connection answers; a bonded but idle device has
+ * no ACL to measure.
+ */
+esp_err_t espix_bt_rssi(const uint8_t bda[ESPIX_BDA_LEN], int *dbm)
+{
+    if (!s_inited || dbm == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_rssi_got = false;
+    /*
+     * The real dBm first -- it is the useful number -- but it needs a
+     * controller that answers Espressif's vendor HCI, and this one returns
+     * zero without complaint. The golden-range delta is standard and always
+     * answers, so it is the fallback rather than an afterthought.
+     */
+    esp_err_t err = esp_bt_gap_read_acl_real_rssi((uint8_t *)bda);
+    if (err == ESP_OK) {
+        int8_t v = 0;
+        err = rssi_wait(&v);
+        if (err == ESP_OK && v != 0) {
+            *dbm = v;
+            return ESP_OK;
+        }
+    }
+
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+/*
+ * The standard fallback, and it is a different unit: the delta between the RSSI
+ * and the "golden receive power range", where 0 means inside it, positive means
+ * stronger than it and negative weaker. It is not dBm and is not dressed up as
+ * any, because a caller that acted on a fabricated dBm would be worse off than
+ * one told plainly what it has.
+ */
+esp_err_t espix_bt_rssi_delta(const uint8_t bda[ESPIX_BDA_LEN], int *delta)
+{
+    if (!s_inited || delta == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_rssi_got = false;
+    const esp_err_t err = esp_bt_gap_read_rssi_delta((uint8_t *)bda);
+    if (err != ESP_OK) {
+        return err;
+    }
+    int8_t d = 0;
+    if (rssi_wait(&d) != ESP_OK) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    *delta = d;
+    return ESP_OK;
+}
+
 esp_err_t espix_bt_info(const uint8_t bda[ESPIX_BDA_LEN], espix_bt_dev_t *out)
 {
     if (s_inited) {
@@ -1080,6 +1223,43 @@ static int a2dp_get_volume(void)
     return v < 0 ? -1 : (v * 100 + 63) / 127;
 }
 
+/*
+ * Wait for the link to take everything it has been handed.
+ *
+ * The PCM ring is the only thing between the writer and the air, so an empty
+ * one means the sink has it all. Bounded, because a link that has gone away
+ * must not wedge the caller -- and the caller is closing a stream, which has to
+ * finish.
+ */
+static void a2dp_drain(void)
+{
+    if (s_pcm == NULL) {
+        return;
+    }
+    bool emptied = false;
+    for (int i = 0; i < 500; i++) {             /* up to ~5 s */
+        if (xStreamBufferIsEmpty(s_pcm)) {
+            emptied = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!emptied) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "drain: the link did not take it all");
+    }
+
+    /*
+     * That was handoff, not playout. Every frame the callback has taken is
+     * still in Bluedroid's transmit queue and the controller's ACL buffers --
+     * bounded at 27 frames, but with the link's own latency on top -- and
+     * suspending flushes all of it. Cutting a waveform off mid-cycle is a step,
+     * and a step is the pop at the end of every short sound. A margin covers
+     * what we cannot see; it costs a quarter second at the end of a stream and
+     * nothing while audio is playing.
+     */
+    vTaskDelay(pdMS_TO_TICKS(250));
+}
+
 static const espix_audio_sink_ops_t s_a2dp_sink = {
     .name       = "a2dp",
     .label      = "Bluetooth",
@@ -1087,6 +1267,7 @@ static const espix_audio_sink_ops_t s_a2dp_sink = {
     .format     = a2dp_format,
     .write      = a2dp_write,
     .start      = a2dp_start,
+    .drain      = a2dp_drain,
     .suspend    = a2dp_suspend,
     .set_volume = a2dp_set_volume,
     .get_volume = a2dp_get_volume,
@@ -1127,6 +1308,8 @@ esp_err_t espix_bt_scan(bool on)              { (void)on; return ESP_ERR_NOT_SUP
 size_t    espix_bt_devices(espix_bt_dev_t *o, size_t n) { (void)o; (void)n; return 0; }
 esp_err_t espix_bt_info(const uint8_t b[ESPIX_BDA_LEN], espix_bt_dev_t *o)
                                               { (void)b; (void)o; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_rssi(const uint8_t b[ESPIX_BDA_LEN], int *m) { (void)b; (void)m; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t espix_bt_rssi_delta(const uint8_t b[ESPIX_BDA_LEN], int *d) { (void)b; (void)d; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_pair(const uint8_t b[ESPIX_BDA_LEN])       { (void)b; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_connect(const uint8_t b[ESPIX_BDA_LEN])    { (void)b; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t espix_bt_disconnect(const uint8_t b[ESPIX_BDA_LEN]) { (void)b; return ESP_ERR_NOT_SUPPORTED; }

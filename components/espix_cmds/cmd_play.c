@@ -11,6 +11,7 @@
 #include "espix_cmds_priv.h"
 #include "espix_shell.h"
 #include "espix_audio.h"
+#include "espix_audio_sink.h"
 
 #if CONFIG_ESPIX_AUDIO
 
@@ -122,7 +123,50 @@ static int cmd_tone(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/*
+ * Which sink the engine would use, and why.
+ *
+ * "Preferred while connected, otherwise the first connected one" is a rule you
+ * cannot see from the shell, and not seeing it is how a test tone can go to the
+ * onboard codec while the speaker across the room hears nothing and gets
+ * blamed.
+ */
+static int cmd_sink(espix_session_t *s, int argc, char **argv)
+{
+    const espix_audio_sink_ops_t *list[8];
+    const size_t n = espix_audio_sink_list(list, sizeof(list) / sizeof(list[0]));
+    const char  *sel = espix_audio_sink_selected();
+    const espix_audio_sink_ops_t *def = espix_audio_sink_default();
+
+    if (argc >= 2) {
+        const esp_err_t err = espix_audio_sink_select(argv[1]);
+        if (err != ESP_OK) {
+            espix_eprintf(s, "sink: %s: %s\n", argv[1], esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "sink: preferred is now '%s' (used while it is connected)\n",
+                     argv[1]);
+        return 0;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const espix_audio_sink_ops_t *o = list[i];
+        const bool is_def = (o == def);
+        const bool is_sel = (sel != NULL && strcmp(sel, o->name) == 0);
+        espix_printf(s, "  %c %-8s %-26s %s\n",
+                     is_def ? '*' : is_sel ? '+' : ' ',
+                     o->name, o->label ? o->label : "-",
+                     o->connected() ? "connected" : "not connected");
+    }
+    espix_printf(s, "preferred %s, would use %s   (* = would use, + = preferred)\n",
+                 sel ? sel : "(none)", def ? def->name : "(none)");
+    return 0;
+}
+
 static espix_cmd_t s_play_cmds[] = {
+    { .name = "sink", .fn = cmd_sink,
+      .help = "list the audio sinks, or make one the preferred output",
+      .usage = "sink [name]" },
     { .name = "play", .fn = cmd_play,
       .help = "play an audio file or stream to the connected A2DP sink",
       .usage = "play [--wait] <file|url> | play {stop|status}" },

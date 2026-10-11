@@ -682,6 +682,16 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
      */
     const espix_audio_sink_ops_t *sink = espix_audio_sink_default();
     if (sink != NULL) {
+        /*
+         * Let it finish first. Suspend flushes whatever the sink still holds,
+         * and between the writer and the link there are seconds of PCM -- so
+         * suspending on the writer's exit throws away the tail of everything
+         * shorter than the buffering. That is the tone that "finishes" in a
+         * third of its length and is never heard.
+         */
+        if (sink->drain != NULL) {
+            sink->drain();
+        }
         sink->suspend();
     }
 
@@ -700,14 +710,36 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
 static void tone_play(espix_audio_stream_t *st, int frames, tone_osc_t *osc,
                       int ch, int16_t *buf)
 {
+    /*
+     * Ramp every segment's ends. Switching channels is a step -- one side goes
+     * from full scale to zero and the other from zero to full scale inside a
+     * single sample -- and a step is a click: heard as an abrupt cut, and as a
+     * right-channel tone that seems to start late. A few milliseconds turns it
+     * into a move, and costs nothing on a tone.
+     */
+    const int total = frames;
+    const int ramp  = (total < 2048) ? total / 4 : 352;      /* ~8 ms at 44.1k */
+    int       done  = 0;
+
     while (frames > 0 && !s_stop_requested) {
         int n = frames > TONE_FRAMES ? TONE_FRAMES : frames;
 
         for (int i = 0; i < n; i++) {
-            const int16_t v = tone_osc_next(osc);
-            buf[2 * i]     = (ch == 1) ? 0 : v;
-            buf[2 * i + 1] = (ch == 0) ? 0 : v;
+            int32_t v = tone_osc_next(osc);
+            if (ramp > 0) {
+                const int pos = done + i;
+                int32_t   g   = 32768;
+                if (pos < ramp) {
+                    g = (int32_t)((int64_t)32768 * pos / ramp);
+                } else if (pos >= total - ramp) {
+                    g = (int32_t)((int64_t)32768 * (total - pos) / ramp);
+                }
+                v = (v * g) >> 15;
+            }
+            buf[2 * i]     = (ch == 1) ? 0 : (int16_t)v;
+            buf[2 * i + 1] = (ch == 0) ? 0 : (int16_t)v;
         }
+        done += n;
         size_t off = 0;
         const size_t bytes = (size_t)n * 4;
         while (off < bytes) {
@@ -760,9 +792,19 @@ esp_err_t espix_audio_tone(int freq_hz, int seconds, bool left_right)
     tone_osc_init(&osc, freq_hz, (int)fmt.rate);
 
     if (left_right) {
-        tone_play(st, one_s, &osc, 0, buf);     /* left  */
-        tone_play(st, one_s, &osc, 1, buf);     /* right */
-        tone_play(st, one_s, &osc, 2, buf);     /* both  */
+        /*
+         * Timed and logged per segment. The three are identical in code -- same
+         * frame count, same generator, same path -- so if one comes out
+         * audibly shorter the number that proves it belongs here, not in a
+         * guess about SBC joint stereo or the far end's rendering.
+         */
+        static const char *const seg[3] = { "left", "right", "both" };
+        for (int ch = 0; ch < 3; ch++) {
+            const int64_t t0 = esp_timer_get_time();
+            tone_play(st, one_s, &osc, ch, buf);
+            espix_klog(ESPIX_KLOG_INFO, TAG, "tone: %s segment %lld ms",
+                       seg[ch], (long long)((esp_timer_get_time() - t0) / 1000));
+        }
     } else {
         tone_play(st, seconds * one_s, &osc, 2, buf);
     }

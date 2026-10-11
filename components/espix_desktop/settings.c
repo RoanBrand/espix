@@ -154,6 +154,45 @@ static void canvas_size(int *w, int *h)
     *h = c != NULL ? espix_canvas_height(c) : 0;
 }
 
+/*
+ * The Playback row shows the engine's own state, and the engine changes it on
+ * its own schedule -- a tone ends when it ends, not when something is clicked.
+ * Without this the panel keeps saying "streaming" after the audio has stopped,
+ * and the only cure is leaving the panel and coming back, which rebuilds the
+ * rows. Cheap: a string compare, and a repaint only when it really changed.
+ */
+static esp_timer_handle_t s_state_timer;
+static char               s_state_last[24];
+
+static void state_tick(void *arg)
+{
+    (void)arg;
+    const char *now = espix_audio_state();
+    if (strcmp(now, s_state_last) == 0) {
+        return;
+    }
+    strlcpy(s_state_last, now, sizeof(s_state_last));
+    if (s_win != NULL) {
+        espix_window_repaint(s_win);
+    }
+}
+
+static void state_timer_start(void)
+{
+    if (s_state_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = state_tick,
+            .name     = "settings-state",
+        };
+        if (esp_timer_create(&args, &s_state_timer) != ESP_OK) {
+            s_state_timer = NULL;
+            return;
+        }
+    }
+    strlcpy(s_state_last, espix_audio_state(), sizeof(s_state_last));
+    (void)esp_timer_start_periodic(s_state_timer, 250 * 1000);
+}
+
 /* Nobody confirmed: put the previous size back and stop asking. */
 static void conf_tick(void *arg)
 {
@@ -753,6 +792,7 @@ espix_window_t *espix_settings_open(void)
 
         refresh_network();
         refresh_bluetooth();
+        state_timer_start();
         espix_window_repaint(s_win);
     }
     return s_win;
@@ -761,6 +801,9 @@ espix_window_t *espix_settings_open(void)
 void espix_settings_forget(void)
 {
     s_win = NULL;                       /* its pixels went with the window */
+    if (s_state_timer != NULL) {
+        (void)esp_timer_stop(s_state_timer);
+    }
 }
 
 espix_window_t *espix_settings_window(void)

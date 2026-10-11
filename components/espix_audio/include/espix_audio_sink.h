@@ -47,6 +47,18 @@ typedef struct {
     /* Begin a new stream: drop stale PCM and re-arm the pre-roll. */
     void (*start)(void);
 
+    /*
+     * Block until everything written has actually reached the consumer.
+     *
+     * Optional (NULL means the sink owns nothing). It exists because a stream
+     * that ends is not the same as audio that has been heard: the rings between
+     * the writer and the link hold seconds of PCM, and suspending a link
+     * *flushes* what is queued. Without this, a 3-second tone that finishes
+     * writing in one second ends with most of itself still in a buffer that the
+     * suspend then throws away -- which is silence, not a stutter.
+     */
+    void (*drain)(void);
+
     /* End a stream: stop the consumer rather than let it run on silence. */
     void (*suspend)(void);
 

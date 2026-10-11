@@ -39,6 +39,19 @@ esp_err_t espix_bt_scan(bool on);
 size_t    espix_bt_devices(espix_bt_dev_t *out, size_t n);
 esp_err_t espix_bt_info(const uint8_t bda[ESPIX_BDA_LEN], espix_bt_dev_t *out);
 
+/*
+ * The ACL's real RSSI in dBm (negative; closer to zero is louder). Only a
+ * connected device has one to report.
+ */
+esp_err_t espix_bt_rssi(const uint8_t bda[ESPIX_BDA_LEN], int *dbm);
+
+/*
+ * The same question in the units the controller is actually willing to answer
+ * in: the delta against the golden receive power range (0 = inside it, negative
+ * = weaker). Use when espix_bt_rssi() reports ESP_ERR_NOT_SUPPORTED.
+ */
+esp_err_t espix_bt_rssi_delta(const uint8_t bda[ESPIX_BDA_LEN], int *delta);
+
 /* Pairing and connection. Phase 1 is A2DP source, so pair/connect both mean
  * "bring up the audio link" (bonding follows from it). */
 esp_err_t espix_bt_pair(const uint8_t bda[ESPIX_BDA_LEN]);
