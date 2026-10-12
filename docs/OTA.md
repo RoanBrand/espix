@@ -296,7 +296,7 @@ if it is ever wanted it can be added behind a build option that defaults off.
 
     upgrade                 # check the manifest, prompt y/N
     sudo upgrade -y         # check, then install without asking
-    upgrade --check         # report only; exit 0 if current, 1 if newer
+    upgrade --check         # report only; exit 0 if current, 100 if newer, 1 on error
 
 The manifest is one small HTTPS GET; the image is fetched only if the version
 is newer. Default source: espix's own GitHub releases.

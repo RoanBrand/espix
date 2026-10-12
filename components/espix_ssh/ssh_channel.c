@@ -35,6 +35,7 @@
 
 #include "espix_auth.h"
 #include "espix_kernel.h"
+#include "espix_net.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
 #include "ssh_priv.h"
@@ -2530,8 +2531,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
                        "exec for %s: %u bytes, over the %d-byte limit",
                        c->user, (unsigned)ch->exec_len, ESPIX_LINE_MAX - 1);
         } else {
-            espix_klog(ESPIX_KLOG_INFO, TAG, "exec for %s: %s", c->user,
-                       ch->exec_cmd);
+            /* A command line can carry a URL with a password in it. */
+            char safe[ESPIX_LINE_MAX];
+            espix_net_redact_url(ch->exec_cmd, safe, sizeof(safe));
+            espix_klog(ESPIX_KLOG_INFO, TAG, "exec for %s: %s", c->user, safe);
         }
 
         /*

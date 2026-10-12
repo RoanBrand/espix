@@ -310,17 +310,27 @@ fi
 # used to be a longjmp out of it: the exit path's fclose() then asserted on the
 # held lock, and the board went down. Ctrl-C did that to any app waiting for
 # input. The signal now ends the read as EOF and the app exits with 128+sig.
-( sleep 15 | _dev_ssh_once "$APP cat" >/dev/null 2>&1 ) &
+# Under a name of its own: other suites run testapp at the same time, and a
+# kill aimed by name would land on theirs. And with input that outlives the
+# test, since under load the login alone can take ten seconds.
+CAT="/tmp/sigcat-$ESPIX_WORKER"
+dev_run "cp $APP $CAT; chmod 755 $CAT" >/dev/null 2>&1
+( sleep 60 | _dev_ssh_once "$CAT cat" >/dev/null 2>&1 ) &
 reader=$!
 pid=""
 for i in 1 2 3 4 5 6; do
     sleep 1
-    pid=$(ps_running | awk '$2 == "testapp" {print $1}' | tail -1)
+    pid=$(ps_running | awk -v n="sigcat-$ESPIX_WORKER" '$2 == n {print $1}')
     [ -n "$pid" ] && break
 done
 if [ -n "$pid" ]; then
     dev_run "kill -INT $pid" >/dev/null
-    if wait_gone "$pid"; then
+    gone=no
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -z "$(ps_running | awk -v p="$pid" '$1 == p')" ] && { gone=yes; break; }
+        sleep 1
+    done
+    if [ "$gone" = yes ]; then
         espix_pass "SIGINT ends an app blocked reading stdin"
     else
         espix_fail "SIGINT ends an app blocked reading stdin" "$(ps_running)"
@@ -333,3 +343,4 @@ else
 fi
 kill "$reader" 2>/dev/null
 wait "$reader" 2>/dev/null
+dev_run "rm $CAT" >/dev/null 2>&1

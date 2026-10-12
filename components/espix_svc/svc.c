@@ -50,6 +50,8 @@ static const char *TAG = "espix:svc";
 #define SVC_RETRY_US      (60LL * 1000000)
 #define SVC_MAX_RETRIES   3
 #define SVC_BUILTIN_STACK 8192
+#define SVC_SUCCESS_MAX   4     /* success= codes a unit may list */
+#define SVC_REQUIRES_LEN  64    /* requires=, as written */
 /* espix_proc_spawn_elf() runs on this task, and it copies the image, the
  * argv and the environment before handing relocation to its own task --
  * the same work the session task does for a foreground command, so it gets
@@ -66,6 +68,12 @@ typedef struct {
     bool        stop;            /* asked to stop, and not gone yet */
     bool        ran;             /* has started at least once */
     int         last_code;       /* what it exited with, once it has */
+    bool        last_ok;         /* and whether that counts as success */
+
+    int         success[SVC_SUCCESS_MAX];   /* exit statuses besides 0 that do */
+    uint8_t     nsuccess;
+    char        requires[SVC_REQUIRES_LEN]; /* units that must be up first */
+    const char *waiting;         /* why it has not started, last logged */
 
     /* A scheduled unit: run once every every_s seconds. 0 means it is not
      * scheduled, and the restart policy above governs instead. */
@@ -292,82 +300,41 @@ static void unit_start(svc_unit_t *u)
                (int)u->pid, cmd->name);
 }
 
-/*
- * Read the units file into a fresh table, then reconcile it with what is
- * running: a unit that is still declared keeps its pid, its policy and its
- * count; one that is gone is asked to stop. Called under the lock.
- */
-/*
- * The file when there is none, and the text the supervisor falls back to when
- * it cannot be written. Everything in it is commented out but the update
- * check: a unit enables itself because somebody uncommented a line.
- *
- * It is a file rather than only a compiled-in default so the format and the
- * options are in front of whoever edits it. The useful part is the list of
- * what espix can start at boot, and a manual is a worse place for it than the
- * file itself.
- */
+/* The file when there is none, and what is parsed when it cannot be written.
+ * Everything but the update check is commented out. */
 static const char *const SVC_DEFAULT_UNITS =
-    "# What espix runs at boot, and keeps running: one unit per line, in order.\n"
+    "# What espix runs at boot: one unit per line.\n"
     "#\n"
-    "#   <name>   <restart>          <command> [args...]\n"
+    "#   <name>  <restart>  [options]  <command> [args...]\n"
     "#\n"
-    "#   name     a label, and only a label: what service lists and what the klog\n"
-    "#            calls it. It need not be a program, but it must be unique.\n"
-    "#   restart  always   start it, and start it again if it exits\n"
-    "#            once     run it once and leave it stopped\n"
-    "#            every N  run it again on that schedule (s, m, h, d)\n"
-    "#   command  a program if it starts with /, otherwise a builtin of the shell\n"
-    "#            and its services. A unit runs as root with no terminal, so its\n"
-    "#            output goes to the klog.\n"
+    "#   name      what service and the klog call it; unique\n"
+    "#   restart   always    start it, and again whenever it exits\n"
+    "#             once      run it once\n"
+    "#             every N   run it on that schedule (s, m, h, d)\n"
+    "#   options   success=N[,N]   exit statuses besides 0 that mean it worked\n"
+    "#             requires=A[,B]  start once those are up: a once unit has\n"
+    "#                             succeeded, an always unit is running\n"
+    "#   command   a program if it starts with /, else a shell builtin; it runs\n"
+    "#             as root with no terminal, and its output goes to the klog\n"
     "#\n"
-    "# This file is the whole set: there is no file per job, so copying one in\n"
-    "# replaces everything. service lists what is running, service start <name>\n"
-    "# starts one now, and an edit takes effect with service reload.\n"
-    "#\n"
-    "# Everything below is commented out but the update check, and that is on\n"
-    "# purpose: a unit enables itself because somebody uncommented the line.\n"
+    "# service lists the units; service reload applies an edit.\n"
     "\n"
-    "# --- espix's own update check (on by default) -----------------------------\n"
-    "# Every six hours, ask whether there is a newer build and log the answer.\n"
-    "# It installs nothing by itself; that is what upgrade without --check does.\n"
-    "autoupdate  every 6h  upgrade --check\n"
+    "# Ask every six hours whether a newer build exists; 100 means one does.\n"
+    "autoupdate  every 6h  success=100  upgrade --check\n"
     "\n"
-    "# --- SSH -----------------------------------------------------------------\n"
-    "# Started by espix itself rather than by this file, so there is nothing to\n"
-    "# uncomment here and no way to switch it off from here. It is the one thing\n"
-    "# that wants thinking about before it becomes a unit: turning it off leaves\n"
-    "# the serial console as the only way in.\n"
-    "\n"
-    "# --- NFS -----------------------------------------------------------------\n"
-    "# Serves what /etc/exports lists, writable unless a line there says ro.\n"
-    "#\n"
+    "# Serve what /etc/exports lists.\n"
     "# nfsd  always  nfsd\n"
     "\n"
-    "# --- The VPN server ------------------------------------------------------\n"
-    "# Brings wg0 up with the peers in /etc/vpn. None of it exists until this\n"
-    "# runs -- no interface, no task, no memory -- so leaving it out costs nothing.\n"
-    "#\n"
+    "# Bring wg0 up with the peers in /etc/vpn.\n"
     "# vpn  once  vpn up\n"
     "\n"
-    "# --- Remote desktop ------------------------------------------------------\n"
-    "# One line, because units start as tasks of their own: a second line here\n"
-    "# would race the first rather than wait for it, and the viewer needs the\n"
-    "# desktop to be up. Until the pair is one command, start the desktop here\n"
-    "# and the viewer by hand.\n"
-    "#\n"
-    "# desktop  once  desktop start\n"
+    "# The canvas and its VNC server, then the desktop on it.\n"
+    "# vnc      once  vnc start\n"
+    "# desktop  once  requires=vnc  desktop start\n"
     "\n"
-    "# --- A dynamic DNS client ------------------------------------------------\n"
-    "# Small and self-contained: dynu's IP-update is an HTTP GET and fetch\n"
-    "# already does HTTP, so this runs the builtin every fifteen minutes and the\n"
-    "# answer lands in /tmp/ddns.out (good <ip>, nochg <ip>, badauth, nohost).\n"
-    "# There is no dynu or ddns command -- the name is a label.\n"
-    "#\n"
-    "# Put your own host and dynu IP-update password in the URL, not the account\n"
-    "# password: fetch logs the URL it fetches, so it reaches the klog.\n"
-    "#\n"
-    "# dynu  every 15m  fetch https://api.dynu.com/nic/update?hostname=YOURHOST&password=YOURPASSWORD /tmp/ddns.out\n";
+    "# Dynamic DNS through dynu, every 15 minutes. Use the IP-update password:\n"
+    "# fetch masks it in the log, but this file holds it.\n"
+    "# dynu  every 15m  fetch https://api.dynu.com/nic/update?hostname=HOST&password=PASSWORD /tmp/ddns.out\n";
 
 /*
  * Write the file the first time, so the format and the options are where
@@ -405,68 +372,123 @@ static void units_seed(void)
     }
 }
 
-/* One line, file or built-in. Mutates the line, as strtok_r does. */
+/* The next blank-separated word of *p, terminated in place; NULL at the end. */
+static char *next_word(char **p)
+{
+    char *w = *p;
+    while (*w == ' ' || *w == '\t') {
+        w++;
+    }
+    if (*w == '\0' || *w == '\n') {
+        *p = w;
+        return NULL;
+    }
+    char *e = w;
+    while (*e != '\0' && *e != ' ' && *e != '\t' && *e != '\n') {
+        e++;
+    }
+    if (*e != '\0') {
+        *e++ = '\0';
+    }
+    *p = e;
+    return w;
+}
+
+/* success=N[,N]: false when it is not a list of statuses. */
+static bool parse_success(svc_unit_t *u, const char *v)
+{
+    while (*v != '\0') {
+        char      *end = NULL;
+        const long c   = strtol(v, &end, 10);
+        if (end == v || c < 0 || c > 255 || u->nsuccess >= SVC_SUCCESS_MAX ||
+            (*end != ',' && *end != '\0')) {
+            return false;
+        }
+        u->success[u->nsuccess++] = (int)c;
+        v = (*end == ',') ? end + 1 : end;
+    }
+    return u->nsuccess > 0;
+}
+
+/* One line, file or built-in. Mutates the line. */
 static void units_parse(svc_unit_t *fresh, int *n, char *line)
 {
-    char *p = line;
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
-    if (*p == '#' || *p == '\n' || *p == '\0') {
+    char *p       = line;
+    char *name    = next_word(&p);
+    char *restart = next_word(&p);
+
+    if (name == NULL || name[0] == '#' || restart == NULL ||
+        strlen(name) >= ESPIX_SVC_NAME_MAX) {
         return;
     }
 
-    char *save    = NULL;
-    char *name    = strtok_r(p, " \t\n", &save);
-    char *restart = strtok_r(NULL, " \t\n", &save);
-    char *cmd     = NULL;
-    uint32_t every_s = 0;
-
-    if (name == NULL || restart == NULL) {
-        return;
-    }
+    svc_unit_t u;
+    memset(&u, 0, sizeof(u));
 
     if (strcmp(restart, "every") == 0) {
-        /* name every <interval> command: a scheduled, oneshot unit. */
-        char *interval = strtok_r(NULL, " \t\n", &save);
-        every_s = (interval != NULL) ? parse_duration(interval) : 0;
-        if (every_s == 0) {
+        char *interval = next_word(&p);
+        u.every_s = (interval != NULL) ? parse_duration(interval) : 0;
+        if (u.every_s == 0) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: bad interval; ignored", name);
             return;
         }
     }
 
-    cmd = strtok_r(NULL, "\n", &save);
-    if (cmd == NULL) {
-        return;
+    /* Options, until the first word that is not one: the command. */
+    for (;;) {
+        char *q = p;
+        char *w = next_word(&q);
+        if (w == NULL) {
+            break;
+        }
+        bool ok;
+        if (strncmp(w, "success=", 8) == 0) {
+            ok = parse_success(&u, w + 8);
+        } else if (strncmp(w, "requires=", 9) == 0) {
+            ok = w[9] != '\0' && strlen(w + 9) < sizeof(u.requires);
+            if (ok) {
+                strlcpy(u.requires, w + 9, sizeof(u.requires));
+            }
+        } else {
+            /* Not an option; next_word() cut it, so put the blank back. */
+            if (q > w && q[-1] == '\0') {
+                q[-1] = ' ';
+            }
+            break;
+        }
+        if (!ok) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: bad option %s; ignored", name, w);
+            return;
+        }
+        p = q;
     }
-    while (*cmd == ' ' || *cmd == '\t') {
-        cmd++;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
     }
-    if (*cmd == '\0' || strlen(name) >= ESPIX_SVC_NAME_MAX) {
+    p[strcspn(p, "\n")] = '\0';
+    if (*p == '\0') {
         return;
     }
 
-    svc_unit_t *u = &fresh[(*n)++];
-    memset(u, 0, sizeof(*u));
-    strlcpy(u->name, name, sizeof(u->name));
-    strlcpy(u->cmdline, cmd, sizeof(u->cmdline));
-    u->always  = (strcmp(restart, "always") == 0);
-    u->enabled = !s_safe_mode;
-    u->pid     = ESPIX_PID_NONE;
-    u->every_s = every_s;
-    u->next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
+    strlcpy(u.name, name, sizeof(u.name));
+    strlcpy(u.cmdline, p, sizeof(u.cmdline));
+    u.always      = (strcmp(restart, "always") == 0);
+    u.enabled     = !s_safe_mode;
+    u.pid         = ESPIX_PID_NONE;
+    u.next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
+    fresh[(*n)++] = u;
 }
 
+/*
+ * Read the units file into a fresh table, then reconcile it with what is
+ * running: a unit still declared keeps its pid and its counts; one that is
+ * gone is asked to stop. Called under the lock.
+ */
 static bool units_load(void)
 {
-    /*
-     * Static, and therefore off the caller's stack. Every caller holds
-     * s_lock, so one copy is safe -- and it has to be one copy the caller can
-     * afford: service reload runs on the SSH connection task, whose 8 KB
-     * stack could not hold this 2.6 KB array plus the session, and the task
-     * died of a stack protection fault (SP below its own bounds) before the
-     * array ever came off it.
-     */
+    /* Static: callers hold s_lock, and service reload runs on an SSH
+     * connection's stack, which has no room for the table. */
     static svc_unit_t fresh[SVC_MAX];
     int n = 0;
 
@@ -481,22 +503,14 @@ static bool units_load(void)
         }
         fclose(f);
     } else if (errno != ENOENT) {
-        /*
-         * There and unreadable -- 0600 root, read as somebody else, which is
-         * what a non-root "service reload" used to be. Substituting the
-         * built-in default here was a real and silent bug: the table became
-         * the stock autoupdate-only set, the operator's units disappeared from
-         * it, and nothing said so. The file is left alone and the caller is
-         * told instead.
-         */
+        /* There and unreadable: leave the table as it is and say so, rather
+         * than fall back to the default and drop the operator's units. */
         espix_klog(ESPIX_KLOG_ERROR, TAG, "%s: cannot be read: %s",
                    SVC_UNITS_FILE, strerror(errno));
         return false;
     } else {
-        /* Written rather than only defaulted: the format belongs in front of
-         * whoever edits it, and a file that appears on the first boot is how
-         * they get there. The default is still parsed below, so a filesystem
-         * that cannot be written behaves exactly as it did. */
+        /* Written, so the format is in front of whoever edits it; parsed
+         * from memory, so an unwritable filesystem still gets the default. */
         units_seed();
 
         char *copy = strdup(SVC_DEFAULT_UNITS);
@@ -519,6 +533,7 @@ static bool units_load(void)
             fresh[i].stop        = old->stop;
             fresh[i].ran         = old->ran;
             fresh[i].last_code   = old->last_code;
+            fresh[i].last_ok     = old->last_ok;
             if (!s_safe_mode) {
                 fresh[i].enabled = old->enabled;
             }
@@ -547,12 +562,23 @@ static bool units_load(void)
  * oneshot and re-armed; a failure retries sooner a few times, so a network
  * that is not up yet costs a minute and not a whole interval.
  */
+static bool unit_succeeded(const svc_unit_t *u, int code)
+{
+    for (int i = 0; i < u->nsuccess; i++) {
+        if (u->success[i] == code) {
+            return true;
+        }
+    }
+    return code == 0;
+}
+
 static void unit_exited(svc_unit_t *u, int code)
 {
     u->last_code = code;
+    u->last_ok   = unit_succeeded(u, code);
     if (u->every_s > 0) {
         const int64_t now = esp_timer_get_time();
-        if (code != 0 && u->fails < SVC_MAX_RETRIES) {
+        if (!u->last_ok && u->fails < SVC_MAX_RETRIES) {
             u->fails++;
             u->next_due_us = now + SVC_RETRY_US;
             espix_klog(ESPIX_KLOG_INFO, TAG, "%s: exit %d; retrying in %d s",
@@ -579,6 +605,39 @@ static void unit_exited(svc_unit_t *u, int code)
 }
 
 /* ------------------------------------------------------------- the task --- */
+
+/*
+ * Whether everything u requires is up: a once or every unit whose last run
+ * succeeded, an always unit that is running. NULL when it is; otherwise why
+ * not, with the unit it is waiting for in dep.
+ */
+static const char *unit_blocked(const svc_unit_t *u, char *dep, size_t len)
+{
+    char  list[SVC_REQUIRES_LEN];
+    char *save = NULL;
+
+    strlcpy(list, u->requires, sizeof(list));
+    for (char *name = strtok_r(list, ",", &save); name != NULL;
+         name = strtok_r(NULL, ",", &save)) {
+        const svc_unit_t *d = unit_find(name);
+        const char       *why = NULL;
+
+        if (d == NULL) {
+            why = "which is not a unit";
+        } else if (d->always) {
+            why = (d->pid != ESPIX_PID_NONE) ? NULL : "which is not running";
+        } else if (d->pid != ESPIX_PID_NONE || !d->ran) {
+            why = "which has not finished";
+        } else if (!d->last_ok) {
+            why = "which failed";
+        }
+        if (why != NULL) {
+            strlcpy(dep, name, len);
+            return why;
+        }
+    }
+    return NULL;
+}
 
 static void supervisor_task(void *arg)
 {
@@ -607,7 +666,16 @@ static void supervisor_task(void *arg)
             if (u->enabled && u->pid == ESPIX_PID_NONE &&
                 !espix_shutdown_started() &&
                 (u->every_s == 0 || now >= u->next_due_us)) {
-                unit_start(u);
+                char        dep[ESPIX_SVC_NAME_MAX];
+                const char *why = unit_blocked(u, dep, sizeof(dep));
+                if (why == NULL) {
+                    u->waiting = NULL;
+                    unit_start(u);
+                } else if (why != u->waiting) {
+                    u->waiting = why;
+                    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: waiting for %s, %s",
+                               u->name, dep, why);
+                }
             }
         }
 
@@ -717,6 +785,9 @@ bool espix_svc_info(int index, espix_svc_info_t *out)
         out->stopping = s_units[index].stop;
         out->ran      = s_units[index].ran;
         out->last_code = s_units[index].last_code;
+        out->last_ok  = s_units[index].last_ok;
+        out->waiting  = s_units[index].waiting != NULL &&
+                        s_units[index].pid == ESPIX_PID_NONE;
         ok = true;
     }
     xSemaphoreGive(s_lock);

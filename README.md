@@ -88,7 +88,7 @@ Use cases:
 | Programs | Fetching a file over HTTP(S) | **yes** | `fetch <url> <path>`, sharing `upgrade`'s HTTP and TLS stack and certificate bundle; checks room first and says where to get some back. An app declares its data in `/etc/apps/<name>.conf` and the launcher — desktop icon or command line — fetches anything missing before it starts, so no program holds a network handle of its own |
 | Programs | Arduino sketches as apps | **partial** | `apps/neopixel` is a sketch with an app-side shim; a runtime shared by every sketch, and an Arduino IDE board that deploys over `scp`, are in [ROADMAP.md](docs/ROADMAP.md#further-out) |
 | Shell | Serial console and SSH, same commands | **yes** | 89 commands |
-| System | Services and timers that outlive a login | **yes** | `/etc/units` is written on the first boot from a self-documenting template at 0600: `always`, `once` or `every <interval>` units (a program or a shell builtin), a supervisor task, `service` to manage them, and safe mode after a fault; the update check `autoupdate` is on by default |
+| System | Services and timers that outlive a login | **yes** | `/etc/units` is written on the first boot from a self-documenting template at 0600: `always`, `once` or `every <interval>` units (a program or a shell builtin), each a process, with `success=` exit statuses and `requires=` ordering, a supervisor task, `service` to manage them, and safe mode after a fault; the update check `autoupdate` is on by default |
 | System | `reboot`, `poweroff` | **yes** | one sequence for both: the units are asked to stop, every process is signalled and waited for, every volume is flushed and unmounted, and then the reset. `poweroff` is deep sleep with a 10-minute timer, because the chip cannot cut its own power; both are root only — [POSIX.md](docs/POSIX.md#processes) |
 | Networking | WiFi, DHCP, NTP | **yes** | comes up as `wlan0`, reconnects on boot |
 | Networking | WiFi access point | **yes** | `wifi ap start` brings up `wlan1` beside the station and NATs clients out the uplink; one radio, one AP, shared channel |
@@ -214,7 +214,7 @@ falls back to the loader, which restores the previous one.
 From the device:
 
     upgrade --slots          # the app slots, their role and state, and /boot
-    upgrade --check          # is there a newer release? (exit 1 means yes)
+    upgrade --check          # is there a newer release? (exit 100 means yes)
     sudo upgrade             # check, ask, then install
     sudo upgrade -y          # ...without asking
     sudo upgrade --file /mnt/sda1/espix.bin   # install from a file

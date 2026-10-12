@@ -254,6 +254,10 @@ esp_err_t espix_fs_resolve(const char *cwd, const char *path,
  */
 bool espix_fs_within(const char *abs_path, const char *dir);
 
+/* Whether an absolute path is on the root filesystem rather than a mount --
+ * the one volume the loader can read. */
+bool espix_fs_on_rootfs(const char *abs_path);
+
 /* Recursive delete, used by `rm -r`. */
 esp_err_t espix_fs_rm_rf(const char *abs_path);
 

@@ -68,13 +68,11 @@ int cmd_fetch(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    {
-    /* The URL can carry a password, and this line goes to the console: log
-     * through the redactor, as the klog does. */
+    /* The URL can carry a password, and a unit's output is the klog: every
+     * line that names it uses the redacted copy. */
     char safe[256];
     espix_net_redact_url(argv[1], safe, sizeof(safe));
     espix_printf(s, "fetch: %s\n", safe);
-}
 
     espix_fetch_progress_t progress = { .s = s };
     espix_fetch_info_t     info     = { 0 };
@@ -107,12 +105,12 @@ int cmd_fetch(espix_session_t *s, int argc, char **argv)
             espix_eprintf(s, "fetch: the server answered HTTP %d\n",
                           info.http_status);
         } else {
-            espix_eprintf(s, "fetch: cannot reach %s\n", argv[1]);
+            espix_eprintf(s, "fetch: cannot reach %s\n", safe);
         }
         return 1;
 
     case ESPIX_FETCH_BAD_HASH:
-        espix_eprintf(s, "fetch: %s is not what was expected\n", argv[1]);
+        espix_eprintf(s, "fetch: %s is not what was expected\n", safe);
         return 1;
 
     case ESPIX_FETCH_IO:

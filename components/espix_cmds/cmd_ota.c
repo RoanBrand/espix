@@ -11,6 +11,7 @@
 #include "esp_ota_ops.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_ota.h"
@@ -197,7 +198,7 @@ static int run_manifest(espix_session_t *s, bool check_only, bool assume_yes)
     espix_printf(s, "\n");
 
     if (check_only) {
-        return 1;           /* 1 means "there is one", for a script */
+        return 100;         /* dnf check-update's "updates are available" */
     }
 
     if (!espix_ota_meets_min(&m)) {
@@ -263,19 +264,24 @@ static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
         char err[192];
 
         /*
-         * A path, not a name. The loader installs the image from where it
-         * already is, so nothing is copied into /boot and the two retained
-         * copies there are left alone -- which is the point of a local install:
-         * the /boot bookkeeping exists for repository updates, not for a file
-         * someone just pushed.
-         *
-         * The file lives exactly until the install has happened, because the
-         * kernel clears /tmp at boot. Nothing has to delete it, and there is no
-         * window where a delete could race the loader.
+         * A path, not a name: the loader installs the image from where it is,
+         * so nothing is copied into /boot. It reads only the root filesystem,
+         * so a file on a mounted disk would be queued and silently skipped.
          */
-        FILE *f = fopen(argv[2], "rb");
+        char abs[ESPIX_PATH_MAX];
+        if (espix_fs_resolve(s->cwd, argv[2], abs, sizeof(abs)) != ESP_OK) {
+            espix_eprintf(s, "upgrade: %s: bad path\n", argv[2]);
+            return 1;
+        }
+        if (!espix_fs_on_rootfs(abs)) {
+            espix_eprintf(s, "upgrade: %s: not on the root filesystem, the only "
+                             "one the loader can read; copy it to /tmp\n", abs);
+            return 1;
+        }
+
+        FILE *f = fopen(abs, "rb");
         if (f == NULL) {
-            espix_eprintf(s, "upgrade: %s: cannot read it\n", argv[2]);
+            espix_eprintf(s, "upgrade: %s: cannot read it\n", abs);
             return 1;
         }
 
@@ -287,11 +293,11 @@ static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
         fclose(f);
 
         if (got != 1 || magic != 0xE9) {
-            espix_eprintf(s, "upgrade: %s: not a firmware image\n", argv[2]);
+            espix_eprintf(s, "upgrade: %s: not a firmware image\n", abs);
             return 1;
         }
 
-        if (espix_ota_queue(argv[2], err, sizeof(err)) != ESP_OK) {
+        if (espix_ota_queue(abs, err, sizeof(err)) != ESP_OK) {
             espix_eprintf(s, "upgrade: %s\n", (err[0] != 0) ? err : "cannot queue it");
             return 1;
         }

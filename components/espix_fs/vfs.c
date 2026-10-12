@@ -1721,6 +1721,12 @@ const espix_fs_meta_ops_t *espix_vfs_meta_ops(const char *abs_path)
     return (l == NULL) ? NULL : l->meta;
 }
 
+bool espix_fs_on_rootfs(const char *abs_path)
+{
+    return abs_path != NULL && abs_path[0] == '/' &&
+           mount_by_path(abs_path) == &s_mounts[0];
+}
+
 bool espix_vfs_mount_owner(const char *abs_path, uint16_t *uid, uint16_t *gid)
 {
     const lower_t *l = mount_by_path(abs_path);

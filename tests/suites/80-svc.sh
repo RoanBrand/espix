@@ -135,6 +135,40 @@ else
     espix_fail "a builtin unit has a pid" "no pid in: $out"
 fi
 
+# success=: exit statuses besides 0 that mean a unit worked, as systemd's
+# SuccessExitStatus. upgrade --check exits 100 when there is an update.
+dev_run "echo okcode once success=100 $APP exit 100 > $UNIT" >/dev/null 2>&1
+dev_run "echo badcode once $APP exit 100 >> $UNIT" >/dev/null 2>&1
+dev_run "sudo cp $UNIT /etc/units" >/dev/null 2>&1
+dev_run 'sudo service reload' >/dev/null 2>&1
+out=$(svc_wait_for_state badcode failed)
+assert_eq "a listed exit status is success" "done" \
+    "$(printf '%s' "$out" | awk '$1 == "okcode" {print $4}')"
+assert_eq "and an unlisted one is not" "failed" \
+    "$(printf '%s' "$out" | awk '$1 == "badcode" {print $4}')"
+
+# requires=: a unit starts only once what it requires is up. A once unit is up
+# when it has exited successfully, so second waits out first's three seconds.
+dev_run "echo first once $APP sleep 3 > $UNIT" >/dev/null 2>&1
+dev_run "echo second once requires=first $APP exit 0 >> $UNIT" >/dev/null 2>&1
+dev_run "echo bad once $APP exit 1 >> $UNIT" >/dev/null 2>&1
+dev_run "echo blocked once requires=bad $APP exit 0 >> $UNIT" >/dev/null 2>&1
+dev_run "echo orphan once requires=nosuch $APP exit 0 >> $UNIT" >/dev/null 2>&1
+dev_run "sudo cp $UNIT /etc/units" >/dev/null 2>&1
+dev_run 'sudo service reload' >/dev/null 2>&1
+out=$(svc_wait_for_state first running)
+assert_eq "a unit waits while what it requires runs" "waiting" \
+    "$(printf '%s' "$out" | awk '$1 == "second" {print $4}')"
+out=$(svc_wait_for_state second done)
+assert_eq "and starts once it has succeeded" "done" \
+    "$(printf '%s' "$out" | awk '$1 == "second" {print $4}')"
+assert_eq "a unit whose requirement failed does not start" "waiting" \
+    "$(printf '%s' "$out" | awk '$1 == "blocked" {print $4}')"
+assert_eq "nor one that requires a unit that does not exist" "waiting" \
+    "$(printf '%s' "$out" | awk '$1 == "orphan" {print $4}')"
+assert_contains "and the klog says why" "blocked: waiting for bad, which failed" \
+    "$(dev_run 'dmesg')"
+
 # Put the operator's file back, so nothing of this suite outlives it -- neither
 # a test unit nor an emptied file.
 dev_run "sudo cp $KEEP /etc/units" >/dev/null 2>&1

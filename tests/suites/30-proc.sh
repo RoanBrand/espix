@@ -156,12 +156,13 @@ ps_col() {
 
 # The live arena bytes of the backgrounded test app, from the HEAP column of
 # 'ps'; empty if it is not listed.
-app_heap_bytes() {
+app_heap_bytes() {                    # <pid>
     # The index first, on its own line: dev_run owns one shared session, and
-    # nesting one inside another's pipeline races them for the same FIFOs.
+    # nesting one inside another's pipeline races them for the same FIFOs. By
+    # pid, because another testapp may still be running.
     local c
     c=$(ps_col HEAP)
-    dev_run ps | awk -v c="$c" '$2 == "testapp" { print $c; exit }'
+    dev_run ps | awk -v c="$c" -v p="$1" '$1 == p { print $c; exit }'
 }
 
 app_running() {
@@ -195,7 +196,7 @@ if [ -z "$pid" ]; then
 fi
 
 sleep 3
-heap=$(app_heap_bytes)
+heap=$(app_heap_bytes "$pid")
 if [ -n "$heap" ] && [ "$heap" -ge 1000000 ] 2>/dev/null; then
     espix_pass "ps shows the app's live arena (HEAP $heap bytes)"
 else

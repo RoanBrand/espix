@@ -106,9 +106,8 @@ fi
 # It is pruned properly after the reboot below, which is what keeps /boot from
 # settling at two kernels and filling the rootfs.
 # Staged on the rootfs, and it has to be: "upgrade --file" only records the
-# path, and the loader reads it before any filesystem but the rootfs is mounted.
-# The USB stick, with its gigabytes, was tried and silently does nothing -- the
-# board comes back on the old build. This is the constraint that keeps the copy
+# path, and the loader reads it before any filesystem but the rootfs is mounted,
+# which is why it refuses a path on the USB stick. This is the constraint that keeps the copy
 # tight: 12 MB rootfs, 9 MB of system, 3.2 MB of image, and the running kernel's
 # known-good copy shares it.
 staging=/tmp/espix.bin

@@ -18,6 +18,9 @@ static const char *state_of(const espix_svc_info_t *u)
     if (u->pid != ESPIX_PID_NONE) {
         return u->stopping ? "stopping" : "running";
     }
+    if (u->waiting && u->enabled) {
+        return "waiting";
+    }
     if (u->every_s > 0) {
         /* Between runs: waiting for its next due time, not starting. */
         return u->enabled ? "scheduled" : "stopped";
@@ -28,7 +31,7 @@ static const char *state_of(const espix_svc_info_t *u)
     if (u->ran) {
         /* A oneshot that has run. It exited; its effect did not -- wg0 is up
          * after "vpn once vpn up" leaves, and that is not a failure. */
-        return (u->last_code == 0) ? "done" : "failed";
+        return u->last_ok ? "done" : "failed";
     }
     return "stopped";
 }

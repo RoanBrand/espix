@@ -20,6 +20,7 @@ idf_component_register(
         espressif__esp_linenoise
         espix_proc
         espix_fs
+        espix_net
         lwip
         mbedtls
         esp_hw_support
