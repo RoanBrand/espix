@@ -39,6 +39,7 @@ together.
   - IP routing, NAT, bridging. Firewall planned.
   - With wifi, eth, USB-NCM, and virtual interfaces.
   - File sharing with NFS v3 (NFSv4, SMB planned)
+  - Wireguard server (PiVPN shaped), and client.
 - File systems:
   - VFAT, exFAT, ext4 (via lwext4) for USB disks, LittleFS for `/` on internal flash.
   - MBR and GPT partition tables.
