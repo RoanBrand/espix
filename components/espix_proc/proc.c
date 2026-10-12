@@ -279,28 +279,35 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->wake_fd  = -1;
     slot->in_select = false;
 
-    if (slot->elf_valid) {
-        esp_elf_deinit(&slot->elf);
-        slot->elf_valid = false;
+    /* An app's image, argv, environment and paths. The block itself goes
+     * last: the process's tasks are gone, so nothing reads its paths now. */
+    if (slot->app != NULL) {
+        if (slot->app->elf_valid) {
+            esp_elf_deinit(&slot->app->elf);
+            slot->app->elf_valid = false;
+        }
+
+        free(slot->app->image);
+        slot->app->image = NULL;
+
+        free(slot->app->argv_block);
+        slot->app->argv_block = NULL;
+        slot->app->argv = NULL;
+        slot->app->argc = 0;
+
+        free(slot->app->env_block);
+        slot->app->env_block = NULL;
+        slot->app->envp = NULL;
+
+        for (int i = 0; i < slot->app->env_added_count; i++) {
+            free(slot->app->env_added[i]);
+            slot->app->env_added[i] = NULL;
+        }
+        slot->app->env_added_count = 0;
+
+        free(slot->app);
+        slot->app = NULL;
     }
-
-    free(slot->image);
-    slot->image = NULL;
-
-    free(slot->argv_block);
-    slot->argv_block = NULL;
-    slot->argv = NULL;
-    slot->argc = 0;
-
-    free(slot->env_block);
-    slot->env_block = NULL;
-    slot->envp = NULL;
-
-    for (int i = 0; i < slot->env_added_count; i++) {
-        free(slot->env_added[i]);
-        slot->env_added[i] = NULL;
-    }
-    slot->env_added_count = 0;
 
     free(slot->sig_handlers);
     slot->sig_handlers = NULL;
@@ -700,9 +707,10 @@ size_t espix_proc_stop_all(int64_t deadline_us)
     for (;;) {
         n = espix_proc_snapshot(live, ESPIX_PROC_MAX);
 
+        /* A kernel thread is not asked, so it is not waited for either. */
         left = 0;
         for (size_t i = 0; i < n; i++) {
-            if (live[i].pid != self) {
+            if (live[i].pid != self && live[i].kind != ESPIX_PROC_KTHREAD) {
                 left++;
             }
         }
@@ -1094,6 +1102,25 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
     (void)proc_wait_gone(pid, pdMS_TO_TICKS(KILL_UNWIND_MS));
 }
 
+/*
+ * A signal to a process that is not an app. It has no handlers and may not be
+ * deleted, so anything that would end it is a stop request, which it answers
+ * at its own pace; SIGKILL too. A kernel thread is not asked at all. Under the
+ * lock.
+ */
+static esp_err_t sig_kernel_locked(espix_proc_slot_t *slot, int sig)
+{
+    if (slot->info.kind == ESPIX_PROC_KTHREAD || sig == SIGSTOP) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (sig_default_ignores(sig)) {
+        return ESP_OK;
+    }
+    slot->stop_requested = true;
+    sig_wake_locked(slot);
+    return ESP_OK;
+}
+
 static esp_err_t proc_force_kill(espix_pid_t pid)
 {
     /*
@@ -1102,6 +1129,12 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
      */
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     espix_proc_slot_t *pre = espix_proc_find(pid);
+    if (pre != NULL && pre->info.kind != ESPIX_PROC_APP &&
+        !state_is_finished(pre->info.state)) {
+        const esp_err_t r = sig_kernel_locked(pre, SIGKILL);
+        xSemaphoreGive(g_espix_proc_lock);
+        return r;
+    }
     TaskHandle_t       pre_task = (pre != NULL) ? pre->info.task : NULL;
     xSemaphoreGive(g_espix_proc_lock);
 
@@ -1270,6 +1303,11 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    if (slot->info.kind != ESPIX_PROC_APP) {
+        const esp_err_t r = sig_kernel_locked(slot, sig);
+        xSemaphoreGive(g_espix_proc_lock);
+        return r;
+    }
 
     const bool was_stopped = slot->sig_stop_req;
 
@@ -1378,6 +1416,14 @@ esp_err_t espix_proc_kill(espix_pid_t pid)
         return ESP_OK;
     }
 
+    espix_proc_kind_t kind = ESPIX_PROC_APP;
+    if (espix_proc_kind_of(pid, &kind) && kind != ESPIX_PROC_APP) {
+        /* Only an app is deleted; espix's own code is left to finish. */
+        espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d did not stop when asked, "
+                   "and is not an app to delete", (int)pid);
+        return ESP_ERR_TIMEOUT;
+    }
+
     espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d did not stop when asked", (int)pid);
     return proc_force_kill(pid);
 }
@@ -1389,21 +1435,30 @@ size_t espix_proc_hangup(const espix_session_t *session)
     }
 
     /*
-     * Snapshot first, then signal: espix_proc_signal() takes the table lock
-     * itself, and a process may well finish on its own in between — which it
-     * reports and we ignore, because that is the outcome we wanted anyway.
+     * The session's pids first, then signal: espix_proc_signal() takes the
+     * table lock itself, and a process may well finish on its own in between --
+     * which it reports and we ignore, because that is the outcome we wanted.
+     * Pids rather than a snapshot of each slot: this runs on the ending
+     * session's own stack.
      */
-    espix_proc_info_t procs[ESPIX_PROC_MAX];
-    const size_t      n = espix_proc_snapshot(procs, ESPIX_PROC_MAX);
+    espix_pid_t pids[ESPIX_PROC_MAX];
+    size_t      n = 0;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        const espix_proc_info_t *const info = &g_espix_proc_table.slots[i].info;
+        if (info->state != ESPIX_PROC_FREE && info->session == session &&
+            !state_is_finished(info->state)) {
+            pids[n++] = info->pid;
+        }
+    }
+    xSemaphoreGive(g_espix_proc_lock);
 
     bool   targeted[ESPIX_PROC_MAX] = { false };
     size_t ended = 0;
 
     for (size_t i = 0; i < n; i++) {
-        if (procs[i].session != session || state_is_finished(procs[i].state)) {
-            continue;
-        }
-        targeted[i] = (espix_proc_signal(procs[i].pid, SIGHUP) == ESP_OK);
+        targeted[i] = (espix_proc_signal(pids[i], SIGHUP) == ESP_OK);
     }
 
     /*
@@ -1421,9 +1476,9 @@ size_t espix_proc_hangup(const espix_session_t *session)
 
         const int32_t left = (int32_t)(deadline - xTaskGetTickCount());
 
-        if (proc_wait_gone(procs[i].pid, (left > 0) ? (TickType_t)left : 0)
+        if (proc_wait_gone(pids[i], (left > 0) ? (TickType_t)left : 0)
             != ESP_OK) {
-            (void)proc_force_kill(procs[i].pid);
+            (void)proc_force_kill(pids[i]);
         }
         ended++;
     }
@@ -1575,13 +1630,16 @@ bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
  */
 void espix_proc_paths(const char **cwd, const char **root)
 {
-    const espix_proc_slot_t *slot = espix_proc_self();
+    const espix_proc_slot_t *const slot = espix_proc_self();
+    const espix_proc_app_t  *const app  = (slot != NULL) ? slot->app : NULL;
 
+    /* A process that is not an app has no paths of its own: "/" and no root,
+     * which is what a kernel task gets too. */
     if (cwd != NULL) {
-        *cwd = (slot == NULL || slot->cwd[0] == '\0') ? "/" : slot->cwd;
+        *cwd = (app == NULL || app->cwd[0] == '\0') ? "/" : app->cwd;
     }
     if (root != NULL) {
-        *root = (slot == NULL || !slot->root_active) ? "" : slot->root;
+        *root = (app == NULL || !app->root_active) ? "" : app->root;
     }
 }
 
@@ -1630,8 +1688,8 @@ void espix_proc_root_arm(void)
 {
     espix_proc_slot_t *slot = espix_proc_self();
 
-    if (slot != NULL) {
-        slot->root_active = true;
+    if (slot != NULL && slot->app != NULL) {
+        slot->app->root_active = true;
     }
 }
 
@@ -1642,7 +1700,7 @@ esp_err_t espix_proc_chdir(const char *abs_path)
     if (abs_path == NULL || abs_path[0] != '/') {
         return ESP_ERR_INVALID_ARG;
     }
-    if (slot == NULL) {
+    if (slot == NULL || slot->app == NULL) {
         /* A kernel task has nowhere to record one, and the sessions that do
          * have a cwd manage it themselves. */
         return ESP_ERR_INVALID_STATE;
@@ -1653,6 +1711,6 @@ esp_err_t espix_proc_chdir(const char *abs_path)
         return ESP_ERR_NOT_FOUND;
     }
 
-    strlcpy(slot->cwd, abs_path, sizeof(slot->cwd));
+    strlcpy(slot->app->cwd, abs_path, sizeof(slot->app->cwd));
     return ESP_OK;
 }

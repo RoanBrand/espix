@@ -980,7 +980,8 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
             break;
         }
 
-        /* At most one select timeout after the command asks: five seconds. */
+        /* At most one select timeout after the command asks: a second, so a
+         * stop fits inside the shutdown's five-second budget. */
         if (s_reload) {
             s_reload = false;
             espix_klog(ESPIX_KLOG_INFO, TAG, "reloaded: %d export(s)",
@@ -988,7 +989,7 @@ esp_err_t espix_nfsd_run(bool (*keep_going)(void))
         }
 
         fd_set         r;
-        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
 
         FD_ZERO(&r);
         FD_SET(pm_udp, &r);

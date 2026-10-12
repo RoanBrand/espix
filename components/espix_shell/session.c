@@ -730,7 +730,9 @@ void espix_shell_job_clear(espix_session_t *s, int slot)
 
 bool espix_shell_stopping(const espix_session_t *s)
 {
-    return (s != NULL && s->stop != NULL && *s->stop);
+    /* The job's flag, or -- for a command running as a process, a unit's
+     * daemon for one -- the process's own stop request. */
+    return (s != NULL && s->stop != NULL && *s->stop) || espix_shell_sigcheck();
 }
 
 /*

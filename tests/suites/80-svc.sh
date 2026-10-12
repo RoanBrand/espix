@@ -89,6 +89,52 @@ sleep 3
 still=$(dev_run 'service' | awk '/onceprobe/ {print $4; exit}')
 assert_eq "and it is not restarted" "done" "$still"
 
+# A builtin unit is a process too: a pid, a row in ps, and the same stop. It
+# used to run on a bare task with none of those, so a reload that dropped its
+# line left it running with nothing tracking it.
+dev_run "echo sleepunit always sleep 600 > $UNIT" >/dev/null 2>&1
+dev_run "sudo cp $UNIT /etc/units" >/dev/null 2>&1
+dev_run 'sudo service reload' >/dev/null 2>&1
+out=$(svc_wait_for_state sleepunit running)
+bpid=$(printf '%s' "$out" | awk '/sleepunit/ {print $2; exit}')
+if [ -n "$bpid" ] && [ "$bpid" -gt 0 ] 2>/dev/null; then
+    espix_pass "a builtin unit has a pid ($bpid)"
+    assert_eq "and ps lists it under that pid" "sleepunit" \
+        "$(dev_run 'ps' | awk -v p="$bpid" '$1 == p {print $2; exit}')"
+
+    # SIGKILL asks espix's own code to stop rather than deleting it; the unit
+    # ends itself, and being an always unit, comes back under a new pid.
+    dev_run "kill -9 $bpid" >/dev/null 2>&1
+    again=""
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        again=$(dev_run 'service' | awk '/sleepunit/ && $4 == "running" {print $2; exit}')
+        [ -n "$again" ] && [ "$again" != "$bpid" ] && break
+        sleep 1
+    done
+    if [ -n "$again" ] && [ "$again" != "$bpid" ]; then
+        espix_pass "kill -9 stops a builtin unit, and always brings it back"
+    else
+        espix_fail "kill -9 stops a builtin unit, and always brings it back" \
+            "$(dev_run 'service')"
+    fi
+    assert_not_contains "and it was asked, not deleted" "killed pid $bpid " \
+        "$(dev_run 'dmesg') "
+
+    # Dropping its line from the file ends it.
+    dev_run "echo onceprobe once $APP exit 0 > $UNIT" >/dev/null 2>&1
+    dev_run "sudo cp $UNIT /etc/units" >/dev/null 2>&1
+    dev_run 'sudo service reload' >/dev/null 2>&1
+    gone=""
+    for i in 1 2 3 4 5; do
+        gone=$(dev_run 'ps' | sed -n '1,/^finished:/p' | awk '$2 == "sleepunit"')
+        [ -z "$gone" ] && break
+        sleep 1
+    done
+    assert_eq "a reload that drops a builtin unit stops it" "" "$gone"
+else
+    espix_fail "a builtin unit has a pid" "no pid in: $out"
+fi
+
 # Put the operator's file back, so nothing of this suite outlives it -- neither
 # a test unit nor an emptied file.
 dev_run "sudo cp $KEEP /etc/units" >/dev/null 2>&1

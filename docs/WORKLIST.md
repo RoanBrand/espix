@@ -103,7 +103,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 
 | id | what | why | done when | status |
 |---|---|---|---|---|
-| R-P5.4 | Move the process table's string fields out of the slot | ~656 B/slot is mostly `cwd[128]`+`root[128]`+`path[128]`; shrinking the table makes raising `ESPIX_PROC_MAX` cheap | slot noticeably smaller | todo -- before R-P8.1, which adds kinds of process |
+| R-P5.4 | Move the process table's string fields out of the slot | ~656 B/slot is mostly `cwd[128]`+`root[128]`+`path[128]`; shrinking the table makes raising `ESPIX_PROC_MAX` cheap | slot noticeably smaller | done -- an app's ELF, argv, env and paths are a PSRAM block of its own; 816 B to 224 B a slot, 9800 B to 2696 B for the table, and the default ESPIX_PROC_MAX is 24 |
 
 ## R-P6 — services and filesystem views
 
@@ -130,8 +130,8 @@ trap boundary rather than for `fork`.
 | id | what | why | done when | status |
 |---|---|---|---|---|
 | R-P8.0 | A signal wakes only a wait for one (notify index 1); app threads in a table with tids, reached by signals and listed by `ps`; a default action only on the main task and never inside a stdio read; 64-bit run-time counter; host unit tests (`make unit`) | `xTaskAbortDelay()` broke lock waits and joins (EBUSY, a panic); Ctrl-C on an app reading stdin panicked the board (`_lock_close` assert); threads were invisible and unsignalled | `testapp sig mutex`/`threadsleep` and the stdin SIGINT case in 35-signals pass; `make unit` green | done |
-| R-P8.1 | A `kind` per process (APP, BUILTIN, DAEMON, KTHREAD) and `espix_proc_spawn_fn()`; only an APP may be force-deleted | The other kinds hold kernel locks by design | a kernel task can be given a pid | todo |
-| R-P8.2 | svc builtin units become DAEMON processes | Removes `espix_svc_stopping()` and the separate UNITS shutdown phase; a deleted unit line stops leaving nfsd untracked | `ps` shows nfsd with a pid | todo |
+| R-P8.1 | A `kind` per process (APP, BUILTIN, DAEMON, KTHREAD) and `espix_proc_spawn_fn()`; only an APP may be force-deleted | The other kinds hold kernel locks by design | a kernel task can be given a pid | done |
+| R-P8.2 | svc builtin units become DAEMON processes | Removes `espix_svc_stopping()` and the separate UNITS shutdown phase; a deleted unit line stops leaving nfsd untracked | `ps` shows nfsd with a pid | done -- `service stop`, `kill` and a reload all end nfsd; shutdown has one process phase |
 | R-P8.3 | Own-stack and background builtins and pipe stages become BUILTIN processes, with pgid/sid and Ctrl-C to the foreground group | Removes `espix_shell_stopping()`; `ping` need not stop at 4 | Ctrl-C ends a pipeline | todo |
 | R-P8.4 | Sessions (console, sshd:conn, vnc0, desktop term) become shell processes | `$$` and a real ppid tree | every app has a ppid | todo |
 | R-P8.5 | Daemons: sshd → per-connection child; desktop drops appwait for SIGCHLD; audio, usb as KTHREADs; svc as pid 1; `/proc/<pid>/{status,task}` | The rest of the ~20 pidless tasks | `ps` shows `-` only for IDF's own tasks | todo |
@@ -152,11 +152,11 @@ trap boundary rather than for `fork`.
 - S31: RV32 dual-core at 320 MHz, **512 KiB SRAM**, 16 MiB octal PSRAM, Sv32 MMU, M/S/U modes, PMP/PMA. Datasheet p.44.
 - Internal heap ~296 KB; PSRAM ~13 MB usable.
 - `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384`, `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768`.
-- `CONFIG_FREERTOS_HZ=100`; `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536`.
+- `CONFIG_FREERTOS_HZ=250`; `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536`.
 - TWDT enabled, idle checked on both cores, `PANIC` off, timeout 5 s.
-- `g_espix_proc_table` is **static .bss**, 736 B x 12 slots + guard = 8840 B (8.6 KB); the completed log `s_done` adds 512 B (`ESPIX_PROC_DONE_MAX` 8 x 64 B), both measured from the ELF. `s_fds` is 0x500 = 1280 B.
+- `g_espix_proc_table` is **static .bss**, 224 B x 24 slots + guard; an app's image, argv, env and paths are a separate PSRAM block. The completed log `s_done` adds 512 B (`ESPIX_PROC_DONE_MAX` 8 x 64 B). `s_fds` is 0x500 = 1280 B.
 - klog ring is a heap pointer (PSRAM), 256 x ~132 B = ~33 KB (R-P0.8 raised it from 96).
-- App stack: 256 KB PSRAM, core 1 (PIE). Relocation runs on an 8 KB internal stack.
+- App stack: 8 KB PSRAM by default (doom 256 KB), core 1 (PIE). Relocation runs on an 8 KB internal stack.
 - 71 commands registered; zero text utilities beyond `cat`/`ls`/`echo`/`df`/`sha256sum`.
 - 53 `ESPIX_KLOG_DEBUG` call sites; 494 `espix_klog` calls; 8 `ESP_LOGx` in espix's own code.
 - Six USB-related tasks exist across host+NCM modes; four in host mode (see R-P5.2).

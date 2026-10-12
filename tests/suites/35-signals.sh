@@ -277,7 +277,14 @@ assert_contains "and cuts its sleep short, while the join waits" "4 left" "$ts_o
 # process's name in braces, the process as its parent.
 pid=$(bg_start mutex)
 if [ -n "$pid" ]; then
-    rows=$(ps_running | awk -v p="$pid" '$2 == "{testapp}" && $8 == p')
+    # Polled: the shell reports the pid once the process is admitted, and the
+    # app is still being loaded then -- its thread comes a moment later.
+    rows=""
+    for i in 1 2 3 4 5; do
+        rows=$(ps_running | awk -v p="$pid" '$2 == "{testapp}" && $8 == p')
+        [ -n "$rows" ] && break
+        sleep 1
+    done
     if [ -n "$rows" ]; then
         espix_pass "ps lists the app's thread under its process"
     else

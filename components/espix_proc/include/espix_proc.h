@@ -66,6 +66,20 @@ typedef enum {
 } espix_proc_state_t;
 
 /*
+ * What a process is, which decides what a signal may do to it. Only an APP is
+ * code espix does not own, and only an APP may be deleted from outside: the
+ * others are espix's own tasks, which take kernel locks by design, so a stop is
+ * a request they act on (espix_proc_stopping()). A KTHREAD is not even asked --
+ * it has a pid to be seen by, and that is all.
+ */
+typedef enum {
+    ESPIX_PROC_APP = 0,     /* an ELF program */
+    ESPIX_PROC_BUILTIN,     /* a shell command on a task of its own */
+    ESPIX_PROC_DAEMON,      /* a kernel service, e.g. a unit */
+    ESPIX_PROC_KTHREAD,     /* a driver's worker; not signallable */
+} espix_proc_kind_t;
+
+/*
  * One completed process, as the process table remembers it after the slot has
  * been released. This is not espix_proc_info_t on purpose: the task handle and
  * the session pointer are meaningless once the process is gone -- the session
@@ -95,7 +109,7 @@ typedef struct {
      */
     espix_pid_t        ppid;
     char               name[ESPIX_PROC_NAME_MAX];
-    char               path[ESPIX_PATH_MAX];
+    espix_proc_kind_t  kind;
     TaskHandle_t       task;
     espix_proc_state_t state;
     int                exit_code;
@@ -117,6 +131,36 @@ typedef struct {
 } espix_proc_info_t;
 
 esp_err_t espix_proc_init(void);
+
+/* A kernel process's body. What it returns is the process's exit status. */
+typedef int (*espix_proc_fn_t)(void *arg);
+
+typedef struct {
+    const char        *name;            /* the process's, and its task's */
+    espix_proc_fn_t    fn;
+    void              *arg;
+    espix_proc_kind_t  kind;            /* BUILTIN, DAEMON or KTHREAD */
+    uint32_t           stack;           /* bytes; 0 for 8192 */
+    UBaseType_t        priority;
+    BaseType_t         core;            /* a core, or tskNO_AFFINITY */
+    bool               internal_stack;  /* it maps or writes flash */
+    espix_session_t   *session;         /* credentials, and who a hangup ends;
+                                           NULL is espix itself, as root */
+} espix_proc_fn_opts_t;
+
+/*
+ * Run `fn` as a process: espix's own code on a task of its own, with a pid, in
+ * ps, and stopped the way any process is. Returns once it is admitted.
+ *
+ * What it does not get is anything an ELF app has -- no image, argv,
+ * environment or paths -- nor deletion from outside. A stop is a request the
+ * function sees through espix_proc_stopping(); see espix_proc_kind_t.
+ */
+esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *opts,
+                              espix_pid_t *out_pid);
+
+/* The kind of process `pid` is. False when there is no such live process. */
+bool espix_proc_kind_of(espix_pid_t pid, espix_proc_kind_t *out);
 
 /*
  * Load the ELF at `abs_path` and run it as a new process. Returns as soon as

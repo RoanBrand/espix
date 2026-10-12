@@ -656,6 +656,15 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
         } else if (err == ESP_ERR_INVALID_STATE) {
             espix_eprintf(s, "kill: %d: already finished\n", (int)pid);
             status = 1;
+        } else if (err == ESP_ERR_TIMEOUT) {
+            /* espix's own code: asked, and never deleted from outside. */
+            espix_eprintf(s, "kill: %d: asked to stop and still stopping "
+                             "(only an app is deleted)\n", (int)pid);
+            status = 1;
+        } else if (err == ESP_ERR_NOT_SUPPORTED) {
+            espix_eprintf(s, "kill: %d: a kernel thread cannot be signalled\n",
+                          (int)pid);
+            status = 1;
         } else if (err != ESP_OK) {
             espix_eprintf(s, "kill: %d: %s\n", (int)pid, esp_err_to_name(err));
             status = 1;

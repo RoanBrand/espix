@@ -120,9 +120,9 @@ static esp_err_t copy_argv(int argc, char **argv, espix_proc_slot_t *slot)
     }
     vec[argc] = NULL;
 
-    slot->argv_block = vec;
-    slot->argv       = vec;
-    slot->argc       = argc;
+    slot->app->argv_block = vec;
+    slot->app->argv       = vec;
+    slot->app->argc       = argc;
     return ESP_OK;
 }
 
@@ -184,8 +184,8 @@ static esp_err_t copy_env(espix_session_t *session, espix_proc_slot_t *slot)
     }
 
     if (count == 0) {
-        slot->env_block = NULL;
-        slot->envp      = NULL;
+        slot->app->env_block = NULL;
+        slot->app->envp      = NULL;
         return ESP_OK;
     }
 
@@ -228,8 +228,8 @@ static esp_err_t copy_env(espix_session_t *session, espix_proc_slot_t *slot)
     }
     vec[at] = NULL;
 
-    slot->env_block = vec;
-    slot->envp      = vec;
+    slot->app->env_block = vec;
+    slot->app->envp      = vec;
     return ESP_OK;
 }
 
@@ -331,7 +331,7 @@ static void relocate_task(void *arg)
 {
     relocate_ctx_t *ctx = arg;
 
-    ctx->rc = esp_elf_relocate(&ctx->slot->elf, ctx->slot->image);
+    ctx->rc = esp_elf_relocate(&ctx->slot->app->elf, ctx->slot->app->image);
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
 }
@@ -402,6 +402,13 @@ void espix_proc_exit(int status)
         slot->info.task == xTaskGetCurrentTaskHandle()) {
         slot->exit_status = status;
         longjmp(*slot->exit_jmp, 1);
+    }
+
+    /* A kernel process has no frame to jump to, and no app to tear down: its
+     * own task ends it, as returning from its function would. */
+    if (slot != NULL && slot->app == NULL &&
+        slot->info.task == xTaskGetCurrentTaskHandle()) {
+        espix_proc_reap_self(slot, ESPIX_PROC_EXITED, status);
     }
 
     /*
@@ -585,13 +592,13 @@ static void proc_task(void *arg)
     /* exit()'s landing site while the app runs; see the call below. */
     jmp_buf exit_jb;
 
-    esp_err_t err = load_image(slot->info.path, &slot->image,
+    esp_err_t err = load_image(slot->app->path, &slot->app->image,
                                &slot->info.image_bytes);
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "pid %d: cannot load %s: %s",
-                   (int)slot->info.pid, slot->info.path, esp_err_to_name(err));
+                   (int)slot->info.pid, slot->app->path, esp_err_to_name(err));
         espix_eprintf(slot->info.session, "espix: %s: %s\n",
-                     slot->info.path, esp_err_to_name(err));
+                     slot->app->path, esp_err_to_name(err));
         /* Could not read the file at all: "not found", which is 127. */
         status = 127;
         goto done;
@@ -610,8 +617,8 @@ static void proc_task(void *arg)
      * endian here, which is also why this does not need the header typedef.
      */
     {
-        const uint16_t machine = (uint16_t)(slot->image[18] |
-                                            ((uint16_t)slot->image[19] << 8));
+        const uint16_t machine = (uint16_t)(slot->app->image[18] |
+                                            ((uint16_t)slot->app->image[19] << 8));
 #if CONFIG_IDF_TARGET_ARCH_RISCV
         const uint16_t mine      = 243;         /* EM_RISCV */
         const char    *mine_name = "RISC-V";
@@ -625,20 +632,20 @@ static void proc_task(void *arg)
                                : "another architecture";
             espix_klog(ESPIX_KLOG_ERROR, TAG,
                        "pid %d: %s is a %s binary; this kernel runs %s apps",
-                       (int)slot->info.pid, slot->info.path, theirs, mine_name);
+                       (int)slot->info.pid, slot->app->path, theirs, mine_name);
             espix_eprintf(slot->info.session,
                           "espix: %s: built for %s; this kernel runs %s apps\n",
-                          slot->info.path, theirs, mine_name);
+                          slot->app->path, theirs, mine_name);
             goto done;                          /* status stays 126 */
         }
     }
 
-    if (esp_elf_init(&slot->elf) != 0) {
+    if (esp_elf_init(&slot->app->elf) != 0) {
         espix_eprintf(slot->info.session, "espix: %s: ELF init failed\n",
-                     slot->info.path);
+                     slot->app->path);
         goto done;
     }
-    slot->elf_valid = true;
+    slot->app->elf_valid = true;
 
     relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary() };
     if (rctx.done == NULL ||
@@ -648,7 +655,7 @@ static void proc_task(void *arg)
             vSemaphoreDelete(rctx.done);
         }
         espix_eprintf(slot->info.session, "espix: %s: no task to relocate\n",
-                     slot->info.path);
+                     slot->app->path);
         goto done;
     }
     (void)xSemaphoreTake(rctx.done, portMAX_DELAY);
@@ -660,12 +667,12 @@ static void proc_task(void *arg)
 
         if (sym[0] != '\0') {
             espix_eprintf(slot->info.session, "espix: %s: undefined symbol: %s\n",
-                         slot->info.path, sym);
+                         slot->app->path, sym);
         } else {
             /* The fallback is the exact wording from before the lookup existed,
              * so a reworded upstream message costs nothing but the detail. */
             espix_eprintf(slot->info.session, "espix: %s: relocation failed\n",
-                         slot->info.path);
+                         slot->app->path);
         }
         goto done;
     }
@@ -676,9 +683,9 @@ static void proc_task(void *arg)
                (int)slot->info.pid, slot->info.name,
                (unsigned)slot->info.image_bytes);
 
-    if (slot->elf.entry == NULL) {
+    if (slot->app->elf.entry == NULL) {
         espix_eprintf(slot->info.session, "espix: %s: no entry point\n",
-                     slot->info.path);
+                     slot->app->path);
         goto done;
     }
 
@@ -715,7 +722,7 @@ static void proc_task(void *arg)
     slot->exit_jmp = &exit_jb;
 
     if (setjmp(exit_jb) == 0) {
-        status = slot->elf.entry(slot->argc, slot->argv);
+        status = slot->app->elf.entry(slot->app->argc, slot->app->argv);
 
         /* Returned with a terminating signal still pending -- one that ended a
          * read as EOF rather than jump out of it. It is what ended the app. */
@@ -864,6 +871,17 @@ bool espix_proc_detach_streams(espix_proc_slot_t *slot)
     return had_ours;
 }
 
+/* Give back a slot whose spawn failed before its task existed. Under the lock. */
+static void spawn_abandon(espix_proc_slot_t *slot)
+{
+    if (slot->app != NULL) {
+        free(slot->app->argv_block);
+        free(slot->app->env_block);
+        free(slot->app);
+    }
+    memset(slot, 0, sizeof(*slot));
+}
+
 esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
                                espix_session_t *session, const char *root,
                                bool foreground, espix_pid_t *out_pid)
@@ -912,9 +930,18 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
         return ESP_ERR_NO_MEM;      /* process table full of live processes */
     }
 
+    slot->app = heap_caps_calloc(1, sizeof(*slot->app),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (slot->app == NULL) {
+        memset(slot, 0, sizeof(*slot));
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    slot->info.kind = ESPIX_PROC_APP;
+
     esp_err_t err = copy_argv(argc, argv, slot);
     if (err != ESP_OK) {
-        memset(slot, 0, sizeof(*slot));
+        spawn_abandon(slot);
         xSemaphoreGive(g_espix_proc_lock);
         return err;
     }
@@ -924,8 +951,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      * and a backgrounded process outlives the command that started it. */
     err = copy_env(session, slot);
     if (err != ESP_OK) {
-        free(slot->argv_block);
-        memset(slot, 0, sizeof(*slot));
+        spawn_abandon(slot);
         xSemaphoreGive(g_espix_proc_lock);
         return err;
     }
@@ -933,7 +959,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     const char *base = strrchr(abs_path, '/');
     base = (base != NULL) ? base + 1 : abs_path;
 
-    strlcpy(slot->info.path, abs_path, sizeof(slot->info.path));
+    strlcpy(slot->app->path, abs_path, sizeof(slot->app->path));
     strlcpy(slot->info.name, base, sizeof(slot->info.name));
     slot->info.pid        = espix_proc_next_pid();
 
@@ -1014,29 +1040,26 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      * path would resolve somewhere it may not name. The root is the sane
      * starting point, and it is the one directory it is guaranteed to have.
      */
-    strlcpy(slot->root, (root != NULL) ? root : "", sizeof(slot->root));
+    strlcpy(slot->app->root, (root != NULL) ? root : "", sizeof(slot->app->root));
 
     /*
-     * Explicitly, rather than trusting how the slot was obtained. A recycled
-     * slot is memset by espix_proc_alloc_slot() and a never-used one was
-     * cleared at init, so this is true today either way -- but a stale
-     * root_active confines the *loader*, and the app then dies with
-     * ESP_ERR_NOT_FOUND on a binary that is plainly there. That is not a
-     * failure anyone should have to debug twice.
+     * Not armed yet: a root_active set now would confine the *loader*, and the
+     * app would die with ESP_ERR_NOT_FOUND on a binary that is plainly there.
+     * The block is fresh and zeroed, so this only says it.
      */
-    slot->root_active = false;
+    slot->app->root_active = false;
 
     const char *const start =
         (session != NULL && session->cwd[0] != '\0') ? session->cwd : "/";
 
-    if (slot->root[0] != '\0' && !espix_fs_within(start, slot->root)) {
-        strlcpy(slot->cwd, slot->root, sizeof(slot->cwd));
+    if (slot->app->root[0] != '\0' && !espix_fs_within(start, slot->app->root)) {
+        strlcpy(slot->app->cwd, slot->app->root, sizeof(slot->app->cwd));
     } else {
-        strlcpy(slot->cwd, start, sizeof(slot->cwd));
+        strlcpy(slot->app->cwd, start, sizeof(slot->app->cwd));
     }
 
-    if (slot->root[0] != '\0') {
-        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: rooted at %s", base, slot->root);
+    if (slot->app->root[0] != '\0') {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: rooted at %s", base, slot->app->root);
     }
     slot->info.started_us = esp_timer_get_time();
     slot->info.exit_code  = 0;
@@ -1107,9 +1130,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
          * the first place, leaking one fd per attempt is how a long run runs the
          * system fd table dry. */
         espix_fs_wake_close(slot->wake_fd);
-        free(slot->argv_block);
-        free(slot->env_block);
-        memset(slot, 0, sizeof(*slot));
+        spawn_abandon(slot);
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_NO_MEM;
     }

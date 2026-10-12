@@ -152,11 +152,6 @@ static void usb_dev_nodes(const espix_usb_dev_t *dev, bool attached)
  * everything else, and the volume on it was already flushed by the storage
  * phase, which is the part that mattered.
  */
-static void shutdown_units(int64_t deadline_us)
-{
-    (void)espix_svc_quiesce(deadline_us);
-}
-
 static void shutdown_processes(int64_t deadline_us)
 {
     (void)espix_proc_stop_all(deadline_us);
@@ -194,8 +189,8 @@ static void shutdown_bluetooth(int64_t deadline_us)
 
 static void shutdown_wiring(void)
 {
-    (void)espix_shutdown_add(ESPIX_SHUTDOWN_UNITS, shutdown_units, "units");
-    (void)espix_shutdown_add(ESPIX_SHUTDOWN_APPS, shutdown_processes, "processes");
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_PROCESSES, shutdown_processes,
+                             "processes");
     (void)espix_shutdown_add(ESPIX_SHUTDOWN_STORAGE, shutdown_storage, "storage");
     (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_display, "display");
     (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_audio, "audio");

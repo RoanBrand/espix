@@ -93,6 +93,15 @@ Two Unix mechanisms are reshaped by having no scheduler you can stop:
   only console may be the one you are typing into. Any signal but SIGSTOP lifts
   a stop. [ROADMAP.md](ROADMAP.md#signals) has the gaps.
 
+Not every process is an app. espix's own code can run as one too
+(`espix_proc_spawn_fn()`): a unit's daemon today, the shell's commands and
+sessions next (WORKLIST R-P8). A pid is identity, not authority. Only an app is
+ever deleted from outside; espix's own code holds kernel locks by design, so a
+stop is a request it answers, SIGKILL included. Some tasks stay out of the table
+for good: the reaper, which tears processes down; the klog flusher and the
+supervisor, whose death is the system's; the panic path; and the tasks ESP-IDF
+owns.
+
 A process is per-process and not per-session where it matters: it has its own
 working directory, and its credentials are copied from the session at spawn
 (following the session's pointer would be a use-after-free, because a

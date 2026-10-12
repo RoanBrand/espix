@@ -40,10 +40,9 @@ typedef struct {
     espix_pid_t pid;             /* ESPIX_PID_NONE when not running */
     bool        always;          /* restart policy */
     bool        enabled;         /* wants to run */
-    bool        running;         /* a builtin task, which has no pid */
     uint32_t    every_s;         /* 0 unless scheduled */
     uint32_t    restarts;
-    bool        stopping;        /* a builtin has been asked to stop */
+    bool        stopping;        /* asked to stop, and not gone yet */
     bool        ran;             /* has started at least once */
     int         last_code;       /* what it exited with, once it has */
 } espix_svc_info_t;
@@ -57,25 +56,7 @@ bool      espix_svc_info(int index, espix_svc_info_t *out);
 esp_err_t espix_svc_start(const char *name);
 esp_err_t espix_svc_stop(const char *name);
 
-/*
- * For a unit that runs on a task rather than as a process: true once its stop
- * has been asked for, so the loop it runs can finish and let the supervisor
- * see it end. False outside a unit, so the same command runs by hand.
- */
-bool      espix_svc_stopping(void);
 esp_err_t espix_svc_reload(void);
-
-/*
- * The shutdown path: ask every unit to stop, and wait for them to go, up to
- * deadline_us. Returns how many were still running when it gave up.
- *
- * Disabling comes first, under the supervisor's lock, so that a unit which
- * exits promptly is not started again before the phase is over. The wait then
- * ends as soon as the last unit is gone: a builtin that has set its done flag
- * counts as gone even though the supervisor has not collected it yet, so the
- * one-second tick is not what a shutdown costs.
- */
-int espix_svc_quiesce(int64_t deadline_us);
 
 /*
  * True when the last boot left a core dump, so units are being held stopped.

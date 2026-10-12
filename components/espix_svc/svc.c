@@ -2,10 +2,11 @@
  * The supervisor.
  *
  * One task wakes once a second, reaps whatever has exited, applies the restart
- * policy and starts whatever should be running. A unit runs as an espix process
- * with no session (so no logout can take it), under a session whose output is
- * the klog -- there is no terminal to write to, and a daemon's first line is
- * usually the reason it is worth having.
+ * policy and starts whatever should be running. Every unit is a process -- a
+ * program, or a builtin run as a DAEMON (espix_proc_spawn_fn()) -- so one pid,
+ * one wait and one stop cover both. It runs under a session no logout can end,
+ * whose output is the klog: there is no terminal to write to, and a daemon's
+ * first line is usually the reason it is worth having.
  */
 
 #include <errno.h>
@@ -62,7 +63,7 @@ typedef struct {
     bool        enabled;
     espix_pid_t pid;
     uint32_t    restarts;
-    bool        stop;            /* a builtin has been asked to stop */
+    bool        stop;            /* asked to stop, and not gone yet */
     bool        ran;             /* has started at least once */
     int         last_code;       /* what it exited with, once it has */
 
@@ -71,12 +72,6 @@ typedef struct {
     uint32_t    every_s;
     int64_t     next_due_us;
     uint32_t    fails;
-
-    /* A builtin unit runs on a task, not as a process, so there is no pid to
-     * watch. The task owns its context and only the supervisor frees it, so
-     * the unit itself is never written from another task. */
-    void       *task;         /* the builtin task, or NULL */
-    void       *builtin;      /* svc_builtin_t while it runs */
 } svc_unit_t;
 
 static svc_unit_t        s_units[SVC_MAX];
@@ -167,37 +162,28 @@ static uint32_t parse_duration(const char *s)
     return (total > 0xFFFFFFFFull) ? 0 : (uint32_t)total;
 }
 
-/* A builtin unit: the command runs on a task of its own, under the unit
- * session, because that is all a process would have given it -- and it means
- * upgrade --check is a unit without anything becoming an ELF. */
+/* A builtin unit: the command, run as a DAEMON process under the unit session,
+ * which is what lets upgrade --check be a unit without becoming an ELF. The
+ * process owns this and frees it. */
 typedef struct {
-    svc_unit_t        *u;
     const espix_cmd_t *cmd;
-    espix_session_t   *s;
     int                argc;
     char             **argv;
-    bool               caps;      /* which allocator the stack came from */
-    volatile bool      done;      /* read by the supervisor, set by the task */
-    int                code;
+    char              *block;     /* the argv strings */
 } svc_builtin_t;
 
-static void builtin_unit_task(void *arg)
+static int builtin_unit_main(void *arg)
 {
-    svc_builtin_t *c = arg;
+    svc_builtin_t *const c = arg;
 
-    espix_shell_set_current(c->s);
-    c->code = c->cmd->fn(c->s, c->argc, c->argv);
+    espix_shell_set_current(&s_svc_session);
+    const int code = c->cmd->fn(&s_svc_session, c->argc, c->argv);
     espix_shell_set_current(NULL);
 
-    /* Hand the result to the supervisor, which frees the context: a task
-     * that freed it could do so while the supervisor is reading it. */
-    c->done = true;
-
-    if (c->caps) {
-        vTaskDeleteWithCaps(NULL);
-    } else {
-        vTaskDelete(NULL);
-    }
+    free(c->block);
+    free(c->argv);
+    free(c);
+    return code;
 }
 
 static void unit_start(svc_unit_t *u)
@@ -252,21 +238,21 @@ static void unit_start(svc_unit_t *u)
     }
 
     svc_builtin_t *c = calloc(1, sizeof(*c));
-    char          *block = malloc(bytes);
     if (c != NULL) {
-        c->argv = calloc((size_t)argc + 1, sizeof(*c->argv));
+        c->argv  = calloc((size_t)argc + 1, sizeof(*c->argv));
+        c->block = malloc(bytes);
     }
-    if (c == NULL || c->argv == NULL || block == NULL) {
+    if (c == NULL || c->argv == NULL || c->block == NULL) {
         if (c != NULL) {
             free(c->argv);
+            free(c->block);
         }
-        free(block);
         free(c);
         u->enabled = false;
         return;
     }
 
-    char *w = block;
+    char *w = c->block;
     for (int i = 0; i < argc; i++) {
         const size_t n = strlen(argv[i]) + 1;
         memcpy(w, argv[i], n);
@@ -276,48 +262,34 @@ static void unit_start(svc_unit_t *u)
     c->argv[argc] = NULL;
     c->argc = argc;
     c->cmd  = cmd;
-    c->u    = u;
-    c->s    = &s_svc_session;
 
-    /* strlcpy, not snprintf: -Wformat-truncation is right that a 32-byte unit
-     * name does not fit a 16-byte task name, and FreeRTOS truncates anyway. */
-    char           name[configMAX_TASK_NAME_LEN];
-    const uint32_t stack = (cmd->stack != 0) ? cmd->stack : SVC_BUILTIN_STACK;
-    strlcpy(name, "svc:", sizeof(name));
-    strlcat(name, u->name, sizeof(name));
-
-    TaskHandle_t task = NULL;
-    bool         caps = false;
-    BaseType_t   ok;
-    if (cmd->internal_stack) {
+    const espix_proc_fn_opts_t opts = {
+        .name           = u->name,
+        .fn             = builtin_unit_main,
+        .arg            = c,
+        .kind           = ESPIX_PROC_DAEMON,
+        .stack          = (cmd->stack != 0) ? cmd->stack : SVC_BUILTIN_STACK,
+        .priority       = SVC_PRIORITY,
+        .core           = 1,
         /* It maps or writes flash, which cannot be done from a PSRAM stack. */
-        ok = xTaskCreatePinnedToCore(builtin_unit_task, name, stack, c,
-                                     SVC_PRIORITY, &task, 1);
-    } else {
-        ok = xTaskCreatePinnedToCoreWithCaps(builtin_unit_task, name, stack, c,
-                                             SVC_PRIORITY, &task, 1,
-                                             MALLOC_CAP_SPIRAM);
-        if (ok == pdPASS) {
-            caps = true;
-        } else {
-            ok = xTaskCreatePinnedToCore(builtin_unit_task, name, stack, c,
-                                         SVC_PRIORITY, &task, 1);
-        }
-    }
-    if (ok != pdPASS) {
+        .internal_stack = cmd->internal_stack,
+        .session        = &s_svc_session,
+    };
+    const esp_err_t err = espix_proc_spawn_fn(&opts, &u->pid);
+    if (err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot start: %s", u->name,
+                   esp_err_to_name(err));
         free(c->argv);
-        free(block);
+        free(c->block);
         free(c);
+        u->pid     = ESPIX_PID_NONE;
         u->enabled = false;
         return;
     }
 
-    c->caps    = caps;
-    u->builtin = c;
-    u->task    = task;
-    u->ran     = true;
-    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started (builtin %s)", u->name,
-               cmd->name);
+    u->ran = true;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: started pid %d (builtin %s)", u->name,
+               (int)u->pid, cmd->name);
 }
 
 /*
@@ -544,8 +516,7 @@ static bool units_load(void)
             fresh[i].restarts    = old->restarts;
             fresh[i].next_due_us = old->next_due_us;
             fresh[i].fails       = old->fails;
-            fresh[i].task        = old->task;
-            fresh[i].builtin     = old->builtin;
+            fresh[i].stop        = old->stop;
             fresh[i].ran         = old->ran;
             fresh[i].last_code   = old->last_code;
             if (!s_safe_mode) {
@@ -625,27 +596,16 @@ static void supervisor_task(void *arg)
                 int code = 0;
                 if (espix_proc_wait(u->pid, &code, 0) == ESP_OK) {
                     const espix_pid_t gone = u->pid;
-                    u->pid = ESPIX_PID_NONE;
+                    u->pid  = ESPIX_PID_NONE;
+                    u->stop = false;
                     espix_klog(ESPIX_KLOG_INFO, TAG, "%s: pid %d exited (%d)",
                                u->name, (int)gone, code);
                     unit_exited(u, code);
                 }
             }
 
-            svc_builtin_t *b = u->builtin;
-            if (b != NULL && b->done) {
-                const int code = b->code;
-                free(b->argv);
-                u->builtin = NULL;
-                u->task    = NULL;
-                u->stop    = false;
-                espix_klog(ESPIX_KLOG_INFO, TAG, "%s: finished (%d)", u->name,
-                           code);
-                unit_exited(u, code);
-            }
-
-            const bool busy = (u->pid != ESPIX_PID_NONE) || (u->task != NULL);
-            if (u->enabled && !busy && !espix_shutdown_started() &&
+            if (u->enabled && u->pid == ESPIX_PID_NONE &&
+                !espix_shutdown_started() &&
                 (u->every_s == 0 || now >= u->next_due_us)) {
                 unit_start(u);
             }
@@ -752,7 +712,6 @@ bool espix_svc_info(int index, espix_svc_info_t *out)
         out->pid      = s_units[index].pid;
         out->always   = s_units[index].always;
         out->enabled  = s_units[index].enabled;
-        out->running  = (s_units[index].task != NULL);
         out->every_s  = s_units[index].every_s;
         out->restarts = s_units[index].restarts;
         out->stopping = s_units[index].stop;
@@ -762,28 +721,6 @@ bool espix_svc_info(int index, espix_svc_info_t *out)
     }
     xSemaphoreGive(s_lock);
     return ok;
-}
-
-bool espix_svc_stopping(void)
-{
-    if (!s_started) {
-        return false;
-    }
-
-    /* Whoever is asking is the builtin, so it is this task's unit that is
-     * being asked to stop -- and no unit of its own means no. */
-    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
-    bool               stopping = false;
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (int i = 0; i < s_count; i++) {
-        if (s_units[i].task != NULL && s_units[i].task == (void *)me) {
-            stopping = s_units[i].stop;
-            break;
-        }
-    }
-    xSemaphoreGive(s_lock);
-    return stopping;
 }
 
 esp_err_t espix_svc_start(const char *name)
@@ -798,7 +735,6 @@ esp_err_t espix_svc_start(const char *name)
     if (u != NULL) {
         u->enabled  = true;             /* the supervisor does the starting */
         u->restarts = 0;                /* and a manual start gets a fresh run */
-        u->stop     = false;
         err = ESP_OK;
     }
     xSemaphoreGive(s_lock);
@@ -818,10 +754,6 @@ esp_err_t espix_svc_stop(const char *name)
         u->enabled = false;
         if (u->pid != ESPIX_PID_NONE) {
             (void)espix_proc_signal(u->pid, SIGTERM);
-        } else if (u->task != NULL) {
-            /* A builtin has no pid to signal: it is asked, and its own loop
-             * says when it has finished. The same arrangement an app gets
-             * from espix_proc_stopping(). */
             u->stop = true;
         }
         err = ESP_OK;
@@ -863,69 +795,3 @@ esp_err_t espix_svc_reload(void)
 
     return loaded ? ESP_OK : ESP_FAIL;
 }
-
-int espix_svc_quiesce(int64_t deadline_us)
-{
-    if (!s_started) {
-        return 0;
-    }
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (int i = 0; i < s_count; i++) {
-        svc_unit_t *u = &s_units[i];
-
-        /*
-         * Disabled first, in the same critical section: a unit that exits
-         * promptly must not be started again by the tick that notices.
-         */
-        u->enabled = false;
-
-        if (u->pid != ESPIX_PID_NONE) {
-            (void)espix_proc_signal(u->pid, SIGTERM);
-        } else if (u->task != NULL) {
-            /* A builtin has no pid to signal: it is asked, the same way
-             * espix_svc_stop() asks one, and its own loop says when it is done. */
-            u->stop = true;
-        }
-    }
-    xSemaphoreGive(s_lock);
-
-    int left = 0;
-
-    for (;;) {
-        left = 0;
-
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        for (int i = 0; i < s_count; i++) {
-            const svc_unit_t *u = &s_units[i];
-
-            /* A builtin that has finished has set its own done flag; the
-             * supervisor is only waiting for a tick to collect the context. */
-            const bool done = (u->builtin != NULL) &&
-                              ((const svc_builtin_t *)u->builtin)->done;
-
-            if ((u->pid != ESPIX_PID_NONE || u->task != NULL) && !done) {
-                left++;
-            }
-        }
-        xSemaphoreGive(s_lock);
-
-        if (left == 0 || esp_timer_get_time() >= deadline_us) {
-            break;
-        }
-
-        /* A poll, because a builtin has no event to wait on. 20ms keeps the
-         * shutdown responsive without the supervisor's one-second tick being
-         * what it costs. */
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-
-    if (left > 0) {
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "%d unit%s did not stop in time; the reset will take them",
-                   left, (left == 1) ? "" : "s");
-    }
-
-    return left;
-}
-

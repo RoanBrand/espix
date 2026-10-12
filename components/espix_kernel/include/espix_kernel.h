@@ -281,10 +281,9 @@ espix_klog_level_t espix_klog_console_level(void);
  * learn what ssh or nfsd is. espix_main.c does the wiring.
  */
 typedef enum {
-    /* Stop supervised units, and anything serving that a unit started. */
-    ESPIX_SHUTDOWN_UNITS = 0,
-    /* SIGTERM every process and wait for the table to empty. */
-    ESPIX_SHUTDOWN_APPS,
+    /* SIGTERM every process -- apps, and the daemons units run -- and wait for
+     * the table to empty. The supervisor starts nothing once shutdown begins. */
+    ESPIX_SHUTDOWN_PROCESSES = 0,
     /* Flush and unmount every volume. */
     ESPIX_SHUTDOWN_STORAGE,
     /* Park what a reset would otherwise leave running: radios, audio, display. */

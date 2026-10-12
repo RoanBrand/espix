@@ -15,7 +15,7 @@
 
 static const char *state_of(const espix_svc_info_t *u)
 {
-    if (u->pid != ESPIX_PID_NONE || u->running) {
+    if (u->pid != ESPIX_PID_NONE) {
         return u->stopping ? "stopping" : "running";
     }
     if (u->every_s > 0) {

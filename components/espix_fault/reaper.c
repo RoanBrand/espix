@@ -94,16 +94,20 @@ static void reaper_task(void *arg)
         }
 
         const espix_pid_t pid = espix_proc_pid_of_task(victim);
+        espix_proc_kind_t kind = ESPIX_PROC_APP;
+        const bool        app  = pid != ESPIX_PID_NONE &&
+                                 espix_proc_kind_of(pid, &kind) &&
+                                 kind == ESPIX_PROC_APP;
 
-        if (pid != ESPIX_PID_NONE) {
+        if (app) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "reaping faulted pid %d", (int)pid);
             espix_proc_kill(pid);
         } else {
-            /* Not an espix process — a kernel task faulted. Deleting it would
-             * leave the system half-alive with no owner, so refuse and let the
-             * report stand. */
+            /* Not an app -- kernel code faulted, a process of espix's own or
+             * not. Deleting it would leave the system half-alive with no
+             * owner, so refuse and let the report stand. */
             espix_klog(ESPIX_KLOG_ERROR, TAG,
-                       "refusing to reap non-process task %s",
+                       "refusing to reap kernel task %s",
                        pcTaskGetName(victim));
         }
     }

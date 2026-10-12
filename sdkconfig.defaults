@@ -388,12 +388,11 @@ CONFIG_ESPIX_SSH_MAX_SESSIONS=8
 # that do real work; anything deeper declares its own stack in the command
 # table, where it costs one command instead of every session.
 # The session task, which is also the app-spawning path: the ELF's sections are
-# copied and relocated here before the new task exists. Measured against a
-# handshake, a prompt and a simple command it is 4056 bytes, so 8192 is the
-# default -- and the S31 loads Doom in that. The S3 needs more for the same load
-# because its frames are bigger; the measurement and the value are in
-# sdkconfig.defaults.esp32s3, where a per-target number belongs.
-CONFIG_ESPIX_SSH_TASK_STACK=8192
+# copied and relocated here before the new task exists. A handshake, a prompt
+# and a simple command measured 4056 bytes, but spawning one backgrounded app
+# took an S31 session from 2268 bytes free to 364 at 8192, and one reached 116
+# under the suite. PSRAM, so 12 KB costs 32 KB of it at eight sessions.
+CONFIG_ESPIX_SSH_TASK_STACK=12288
 
 #
 # The task watchdog keeps its idle-task check, at the slowest interval IDF

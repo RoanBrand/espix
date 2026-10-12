@@ -110,9 +110,10 @@ typedef struct {
     size_t              size;
 } espix_app_region_t;
 
+/*
+ * The part of a process only an ELF app has. See espix_proc_slot_t.app.
+ */
 typedef struct {
-    espix_proc_info_t info;
-
     esp_elf_t elf;
     bool      elf_valid;
     uint8_t  *image;        /* raw file bytes, freed once the ELF is torn down */
@@ -139,37 +140,9 @@ typedef struct {
     char  *env_added[ESPIX_PROC_ENV_ADDED_MAX];
     int    env_added_count;
 
-    /*
-     * Set when someone has asked this process to stop. Volatile because the
-     * app polls it from its own task while another task writes it, and no lock
-     * is taken on the read path: a single bool needs none, and an app should
-     * not block to ask whether it is still wanted.
-     *
-     * Still a plain bool rather than "SIGTERM is pending": it is the *decision*
-     * to leave, which a default action reaches and a handled signal does not.
-     * An app that handles SIGINT and returns keeps running, and this stays
-     * false.
-     */
-    volatile bool stop_requested;
-
-    /*
-     * How exit() gets home.
-     *
-     * An app's exit()/_Exit()/abort() must run the same teardown a return from
-     * app_main() does -- streams closed, ELF released, the slot marked EXITED
-     * with the right status. Deleting the task right there instead is what used
-     * to leak the image and lose the exit status, so proc_task() arms a longjmp
-     * target across the call into the app and espix_proc_exit() jumps to it.
-     *
-     * The jmp_buf lives in proc_task()'s frame, not here: it is valid only
-     * while that frame is alive, and a jmp_buf per slot would be paid by every
-     * slot to hold a pointer that is NULL except while the app runs. exit_jmp
-     * being non-NULL is therefore also the test for "this slot's own task is
-     * running the app", which is what keeps exit() called from a thread the app
-     * created from longjmp'ing into a stack it does not own.
-     */
-    jmp_buf  *exit_jmp;
-    int       exit_status;
+    /* The program's absolute path, for loading it and for the messages that
+     * say which one failed. */
+    char path[ESPIX_PATH_MAX];
 
     /*
      * The process's working directory, so a relative path an app hands to
@@ -230,15 +203,59 @@ typedef struct {
      * and the only reader that matters is the same task asking about itself.
      */
     volatile bool root_active;
+} espix_proc_app_t;
+
+typedef struct {
+    espix_proc_info_t info;
+
+    /*
+     * What only an ELF app has: its image, argv, environment and paths. NULL
+     * for every other kind of process, so a daemon or a kernel thread costs
+     * the table none of it. Allocated in PSRAM at spawn and freed with the
+     * slot's other resources, after the process's tasks are gone -- which is
+     * what lets espix_proc_paths() read it without a lock.
+     */
+    espix_proc_app_t *app;
+
+    /*
+     * Set when someone has asked this process to stop. Volatile because the
+     * app polls it from its own task while another task writes it, and no lock
+     * is taken on the read path: a single bool needs none, and an app should
+     * not block to ask whether it is still wanted.
+     *
+     * Still a plain bool rather than "SIGTERM is pending": it is the *decision*
+     * to leave, which a default action reaches and a handled signal does not.
+     * An app that handles SIGINT and returns keeps running, and this stays
+     * false.
+     */
+    volatile bool stop_requested;
+
+    /*
+     * How exit() gets home.
+     *
+     * An app's exit()/_Exit()/abort() must run the same teardown a return from
+     * app_main() does -- streams closed, ELF released, the slot marked EXITED
+     * with the right status. Deleting the task right there instead is what used
+     * to leak the image and lose the exit status, so proc_task() arms a longjmp
+     * target across the call into the app and espix_proc_exit() jumps to it.
+     *
+     * The jmp_buf lives in proc_task()'s frame, not here: it is valid only
+     * while that frame is alive, and a jmp_buf per slot would be paid by every
+     * slot to hold a pointer that is NULL except while the app runs. exit_jmp
+     * being non-NULL is therefore also the test for "this slot's own task is
+     * running the app", which is what keeps exit() called from a thread the app
+     * created from longjmp'ing into a stack it does not own.
+     */
+    jmp_buf  *exit_jmp;
+    int       exit_status;
+
 
     /*
      * Signal state.
      *
-     * Here rather than in espix_proc_info_t deliberately. That struct is what
-     * espix_proc_snapshot() bulk-copies, and callers put it on the stack —
-     * cmd_ps as [8], espix_proc_hangup as [12] on an SSH task. A handler table
-     * in there would cost every one of those arrays 128 bytes an entry to carry
-     * something no caller can use.
+     * Here rather than in espix_proc_info_t deliberately: that struct is what
+     * espix_proc_snapshot() bulk-copies, and a caller's array of them would
+     * carry the lot for nothing.
      *
      * Bit N is signal N, matching newlib's sigset_t convention exactly, so the
      * two interchange without a shuffle. uint32_t and not uint8_t: SIGTERM is
@@ -357,6 +374,10 @@ typedef struct {
     /* Run time of this process's threads that have already ended, so `ps`
      * charges a process for all of its CPU and not just its live tasks'. */
     uint64_t           cpu_threads_done;
+
+    /* A kernel process's body and its argument; see espix_proc_spawn_fn(). */
+    espix_proc_fn_t    fn;
+    void              *fn_arg;
 } espix_proc_slot_t;
 
 /*

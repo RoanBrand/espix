@@ -52,19 +52,19 @@ static bool entry_is(const char *entry, const char *name, size_t nlen)
 static char *espix_abi_getenv(const char *name)
 {
     espix_proc_slot_t *slot = espix_proc_self();
-    if (slot == NULL || name == NULL || name[0] == '\0') {
+    if (slot == NULL || slot->app == NULL || name == NULL || name[0] == '\0') {
         return NULL;
     }
     const size_t nlen = strlen(name);
 
     /* Anything the app added wins over what it inherited: a later setenv()
      * replaces an earlier value, and the added table is searched first. */
-    for (int i = 0; i < slot->env_added_count; i++) {
-        if (entry_is(slot->env_added[i], name, nlen)) {
-            return slot->env_added[i] + nlen + 1;
+    for (int i = 0; i < slot->app->env_added_count; i++) {
+        if (entry_is(slot->app->env_added[i], name, nlen)) {
+            return slot->app->env_added[i] + nlen + 1;
         }
     }
-    for (char **e = slot->envp; e != NULL && *e != NULL; e++) {
+    for (char **e = slot->app->envp; e != NULL && *e != NULL; e++) {
         if (entry_is(*e, name, nlen)) {
             return *e + nlen + 1;
         }
@@ -75,7 +75,7 @@ static char *espix_abi_getenv(const char *name)
 static int espix_abi_setenv(const char *name, const char *value, int overwrite)
 {
     espix_proc_slot_t *slot = espix_proc_self();
-    if (slot == NULL || name == NULL || value == NULL || name[0] == '\0' ||
+    if (slot == NULL || slot->app == NULL || name == NULL || value == NULL || name[0] == '\0' ||
         strchr(name, '=') != NULL) {
         errno = EINVAL;
         return -1;
@@ -95,38 +95,38 @@ static int espix_abi_setenv(const char *name, const char *value, int overwrite)
     sprintf(entry, "%s=%s", name, value);
 
     /* Replace in place if the app has already set this one. */
-    for (int i = 0; i < slot->env_added_count; i++) {
-        if (entry_is(slot->env_added[i], name, nlen)) {
-            free(slot->env_added[i]);
-            slot->env_added[i] = entry;
+    for (int i = 0; i < slot->app->env_added_count; i++) {
+        if (entry_is(slot->app->env_added[i], name, nlen)) {
+            free(slot->app->env_added[i]);
+            slot->app->env_added[i] = entry;
             return 0;
         }
     }
 
-    if (slot->env_added_count >= ESPIX_PROC_ENV_ADDED_MAX) {
+    if (slot->app->env_added_count >= ESPIX_PROC_ENV_ADDED_MAX) {
         free(entry);
         errno = ENOMEM;
         return -1;
     }
-    slot->env_added[slot->env_added_count++] = entry;
+    slot->app->env_added[slot->app->env_added_count++] = entry;
     return 0;
 }
 
 static int espix_abi_unsetenv(const char *name)
 {
     espix_proc_slot_t *slot = espix_proc_self();
-    if (slot == NULL || name == NULL || name[0] == '\0' ||
+    if (slot == NULL || slot->app == NULL || name == NULL || name[0] == '\0' ||
         strchr(name, '=') != NULL) {
         errno = EINVAL;
         return -1;
     }
     const size_t nlen = strlen(name);
 
-    for (int i = 0; i < slot->env_added_count; i++) {
-        if (entry_is(slot->env_added[i], name, nlen)) {
-            free(slot->env_added[i]);
-            slot->env_added[i] = slot->env_added[--slot->env_added_count];
-            slot->env_added[slot->env_added_count] = NULL;
+    for (int i = 0; i < slot->app->env_added_count; i++) {
+        if (entry_is(slot->app->env_added[i], name, nlen)) {
+            free(slot->app->env_added[i]);
+            slot->app->env_added[i] = slot->app->env_added[--slot->app->env_added_count];
+            slot->app->env_added[slot->app->env_added_count] = NULL;
             break;
         }
     }
@@ -137,8 +137,8 @@ static int espix_abi_unsetenv(const char *name)
      * that must stay intact to be freed. Shifting the vector down is enough --
      * the strings stay where they are and the block still frees in one call.
      */
-    if (slot->envp != NULL) {
-        for (char **e = slot->envp; *e != NULL; e++) {
+    if (slot->app->envp != NULL) {
+        for (char **e = slot->app->envp; *e != NULL; e++) {
             if (entry_is(*e, name, nlen)) {
                 for (char **q = e; *q != NULL; q++) {
                     q[0] = q[1];

@@ -43,7 +43,7 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   for it. `tests/suites/35-signals.sh` pins both halves.
 
 - **`ps` shows only the last eight exits.** The finished list is a fixed
-  eight-entry ring (`ESPIX_PROC_DONE_MAX`), separate from the 12-slot live
+  eight-entry ring (`ESPIX_PROC_DONE_MAX`), separate from the live
   table, so a ninth exit pushes the oldest out of the `finished:` list. A ring
   because it is bookkeeping, and a spawn must never fail for it.
 

@@ -63,7 +63,7 @@ menu "espix SSH"
         int "Connection task stack (bytes)"
         depends on ESPIX_SSH_ENABLED
         range 4096 16384
-        default 8192
+        default 12288
         help
             The protocol logic is shallow, but the handshake is not: x25519,
             ECDSA and PBKDF2 run here, and a live session measured 4056 bytes
@@ -88,6 +88,11 @@ menu "espix SSH"
             the deep ones pay for themselves. Raising it is still the wrong fix
             for a command that needs more: declare the size in the command table,
             where it costs one command's stack instead of every session's.
+
+            What has no table entry is starting a program, which runs inline: an
+            interactive session went from 2268 bytes free to 364 on a single
+            backgrounded app at 8192, and one reached 116 under the test suite.
+            Hence 12288. It is PSRAM, so eight sessions cost 32 KB of 13 MB.
 
             Sizing is measured, not guessed. `ps` shows a running task's
             high-water mark, and the dispatcher logs the same figure for a
