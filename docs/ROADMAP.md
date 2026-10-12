@@ -224,17 +224,6 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## SSH
 
-- **`sshd` as a unit, so it can be turned off from /etc/units.** The server is
-  started by espix itself today -- `ssh_server.c` creates its accept task at
-  boot -- and there is no `sshd` builtin, so a line in the units file would do
-  nothing (which is what the example file used to imply). What it costs is a
-  builtin that starts the server and then blocks, which a unit with `always`
-  keeps up, plus removing the boot-time start. What it buys is the control every
-  other daemon already has. The decision to settle first is the way back in: a
-  device whose SSH is off is reached over the serial console, so the default has
-  to stay on, and turning it off has to be a deliberate edit rather than an
-  uncommented line somebody copied.
-
 - **More than one channel per connection.** `direct-tcpip` landed, so
   `ssh -N -L` works -- but the server carries exactly one channel for the life
   of a connection, which is why `ssh -L` (a shell *and* a forward) is refused.
@@ -245,11 +234,9 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   refactor -- today the connection task *is* the channel.
 - **Split the connection task from the session task.** Today one task reads
   the wire, runs the shell, runs a foreground command and pumps a program's
-  stdin, and it is the only reader of the socket -- which is why a foreground
-  command has to poll for Ctrl-C rather than block on it (R-P7.1 item 2). A
-  reader task feeding a queue turns that into a push, and several other things
-  with it: the foreground wait could block on an event group instead of a 50 ms
-  loop; chan_poll_interrupt's bounded drains could become a real recv or
+  stdin, and it is the only task that decrypts. The socket reader already wakes
+  the foreground wait (R-P8.7); a reader that also parsed would turn more into a
+  push: chan_poll_interrupt's bounded drains could become a real recv or
   select; the transport's vTaskDelay(1) retries in ssh_transport.c would have
   somewhere to block (R-P7.1 item 5); Ctrl-Z and q need the key reported rather
   than consumed (R-P7.7); and the orphaned transmit lock a force-killed writer

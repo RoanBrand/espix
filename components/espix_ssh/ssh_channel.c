@@ -684,21 +684,6 @@ static bool drain_pending_to_stdin(ssh_chan_t *ch, bool *hit)
                  * moment somebody is reaching for it. A terminal's overflow is
                  * dropped instead, which is what a tty does.
                  */
-                /*
-                 * A pipe waits for room; a terminal never does.
-                 *
-                 * Waiting is what keeps the rate off the poll interval. The
-                 * producer only runs from cmd_run's wait loop, once per
-                 * RUN_POLL_MS, so returning when the queue is full moves one
-                 * queue per 50ms -- 256 bytes per 50ms, ~5 KB/s, slow enough
-                 * that a 2MB `prog < file` hit the foreground timeout and was
-                 * truncated mid-stream. Measured both ways.
-                 *
-                 * Never for a pty: this is the connection task, and blocking it
-                 * stops the poll that notices Ctrl-C at exactly the moment
-                 * somebody is reaching for it. A terminal's overflow is dropped
-                 * instead, as a tty does.
-                 */
                 const TickType_t wait = ch->has_pty
                                             ? 0
                                             : pdMS_TO_TICKS(STDIN_SEND_WAIT_MS);
@@ -930,6 +915,29 @@ static int chan_stream_write_err(void *cookie, const char *data, int len)
 }
 
 /*
+ * The foreground wait's sleep. The socket reader notifies this task when bytes
+ * land, and a child's exit does too. Input already off the wire but not yet
+ * handed on -- a pipe waiting for its reader -- is the poll's to move now, and
+ * a closed channel is reported by every poll, so that waits a tick at most.
+ */
+static void chan_wait_input(espix_session_t *s, uint32_t ms)
+{
+    ssh_chan_t *ch = s->transport;
+
+    if (ch == NULL) {
+        return;
+    }
+    if (ch->closed && ms > STDIN_SEND_WAIT_MS) {
+        ms = STDIN_SEND_WAIT_MS;
+    } else if (ch->pending_pos < ch->pending_len || ssh_rx_pending(ch->conn) > 0) {
+        return;
+    }
+    (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
+                                  (ms == UINT32_MAX) ? portMAX_DELAY
+                                                     : pdMS_TO_TICKS(ms));
+}
+
+/*
  * An app's standard input.
  *
  * Reads the queue that chan_poll_interrupt() fills, never the socket: the
@@ -957,26 +965,6 @@ static int chan_stream_read(void *cookie, char *buf, int len)
     }
 
     for (;;) {
-        /*
-         * Non-blocking, and that is a correctness requirement rather than a
-         * style choice.
-         *
-         * A *blocking* xStreamBufferReceive() registers this task in the
-         * buffer (stream_buffer.c: `xTaskWaitingToReceive =
-         * xTaskGetCurrentTaskHandle()`) and FreeRTOS never deregisters a task
-         * that is deleted while it waits. espix force-kills processes -- on
-         * `kill -9`, on the third Ctrl-C, and on hangup once TERM_GRACE_MS
-         * expires -- so a process asleep in here got deleted with its handle
-         * still registered, and the connection task's next send then notified
-         * a freed TCB. Measured, not theorised: `kill -9` on a backgrounded
-         * `testapp cat` took the device down every time, while the same kill
-         * on an app that never *read* stdin was harmless.
-         *
-         * vTaskDelay() has no such problem -- a deleted task is simply removed
-         * from the delayed list -- and it is better on every other axis too:
-         * espix_proc_signal() already calls xTaskAbortDelay(), so a signal
-         * ends the wait at once rather than up to a second later.
-         */
         /*
          * Blocking, with a timeout -- not polling.
          *
@@ -2435,6 +2423,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .cwd       = "/",
             .transport = ch,
             .fg_pgid    = ESPIX_PID_NONE,
+            .ppid      = ch->conn->parent,
             .uid       = ESPIX_UID_NOBODY,
             .gid       = ESPIX_UID_NOBODY,
         };
@@ -2482,6 +2471,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .write     = chan_write,
             .write_err = chan_write_err,
             .poll_interrupt = chan_poll_interrupt,
+            .wait_input     = chan_wait_input,
             .term_size      = chan_term_size,
             .task_gone      = chan_task_gone,
             .transport = ch,
@@ -2490,6 +2480,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .uid       = ESPIX_UID_NOBODY,
             .gid       = ESPIX_UID_NOBODY,
             .fg_pgid    = ESPIX_PID_NONE,
+            .ppid      = ch->conn->parent,
             .ansi      = ch->has_pty,
             .open_stream = chan_open_stream,
         };
@@ -2599,8 +2590,9 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .cwd       = "/",
         .read_line = chan_read_line,
         .write     = chan_write,
-            .write_err = chan_write_err,
+        .write_err = chan_write_err,
         .poll_interrupt = chan_poll_interrupt,
+        .wait_input     = chan_wait_input,
         .term_size      = chan_term_size,
         .task_gone      = chan_task_gone,
         .transport = ch,
@@ -2609,6 +2601,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .uid       = ESPIX_UID_NOBODY,
         .gid       = ESPIX_UID_NOBODY,
         .fg_pgid    = ESPIX_PID_NONE,
+        .ppid      = ch->conn->parent,
         .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,
     };

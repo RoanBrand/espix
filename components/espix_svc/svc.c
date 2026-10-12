@@ -301,7 +301,8 @@ static void unit_start(svc_unit_t *u)
 }
 
 /* The file when there is none, and what is parsed when it cannot be written.
- * Everything but the update check is commented out. */
+ * Everything but sshd and the update check is commented out. */
+#define SVC_SSHD_LINE "sshd  always  sshd\n"
 static const char *const SVC_DEFAULT_UNITS =
     "# What espix runs at boot: one unit per line.\n"
     "#\n"
@@ -318,6 +319,10 @@ static const char *const SVC_DEFAULT_UNITS =
     "#             as root with no terminal, and its output goes to the klog\n"
     "#\n"
     "# service lists the units; service reload applies an edit.\n"
+    "\n"
+    "# The SSH server. Without it the serial console is the only way in, so it\n"
+    "# starts even in safe mode.\n"
+    SVC_SSHD_LINE
     "\n"
     "# Ask every six hours whether a newer build exists; 100 means one does.\n"
     "autoupdate  every 6h  success=100  upgrade --check\n"
@@ -411,6 +416,13 @@ static bool parse_success(svc_unit_t *u, const char *v)
 }
 
 /* One line, file or built-in. Mutates the line. */
+/* sshd is how a board in safe mode is reached, so it starts there too. */
+static bool unit_is_sshd(const char *cmdline)
+{
+    return strncmp(cmdline, "sshd", 4) == 0 &&
+           (cmdline[4] == '\0' || cmdline[4] == ' ' || cmdline[4] == '\t');
+}
+
 static void units_parse(svc_unit_t *fresh, int *n, char *line)
 {
     char *p       = line;
@@ -474,10 +486,68 @@ static void units_parse(svc_unit_t *fresh, int *n, char *line)
     strlcpy(u.name, name, sizeof(u.name));
     strlcpy(u.cmdline, p, sizeof(u.cmdline));
     u.always      = (strcmp(restart, "always") == 0);
-    u.enabled     = !s_safe_mode;
+    u.enabled     = !s_safe_mode || unit_is_sshd(p);
     u.pid         = ESPIX_PID_NONE;
     u.next_due_us = esp_timer_get_time() + SVC_FIRST_DUE_US;
     fresh[(*n)++] = u;
+}
+
+/*
+ * A units file from before sshd was a unit has no line for it, and reading it
+ * as it is would leave the board with no way in over the network. So a file
+ * that names sshd nowhere, not even commented out, gets the line once, after
+ * its opening comment; commenting it out is how to turn sshd off.
+ */
+static void units_add_sshd(void)
+{
+    FILE *f = fopen(SVC_UNITS_FILE, "r");
+    if (f == NULL) {
+        return;
+    }
+    char  *text = NULL;
+    size_t len  = 0;
+    FILE  *mem  = open_memstream(&text, &len);
+    char   line[SVC_LINE_MAX];
+    bool   named = false;
+    size_t head  = 0;           /* where the opening comment block ends */
+    bool   in_head = true;
+
+    while (mem != NULL && fgets(line, sizeof(line), f) != NULL) {
+        const char *w = line + strspn(line, " \t#");
+        if (strncmp(w, "sshd", 4) == 0 && (w[4] == ' ' || w[4] == '\t')) {
+            named = true;
+        }
+        fputs(line, mem);
+        if (in_head) {
+            fflush(mem);
+            if (line[0] == '#') {
+                head = len;
+            } else {
+                in_head = false;
+            }
+        }
+    }
+    fclose(f);
+    if (mem == NULL) {
+        return;
+    }
+    fclose(mem);
+
+    if (!named) {
+        const int fd = open(SVC_UNITS_FILE, O_WRONLY | O_TRUNC);
+        FILE *out    = (fd >= 0) ? fdopen(fd, "w") : NULL;
+        if (out != NULL) {
+            fwrite(text, 1, head, out);
+            fputs((head > 0) ? "\n" SVC_SSHD_LINE : SVC_SSHD_LINE, out);
+            fwrite(text + head, 1, len - head, out);
+            fclose(out);
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: added the sshd unit",
+                       SVC_UNITS_FILE);
+        } else if (fd >= 0) {
+            close(fd);
+        }
+    }
+    free(text);
 }
 
 /*
@@ -493,6 +563,8 @@ static bool units_load(void)
     int n = 0;
 
     memset(fresh, 0, sizeof(fresh));
+
+    units_add_sshd();
 
     errno = 0;                      /* so the branch below is about this open */
     FILE *f = fopen(SVC_UNITS_FILE, "r");

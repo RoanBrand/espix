@@ -15,6 +15,7 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>   /* struct timeval, for SO_RCVTIMEO and SO_SNDTIMEO */
 
@@ -25,7 +26,9 @@
 #include "esp_memory_utils.h"   /* esp_stack_ptr_in_extram, esp_ptr_external_ram */
 #include "esp_timer.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_ssh.h"
 #include "sdkconfig.h"
 #include "ssh_priv.h"
@@ -77,6 +80,7 @@ _Static_assert(CONFIG_LWIP_MAX_ACTIVE_TCP >= 2 * CONFIG_ESPIX_SSH_MAX_SESSIONS,
                "the lwIP TCP pool cannot hold the queued and accepted sessions at once");
 
 static int                s_listen_fd = -1;
+static espix_pid_t        s_sshd_pid  = ESPIX_PID_NONE;   /* the unit running the listener */
 static espix_ssh_status_t s_status;
 
 /* ------------------------------------------------------------------ */
@@ -497,7 +501,8 @@ static void connection_task(void *arg)
         conn_task_exit();
         return;
     }
-    c->fd = fd;
+    c->fd     = fd;
+    c->parent = s_sshd_pid;
 
     /* The reader owns recv() from here; everything else reads the ring. */
     if (ssh_rx_start(c) != ESP_OK) {
@@ -602,197 +607,193 @@ static void connection_task(void *arg)
     conn_task_exit();
 }
 
-static void accept_task(void *arg)
+/* One accepted connection: its socket options, a refusal if it cannot be
+ * served, else a connection task of its own. */
+static void serve(int fd, const struct sockaddr_in *peer)
 {
-    (void)arg;
+    /* Disable Nagle: a shell echoes single keystrokes, and coalescing them
+     * makes typing feel broken. */
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    for (;;) {
-        struct sockaddr_in peer;
-        socklen_t          peer_len = sizeof(peer);
+    /*
+     * Set before the session limit is checked, not after: the refusal
+     * path below reads from this socket too, and without a timeout that
+     * read blocks forever -- in the accept loop, which stops the server
+     * answering anything at all.
+     *
+     * A receive timeout, so no read can block this connection's task
+     * forever. read_exact() turns it into "wait indefinitely" between
+     * packets and "give up eventually" partway through one -- see the note
+     * there for why those must differ.
+     *
+     * Without it a peer that sent half a packet and stopped parked the task
+     * permanently. The task never exited, so s_status.sessions never came
+     * back down, and enough such connections made the server refuse
+     * everything thereafter. It is also reachable by anything that can open
+     * a socket to port 22, which makes it a denial of service rather than
+     * only a bug.
+     */
+    const struct timeval io_timeout = {
+        .tv_sec  = 0,
+        .tv_usec = 250 * 1000,
+    };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
 
-        const int fd = accept(s_listen_fd, (struct sockaddr *)&peer, &peer_len);
-        if (fd < 0) {
-            /* A transient accept error must not kill the listener; a permanent
-             * one would otherwise spin, hence the pause. */
-            espix_klog(ESPIX_KLOG_WARN, TAG, "accept failed: %d", errno);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
+    /*
+     * And the same in the other direction, for the same reason -- which was
+     * missed the first time round, so the paragraph above stayed true of
+     * sends long after it stopped being true of reads.
+     *
+     * A peer that stops reading and does *not* close parks this task inside
+     * send() for as long as it stays silent: the window shuts, lwIP has
+     * nowhere to put the bytes, and a blocking socket simply waits. Enough
+     * such peers exhaust CONFIG_ESPIX_SSH_MAX_SESSIONS, which is the same
+     * denial of service the receive timeout was added to close. (A peer
+     * that stops reading and then *closes* was always handled: the send
+     * fails and teardown runs.)
+     *
+     * This is also what makes write_all()'s EAGAIN branch reachable. On a
+     * blocking socket send() never returns EAGAIN, so that retry -- and the
+     * BLOCKED_WRITE_TIMEOUT_MS clock it keeps -- was dead code, and an
+     * earlier investigation's "zero EAGAIN on every connection" was true
+     * and meaningless. With a send timeout the branch does its intended
+     * job: retry while the peer is merely slow, give up when it is gone.
+     */
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
+
+    /*
+     * Keepalive, with short timers rather than the two-hour default.
+     *
+     * The two timeouts above cover a peer that stops mid-packet and one
+     * that stops draining. Neither covers a peer that simply *vanishes*
+     * without its FIN reaching us: the socket still looks healthy, so a
+     * read times out as "nothing right now" -- and idle is a legitimate
+     * state that may last hours -- while a write keeps succeeding into a
+     * connection nothing is reading any more.
+     *
+     * 55-sessions reproduces exactly that. A killed client's connection
+     * held its session slot while a foreground \`top\` ran to the last of its
+     * frames; neither a read nor a select ever reported the close, and the
+     * probe that tried a zero-length peek saw nothing to see.
+     *
+     * LWIP_TCP_KEEPALIVE is on in this build, so the timers take effect:
+     * ten seconds of silence, then a probe every five, three of them. A
+     * dead peer is reaped in about twenty-five, and one that is merely
+     * quiet is probed and left alone. TCP_KEEPCNT is the load-bearing one
+     * -- without it lwIP probes forever and the session is never given up.
+     */
+    int keepalive = 1;
+    int keep_idle = 10;
+    int keep_intvl = 5;
+    int keep_cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+
+    /*
+     * Going down: refuse with a line rather than a bare close, for the same
+     * reason the session limit does. RFC 4253 4.2 lets a server send
+     * CRLF-terminated text before its version string and requires clients to
+     * cope, which is how OpenSSH reports its own refusals -- so this reads
+     * as a reason rather than as a truncated command.
+     */
+    if (espix_shutdown_started()) {
+        static const char going_down[] =
+            "espix: system is going down\r\n";
+        (void)send(fd, going_down, sizeof(going_down) - 1, 0);
+        close(fd);
+        return;
+    }
+
+    if (!sessions_take()) {
+        /*
+         * Refusing cleanly beats letting a connection half-work. The limit
+         * is above one because scp and sftp open their own connection, and
+         * transferring a file while a shell is open is the normal case.
+         *
+         * The count in the message is what the test harness reads to learn
+         * the device's real limit, rather than trusting a sdkconfig that
+         * may predate the Kconfig default -- so keep the "(N of M in use)"
+         * shape.
+         *
+         * Say why. RFC 4253 4.2 lets a server send arbitrary CRLF-terminated
+         * lines before its version string, and requires clients to cope with
+         * them -- it is how OpenSSH reports "Exceeded MaxStartups". The one
+         * rule is that such a line must not begin with "SSH-".
+         *
+         * Closing without a word is what this used to do, and the client
+         * then prints "Connection closed by remote host", which is
+         * indistinguishable from a crash, a hang, or a truncated command.
+         * That ambiguity cost real debugging time: refused connections were
+         * being read as truncated ones.
+         */
+        char msg[80];
+        const int n = snprintf(msg, sizeof(msg),
+                               "espix: too many connections (%d of %d in use)\r\n",
+                               s_status.sessions,
+                               CONFIG_ESPIX_SSH_MAX_SESSIONS);
+        if (n > 0) {
+            (void)send(fd, msg, (size_t)n, 0);
         }
 
-        /* Disable Nagle: a shell echoes single keystrokes, and coalescing them
-         * makes typing feel broken. */
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        espix_klog(ESPIX_KLOG_WARN, TAG, "refusing connection: %d already open",
+                   s_status.sessions);
+        close_gracefully(fd);   /* or the reset discards the line just sent */
+        return;
+    }
 
-        /*
-         * Set before the session limit is checked, not after: the refusal
-         * path below reads from this socket too, and without a timeout that
-         * read blocks forever -- in the accept loop, which stops the server
-         * answering anything at all.
-         *
-         * A receive timeout, so no read can block this connection's task
-         * forever. read_exact() turns it into "wait indefinitely" between
-         * packets and "give up eventually" partway through one -- see the note
-         * there for why those must differ.
-         *
-         * Without it a peer that sent half a packet and stopped parked the task
-         * permanently. The task never exited, so s_status.sessions never came
-         * back down, and enough such connections made the server refuse
-         * everything thereafter. It is also reachable by anything that can open
-         * a socket to port 22, which makes it a denial of service rather than
-         * only a bug.
-         */
-        const struct timeval io_timeout = {
-            .tv_sec  = 0,
-            .tv_usec = 250 * 1000,
-        };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
+    espix_klog(ESPIX_KLOG_INFO, TAG, "connection from %s",
+               inet_ntoa(peer->sin_addr));
 
-        /*
-         * And the same in the other direction, for the same reason -- which was
-         * missed the first time round, so the paragraph above stayed true of
-         * sends long after it stopped being true of reads.
-         *
-         * A peer that stops reading and does *not* close parks this task inside
-         * send() for as long as it stays silent: the window shuts, lwIP has
-         * nowhere to put the bytes, and a blocking socket simply waits. Enough
-         * such peers exhaust CONFIG_ESPIX_SSH_MAX_SESSIONS, which is the same
-         * denial of service the receive timeout was added to close. (A peer
-         * that stops reading and then *closes* was always handled: the send
-         * fails and teardown runs.)
-         *
-         * This is also what makes write_all()'s EAGAIN branch reachable. On a
-         * blocking socket send() never returns EAGAIN, so that retry -- and the
-         * BLOCKED_WRITE_TIMEOUT_MS clock it keeps -- was dead code, and an
-         * earlier investigation's "zero EAGAIN on every connection" was true
-         * and meaningless. With a send timeout the branch does its intended
-         * job: retry while the peer is merely slow, give up when it is gone.
-         */
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
-
-        /*
-         * Keepalive, with short timers rather than the two-hour default.
-         *
-         * The two timeouts above cover a peer that stops mid-packet and one
-         * that stops draining. Neither covers a peer that simply *vanishes*
-         * without its FIN reaching us: the socket still looks healthy, so a
-         * read times out as "nothing right now" -- and idle is a legitimate
-         * state that may last hours -- while a write keeps succeeding into a
-         * connection nothing is reading any more.
-         *
-         * 55-sessions reproduces exactly that. A killed client's connection
-         * held its session slot while a foreground \`top\` ran to the last of its
-         * frames; neither a read nor a select ever reported the close, and the
-         * probe that tried a zero-length peek saw nothing to see.
-         *
-         * LWIP_TCP_KEEPALIVE is on in this build, so the timers take effect:
-         * ten seconds of silence, then a probe every five, three of them. A
-         * dead peer is reaped in about twenty-five, and one that is merely
-         * quiet is probed and left alone. TCP_KEEPCNT is the load-bearing one
-         * -- without it lwIP probes forever and the session is never given up.
-         */
-        int keepalive = 1;
-        int keep_idle = 10;
-        int keep_intvl = 5;
-        int keep_cnt = 3;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
-
-        /*
-         * Going down: refuse with a line rather than a bare close, for the same
-         * reason the session limit does. RFC 4253 4.2 lets a server send
-         * CRLF-terminated text before its version string and requires clients to
-         * cope, which is how OpenSSH reports its own refusals -- so this reads
-         * as a reason rather than as a truncated command.
-         */
-        if (espix_shutdown_started()) {
-            static const char going_down[] =
-                "espix: system is going down\r\n";
-            (void)send(fd, going_down, sizeof(going_down) - 1, 0);
-            close(fd);
-            continue;
-        }
-
-        if (!sessions_take()) {
-            /*
-             * Refusing cleanly beats letting a connection half-work. The limit
-             * is above one because scp and sftp open their own connection, and
-             * transferring a file while a shell is open is the normal case.
-             *
-             * The count in the message is what the test harness reads to learn
-             * the device's real limit, rather than trusting a sdkconfig that
-             * may predate the Kconfig default -- so keep the "(N of M in use)"
-             * shape.
-             *
-             * Say why. RFC 4253 4.2 lets a server send arbitrary CRLF-terminated
-             * lines before its version string, and requires clients to cope with
-             * them -- it is how OpenSSH reports "Exceeded MaxStartups". The one
-             * rule is that such a line must not begin with "SSH-".
-             *
-             * Closing without a word is what this used to do, and the client
-             * then prints "Connection closed by remote host", which is
-             * indistinguishable from a crash, a hang, or a truncated command.
-             * That ambiguity cost real debugging time: refused connections were
-             * being read as truncated ones.
-             */
-            char msg[80];
-            const int n = snprintf(msg, sizeof(msg),
-                                   "espix: too many connections (%d of %d in use)\r\n",
-                                   s_status.sessions,
-                                   CONFIG_ESPIX_SSH_MAX_SESSIONS);
-            if (n > 0) {
-                (void)send(fd, msg, (size_t)n, 0);
-            }
-
-            espix_klog(ESPIX_KLOG_WARN, TAG, "refusing connection: %d already open",
-                       s_status.sessions);
-            close_gracefully(fd);   /* or the reset discards the line just sent */
-            continue;
-        }
-
-        espix_klog(ESPIX_KLOG_INFO, TAG, "connection from %s",
-                   inet_ntoa(peer.sin_addr));
-
-        /*
-         * A PSRAM stack, with the internal fallback the rest of espix uses.
-         *
-         * 8192 bytes each and up to CONFIG_ESPIX_SSH_MAX_SESSIONS of them, so at
-         * eight this is 64 KB -- of PSRAM, not of the internal pool. The
-         * fallback below is what once drove internal RAM to zero at eight
-         * sessions; with PSRAM available, what a connection costs internally is
-         * its channel receive buffer. Nothing on this task's path needs the
-         * flash cache frozen (which is what keeps elfreloc's stack internal),
-         * and nothing here is DMA.
-         */
-        BaseType_t ok = xTaskCreateWithCaps(connection_task, "sshd:conn",
-                                            CONFIG_ESPIX_SSH_TASK_STACK,
-                                            (void *)(intptr_t)fd,
-                                            CONFIG_ESPIX_SSH_TASK_PRIO, NULL,
-                                            MALLOC_CAP_SPIRAM);
-        if (ok != pdPASS) {
-            /* Out of PSRAM, which is 13 MB and not the pool under pressure --
-             * so serve the connection from internal RAM rather than refusing it.
-             * conn_task_exit() gives that stack back the ordinary way. */
-            espix_klog(ESPIX_KLOG_DEBUG, TAG,
-                       "no PSRAM for a connection stack; using internal");
-            ok = xTaskCreate(connection_task, "sshd:conn",
-                             CONFIG_ESPIX_SSH_TASK_STACK, (void *)(intptr_t)fd,
-                             CONFIG_ESPIX_SSH_TASK_PRIO, NULL);
-        }
-        if (ok != pdPASS) {
-            espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start connection task");
-            sessions_release();     /* the task that would have done this never ran */
-            close(fd);
-        }
+    /*
+     * A PSRAM stack, with the internal fallback the rest of espix uses.
+     *
+     * 8192 bytes each and up to CONFIG_ESPIX_SSH_MAX_SESSIONS of them, so at
+     * eight this is 64 KB -- of PSRAM, not of the internal pool. The
+     * fallback below is what once drove internal RAM to zero at eight
+     * sessions; with PSRAM available, what a connection costs internally is
+     * its channel receive buffer. Nothing on this task's path needs the
+     * flash cache frozen (which is what keeps elfreloc's stack internal),
+     * and nothing here is DMA.
+     */
+    BaseType_t ok = xTaskCreateWithCaps(connection_task, "sshd:conn",
+                                        CONFIG_ESPIX_SSH_TASK_STACK,
+                                        (void *)(intptr_t)fd,
+                                        CONFIG_ESPIX_SSH_TASK_PRIO, NULL,
+                                        MALLOC_CAP_SPIRAM);
+    if (ok != pdPASS) {
+        /* Out of PSRAM, which is 13 MB and not the pool under pressure --
+         * so serve the connection from internal RAM rather than refusing it.
+         * conn_task_exit() gives that stack back the ordinary way. */
+        espix_klog(ESPIX_KLOG_DEBUG, TAG,
+                   "no PSRAM for a connection stack; using internal");
+        ok = xTaskCreate(connection_task, "sshd:conn",
+                         CONFIG_ESPIX_SSH_TASK_STACK, (void *)(intptr_t)fd,
+                         CONFIG_ESPIX_SSH_TASK_PRIO, NULL);
+    }
+    if (ok != pdPASS) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start connection task");
+        sessions_release();     /* the task that would have done this never ran */
+        close(fd);
     }
 }
 
-esp_err_t espix_ssh_start(void)
+/*
+ * The listener, run by the sshd unit's process until keep_going() says
+ * otherwise. Waits in select() on the socket and the process's wake fd, so a
+ * stop ends it at once. Open connections are their own tasks and stay up:
+ * stopping sshd stops new logins, as on Linux.
+ */
+esp_err_t espix_ssh_run(bool (*keep_going)(void))
 {
     if (s_listen_fd >= 0) {
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ssh_hostkey_init() != ESP_OK) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "no host key; not accepting connections");
+        return ESP_FAIL;
     }
 
     s_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -818,25 +819,55 @@ esp_err_t espix_ssh_start(void)
         return ESP_FAIL;
     }
 
-    if (xTaskCreate(accept_task, "sshd", 3072, NULL,
-                    CONFIG_ESPIX_SSH_TASK_PRIO, NULL) != pdPASS) {
-        close(s_listen_fd);
-        s_listen_fd = -1;
-        return ESP_ERR_NO_MEM;
-    }
+    /* A unit runs at the supervisor's priority, below the sessions and their
+     * jobs; accepting at that, a busy board timed new logins out. */
+    vTaskPrioritySet(NULL, CONFIG_ESPIX_SSH_TASK_PRIO);
 
-    if (ssh_hostkey_init() != ESP_OK) {
-        espix_klog(ESPIX_KLOG_ERROR, TAG, "no host key; not accepting connections");
-        close(s_listen_fd);
-        s_listen_fd = -1;
-        return ESP_FAIL;
-    }
-
+    s_sshd_pid       = espix_proc_self_pid();
     s_status.running = true;
     s_status.port    = CONFIG_ESPIX_SSH_PORT;
-
     espix_klog(ESPIX_KLOG_INFO, TAG, "listening on port %d",
                CONFIG_ESPIX_SSH_PORT);
+
+    while (keep_going()) {
+        const int wake = espix_proc_select_begin();
+        fd_set    rfds;
+
+        FD_ZERO(&rfds);
+        FD_SET(s_listen_fd, &rfds);
+        if (wake >= 0) {
+            FD_SET(wake, &rfds);
+        }
+        const int ready = select(((wake > s_listen_fd) ? wake : s_listen_fd) + 1,
+                                 &rfds, NULL, NULL, NULL);
+        espix_proc_select_end();
+
+        if (ready > 0 && wake >= 0 && FD_ISSET(wake, &rfds)) {
+            (void)espix_fs_wake_drain(wake);
+        }
+        if (ready <= 0 || !FD_ISSET(s_listen_fd, &rfds)) {
+            continue;
+        }
+
+        struct sockaddr_in peer;
+        socklen_t          peer_len = sizeof(peer);
+
+        const int fd = accept(s_listen_fd, (struct sockaddr *)&peer, &peer_len);
+        if (fd < 0) {
+            /* A transient accept error must not kill the listener; a permanent
+             * one would otherwise spin, hence the pause. */
+            espix_klog(ESPIX_KLOG_WARN, TAG, "accept failed: %d", errno);
+            (void)espix_proc_sleep(500);
+            continue;
+        }
+        serve(fd, &peer);
+    }
+
+    close(s_listen_fd);
+    s_listen_fd      = -1;
+    s_sshd_pid       = ESPIX_PID_NONE;
+    s_status.running = false;
+    espix_klog(ESPIX_KLOG_INFO, TAG, "no longer listening");
     return ESP_OK;
 }
 

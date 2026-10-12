@@ -270,6 +270,8 @@ typedef struct {
     bool              rx_err;
     volatile bool     rx_stop;      /* teardown asked the reader to finish */
     espix_task_exit_t rx_exit;      /* the reader, announced as it leaves */
+    TaskHandle_t      rx_wake;      /* the connection task, notified on arrival */
+    espix_pid_t       parent;       /* the sshd that accepted it */
 } ssh_conn_t;
 
 /* The reader's ring and stack. 3072 is what a recv() loop and its memcpy need;

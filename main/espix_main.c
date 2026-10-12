@@ -45,7 +45,6 @@
 #include "espix_proc.h"
 #include "espix_svc.h"
 #include "espix_shell.h"
-#include "espix_ssh.h"
 #include "espix_time.h"
 #include "espix_usb.h"
 
@@ -283,14 +282,6 @@ void app_main(void)
     /* Installed whether or not the stack came up: an empty socket is the normal
      * case, and a device-role build simply never hears anything. */
     espix_usb_set_dev_hook(usb_dev_nodes);
-
-#if CONFIG_ESPIX_SSH_ENABLED
-    /* Binds immediately and accepts asynchronously, so this does not wait for
-     * an address; a connection simply cannot arrive until one exists. */
-    if (net_err == ESP_OK && espix_ssh_start() != ESP_OK) {
-        ESP_LOGW(TAG, "ssh server did not start");
-    }
-#endif
 
     espix_cmds_register_all();
 

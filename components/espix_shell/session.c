@@ -9,6 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 
 #include "esp_console.h"
@@ -16,6 +17,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_task.h"
 
 #define TAG "shell"
 
@@ -934,9 +936,12 @@ static int exec_one(espix_session_t *s, const char *line)
         } else {
             status = start_background_job(s, cmd, argc, av);
         }
-    } else if (cmd->shell || !on_shell) {
+    } else if (cmd->shell ||
+               (!on_shell && (!cmd->internal_stack || s_proc == NULL))) {
         status = cmd->fn(s, argc, av);
     } else {
+        /* Including under sudo, for a command that maps flash: the caller's
+         * stack is in PSRAM, which the cache freeze makes unreachable. */
         status = run_as_process(s, cmd, argc, av);
     }
 
@@ -1003,15 +1008,34 @@ typedef struct {
     FILE                *rd;
     volatile bool        wr_closed;
     volatile bool        rd_closed;     /* the reader's command has returned */
-} pipe_t;
 
-/* Waits are bounded so both ends can notice the other has gone, or that the
- * command was asked to stop. */
-#define PIPE_WAIT_MS 100
+    /* Each end waits on its task's notification (ESPIX_NOTIFY_SIG_IDX), so
+     * the other end's progress and a signal both wake it. The lock keeps a
+     * handle from outliving the wait it names. */
+    SemaphoreHandle_t    lock;
+    TaskHandle_t         rd_wait;
+    TaskHandle_t         wr_wait;
+} pipe_t;
 
 static bool pipe_stopping(void)
 {
     return espix_shell_stopping(espix_shell_current());
+}
+
+static void pipe_park(pipe_t *p, TaskHandle_t *waiter, bool on)
+{
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    *waiter = on ? xTaskGetCurrentTaskHandle() : NULL;
+    xSemaphoreGive(p->lock);
+}
+
+static void pipe_poke(pipe_t *p, TaskHandle_t *waiter)
+{
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    if (*waiter != NULL) {
+        (void)xTaskNotifyGiveIndexed(*waiter, ESPIX_NOTIFY_SIG_IDX);
+    }
+    xSemaphoreGive(p->lock);
 }
 
 /*
@@ -1024,16 +1048,24 @@ static int pipe_write(void *cookie, const char *buf, int len)
     pipe_t *p    = cookie;
     int     sent = 0;
 
+    pipe_park(p, &p->wr_wait, true);
     while (sent < len) {
         if (p->rd_closed || pipe_stopping()) {
+            pipe_park(p, &p->wr_wait, false);
             errno = EPIPE;
             return -1;
         }
         const size_t n = xStreamBufferSend(p->sb, buf + sent,
-                                           (size_t)(len - sent),
-                                           pdMS_TO_TICKS(PIPE_WAIT_MS));
-        sent += (int)n;
+                                           (size_t)(len - sent), 0);
+        if (n > 0) {
+            sent += (int)n;
+            pipe_poke(p, &p->rd_wait);
+            continue;
+        }
+        (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
+                                      portMAX_DELAY);
     }
+    pipe_park(p, &p->wr_wait, false);
     return sent;
 }
 
@@ -1041,16 +1073,19 @@ static int pipe_read(void *cookie, char *buf, int len)
 {
     pipe_t *p = cookie;
 
+    pipe_park(p, &p->rd_wait, true);
     for (;;) {
-        const size_t n = xStreamBufferReceive(p->sb, buf, (size_t)len,
-                                              pdMS_TO_TICKS(PIPE_WAIT_MS));
-        if (n > 0) {
+        /* The writer may close just after a miss: one more look before EOF. */
+        const bool   closed = p->wr_closed || pipe_stopping();
+        const size_t n      = xStreamBufferReceive(p->sb, buf, (size_t)len, 0);
+
+        if (n > 0 || closed) {
+            pipe_park(p, &p->rd_wait, false);
+            pipe_poke(p, &p->wr_wait);
             return (int)n;
         }
-        /* Empty: the writer is slow, or it has finished. */
-        if (p->wr_closed || pipe_stopping()) {
-            return 0;
-        }
+        (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
+                                      portMAX_DELAY);
     }
 }
 
@@ -1073,6 +1108,7 @@ static int pipe_stage(void *arg)
     /* The writer before this stage must not wait on a reader that is gone. */
     if (st->in != NULL) {
         st->in->rd_closed = true;
+        pipe_poke(st->in, &st->in->wr_wait);
     }
     /* Closed here, so the next stage sees EOF as soon as this one is done. */
     if (st->out != NULL) {
@@ -1081,6 +1117,7 @@ static int pipe_stage(void *arg)
         st->out->wr        = NULL;
         st->s.redirect     = NULL;
         st->out->wr_closed = true;
+        pipe_poke(st->out, &st->out->rd_wait);
     }
 
     espix_shell_set_current(NULL);
@@ -1189,17 +1226,19 @@ static int run_pipeline(espix_session_t *s, char *line)
     memset(pipes, 0, sizeof(pipes));
 
     for (int i = 0; i < n - 1; i++) {
-        pipes[i].sb = xStreamBufferCreate(PIPE_BUF_BYTES, 1);
-        if (pipes[i].sb != NULL) {
+        pipes[i].sb   = xStreamBufferCreate(PIPE_BUF_BYTES, 1);
+        pipes[i].lock = xSemaphoreCreateMutex();
+        if (pipes[i].sb != NULL && pipes[i].lock != NULL) {
             pipes[i].wr = funopen(&pipes[i], NULL, pipe_write, NULL, NULL);
             pipes[i].rd = funopen(&pipes[i], pipe_read, NULL, NULL, NULL);
         }
-        if (pipes[i].sb == NULL || pipes[i].wr == NULL || pipes[i].rd == NULL) {
+        if (pipes[i].wr == NULL || pipes[i].rd == NULL) {
             espix_eprintf(s, "espix: no memory for a pipe\n");
             for (int k = 0; k <= i; k++) {
-                if (pipes[k].wr != NULL) { fclose(pipes[k].wr); }
-                if (pipes[k].rd != NULL) { fclose(pipes[k].rd); }
-                if (pipes[k].sb != NULL) { vStreamBufferDelete(pipes[k].sb); }
+                if (pipes[k].wr != NULL)   { fclose(pipes[k].wr); }
+                if (pipes[k].rd != NULL)   { fclose(pipes[k].rd); }
+                if (pipes[k].sb != NULL)   { vStreamBufferDelete(pipes[k].sb); }
+                if (pipes[k].lock != NULL) { vSemaphoreDelete(pipes[k].lock); }
             }
             return 2;
         }
@@ -1251,6 +1290,8 @@ static int run_pipeline(espix_session_t *s, char *line)
         for (int i = 0; i < n - 1; i++) {
             pipes[i].rd_closed = true;
             pipes[i].wr_closed = true;
+            pipe_poke(&pipes[i], &pipes[i].rd_wait);
+            pipe_poke(&pipes[i], &pipes[i].wr_wait);
         }
     }
 
@@ -1270,6 +1311,7 @@ static int run_pipeline(espix_session_t *s, char *line)
         if (pipes[i].wr != NULL) { fclose(pipes[i].wr); }
         if (pipes[i].rd != NULL) { fclose(pipes[i].rd); }
         if (pipes[i].sb != NULL) { vStreamBufferDelete(pipes[i].sb); }
+        vSemaphoreDelete(pipes[i].lock);
     }
     free(st);
 

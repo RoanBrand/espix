@@ -9,6 +9,7 @@ idf_component_register(
         "cmd_net.c"
         "cmd_vpn.c"
         "cmd_nfsd.c"
+        "cmd_sshd.c"
         "cmd_motd.c"
         "cmd_time.c"
         "cmd_blk.c"
@@ -36,6 +37,7 @@ idf_component_register(
         espix_appdata
         espix_net
         espix_nfsd
+        espix_ssh
         espressif__qrcode
         espix_bt
         espix_audio

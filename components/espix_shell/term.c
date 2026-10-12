@@ -27,6 +27,7 @@
 #include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_task.h"
 #include "espix_term.h"
 
 #define TAG "term"
@@ -66,8 +67,8 @@ struct espix_term {
     int    row, col;
     QueueHandle_t keys;         /* chars from the input callback */
     volatile bool quit;
-    /* A process has the terminal open as stdin, so the keys are its; and a
-     * Ctrl-C it read, which is the shell's to act on rather than data. */
+    /* A process is reading the terminal, so the keys are its; and a Ctrl-C
+     * it read, which is the shell's to act on rather than data. */
     volatile int  stdin_readers;
     volatile bool intr;
     int    esc;                 /* 0 outside an escape, 1 after ESC, 2 inside CSI */
@@ -86,6 +87,16 @@ struct espix_term {
     espix_history_t       *history;
     espix_session_t        session;
 };
+
+/* Wake the shell's foreground wait, which sleeps on its task's notification. */
+static void term_wake(espix_term_t *t)
+{
+    TaskHandle_t const shell = (TaskHandle_t)t->session.shell_task;
+
+    if (shell != NULL) {
+        (void)xTaskNotifyGiveIndexed(shell, ESPIX_NOTIFY_SIG_IDX);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Drawing                                                             */
@@ -517,6 +528,7 @@ void espix_term_key(espix_term_t *t, uint32_t keysym, bool down)
     }
 
     (void)xQueueSend(t->keys, &ch, 0);
+    term_wake(t);
 }
 
 void espix_term_write(espix_term_t *t, const char *data, size_t len)
@@ -570,6 +582,9 @@ static int term_stream_read(void *cookie, char *buf, int len)
 {
     espix_term_t *t = term_of((espix_session_t *)cookie);
 
+    /* While it reads, the keys are its own; see term_poll_interrupt(). */
+    __atomic_fetch_add(&t->stdin_readers, 1, __ATOMIC_RELAXED);
+
     /*
      * Blocks until there is something, then takes whatever else is already
      * queued: waiting for a full request would leave an interactive reader
@@ -591,29 +606,22 @@ static int term_stream_read(void *cookie, char *buf, int len)
          * as SSH's transport treats it. */
         if (ch == 0x03) {
             t->intr = true;
+            term_wake(t);
             continue;
         }
         /* ICRNL, as term_edit_read() does: Enter arrives as CR. */
         buf[n++] = (ch == '\r') ? '\n' : ch;
     }
-    return n;
-}
-
-static int term_stream_close(void *cookie)
-{
-    espix_term_t *t = term_of((espix_session_t *)cookie);
-
     __atomic_fetch_sub(&t->stdin_readers, 1, __ATOMIC_RELAXED);
-    return 0;
+    return n;
 }
 
 static FILE *term_open_stream(espix_session_t *s, espix_stream_t which)
 {
     if (which == ESPIX_STREAM_IN) {
-        FILE *f = funopen(s, term_stream_read, NULL, NULL, term_stream_close);
+        FILE *f = funopen(s, term_stream_read, NULL, NULL, NULL);
         if (f != NULL) {
             setvbuf(f, NULL, _IOFBF, 512);
-            __atomic_fetch_add(&term_of(s)->stdin_readers, 1, __ATOMIC_RELAXED);
         }
         return f;
     }
@@ -732,6 +740,16 @@ static int term_read_line(espix_session_t *s, const char *prompt,
  * and what stops typed keys from piling up and then being replayed as a line
  * the moment the command exits.
  */
+/* The foreground wait's sleep: a key, the viewer leaving, or a child's exit
+ * all notify the shell's task. */
+static void term_wait_input(espix_session_t *s, uint32_t ms)
+{
+    (void)s;
+    (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
+                                  (ms == UINT32_MAX) ? portMAX_DELAY
+                                                     : pdMS_TO_TICKS(ms));
+}
+
 static bool term_poll_interrupt(espix_session_t *s)
 {
     espix_term_t *t = term_of(s);
@@ -772,6 +790,7 @@ espix_session_t *espix_term_session(espix_term_t *t)
         .read_line      = term_read_line,
         .write          = term_write,
         .poll_interrupt = term_poll_interrupt,
+        .wait_input     = term_wait_input,
         .open_stream    = term_open_stream,
         .transport      = t,
         .term_size      = term_term_size,
@@ -834,6 +853,7 @@ void espix_term_stop(espix_term_t *t)
 {
     if (t != NULL) {
         t->quit = true;
+        term_wake(t);
     }
 }
 

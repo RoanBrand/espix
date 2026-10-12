@@ -717,7 +717,13 @@ static int console_read_line(espix_session_t *s, const char *prompt,
 static bool console_poll_interrupt(espix_session_t *s)
 {
     const int fd  = fileno(stdin);
-    bool      hit = false;
+    bool      hit = s->intr;
+
+    /* An app reading stdin owns the keys, and passes ^C on through intr. */
+    s->intr = false;
+    if (s->stdin_readers > 0) {
+        return hit;
+    }
 
     for (;;) {
         fd_set         rfds;
@@ -742,6 +748,58 @@ static bool console_poll_interrupt(espix_session_t *s)
                 s->last_key = (int)buf[i];
             }
         }
+    }
+}
+
+/* End a console_wait_input(); under the process table's lock, and the eventfd
+ * write does not block. */
+static void console_wake(espix_session_t *s)
+{
+    (void)s;
+    if (s_wake_fd >= 0) {
+        const uint64_t one = 1;
+        (void)write(s_wake_fd, &one, sizeof(one));
+    }
+}
+
+/*
+ * The foreground wait's sleep: a key, or the eventfd a child's exit and a
+ * reading app's ^C write. Stdin is left out while an app reads it. Without the
+ * eventfd an exit cannot reach this, so the wait is capped.
+ */
+static void console_wait_input(espix_session_t *s, uint32_t ms)
+{
+    const int fd    = fileno(stdin);
+    int       maxfd = -1;
+    fd_set    rfds;
+
+    FD_ZERO(&rfds);
+    if (s->stdin_readers == 0) {
+        FD_SET(fd, &rfds);
+        maxfd = fd;
+    }
+    if (s_wake_fd >= 0) {
+        FD_SET(s_wake_fd, &rfds);
+        maxfd = (s_wake_fd > maxfd) ? s_wake_fd : maxfd;
+    } else if (ms > 50) {
+        ms = 50;
+    }
+    if (maxfd < 0) {
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        return;
+    }
+
+    struct timeval  tv;
+    struct timeval *tvp = NULL;
+    if (ms != UINT32_MAX) {
+        tv.tv_sec  = (time_t)(ms / 1000);
+        tv.tv_usec = (suseconds_t)((ms % 1000) * 1000);
+        tvp        = &tv;
+    }
+    if (select(maxfd + 1, &rfds, NULL, NULL, tvp) > 0 && s_wake_fd >= 0 &&
+        FD_ISSET(s_wake_fd, &rfds)) {
+        uint64_t sink = 0;
+        (void)read(s_wake_fd, &sink, sizeof(sink));
     }
 }
 
@@ -957,6 +1015,8 @@ esp_err_t espix_console_session_start(void)
         .read_line = console_read_line,
         .write     = console_write,
         .poll_interrupt = console_poll_interrupt,
+        .wait_input     = console_wait_input,
+        .wake           = console_wake,
         .fg_pgid    = ESPIX_PID_NONE,
         .ansi      = ansi,
         /* No stdio rebinding: the editor owns stdin and output goes through

@@ -14,6 +14,7 @@
 
 #include "espix_proc.h"
 #include "espix_sigset.h"
+#include "espix_task.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,16 +67,6 @@ extern "C" {
 #if CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS <= ESPIX_TLS_PROC_IDX
 #error "CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS must be greater than ESPIX_TLS_PROC_IDX (the proc TLS slot). Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
 #endif
-
-/*
- * The task-notification index a process waits on for signals, and the only one
- * a signal ever touches. Index 0 belongs to stream buffers, pthread_join and
- * espix's own hand-offs; a signal that woke those waits -- xTaskAbortDelay did --
- * let a task carry on without the lock or the join it was waiting for. A wait
- * on this index is woken only by a notify on it, so a signal ends exactly the
- * waits that are waiting for one, and a notify sent first is remembered.
- */
-#define ESPIX_NOTIFY_SIG_IDX 1
 
 #if CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES <= ESPIX_NOTIFY_SIG_IDX
 #error "CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES must be greater than ESPIX_NOTIFY_SIG_IDX. Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
@@ -307,6 +298,8 @@ typedef struct {
      */
     int               wake_fd;
     volatile bool     in_select;
+    volatile bool     console_stdin;    /* in a console read: counted in its
+                                           session's stdin_readers */
 
     /*
      * The interval timer behind alarm() and setitimer(), and so the only source

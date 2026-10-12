@@ -11,7 +11,6 @@ set(espix_main_requires
     espix_net
     espix_usb
     espix_auth
-    espix_ssh
     espix_time
     espix_ota
     espix_svc

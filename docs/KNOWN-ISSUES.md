@@ -756,6 +756,14 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## SSH
 
+- **Under four test workers a shell can stop taking a typed line.** About one
+  full run in two (`make test`, seed 77726 reproduces it), a session in
+  35-signals stops echoing part way through the line after `kill` ended one of
+  its background apps; the rest of the line never arrives and the shell waits
+  at its prompt until the client gives up. Present on commit B's image too, so
+  it predates the blocking foreground wait; alone the suite passes. The harness
+  now prints `ps` and `dmesg` when a session hangs. Open.
+
 - **SFTP transfers cannot reach past 4 GiB, and say so.** The read and write
   handlers seek with `fseek()`, which takes a `long`; `off_t` is 64 bits now, so
   the client's 64-bit offset is truncated on the way in. The 64-bit sibling

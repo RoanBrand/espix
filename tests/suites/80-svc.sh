@@ -49,6 +49,21 @@ out=$(svc_wait_for_state svcprobe running)
 assert_contains "a unit is listed" "svcprobe" "$out"
 assert_contains "and it is running" "running" "$out"
 
+# sshd is a unit too. A file that does not name it gets it back, or a reload of
+# this suite's file would have closed the way in; and a login is its child.
+assert_contains "a units file without sshd gets it back" "sshd  always  sshd" \
+    "$(dev_run 'sudo cat /etc/units')"
+spid=$(printf '%s' "$out" | awk '$1 == "sshd" && $4 == "running" {print $2; exit}')
+if [ -n "$spid" ] && [ "$spid" -gt 0 ] 2>/dev/null; then
+    espix_pass "sshd is a running unit ($spid)"
+    me=$(dev_run 'echo $$')
+    assert_eq "and this login is its child" "$spid" \
+        "$(dev_run ps | awk -v p="$me" 'NR == 1 { for (i = 1; i <= NF; i++)
+            if ($i == "PPID") c = i } $1 == p { print $c; exit }')"
+else
+    espix_fail "sshd is a running unit" "$out"
+fi
+
 # The point of the whole thing: a unit is a process, not a job, so nothing
 # about its life belongs to the session that started it. A different login
 # sees it.

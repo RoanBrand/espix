@@ -248,6 +248,16 @@ static size_t rx_pop(ssh_conn_t *c, uint8_t *dst, size_t n)
     return n;
 }
 
+/* Bytes, an EOF or an error: wake a read of the ring, and the connection task
+ * if it is waiting on a foreground job instead (ESPIX_NOTIFY_SIG_IDX). */
+static void rx_arrived(ssh_conn_t *c)
+{
+    (void)xSemaphoreGive(c->rx_data);
+    if (c->rx_wake != NULL) {
+        (void)xTaskNotifyGiveIndexed(c->rx_wake, ESPIX_NOTIFY_SIG_IDX);
+    }
+}
+
 static void ssh_reader_task(void *arg)
 {
     ssh_conn_t *c = arg;
@@ -278,12 +288,12 @@ static void ssh_reader_task(void *arg)
         const ssize_t n = recv(c->fd, tmp, want, 0);
         if (n > 0) {
             rx_push(c, tmp, (size_t)n);
-            (void)xSemaphoreGive(c->rx_data);
+            rx_arrived(c);
             continue;
         }
         if (n == 0) {
             c->rx_eof = true;
-            (void)xSemaphoreGive(c->rx_data);
+            rx_arrived(c);
             break;
         }
         if (errno == EINTR) {
@@ -296,7 +306,7 @@ static void ssh_reader_task(void *arg)
             continue;
         }
         c->rx_err = true;
-        (void)xSemaphoreGive(c->rx_data);
+        rx_arrived(c);
         break;
     }
 
@@ -329,6 +339,8 @@ esp_err_t ssh_rx_start(ssh_conn_t *c)
         c->rx_buf = NULL;
         return ESP_ERR_NO_MEM;
     }
+
+    c->rx_wake = xTaskGetCurrentTaskHandle();
 
     if (xTaskCreateWithCaps(ssh_reader_task, "sshd:rx", SSH_RX_STACK, c,
                             CONFIG_ESPIX_SSH_TASK_PRIO, &c->rx_exit.task,

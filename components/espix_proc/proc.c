@@ -348,6 +348,13 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->wake_fd  = -1;
     slot->in_select = false;
 
+    /* Here and not at fclose(), which a force-kill may never reach. */
+    if (slot->console_stdin && slot->info.session != NULL) {
+        __atomic_fetch_sub(&slot->info.session->stdin_readers, 1,
+                           __ATOMIC_RELAXED);
+        slot->console_stdin = false;
+    }
+
     /* An app's image, argv, environment and paths. The block itself goes
      * last: the process's tasks are gone, so nothing reads its paths now. */
     if (slot->app != NULL) {
@@ -457,6 +464,12 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
                 p->info.pid == slot->info.ppid) {
                 p->sig_pending |= espix_sigbit(SIGCHLD);
                 sig_wake_locked(p);
+                /* A shell waiting in select() hears it here instead. */
+                espix_session_t *const ps = p->info.session;
+                if (p->info.kind == ESPIX_PROC_SESSION && ps != NULL &&
+                    ps->wake != NULL) {
+                    ps->wake(ps);
+                }
                 break;
             }
         }
@@ -1466,6 +1479,11 @@ int espix_proc_select_begin(void)
     espix_proc_slot_t *slot = espix_proc_self();
     if (slot == NULL) {
         return -1;
+    }
+    /* An app has one from spawn; espix's own code gets one when it first
+     * waits. The teardown closes it either way. */
+    if (slot->wake_fd < 0) {
+        slot->wake_fd = espix_fs_wake_create();
     }
 
     slot->in_select = true;

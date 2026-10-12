@@ -39,7 +39,6 @@ wants idle time -- so each case is judged on what it is actually waiting for.
 | cmd_text.c:729 (sleep), cmd_sys.c:371 (ps -d), desktop.c:2164 (appdata panel) | the sleep is the requested behaviour |
 | espix_audio.c:563 | the 5 s idle yield kept by R-P4.2 for the SMP tick |
 | wifi.c:318 | uses a timer rather than blocking the event loop -- the right shape already |
-| cmd_run.c:168 (foreground wait), cmd_sys.c:1049 (top frame) | Deferred: **feasible, and its own piece.** A task *can* wait on two sources, if both can signal the same object: one event group with FINISH (set by the process-finish path, which knows the session) and KEY (set by the transport), or -- the better shape for SSH -- the connection task blocking in select() over {the ssh socket, a wake eventfd that the process-finish path writes}, which is the eventfd R-P6.6 already built. The cost is not the multiplexing: over SSH the connection task *is* the reader, so the event-group route needs a second reader task (a task plus a wakeup per packet) and the select route needs the transport read loop reworked -- mbedtls may hold bytes already read off the fd, and the app-stdin pump and the SO_RCVTIMEO logic sit in the same loop. Worth doing deliberately, not as a drive-by. |
 | reaper.c:80 | portMAX_DELAY -- the model to copy |
 
 ## Shared primitives worth building once
@@ -76,14 +75,14 @@ reclaimer), rather than to move these.
 **Converted:** item 1 (task-exit notification, three modules), item 3 (boot
 barrier and log flusher), item 4 (job-stop), and the read half of item 5 --
 the per-connection reader task, which is also the SSH task split the roadmap
-entry asked for.
+entry asked for. Item 2 (R-P8.7): the foreground wait blocks in the transport's
+wait_input() on the second notification the deferral asked for -- index 1, which
+a child's exit already sends its shell and the socket reader and the terminal's
+keys now send too; the console waits on its eventfd. Pipe ends and console
+stdin block the same way, and top's frame slice is espix_proc_sleep().
 
 **Deferred, with the reason:**
 
-- **Item 2 (cmd_run's 50 ms and top's frame slice).** The wake object would be
-  the ring's semaphore, which packet reads also wait on, so a child-exit wake
-  can be swallowed by a partial read_exact. The fix is a second notification
-  (or a non-blocking packet peek), which is its own design. Tracked as R-P8.7.
 - **Item 6, the gfx wait.** espix_gfx_poll_event is poll-shaped and an
   event-driven app would spin, but the two apps that exist (plasma, doom)
   animate and must poll once per frame; a blocking wait is for the first app

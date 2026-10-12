@@ -22,11 +22,10 @@ extern "C" {
 #endif
 
 /*
- * Start the listener. Returns once the socket is bound and the accept task is
- * running; connections are handled asynchronously. Requires a network
- * interface with an address, so call it after espix_net_init().
+ * Listen and accept until keep_going() is false, on the calling process -- the
+ * sshd unit. Each connection gets a task of its own and outlives a stop.
  */
-esp_err_t espix_ssh_start(void);
+esp_err_t espix_ssh_run(bool (*keep_going)(void));
 
 /* Host key fingerprint in OpenSSH's SHA256:base64 form, for comparing against
  * what a client shows on first connect. Empty until the key exists. */

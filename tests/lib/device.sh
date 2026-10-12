@@ -206,9 +206,21 @@ dev_run() {
         return 1
     fi
 
-    # A framed error with a closed frame: the command itself was refused (an
-    # unsupported `|`, say). The session is still good.
+    # A framed error with a closed frame: session.py reported why and then
+    # ended the session, as it does after any error. Say why here -- this was
+    # silent, so the cause vanished and the next command only saw a dead
+    # session.
     if [ -n "$why" ]; then
+        DEV_SESSION_DEAD=yes
+        printf '  %s session ended while running: %s\n       %s\n' \
+               "$(_espix_red FAIL)" "$1" "$why" >&2
+        # A command that never came back: what the board was doing, from a
+        # login of its own, is the evidence the dead session cannot give.
+        case "$why" in
+            *"no prompt within"*)
+                { _dev_ssh_once 'ps'; _dev_ssh_once 'dmesg' | tail -25; } 2>&1 |
+                    sed 's/^/       | /' >&2 ;;
+        esac
         printf '%s' "$DEV_DEAD"
         return 1
     fi

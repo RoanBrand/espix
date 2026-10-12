@@ -22,6 +22,19 @@
 extern "C" {
 #endif
 
+/*
+ * The task-notification index a process waits on for signals, and the only one
+ * a signal ever touches. Index 0 belongs to stream buffers, pthread_join and
+ * espix's own hand-offs; a signal that woke those waits -- xTaskAbortDelay did --
+ * let a task carry on without the lock or the join it was waiting for. A wait
+ * on this index is woken only by a notify on it, so a signal ends exactly the
+ * waits that are waiting for one, and a notify sent first is remembered.
+ *
+ * A shell's waits are on it too: a child's exit notifies its parent here, and
+ * a transport notifies it when input arrives.
+ */
+#define ESPIX_NOTIFY_SIG_IDX 1
+
 typedef struct {
     TaskHandle_t      task;
     SemaphoreHandle_t done;

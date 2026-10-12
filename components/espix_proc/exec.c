@@ -341,29 +341,80 @@ static void relocate_task(void *arg)
  * driver with portMAX_DELAY, holding the driver's read lock and the FILE's, so
  * nothing could get a process out of it but deletion -- and deleted there, it
  * leaves both locks held by a dead task. Waiting in select() instead holds
- * neither, and gives a signal somewhere to land.
+ * neither, and the process's wake fd lets a signal end it.
+ *
+ * While an app is reading, the shell's poll leaves the console to it, so a ^C
+ * arrives here: it goes to the shell, as a terminal's ISIG would send it, and
+ * is not input. Counted on the slot, so a force-kill mid-read is uncounted by
+ * the teardown.
  */
-#define CONSOLE_STDIN_POLL_MS 50
+static int s_console_fd = -1;
+
+static int console_stdin_wait(espix_session_t *s, char *buf, int len);
 
 static int console_stdin_read(void *cookie, char *buf, int len)
 {
-    const int fd = (int)(intptr_t)cookie;
+    espix_session_t *const   s    = cookie;
+    espix_proc_slot_t *const self = espix_proc_self();
+
+    if (self != NULL) {
+        __atomic_fetch_add(&s->stdin_readers, 1, __ATOMIC_RELAXED);
+        self->console_stdin = true;
+    }
+    const int n = console_stdin_wait(s, buf, len);
+    if (self != NULL) {
+        self->console_stdin = false;
+        __atomic_fetch_sub(&s->stdin_readers, 1, __ATOMIC_RELAXED);
+    }
+    return n;
+}
+
+static int console_stdin_wait(espix_session_t *s, char *buf, int len)
+{
+    const int fd = s_console_fd;
 
     for (;;) {
-        fd_set         rfds;
-        struct timeval tv = { .tv_sec = 0,
-                              .tv_usec = CONSOLE_STDIN_POLL_MS * 1000 };
+        const int wake  = espix_proc_select_begin();
+        fd_set    rfds;
 
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
-
-        const int ready = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (ready > 0) {
-            const ssize_t n = read(fd, buf, (size_t)len);
-            return (n < 0) ? -1 : (int)n;
+        if (wake >= 0) {
+            FD_SET(wake, &rfds);
         }
+        const int ready = select(((wake > fd) ? wake : fd) + 1, &rfds, NULL,
+                                 NULL, NULL);
+        espix_proc_select_end();
+
         if (ready < 0 && errno != EINTR) {
             return -1;
+        }
+        if (ready > 0 && wake >= 0 && FD_ISSET(wake, &rfds)) {
+            (void)espix_fs_wake_drain(wake);
+        }
+        if (ready > 0 && FD_ISSET(fd, &rfds)) {
+            const ssize_t n = read(fd, buf, (size_t)len);
+            if (n < 0) {
+                return -1;
+            }
+            int  kept = 0;
+            bool intr = false;
+            for (ssize_t i = 0; i < n; i++) {
+                if (buf[i] == 0x03) {
+                    intr = true;
+                } else {
+                    buf[kept++] = buf[i];
+                }
+            }
+            if (intr) {
+                s->intr = true;
+                if (s->wake != NULL) {
+                    s->wake(s);
+                }
+            }
+            if (kept > 0) {
+                return kept;
+            }
         }
         /* No EINTR through fgets(), so a signal ends the read as EOF would. */
         if (espix_sigcheck_io()) {
@@ -568,10 +619,10 @@ static void proc_task(void *arg)
             own_in = true;
         }
     } else if (session != NULL) {
-        /* The console: output stays on the UART, but stdin is read in short
-         * waits, so a signal ends a read. */
-        FILE *const in = funopen((void *)(intptr_t)fileno(stdin),
-                                 console_stdin_read, NULL, NULL, NULL);
+        /* The console: output stays on the UART; stdin is read so that a
+         * signal can end the read. */
+        s_console_fd = fileno(stdin);
+        FILE *const in = funopen(session, console_stdin_read, NULL, NULL, NULL);
         if (in != NULL) {
             stdin  = in;
             own_in = true;

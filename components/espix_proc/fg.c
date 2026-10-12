@@ -1,14 +1,15 @@
 /*
  * The foreground wait: a shell's job, run to its end, with ^C.
  *
- * In 50 ms slices rather than one long block, so the shell can read its
- * terminal for ^C: on SSH and the console nothing else reads it while a job
- * runs (R-P8.7). A waiter that is not a shell, or a job that reads the terminal
- * itself, blocks outright.
+ * Nothing else reads the terminal while a job runs, so the shell does. It
+ * blocks in the transport's wait_input() until a key arrives or the job ends;
+ * a transport without one is polled every 50 ms. A waiter that is not a
+ * shell, or a job that reads the terminal itself, waits for the exit alone.
  */
 
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
@@ -62,6 +63,14 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
                                            self->info.kind == ESPIX_PROC_SESSION;
     const bool poll = shell && !fg->tty && s->poll_interrupt != NULL;
 
+    /*
+     * Blocking rather than polling needs both wakes: the transport's for a key,
+     * and the exit notification, which goes to the job's parent -- so not for a
+     * job some other process started, such as `fg` of one sudo backgrounded.
+     */
+    const bool push = poll && s->wait_input != NULL &&
+                      espix_proc_parent_of(pid) == self->info.pid;
+
     espix_proc_kind_t kind = ESPIX_PROC_APP;
     (void)espix_proc_kind_of(pid, &kind);
 
@@ -75,8 +84,6 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
 
     const int64_t deadline = (fg->limit_us > 0) ? esp_timer_get_time() + fg->limit_us
                                                 : 0;
-    const TickType_t slice = (poll || deadline > 0) ? pdMS_TO_TICKS(FG_POLL_MS)
-                                                    : portMAX_DELAY;
     int       exit_code  = -1;
     esp_err_t err        = ESP_ERR_TIMEOUT;
     unsigned  interrupts = 0;
@@ -98,26 +105,46 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
             killed = true;
         }
 
-        err = espix_proc_wait(pid, &exit_code, slice);
+        /* Until the next thing the limit has to do, or for ever. */
+        int64_t until = 0;
+        if (deadline > 0 && !fg->timed_out) {
+            until = deadline;
+        } else if (fg->timed_out && !killed) {
+            until = term_at + (int64_t)FG_KILL_GRACE_MS * 1000;
+        }
+        const uint32_t ms = (until == 0) ? UINT32_MAX
+                          : (uint32_t)((until > now ? until - now : 0) / 1000 + 1);
+
+        TickType_t ticks;
+        if (push) {
+            ticks = 0;
+        } else if (poll) {
+            ticks = pdMS_TO_TICKS(FG_POLL_MS);
+        } else {
+            ticks = (ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(ms);
+        }
+
+        err = espix_proc_wait(pid, &exit_code, ticks);
         if (err != ESP_ERR_TIMEOUT) {
             break;
         }
-        if (!poll || !s->poll_interrupt(s)) {
-            continue;
-        }
+        if (poll && s->poll_interrupt(s)) {
+            say(s, false, "^C\n");
+            interrupts++;
 
-        say(s, false, "^C\n");
-        interrupts++;
-
-        if (interrupts < FG_INTERRUPTS_TO_KILL) {
-            (void)espix_proc_signal_group(pgid, SIGINT);
-            if (interrupts + 1 == FG_INTERRUPTS_TO_KILL) {
-                say(s, true, "%s: pid %d has not stopped; press Ctrl-C again "
-                             "to force it\n", who, (int)pid);
+            if (interrupts < FG_INTERRUPTS_TO_KILL) {
+                (void)espix_proc_signal_group(pgid, SIGINT);
+                if (interrupts + 1 == FG_INTERRUPTS_TO_KILL) {
+                    say(s, true, "%s: pid %d has not stopped; press Ctrl-C "
+                                 "again to force it\n", who, (int)pid);
+                }
+            } else if (interrupts == FG_INTERRUPTS_TO_KILL) {
+                say(s, true, "%s: killing pid %d\n", who, (int)pid);
+                (void)espix_proc_signal_group(pgid, SIGKILL);
             }
-        } else if (interrupts == FG_INTERRUPTS_TO_KILL) {
-            say(s, true, "%s: killing pid %d\n", who, (int)pid);
-            (void)espix_proc_signal_group(pgid, SIGKILL);
+        }
+        if (push) {
+            s->wait_input(s, ms);
         }
     }
 

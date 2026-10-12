@@ -209,6 +209,28 @@ struct espix_session {
     bool (*poll_interrupt)(espix_session_t *s);
 
     /*
+     * The foreground wait's sleep: block until input may be waiting, a child of
+     * the shell has finished, or `ms` pass (UINT32_MAX: no limit), so ^C is
+     * seen the moment it is typed. NULL: the wait polls every 50 ms instead.
+     */
+    void (*wait_input)(espix_session_t *s, uint32_t ms);
+
+    /*
+     * End a wait_input(): a child of the shell has finished, or an app reading
+     * stdin saw ^C. Called under the process table's lock, so it must not
+     * block. NULL where the notification a child's exit sends the shell's task
+     * already does it.
+     */
+    void (*wake)(espix_session_t *s);
+
+    /*
+     * The console only: apps reading its stdin directly, which the shell's poll
+     * then leaves alone, and a ^C one of them read on the shell's behalf.
+     */
+    volatile int  stdin_readers;
+    volatile bool intr;
+
+    /*
      * The terminal's size, for an app that has just been sent SIGWINCH. NULL
      * when the transport has no answer -- the serial console is the case -- and
      * then espix_shell_term_size() fails rather than inventing a size, which is
@@ -245,6 +267,7 @@ struct espix_session {
     void       *transport;                 /* implementation-owned */
     espix_pid_t fg_pgid;                   /* foreground job's group, or NONE */
     espix_pid_t pid;                       /* the shell's own process, for $$ */
+    espix_pid_t ppid;                      /* who started the login (sshd), or 0 */
 
     /* The task the shell runs on (a TaskHandle_t), while it is a process. A
      * command dispatched there becomes a process; anywhere else -- a pipe

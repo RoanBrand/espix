@@ -428,6 +428,11 @@ if [ -n "$bpid" ]; then
 else
     espix_fail "a backgrounded builtin reports its pid" "$(dev_run 'sleep 1 &')"
 fi
+# sudo runs its command inside its own process, on a PSRAM stack; one that maps
+# flash still gets a process with an internal stack. On sudo's own, `sudo
+# coredump` and `sudo upgrade` asserted in the cache freeze and reset the board.
+assert_contains "sudo can run a command that maps flash" "core dump" \
+    "$(dev_run 'sudo coredump')"
 assert_contains "type names a shell builtin" "cd is a shell builtin" \
     "$(dev_run 'type cd')"
 assert_contains "and a command run as a process" "ls is a command" \

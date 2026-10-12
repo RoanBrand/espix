@@ -149,7 +149,7 @@ esp_err_t espix_proc_adopt(espix_session_t *s, const char *name,
     strlcpy(slot->info.name, name, sizeof(slot->info.name));
     slot->info.kind       = ESPIX_PROC_SESSION;
     slot->info.pid        = espix_proc_next_pid();
-    slot->info.ppid       = ESPIX_PID_NONE;
+    slot->info.ppid       = (s->ppid > 0) ? s->ppid : ESPIX_PID_NONE;
     slot->info.pgid       = slot->info.pid;
     slot->info.sid        = slot->info.pid;
     slot->info.session    = s;
