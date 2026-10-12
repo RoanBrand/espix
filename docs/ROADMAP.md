@@ -25,6 +25,13 @@ things are as they are.
   rather than only that one did (R-P7.7), so the field a handler needs exists;
   Ctrl-Z itself is still missing.
 
+- **User mode on the S31 (R-P8.6, deferred from the process model).** A spike
+  before memory protection (R-P3.2, R-P3.3) is committed to: a two-page Sv32
+  table, `mret` into U-mode, one load, one `ecall`, and a page fault back to the
+  kernel. It answers what the S31 costs -- ASIDs, A/D bits, a TLB miss -- with
+  numbers rather than a datasheet, and it is also what asynchronous signal
+  delivery is waiting for. The S3 has no MMU for it and stays as it is.
+
 ## Filesystem
 
 - **Owning the syscalls (option C), if the triggers arrive.** espix routes

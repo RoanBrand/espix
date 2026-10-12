@@ -13,6 +13,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Processes
 
+- **The S3 corrupts its heap under the full suite's four workers.** It panics
+  within about two minutes of `make test` -- a bad pointer freed inside mbedtls'
+  software ECP during an SSH key exchange, or a store fault in a flash read --
+  and reboots into safe mode. The same seed does it on 75d7a5f, before the
+  process-model work, so it is older than that; the S31, whose ECC is hardware,
+  does not. Idle, the S3 stays up. Open.
+
 - **`exit()` from a thread the app created ends the thread, not the process.**
   POSIX says `exit()` in any thread terminates the whole process; espix ends the
   calling thread and logs a warning. The reason is mechanical rather than a
