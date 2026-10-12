@@ -35,6 +35,7 @@
 #include "espix_net.h"
 #include "espix_time.h"
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_ota.h"
 
 #define TAG "ota"
@@ -1155,11 +1156,10 @@ esp_err_t espix_ota_init(void)
      * its 8 kB of internal RAM is better spent on the audio codec. Internal is
      * still the fallback.
      */
-    } else if (xTaskCreateWithCaps(check_task, "ota:check", 8192, NULL,
-                                   tskIDLE_PRIORITY + 1, &s_check_task,
-                                   MALLOC_CAP_SPIRAM) != pdPASS &&
-               xTaskCreate(check_task, "ota:check", 8192, NULL,
-                           tskIDLE_PRIORITY + 1, &s_check_task) != pdPASS) {
+    } else if (espix_kthread_start(&(const espix_kthread_t){
+                   .name = "ota:check", .fn = check_task, .stack = 8192,
+                   .priority = tskIDLE_PRIORITY + 1, .core = tskNO_AFFINITY },
+                   &s_check_task) != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task for the periodic check");
     } else if (esp_event_handler_instance_register(
                    IP_EVENT, ESP_EVENT_ANY_ID, on_ip_event, NULL, NULL) != ESP_OK) {

@@ -21,6 +21,7 @@
 #include "sdkconfig.h"
 
 #include "espix_kernel.h"
+#include "espix_task.h"
 
 #define KLOG_LINES CONFIG_ESPIX_KLOG_LINES
 
@@ -397,11 +398,11 @@ void espix_klog_start_flusher(void)
 
     /* PSRAM first, internal as a fallback: this task is not realtime, and
      * internal is the pool that has to stay spare for Bluetooth. */
-    if (xTaskCreateWithCaps(klog_flusher_task, "espix:klog", 4096, NULL, 2,
-                            &s_flusher, MALLOC_CAP_SPIRAM) != pdPASS) {
-        (void)xTaskCreateWithCaps(klog_flusher_task, "espix:klog", 4096, NULL, 2,
-                                  &s_flusher, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    const espix_kthread_t k = {
+        .name = "espix:klog", .fn = klog_flusher_task, .stack = 4096,
+        .priority = 2, .core = tskNO_AFFINITY,
+    };
+    (void)espix_kthread_start(&k, &s_flusher);
 }
 
 void espix_klog_put(espix_klog_level_t level, const char *line)

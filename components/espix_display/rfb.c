@@ -2073,7 +2073,6 @@ static void rfb_task(void *arg)
     close(s_listen_fd);
     s_listen_fd = -1;
     espix_task_exited(&s_exit);
-    vTaskDeleteWithCaps(NULL);              /* frees the PSRAM stack it was given */
 }
 
 /*
@@ -2173,13 +2172,9 @@ esp_err_t espix_display_rfb_listen(uint16_t port)
      * The cost is a cross-core wakeup per event, which at these rates is noise
      * next to a core that is a third idle.
      */
-    if (xTaskCreatePinnedToCoreWithCaps(rfb_task, "espix:vnc", 8192, NULL, 4,
-                            &s_exit.task, 1,
-                            MALLOC_CAP_SPIRAM) != pdPASS) {
-        (void)xTaskCreatePinnedToCoreWithCaps(rfb_task, "espix:vnc", 8192, NULL,
-                                  4, &s_exit.task, 1,
-                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    (void)espix_kthread_start(&(const espix_kthread_t){
+        .name = "espix:vnc", .fn = rfb_task, .stack = 8192, .priority = 4,
+        .core = 1 }, &s_exit.task);
     if (s_exit.task == NULL) {
         s_run = false;
         close(fd);
@@ -2197,11 +2192,9 @@ void espix_display_rfb_stop(void)
 
     s_run = false;
 
-    /*
-     * Wait for the task to clear its own handle. It notices within one accept
-     * or recv timeout, and deletes itself with the matching vTaskDeleteWithCaps
-     * -- deleting it from here would leak the PSRAM stack it was given.
-     */
+    /* Wait for the task to clear its own handle. It notices within one accept
+     * or recv timeout and returns; deleting it from here would leave its
+     * process half torn down. */
     (void)espix_task_exit_wait(&s_exit, 3000);
     s_port = 0;
 }

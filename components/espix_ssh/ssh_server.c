@@ -29,6 +29,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_proc.h"
+#include "espix_task.h"
 #include "espix_ssh.h"
 #include "sdkconfig.h"
 #include "ssh_priv.h"
@@ -80,7 +81,6 @@ _Static_assert(CONFIG_LWIP_MAX_ACTIVE_TCP >= 2 * CONFIG_ESPIX_SSH_MAX_SESSIONS,
                "the lwIP TCP pool cannot hold the queued and accepted sessions at once");
 
 static int                s_listen_fd = -1;
-static espix_pid_t        s_sshd_pid  = ESPIX_PID_NONE;   /* the unit running the listener */
 static espix_ssh_status_t s_status;
 
 /* ------------------------------------------------------------------ */
@@ -330,37 +330,6 @@ static ssh_conn_t *conn_alloc(void)
 }
 
 /*
- * End this connection task, giving its stack back to the pool it came from.
- *
- * A task created WithCaps must be deleted WithCaps, and one created the ordinary
- * way must not be: the first leaks its stack otherwise, because the idle task
- * only frees what FreeRTOS allocated itself, and the second double-frees. IDF
- * makes that distinction explicit and offers no way to ask a task which it is --
- * so the stack's own address is the answer. A local lives in this task's stack
- * and this runs on that stack, so where the marker is says where the stack is.
- *
- * A flag in the connection struct would not do: the earliest way out of this
- * task -- conn_alloc() failing -- has no struct to hold one.
- */
-static void conn_task_exit(void)
-{
-    char marker = 0;   /* only its address is read; see below */
-
-    /*
-     * Deliberately NOT esp_stack_ptr_in_extram(): that also demands the address
-     * be 16-byte aligned, and `marker` is a char, so it answered "internal" for
-     * every PSRAM-stacked connection -- which then took the plain vTaskDelete()
-     * and leaked its 8 KB stack, one per connection. esp_ptr_external_ram()
-     * asks only the range question that is wanted here.
-     */
-    if (esp_ptr_external_ram(&marker)) {
-        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
-    } else {
-        vTaskDelete(NULL);
-    }
-}
-
-/*
  * How long to wait for the peer to hang up before hanging up on it. A client
  * that is answering takes milliseconds; one that has wandered off costs us this
  * much and no more.
@@ -377,7 +346,7 @@ static void conn_task_exit(void)
  * reached "connection closed" normally -- because nothing was wrong with the
  * session. It was only the goodbye.
  *
- * The refusal path in accept_task() needs this too: a reset there discards the
+ * The refusal path in serve() needs this too: a reset there discards the
  * "too many connections" line before the client can read it, which is how that
  * message came to be written and never once seen.
  *
@@ -498,11 +467,9 @@ static void connection_task(void *arg)
 
         close_gracefully(fd);   /* or the reset discards the line just sent */
         sessions_release();
-        conn_task_exit();
         return;
     }
-    c->fd     = fd;
-    c->parent = s_sshd_pid;
+    c->fd = fd;
 
     /* The reader owns recv() from here; everything else reads the ring. */
     if (ssh_rx_start(c) != ESP_OK) {
@@ -510,7 +477,6 @@ static void connection_task(void *arg)
         close_gracefully(fd);
         free(c);
         sessions_release();
-        conn_task_exit();
         return;
     }
 
@@ -603,8 +569,6 @@ static void connection_task(void *arg)
 
     sessions_release();
     espix_klog(ESPIX_KLOG_INFO, TAG, "connection closed");
-
-    conn_task_exit();
 }
 
 /* One accepted connection: its socket options, a refusal if it cannot be
@@ -748,32 +712,19 @@ static void serve(int fd, const struct sockaddr_in *peer)
                inet_ntoa(peer->sin_addr));
 
     /*
-     * A PSRAM stack, with the internal fallback the rest of espix uses.
+     * A process of its own, sshd's child, which becomes the shell at login.
      *
-     * 8192 bytes each and up to CONFIG_ESPIX_SSH_MAX_SESSIONS of them, so at
-     * eight this is 64 KB -- of PSRAM, not of the internal pool. The
-     * fallback below is what once drove internal RAM to zero at eight
-     * sessions; with PSRAM available, what a connection costs internally is
-     * its channel receive buffer. Nothing on this task's path needs the
-     * flash cache frozen (which is what keeps elfreloc's stack internal),
-     * and nothing here is DMA.
+     * Its stack is PSRAM first: 8192 bytes each and up to
+     * CONFIG_ESPIX_SSH_MAX_SESSIONS of them, so at eight this is 64 KB -- of
+     * PSRAM, not of the internal pool, which at eight sessions once ran out.
+     * Nothing on this task's path needs the flash cache frozen, and nothing
+     * here is DMA.
      */
-    BaseType_t ok = xTaskCreateWithCaps(connection_task, "sshd:conn",
-                                        CONFIG_ESPIX_SSH_TASK_STACK,
-                                        (void *)(intptr_t)fd,
-                                        CONFIG_ESPIX_SSH_TASK_PRIO, NULL,
-                                        MALLOC_CAP_SPIRAM);
-    if (ok != pdPASS) {
-        /* Out of PSRAM, which is 13 MB and not the pool under pressure --
-         * so serve the connection from internal RAM rather than refusing it.
-         * conn_task_exit() gives that stack back the ordinary way. */
-        espix_klog(ESPIX_KLOG_DEBUG, TAG,
-                   "no PSRAM for a connection stack; using internal");
-        ok = xTaskCreate(connection_task, "sshd:conn",
-                         CONFIG_ESPIX_SSH_TASK_STACK, (void *)(intptr_t)fd,
-                         CONFIG_ESPIX_SSH_TASK_PRIO, NULL);
-    }
-    if (ok != pdPASS) {
+    const esp_err_t started = espix_kthread_start(&(const espix_kthread_t){
+        .name = "sshd:conn", .fn = connection_task, .arg = (void *)(intptr_t)fd,
+        .stack = CONFIG_ESPIX_SSH_TASK_STACK,
+        .priority = CONFIG_ESPIX_SSH_TASK_PRIO, .core = tskNO_AFFINITY }, NULL);
+    if (started != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot start connection task");
         sessions_release();     /* the task that would have done this never ran */
         close(fd);
@@ -823,7 +774,6 @@ esp_err_t espix_ssh_run(bool (*keep_going)(void))
      * jobs; accepting at that, a busy board timed new logins out. */
     vTaskPrioritySet(NULL, CONFIG_ESPIX_SSH_TASK_PRIO);
 
-    s_sshd_pid       = espix_proc_self_pid();
     s_status.running = true;
     s_status.port    = CONFIG_ESPIX_SSH_PORT;
     espix_klog(ESPIX_KLOG_INFO, TAG, "listening on port %d",
@@ -865,7 +815,6 @@ esp_err_t espix_ssh_run(bool (*keep_going)(void))
 
     close(s_listen_fd);
     s_listen_fd      = -1;
-    s_sshd_pid       = ESPIX_PID_NONE;
     s_status.running = false;
     espix_klog(ESPIX_KLOG_INFO, TAG, "no longer listening");
     return ESP_OK;

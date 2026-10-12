@@ -332,15 +332,6 @@ static volatile bool s_running;
  */
 static volatile bool s_stop_requested;
 
-/*
- * Whether the running task's stack came from xTaskCreatePinnedToCoreWithCaps
- * (PSRAM) or the plain xTaskCreatePinnedToCore fallback (internal). It decides
- * how it must be deleted: a WithCaps task deleted with vTaskDelete() leaks its
- * stack, because the idle task only frees what FreeRTOS allocated itself -- and
- * deleting a plain task with vTaskDeleteWithCaps() would double-free. IDF's own
- * comment says as much in idf_additions.c.
- */
-static bool s_task_caps;
 static char          s_uri[200];
 
 /* ------------------------------------------------------------------ */
@@ -883,7 +874,6 @@ static void mixer_task(void *arg)
     free(out);
     free(in);
     espix_task_exited(&s_mixer_exit);
-    vTaskDeleteWithCaps(NULL);
 }
 
 espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
@@ -1004,18 +994,15 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
     s_mixer_up   = true;
     sink->start();
 
-    if (xTaskCreatePinnedToCoreWithCaps(mixer_task, "espix:mix", STREAM_STACK, NULL, 20,
-                                        &s_mixer_exit.task, 1,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-        if (xTaskCreatePinnedToCore(mixer_task, "espix:mix", STREAM_STACK, NULL, 20,
-                                    &s_mixer_exit.task, 1) != pdPASS) {
-            s_mixer_exit.task = NULL;
-            s_mixer_up        = false;
-            s_streams[slot]   = NULL;
-            vStreamBufferDeleteWithCaps(st->sb);
-            free(st);
-            return NULL;
-        }
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "espix:mix", .fn = mixer_task, .stack = STREAM_STACK,
+            .priority = 20, .core = 1 }, &s_mixer_exit.task) != ESP_OK) {
+        s_mixer_exit.task = NULL;
+        s_mixer_up        = false;
+        s_streams[slot]   = NULL;
+        vStreamBufferDeleteWithCaps(st->sb);
+        free(st);
+        return NULL;
     }
     return st;
 }
@@ -1378,7 +1365,6 @@ static void tone_task(void *arg)
     if (!s_stop_requested) {
         (void)espix_audio_tone(a.freq_hz, a.seconds, a.left_right);
     }
-    vTaskDeleteWithCaps(NULL);
 }
 
 esp_err_t espix_audio_tone_async(int freq_hz, int seconds, bool left_right)
@@ -1392,8 +1378,9 @@ esp_err_t espix_audio_tone_async(int freq_hz, int seconds, bool left_right)
     a->seconds     = seconds;
     a->left_right  = left_right;
 
-    if (xTaskCreateWithCaps(tone_task, "espix:tone", STREAM_STACK, a, 4,
-                            NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "espix:tone", .fn = tone_task, .arg = a, .stack = STREAM_STACK,
+            .priority = 4, .core = tskNO_AFFINITY }, NULL) != ESP_OK) {
         free(a);
         return ESP_ERR_NO_MEM;
     }
@@ -1898,7 +1885,6 @@ static void pipe_task(void *arg)
     if (buf == NULL) {
         p->done = true;
         p->task = NULL;
-        vTaskDeleteWithCaps(NULL);
         return;
     }
 
@@ -1946,7 +1932,6 @@ out:
     free(buf);
     p->done = true;
     p->task = NULL;
-    vTaskDeleteWithCaps(NULL);
 }
 
 int espix_audio_pipe_add(const char *source, const char *sink)
@@ -1991,11 +1976,10 @@ int espix_audio_pipe_add(const char *source, const char *sink)
         p->src = src;
         p->snk = snk;
 
-        if (xTaskCreatePinnedToCoreWithCaps(pipe_task, "espix:pipe", STREAM_STACK,
-                                            p, 20, &p->task, 1,
-                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS &&
-            xTaskCreatePinnedToCore(pipe_task, "espix:pipe", STREAM_STACK,
-                                    p, 20, &p->task, 1) != pdPASS) {
+        if (espix_kthread_start(&(const espix_kthread_t){
+                .name = "espix:pipe", .fn = pipe_task, .arg = p,
+                .stack = STREAM_STACK, .priority = 20, .core = 1 },
+                &p->task) != ESP_OK) {
             p->id = 0;
             espix_klog(ESPIX_KLOG_WARN, TAG, "pipe: no task");
             return -1;
@@ -2298,12 +2282,6 @@ out:
     }
     espix_task_exited(&s_exit);
     espix_klog(ESPIX_KLOG_INFO, TAG, "finished");
-
-    if (s_task_caps) {
-        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
-    } else {
-        vTaskDelete(NULL);
-    }
 }
 
 static esp_err_t play_common(const char *uri, bool wait)
@@ -2376,28 +2354,20 @@ static esp_err_t play_common(const char *uri, bool wait)
      * exhausted. This task's working set is small, so try PSRAM and fall back
      * if it is not available.
      */
-    /*
-     * s_task_caps is set before each attempt, and the fallback only runs when
-     * the caps attempt failed -- so no task is alive to race the flag.
-     */
     if (!espix_task_exit_init(&s_exit)) {
         (void)espix_audio_stream_close(s_play_stream);
         s_play_stream = NULL;
         return ESP_ERR_NO_MEM;
     }
 
-    s_task_caps = true;
-    if (xTaskCreatePinnedToCoreWithCaps(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
-                                        &s_exit.task, 1,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-        s_task_caps = false;
-        if (xTaskCreatePinnedToCore(audio_task, "espix:audio", TASK_STACK, s_uri, 20,
-                                    &s_exit.task, 1) != pdPASS) {
-            s_exit.task = NULL;
-            (void)espix_audio_stream_close(s_play_stream);
-            s_play_stream = NULL;
-            return ESP_FAIL;
-        }
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "espix:audio", .fn = audio_task, .arg = s_uri,
+            .stack = TASK_STACK, .priority = 20, .core = 1 },
+            &s_exit.task) != ESP_OK) {
+        s_exit.task = NULL;
+        (void)espix_audio_stream_close(s_play_stream);
+        s_play_stream = NULL;
+        return ESP_FAIL;
     }
     s_running = true;
     return ESP_OK;

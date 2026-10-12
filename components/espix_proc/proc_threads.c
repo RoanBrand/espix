@@ -37,6 +37,17 @@ bool espix_threads_set_task(espix_threads_t *t, int32_t tid, void *task,
     return true;
 }
 
+bool espix_threads_set_caps(espix_threads_t *t, int32_t tid)
+{
+    espix_thread_t *const e = find_tid(t, tid);
+
+    if (e == NULL) {
+        return false;
+    }
+    e->caps = true;
+    return true;
+}
+
 bool espix_threads_remove(espix_threads_t *t, int32_t tid, espix_thread_t *out)
 {
     espix_thread_t *const e = find_tid(t, tid);

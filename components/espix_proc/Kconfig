@@ -16,14 +16,15 @@ menu "espix processes"
             pids too, cost the slot alone.
 
     config ESPIX_PTHREAD_MAX
-        int "Maximum app threads, across all processes"
+        int "Maximum threads, across all processes"
         range 4 64
-        default 16
+        default 32
         help
-            Size of the table that ties an app's pthreads to its process, so a
-            signal reaches them and the process's end can end them. One table
-            for the whole system, 16 bytes an entry; pthread_create beyond it
-            fails with EAGAIN rather than starting a thread nobody can reach.
+            Size of the table that ties a thread to its process -- an app's
+            pthreads, and espix's own (sshd:rx, audio's mixer) -- so a signal
+            reaches them and the process's end can end them. One table for the
+            whole system, 20 bytes an entry; pthread_create beyond it fails with
+            EAGAIN rather than starting a thread nobody can reach.
 
     config ESPIX_PROC_STACK_SIZE
         int "Default stack size for a loaded app (bytes)"

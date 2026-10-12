@@ -311,7 +311,6 @@ static void ssh_reader_task(void *arg)
     }
 
     espix_task_exited(&c->rx_exit);
-    vTaskDeleteWithCaps(NULL);
 }
 
 esp_err_t ssh_rx_start(ssh_conn_t *c)
@@ -342,18 +341,17 @@ esp_err_t ssh_rx_start(ssh_conn_t *c)
 
     c->rx_wake = xTaskGetCurrentTaskHandle();
 
-    if (xTaskCreateWithCaps(ssh_reader_task, "sshd:rx", SSH_RX_STACK, c,
-                            CONFIG_ESPIX_SSH_TASK_PRIO, &c->rx_exit.task,
-                            MALLOC_CAP_SPIRAM) != pdPASS) {
-        if (xTaskCreate(ssh_reader_task, "sshd:rx", SSH_RX_STACK, c,
-                        CONFIG_ESPIX_SSH_TASK_PRIO,
-                        &c->rx_exit.task) != pdPASS) {
-            vSemaphoreDelete(c->rx_data);
-            c->rx_data = NULL;
-            heap_caps_free(c->rx_buf);
-            c->rx_buf = NULL;
-            return ESP_ERR_NO_MEM;
-        }
+    /* A thread of the connection's process, which outlives it: the
+     * connection stops it before its own end. */
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "sshd:rx", .fn = ssh_reader_task, .arg = c,
+            .stack = SSH_RX_STACK, .priority = CONFIG_ESPIX_SSH_TASK_PRIO,
+            .core = tskNO_AFFINITY, .thread = true }, &c->rx_exit.task) != ESP_OK) {
+        vSemaphoreDelete(c->rx_data);
+        c->rx_data = NULL;
+        heap_caps_free(c->rx_buf);
+        c->rx_buf = NULL;
+        return ESP_ERR_NO_MEM;
     }
 
     /*

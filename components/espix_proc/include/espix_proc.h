@@ -142,6 +142,8 @@ typedef struct {
     UBaseType_t        priority;
     BaseType_t         core;            /* a core, or tskNO_AFFINITY */
     bool               internal_stack;  /* it maps or writes flash */
+    bool               init;            /* pid 1: the supervisor, once */
+    TaskHandle_t      *task_out;        /* the task, written before it runs */
     espix_session_t   *session;         /* credentials, and who a hangup ends;
                                            NULL is espix itself, as root */
     espix_pid_t        pgid;            /* a group to join; 0 for a new one */

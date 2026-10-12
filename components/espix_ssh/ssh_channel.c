@@ -2423,7 +2423,6 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .cwd       = "/",
             .transport = ch,
             .fg_pgid    = ESPIX_PID_NONE,
-            .ppid      = ch->conn->parent,
             .uid       = ESPIX_UID_NOBODY,
             .gid       = ESPIX_UID_NOBODY,
         };
@@ -2480,7 +2479,6 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .uid       = ESPIX_UID_NOBODY,
             .gid       = ESPIX_UID_NOBODY,
             .fg_pgid    = ESPIX_PID_NONE,
-            .ppid      = ch->conn->parent,
             .ansi      = ch->has_pty,
             .open_stream = chan_open_stream,
         };
@@ -2601,7 +2599,6 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .uid       = ESPIX_UID_NOBODY,
         .gid       = ESPIX_UID_NOBODY,
         .fg_pgid    = ESPIX_PID_NONE,
-        .ppid      = ch->conn->parent,
         .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,
     };

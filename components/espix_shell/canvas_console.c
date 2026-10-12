@@ -243,7 +243,7 @@ static void con_task(void *arg)
 
     if (gen != s_gen) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "stale console task exiting");
-        vTaskDeleteWithCaps(NULL);
+        return;
     }
 
     s_con.term = NULL;
@@ -251,7 +251,6 @@ static void con_task(void *arg)
     espix_task_exited(&s_exit);
 
     espix_display_release(&s_console_screen);
-    vTaskDeleteWithCaps(NULL);          /* frees the PSRAM stack it was given */
 }
 
 esp_err_t espix_console_canvas_start(void)
@@ -306,12 +305,9 @@ esp_err_t espix_console_canvas_start(void)
      * A command that needs more still declares its own stack in the command
      * table, where it costs one command rather than every console.
      */
-    if (xTaskCreateWithCaps(con_task, "espix:vnc0", 8192, gen, 4, &s_exit.task,
-                            MALLOC_CAP_SPIRAM) != pdPASS) {
-        (void)xTaskCreateWithCaps(con_task, "espix:vnc0", 8192, gen, 4,
-                                  &s_exit.task,
-                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    (void)espix_kthread_start(&(const espix_kthread_t){
+        .name = "espix:vnc0", .fn = con_task, .arg = gen, .stack = 8192,
+        .priority = 4, .core = tskNO_AFFINITY }, &s_exit.task);
     if (s_exit.task == NULL) {
         espix_display_release(&s_console_screen);
         espix_term_free(s_con.term);

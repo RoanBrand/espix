@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_task.h"
 #include "espix_shell.h"
 #include "espix_audio_source.h"
 
@@ -93,7 +94,6 @@ static void writer_task(void *arg)
 
     free(buf);
     w->task = NULL;
-    vTaskDelete(NULL);
 }
 
 static int cmd_record(espix_session_t *s, int argc, char **argv)
@@ -178,8 +178,11 @@ static int cmd_record(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    if (xTaskCreate(writer_task, "recwrite", 6144, &s_rec, 4,
-                    &s_rec.task) != pdPASS) {
+    /* A thread of this command, so ps shows it under record. */
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "recwrite", .fn = writer_task, .arg = &s_rec, .stack = 6144,
+            .priority = 4, .core = tskNO_AFFINITY, .internal_stack = true,
+            .thread = true }, &s_rec.task) != ESP_OK) {
         espix_eprintf(s, "record: cannot start the writer\n");
         vStreamBufferDeleteWithCaps(s_rec.sb);
         close(fd);

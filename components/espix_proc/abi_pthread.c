@@ -37,6 +37,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
+#include "freertos/idf_additions.h"
 
 #include "pthread.h"
 
@@ -195,7 +197,11 @@ void espix_pthread_reap(espix_proc_slot_t *slot)
             espix_klog(ESPIX_KLOG_WARN, TAG,
                        "ending thread %d, which its process left behind",
                        (int)victim.tid);
-            vTaskDelete((TaskHandle_t)victim.task);
+            if (victim.caps) {
+                vTaskDeleteWithCaps((TaskHandle_t)victim.task);
+            } else {
+                vTaskDelete((TaskHandle_t)victim.task);
+            }
         }
     }
 }
@@ -330,6 +336,79 @@ static int espix_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         xSemaphoreGive(g_espix_proc_lock);
     }
     return rc;
+}
+
+/*
+ * espix's own thread of a process: sshd:rx under its connection, audio's mixer
+ * under audio. Booked like an app's, so ps lists it and a signal wakes it, but
+ * with no stdio to take or give back.
+ */
+typedef struct {
+    espix_kthread_fn_t fn;
+    void              *arg;
+    espix_proc_slot_t *slot;
+    espix_pid_t        tid;
+} kthread_start_t;
+
+static void kthread_trampoline(void *arg)
+{
+    const kthread_start_t st = *(kthread_start_t *)arg;
+    free(arg);
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const bool live = espix_threads_set_task(&s_threads, st.tid,
+                                             xTaskGetCurrentTaskHandle(), NULL);
+    xSemaphoreGive(g_espix_proc_lock);
+
+    if (live) {
+        vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, st.slot);
+        st.fn(st.arg);
+        vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
+        espix_pthread_unregister(st.slot);
+    }
+    vTaskDeleteWithCaps(NULL);
+}
+
+esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
+                                  const espix_kthread_t *k, TaskHandle_t *out)
+{
+    kthread_start_t *const st = malloc(sizeof(*st));
+    if (st == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    *st = (kthread_start_t){ .fn = k->fn, .arg = k->arg, .slot = slot };
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    st->tid = espix_proc_next_pid();
+    const bool room = espix_threads_add(&s_threads, slot, st->tid) &&
+                      espix_threads_set_caps(&s_threads, st->tid);
+    xSemaphoreGive(g_espix_proc_lock);
+    if (!room) {
+        free(st);
+        return ESP_ERR_NO_MEM;
+    }
+
+    const espix_pid_t tid = st->tid;
+    BaseType_t        ok  = pdFAIL;
+    if (!k->internal_stack) {
+        ok = xTaskCreatePinnedToCoreWithCaps(kthread_trampoline, k->name,
+                                             k->stack, st, k->priority, out,
+                                             k->core, MALLOC_CAP_SPIRAM);
+    }
+    if (ok != pdPASS) {
+        ok = xTaskCreatePinnedToCoreWithCaps(kthread_trampoline, k->name,
+                                             k->stack, st, k->priority, out,
+                                             k->core,
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (ok != pdPASS) {
+        free(st);
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        (void)espix_threads_remove(&s_threads, tid, NULL);
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 /*

@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -57,6 +58,41 @@ void espix_task_exited(espix_task_exit_t *t);
  * wait at all.
  */
 bool espix_task_exit_wait(espix_task_exit_t *t, uint32_t timeout_ms);
+
+/*
+ * espix's own tasks. Once espix_proc is up, one is a kernel process (KTHREAD)
+ * of its own -- or a thread of one, with `thread` -- so ps names it, a pid
+ * reaches it, and nothing of espix runs unaccounted for. Before that it is a
+ * plain task, which espix_proc adopts when it starts. Components below
+ * espix_proc start their tasks here for that reason, as the shell does through
+ * its ops table.
+ *
+ * fn returning ends the task; it must not vTaskDelete() itself.
+ */
+typedef void (*espix_kthread_fn_t)(void *arg);
+
+typedef struct {
+    const char        *name;
+    espix_kthread_fn_t fn;
+    void              *arg;
+    uint32_t           stack;           /* bytes */
+    UBaseType_t        priority;
+    BaseType_t         core;            /* a core, or tskNO_AFFINITY */
+    bool               internal_stack;  /* internal RAM; else PSRAM first */
+    bool               thread;          /* a thread of the caller's process */
+} espix_kthread_t;
+
+/* *out is the task, written before it runs. */
+esp_err_t espix_kthread_start(const espix_kthread_t *k, TaskHandle_t *out);
+
+/* espix_proc's side; registering it adopts the tasks started before. */
+typedef struct {
+    esp_err_t (*start)(const espix_kthread_t *k, TaskHandle_t *out);
+    void      (*adopt)(TaskHandle_t task, const char *name);
+    void      (*gone)(TaskHandle_t task);   /* an adopted task is ending */
+} espix_kthread_ops_t;
+
+void espix_kthread_set_ops(const espix_kthread_ops_t *ops);
 
 #ifdef __cplusplus
 }

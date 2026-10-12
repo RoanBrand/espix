@@ -267,7 +267,6 @@ struct espix_session {
     void       *transport;                 /* implementation-owned */
     espix_pid_t fg_pgid;                   /* foreground job's group, or NONE */
     espix_pid_t pid;                       /* the shell's own process, for $$ */
-    espix_pid_t ppid;                      /* who started the login (sshd), or 0 */
 
     /* The task the shell runs on (a TaskHandle_t), while it is a process. A
      * command dispatched there becomes a process; anywhere else -- a pipe

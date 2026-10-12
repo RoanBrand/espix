@@ -39,6 +39,13 @@ typedef struct {
     bool             shell;     /* listing: the shell builtins, or the rest */
 } help_ctx_t;
 
+/* An app's threads are all "pthread", so one is named for its process, as
+ * pstree does; espix's own have names of their own (sshd:rx). */
+static const char *thread_label(const char *task_name, const char *proc_name)
+{
+    return (strcmp(task_name, "pthread") == 0) ? proc_name : task_name;
+}
+
 static bool help_visit(void *ctx, const espix_cmd_t *cmd)
 {
     help_ctx_t *h = ctx;
@@ -572,7 +579,8 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
             espix_proc_name_of(pid, name, sizeof(name))) {
             shown = name;
         } else if (thread && espix_proc_name_of(th_pid, name, sizeof(name))) {
-            snprintf(thread_name, sizeof(thread_name), "{%s}", name);
+            snprintf(thread_name, sizeof(thread_name), "{%s}",
+                     thread_label(tasks[i].pcTaskName, name));
             shown = thread_name;
         }
 
@@ -1050,7 +1058,8 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             } else if (espix_proc_thread_of_task(t->xHandle, &th_pid, &th_tid) &&
                        espix_proc_name_of(th_pid, name, sizeof(name))) {
                 snprintf(pid_str, sizeof(pid_str), "%d", (int)th_tid);
-                snprintf(thread_name, sizeof(thread_name), "{%s}", name);
+                snprintf(thread_name, sizeof(thread_name), "{%s}",
+                         thread_label(t->pcTaskName, name));
                 shown = thread_name;
             } else {
                 snprintf(pid_str, sizeof(pid_str), "-");

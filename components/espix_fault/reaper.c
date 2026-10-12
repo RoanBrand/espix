@@ -31,6 +31,7 @@
 #include "espix_fault.h"
 #include "espix_fault_priv.h"
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_proc.h"
 
 #define TAG "reaper"
@@ -129,10 +130,11 @@ esp_err_t espix_fault_reaper_start(void)
      * anger, and internal RAM is the pool the audio codec needs. Internal stays
      * the fallback so a board without PSRAM still reaps.
      */
-    if (xTaskCreateWithCaps(reaper_task, "espix:reaper", REAPER_STACK_SIZE, NULL,
-                            REAPER_PRIORITY, NULL, MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreate(reaper_task, "espix:reaper", REAPER_STACK_SIZE, NULL,
-                    REAPER_PRIORITY, NULL) != pdPASS) {
+    const espix_kthread_t k = {
+        .name = "espix:reaper", .fn = reaper_task, .stack = REAPER_STACK_SIZE,
+        .priority = REAPER_PRIORITY, .core = tskNO_AFFINITY,
+    };
+    if (espix_kthread_start(&k, NULL) != ESP_OK) {
         vQueueDelete(s_queue);
         s_queue = NULL;
         return ESP_ERR_NO_MEM;

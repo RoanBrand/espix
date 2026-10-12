@@ -300,6 +300,8 @@ typedef struct {
     volatile bool     in_select;
     volatile bool     console_stdin;    /* in a console read: counted in its
                                            session's stdin_readers */
+    bool              was_kthread;      /* a KTHREAD that became a login's
+                                           shell, and is one again after */
 
     /*
      * The interval timer behind alarm() and setitimer(), and so the only source
@@ -585,6 +587,13 @@ espix_proc_slot_t *espix_proc_find(espix_pid_t pid);
 /* The calling task's slot, or NULL if it is not a process. Takes no lock: the
  * caller is the process itself, so its slot cannot be recycled underneath it. */
 espix_proc_slot_t *espix_proc_self(void);
+
+/* espix_kthread_start(), as espix_proc does it; registered at init. */
+extern const espix_kthread_ops_t g_espix_kthread_ops;
+
+/* Start k as a thread of `slot`. abi_pthread.c, which owns the table. */
+esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
+                                  const espix_kthread_t *k, TaskHandle_t *out);
 
 /* The group a new process `pid` joins: `asked` if set; else a shell's or the
  * kernel's child leads its own job, and anyone else's joins its parent's. */

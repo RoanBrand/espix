@@ -26,7 +26,7 @@ espix_proc_table_t  g_espix_proc_table;
 SemaphoreHandle_t  g_espix_proc_lock;
 EventGroupHandle_t g_espix_proc_events;
 
-static espix_pid_t s_next_pid = 1;
+static espix_pid_t s_next_pid = 2;     /* 1 is init's; see spawn_fn */
 
 /*
  * The completed log: where a status lives once the slot is gone.
@@ -218,6 +218,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
     espix_shell_set_proc_ops(&s_shell_ops);
+    espix_kthread_set_ops(&g_espix_kthread_ops);   /* adopts the early ones */
     espix_proc_abi_env_register();
     espix_proc_abi_exit_register();
     espix_proc_abi_alloc_register();
@@ -482,9 +483,11 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      * slot pointer must not be used after this function returns -- the next
      * spawn may claim it immediately.
      */
-    /* A shell leaves no record: nobody waits for one, and logins would push
-     * every app's exit out of the short list ps shows. */
-    if (slot->info.kind != ESPIX_PROC_SESSION) {
+    /* A shell or a kernel task leaves no record: nobody waits for one, and
+     * logins and connections would push every app's exit out of the short
+     * list ps shows. */
+    if (slot->info.kind != ESPIX_PROC_SESSION &&
+        slot->info.kind != ESPIX_PROC_KTHREAD) {
         done_record(slot, state, exit_code);
     }
     memset(slot, 0, sizeof(*slot));

@@ -30,6 +30,7 @@
 #include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
 #include "espix_term.h"
@@ -1442,8 +1443,6 @@ static void term_task(void *arg)
         s_term_task = NULL;
     }
     desk_unlock();
-
-    vTaskDeleteWithCaps(NULL);
 }
 
 static void term_start(void)
@@ -1480,12 +1479,9 @@ static void term_start(void)
 
     void *const gen = (void *)(uintptr_t)++s_term_gen;
 
-    if (xTaskCreateWithCaps(term_task, "espix:term", 8192, gen, 4, &s_term_task,
-                            MALLOC_CAP_SPIRAM) != pdPASS) {
-        (void)xTaskCreateWithCaps(term_task, "espix:term", 8192, gen, 4,
-                                  &s_term_task,
-                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    (void)espix_kthread_start(&(const espix_kthread_t){
+        .name = "espix:term", .fn = term_task, .arg = gen, .stack = 8192,
+        .priority = 4, .core = tskNO_AFFINITY }, &s_term_task);
     if (s_term_task == NULL) {
         espix_term_free(s_shell);
         s_shell = NULL;
@@ -2061,28 +2057,6 @@ static void bar_damage(void)
 
 static void term_open(void);
 
-/*
- * Run a program on the whole screen.
- *
- * The app claims the screen for itself, so the desktop stops being the owner
- * the moment it starts. When it leaves, the display falls back to the console
- * rather than to us -- which is why a waiter reclaims the desktop instead of
- * letting the console keep it.
- */
-static void app_waiter(void *arg)
-{
-    const espix_pid_t pid = (espix_pid_t)(uintptr_t)arg;
-
-    (void)espix_proc_wait(pid, NULL, portMAX_DELAY);
-    espix_display_hold(false);
-
-    if (espix_display_canvas() != NULL) {
-        /* Rebuilt, not just reclaimed: launch_app() tore the desktop down so
-         * the app could have its PSRAM, so there are no windows to return to. */
-        (void)espix_desktop_start();
-    }
-    vTaskDelete(NULL);
-}
 
 /*
  * First-launch data, drawn while it happens.
@@ -2295,20 +2269,21 @@ static void launch_task(void *arg)
         (void)espix_desktop_start();    /* nothing was started after all */
         desk_unlock();
         s_launching = false;
-        /* Created WithCaps on both attempts in launch_app(), so it must be
-         * deleted the same way or the 8 KB stack leaks -- the same shape as
-         * conn_task_exit() in ssh_server.c. */
-        vTaskDeleteWithCaps(NULL);
         return;
     }
-
-    if (xTaskCreate(app_waiter, "espix:appwait", 2560, (void *)(uintptr_t)pid, 3,
-                    NULL) != pdPASS) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "no task to wait for %s", path);
-    }
-
     s_launching = false;
-    vTaskDeleteWithCaps(NULL);
+
+    /*
+     * The app is this process's child, so this is where it is waited for. It
+     * claims the screen, and when it leaves the display falls back to the
+     * console rather than to us -- so the desktop is taken back here, rebuilt
+     * rather than reclaimed: it was torn down so the app could have its PSRAM.
+     */
+    (void)espix_proc_wait(pid, NULL, portMAX_DELAY);
+    espix_display_hold(false);
+    if (espix_display_canvas() != NULL) {
+        (void)espix_desktop_start();
+    }
 }
 
 static void launch_app(const char *path)
@@ -2327,12 +2302,9 @@ static void launch_app(const char *path)
     /* On the heap and preferably in PSRAM, like the other long-lived stacks:
      * this one holds a TLS handshake, and internal RAM is what the app that
      * follows is about to want. */
-    if (xTaskCreatePinnedToCoreWithCaps(launch_task, "espix:appstart", 8192,
-                            (void *)path, 3, NULL, tskNO_AFFINITY,
-                            MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreatePinnedToCoreWithCaps(launch_task, "espix:appstart", 8192,
-                            (void *)path, 3, NULL, tskNO_AFFINITY,
-                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "espix:appstart", .fn = launch_task, .arg = (void *)path,
+            .stack = 8192, .priority = 3, .core = tskNO_AFFINITY }, NULL) != ESP_OK) {
         s_launching = false;
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task to start %s", path);
     }

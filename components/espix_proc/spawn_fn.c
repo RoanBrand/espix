@@ -9,6 +9,7 @@
  * request it answers (espix_proc_stopping()). See espix_proc_kind_t.
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -58,7 +59,8 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pi
 
     strlcpy(slot->info.name, o->name, sizeof(slot->info.name));
     slot->info.kind    = o->kind;
-    slot->info.pid     = espix_proc_next_pid();
+    slot->info.pid     = (o->init && espix_proc_find(1) == NULL)
+                       ? 1 : espix_proc_next_pid();
     slot->info.state   = ESPIX_PROC_READY;
     slot->info.session = o->session;
 
@@ -111,6 +113,9 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pi
     if (out_pid != NULL) {
         *out_pid = slot->info.pid;
     }
+    if (o->task_out != NULL) {
+        *o->task_out = task;
+    }
 
     xSemaphoreGive(g_espix_proc_lock);
     return ESP_OK;
@@ -136,9 +141,28 @@ esp_err_t espix_proc_adopt(espix_session_t *s, const char *name,
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
 
-    if (espix_proc_self() != NULL) {
+    /*
+     * A kernel task that becomes a login's shell -- sshd:conn -- keeps its pid
+     * and its parent, and is a kernel task again when the login ends.
+     */
+    espix_proc_slot_t *const self = espix_proc_self();
+    if (self != NULL) {
+        if (self->info.kind != ESPIX_PROC_KTHREAD || self->info.task !=
+            xTaskGetCurrentTaskHandle()) {
+            xSemaphoreGive(g_espix_proc_lock);
+            return ESP_ERR_INVALID_STATE;
+        }
+        strlcpy(self->info.name, name, sizeof(self->info.name));
+        self->was_kthread  = true;
+        self->info.kind    = ESPIX_PROC_SESSION;
+        self->info.session = s;
+        self->info.pgid    = self->info.pid;
+        self->info.sid     = self->info.pid;
+        if (out_pid != NULL) {
+            *out_pid = self->info.pid;
+        }
         xSemaphoreGive(g_espix_proc_lock);
-        return ESP_ERR_INVALID_STATE;       /* already a process */
+        return ESP_OK;
     }
     espix_proc_slot_t *const slot = espix_proc_alloc_slot();
     if (slot == NULL) {
@@ -149,7 +173,7 @@ esp_err_t espix_proc_adopt(espix_session_t *s, const char *name,
     strlcpy(slot->info.name, name, sizeof(slot->info.name));
     slot->info.kind       = ESPIX_PROC_SESSION;
     slot->info.pid        = espix_proc_next_pid();
-    slot->info.ppid       = (s->ppid > 0) ? s->ppid : ESPIX_PID_NONE;
+    slot->info.ppid       = ESPIX_PID_NONE;
     slot->info.pgid       = slot->info.pid;
     slot->info.sid        = slot->info.pid;
     slot->info.session    = s;
@@ -172,6 +196,112 @@ void espix_proc_leave(int status)
     if (slot == NULL || slot->info.kind != ESPIX_PROC_SESSION) {
         return;
     }
+    if (slot->was_kthread) {
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        slot->info.kind    = ESPIX_PROC_KTHREAD;
+        slot->info.session = NULL;
+        slot->was_kthread  = false;
+        xSemaphoreGive(g_espix_proc_lock);
+        return;
+    }
     espix_proc_release_resources(slot);
     espix_proc_finish(slot, ESPIX_PROC_EXITED, status);
 }
+
+/* ------------------------------------------------------- espix_kthread_* --- */
+
+typedef struct {
+    espix_kthread_fn_t fn;
+    void              *arg;
+} kthread_arg_t;
+
+static int kthread_main(void *arg)
+{
+    const kthread_arg_t st = *(kthread_arg_t *)arg;
+    free(arg);
+    st.fn(st.arg);
+    return 0;
+}
+
+static esp_err_t kthread_start(const espix_kthread_t *k, TaskHandle_t *out)
+{
+    if (k->thread) {
+        espix_proc_slot_t *const owner = espix_proc_self();
+        /* Not a process, or a full thread table, leaves it a process of its
+         * own: counted either way. */
+        if (owner != NULL && espix_proc_thread_start(owner, k, out) == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+
+    kthread_arg_t *const a = malloc(sizeof(*a));
+    if (a == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    *a = (kthread_arg_t){ .fn = k->fn, .arg = k->arg };
+
+    const espix_proc_fn_opts_t o = {
+        .name           = k->name,
+        .fn             = kthread_main,
+        .arg            = a,
+        .kind           = ESPIX_PROC_KTHREAD,
+        .stack          = k->stack,
+        .priority       = k->priority,
+        .core           = k->core,
+        .internal_stack = k->internal_stack,
+        .task_out       = out,
+    };
+    const esp_err_t err = espix_proc_spawn_fn(&o, NULL);
+    if (err != ESP_OK) {
+        free(a);
+    }
+    return err;
+}
+
+/* A task started before espix_proc, now given a slot. */
+static void kthread_adopt(TaskHandle_t task, const char *name)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    espix_proc_slot_t *const slot = espix_proc_alloc_slot();
+    if (slot != NULL) {
+        strlcpy(slot->info.name, name, sizeof(slot->info.name));
+        slot->info.kind       = ESPIX_PROC_KTHREAD;
+        slot->info.pid        = espix_proc_next_pid();
+        slot->info.ppid       = ESPIX_PID_NONE;
+        slot->info.pgid       = slot->info.pid;
+        slot->info.sid        = slot->info.pid;
+        slot->info.started_us = esp_timer_get_time();
+        slot->wake_fd         = -1;
+        slot->info.task       = task;
+        slot->info.state      = ESPIX_PROC_RUNNING;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+}
+
+/* An adopted task is ending: it has no fn_task to reap it. */
+static void kthread_gone(TaskHandle_t task)
+{
+    espix_proc_slot_t *slot = NULL;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        espix_proc_slot_t *const e = &g_espix_proc_table.slots[i];
+        if (e->info.state != ESPIX_PROC_FREE && e->info.task == task &&
+            e->info.kind == ESPIX_PROC_KTHREAD && e->fn == NULL) {
+            slot = e;
+            break;
+        }
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+
+    if (slot != NULL) {
+        espix_proc_release_resources(slot);
+        espix_proc_finish(slot, ESPIX_PROC_EXITED, 0);
+    }
+}
+
+const espix_kthread_ops_t g_espix_kthread_ops = {
+    .start = kthread_start,
+    .adopt = kthread_adopt,
+    .gone  = kthread_gone,
+};

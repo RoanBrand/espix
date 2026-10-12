@@ -86,6 +86,7 @@ idf_component_register(
         "espix_pm.c"
         "shutdown.c"
         "task_exit.c"
+        "kthread.c"
     INCLUDE_DIRS
         "include"
         "${CMAKE_CURRENT_BINARY_DIR}"
@@ -100,4 +101,5 @@ idf_component_register(
         esp_app_format
         log
         freertos
+        heap
 )

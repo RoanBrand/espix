@@ -40,6 +40,7 @@
 #include "esp_mbr_utils.h"
 
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_usb.h"
 #include "espix_usb_priv.h"
 
@@ -2568,11 +2569,11 @@ esp_err_t espix_usb_host_init(void)
      * which is why both USB tasks are safe to move and no other change is
      * needed to make transfers work.
      */
-    if (xTaskCreateWithCaps(host_task, "usb:lib", HOST_TASK_STACK, NULL,
-                            HOST_TASK_PRIO, NULL,
-                            MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreate(host_task, "usb:lib", HOST_TASK_STACK, NULL, HOST_TASK_PRIO,
-                    NULL) != pdPASS) {
+    const espix_kthread_t lib = {
+        .name = "usb:lib", .fn = host_task, .stack = HOST_TASK_STACK,
+        .priority = HOST_TASK_PRIO, .core = tskNO_AFFINITY,
+    };
+    if (espix_kthread_start(&lib, NULL) != ESP_OK) {
         usb_host_uninstall();
         return ESP_ERR_NO_MEM;
     }
@@ -2587,11 +2588,11 @@ esp_err_t espix_usb_host_init(void)
     }
     /* PSRAM first, as above: this is the larger of the two stacks (6144) and
      * the one that holds the mount applier's frames. */
-    if (xTaskCreateWithCaps(dev_task, "usb:dev", DEV_TASK_STACK, NULL,
-                            DEV_TASK_PRIO, NULL,
-                            MALLOC_CAP_SPIRAM) != pdPASS &&
-        xTaskCreate(dev_task, "usb:dev", DEV_TASK_STACK, NULL, DEV_TASK_PRIO,
-                    NULL) != pdPASS) {
+    const espix_kthread_t dev = {
+        .name = "usb:dev", .fn = dev_task, .stack = DEV_TASK_STACK,
+        .priority = DEV_TASK_PRIO, .core = tskNO_AFFINITY,
+    };
+    if (espix_kthread_start(&dev, NULL) != ESP_OK) {
         vQueueDelete(s_dev);
         s_dev = NULL;
         return ESP_ERR_NO_MEM;
@@ -2615,8 +2616,10 @@ esp_err_t espix_usb_host_init(void)
         s_monitor = NULL;
         espix_klog(ESPIX_KLOG_WARN, TAG, "no device monitor: %s",
                    esp_err_to_name(err));
-    } else if (xTaskCreate(mon_task, "usb:mon", MON_TASK_STACK, NULL,
-                           MON_TASK_PRIO, NULL) != pdPASS) {
+    } else if (espix_kthread_start(&(const espix_kthread_t){
+                   .name = "usb:mon", .fn = mon_task, .stack = MON_TASK_STACK,
+                   .priority = MON_TASK_PRIO, .core = tskNO_AFFINITY,
+                   .internal_stack = true }, NULL) != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no monitor task");
     }
 

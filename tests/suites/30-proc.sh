@@ -433,6 +433,15 @@ fi
 # coredump` and `sudo upgrade` asserted in the cache freeze and reset the board.
 assert_contains "sudo can run a command that maps flash" "core dump" \
     "$(dev_run 'sudo coredump')"
+# espix's own tasks are processes too (R-P8.5): the supervisor is init, pid 1,
+# and a login's socket reader is a thread of the login.
+pslist=$(dev_run ps | sed -n '1,/^finished:/p')
+assert_eq "init is pid 1" "init" \
+    "$(printf '%s' "$pslist" | awk '$1 == 1 { print $2; exit }')"
+assert_eq "no espix task is left without a pid" "" \
+    "$(printf '%s' "$pslist" | awk '$1 == "-" && $2 ~ /^(espix:|usb:|sshd|init)/')"
+assert_eq "a login's reader is its thread" "$ids_ppid" \
+    "$(printf '%s' "$pslist" | awk -v c="$(ps_col PPID)" '$2 == "{sshd:rx}" && $c == '"$ids_ppid"' { print $c; exit }')"
 assert_contains "type names a shell builtin" "cd is a shell builtin" \
     "$(dev_run 'type cd')"
 assert_contains "and a command run as a process" "ls is a command" \

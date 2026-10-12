@@ -711,7 +711,7 @@ static const char *unit_blocked(const svc_unit_t *u, char *dep, size_t len)
     return NULL;
 }
 
-static void supervisor_task(void *arg)
+static int supervisor_main(void *arg)
 {
     (void)arg;
 
@@ -754,6 +754,7 @@ static void supervisor_task(void *arg)
         xSemaphoreGive(s_lock);
         vTaskDelay(pdMS_TO_TICKS(SVC_TICK_MS));
     }
+    return 0;
 }
 
 /* --------------------------------------------------------------- public --- */
@@ -813,12 +814,17 @@ esp_err_t espix_svc_init(void)
      * vectorised copy on core 0 is an illegal-instruction trap. spawn_elf()
      * below copies the image and the environment, so it is full of them.
      */
-    if (xTaskCreatePinnedToCoreWithCaps(supervisor_task, "espix:svc", SVC_STACK,
-                                        NULL, SVC_PRIORITY, NULL, 1,
-                                        MALLOC_CAP_SPIRAM) != pdPASS) {
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
+    /* Pid 1, as init is: every unit is its child. */
+    const espix_proc_fn_opts_t opts = {
+        .name     = "init",
+        .fn       = supervisor_main,
+        .kind     = ESPIX_PROC_KTHREAD,
+        .stack    = SVC_STACK,
+        .priority = SVC_PRIORITY,
+        .core     = 1,
+        .init     = true,
+    };
+    return espix_proc_spawn_fn(&opts, NULL);
 }
 
 bool espix_svc_safe_mode(void)
