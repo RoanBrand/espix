@@ -30,6 +30,7 @@
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
 #include "espix_shell.h"
@@ -1172,7 +1173,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      */
     const BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
         proc_task, task_name, app_stack, slot,
-        CONFIG_ESPIX_PROC_PRIORITY, &task, 1, MALLOC_CAP_SPIRAM);
+        CONFIG_ESPIX_PROC_PRIORITY, &task, 1, ESPIX_STACK_CAPS);
     if (ok != pdPASS) {
         /* The wake eventfd is live by now, and the memset below would shed the
          * only record of it. Under the load that makes task creation fail in

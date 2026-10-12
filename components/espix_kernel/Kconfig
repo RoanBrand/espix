@@ -52,4 +52,25 @@ menu "espix kernel"
             release assets and the manifest entry the device reads. Flash size is
             deliberately not part of it. Nothing branches on it.
 
+    config ESPIX_INTERNAL_STACKS
+        bool "Put every espix task stack in internal RAM (testing only)"
+        default n
+        help
+            Commands, daemons, kernel tasks and apps normally get PSRAM stacks,
+            leaving internal RAM to what must have it. This puts them all in
+            internal RAM, to test whether a fault comes from a PSRAM stack
+            touched while the flash cache is disabled -- out of bounds on the
+            S3, where flash and PSRAM share one cache. Internal RAM runs out
+            under any real load.
+
+    config ESPIX_HEAP_CHECK_MS
+        int "Check the whole heap every N ms (0: never)"
+        default 0
+        help
+            A kernel thread that runs heap_caps_check_integrity_all() on this
+            period and aborts with a dump of the damage when it fails, so heap
+            corruption is dated to one period instead of found by whatever
+            free() trips over it later. For hunting, with heap poisoning on:
+            see profiles/heapdebug.conf.
+
 endmenu

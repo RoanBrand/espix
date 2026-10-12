@@ -71,7 +71,7 @@ esp_err_t espix_kthread_start(const espix_kthread_t *k, TaskHandle_t *out)
     if (!k->internal_stack) {
         ok = xTaskCreatePinnedToCoreWithCaps(plain_task, k->name, k->stack, p,
                                              k->priority, &task, k->core,
-                                             MALLOC_CAP_SPIRAM);
+                                             ESPIX_STACK_CAPS);
     }
     if (ok != pdPASS) {
         ok = xTaskCreatePinnedToCoreWithCaps(plain_task, k->name, k->stack, p,

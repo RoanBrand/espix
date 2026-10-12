@@ -13,9 +13,14 @@ APP="/home/$ESPIX_USER/testapp"
 UNIT=/tmp/svc-units-$ESPIX_WORKER
 # The operator's file, kept so it can be put back: this suite rewrites
 # /etc/units, and on a board somebody is using that file is theirs. It used to
-# be emptied on the way out, which destroyed whatever was there.
-KEEP=/tmp/svc-keep-$ESPIX_WORKER
+# be emptied on the way out, which destroyed whatever was there. Kept in the
+# home, not /tmp, which make flash-ota empties; and one still there is from a
+# run that never got to the end, so it is the operator's and goes back first.
+KEEP=/home/$ESPIX_USER/.svc-keep-$ESPIX_WORKER
 
+if dev_status "ls $KEEP"; then
+    dev_run "sudo cp $KEEP /etc/units" >/dev/null 2>&1
+fi
 dev_run "sudo cp /etc/units $KEEP" >/dev/null 2>&1
 
 # One always-unit, running the test app as a daemon. The file is built in /tmp
@@ -187,5 +192,6 @@ assert_contains "and the klog says why" "blocked: waiting for bad, which failed"
 # Put the operator's file back, so nothing of this suite outlives it -- neither
 # a test unit nor an emptied file.
 dev_run "sudo cp $KEEP /etc/units" >/dev/null 2>&1
+dev_run "sudo rm $KEEP" >/dev/null 2>&1
 dev_run 'sudo service reload' >/dev/null 2>&1
 sleep 1

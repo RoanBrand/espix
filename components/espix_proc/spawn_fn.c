@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 
 #include "espix_kernel.h"
+#include "espix_task.h"
 #include "espix_proc_priv.h"
 #include "espix_shell.h"
 
@@ -94,7 +95,7 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pi
     if (!o->internal_stack) {
         ok = xTaskCreatePinnedToCoreWithCaps(fn_task, o->name, stack, slot,
                                              o->priority, &task, o->core,
-                                             MALLOC_CAP_SPIRAM);
+                                             ESPIX_STACK_CAPS);
     }
     if (ok != pdPASS) {
         ok = xTaskCreatePinnedToCoreWithCaps(fn_task, o->name, stack, slot,

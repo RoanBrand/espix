@@ -393,7 +393,7 @@ esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
     if (!k->internal_stack) {
         ok = xTaskCreatePinnedToCoreWithCaps(kthread_trampoline, k->name,
                                              k->stack, st, k->priority, out,
-                                             k->core, MALLOC_CAP_SPIRAM);
+                                             k->core, ESPIX_STACK_CAPS);
     }
     if (ok != pdPASS) {
         ok = xTaskCreatePinnedToCoreWithCaps(kthread_trampoline, k->name,

@@ -13,12 +13,18 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 ## Processes
 
-- **The S3 corrupts its heap under the full suite's four workers.** It panics
-  within about two minutes of `make test` -- a bad pointer freed inside mbedtls'
-  software ECP during an SSH key exchange, or a store fault in a flash read --
-  and reboots into safe mode. The same seed does it on 75d7a5f, before the
-  process-model work, so it is older than that; the S31, whose ECC is hardware,
-  does not. Idle, the S3 stays up. Open.
+- **The S3 crashes under the full suite's four workers.** Within about two
+  minutes of `make test`, and on 75d7a5f too, so it predates the process
+  model; idle it stays up, one worker passes, and the S31 never does it. The
+  faults land in different places -- a bad free in mbedtls' software ECP during
+  an SSH key exchange, a store fault in a flash read in `cat`, a double
+  exception saving context to an sshd:conn's PSRAM stack inside a littlefs
+  read -- and `make PROFILE=heapdebug` (poisoning plus a heap check every
+  100 ms) catches no heap damage before one. The lead: on the S3 flash and
+  PSRAM share one cache, and every espix stack but the internal ones is PSRAM,
+  which IDF allows only for a stack never touched while the cache is disabled.
+  Moving all of them to internal RAM (`CONFIG_ESPIX_INTERNAL_STACKS`) ran the
+  board out of memory before the load built up, so it is not settled. Open.
 
 - **`exit()` from a thread the app created ends the thread, not the process.**
   POSIX says `exit()` in any thread terminates the whole process; espix ends the

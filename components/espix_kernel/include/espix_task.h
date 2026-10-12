@@ -15,6 +15,8 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -82,6 +84,13 @@ typedef struct {
     bool               thread;          /* a thread of the caller's process */
 } espix_kthread_t;
 
+/* The heap a task stack comes from first; see CONFIG_ESPIX_INTERNAL_STACKS. */
+#if CONFIG_ESPIX_INTERNAL_STACKS
+#define ESPIX_STACK_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#else
+#define ESPIX_STACK_CAPS MALLOC_CAP_SPIRAM
+#endif
+
 /* *out is the task, written before it runs. */
 esp_err_t espix_kthread_start(const espix_kthread_t *k, TaskHandle_t *out);
 
@@ -93,6 +102,9 @@ typedef struct {
 } espix_kthread_ops_t;
 
 void espix_kthread_set_ops(const espix_kthread_ops_t *ops);
+
+/* CONFIG_ESPIX_HEAP_CHECK_MS's thread; nothing when that is 0. */
+void espix_heapcheck_start(void);
 
 #ifdef __cplusplus
 }

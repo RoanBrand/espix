@@ -223,7 +223,7 @@ fi
 # espix_build_id() reports exactly this string as `uname -v`.
 _local_build_id() {
     local target="${ESPIX_TARGET:-esp32s3}" bin sha
-    bin="$ESPIX_ROOT/build-$target/espix.bin"
+    bin="$ESPIX_ROOT/build-$target${ESPIX_PROFILE:+-$ESPIX_PROFILE}/espix.bin"
     [ -f "$bin" ] || return 1
     sha=$(dd if="$bin" bs=1 skip=176 count=32 2>/dev/null | od -An -tx1 -v |
           tr -d ' \n' | cut -c1-9)

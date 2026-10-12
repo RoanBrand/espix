@@ -44,6 +44,7 @@
 #include "espix_ota.h"
 #include "espix_proc.h"
 #include "espix_svc.h"
+#include "espix_task.h"
 #include "espix_shell.h"
 #include "espix_time.h"
 #include "espix_usb.h"
@@ -204,6 +205,7 @@ void app_main(void)
     ESP_ERROR_CHECK(espix_fault_init());
     ESP_ERROR_CHECK(espix_fs_mount_root());
     ESP_ERROR_CHECK(espix_proc_init());
+    espix_heapcheck_start();
 
     /* Before networking: SSH will authenticate against this, and it warns while
      * the shipped default password is still in place. */

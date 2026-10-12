@@ -87,6 +87,7 @@ idf_component_register(
         "shutdown.c"
         "task_exit.c"
         "kthread.c"
+        "heapcheck.c"
     INCLUDE_DIRS
         "include"
         "${CMAKE_CURRENT_BINARY_DIR}"
