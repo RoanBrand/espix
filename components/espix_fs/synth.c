@@ -63,6 +63,7 @@ typedef struct {
     const synth_tree_t *tree;
     int                 cursor;
     bool                in_use;
+    char                path[32];   /* a directory below the tree's, or "" */
 } synth_dir_t;
 
 static synth_slot_t      s_slots[ESPIX_SYNTH_FD_COUNT];
@@ -173,9 +174,17 @@ const void *espix_synth_lookup(const char *abs_path)
     return (tr->dyn_lookup != NULL) ? tr->dyn_lookup(abs_path) : NULL;
 }
 
+/* A directory below a tree's own, which the tree answers for. */
+static const synth_tree_t *subdir_tree(const char *abs_path)
+{
+    const synth_tree_t *tr = under_tree(abs_path);
+    return (tr != NULL && tr->dyn_isdir != NULL && tr->dyn_isdir(abs_path))
+           ? tr : NULL;
+}
+
 bool espix_synth_isdir(const char *abs_path)
 {
-    return dir_tree(abs_path) != NULL;
+    return dir_tree(abs_path) != NULL || subdir_tree(abs_path) != NULL;
 }
 
 bool espix_synth_under(const char *abs_path)
@@ -306,7 +315,9 @@ static ssize_t read_at(const synth_node_t *n, void *dst, size_t size, off_t off)
 
     if (n->kind == SYNTH_TEXT) {
         char         buf[SYNTH_TEXT_MAX];
-        const size_t len = (n->gen != NULL) ? n->gen(buf, sizeof(buf)) : 0;
+        const size_t len = (n->gen_key != NULL) ? n->gen_key(buf, sizeof(buf), n->key)
+                         : (n->gen != NULL)     ? n->gen(buf, sizeof(buf))
+                                                : 0;
 
         if (off < 0 || off >= (off_t)len) {
             return 0;
@@ -448,9 +459,15 @@ bool espix_synth_dirp(DIR *pdir)
 
 DIR *espix_synth_opendir(const char *abs_path)
 {
-    const synth_tree_t *tr = (abs_path != NULL) ? dir_tree(abs_path) : NULL;
-    if (tr == NULL) {
+    const synth_tree_t *tr  = (abs_path != NULL) ? dir_tree(abs_path) : NULL;
+    const synth_tree_t *sub = (tr == NULL && abs_path != NULL)
+                              ? subdir_tree(abs_path) : NULL;
+    if (tr == NULL && sub == NULL) {
         errno = ENOTDIR;
+        return NULL;
+    }
+    if (sub != NULL && strlen(abs_path) >= sizeof(s_dirs[0].path)) {
+        errno = ENAMETOOLONG;
         return NULL;
     }
 
@@ -459,7 +476,9 @@ DIR *espix_synth_opendir(const char *abs_path)
         if (!s_dirs[i].in_use) {
             s_dirs[i].in_use = true;
             s_dirs[i].cursor = 0;
-            s_dirs[i].tree   = tr;
+            s_dirs[i].tree   = (tr != NULL) ? tr : sub;
+            strlcpy(s_dirs[i].path, (sub != NULL) ? abs_path : "",
+                    sizeof(s_dirs[i].path));
             xSemaphoreGive(s_lock);
             return (DIR *)&s_dirs[i];
         }
@@ -486,7 +505,13 @@ int espix_synth_readdir_r(DIR *pdir, struct dirent *entry, struct dirent **out)
      * pool), which is why the cursor is only ever advanced here.
      */
     const synth_node_t *n = NULL;
-    while (d->cursor < d->tree->count) {
+    if (d->path[0] != '\0') {
+        n = d->tree->dyn_dir_at(d->path, d->cursor);
+        if (n != NULL) {
+            d->cursor++;
+        }
+    }
+    while (d->path[0] == '\0' && n == NULL && d->cursor < d->tree->count) {
         const synth_node_t *cand = &d->tree->nodes[d->cursor++];
         if (cand->kind == SYNTH_APP && app_of(cand) == NULL) {
             continue;
@@ -494,7 +519,7 @@ int espix_synth_readdir_r(DIR *pdir, struct dirent *entry, struct dirent **out)
         n = cand;
         break;
     }
-    if (n == NULL && d->tree->dyn_at != NULL) {
+    if (d->path[0] == '\0' && n == NULL && d->tree->dyn_at != NULL) {
         n = d->tree->dyn_at(d->cursor - d->tree->count);
         if (n != NULL) {
             d->cursor++;
@@ -513,6 +538,7 @@ int espix_synth_readdir_r(DIR *pdir, struct dirent *entry, struct dirent **out)
     switch (n->kind) {
     case SYNTH_NULL:  entry->d_type = DT_CHR; break;
     case SYNTH_BLOCK: entry->d_type = DT_BLK; break;
+    case SYNTH_DIR:   entry->d_type = DT_DIR; break;
     default:          entry->d_type = DT_REG; break;
     }
     strlcpy(entry->d_name, base, sizeof(entry->d_name));

@@ -442,6 +442,24 @@ assert_eq "no espix task is left without a pid" "" \
     "$(printf '%s' "$pslist" | awk '$1 == "-" && $2 ~ /^(espix:|usb:|sshd|init)/')"
 assert_eq "a login's reader is its thread" "$ids_ppid" \
     "$(printf '%s' "$pslist" | awk -v c="$(ps_col PPID)" '$2 == "{sshd:rx}" && $c == '"$ids_ppid"' { print $c; exit }')"
+# /proc/<pid>: a directory per process, with status and its threads under task.
+assert_contains "/proc lists a directory per process" "1" \
+    "$(dev_run 'ls -1 /proc' | awk '$0 == 1')"
+assert_contains "and init's status names it" "Name:	init" \
+    "$(dev_run 'cat /proc/1/status')"
+st=$(dev_run "cat /proc/$ids_ppid/status")
+assert_contains "a login's status says it is a shell" "Kind:	shell" "$st"
+assert_contains "and names its parent" "PPid:	$(dev_run ps | awk '$2 == "sshd" { print $1; exit }')" "$st"
+rx=$(printf '%s' "$pslist" | awk '$2 == "{sshd:rx}" && $NF != "" { print $1 }' |
+     while read -r t; do dev_run "ls -1 /proc/$ids_ppid/task" | grep -qx "$t" && echo "$t"; done | head -1)
+if [ -n "$rx" ]; then
+    espix_pass "and its task directory lists its reader ($rx)"
+    assert_contains "whose status names it" "Name:	sshd:rx" \
+        "$(dev_run "cat /proc/$ids_ppid/task/$rx/status")"
+else
+    espix_fail "a login's task directory lists its reader" \
+        "$(dev_run "ls -1 /proc/$ids_ppid/task")"
+fi
 assert_contains "type names a shell builtin" "cd is a shell builtin" \
     "$(dev_run 'type cd')"
 assert_contains "and a command run as a process" "ls is a command" \

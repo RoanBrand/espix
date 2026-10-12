@@ -35,10 +35,10 @@
 static const char *TAG = "devfs";
 
 static const synth_node_t s_dev_nodes[] = {
-    { "/dev/null",    SYNTH_NULL, S_IFCHR | 0666, 0, 0, NULL },
-    { "/dev/factory", SYNTH_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL },
-    { "/dev/ota0",    SYNTH_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL },
-    { "/dev/ota1",    SYNTH_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL },
+    { "/dev/null",    SYNTH_NULL, S_IFCHR | 0666, 0, 0, NULL, NULL, 0 },
+    { "/dev/factory", SYNTH_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL, NULL, 0 },
+    { "/dev/ota0",    SYNTH_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL, NULL, 0 },
+    { "/dev/ota1",    SYNTH_APP,  S_IFREG | 0444, 0, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL, NULL, 0 },
 };
 
 #define DEV_NODE_COUNT ((int)(sizeof(s_dev_nodes) / sizeof(s_dev_nodes[0])))

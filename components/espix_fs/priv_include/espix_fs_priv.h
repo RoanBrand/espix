@@ -195,6 +195,7 @@ typedef enum {
     SYNTH_APP,      /* an application partition: read-only raw image */
     SYNTH_BLOCK,    /* a named block device: a name, open refuses */
     SYNTH_TEXT,     /* generated on read by gen() */
+    SYNTH_DIR,      /* a directory a tree lists dynamically: /proc/<pid> */
 } synth_kind_t;
 
 typedef struct synth_node {
@@ -207,6 +208,9 @@ typedef struct synth_node {
      * Called on every read, which is what makes the file cost nothing at rest
      * and report the value as of the read rather than of the mount. */
     size_t     (*gen)(char *buf, size_t cap);
+    /* Or this, for a file generated about one thing: a pid. */
+    size_t     (*gen_key)(char *buf, size_t cap, int32_t key);
+    int32_t      key;
 } synth_node_t;
 
 typedef struct synth_tree {
@@ -214,9 +218,13 @@ typedef struct synth_tree {
     size_t              prefix_len;
     const synth_node_t *nodes;
     int                 count;
-    /* Optional dynamic nodes. Both set, or both NULL. */
+    /* Optional dynamic nodes. Both set, or both NULL. dyn_lookup() answers
+     * files only; a directory is dyn_isdir()'s. */
     const synth_node_t *(*dyn_at)(int nth);
     const synth_node_t *(*dyn_lookup)(const char *abs_path);
+    /* Optional directories below the tree's own: /proc/<pid>/task. */
+    bool                (*dyn_isdir)(const char *abs_path);
+    const synth_node_t *(*dyn_dir_at)(const char *abs_path, int nth);
 } synth_tree_t;
 
 #define ESPIX_SYNTH_FD_BASE   240
