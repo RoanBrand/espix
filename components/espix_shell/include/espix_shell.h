@@ -274,7 +274,8 @@ struct espix_session {
     bool        ansi;
 
     void       *transport;                 /* implementation-owned */
-    espix_pid_t fg_pid;                    /* foreground process, or ESPIX_PID_NONE */
+    espix_pid_t fg_pgid;                   /* foreground job's group, or NONE */
+    espix_pid_t pid;                       /* the shell's own process, for $$ */
 
     /*
      * Background jobs, in the order `&` started them, with the name the shell
@@ -703,30 +704,29 @@ int espix_session_write(espix_session_t *s, const char *data, size_t len,
  * loop on the calling task. Normally never returns.
  */
 /*
- * Called when a session ends and whatever it spawned must go with it.
- *
- * Registered rather than called directly because the component that owns the
- * process table -- espix_proc -- sits *above* this one: it depends on
- * espix_shell for espix_session_t, so the call cannot go the other way. Same
- * shape, and the same reason, as task_gone and poll_interrupt.
- *
- * It is here, rather than in each transport, because that is where Linux puts
- * it: losing a session's controlling terminal hangs its processes up in the
- * *kernel*, so sshd only has to close the pty and no transport can forget.
- * espix's equivalent of losing the terminal is read_line() reporting EOF, which
- * happens inside espix_shell_session_run() -- so that is where it lands, and
- * every transport gets it without knowing it exists.
+ * What the shell needs from the process table. espix_proc sits *above* this
+ * component -- it depends on it for espix_session_t -- so it registers these at
+ * init rather than being called by name.
  */
-void espix_shell_set_session_end_hook(size_t (*fn)(const espix_session_t *s));
+typedef struct {
+    /* The calling task becomes the session's shell process. */
+    void   (*begin)(espix_session_t *s);
+    /* Hang up what the session started, then leave the table; returns how
+     * many it had to end. Before the transport goes, which they write through. */
+    size_t (*end)(espix_session_t *s);
+    /* espix_sigcheck_io(): handlers run, true when the caller should stop. */
+    bool   (*sigcheck)(void);
+    /* The calling process was asked to stop; no handlers run. */
+    bool   (*stopping)(void);
+} espix_shell_proc_ops_t;
 
-/*
- * Ask whether the calling process has a signal to act on, running its handlers:
- * espix_sigcheck(), reached through a hook for the same reason as the one
- * above. A stream a process reads through the shell -- the desktop terminal's
- * stdin -- asks this while it waits. False until espix_proc registers it, and
- * for a task that is not a process.
- */
-void espix_shell_set_sigcheck_hook(bool (*fn)(void));
+void espix_shell_set_proc_ops(const espix_shell_proc_ops_t *ops);
+
+/* For a transport that runs lines outside espix_shell_session_run() -- an ssh
+ * exec, sftp -- so it is a process and hangs up the same way. */
+void   espix_shell_session_begin(espix_session_t *s);
+size_t espix_shell_session_end(espix_session_t *s);
+
 bool espix_shell_sigcheck(void);
 
 esp_err_t espix_console_session_start(void);

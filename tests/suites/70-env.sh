@@ -310,3 +310,10 @@ assert_eq "\$? follows the last segment, not the first" "0" \
     "$(dev_run 'false; true; echo $?')"
 assert_eq "\$? after an && skip and an || run" "1" \
     "$(dev_run 'false && echo no || echo $?')"
+
+# A line past the limit is refused whole. It used to be cut and run: an rm of
+# twelve files removed nine.
+long="echo $(printf 'x%.0s' $(seq 1 300))"
+assert_contains "a line past the limit is refused, not cut" "line too long" \
+    "$(dev_run "$long" 2>&1)"
+assert_eq "and the session goes on" "ok" "$(dev_run 'echo ok')"

@@ -381,7 +381,7 @@ typedef struct {
 } espix_proc_slot_t;
 
 /*
- * The delivery point, reporting what it delivered.
+ * The delivery point, reporting the signals it caught (and ESPIX_SIG_STOPPING).
  *
  * espix_sigcheck() is this with the answer reduced to a bool. The mask is what
  * an interrupted blocking call needs: POSIX says sleep() returns its unslept

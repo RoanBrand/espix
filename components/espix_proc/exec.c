@@ -963,15 +963,13 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     strlcpy(slot->info.name, base, sizeof(slot->info.name));
     slot->info.pid        = espix_proc_next_pid();
 
-    /*
-     * Who asked for it. The spawner is usually the shell, which is a session
-     * task and not a process, so this is ESPIX_PID_NONE for everything spawned
-     * today -- and it is what a child's exit is reported to, so it has to be
-     * recorded the moment there is a process that can spawn.
-     */
+    /* Who asked for it -- usually its shell -- which a child's exit is reported
+     * to; and its own group, which is the job ^C reaches. */
     {
         const espix_proc_slot_t *const parent = espix_proc_self();
         slot->info.ppid = (parent != NULL) ? parent->info.pid : ESPIX_PID_NONE;
+        slot->info.pgid = slot->info.pid;       /* a job of its own */
+        slot->info.sid  = (parent != NULL) ? parent->info.sid : slot->info.pid;
     }
 
     slot->info.state      = ESPIX_PROC_READY;

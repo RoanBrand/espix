@@ -77,6 +77,7 @@ typedef enum {
     ESPIX_PROC_BUILTIN,     /* a shell command on a task of its own */
     ESPIX_PROC_DAEMON,      /* a kernel service, e.g. a unit */
     ESPIX_PROC_KTHREAD,     /* a driver's worker; not signallable */
+    ESPIX_PROC_SESSION,     /* a shell; ended by logging out, not by a signal */
 } espix_proc_kind_t;
 
 /*
@@ -100,14 +101,11 @@ typedef struct {
 typedef struct {
     espix_pid_t        pid;
 
-    /*
-     * The process that spawned this one, or ESPIX_PID_NONE when espix started
-     * it itself -- which today is every process, because the shell is a session
-     * task and not a process, and nothing an app can call spawns. Recorded
-     * anyway because it is what a child's exit is reported to (SIGCHLD), and
-     * because a listing should be able to say who asked for a process.
-     */
+    /* The process that spawned this one -- for an app, its shell -- or
+     * ESPIX_PID_NONE when espix started it itself. */
     espix_pid_t        ppid;
+    espix_pid_t        pgid;      /* process group: a job, which ^C reaches */
+    espix_pid_t        sid;       /* session: its shell's pid */
     char               name[ESPIX_PROC_NAME_MAX];
     espix_proc_kind_t  kind;
     TaskHandle_t       task;
@@ -146,6 +144,7 @@ typedef struct {
     bool               internal_stack;  /* it maps or writes flash */
     espix_session_t   *session;         /* credentials, and who a hangup ends;
                                            NULL is espix itself, as root */
+    espix_pid_t        pgid;            /* a group to join; 0 for a new one */
 } espix_proc_fn_opts_t;
 
 /*
@@ -161,6 +160,25 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *opts,
 
 /* The kind of process `pid` is. False when there is no such live process. */
 bool espix_proc_kind_of(espix_pid_t pid, espix_proc_kind_t *out);
+
+/*
+ * Make the calling task the shell of session `s`: a SESSION process, its own
+ * group and session, the parent of what it starts. espix_proc_leave() takes it
+ * out of the table again without ending the task, which goes on to its next
+ * login or its own teardown. See espix_shell_proc_ops_t.
+ */
+esp_err_t espix_proc_adopt(espix_session_t *s, const char *name,
+                           espix_pid_t *out_pid);
+void      espix_proc_leave(int status);
+
+/* Signal every live process in group `pgid`. ESP_ERR_NOT_FOUND when it has
+ * none; otherwise ESP_OK if any of them took it. Signal 0 only asks whether
+ * the group exists. */
+esp_err_t espix_proc_signal_group(espix_pid_t pgid, int sig);
+
+/* The group and session of `pid`, or ESPIX_PID_NONE. */
+espix_pid_t espix_proc_pgid_of(espix_pid_t pid);
+espix_pid_t espix_proc_sid_of(espix_pid_t pid);
 
 /*
  * Load the ELF at `abs_path` and run it as a new process. Returns as soon as

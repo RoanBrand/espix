@@ -3,7 +3,7 @@ menu "espix processes"
     config ESPIX_PROC_MAX
         int "Maximum tracked processes"
         range 2 64
-        default 24
+        default 32
         help
             Size of the espix process table: the limit on processes alive at
             once. A finished process copies what a listing needs into the

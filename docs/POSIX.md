@@ -19,7 +19,7 @@ merely missing.
 | Error redirection `2>` `2>>` `2>&1` | **yes** | attached or separated (`2>file`); diagnostics are their own stream, and over SSH they arrive as `CHANNEL_EXTENDED_DATA`, so the client's `2>` separates them too |
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
-| Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`/Ctrl-Z; a job still dies at logout by design |
+| Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`; a job still dies at logout by design; Ctrl-Z is planned |
 | Pipes <code>&#124;</code> | **yes** | builtins only; one StreamBuffer per pipe, and a writer fails once its reader is done (`cat f \| head -1`) |
 | Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |
 | Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv` |
@@ -32,7 +32,8 @@ merely missing.
 |---|---|---|
 | Run a cross-compiled native app by name | **yes** | `/bin` search, argv, exit status |
 | `ps`, `top` | **yes** | live CPU and memory, per core |
-| Stop a running app — Ctrl-C, `kill` | **yes** | Ctrl-C is SIGINT; `kill` asks, then insists |
+| Stop a running app — Ctrl-C, `kill` | **yes** | Ctrl-C is SIGINT to the foreground job's group; `kill` asks, then insists |
+| Process tree — `$$`, `getppid`, `getpgrp`, `getsid`, `kill -<pgid>`, `killpg` | **yes** | a shell is a process and its apps' parent; each job is its own group |
 | Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names; delivered when the app calls in, not asynchronously |
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |

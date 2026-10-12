@@ -376,15 +376,29 @@ assert_contains "and the run leaves no descriptor behind" "dup ok:" \
 
 dev_run "rm $DUPFILE" >/dev/null 2>&1
 
-# --- parentage is recorded, even when there is nothing to be a parent ------
+# --- the process tree: a shell is a process, and an app is its child -------
 #
-# The shell is a session task rather than a process, so an app it starts has no
-# parent and shows '-' in the last column. The field behind it is what a child's
-# exit is reported to (SIGCHLD), which needs something that is a process to
-# spawn -- so the column is checked now and the notification is written and
-# inert until then.
+# The shell this suite talks through is the parent of what it starts; the app
+# is a job of its own (its own group) in the shell's session. Over SSH the shell
+# is the connection's task, which keeps the sshd:conn name.
 
 assert_contains "ps has a parent column" "PPID" "$(dev_run ps | head -1)"
+
+ids=$(dev_run "$APP ids")
+ids_pid=$(printf '%s' "$ids" | sed -n 's/.*pid=\([0-9]*\) ppid.*/\1/p')
+ids_ppid=$(printf '%s' "$ids" | sed -n 's/.*ppid=\([0-9]*\).*/\1/p')
+ids_pgrp=$(printf '%s' "$ids" | sed -n 's/.*pgrp=\([0-9]*\).*/\1/p')
+ids_sid=$(printf '%s' "$ids" | sed -n 's/.*sid=\([0-9]*\).*/\1/p')
+if [ -n "$ids_ppid" ] && [ "$ids_ppid" -gt 0 ] 2>/dev/null; then
+    espix_pass "an app has a parent ($ids_ppid)"
+    assert_eq "and the parent is its shell" "sshd:conn" \
+        "$(dev_run ps | awk -v p="$ids_ppid" '$1 == p { print $2; exit }')"
+else
+    espix_fail "an app has a parent" "got: $ids"
+fi
+assert_eq "\$\$ is the shell's pid" "$ids_ppid" "$(dev_run 'echo $$')"
+assert_eq "an app is a job of its own" "$ids_pid" "$ids_pgrp"
+assert_eq "in its shell's session" "$ids_ppid" "$ids_sid"
 
 pid=$(dev_run "$APP hold 60 1000 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 if [ -z "$pid" ]; then
@@ -393,9 +407,12 @@ else
     sleep 1
     ppid_idx=$(ps_col PPID)
     ppid_col=$(dev_run ps | awk -v c="$ppid_idx" -v p="$pid" '$1 == p { print $c; exit }')
-    assert_eq "a shell-spawned app has no parent" "-" "$ppid_col"
+    assert_eq "ps shows the same parent" "$ids_ppid" "$ppid_col"
     dev_run "kill -9 $pid" >/dev/null
 fi
+
+assert_contains "a shell cannot be signalled" "cannot be signalled" \
+    "$(dev_run "kill -TERM $ids_ppid" 2>&1)"
 
 
 # --- a finished process leaves the table, and the log keeps the record ------

@@ -794,21 +794,6 @@ static bool chan_poll_interrupt(espix_session_t *s)
         }
 
         /*
-         * A channel with a reader waits briefly for the next packet; a
-         * terminal does not wait at all.
-         *
-         * With a zero timeout this returned the instant the socket was empty,
-         * which is immediately after draining one packet -- so the caller slept
-         * out its RUN_POLL_MS slice and the next packet waited 50ms for it.
-         * That is one packet per poll, and it measured 21 KB/s regardless of
-         * queue size or whether either side of the hand-off blocked, which is
-         * what finally identified it: the bottleneck was never the hand-off, it
-         * was getting bytes off the wire.
-         *
-         * Never for a pty: this is the connection task and waiting here is
-         * waiting to notice Ctrl-C.
-         */
-        /*
          * A channel with a reader waits briefly for the next packet; a terminal
          * does not wait at all.
          *
@@ -1729,8 +1714,8 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
              * blocked in. Nothing to tell when the shell is at the prompt.
              */
             espix_session_t *resized = espix_shell_current();
-            if (resized != NULL && resized->fg_pid != ESPIX_PID_NONE) {
-                (void)espix_proc_signal(resized->fg_pid, SIGWINCH);
+            if (resized != NULL && resized->fg_pgid != ESPIX_PID_NONE) {
+                (void)espix_proc_signal_group(resized->fg_pgid, SIGWINCH);
             }
         }
         /* Never carries want_reply per RFC 4254 §6.7. Load-bearing: this is
@@ -2244,22 +2229,8 @@ static void apply_account(espix_session_t *session, const char *user)
  */
 static void finish_session(ssh_chan_t *ch, espix_session_t *session)
 {
-    /*
-     * Backgrounded builtins first, and before the environment goes: a job runs
-     * against a copy of this session, so it must not outlive the table that
-     * copy shares. The REPL path has already drained by now -- the shell does
-     * it as espix_shell_session_run() returns -- and draining twice is a
-     * no-op, which is what makes the exec path below (which never reaches the
-     * REPL) safe without a second call site.
-     */
-    espix_shell_jobs_drain(session);
-
-    /*
-     * The processes are no longer this function's business: the shell hangs up
-     * whatever a session spawned as it returns, so every transport has that for
-     * free instead of each one remembering. What is left here is the session's
-     * own table, which only the transport knows when it has finished with.
-     */
+    /* The session has already ended -- jobs drained, processes hung up -- on
+     * whichever path ran it; what is left is its environment table. */
     espix_env_free(session);
 
     if (!ch->tx_orphaned
@@ -2463,7 +2434,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .name      = "sftp",
             .cwd       = "/",
             .transport = ch,
-            .fg_pid    = ESPIX_PID_NONE,
+            .fg_pgid    = ESPIX_PID_NONE,
             .uid       = ESPIX_UID_NOBODY,
             .gid       = ESPIX_UID_NOBODY,
         };
@@ -2471,7 +2442,9 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         apply_account(&session, c->user);
 
         s_raw_chan = ch;
+        espix_shell_session_begin(&session);
         espix_sftp_run(c, &session);
+        (void)espix_shell_session_end(&session);
         s_raw_chan = NULL;
 
         /*
@@ -2516,7 +2489,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
              * path which forgets to set it fails closed instead of open. */
             .uid       = ESPIX_UID_NOBODY,
             .gid       = ESPIX_UID_NOBODY,
-            .fg_pid    = ESPIX_PID_NONE,
+            .fg_pgid    = ESPIX_PID_NONE,
             .ansi      = ch->has_pty,
             .open_stream = chan_open_stream,
         };
@@ -2563,7 +2536,10 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             session.last_status = 127;
         } else {
             espix_shell_set_current(&session);
+            espix_shell_session_begin(&session);
             (void)espix_shell_run_line(&session, ch->exec_cmd);
+            espix_shell_jobs_drain(&session);
+            (void)espix_shell_session_end(&session);
             espix_shell_set_current(NULL);
         }
 
@@ -2633,7 +2609,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
          * path which forgets to set it fails closed instead of open. */
         .uid       = ESPIX_UID_NOBODY,
         .gid       = ESPIX_UID_NOBODY,
-        .fg_pid    = ESPIX_PID_NONE,
+        .fg_pgid    = ESPIX_PID_NONE,
         .ansi      = true,          /* the client asked for a pty */
         .open_stream = chan_open_stream,
     };

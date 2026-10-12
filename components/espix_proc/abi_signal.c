@@ -176,8 +176,42 @@ static int errno_from_esp(esp_err_t err)
     }
 }
 
+/* The caller's process group, or 0 when it is not a process. */
+static espix_pid_t self_pgid(void)
+{
+    const espix_proc_slot_t *const slot = espix_proc_self();
+    return (slot != NULL) ? slot->info.pgid : 0;
+}
+
+/* kill() for pid 0 (the caller's group) and -pgid (that group). */
+static int kill_group(espix_pid_t pgid, int sig)
+{
+    if (pgid <= 0) {
+        errno = ESRCH;
+        return -1;
+    }
+    const esp_err_t err = espix_proc_signal_group(pgid, sig);
+    if (err != ESP_OK) {
+        errno = errno_from_esp(err);
+        return -1;
+    }
+    /* POSIX: a signal the caller sent itself is delivered before kill()
+     * returns, as raise() does. */
+    if (pgid == self_pgid()) {
+        (void)espix_sigcheck_mask();
+    }
+    return 0;
+}
+
 static int espix_abi_kill(pid_t pid, int sig)
 {
+    if (pid == 0) {
+        return kill_group(self_pgid(), sig);
+    }
+    if (pid < 0) {
+        return kill_group((espix_pid_t)-pid, sig);
+    }
+
     /*
      * kill(pid, 0) is POSIX's "does this process exist" probe and must not
      * deliver anything. espix_proc_signal() would reject signal 0 as invalid,
@@ -203,6 +237,37 @@ static int espix_abi_kill(pid_t pid, int sig)
         return -1;
     }
     return 0;
+}
+
+static int espix_abi_killpg(pid_t pgrp, int sig)
+{
+    return (pgrp <= 0) ? (errno = EINVAL, -1) : kill_group((espix_pid_t)pgrp, sig);
+}
+
+/* Its shell, or 0 when espix started it itself. */
+static pid_t espix_abi_getppid(void)
+{
+    const espix_proc_slot_t *const slot = espix_proc_self();
+    return (slot != NULL && slot->info.ppid != ESPIX_PID_NONE)
+               ? (pid_t)slot->info.ppid : 0;
+}
+
+static pid_t espix_abi_getpgrp(void)
+{
+    return (pid_t)self_pgid();
+}
+
+static pid_t espix_abi_getsid(pid_t pid)
+{
+    const espix_proc_slot_t *const self = espix_proc_self();
+    const espix_pid_t sid = (pid == 0)
+        ? ((self != NULL) ? self->info.sid : ESPIX_PID_NONE)
+        : espix_proc_sid_of((espix_pid_t)pid);
+    if (sid == ESPIX_PID_NONE) {
+        errno = ESRCH;
+        return -1;
+    }
+    return (pid_t)sid;
 }
 
 static pid_t espix_abi_getpid(void)
@@ -574,6 +639,10 @@ static const abi_sym_t s_signal_syms[] = {
     ABI_SYM("kill",        espix_abi_kill),
     ABI_SYM("raise",       espix_abi_raise),
     ABI_SYM("getpid",      espix_abi_getpid),
+    ABI_SYM("getppid",     espix_abi_getppid),
+    ABI_SYM("getpgrp",     espix_abi_getpgrp),
+    ABI_SYM("getsid",      espix_abi_getsid),
+    ABI_SYM("killpg",      espix_abi_killpg),
 
     /* The timer signal. There is no other source of SIGALRM, so without these
      * an app cannot interrupt its own sleep() on a deadline. */

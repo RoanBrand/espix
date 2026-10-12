@@ -59,13 +59,10 @@ assert_not_contains "the last copy is not empty" " 0 " \
 assert_contains "and its contents match the source" "$(dev_run 'cat /etc/hostname')" \
                 "$(dev_run "cat /home/$ESPIX_USER/vfs-loop-12.txt")"
 
-dev_run "rm /home/$ESPIX_USER/vfs-loop-1.txt /home/$ESPIX_USER/vfs-loop-2.txt \
-      /home/$ESPIX_USER/vfs-loop-3.txt /home/$ESPIX_USER/vfs-loop-4.txt \
-      /home/$ESPIX_USER/vfs-loop-5.txt /home/$ESPIX_USER/vfs-loop-6.txt \
-      /home/$ESPIX_USER/vfs-loop-7.txt /home/$ESPIX_USER/vfs-loop-8.txt \
-      /home/$ESPIX_USER/vfs-loop-9.txt /home/$ESPIX_USER/vfs-loop-10.txt \
-      /home/$ESPIX_USER/vfs-loop-11.txt /home/$ESPIX_USER/vfs-loop-12.txt" \
-      >/dev/null 2>&1
+# One rm per file: all twelve on one line is past the shell's line limit.
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    dev_run "rm /home/$ESPIX_USER/vfs-loop-$i.txt" >/dev/null 2>&1
+done
 
 # 3. A lower filesystem has no second name of its own. The stacked design exists
 #    so that a filesystem is reachable only where it is mounted; the IDF patches

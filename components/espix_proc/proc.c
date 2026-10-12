@@ -116,6 +116,37 @@ static bool state_is_finished(espix_proc_state_t s)
     return espix_proc_state_is_finished(s);
 }
 
+/*
+ * A session's shell. Over SSH the connection's own task runs it, so it keeps
+ * the connection's name until sshd and its shell are separate processes;
+ * everywhere else it is "sh".
+ */
+static void shell_begin(espix_session_t *s)
+{
+    const bool  ssh  = strncmp(s->name, "ssh", 3) == 0 ||
+                       strcmp(s->name, "sftp") == 0;
+    const char *name = ssh ? "sshd:conn" : "sh";
+    if (espix_proc_adopt(s, name, &s->pid) == ESP_ERR_NO_MEM) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no process slot for the session",
+                   s->user);
+    }
+}
+
+static size_t shell_end(espix_session_t *s)
+{
+    const size_t ended = espix_proc_hangup(s);
+    espix_proc_leave(s->last_status);
+    s->pid = ESPIX_PID_NONE;
+    return ended;
+}
+
+static const espix_shell_proc_ops_t s_shell_ops = {
+    .begin    = shell_begin,
+    .end      = shell_end,
+    .sigcheck = espix_sigcheck_io,
+    .stopping = espix_proc_stopping,
+};
+
 esp_err_t espix_proc_init(void)
 {
     if (g_espix_proc_lock != NULL) {
@@ -148,7 +179,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_drivers_register();
     espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
-    espix_shell_set_sigcheck_hook(espix_sigcheck_io);
+    espix_shell_set_proc_ops(&s_shell_ops);
     espix_proc_abi_env_register();
     espix_proc_abi_exit_register();
     espix_proc_abi_alloc_register();
@@ -400,7 +431,11 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      * slot pointer must not be used after this function returns -- the next
      * spawn may claim it immediately.
      */
-    done_record(slot, state, exit_code);
+    /* A shell leaves no record: nobody waits for one, and logins would push
+     * every app's exit out of the short list ps shows. */
+    if (slot->info.kind != ESPIX_PROC_SESSION) {
+        done_record(slot, state, exit_code);
+    }
     memset(slot, 0, sizeof(*slot));
 
     /*
@@ -689,7 +724,7 @@ size_t espix_proc_stop_all(int64_t deadline_us)
     size_t asked = 0;
 
     for (size_t i = 0; i < n; i++) {
-        if (live[i].pid == self) {
+        if (live[i].pid == self || live[i].kind == ESPIX_PROC_SESSION) {
             continue;
         }
         if (espix_proc_signal(live[i].pid, SIGTERM) == ESP_OK) {
@@ -707,10 +742,11 @@ size_t espix_proc_stop_all(int64_t deadline_us)
     for (;;) {
         n = espix_proc_snapshot(live, ESPIX_PROC_MAX);
 
-        /* A kernel thread is not asked, so it is not waited for either. */
+        /* A kernel thread or a shell is not asked, so it is not waited for. */
         left = 0;
         for (size_t i = 0; i < n; i++) {
-            if (live[i].pid != self && live[i].kind != ESPIX_PROC_KTHREAD) {
+            if (live[i].pid != self && live[i].kind != ESPIX_PROC_KTHREAD &&
+                live[i].kind != ESPIX_PROC_SESSION) {
                 left++;
             }
         }
@@ -831,8 +867,9 @@ static void set_state(espix_proc_slot_t *slot, espix_proc_state_t st)
 }
 
 /*
- * Run the handlers for everything pending and unblocked. Returns what was
- * delivered.
+ * Run the handlers for everything pending and unblocked. Returns the signals
+ * whose handler ran: only a caught signal interrupts a sleep, so an ignored one
+ * -- SIGCONT from fg, SIGCHLD -- must not end it.
  *
  * One pass, not a loop until empty: a handler that re-raises its own signal
  * would spin here for ever. A signal that arrives while a handler is running is
@@ -889,6 +926,8 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
     slot->sig_pending &= ~deliver;
     xSemaphoreGive(g_espix_proc_lock);
 
+    uint32_t caught = 0;
+
     for (int sig = 1; sig < NSIG; sig++) {
         if ((deliver & espix_sigbit(sig)) == 0) {
             continue;
@@ -908,6 +947,7 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
         }
         if (handler != SIG_DFL) {
             handler(sig);       /* app code; no lock held, by design */
+            caught |= espix_sigbit(sig);
             continue;
         }
         if (!sig_default_ignores(sig)) {
@@ -926,8 +966,9 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
              * give a sketch what the shim can give it.
              *
              * This runs on the process's own task (a thread left it pending,
-             * above), at a delivery point it reached itself, with no lock held (the table lock is released
-             * above the loop), so ending the process is the ordinary exit:
+             * above), at a delivery point it reached itself, with no lock held
+             * (the table lock is released above the loop), so ending the
+             * process is the ordinary exit:
              * streams closed, the ELF released, the slot marked EXITED with
              * 128+sig, and that status reaches whoever ran it. The same door an
              * app's own exit() uses.
@@ -936,7 +977,7 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
         }
     }
 
-    return deliver;
+    return caught;
 }
 
 /*
@@ -1110,7 +1151,10 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
  */
 static esp_err_t sig_kernel_locked(espix_proc_slot_t *slot, int sig)
 {
-    if (slot->info.kind == ESPIX_PROC_KTHREAD || sig == SIGSTOP) {
+    /* A shell is not asked either: a stop request would mute it for good, and
+     * logging out is how it ends. */
+    if (slot->info.kind == ESPIX_PROC_KTHREAD ||
+        slot->info.kind == ESPIX_PROC_SESSION || sig == SIGSTOP) {
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (sig_default_ignores(sig)) {
@@ -1393,6 +1437,58 @@ void espix_proc_select_end(void)
     }
 }
 
+esp_err_t espix_proc_signal_group(espix_pid_t pgid, int sig)
+{
+    if (pgid <= 0 || (sig != 0 && espix_sigbit(sig) == 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    espix_pid_t pids[ESPIX_PROC_MAX];
+    size_t      n = 0;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        const espix_proc_info_t *const info = &g_espix_proc_table.slots[i].info;
+        if (info->state != ESPIX_PROC_FREE && info->pgid == pgid &&
+            !state_is_finished(info->state)) {
+            pids[n++] = info->pid;
+        }
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+
+    if (n == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (sig == 0) {
+        return ESP_OK;              /* kill(-pgid, 0): the group exists */
+    }
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    for (size_t i = 0; i < n; i++) {
+        if (espix_proc_signal(pids[i], sig) == ESP_OK) {
+            err = ESP_OK;
+        }
+    }
+    return err;
+}
+
+espix_pid_t espix_proc_pgid_of(espix_pid_t pid)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *const slot = espix_proc_find(pid);
+    const espix_pid_t pgid = (slot != NULL) ? slot->info.pgid : ESPIX_PID_NONE;
+    xSemaphoreGive(g_espix_proc_lock);
+    return pgid;
+}
+
+espix_pid_t espix_proc_sid_of(espix_pid_t pid)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *const slot = espix_proc_find(pid);
+    const espix_pid_t sid = (slot != NULL) ? slot->info.sid : ESPIX_PID_NONE;
+    xSemaphoreGive(g_espix_proc_lock);
+    return sid;
+}
+
 esp_err_t espix_proc_request_stop(espix_pid_t pid)
 {
     return espix_proc_signal(pid, SIGTERM);
@@ -1448,7 +1544,7 @@ size_t espix_proc_hangup(const espix_session_t *session)
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
         const espix_proc_info_t *const info = &g_espix_proc_table.slots[i].info;
         if (info->state != ESPIX_PROC_FREE && info->session == session &&
-            !state_is_finished(info->state)) {
+            info->kind != ESPIX_PROC_SESSION && !state_is_finished(info->state)) {
             pids[n++] = info->pid;
         }
     }
@@ -1592,6 +1688,11 @@ bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
         if (info->task != task) {
             continue;
         }
+        /* A shell's credentials are its session's, live -- sudo changes them --
+         * so the caller asks the session instead. */
+        if (info->kind == ESPIX_PROC_SESSION) {
+            return false;
+        }
         if (uid != NULL) {
             *uid = info->uid;
         }
@@ -1633,10 +1734,18 @@ void espix_proc_paths(const char **cwd, const char **root)
     const espix_proc_slot_t *const slot = espix_proc_self();
     const espix_proc_app_t  *const app  = (slot != NULL) ? slot->app : NULL;
 
-    /* A process that is not an app has no paths of its own: "/" and no root,
-     * which is what a kernel task gets too. */
+    /* An app has its own cwd; a shell has its session's; anything else gets
+     * "/" and no root, as a kernel task does. */
     if (cwd != NULL) {
-        *cwd = (app == NULL || app->cwd[0] == '\0') ? "/" : app->cwd;
+        if (app != NULL) {
+            *cwd = (app->cwd[0] == '\0') ? "/" : app->cwd;
+        } else if (slot != NULL && slot->info.kind == ESPIX_PROC_SESSION &&
+                   slot->info.session != NULL &&
+                   slot->info.session->cwd[0] != '\0') {
+            *cwd = slot->info.session->cwd;
+        } else {
+            *cwd = "/";
+        }
     }
     if (root != NULL) {
         *root = (app == NULL || !app->root_active) ? "" : app->root;

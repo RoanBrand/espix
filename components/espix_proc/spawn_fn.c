@@ -64,6 +64,9 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pi
 
     const espix_proc_slot_t *const parent = espix_proc_self();
     slot->info.ppid = (parent != NULL) ? parent->info.pid : ESPIX_PID_NONE;
+    slot->info.pgid = (o->pgid != ESPIX_PID_NONE && o->pgid != 0) ? o->pgid
+                                                                  : slot->info.pid;
+    slot->info.sid  = (parent != NULL) ? parent->info.sid : slot->info.pid;
 
     espix_session_t *const s = o->session;
     slot->info.uid     = (s != NULL) ? s->uid : 0;
@@ -123,4 +126,53 @@ bool espix_proc_kind_of(espix_pid_t pid, espix_proc_kind_t *out)
     }
     xSemaphoreGive(g_espix_proc_lock);
     return slot != NULL;
+}
+
+esp_err_t espix_proc_adopt(espix_session_t *s, const char *name,
+                           espix_pid_t *out_pid)
+{
+    if (s == NULL || name == NULL || g_espix_proc_lock == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+
+    if (espix_proc_self() != NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_INVALID_STATE;       /* already a process */
+    }
+    espix_proc_slot_t *const slot = espix_proc_alloc_slot();
+    if (slot == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    strlcpy(slot->info.name, name, sizeof(slot->info.name));
+    slot->info.kind       = ESPIX_PROC_SESSION;
+    slot->info.pid        = espix_proc_next_pid();
+    slot->info.ppid       = ESPIX_PID_NONE;
+    slot->info.pgid       = slot->info.pid;
+    slot->info.sid        = slot->info.pid;
+    slot->info.session    = s;
+    slot->info.started_us = esp_timer_get_time();
+    slot->wake_fd         = -1;
+    slot->info.task       = xTaskGetCurrentTaskHandle();
+    slot->info.state      = ESPIX_PROC_RUNNING;
+
+    if (out_pid != NULL) {
+        *out_pid = slot->info.pid;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return ESP_OK;
+}
+
+void espix_proc_leave(int status)
+{
+    espix_proc_slot_t *const slot = espix_proc_self();
+
+    if (slot == NULL || slot->info.kind != ESPIX_PROC_SESSION) {
+        return;
+    }
+    espix_proc_release_resources(slot);
+    espix_proc_finish(slot, ESPIX_PROC_EXITED, status);
 }

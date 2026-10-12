@@ -775,7 +775,7 @@ espix_session_t *espix_term_session(espix_term_t *t)
         .open_stream    = term_open_stream,
         .transport      = t,
         .term_size      = term_term_size,
-        .fg_pid         = ESPIX_PID_NONE,
+        .fg_pgid         = ESPIX_PID_NONE,
         .login          = false,
         /*
          * True now that there is a parser behind this. It is not cosmetic:

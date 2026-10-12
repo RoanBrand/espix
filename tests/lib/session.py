@@ -37,6 +37,9 @@ import time
 PROMPT = re.compile(rb"[a-zA-Z0-9_.-]+:[^\r\n]*[#$] $")
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]")
 
+# `<<<INTR n>>> command`: run it, and n seconds in press Ctrl-C.
+INTR = re.compile(r"^<<<INTR ([0-9.]+)>>> (.*)$")
+
 
 def strip_ansi(data):
     return ANSI.sub(b"", data).replace(b"\x1b[6n", b"")
@@ -142,6 +145,22 @@ class Session:
                 raise TimeoutError(
                     f"no prompt within {limit}s; got: {self.buf[-400:]!r}")
 
+    def _wait_echo(self, command):
+        """Wait for the line as submitted -- the editor's last redraw, then the
+        newline -- before looking for the next prompt.
+
+        The editor redraws the whole line on every keystroke, and a read can
+        end just after a redraw's "esp:~$ ", which is a prompt to
+        _wait_prompt(): the command was taken as finished before it ran, and its
+        output arrived inside the next command's frame. An echo that never
+        comes -- a line too long for the editor -- costs five seconds, not the
+        run."""
+        echoed = re.compile(re.escape(command.encode()) + rb"\r*\n")
+        deadline = time.time() + min(self.timeout, 5)
+        while not echoed.search(strip_ansi(self.buf)):
+            if not self._read_some(deadline):
+                return
+
     def run(self, command):
         """Send one command, return its output with the echo and prompt gone.
 
@@ -149,8 +168,18 @@ class Session:
         them. There used to be a guard here that refused `;` because it would
         have run as an argument to the first word -- that is no longer true, so
         the guard is gone rather than left to reject working syntax."""
+        intr = INTR.match(command)
+        if intr is not None:
+            command = intr.group(2)
+
         self.buf = b""
         os.write(self.fd, command.encode() + b"\r")
+        self._wait_echo(command)
+        if intr is not None:
+            deadline = time.time() + float(intr.group(1))
+            while time.time() < deadline and self._read_some(deadline):
+                pass
+            os.write(self.fd, b"\x03")
         self._wait_prompt()
 
         text = strip_ansi(self.buf).decode("utf-8", "replace")

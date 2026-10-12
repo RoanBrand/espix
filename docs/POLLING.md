@@ -83,7 +83,7 @@ entry asked for.
 - **Item 2 (cmd_run's 50 ms and top's frame slice).** The wake object would be
   the ring's semaphore, which packet reads also wait on, so a child-exit wake
   can be swallowed by a partial read_exact. The fix is a second notification
-  (or a non-blocking packet peek), which is its own design.
+  (or a non-blocking packet peek), which is its own design. Tracked as R-P8.7.
 - **Item 6, the gfx wait.** espix_gfx_poll_event is poll-shaped and an
   event-driven app would spin, but the two apps that exist (plasma, doom)
   animate and must poll once per frame; a blocking wait is for the first app

@@ -70,10 +70,10 @@ fact that most corruption never reaches the fault handler at all.
 
 ### Tasks are not processes
 
-FreeRTOS tasks are what the scheduler runs. espix adds a process table for the
-programs a shell starts, because those need a pid, an exit status and something
-to kill; builtins run in the session's own task and have none of that. An app is
-entered directly — `espix_proc` calls the ELF entry itself, which also keeps the
+FreeRTOS tasks are what the scheduler runs. espix adds a process table on top:
+a session's shell is a process, and an app it starts is its child, a job of its
+own (a process group, which is what Ctrl-C reaches) in the shell's session. An
+app is entered directly — `espix_proc` calls the ELF entry itself, which also keeps the
 return value the loader's request wrapper discards.
 
 Two Unix mechanisms are reshaped by having no scheduler you can stop:
@@ -89,8 +89,8 @@ Two Unix mechanisms are reshaped by having no scheduler you can stop:
   process *in itself*, because suspending it from outside would freeze whatever
   mutex it held.
 - **`kill <pid>` escalates** — SIGTERM, a two-second grace, then SIGKILL —
-  because there is no job control and no `fg` to deliver a later signal, and the
-  only console may be the one you are typing into. Any signal but SIGSTOP lifts
+  because the only console may be the one you are typing into, and an app that
+  ignores SIGTERM there would otherwise be unstoppable. Any signal but SIGSTOP lifts
   a stop. [ROADMAP.md](ROADMAP.md#signals) has the gaps.
 
 Not every process is an app. espix's own code can run as one too

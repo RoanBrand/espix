@@ -117,6 +117,8 @@ static void appdata_resolve(espix_session_t *s, const char *abs)
  * report its status. Shared by `confine` and by the fallback that resolves a
  * bare command name to a program.
  */
+static void job_prune(espix_session_t *s);
+
 /*
  * Wait for pid, the shell's foreground process, and reap it. Returns its exit
  * status, or -1 when the wait itself failed (already reported). limit_us is how
@@ -147,21 +149,26 @@ static int wait_foreground(espix_session_t *s, espix_pid_t pid, const char *who,
     }
     const int64_t deadline = (limit_us > 0) ? esp_timer_get_time() + limit_us : 0;
 
-    s->fg_pid = pid;
+    /* The job's group, so ^C reaches every process in it. */
+    espix_pid_t pgid = espix_proc_pgid_of(pid);
+    if (pgid == ESPIX_PID_NONE) {
+        pgid = pid;
+    }
+    s->fg_pgid = pgid;
 
     for (;;) {
         const int64_t now = esp_timer_get_time();
 
         if (deadline > 0 && !overran && now >= deadline) {
             espix_eprintf(s, "%s: pid %d: time limit reached\n", who, (int)pid);
-            (void)espix_proc_signal(pid, SIGTERM);
+            (void)espix_proc_signal_group(pgid, SIGTERM);
             overran = true;
             term_at = now;
         } else if (overran && !killed &&
                    now >= term_at + (int64_t)RUN_KILL_GRACE_MS * 1000) {
             espix_eprintf(s, "%s: pid %d: did not stop; killing it\n",
                           who, (int)pid);
-            (void)espix_proc_signal(pid, SIGKILL);
+            (void)espix_proc_signal_group(pgid, SIGKILL);
             killed = true;
         }
 
@@ -178,7 +185,7 @@ static int wait_foreground(espix_session_t *s, espix_pid_t pid, const char *who,
         interrupts++;
 
         if (interrupts < RUN_INTERRUPTS_TO_KILL) {
-            (void)espix_proc_signal(pid, SIGINT);
+            (void)espix_proc_signal_group(pgid, SIGINT);
 
             if (interrupts + 1 == RUN_INTERRUPTS_TO_KILL) {
                 espix_eprintf(s, "%s: pid %d is ignoring SIGINT; "
@@ -187,7 +194,7 @@ static int wait_foreground(espix_session_t *s, espix_pid_t pid, const char *who,
             }
         } else if (interrupts == RUN_INTERRUPTS_TO_KILL) {
             espix_eprintf(s, "%s: killing pid %d\n", who, (int)pid);
-            (void)espix_proc_signal(pid, SIGKILL);
+            (void)espix_proc_signal_group(pgid, SIGKILL);
         }
     }
 
@@ -195,7 +202,7 @@ static int wait_foreground(espix_session_t *s, espix_pid_t pid, const char *who,
         (void)s->poll_interrupt(s);
     }
 
-    s->fg_pid = ESPIX_PID_NONE;
+    s->fg_pgid = ESPIX_PID_NONE;
 
     if (timed_out != NULL) {
         *timed_out = overran;
@@ -229,6 +236,7 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
 
         const char *base = strrchr(abs, '/');
         base = (base != NULL) ? base + 1 : abs;
+        job_prune(s);               /* finished jobs give their slots back */
         if (!espix_shell_job_add(s, pid, base)) {
             /* It is running either way; only the session's memory of it is
              * lost, which is worth a line rather than a `jobs` that is quietly
@@ -597,7 +605,7 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
     int first = 1;
 
     if (argc < 2) {
-        espix_eprintf(s, "usage: kill [-s] <pid>...\n");
+        espix_eprintf(s, "usage: kill [-s] <pid|-pgid>...\n");
         return 1;
     }
 
@@ -637,6 +645,16 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
             continue;
         }
 
+        /* A negative pid is a process group, as on Unix. */
+        if (v < 0) {
+            const esp_err_t gerr = espix_proc_signal_group((espix_pid_t)-v, sig);
+            if (gerr != ESP_OK) {
+                espix_eprintf(s, "kill: %ld: no such process group\n", v);
+                status = 1;
+            }
+            continue;
+        }
+
         const espix_pid_t pid = (espix_pid_t)v;
 
         /*
@@ -662,8 +680,8 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
                              "(only an app is deleted)\n", (int)pid);
             status = 1;
         } else if (err == ESP_ERR_NOT_SUPPORTED) {
-            espix_eprintf(s, "kill: %d: a kernel thread cannot be signalled\n",
-                          (int)pid);
+            espix_eprintf(s, "kill: %d: a shell or a kernel thread; it cannot be "
+                             "signalled\n", (int)pid);
             status = 1;
         } else if (err != ESP_OK) {
             espix_eprintf(s, "kill: %d: %s\n", (int)pid, esp_err_to_name(err));
@@ -863,12 +881,11 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
 
     (void)espix_proc_signal(pid, SIGCONT);
 
-    int             code = 0;
-    const esp_err_t err  = espix_proc_wait(pid, &code, portMAX_DELAY);
+    /* The foreground wait, so ^C reaches it as it would any job. */
+    const int code = wait_foreground(s, pid, "fg", 0, NULL);
     espix_shell_job_clear(s, slot);
 
-    if (err != ESP_OK) {
-        espix_eprintf(s, "fg: %d: %s\n", (int)pid, esp_err_to_name(err));
+    if (code < 0) {
         return 1;
     }
     if (code != 0) {
@@ -886,7 +903,7 @@ static espix_cmd_t s_run_cmds[] = {
       .usage = "confine <dir> <path> [args...] [&]" },
     { .name = "kill",  .fn = cmd_kill,
       .help = "send a signal to a process",
-      .usage = "kill [-SIG|-l] <pid>..." },
+      .usage = "kill [-SIG|-l] <pid|-pgid>..." },
     { .name = "crash", .fn = cmd_crash,
       .help = "fault on purpose, to test fault reporting",
       .usage = "crash [abi]" },

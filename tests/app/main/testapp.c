@@ -874,6 +874,26 @@ static int sig_threadsleep(void)
     return (s_ts_ms >= 0 && s_ts_ms < 4000 && s_ts_alarm) ? 0 : 1;
 }
 
+/* kill(0, sig) reaches the caller's own group, the caller included, and the
+ * handler runs before kill() returns. */
+static volatile sig_atomic_t s_group_seen;
+
+static void on_group(int sig)
+{
+    (void)sig;
+    s_group_seen = 1;
+}
+
+static int sig_group(void)
+{
+    signal(SIGUSR1, on_group);
+    const int rc     = kill(0, SIGUSR1);
+    const int probe  = kill(-getpgrp(), 0);
+    printf("sig: group rc=%d seen=%d probe=%d\n", rc, (int)s_group_seen, probe);
+    fflush(stdout);
+    return (rc == 0 && s_group_seen && probe == 0) ? 0 : 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -908,6 +928,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "threadsleep") == 0) {
         return sig_threadsleep();
+    }
+    if (strcmp(mode, "group") == 0) {
+        return sig_group();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
@@ -1559,7 +1582,8 @@ static void usage(void)
            "  cat                 echo stdin, then its byte count\n"
            "  sink                read stdin, report the byte count only\n"
            "  sig [mode]          handlers (default) | ignore | spin | alarm | size | winch | pipe | select\n"
-           "                      | mutex | threadsleep\n"
+           "                      | mutex | threadsleep | group\n"
+           "  ids                 pid, parent, process group and session\n"
            "  sleep <secs>        sleep, for signal and job-control tests\n"
            "  hold <secs> <bytes>...  hold memory, sleeping secs, then release\n"
            "  holdthread <bytes>  free, in a new thread, what main allocated\n"
@@ -1674,6 +1698,12 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "env") == 0 && argc > 2) {
         return cmd_env(argc - 2, argv + 2);
     }
+    if (strcmp(cmd, "ids") == 0) {
+        printf("pid=%d ppid=%d pgrp=%d sid=%d\n", (int)getpid(), (int)getppid(),
+               (int)getpgrp(), (int)getsid(0));
+        return 0;
+    }
+
     if (strcmp(cmd, "sleep") == 0 && argc > 2) {
         sleep((unsigned)strtol(argv[2], NULL, 10));
         printf("slept %s\n", argv[2]);

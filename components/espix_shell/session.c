@@ -64,6 +64,8 @@ int espix_shell_term_size(int *cols, int *rows)
     return 0;
 }
 
+static bool proc_stopping(void);
+
 static int session_out(espix_session_t *s, const char *data, size_t len)
 {
     if (s != NULL && s->redirect != NULL) {
@@ -71,6 +73,11 @@ static int session_out(espix_session_t *s, const char *data, size_t len)
     }
     if (s == NULL || s->write == NULL) {
         return (int)fwrite(data, 1, len, stdout);
+    }
+    /* A process asked to stop may outlive its session; it does not get to
+     * write into a transport that may be gone. */
+    if (proc_stopping()) {
+        return -1;
     }
     return s->write(s, data, len);
 }
@@ -96,6 +103,9 @@ static int session_err(espix_session_t *s, const char *data, size_t len)
     }
     if (s->redirect_err != NULL) {
         return (int)fwrite(data, 1, len, s->redirect_err);
+    }
+    if (proc_stopping()) {
+        return -1;
     }
     if (s->write_err != NULL) {
         return s->write_err(s, data, len);
@@ -473,12 +483,15 @@ static bool expand_token(const espix_session_t *s, const char *in,
             continue;
         }
 
-        /* $? -- the status of the last command, which the session has always
-         * tracked and never been able to say. */
-        if (p[1] == '?') {
+        /* $? -- the status of the last command; $$ -- the shell's pid. */
+        if (p[1] == '?' || p[1] == '$') {
+            int v = 0;
+            if (s != NULL) {
+                v = (p[1] == '?') ? s->last_status
+                                  : (s->pid > 0 ? (int)s->pid : 0);
+            }
             char num[12];
-            const int n = snprintf(num, sizeof(num), "%d",
-                                   (s != NULL) ? s->last_status : 0);
+            const int n = snprintf(num, sizeof(num), "%d", v);
             if (n < 0 || o + (size_t)n >= out_len) { return false; }
             memcpy(out + o, num, (size_t)n);
             o += (size_t)n;
@@ -1746,24 +1759,38 @@ int espix_shell_run_line(espix_session_t *s, const char *line)
     return s->last_status;
 }
 
-/* See espix_shell_set_session_end_hook(). */
-static size_t (*s_end_hook)(const espix_session_t *s);
+static const espix_shell_proc_ops_t *s_proc;
 
-static bool (*s_sigcheck_hook)(void);
-
-void espix_shell_set_sigcheck_hook(bool (*fn)(void))
+void espix_shell_set_proc_ops(const espix_shell_proc_ops_t *ops)
 {
-    s_sigcheck_hook = fn;
+    s_proc = ops;
 }
 
 bool espix_shell_sigcheck(void)
 {
-    return s_sigcheck_hook != NULL && s_sigcheck_hook();
+    return s_proc != NULL && s_proc->sigcheck();
 }
 
-void espix_shell_set_session_end_hook(size_t (*fn)(const espix_session_t *s))
+static bool proc_stopping(void)
 {
-    s_end_hook = fn;
+    return s_proc != NULL && s_proc->stopping();
+}
+
+void espix_shell_session_begin(espix_session_t *s)
+{
+    if (s_proc != NULL) {
+        s_proc->begin(s);
+    }
+}
+
+size_t espix_shell_session_end(espix_session_t *s)
+{
+    const size_t orphans = (s_proc != NULL) ? s_proc->end(s) : 0;
+    if (orphans > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",
+                   s->user, (unsigned)orphans, orphans == 1 ? "" : "es");
+    }
+    return orphans;
 }
 
 void espix_shell_session_run(espix_session_t *s)
@@ -1773,6 +1800,7 @@ void espix_shell_session_run(espix_session_t *s)
     }
 
     espix_shell_set_current(s);
+    espix_shell_session_begin(s);
 
     char line[ESPIX_LINE_MAX];
     char prompt[ESPIX_PATH_MAX + 16];
@@ -1785,6 +1813,13 @@ void espix_shell_session_run(espix_session_t *s)
             break;                          /* EOF or transport gone */
         }
         if (n == 0) {
+            continue;
+        }
+        /* A full buffer may be a cut line, and running what is left of one --
+         * an rm missing its last names -- is worse than running none of it. */
+        if ((size_t)n >= sizeof(line) - 1) {
+            espix_eprintf(s, "espix: line too long (max %u)\n",
+                          (unsigned)(sizeof(line) - 2));
             continue;
         }
 
@@ -1806,14 +1841,7 @@ void espix_shell_session_run(espix_session_t *s)
      * processes follow, in the end hook below.
      */
     espix_shell_jobs_drain(s);
-
-    if (s_end_hook != NULL) {
-        const size_t orphans = s_end_hook(s);
-        if (orphans > 0) {
-            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",
-                       s->user, (unsigned)orphans, orphans == 1 ? "" : "es");
-        }
-    }
+    (void)espix_shell_session_end(s);
 
     espix_shell_set_current(NULL);
 }

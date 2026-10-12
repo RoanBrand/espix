@@ -206,13 +206,6 @@ void app_main(void)
     ESP_ERROR_CHECK(espix_fs_mount_root());
     ESP_ERROR_CHECK(espix_proc_init());
 
-    /*
-     * The shell ends a session; this is what ends the processes in it. Wired
-     * here because espix_proc is above espix_shell and cannot call down into
-     * it, and because this file is the one place that knows both.
-     */
-    espix_shell_set_session_end_hook(espix_proc_hangup);
-
     /* Before networking: SSH will authenticate against this, and it warns while
      * the shipped default password is still in place. */
     ESP_ERROR_CHECK(espix_auth_init());

@@ -344,3 +344,83 @@ fi
 kill "$reader" 2>/dev/null
 wait "$reader" 2>/dev/null
 dev_run "rm $CAT" >/dev/null 2>&1
+
+# Ctrl-C as a keystroke, not a kill: the transport reports it and the shell
+# sends SIGINT to the foreground job's whole group.
+t0=$(date +%s)
+intr_out=$(dev_run "<<<INTR 2>>> $APP sleep 30")
+t1=$(date +%s)
+assert_contains "Ctrl-C reaches a foreground app" "^C" "$intr_out"
+if [ $((t1 - t0)) -lt 10 ]; then
+    espix_pass "and ends it ($((t1 - t0)) s, not 30)"
+else
+    espix_fail "and ends it" "took $((t1 - t0)) s"
+fi
+
+# fg used to wait with no way out; it is the same foreground wait now.
+pid=$(bg_start handlers)
+if [ -n "$pid" ]; then
+    t0=$(date +%s)
+    dev_run "<<<INTR 2>>> fg $pid" >/dev/null
+    t1=$(date +%s)
+    if [ $((t1 - t0)) -lt 10 ] && wait_gone "$pid"; then
+        espix_pass "fg can be interrupted ($((t1 - t0)) s)"
+    else
+        espix_fail "fg can be interrupted" "took $((t1 - t0)) s; $(ps_running)"
+        dev_run "kill -9 $pid" >/dev/null
+    fi
+else
+    espix_fail "backgrounding sig handlers reports its pid" "no [pid] line"
+fi
+
+# A negative pid is a process group: an app is its own job, so -pid ends it.
+# An app that ends silently: kill returns before a handler's last line would
+# be written, and that line would land after the prompt.
+bg_out=$(dev_run "$APP sleep 60 &")
+pid=$(printf '%s\n' "$bg_out" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -n "$pid" ]; then
+    dev_run "kill -INT -$pid" >/dev/null
+    if wait_gone "$pid"; then
+        espix_pass "kill -INT -<pgid> reaches the group"
+    else
+        espix_fail "kill -INT -<pgid> reaches the group" "$(ps_running)"
+    fi
+else
+    espix_fail "kill -INT -<pgid> reaches the group" "no [pid] line in: $bg_out"
+fi
+
+assert_contains "kill(0) reaches the caller's own group, the caller included" \
+    "rc=0 seen=1 probe=0" "$(dev_run "$APP sig group")"
+
+# `ssh host cmd` is a session too, so what it leaves running is hung up when
+# it ends rather than outliving it. Under a name of its own, as above.
+HUP="/tmp/exechup-$ESPIX_WORKER"
+dev_run "cp $APP $HUP; chmod 755 $HUP" >/dev/null 2>&1
+dev_once "$HUP sleep 60 &" >/dev/null 2>&1
+left=""
+for i in 1 2 3 4 5 6; do
+    sleep 1
+    left=$(dev_run 'ps' | sed -n '1,/^finished:/p' |
+           awk -v n="exechup-$ESPIX_WORKER" '$2 == n' | grep -c . || true)
+    [ "$left" = 0 ] && break
+done
+assert_eq "an exec session's background app ends with it" "0" "$left"
+dev_run "rm $HUP" >/dev/null 2>&1
+
+# An ignored signal does not cut a sleep short; only a caught one does. SIGCONT
+# from fg used to end a sleep(60) at once, which the app saw as time passed.
+pid=$(dev_run "$APP sleep 20 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -n "$pid" ]; then
+    sleep 1
+    dev_run "kill -CONT $pid" >/dev/null
+    dev_run "kill -WINCH $pid" >/dev/null
+    sleep 2
+    if is_running "$pid"; then
+        espix_pass "an ignored signal leaves a sleep alone"
+    else
+        espix_fail "an ignored signal leaves a sleep alone" "pid $pid ended early"
+    fi
+    dev_run "kill -9 $pid" >/dev/null
+else
+    espix_fail "an ignored signal leaves a sleep alone" "no [pid] line"
+fi

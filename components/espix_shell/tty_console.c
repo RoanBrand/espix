@@ -957,7 +957,7 @@ esp_err_t espix_console_session_start(void)
         .read_line = console_read_line,
         .write     = console_write,
         .poll_interrupt = console_poll_interrupt,
-        .fg_pid    = ESPIX_PID_NONE,
+        .fg_pgid    = ESPIX_PID_NONE,
         .ansi      = ansi,
         /* No stdio rebinding: the editor owns stdin and output goes through
          * stdio, so a spawned app inherits the global streams — which for the
