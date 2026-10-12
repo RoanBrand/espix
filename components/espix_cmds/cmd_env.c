@@ -174,10 +174,10 @@ static int cmd_unset(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_env_cmds[] = {
     { .name = "env",    .fn = cmd_env,
       .help = "list the environment a program would get", .usage = "env" },
-    { .name = "export", .fn = cmd_export,
+    { .name = "export", .fn = cmd_export, .shell = true,
       .help = "set a variable, or mark one for export",
       .usage = "export [name[=value]]..." },
-    { .name = "unset",  .fn = cmd_unset,
+    { .name = "unset",  .fn = cmd_unset, .shell = true,
       .help = "remove a session variable",     .usage = "unset <name>..." },
 };
 

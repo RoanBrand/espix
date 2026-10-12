@@ -140,11 +140,49 @@ static size_t shell_end(espix_session_t *s)
     return ended;
 }
 
+/* A command the shell runs as a process: its priority, any core. */
+static esp_err_t shell_spawn(espix_session_t *s, espix_shell_spawn_t *sp,
+                             espix_pid_t *pid)
+{
+    const espix_proc_fn_opts_t o = {
+        .name           = sp->name,
+        .fn             = sp->fn,
+        .arg            = sp->arg,
+        .kind           = ESPIX_PROC_BUILTIN,
+        .stack          = sp->stack,
+        .priority       = uxTaskPriorityGet(NULL),
+        .core           = tskNO_AFFINITY,
+        .internal_stack = sp->internal_stack,
+        .session        = s,
+        .pgid           = sp->pgid,
+    };
+    const esp_err_t err = espix_proc_spawn_fn(&o, pid);
+    if (err == ESP_OK) {
+        /* Worked out again rather than looked up: it may have finished. */
+        sp->pgid = espix_proc_group_for(espix_proc_self(), sp->pgid, *pid);
+    }
+    return err;
+}
+
+static int shell_wait(espix_session_t *s, espix_pid_t pid, bool tty)
+{
+    espix_proc_fg_t fg = { .tty = tty };
+    return espix_proc_wait_fg(s, pid, &fg);
+}
+
+static bool shell_alive(espix_pid_t pid)
+{
+    return espix_proc_state_of(pid) != ESPIX_PROC_FREE;
+}
+
 static const espix_shell_proc_ops_t s_shell_ops = {
     .begin    = shell_begin,
     .end      = shell_end,
     .sigcheck = espix_sigcheck_io,
     .stopping = espix_proc_stopping,
+    .spawn    = shell_spawn,
+    .wait     = shell_wait,
+    .alive    = shell_alive,
 };
 
 esp_err_t espix_proc_init(void)
@@ -561,6 +599,19 @@ espix_proc_slot_t *espix_proc_find(espix_pid_t pid)
         }
     }
     return NULL;
+}
+
+espix_pid_t espix_proc_group_for(const espix_proc_slot_t *parent,
+                                 espix_pid_t asked, espix_pid_t pid)
+{
+    if (asked > 0) {
+        return asked;
+    }
+    if (parent == NULL || parent->info.kind == ESPIX_PROC_SESSION ||
+        parent->info.kind == ESPIX_PROC_KTHREAD) {
+        return pid;
+    }
+    return parent->info.pgid;
 }
 
 espix_proc_slot_t *espix_proc_self(void)
@@ -1688,9 +1739,10 @@ bool espix_proc_cred_of_task(TaskHandle_t task, uint16_t *uid, uint16_t *gid,
         if (info->task != task) {
             continue;
         }
-        /* A shell's credentials are its session's, live -- sudo changes them --
-         * so the caller asks the session instead. */
-        if (info->kind == ESPIX_PROC_SESSION) {
+        /* A shell's credentials, and a command's, are its session's, live --
+         * sudo changes them -- so the caller asks the session instead. */
+        if (info->kind == ESPIX_PROC_SESSION ||
+            info->kind == ESPIX_PROC_BUILTIN) {
             return false;
         }
         if (uid != NULL) {
@@ -1734,15 +1786,19 @@ void espix_proc_paths(const char **cwd, const char **root)
     const espix_proc_slot_t *const slot = espix_proc_self();
     const espix_proc_app_t  *const app  = (slot != NULL) ? slot->app : NULL;
 
-    /* An app has its own cwd; a shell has its session's; anything else gets
-     * "/" and no root, as a kernel task does. */
+    /* An app has its own cwd; a shell or a command has its session's -- a
+     * job's or a pipe stage's own copy; anything else gets "/" and no root, as
+     * a kernel task does. */
     if (cwd != NULL) {
+        const espix_session_t *const s =
+            (app == NULL && slot != NULL &&
+             (slot->info.kind == ESPIX_PROC_SESSION ||
+              slot->info.kind == ESPIX_PROC_BUILTIN)) ? espix_shell_current()
+                                                       : NULL;
         if (app != NULL) {
             *cwd = (app->cwd[0] == '\0') ? "/" : app->cwd;
-        } else if (slot != NULL && slot->info.kind == ESPIX_PROC_SESSION &&
-                   slot->info.session != NULL &&
-                   slot->info.session->cwd[0] != '\0') {
-            *cwd = slot->info.session->cwd;
+        } else if (s != NULL && s->cwd[0] != '\0') {
+            *cwd = s->cwd;
         } else {
             *cwd = "/";
         }

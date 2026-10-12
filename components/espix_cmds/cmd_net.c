@@ -322,7 +322,7 @@ static void ping_end(esp_ping_handle_t hdl, void *args)
 static int cmd_ping(espix_session_t *s, int argc, char **argv)
 {
     const char *host  = NULL;
-    uint32_t    count = 4;   /* bounded: there is no Ctrl-C to stop it yet */
+    uint32_t    count = 0;   /* until ^C, as on Linux */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -374,11 +374,25 @@ static int cmd_ping(espix_session_t *s, int argc, char **argv)
 
     esp_ping_start(hdl);
 
-    /* Wait for on_ping_end, with a margin over the worst case so a wedged
+    /* Until on_ping_end, which a stop runs too, so ^C still prints the
+     * statistics. A bounded run has a margin over its worst case, so a wedged
      * session cannot hold the shell forever. */
-    const TickType_t limit =
-        pdMS_TO_TICKS((cfg.interval_ms + cfg.timeout_ms) * (count + 2));
-    xEventGroupWaitBits(ctx.done, PING_DONE_BIT, pdTRUE, pdTRUE, limit);
+    const TickType_t limit = (count == 0) ? portMAX_DELAY
+        : pdMS_TO_TICKS((cfg.interval_ms + cfg.timeout_ms) * (count + 2));
+    const TickType_t start = xTaskGetTickCount();
+
+    while ((xEventGroupWaitBits(ctx.done, PING_DONE_BIT, pdTRUE, pdTRUE,
+                                pdMS_TO_TICKS(50)) & PING_DONE_BIT) == 0) {
+        if (espix_shell_stopping(s)) {
+            esp_ping_stop(hdl);
+            xEventGroupWaitBits(ctx.done, PING_DONE_BIT, pdTRUE, pdTRUE,
+                                pdMS_TO_TICKS(cfg.timeout_ms + 500));
+            break;
+        }
+        if (limit != portMAX_DELAY && xTaskGetTickCount() - start >= limit) {
+            break;
+        }
+    }
 
     esp_ping_stop(hdl);
     esp_ping_delete_session(hdl);

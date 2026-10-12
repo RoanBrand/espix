@@ -181,6 +181,26 @@ espix_pid_t espix_proc_pgid_of(espix_pid_t pid);
 espix_pid_t espix_proc_sid_of(espix_pid_t pid);
 
 /*
+ * Wait for a foreground job and reap it. A shell polls its terminal meanwhile:
+ * ^C sends SIGINT to the job's group, the third press SIGKILL. A process
+ * waiting on its own child leaves that to the shell, whose group it is in.
+ * Returns the exit status -- 130 for a command ^C ended -- or -1 when the wait
+ * failed, already reported.
+ */
+typedef struct {
+    const char *who;            /* names the messages; "espix" when NULL */
+    int64_t     limit_us;       /* SIGTERM at this, SIGKILL a grace later; 0: none */
+    bool        tty;            /* the job reads the terminal: leave it alone */
+    bool        timed_out;      /* out: the limit was reached */
+} espix_proc_fg_t;
+
+int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg);
+
+/* Sleep up to `ms`, ending at once when the calling process is signalled. True
+ * when it has been asked to stop. For espix's own code; an app has sleep(). */
+bool espix_proc_sleep(uint32_t ms);
+
+/*
  * Load the ELF at `abs_path` and run it as a new process. Returns as soon as
  * the process is admitted; use espix_proc_wait() to block for completion.
  *

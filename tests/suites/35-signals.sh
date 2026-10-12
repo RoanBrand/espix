@@ -424,3 +424,22 @@ if [ -n "$pid" ]; then
 else
     espix_fail "an ignored signal leaves a sleep alone" "no [pid] line"
 fi
+
+# A builtin is a process, so ^C reaches it as it does an app: a sleep, every
+# stage of a pipeline, and a ping that runs until it is told to stop.
+t0=$(date +%s)
+out=$(dev_run "<<<INTR 2>>> sleep 30 ; echo st=\$?")
+t1=$(date +%s)
+assert_contains "Ctrl-C ends a builtin with 130" "st=130" "$out"
+[ $((t1 - t0)) -lt 10 ] && espix_pass "at once ($((t1 - t0)) s)" ||
+    espix_fail "at once" "took $((t1 - t0)) s"
+
+t0=$(date +%s)
+out=$(dev_run "<<<INTR 2>>> sleep 30 | cat ; echo st=\$?")
+t1=$(date +%s)
+assert_contains "Ctrl-C ends a whole pipeline" "st=130" "$out"
+[ $((t1 - t0)) -lt 10 ] && espix_pass "every stage of it ($((t1 - t0)) s)" ||
+    espix_fail "every stage of it" "took $((t1 - t0)) s"
+
+out=$(dev_run "<<<INTR 3>>> ping 127.0.0.1")
+assert_contains "ping runs until Ctrl-C, then reports" "packets transmitted" "$out"

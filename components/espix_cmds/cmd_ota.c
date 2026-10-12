@@ -334,7 +334,7 @@ static int cmd_upgrade(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_ota_cmds[] = {
-    { .name = "upgrade", .fn = cmd_upgrade,
+    { .name = "upgrade", .fn = cmd_upgrade, .tty = true,
       .help = "fetch a kernel image, queue it for the loader",
       .usage = "upgrade [-y|--check] | --slots | --file <path> | --rollback | <url>",
       .stack = 8192,

@@ -414,6 +414,25 @@ fi
 assert_contains "a shell cannot be signalled" "cannot be signalled" \
     "$(dev_run "kill -TERM $ids_ppid" 2>&1)"
 
+# A builtin is a process too: a child of its shell, in a group of its own.
+bpid=$(dev_run 'sleep 20 &' | sed -n 's/^\[\([0-9][0-9]*\)\] sleep.*/\1/p')
+if [ -n "$bpid" ]; then
+    brow=$(dev_run ps | awk -v p="$bpid" '$1 == p')
+    assert_contains "a backgrounded builtin is listed by ps" "sleep" "$brow"
+    assert_eq "and its parent is the shell" "$ids_ppid" \
+        "$(printf '%s' "$brow" | awk -v c="$(ps_col PPID)" '{ print $c }')"
+    dev_run "kill -INT $bpid" >/dev/null
+    sleep 1
+    assert_eq "and SIGINT ends it" "" \
+        "$(dev_run ps | sed -n '1,/^finished:/p' | awk -v p="$bpid" '$1 == p')"
+else
+    espix_fail "a backgrounded builtin reports its pid" "$(dev_run 'sleep 1 &')"
+fi
+assert_contains "type names a shell builtin" "cd is a shell builtin" \
+    "$(dev_run 'type cd')"
+assert_contains "and a command run as a process" "ls is a command" \
+    "$(dev_run 'type ls')"
+
 
 # --- a finished process leaves the table, and the log keeps the record ------
 #

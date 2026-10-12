@@ -64,8 +64,7 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pi
 
     const espix_proc_slot_t *const parent = espix_proc_self();
     slot->info.ppid = (parent != NULL) ? parent->info.pid : ESPIX_PID_NONE;
-    slot->info.pgid = (o->pgid != ESPIX_PID_NONE && o->pgid != 0) ? o->pgid
-                                                                  : slot->info.pid;
+    slot->info.pgid = espix_proc_group_for(parent, o->pgid, slot->info.pid);
     slot->info.sid  = (parent != NULL) ? parent->info.sid : slot->info.pid;
 
     espix_session_t *const s = o->session;

@@ -32,7 +32,7 @@ merely missing.
 |---|---|---|
 | Run a cross-compiled native app by name | **yes** | `/bin` search, argv, exit status |
 | `ps`, `top` | **yes** | live CPU and memory, per core |
-| Stop a running app — Ctrl-C, `kill` | **yes** | Ctrl-C is SIGINT to the foreground job's group; `kill` asks, then insists |
+| Stop a running command — Ctrl-C, `kill` | **yes** | a command is a process like an app; Ctrl-C is SIGINT to the foreground job's group; `kill` asks, then insists |
 | Process tree — `$$`, `getppid`, `getpgrp`, `getsid`, `kill -<pgid>`, `killpg` | **yes** | a shell is a process and its apps' parent; each job is its own group |
 | Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names; delivered when the app calls in, not asynchronously |
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |

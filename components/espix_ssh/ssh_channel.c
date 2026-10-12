@@ -2538,7 +2538,6 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             espix_shell_set_current(&session);
             espix_shell_session_begin(&session);
             (void)espix_shell_run_line(&session, ch->exec_cmd);
-            espix_shell_jobs_drain(&session);
             (void)espix_shell_session_end(&session);
             espix_shell_set_current(NULL);
         }

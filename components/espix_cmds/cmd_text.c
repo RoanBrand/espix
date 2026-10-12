@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_proc.h"
 
 #define TEXT_LINE_MAX 256
 
@@ -50,9 +51,9 @@ static FILE *espix_cmd_open(espix_session_t *s, const char *who, const char *arg
 
 /*
  * The stream a command with no file operands reads from: the shell's `<`
- * target, or NULL when there is none. A builtin has no other standard input --
- * it runs on the session task, not as a process -- so a command with neither a
- * file nor a `<` says so rather than blocking. See R-P2.4.
+ * target, or NULL when there is none. A builtin has no stdin stream of its own,
+ * so a command with neither a file nor a `<` says so rather than blocking. See
+ * R-P2.4.
  */
 static FILE *stdin_stream(espix_session_t *s)
 {
@@ -705,38 +706,15 @@ static int cmd_sleep(espix_session_t *s, int argc, char **argv)
     }
     if (secs > 86400) { secs = 86400; }
 
-    /*
-     * In slices, checking the session's interrupt hook, so a long sleep does
-     * not make the terminal unresponsive: a builtin runs on the session task,
-     * and there is no signal to cut it short -- see R-P2.8 for the task case.
-     */
-    const TickType_t end_tick = xTaskGetTickCount() + pdMS_TO_TICKS(secs * 1000);
-
-    while ((int32_t)(end_tick - xTaskGetTickCount()) > 0) {
-        /*
-         * A background job is asked to stop rather than interrupted, and it
-         * must not consume the terminal input doing it: that belongs to the
-         * shell, which is still reading.
-         */
-        if (espix_shell_stopping(s)) {
-            return 130;
-        }
-        if (s->stop == NULL && s->poll_interrupt != NULL &&
-            s->poll_interrupt(s)) {
-            espix_printf(s, "^C\n");
-            return 130;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    return 0;
+    return espix_proc_sleep((uint32_t)secs * 1000) ? 130 : 0;
 }
 
 /* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_text_cmds[] = {
-    { .name = "true",  .fn = cmd_true,
+    { .name = "true",  .fn = cmd_true, .shell = true,
       .help = "do nothing, successfully", .usage = "true" },
-    { .name = "false", .fn = cmd_false,
+    { .name = "false", .fn = cmd_false, .shell = true,
       .help = "do nothing, unsuccessfully", .usage = "false" },
     { .name = "wc",    .fn = cmd_wc,
       .help = "count lines, words and bytes", .usage = "wc [-lwc] <file>..." },
@@ -751,9 +729,9 @@ static espix_cmd_t s_text_cmds[] = {
       .help = "sort lines", .usage = "sort [-rnu] <file>..." },
     { .name = "find",  .fn = cmd_find,
       .help = "walk a directory tree", .usage = "find [path...]" },
-    { .name = "test",  .fn = cmd_test,
+    { .name = "test",  .fn = cmd_test, .shell = true,
       .help = "evaluate an expression", .usage = "test <expr>" },
-    { .name = "[",     .fn = cmd_bracket,
+    { .name = "[",     .fn = cmd_bracket, .shell = true,
       .help = "test, with a closing ]", .usage = "[ <expr> ]" },
     { .name = "sleep", .fn = cmd_sleep,
       .help = "pause for a number of seconds", .usage = "sleep <seconds>" },

@@ -593,6 +593,11 @@ espix_proc_slot_t *espix_proc_find(espix_pid_t pid);
  * caller is the process itself, so its slot cannot be recycled underneath it. */
 espix_proc_slot_t *espix_proc_self(void);
 
+/* The group a new process `pid` joins: `asked` if set; else a shell's or the
+ * kernel's child leads its own job, and anyone else's joins its parent's. */
+espix_pid_t espix_proc_group_for(const espix_proc_slot_t *parent,
+                                 espix_pid_t asked, espix_pid_t pid);
+
 /* End the calling process with `status`, running the same teardown a return
  * from the app's entry point does. Never returns. Called by the override table
  * in abi_exit.c; see the note there for why it is a longjmp rather than a

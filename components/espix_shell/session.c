@@ -12,7 +12,6 @@
 #include "freertos/stream_buffer.h"
 
 #include "esp_console.h"
-#include "esp_log.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -20,27 +19,7 @@
 
 #define TAG "shell"
 
-/*
- * The lock the builtin-job teardown handshake runs under.
- *
- * One for the whole component rather than one per session: the critical
- * section is a few stores long and a background builtin is rare, so sharing it
- * costs nothing next to a mutex per session.
- */
-static portMUX_TYPE s_job_lock = portMUX_INITIALIZER_UNLOCKED;
-
-/*
- * What a background builtin that declares no stack of its own gets. Commands
- * that declare one use it; the rest were sized for the session task, and this
- * is that figure (CONFIG_ESPIX_SSH_TASK_STACK), so backgrounding one does not
- * narrow what it may use.
- */
-#define JOB_STACK_DEFAULT 8192
-
-/* How long a background builtin gets to notice its stop flag before the drain
- * deletes it. A loop that checks leaves in an iteration; this is the grace for
- * one that is mid-write. */
-#define JOB_STOP_MS 250
+static const espix_shell_proc_ops_t *s_proc;
 
 espix_session_t *espix_shell_current(void)
 {
@@ -578,127 +557,75 @@ static int take_assignments(espix_session_t *s, int argc, char **argv,
 }
 
 /*
- * A command that declared a stack of its own runs on a task created for it.
- *
- * The context is a stack local in the spawner, which waits for the task before
- * returning -- so it outlives the task by construction, and so does the argv it
- * points at, which lives in espix_shell_exec()'s scratch buffer. Nothing else
- * touches that buffer until this returns.
+ * A command as a process of its own, so ^C, kill and ps reach it. In the
+ * foreground it runs against the session itself while the shell only waits, so
+ * a redirect, `sudo cd` and the creds sudo raises all apply; a job gets a copy,
+ * because the shell carries on.
  */
 typedef struct {
     espix_session_t *s;
     espix_cmd_fn     fn;
     int              argc;
     char           **argv;
-    uint32_t         stack;
-    int              status;
-    TaskHandle_t     caller;        /* notified when the command is done */
-    /*
-     * How this task's stack was allocated, so it is deleted the matching way:
-     * a WithCaps task deleted with vTaskDelete() leaks its stack (the idle task
-     * only frees what FreeRTOS allocated itself), while a plain task deleted
-     * with vTaskDeleteWithCaps() would be double-freed.
-     */
-    bool             caps;
-} cmd_task_ctx_t;
+    bool             owned;     /* a job's, in one allocation; freed at the end */
+} cmd_proc_t;
 
-static void cmd_task(void *arg)
+static int cmd_proc(void *arg)
 {
-    cmd_task_ctx_t *c = arg;
+    cmd_proc_t *const c = arg;
 
-    /*
-     * The session this command belongs to. Thread-local storage does not
-     * cross xTaskCreate, and everything that answers "who is asking" reads
-     * it: the filesystem permission check, the ownership rule,
-     * espix_shell_current() itself. Without this a command with a stack of
-     * its own was taken for espix itself -- permission checks were skipped,
-     * and a directory it created outside a home was left owned by root, so
-     * the user who made it could not write into it. `mkdir /tmp/x` then
-     * `echo hi > /tmp/x/f` was "Permission denied".
-     */
     espix_shell_set_current(c->s);
-
-    c->status = c->fn(c->s, c->argc, c->argv);
-
-    /* The task is about to be deleted; do not leave the pointer on a task
-     * that FreeRTOS may reuse. */
+    const int status = c->fn(c->s, c->argc, c->argv);
     espix_shell_set_current(NULL);
 
-    /*
-     * Reported before the task exits, because afterwards nothing can ask it: a
-     * deleted task takes its high-water mark with it, and this figure is where
-     * the size in the command table should come from. `used` is what the command
-     * actually needed, which is the number worth writing down.
-     */
-    const uint32_t free_min = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGD(TAG, "cmd: %s: %u of %u bytes used", c->argv[0],
-             (unsigned)(c->stack - free_min), (unsigned)c->stack);
-
-    xTaskNotifyGive(c->caller);
-
-    if (c->caps) {
-        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
-    } else {
-        vTaskDelete(NULL);
+    if (c->owned) {
+        free(c);
     }
+    return status;
 }
 
-static int run_on_own_task(espix_session_t *s, const espix_cmd_t *cmd,
-                           int argc, char **argv)
+/* Under the real session, whatever c->s is, so a hangup reaches it. */
+static esp_err_t cmd_spawn(espix_session_t *s, const espix_cmd_t *cmd,
+                           cmd_proc_t *c, espix_pid_t *pid)
 {
-    cmd_task_ctx_t ctx = {
-        .s      = s,
-        .fn     = cmd->fn,
-        .argc   = argc,
-        .argv   = argv,
-        .stack  = cmd->stack,
-        .status = 1,
-        .caller = xTaskGetCurrentTaskHandle(),
+    espix_shell_spawn_t sp = {
+        .name           = cmd->name,
+        .fn             = cmd_proc,
+        .arg            = c,
+        .stack          = (cmd->stack != 0) ? cmd->stack : ESPIX_CMD_STACK,
+        .internal_stack = cmd->internal_stack,
     };
+    return s_proc->spawn(s, &sp, pid);
+}
 
-    /* Named for the command, so `ps` says what is running. FreeRTOS truncates
-     * the name at configTASK_NAME_LEN. */
-    char name[24];
-    snprintf(name, sizeof(name), "cmd:%s", cmd->name);
+static int run_as_process(espix_session_t *s, const espix_cmd_t *cmd,
+                          int argc, char **argv)
+{
+    cmd_proc_t  c   = { .s = s, .fn = cmd->fn, .argc = argc, .argv = argv };
+    espix_pid_t pid = ESPIX_PID_NONE;
 
-    /* Anything already pending is somebody else's, and would let this return
-     * before the command has run. */
-    ulTaskNotifyTake(pdTRUE, 0);
-
-    /*
-     * The session's priority, so a command behaves the same either way. PSRAM
-     * first: a command that asks for its own stack is doing something long -- a
-     * big copy, an update -- not something realtime, and internal is the pool the
-     * audio codec needs. Internal stays the fallback.
-     *
-     * Unless the command maps flash: freezing the external-memory cache to
-     * rewrite the MMU makes PSRAM unaddressable, so the stack underneath it
-     * must be internal RAM. See cmd->internal_stack.
-     */
-    /* ctx.caps is set before each attempt; the fallback runs only after the
-     * caps attempt failed, so no task is alive to race the flag. */
-    ctx.caps = !cmd->internal_stack;
-    bool started = false;
-
-    if (ctx.caps) {
-        started = (xTaskCreateWithCaps(cmd_task, name, cmd->stack, &ctx,
-                                       uxTaskPriorityGet(NULL), NULL,
-                                       MALLOC_CAP_SPIRAM) == pdPASS);
-        if (!started) {
-            /* The fallback allocates internally, so there is nothing to free. */
-            ctx.caps = false;
-        }
-    }
-
-    if (!started &&
-        xTaskCreate(cmd_task, name, cmd->stack, &ctx, uxTaskPriorityGet(NULL),
-                    NULL) != pdPASS) {
-        espix_eprintf(s, "espix: %s: cannot start a task for it\n", cmd->name);
+    const esp_err_t err = cmd_spawn(s, cmd, &c, &pid);
+    if (err != ESP_OK) {
+        espix_eprintf(s, "espix: %s: cannot start: %s\n", cmd->name,
+                      esp_err_to_name(err));
         return 1;
     }
+    /* Returns only once the process has ended, so `c` outlives it. */
+    const int status = s_proc->wait(s, pid, cmd->tty);
+    return (status < 0) ? 1 : status;
+}
 
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    return ctx.status;
+void espix_shell_jobs_prune(espix_session_t *s)
+{
+    if (s == NULL) {
+        return;
+    }
+    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
+        const espix_pid_t pid = s->jobs[i].pid;
+        if (pid > 0 && (s_proc == NULL || !s_proc->alive(pid))) {
+            espix_shell_job_clear(s, i);
+        }
+    }
 }
 
 bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name)
@@ -706,28 +633,16 @@ bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name)
     if (s == NULL || pid <= 0) {
         return false;
     }
+    espix_shell_jobs_prune(s);
 
-    /* A builtin that has finished is the session's to forget at once; its
-     * task owns its own teardown, so the slot is free the moment the finished
-     * flag is set. A process job's slot needs espix_proc to judge, which this
-     * component may not ask, so the jobs command prunes those. */
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        if (s->jobs[i].task != NULL && s->jobs[i].finished) {
-            espix_shell_job_clear(s, i);
-        }
-    }
-
-    portENTER_CRITICAL(&s_job_lock);
     for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
         espix_job_t *j = &s->jobs[i];
-        if (j->pid <= 0 && j->task == NULL && !j->finished) {
+        if (j->pid <= 0) {
             j->pid = pid;
             strlcpy(j->name, (name != NULL) ? name : "?", ESPIX_JOB_NAME_MAX);
-            portEXIT_CRITICAL(&s_job_lock);
             return true;
         }
     }
-    portEXIT_CRITICAL(&s_job_lock);
     return false;
 }
 
@@ -736,205 +651,67 @@ void espix_shell_job_clear(espix_session_t *s, int slot)
     if (s == NULL || slot < 0 || slot >= ESPIX_SESSION_JOBS) {
         return;
     }
-    portENTER_CRITICAL(&s_job_lock);
     memset(&s->jobs[slot], 0, sizeof(s->jobs[slot]));
-    portEXIT_CRITICAL(&s_job_lock);
 }
 
 bool espix_shell_stopping(const espix_session_t *s)
 {
-    /* The job's flag, or -- for a command running as a process, a unit's
-     * daemon for one -- the process's own stop request. */
-    return (s != NULL && s->stop != NULL && *s->stop) || espix_shell_sigcheck();
+    (void)s;
+    return espix_shell_sigcheck();
 }
 
 /*
- * A background builtin: the command on a task of its own, against a *copy* of
- * the session, for the same reason a pipe stage has one -- the shell runs the
- * next command meanwhile, so the printf buffer, the redirects and the cwd have
- * to belong to one of the two. The argv is copied as well, because it points
- * into the shell scratch, which is reused the moment exec_one() returns.
- *
- * caps is remembered here and not read back from the job record at the end,
- * because by then the shell may have reclaimed the slot for another job.
+ * A background builtin: a process with a heap copy of the session -- the shell
+ * runs the next command meanwhile, so the printf buffer, the redirects and the
+ * cwd have to belong to one of the two -- and of its argv, which points into
+ * the shell scratch. Returns the status exec_one() reports.
  */
-typedef struct {
-    espix_job_t     *job;       /* this job record, for the handshake */
-    espix_cmd_fn     fn;
-    espix_session_t  s;         /* the job own session copy */
-    int              argc;
-    char           **argv;      /* argc + 1 pointers into block */
-    char            *block;     /* the argv strings, in one allocation */
-    bool             caps;      /* how the stack was allocated */
-} bg_ctx_t;
-
-static void bg_task(void *arg)
-{
-    bg_ctx_t *c = arg;
-
-    espix_shell_set_current(&c->s);
-    (void)c->fn(&c->s, c->argc, c->argv);
-    espix_shell_set_current(NULL);
-
-    /*
-     * The teardown handshake. The drain may be doing this exact thing at this
-     * moment, so the completion state and the claim are written together in
-     * one critical section: whoever finds owner == 0 owns the context *and*
-     * the deletion. That is what keeps a task that finished on its own from
-     * being deleted twice, or its context freed twice.
-     */
-    portENTER_CRITICAL(&s_job_lock);
-    c->job->finished = true;
-    const bool mine = (c->job->owner == 0);
-    if (mine) {
-        c->job->owner = 1;
-    }
-    portEXIT_CRITICAL(&s_job_lock);
-
-    /* Tell the session's drain this one is gone. Before the suspend below, so a
-     * drain already waiting is woken even when it owns the deletion. */
-    if (c->s.jobs_done != NULL) {
-        (void)xSemaphoreGive((SemaphoreHandle_t)c->s.jobs_done);
-    }
-
-    if (!mine) {
-        /* The drain owns this and will delete the task. All this one may do is
-         * stop touching memory that is about to be freed. Never returns. */
-        vTaskSuspend(NULL);
-    }
-
-    const bool caps = c->caps;
-    free(c->argv);
-    free(c->block);
-    free(c);
-
-    if (caps) {
-        vTaskDeleteWithCaps(NULL);      /* frees the PSRAM stack it was given */
-    } else {
-        vTaskDelete(NULL);
-    }
-}
-
-/* Start a builtin as a background job. Returns the status exec_one() reports:
- * 0 when it started, 1 when it did not. */
 static int start_background_job(espix_session_t *s, const espix_cmd_t *cmd,
                                 int argc, char **argv)
 {
-    espix_job_t *j = NULL;
-
-    /* Reclaim a finished builtin's slot first, so four quick background lines
-     * do not fill the table with jobs that are already over. */
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        if (s->jobs[i].task != NULL && s->jobs[i].finished) {
-            espix_shell_job_clear(s, i);
-        }
-    }
-
-    portENTER_CRITICAL(&s_job_lock);
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        if (s->jobs[i].pid <= 0 && s->jobs[i].task == NULL &&
-            !s->jobs[i].finished) {
-            j = &s->jobs[i];
-            break;
-        }
-    }
-    portEXIT_CRITICAL(&s_job_lock);
-
-    if (j == NULL) {
-        espix_eprintf(s, "espix: too many background jobs\n");
-        return 1;
-    }
-
-    /* Before the context copies the session below, so the job's own copy
-     * carries the handle. Counting: every job gives once. */
-    if (s->jobs_done == NULL) {
-        s->jobs_done = (void *)xSemaphoreCreateCounting(ESPIX_SESSION_JOBS, 0);
-        if (s->jobs_done == NULL) {
-            espix_eprintf(s, "espix: %s: no memory for a job\n", argv[0]);
-            return 1;
-        }
-    }
-
     size_t bytes = 0;
     for (int i = 0; i < argc; i++) {
         bytes += strlen(argv[i]) + 1;
     }
 
-    bg_ctx_t *c = calloc(1, sizeof(*c));
-    if (c != NULL) {
-        c->argv  = calloc((size_t)argc + 1, sizeof(*c->argv));
-        c->block = malloc(bytes);
-    }
-    if (c == NULL || c->argv == NULL || c->block == NULL) {
-        if (c != NULL) {
-            free(c->argv);
-            free(c->block);
-            free(c);
-        }
+    /* cmd_proc_t, the session copy, the argv pointers, the strings. */
+    cmd_proc_t *c = malloc(sizeof(*c) + sizeof(espix_session_t) +
+                           ((size_t)argc + 1) * sizeof(char *) + bytes);
+    if (c == NULL) {
         espix_eprintf(s, "espix: %s: no memory for a job\n", argv[0]);
         return 1;
     }
+    espix_session_t *const copy = (espix_session_t *)(c + 1);
+    char **const           av   = (char **)(copy + 1);
+    char                  *w    = (char *)(av + argc + 1);
 
-    char *w = c->block;
+    *copy = *s;
+    copy->background = false;           /* a job now, not a & line */
     for (int i = 0; i < argc; i++) {
         const size_t n = strlen(argv[i]) + 1;
         memcpy(w, argv[i], n);
-        c->argv[i] = w;
+        av[i] = w;
         w += n;
     }
-    c->argv[argc] = NULL;
+    av[argc] = NULL;
 
-    c->fn   = cmd->fn;
-    c->argc = argc;
-    c->s    = *s;
-    c->s.stop       = &j->stop;
-    c->s.background = false;        /* it is a job now, not a & line */
-    c->job  = j;
+    *c = (cmd_proc_t){ .s = copy, .fn = cmd->fn, .argc = argc, .argv = av,
+                       .owned = true };
 
-    const uint32_t stack = (cmd->stack != 0) ? cmd->stack : JOB_STACK_DEFAULT;
-    char name[24];
-    snprintf(name, sizeof(name), "sh:%s", cmd->name);
-
-    /* The record is filled before the task exists, so the task can finish
-     * immediately without racing the shell for its own bookkeeping. */
-    j->pid      = 0;
-    j->ctx      = c;
-    j->caps     = c->caps = true;
-    j->stop     = false;
-    j->finished = false;
-    j->owner    = 0;
-    strlcpy(j->name, argv[0], sizeof(j->name));
-
-    /*
-     * PSRAM first, for the same reason run_on_own_task() prefers it, with the
-     * internal fallback. A command that maps flash must not run on a PSRAM
-     * stack at all -- see espix_cmd_t.internal_stack -- so it skips the first
-     * attempt rather than risking the cache freeze on the fallback.
-     */
-    TaskHandle_t task = NULL;
-    j->caps = c->caps = !cmd->internal_stack;
-    if (!j->caps ||
-        xTaskCreateWithCaps(bg_task, name, stack, c, uxTaskPriorityGet(NULL),
-                            &task, MALLOC_CAP_SPIRAM) != pdPASS) {
-        j->caps = c->caps = false;
-        if (xTaskCreate(bg_task, name, stack, c, uxTaskPriorityGet(NULL),
-                        &task) != pdPASS) {
-            espix_eprintf(s, "espix: %s: cannot start a task for it\n", argv[0]);
-            j->ctx = NULL;
-            free(c->argv);
-            free(c->block);
-            free(c);
-            return 1;
-        }
+    espix_pid_t     pid = ESPIX_PID_NONE;
+    const esp_err_t err = cmd_spawn(s, cmd, c, &pid);
+    if (err != ESP_OK) {
+        free(c);
+        espix_eprintf(s, "espix: %s: cannot start: %s\n", argv[0],
+                      esp_err_to_name(err));
+        return 1;
     }
-    j->task = task;
 
-    /*
-     * The number sh prints for a job, and the command as typed. There is no pid
-     * to print -- a builtin is not a process -- so the slot number is the whole
-     * handle fg and bg would take.
-     */
-    espix_printf(s, "[%d] %s\n", (int)(j - s->jobs) + 1, argv[0]);
+    espix_printf(s, "[%d] %s\n", (int)pid, argv[0]);
+    if (!espix_shell_job_add(s, pid, argv[0])) {
+        espix_eprintf(s, "espix: %d: no job slot; it runs untracked\n",
+                      (int)pid);
+    }
     return 0;
 }
 
@@ -947,111 +724,6 @@ int espix_shell_take_key(espix_session_t *s)
     const int key = s->last_key;
     s->last_key = 0;
     return key;
-}
-
-void espix_shell_jobs_drain(espix_session_t *s)
-{
-    if (s == NULL) {
-        return;
-    }
-
-    /* The cooperative request: set every stop flag first, so all of them have
-     * the whole grace to notice. */
-    bool any = false;
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        espix_job_t *j = &s->jobs[i];
-        if (j->task != NULL && !j->finished) {
-            j->stop = true;
-            any = true;
-        }
-    }
-    if (!any) {
-        return;
-    }
-
-    /*
-     * A bounded wait, not an open one: a job that checks the flag leaves in an
-     * iteration, and one that never will must not hold the session open.
-     */
-    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(JOB_STOP_MS);
-
-    for (;;) {
-        int left_jobs = 0;
-        for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-            if (s->jobs[i].task != NULL && !s->jobs[i].finished) {
-                left_jobs++;
-            }
-        }
-        if (left_jobs == 0) {
-            break;
-        }
-
-        const TickType_t left = (int32_t)(deadline - xTaskGetTickCount());
-        if ((int32_t)left <= 0) {
-            break;
-        }
-
-        /* Re-counts after every wake, so a token from a job that finished
-         * earlier only costs one extra pass. */
-        SemaphoreHandle_t done = (SemaphoreHandle_t)s->jobs_done;
-        if (done == NULL) {
-            vTaskDelay(pdMS_TO_TICKS(10));      /* creation failed; coarse */
-            break;
-        }
-        if (xSemaphoreTake(done, left) != pdTRUE) {
-            break;
-        }
-    }
-
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        espix_job_t *j = &s->jobs[i];
-        if (j->task == NULL) {
-            continue;
-        }
-
-        portENTER_CRITICAL(&s_job_lock);
-        const bool mine = (!j->finished && j->owner == 0);
-        if (mine) {
-            j->owner = 2;
-        }
-        portEXIT_CRITICAL(&s_job_lock);
-
-        if (mine) {
-            /*
-             * It never looked at the flag. Deleting it here is R-P7.9 hazard
-             * taken deliberately, and this is the only place in espix that
-             * takes it -- a task deleted mid-write may hold a lock that is then
-             * orphaned. The alternative is letting it run on through a session
-             * and a transport that are about to be freed.
-             */
-            TaskHandle_t task = (TaskHandle_t)j->task;
-            bg_ctx_t    *c    = j->ctx;
-            const bool   caps = j->caps;
-
-            if (caps) {
-                vTaskDeleteWithCaps(task);
-            } else {
-                vTaskDelete(task);
-            }
-            if (c != NULL) {
-                free(c->argv);
-                free(c->block);
-                free(c);
-            }
-        }
-        /* When the task got there first it owns its own teardown; either way
-         * the record is the session and goes with it. */
-        portENTER_CRITICAL(&s_job_lock);
-        memset(j, 0, sizeof(*j));
-        portEXIT_CRITICAL(&s_job_lock);
-    }
-
-    /* The session is ending; the token semaphore goes with it. A second drain
-     * finds no jobs and no semaphore. */
-    if (s->jobs_done != NULL) {
-        vSemaphoreDelete((SemaphoreHandle_t)s->jobs_done);
-        s->jobs_done = NULL;
-    }
 }
 
 /*
@@ -1238,11 +910,16 @@ static int exec_one(espix_session_t *s, const char *line)
      * through to PATH. */
     int status;
 
+    /* Dispatched by the shell itself, so a command here becomes a process;
+     * anywhere else -- a pipe stage, a job, sudo -- the caller already is one. */
+    const bool on_shell = s_proc != NULL && s->shell_task != NULL &&
+                          s->shell_task == (void *)xTaskGetCurrentTaskHandle();
+
     if (cmd == NULL) {
         status = s_exec_fallback(s, argc, av);
-    } else if (s->background && !cmd->backgrounds) {
+    } else if (s->background && !cmd->backgrounds && s_proc != NULL) {
         /*
-         * A builtin on a job task of its own (R-P2.8). confine is the
+         * A builtin as a background process (R-P2.8). confine is the
          * exception: it spawns a program, and a program is a process with a
          * pid, so it backgrounds itself through the flag.
          *
@@ -1257,12 +934,10 @@ static int exec_one(espix_session_t *s, const char *line)
         } else {
             status = start_background_job(s, cmd, argc, av);
         }
-    } else if (cmd->stack == 0) {
-        /* Declared to fit on the session's own task, which is sized for the
-         * protocol plus exactly the commands that declare zero. */
+    } else if (cmd->shell || !on_shell) {
         status = cmd->fn(s, argc, av);
     } else {
-        status = run_on_own_task(s, cmd, argc, av);
+        status = run_as_process(s, cmd, argc, av);
     }
 
     /*
@@ -1316,7 +991,6 @@ static bool blank_segment(const char *p)
 
 #define PIPE_BUF_BYTES   1024
 #define PIPE_MAX_STAGES  4
-#define PIPE_STAGE_STACK 6144
 
 /*
  * One pipe: a StreamBuffer with a FILE on each end, so a builtin's ordinary
@@ -1380,47 +1054,37 @@ static int pipe_read(void *cookie, char *buf, int len)
     }
 }
 
-/* A producer stage. The session is a *copy*: its printf buffer and its
- * redirects have to be its own, because the consumer is running on the session
- * task at the same time. */
+/* A stage's process. Its session is a copy: the stages run at once, so each
+ * needs its own printf buffer and redirects. */
 typedef struct {
-    espix_session_t   s;
-    const char       *line;     /* into the caller's buffer, alive to the end */
-    FILE             *out;      /* this stage's end, closed from the task */
-    pipe_t           *pipe;
-    pipe_t           *in_pipe;  /* the pipe it reads, or NULL for the first */
-    TaskHandle_t      task;
-    SemaphoreHandle_t done;
+    espix_session_t s;
+    const char     *line;       /* into the caller's buffer, alive to the end */
+    pipe_t         *out;        /* the pipe it writes, or NULL for the last */
+    pipe_t         *in;         /* the pipe it reads, or NULL for the first */
 } pipe_stage_t;
 
-static void pipe_stage_task(void *arg)
+static int pipe_stage(void *arg)
 {
     pipe_stage_t *st = arg;
 
     espix_shell_set_current(&st->s);
-    (void)exec_one(&st->s, st->line);
+    const int status = exec_one(&st->s, st->line);
 
-    /* This stage read the pipe before it; that pipe's writer must not wait on
-     * a reader that is gone. */
-    if (st->in_pipe != NULL) {
-        st->in_pipe->rd_closed = true;
+    /* The writer before this stage must not wait on a reader that is gone. */
+    if (st->in != NULL) {
+        st->in->rd_closed = true;
     }
-
-    /*
-     * Flush and close the write end here, so the reader sees EOF as soon as
-     * this stage has nothing more to say. Closing it from the caller would
-     * deadlock: the caller is the reader.
-     */
+    /* Closed here, so the next stage sees EOF as soon as this one is done. */
     if (st->out != NULL) {
-        fflush(st->out);
-        fclose(st->out);
-        st->s.redirect      = NULL;
-        st->pipe->wr_closed = true;
+        fflush(st->out->wr);
+        fclose(st->out->wr);
+        st->out->wr        = NULL;
+        st->s.redirect     = NULL;
+        st->out->wr_closed = true;
     }
 
     espix_shell_set_current(NULL);
-    xSemaphoreGive(st->done);
-    vTaskDeleteWithCaps(NULL);
+    return status;
 }
 
 /* Does this stage end with an & token? A pipeline cannot background a stage:
@@ -1451,11 +1115,9 @@ static void first_token(const char *line, char *out, size_t len)
 }
 
 /*
- * A pipeline: `a | b | c`. Every stage but the last runs on a task of its own
- * with a copy of the session, feeding the next through a pipe; the last runs
- * here, on the session task, and the shell waits for the rest before returning.
- * That is why these tasks need none of the ownership rule a background `&`
- * would: nothing outlives the line.
+ * A pipeline: `a | b | c`. Every stage is a process in one group, feeding the
+ * next through a pipe, and the shell waits for them all -- so ^C reaches every
+ * stage, and nothing outlives the line.
  *
  * A program stage is refused rather than run. An app's stdout is its session
  * stream, and pointing that at a pipe needs the descriptor plumbing R-P2.8
@@ -1507,10 +1169,17 @@ static int run_pipeline(espix_session_t *s, char *line)
         }
     }
 
+    if (s_proc == NULL) {
+        espix_eprintf(s, "espix: pipes need the process table\n");
+        return 2;
+    }
+
+    const espix_cmd_t *cmds[PIPE_MAX_STAGES];
     for (int i = 0; i < n; i++) {
         char word[32];
         first_token(stage[i], word, sizeof(word));
-        if (word[0] != '\0' && espix_shell_find(word) == NULL) {
+        cmds[i] = espix_shell_find(word);
+        if (word[0] != '\0' && cmds[i] == NULL) {
             espix_eprintf(s, "espix: %s: pipes are for builtins for now\n", word);
             return 2;
         }
@@ -1539,71 +1208,70 @@ static int run_pipeline(espix_session_t *s, char *line)
         setvbuf(pipes[i].wr, NULL, _IOLBF, 128);
     }
 
-    pipe_stage_t *st[PIPE_MAX_STAGES - 1];
-    memset(st, 0, sizeof(st));
+    pipe_stage_t *st = calloc((size_t)n, sizeof(*st));
+    espix_pid_t   pids[PIPE_MAX_STAGES] = { 0 };
+    espix_pid_t   pgid    = 0;
+    int           started = 0;
 
-    int started = 0;
-    int status  = 2;
+    for (int i = 0; st != NULL && i < n; i++) {
+        const bool last = (i == n - 1);
 
-    for (int i = 0; i < n - 1; i++) {
-        st[i] = calloc(1, sizeof(*st[i]));
-        if (st[i] == NULL) {
+        st[i].s             = *s;
+        st[i].s.redirect    = last ? s->redirect : pipes[i].wr;
+        st[i].s.redirect_in = (i > 0) ? pipes[i - 1].rd : s->redirect_in;
+        st[i].s.err_to_out  = last && s->err_to_out;
+        st[i].line          = stage[i];
+        st[i].out           = last ? NULL : &pipes[i];
+        st[i].in            = (i > 0) ? &pipes[i - 1] : NULL;
+
+        /* Room for exec_one()'s own frames on top of the command's. */
+        const espix_cmd_t *cmd   = cmds[i];
+        uint32_t           stack = ESPIX_CMD_STACK;
+        if (cmd != NULL && cmd->stack + 4096 > stack) {
+            stack = cmd->stack + 4096;
+        }
+        espix_shell_spawn_t sp = {
+            .name           = (cmd != NULL) ? cmd->name : "sh",
+            .fn             = pipe_stage,
+            .arg            = &st[i],
+            .stack          = stack,
+            .internal_stack = cmd != NULL && cmd->internal_stack,
+            .pgid           = pgid,
+        };
+        if (s_proc->spawn(s, &sp, &pids[i]) != ESP_OK) {
             break;
         }
-        st[i]->done = xSemaphoreCreateBinary();
-        st[i]->s             = *s;
-        st[i]->s.redirect    = pipes[i].wr;
-        st[i]->s.redirect_in = (i > 0) ? pipes[i - 1].rd : s->redirect_in;
-        st[i]->s.err_to_out  = false;
-        st[i]->line          = stage[i];
-        st[i]->out           = pipes[i].wr;
-        st[i]->pipe          = &pipes[i];
-        st[i]->in_pipe       = (i > 0) ? &pipes[i - 1] : NULL;
-
-        if (st[i]->done == NULL ||
-            xTaskCreateWithCaps(pipe_stage_task, "sh:pipe", PIPE_STAGE_STACK,
-                                st[i], uxTaskPriorityGet(NULL), &st[i]->task,
-                                MALLOC_CAP_SPIRAM) != pdPASS) {
-            if (st[i]->done != NULL) {
-                vSemaphoreDelete(st[i]->done);
-                st[i]->done = NULL;
-            }
-            break;
-        }
+        pgid = sp.pgid;
         started++;
     }
 
-    if (started == n - 1) {
-        FILE *const saved = s->redirect_in;
-        s->redirect_in = pipes[n - 2].rd;
-        status = exec_one(s, stage[n - 1]);
-        s->redirect_in = saved;
-        pipes[n - 2].rd_closed = true;
-    } else {
-        /* Out of memory for a task or a semaphore. The producers already
-         * started are blocked on pipes nothing will drain, so deleting them is
-         * the only way out -- and the only time it happens is here. */
+    if (started < n) {
+        /* Let the stages already running out of pipes nothing will drain. */
         espix_eprintf(s, "espix: cannot start a pipe stage\n");
-        for (int i = 0; i < started; i++) {
-            vTaskDeleteWithCaps(st[i]->task);
-            st[i]->task = NULL;
+        for (int i = 0; i < n - 1; i++) {
+            pipes[i].rd_closed = true;
+            pipes[i].wr_closed = true;
         }
-        for (int i = 0; i < started; i++) {
-            if (pipes[i].wr != NULL) { fclose(pipes[i].wr); pipes[i].wr = NULL; }
+    }
+
+    /* The last stage's status is the line's; the rest are waited for so none
+     * outlives its pipes. */
+    int status = 2;
+    for (int i = n - 1; i >= 0; i--) {
+        if (pids[i] > 0) {
+            const int st_status = s_proc->wait(s, pids[i], false);
+            if (i == n - 1) {
+                status = (st_status < 0) ? 1 : st_status;
+            }
         }
     }
 
     for (int i = 0; i < n - 1; i++) {
-        if (st[i] != NULL) {
-            if (st[i]->done != NULL) {
-                xSemaphoreTake(st[i]->done, portMAX_DELAY);
-                vSemaphoreDelete(st[i]->done);
-            }
-            free(st[i]);
-        }
+        if (pipes[i].wr != NULL) { fclose(pipes[i].wr); }
         if (pipes[i].rd != NULL) { fclose(pipes[i].rd); }
         if (pipes[i].sb != NULL) { vStreamBufferDelete(pipes[i].sb); }
     }
+    free(st);
 
     return status;
 }
@@ -1759,8 +1427,6 @@ int espix_shell_run_line(espix_session_t *s, const char *line)
     return s->last_status;
 }
 
-static const espix_shell_proc_ops_t *s_proc;
-
 void espix_shell_set_proc_ops(const espix_shell_proc_ops_t *ops)
 {
     s_proc = ops;
@@ -1780,11 +1446,15 @@ void espix_shell_session_begin(espix_session_t *s)
 {
     if (s_proc != NULL) {
         s_proc->begin(s);
+        if (s->pid != ESPIX_PID_NONE) {
+            s->shell_task = (void *)xTaskGetCurrentTaskHandle();
+        }
     }
 }
 
 size_t espix_shell_session_end(espix_session_t *s)
 {
+    s->shell_task = NULL;
     const size_t orphans = (s_proc != NULL) ? s_proc->end(s) : 0;
     if (orphans > 0) {
         espix_klog(ESPIX_KLOG_INFO, TAG, "%s: killed %u process%s on exit",
@@ -1835,12 +1505,6 @@ void espix_shell_session_run(espix_session_t *s)
      * started with & still gets SIGHUP when the terminal closes. An escape
      * hatch is a feature nobody has asked for yet.
      */
-    /*
-     * Background builtins first: they write through this session, so they have
-     * to be gone before the transport that carries their bytes is. The
-     * processes follow, in the end hook below.
-     */
-    espix_shell_jobs_drain(s);
     (void)espix_shell_session_end(s);
 
     espix_shell_set_current(NULL);

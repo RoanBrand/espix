@@ -36,6 +36,7 @@ typedef struct {
     espix_session_t *s;
     const char      *want;      /* NULL = list everything */
     bool             found;
+    bool             shell;     /* listing: the shell builtins, or the rest */
 } help_ctx_t;
 
 static bool help_visit(void *ctx, const espix_cmd_t *cmd)
@@ -52,7 +53,9 @@ static bool help_visit(void *ctx, const espix_cmd_t *cmd)
         return false;
     }
 
-    espix_printf(h->s, "  %-8s %s\n", cmd->name, cmd->help ? cmd->help : "");
+    if (cmd->shell == h->shell) {
+        espix_printf(h->s, "  %-8s %s\n", cmd->name, cmd->help ? cmd->help : "");
+    }
     return true;
 }
 
@@ -63,6 +66,13 @@ static int cmd_help(espix_session_t *s, int argc, char **argv)
         .want = (argc > 1) ? argv[1] : NULL,
     };
 
+    if (ctx.want == NULL) {
+        espix_printf(s, "shell builtins:\n");
+        ctx.shell = true;
+        espix_shell_foreach(help_visit, &ctx);
+        espix_printf(s, "commands, each a process of its own:\n");
+        ctx.shell = false;
+    }
     espix_shell_foreach(help_visit, &ctx);
 
     if (ctx.want != NULL && !ctx.found) {
@@ -704,7 +714,7 @@ static int cmd_ps(espix_session_t *s, int argc, char **argv)
  */
 
 #define TOP_INTERVAL_MS 1000
-#define TOP_SLICE_MS      50    /* how often Ctrl-C is checked between frames */
+#define TOP_SLICE_MS      50    /* how often q is checked between frames */
 #define TOP_ROWS_MAX      24    /* tasks listed; a terminal has only so many */
 
 typedef struct {
@@ -1097,24 +1107,17 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
             break;
         }
 
-        /*
-         * Sleep in slices so Ctrl-C is felt straight away rather than a whole
-         * frame later. poll_interrupt() consumes what is waiting either way,
-         * which is what stops keystrokes typed at top arriving at the next
-         * prompt.
-         */
+        /* ^C ends the sleep at once; q, the key top reads (R-P7.7), is
+         * checked each slice. */
         for (unsigned waited = 0; waited < TOP_INTERVAL_MS; waited += TOP_SLICE_MS) {
-            if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
+            if (espix_proc_sleep(TOP_SLICE_MS)) {
                 interrupted = true;
                 break;
             }
-            /* Ctrl-C ends it from the transport's side; q is the key the
-             * command itself reads (R-P7.7). */
             if (espix_shell_take_key(s) == 'q') {
                 interrupted = true;
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(TOP_SLICE_MS));
         }
     }
 
@@ -1271,10 +1274,7 @@ static int dmesg_follow(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
     uint32_t           lost = 0;
 
     for (;;) {
-        if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
-            break;
-        }
-        if (espix_shell_take_key(s) == 'q') {
+        if (espix_shell_stopping(s) || espix_shell_take_key(s) == 'q') {
             break;
         }
 
@@ -1289,13 +1289,11 @@ static int dmesg_follow(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
         }
 
         if (n == 0) {
-            /* In slices, so Ctrl-C is felt at once rather than up to 200 ms
-             * later. */
+            /* In slices, for q; ^C ends a slice at once. */
             for (unsigned waited = 0; waited < 200; waited += 50) {
-                if (s->poll_interrupt != NULL && s->poll_interrupt(s)) {
+                if (espix_proc_sleep(50)) {
                     return 0;
                 }
-                vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
     }
@@ -2051,7 +2049,7 @@ static int cmd_logout(espix_session_t *s, int argc, char **argv)
 /* ------------------------------------------------------------------ */
 
 static espix_cmd_t s_sys_cmds[] = {
-    { .name = "help",   .fn = cmd_help,
+    { .name = "help",   .fn = cmd_help, .shell = true,
       .help = "list commands, or describe one", .usage = "help [command]" },
     { .name = "uname",  .fn = cmd_uname,
       .help = "print system information",       .usage = "uname [-a]" },
@@ -2115,18 +2113,15 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "groups [user]" },
     { .name = "sudo",   .fn = cmd_sudo,
       .help = "run a command as root, or as another user",
-      .usage = "sudo [-u <user>] <command> [args...]",
-      /* Re-enters the dispatcher, so the command it runs gets a stack of its
-       * own instead of two frames sharing the session's. */
-      .stack = 8192 },
-    { .name = "echo",   .fn = cmd_echo,
+      .usage = "sudo [-u <user>] <command> [args...]" },
+    { .name = "echo",   .fn = cmd_echo, .shell = true,
       .help = "print arguments",                .usage = "echo [text]..." },
     { .name = "clear",  .fn = cmd_clear,
       .help = "clear the screen",               .usage = "clear" },
-    { .name = "exit",   .fn = cmd_exit,
+    { .name = "exit",   .fn = cmd_exit, .shell = true,
       .help = "end this session",
       .usage = "exit [status]" },
-    { .name = "logout", .fn = cmd_logout,
+    { .name = "logout", .fn = cmd_logout, .shell = true,
       .help = "end this session (login shells only)",
       .usage = "logout" },
     { .name = "reboot", .fn = cmd_reboot,

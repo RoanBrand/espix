@@ -71,8 +71,9 @@ fact that most corruption never reaches the fault handler at all.
 ### Tasks are not processes
 
 FreeRTOS tasks are what the scheduler runs. espix adds a process table on top:
-a session's shell is a process, and an app it starts is its child, a job of its
-own (a process group, which is what Ctrl-C reaches) in the shell's session. An
+a session's shell is a process, and an app or command it starts is its child, a
+job of its own (a process group, which is what Ctrl-C reaches) in the shell's
+session; only the shell builtins (`cd`, `fg`, `echo`...) run on its task. An
 app is entered directly — `espix_proc` calls the ELF entry itself, which also keeps the
 return value the loader's request wrapper discards.
 

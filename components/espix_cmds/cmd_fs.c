@@ -572,8 +572,7 @@ static int cmd_cat(espix_session_t *s, int argc, char **argv)
 {
     /*
      * No operand means standard input, which for a builtin is the shell's `<`
-     * target and nothing else: it runs on the session task, not as a process,
-     * so there is no descriptor to inherit. See R-P2.4.
+     * target and nothing else: it has no stdin stream of its own. See R-P2.4.
      */
     if (argc < 2) {
         FILE *in = s->redirect_in;
@@ -1457,9 +1456,9 @@ static int cmd_chown(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_fs_cmds[] = {
-    { .name = "pwd",   .fn = cmd_pwd,
+    { .name = "pwd",   .fn = cmd_pwd, .shell = true,
       .help = "print the working directory",     .usage = "pwd" },
-    { .name = "cd",    .fn = cmd_cd,
+    { .name = "cd",    .fn = cmd_cd, .shell = true,
       .help = "change the working directory",    .usage = "cd [dir]" },
     { .name = "ls",    .fn = cmd_ls,
       .help = "list directory contents",         .usage = "ls [-1adhiltr] [path]",

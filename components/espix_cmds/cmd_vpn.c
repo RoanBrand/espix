@@ -565,7 +565,7 @@ static int cmd_vpn(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_vpn_cmds[] = {
-    { .name = "vpn", .fn = cmd_vpn,
+    { .name = "vpn", .fn = cmd_vpn, .tty = true,
       .help = "the WireGuard server",
       .usage = "vpn [setup|up|down|status|list|remove <name>|add <name> [access]|qr <name>|endpoint [host]|dns [public|router|list]]" },
 };

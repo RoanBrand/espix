@@ -31,45 +31,14 @@
 
 #include "espix_kernel.h"
 
-/*
- * Background jobs one session remembers, for `jobs`, `fg` and `bg`.
- *
- * Two kinds of job share one record. A *process* job is a loaded app: it has a
- * pid, it can be signalled, and `fg`/`bg` resume it with SIGCONT. A *builtin*
- * job is a task of the shell's own. espix can delete a task but not stop and
- * resume one, so it has no pid and nothing for `fg`/`bg` to act on -- what it
- * has instead is a stop flag its blocking loops poll, and one owner for its
- * teardown. See espix_shell_stopping() and espix_shell_jobs_drain().
- */
+/* Background jobs one session remembers, for `jobs`, `fg` and `bg`. An app and
+ * a builtin are both processes, so a job is a pid either way. */
 #define ESPIX_SESSION_JOBS  4
 #define ESPIX_JOB_NAME_MAX 24
 
 typedef struct espix_job {
-    espix_pid_t   pid;          /* >0 for a process job, 0 for a builtin task */
-
-    /*
-     * The builtin task and its context. `task` is a TaskHandle_t, typed void *
-     * because this header stays FreeRTOS-free; `ctx` is heap memory holding
-     * the task's session copy and its argv. `caps` remembers which allocator
-     * the stack came from, so it is deleted the matching way.
-     */
-    void         *task;
-    void         *ctx;
-    bool          caps;
-
-    /* Set to ask the task to return. espix_shell_stopping() reads it. */
-    volatile bool stop;
-
-    /*
-     * The teardown handshake. `finished` says the task has reached its end;
-     * `owner` says who frees the context and deletes the task -- 0 while
-     * nobody has claimed it, 1 when the task claimed it, 2 when the drain did.
-     * One critical section decides, so exactly one of them ever acts.
-     */
-    volatile bool finished;
-    volatile int  owner;
-
-    char          name[ESPIX_JOB_NAME_MAX];
+    espix_pid_t pid;            /* 0: a free slot */
+    char        name[ESPIX_JOB_NAME_MAX];
 } espix_job_t;
 
 #ifdef __cplusplus
@@ -277,29 +246,14 @@ struct espix_session {
     espix_pid_t fg_pgid;                   /* foreground job's group, or NONE */
     espix_pid_t pid;                       /* the shell's own process, for $$ */
 
-    /*
-     * Background jobs, in the order `&` started them, with the name the shell
-     * showed. A slot is free when both pid and task are clear, so a session
-     * that never backgrounds anything needs no initialisation. See
-     * espix_shell_job_add().
-     */
+    /* The task the shell runs on (a TaskHandle_t), while it is a process. A
+     * command dispatched there becomes a process; anywhere else -- a pipe
+     * stage, a job, sudo -- it runs on the caller's own task. */
+    void       *shell_task;
+
+    /* Background jobs, in the order `&` started them. See
+     * espix_shell_job_add(). */
     espix_job_t jobs[ESPIX_SESSION_JOBS];
-
-    /*
-     * One token per job that leaves, so espix_shell_jobs_drain() blocks on an
-     * event instead of re-reading the table every 10 ms (R-P7.1). Typed void *
-     * to keep this header FreeRTOS-free; created when the first job starts and
-     * deleted with the session.
-     */
-    void       *jobs_done;
-
-    /*
-     * Non-NULL only in a background builtin's session copy, where it points at
-     * that job's stop flag. The loops that can block poll it; NULL everywhere
-     * else, which is what makes espix_shell_stopping() false in an ordinary
-     * session and leaves poll_interrupt the only way to cut a command short.
-     */
-    const volatile bool *stop;
 
     /*
      * The last key a transport saw while polling, or 0.
@@ -352,9 +306,8 @@ struct espix_session {
 
     /*
      * Set for the duration of one command when its input was redirected with
-     * `<`, and NULL otherwise. A builtin that reads input takes it from here:
-     * it runs on the session task, not as a process, so there is no other
-     * standard input for it. See R-P2.4.
+     * `<`, and NULL otherwise. A builtin that reads input takes it from here;
+     * it has no stdin stream of its own. See R-P2.4.
      */
     FILE       *redirect_in;
 
@@ -366,8 +319,8 @@ struct espix_session {
      * can print at once and each needs its own.
      *
      * Within a session it is not reentrant, which is fine: a command runs to
-     * completion before the next begins, and one that waits for another -- `sudo`
-     * -- is on its own stack by then.
+     * completion before the next begins, and the shell does not print through
+     * it while it waits. A pipe stage or a job has a session copy of its own.
      */
     char        printf_buf[ESPIX_LINE_MAX];
 };
@@ -385,21 +338,9 @@ typedef struct espix_cmd {
     espix_cmd_fn     fn;
 
     /*
-     * The task stack this command needs, in bytes, or 0 to run on the session's
-     * own task.
-     *
-     * A command's stack cost is part of its contract. The session task is sized
-     * for the protocol plus the commands that declare 0 here, and anything that
-     * declares a size runs on a task of its own -- sized for it, freed when it
-     * exits, and never charged to every open connection. `sudo` declares one
-     * because it re-enters the dispatcher, so the command it runs gets a stack
-     * of its own instead of paying for two frames on one.
-     *
-     * A command that declares too little is caught by the stack canary, which is
-     * how `mount` was caught using 9556 bytes of a 10240-byte session stack.
-     * `ps` reports a running task's high-water mark, and the dispatcher logs the
-     * same figure when a spawned command finishes, so the numbers here are
-     * measured rather than believed.
+     * The process stack this command needs, in bytes, or 0 for the default
+     * (ESPIX_CMD_STACK). Measured, not believed: `ps` reports a running task's
+     * high-water mark. Ignored for a `shell` command.
      */
     uint32_t         stack;
 
@@ -422,11 +363,23 @@ typedef struct espix_cmd {
      *
      * True only for a command that *spawns*: `confine` turns a program into a
      * process and gives it a pid, so it does its own backgrounding. Every
-     * other builtin is now run on a job task by the shell when `&` is present
-     * (R-P2.8), so this flag is no longer a refusal -- without it a spawner
-     * would be quietly forked a second time.
+     * other builtin becomes a background process when `&` is present (R-P2.8);
+     * without this a spawner would be quietly forked a second time.
      */
     bool             backgrounds;
+
+    /*
+     * Runs in the shell, on its own task, rather than as a process: it changes
+     * the shell (cd, export, exit), drives its jobs (fg, timeout), or is too
+     * small to be worth a process (echo, true). Must fit the session's stack.
+     */
+    bool             shell;
+
+    /*
+     * Reads the terminal itself -- a y/N prompt. The shell leaves the terminal
+     * to it while it runs, so ^C is not seen until it finishes.
+     */
+    bool             tty;
 
     struct espix_cmd *next;                /* registry-owned; do not set */
 } espix_cmd_t;
@@ -592,39 +545,21 @@ typedef int (*espix_exec_fallback_fn)(espix_session_t *s, int argc, char **argv)
 void espix_shell_set_exec_fallback(espix_exec_fallback_fn fn);
 
 /*
- * Record a background *process* against the session, for `jobs`/`fg`/`bg`.
- * Returns false when the table is full, which the caller reports rather than
- * losing the job silently. Lives here and not with the `jobs` command because
- * the table is the session's; the process lookups that prune it are in
- * espix_cmds, which may depend on espix_proc and this header may not.
+ * Record a background process against the session, for `jobs`/`fg`/`bg`.
+ * Forgets finished jobs first. Returns false when the table is still full,
+ * which the caller reports rather than losing the job silently.
  */
 bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name);
 
-/*
- * Reclaim a finished job slot. Called by the `jobs` command when it finds a
- * process gone or a builtin task finished; the task owns its own teardown, so
- * this only forgets what the session remembered. Lives here because the
- * teardown handshake is under a lock this component owns.
- */
+/* Forget the jobs that have ended, or one slot. */
+void espix_shell_jobs_prune(espix_session_t *s);
 void espix_shell_job_clear(espix_session_t *s, int slot);
 
 /*
- * Has this session -- a background builtin's copy -- been asked to stop?
- *
- * The cooperative equivalent of a signal, and the only one a builtin can have:
- * espix can delete a task but not signal it. A blocking loop polls this and
- * returns early; false in every ordinary session, so it is free there.
+ * Has the calling command been asked to stop -- ^C, a hangup, kill? A loop
+ * that can run long checks this and returns. Runs an app's handlers.
  */
 bool espix_shell_stopping(const espix_session_t *s);
-
-/*
- * Stop every background builtin this session still has, before the session and
- * its transport go away. Sets each job's stop flag, gives its loops a bounded
- * moment to notice, then deletes only what ignored it. Called from
- * espix_shell_session_run() before the session-end hook, and by SSH's
- * finish_session() for the exec path, which never reaches the REPL.
- */
-void espix_shell_jobs_drain(espix_session_t *s);
 
 /* The last key a transport reported while polling, and clear it. 0 when there
  * was none. The transport sets it, the command reads it. */
@@ -703,6 +638,20 @@ int espix_session_write(espix_session_t *s, const char *data, size_t len,
  * Sets up the driver, line endings and the line editor, then runs the session
  * loop on the calling task. Normally never returns.
  */
+/* The default process stack for a command that declares none. PSRAM. */
+#define ESPIX_CMD_STACK 12288
+
+/* A command to run as a process: espix_proc_fn_opts_t, as far as the shell
+ * needs it. */
+typedef struct {
+    const char  *name;
+    int        (*fn)(void *arg);
+    void        *arg;
+    uint32_t     stack;
+    bool         internal_stack;
+    espix_pid_t  pgid;          /* in: 0 for the default group; out: its group */
+} espix_shell_spawn_t;
+
 /*
  * What the shell needs from the process table. espix_proc sits *above* this
  * component -- it depends on it for espix_session_t -- so it registers these at
@@ -718,6 +667,14 @@ typedef struct {
     bool   (*sigcheck)(void);
     /* The calling process was asked to stop; no handlers run. */
     bool   (*stopping)(void);
+    /* Start a command as a process of the session. */
+    esp_err_t (*spawn)(espix_session_t *s, espix_shell_spawn_t *sp,
+                       espix_pid_t *pid);
+    /* Wait for a foreground job and reap it, ^C included; its status, or -1.
+     * tty: the job reads the terminal, so the wait does not. */
+    int    (*wait)(espix_session_t *s, espix_pid_t pid, bool tty);
+    /* The process has not been reaped. */
+    bool   (*alive)(espix_pid_t pid);
 } espix_shell_proc_ops_t;
 
 void espix_shell_set_proc_ops(const espix_shell_proc_ops_t *ops);

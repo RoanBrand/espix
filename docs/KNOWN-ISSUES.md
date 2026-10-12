@@ -779,8 +779,8 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 - **Only a foreground process reads stdin.** `chan_poll_interrupt()` is the
   single consumer of the channel's receive buffer and the thing that fills a
-  process's stdin queue, and it runs from the foreground wait loop in
-  `cmd_run.c`. So a backgrounded app's `stdin` is open but nothing arrives on
+  process's stdin queue, and it runs from the foreground wait loop
+  (`espix_proc/fg.c`). So a backgrounded app's `stdin` is open but nothing arrives on
   it — it blocks until the session ends. `chan_pump()` overwrites that buffer
   rather than appending, so a second reader is not a small change: it needs
   the buffer to become a ring first.
@@ -1051,13 +1051,10 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   image actually exposes. Which slot is *running* is `upgrade --slots`, not the
   directory listing.
 
-- **A command with its own task cannot read stdin.** `run_on_own_task()` spawns
-  the command and waits on it, and the connection task is the only reader of the
-  SSH wire -- so nothing drains the channel, a read blocks forever, and the
-  session ends dead with otadata mid-write. Foreground *apps* read stdin fine
-  because the connection task pumps while they run. This is why `upgrade
-  --stdin` does not exist and `make flash-ota` copies the image to `/tmp` and
-  queues it with `--file`.
+- **A builtin has no stdin.** Its input is a file or `<`: the foreground wait
+  pumps the SSH channel into an app's stdin queue, and a builtin has none. This
+  is why `upgrade --stdin` does not exist and `make flash-ota` copies the image
+  to `/tmp` and queues it with `--file`.
 
 - **The update cache is root's to write.** The background check records what it
   found in `/var/lib/espix/update`, and `/var` is root-owned, so `upgrade --check`

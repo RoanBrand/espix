@@ -17,38 +17,12 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include "freertos/FreeRTOS.h"
-
-#include "esp_timer.h"
-
 #include "espix_appdata.h"
 #include "espix_cmds_priv.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
-
-/* How often the foreground wait comes up for air to check for Ctrl-C. */
-#define RUN_POLL_MS 50
-
-/*
- * Ctrl-C presses before the shell stops asking and starts insisting.
- *
- * Ctrl-C sends SIGINT and nothing more, which is what Unix does and what makes
- * a handler worth writing: an app is allowed to catch it, tidy up on its own
- * schedule, or decline. But espix has one console and no second terminal to run
- * `kill -9` from, so refusing to ever escalate would mean an app that ignores
- * SIGINT could hold the only shell you have. The third press is that escape
- * hatch, and it announces itself before it fires.
- */
-#define RUN_INTERRUPTS_TO_KILL 3
-
-/*
- * How long timeout waits after SIGTERM before insisting with SIGKILL. The same
- * shape as the Ctrl-C escalation above, and for the same reason: an app
- * deserves the chance to put its hardware back, but not forever.
- */
-#define RUN_KILL_GRACE_MS 2000
 
 /*
  * Whatever the program declared it needs, before it starts.
@@ -117,104 +91,6 @@ static void appdata_resolve(espix_session_t *s, const char *abs)
  * report its status. Shared by `confine` and by the fallback that resolves a
  * bare command name to a program.
  */
-static void job_prune(espix_session_t *s);
-
-/*
- * Wait for pid, the shell's foreground process, and reap it. Returns its exit
- * status, or -1 when the wait itself failed (already reported). limit_us is how
- * long to allow, 0 for no limit, which is what a plain foreground command
- * wants; timeout passes one, and *timed_out says whether it was reached. The
- * deadline is built from the clock here, not taken from the caller: comparing
- * an absolute uptime against a duration is how timeout first gave everything
- * that started after its limit an instant 124.
- *
- * In 50ms slices rather than one long block, so Ctrl-C can be noticed. Nothing
- * else reads input while a foreground process runs -- the editor is not running
- * and this task is the one that would be reading -- so without this a program
- * that ignores its own exit conditions cannot be stopped from the session that
- * started it, and the presses surface as blank lines once it finally dies.
- */
-static int wait_foreground(espix_session_t *s, espix_pid_t pid, const char *who,
-                           int64_t limit_us, bool *timed_out)
-{
-    int       exit_code  = -1;
-    esp_err_t wait_err   = ESP_ERR_TIMEOUT;
-    unsigned  interrupts = 0;
-    bool      overran    = false;
-    bool      killed     = false;
-    int64_t   term_at    = 0;
-
-    if (timed_out != NULL) {
-        *timed_out = false;
-    }
-    const int64_t deadline = (limit_us > 0) ? esp_timer_get_time() + limit_us : 0;
-
-    /* The job's group, so ^C reaches every process in it. */
-    espix_pid_t pgid = espix_proc_pgid_of(pid);
-    if (pgid == ESPIX_PID_NONE) {
-        pgid = pid;
-    }
-    s->fg_pgid = pgid;
-
-    for (;;) {
-        const int64_t now = esp_timer_get_time();
-
-        if (deadline > 0 && !overran && now >= deadline) {
-            espix_eprintf(s, "%s: pid %d: time limit reached\n", who, (int)pid);
-            (void)espix_proc_signal_group(pgid, SIGTERM);
-            overran = true;
-            term_at = now;
-        } else if (overran && !killed &&
-                   now >= term_at + (int64_t)RUN_KILL_GRACE_MS * 1000) {
-            espix_eprintf(s, "%s: pid %d: did not stop; killing it\n",
-                          who, (int)pid);
-            (void)espix_proc_signal_group(pgid, SIGKILL);
-            killed = true;
-        }
-
-        wait_err = espix_proc_wait(pid, &exit_code, pdMS_TO_TICKS(RUN_POLL_MS));
-        if (wait_err != ESP_ERR_TIMEOUT) {
-            break;
-        }
-
-        if (s->poll_interrupt == NULL || !s->poll_interrupt(s)) {
-            continue;
-        }
-
-        espix_printf(s, "^C\n");
-        interrupts++;
-
-        if (interrupts < RUN_INTERRUPTS_TO_KILL) {
-            (void)espix_proc_signal_group(pgid, SIGINT);
-
-            if (interrupts + 1 == RUN_INTERRUPTS_TO_KILL) {
-                espix_eprintf(s, "%s: pid %d is ignoring SIGINT; "
-                                 "press Ctrl-C again to force it\n",
-                              who, (int)pid);
-            }
-        } else if (interrupts == RUN_INTERRUPTS_TO_KILL) {
-            espix_eprintf(s, "%s: killing pid %d\n", who, (int)pid);
-            (void)espix_proc_signal_group(pgid, SIGKILL);
-        }
-    }
-
-    if (s->poll_interrupt != NULL) {
-        (void)s->poll_interrupt(s);
-    }
-
-    s->fg_pgid = ESPIX_PID_NONE;
-
-    if (timed_out != NULL) {
-        *timed_out = overran;
-    }
-    if (wait_err != ESP_OK) {
-        espix_eprintf(s, "%s: pid %d: %s\n", who, (int)pid,
-                      esp_err_to_name(wait_err));
-        return -1;
-    }
-    return exit_code;
-}
-
 static int run_program(espix_session_t *s, const char *abs, int argc,
                        char **argv, bool background, const char *root,
                        const char *who)
@@ -236,7 +112,6 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
 
         const char *base = strrchr(abs, '/');
         base = (base != NULL) ? base + 1 : abs;
-        job_prune(s);               /* finished jobs give their slots back */
         if (!espix_shell_job_add(s, pid, base)) {
             /* It is running either way; only the session's memory of it is
              * lost, which is worth a line rather than a `jobs` that is quietly
@@ -247,7 +122,8 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
         return 0;
     }
 
-    const int status = wait_foreground(s, pid, who, 0, NULL);
+    espix_proc_fg_t fg     = { .who = who };
+    const int       status = espix_proc_wait_fg(s, pid, &fg);
     if (status < 0) {
         return 1;
     }
@@ -557,10 +433,9 @@ static int cmd_timeout(espix_session_t *s, int argc, char **argv)
         return 126;
     }
 
-    bool      timed_out = false;
-    const int status = wait_foreground(s, pid, "timeout",
-                                       (int64_t)secs * 1000000, &timed_out);
-    if (timed_out) {
+    espix_proc_fg_t fg     = { .who = "timeout", .limit_us = (int64_t)secs * 1000000 };
+    const int       status = espix_proc_wait_fg(s, pid, &fg);
+    if (fg.timed_out) {
         return 124;
     }
     if (status < 0) {
@@ -568,6 +443,28 @@ static int cmd_timeout(espix_session_t *s, int argc, char **argv)
     }
     if (status != 0) {
         espix_printf(s, "[exit %d]\n", status);
+    }
+    return status;
+}
+
+/* type <name>...: what the shell would run for each name. */
+static int cmd_type(espix_session_t *s, int argc, char **argv)
+{
+    int status = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const espix_cmd_t *cmd = espix_shell_find(argv[i]);
+        char               abs[ESPIX_PATH_MAX];
+
+        if (cmd != NULL) {
+            espix_printf(s, "%s is a %s\n", argv[i],
+                         cmd->shell ? "shell builtin" : "command, run as a process");
+        } else if (resolve_program(s, argv[i], abs, sizeof(abs)) == 0) {
+            espix_printf(s, "%s is %s\n", argv[i], abs);
+        } else {
+            espix_eprintf(s, "type: %s: not found\n", argv[i]);
+            status = 1;
+        }
     }
     return status;
 }
@@ -727,48 +624,19 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
 /* jobs, fg, bg                                                        */
 /* ------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------ */
-/* jobs, fg, bg                                                        */
-/* ------------------------------------------------------------------ */
-
-/*
- * The session's job table holds two kinds of job (see espix_job_t): a
- * *process*, which is a loaded app and can be signalled, and a *builtin task*,
- * which cannot -- espix can delete a task but not stop and resume one. jobs
- * lists both; fg and bg only mean anything for a process.
- *
- * Ctrl-Z is still missing, because the transports report only that a key
- * arrived and not which one -- see R-P7.7.
- */
+/* Ctrl-Z is still missing: the transports report only that a key arrived and
+ * not which one -- see R-P7.7. */
 
 static bool job_live(const espix_job_t *j)
 {
-    return j->pid > 0 || (j->task != NULL && !j->finished);
-}
-
-/* Forget jobs that have ended. A process is live until espix_proc_state_of()
- * says FREE -- nobody reaps a backgrounded app's status, so without this a
- * finished job would be listed for ever. A builtin task sets finished as it
- * exits; the shell only has to forget it, since the task owns its own
- * teardown. */
-static void job_prune(espix_session_t *s)
-{
-    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
-        espix_job_t *j = &s->jobs[i];
-
-        if (j->pid > 0 && espix_proc_state_of(j->pid) == ESPIX_PROC_FREE) {
-            espix_shell_job_clear(s, i);
-        } else if (j->task != NULL && j->finished) {
-            espix_shell_job_clear(s, i);
-        }
-    }
+    return j->pid > 0;
 }
 
 /* The job arg names -- "%2" by number, or a pid -- or the most recent one for
  * NULL. NULL when there is no such job. */
 static espix_job_t *job_pick(espix_session_t *s, const char *arg)
 {
-    job_prune(s);
+    espix_shell_jobs_prune(s);
 
     if (arg == NULL || arg[0] == '\0') {
         for (int i = ESPIX_SESSION_JOBS - 1; i >= 0; i--) {
@@ -806,20 +674,13 @@ static espix_job_t *job_pick(espix_session_t *s, const char *arg)
     return NULL;
 }
 
-/* fg and bg need a process to signal. Returns the job, or NULL with the message
- * already printed. */
+/* Returns the job, or NULL with the message already printed. */
 static espix_job_t *job_pick_process(espix_session_t *s, const char *who,
                                      const char *arg)
 {
     espix_job_t *j = job_pick(s, arg);
     if (j == NULL) {
         espix_eprintf(s, "%s: no such job\n", who);
-        return NULL;
-    }
-    if (j->pid <= 0) {
-        espix_eprintf(s, "%s: %s is a builtin; it cannot be stopped or resumed\n",
-                      who, j->name);
-        return NULL;
     }
     return j;
 }
@@ -828,22 +689,15 @@ static int cmd_jobs(espix_session_t *s, int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    job_prune(s);
+    espix_shell_jobs_prune(s);
 
     int n = 0;
     for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
         espix_job_t *j = &s->jobs[i];
-        if (!job_live(j)) {
-            continue;
-        }
-        if (j->pid > 0) {
+        if (job_live(j)) {
             espix_printf(s, "[%d] %5d %-4s %s\n", ++n, (int)j->pid,
                          espix_proc_state_str(espix_proc_state_of(j->pid)),
                          j->name);
-        } else {
-            /* A builtin task has no pid and no proc state; it is running
-             * whenever it is listed at all. */
-            espix_printf(s, "[%d]     - Run  %s\n", ++n, j->name);
         }
     }
     if (n == 0) {
@@ -882,7 +736,8 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
     (void)espix_proc_signal(pid, SIGCONT);
 
     /* The foreground wait, so ^C reaches it as it would any job. */
-    const int code = wait_foreground(s, pid, "fg", 0, NULL);
+    espix_proc_fg_t fg   = { .who = "fg" };
+    const int       code = espix_proc_wait_fg(s, pid, &fg);
     espix_shell_job_clear(s, slot);
 
     if (code < 0) {
@@ -895,25 +750,28 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
 }
 
 static espix_cmd_t s_run_cmds[] = {
-    { .name = "timeout", .fn = cmd_timeout,
+    { .name = "timeout", .fn = cmd_timeout, .shell = true,
       .help = "run a program, ending it if it overruns",
       .usage = "timeout <seconds> <program> [args...]" },
-    { .name = "confine", .fn = cmd_confine, .backgrounds = true,
+    { .name = "confine", .fn = cmd_confine, .backgrounds = true, .shell = true,
       .help = "run a program that can name nothing outside <dir>",
       .usage = "confine <dir> <path> [args...] [&]" },
+    { .name = "type", .fn = cmd_type, .shell = true,
+      .help = "say whether a name is a builtin, a command or a program",
+      .usage = "type <name>..." },
     { .name = "kill",  .fn = cmd_kill,
       .help = "send a signal to a process",
       .usage = "kill [-SIG|-l] <pid|-pgid>..." },
     { .name = "crash", .fn = cmd_crash,
       .help = "fault on purpose, to test fault reporting",
       .usage = "crash [abi]" },
-    { .name = "jobs", .fn = cmd_jobs,
+    { .name = "jobs", .fn = cmd_jobs, .shell = true,
       .help = "list this session's background jobs",
       .usage = "jobs" },
-    { .name = "fg", .fn = cmd_fg,
+    { .name = "fg", .fn = cmd_fg, .shell = true,
       .help = "resume a background job in the foreground",
       .usage = "fg [%n|pid]" },
-    { .name = "bg", .fn = cmd_bg,
+    { .name = "bg", .fn = cmd_bg, .shell = true,
       .help = "resume a stopped background job",
       .usage = "bg [%n|pid]" },
 };

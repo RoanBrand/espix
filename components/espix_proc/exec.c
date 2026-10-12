@@ -964,11 +964,11 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     slot->info.pid        = espix_proc_next_pid();
 
     /* Who asked for it -- usually its shell -- which a child's exit is reported
-     * to; and its own group, which is the job ^C reaches. */
+     * to; and its group, which is the job ^C reaches. */
     {
         const espix_proc_slot_t *const parent = espix_proc_self();
         slot->info.ppid = (parent != NULL) ? parent->info.pid : ESPIX_PID_NONE;
-        slot->info.pgid = slot->info.pid;       /* a job of its own */
+        slot->info.pgid = espix_proc_group_for(parent, 0, slot->info.pid);
         slot->info.sid  = (parent != NULL) ? parent->info.sid : slot->info.pid;
     }
 
