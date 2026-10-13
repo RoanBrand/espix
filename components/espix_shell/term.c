@@ -89,6 +89,19 @@ struct espix_term {
 
     /* A line waiting for the first prompt; see espix_term_feed(). */
     char                   startup[ESPIX_LINE_MAX];
+
+    /*
+     * Output is drawn per row at the end of a write, not per character.
+     *
+     * A character at a time is what this did, and in a desktop window each one
+     * cost a compositing pass -- fill the cell, blit every window over it, move
+     * the cursor -- because the view's cell callback damages an 8x8 rectangle.
+     * One line of output was 76 of those, and showing one ps took six seconds.
+     * The grid is still updated immediately; only the drawing waits.
+     */
+    bool    defer;
+    bool    repaint_all;
+    uint8_t dirty[(ESPIX_TERM_MAX_ROWS + 7) / 8];
 };
 
 /* Wake the shell's foreground wait, which sleeps on its task's notification. */
@@ -105,8 +118,26 @@ static void term_wake(espix_term_t *t)
 /* Drawing                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Mark a row for the flush that ends a write; see term_flush(). */
+static void term_mark_dirty(espix_term_t *t, int row)
+{
+    if (row >= 0 && row < t->rows) {
+        t->dirty[row >> 3] |= (uint8_t)(1u << (row & 7));
+    }
+}
+
+static void term_mark_all(espix_term_t *t)
+{
+    memset(t->dirty, 0xFF, sizeof(t->dirty));
+    t->repaint_all = true;
+}
+
 static void term_cell(espix_term_t *t, int row, int col, char ch)
 {
+    if (t->defer) {
+        term_mark_dirty(t, row);
+        return;
+    }
     if (t->view.cell != NULL) {
         t->view.cell(t->view.ctx, row, col, ch);
     }
@@ -164,11 +195,17 @@ static void term_putc(espix_term_t *t, char c);
 /* One row, from the model. */
 static void term_draw_row(espix_term_t *t, int row)
 {
-    if (t->view.row == NULL || row < 0 || row >= t->rows) {
+    if (row < 0 || row >= t->rows) {
         return;
     }
-    t->view.row(t->view.ctx, row, t->grid + (size_t)row * (size_t)t->cols,
-                t->cols);
+    if (t->defer) {
+        term_mark_dirty(t, row);
+        return;
+    }
+    if (t->view.row != NULL) {
+        t->view.row(t->view.ctx, row, t->grid + (size_t)row * (size_t)t->cols,
+                    t->cols);
+    }
 }
 
 /* 0 = cursor to end, 1 = start to cursor, 2 = the whole line. */
@@ -453,12 +490,40 @@ static void term_putc_inner(espix_term_t *t, char c)
  */
 static void term_repaint(espix_term_t *t)
 {
+    if (t->defer) {
+        term_mark_all(t);
+        return;
+    }
     if (t->view.clear != NULL) {
         t->view.clear(t->view.ctx);
     }
     for (int r = 0; r < t->rows; r++) {
         term_draw_row(t, r);
     }
+}
+
+/* The end of a write: every row it touched, drawn once each. */
+static void term_flush(espix_term_t *t)
+{
+    if (t->repaint_all) {
+        t->repaint_all = false;
+        memset(t->dirty, 0, sizeof(t->dirty));
+
+        if (t->view.clear != NULL) {
+            t->view.clear(t->view.ctx);
+        }
+        for (int r = 0; r < t->rows; r++) {
+            term_draw_row(t, r);
+        }
+        return;
+    }
+
+    for (int r = 0; r < t->rows; r++) {
+        if (t->dirty[r >> 3] & (uint8_t)(1u << (r & 7))) {
+            term_draw_row(t, r);
+        }
+    }
+    memset(t->dirty, 0, sizeof(t->dirty));
 }
 
 void espix_term_repaint(espix_term_t *t)
@@ -612,9 +677,29 @@ void espix_term_key(espix_term_t *t, uint32_t keysym, bool down)
 
 void espix_term_write(espix_term_t *t, const char *data, size_t len)
 {
+    if (t == NULL) {
+        return;
+    }
+
+    /* A nested write keeps the outer batch open; only the outermost flushes. */
+    const bool batched = t->defer;
+
+    if (!batched) {
+        t->defer       = true;
+        t->repaint_all = false;
+        memset(t->dirty, 0, sizeof(t->dirty));
+    }
+
     for (size_t i = 0; i < len; i++) {
         term_putc(t, data[i]);
     }
+
+    if (batched) {
+        return;
+    }
+
+    t->defer = false;
+    term_flush(t);
 }
 
 void espix_term_feed(espix_term_t *t, const char *line)
