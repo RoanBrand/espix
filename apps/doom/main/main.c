@@ -137,24 +137,24 @@ void app_main(int app_argc, char **app_argv)
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), avail);
 
     /*
-     * Refuse rather than die. I_Error is survivable now that exit() ends the app, but
-     * a zone too small to load a level with would fail *inside* the engine,
-     * after the WAD has been read and half the subsystems initialised -- so the
-     * check happens here, before any of that. Below 4 MiB the shareware's levels
-     * do not fit anyway; between 4 and 6, ask the engine for a zone it can have.
+     * Give the engine what there is, not what a guess says it needs.
+     *
+     * The zone is Doom's own allocator and it purges; the question the app can
+     * actually answer is "what is the largest whole MiB block I have", and the
+     * engine takes exactly that (-mb is whole MiB). So there is no floor to get
+     * wrong when the kernel grows or the board changes: an S31 with 10 MiB free
+     * gets 6, an S3 with 3 1/2 gets 3, and a board with 2 gets 2. The engine's
+     * own default is 6 MiB and more is not useful, which is the only number
+     * worth capping at.
+     *
+     * The one guard left is structural, not a judgement: a zero-MiB block is
+     * not a zone, so below one whole MiB there is nothing to ask for. Above
+     * that the engine finds out for itself -- and since exit() ends the app
+     * cleanly now, an I_Error inside it is a report and not a reset.
      */
-    /*
-     * The floor is a judgement, not a fact -- 4 MiB was our port's reading of
-     * what a shareware level needs -- so it can be overridden per run:
-     * DOOM_MIN_MB=3 doom. The engine's zone is whole MiB (-mb is atoi'd as MiB),
-     * so a fractional value here does not reach it.
-     */
-    const char *min_env = getenv("DOOM_MIN_MB");
-    const int   min_mb  = (min_env != NULL && atoi(min_env) > 0) ? atoi(min_env) : 4;
-
-    if (avail < min_mb) {
-        printf("doom: not enough PSRAM (need %d MiB, have %d) -- not starting\n",
-               min_mb, avail);
+    if (avail < 1) {
+        printf("doom: not enough PSRAM for a zone (largest block %u KB) -- not starting\n",
+               (unsigned)(largest / 1024));
         fflush(stdout);
         return;
     }
@@ -164,12 +164,14 @@ void app_main(int app_argc, char **app_argv)
     char *argv[16] = { "doom", "-iwad", (char *)wad, NULL, NULL, NULL };
     int   argc    = 3;
 
-    if (avail < 6) {
-        snprintf(mb_arg, sizeof(mb_arg), "%d", avail);
-        argv[argc++] = "-mb";
-        argv[argc++] = mb_arg;
-        printf("doom: only %d MiB free; starting with a %d MiB zone\n", avail, avail);
-    }
+    /*
+     * Always stated, even at 6: with -mb the engine sets its own minimum to the
+     * same value, so it asks for this size once and says so if it fails, rather
+     * than falling back to a 6 MiB default that may not be there.
+     */
+    snprintf(mb_arg, sizeof(mb_arg), "%d", avail);
+    argv[argc++] = "-mb";
+    argv[argc++] = mb_arg;
 
     /* The launcher's own arguments, argv[0] aside, leaving room for the NULL. */
     for (int i = 1; i < app_argc && argc + 1 < (int)(sizeof(argv) / sizeof(argv[0]));
