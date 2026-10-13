@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -201,6 +202,17 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
 /* Sleep up to `ms`, ending at once when the calling process is signalled. True
  * when it has been asked to stop. For espix's own code; an app has sleep(). */
 bool espix_proc_sleep(uint32_t ms);
+
+/*
+ * The terminal as a program reads it, for a command built into the kernel that
+ * runs as a process -- the same stream an ELF app is handed at spawn. NULL when
+ * the session has no terminal, or its transport cannot open one.
+ *
+ * A command that only needs a line has read_line(); this is for the ones that
+ * need keys, and it exists so "compiled in" and "loaded from /bin" are not two
+ * different terminals. The caller owns the FILE and fcloses it.
+ */
+FILE *espix_proc_stdin_open(espix_session_t *s);
 
 /*
  * Load the ELF at `abs_path` and run it as a new process. Returns as soon as

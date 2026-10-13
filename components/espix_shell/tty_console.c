@@ -312,9 +312,23 @@ static void console_klog_output_done(void)
     (void)write(s_wake_fd, &one, sizeof(one));
 }
 
+/*
+ * May a kernel line be echoed to this terminal right now?
+ *
+ * No while a program owns it: `top`, `nano`, an app -- any of them draws a
+ * screen a log line would land in the middle of. The line is still stored, so
+ * `dmesg` has it. The console's own line editor is not a foreground process, so
+ * the prompt-fitting hooks above keep working as they did.
+ */
+static bool console_klog_output_wanted(void)
+{
+    return s_console.fg_pgid <= 0 && s_console.stdin_readers == 0;
+}
+
 static const espix_klog_console_hooks_t k_console_hooks = {
-    .output_begin = console_klog_output_begin,
-    .output_done  = console_klog_output_done,
+    .output_begin  = console_klog_output_begin,
+    .output_done   = console_klog_output_done,
+    .output_wanted = console_klog_output_wanted,
 };
 
 static void inject(const char *fmt, ...)

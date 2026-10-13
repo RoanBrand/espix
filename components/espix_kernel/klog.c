@@ -280,6 +280,17 @@ static void klog_echo(const espix_klog_entry_t *e)
         s_console_out = stdout;     /* boot, on the main task */
     }
 
+    /*
+     * Somebody's full-screen program may own the terminal. The line stays in
+     * the ring either way; this only decides whether it is painted across a
+     * screen that would then have to be redrawn. See the hook's definition.
+     */
+    const espix_klog_console_hooks_t *h = s_console;
+    if (h != NULL && h->output_wanted != NULL && !h->output_wanted()) {
+        s_last_echo_ms = e->ts_ms;
+        return;
+    }
+
     /* To the captured console, never to the caller's stdout -- see the note on
      * s_console_out for what that cost the SSH server. */
     console_output_begin();

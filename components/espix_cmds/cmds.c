@@ -115,6 +115,7 @@ void espix_cmds_register_all(void)
     espix_cmds_register_ota();
     espix_cmds_register_hash();
     espix_cmds_register_text();
+    espix_cmds_register_edit();
     espix_cmds_register_bt();
     espix_cmds_register_play();
     espix_cmds_register_record();

@@ -237,6 +237,13 @@ bool espix_klog_drained_wait(uint32_t timeout_ms);
 typedef struct {
     void (*output_begin)(void);   /* about to write; clear a prompt if one is up */
     void (*output_done)(void);    /* written; put a prompt back */
+    /*
+     * Whether the line may reach this terminal at all. Optional; NULL means
+     * always. A false answer leaves the line in the ring -- `dmesg` still has
+     * it -- and is how a full-screen program keeps kernel output from being
+     * painted across its screen.
+     */
+    bool (*output_wanted)(void);
 } espix_klog_console_hooks_t;
 
 /* `hooks` must outlive the call -- it is held by pointer, not copied. NULL

@@ -17,6 +17,7 @@ idf_component_register(
         "cmd_ota.c"
         "cmd_hash.c"
         "cmd_text.c"
+        "cmd_edit.c"
         "cmd_bt.c"
         "cmd_play.c"
         "cmd_record.c"

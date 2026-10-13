@@ -370,6 +370,34 @@ static int console_stdin_read(void *cookie, char *buf, int len)
     return n;
 }
 
+/*
+ * The terminal a program reads, whether it came from /bin or is compiled into
+ * the kernel. An ELF app has had stdin set to this since spawn; a builtin that
+ * runs as a process never went through that path, so without this it could only
+ * ask for a whole line (read_line, i.e. the shell's editor) and never a key.
+ *
+ * SSH and the desktop terminal own their stream, and that stream is already the
+ * right one. The serial console has none -- exec's spawn path gives apps a
+ * reader directly -- so it is opened here over the same console_stdin_read(), as
+ * root or not, which is what makes ^C reach the shell instead of the program.
+ */
+FILE *espix_proc_stdin_open(espix_session_t *s)
+{
+    if (s == NULL) {
+        return NULL;
+    }
+    if (s->open_stream != NULL) {
+        return s->open_stream(s, ESPIX_STREAM_IN);
+    }
+    if (s_console_fd < 0) {
+        s_console_fd = fileno(stdin);
+    }
+    if (s_console_fd < 0) {
+        return NULL;
+    }
+    return funopen(s, console_stdin_read, NULL, NULL, NULL);
+}
+
 static int console_stdin_wait(espix_session_t *s, char *buf, int len)
 {
     const int fd = s_console_fd;
