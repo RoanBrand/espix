@@ -1032,13 +1032,6 @@ static void focus_at(int x, int y)
 /* The launcher square, and the window it opens                       */
 /* ------------------------------------------------------------------ */
 
-/*
- * The picture the launcher's own "photo" entry shows. The hardcoded path is
- * what is left of the first window this desktop had: the browser hands it a
- * path now, and this is the fallback.
- */
-#define PHOTO_PATH "/home/esp/test.jpg"
-
 static espix_window_t  *s_img_win;
 static espix_surface_t *s_img;          /* decoded, and kept for this path */
 static char             s_img_path[ESPIX_PATH_MAX];
@@ -1248,11 +1241,6 @@ static void photo_open_path(const char *path)
     window_present(s_img_win);
 }
 
-static void photo_open(void)
-{
-    photo_open_path(PHOTO_PATH);
-}
-
 /* The browser's way in, beside espix_desktop_open_terminal(). */
 void espix_desktop_open_image(const char *path)
 {
@@ -1368,6 +1356,48 @@ static espix_rect_t term_grid_rect(const term_win_t *tw,
 }
 
 /*
+ * The cursor, drawn over the cell it is on with the two colours swapped -- a
+ * block, which is what a terminal shows, and what the editor expects to find:
+ * it positions the cursor and draws nothing there itself.
+ */
+static void term_paint_cursor_row(espix_window_t *w, espix_surface_t *s,
+                                  term_win_t *tw, int row, const char *cells,
+                                  int len)
+{
+    int cr = -1;
+    int cc = -1;
+
+    if (tw->term == NULL || !espix_term_cursor(tw->term, &cr, &cc)
+        || cr != row || cc < 0 || cc >= len) {
+        return;
+    }
+
+    const espix_rect_t c     = espix_window_content(w);
+    const char         one[2] = { cells[cc], '\0' };
+
+    espix_surface_text(s, c.x + cc * CELL_W, c.y + row * CELL_H, one,
+                       COL_WIN_BG, COL_TEXT_FG);
+}
+
+static void term_paint_cursor_cell(espix_window_t *w, espix_surface_t *s,
+                                   term_win_t *tw, int row, int col, char ch)
+{
+    int cr = -1;
+    int cc = -1;
+
+    if (tw->term == NULL || !espix_term_cursor(tw->term, &cr, &cc)
+        || cr != row || cc != col) {
+        return;
+    }
+
+    const espix_rect_t c     = espix_window_content(w);
+    const char         one[2] = { ch, '\0' };
+
+    espix_surface_text(s, c.x + col * CELL_W, c.y + row * CELL_H, one,
+                       COL_WIN_BG, COL_TEXT_FG);
+}
+
+/*
  * The terminal's view, into the window's surface.
  *
  * Three locks, in one order, each there for a different reason. The desktop's
@@ -1399,6 +1429,7 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
         espix_surface_lock(s);
         espix_surface_text(s, c.x, c.y + row * CELL_H, line, COL_TEXT_FG,
                            COL_WIN_BG);
+        term_paint_cursor_row(w, s, tw, row, line, len);
         espix_surface_unlock(s);
 
         espix_window_damage(w, (espix_rect_t){ c.x, c.y + row * CELL_H,
@@ -1423,6 +1454,7 @@ static void term_view_cell(void *ctx, int row, int col, char ch)
         espix_surface_lock(s);
         espix_surface_text(s, c.x + col * CELL_W, c.y + row * CELL_H, cell,
                            COL_TEXT_FG, COL_WIN_BG);
+        term_paint_cursor_cell(w, s, tw, row, col, ch);
         espix_surface_unlock(s);
 
         espix_window_damage(w, term_cell(w, row, col));
@@ -1491,6 +1523,7 @@ static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
         memcpy(line, cells, (size_t)cols);
         line[cols] = '\0';
         espix_surface_text(s, c.x, y, line, COL_TEXT_FG, COL_WIN_BG);
+        term_paint_cursor_row(w, s, tw, row, line, cols);
     }
 }
 
@@ -1928,8 +1961,8 @@ static espix_rect_t tray_rect(void)
  */
 #define MENU_DIVIDER_H 7
 
-static const char *const s_menu_items[] = { "plasma", "files", "photo",
-                                            "terminal", "settings", "about",
+static const char *const s_menu_items[] = { "files", "terminal",
+                                            "settings", "about",
                                             NULL,
                                             "reboot", "poweroff" };
 #define MENU_N ((int)(sizeof(s_menu_items) / sizeof(s_menu_items[0])))
@@ -2674,12 +2707,8 @@ static void menu_activate(int i)
 {
     s_menu = false;
 
-    if (strcmp(s_menu_items[i], "plasma") == 0) {
-        launch_app("/bin/plasma");
-    } else if (strcmp(s_menu_items[i], "files") == 0) {
+    if (strcmp(s_menu_items[i], "files") == 0) {
         window_present(espix_browser_open(NULL));
-    } else if (strcmp(s_menu_items[i], "photo") == 0) {
-        photo_open();
     } else if (strcmp(s_menu_items[i], "about") == 0) {
         if (s_about == NULL) {
             s_about = espix_window_new(300, 190, 220, 96, "about");
@@ -3006,32 +3035,12 @@ static void confirm_open(confirm_kind_t kind)
 
 static void windows_create(void)
 {
-    /* The window, the terminal inside it and the shell that runs in that. */
-    (void)term_start(NULL);
-
-    s_about = espix_window_new(300, 190, 220, 96, "about");
-    if (s_about != NULL) {
-        espix_window_set_draw(s_about, about_draw);
-        espix_window_repaint(s_about);
-    }
-
     /*
-     * The terminal is the one to type at, so it starts in front and focused.
-     * Through espix_window_focus() rather than by assigning s_focus, because
-     * creating the about window focused it -- and that painted the about's title
-     * bar as the focused one and the terminal's as the unfocused one, which is
-     * the state the pixels would otherwise still show.
+     * Nothing. The desktop starts with its icons and its taskbar and no windows
+     * at all: a terminal nobody asked for and an about box nobody read were two
+     * windows to close before reaching the launcher, and the thing they covered
+     * is the point of the desktop.
      */
-    term_win_t *tw = term_newest();
-
-    if (tw != NULL && tw->win != NULL) {
-        window_raise_raw(tw->win);
-        /* Not `s_focus = s_term`: that leaves the about window wearing the
-         * focused title bar it was given when it was created. Going through
-         * espix_window_focus() repaints both, because it knows which one is
-         * losing the focus. */
-        espix_window_focus(tw->win);
-    }
 }
 
 static void windows_destroy(void)

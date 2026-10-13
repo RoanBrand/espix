@@ -139,6 +139,18 @@ void espix_term_feed(espix_term_t *t, const char *line);
  */
 bool espix_term_resize(espix_term_t *t, int cols, int rows);
 
+/*
+ * Where the cursor is, for the renderer to draw one.
+ *
+ * The terminal has no pixels and a cursor is pixels, so a program that
+ * positions it -- which is what a full-screen editor does, once, at the end of
+ * every redraw -- is asking whoever is drawing the grid to show one there. That
+ * is why the editor had no cursor anywhere: nothing was drawing it.
+ *
+ * True when there is one to draw, which is unless the grid is not on screen.
+ */
+bool espix_term_cursor(const espix_term_t *t, int *row, int *col);
+
 #ifdef __cplusplus
 }
 #endif

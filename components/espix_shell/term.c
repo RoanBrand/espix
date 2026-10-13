@@ -112,6 +112,26 @@ static void term_cell(espix_term_t *t, int row, int col, char ch)
     }
 }
 
+/*
+ * The cursor moved: the cell it was on has to be drawn again, or the renderer's
+ * block stays there. Both cells are redrawn -- the old one from the grid, which
+ * is what takes the block off it, and the new one, which is what puts it on --
+ * and the renderer decides which is which from espix_term_cursor().
+ */
+static void term_cursor_left(espix_term_t *t, int row, int col)
+{
+    if (row == t->row && col == t->col) {
+        return;
+    }
+    if (row >= 0 && row < t->rows && col >= 0 && col < t->cols) {
+        term_cell(t, row, col, t->grid[(size_t)row * (size_t)t->cols + col]);
+    }
+    if (t->row >= 0 && t->row < t->rows && t->col >= 0 && t->col < t->cols) {
+        term_cell(t, t->row, t->col,
+                  t->grid[(size_t)t->row * (size_t)t->cols + t->col]);
+    }
+}
+
 static void term_repaint(espix_term_t *t);
 
 static void term_scroll(espix_term_t *t)
@@ -234,6 +254,10 @@ static void term_csi(espix_term_t *t, char final)
     const int a = t->nparam > 0 ? t->params[0] : 0;
     const int b = t->nparam > 1 ? t->params[1] : 0;
 
+    /* Where it was, so the renderer can take the cursor off that cell. */
+    const int orow = t->row;
+    const int ocol = t->col;
+
     switch (final) {
     case 'A': t->row -= (a ? a : 1); break;
     case 'B': t->row += (a ? a : 1); break;
@@ -302,9 +326,28 @@ static void term_csi(espix_term_t *t, char final)
     if (t->row >= t->rows)   { t->row = t->rows - 1; }
     if (t->col < 0)          { t->col = 0; }
     if (t->col >= t->cols)   { t->col = t->cols - 1; }
+
+    term_cursor_left(t, orow, ocol);
 }
 
+static void term_putc_inner(espix_term_t *t, char c);
+
+/*
+ * Every path that can move the cursor goes through here, so the old cursor cell
+ * is always repainted -- whether the move was a character, a newline or an
+ * escape sequence. Splitting the body out rather than auditing every return in
+ * it is what keeps that true when the next one is added.
+ */
 static void term_putc(espix_term_t *t, char c)
+{
+    const int orow = t->row;
+    const int ocol = t->col;
+
+    term_putc_inner(t, c);
+    term_cursor_left(t, orow, ocol);
+}
+
+static void term_putc_inner(espix_term_t *t, char c)
 {
     /*
      * Escape sequences: parsed, and the ones that move the cursor acted on.
@@ -513,6 +556,39 @@ void espix_term_key(espix_term_t *t, uint32_t keysym, bool down)
 
     char ch = espix_keysym_char(keysym);
     if (ch == '\0') {
+        /*
+         * Everything that is not text. A viewer arrives with a keysym and
+         * espix_keysym_char() answers 0 for every key that has no character --
+         * which is every key a full-screen program navigates with. A terminal
+         * sends those as escape sequences, so that is what is queued here; over
+         * SSH they arrive that way already, which is why this only showed up in
+         * a window.
+         */
+        static const struct {
+            uint32_t    keysym;
+            const char *seq;
+        } s_key_seq[] = {
+            { 0xFF52, "\x1b[A"  },      /* Up */
+            { 0xFF54, "\x1b[B"  },      /* Down */
+            { 0xFF53, "\x1b[C"  },      /* Right */
+            { 0xFF51, "\x1b[D"  },      /* Left */
+            { 0xFF50, "\x1b[1~" },      /* Home */
+            { 0xFF57, "\x1b[4~" },      /* End */
+            { 0xFF55, "\x1b[5~" },      /* Page Up */
+            { 0xFF56, "\x1b[6~" },      /* Page Down */
+            { 0xFF63, "\x1b[2~" },      /* Insert */
+            { 0xFF9F, "\x1b[3~" },      /* Delete */
+        };
+
+        for (size_t i = 0; i < sizeof(s_key_seq) / sizeof(s_key_seq[0]); i++) {
+            if (s_key_seq[i].keysym == keysym) {
+                for (const char *p = s_key_seq[i].seq; *p != '\0'; p++) {
+                    (void)xQueueSend(t->keys, p, 0);
+                }
+                term_wake(t);
+                return;
+            }
+        }
         return;
     }
 
@@ -547,6 +623,20 @@ void espix_term_feed(espix_term_t *t, const char *line)
         return;
     }
     strlcpy(t->startup, line, sizeof(t->startup));
+}
+
+bool espix_term_cursor(const espix_term_t *t, int *row, int *col)
+{
+    if (t == NULL || t->rows <= 0 || t->cols <= 0) {
+        return false;
+    }
+    if (row != NULL) {
+        *row = t->row;
+    }
+    if (col != NULL) {
+        *col = t->col;
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------ */

@@ -100,6 +100,44 @@ static bool con_on_screen(void)
 /* ------------------------------------------------------------------ */
 
 /*
+ * The cursor, drawn over the cell it is on with the two colours swapped. The
+ * terminal only positions it and nothing else draws it, so without this neither
+ * a shell prompt nor a full-screen editor had a cursor anywhere.
+ */
+static void con_paint_cursor_row(espix_canvas_t *cv, int row, const char *line,
+                                 int len)
+{
+    int cr = -1;
+    int cc = -1;
+
+    if (s_con.term == NULL || !espix_term_cursor(s_con.term, &cr, &cc)
+        || cr != row || cc < 0 || cc >= len) {
+        return;
+    }
+
+    const char one[2] = { line[cc], '\0' };
+
+    espix_canvas_text(cv, CON_MARGIN + cc * 8, CON_MARGIN + row * 8, one,
+                      CON_BG, CON_FG);
+}
+
+static void con_paint_cursor_cell(espix_canvas_t *cv, int row, int col, char ch)
+{
+    int cr = -1;
+    int cc = -1;
+
+    if (s_con.term == NULL || !espix_term_cursor(s_con.term, &cr, &cc)
+        || cr != row || cc != col) {
+        return;
+    }
+
+    const char one[2] = { ch, '\0' };
+
+    espix_canvas_text(cv, CON_MARGIN + col * 8, CON_MARGIN + row * 8, one,
+                      CON_BG, CON_FG);
+}
+
+/*
  * The terminal's view, which is the only part of it that knows about the
  * canvas. Each entry point locks the canvas for itself and does not nest --
  * espix_canvas_lock() is a plain mutex, and the drawing calls below it take no
@@ -119,6 +157,7 @@ static void con_view_cell(void *ctx, int row, int col, char ch)
     espix_canvas_lock(cv);
     espix_canvas_text(cv, CON_MARGIN + col * 8, CON_MARGIN + row * 8,
                       cell, CON_FG, CON_BG);
+    con_paint_cursor_cell(cv, row, col, ch);
     espix_canvas_unlock(cv);
 }
 
@@ -140,6 +179,7 @@ static void con_view_row(void *ctx, int row, const char *cells, int len)
 
     espix_canvas_lock(cv);
     espix_canvas_text(cv, CON_MARGIN, CON_MARGIN + row * 8, line, CON_FG, CON_BG);
+    con_paint_cursor_row(cv, row, line, len);
     espix_canvas_unlock(cv);
 }
 
