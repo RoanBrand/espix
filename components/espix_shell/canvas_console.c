@@ -104,8 +104,24 @@ static bool con_on_screen(void)
  * terminal only positions it and nothing else draws it, so without this neither
  * a shell prompt nor a full-screen editor had a cursor anywhere.
  */
+/* One run of cells that share a colour: fg in the low nibble, bg in the high. */
+static void con_paint_run(espix_canvas_t *cv, int x, int y, const char *cells,
+                          int len, uint8_t attr)
+{
+    char line[ESPIX_TERM_MAX_COLS + 1];
+
+    if (len > ESPIX_TERM_MAX_COLS) {
+        len = ESPIX_TERM_MAX_COLS;
+    }
+    memcpy(line, cells, (size_t)len);
+    line[len] = '\0';
+
+    espix_canvas_text(cv, x, y, line, espix_ansi_colour((uint8_t)(attr & 0x0F)),
+                      espix_ansi_colour((uint8_t)((attr >> 4) & 0x0F)));
+}
+
 static void con_paint_cursor_row(espix_canvas_t *cv, int row, const char *line,
-                                 int len)
+                                 const uint8_t *attrs, int len)
 {
     int cr = -1;
     int cc = -1;
@@ -118,10 +134,12 @@ static void con_paint_cursor_row(espix_canvas_t *cv, int row, const char *line,
     const char one[2] = { line[cc], '\0' };
 
     espix_canvas_text(cv, CON_MARGIN + cc * 8, CON_MARGIN + row * 8, one,
-                      CON_BG, CON_FG);
+                      espix_ansi_colour((uint8_t)((attrs[cc] >> 4) & 0x0F)),
+                      espix_ansi_colour((uint8_t)(attrs[cc] & 0x0F)));
 }
 
-static void con_paint_cursor_cell(espix_canvas_t *cv, int row, int col, char ch)
+static void con_paint_cursor_cell(espix_canvas_t *cv, int row, int col, char ch,
+                                  uint8_t attr)
 {
     int cr = -1;
     int cc = -1;
@@ -134,7 +152,8 @@ static void con_paint_cursor_cell(espix_canvas_t *cv, int row, int col, char ch)
     const char one[2] = { ch, '\0' };
 
     espix_canvas_text(cv, CON_MARGIN + col * 8, CON_MARGIN + row * 8, one,
-                      CON_BG, CON_FG);
+                      espix_ansi_colour((uint8_t)((attr >> 4) & 0x0F)),
+                      espix_ansi_colour((uint8_t)(attr & 0x0F)));
 }
 
 /*
@@ -144,7 +163,8 @@ static void con_paint_cursor_cell(espix_canvas_t *cv, int row, int col, char ch)
  * lock of their own. A repaint therefore holds the lock per row rather than
  * across the lot; the damage each row marks is what keeps a viewer correct.
  */
-static void con_view_cell(void *ctx, int row, int col, char ch)
+static void con_view_cell(void *ctx, int row, int col, char ch,
+                           uint8_t attr)
 {
     (void)ctx;
 
@@ -155,13 +175,15 @@ static void con_view_cell(void *ctx, int row, int col, char ch)
     const char cell[2] = { ch, '\0' };
 
     espix_canvas_lock(cv);
-    espix_canvas_text(cv, CON_MARGIN + col * 8, CON_MARGIN + row * 8,
-                      cell, CON_FG, CON_BG);
-    con_paint_cursor_cell(cv, row, col, ch);
+    espix_canvas_text(cv, CON_MARGIN + col * 8, CON_MARGIN + row * 8, cell,
+                      espix_ansi_colour((uint8_t)(attr & 0x0F)),
+                      espix_ansi_colour((uint8_t)((attr >> 4) & 0x0F)));
+    con_paint_cursor_cell(cv, row, col, ch, attr);
     espix_canvas_unlock(cv);
 }
 
-static void con_view_row(void *ctx, int row, const char *cells, int len)
+static void con_view_row(void *ctx, int row, const char *cells,
+                          const uint8_t *attrs, int len)
 {
     (void)ctx;
 
@@ -178,8 +200,17 @@ static void con_view_row(void *ctx, int row, const char *cells, int len)
     line[len] = '\0';
 
     espix_canvas_lock(cv);
-    espix_canvas_text(cv, CON_MARGIN, CON_MARGIN + row * 8, line, CON_FG, CON_BG);
-    con_paint_cursor_row(cv, row, line, len);
+    for (int i = 0; i < len; ) {
+        int j = i;
+
+        while (j < len && attrs[j] == attrs[i]) {
+            j++;
+        }
+        con_paint_run(cv, CON_MARGIN + i * 8, CON_MARGIN + row * 8, line + i,
+                      j - i, attrs[i]);
+        i = j;
+    }
+    con_paint_cursor_row(cv, row, line, attrs, len);
     espix_canvas_unlock(cv);
 }
 

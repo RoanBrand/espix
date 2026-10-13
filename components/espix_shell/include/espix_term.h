@@ -49,8 +49,14 @@ extern "C" {
  */
 typedef struct {
     void *ctx;
-    void (*cell)(void *ctx, int row, int col, char ch);
-    void (*row)(void *ctx, int row, const char *cells, int len);
+    /*
+     * One cell, and one row. The attr is the cell's colour: the foreground in the
+     * low nibble, the background in the high, both 0-15 of the ANSI palette -- so
+     * a renderer maps them through espix_ansi_colour() and draws.
+     */
+    void (*cell)(void *ctx, int row, int col, char ch, uint8_t attr);
+    void (*row)(void *ctx, int row, const char *cells, const uint8_t *attrs,
+                int len);
     void (*clear)(void *ctx);
 } espix_term_view_t;
 
@@ -108,6 +114,9 @@ void espix_term_repaint(espix_term_t *t);
 int         espix_term_cols(const espix_term_t *t);
 int         espix_term_rows(const espix_term_t *t);
 const char *espix_term_row_text(const espix_term_t *t, int row);
+
+/* The row's colours, one byte a cell, in the order espix_term_row_text() has. */
+const uint8_t *espix_term_row_attr(const espix_term_t *t, int row);
 
 /* Bytes into the parser, as if a program had written them. */
 void espix_term_write(espix_term_t *t, const char *data, size_t len);

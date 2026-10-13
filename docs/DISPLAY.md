@@ -607,10 +607,12 @@ Two clients were tried first, and both taught something.
   reason a file failed is logged. Worth knowing when producing a test image:
   macOS `sips` re-encodes a JPEG as progressive if the source was progressive,
   and a round trip through PNG is the quick way to get baseline out of it.
-- **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
-  font is one bit per pixel and the grid holds one byte per cell, so colour
-  wants an attribute per cell and a renderer that reads it. Until then a
-  program that colours its output is perfectly readable, just not coloured.
+- **The console is sixteen colours, not 256 and not true colour.** A cell
+  carries an attribute byte -- foreground in the low nibble, background in the
+  high -- which SGR sets, so a colouring program and the motd's logo look as they
+  should. A program that asks for `38;5;N` or `38;2;r;g;b` gets the nearest of
+  the sixteen rather than nothing. The font is still one bit per pixel, so a
+  glyph is one colour on a background, as in every other terminal bitmap font.
 - **One client at a time**, like `sshd` for now: memory and failure isolation
   are worth proving with a single session before multiplying them.
 - **Authentication is weak and not enforced against a client that can

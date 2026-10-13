@@ -141,6 +141,15 @@ size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max
 void   espix_canvas_damage_clear(espix_canvas_t *c);
 bool   espix_canvas_damaged(const espix_canvas_t *c);
 
+/*
+ * The sixteen ANSI colours as RGB565, for the terminal's SGR.
+ *
+ * Here rather than in the terminal or in each renderer because a colour is a
+ * pixel and this service is what owns pixels -- and because two renderers, the
+ * console and a desktop window, have to agree about what colour 4 is.
+ */
+espix_px_t espix_ansi_colour(uint8_t index);
+
 /* ------------------------------------------------------------------ */
 /* Benchmark                                                           */
 /* ------------------------------------------------------------------ */

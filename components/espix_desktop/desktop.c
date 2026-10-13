@@ -1360,9 +1360,25 @@ static espix_rect_t term_grid_rect(const term_win_t *tw,
  * block, which is what a terminal shows, and what the editor expects to find:
  * it positions the cursor and draws nothing there itself.
  */
+/* One run of cells that share a colour: fg in the low nibble, bg in the high. */
+static void term_paint_run(espix_surface_t *s, int x, int y, const char *cells,
+                           int len, uint8_t attr)
+{
+    char line[ESPIX_TERM_MAX_COLS + 1];
+
+    if (len > ESPIX_TERM_MAX_COLS) {
+        len = ESPIX_TERM_MAX_COLS;
+    }
+    memcpy(line, cells, (size_t)len);
+    line[len] = '\0';
+
+    espix_surface_text(s, x, y, line, espix_ansi_colour((uint8_t)(attr & 0x0F)),
+                       espix_ansi_colour((uint8_t)((attr >> 4) & 0x0F)));
+}
+
 static void term_paint_cursor_row(espix_window_t *w, espix_surface_t *s,
                                   term_win_t *tw, int row, const char *cells,
-                                  int len)
+                                  const uint8_t *attrs, int len)
 {
     int cr = -1;
     int cc = -1;
@@ -1375,12 +1391,15 @@ static void term_paint_cursor_row(espix_window_t *w, espix_surface_t *s,
     const espix_rect_t c     = espix_window_content(w);
     const char         one[2] = { cells[cc], '\0' };
 
+    /* The block is the cell's own two colours the other way round. */
     espix_surface_text(s, c.x + cc * CELL_W, c.y + row * CELL_H, one,
-                       COL_WIN_BG, COL_TEXT_FG);
+                       espix_ansi_colour((uint8_t)((attrs[cc] >> 4) & 0x0F)),
+                       espix_ansi_colour((uint8_t)(attrs[cc] & 0x0F)));
 }
 
 static void term_paint_cursor_cell(espix_window_t *w, espix_surface_t *s,
-                                   term_win_t *tw, int row, int col, char ch)
+                                   term_win_t *tw, int row, int col, char ch,
+                                   uint8_t attr)
 {
     int cr = -1;
     int cc = -1;
@@ -1394,7 +1413,8 @@ static void term_paint_cursor_cell(espix_window_t *w, espix_surface_t *s,
     const char         one[2] = { ch, '\0' };
 
     espix_surface_text(s, c.x + col * CELL_W, c.y + row * CELL_H, one,
-                       COL_WIN_BG, COL_TEXT_FG);
+                       espix_ansi_colour((uint8_t)((attr >> 4) & 0x0F)),
+                       espix_ansi_colour((uint8_t)(attr & 0x0F)));
 }
 
 /*
@@ -1408,7 +1428,8 @@ static void term_paint_cursor_cell(espix_window_t *w, espix_surface_t *s,
  * is released before the damage, because damaging a window repaints it, which
  * takes the surface lock again, and that one is not recursive.
  */
-static void term_view_row(void *ctx, int row, const char *cells, int len)
+static void term_view_row(void *ctx, int row, const char *cells,
+                           const uint8_t *attrs, int len)
 {
     term_win_t *tw = ctx;
 
@@ -1427,9 +1448,17 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
         const espix_rect_t c = espix_window_content(w);
 
         espix_surface_lock(s);
-        espix_surface_text(s, c.x, c.y + row * CELL_H, line, COL_TEXT_FG,
-                           COL_WIN_BG);
-        term_paint_cursor_row(w, s, tw, row, line, len);
+        for (int i = 0; i < len; ) {
+            int j = i;
+
+            while (j < len && attrs[j] == attrs[i]) {
+                j++;
+            }
+            term_paint_run(s, c.x + i * CELL_W, c.y + row * CELL_H, line + i,
+                           j - i, attrs[i]);
+            i = j;
+        }
+        term_paint_cursor_row(w, s, tw, row, line, attrs, len);
         espix_surface_unlock(s);
 
         espix_window_damage(w, (espix_rect_t){ c.x, c.y + row * CELL_H,
@@ -1439,7 +1468,8 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
     desk_unlock();
 }
 
-static void term_view_cell(void *ctx, int row, int col, char ch)
+static void term_view_cell(void *ctx, int row, int col, char ch,
+                            uint8_t attr)
 {
     term_win_t *tw = ctx;
 
@@ -1453,8 +1483,9 @@ static void term_view_cell(void *ctx, int row, int col, char ch)
 
         espix_surface_lock(s);
         espix_surface_text(s, c.x + col * CELL_W, c.y + row * CELL_H, cell,
-                           COL_TEXT_FG, COL_WIN_BG);
-        term_paint_cursor_cell(w, s, tw, row, col, ch);
+                           espix_ansi_colour((uint8_t)(attr & 0x0F)),
+                           espix_ansi_colour((uint8_t)((attr >> 4) & 0x0F)));
+        term_paint_cursor_cell(w, s, tw, row, col, ch, attr);
         espix_surface_unlock(s);
 
         espix_window_damage(w, term_cell(w, row, col));
@@ -1515,15 +1546,26 @@ static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
         if (y + CELL_H <= r.y || y >= r.y + r.h) {
             continue;
         }
-        const char *cells = espix_term_row_text(tw->term, row);
-        if (cells == NULL) {
+        const char    *cells = espix_term_row_text(tw->term, row);
+        const uint8_t *attrs = espix_term_row_attr(tw->term, row);
+
+        if (cells == NULL || attrs == NULL) {
             continue;
         }
         char line[ESPIX_TERM_MAX_COLS + 1];
         memcpy(line, cells, (size_t)cols);
         line[cols] = '\0';
-        espix_surface_text(s, c.x, y, line, COL_TEXT_FG, COL_WIN_BG);
-        term_paint_cursor_row(w, s, tw, row, line, cols);
+
+        for (int i = 0; i < cols; ) {
+            int j = i;
+
+            while (j < cols && attrs[j] == attrs[i]) {
+                j++;
+            }
+            term_paint_run(s, c.x + i * CELL_W, y, line + i, j - i, attrs[i]);
+            i = j;
+        }
+        term_paint_cursor_row(w, s, tw, row, line, attrs, cols);
     }
 }
 

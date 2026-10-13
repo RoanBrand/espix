@@ -206,6 +206,31 @@ static void *buf_alloc(size_t bytes)
     return p;
 }
 
+/*
+ * xterm's first sixteen colours, which is what every program means by SGR 30-37
+ * and 90-97. The bright half is a separate palette here rather than "the same
+ * colour at full volume", because that is what a program asking for 90-97
+ * expects to see.
+ */
+static const struct {
+    uint8_t r, g, b;
+} s_ansi[16] = {
+    {   0,   0,   0 }, { 170,   0,   0 }, {   0, 170,   0 }, { 170,  85,   0 },
+    {   0,   0, 170 }, { 170,   0, 170 }, {   0, 170, 170 }, { 170, 170, 170 },
+    {  85,  85,  85 }, { 255,  85,  85 }, {  85, 255,  85 }, { 255, 255,  85 },
+    {  85,  85, 255 }, { 255,  85, 255 }, {  85, 255, 255 }, { 255, 255, 255 },
+};
+
+espix_px_t espix_ansi_colour(uint8_t index)
+{
+    const uint8_t i = (uint8_t)(index & 0x0F);
+    const uint8_t r = s_ansi[i].r;
+    const uint8_t g = s_ansi[i].g;
+    const uint8_t b = s_ansi[i].b;
+
+    return (espix_px_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | ((b & 0xF8u) >> 3));
+}
+
 espix_canvas_t *espix_canvas_new(int w, int h, const char *name)
 {
     if (w <= 0 || h <= 0) {

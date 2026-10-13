@@ -27,6 +27,7 @@
 #include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_display.h"
 #include "espix_task.h"
 #include "espix_term.h"
 
@@ -73,7 +74,7 @@ struct espix_term {
     volatile bool intr;
     int    esc;                 /* 0 outside an escape, 1 after ESC, 2 inside CSI */
 
-    uint16_t params[4];
+    uint16_t params[8];
     int      nparam;
     int      param;
 
@@ -102,6 +103,19 @@ struct espix_term {
     bool    defer;
     bool    repaint_all;
     uint8_t dirty[(ESPIX_TERM_MAX_ROWS + 7) / 8];
+
+    /*
+     * One byte a cell, the same shape as the grid: the foreground colour in the
+     * low nibble, the background in the high, both 0-15. A parallel array
+     * rather than a wider cell, so the grid stays a byte a cell and a renderer
+     * walks two buffers it can rely on being the same length.
+     */
+    uint8_t *attr;
+
+    /* What SGR has asked for, and the attribute built from it when it changes. */
+    uint8_t sgr_fg, sgr_bg;
+    bool    sgr_bold, sgr_rev;
+    uint8_t cur_attr;
 };
 
 /* Wake the shell's foreground wait, which sleeps on its task's notification. */
@@ -139,7 +153,8 @@ static void term_cell(espix_term_t *t, int row, int col, char ch)
         return;
     }
     if (t->view.cell != NULL) {
-        t->view.cell(t->view.ctx, row, col, ch);
+        t->view.cell(t->view.ctx, row, col, ch,
+                     t->attr[(size_t)row * (size_t)t->cols + col]);
     }
 }
 
@@ -169,6 +184,9 @@ static void term_scroll(espix_term_t *t)
 {
     memmove(t->grid, t->grid + t->cols, (size_t)(t->rows - 1) * (size_t)t->cols);
     memset(t->grid + (size_t)(t->rows - 1) * (size_t)t->cols, ' ',
+           (size_t)t->cols);
+    memmove(t->attr, t->attr + t->cols, (size_t)(t->rows - 1) * (size_t)t->cols);
+    memset(t->attr + (size_t)(t->rows - 1) * (size_t)t->cols, t->cur_attr,
            (size_t)t->cols);
     t->row = t->rows - 1;
 
@@ -204,7 +222,7 @@ static void term_draw_row(espix_term_t *t, int row)
     }
     if (t->view.row != NULL) {
         t->view.row(t->view.ctx, row, t->grid + (size_t)row * (size_t)t->cols,
-                    t->cols);
+                    t->attr + (size_t)row * (size_t)t->cols, t->cols);
     }
 }
 
@@ -221,6 +239,8 @@ static void term_erase_line(espix_term_t *t, int mode)
 
     memset(t->grid + (size_t)t->row * (size_t)t->cols + from, ' ',
            (size_t)(to - from));
+    memset(t->attr + (size_t)t->row * (size_t)t->cols + from, t->cur_attr,
+           (size_t)(to - from));
     term_draw_row(t, t->row);
 }
 
@@ -228,6 +248,7 @@ static void term_erase_screen(espix_term_t *t, int mode)
 {
     if (mode == 2 || mode == 3) {
         memset(t->grid, ' ', (size_t)t->rows * (size_t)t->cols);
+        memset(t->attr, t->cur_attr, (size_t)t->rows * (size_t)t->cols);
         term_repaint(t);
         return;
     }
@@ -235,6 +256,8 @@ static void term_erase_screen(espix_term_t *t, int mode)
         term_erase_line(t, 0);
         for (int r = t->row + 1; r < t->rows; r++) {
             memset(t->grid + (size_t)r * (size_t)t->cols, ' ', (size_t)t->cols);
+            memset(t->attr + (size_t)r * (size_t)t->cols, t->cur_attr,
+                   (size_t)t->cols);
         }
         term_repaint(t);
     }
@@ -275,6 +298,137 @@ static void term_glyph(espix_term_t *t, uint32_t cp)
     term_putc(t, ch);
 }
 
+/* ------------------------------------------------------------------ */
+/* Colour                                                              */
+/* ------------------------------------------------------------------ */
+
+/* Light grey on black, which is what a terminal starts as. */
+#define TERM_ATTR_DEFAULT 0x07u
+
+static uint8_t term_attr_build(const espix_term_t *t)
+{
+    uint8_t fg = t->sgr_fg;
+    uint8_t bg = t->sgr_bg;
+
+    if (t->sgr_bold && fg < 8) {
+        fg = (uint8_t)(fg + 8);
+    }
+    if (t->sgr_rev) {
+        const uint8_t x = fg;
+        fg = bg;
+        bg = x;
+    }
+    return (uint8_t)(((bg & 0x0F) << 4) | (fg & 0x0F));
+}
+
+static void term_sgr_reset(espix_term_t *t)
+{
+    t->sgr_fg   = 7;
+    t->sgr_bg   = 0;
+    t->sgr_bold = false;
+    t->sgr_rev  = false;
+    t->cur_attr = TERM_ATTR_DEFAULT;
+}
+
+/* The sixteen this terminal can draw, from a palette entry described in RGB. */
+static uint8_t term_nearest16(int r, int g, int b)
+{
+    uint8_t best  = 0;
+    long    bestd = -1;
+
+    for (uint8_t i = 0; i < 16; i++) {
+        const espix_px_t p = espix_ansi_colour(i);
+        const int pr = (int)(((p >> 11) & 0x1Fu) * 255u / 31u);
+        const int pg = (int)(((p >> 5) & 0x3Fu) * 255u / 63u);
+        const int pb = (int)((p & 0x1Fu) * 255u / 31u);
+        const long d = (long)(r - pr) * (r - pr) + (long)(g - pg) * (g - pg)
+                     + (long)(b - pb) * (b - pb);
+
+        if (bestd < 0 || d < bestd) {
+            bestd = d;
+            best  = i;
+        }
+    }
+    return best;
+}
+
+/*
+ * A 256-colour index, reduced to the sixteen. A program that asks for 38;5;222
+ * gets the nearest colour this can draw rather than nothing, which is what a
+ * terminal without 256 colours is expected to do.
+ */
+static uint8_t term_256_to_16(int idx)
+{
+    static const int ramp[6] = { 0, 95, 135, 175, 215, 255 };
+
+    if (idx < 0)   { idx = 0; }
+    if (idx > 255) { idx = 255; }
+
+    if (idx < 16) {
+        return (uint8_t)idx;            /* the first sixteen are the palette */
+    }
+    if (idx < 232) {
+        const int n = idx - 16;
+        return term_nearest16(ramp[(n / 36) % 6], ramp[(n / 6) % 6],
+                              ramp[n % 6]);
+    }
+
+    const int v = 8 + (idx - 232) * 10; /* 232-255 are greys */
+    return term_nearest16(v, v, v);
+}
+
+static void term_sgr(espix_term_t *t, int n)
+{
+    if (n == 0) {
+        term_sgr_reset(t);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        const int p = t->params[i];
+
+        switch (p) {
+        case 0:  term_sgr_reset(t);  break;
+        case 1:  t->sgr_bold = true;  break;
+        case 7:  t->sgr_rev  = true;  break;
+        case 22: t->sgr_bold = false; break;
+        case 27: t->sgr_rev  = false; break;
+        case 39: t->sgr_fg   = 7;     break;
+        case 49: t->sgr_bg   = 0;     break;
+        default:
+            if (p >= 30 && p <= 37) {
+                t->sgr_fg = (uint8_t)(p - 30);
+            } else if (p >= 40 && p <= 47) {
+                t->sgr_bg = (uint8_t)(p - 40);
+            } else if (p >= 90 && p <= 97) {
+                t->sgr_fg = (uint8_t)(p - 90 + 8);
+            } else if (p >= 100 && p <= 107) {
+                t->sgr_bg = (uint8_t)(p - 100 + 8);
+            } else if ((p == 38 || p == 48) && i + 1 < n) {
+                uint8_t c = 7;
+
+                if (t->params[i + 1] == 5 && i + 2 < n) {
+                    c = term_256_to_16(t->params[i + 2]);
+                    i += 2;
+                } else if (t->params[i + 1] == 2 && i + 4 < n) {
+                    c = term_nearest16(t->params[i + 2], t->params[i + 3],
+                                       t->params[i + 4]);
+                    i += 4;
+                } else {
+                    break;
+                }
+                if (p == 38) {
+                    t->sgr_fg = c;
+                } else {
+                    t->sgr_bg = c;
+                }
+            }
+            break;
+        }
+    }
+    t->cur_attr = term_attr_build(t);
+}
+
 /*
  * The bit that makes this a terminal rather than a printer: a program that
  * wants the cursor somewhere says so with an escape sequence, and this moves
@@ -284,7 +438,7 @@ static void term_glyph(espix_term_t *t, uint32_t cp)
  */
 static void term_csi(espix_term_t *t, char final)
 {
-    if (t->nparam < 4) {
+    if (t->nparam < 8) {
         t->params[t->nparam++] = (uint16_t)t->param;
     }
 
@@ -356,7 +510,9 @@ static void term_csi(espix_term_t *t, char final)
         }
         break;
 
-    default:  break;    /* SGR and the rest: recognised, nothing to render */
+    case 'm': term_sgr(t, (int)t->nparam); break;
+
+    default:  break;    /* the rest: recognised, and nothing to render */
     }
 
     if (t->row < 0)          { t->row = 0; }
@@ -413,7 +569,7 @@ static void term_putc_inner(espix_term_t *t, char c)
                 t->param = 9999;
             }
         } else if (c == ';') {
-            if (t->nparam < 4) {
+            if (t->nparam < 8) {
                 t->params[t->nparam++] = (uint16_t)t->param;
             }
             t->param = 0;
@@ -452,8 +608,11 @@ static void term_putc_inner(espix_term_t *t, char c)
 
     if (c == '\b') {
         if (t->col > 0) {
+            const size_t at = (size_t)t->row * (size_t)t->cols + t->col - 1;
+
             t->col--;
-            t->grid[(size_t)t->row * (size_t)t->cols + t->col] = ' ';
+            t->grid[at] = ' ';
+            t->attr[at] = t->cur_attr;
             term_cell(t, t->row, t->col, ' ');
         }
         return;
@@ -474,7 +633,10 @@ static void term_putc_inner(espix_term_t *t, char c)
         return;
     }
 
-    t->grid[(size_t)t->row * (size_t)t->cols + t->col] = c;
+    const size_t at = (size_t)t->row * (size_t)t->cols + t->col;
+
+    t->grid[at] = c;
+    t->attr[at] = t->cur_attr;
     term_cell(t, t->row, t->col, c);
 
     if (++t->col >= t->cols) {
@@ -554,6 +716,16 @@ bool espix_term_resize(espix_term_t *t, int cols, int rows)
     }
     memset(grid, ' ', cells);
 
+    uint8_t *attr = heap_caps_malloc(cells, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (attr == NULL) {
+        attr = heap_caps_malloc(cells, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (attr == NULL) {
+        heap_caps_free(grid);
+        return false;
+    }
+    memset(attr, TERM_ATTR_DEFAULT, cells);
+
     /* Same row, same column, for as much of both grids as exists. */
     const int keep_rows = rows < t->rows ? rows : t->rows;
     const int keep_cols = cols < t->cols ? cols : t->cols;
@@ -561,10 +733,14 @@ bool espix_term_resize(espix_term_t *t, int cols, int rows)
     for (int r = 0; r < keep_rows; r++) {
         memcpy(grid + (size_t)r * (size_t)cols,
                t->grid + (size_t)r * (size_t)t->cols, (size_t)keep_cols);
+        memcpy(attr + (size_t)r * (size_t)cols,
+               t->attr + (size_t)r * (size_t)t->cols, (size_t)keep_cols);
     }
 
     heap_caps_free(t->grid);
+    heap_caps_free(t->attr);
     t->grid = grid;
+    t->attr = attr;
     t->cols = cols;
     t->rows = rows;
 
@@ -593,6 +769,14 @@ const char *espix_term_row_text(const espix_term_t *t, int row)
         return NULL;
     }
     return t->grid + (size_t)row * (size_t)t->cols;
+}
+
+const uint8_t *espix_term_row_attr(const espix_term_t *t, int row)
+{
+    if (t == NULL || row < 0 || row >= t->rows) {
+        return NULL;
+    }
+    return t->attr + (size_t)row * (size_t)t->cols;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1097,6 +1281,19 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
     }
     memset(t->grid, ' ', cells);
 
+    t->attr = heap_caps_malloc(cells, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (t->attr == NULL) {
+        t->attr = heap_caps_malloc(cells, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (t->attr == NULL) {
+        heap_caps_free(t->grid);
+        heap_caps_free(t->attr);
+        free(t);
+        return NULL;
+    }
+    memset(t->attr, TERM_ATTR_DEFAULT, cells);
+    term_sgr_reset(t);
+
     /*
      * Before the editor, not after it. esp_linenoise issues a cursor-position
      * query when it starts and reads the reply back through term_edit_read(),
@@ -1107,6 +1304,7 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
     t->keys = xQueueCreate(64, sizeof(char));
     if (t->keys == NULL) {
         heap_caps_free(t->grid);
+        heap_caps_free(t->attr);
         free(t);
         return NULL;
     }
@@ -1123,6 +1321,7 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
         espix_klog(ESPIX_KLOG_ERROR, TAG, "no editor slot for another terminal");
         vQueueDelete(t->keys);
         heap_caps_free(t->grid);
+        heap_caps_free(t->attr);
         free(t);
         return NULL;
     }
@@ -1146,6 +1345,7 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
         s_edit_slot[slot] = NULL;
         vQueueDelete(t->keys);
         heap_caps_free(t->grid);
+        heap_caps_free(t->attr);
         free(t);
         return NULL;
     }
@@ -1174,6 +1374,10 @@ void espix_term_free(espix_term_t *t)
     if (t->grid != NULL) {
         heap_caps_free(t->grid);
         t->grid = NULL;
+    }
+    if (t->attr != NULL) {
+        heap_caps_free(t->attr);
+        t->attr = NULL;
     }
     free(t);
 }
