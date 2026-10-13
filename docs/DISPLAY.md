@@ -592,12 +592,14 @@ Two clients were tried first, and both taught something.
   screen when it exits or is killed. A killed app that died holding the canvas
   leaves the canvas lock orphaned for the rest of the boot -- correct rather than
   mutually exclusive, which is the price of not wedging the board.
-- **The file browser browses, and does not open anything yet.** It walks the
-  tree, lists directories with their sizes, and navigates by mouse and keyboard;
-  a Places column holds home, the root and a few fixed directories. Opening a
-  file is the one function the viewers and the terminal will be dispatched from,
-  and until there is something to dispatch to it says so on the screen. Mounted
-  volumes do not appear in Places yet, and it never mounts anything itself.
+- **The file browser browses, and opens text files only.** It walks the tree,
+  lists directories with their sizes, and navigates by mouse and keyboard; a
+  Places column holds home, the root and a few fixed directories. A file whose
+  extension is one the browser knows as text opens in the editor, in a terminal
+  window of its own; anything else reports "no handler yet" on the status line,
+  which is where the image, audio and video viewers will be dispatched from.
+  Mounted volumes do not appear in Places yet, and it never mounts anything
+  itself.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a

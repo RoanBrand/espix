@@ -1248,10 +1248,64 @@ static void photo_open(void)
 #define TERM_COLS 76
 #define TERM_ROWS 28
 
-static espix_window_t *s_term;          /* the window */
-static espix_term_t   *s_shell;         /* the terminal inside it */
-static TaskHandle_t    s_term_task;
-static uint32_t        s_term_gen;
+/*
+ * More than one terminal now exists, because opening a file wants an editor
+ * with a shell of its own around it rather than a takeover of the window
+ * someone is already typing in. A terminal is a window, the terminal inside it
+ * and the task that runs the shell; the view's ctx is this record, so a
+ * terminal that is not the one in front still knows which window its pixels go
+ * to.
+ *
+ * Three is the useful ceiling: espix_term has four editor slots and the
+ * on-screen console can hold one of them, so a fourth window would be created
+ * and then fail to get an editor of its own.
+ */
+#define TERM_MAX 3
+
+typedef struct term_win {
+    espix_window_t  *win;       /* NULL once it is being closed */
+    espix_term_t    *term;      /* freed by the task that runs it */
+    TaskHandle_t     task;
+    struct term_win *next;
+} term_win_t;
+
+static term_win_t *s_terms;
+
+static term_win_t *term_of_win(espix_window_t *w)
+{
+    for (term_win_t *t = s_terms; t != NULL; t = t->next) {
+        if (t->win == w) {
+            return t;
+        }
+    }
+    return NULL;
+}
+
+static int term_count(void)
+{
+    int n = 0;
+
+    for (const term_win_t *t = s_terms; t != NULL; t = t->next) {
+        n++;
+    }
+    return n;
+}
+
+/* The newest, which is what a request that cannot have a new window gets. */
+static term_win_t *term_newest(void)
+{
+    return s_terms;
+}
+
+static void term_unlink(term_win_t *t)
+{
+    for (term_win_t **p = &s_terms; *p != NULL; p = &(*p)->next) {
+        if (*p == t) {
+            *p = t->next;
+            return;
+        }
+    }
+}
 
 /* The rectangle one character cell occupies, in surface coordinates. */
 static espix_rect_t term_cell(const espix_window_t *w, int row, int col)
@@ -1262,11 +1316,14 @@ static espix_rect_t term_cell(const espix_window_t *w, int row, int col)
 
 /* The grid's size is the terminal's, not the constant it was created with:
  * maximising the window makes it a different shape. */
-static espix_rect_t term_grid_rect(const espix_window_t *w)
+static espix_rect_t term_grid_rect(const term_win_t *tw,
+                                   const espix_window_t *w)
 {
     const espix_rect_t c    = espix_window_content(w);
-    const int          cols = s_shell != NULL ? espix_term_cols(s_shell) : TERM_COLS;
-    const int          rows = s_shell != NULL ? espix_term_rows(s_shell) : TERM_ROWS;
+    const int          cols = tw->term != NULL ? espix_term_cols(tw->term)
+                                               : TERM_COLS;
+    const int          rows = tw->term != NULL ? espix_term_rows(tw->term)
+                                               : TERM_ROWS;
 
     return (espix_rect_t){ c.x, c.y, cols * CELL_W, rows * CELL_H };
 }
@@ -1284,10 +1341,10 @@ static espix_rect_t term_grid_rect(const espix_window_t *w)
  */
 static void term_view_row(void *ctx, int row, const char *cells, int len)
 {
-    (void)ctx;
+    term_win_t *tw = ctx;
 
     desk_lock();
-    if (s_term != NULL && s_shell != NULL) {
+    if (tw->win != NULL && tw->term != NULL) {
         char line[ESPIX_TERM_MAX_COLS + 1];
 
         if (len > ESPIX_TERM_MAX_COLS) {
@@ -1296,7 +1353,7 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
         memcpy(line, cells, (size_t)len);
         line[len] = '\0';
 
-        espix_window_t    *w = s_term;
+        espix_window_t    *w = tw->win;
         espix_surface_t   *s = espix_window_surface(w);
         const espix_rect_t c = espix_window_content(w);
 
@@ -1306,7 +1363,7 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
         espix_surface_unlock(s);
 
         espix_window_damage(w, (espix_rect_t){ c.x, c.y + row * CELL_H,
-                                               espix_term_cols(s_shell) * CELL_W,
+                                               espix_term_cols(tw->term) * CELL_W,
                                                CELL_H });
     }
     desk_unlock();
@@ -1314,13 +1371,13 @@ static void term_view_row(void *ctx, int row, const char *cells, int len)
 
 static void term_view_cell(void *ctx, int row, int col, char ch)
 {
-    (void)ctx;
+    term_win_t *tw = ctx;
 
     desk_lock();
-    if (s_term != NULL && s_shell != NULL) {
+    if (tw->win != NULL && tw->term != NULL) {
         const char cell[2] = { ch, '\0' };
 
-        espix_window_t    *w = s_term;
+        espix_window_t    *w = tw->win;
         espix_surface_t   *s = espix_window_surface(w);
         const espix_rect_t c = espix_window_content(w);
 
@@ -1336,13 +1393,13 @@ static void term_view_cell(void *ctx, int row, int col, char ch)
 
 static void term_view_clear(void *ctx)
 {
-    (void)ctx;
+    term_win_t *tw = ctx;
 
     desk_lock();
-    if (s_term != NULL && s_shell != NULL) {
-        espix_window_t  *w = s_term;
+    if (tw->win != NULL && tw->term != NULL) {
+        espix_window_t  *w = tw->win;
         espix_surface_t *s = espix_window_surface(w);
-        const espix_rect_t g = term_grid_rect(w);
+        const espix_rect_t g = term_grid_rect(tw, w);
 
         espix_surface_lock(s);
         espix_surface_fill(s, g, COL_WIN_BG);
@@ -1353,12 +1410,17 @@ static void term_view_clear(void *ctx)
     desk_unlock();
 }
 
-static const espix_term_view_t s_term_view = {
-    .ctx   = NULL,
-    .cell  = term_view_cell,
-    .row   = term_view_row,
-    .clear = term_view_clear,
-};
+/* Built per terminal, because the ctx is the terminal's own record. Copied by
+ * espix_term_new(), so a value on the stack is enough. */
+static espix_term_view_t term_view_of(term_win_t *tw)
+{
+    return (espix_term_view_t){
+        .ctx   = tw,
+        .cell  = term_view_cell,
+        .row   = term_view_row,
+        .clear = term_view_clear,
+    };
+}
 
 /*
  * Redrawing from the model, for a window being composited. The surface lock is
@@ -1368,20 +1430,21 @@ static const espix_term_view_t s_term_view = {
 static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
                       void *ctx)
 {
-    (void)ctx;
-    if (s_shell == NULL) {
+    term_win_t *tw = ctx;
+
+    if (tw == NULL || tw->term == NULL) {
         return;
     }
     const espix_rect_t c    = espix_window_content(w);
-    const int          cols = espix_term_cols(s_shell);
-    const int          rows = espix_term_rows(s_shell);
+    const int          cols = espix_term_cols(tw->term);
+    const int          rows = espix_term_rows(tw->term);
 
     for (int row = 0; row < rows; row++) {
         const int y = c.y + row * CELL_H;
         if (y + CELL_H <= r.y || y >= r.y + r.h) {
             continue;
         }
-        const char *cells = espix_term_row_text(s_shell, row);
+        const char *cells = espix_term_row_text(tw->term, row);
         if (cells == NULL) {
             continue;
         }
@@ -1397,10 +1460,10 @@ static void term_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
 static void term_resize(espix_window_t *w, espix_rect_t content, void *ctx)
 {
     (void)w;
-    (void)ctx;
+    term_win_t *tw = ctx;
 
-    if (s_shell != NULL) {
-        (void)espix_term_resize(s_shell, content.w / CELL_W,
+    if (tw != NULL && tw->term != NULL) {
+        (void)espix_term_resize(tw->term, content.w / CELL_W,
                                 content.h / CELL_H);
     }
 }
@@ -1408,22 +1471,22 @@ static void term_resize(espix_window_t *w, espix_rect_t content, void *ctx)
 static void term_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
 {
     (void)w;
-    (void)ctx;
+    term_win_t *tw = ctx;
 
-    if (s_shell != NULL) {
-        espix_term_key(s_shell, keysym, down);
+    if (tw != NULL && tw->term != NULL) {
+        espix_term_key(tw->term, keysym, down);
     }
 }
 
 static void term_task(void *arg)
 {
-    const uint32_t gen = (uint32_t)(uintptr_t)arg;
-    espix_term_t  *t   = s_shell;
+    term_win_t   *tw = arg;
+    espix_term_t *t  = (tw != NULL) ? tw->term : NULL;
 
     if (t != NULL) {
         espix_session_t *s = espix_term_session(t);
 
-        s->name = "term0";
+        s->name = "term";
         /* The esp account, like the VNC console: a window on a screen someone
          * reached over the network is not the serial cable. */
         s->uid  = 1000;
@@ -1435,37 +1498,64 @@ static void term_task(void *arg)
     }
 
     /* This task is the only thing that knows it has stopped touching the grid,
-     * so it owns the freeing -- the same bargain the console makes. */
+     * so it owns the freeing -- the same bargain the console makes. It owns the
+     * record too: by the time a stop has worked the window and the desktop have
+     * both let go of it, and nothing else may touch it after this. */
     espix_term_free(t);
 
-    desk_lock();
-    if (gen == s_term_gen) {
-        s_term_task = NULL;
+    if (tw != NULL) {
+        desk_lock();
+        tw->term = NULL;
+        tw->win  = NULL;
+        term_unlink(tw);
+        desk_unlock();
+        free(tw);
     }
-    desk_unlock();
 }
 
-static void term_start(void)
+static term_win_t *term_start(const char *cmd)
 {
-    /* Right of the launcher column, so the desktop icons stay reachable. */
-    s_term = espix_window_new(120, 40,
-                              TERM_COLS * CELL_W + 2 * PAD,
-                              TERM_ROWS * CELL_H + TITLE_H + 2 * PAD,
-                              "terminal");
-    if (s_term == NULL) {
-        return;
+    if (term_count() >= TERM_MAX) {
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "%d terminals already open; not opening another", TERM_MAX);
+        return term_newest();
     }
 
-    s_shell = espix_term_new(&s_term_view, TERM_COLS, TERM_ROWS, "esp");
-    if (s_shell == NULL) {
-        espix_window_free(s_term);
-        s_term = NULL;
-        return;
+    term_win_t *tw = calloc(1, sizeof(*tw));
+    if (tw == NULL) {
+        return NULL;
     }
 
-    espix_window_set_draw(s_term, term_draw);
-    espix_window_set_key(s_term, term_key);
-    espix_window_set_resize(s_term, term_resize);
+    /* Right of the launcher column, so the desktop icons stay reachable, and
+     * cascaded a little so a second terminal is visibly a second window. */
+    const int step = term_count() * 24;
+
+    tw->win = espix_window_new(120 + step, 40 + step,
+                               TERM_COLS * CELL_W + 2 * PAD,
+                               TERM_ROWS * CELL_H + TITLE_H + 2 * PAD,
+                               "terminal");
+    if (tw->win == NULL) {
+        free(tw);
+        return NULL;
+    }
+
+    const espix_term_view_t view = term_view_of(tw);
+
+    tw->term = espix_term_new(&view, TERM_COLS, TERM_ROWS, "esp");
+    if (tw->term == NULL) {
+        espix_window_free(tw->win);
+        free(tw);
+        return NULL;
+    }
+
+    if (cmd != NULL && cmd[0] != '\0') {
+        espix_term_feed(tw->term, cmd);
+    }
+
+    espix_window_set_ctx(tw->win, tw);
+    espix_window_set_draw(tw->win, term_draw);
+    espix_window_set_key(tw->win, term_key);
+    espix_window_set_resize(tw->win, term_resize);
 
     /*
      * A new window's *surface* is painted by espix_window_new, and the canvas is
@@ -1475,17 +1565,23 @@ static void term_start(void)
      * start menu got no such repaint and showed its title bar and its text
      * cells, with no background and no border, until it was moved.
      */
-    espix_window_repaint(s_term);
+    espix_window_repaint(tw->win);
 
-    void *const gen = (void *)(uintptr_t)++s_term_gen;
+    tw->next = s_terms;
+    s_terms  = tw;
 
-    (void)espix_kthread_start(&(const espix_kthread_t){
-        .name = "espix:term", .fn = term_task, .arg = gen, .stack = 8192,
-        .priority = 4, .core = tskNO_AFFINITY }, &s_term_task);
-    if (s_term_task == NULL) {
-        espix_term_free(s_shell);
-        s_shell = NULL;
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "espix:term", .fn = term_task, .arg = tw, .stack = 8192,
+            .priority = 4, .core = tskNO_AFFINITY }, &tw->task) != ESP_OK
+        || tw->task == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no task for a terminal");
+        term_unlink(tw);
+        espix_term_free(tw->term);
+        espix_window_free(tw->win);
+        free(tw);
+        return NULL;
     }
+    return tw;
 }
 
 /*
@@ -1500,16 +1596,19 @@ static void term_start(void)
  * The terminal itself is the task's to free, and it may take a moment: it is
  * blocked in read_line, which notices the stop within its 100 ms poll.
  */
-static void term_stop(void)
+static void term_stop(term_win_t *tw)
 {
+    if (tw == NULL) {
+        return;
+    }
+
     espix_term_t *t;
 
     desk_lock();
-    t = s_shell;
-    s_shell = NULL;
-    if (s_term != NULL) {
-        espix_window_t *w = s_term;
-        s_term = NULL;
+    t = tw->term;
+    if (tw->win != NULL) {
+        espix_window_t *w = tw->win;
+        tw->win = NULL;
         espix_window_free(w);
     }
     desk_unlock();
@@ -1535,14 +1634,37 @@ static void term_stop(void)
      */
 }
 
-/* Open the terminal, or bring back the one that is already there. Closing a
- * window should not be the end of the application in it. */
+/* A terminal, or the newest one once the cap is reached. The menu opens a new
+ * window each time: one terminal was a limit that made "open a file in an
+ * editor" impossible to do without taking over what someone was typing. */
 static void term_open(void)
 {
-    if (s_term == NULL) {
-        term_start();
+    term_win_t *tw = term_start(NULL);
+
+    if (tw != NULL && tw->win != NULL) {
+        window_present(tw->win);
     }
-    window_present(s_term);
+}
+
+/*
+ * A terminal with a command waiting at its first prompt -- what opening a text
+ * file in the editor is. A new window, because the one already there may be in
+ * the middle of something.
+ */
+static void term_open_run(const char *cmd)
+{
+    term_win_t *tw = term_start(cmd);
+
+    if (tw != NULL && tw->win != NULL) {
+        window_present(tw->win);
+    }
+}
+
+/* The browser's way in: an internal app may not reach into the desktop's
+ * terminal table, and this is the one thing it needs from the desktop. */
+void espix_desktop_open_terminal(const char *cmd)
+{
+    term_open_run(cmd);
 }
 
 /*
@@ -2544,8 +2666,9 @@ static void window_close(espix_window_t *w)
     if (w == NULL) {
         return;
     }
-    if (w == s_term) {
-        term_stop();                    /* takes the window with it */
+    term_win_t *tw = term_of_win(w);
+    if (tw != NULL) {
+        term_stop(tw);                  /* takes the window with it */
         return;
     }
     if (w == s_img_win) {
@@ -2684,7 +2807,7 @@ static void confirm_open(confirm_kind_t kind)
 static void windows_create(void)
 {
     /* The window, the terminal inside it and the shell that runs in that. */
-    term_start();
+    (void)term_start(NULL);
 
     s_about = espix_window_new(300, 190, 220, 96, "about");
     if (s_about != NULL) {
@@ -2699,13 +2822,15 @@ static void windows_create(void)
      * bar as the focused one and the terminal's as the unfocused one, which is
      * the state the pixels would otherwise still show.
      */
-    if (s_term != NULL) {
-        window_raise_raw(s_term);
+    term_win_t *tw = term_newest();
+
+    if (tw != NULL && tw->win != NULL) {
+        window_raise_raw(tw->win);
         /* Not `s_focus = s_term`: that leaves the about window wearing the
          * focused title bar it was given when it was created. Going through
          * espix_window_focus() repaints both, because it knows which one is
          * losing the focus. */
-        espix_window_focus(s_term);
+        espix_window_focus(tw->win);
     }
 }
 
@@ -2713,7 +2838,9 @@ static void windows_destroy(void)
 {
     /* Before the windows, not with them: the shell task is drawing into the
      * terminal window's surface, and term_stop() is what makes it stop. */
-    term_stop();
+    for (term_win_t *tw = s_terms; tw != NULL; tw = tw->next) {
+        term_stop(tw);                  /* each takes its window with it */
+    }
     espix_browser_forget();
 
     while (s_nwin > 0) {
@@ -2723,7 +2850,6 @@ static void windows_destroy(void)
         s_wins[--s_nwin] = NULL;
     }
     s_focus = NULL;
-    s_term  = NULL;
     s_about = NULL;
 
     /*

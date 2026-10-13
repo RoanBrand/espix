@@ -164,6 +164,13 @@ espix_window_t *espix_browser_open(const char *path);
 void            espix_browser_forget(void);
 espix_window_t *espix_browser_window(void);
 
+/*
+ * A terminal window, with `cmd` already at its first prompt (NULL for a plain
+ * shell). How the browser opens a text file: an internal app may not reach into
+ * the desktop's terminal table, and this is the one thing it needs from it.
+ */
+void espix_desktop_open_terminal(const char *cmd);
+
 #ifdef __cplusplus
 }
 #endif

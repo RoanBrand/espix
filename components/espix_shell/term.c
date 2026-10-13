@@ -86,6 +86,9 @@ struct espix_term {
     esp_linenoise_handle_t editor;
     espix_history_t       *history;
     espix_session_t        session;
+
+    /* A line waiting for the first prompt; see espix_term_feed(). */
+    char                   startup[ESPIX_LINE_MAX];
 };
 
 /* Wake the shell's foreground wait, which sleeps on its task's notification. */
@@ -538,6 +541,14 @@ void espix_term_write(espix_term_t *t, const char *data, size_t len)
     }
 }
 
+void espix_term_feed(espix_term_t *t, const char *line)
+{
+    if (t == NULL || line == NULL) {
+        return;
+    }
+    strlcpy(t->startup, line, sizeof(t->startup));
+}
+
 /* ------------------------------------------------------------------ */
 /* The session                                                         */
 /* ------------------------------------------------------------------ */
@@ -704,6 +715,23 @@ static int term_read_line(espix_session_t *s, const char *prompt,
 
     if (t->quit || t->editor == NULL) {
         return -1;
+    }
+
+    /*
+     * A line waiting from espix_term_feed(): run it instead of reading one, and
+     * echo it by hand -- the editor is what normally echoes, and it is being
+     * stepped over here, so the screen has to show the command that ran.
+     */
+    if (t->startup[0] != '\0') {
+        strlcpy(buf, t->startup, len);
+        t->startup[0] = '\0';
+
+        term_write(s, buf, strlen(buf));
+        term_write(s, "\r\n", 2);
+
+        espix_history_push(t->history, buf);
+        espix_history_apply(t->history, t->editor);
+        return (int)strlen(buf);
     }
 
     esp_linenoise_set_prompt(t->editor, prompt);

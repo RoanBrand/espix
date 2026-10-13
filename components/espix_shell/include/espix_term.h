@@ -113,6 +113,21 @@ const char *espix_term_row_text(const espix_term_t *t, int row);
 void espix_term_write(espix_term_t *t, const char *data, size_t len);
 
 /*
+ * Run `line` at the terminal's first prompt, as if it had been typed there.
+ *
+ * Deliberately not a push into the key queue, which is what this looks like it
+ * should be. esp_linenoise answers its own cursor-position query through that
+ * queue as soon as it starts, so bytes put there before the shell reads are
+ * parsed as the reply to a question nobody asked yet -- and the command is
+ * eaten. This is a line waiting for the first read_line() instead, which is the
+ * moment a person would have typed it.
+ *
+ * One line, once: the first session claims it, and the next session after an
+ * `exit` starts at an empty prompt.
+ */
+void espix_term_feed(espix_term_t *t, const char *line);
+
+/*
  * A bigger or smaller grid, for a window that changed size.
  *
  * What is already on the screen keeps its row and its column and the rest of each

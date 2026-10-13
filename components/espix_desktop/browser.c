@@ -360,6 +360,34 @@ static void size_text(uint32_t n, char *out, size_t len)
     }
 }
 
+/*
+ * What opens in the editor. An extension whitelist rather than a guess: nothing
+ * here reads the file to decide what it is, so a file with no extension or an
+ * unknown one is offered as "no handler yet" rather than opened as text and
+ * found to be a binary. The table is also where the viewers will register --
+ * image, audio, video -- once there are viewers to register.
+ */
+static const char *const s_text_ext[] = {
+    "txt", "md", "conf", "cfg", "ini", "log", "json", "csv",
+    "c", "h", "sh", "py", "js",
+};
+#define TEXT_EXT_N ((int)(sizeof(s_text_ext) / sizeof(s_text_ext[0])))
+
+static bool name_is_text(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+
+    if (dot == NULL || dot[1] == '\0') {
+        return false;
+    }
+    for (int i = 0; i < TEXT_EXT_N; i++) {
+        if (strcasecmp(dot + 1, s_text_ext[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ------------------------------------------------------------------ */
 /* Navigation                                                          */
 /* ------------------------------------------------------------------ */
@@ -398,17 +426,28 @@ static void browser_activate(int row)
         return;
     }
 
-    if (ent->is_dir) {
-        char child[ESPIX_PATH_MAX];
+    char child[ESPIX_PATH_MAX];
+    path_child(s_path, ent->name, child, sizeof(child));
 
-        path_child(s_path, ent->name, child, sizeof(child));
+    if (ent->is_dir) {
         browser_go(child);
         return;
     }
 
-    /* Stage two: dispatch by kind -- text to a terminal window, media to its
-     * viewer, an executable to a run. Until then, a file that does nothing at
-     * all is worse than one that says so. */
+    if (name_is_text(ent->name)) {
+        /* The editor, in a terminal window of its own. Quoted, because this is
+         * the one place a path is handed to a shell -- a name with a space in
+         * it survives that much. */
+        char cmd[ESPIX_PATH_MAX + 8];
+
+        snprintf(cmd, sizeof(cmd), "nano '%.120s'", child);
+        espix_desktop_open_terminal(cmd);
+        return;
+    }
+
+    /* Stage three: an image, an audio file or a video gets its viewer here.
+     * Until then, a file that does nothing at all is worse than one that says
+     * so. */
     snprintf(s_status, sizeof(s_status), "%.64s: no handler yet", ent->name);
     espix_window_repaint(s_win);
 }
