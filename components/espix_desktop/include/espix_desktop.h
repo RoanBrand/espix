@@ -152,6 +152,18 @@ espix_window_t *espix_settings_open(void);
 void espix_settings_forget(void);
 espix_window_t *espix_settings_window(void);
 
+/*
+ * The file browser. Same contract as the settings panel: opening it brings back
+ * the window that is already there, and here is what a close tells it.
+ *
+ * A path starts it somewhere; NULL starts it at home. Opening again with a path
+ * navigates the window that is up rather than making a second one, so a Places
+ * click and a menu click are the same call.
+ */
+espix_window_t *espix_browser_open(const char *path);
+void            espix_browser_forget(void);
+espix_window_t *espix_browser_window(void);
+
 #ifdef __cplusplus
 }
 #endif

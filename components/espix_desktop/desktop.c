@@ -69,7 +69,7 @@
 #define ITEM_H      20
 #define BUTTON_MAX  120
 
-#define WIN_MAX 8
+#define WIN_MAX 12
 
 struct espix_window {
     int              x, y, w, h;
@@ -1767,8 +1767,8 @@ static espix_rect_t tray_rect(void)
  */
 #define MENU_DIVIDER_H 7
 
-static const char *const s_menu_items[] = { "plasma", "photo", "terminal",
-                                            "settings", "about",
+static const char *const s_menu_items[] = { "plasma", "files", "photo",
+                                            "terminal", "settings", "about",
                                             NULL,
                                             "reboot", "poweroff" };
 #define MENU_N ((int)(sizeof(s_menu_items) / sizeof(s_menu_items[0])))
@@ -2359,6 +2359,8 @@ static void menu_activate(int i)
 
     if (strcmp(s_menu_items[i], "plasma") == 0) {
         launch_app("/bin/plasma");
+    } else if (strcmp(s_menu_items[i], "files") == 0) {
+        window_present(espix_browser_open(NULL));
     } else if (strcmp(s_menu_items[i], "photo") == 0) {
         photo_open();
     } else if (strcmp(s_menu_items[i], "about") == 0) {
@@ -2555,6 +2557,9 @@ static void window_close(espix_window_t *w)
     if (w == espix_settings_window()) {
         espix_settings_forget();
     }
+    if (w == espix_browser_window()) {
+        espix_browser_forget();
+    }
     if (w == s_confirm) {
         s_confirm = NULL;
     }
@@ -2709,6 +2714,7 @@ static void windows_destroy(void)
     /* Before the windows, not with them: the shell task is drawing into the
      * terminal window's surface, and term_stop() is what makes it stop. */
     term_stop();
+    espix_browser_forget();
 
     while (s_nwin > 0) {
         espix_window_t *w = s_wins[s_nwin - 1];

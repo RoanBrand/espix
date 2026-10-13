@@ -586,12 +586,18 @@ Two clients were tried first, and both taught something.
 
 ## Known limitations
 
-- **The launcher is one hardcoded icon.** The desktop's icon table holds a
-  single entry (`plasma`) at an absolute path; there is no file browser and no
-  app registry yet. Double-click runs it full-screen and the desktop reclaims the
+- **The launcher is a menu of hardcoded entries.** The desktop's icon table and
+  its start menu name their programs by absolute path; there is no app registry
+  yet. Double-click runs an external app full-screen and the desktop reclaims the
   screen when it exits or is killed. A killed app that died holding the canvas
   leaves the canvas lock orphaned for the rest of the boot -- correct rather than
   mutually exclusive, which is the price of not wedging the board.
+- **The file browser browses, and does not open anything yet.** It walks the
+  tree, lists directories with their sizes, and navigates by mouse and keyboard;
+  a Places column holds home, the root and a few fixed directories. Opening a
+  file is the one function the viewers and the terminal will be dispatched from,
+  and until there is something to dispatch to it says so on the screen. Mounted
+  volumes do not appear in Places yet, and it never mounts anything itself.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a

@@ -3,6 +3,7 @@ idf_component_register(
         "desktop.c"
         "widgets.c"
         "settings.c"
+        "browser.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
