@@ -1033,35 +1033,34 @@ static void focus_at(int x, int y)
 /* ------------------------------------------------------------------ */
 
 /*
- * A hardcoded path, deliberately. There is no file browser and no launcher, and
- * the point of this is the smallest thing that proves the shape: something on
- * the desktop, clicked with the mouse, that puts a window on the screen. A path
- * from somewhere else is one line, once there is a somewhere else.
+ * The picture the launcher's own "photo" entry shows. The hardcoded path is
+ * what is left of the first window this desktop had: the browser hands it a
+ * path now, and this is the fallback.
  */
 #define PHOTO_PATH "/home/esp/test.jpg"
 
 static espix_window_t  *s_img_win;
-static espix_surface_t *s_img;          /* decoded once, then kept */
-static bool             s_img_tried;
+static espix_surface_t *s_img;          /* decoded, and kept for this path */
+static char             s_img_path[ESPIX_PATH_MAX];
 
 /*
  * Read the file and decode it, once. The whole file is in memory before the
  * decode because that is what the decoder takes -- reading it is not the display
  * service's job -- and because a JPEG is read forwards, backwards and twice.
  */
-static bool photo_load(void)
+static bool photo_load(const char *path)
 {
-    if (s_img != NULL) {
+    if (s_img != NULL && strcmp(s_img_path, path) == 0) {
         return true;
     }
-    if (s_img_tried) {
-        return false;             /* said why once already */
-    }
-    s_img_tried = true;
 
-    FILE *f = fopen(PHOTO_PATH, "rb");
+    /* A different picture: the old one goes first, or two are held at once. */
+    espix_surface_free(s_img);
+    s_img = NULL;
+
+    FILE *f = fopen(path, "rb");
     if (f == NULL) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: %s", PHOTO_PATH, strerror(errno));
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: %s", path, strerror(errno));
         return false;
     }
 
@@ -1081,7 +1080,7 @@ static bool photo_load(void)
 
     if (buf == NULL) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: cannot read %ld bytes",
-                   PHOTO_PATH, n);
+                   path, n);
         return false;
     }
 
@@ -1094,8 +1093,9 @@ static bool photo_load(void)
         return false;
     }
 
+    strlcpy(s_img_path, path, sizeof(s_img_path));
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s: %dx%d decoded in %lld ms",
-               PHOTO_PATH, espix_surface_width(s_img),
+               path, espix_surface_width(s_img),
                espix_surface_height(s_img),
                (long long)((t1 - t0) / 1000));
     return true;
@@ -1195,11 +1195,16 @@ static void photo_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
                        espix_surface_pixels(s_img_fit), fw, fh, fw);
 }
 
-static void photo_open(void)
+/*
+ * Open the picture at a path, or bring the window back with this one in it.
+ * The browser calls this with an image it was double-clicked on; the launcher's
+ * own "photo" entry calls it with the default.
+ */
+static void photo_open_path(const char *path)
 {
-    if (s_img_win == NULL) {
-        const bool got = photo_load();
+    const bool got = photo_load(path);
 
+    if (s_img_win == NULL) {
         /* A window either way: one that says why there is no picture is more
          * use than a click that appears to do nothing. */
         const int iw = got ? espix_surface_width(s_img) : 160;
@@ -1217,6 +1222,15 @@ static void photo_open(void)
 
         int ww = iw + 2 * PAD;
         int wh = ih + TITLE_H + 2 * PAD;
+
+        /*
+         * A minimum, because the window buttons are drawn after the title and a
+         * narrow window puts them on top of it: a 64-pixel picture got a
+         * 72-pixel window whose title bar said "p" and then two grey boxes.
+         */
+        if (ww < 160) { ww = 160; }
+        if (wh < 90)  { wh = 90; }
+
         if (ww > cw - 16) { ww = cw - 16; }
         if (wh > ch - 16) { wh = ch - 16; }
 
@@ -1226,11 +1240,23 @@ static void photo_open(void)
         }
         espix_window_set_draw(s_img_win, photo_draw);
         espix_window_set_resize(s_img_win, photo_resize);
-        photo_fit(s_img_win);
-        espix_window_repaint(s_img_win);
     }
 
+    /* Fitted every time, because the picture may be a different one now. */
+    photo_fit(s_img_win);
+    espix_window_repaint(s_img_win);
     window_present(s_img_win);
+}
+
+static void photo_open(void)
+{
+    photo_open_path(PHOTO_PATH);
+}
+
+/* The browser's way in, beside espix_desktop_open_terminal(). */
+void espix_desktop_open_image(const char *path)
+{
+    photo_open_path(path);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3030,8 +3056,8 @@ static void windows_destroy(void)
     espix_surface_free(s_img);
     s_img = NULL;
     espix_surface_free(s_img_fit);
-    s_img_fit   = NULL;
-    s_img_tried = false;
+    s_img_fit     = NULL;
+    s_img_path[0] = '\0';
 
     /* A drag that was in progress ends with the window it was holding. */
     s_drag    = NULL;

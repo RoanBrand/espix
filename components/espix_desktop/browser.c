@@ -355,11 +355,10 @@ static void size_text(uint32_t n, char *out, size_t len)
 }
 
 /*
- * What opens in the editor. An extension whitelist rather than a guess: nothing
- * here reads the file to decide what it is, so a file with no extension or an
- * unknown one is offered as "no handler yet" rather than opened as text and
- * found to be a binary. The table is also where the viewers will register --
- * image, audio, video -- once there are viewers to register.
+ * What opens where. An extension whitelist rather than a guess: nothing here
+ * reads the file to decide what it is, so a file with no extension or an
+ * unknown one is reported as having no handler rather than opened as something
+ * it is not. These tables are where the audio and video viewers will register.
  */
 static const char *const s_text_ext[] = {
     "txt", "md", "conf", "cfg", "ini", "log", "json", "csv",
@@ -367,19 +366,32 @@ static const char *const s_text_ext[] = {
 };
 #define TEXT_EXT_N ((int)(sizeof(s_text_ext) / sizeof(s_text_ext[0])))
 
-static bool name_is_text(const char *name)
+static const char *const s_image_ext[] = { "jpg", "jpeg" };
+#define IMAGE_EXT_N ((int)(sizeof(s_image_ext) / sizeof(s_image_ext[0])))
+
+static bool name_has_ext(const char *name, const char *const *exts, int n)
 {
     const char *dot = strrchr(name, '.');
 
     if (dot == NULL || dot[1] == '\0') {
         return false;
     }
-    for (int i = 0; i < TEXT_EXT_N; i++) {
-        if (strcasecmp(dot + 1, s_text_ext[i]) == 0) {
+    for (int i = 0; i < n; i++) {
+        if (strcasecmp(dot + 1, exts[i]) == 0) {
             return true;
         }
     }
     return false;
+}
+
+static bool name_is_text(const char *name)
+{
+    return name_has_ext(name, s_text_ext, TEXT_EXT_N);
+}
+
+static bool name_is_image(const char *name)
+{
+    return name_has_ext(name, s_image_ext, IMAGE_EXT_N);
 }
 
 /* ------------------------------------------------------------------ */
@@ -439,9 +451,13 @@ static void browser_activate(int row)
         return;
     }
 
-    /* Stage three: an image, an audio file or a video gets its viewer here.
-     * Until then, a file that does nothing at all is worse than one that says
-     * so. */
+    if (name_is_image(ent->name)) {
+        espix_desktop_open_image(child);
+        return;
+    }
+
+    /* An audio file or a video gets its player here, once there is one. Until
+     * then, a file that does nothing at all is worse than one that says so. */
     snprintf(s_status, sizeof(s_status), "%.64s: no handler yet", ent->name);
     espix_window_repaint(s_win);
 }

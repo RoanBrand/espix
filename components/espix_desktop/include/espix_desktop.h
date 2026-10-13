@@ -171,6 +171,12 @@ espix_window_t *espix_browser_window(void);
  */
 void espix_desktop_open_terminal(const char *cmd);
 
+/*
+ * The image viewer, on a file. The same contract as the settings panel and the
+ * browser: one window, brought back with a new picture in it.
+ */
+void espix_desktop_open_image(const char *path);
+
 #ifdef __cplusplus
 }
 #endif
