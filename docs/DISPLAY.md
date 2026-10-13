@@ -592,15 +592,16 @@ Two clients were tried first, and both taught something.
   screen when it exits or is killed. A killed app that died holding the canvas
   leaves the canvas lock orphaned for the rest of the boot -- correct rather than
   mutually exclusive, which is the price of not wedging the board.
-- **The file browser opens text and JPEG images, and nothing else yet.** It
-  walks the tree, lists directories with their sizes, and navigates by mouse and
-  keyboard; a Places column holds home, the root, a few fixed directories and
-  the mounted volumes, which appear as desktop icons too -- the way a stick is
-  reached. A file whose extension the browser knows as text opens in the editor,
-  in a terminal window of its own; a .jpg or .jpeg opens in the image viewer.
-  Anything else reports "no handler yet" on the status line, which is where the
-  audio and video players will be dispatched from. Neither the browser nor the
-  desktop mounts anything itself.
+- **The file browser opens text, JPEG images and audio, and nothing else yet.**
+  It walks the tree, lists directories with their sizes, and navigates by mouse
+  and keyboard; a Places column holds home, the root, a few fixed directories
+  and the mounted volumes, which appear as desktop icons too -- the way a stick
+  is reached. A file whose extension the browser knows as text opens in the
+  editor, in a terminal window of its own; a .jpg or .jpeg opens in the image
+  viewer; an .mp3, .wav, .aac or .flac opens in the music player. Anything else
+  reports "no handler yet" on the status line, which is where a video player
+  will be dispatched from. Neither the browser nor the desktop mounts anything
+  itself.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a

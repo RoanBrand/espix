@@ -1259,6 +1259,16 @@ void espix_desktop_open_image(const char *path)
     photo_open_path(path);
 }
 
+/* ...and the music player, which brings its own window. */
+void espix_desktop_open_audio(const char *path)
+{
+    espix_window_t *w = espix_music_open(path);
+
+    if (w != NULL) {
+        window_present(w);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* The windows that ship with it                                      */
 /* ------------------------------------------------------------------ */
@@ -2870,6 +2880,9 @@ static void window_close(espix_window_t *w)
     if (w == espix_browser_window()) {
         espix_browser_forget();
     }
+    if (w == espix_music_window()) {
+        espix_music_forget();
+    }
     if (w == s_confirm) {
         s_confirm = NULL;
     }
@@ -3029,6 +3042,7 @@ static void windows_destroy(void)
         term_stop(tw);                  /* each takes its window with it */
     }
     espix_browser_forget();
+    espix_music_forget();
 
     while (s_nwin > 0) {
         espix_window_t *w = s_wins[s_nwin - 1];

@@ -369,6 +369,10 @@ static const char *const s_text_ext[] = {
 static const char *const s_image_ext[] = { "jpg", "jpeg" };
 #define IMAGE_EXT_N ((int)(sizeof(s_image_ext) / sizeof(s_image_ext[0])))
 
+/* What the audio engine has decoders for; the rest of the list is its Kconfig. */
+static const char *const s_audio_ext[] = { "mp3", "wav", "aac", "flac" };
+#define AUDIO_EXT_N ((int)(sizeof(s_audio_ext) / sizeof(s_audio_ext[0])))
+
 static bool name_has_ext(const char *name, const char *const *exts, int n)
 {
     const char *dot = strrchr(name, '.');
@@ -392,6 +396,11 @@ static bool name_is_text(const char *name)
 static bool name_is_image(const char *name)
 {
     return name_has_ext(name, s_image_ext, IMAGE_EXT_N);
+}
+
+static bool name_is_audio(const char *name)
+{
+    return name_has_ext(name, s_audio_ext, AUDIO_EXT_N);
 }
 
 /* ------------------------------------------------------------------ */
@@ -456,8 +465,13 @@ static void browser_activate(int row)
         return;
     }
 
-    /* An audio file or a video gets its player here, once there is one. Until
-     * then, a file that does nothing at all is worse than one that says so. */
+    if (name_is_audio(ent->name)) {
+        espix_desktop_open_audio(child);
+        return;
+    }
+
+    /* A video gets its player here, once there is one. Until then, a file that
+     * does nothing at all is worse than one that says so. */
     snprintf(s_status, sizeof(s_status), "%.64s: no handler yet", ent->name);
     espix_window_repaint(s_win);
 }

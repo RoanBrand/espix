@@ -177,6 +177,14 @@ void espix_desktop_open_terminal(const char *cmd);
  */
 void espix_desktop_open_image(const char *path);
 
+/* The music player, on a file. Same contract again. */
+void espix_desktop_open_audio(const char *path);
+
+/* The music window itself, so the desktop can forget it when it is closed. */
+espix_window_t *espix_music_open(const char *path);
+void            espix_music_forget(void);
+espix_window_t *espix_music_window(void);
+
 #ifdef __cplusplus
 }
 #endif
