@@ -30,6 +30,7 @@
 #include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_places.h"
 #include "espix_task.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
@@ -328,6 +329,7 @@ static espix_rect_t menu_rect(void);
 static espix_rect_t bar_rect(void);
 static void bar_damage(void);
 static void icons_paint(espix_canvas_t *c, espix_rect_t r);
+static void vols_paint(espix_canvas_t *c, espix_rect_t r);
 
 /* How often a drag lets the screen catch up. See the note where it is used. */
 #define DRAG_TICK_US (16 * 1000)
@@ -567,6 +569,7 @@ static void desktop_repair_locked(espix_rect_t r)
     espix_canvas_lock(c);
     espix_canvas_fill(c, r, COL_DESKTOP);
     icons_paint(c, r);              /* on the bare desktop, under the windows */
+    vols_paint(c, r);
 
     for (int i = 0; i < s_nwin; i++) {
         const espix_window_t *w = s_wins[i];
@@ -1959,6 +1962,162 @@ static void disc_paint(espix_canvas_t *c, int cx, int cy, int rad, espix_px_t co
     }
 }
 
+/*
+ * Mounted volumes: the desktop's answer to what is plugged in, read from the
+ * same list the browser's Places column uses. The desktop does not mount
+ * anything -- it asks the mount table what is already there, and only for
+ * volumes under /mnt that belong to the esp account.
+ *
+ * They go in the same column as the program icons, below them, and that is a
+ * placement rather than an accident: the terminal window is 616 pixels wide and
+ * starts at x=120, the browser starts at x=100, so a second column anywhere to
+ * the right of the first would be under one of them. The left strip is the one
+ * part of the desktop that stays visible.
+ */
+static espix_place_t s_vols[ESPIX_PLACES_MAX];
+static int           s_nvols;
+static int           s_vol_sel = -1;
+static int64_t       s_vol_click_us;
+
+/* The same threshold icon_press() uses. */
+#define VOL_DBLCLICK_US (400 * 1000)
+
+static espix_rect_t vol_rect(int i)
+{
+    return (espix_rect_t){ ICON_LEFT,
+                           ICON_TOP + (ICON_N + i) * (ICON_CELL_H + ICON_GAP),
+                           ICON_CELL_W, ICON_CELL_H };
+}
+
+static int vol_at(int x, int y)
+{
+    for (int i = 0; i < s_nvols; i++) {
+        if (in_rect(vol_rect(i), x, y)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void vol_set_sel(int i)
+{
+    if (i == s_vol_sel) {
+        return;
+    }
+    const int old = s_vol_sel;
+    s_vol_sel = i;
+    if (old >= 0) {
+        desktop_repair(vol_rect(old));
+    }
+    if (i >= 0) {
+        desktop_repair(vol_rect(i));
+    }
+}
+
+/*
+ * The same plate as a program icon, with a platter instead of bands: a mounted
+ * volume is a thing to look inside, not a program to run.
+ */
+static void vols_paint(espix_canvas_t *c, espix_rect_t r)
+{
+    for (int i = 0; i < s_nvols; i++) {
+        const espix_rect_t cell = vol_rect(i);
+
+        if (!rects_overlap(cell, r)) {
+            continue;
+        }
+
+        const espix_px_t sel_bg   = RGB565(0x3E, 0x46, 0x58);
+        const espix_px_t label_bg = (i == s_vol_sel) ? sel_bg : COL_DESKTOP;
+
+        if (i == s_vol_sel) {
+            espix_canvas_fill(c, cell, sel_bg);
+        }
+
+        const int bx = cell.x + (cell.w - ICON_BOX) / 2;
+        const int by = cell.y + 4;
+
+        espix_canvas_fill(c, (espix_rect_t){ bx, by, ICON_BOX, ICON_BOX },
+                          RGB565(0x14, 0x18, 0x1E));
+        espix_canvas_outline(c, (espix_rect_t){ bx, by, ICON_BOX, ICON_BOX },
+                             RGB565(0x6A, 0x78, 0x90));
+
+        const int cx = bx + ICON_BOX / 2;
+        const int cy = by + ICON_BOX / 2;
+
+        disc_paint(c, cx, cy, 14, RGB565(0x38, 0xA0, 0xA8));
+        espix_canvas_fill(c, (espix_rect_t){ cx - 3, cy - 3, 6, 6 },
+                          RGB565(0x14, 0x18, 0x1E));
+
+        const int len = (int)strlen(s_vols[i].label);
+        int       tx  = cell.x + (cell.w - len * CELL_W) / 2;
+
+        if (tx < cell.x) {
+            tx = cell.x;
+        }
+        espix_canvas_text(c, tx, by + ICON_BOX + 4, s_vols[i].label,
+                          (i == s_vol_sel) ? COL_TITLE_FG : COL_TEXT_FG,
+                          label_bg);
+    }
+}
+
+/*
+ * Recompute the volumes, and repaint when the set of them changes: a stick can
+ * arrive while the desktop is up, and an icon that appears only after a reboot
+ * is an icon nobody trusts. The list is static because this runs from the
+ * clock's timer callback, where a kilobyte of stack is not on offer.
+ */
+static void vols_refresh(void)
+{
+    static espix_place_t all[ESPIX_PLACES_MAX];
+
+    const size_t n = espix_places(all, ESPIX_PLACES_MAX);
+    int          k = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (all[i].volume) {
+            all[k++] = all[i];      /* compact in place; k <= i always */
+        }
+    }
+
+    bool changed = (k != s_nvols);
+
+    for (int i = 0; !changed && i < k; i++) {
+        changed = strcmp(all[i].path, s_vols[i].path) != 0;
+    }
+    if (!changed) {
+        return;
+    }
+
+    desk_lock();
+    memcpy(s_vols, all, sizeof(s_vols[0]) * (size_t)k);
+    s_nvols = k;
+    if (s_vol_sel >= s_nvols) {
+        s_vol_sel = -1;
+    }
+    desk_unlock();
+
+    if (desktop_on_screen()) {
+        espix_desktop_repaint();
+    }
+}
+
+static void vol_press(int i)
+{
+    const int64_t now = esp_timer_get_time();
+
+    if (i == s_vol_sel && now - s_vol_click_us < VOL_DBLCLICK_US) {
+        char path[ESPIX_PATH_MAX];
+
+        strlcpy(path, s_vols[i].path, sizeof(path));
+        vol_set_sel(-1);
+        window_present(espix_browser_open(path));
+        return;
+    }
+    s_vol_click_us = now;
+    vol_set_sel(i);
+}
+
 static void start_paint(espix_canvas_t *c)
 {
     const espix_rect_t b  = start_rect();
@@ -2533,6 +2692,8 @@ static void clock_tick(void *arg)
 {
     (void)arg;
 
+    vols_refresh();
+
     char now[8];
     clock_text(now, sizeof(now));
 
@@ -3052,8 +3213,14 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                     icon_press(ic);
                     return;
                 }
+                const int iv = vol_at(ev->x, ev->y);
+                if (iv >= 0) {
+                    vol_press(iv);
+                    return;
+                }
             }
             icon_set_sel(-1);
+            vol_set_sel(-1);
 
             /*
              * Close before focus, and on the window under the pointer rather
@@ -3259,6 +3426,7 @@ esp_err_t espix_desktop_start(void)
     if (s_nwin == 0) {
         windows_create();
     }
+    vols_refresh();
     input_reset();
     return espix_display_claim(&s_desktop_screen);
 }

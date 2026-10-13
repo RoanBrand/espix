@@ -35,6 +35,7 @@
 #include "espix_desktop.h"
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_places.h"
 #include "espix_widgets.h"
 
 #define TAG "browser"
@@ -62,21 +63,13 @@ typedef struct {
 } browser_entry_t;
 
 /*
- * The Places column: fixed for now. Stage three turns the /mnt row into one row
- * per mounted volume -- the mount table is public (espix_fs_mount_at() and
- * espix_fs_mount_owner()) and this list is where they will land.
+ * The Places column: the fixed few, then one row per mounted volume. Rebuilt
+ * whenever the directory is rescanned, so a stick that arrives while the window
+ * is open is a row the next time anything navigates -- and the desktop's icons
+ * read the same list, from the same place.
  */
-static const struct {
-    const char *label;
-    const char *path;
-} s_places[] = {
-    { "Home",   "/home/esp" },
-    { "Root",   "/"         },
-    { "Bin",    "/bin"      },
-    { "Etc",    "/etc"      },
-    { "Media",  "/mnt"      },
-};
-#define PLACE_N ((int)(sizeof(s_places) / sizeof(s_places[0])))
+static espix_place_t s_places[ESPIX_PLACES_MAX];
+static int           s_nplaces;
 
 static espix_window_t  *s_win;
 static char             s_path[ESPIX_PATH_MAX];
@@ -253,6 +246,7 @@ static int ent_cmp(const void *a, const void *b)
  */
 static void browser_scan(void)
 {
+    s_nplaces   = (int)espix_places(s_places, ESPIX_PLACES_MAX);
     s_nents     = 0;
     s_truncated = false;
     s_status[0] = '\0';
@@ -487,7 +481,7 @@ static void browser_draw(espix_window_t *w, espix_surface_t *s, espix_rect_t r,
     espix_surface_fill(s, c, WGT_PANE);
     espix_surface_fill(s, n, WGT_NAV);
 
-    for (int i = 0; i < PLACE_N; i++) {
+    for (int i = 0; i < s_nplaces; i++) {
         espix_wgt_navrow(s, nav_row(w, i), s_places[i].label,
                          place_selected(i), false);
     }
@@ -570,7 +564,7 @@ static void browser_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
         return;                         /* act on the press, not the release */
     }
 
-    for (int i = 0; i < PLACE_N; i++) {
+    for (int i = 0; i < s_nplaces; i++) {
         if (espix_wgt_hit(nav_row(w, i), x, y)) {
             browser_go(s_places[i].path);
             return;

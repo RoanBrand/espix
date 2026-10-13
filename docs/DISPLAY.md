@@ -598,8 +598,9 @@ Two clients were tried first, and both taught something.
   extension is one the browser knows as text opens in the editor, in a terminal
   window of its own; anything else reports "no handler yet" on the status line,
   which is where the image, audio and video viewers will be dispatched from.
-  Mounted volumes do not appear in Places yet, and it never mounts anything
-  itself.
+  Volumes mounted under /mnt that belong to the esp account appear in Places and
+  as desktop icons, which is how a stick is reached; neither the browser nor the
+  desktop mounts anything itself.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a

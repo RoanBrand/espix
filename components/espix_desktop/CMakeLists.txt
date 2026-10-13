@@ -4,11 +4,15 @@ idf_component_register(
         "widgets.c"
         "settings.c"
         "browser.c"
+        "places.c"
     INCLUDE_DIRS
         "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
     REQUIRES
         espix_display
     PRIV_REQUIRES
+        espix_fs
         espix_kernel
         espix_proc
         espix_shell
