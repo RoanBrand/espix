@@ -602,6 +602,11 @@ Two clients were tried first, and both taught something.
   reports "no handler yet" on the status line, which is where a video player
   will be dispatched from. Neither the browser nor the desktop mounts anything
   itself.
+- **A JPEG has to be baseline; a progressive one shows "no image".** The decoder
+  every target keeps is TJpgDec in the ROM, which is baseline only, and the
+  reason a file failed is logged. Worth knowing when producing a test image:
+  macOS `sips` re-encodes a JPEG as progressive if the source was progressive,
+  and a round trip through PNG is the quick way to get baseline out of it.
 - **The console is monochrome.** SGR sequences are parsed and dropped: the 8x8
   font is one bit per pixel and the grid holds one byte per cell, so colour
   wants an attribute per cell and a renderer that reads it. Until then a
