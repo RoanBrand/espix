@@ -116,6 +116,41 @@ static uint8_t         s_buttons;
 static espix_window_t *s_drag;
 static espix_window_t *s_press_win;     /* who took the press, for the release */
 
+/*
+ * Damage is a request; a frame is when it is honoured.
+ *
+ * A command that prints five hundred lines arrives as five hundred writes, and
+ * compositing each separately repainted the whole grid five hundred times --
+ * measured at eleven seconds for one directory listing. The surfaces are painted
+ * and the canvas is composited once per frame instead, over the union of
+ * everything that happened in it.
+ *
+ * Nothing is ever stale when something else composites: desktop_repair_locked()
+ * honours the pending damage before it starts, so an immediate repair (a drag, a
+ * focus change, a claim) flushes the frame early rather than compositing over
+ * surfaces that have not caught up.
+ */
+#define DAMAGE_FRAME_US (16 * 1000)
+
+static espix_rect_t         s_dmg;
+static bool                 s_dmg_pending;
+static esp_timer_handle_t   s_dmg_timer;
+
+static void damage_flush_locked(void);
+static void damage_schedule(espix_rect_t r);
+static void damage_tick(void *arg);
+static void desktop_repair_locked(espix_rect_t r);
+
+static espix_rect_t rect_union(espix_rect_t a, espix_rect_t b)
+{
+    const int x0 = (a.x < b.x) ? a.x : b.x;
+    const int y0 = (a.y < b.y) ? a.y : b.y;
+    const int x1 = (a.x + a.w > b.x + b.w) ? a.x + a.w : b.x + b.w;
+    const int y1 = (a.y + a.h > b.y + b.h) ? a.y + a.h : b.y + b.h;
+
+    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
+}
+
 static void desk_lock(void)
 {
     if (s_desk_lock != NULL) {
@@ -519,17 +554,12 @@ void espix_window_damage(espix_window_t *w, espix_rect_t r)
         return;
     }
 
-    window_paint(w, r);
-
-    /*
-     * Then the *region*, from every window that reaches it and in z-order -- not
-     * this window's surface alone. Blitting just the damaged window paints over
-     * whatever is above it, which is visible the moment a window is focused
-     * without being raised: its title bar appears through the window on top of
-     * it. The region is one window's worth, so this is still cheap.
-     */
-    desktop_repair((espix_rect_t){ w->x + r.x, w->y + r.y, r.w, r.h });
+    desk_lock();
+    damage_schedule((espix_rect_t){ w->x + r.x, w->y + r.y, r.w, r.h });
+    desk_unlock();
 }
+
+
 
 void espix_window_repaint(espix_window_t *w)
 {
@@ -551,12 +581,85 @@ void espix_window_repaint(espix_window_t *w)
  * of the window's old and new rectangles, so filling and blitting those instead
  * of the whole canvas is a few times less work for the same picture.
  */
+/*
+ * Paint every window the pending region reaches, then composite it: this is
+ * what the frame does, and what any immediate repair does first.
+ */
+static void damage_flush_locked(void)
+{
+    if (!s_dmg_pending) {
+        return;
+    }
+
+    const espix_rect_t r = s_dmg;
+
+    s_dmg_pending = false;              /* before the repair below re-enters */
+
+    for (int i = 0; i < s_nwin; i++) {
+        espix_window_t *w = s_wins[i];
+
+        if (w->hidden || w->surf == NULL) {
+            continue;
+        }
+        if (r.x >= w->x + w->w || w->x >= r.x + r.w
+            || r.y >= w->y + w->h || w->y >= r.y + r.h) {
+            continue;                   /* does not reach the region */
+        }
+
+        const espix_rect_t wr = win_clip((espix_rect_t){ r.x - w->x,
+                                                         r.y - w->y,
+                                                         r.w, r.h },
+                                         w->w, w->h);
+        if (wr.w > 0 && wr.h > 0) {
+            window_paint(w, wr);
+        }
+    }
+
+    desktop_repair_locked(r);
+}
+
+static void damage_tick(void *arg)
+{
+    (void)arg;
+
+    desk_lock();
+    damage_flush_locked();
+    desk_unlock();
+}
+
+static void damage_schedule(espix_rect_t r)
+{
+    s_dmg = s_dmg_pending ? rect_union(s_dmg, r) : r;
+
+    if (s_dmg_pending) {
+        return;                         /* already due: this joins that frame */
+    }
+
+    if (s_dmg_timer == NULL) {
+        const esp_timer_create_args_t args = { .callback = damage_tick,
+                                               .name     = "desk-damage" };
+        if (esp_timer_create(&args, &s_dmg_timer) != ESP_OK) {
+            s_dmg_timer = NULL;
+        }
+    }
+
+    s_dmg_pending = true;
+
+    if (s_dmg_timer != NULL) {
+        (void)esp_timer_start_once(s_dmg_timer, DAMAGE_FRAME_US);
+    } else {
+        damage_flush_locked();          /* no timer: composite now */
+    }
+}
+
 static void desktop_repair_locked(espix_rect_t r)
 {
     espix_canvas_t *c = espix_display_canvas();
     if (c == NULL || !desktop_on_screen()) {
         return;
     }
+
+    damage_flush_locked();              /* pending paints, before the pixels */
 
     r = win_clip(r, espix_canvas_width(c), espix_canvas_height(c));
     if (r.w <= 0 || r.h <= 0) {
@@ -1294,6 +1397,15 @@ typedef struct term_win {
     espix_term_t    *term;      /* freed by the task that runs it */
     TaskHandle_t     task;
     struct term_win *next;
+
+    /*
+     * The rows drawn since the last composite. A term_repaint() -- which is what
+     * one scrolled line costs once the screen is full -- draws every row, and
+     * compositing each of them separately was thirty blits and thirty frames on
+     * the wire for one line of output.
+     */
+    bool dirty;
+    int  dirty_top, dirty_bot;
 } term_win_t;
 
 static term_win_t *s_terms;
@@ -1360,6 +1472,48 @@ static espix_rect_t term_grid_rect(const term_win_t *tw,
  * block, which is what a terminal shows, and what the editor expects to find:
  * it positions the cursor and draws nothing there itself.
  */
+static void term_note_damage(term_win_t *tw, int row)
+{
+    if (!tw->dirty) {
+        tw->dirty     = true;
+        tw->dirty_top = row;
+        tw->dirty_bot = row;
+        return;
+    }
+    if (row < tw->dirty_top) { tw->dirty_top = row; }
+    if (row > tw->dirty_bot) { tw->dirty_bot = row; }
+}
+
+/* One row drawn: remember it, and let the flush do the one composite. */
+static void term_note_all(term_win_t *tw)
+{
+    const int rows = (tw->term != NULL) ? espix_term_rows(tw->term) : 0;
+
+    tw->dirty     = true;
+    tw->dirty_top = 0;
+    tw->dirty_bot = (rows > 0) ? rows - 1 : 0;
+}
+
+static void term_view_flush(void *ctx)
+{
+    term_win_t *tw = ctx;
+
+    desk_lock();
+
+    if (tw->dirty && tw->win != NULL && tw->term != NULL) {
+        const espix_rect_t c = espix_window_content(tw->win);
+
+        espix_window_damage(tw->win,
+                            (espix_rect_t){
+                                c.x, c.y + tw->dirty_top * CELL_H,
+                                espix_term_cols(tw->term) * CELL_W,
+                                (tw->dirty_bot - tw->dirty_top + 1) * CELL_H });
+    }
+    tw->dirty = false;
+
+    desk_unlock();
+}
+
 /* One run of cells that share a colour: fg in the low nibble, bg in the high. */
 static void term_paint_run(espix_surface_t *s, int x, int y, const char *cells,
                            int len, uint8_t attr)
@@ -1428,42 +1582,27 @@ static void term_paint_cursor_cell(espix_window_t *w, espix_surface_t *s,
  * is released before the damage, because damaging a window repaints it, which
  * takes the surface lock again, and that one is not recursive.
  */
+/*
+ * A row changed: note it, and let the compositor draw it.
+ *
+ * The surface is not painted here, and that is the point. espix_window_damage()
+ * repaints whatever region it is given from the model -- window_paint() calls
+ * this window's draw callback, which is term_draw() -- so painting here as well
+ * was two full-grid renders for one scrolled line. The console still paints in
+ * its own view, because it has no compositor to do it for it.
+ */
 static void term_view_row(void *ctx, int row, const char *cells,
-                           const uint8_t *attrs, int len)
+                          const uint8_t *attrs, int len)
 {
     term_win_t *tw = ctx;
 
+    (void)cells;
+    (void)attrs;
+    (void)len;
+
     desk_lock();
     if (tw->win != NULL && tw->term != NULL) {
-        char line[ESPIX_TERM_MAX_COLS + 1];
-
-        if (len > ESPIX_TERM_MAX_COLS) {
-            len = ESPIX_TERM_MAX_COLS;
-        }
-        memcpy(line, cells, (size_t)len);
-        line[len] = '\0';
-
-        espix_window_t    *w = tw->win;
-        espix_surface_t   *s = espix_window_surface(w);
-        const espix_rect_t c = espix_window_content(w);
-
-        espix_surface_lock(s);
-        for (int i = 0; i < len; ) {
-            int j = i;
-
-            while (j < len && attrs[j] == attrs[i]) {
-                j++;
-            }
-            term_paint_run(s, c.x + i * CELL_W, c.y + row * CELL_H, line + i,
-                           j - i, attrs[i]);
-            i = j;
-        }
-        term_paint_cursor_row(w, s, tw, row, line, attrs, len);
-        espix_surface_unlock(s);
-
-        espix_window_damage(w, (espix_rect_t){ c.x, c.y + row * CELL_H,
-                                               espix_term_cols(tw->term) * CELL_W,
-                                               CELL_H });
+        term_note_damage(tw, row);
     }
     desk_unlock();
 }
@@ -1507,7 +1646,7 @@ static void term_view_clear(void *ctx)
         espix_surface_fill(s, g, COL_WIN_BG);
         espix_surface_unlock(s);
 
-        espix_window_damage(w, g);
+        term_note_all(tw);
     }
     desk_unlock();
 }
@@ -1521,6 +1660,7 @@ static espix_term_view_t term_view_of(term_win_t *tw)
         .cell  = term_view_cell,
         .row   = term_view_row,
         .clear = term_view_clear,
+        .flush = term_view_flush,
     };
 }
 
@@ -3531,6 +3671,12 @@ void espix_desktop_stop(void)
         esp_timer_delete(s_clock_timer);
         s_clock_timer = NULL;
     }
+    if (s_dmg_timer != NULL) {
+        esp_timer_stop(s_dmg_timer);
+        esp_timer_delete(s_dmg_timer);
+        s_dmg_timer = NULL;
+    }
+    s_dmg_pending = false;
 
     espix_display_release(&s_desktop_screen);
 

@@ -650,6 +650,13 @@ static void term_putc_inner(espix_term_t *t, char c)
  * handover of state: a terminal keeps its screen whether or not it is the one
  * on display -- and, for the console, whether or not it is behind the desktop.
  */
+static void term_view_flush(espix_term_t *t)
+{
+    if (t->view.flush != NULL) {
+        t->view.flush(t->view.ctx);
+    }
+}
+
 static void term_repaint(espix_term_t *t)
 {
     if (t->defer) {
@@ -662,6 +669,7 @@ static void term_repaint(espix_term_t *t)
     for (int r = 0; r < t->rows; r++) {
         term_draw_row(t, r);
     }
+    term_view_flush(t);
 }
 
 /* The end of a write: every row it touched, drawn once each. */
@@ -677,6 +685,7 @@ static void term_flush(espix_term_t *t)
         for (int r = 0; r < t->rows; r++) {
             term_draw_row(t, r);
         }
+        term_view_flush(t);
         return;
     }
 
@@ -686,6 +695,7 @@ static void term_flush(espix_term_t *t)
         }
     }
     memset(t->dirty, 0, sizeof(t->dirty));
+    term_view_flush(t);
 }
 
 void espix_term_repaint(espix_term_t *t)

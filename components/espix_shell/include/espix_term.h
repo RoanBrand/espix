@@ -58,6 +58,14 @@ typedef struct {
     void (*row)(void *ctx, int row, const char *cells, const uint8_t *attrs,
                 int len);
     void (*clear)(void *ctx);
+    /*
+     * The rows are drawn; composite them now. A renderer with a compositor
+     * (a desktop window) draws each row into its surface as it is told and
+     * collects the region, then does one blit here -- because a screenful of
+     * output is one change, not thirty. Optional: the console draws straight to
+     * the canvas and has nothing to coalesce.
+     */
+    void (*flush)(void *ctx);
 } espix_term_view_t;
 
 typedef struct espix_term espix_term_t;

@@ -925,3 +925,42 @@ behind them. See docs/UPSTREAM.md for the Xtensa macro bug that forces it. The
 same audit belongs on the kernel, which the same backend builds, and on any
 runtime character classification in it ( uses, such as the OTA
 build-id comparison, are the first candidates).
+
+## The terminal's colour, font and rendering
+
+What a cell can say is one byte of text and one byte of colour, and both of the
+next steps need more than that. In rough order of what it would buy:
+
+- **Box-drawing glyphs.** The motd's antenna is heavy box-drawing, and
+  term_glyph() approximates every one of those characters to a dash, a bar or a
+  plus, so the logo draws as an ASCII sketch of itself. Real glyphs need either a
+  spare byte range (0x80 and up) with every renderer's font index widened from
+  char, or a small procedural line drawer for the box characters. The second is
+  probably right: it covers light, heavy and double variants without a font of
+  its own, and lines land on exact pixel boundaries at any cell size.
+- **256 and true colour.** SGR 38;5;N and 38;2;r;g;b are reduced to the nearest
+  of the sixteen, which is honest but lossy. Carrying the real value means a wider
+  attribute -- two bytes a cell, or an attribute byte that indexes a palette --
+  and the renderers draw a row as runs of one colour today, so more colours per
+  row costs more text calls. The measurement to make first is how much of a
+  screenful a colour-heavy program like ls --color actually splits into runs.
+- **Wide, combining and non-ASCII text.** Everything outside ASCII becomes a
+  space, and there is no double-width handling, so a CJK line would be four
+  columns of nothing.
+- **A scroll is a pixel move, not a repaint.** This is the one left with
+  numbers behind it. A command that scrolls the screen repeatedly -- listing a
+  500-entry directory -- settles in 3.2 seconds, and what is left is the drawing:
+  every scrolled line repaints the whole grid from the model (28 rows, 2128
+  glyphs) and re-blits it. A scroll should *move* pixels instead. The shape: a
+  scroll callback on the terminal view; the window memmoving its surface up a row;
+  the console calling espix_canvas_move, which is already wired to CopyRect on the
+  wire and is the primitive dragged windows use; and then drawing only the newly
+  exposed row. That turns 2128 glyphs and a full-grid blit per line into one row.
+  The real work is in the compositor, which has to be told that a region moved
+  rather than changed -- desktop_repair() re-blits whatever it is given today.
+  Worth trying: the win is large and the measurement is already in place.
+- **Rendering cost, otherwise.** Output is drawn per row and the canvas is
+  composited once a frame (DAMAGE_FRAME_US in desktop.c), which is what the
+  eleven-to-three seconds above bought. Beyond the scroll, the S3 has no PPA where
+  the S31 and the P4 do -- a row-at-a-time blit is exactly where an accelerator
+  pays -- and the P4's panel path is a different renderer again.
