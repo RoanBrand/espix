@@ -6,6 +6,7 @@ idf_component_register(
         "browser.c"
         "places.c"
         "music.c"
+        "video.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

@@ -165,6 +165,29 @@ static void desk_unlock(void)
     }
 }
 
+/*
+ * The desktop's lock, for an internal app whose *own task* paints its window.
+ *
+ * Exposed because the alternative is a use-after-free with a window in it. The
+ * desktop frees a closed window while holding this lock, so a task that reads
+ * the pointer, releases the lock and then paints is holding a pointer into
+ * freed memory for however long the read and the call are apart. Taking the
+ * lock across both makes the two orderings the only two: the free waits for the
+ * paint, or the paint sees a NULL window and does nothing.
+ *
+ * Recursive, and the same lock the compositor and the input handler use, so a
+ * caller inside the desktop does not deadlock against itself.
+ */
+void espix_desktop_lock(void)
+{
+    desk_lock();
+}
+
+void espix_desktop_unlock(void)
+{
+    desk_unlock();
+}
+
 /* ------------------------------------------------------------------ */
 /* Cursor                                                              */
 /* ------------------------------------------------------------------ */
@@ -1354,6 +1377,16 @@ void espix_desktop_open_image(const char *path)
 void espix_desktop_open_audio(const char *path)
 {
     espix_window_t *w = espix_music_open(path);
+
+    if (w != NULL) {
+        window_present(w);
+    }
+}
+
+/* ...and the video player, which does too. */
+void espix_desktop_open_video(const char *path)
+{
+    espix_window_t *w = espix_video_open(path);
 
     if (w != NULL) {
         window_present(w);
@@ -3094,6 +3127,9 @@ static void window_close(espix_window_t *w)
     if (w == espix_music_window()) {
         espix_music_forget();
     }
+    if (w == espix_video_window()) {
+        espix_video_forget();
+    }
     if (w == s_confirm) {
         s_confirm = NULL;
     }
@@ -3234,6 +3270,7 @@ static void windows_destroy(void)
     }
     espix_browser_forget();
     espix_music_forget();
+    espix_video_forget();
 
     while (s_nwin > 0) {
         espix_window_t *w = s_wins[s_nwin - 1];

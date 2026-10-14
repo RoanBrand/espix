@@ -185,6 +185,27 @@ espix_window_t *espix_music_open(const char *path);
 void            espix_music_forget(void);
 espix_window_t *espix_music_window(void);
 
+/*
+ * The video player, on an MJPEG file -- JPEG frames back to back, no container.
+ * The same contract again: one window, brought back with a new video in it.
+ */
+void espix_desktop_open_video(const char *path);
+
+espix_window_t *espix_video_open(const char *path);
+void            espix_video_forget(void);
+espix_window_t *espix_video_window(void);
+
+/*
+ * The desktop's lock, for an internal app whose own task paints its own window.
+ *
+ * Recursive, and the same lock the compositor and the input handler take. An
+ * app that does not run a task wants nothing to do with it; one that does needs
+ * it, because a window may be freed the moment it is closed and a task that
+ * read the pointer without the lock would be painting freed memory.
+ */
+void espix_desktop_lock(void);
+void espix_desktop_unlock(void);
+
 #ifdef __cplusplus
 }
 #endif

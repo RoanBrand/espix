@@ -592,16 +592,30 @@ Two clients were tried first, and both taught something.
   screen when it exits or is killed. A killed app that died holding the canvas
   leaves the canvas lock orphaned for the rest of the boot -- correct rather than
   mutually exclusive, which is the price of not wedging the board.
-- **The file browser opens text, JPEG images and audio, and nothing else yet.**
+- **The file browser opens text, JPEG images, audio and MJPEG video, and
+  nothing else yet.**
   It walks the tree, lists directories with their sizes, and navigates by mouse
   and keyboard; a Places column holds home, the root, a few fixed directories
   and the mounted volumes, which appear as desktop icons too -- the way a stick
   is reached. A file whose extension the browser knows as text opens in the
   editor, in a terminal window of its own; a .jpg or .jpeg opens in the image
-  viewer; an .mp3, .wav, .aac or .flac opens in the music player. Anything else
-  reports "no handler yet" on the status line, which is where a video player
-  will be dispatched from. Neither the browser nor the desktop mounts anything
-  itself.
+  viewer; an .mp3, .wav, .aac or .flac opens in the music player; a .mjpg or
+  .mjpeg opens in the video player, which plays it with the controls drawn over
+  the bottom of the picture and space, s, + and - on the keyboard. Anything else
+  reports "no handler yet" on the status line. Neither the browser nor the
+  desktop mounts anything itself.
+- **The video player reads raw MJPEG, and only raw MJPEG.** JPEG frames written
+  back to back with no container, because the JPEG codec is the only video
+  decoder any of the targets has: the S31 and the P4 decode each frame in it,
+  and the S3 in TJpgDec. An MPEG container is not close enough to reuse it --
+  inter-frame prediction is precisely what a JPEG decoder does not have. A frame
+  is decoded into a surface the player reuses, which on the S31 measures **5-6 ms
+  for 640x480**, and the player holds 24 fps. What does not hold is the far end:
+  a full-size window costs the RFB server ~58 ms an update at a 12 fps target
+  (canvas 16, encode 34, wire 7) and ~76 ms at 24, so a client sees about **8
+  updates a second and ~960 KB/s** either way. The encoder is the limit, and no
+  lossless encoding gets around it for photographic frames -- that is what
+  Tight+JPEG is for.
 - **A JPEG has to be baseline; a progressive one shows "no image".** The decoder
   every target keeps is TJpgDec in the ROM, which is baseline only, and the
   reason a file failed is logged. Worth knowing when producing a test image:

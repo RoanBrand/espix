@@ -120,6 +120,7 @@ Use cases:
 | Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag, minimise, maximise and close, and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |
 | Display | Fitting a picture to a window | **yes** | `espix_surface_scale` — PPA SRM with the scale factors set, and a nearest-neighbour loop where there is no PPA at all, which is the S3 |
 | Display | A system tray, beyond the clock | **no** | one item is the look; radio status, volume and the rest wait for something to report them |
+| Display | Playing a video | **partial** | raw MJPEG only — the one shape every target can decode (the JPEG codec on the S31 and the P4, TJpgDec on the S3); a 640x480 frame decodes in 5-6 ms and the player holds 24 fps, while the RFB encoder is what caps it near 8 updates a second — [DISPLAY.md](docs/DISPLAY.md#known-limitations) |
 | Display | A terminal you can work in | **yes** | the desktop's terminal window runs a real shell session — the same `espix_term` as the on-screen console, so the motd, the prompt, history, arrows, Ctrl-C and every command work there; a close button sits in the title bar |
 | Services | Scheduled work: a `cron` | **partial** | units with `every <interval>` — `autoupdate` is one, every 6h; crontab syntax, per-user jobs and `at` are not there |
 

@@ -322,6 +322,75 @@ done:
     return s;
 }
 
+/*
+ * The same decode, into pixels the caller already has.
+ *
+ * Only when the picture is exactly the size of the surface it is going into.
+ * The codec writes whole MCUs and reports the pitch it used afterwards, so a
+ * destination that is not the padded geometry would have to be decoded
+ * elsewhere and copied; that case is the caller's to detect (a non-multiple of
+ * 16), and espix_image_jpeg_into() below falls back to a decode and a copy.
+ *
+ * The direct write is the point: a video player decodes the same shape hundreds
+ * of times, and an allocation and a 600 KiB memcpy per frame is most of what a
+ * frame costs.
+ */
+static esp_err_t jpeg_hw_into(espix_surface_t *dst, const uint8_t *jpg, size_t len)
+{
+    jpeg_decode_picture_info_t info;
+    SemaphoreHandle_t          lock;
+
+    if (jpeg_decoder_get_info(jpg, (uint32_t)len, &info) != ESP_OK) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int w = (int)info.width;
+    const int h = (int)info.height;
+
+    int mx, my;
+    mcu_size(info.sample_method, &mx, &my);
+
+    if (w <= 0 || h <= 0
+        || ((w + mx - 1) / mx * mx) != espix_surface_width(dst)
+        || ((h + my - 1) / my * my) != espix_surface_height(dst)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    lock = engine_lock();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+
+    esp_err_t   err = ESP_FAIL;
+    jpeg_decoder_handle_t eng = engine_get();
+
+    if (eng == NULL) {
+        goto done;
+    }
+
+    const jpeg_decode_cfg_t dcfg = {
+        .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+        .rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
+        .conv_std      = JPEG_YUV_RGB_CONV_STD_BT601,
+    };
+
+    const uint32_t bytes = (uint32_t)((size_t)espix_surface_width(dst)
+                                      * (size_t)espix_surface_height(dst)
+                                      * sizeof(espix_px_t));
+    uint32_t got = 0;
+
+    if (jpeg_decoder_process(eng, &dcfg, jpg, (uint32_t)len,
+                             (uint8_t *)espix_surface_pixels(dst), bytes,
+                             &got) == ESP_OK) {
+        err = ESP_OK;
+    }
+
+done:
+    xSemaphoreGive(lock);
+    return err;
+}
+
 static const char *jpeg_hw_name(void)
 {
     return "JPEG codec";
@@ -333,6 +402,12 @@ static espix_surface_t *jpeg_hw(const uint8_t *jpg, size_t len)
 {
     (void)jpg; (void)len;
     return NULL;
+}
+
+static esp_err_t jpeg_hw_into(espix_surface_t *dst, const uint8_t *jpg, size_t len)
+{
+    (void)dst; (void)jpg; (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 static const char *jpeg_hw_name(void)
@@ -354,6 +429,45 @@ espix_surface_t *espix_image_jpeg(const uint8_t *jpg, size_t len)
         return s;
     }
     return jpeg_sw(jpg, len);
+}
+
+/*
+ * Decode into a surface the caller already has, which must be exactly the
+ * picture's size. True when the surface now holds it.
+ *
+ * The hardware path is a codec write straight into those pixels when the
+ * geometry is MCU-aligned, which every video frame at a multiple of 16 is; the
+ * software path, and any picture that is not, decodes into a surface of its own
+ * and copies. Either way the caller does not have to know which one happened.
+ */
+esp_err_t espix_image_jpeg_into(espix_surface_t *dst, const uint8_t *jpg, size_t len)
+{
+    if (dst == NULL || jpg == NULL || len < 4) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const esp_err_t hw = jpeg_hw_into(dst, jpg, len);
+    if (hw == ESP_OK) {
+        return ESP_OK;
+    }
+
+    espix_surface_t *tmp = jpeg_sw(jpg, len);
+    if (tmp == NULL) {
+        return ESP_FAIL;
+    }
+
+    const int w = espix_surface_width(tmp);
+    const int h = espix_surface_height(tmp);
+
+    if (w != espix_surface_width(dst) || h != espix_surface_height(dst)) {
+        espix_surface_free(tmp);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(espix_surface_pixels(dst), espix_surface_pixels(tmp),
+           (size_t)w * (size_t)h * sizeof(espix_px_t));
+    espix_surface_free(tmp);
+    return ESP_OK;
 }
 
 /*

@@ -275,6 +275,16 @@ void espix_canvas_scale_surface(espix_canvas_t *c, const espix_surface_t *s);
 espix_surface_t *espix_image_jpeg(const uint8_t *jpg, size_t len);
 
 /*
+ * Decode into a surface the caller already has, instead of a new one.
+ *
+ * The surface must be exactly the picture's size; a caller that decodes the
+ * same shape repeatedly -- a video player, frame after frame -- is what this is
+ * for. True when the surface now holds the picture.
+ */
+esp_err_t espix_image_jpeg_into(espix_surface_t *dst, const uint8_t *jpg,
+                                size_t len);
+
+/*
  * Both paths on one file, for the benchmark: software, and the codec where there
  * is one, with hw_ok saying whether the two agree -- so a fast wrong answer is
  * not worth more than a slow right one. Fills one row and returns false when the

@@ -358,7 +358,7 @@ static void size_text(uint32_t n, char *out, size_t len)
  * What opens where. An extension whitelist rather than a guess: nothing here
  * reads the file to decide what it is, so a file with no extension or an
  * unknown one is reported as having no handler rather than opened as something
- * it is not. These tables are where the audio and video viewers will register.
+ * it is not. Text, images, audio and video each have a table here.
  */
 static const char *const s_text_ext[] = {
     "txt", "md", "conf", "cfg", "ini", "log", "json", "csv",
@@ -372,6 +372,12 @@ static const char *const s_image_ext[] = { "jpg", "jpeg" };
 /* What the audio engine has decoders for; the rest of the list is its Kconfig. */
 static const char *const s_audio_ext[] = { "mp3", "wav", "aac", "flac" };
 #define AUDIO_EXT_N ((int)(sizeof(s_audio_ext) / sizeof(s_audio_ext[0])))
+
+/* Raw MJPEG -- JPEG frames written back to back, no container. The one shape of
+ * video every target can decode: the JPEG codec on the S31 and the P4, TJpgDec
+ * on the S3. */
+static const char *const s_video_ext[] = { "mjpg", "mjpeg" };
+#define VIDEO_EXT_N ((int)(sizeof(s_video_ext) / sizeof(s_video_ext[0])))
 
 static bool name_has_ext(const char *name, const char *const *exts, int n)
 {
@@ -401,6 +407,11 @@ static bool name_is_image(const char *name)
 static bool name_is_audio(const char *name)
 {
     return name_has_ext(name, s_audio_ext, AUDIO_EXT_N);
+}
+
+static bool name_is_video(const char *name)
+{
+    return name_has_ext(name, s_video_ext, VIDEO_EXT_N);
 }
 
 /* ------------------------------------------------------------------ */
@@ -470,8 +481,13 @@ static void browser_activate(int row)
         return;
     }
 
-    /* A video gets its player here, once there is one. Until then, a file that
-     * does nothing at all is worse than one that says so. */
+    if (name_is_video(ent->name)) {
+        espix_desktop_open_video(child);
+        return;
+    }
+
+    /* Anything else says so. Nothing here reads the file to decide what it is,
+     * so a file with an unknown extension is reported rather than guessed at. */
     snprintf(s_status, sizeof(s_status), "%.64s: no handler yet", ent->name);
     espix_window_repaint(s_win);
 }

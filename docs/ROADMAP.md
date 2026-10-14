@@ -844,8 +844,12 @@ other way round.
   role.
 
 - **A minimal 2D desktop environment**: a filesystem browser, a JPEG viewer, an
-  audio player for whatever formats decode cheaply, and video on the P4, which
-  has the hardware for it. These are *apps*, not kernel work -- which is the
+  audio player for whatever formats decode cheaply, and video -- which on this
+  hardware means MJPEG, a sequence of JPEG frames, because the JPEG codec is the
+  only video decoder any of the targets has. The P4 is not the exception it read
+  as here: its H.264 block is an *encoder*, for a camera, and cannot play a file
+  back at all, while the JPEG codec is the S31's too. An MPEG container is
+  software the whole way down. These are *apps*, not kernel work -- which is the
   point of the ELF loader and the export table, and the best argument for
   keeping that boundary honest. The gap between here and there is mostly a
   graphics stack and a windowing model, neither of which espix has any business
