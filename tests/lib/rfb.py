@@ -38,6 +38,12 @@ import time
 ENC_RAW = 0
 ENC_COPYRECT = 1
 ENC_HEXTILE = 5
+ENC_TIGHT = 7
+
+# Tight's ten quality levels, as pseudo-encodings: -32 is level 0 (lossless) and
+# -23 is level 9. Sending them is a client saying it will take a lossy update,
+# which is what the server needs before it may send a JPEG.
+ENC_TIGHT_QUALITY = list(range(-32, -22))
 # A pseudo-encoding (negative 32-bit): the server can change the screen size
 # under a live connection with it. The value is TigerVNC's, so the test client
 # and the real one agree.
@@ -120,7 +126,7 @@ class Reader:
 
 class Rfb:
     def __init__(self, host, port=5900, password=DEFAULT_PASSWORD, timeout=30.0,
-                 raw_only=False, copyrect=True, eds=False):
+                 raw_only=False, copyrect=True, eds=False, tight=False):
         self.host = host
         self.port = port
         self.password = password
@@ -128,6 +134,11 @@ class Rfb:
         self.raw_only = raw_only
         self.copyrect = copyrect
         self.eds = eds
+        # Offer Tight, and skip its payloads rather than decode them. There is
+        # no JPEG decoder here, so the framebuffer is wrong where a Tight
+        # rectangle landed -- which is fine for the question this mode exists to
+        # answer, which is what Tight costs the *server* in bytes and updates.
+        self.tight = tight
         # Set to (w, h) by the ExtendedDesktopSize handler when the server
         # changes the size, so a caller can notice without polling.
         self.resized = None
@@ -142,7 +153,8 @@ class Rfb:
         self.height = 0
         # What actually crossed the socket, so a claim about the cost of a frame
         # is a measurement rather than a memory of one.
-        self.wire = {"bytes": 0, "frames": 0, "encodings": {}}
+        self.wire = {"bytes": 0, "frames": 0, "encodings": {},
+                     "tight": {"rects": 0, "bytes": 0}}
 
     # -- handshake ----------------------------------------------------
 
@@ -190,6 +202,9 @@ class Rfb:
 
         if self.raw_only:
             encodings = [ENC_RAW]
+        elif self.tight:
+            encodings = [ENC_TIGHT] + ENC_TIGHT_QUALITY + \
+                        [ENC_HEXTILE, ENC_COPYRECT, ENC_RAW]
         elif self.copyrect:
             encodings = [ENC_HEXTILE, ENC_COPYRECT, ENC_RAW]
         else:
@@ -295,6 +310,8 @@ class Rfb:
                         self._hextile(fb, x, y, w, h, r)
                     elif enc == ENC_COPYRECT:
                         self._copyrect(fb, x, y, w, h, r)
+                    elif enc == ENC_TIGHT:
+                        self._tight(r)
                     elif enc == ENC_EXTENDED_DESKTOP_SIZE:
                         self._extended_desktop_size(r)
                     else:
@@ -324,6 +341,40 @@ class Rfb:
             src = ((sy + row) * self.width + sx) * 4
             dst = ((y + row) * self.width + x) * 4
             fb[dst:dst + w * 4] = fb[src:src + w * 4]
+
+    def _tight(self, r):
+        """Skip one Tight rectangle, counting what it cost.
+
+        The control byte's high nibble is the subencoding and its low nibble
+        says which zlib streams to reset. Only the JPEG form is skipped here;
+        anything else is a shape the server does not send, and saying so beats
+        a silent desync.
+        """
+        sub = r.byte() >> 4
+
+        if sub == 0x09:                              # JPEG
+            n = self._tight_len(r)
+            r.skip(n)
+            self.wire["tight"]["rects"] += 1
+            self.wire["tight"]["bytes"] += n
+        elif sub == 0x08:                            # solid fill
+            r.skip(3)
+            self.wire["tight"]["rects"] += 1
+        else:
+            raise RfbError("Tight subencoding %#x, which this client cannot skip"
+                           % sub)
+
+    @staticmethod
+    def _tight_len(r):
+        """The length that precedes a Tight payload: 7 bits a byte."""
+        b = r.byte()
+        n = b & 0x7F
+        if b & 0x80:
+            b = r.byte()
+            n |= (b & 0x7F) << 7
+            if b & 0x80:
+                n |= r.byte() << 14
+        return n
 
     def _raw(self, fb, x, y, w, h, r):
         data = r.take(w * h * 4)

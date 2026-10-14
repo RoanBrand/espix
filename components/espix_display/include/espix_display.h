@@ -174,7 +174,7 @@ typedef struct {
     bool        hw_ok;      /* the accelerated path produced the right pixels */
 } espix_display_bench_t;
 
-#define ESPIX_DISPLAY_BENCH_MAX 16
+#define ESPIX_DISPLAY_BENCH_MAX 24
 
 /* Fills up to `max` rows and returns how many. Allocates its own buffers. */
 size_t espix_display_bench(espix_display_bench_t *out, size_t max);
@@ -283,6 +283,46 @@ espix_surface_t *espix_image_jpeg(const uint8_t *jpg, size_t len);
  */
 esp_err_t espix_image_jpeg_into(espix_surface_t *dst, const uint8_t *jpg,
                                 size_t len);
+
+/*
+ * The JPEG encoder, in two calls because the driver owns its buffers.
+ *
+ * The other half of espix_image_jpeg_into(), and the primitive a Tight+JPEG
+ * update is made of: the codec that decodes a photograph encodes one too, and
+ * the encoder is what makes photographic rectangles affordable on the wire.
+ *
+ *   espix_px_t *in = espix_display_jpeg_input(w * h);   // NULL: no encoder
+ *   ...fill in with the w x h rectangle...
+ *   size_t n = espix_display_jpeg_encode(w, h, quality, out, cap);
+ *
+ * The input is the encoder's own allocation, handed back so the pixels go into
+ * it once. Tightly packed, because the codec takes a picture and not a pitch:
+ * a caller with a rectangle out of a wider buffer gathers it into here.
+ * Returns the bytes written, or 0 when there is no encoder on this target.
+ */
+espix_px_t *espix_display_jpeg_input(size_t pixels);
+size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
+                                 size_t out_cap);
+
+/*
+ * Would this rectangle be better on the wire as a JPEG?
+ *
+ * The comparison the server makes for every rectangle it sends, exposed because
+ * the thresholds in it are worth setting from measurements of real content
+ * rather than from an opinion -- and a file, or the canvas itself, is a great
+ * deal easier to point at than a running desktop. `colours` is how many
+ * distinct RGB565 values a sampled grid held (capped at 256), `edges` how many
+ * neighbouring pixels differed, and `jpeg` the verdict.
+ */
+typedef struct {
+    uint32_t colours;
+    uint32_t edges;
+    uint32_t pairs;
+    bool     jpeg;
+} espix_display_class_t;
+
+void espix_display_classify(const espix_px_t *px, int stride, int x, int y,
+                            int w, int h, espix_display_class_t *out);
 
 /*
  * Both paths on one file, for the benchmark: software, and the codec where there

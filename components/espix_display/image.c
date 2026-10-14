@@ -27,6 +27,7 @@
 
 #if SOC_JPEG_CODEC_SUPPORTED
 #include "driver/jpeg_decode.h"
+#include "driver/jpeg_encode.h"
 #endif
 
 #define TAG "image"
@@ -323,6 +324,140 @@ done:
 }
 
 /*
+ * The encoder, beside the decoder and behind the same lock, because it is the
+ * same block on the die: one JPEG codec, two directions.
+ */
+static jpeg_encoder_handle_t s_enc;
+
+static jpeg_encoder_handle_t encoder_get(void)
+{
+    if (s_enc != NULL) {
+        return s_enc;
+    }
+
+    const jpeg_encode_engine_cfg_t cfg = { .timeout_ms = 2000 };
+    jpeg_encoder_handle_t          h   = NULL;
+
+    if (jpeg_new_encoder_engine(&cfg, &h) != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no JPEG encode engine");
+        return NULL;
+    }
+    s_enc = h;
+    return s_enc;
+}
+
+/*
+ * The frame the encoder reads, and the one it writes.
+ *
+ * Both from jpeg_alloc_encoder_mem rather than the heap, because the driver
+ * builds its DMA descriptors out of them and will not take a buffer of its own
+ * choosing -- measured: handed a plain PSRAM block it answers ESP_ERR_INVALID_ARG
+ * and produces nothing. The input is handed back to the caller so the pixels go
+ * into it once: a staging copy and then a copy into here would be two copies of
+ * 600 KiB a frame, which is most of what this is meant to save.
+ *
+ * The caller owns the frame between the two calls, so one encoder is one
+ * caller at a time -- which is the RFB server's single connection.
+ */
+static uint8_t *s_enc_in;
+static size_t   s_enc_in_px;
+static uint8_t *s_enc_out;
+static size_t   s_enc_out_cap;
+
+espix_px_t *espix_display_jpeg_input(size_t pixels)
+{
+    if (pixels == 0) {
+        return NULL;
+    }
+    if (encoder_get() == NULL) {
+        return NULL;
+    }
+    if (s_enc_in != NULL && pixels <= s_enc_in_px) {
+        return (espix_px_t *)s_enc_in;
+    }
+
+    const jpeg_encode_memory_alloc_cfg_t cfg = {
+        .buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER,
+    };
+    size_t       got = 0;
+    uint8_t     *buf = jpeg_alloc_encoder_mem(pixels * sizeof(espix_px_t), &cfg, &got);
+
+    if (buf == NULL) {
+        return NULL;
+    }
+    heap_caps_free(s_enc_in);
+    s_enc_in    = buf;
+    s_enc_in_px = got / sizeof(espix_px_t);
+    return (espix_px_t *)s_enc_in;
+}
+
+size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
+                                 size_t out_cap)
+{
+    jpeg_encoder_handle_t enc = encoder_get();
+
+    if (enc == NULL || s_enc_in == NULL || out == NULL
+        || w <= 0 || h <= 0 || out_cap == 0
+        || (size_t)w * (size_t)h > s_enc_in_px) {
+        return 0;
+    }
+
+    /*
+     * The output is the driver's too, and grows to the largest frame asked for.
+     * An RGB565 frame at quality 100 can be larger than its pixels, so the
+     * allowance is two bytes a pixel plus room for the headers -- measured at
+     * q80, a 640x480 photograph comes back at about 9 KB, so this is slack.
+     */
+    const size_t want = (size_t)w * (size_t)h * sizeof(espix_px_t) + 1024;
+
+    if (s_enc_out == NULL || s_enc_out_cap < want) {
+        const jpeg_encode_memory_alloc_cfg_t cfg = {
+            .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
+        };
+        size_t       got = 0;
+        uint8_t     *buf = jpeg_alloc_encoder_mem(want, &cfg, &got);
+
+        if (buf == NULL) {
+            return 0;
+        }
+        heap_caps_free(s_enc_out);
+        s_enc_out     = buf;
+        s_enc_out_cap = got;
+    }
+
+    SemaphoreHandle_t lock = engine_lock();
+    if (lock == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+
+    const jpeg_encode_cfg_t ecfg = {
+        .width         = (uint32_t)w,
+        .height        = (uint32_t)h,
+        .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
+        .sub_sample    = JPEG_DOWN_SAMPLING_YUV420,
+        .image_quality = (uint32_t)quality,
+        .pixel_reverse = false,
+    };
+    uint32_t got = 0;
+
+    const bool ok = (jpeg_encoder_process(enc, &ecfg, s_enc_in,
+                                          (uint32_t)((size_t)w * (size_t)h
+                                                     * sizeof(espix_px_t)),
+                                          s_enc_out,
+                                          (uint32_t)(s_enc_out_cap < out_cap
+                                                     ? s_enc_out_cap : out_cap),
+                                          &got) == ESP_OK);
+    xSemaphoreGive(lock);
+
+    if (!ok) {
+        return 0;
+    }
+    memcpy(out, s_enc_out, got);
+    return got;
+}
+
+/*
  * The same decode, into pixels the caller already has.
  *
  * Only when the picture is exactly the size of the surface it is going into.
@@ -408,6 +543,19 @@ static esp_err_t jpeg_hw_into(espix_surface_t *dst, const uint8_t *jpg, size_t l
 {
     (void)dst; (void)jpg; (void)len;
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+espix_px_t *espix_display_jpeg_input(size_t pixels)
+{
+    (void)pixels;
+    return NULL;
+}
+
+size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
+                                 size_t out_cap)
+{
+    (void)w; (void)h; (void)quality; (void)out; (void)out_cap;
+    return 0;
 }
 
 static const char *jpeg_hw_name(void)
@@ -563,6 +711,48 @@ bool espix_image_bench(espix_display_bench_t *row, const uint8_t *jpg, size_t le
         espix_klog(ESPIX_KLOG_INFO, TAG,
                    "codec against TJpgDec on %dx%d: %d%% of pixels agree%s",
                    row->w, row->h, agree, row->hw_ok ? "" : "  (MISMATCH)");
+    }
+
+    /*
+     * And the same picture back through the encoder. The numbers a Tight+JPEG
+     * update needs are bytes and milliseconds, and the round trip is the check
+     * that the encoder's pixel order is the decoder's: a picture that does not
+     * decode back to itself is a byte order nobody would notice until a client
+     * showed it.
+     */
+    espix_surface_t *src = (hw != NULL) ? hw : sw;
+    const int        ew  = espix_surface_width(src);
+    const int        eh  = espix_surface_height(src);
+    const size_t     cap = (size_t)ew * (size_t)eh * sizeof(espix_px_t) + 1024;
+    void            *jbuf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (jbuf != NULL) {
+        const int64_t t3 = esp_timer_get_time();
+
+        espix_px_t *in = espix_display_jpeg_input((size_t)ew * (size_t)eh);
+        size_t      n  = 0;
+
+        if (in != NULL) {
+            memcpy(in, espix_surface_pixels(src),
+                   (size_t)ew * (size_t)eh * sizeof(espix_px_t));
+            n = espix_display_jpeg_encode(ew, eh, 80, jbuf, cap);
+        }
+        const int64_t t4 = esp_timer_get_time();
+
+        if (n > 0) {
+            espix_surface_t *back  = jpeg_hw((const uint8_t *)jbuf, n);
+            const int        agree = jpeg_agreement(src, back);
+
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "codec encoded %dx%d at q80: %u bytes in %d ms, "
+                       "%d%% back%s",
+                       ew, eh, (unsigned)n, (int)((t4 - t3) / 1000), agree,
+                       agree >= 80 ? "" : "  (MISMATCH)");
+            espix_surface_free(back);
+        } else {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "the encoder produced nothing");
+        }
+        heap_caps_free(jbuf);
     }
 
     espix_surface_free(sw);

@@ -215,6 +215,80 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
     }
 
     /*
+     * Which rectangles would be better off as a JPEG, asked directly.
+     *
+     * The same classifier the server runs on every rectangle it sends, and the
+     * reason it is a command: the thresholds in it are worth setting from
+     * measurements of actual content, and a file -- or the canvas itself, with
+     * no argument -- is a great deal easier to point at than a running desktop
+     * driven over RFB.
+     */
+    if (strcmp(sub, "classify") == 0) {
+        espix_surface_t *img = NULL;
+        uint8_t         *buf = NULL;
+        const espix_px_t *px = NULL;
+        int w = 0, h = 0, stride = 0;
+
+        if (argc >= 3) {
+            FILE *f = fopen(argv[2], "rb");
+
+            if (f != NULL) {
+                fseek(f, 0, SEEK_END);
+                const long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+
+                if (sz > 4 && sz < (4 << 20)) {
+                    buf = malloc((size_t)sz);
+                    if (buf != NULL && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+                        free(buf);
+                        buf = NULL;
+                    }
+                    if (buf != NULL) {
+                        img = espix_image_jpeg(buf, (size_t)sz);
+                    }
+                }
+                fclose(f);
+            }
+            if (img == NULL) {
+                espix_eprintf(s, "display classify: cannot read %s\n", argv[2]);
+                free(buf);
+                return 1;
+            }
+            px     = espix_surface_pixels(img);
+            w      = espix_surface_width(img);
+            h      = espix_surface_height(img);
+            stride = w;
+        } else {
+            espix_canvas_t *cv = espix_display_canvas();
+
+            if (cv == NULL) {
+                espix_eprintf(s, "display classify: the display is down\n");
+                return 1;
+            }
+            espix_canvas_lock(cv);
+            px     = espix_canvas_pixels(cv);
+            w      = espix_canvas_width(cv);
+            h      = espix_canvas_height(cv);
+            stride = w;
+        }
+
+        espix_display_class_t cl;
+        espix_display_classify(px, stride, 0, 0, w, h, &cl);
+
+        espix_printf(s, "classify %dx%d: %u colours, %u%% edges -> %s\n",
+                     w, h, (unsigned)cl.colours,
+                     (unsigned)(cl.pairs ? cl.edges * 100 / cl.pairs : 0),
+                     cl.jpeg ? "JPEG" : "Hextile");
+
+        if (argc < 3) {
+            espix_canvas_unlock(espix_display_canvas());
+        }
+        espix_surface_free(img);
+        free(buf);
+        return 0;
+    }
+
+    /*
      * The software path, measured, before there is anything to compare it
      * with. Mpx/s rather than MB/s because bytes per pixel is a convention and
      * pixels per second is not -- and it is the figure the accelerators have to

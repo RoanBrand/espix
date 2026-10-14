@@ -385,6 +385,47 @@ Not a defect — worth recording only because its presence suggests a POSIX laye
 that is not there. Upstream never implemented signals either, so it is not a
 source to draw on.
 
+### A JPEG operation can wedge the 2D-DMA, and the next one spins in a reset
+
+Seen twice on the S31, from a shell command decoding a 640x480 baseline JPEG
+through `driver/jpeg_decode.h`, and never reproduced since. The core dump says
+exactly where it stops:
+
+```
+#0  dma2d_hal_rx_reset_channel (hal=..., channel=0)        dma2d_hal.c:28
+#1  dma2d_connect (dma2d_chan=..., trig_periph=...)        dma2d.c:683
+#2  jpeg_dec_transaction_on_picked                         jpeg_decode.c:686
+#3  dma2d_enqueue (dma2d_pool=..., trans_desc=...)         dma2d.c:1119
+#4  jpeg_decoder_process (stream_size=13512, out=614400)   jpeg_decode.c:351
+#5  jpeg_hw                       components/espix_display/image.c
+#6  espix_image_jpeg              components/espix_display/image.c
+```
+
+The channel reset polls a register and never comes back, so the calling task
+trips the interrupt watchdog five seconds later and the board restarts. The
+engine's `timeout_ms` does not cover it: that bounds the transfer, and this is
+before the transfer has started.
+
+What it is not, so far. Not the bitstream or its content: a second file with the
+same format decodes fine, and the first file decodes fine again from a clean
+boot. Not the marker layout: both files are baseline, 4:2:0, 640x480, with the
+same markers in the same order. Not the caller's buffer, which is the same shape
+the bench has used all along.
+
+Which leaves the DMA2D channel's state, and the one thing that preceded it both
+times: **an earlier JPEG operation in the same boot**. The JPEG encoder and the
+decoder are one block and both drive DMA2D, and the first of the two crashes had
+the encoder running when it died -- so a channel left busy by either direction
+would show up as this same spin in the other, and the dump here would be the
+innocent half.
+
+No workaround yet, and none written from theory: the picture is that this is
+rare (a 240-frame video clip has decoded without it), that the symptom is a
+reboot rather than wrong pixels, and that the fix to reach for when there is a
+reproduction is a reset that gives up instead of one that waits -- at which
+point the failure becomes a failed decode and a log line rather than a
+watchdog.
+
 ## Bluetooth Classic on ESP32-S31
 
 ### An A2DP source cannot open against some sinks (issue #19130)

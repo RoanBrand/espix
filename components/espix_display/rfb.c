@@ -207,7 +207,26 @@ enum {
     RFB_ENC_RAW      = 0,
     RFB_ENC_COPYRECT = 1,
     RFB_ENC_HEXTILE  = 5,
+    RFB_ENC_TIGHT    = 7,
 };
+
+/*
+ * Tight is the only encoding in the base protocol that can carry a lossy
+ * rectangle: zlib for the pixel data, a palette or a solid fill for the cheap
+ * cases, and JPEG for a photograph. A client that offers it and also offers a
+ * quality level is saying it will take a lossy update; one that offers Tight
+ * and no level is asking for the lossless half only, and sending it JPEG anyway
+ * is a protocol violation.
+ *
+ * The quality levels are pseudo-encodings -32 (level 0, lossless) to -23
+ * (level 9), which is TightVNC's numbering and what TigerVNC and noVNC both
+ * send. The subencoding bytes inside a Tight rectangle were taken from noVNC's
+ * decoder rather than from memory: the control byte is (subencoding << 4) |
+ * zlib-reset bits, 0x9 is JPEG, 0x8 is fill, and the JPEG payload is preceded
+ * by a compact length written 7 bits at a time.
+ */
+#define RFB_ENC_TIGHT_Q_MAX ((int32_t)-23)   /* level 9: the loosest */
+#define RFB_ENC_TIGHT_Q_MIN ((int32_t)-32)   /* level 0: lossless */
 
 /*
  * ExtendedDesktopSize is a pseudo-encoding: a negative 32-bit number. It is
@@ -1005,6 +1024,105 @@ static void enc_hextile(sink_t *s, const espix_px_t *px, int stride, espix_rect_
 }
 
 /* ------------------------------------------------------------------ */
+/* Tight, with JPEG                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The JPEG quality each of Tight's ten levels asks for.
+ *
+ * Level 0 means lossless and never reaches here; 1-9 is the client saying how
+ * much quality it will give up for bytes. TightVNC's own mapping, so a client
+ * that picks a level gets what it asked for.
+ */
+static int tight_quality(int level)
+{
+    static const int q[10] = { 5, 10, 15, 25, 37, 50, 60, 70, 80, 90 };
+
+    if (level < 1) { level = 1; }
+    if (level > 9) { level = 9; }
+    return q[level];
+}
+
+/* Where a JPEG goes between the codec and the socket buffer. */
+static uint8_t *s_tight_out;
+static size_t   s_tight_cap;
+
+/* A JPEG of whatever the encoder's input holds, or 0 when it will not encode. */
+static size_t tight_jpeg(espix_rect_t r, int level)
+{
+    const size_t want = (size_t)r.w * (size_t)r.h * sizeof(espix_px_t) + 4096;
+
+    if (s_tight_out == NULL || s_tight_cap < want) {
+        uint8_t *n = heap_caps_malloc(want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+        if (n == NULL) {
+            return 0;
+        }
+        heap_caps_free(s_tight_out);
+        s_tight_out = n;
+        s_tight_cap = want;
+    }
+    return espix_display_jpeg_encode(r.w, r.h, tight_quality(level),
+                                     s_tight_out, s_tight_cap);
+}
+
+/*
+ * The control byte and the length that precede a Tight rectangle.
+ *
+ * The control byte carries the subencoding in its high nibble and, in the low
+ * one, which of the four zlib streams to reset -- none, for a JPEG. The length
+ * follows it seven bits at a time, low group first, a set high bit meaning
+ * "another byte follows". Both were taken from noVNC's decoder rather than from
+ * memory, and 0x90 for a JPEG is what a real client expects to read.
+ */
+static void tight_head(sink_t *s, uint8_t ctl, size_t n)
+{
+    uint8_t hdr[4];
+    int     k = 0;
+
+    /*
+     * The control byte is the control byte and nothing else. The length is not
+     * folded into it -- an earlier version here did exactly that, and a 19 KB
+     * JPEG then arrived at the client as subencoding 0xB rather than 0x9
+     * because the low bits of the length landed in the nibble that says what
+     * the payload is. The length is its own field, and the client read that
+     * correctly before this was fixed.
+     */
+    hdr[k++] = ctl;
+
+    hdr[k++] = (uint8_t)(n & 0x7F);
+    if (n > 0x7F) {
+        hdr[k - 1] |= 0x80;
+        hdr[k++] = (uint8_t)((n >> 7) & 0x7F);
+        if (n > 0x3FFF) {
+            hdr[k - 1] |= 0x80;
+            hdr[k++] = (uint8_t)((n >> 14) & 0xFF);
+        }
+    }
+    sink_write(s, hdr, (size_t)k);
+}
+
+/*
+ * The rectangle the encoder was handed, put back on the stage at canvas stride.
+ *
+ * Only for the update that has to fall back: nothing has announced the
+ * rectangle as Tight yet, but its pixels are in the encoder's input rather than
+ * in the stage, and Hextile reads the stage.
+ */
+static void tight_restage(espix_rect_t r, espix_px_t *stage, int cw)
+{
+    const espix_px_t *in = espix_display_jpeg_input((size_t)r.w * (size_t)r.h);
+
+    if (in == NULL) {
+        return;
+    }
+    for (int y = 0; y < r.h; y++) {
+        memcpy(stage + (size_t)(r.y + y) * cw + r.x,
+               in + (size_t)y * r.w, (size_t)r.w * sizeof(espix_px_t));
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Connection state                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -1012,6 +1130,9 @@ typedef struct {
     int       fd;
     rfb_pf_t  pf;
     bool      hextile;
+    bool      tight;          /* ...and it speaks Tight, lossless or JPEG */
+    bool      lossy;          /* ...and it allowed lossy: a quality level >= 1 */
+    int       qlevel;         /* the level to use, 0-9; -1 when none was offered */
     bool      pending;        /* an update is owed to the client */
     bool      pending_full;   /* ...and it asked for a whole frame */
     bool      copyrect;       /* ...and it can be told to move pixels itself */
@@ -1044,6 +1165,194 @@ static struct {
  * rate this runs at, and above it something is holding the send up.
  */
 #define QUEUE_REPORT_US 1000
+
+/* ------------------------------------------------------------------ */
+/* Which rectangles are photographs                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Would this rectangle be better off as a JPEG?
+ *
+ * Observer only, for now: it decides, counts and says so in the log, and
+ * nothing goes on the wire differently. Deciding is cheap; acting on it changes
+ * what every client sees, and the thresholds to do that with should come from
+ * measurements of the content this desktop actually shows rather than from an
+ * opinion about it.
+ *
+ * Two numbers, because one is not enough. The distinct colour count separates a
+ * photograph from a user interface -- a text row, a window frame and a flat
+ * panel are a handful of colours, a photograph is thousands. The edge count
+ * separates them the other way: palette art and text are few colours *and* hard
+ * edges, which is what a JPEG rings on and compresses badly, so the rectangle
+ * worth a JPEG is the one that is both colourful and smooth.
+ *
+ * Sampled on a step that lands on about CLS_SAMPLES points whatever the area,
+ * so looking costs the same for a window as for a whole canvas -- well under a
+ * millisecond beside the 28 ms an encode takes.
+ */
+#define CLS_SAMPLES       4096
+#define CLS_COLOURS       256
+#define CLS_JPEG_COLOURS  64        /* "more colours than a desktop uses" */
+#define CLS_EDGE_DIFF     32        /* "differs by four or more 5-bit steps" */
+#define CLS_RUN           8         /* pixels examined from each sampled point */
+#define CLS_JPEG_MIN_PX   4096      /* a JPEG header is not worth a small rect */
+#define CLS_JPEG_MAX_EDGE 40        /* per cent of neighbours that differ */
+
+static espix_px_t s_cls_seen[CLS_COLOURS];
+static bool       s_cls_used[CLS_COLOURS];
+
+static int cls_diff(espix_px_t a, espix_px_t b)
+{
+    int dr = (int)((a >> 11) & 0x1F) - (int)((b >> 11) & 0x1F);
+    int dg = (int)((a >>  5) & 0x3F) - (int)((b >>  5) & 0x3F);
+    int db = (int)( a        & 0x1F) - (int)( b        & 0x1F);
+
+    if (dr < 0) { dr = -dr; }
+    if (dg < 0) { dg = -dg; }
+    if (db < 0) { db = -db; }
+
+    return dr * 8 + dg * 4 + db * 8;
+}
+
+void espix_display_classify(const espix_px_t *px, int stride, int rx, int ry,
+                            int rw, int rh, espix_display_class_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->colours = 0;
+    out->edges   = 0;
+    out->pairs   = 0;
+    out->jpeg    = false;
+
+    if (px == NULL || rw <= 0 || rh <= 0) {
+        return;
+    }
+
+    const espix_rect_t r = { rx, ry, rw, rh };
+    uint32_t step = 1;
+
+    while (step < 32
+           && (uint32_t)(r.w / (int)step) * (uint32_t)(r.h / (int)step) > CLS_SAMPLES) {
+        step++;
+    }
+
+    memset(s_cls_used, 0, sizeof(s_cls_used));
+
+    uint32_t nseen = 0, edges = 0, pairs = 0;
+
+    /*
+     * A sampled point is the start of a short run, not a lone pixel.
+     *
+     * Comparing a sample against the *next* sample measures content, not detail
+     * -- nine pixels away, even a photograph has changed -- and comparing it
+     * against the pixel beside it measures detail but only where the sample
+     * happens to land on an edge, which on a sparse grid is almost never.
+     * Measured: a desktop full of text read as 0% edges that way.
+     *
+     * So each seed is walked for CLS_RUN pixels: the colours come from all of
+     * them, and the edges are the neighbouring pairs among them. Smooth
+     * photographic tone changes slowly enough that neighbours usually land on
+     * the same RGB565 value; dithering and text do not.
+     */
+    for (int y = r.y; y < r.y + r.h && nseen < CLS_COLOURS; y += (int)step) {
+        const espix_px_t *row = px + (size_t)y * stride;
+
+        for (int x = r.x; x < r.x + r.w; x += (int)step) {
+            espix_px_t prev = row[x];
+
+            for (int k = 0; k < CLS_RUN && x + k < r.x + r.w; k++) {
+                const espix_px_t p = row[x + k];
+
+                if (nseen < CLS_COLOURS) {
+                    uint32_t i = ((uint32_t)p * 2654435761u >> 12) % CLS_COLOURS;
+
+                    for (uint32_t probe = 0; probe < CLS_COLOURS; probe++) {
+                        if (!s_cls_used[i]) {
+                            s_cls_used[i] = true;
+                            s_cls_seen[i] = p;
+                            nseen++;
+                            break;
+                        }
+                        if (s_cls_seen[i] == p) {
+                            break;
+                        }
+                        i = (i + 1) % CLS_COLOURS;
+                    }
+                }
+
+                if (k > 0) {
+                    pairs++;
+                    if (cls_diff(prev, p) > CLS_EDGE_DIFF) { edges++; }
+                }
+                prev = p;
+            }
+        }
+    }
+
+    out->colours = nseen;
+    out->edges   = edges;
+    out->pairs   = pairs;
+
+    const uint32_t area = (uint32_t)r.w * (uint32_t)r.h;
+
+    out->jpeg = area >= CLS_JPEG_MIN_PX
+        && nseen >= CLS_JPEG_COLOURS
+        && (pairs == 0 || (uint64_t)edges * 100 / pairs <= CLS_JPEG_MAX_EDGE);
+}
+
+/* What the classifier has seen since the last line, and the client's answer. */
+static struct {
+    uint32_t rects;
+    uint32_t jpeg;
+    uint32_t px_all;
+    uint32_t px_jpeg;
+    uint64_t colours;
+    uint64_t edges;
+    uint64_t pairs;
+    bool     lossy;
+    uint32_t sent_jpeg;     /* rectangles actually put on the wire as Tight */
+    /* And the largest rectangle, whole, because an average over a hundred
+     * rectangles hides the one the question is about. */
+    uint32_t big_px;
+    uint32_t big_colours;
+    uint32_t big_edges;
+    uint32_t big_pairs;
+    bool     big_jpeg;
+} s_cls;
+
+static void classify_note(const rfb_conn_t *c, const espix_px_t *px, int stride,
+                          espix_rect_t r)
+{
+    espix_display_class_t cl;
+    espix_display_classify(px, stride, r.x, r.y, r.w, r.h, &cl);
+
+    const uint32_t colours = cl.colours;
+    const uint32_t edges   = cl.edges;
+    const uint32_t pairs   = cl.pairs;
+    const bool     jpeg    = cl.jpeg;
+    const uint32_t area    = (uint32_t)r.w * (uint32_t)r.h;
+
+    s_cls.rects++;
+    s_cls.px_all  += area;
+    s_cls.colours += colours;
+    s_cls.edges   += edges;
+    s_cls.pairs   += pairs;
+    s_cls.lossy    = c->lossy;
+
+    if (jpeg) {
+        s_cls.jpeg++;
+        s_cls.px_jpeg += area;
+    }
+
+    if (area > s_cls.big_px) {
+        s_cls.big_px      = area;
+        s_cls.big_colours = colours;
+        s_cls.big_edges   = edges;
+        s_cls.big_pairs   = pairs;
+        s_cls.big_jpeg    = jpeg;
+    }
+}
 
 static void send_stat(int64_t us, size_t rects)
 {
@@ -1119,6 +1428,24 @@ static void send_stat(int64_t us, size_t rects)
                (long long)((analyse_us + emit_us) / tiles),
                (long long)(analyse_us / tiles),
                (long long)(emit_us / tiles));
+
+    if (s_cls.rects > 0) {
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "classify: %u rects, %u sent as Tight "
+                   "(client takes lossy: %s)",
+                   (unsigned)s_cls.rects, (unsigned)s_cls.sent_jpeg,
+                   s_cls.lossy ? "yes" : "no");
+        if (s_cls.big_px > 0) {
+            const uint32_t big_edge = s_cls.big_pairs
+                ? (uint32_t)((uint64_t)s_cls.big_edges * 100 / s_cls.big_pairs) : 0;
+
+            espix_klog(ESPIX_KLOG_INFO, TAG,
+                       "classify: largest was %u px: %u colours, %u%% edges -> %s",
+                       (unsigned)s_cls.big_px, (unsigned)s_cls.big_colours,
+                       (unsigned)big_edge, s_cls.big_jpeg ? "JPEG" : "Hextile");
+        }
+        memset(&s_cls, 0, sizeof(s_cls));
+    }
 
     s_enc.analyse_cyc = 0;
     s_enc.emit_cyc    = 0;
@@ -1358,8 +1685,59 @@ static bool update_send(rfb_conn_t *c)
      * which on a slow link is the difference between a desktop and a slideshow.
      */
     const espix_px_t *px = espix_canvas_pixels(cv);
+
+    /*
+     * One rectangle in an update may go as JPEG, and it is chosen before
+     * anything is copied.
+     *
+     * The encoder owns one input buffer, so a second photographic rectangle in
+     * the same update would need a second 600 KiB copy and a second 28 ms
+     * encode -- and the largest rectangle is the one worth it anyway. Its
+     * pixels are copied out *packed*, straight from the canvas, because the
+     * codec takes a picture and not a pitch: staging it at canvas stride and
+     * gathering it afterwards is two copies of the same 600 KiB, which is more
+     * CPU than the Hextile it replaces rather than less.
+     *
+     * Off unless the client offered Tight *and* allowed lossy, so a client that
+     * speaks only Hextile never reaches any of this.
+     */
+    int jpeg_i = -1;
+
+    if (c->tight && c->lossy && n > 0) {
+        size_t best = 0;
+
+        for (size_t i = 1; i < n; i++) {
+            if ((uint32_t)rects[i].w * (uint32_t)rects[i].h
+                > (uint32_t)rects[best].w * (uint32_t)rects[best].h) {
+                best = i;
+            }
+        }
+
+        const espix_rect_t    r = rects[best];
+        espix_display_class_t cl;
+
+        espix_display_classify(px, cw, r.x, r.y, r.w, r.h, &cl);
+
+        if (cl.jpeg) {
+            espix_px_t *in = espix_display_jpeg_input((size_t)r.w * (size_t)r.h);
+
+            if (in != NULL) {
+                for (int y = 0; y < r.h; y++) {
+                    memcpy(in + (size_t)y * r.w,
+                           px + (size_t)(r.y + y) * cw + r.x,
+                           (size_t)r.w * sizeof(espix_px_t));
+                }
+                jpeg_i = (int)best;
+            }
+        }
+    }
+
     for (size_t i = 0; i < n; i++) {
         const espix_rect_t r = rects[i];
+
+        if ((int)i == jpeg_i) {
+            continue;                   /* in the encoder's input already */
+        }
 
         /*
          * A full-width rectangle is one contiguous run of pixels, so the common
@@ -1381,6 +1759,23 @@ static bool update_send(rfb_conn_t *c)
     t_canvas = esp_timer_get_time();
     RFB_MARK_STOP(RFB_MARK_CANVAS);
     RFB_MARK_START(RFB_MARK_ENCODE);
+
+    /*
+     * The JPEG next, and before any header is written: the encoder is the half
+     * that can fail, and a rectangle announced as Tight cannot then be sent as
+     * Hextile. On failure the pixels go back on the stage -- they are still in
+     * the encoder's input -- and the rectangle goes losslessly instead.
+     */
+    size_t jpeg_len = 0;
+
+    if (jpeg_i >= 0) {
+        jpeg_len = tight_jpeg(rects[jpeg_i], c->qlevel);
+
+        if (jpeg_len == 0) {
+            tight_restage(rects[jpeg_i], c->stage, cw);
+            jpeg_i = -1;
+        }
+    }
 
     if (!c->logged_send) {
         c->logged_send = true;
@@ -1421,16 +1816,34 @@ static bool update_send(rfb_conn_t *c)
 
     RFB_MARK_START(RFB_MARK_PIXELS);
     for (size_t i = 0; i < n; i++) {
-        const espix_rect_t r = rects[i];
+        const espix_rect_t r     = rects[i];
+        const bool         tight = ((int)i == jpeg_i);
         uint8_t            rh[12];
+
+        /* The observer counts what went out, and only for the rectangles it
+         * can still see: a JPEG rectangle's pixels are in the encoder's input,
+         * not in the stage, so classifying the stage for it would be reading
+         * whatever the last frame left there. */
+        if (!tight) {
+            classify_note(c, c->stage, cw, r);
+        } else {
+            s_cls.rects++;
+            s_cls.px_all += (uint32_t)r.w * (uint32_t)r.h;
+            s_cls.sent_jpeg++;
+        }
+
         wr16(rh + 0, (uint16_t)r.x);
         wr16(rh + 2, (uint16_t)r.y);
         wr16(rh + 4, (uint16_t)r.w);
         wr16(rh + 6, (uint16_t)r.h);
-        wr32(rh + 8, c->hextile ? RFB_ENC_HEXTILE : RFB_ENC_RAW);
+        wr32(rh + 8, tight ? RFB_ENC_TIGHT
+                           : (c->hextile ? RFB_ENC_HEXTILE : RFB_ENC_RAW));
         sink_write(&s, rh, sizeof(rh));
 
-        if (c->hextile) {
+        if (tight) {
+            tight_head(&s, 0x90, jpeg_len);
+            sink_write(&s, s_tight_out, jpeg_len);
+        } else if (c->hextile) {
             enc_hextile(&s, c->stage, cw, r, &c->pf, c->row);
         } else {
             enc_raw(&s, c->stage, cw, r, &c->pf);
@@ -1501,6 +1914,9 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
         bool           copyrect = false;
         bool           eds      = false;
         bool           desksize = false;
+        bool           tight    = false;
+        int            qmin     = -1;       /* quality levels offered, 0-9 */
+        int            qmax     = -1;
         char           offered[192];
         size_t         off = 0;
 
@@ -1511,15 +1927,30 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
             if (!read_full(c->fd, e, sizeof(e))) {
                 return false;
             }
-            const uint32_t enc = rd32(e);
+            const uint32_t enc  = rd32(e);
+            const int32_t  senc = (int32_t)enc;
+
             if (enc == RFB_ENC_HEXTILE) {
                 hextile = true;
+            } else if (enc == RFB_ENC_TIGHT) {
+                tight = true;
             } else if (enc == RFB_ENC_COPYRECT) {
                 copyrect = true;
             } else if (enc == RFB_ENC_EXTENDED_DESKTOP_SIZE) {
                 eds = true;
             } else if (enc == RFB_ENC_DESKTOP_SIZE) {
                 desksize = true;
+            } else if (senc >= RFB_ENC_TIGHT_Q_MIN && senc <= RFB_ENC_TIGHT_Q_MAX) {
+                /*
+                 * A quality level: -32 is level 0 and means lossless, -23 is
+                 * level 9. Offering any of them is offering to take a JPEG;
+                 * which one is a question of how much quality the client will
+                 * give up, and only it can answer.
+                 */
+                const int lvl = (int)(senc - RFB_ENC_TIGHT_Q_MIN);
+
+                if (qmin < 0 || lvl < qmin) { qmin = lvl; }
+                if (lvl > qmax)             { qmax = lvl; }
             }
             /*
              * And the numbers themselves, because which pseudo-encoding a
@@ -1539,6 +1970,15 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
         c->copyrect = copyrect;
         c->eds      = eds;
         c->desksize = desksize;
+        c->tight    = tight;
+        c->lossy    = (qmax >= 1);          /* level 0 is lossless, so 1 is the flag */
+        /*
+         * Which level to use is the client's bounds and our choice between
+         * quality and bytes. Six is TightVNC's own default and a starting point
+         * to measure from rather than a decision.
+         */
+        c->qlevel   = c->lossy ? ((qmax >= 6) ? 6 : qmax) : 0;
+
         snprintf(s_encodings, sizeof(s_encodings), "%u offered: hextile %s, "
                  "copyrect %s", n, hextile ? "yes" : "no",
                  copyrect ? "yes" : "no");
@@ -1549,8 +1989,11 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
          * neither gives no other way to tell from the outside.
          */
         espix_klog(ESPIX_KLOG_INFO, TAG, "client offered %u encodings: hextile "
-                   "%s, copyrect %s, resize %s (%s) [%s]", n,
+                   "%s, copyrect %s, tight %s, lossy %s (levels %d-%d)", n,
                    hextile ? "yes" : "no", copyrect ? "yes" : "no",
+                   tight ? "yes" : "no", c->lossy ? "yes" : "no", qmin, qmax);
+        /* The list separately, so neither line is long enough to be cut. */
+        espix_klog(ESPIX_KLOG_INFO, TAG, "resize %s (%s); all of them [%s]",
                    eds ? "extended" : (desksize ? "desktopsize" : "no"),
                    copyrect ? "drags will be copies" : "drags will be pixels",
                    offered);
@@ -1910,7 +2353,8 @@ static void rfb_serve(int fd)
 
     rfb_conn_t c;
     memset(&c, 0, sizeof(c));
-    c.fd = fd;
+    c.fd     = fd;
+    c.qlevel = -1;              /* nothing offered yet, and Tight is not assumed */
     c.pf = pf_default();
 
     c.stage = heap_caps_malloc((size_t)cw * ch * sizeof(espix_px_t),
