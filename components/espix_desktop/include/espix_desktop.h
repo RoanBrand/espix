@@ -106,6 +106,17 @@ void espix_window_set_resize(espix_window_t *w, espix_window_resize_fn fn);
 void espix_window_set_pointer(espix_window_t *w, espix_window_pointer_fn fn);
 
 /*
+ * A moving picture at `r` (window coordinates), composited straight from its own pixels:
+ * fn draws the part inside `clip` (canvas coordinates) at canvas (x, y), under the canvas lock.
+ */
+typedef void (*espix_window_overlay_fn)(espix_window_t *w, espix_canvas_t *c,
+                                        int x, int y, espix_rect_t clip,
+                                        void *ctx);
+
+void espix_window_set_overlay(espix_window_t *w, espix_rect_t r,
+                              espix_window_overlay_fn fn);
+
+/*
  * A new size, and a new surface to go with it -- because the surface is the
  * window, frame included, so a resize cannot be a bigger blit of a smaller
  * buffer. The content callback is told in between, and the region the window
@@ -205,6 +216,14 @@ espix_window_t *espix_video_window(void);
  */
 void espix_desktop_lock(void);
 void espix_desktop_unlock(void);
+
+/*
+ * Run fn(arg) on the desktop task under its lock. For timers: an esp_timer callback must
+ * never take the desktop lock. Never blocks; false when not running or full.
+ */
+typedef void (*espix_desktop_fn_t)(void *arg);
+
+bool espix_desktop_post(espix_desktop_fn_t fn, void *arg);
 
 #ifdef __cplusplus
 }

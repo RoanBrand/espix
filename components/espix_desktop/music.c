@@ -110,13 +110,20 @@ static void music_refresh(bool force)
     }
 }
 
-static void music_tick(void *arg)
+static void music_tick_desk(void *arg)
 {
     (void)arg;
 
     if (s_win != NULL) {
         music_refresh(false);
     }
+}
+
+/* esp_timer context: the refresh is the desktop task's to do. */
+static void music_tick(void *arg)
+{
+    (void)arg;
+    (void)espix_desktop_post(music_tick_desk, NULL);
 }
 
 /* ------------------------------------------------------------------ */

@@ -24,6 +24,7 @@
 
 #include "espix_display.h"
 #include "espix_kernel.h"
+#include "espix_dma2d.h"
 
 #if SOC_JPEG_CODEC_SUPPORTED
 #include "driver/jpeg_decode.h"
@@ -177,6 +178,9 @@ done:
  * JPEG -- and measurably would be most of the cost of a small one. Created on
  * the first hardware decode and alive after that.
  */
+/* How long the codec waits for the 2D-DMA engine before giving up. */
+#define JPEG_DMA_WAIT_MS 1000
+
 static jpeg_decoder_handle_t s_engine;
 static SemaphoreHandle_t     s_engine_lock;
 static portMUX_TYPE          s_engine_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -290,8 +294,13 @@ static espix_surface_t *jpeg_hw(const uint8_t *jpg, size_t len)
     };
 
     uint32_t got = 0;
-    if (jpeg_decoder_process(eng, &dcfg, jpg, (uint32_t)len, out,
-                             (uint32_t)out_cap, &got) != ESP_OK) {
+    if (!espix_dma2d_take(pdMS_TO_TICKS(JPEG_DMA_WAIT_MS))) {
+        goto done;
+    }
+    const esp_err_t derr = jpeg_decoder_process(eng, &dcfg, jpg, (uint32_t)len, out,
+                                                (uint32_t)out_cap, &got);
+    espix_dma2d_give();
+    if (derr != ESP_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "codec refused a %dx%d picture", w, h);
         goto done;
     }
@@ -379,8 +388,10 @@ espix_px_t *espix_display_jpeg_input(size_t pixels)
     const jpeg_encode_memory_alloc_cfg_t cfg = {
         .buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER,
     };
-    size_t       got = 0;
-    uint8_t     *buf = jpeg_alloc_encoder_mem(pixels * sizeof(espix_px_t), &cfg, &got);
+    /* Whole cache lines, so the PPA may describe the buffer as a picture. */
+    const size_t want = (pixels * sizeof(espix_px_t) + 127) & ~(size_t)127;
+    size_t       got  = 0;
+    uint8_t     *buf  = jpeg_alloc_encoder_mem(want, &cfg, &got);
 
     if (buf == NULL) {
         return NULL;
@@ -440,14 +451,18 @@ size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
         .pixel_reverse = false,
     };
     uint32_t got = 0;
+    bool     ok  = false;
 
-    const bool ok = (jpeg_encoder_process(enc, &ecfg, s_enc_in,
-                                          (uint32_t)((size_t)w * (size_t)h
-                                                     * sizeof(espix_px_t)),
-                                          s_enc_out,
-                                          (uint32_t)(s_enc_out_cap < out_cap
-                                                     ? s_enc_out_cap : out_cap),
-                                          &got) == ESP_OK);
+    if (espix_dma2d_take(pdMS_TO_TICKS(JPEG_DMA_WAIT_MS))) {
+        ok = (jpeg_encoder_process(enc, &ecfg, s_enc_in,
+                                   (uint32_t)((size_t)w * (size_t)h
+                                              * sizeof(espix_px_t)),
+                                   s_enc_out,
+                                   (uint32_t)(s_enc_out_cap < out_cap
+                                              ? s_enc_out_cap : out_cap),
+                                   &got) == ESP_OK);
+        espix_dma2d_give();
+    }
     xSemaphoreGive(lock);
 
     if (!ok) {
@@ -515,10 +530,13 @@ static esp_err_t jpeg_hw_into(espix_surface_t *dst, const uint8_t *jpg, size_t l
                                       * sizeof(espix_px_t));
     uint32_t got = 0;
 
-    if (jpeg_decoder_process(eng, &dcfg, jpg, (uint32_t)len,
-                             (uint8_t *)espix_surface_pixels(dst), bytes,
-                             &got) == ESP_OK) {
-        err = ESP_OK;
+    if (espix_dma2d_take(pdMS_TO_TICKS(JPEG_DMA_WAIT_MS))) {
+        if (jpeg_decoder_process(eng, &dcfg, jpg, (uint32_t)len,
+                                 (uint8_t *)espix_surface_pixels(dst), bytes,
+                                 &got) == ESP_OK) {
+            err = ESP_OK;
+        }
+        espix_dma2d_give();
     }
 
 done:

@@ -26,11 +26,14 @@
 
 #if SOC_PPA_SUPPORTED
 #include "driver/ppa.h"
+#include "esp_private/esp_cache_private.h"
+#include "esp_memory_utils.h"
 #endif
 
 #include "espix_display.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_dma2d.h"
 
 #define TAG "display"
 
@@ -120,6 +123,7 @@ struct espix_canvas {
     int              ndamage;
     espix_move_t     moves[ESPIX_DISPLAY_MOVE_MAX];
     int              nmoves;
+    espix_rect_t     photo;       /* where the owner says a picture is, or empty */
 };
 
 /*
@@ -206,6 +210,16 @@ static void *buf_alloc(size_t bytes)
     return p;
 }
 
+/* Defined with the PPA below: a buffer a lost transaction may still write. */
+static bool ppa_quarantined(const void *p);
+
+static void buf_free(void *p)
+{
+    if (!ppa_quarantined(p)) {
+        heap_caps_free(p);
+    }
+}
+
 /*
  * xterm's first sixteen colours, which is what every program means by SGR 30-37
  * and 90-97. The bright half is a separate palette here rather than "the same
@@ -269,7 +283,7 @@ void espix_canvas_free(espix_canvas_t *c)
     if (c->lock != NULL) {
         vSemaphoreDelete(c->lock);
     }
-    heap_caps_free(c->px);
+    buf_free(c->px);
     free(c);
 }
 
@@ -308,13 +322,14 @@ esp_err_t espix_canvas_resize(espix_canvas_t *c, int w, int h)
     c->h       = h;
     c->ndamage = 0;
     c->nmoves  = 0;
+    c->photo   = (espix_rect_t){ 0, 0, 0, 0 };
     espix_canvas_damage(c, (espix_rect_t){ 0, 0, w, h });
 
     espix_canvas_unlock(c);
 
     /* Nothing can still reference it: the swap was under the lock, and no
      * caller holds a pixel pointer across an unlock. */
-    heap_caps_free(old);
+    buf_free(old);
     return ESP_OK;
 }
 
@@ -369,12 +384,30 @@ espix_px_t *espix_canvas_pixels(espix_canvas_t *c) { return c->px; }
 /* Damage                                                              */
 /* ------------------------------------------------------------------ */
 
+/* A backend's wake-up: called under the canvas lock whenever there is news. */
+static espix_display_damage_hook_t s_damage_hook;
+
+void espix_display_set_damage_hook(espix_display_damage_hook_t fn)
+{
+    s_damage_hook = fn;
+}
+
+static void damage_notify(void)
+{
+    const espix_display_damage_hook_t fn = s_damage_hook;
+
+    if (fn != NULL) {
+        fn();
+    }
+}
+
 void espix_canvas_damage(espix_canvas_t *c, espix_rect_t r)
 {
     r = rect_clip(c, r);
     if (r.w <= 0 || r.h <= 0) {
         return;
     }
+    damage_notify();
 
     /*
      * Fold into anything it touches, and keep folding: growing into one
@@ -438,6 +471,8 @@ void espix_canvas_damage_clear(espix_canvas_t *c) { c->ndamage = 0; }
  */
 static void canvas_note_move(espix_canvas_t *c, espix_rect_t r, int sx, int sy)
 {
+    damage_notify();
+
     if (c->nmoves == 1) {
         espix_move_t *m = &c->moves[0];
         int           x0, y0, x1, y1;
@@ -593,6 +628,42 @@ void espix_canvas_move_clear(espix_canvas_t *c) { c->nmoves = 0; }
 
 bool espix_canvas_damaged(const espix_canvas_t *c) { return c->ndamage > 0; }
 
+void espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r)
+{
+    c->photo = rect_clip(c, r);
+}
+
+espix_rect_t espix_canvas_photo(const espix_canvas_t *c) { return c->photo; }
+
+/* One 2D-DMA user at a time (see espix_dma2d.h); also one PPA completion in flight. */
+static SemaphoreHandle_t s_dma2d_lock;
+static portMUX_TYPE      s_dma2d_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool espix_dma2d_take(TickType_t wait)
+{
+    if (s_dma2d_lock == NULL) {
+        SemaphoreHandle_t m = xSemaphoreCreateMutex();
+        portENTER_CRITICAL(&s_dma2d_mux);
+        if (s_dma2d_lock == NULL) {
+            s_dma2d_lock = m;
+            m = NULL;
+        }
+        portEXIT_CRITICAL(&s_dma2d_mux);
+        if (m != NULL) {
+            vSemaphoreDelete(m);
+        }
+        if (s_dma2d_lock == NULL) {
+            return false;
+        }
+    }
+    return xSemaphoreTake(s_dma2d_lock, wait) == pdTRUE;
+}
+
+void espix_dma2d_give(void)
+{
+    xSemaphoreGive(s_dma2d_lock);
+}
+
 #if SOC_PPA_SUPPORTED
 /*
  * PPA, for the two operations below.
@@ -623,75 +694,87 @@ static ppa_client_handle_t s_ppa_srm;
 #define PPA_MIN_PIXELS 2048
 
 /* The benchmark's two columns, and nothing else: production never sets either. */
-/* Software, always, for now -- and this is a fix, not a preference.
- * The accelerator is three times faster on fills and blits and it is driven in
- * blocking mode, and on this board a transaction can simply never complete:
- * measured, the canvas held for fifty-five seconds inside one, with the
- * desktop, its input handler and every repaint behind it. Opening a window
- * paints it through these calls, which is why a panel that opens looked like a
- * panel that hangs. Until the PPA can be driven in non-blocking mode with a
- * completion callback and a timeout, the loop is what runs. */
-/* Off for now: the canvas phase still stalls with it on, and until that is
- * understood the software path is the only one that cannot freeze the board.
- * The PPA work below (non-blocking, callback, bounded wait, aligned buffers) is
- * what it should look like when it comes back. */
-/*
- * The accelerator is on. The freeze that looked like it was caused by the PPA
- * was espix_klog(): the per-rectangle log lines write to a 115200-baud serial
- * console, the console backs up, and the task that logs blocks inside the log
- * call -- which is the task that also holds the canvas and runs the desktop.
- * With the logs out, a full frame with the PPA on takes 0.06 s and the desktop
- * runs at 140 updates a second.
- */
 static bool s_sw_only;
 static bool s_force_hw;
 
-/*
- * How long a transaction may take before the software path takes over.
- *
- * The driver's blocking mode has no timeout of its own -- it waits on a
- * completion that, for a transaction the hardware never finishes, does not
- * come. Measured: the server inside one for fifty-five seconds, holding the
- * canvas, with the desktop and its input handler behind it. Non-blocking plus
- * a callback from the documentation's "Register PPA Event Callbacks" section
- * turns that into a bounded wait, and past the bound the loop does the work.
- */
-#define PPA_WAIT_MS 60
+/* Past this a transaction is lost (seen on this board); a full canvas takes ~20 ms. */
+#define PPA_WAIT_MS 250
 
-static SemaphoreHandle_t s_ppa_srm_done;    /* one per client: their completions */
-static SemaphoreHandle_t s_ppa_fill_done;   /* are not each other's */
+/* A lost transaction still owns the engine, so it retires the PPA for the boot. */
+static volatile bool s_ppa_dead;
+static char          s_ppa_why[160];
 
-/* Runs in the interrupt context: give and go, nothing else. */
+static SemaphoreHandle_t s_ppa_done;
+
+/* Outputs a lost transaction may still write: never freed, never reused. */
+#define PPA_QUARANTINE_MAX 4
+
+static void *s_ppa_quarantine[PPA_QUARANTINE_MAX];
+
+static bool ppa_quarantined(const void *p)
+{
+    for (int i = 0; i < PPA_QUARANTINE_MAX; i++) {
+        if (p != NULL && s_ppa_quarantine[i] == p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ppa_quarantine(void *p)
+{
+    for (int i = 0; i < PPA_QUARANTINE_MAX; i++) {
+        if (s_ppa_quarantine[i] == NULL) {
+            s_ppa_quarantine[i] = p;
+            return;
+        }
+    }
+}
+
+/* ISR context: the one transaction in flight is the one being waited for. */
 static bool IRAM_ATTR ppa_on_done(ppa_client_handle_t client,
                                   ppa_event_data_t *edata, void *user)
 {
     (void)client;
     (void)edata;
+    (void)user;
 
     BaseType_t woken = pdFALSE;
 
-    /*
-     * The semaphore belongs to the transaction, not to the callback.
-     *
-     * There was one binary semaphore for both clients -- the SRM one that
-     * blits and copies, and the fill one -- so a fill finishing could satisfy
-     * the wait for a blit. The caller then read its staging buffer while the
-     * copy was still writing it: a torn frame, which on a video is grey smear
-     * that comes and goes. The driver hands each transaction's own user_data
-     * back here, so each one waits for its own completion.
-     */
-    SemaphoreHandle_t done = (SemaphoreHandle_t)user;
-
-    if (done != NULL) {
-        xSemaphoreGiveFromISR(done, &woken);
-    }
+    xSemaphoreGiveFromISR(s_ppa_done, &woken);
     return woken == pdTRUE;
+}
+
+/* The driver's own rule: a cache line of whichever memory the buffer is in. */
+static bool ppa_aligned(const void *p)
+{
+    static size_t ext, in;
+
+    if (ext == 0) {
+        if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &ext) != ESP_OK || ext == 0) {
+            ext = BUF_ALIGN;
+        }
+        if (esp_cache_get_alignment(MALLOC_CAP_INTERNAL, &in) != ESP_OK || in == 0) {
+            in = 4;
+        }
+    }
+    const size_t a = esp_ptr_external_ram(p) ? ext : in;
+    return ((uintptr_t)p & (a - 1)) == 0;
 }
 
 static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
 {
+    if (s_ppa_dead) {
+        return false;
+    }
     if (*client != NULL) {
         return true;
+    }
+    if (s_ppa_done == NULL) {
+        s_ppa_done = xSemaphoreCreateBinary();
+        if (s_ppa_done == NULL) {
+            return false;
+        }
     }
     const ppa_client_config_t cfg = {
         .oper_type             = op,
@@ -701,32 +784,76 @@ static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
         *client = NULL;
         return false;
     }
-
-    SemaphoreHandle_t *done = (op == PPA_OPERATION_FILL) ? &s_ppa_fill_done
-                                                         : &s_ppa_srm_done;
-
-    if (*done == NULL) {
-        *done = xSemaphoreCreateBinary();
-    }
-    if (*done != NULL) {
-        const ppa_event_callbacks_t cbs = { .on_trans_done = ppa_on_done };
-        (void)ppa_client_register_event_callbacks(*client, &cbs);
+    const ppa_event_callbacks_t cbs = { .on_trans_done = ppa_on_done };
+    if (ppa_client_register_event_callbacks(*client, &cbs) != ESP_OK) {
+        (void)ppa_unregister_client(*client);
+        *client = NULL;
+        return false;
     }
     return true;
 }
 
-/*
- * Wait for the transaction just queued. False means the software path runs
- * instead -- and if the client is left busy by the one that did not finish,
- * every later operation fails to queue and takes the same road, which is the
- * intended shape: correct, a little slow, and never a wedged board.
- */
-static bool ppa_wait(esp_err_t queued, SemaphoreHandle_t done)
+static bool ppa_lock_take(void)
 {
-    if (queued != ESP_OK || done == NULL) {
+    return espix_dma2d_take(pdMS_TO_TICKS(2 * PPA_WAIT_MS));
+}
+
+static void ppa_lock_give(void)
+{
+    espix_dma2d_give();
+}
+
+/* What a lost transaction was, from its config: only built when one is lost. */
+static void ppa_describe(bool fill, const void *cfg)
+{
+    if (fill) {
+        const ppa_fill_oper_config_t *f = cfg;
+        snprintf(s_ppa_why, sizeof(s_ppa_why),
+                 "fill %ux%u at %u,%u of %ux%u @%p",
+                 (unsigned)f->fill_block_w, (unsigned)f->fill_block_h,
+                 (unsigned)f->out.block_offset_x, (unsigned)f->out.block_offset_y,
+                 (unsigned)f->out.pic_w, (unsigned)f->out.pic_h, f->out.buffer);
+        return;
+    }
+    const ppa_srm_oper_config_t *m = cfg;
+    snprintf(s_ppa_why, sizeof(s_ppa_why),
+             "srm %ux%u from %u,%u of %ux%u @%p to %u,%u of %ux%u @%p",
+             (unsigned)m->in.block_w, (unsigned)m->in.block_h,
+             (unsigned)m->in.block_offset_x, (unsigned)m->in.block_offset_y,
+             (unsigned)m->in.pic_w, (unsigned)m->in.pic_h, m->in.buffer,
+             (unsigned)m->out.block_offset_x, (unsigned)m->out.block_offset_y,
+             (unsigned)m->out.pic_w, (unsigned)m->out.pic_h, m->out.buffer);
+}
+
+/* Queue one operation and wait for it; false means do it in software. */
+static bool ppa_run(ppa_client_handle_t client, bool fill, const void *cfg,
+                    void *dst)
+{
+    if (s_ppa_dead || !ppa_lock_take()) {
         return false;
     }
-    return xSemaphoreTake(done, pdMS_TO_TICKS(PPA_WAIT_MS)) == pdTRUE;
+    if (s_ppa_dead) {
+        ppa_lock_give();
+        return false;
+    }
+
+    (void)xSemaphoreTake(s_ppa_done, 0);
+    const esp_err_t err = fill ? ppa_do_fill(client, cfg)
+                               : ppa_do_scale_rotate_mirror(client, cfg);
+    bool ok = false;
+
+    if (err == ESP_OK) {
+        ok = xSemaphoreTake(s_ppa_done, pdMS_TO_TICKS(PPA_WAIT_MS)) == pdTRUE;
+        if (!ok) {
+            s_ppa_dead = true;
+            ppa_quarantine(dst);
+            ppa_describe(fill, cfg);
+            espix_klog(ESPIX_KLOG_ERROR, TAG, "PPA %s did not complete in %d ms; "
+                       "the accelerator is off until reboot", s_ppa_why, PPA_WAIT_MS);
+        }
+    }
+    ppa_lock_give();
+    return ok;
 }
 
 /*
@@ -752,66 +879,25 @@ static uint32_t rgb565_to_rgb888(espix_px_t v)
             ((b << 3) | (b >> 2));
 }
 
-/*
- * One PPA engine, one caller at a time.
- *
- * The client is not re-entrant and the driver does not say so. It is called
- * from the desktop -- window-surface blits in window_paint(), canvas fills --
- * and from the RFB server's staging copy, and those are different tasks whose
- * locks do not intersect: the canvas lock does not cover a surface blit, which
- * happens before the repair that takes it. Two blocking transactions
- * overlapping on one client is the hazard the accelerator's own documentation
- * warns about, and its shape here was a task that sat inside the canvas phase
- * for thirty seconds, holding the canvas, with every other task behind it.
- */
-static SemaphoreHandle_t s_ppa_lock;
-
-static bool ppa_lock_take(void)
-{
-    if (s_ppa_lock == NULL) {
-        s_ppa_lock = xSemaphoreCreateMutex();
-        if (s_ppa_lock == NULL) {
-            return false;               /* no lock: do it in software */
-        }
-    }
-    return xSemaphoreTake(s_ppa_lock, portMAX_DELAY) == pdTRUE;
-}
-
-static void ppa_lock_give(void)
-{
-    xSemaphoreGive(s_ppa_lock);
-}
-
 static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
                           espix_rect_t r, espix_px_t v)
 {
-    /*
-     * A stride that is not the width cannot be said in the config -- the picture
-     * is contiguous and pic_w is its stride -- so that case stays on the
-     * software path. Nothing allocates one today; the check is here so that
-     * nothing silently draws in the wrong place when something does.
-     */
-    if (s_sw_only || stride != w || !ppa_ready(PPA_OPERATION_FILL, &s_ppa_fill)) {
+    /* pic_w is the pitch, so a padded stride cannot be described. */
+    if (s_sw_only || stride != w || r.w <= 0 || r.h <= 0) {
         return false;
     }
-    /*
-     * The documentation's one hard rule about buffers: "the out.buffer address
-     * and out.buffer_size must be aligned to the cache line size, if the buffer
-     * is located in a memory region that is cacheable". This check was on the
-     * blit path and missing here, so a fill on an unaligned buffer went to the
-     * driver anyway, was refused inside it, and left the client unable to
-     * complete another transaction -- which the blocking calls of the day then
-     * waited on for ever.
-     */
-    if (((uintptr_t)px & (BUF_ALIGN - 1)) != 0
-        || (buf_size(w, h) & (BUF_ALIGN - 1)) != 0) {
+    /* "out.buffer and out.buffer_size must be aligned to the cache line". */
+    if (!ppa_aligned(px)) {
         return false;
     }
     if (!s_force_hw && r.w * r.h < PPA_MIN_PIXELS) {
         return false;
     }
+    if (!ppa_ready(PPA_OPERATION_FILL, &s_ppa_fill)) {
+        return false;
+    }
 
-    ppa_fill_oper_config_t cfg = {
+    const ppa_fill_oper_config_t cfg = {
         .out = {
             .buffer         = px,
             .buffer_size    = (uint32_t)buf_size(w, h),
@@ -826,80 +912,38 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
         .fill_color_val = rgb565_to_rgb888(v),
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
-    if (!ppa_lock_take()) {
-        return false;
-    }
-    cfg.user_data = s_ppa_fill_done;
-    (void)xSemaphoreTake(s_ppa_fill_done, 0);   /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_fill(s_ppa_fill, &cfg), s_ppa_fill_done);
-
-    ppa_lock_give();
-    return ok;
+    return ppa_run(s_ppa_fill, true, &cfg, px);
 }
 
-/*
- * A block of `src` into a block of `dst`, both described by an offset within
- * their picture rather than by a moved pointer.
- *
- * That distinction is load-bearing and was got wrong twice. PPA checks the
- * *output* buffer's address and size for cache-line alignment and takes the
- * input on trust -- so a source pointer offset by an odd number of pixels is
- * read unaligned and comes back as garbage rather than as an error. The offsets
- * belong in block_offset_x/block_offset_y, where the hardware expects them, and
- * the buffer stays at the allocation's aligned base.
- */
+/* Block to block, by offsets within each picture (never a moved pointer); sph: source height. */
 static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
                           int dx, int dy,
                           const espix_px_t *src, int sx, int sy,
-                          int sw, int sh, int sstride)
+                          int sw, int sh, int sstride, int sph)
 {
-    if (s_sw_only || dstride != dw) {
+    if (s_sw_only || dstride != dw || sw <= 0 || sh <= 0) {
         return false;
     }
     if (!s_force_hw && sw * sh < PPA_MIN_PIXELS) {
         return false;
     }
-    /* PPA does not clip, so a block that hangs off either picture stays with
-     * the software loop -- which is the loop that already clips. */
-    if (dx < 0 || dy < 0 || dx + sw > dw || dy + sh > dh) {
+    /* PPA does not clip; the loop does. */
+    if (dx < 0 || dy < 0 || dx + sw > dw || dy + sh > dh
+        || sx < 0 || sy < 0 || sx + sw > sstride || sy + sh > sph) {
         return false;
     }
-    /* The guard PPA does not have. An unaligned base is a driver error, and
-     * the loop below is the right answer rather than a slow one. */
-    if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0) {
-        return false;
-    }
-    /*
-     * And the same guard for the destination, which was missing and mattered.
-     *
-     * The driver does check it -- and logs an error when it does not hold,
-     * which is not the same thing as refusing: espix's own staging buffer was
-     * a plain allocation, every rectangle the server sent went into the PPA
-     * with an unaligned output, and after a few of those the desktop stopped
-     * opening its own Start menu and the board had to be rebooted. Asking the
-     * hardware and being refused is not a fallback; not asking is.
-     */
-    if (((uintptr_t)dst & (BUF_ALIGN - 1)) != 0
-        || (buf_size(dw, dh) & (BUF_ALIGN - 1)) != 0) {
+    if (!ppa_aligned(src) || !ppa_aligned(dst)) {
         return false;
     }
     if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
         return false;
     }
 
-    ppa_srm_oper_config_t cfg = {
+    const ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
-            /*
-             * The *picture* width, which is the source's row pitch and not the
-             * block's width: the hardware steps pic_w pixels per row. They are
-             * the same number for a whole-surface copy, which is why this was
-             * wrong without being noticeable until a block was copied out of a
-             * wider picture -- a window out of the canvas, which is the case
-             * compositing is made of.
-             */
             .pic_w          = (uint32_t)sstride,
-            .pic_h          = (uint32_t)(sy + sh),
+            .pic_h          = (uint32_t)sph,
             .block_w        = (uint32_t)sw,
             .block_h        = (uint32_t)sh,
             .block_offset_x = (uint32_t)sx,
@@ -920,82 +964,7 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
         .scale_y        = 1.0f,
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
-    if (!ppa_lock_take()) {
-        return false;
-    }
-    cfg.user_data = s_ppa_srm_done;
-    (void)xSemaphoreTake(s_ppa_srm_done, 0);    /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg),
-                             s_ppa_srm_done);
-
-    ppa_lock_give();
-    return ok;
-}
-
-/*
- * The same operation with the scale factors set, which is the whole of what
- * scaling is: SRM is scale-rotate-mirror, and the blit above is it at 1:1.
- *
- * The source is the whole picture and the destination is a whole surface, so
- * there is no block offset anywhere -- which is deliberate, because an offset
- * is the field this driver has already been got wrong on twice.
- */
-/*
- * Copy a rectangle of the canvas into a buffer, with the PPA where it can and
- * the loop where it cannot.
- *
- * This is the copy the RFB server makes of every changed rectangle before it
- * encodes one, and it was the largest single cost in an update: measured at
- * 6.8 Mpx/s as a row-by-row memcpy over a cold 350,000-pixel region, against
- * 17.2 Mpx/s for the board's own software blit and 49 Mpx/s for the hardware
- * one. The bytes are the same either way; only the engine differs, and the
- * engine is seven times faster.
- *
- * dstride must equal dw, which is the PPA's own requirement and is checked
- * below: the destination is a picture and the rectangle is placed in it with
- * dx and dy. The fallback clips nothing and splits nothing -- it is the loop
- * that always worked.
- */
-bool espix_canvas_copy_rect(const espix_canvas_t *c, espix_rect_t r,
-                            espix_px_t *dst, int dw, int dh, int dstride,
-                            int dx, int dy)
-{
-    if (c == NULL || c->px == NULL || dst == NULL || r.w <= 0 || r.h <= 0) {
-        return false;
-    }
-
-    /*
-     * Software, and no PPA, and that is a fix rather than a choice.
-     *
-     * This copy used ppa_blit_rect() first: it is three times faster in the
-     * benchmark, and it is a blocking transaction, and on this board it
-     * sometimes never returns. Measured: the server inside this phase for
-     * fifty-five seconds and counting, holding the canvas lock, with the
-     * desktop -- its input handler, its repaints, the Start menu -- behind it
-     * for the whole of it. That is the freeze, and it was mine: the call was
-     * added with the Tight work and it hits any update with a large rectangle,
-     * which is every first frame and every menu.
-     *
-     * The accelerator is still worth having here, but not like this: it needs
-     * the non-blocking mode with a completion callback and a timeout, so a
-     * transaction that does not finish degrades to this loop instead of
-     * taking the board with it. Until that exists, the loop is what runs.
-     */
-    if (!ppa_lock_take()) {
-        return false;
-    }
-    const bool ok = ppa_blit_rect(dst, dw, dh, dstride, dx, dy,
-                                 c->px, r.x, r.y, r.w, r.h, c->w);
-
-    ppa_lock_give();
-    return ok;
-
-    for (int y = 0; y < r.h; y++) {
-        memcpy(dst + (size_t)(dy + y) * dstride + dx,
-               c->px + (size_t)(r.y + y) * c->w + r.x,
-               (size_t)r.w * sizeof(espix_px_t));
-    }
-    return false;
+    return ppa_run(s_ppa_srm, false, &cfg, dst);
 }
 
 static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
@@ -1007,14 +976,14 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
     if (!s_force_hw && sw * sh < PPA_MIN_PIXELS) {
         return false;
     }
-    if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0) {
+    if (!ppa_aligned(src) || !ppa_aligned(dst)) {
         return false;
     }
     if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
         return false;
     }
 
-    ppa_srm_oper_config_t cfg = {
+    const ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
             .pic_w          = (uint32_t)sw,
@@ -1039,41 +1008,25 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
         .scale_y        = (float)dh / (float)sh,
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
-    if (!ppa_lock_take()) {
-        return false;
-    }
-    cfg.user_data = s_ppa_srm_done;
-    (void)xSemaphoreTake(s_ppa_srm_done, 0);    /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg),
-                             s_ppa_srm_done);
-
-    ppa_lock_give();
-    return ok;
+    return ppa_run(s_ppa_srm, false, &cfg, dst);
 }
 
-/*
- * RGB565 -> ARGB8888, in one transaction.
- *
- * This is the conversion an RFB update pays when the client asks for 32bpp:
- * every pixel the encoder emits is expanded on the way out. SRM does it with
- * different input and output colour modes -- the same engine as the blit, which
- * is this at 1:1 and one colour mode. The alpha byte is don't-care; the client
- * asks for depth 24.
- */
+/* RGB565 -> ARGB8888 in one transaction: the benchmark's conversion row. */
 static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
 {
     if (s_sw_only || w <= 0 || h <= 0) {
         return false;
     }
     if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0 ||
-        ((uintptr_t)dst & (BUF_ALIGN - 1)) != 0) {
+        ((uintptr_t)dst & (BUF_ALIGN - 1)) != 0 ||
+        (((size_t)w * h * 4) & (BUF_ALIGN - 1)) != 0) {
         return false;
     }
     if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
         return false;
     }
 
-    ppa_srm_oper_config_t cfg = {
+    const ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
             .pic_w          = (uint32_t)w,
@@ -1098,16 +1051,7 @@ static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
         .scale_y        = 1.0f,
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
-    if (!ppa_lock_take()) {
-        return false;
-    }
-    cfg.user_data = s_ppa_srm_done;
-    (void)xSemaphoreTake(s_ppa_srm_done, 0);    /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg),
-                             s_ppa_srm_done);
-
-    ppa_lock_give();
-    return ok;
+    return ppa_run(s_ppa_srm, false, &cfg, dst);
 }
 
 /* The conversion as a benchmark row: software expansion against PPA SRM. */
@@ -1176,9 +1120,292 @@ static bool bench_convert_verify(const espix_px_t *src, uint32_t *dst, int w, in
     heap_caps_free(ref);
     return ok;
 }
+
+const char *espix_display_accel_fault(void)
+{
+    return s_ppa_dead ? s_ppa_why : NULL;
+}
+
+/* A pattern no two neighbouring pixels share, so an offset error shows. */
+static espix_px_t stress_px(int x, int y)
+{
+    return (espix_px_t)(x * 7 + y * 131 + ((x ^ y) << 5));
+}
+
+static uint32_t stress_rand(uint32_t *s)
+{
+    *s = *s * 1664525u + 1013904223u;
+    return *s >> 8;
+}
+
+/* One blit through the PPA, then every destination pixel checked. */
+/* The old input description: a picture that ends where the block does. */
+static bool s_stress_tight;
+
+static bool stress_one(espix_px_t *dst, int dw, int dh, espix_px_t *src,
+                       int sw, int sh, int bx, int by, int bw, int bhh,
+                       int dx, int dy, char *out, size_t len, size_t *at)
+{
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++) {
+            src[(size_t)y * sw + x] = stress_px(x, y);
+        }
+    }
+    for (int i = 0; i < dw * dh; i++) {
+        dst[i] = 0xF81F;
+    }
+    s_force_hw = true;
+    const bool hw = ppa_blit_rect(dst, dw, dh, dw, dx, dy, src, bx, by, bw, bhh,
+                                  sw, s_stress_tight ? by + bhh : sh);
+    s_force_hw = false;
+
+    bool ok = hw;
+    for (int y = 0; y < bhh && ok; y++) {
+        for (int x = 0; x < bw; x++) {
+            if (dst[(size_t)(dy + y) * dw + dx + x] != stress_px(bx + x, by + y)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (!ok && *at < len) {
+        *at += (size_t)snprintf(out + *at, len - *at,
+                                "%s: %dx%d from %d,%d of %dx%d to %d,%d of %dx%d\n",
+                                hw ? "wrong pixels" : (s_ppa_dead ? "LOST" : "refused"),
+                                bw, bhh, bx, by, sw, sh, dx, dy, dw, dh);
+    }
+    return ok;
+}
+
+int espix_display_ppa_stress(int iters, bool tight, char *out, size_t len)
+{
+    size_t at = 0;
+    int    bad = 0;
+
+    if (out == NULL || len == 0) {
+        return -1;
+    }
+    s_stress_tight = tight;
+    out[0] = '\0';
+
+    espix_surface_t *src = espix_surface_new(1024, 768);
+    espix_surface_t *dst = espix_surface_new(1024, 768);
+    if (src == NULL || dst == NULL) {
+        espix_surface_free(src);
+        espix_surface_free(dst);
+        snprintf(out, len, "no memory for two 1024x768 surfaces\n");
+        return -1;
+    }
+    espix_px_t *sp = espix_surface_pixels(src);
+    espix_px_t *dp = espix_surface_pixels(dst);
+
+    /* The hang the coredump caught: a 620x440 window's title strip. */
+    if (!stress_one(dp, 1024, 768, sp, 620, 440, 0, 0, 620, 18, 100, 60,
+                    out, len, &at)) {
+        bad++;
+    }
+
+    uint32_t seed = 0x5EED1234u;
+    int      run  = 0;
+
+    for (; run < iters && !s_ppa_dead; run++) {
+        const int sw = 64 + (int)(stress_rand(&seed) % 961);
+        const int sh = 32 + (int)(stress_rand(&seed) % 737);
+        const int bw = 1 + (int)(stress_rand(&seed) % (uint32_t)sw);
+        const int bh = 1 + (int)(stress_rand(&seed) % (uint32_t)sh);
+        const int bx = (int)(stress_rand(&seed) % (uint32_t)(sw - bw + 1));
+        const int by = (int)(stress_rand(&seed) % (uint32_t)(sh - bh + 1));
+        const int dx = (int)(stress_rand(&seed) % (uint32_t)(1024 - bw + 1));
+        const int dy = (int)(stress_rand(&seed) % (uint32_t)(768 - bh + 1));
+
+        if (bw * bh < PPA_MIN_PIXELS) {
+            continue;
+        }
+        if (!stress_one(dp, 1024, 768, sp, sw, sh, bx, by, bw, bh, dx, dy,
+                        out, len, &at)) {
+            bad++;
+        }
+    }
+
+    if (at < len) {
+        snprintf(out + at, len - at, "%d random blits, %d failed%s%s\n", run, bad,
+                 s_ppa_dead ? "; accelerator lost: " : "",
+                 s_ppa_dead ? s_ppa_why : "");
+    }
+    espix_surface_free(src);
+    espix_surface_free(dst);
+    return bad;
+}
+
+/* ---- DMA2D: PPA and the JPEG codec, side by side or one at a time ---- */
+
+typedef struct {
+    volatile bool stop;
+    volatile uint32_t ppa, jpeg;
+    volatile int  failed;
+    SemaphoreHandle_t done;
+} dmatest_t;
+
+static void dmatest_ppa_step(espix_surface_t *a, espix_surface_t *b, uint32_t *seed)
+{
+    const int bw = 64 + (int)(stress_rand(seed) % 512);
+    const int bh = 32 + (int)(stress_rand(seed) % 256);
+    const int dx = (int)(stress_rand(seed) % (uint32_t)(1024 - bw));
+    const int dy = (int)(stress_rand(seed) % (uint32_t)(768 - bh));
+
+    (void)ppa_blit_rect(espix_surface_pixels(b), 1024, 768, 1024, dx, dy,
+                        espix_surface_pixels(a), 0, 0, bw, bh, 1024, 768);
+    espix_surface_fill(b, (espix_rect_t){ dy % 400, dx % 300, bw, bh },
+                       (espix_px_t)stress_rand(seed));
+}
+
+/* Encode a 640x480 picture, decode it back: both directions of the codec. */
+static bool dmatest_jpeg_step(espix_surface_t *pic, espix_surface_t *back,
+                              uint8_t *jbuf, size_t cap)
+{
+    espix_px_t *in = espix_display_jpeg_input(640 * 480);
+    if (in == NULL) {
+        return false;
+    }
+    memcpy(in, espix_surface_pixels(pic), 640 * 480 * sizeof(espix_px_t));
+    const size_t n = espix_display_jpeg_encode(640, 480, 60, jbuf, cap);
+    return n > 0 && espix_image_jpeg_into(back, jbuf, n) == ESP_OK;
+}
+
+static void dmatest_ppa_task(void *arg)
+{
+    dmatest_t       *t = arg;
+    espix_surface_t *a = espix_surface_new(1024, 768);
+    espix_surface_t *b = espix_surface_new(1024, 768);
+    uint32_t         seed = 0xC0FFEEu;
+
+    while (a != NULL && b != NULL && !t->stop && !s_ppa_dead) {
+        dmatest_ppa_step(a, b, &seed);
+        t->ppa++;
+    }
+    espix_surface_free(a);
+    espix_surface_free(b);
+    xSemaphoreGive(t->done);
+    vTaskDelete(NULL);
+}
+
+int espix_display_dma_stress(int secs, bool serial, char *out, size_t len)
+{
+    dmatest_t t = { 0 };
+    espix_surface_t *pic  = espix_surface_new(640, 480);
+    espix_surface_t *back = espix_surface_new(640, 480);
+    const size_t     cap  = 640 * 480 * 2 + 1024;
+    uint8_t         *jbuf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    espix_surface_t *a = serial ? espix_surface_new(1024, 768) : NULL;
+    espix_surface_t *b = serial ? espix_surface_new(1024, 768) : NULL;
+    uint32_t         seed = 0xBEEFu;
+
+    t.done = xSemaphoreCreateBinary();
+    if (pic == NULL || back == NULL || jbuf == NULL || t.done == NULL
+        || (serial && (a == NULL || b == NULL))) {
+        snprintf(out, len, "no memory\n");
+        goto done;
+    }
+    for (int i = 0; i < 640 * 480; i++) {
+        espix_surface_pixels(pic)[i] = stress_px(i % 640, i / 640);
+    }
+
+    if (!serial && xTaskCreatePinnedToCore(dmatest_ppa_task, "dmatest", 4096, &t, 3,
+                                           NULL, tskNO_AFFINITY) != pdPASS) {
+        snprintf(out, len, "no task\n");
+        goto done;
+    }
+
+    const int64_t end = esp_timer_get_time() + (int64_t)secs * 1000000;
+    while (esp_timer_get_time() < end && !s_ppa_dead) {
+        if (serial) {
+            dmatest_ppa_step(a, b, &seed);
+            t.ppa++;
+        }
+        if (!dmatest_jpeg_step(pic, back, jbuf, cap)) {
+            t.failed++;
+        }
+        t.jpeg++;
+    }
+    t.stop = true;
+    if (!serial) {
+        (void)xSemaphoreTake(t.done, pdMS_TO_TICKS(2000));
+    }
+    snprintf(out, len, "%s: %u PPA steps, %u JPEG round trips (%d failed)%s%s\n",
+             serial ? "serial" : "concurrent", (unsigned)t.ppa, (unsigned)t.jpeg,
+             t.failed, s_ppa_dead ? "; accelerator lost: " : "",
+             s_ppa_dead ? s_ppa_why : "");
+done:
+    espix_surface_free(pic);
+    espix_surface_free(back);
+    espix_surface_free(a);
+    espix_surface_free(b);
+    heap_caps_free(jbuf);
+    if (t.done != NULL) {
+        vSemaphoreDelete(t.done);
+    }
+    return t.failed;
+}
 #else
 static bool s_sw_only;      /* unused without an accelerator, but harmless */
+
+static bool ppa_quarantined(const void *p)
+{
+    (void)p;
+    return false;
+}
+
+const char *espix_display_accel_fault(void)
+{
+    return NULL;
+}
+
+int espix_display_dma_stress(int secs, bool serial, char *out, size_t len)
+{
+    (void)secs;
+    (void)serial;
+    if (out != NULL && len > 0) {
+        snprintf(out, len, "no PPA on this target\n");
+    }
+    return -1;
+}
+
+int espix_display_ppa_stress(int iters, bool tight, char *out, size_t len)
+{
+    (void)iters;
+    (void)tight;
+    if (out != NULL && len > 0) {
+        snprintf(out, len, "no PPA on this target\n");
+    }
+    return -1;
+}
 #endif  /* SOC_PPA_SUPPORTED */
+
+/* Always copies; true when the PPA did it. dst is a dw x dh picture of >= buf_size(dw, dh) bytes. */
+bool espix_canvas_copy_rect(const espix_canvas_t *c, espix_rect_t r,
+                            espix_px_t *dst, int dw, int dh, int dstride,
+                            int dx, int dy)
+{
+    if (c == NULL || c->px == NULL || dst == NULL || r.w <= 0 || r.h <= 0) {
+        return false;
+    }
+
+#if SOC_PPA_SUPPORTED
+    if (ppa_blit_rect(dst, dw, dh, dstride, dx, dy,
+                      c->px, r.x, r.y, r.w, r.h, c->w, c->h)) {
+        return true;
+    }
+#else
+    (void)dw; (void)dh;
+#endif
+
+    for (int y = 0; y < r.h; y++) {
+        memcpy(dst + (size_t)(dy + y) * dstride + dx,
+               c->px + (size_t)(r.y + y) * c->w + r.x,
+               (size_t)r.w * sizeof(espix_px_t));
+    }
+    return false;
+}
 
 /* ------------------------------------------------------------------ */
 /* Drawing                                                             */
@@ -1197,10 +1424,32 @@ static bool s_sw_only;      /* unused without an accelerator, but harmless */
  * Both take the destination as pixels and geometry rather than as a canvas or a
  * surface, because both are called with either.
  */
+/* One row of one colour, two pixels per store once the row is word aligned. */
+static void px_fill_row(espix_px_t *row, int n, espix_px_t v)
+{
+    if (n > 0 && ((uintptr_t)row & 2) != 0) {
+        *row++ = v;
+        n--;
+    }
+
+    uint32_t      *w2 = (uint32_t *)row;
+    const uint32_t vv = (uint32_t)v | ((uint32_t)v << 16);
+
+    for (int i = 0; i < n / 2; i++) {
+        w2[i] = vv;
+    }
+    if (n & 1) {
+        row[n - 1] = v;
+    }
+}
+
 static void op_fill(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
                     espix_px_t v)
 {
     r = rect_clip_wh(r, w, h);
+    if (r.w <= 0 || r.h <= 0) {
+        return;
+    }
 
 #if SOC_PPA_SUPPORTED
     if (ppa_fill_rect(px, w, h, stride, r, v)) {
@@ -1208,37 +1457,38 @@ static void op_fill(espix_px_t *px, int w, int h, int stride, espix_rect_t r,
     }
 #endif
     for (int y = 0; y < r.h; y++) {
-        espix_px_t *row = px + (size_t)(r.y + y) * stride + r.x;
-        for (int x = 0; x < r.w; x++) {
-            row[x] = v;
-        }
+        px_fill_row(px + (size_t)(r.y + y) * stride + r.x, r.w, v);
     }
 }
 
+/* src_ph is the source picture's height; the software path clips once and copies rows. */
 static void op_blit(espix_px_t *px, int w, int h, int stride,
                     int dst_x, int dst_y,
                     const espix_px_t *src, int src_x, int src_y,
-                    int src_w, int src_h, int src_stride)
+                    int src_w, int src_h, int src_stride, int src_ph)
 {
 #if SOC_PPA_SUPPORTED
     if (ppa_blit_rect(px, w, h, stride, dst_x, dst_y, src, src_x, src_y,
-                      src_w, src_h, src_stride)) {
+                      src_w, src_h, src_stride, src_ph)) {
         return;
     }
+#else
+    (void)src_ph;
 #endif
-    for (int y = 0; y < src_h; y++) {
-        const int cy = dst_y + y;
-        if (cy < 0 || cy >= h) {
-            continue;
-        }
-        for (int x = 0; x < src_w; x++) {
-            const int cx = dst_x + x;
-            if (cx < 0 || cx >= w) {
-                continue;
-            }
-            px[(size_t)cy * stride + cx] =
-                src[(size_t)(src_y + y) * src_stride + src_x + x];
-        }
+    int x0 = 0, y0 = 0, x1 = src_w, y1 = src_h;
+
+    if (dst_x < 0)          { x0 = -dst_x; }
+    if (dst_y < 0)          { y0 = -dst_y; }
+    if (dst_x + x1 > w)     { x1 = w - dst_x; }
+    if (dst_y + y1 > h)     { y1 = h - dst_y; }
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+
+    for (int y = y0; y < y1; y++) {
+        memcpy(px + (size_t)(dst_y + y) * stride + dst_x + x0,
+               src + (size_t)(src_y + y) * src_stride + src_x + x0,
+               (size_t)(x1 - x0) * sizeof(espix_px_t));
     }
 }
 
@@ -1289,7 +1539,7 @@ void espix_canvas_blit(espix_canvas_t *c, int dst_x, int dst_y,
                        const espix_px_t *src, int src_w, int src_h, int src_stride)
 {
     op_blit(c->px, c->w, c->h, c->w, dst_x, dst_y, src, 0, 0, src_w, src_h,
-            src_stride);
+            src_stride, src_h);
     espix_canvas_damage(c, (espix_rect_t){ dst_x, dst_y, src_w, src_h });
 }
 
@@ -1330,7 +1580,7 @@ void espix_canvas_blit_surface_rect(espix_canvas_t *c, int x, int y,
      * being eaten by the one dragged over it.
      */
     op_blit(c->px, c->w, c->h, c->w, x + r.x, y + r.y,
-            s->px, r.x, r.y, r.w, r.h, s->stride);
+            s->px, r.x, r.y, r.w, r.h, s->stride, s->h);
     espix_canvas_damage(c, (espix_rect_t){ x + r.x, y + r.y, r.w, r.h });
 }
 
@@ -1406,7 +1656,7 @@ void espix_surface_free(espix_surface_t *s)
     if (s->lock != NULL) {
         vSemaphoreDelete(s->lock);
     }
-    heap_caps_free(s->px);
+    buf_free(s->px);
     free(s);
 }
 
@@ -1427,7 +1677,7 @@ void espix_surface_blit(espix_surface_t *s, int dst_x, int dst_y,
                         int src_stride)
 {
     op_blit(s->px, s->w, s->h, s->stride, dst_x, dst_y, src, 0, 0, src_w,
-            src_h, src_stride);
+            src_h, src_stride, src_h);
 }
 
 /*

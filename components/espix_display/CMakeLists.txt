@@ -26,9 +26,13 @@ idf_component_register(
         espix_net
         freertos
         lwip
+        # The eventfd that wakes the RFB loop on damage.
+        vfs
         heap
         esp_timer
         esp_hw_support
+        # esp_cache_get_alignment(): the PPA's buffer rule, per memory.
+        esp_mm
         esp_system
         esp_rom
         # Unconditional, and free where it does not apply, the same way: both

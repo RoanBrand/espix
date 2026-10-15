@@ -172,7 +172,7 @@ static char               s_state_last[24];
  * on another stack; see settings_refresh(). */
 static TaskHandle_t       s_refresh_task;
 
-static void state_tick(void *arg)
+static void state_tick_desk(void *arg)
 {
     (void)arg;
     const char *now = espix_audio_state();
@@ -183,6 +183,13 @@ static void state_tick(void *arg)
     if (s_win != NULL) {
         espix_window_repaint(s_win);
     }
+}
+
+/* esp_timer context: ask the desktop task, never take its lock here. */
+static void state_tick(void *arg)
+{
+    (void)arg;
+    (void)espix_desktop_post(state_tick_desk, NULL);
 }
 
 static void state_timer_start(void)
@@ -202,7 +209,7 @@ static void state_timer_start(void)
 }
 
 /* Nobody confirmed: put the previous size back and stop asking. */
-static void conf_tick(void *arg)
+static void conf_tick_desk(void *arg)
 {
     (void)arg;
     if (s_conf != CONF_REVERT) {
@@ -221,6 +228,12 @@ static void conf_tick(void *arg)
     if (s_win != NULL) {
         espix_window_repaint(s_win);
     }
+}
+
+static void conf_tick(void *arg)
+{
+    (void)arg;
+    (void)espix_desktop_post(conf_tick_desk, NULL);
 }
 
 static void conf_end(void)
@@ -274,39 +287,61 @@ static espix_rect_t row_rect(const espix_window_t *w, int i)
 /* What is in each section                                             */
 /* ------------------------------------------------------------------ */
 
+/* Queried into these without the lock, then copied in under it, so a paint never sees half a table. */
+static espix_ifinfo_t s_ifs_next[8];
+static espix_bt_dev_t s_devs_next[8];
+static char           s_ifname_next[ESPIX_IF_NAME_MAX];
+static char           s_dns_next[ESPIX_IP4STR_MAX * 4];
+
 static void refresh_network(void)
 {
-    s_nif = (int)espix_net_iflist(s_ifs, sizeof(s_ifs) / sizeof(s_ifs[0]));
+    const int nif = (int)espix_net_iflist(s_ifs_next,
+                                          sizeof(s_ifs_next) / sizeof(s_ifs_next[0]));
 
     uint32_t gw = 0;
-    s_gw = espix_net_default_route(s_ifname, sizeof(s_ifname), &gw) ? gw : 0;
+    const bool have_gw = espix_net_default_route(s_ifname_next,
+                                                 sizeof(s_ifname_next), &gw);
 
-    s_dns[0] = '\0';
+    s_dns_next[0] = '\0';
     uint32_t dns[3];
     const size_t n = espix_net_dns(dns, 3);
     char         one[ESPIX_IP4STR_MAX];
 
     for (size_t i = 0; i < n; i++) {
         if (i != 0) {
-            strlcat(s_dns, ", ", sizeof(s_dns));
+            strlcat(s_dns_next, ", ", sizeof(s_dns_next));
         }
-        strlcat(s_dns, espix_net_ip4str(dns[i], one, sizeof(one)), sizeof(s_dns));
+        strlcat(s_dns_next, espix_net_ip4str(dns[i], one, sizeof(one)),
+                sizeof(s_dns_next));
     }
+
+    espix_desktop_lock();
+    memcpy(s_ifs, s_ifs_next, sizeof(s_ifs));
+    s_nif = nif;
+    s_gw  = have_gw ? gw : 0;
+    strlcpy(s_ifname, s_ifname_next, sizeof(s_ifname));
+    strlcpy(s_dns, s_dns_next, sizeof(s_dns));
     s_dns_ok = (s_dns[0] != '\0');
     if (!s_dns_ok) {
         strlcpy(s_dns, "none", sizeof(s_dns));
     }
+    espix_desktop_unlock();
 }
 
 static void refresh_bluetooth(void)
 {
-    s_ndev = espix_bt_ready()
-           ? (int)espix_bt_devices(s_devs, sizeof(s_devs) / sizeof(s_devs[0]))
-           : 0;
+    const int n = espix_bt_ready()
+                ? (int)espix_bt_devices(s_devs_next,
+                                        sizeof(s_devs_next) / sizeof(s_devs_next[0]))
+                : 0;
 
+    espix_desktop_lock();
+    memcpy(s_devs, s_devs_next, sizeof(s_devs));
+    s_ndev = n;
     if (s_dev_sel >= s_ndev) {
         s_dev_sel = -1;
     }
+    espix_desktop_unlock();
 }
 
 /*
@@ -802,26 +837,21 @@ static void settings_key(espix_window_t *w, uint32_t keysym, bool down, void *ct
  * the panel shows what it had and the desktop carries on -- which is the whole
  * difference between a stale row and a dead board.
  */
-static volatile bool s_refresh_want;
-
 static void settings_refresh_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-
-        if (!s_refresh_want) {
-            continue;
-        }
-        s_refresh_want = false;
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         refresh_network();
         refresh_bluetooth();
 
+        espix_desktop_lock();
         if (s_win != NULL) {
-            espix_window_repaint(s_win);    /* it takes the lock itself */
+            espix_window_repaint(s_win);
         }
+        espix_desktop_unlock();
     }
 }
 
@@ -838,7 +868,7 @@ static void settings_refresh(void)
         refresh_bluetooth();
         return;
     }
-    s_refresh_want = true;
+    xTaskNotifyGive(s_refresh_task);
 }
 
 espix_window_t *espix_settings_open(void)
@@ -868,6 +898,8 @@ void espix_settings_forget(void)
     if (s_state_timer != NULL) {
         (void)esp_timer_stop(s_state_timer);
     }
+    /* An unconfirmed size is kept rather than reverted by a closed panel. */
+    conf_end();
 }
 
 espix_window_t *espix_settings_window(void)

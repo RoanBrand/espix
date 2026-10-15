@@ -39,6 +39,7 @@
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
+#include "esp_vfs_eventfd.h"
 
 #include "espix_display.h"
 #include "espix_kernel.h"
@@ -104,27 +105,8 @@
  * always sent in reply. */
 #define LIVENESS_US    (30 * 1000 * 1000)
 
-/*
- * How long a change made by *another task* may wait to be sent.
- *
- * Nothing wakes this task when the canvas is damaged, and it blocks in recv(),
- * so the only thing that can notice a local mouse is the receive timeout. At
- * POLL_US that is a quarter of a second, and it showed: the update rate for a
- * local mouse was 5-12 a second with a floor at 1/250ms, while a pointer moved
- * over VNC was sent the instant the client's own message was handled. The
- * asymmetry was never the input path -- it was this wait.
- *
- * A viewer keeps one FramebufferUpdateRequest outstanding, and update_send()
- * holds it rather than answering with an empty update, so polling fast is only
- * worth doing while an update is actually owed: the loop picks the timeout from
- * c->pending, and an idle connection still sleeps for POLL_US.
- */
-#define TICK_US        (10 * 1000)
-
-/* The same ten seconds as STALL_LIMIT, counted at the tick rather than at
- * POLL_US: read_full() is the path that waits on a peer part-way through a
- * message, and it uses whichever receive timeout is current. */
-#define READ_STALL_LIMIT (STALL_LIMIT * POLL_US / TICK_US)
+/* Ten seconds of a peer stalled part-way through a message, at POLL_US a try. */
+#define READ_STALL_LIMIT STALL_LIMIT
 #define OUT_CAP        (64 * 1024)    /* encode buffer, flushed to the socket */
 
 /* The PPA's cache-line requirement, for the staging buffers it may be asked to
@@ -304,11 +286,78 @@ static int recv_byte(int fd, uint8_t *b)
     return -2;
 }
 
-/* How long recv() may block for, which is the only clock this loop has. */
-static void set_recv_timeout(int fd, int us)
+/* The serve loop sleeps on the socket and this eventfd; damage pokes it while an update is owed. */
+static int           s_wake_fd = -1;
+static volatile bool s_wake_armed;
+
+static void rfb_damage_hook(void)
 {
-    const struct timeval tv = { .tv_sec = 0, .tv_usec = us };
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!s_wake_armed || s_wake_fd < 0) {
+        return;
+    }
+    s_wake_armed = false;
+
+    const uint64_t one = 1;
+    (void)write(s_wake_fd, &one, sizeof(one));
+}
+
+static void wake_open(void)
+{
+    if (s_wake_fd >= 0) {
+        return;
+    }
+    s_wake_fd = eventfd(0, 0);
+    if (s_wake_fd < 0) {
+        const esp_vfs_eventfd_config_t ev = ESP_VFS_EVENTD_CONFIG_DEFAULT();
+        if (esp_vfs_eventfd_register(&ev) == ESP_OK) {
+            s_wake_fd = eventfd(0, 0);
+        }
+    }
+    if (s_wake_fd < 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no eventfd: updates owed are polled");
+    }
+}
+
+static void wake_drain(void)
+{
+    uint64_t n;
+
+    if (s_wake_fd >= 0) {
+        (void)read(s_wake_fd, &n, sizeof(n));
+    }
+}
+
+/* Wait for the client, the canvas, or room for a deferred frame; 1 when the socket is readable. */
+#define WAIT_POLL_US (10 * 1000)        /* only without an eventfd */
+
+static int conn_wait(int fd, bool owed, bool want_write)
+{
+    fd_set r, w;
+    int    maxfd = fd;
+
+    FD_ZERO(&r);
+    FD_ZERO(&w);
+    FD_SET(fd, &r);
+    if (want_write) {
+        FD_SET(fd, &w);                 /* a deferred frame waits for room */
+    }
+    if (owed && s_wake_fd >= 0) {
+        FD_SET(s_wake_fd, &r);
+        if (s_wake_fd > maxfd) {
+            maxfd = s_wake_fd;
+        }
+    }
+
+    const int      us = (owed && s_wake_fd < 0) ? WAIT_POLL_US : POLL_US;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = us };
+
+    if (select(maxfd + 1, &r, want_write ? &w : NULL, NULL, &tv) <= 0) {
+        return 0;
+    }
+    if (s_wake_fd >= 0 && FD_ISSET(s_wake_fd, &r)) {
+        wake_drain();
+    }
+    return FD_ISSET(fd, &r) ? 1 : 0;
 }
 
 static bool read_full(int fd, void *buf, size_t n)
@@ -863,6 +912,20 @@ static void enc_raw(sink_t *s, const espix_px_t *px, int stride, espix_rect_t r,
         row_to_pf(px + (size_t)(r.y + y) * stride + r.x, o, r.w, pf);
         sink_commit(s, o + rb);
     }
+}
+
+/* The overlap of two rectangles; empty when they do not meet. */
+static espix_rect_t rect_meet(espix_rect_t a, espix_rect_t b)
+{
+    const int x0 = a.x > b.x ? a.x : b.x;
+    const int y0 = a.y > b.y ? a.y : b.y;
+    const int x1 = (a.x + a.w) < (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    const int y1 = (a.y + a.h) < (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+
+    if (x1 <= x0 || y1 <= y0) {
+        return (espix_rect_t){ 0, 0, 0, 0 };
+    }
+    return (espix_rect_t){ x0, y0, x1 - x0, y1 - y0 };
 }
 
 /*
@@ -1717,28 +1780,25 @@ static bool send_desktop_size_old(rfb_conn_t *c, int w, int h)
  * offered ExtendedDesktopSize cannot be resized in place, so it is dropped and
  * reconnects at the new size -- ServerInit is only ever sent once.
  */
+/* Cache-line aligned and sized, so the PPA can write it. */
+static void *stage_alloc(size_t bytes)
+{
+    bytes = (bytes + RFB_ALIGN - 1) & ~(size_t)(RFB_ALIGN - 1);
+
+    void *p = heap_caps_aligned_alloc(RFB_ALIGN, bytes,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == NULL) {
+        p = heap_caps_aligned_alloc(RFB_ALIGN, bytes,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return p;
+}
+
 static bool connection_resize(rfb_conn_t *c, int w, int h)
 {
-    /*
-     * Cache-line aligned, because the PPA will not take it otherwise: the
-     * staging copy is the largest single item in an update, and the hardware
-     * does it three times faster than the loop -- but only from an aligned
-     * buffer. See the guard in ppa_blit_rect().
-     */
-    espix_px_t *stage = heap_caps_aligned_alloc(RFB_ALIGN,
-                                                (size_t)w * h * sizeof(espix_px_t),
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t    *row   = heap_caps_aligned_alloc(RFB_ALIGN, (size_t)w * 4,
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (stage == NULL) {
-        stage = heap_caps_aligned_alloc(RFB_ALIGN,
-                                        (size_t)w * h * sizeof(espix_px_t),
-                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (row == NULL) {
-        row = heap_caps_aligned_alloc(RFB_ALIGN, (size_t)w * 4,
-                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    espix_px_t *stage = stage_alloc((size_t)w * h * sizeof(espix_px_t));
+    uint8_t    *row   = stage_alloc((size_t)w * 4);
+
     if (stage == NULL || row == NULL) {
         heap_caps_free(stage);
         heap_caps_free(row);
@@ -1942,10 +2002,31 @@ static bool update_send(rfb_conn_t *c)
             }
         }
 
-        const espix_rect_t    r = rects[best];
-        espix_display_class_t cl;
+        /* Where the owner says a picture is, that overlap is the JPEG, unsampled. */
+        const espix_rect_t photo = espix_canvas_photo(cv);
+        const espix_rect_t ov    = rect_meet(rects[best], photo);
+        bool               hint  = false;
 
-        espix_display_classify(px, cw, r.x, r.y, r.w, r.h, &cl);
+        if (ov.w > 0 && ov.h > 0
+            && (uint32_t)ov.w * ov.h * 2 >= (uint32_t)photo.w * photo.h) {
+            espix_rect_t rest[4];
+            const size_t nr = rect_subtract(rects[best], ov, rest);
+
+            if (n - 1 + nr <= ESPIX_DISPLAY_DAMAGE_MAX) {
+                rects[best] = ov;
+                for (size_t k = 0; k < nr; k++) {
+                    rects[n++] = rest[k];
+                }
+                hint = true;
+            }
+        }
+
+        const espix_rect_t    r = rects[best];
+        espix_display_class_t cl = { .jpeg = hint };
+
+        if (!hint) {
+            espix_display_classify(px, cw, r.x, r.y, r.w, r.h, &cl);
+        }
         t_cls = esp_timer_get_time();
 
         if (cl.jpeg) {
@@ -2074,23 +2155,6 @@ static bool update_send(rfb_conn_t *c)
     for (size_t i = 0; i < n; i++) {
         const espix_rect_t r     = rects[i];
         const bool         tight = ((int)i == jpeg_i);
-
-
-        /*
-         * What is about to go on the wire, before it goes.
-         *
-         * Temporary, and the reason it is before the write: a client that hangs
-         * mid-frame leaves this as the last line, which names the rectangle it
-         * hung on. The state reporter can only say that the server is idle
-         * waiting for a request -- a client stuck inside a rectangle looks
-         * exactly like a client that has nothing to ask for.
-         */
-        espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "rect %u/%u: %d,%d %dx%d enc %d%s",
-                   (unsigned)(i + 1), (unsigned)total, r.x, r.y, r.w, r.h,
-                   (int)(tight ? RFB_ENC_TIGHT
-                               : (c->hextile ? RFB_ENC_HEXTILE : RFB_ENC_RAW)),
-                   tight ? " (jpeg)" : "");
         uint8_t            rh[12];
 
         /* The observer counts what went out, and only for the rectangles it
@@ -2307,9 +2371,7 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
             .keysym = rd32(buf + 3),
         };
         espix_display_input(&ev);
-        /* The desktop task outranks this one, so the damage it just made is
-         * already there -- no need to wait for the poll to notice. */
-        return c->pending ? update_send(c) : true;
+        return true;                        /* its damage wakes the loop */
     }
 
     case RFB_POINTER_EVENT: {
@@ -2329,7 +2391,7 @@ static bool rfb_handle(rfb_conn_t *c, uint8_t type)
             .y       = (int16_t)rd16(buf + 3),
         };
         espix_display_input(&ev);
-        return c->pending ? update_send(c) : true;
+        return true;                        /* its damage wakes the loop */
     }
 
     case RFB_CLIENT_CUT_TEXT: {
@@ -2630,15 +2692,11 @@ static void rfb_serve(int fd)
     c.qlevel = -1;              /* nothing offered yet, and Tight is not assumed */
     c.pf = pf_default();
 
-    c.stage = heap_caps_malloc((size_t)cw * ch * sizeof(espix_px_t),
-                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    c.out = heap_caps_malloc(OUT_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    c.row = heap_caps_malloc((size_t)cw * 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    c.stage = stage_alloc((size_t)cw * ch * sizeof(espix_px_t));
+    c.row   = stage_alloc((size_t)cw * 4);
+    c.out   = heap_caps_malloc(OUT_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (c.out == NULL) {
         c.out = heap_caps_malloc(OUT_CAP, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (c.row == NULL) {
-        c.row = heap_caps_malloc((size_t)cw * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
 
     if (c.stage == NULL || c.out == NULL || c.row == NULL) {
@@ -2686,46 +2744,35 @@ static void rfb_serve(int fd)
      */
     espix_display_viewer_attached();
 
+    espix_display_set_damage_hook(rfb_damage_hook);
+
     while (s_run) {
         uint8_t type;
 
         vnc_state(VNC_WAIT);
 
-        /*
-         * Owed an update, poll at the tick so a change another task made goes
-         * out promptly. Not owed one, sleep on the socket: there is nothing to
-         * send until the client asks, so waking early would only burn cycles.
-         */
-        set_recv_timeout(fd, c.pending ? TICK_US : POLL_US);
+        /* Armed before looking, so damage between the look and the sleep still wakes it. */
+        s_wake_armed = c.pending;
+        if (c.pending && !update_send(&c)) {
+            break;
+        }
+
+        if (conn_wait(fd, c.pending, c.pending && c.deferred > 0) == 0) {
+            /* Idle viewers are answered twice a second, so this much silence means gone. */
+            if (esp_timer_get_time() - c.last_rx_us > LIVENESS_US) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "client silent for %d s after an answer; dropping it",
+                           (int)(LIVENESS_US / 1000000));
+                break;
+            }
+            continue;
+        }
 
         const int rc = recv_byte(fd, &type);
+        if (rc == -1) {
+            continue;                   /* readable, then not: a spurious wake */
+        }
         if (rc <= 0) {
-            if (rc == -1) {
-                /* Nothing arrived: the tick that lets a late update go out. */
-                if (c.pending && !update_send(&c)) {
-                    break;
-                }
-
-                /*
-                 * Answered, and then not a word back.
-                 *
-                 * This is a liveness test only because of update_send_empty():
-                 * a viewer keeps a request outstanding and sends the next one
-                 * the moment it is answered, so a client that has been replied
-                 * to and stays silent is not a quiet client, it is a gone one.
-                 * Before empty updates existed this would have been wrong --
-                 * silence was the normal state of a static screen -- and a
-                 * peer whose window swallowed the frame could hold this task,
-                 * and the next client's connection, for ever.
-                 */
-                if (esp_timer_get_time() - c.last_rx_us > LIVENESS_US) {
-                    espix_klog(ESPIX_KLOG_WARN, TAG,
-                               "client silent for %d s after an answer; dropping it",
-                               (int)(LIVENESS_US / 1000000));
-                    break;
-                }
-                continue;
-            }
             break;
         }
 
@@ -2735,6 +2782,9 @@ static void rfb_serve(int fd)
             break;
         }
     }
+
+    s_wake_armed = false;
+    espix_display_set_damage_hook(NULL);
 
     s_clients = 0;
     s_peer[0] = '\0';
@@ -2774,6 +2824,7 @@ static void rfb_task(void *arg)
         socklen_t          plen = sizeof(peer);
 
         vnc_state(VNC_ACCEPT);
+        wake_open();
         const int fd = accept(s_listen_fd, (struct sockaddr *)&peer, &plen);
         if (fd < 0) {
             /* SO_RCVTIMEO makes this the normal idle path, not an error. */

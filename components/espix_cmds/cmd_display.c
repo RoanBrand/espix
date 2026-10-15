@@ -181,6 +181,11 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "display: %dx%d canvas up, vnc %s\n",
                      espix_canvas_width(cv), espix_canvas_height(cv),
                      espix_display_vnc_running() ? "attached" : "not attached");
+
+        const char *fault = espix_display_accel_fault();
+        if (fault != NULL) {
+            espix_printf(s, "accelerator: off -- %s\n", fault);
+        }
         return 0;
     }
 
@@ -432,8 +437,33 @@ static int cmd_display(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(sub, "dmatest") == 0) {
+        const int  secs   = (argc >= 3) ? atoi(argv[2]) : 20;
+        const bool serial = (argc >= 4) && strcmp(argv[3], "serial") == 0;
+        char       out[200];
+
+        const int bad = espix_display_dma_stress(secs, serial, out, sizeof(out));
+        espix_printf(s, "%s", out);
+        return bad == 0 ? 0 : 1;
+    }
+
+    if (strcmp(sub, "ppatest") == 0) {
+        const int iters = (argc >= 3) ? atoi(argv[2]) : 200;
+        char     *out   = malloc(2048);
+
+        if (out == NULL) {
+            espix_eprintf(s, "display ppatest: no memory\n");
+            return 1;
+        }
+        const bool tight = (argc >= 4) && strcmp(argv[3], "tight") == 0;
+        const int  bad   = espix_display_ppa_stress(iters, tight, out, 2048);
+        espix_printf(s, "%s", out);
+        free(out);
+        return bad == 0 ? 0 : 1;
+    }
+
     espix_eprintf(s, "usage: display [start | stop | status | size <w>x<h> | "
-                     "bench [jpeg]]\n");
+                     "bench [jpeg] | ppatest [n [tight]]]\n");
     return 1;
 }
 

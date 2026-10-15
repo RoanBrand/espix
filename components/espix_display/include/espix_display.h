@@ -138,6 +138,15 @@ size_t espix_canvas_move_take(espix_canvas_t *c, espix_move_t *out, size_t max);
 void   espix_canvas_move_clear(espix_canvas_t *c);
 
 void   espix_canvas_damage(espix_canvas_t *c, espix_rect_t r);
+
+/* Called under the canvas lock on new damage or a move note; must not block. */
+typedef void (*espix_display_damage_hook_t)(void);
+
+/* Where the owner knows a moving picture is (canvas coordinates, or empty); under the canvas lock. */
+void         espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r);
+espix_rect_t espix_canvas_photo(const espix_canvas_t *c);
+
+void   espix_display_set_damage_hook(espix_display_damage_hook_t fn);
 size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max);
 void   espix_canvas_damage_clear(espix_canvas_t *c);
 bool   espix_canvas_damaged(const espix_canvas_t *c);
@@ -179,6 +188,15 @@ typedef struct {
 
 /* Fills up to `max` rows and returns how many. Allocates its own buffers. */
 size_t espix_display_bench(espix_display_bench_t *out, size_t max);
+
+/* Why the accelerator was retired (a lost transaction, with its geometry), or NULL. */
+const char *espix_display_accel_fault(void);
+
+/* PPA blits checked pixel by pixel: the recorded hang's geometry, then `iters` random; failures or -1. */
+int espix_display_ppa_stress(int iters, bool tight, char *out, size_t len);
+
+/* PPA and the JPEG codec for `secs` seconds, on two tasks or (`serial`) one. */
+int espix_display_dma_stress(int secs, bool serial, char *out, size_t len);
 
 /* ------------------------------------------------------------------ */
 /* Surfaces                                                            */
@@ -327,9 +345,10 @@ void espix_display_classify(const espix_px_t *px, int stride, int x, int y,
 
 /*
  * Copy a rectangle of the canvas into a buffer: the rectangle at (dx, dy)
- * inside a picture dw x dh whose rows are dstride pixels apart. Hardware (the
- * PPA) where it applies, software where it does not; true when the hardware
- * did it.
+ * inside a picture dw x dh whose rows are dstride pixels apart, in an
+ * allocation of at least dw * dh * 2 bytes rounded up to 128. Hardware (the
+ * PPA) where it applies, software where it does not -- the copy is made either
+ * way, and the return value only says which engine made it.
  */
 bool espix_canvas_copy_rect(const espix_canvas_t *c, espix_rect_t r,
                             espix_px_t *dst, int dw, int dh, int dstride,

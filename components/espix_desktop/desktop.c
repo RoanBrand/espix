@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -85,6 +86,8 @@ struct espix_window {
     void            *ctx;
     bool             maxed;     /* filling the work area, with `rest` to go back to */
     espix_rect_t     rest;
+    espix_rect_t     ov;        /* the overlay, window coordinates; empty: none */
+    espix_window_overlay_fn ov_fn;
 };
 
 /* Bottom first, top last: the array *is* the z-order. */
@@ -93,20 +96,7 @@ static int             s_nwin;
 static espix_window_t *s_focus;
 static uint32_t        s_win_seq;
 
-/*
- * The desktop's own lock, and it is here rather than on the canvas because
- * there is now more than one thing that repaints: the owner's callbacks arrive
- * in the context of whoever posted them -- the RFB task for input, the console
- * task for a claim -- and the clock in the taskbar ticks in the timer task.
- * Three tasks all moving windows and painting the same pixels.
- *
- * Recursive, because a repair nests in a repair: espix_window_damage() repaints
- * a surface and then repairs the region it is in. Held across a whole input
- * event, so a press that opens a window and a tick that redraws the clock cannot
- * interleave, and released for the long ones -- the JPEG decode behind the photo
- * launcher runs with it held, which is why the number in the benchmark matters
- * here too.
- */
+/* Recursive: a repair nests in a repair. Contended only by tasks that paint their own windows. */
 static SemaphoreHandle_t s_desk_lock;
 
 /* The last button mask any event carried, and the drag in progress; see the
@@ -132,13 +122,12 @@ static espix_window_t *s_press_win;     /* who took the press, for the release *
  */
 #define DAMAGE_FRAME_US (16 * 1000)
 
-static espix_rect_t         s_dmg;
-static bool                 s_dmg_pending;
-static esp_timer_handle_t   s_dmg_timer;
+static espix_rect_t s_dmg;
+static bool         s_dmg_pending;
+static int64_t      s_dmg_due;          /* when the pending frame is honoured */
 
 static void damage_flush_locked(void);
 static void damage_schedule(espix_rect_t r);
-static void damage_tick(void *arg);
 static void desktop_repair_locked(espix_rect_t r);
 
 static espix_rect_t rect_union(espix_rect_t a, espix_rect_t b)
@@ -186,6 +175,189 @@ void espix_desktop_lock(void)
 void espix_desktop_unlock(void)
 {
     desk_unlock();
+}
+
+/* ------------------------------------------------------------------ */
+/* The desktop's task                                                  */
+/* ------------------------------------------------------------------ */
+
+/* One task owns the desktop: input, timers and the frame are messages to it; posting never blocks. */
+#define DESK_QUEUE_LEN 64
+
+typedef enum {
+    DESK_INPUT,         /* an input event, carried whole */
+    DESK_POINTER,       /* the latest absolute pointer event is in the slot */
+    DESK_CALL,          /* fn(arg), under the lock */
+    DESK_WAKE,          /* nothing: re-read the frame deadline */
+} desk_kind_t;
+
+typedef struct {
+    desk_kind_t kind;
+    union {
+        espix_input_event_t ev;
+        struct {
+            espix_desktop_fn_t fn;
+            void              *arg;
+        } call;
+    } u;
+} desk_msg_t;
+
+static QueueHandle_t     s_desk_q;
+static TaskHandle_t      s_desk_task;
+static SemaphoreHandle_t s_post_lock;
+
+/* Motion coalesces into the queued DESK_POINTER while it is newest; a button change always queues. */
+static espix_input_event_t s_ptr_slot;
+static bool                s_ptr_full;
+static uint32_t            s_posted;        /* messages queued, ever */
+static uint32_t            s_ptr_seq;       /* ...and which one the slot's is */
+static uint32_t            s_dropped;
+
+static void desktop_input_locked(void *ctx, const espix_input_event_t *ev);
+static void input_stat(const espix_input_event_t *ev, int64_t us);
+static bool desktop_on_screen(void);
+
+static bool desk_post(const desk_msg_t *m)
+{
+    if (s_desk_q == NULL || s_post_lock == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_post_lock, portMAX_DELAY);
+
+    const bool ok = xQueueSend(s_desk_q, m, 0) == pdTRUE;
+    if (ok) {
+        s_posted++;
+    } else {
+        s_dropped++;
+    }
+    xSemaphoreGive(s_post_lock);
+    return ok;
+}
+
+bool espix_desktop_post(espix_desktop_fn_t fn, void *arg)
+{
+    if (fn == NULL) {
+        return false;
+    }
+    const desk_msg_t m = { .kind = DESK_CALL, .u.call = { fn, arg } };
+    return desk_post(&m);
+}
+
+static void desk_post_pointer(const espix_input_event_t *ev)
+{
+    if (s_desk_q == NULL || s_post_lock == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_post_lock, portMAX_DELAY);
+
+    if (s_ptr_full && s_ptr_seq == s_posted && s_ptr_slot.buttons == ev->buttons) {
+        s_ptr_slot = *ev;                       /* the queued one moves on */
+        xSemaphoreGive(s_post_lock);
+        return;
+    }
+
+    desk_msg_t m;
+    if (!s_ptr_full) {
+        s_ptr_slot = *ev;
+        m.kind     = DESK_POINTER;
+    } else {
+        m.kind = DESK_INPUT;                    /* the slot is behind it */
+        m.u.ev = *ev;
+    }
+    if (xQueueSend(s_desk_q, &m, 0) == pdTRUE) {
+        s_posted++;
+        if (m.kind == DESK_POINTER) {
+            s_ptr_full = true;
+            s_ptr_seq  = s_posted;
+        }
+    } else {
+        s_dropped++;
+    }
+    xSemaphoreGive(s_post_lock);
+}
+
+/* Damage from another task: wake the desktop task to see the new frame deadline. */
+static void desk_wake(void)
+{
+    if (xTaskGetCurrentTaskHandle() == s_desk_task) {
+        return;
+    }
+    const desk_msg_t m = { .kind = DESK_WAKE };
+    (void)desk_post(&m);
+}
+
+static void desk_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        TickType_t wait = portMAX_DELAY;
+
+        if (s_dmg_pending) {
+            const int64_t left = s_dmg_due - esp_timer_get_time();
+            wait = (left <= 0) ? 0 : pdMS_TO_TICKS((left + 999) / 1000) + 1;
+        }
+
+        desk_msg_t m;
+        if (xQueueReceive(s_desk_q, &m, wait) == pdTRUE) {
+            if (m.kind == DESK_POINTER) {
+                xSemaphoreTake(s_post_lock, portMAX_DELAY);
+                m.u.ev     = s_ptr_slot;
+                s_ptr_full = false;
+                xSemaphoreGive(s_post_lock);
+            }
+
+            const int64_t t0 = esp_timer_get_time();
+
+            desk_lock();
+            switch (m.kind) {
+            case DESK_INPUT:
+            case DESK_POINTER:
+                /* Queued before the screen changed hands: not ours to draw. */
+                if (desktop_on_screen()) {
+                    desktop_input_locked(NULL, &m.u.ev);
+                }
+                break;
+            case DESK_CALL:
+                m.u.call.fn(m.u.call.arg);
+                break;
+            case DESK_WAKE:
+                break;
+            }
+            desk_unlock();
+
+            if (m.kind == DESK_INPUT || m.kind == DESK_POINTER) {
+                input_stat(&m.u.ev, esp_timer_get_time() - t0);
+            }
+        }
+
+        if (s_dmg_pending && esp_timer_get_time() >= s_dmg_due) {
+            desk_lock();
+            damage_flush_locked();
+            desk_unlock();
+        }
+    }
+}
+
+static bool desk_task_start(void)
+{
+    if (s_desk_task != NULL) {
+        return true;
+    }
+    if (s_post_lock == NULL) {
+        s_post_lock = xSemaphoreCreateMutex();
+    }
+    if (s_desk_q == NULL) {
+        s_desk_q = xQueueCreate(DESK_QUEUE_LEN, sizeof(desk_msg_t));
+    }
+    if (s_post_lock == NULL || s_desk_q == NULL) {
+        return false;
+    }
+    /* Above the VNC task so input lands before the next update; any core. */
+    return espix_kthread_start(&(const espix_kthread_t){
+               .name = "espix:desktop", .fn = desk_task, .stack = 8192,
+               .priority = 5, .core = tskNO_AFFINITY }, &s_desk_task) == ESP_OK
+           && s_desk_task != NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -271,18 +443,16 @@ static void cursor_build(void)
  * before the change, so restoring it afterwards would put back a window that
  * has since moved.
  */
-static void cursor_hide(void)
+/* Put back what was under the cursor. The canvas lock is held. */
+static void cursor_hide_locked(espix_canvas_t *c)
 {
-    espix_canvas_t *c = espix_display_canvas();
-    if (c == NULL || !s_cursor_on) {
+    if (!s_cursor_on) {
         return;
     }
 
-    /* Dimensions under the lock: a live resize can change them, and this loop
-     * indexes the buffer with cw. */
-    espix_canvas_lock(c);
-    const int cw = espix_canvas_width(c);
-    const int ch = espix_canvas_height(c);
+    /* Dimensions under the lock: a live resize can change them. */
+    const int   cw = espix_canvas_width(c);
+    const int   ch = espix_canvas_height(c);
     espix_px_t *px = espix_canvas_pixels(c);
 
     for (int by = 0; by < CUR_BH; by++) {
@@ -295,20 +465,12 @@ static void cursor_hide(void)
         }
     }
     espix_canvas_damage(c, (espix_rect_t){ s_cx - 1, s_cy - 1, CUR_BW, CUR_BH });
-    espix_canvas_unlock(c);
-
     s_cursor_on = false;
 }
 
-/* Save what is under it, then draw it. */
-static void cursor_show(int hx, int hy)
+/* Save what is under it, then draw it. The canvas lock is held. */
+static void cursor_show_locked(espix_canvas_t *c, int hx, int hy)
 {
-    espix_canvas_t *c = espix_display_canvas();
-    if (c == NULL) {
-        return;
-    }
-
-    espix_canvas_lock(c);
     const int cw = espix_canvas_width(c);
     const int ch = espix_canvas_height(c);
 
@@ -353,14 +515,19 @@ static void cursor_show(int hx, int hy)
 
     espix_canvas_damage(c, (espix_rect_t){ hx - 1, hy - 1, CUR_BW, CUR_BH });
     s_cursor_on = true;
-    espix_canvas_unlock(c);
 }
 
-/* Move it: undo where it was, then draw it where it is going. */
+/* Move it, in one hold of the canvas so no update sees it half moved. */
 static void cursor_put(int hx, int hy)
 {
-    cursor_hide();
-    cursor_show(hx, hy);
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+    espix_canvas_lock(c);
+    cursor_hide_locked(c);
+    cursor_show_locked(c, hx, hy);
+    espix_canvas_unlock(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -633,23 +800,20 @@ static void damage_flush_locked(void)
                                                          r.y - w->y,
                                                          r.w, r.h },
                                          w->w, w->h);
-        if (wr.w > 0 && wr.h > 0) {
-            window_paint(w, wr);
+        const bool in_ov = w->ov_fn != NULL
+            && wr.x >= w->ov.x && wr.y >= w->ov.y
+            && wr.x + wr.w <= w->ov.x + w->ov.w
+            && wr.y + wr.h <= w->ov.y + w->ov.h;
+
+        if (wr.w > 0 && wr.h > 0 && !in_ov) {
+            window_paint(w, wr);        /* an overlay paints itself, later */
         }
     }
 
     desktop_repair_locked(r);
 }
 
-static void damage_tick(void *arg)
-{
-    (void)arg;
-
-    desk_lock();
-    damage_flush_locked();
-    desk_unlock();
-}
-
+/* Called with the desktop lock held, from any task. */
 static void damage_schedule(espix_rect_t r)
 {
     s_dmg = s_dmg_pending ? rect_union(s_dmg, r) : r;
@@ -657,22 +821,70 @@ static void damage_schedule(espix_rect_t r)
     if (s_dmg_pending) {
         return;                         /* already due: this joins that frame */
     }
-
-    if (s_dmg_timer == NULL) {
-        const esp_timer_create_args_t args = { .callback = damage_tick,
-                                               .name     = "desk-damage" };
-        if (esp_timer_create(&args, &s_dmg_timer) != ESP_OK) {
-            s_dmg_timer = NULL;
-        }
-    }
-
     s_dmg_pending = true;
+    s_dmg_due     = esp_timer_get_time() + DAMAGE_FRAME_US;
 
-    if (s_dmg_timer != NULL) {
-        (void)esp_timer_start_once(s_dmg_timer, DAMAGE_FRAME_US);
-    } else {
-        damage_flush_locked();          /* no timer: composite now */
+    if (s_desk_task == NULL) {
+        damage_flush_locked();          /* no task to wait for: composite now */
+        return;
     }
+    desk_wake();
+}
+
+static espix_rect_t rect_meet(espix_rect_t a, espix_rect_t b);
+static size_t rect_cut(espix_rect_t r, espix_rect_t hole, espix_rect_t *out);
+static espix_rect_t window_ov(const espix_window_t *w);
+
+static bool rect_inside(espix_rect_t in, espix_rect_t out)
+{
+    return in.x >= out.x && in.y >= out.y
+        && in.x + in.w <= out.x + out.w && in.y + in.h <= out.y + out.h;
+}
+
+/* One window's share of a repair: its surface, then its overlay over it. */
+static void window_compose(espix_canvas_t *c, espix_window_t *w, espix_rect_t r)
+{
+    const espix_rect_t wr = rect_meet(r, (espix_rect_t){ w->x, w->y, w->w, w->h });
+    if (wr.w <= 0 || wr.h <= 0) {
+        return;
+    }
+
+    const espix_rect_t ov = window_ov(w);
+    const espix_rect_t oc = rect_meet(wr, ov);
+    espix_rect_t       parts[4];
+    size_t             np = 1;
+
+    parts[0] = wr;
+    if (oc.w > 0 && oc.h > 0) {
+        np = rect_cut(wr, oc, parts);   /* the surface is not shown under it */
+    }
+    for (size_t i = 0; i < np; i++) {
+        espix_canvas_blit_surface_rect(c, w->x, w->y, w->surf,
+                                       (espix_rect_t){ parts[i].x - w->x,
+                                                       parts[i].y - w->y,
+                                                       parts[i].w, parts[i].h });
+    }
+    if (oc.w > 0 && oc.h > 0) {
+        w->ov_fn(w, c, ov.x, ov.y, oc, w->ctx);
+        espix_canvas_damage(c, oc);
+    }
+}
+
+/* The topmost window's overlay, if it has one: what the encoder may send as a picture. */
+static espix_rect_t photo_rect(void)
+{
+    for (int i = s_nwin - 1; i >= 0; i--) {
+        const espix_window_t *w = s_wins[i];
+        if (w->hidden) {
+            continue;
+        }
+        const espix_rect_t ov = window_ov(w);
+        if (ov.w > 0) {
+            return ov;
+        }
+        return (espix_rect_t){ 0, 0, 0, 0 };   /* something else is on top */
+    }
+    return (espix_rect_t){ 0, 0, 0, 0 };
 }
 
 static void desktop_repair_locked(espix_rect_t r)
@@ -689,40 +901,42 @@ static void desktop_repair_locked(espix_rect_t r)
         return;
     }
 
-    /* Off first: its save-under is pixels from before the change. */
-    cursor_hide();
+    /* A window that covers the region hides everything under it. */
+    int  first   = 0;
+    bool covered = false;
 
-    espix_canvas_lock(c);
-    espix_canvas_fill(c, r, COL_DESKTOP);
-    icons_paint(c, r);              /* on the bare desktop, under the windows */
-    vols_paint(c, r);
-
-    for (int i = 0; i < s_nwin; i++) {
+    for (int i = s_nwin - 1; i >= 0 && !covered; i--) {
         const espix_window_t *w = s_wins[i];
-        if (w->hidden) {
-            continue;                   /* minimised: not on the screen */
+        if (!w->hidden && rect_inside(r, (espix_rect_t){ w->x, w->y, w->w, w->h })) {
+            first   = i;
+            covered = true;
         }
-        const int x0 = w->x > r.x ? w->x : r.x;
-        const int y0 = w->y > r.y ? w->y : r.y;
-        const int x1 = (w->x + w->w) < (r.x + r.w) ? (w->x + w->w) : (r.x + r.w);
-        const int y1 = (w->y + w->h) < (r.y + r.h) ? (w->y + w->h) : (r.y + r.h);
+    }
 
-        if (x1 <= x0 || y1 <= y0) {
-            continue;                   /* does not reach the region */
+    /* One canvas hold from cursor off to on, so no update sees half a repair. */
+    espix_canvas_lock(c);
+    cursor_hide_locked(c);              /* its save-under predates the change */
+    if (!covered) {
+        espix_canvas_fill(c, r, COL_DESKTOP);
+        icons_paint(c, r);              /* on the bare desktop, under the windows */
+        vols_paint(c, r);
+    }
+
+    for (int i = first; i < s_nwin; i++) {
+        if (!s_wins[i]->hidden) {
+            window_compose(c, s_wins[i], r);
         }
-        espix_canvas_blit_surface_rect(c, w->x, w->y, w->surf,
-                                       (espix_rect_t){ x0 - w->x, y0 - w->y,
-                                                       x1 - x0, y1 - y0 });
     }
     /* Over the windows, not beside them: a window that reaches the bottom of
      * the screen goes under the bar, which is what makes it a bar. */
     taskbar_paint(c, r);
     menu_paint(c, r);
-    espix_canvas_unlock(c);
+    espix_canvas_set_photo(c, photo_rect());
 
     int px = 0, py = 0;
     espix_display_pointer(&px, &py);
-    cursor_show(px, py);
+    cursor_show_locked(c, px, py);
+    espix_canvas_unlock(c);
 }
 
 static void desktop_repair(espix_rect_t r)
@@ -824,6 +1038,24 @@ void espix_window_set_draw(espix_window_t *w, espix_window_draw_fn fn) { w->draw
 void espix_window_set_key(espix_window_t *w, espix_window_key_fn fn) { w->key = fn; }
 void espix_window_set_resize(espix_window_t *w, espix_window_resize_fn fn) { w->resize = fn; }
 void espix_window_set_pointer(espix_window_t *w, espix_window_pointer_fn fn) { w->pointer = fn; }
+
+void espix_window_set_overlay(espix_window_t *w, espix_rect_t r,
+                              espix_window_overlay_fn fn)
+{
+    desk_lock();
+    w->ov    = (fn != NULL) ? r : (espix_rect_t){ 0, 0, 0, 0 };
+    w->ov_fn = fn;
+    desk_unlock();
+}
+
+/* The overlay in canvas coordinates, or an empty rectangle. */
+static espix_rect_t window_ov(const espix_window_t *w)
+{
+    if (w->ov_fn == NULL || w->ov.w <= 0 || w->ov.h <= 0) {
+        return (espix_rect_t){ 0, 0, 0, 0 };
+    }
+    return (espix_rect_t){ w->x + w->ov.x, w->y + w->ov.y, w->ov.w, w->ov.h };
+}
 
 /* A new surface, because the surface is the window -- frame included -- so a
  * bigger window is not a bigger blit of a smaller buffer. */
@@ -2075,7 +2307,7 @@ static int icon_at(int x, int y)
 /* An icon whose program is not installed draws greyed and refuses to launch,
  * rather than starting nothing. The binary is the thing esperienced: /bin/doom
  * is a release artifact, the WAD is fetched separately. */
-static bool icon_available(int i)
+static bool icon_probe(int i)
 {
     /* fopen, not access(): LittleFS's port never implemented access(), and
      * espix's ABI deliberately leaves it out -- so an access() test answers
@@ -2086,6 +2318,37 @@ static bool icon_available(int i)
     }
     fclose(f);
     return true;
+}
+
+/* Installed or not, cached: the paint holds the canvas lock and must not open files. */
+static bool s_icon_avail[ICON_N];
+static bool s_icon_known;
+
+static bool icon_available(int i)
+{
+    if (!s_icon_known) {
+        for (int k = 0; k < ICON_N; k++) {
+            s_icon_avail[k] = icon_probe(k);
+        }
+        s_icon_known = true;
+    }
+    return s_icon_avail[i];
+}
+
+static void desktop_repair(espix_rect_t r);
+
+static void icons_refresh(void)
+{
+    for (int i = 0; i < ICON_N; i++) {
+        const bool now = icon_probe(i);
+
+        if (s_icon_known && now != s_icon_avail[i]) {
+            s_icon_avail[i] = now;
+            desktop_repair(icon_rect(i));
+        }
+        s_icon_avail[i] = now;
+    }
+    s_icon_known = true;
 }
 
 static void icons_paint(espix_canvas_t *c, espix_rect_t r)
@@ -2706,7 +2969,9 @@ static void appdata_progress(void *ctx, const char *path, size_t done,
                  (unsigned)(done / 1024));
     }
 
+    espix_canvas_lock(c);
     appdata_panel(c, p, "Downloading app data", line, permille);
+    espix_canvas_unlock(c);
 }
 
 /* Why the data could not be fetched, said on the screen rather than in a log
@@ -2753,7 +3018,9 @@ static void appdata_report(const char *app, espix_appdata_status_t st,
 
     espix_klog(ESPIX_KLOG_WARN, TAG, "%s: app data not available (%s)",
                app, line1);
+    espix_canvas_lock(c);
     appdata_panel(c, &panel, line1, line2, -1);
+    espix_canvas_unlock(c);
 
     /* Long enough to read and act on, and it is spent before the app's own
      * screen takes over. */
@@ -2906,7 +3173,8 @@ static void icon_press(int i)
         const char *path = s_icons[i].path;
         icon_set_sel(-1);
 
-        if (!icon_available(i)) {
+        s_icon_avail[i] = icon_probe(i);
+        if (!s_icon_avail[i]) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "%s is not installed (%s)",
                        s_icons[i].label, path);
             return;
@@ -2968,10 +3236,20 @@ static void clock_text(char *out, size_t len)
  * more than five seconds late; the string comparison is what keeps it to one
  * repair rather than twelve.
  */
+static void clock_tick_desk(void *arg);
+
+/* The timer only asks: the work is the desktop task's. */
 static void clock_tick(void *arg)
 {
     (void)arg;
+    (void)espix_desktop_post(clock_tick_desk, NULL);
+}
 
+static void clock_tick_desk(void *arg)
+{
+    (void)arg;
+
+    icons_refresh();
     vols_refresh();
 
     char now[8];
@@ -3271,6 +3549,8 @@ static void windows_destroy(void)
     espix_browser_forget();
     espix_music_forget();
     espix_video_forget();
+    espix_settings_forget();
+    s_confirm = NULL;
 
     while (s_nwin > 0) {
         espix_window_t *w = s_wins[s_nwin - 1];
@@ -3608,15 +3888,17 @@ static void input_stat(const espix_input_event_t *ev, int64_t us)
     s_input_stat[kind].worst = 0;
 }
 
+/* In the poster's context (VNC or HID task): queue and return, never block it. */
 static void desktop_input(void *ctx, const espix_input_event_t *ev)
 {
-    const int64_t t0 = esp_timer_get_time();
+    (void)ctx;
 
-    desk_lock();
-    desktop_input_locked(ctx, ev);
-    desk_unlock();
-
-    input_stat(ev, esp_timer_get_time() - t0);
+    if (ev->kind == ESPIX_INPUT_POINTER) {
+        desk_post_pointer(ev);
+        return;
+    }
+    const desk_msg_t m = { .kind = DESK_INPUT, .u.ev = *ev };
+    (void)desk_post(&m);
 }
 
 static void desktop_repaint(void *ctx)
@@ -3677,6 +3959,9 @@ esp_err_t espix_desktop_start(void)
     if (s_desk_lock == NULL) {
         s_desk_lock = xSemaphoreCreateRecursiveMutex();
     }
+    if (!desk_task_start()) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "no desktop task; input will be dropped");
+    }
     if (s_clock_timer == NULL) {
         clock_text(s_clock, sizeof(s_clock));
 
@@ -3707,11 +3992,6 @@ void espix_desktop_stop(void)
         esp_timer_stop(s_clock_timer);
         esp_timer_delete(s_clock_timer);
         s_clock_timer = NULL;
-    }
-    if (s_dmg_timer != NULL) {
-        esp_timer_stop(s_dmg_timer);
-        esp_timer_delete(s_dmg_timer);
-        s_dmg_timer = NULL;
     }
     s_dmg_pending = false;
 
