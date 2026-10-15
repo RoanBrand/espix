@@ -44,7 +44,21 @@ typedef struct {
     uint32_t len;
 } vframe_t;
 
-#define VIDEO_MAX_FRAMES 8192
+/* A frame that never ends is not a frame: the read gives up here rather than
+ * growing the buffer for a file that has lost its EOI. */
+#define VIDEO_MAX_FRAME_BYTES (4 << 20)
+
+/*
+ * How much is read at a time.
+ *
+ * A frame is eight or nine kilobytes and the card serves a read at about
+ * 640 KB/s, which is latency rather than bandwidth -- measured: one frame's
+ * read cost fourteen milliseconds of a forty-one millisecond budget, and
+ * playback fell from twenty-four frames a second to twenty. Sixty-four
+ * kilobytes covers six or seven frames, so the wait is paid once for all of
+ * them and the ones that follow are already in memory.
+ */
+#define VIDEO_READ_STEP (64 * 1024)
 #define VIDEO_MAX_BYTES  (64u << 20)
 
 #define VIDEO_RATE_MIN   1
@@ -67,17 +81,35 @@ typedef struct {
 
 static espix_window_t  *s_win;
 static char             s_path[ESPIX_PATH_MAX];
-static uint8_t         *s_file;             /* the whole file, PSRAM */
+static FILE            *s_f;                /* open while the video is loaded */
+static uint8_t         *s_buf;              /* one frame's bytes, and no more */
+static size_t           s_buf_cap;
 static size_t           s_file_len;
-static vframe_t        *s_frames;
-static int              s_nframes;
+static size_t           s_off, s_len;       /* where the frame on screen is */
+static size_t           s_base, s_fill;     /* the read window: file offset, bytes */
+static size_t           s_beg;              /* ...and the frame's own start in it */
+static int              s_nframes;          /* how many frames the file holds */
 
 static espix_surface_t *s_frame;            /* decoded, reused every frame */
 static espix_surface_t *s_fit;              /* only when it does not fit */
 static int              s_fw, s_fh;         /* the video's own size */
 
 static volatile bool    s_playing;
-static volatile int     s_rate = 12;
+static volatile bool    s_rewind;           /* Stop asks for frame 0 again */
+
+/*
+ * Frames a second to aim for.
+ *
+ * Raw MJPEG carries no timing at all -- there is no field to read -- so the
+ * rate has to come from somewhere, and a default is where it comes from today.
+ * Twenty-four because that is what the camera, the film and the encoder behind
+ * anything anyone actually puts on this board are most likely to have used, and
+ * because the decoder is nowhere near the limit: a 640x480 frame costs 5-6 ms
+ * of an 83 ms budget at twelve, and 5-6 of 42 at twenty-four. The buttons are
+ * the override, and a file that says what it is -- a name, or a sidecar -- is
+ * the honest fix when there is a container to put it in.
+ */
+static volatile int     s_rate = 24;
 static int              s_cur;
 static char             s_err[96];
 
@@ -95,13 +127,21 @@ static int64_t          s_stat_at;
 
 static void video_unload(void)
 {
-    heap_caps_free(s_file);
-    heap_caps_free(s_frames);
+    heap_caps_free(s_buf);
     espix_surface_free(s_frame);
     espix_surface_free(s_fit);
 
-    s_file     = NULL;
-    s_frames   = NULL;
+    if (s_f != NULL) {
+        fclose(s_f);
+    }
+
+    s_f        = NULL;
+    s_buf      = NULL;
+    s_buf_cap  = 0;
+    s_beg      = 0;
+    s_base     = 0;
+    s_fill     = 0;
+    s_rewind   = false;
     s_frame    = NULL;
     s_fit      = NULL;
     s_file_len = 0;
@@ -118,30 +158,55 @@ static void video_unload(void)
  * 0xFF 0x00, so 0xFF 0xD9 appears once, as the end of a frame. Nothing is
  * assumed about what sits between two frames either -- some writers pad, this
  * one does not -- because the scan skips to the next SOI regardless.
+ *
+ * Read in chunks, and the last byte of each chunk is read again in the next:
+ * a marker is two bytes and does not care where the chunk boundary fell. The
+ * index itself is a few bytes a frame; it is the *pixels* that are the reason
+ * this no longer holds the whole file -- a twenty-second clip cost four
+ * megabytes of the thirteen this board has, and left the pool so fragmented
+ * that the largest free block fell to 672 KB while it played.
  */
-static int video_index(uint8_t *p, size_t n, vframe_t *out, int max)
+static int video_count(FILE *f, size_t n)
 {
-    size_t i = 0;
-    int    k = 0;
+    uint8_t buf[4096];
+    size_t  base = 0;                   /* the file offset of buf[0] */
+    size_t  have = 0;                   /* read, not yet scanned */
+    long    start = -1;
+    int     k     = 0;
 
-    while (i + 1 < n && k < max) {
-        if (p[i] != 0xFF || p[i + 1] != 0xD8) {
-            i++;
-            continue;
+    while (base < n) {
+        const size_t got   = fread(buf + have, 1, sizeof(buf) - have, f);
+        const size_t total = have + got;
+
+        if (total < 2) {
+            break;                      /* nothing more to look at */
         }
 
-        size_t j = i + 2;
-        while (j + 1 < n && !(p[j] == 0xFF && p[j + 1] == 0xD9)) {
-            j++;
-        }
-        if (j + 1 >= n) {
-            break;                      /* a frame with no end: truncated file */
+        for (size_t i = 0; i + 1 < total; i++) {
+            if (buf[i] != 0xFF) {
+                continue;
+            }
+            if (buf[i + 1] == 0xD8) {
+                start = (long)(base + i);
+            } else if (buf[i + 1] == 0xD9 && start >= 0) {
+                k++;
+                start = -1;
+            }
         }
 
-        out[k].off = (uint32_t)i;
-        out[k].len = (uint32_t)(j + 2 - i);
-        k++;
-        i = j + 2;
+        if (got == 0 || total < sizeof(buf)) {
+            break;                      /* the end of the file */
+        }
+
+        /*
+         * Carry the last byte into the next read rather than seeking back to
+         * it: a marker is two bytes and the read may have split one, and
+         * reading on is the difference between one sequential pass and a
+         * thousand little ones.
+         */
+        buf[0] = buf[total - 1];
+        base += total - 1;
+        have  = 1;
     }
     return k;
 }
@@ -168,42 +233,123 @@ static bool video_load(const char *path)
         return false;
     }
 
-    s_file = heap_caps_malloc((size_t)n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_file == NULL || fread(s_file, 1, (size_t)n, f) != (size_t)n) {
-        fclose(f);
-        heap_caps_free(s_file);
-        s_file = NULL;
-        snprintf(s_err, sizeof(s_err), "%.32s: cannot read %ld bytes", path, n);
-        return false;
-    }
-    fclose(f);
     s_file_len = (size_t)n;
-
-    s_frames = heap_caps_malloc(sizeof(vframe_t) * VIDEO_MAX_FRAMES,
-                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_frames == NULL) {
-        video_unload();
-        snprintf(s_err, sizeof(s_err), "no room to index the frames");
-        return false;
-    }
-
-    s_nframes = video_index(s_file, s_file_len, s_frames, VIDEO_MAX_FRAMES);
+    s_nframes  = video_count(f, (size_t)n);
     if (s_nframes == 0) {
+        fclose(f);
         video_unload();
         snprintf(s_err, sizeof(s_err), "%.32s: no JPEG frames in it", path);
         return false;
     }
+
+    s_f = f;                            /* read frame by frame as it plays */
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s: %d frames, %u bytes",
                path, s_nframes, (unsigned)s_file_len);
     return true;
 }
 
-/* Decode frame i into s_frame, allocating it on the first one. */
-static bool video_decode(int i)
+/*
+ * Find the frame at or after an offset, and read it into s_buf.
+ *
+ * The search and the read are one pass, and that is the point: a frame's bytes
+ * have to be in memory for the decoder anyway, so looking for its end while
+ * reading it costs nothing that reading it would not have cost. That is what
+ * makes an index unnecessary -- and with the index goes the cap on how many
+ * frames a file may hold, which was 8,192, or five and a half minutes of
+ * twenty-four a second.
+ *
+ * The buffer grows to fit what it finds and is then reused, so a clip with one
+ * large frame pays for it once.
+ */
+static bool video_read_frame(size_t from)
 {
-    const uint8_t *p = s_file + s_frames[i].off;
-    const size_t   n = s_frames[i].len;
+    if (s_f == NULL) {
+        return false;
+    }
+
+    size_t at;                          /* where to look, within s_buf */
+
+    if (from >= s_base && from < s_base + s_fill) {
+        at = from - s_base;             /* in the window already: no read */
+    } else {
+        s_base = from;
+        s_fill = 0;
+        at     = 0;
+    }
+
+    for (;;) {
+        if (s_fill + VIDEO_READ_STEP > s_buf_cap) {
+            const size_t ncap = s_buf_cap ? s_buf_cap * 2
+                                          : VIDEO_READ_STEP * 2;
+
+            if (ncap > VIDEO_MAX_FRAME_BYTES) {
+                return false;           /* no end in sight: not a frame */
+            }
+            uint8_t *nb = heap_caps_malloc(ncap,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (nb == NULL) {
+                return false;
+            }
+            if (s_buf != NULL) {
+                memcpy(nb, s_buf, s_fill);
+            }
+            heap_caps_free(s_buf);
+            s_buf     = nb;
+            s_buf_cap = ncap;
+        }
+
+        if (s_fill < s_buf_cap) {
+            if (fseek(s_f, (long)(s_base + s_fill), SEEK_SET) != 0) {
+                return false;
+            }
+            const size_t got = fread(s_buf + s_fill, 1, s_buf_cap - s_fill, s_f);
+            s_fill += got;
+            if (got == 0 && s_fill < 2) {
+                return false;           /* nothing left to read */
+            }
+        }
+
+        size_t i     = at;
+        long   start = -1;
+
+        while (i + 1 < s_fill) {
+            if (s_buf[i] == 0xFF && s_buf[i + 1] == 0xD8) {
+                start = (long)i;
+                break;
+            }
+            i++;
+        }
+
+        if (start < 0) {
+            if (s_fill < s_buf_cap) {
+                return false;           /* no frame from here to the end */
+            }
+            at = s_fill - 1;            /* keep the byte that may begin one */
+            continue;
+        }
+
+        for (i = (size_t)start + 2; i + 1 < s_fill; i++) {
+            if (s_buf[i] == 0xFF && s_buf[i + 1] == 0xD9) {
+                s_beg = (size_t)start;
+                s_off = s_base + (size_t)start;
+                s_len = i + 2 - (size_t)start;
+                return true;
+            }
+        }
+
+        if (s_fill < s_buf_cap) {
+            return false;               /* a frame with no end: truncated */
+        }
+        at = (size_t)start;             /* it runs past the window: read on */
+    }
+}
+
+/* Decode what video_read_frame() left in s_buf, into s_frame. */
+static bool video_decode(void)
+{
+    const uint8_t *p = s_buf + s_beg;
+    const size_t   n = s_len;
 
     if (s_frame == NULL) {
         s_frame = espix_image_jpeg(p, n);
@@ -353,7 +499,7 @@ static void video_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
         s_playing = !s_playing;
     } else if (espix_wgt_hit(video_btn(w, 1), x, y)) {
         s_playing = false;
-        s_cur     = 0;
+        s_rewind  = true;
     } else if (espix_wgt_hit(video_btn(w, 2), x, y)) {
         video_rate(-VIDEO_RATE_STEP);
     } else if (espix_wgt_hit(video_btn(w, 3), x, y)) {
@@ -378,7 +524,7 @@ static void video_key(espix_window_t *w, uint32_t keysym, bool down, void *ctx)
         break;
     case 's':
         s_playing = false;
-        s_cur     = 0;
+        s_rewind  = true;
         break;
     case '-':
         video_rate(-VIDEO_RATE_STEP);
@@ -468,20 +614,39 @@ static void video_task(void *arg)
             continue;
         }
 
-        const int     i  = s_cur;
-        const int64_t t0 = esp_timer_get_time();
-        const bool    ok = video_decode(i);
-        const int64_t t1 = esp_timer_get_time();
+        if (s_rewind) {
+            s_rewind = false;
+            s_cur    = 0;
+            (void)video_read_frame(0);
+        }
+
+        const int     shown = s_cur;
+        const int64_t t0    = esp_timer_get_time();
+        const bool    ok    = video_decode();
+        const int64_t t1    = esp_timer_get_time();
 
         if (ok) {
             if (s_fit != NULL) {
                 (void)espix_surface_scale(s_fit, s_frame);
             }
             espix_window_repaint(s_win);
-            s_cur = (s_cur + 1) % s_nframes;
+
+            /*
+             * Read the next frame now rather than when it is shown: the read
+             * is the one part of the tick that waits on the card, and this
+             * puts it behind the paint instead of in front of the next
+             * frame's decode.
+             */
+            if (video_read_frame(s_off + s_len)) {
+                s_cur++;
+            } else if (video_read_frame(0)) {
+                s_cur = 0;              /* the end: play it again */
+            } else {
+                s_playing = false;
+            }
         } else {
             s_playing = false;
-            snprintf(s_err, sizeof(s_err), "frame %d will not decode", i);
+            snprintf(s_err, sizeof(s_err), "frame %d will not decode", shown);
             espix_window_repaint(s_win);
         }
 
@@ -540,7 +705,7 @@ static bool video_start(const char *path)
     if (!video_load(path)) {
         return false;
     }
-    if (!video_decode(0)) {
+    if (!video_read_frame(0) || !video_decode()) {
         snprintf(s_err, sizeof(s_err), "%.32s: the first frame will not decode",
                  path);
         return false;
