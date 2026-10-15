@@ -658,7 +658,8 @@ static bool s_force_hw;
  */
 #define PPA_WAIT_MS 60
 
-static SemaphoreHandle_t s_ppa_done;        /* given by the ISR on completion */
+static SemaphoreHandle_t s_ppa_srm_done;    /* one per client: their completions */
+static SemaphoreHandle_t s_ppa_fill_done;   /* are not each other's */
 
 /* Runs in the interrupt context: give and go, nothing else. */
 static bool IRAM_ATTR ppa_on_done(ppa_client_handle_t client,
@@ -666,12 +667,23 @@ static bool IRAM_ATTR ppa_on_done(ppa_client_handle_t client,
 {
     (void)client;
     (void)edata;
-    (void)user;
 
     BaseType_t woken = pdFALSE;
 
-    if (s_ppa_done != NULL) {
-        xSemaphoreGiveFromISR(s_ppa_done, &woken);
+    /*
+     * The semaphore belongs to the transaction, not to the callback.
+     *
+     * There was one binary semaphore for both clients -- the SRM one that
+     * blits and copies, and the fill one -- so a fill finishing could satisfy
+     * the wait for a blit. The caller then read its staging buffer while the
+     * copy was still writing it: a torn frame, which on a video is grey smear
+     * that comes and goes. The driver hands each transaction's own user_data
+     * back here, so each one waits for its own completion.
+     */
+    SemaphoreHandle_t done = (SemaphoreHandle_t)user;
+
+    if (done != NULL) {
+        xSemaphoreGiveFromISR(done, &woken);
     }
     return woken == pdTRUE;
 }
@@ -690,10 +702,13 @@ static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
         return false;
     }
 
-    if (s_ppa_done == NULL) {
-        s_ppa_done = xSemaphoreCreateBinary();
+    SemaphoreHandle_t *done = (op == PPA_OPERATION_FILL) ? &s_ppa_fill_done
+                                                         : &s_ppa_srm_done;
+
+    if (*done == NULL) {
+        *done = xSemaphoreCreateBinary();
     }
-    if (s_ppa_done != NULL) {
+    if (*done != NULL) {
         const ppa_event_callbacks_t cbs = { .on_trans_done = ppa_on_done };
         (void)ppa_client_register_event_callbacks(*client, &cbs);
     }
@@ -706,12 +721,12 @@ static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
  * every later operation fails to queue and takes the same road, which is the
  * intended shape: correct, a little slow, and never a wedged board.
  */
-static bool ppa_wait(esp_err_t queued)
+static bool ppa_wait(esp_err_t queued, SemaphoreHandle_t done)
 {
-    if (queued != ESP_OK || s_ppa_done == NULL) {
+    if (queued != ESP_OK || done == NULL) {
         return false;
     }
-    return xSemaphoreTake(s_ppa_done, pdMS_TO_TICKS(PPA_WAIT_MS)) == pdTRUE;
+    return xSemaphoreTake(done, pdMS_TO_TICKS(PPA_WAIT_MS)) == pdTRUE;
 }
 
 /*
@@ -796,7 +811,7 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
         return false;
     }
 
-    const ppa_fill_oper_config_t cfg = {
+    ppa_fill_oper_config_t cfg = {
         .out = {
             .buffer         = px,
             .buffer_size    = (uint32_t)buf_size(w, h),
@@ -814,8 +829,9 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
     if (!ppa_lock_take()) {
         return false;
     }
-    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_fill(s_ppa_fill, &cfg));
+    cfg.user_data = s_ppa_fill_done;
+    (void)xSemaphoreTake(s_ppa_fill_done, 0);   /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_fill(s_ppa_fill, &cfg), s_ppa_fill_done);
 
     ppa_lock_give();
     return ok;
@@ -871,7 +887,7 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
         return false;
     }
 
-    const ppa_srm_oper_config_t cfg = {
+    ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
             /*
@@ -907,8 +923,10 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
     if (!ppa_lock_take()) {
         return false;
     }
-    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg));
+    cfg.user_data = s_ppa_srm_done;
+    (void)xSemaphoreTake(s_ppa_srm_done, 0);    /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg),
+                             s_ppa_srm_done);
 
     ppa_lock_give();
     return ok;
@@ -996,7 +1014,7 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
         return false;
     }
 
-    const ppa_srm_oper_config_t cfg = {
+    ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
             .pic_w          = (uint32_t)sw,
@@ -1024,8 +1042,10 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
     if (!ppa_lock_take()) {
         return false;
     }
-    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg));
+    cfg.user_data = s_ppa_srm_done;
+    (void)xSemaphoreTake(s_ppa_srm_done, 0);    /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg),
+                             s_ppa_srm_done);
 
     ppa_lock_give();
     return ok;
@@ -1053,7 +1073,7 @@ static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
         return false;
     }
 
-    const ppa_srm_oper_config_t cfg = {
+    ppa_srm_oper_config_t cfg = {
         .in = {
             .buffer         = src,
             .pic_w          = (uint32_t)w,
@@ -1081,8 +1101,10 @@ static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
     if (!ppa_lock_take()) {
         return false;
     }
-    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
-    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg));
+    cfg.user_data = s_ppa_srm_done;
+    (void)xSemaphoreTake(s_ppa_srm_done, 0);    /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg),
+                             s_ppa_srm_done);
 
     ppa_lock_give();
     return ok;
