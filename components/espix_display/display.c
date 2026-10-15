@@ -623,8 +623,58 @@ static ppa_client_handle_t s_ppa_srm;
 #define PPA_MIN_PIXELS 2048
 
 /* The benchmark's two columns, and nothing else: production never sets either. */
+/* Software, always, for now -- and this is a fix, not a preference.
+ * The accelerator is three times faster on fills and blits and it is driven in
+ * blocking mode, and on this board a transaction can simply never complete:
+ * measured, the canvas held for fifty-five seconds inside one, with the
+ * desktop, its input handler and every repaint behind it. Opening a window
+ * paints it through these calls, which is why a panel that opens looked like a
+ * panel that hangs. Until the PPA can be driven in non-blocking mode with a
+ * completion callback and a timeout, the loop is what runs. */
+/* Off for now: the canvas phase still stalls with it on, and until that is
+ * understood the software path is the only one that cannot freeze the board.
+ * The PPA work below (non-blocking, callback, bounded wait, aligned buffers) is
+ * what it should look like when it comes back. */
+/*
+ * The accelerator is on. The freeze that looked like it was caused by the PPA
+ * was espix_klog(): the per-rectangle log lines write to a 115200-baud serial
+ * console, the console backs up, and the task that logs blocks inside the log
+ * call -- which is the task that also holds the canvas and runs the desktop.
+ * With the logs out, a full frame with the PPA on takes 0.06 s and the desktop
+ * runs at 140 updates a second.
+ */
 static bool s_sw_only;
 static bool s_force_hw;
+
+/*
+ * How long a transaction may take before the software path takes over.
+ *
+ * The driver's blocking mode has no timeout of its own -- it waits on a
+ * completion that, for a transaction the hardware never finishes, does not
+ * come. Measured: the server inside one for fifty-five seconds, holding the
+ * canvas, with the desktop and its input handler behind it. Non-blocking plus
+ * a callback from the documentation's "Register PPA Event Callbacks" section
+ * turns that into a bounded wait, and past the bound the loop does the work.
+ */
+#define PPA_WAIT_MS 60
+
+static SemaphoreHandle_t s_ppa_done;        /* given by the ISR on completion */
+
+/* Runs in the interrupt context: give and go, nothing else. */
+static bool IRAM_ATTR ppa_on_done(ppa_client_handle_t client,
+                                  ppa_event_data_t *edata, void *user)
+{
+    (void)client;
+    (void)edata;
+    (void)user;
+
+    BaseType_t woken = pdFALSE;
+
+    if (s_ppa_done != NULL) {
+        xSemaphoreGiveFromISR(s_ppa_done, &woken);
+    }
+    return woken == pdTRUE;
+}
 
 static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
 {
@@ -639,7 +689,29 @@ static bool ppa_ready(ppa_operation_t op, ppa_client_handle_t *client)
         *client = NULL;
         return false;
     }
+
+    if (s_ppa_done == NULL) {
+        s_ppa_done = xSemaphoreCreateBinary();
+    }
+    if (s_ppa_done != NULL) {
+        const ppa_event_callbacks_t cbs = { .on_trans_done = ppa_on_done };
+        (void)ppa_client_register_event_callbacks(*client, &cbs);
+    }
     return true;
+}
+
+/*
+ * Wait for the transaction just queued. False means the software path runs
+ * instead -- and if the client is left busy by the one that did not finish,
+ * every later operation fails to queue and takes the same road, which is the
+ * intended shape: correct, a little slow, and never a wedged board.
+ */
+static bool ppa_wait(esp_err_t queued)
+{
+    if (queued != ESP_OK || s_ppa_done == NULL) {
+        return false;
+    }
+    return xSemaphoreTake(s_ppa_done, pdMS_TO_TICKS(PPA_WAIT_MS)) == pdTRUE;
 }
 
 /*
@@ -707,6 +779,19 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
     if (s_sw_only || stride != w || !ppa_ready(PPA_OPERATION_FILL, &s_ppa_fill)) {
         return false;
     }
+    /*
+     * The documentation's one hard rule about buffers: "the out.buffer address
+     * and out.buffer_size must be aligned to the cache line size, if the buffer
+     * is located in a memory region that is cacheable". This check was on the
+     * blit path and missing here, so a fill on an unaligned buffer went to the
+     * driver anyway, was refused inside it, and left the client unable to
+     * complete another transaction -- which the blocking calls of the day then
+     * waited on for ever.
+     */
+    if (((uintptr_t)px & (BUF_ALIGN - 1)) != 0
+        || (buf_size(w, h) & (BUF_ALIGN - 1)) != 0) {
+        return false;
+    }
     if (!s_force_hw && r.w * r.h < PPA_MIN_PIXELS) {
         return false;
     }
@@ -724,12 +809,13 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
         .fill_block_w   = (uint32_t)r.w,
         .fill_block_h   = (uint32_t)r.h,
         .fill_color_val = rgb565_to_rgb888(v),
-        .mode           = PPA_TRANS_MODE_BLOCKING,
+        .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
     if (!ppa_lock_take()) {
         return false;
     }
-    const bool ok = ppa_do_fill(s_ppa_fill, &cfg) == ESP_OK;
+    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_fill(s_ppa_fill, &cfg));
 
     ppa_lock_give();
     return ok;
@@ -816,12 +902,13 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x        = 1.0f,
         .scale_y        = 1.0f,
-        .mode           = PPA_TRANS_MODE_BLOCKING,
+        .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
     if (!ppa_lock_take()) {
         return false;
     }
-    const bool ok = ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg));
 
     ppa_lock_give();
     return ok;
@@ -876,7 +963,14 @@ bool espix_canvas_copy_rect(const espix_canvas_t *c, espix_rect_t r,
      * transaction that does not finish degrades to this loop instead of
      * taking the board with it. Until that exists, the loop is what runs.
      */
-    (void)dw; (void)dh; (void)dstride; (void)dx; (void)dy;
+    if (!ppa_lock_take()) {
+        return false;
+    }
+    const bool ok = ppa_blit_rect(dst, dw, dh, dstride, dx, dy,
+                                 c->px, r.x, r.y, r.w, r.h, c->w);
+
+    ppa_lock_give();
+    return ok;
 
     for (int y = 0; y < r.h; y++) {
         memcpy(dst + (size_t)(dy + y) * dstride + dx,
@@ -925,12 +1019,13 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x        = (float)dw / (float)sw,
         .scale_y        = (float)dh / (float)sh,
-        .mode           = PPA_TRANS_MODE_BLOCKING,
+        .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
     if (!ppa_lock_take()) {
         return false;
     }
-    const bool ok = ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg));
 
     ppa_lock_give();
     return ok;
@@ -981,12 +1076,13 @@ static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x        = 1.0f,
         .scale_y        = 1.0f,
-        .mode           = PPA_TRANS_MODE_BLOCKING,
+        .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
     if (!ppa_lock_take()) {
         return false;
     }
-    const bool ok = ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+    (void)xSemaphoreTake(s_ppa_done, 0);        /* no stale completion */
+    const bool ok = ppa_wait(ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg));
 
     ppa_lock_give();
     return ok;

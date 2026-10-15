@@ -2075,6 +2075,7 @@ static bool update_send(rfb_conn_t *c)
         const espix_rect_t r     = rects[i];
         const bool         tight = ((int)i == jpeg_i);
 
+
         /*
          * What is about to go on the wire, before it goes.
          *
