@@ -91,6 +91,11 @@
 #define POLL_US        (250 * 1000)   /* send and accept timeout */
 #define STALL_LIMIT    40             /* * POLL_US before a peer is gone */
 
+/* Thirty seconds of a client asking for nothing, reported once. An idle viewer
+ * is legitimately quiet, so this is a log line and not a disconnect: what it
+ * answers is whether "unreachable board" is a client that never asks again. */
+#define DEFER_LIMIT    40             /* quarter-seconds a frame may stay owed */
+
 /*
  * How long a change made by *another task* may wait to be sent.
  *
@@ -430,20 +435,33 @@ static uint64_t cyc_to_us(uint64_t cycles)
  */
 static bool write_full(int fd, const void *buf, size_t n);
 
-static bool write_start(int fd, const void *buf, size_t n)
+/*
+ * Start a frame: 1 written, 0 would block (nothing written), -1 gone.
+ *
+ * The distinction is the whole of it. This used to answer true or false, and
+ * the caller treated false as "not now, still owed" -- right for a peer that is
+ * merely slow, and catastrophic for one that has gone away, because the frame
+ * is then deferred and retried for ever: an update every quarter of a second
+ * against a dead socket, this loop never reading and never accepting, and no
+ * log line, because each attempt looks exactly like the last. Measured: a
+ * viewer that stopped asking after its own sixty-second timeout, a server that
+ * said nothing at all, and a board that could not be reached until it was
+ * restarted.
+ */
+static int write_start(int fd, const void *buf, size_t n)
 {
     const ssize_t w = send(fd, buf, n, MSG_DONTWAIT);
 
     if (w == (ssize_t)n) {
-        return true;                    /* done, and nothing was waited for */
+        return 1;                       /* done, and nothing was waited for */
     }
     if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        return false;                   /* nothing written: try again later */
+        return 0;                       /* nothing written: try again later */
     }
     if (w < 0) {
-        return false;
+        return -1;                      /* the connection is not usable */
     }
-    return write_full(fd, (const uint8_t *)buf + w, n - (size_t)w);
+    return write_full(fd, (const uint8_t *)buf + w, n - (size_t)w) ? 1 : -1;
 }
 
 /*
@@ -475,20 +493,6 @@ static bool write_full(int fd, const void *buf, size_t n)
     const int64_t  t0 = esp_timer_get_time();
 
     while (n > 0) {
-        if (!writable_within(fd, POLL_US)) {
-            /*
-             * Not draining. Retry while it is merely slow, but only for as long
-             * as the whole write may take -- this task is also the one that
-             * accepts the next client, so a viewer that has stopped reading
-             * must not be able to hold the door shut.
-             */
-            if (!s_run || ++stalls > STALL_LIMIT) {
-                s_q.stalls += (uint32_t)stalls;
-                return false;
-            }
-            continue;
-        }
-
         const ssize_t w = send(fd, p, n, 0);
         if (w > 0) {
             p += w;
@@ -500,8 +504,17 @@ static bool write_full(int fd, const void *buf, size_t n)
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* Ready and still refused: count it like a timeout. */
-            if (!s_run || ++stalls > STALL_LIMIT) {
+            /*
+             * The peer stopped draining. Wait for it rather than spin -- but
+             * only here, on the refusal, and never before a send that is going
+             * to work: asking first cost four times the throughput of this
+             * whole path when it was tried, because a healthy socket pays the
+             * question and does not need it. Retry while the peer is merely
+             * slow, and not for longer than the write may take: this task also
+             * accepts the next client.
+             */
+            if (!writable_within(fd, POLL_US) || !s_run
+                || ++stalls > STALL_LIMIT) {
                 s_q.stalls += (uint32_t)stalls;
                 return false;
             }
@@ -1254,6 +1267,7 @@ typedef struct {
     bool      lossy;          /* ...and it allowed lossy: a quality level >= 1 */
     int       qlevel;         /* the level to use, 0-9; -1 when none was offered */
     bool      pending;        /* an update is owed to the client */
+uint32_t  deferred;       /* frames abandoned because the socket was full */
     bool      pending_full;   /* ...and it asked for a whole frame */
     bool      copyrect;       /* ...and it can be told to move pixels itself */
     bool      eds;            /* ...and it can be resized without reconnecting */
@@ -1971,12 +1985,32 @@ static bool update_send(rfb_conn_t *c)
     hdr[0] = 0;                             /* FramebufferUpdate */
     hdr[1] = 0;
     wr16(hdr + 2, (uint16_t)total);
-    if (!write_start(c->fd, hdr, 4)) {
-        /* Not now. Still owed, so the next attempt describes the screen as it is
-         * by then rather than as it was. */
+    const int ws = write_start(c->fd, hdr, 4);
+
+    if (ws < 0) {
+        RFB_MARK_STOP(RFB_MARK_ENCODE);
+        return false;                   /* gone: close rather than retry */
+    }
+    if (ws == 0) {
+        /*
+         * Not now. Still owed, so the next attempt describes the screen as it
+         * is by then rather than as it was -- but only for so long: a peer that
+         * never takes the frame is not a peer, and this is bounded so that the
+         * deferral cannot become the silent loop it used to be.
+         */
+        if (++c->deferred > DEFER_LIMIT) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "client has not taken an update in %d tries; dropping it",
+                       DEFER_LIMIT);
+            c->deferred = 0;
+            RFB_MARK_STOP(RFB_MARK_ENCODE);
+            return false;
+        }
         RFB_MARK_STOP(RFB_MARK_ENCODE);
         return true;
     }
+
+    c->deferred = 0;
 
     sink_t s = { .fd = c->fd, .buf = c->out, .cap = OUT_CAP };
 
@@ -2000,6 +2034,22 @@ static bool update_send(rfb_conn_t *c)
     for (size_t i = 0; i < n; i++) {
         const espix_rect_t r     = rects[i];
         const bool         tight = ((int)i == jpeg_i);
+
+        /*
+         * What is about to go on the wire, before it goes.
+         *
+         * Temporary, and the reason it is before the write: a client that hangs
+         * mid-frame leaves this as the last line, which names the rectangle it
+         * hung on. The state reporter can only say that the server is idle
+         * waiting for a request -- a client stuck inside a rectangle looks
+         * exactly like a client that has nothing to ask for.
+         */
+        espix_klog(ESPIX_KLOG_INFO, TAG,
+                   "rect %u/%u: %d,%d %dx%d enc %d%s",
+                   (unsigned)(i + 1), (unsigned)total, r.x, r.y, r.w, r.h,
+                   (int)(tight ? RFB_ENC_TIGHT
+                               : (c->hextile ? RFB_ENC_HEXTILE : RFB_ENC_RAW)),
+                   tight ? " (jpeg)" : "");
         uint8_t            rh[12];
 
         /* The observer counts what went out, and only for the rectangles it
@@ -2617,6 +2667,7 @@ static void rfb_serve(int fd)
             }
             break;
         }
+
         vnc_state(VNC_HANDLING);
         if (!rfb_handle(&c, type)) {
             break;
@@ -2666,6 +2717,25 @@ static void rfb_task(void *arg)
             /* SO_RCVTIMEO makes this the normal idle path, not an error. */
             continue;
         }
+
+        /*
+         * Keepalive, because "quiet" and "gone" look identical from here and
+         * only one of them should hold this task -- which is also the task that
+         * accepts the next client. An idle viewer is legitimately silent for
+         * minutes (the server only answers when something changed), so a
+         * silence timeout would drop real clients; the stack probing the peer
+         * is the only thing that tells the two apart.
+         */
+        const int one_on = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one_on, sizeof(one_on));
+#ifdef TCP_KEEPIDLE
+        {
+            const int idle = 15, intvl = 5, cnt = 3;
+            (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+            (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+            (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+        }
+#endif
 
         vnc_state(VNC_HANDSHAKE);
         if (espix_shutdown_started()) {
