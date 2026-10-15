@@ -154,7 +154,7 @@ class Rfb:
         # What actually crossed the socket, so a claim about the cost of a frame
         # is a measurement rather than a memory of one.
         self.wire = {"bytes": 0, "frames": 0, "encodings": {},
-                     "tight": {"rects": 0, "bytes": 0}}
+                     "tight": {"rects": 0, "bytes": 0, "sizes": {}}}
 
     # -- handshake ----------------------------------------------------
 
@@ -311,7 +311,7 @@ class Rfb:
                     elif enc == ENC_COPYRECT:
                         self._copyrect(fb, x, y, w, h, r)
                     elif enc == ENC_TIGHT:
-                        self._tight(r)
+                        self._tight(r, w, h)
                     elif enc == ENC_EXTENDED_DESKTOP_SIZE:
                         self._extended_desktop_size(r)
                     else:
@@ -342,7 +342,7 @@ class Rfb:
             dst = ((y + row) * self.width + x) * 4
             fb[dst:dst + w * 4] = fb[src:src + w * 4]
 
-    def _tight(self, r):
+    def _tight(self, r, w, h):
         """Skip one Tight rectangle, counting what it cost.
 
         The control byte's high nibble is the subencoding and its low nibble
@@ -354,15 +354,44 @@ class Rfb:
 
         if sub == 0x09:                              # JPEG
             n = self._tight_len(r)
-            r.skip(n)
+            data = r.take(n)
             self.wire["tight"]["rects"] += 1
             self.wire["tight"]["bytes"] += n
+            self.wire["tight"]["sizes"][(w, h)] = \
+                self.wire["tight"]["sizes"].get((w, h), 0) + 1
+            # The JPEG's own size against the rectangle that claims it: they
+            # have to agree, and a codec working in 16-pixel blocks can make
+            # them disagree for a rectangle that is not a multiple of one.
+            jw, jh = self._jpeg_size(data)
+            if (jw, jh) != (w, h):
+                self.wire["tight"]["mismatch"] = \
+                    self.wire["tight"].get("mismatch", []) + [(w, h, jw, jh)]
         elif sub == 0x08:                            # solid fill
             r.skip(3)
             self.wire["tight"]["rects"] += 1
         else:
             raise RfbError("Tight subencoding %#x, which this client cannot skip"
                            % sub)
+
+    @staticmethod
+    def _jpeg_size(data):
+        """The width and height out of a JPEG's SOF marker, or (0, 0)."""
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                return (0, 0)
+            m = data[i + 1]
+            if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
+                i += 2
+                continue
+            ln = (data[i + 2] << 8) | data[i + 3]
+            if m in (0xC0, 0xC1, 0xC2):
+                return ((data[i + 7] << 8) | data[i + 8],
+                        (data[i + 5] << 8) | data[i + 6])
+            if m == 0xDA:
+                return (0, 0)
+            i += 2 + ln
+        return (0, 0)
 
     @staticmethod
     def _tight_len(r):

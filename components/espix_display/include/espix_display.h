@@ -325,6 +325,16 @@ void espix_display_classify(const espix_px_t *px, int stride, int x, int y,
                             int w, int h, espix_display_class_t *out);
 
 /*
+ * Copy a rectangle of the canvas into a buffer: the rectangle at (dx, dy)
+ * inside a picture dw x dh whose rows are dstride pixels apart. Hardware (the
+ * PPA) where it applies, software where it does not; true when the hardware
+ * did it.
+ */
+bool espix_canvas_copy_rect(const espix_canvas_t *c, espix_rect_t r,
+                            espix_px_t *dst, int dw, int dh, int dstride,
+                            int dx, int dy);
+
+/*
  * Both paths on one file, for the benchmark: software, and the codec where there
  * is one, with hw_ok saying whether the two agree -- so a fast wrong answer is
  * not worth more than a slow right one. Fills one row and returns false when the

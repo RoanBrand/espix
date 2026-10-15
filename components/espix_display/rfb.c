@@ -350,6 +350,20 @@ static struct {
     uint64_t canvas_us;
     uint64_t encode_us;
     uint64_t write_us;
+    /* The canvas phase, split: waiting for it, taking the damage, deciding and
+     * packing a JPEG, and staging everything else. Asked because it is the
+     * largest phase and the split says which part of it to aim at. */
+    uint64_t lock_us;
+    uint64_t pick_us;
+    uint64_t cls_us;
+    uint64_t copy_us;
+    /* ...and what the staging copy was carrying: the copy is the largest item
+     * in the phase, and its size is the question. */
+    uint32_t stage_rects;
+    uint64_t stage_px;
+    uint32_t stage_big_px;
+    uint16_t stage_big_w;
+    uint16_t stage_big_h;
 } s_phase;
 
 /*
@@ -1192,7 +1206,26 @@ static struct {
  */
 #define CLS_SAMPLES       4096
 #define CLS_COLOURS       256
-#define CLS_JPEG_COLOURS  64        /* "more colours than a desktop uses" */
+/*
+ * "More colours than a desktop uses" -- and the number is 32 because 64 was
+ * above the thing it was meant to catch.
+ *
+ * Measured over RFB: a desktop canvas classifies at 12-15 colours, the browser
+ * at 4-8 (text and chrome are a handful of colours), and a *dark* 640x480 video
+ * frame at 46-62 -- the video window's own pixels, where a bright frame
+ * saturates the count at 256 and a near-black one does not. Sixty-four sent
+ * every dark frame to Hextile, which was the largest cost left on the board:
+ * the whole 660x530 window staged and copied (350,000 px, 14.5 ms of the 30 ms
+ * canvas phase, measured) and Hextile-encoded into roughly six times the bytes,
+ * on about two updates in five.
+ *
+ * Thirty-two sits between the two, with the desktop's 15 and the video's 46
+ * as the margin. Palette art -- the case a colour count cannot separate from a
+ * photograph, because there is nothing in the count to separate -- is the edge
+ * test's job, and stays the edge test's job: a dithered picture has many
+ * differing neighbours, and a photograph has few.
+ */
+#define CLS_JPEG_COLOURS  32        /* "more colours than a desktop uses" */
 #define CLS_EDGE_DIFF     32        /* "differs by four or more 5-bit steps" */
 #define CLS_RUN           8         /* pixels examined from each sampled point */
 #define CLS_JPEG_MIN_PX   4096      /* a JPEG header is not worth a small rect */
@@ -1406,6 +1439,18 @@ static void send_stat(int64_t us, size_t rects)
                (long long)s_send_stat.worst,
                (long long)((s_send_stat.rects + 50) / 100));
 
+    espix_klog(ESPIX_KLOG_INFO, TAG,
+               "canvas: of %lld, wait %lld + take %lld + decide-pack %lld "
+               "+ stage %lld (of %u rects, %llu px, largest %ux%u)",
+               (long long)(s_phase.canvas_us / u),
+               (long long)(s_phase.lock_us / u),
+               (long long)(s_phase.pick_us / u),
+               (long long)(s_phase.cls_us / u),
+               (long long)(s_phase.copy_us / u),
+               (unsigned)s_phase.stage_rects,
+               (unsigned long long)s_phase.stage_px,
+               (unsigned)s_phase.stage_big_w, (unsigned)s_phase.stage_big_h);
+
     const uint32_t tiles = s_enc.tiles ? s_enc.tiles : 1;
     /*
      * The emit counter covers the socket flush it triggered as well, and the
@@ -1460,6 +1505,15 @@ static void send_stat(int64_t us, size_t rects)
     s_phase.canvas_us = 0;
     s_phase.encode_us = 0;
     s_phase.write_us = 0;
+    s_phase.lock_us  = 0;
+    s_phase.pick_us  = 0;
+    s_phase.cls_us   = 0;
+    s_phase.copy_us  = 0;
+    s_phase.stage_rects = 0;
+    s_phase.stage_px    = 0;
+    s_phase.stage_big_px = 0;
+    s_phase.stage_big_w  = 0;
+    s_phase.stage_big_h  = 0;
     s_send_stat.n     = 0;
     s_send_stat.us    = 0;
     s_send_stat.rects = 0;
@@ -1575,6 +1629,7 @@ static bool update_send(rfb_conn_t *c)
     const int64_t  t0 = esp_timer_get_time();
     int64_t        t_canvas;
     int64_t        t_sent;
+    int64_t        t_lock = 0, t_pick = 0, t_cls = 0;
     espix_canvas_t *cv = espix_display_canvas();
     if (cv == NULL || c->stage == NULL) {
         return false;
@@ -1604,6 +1659,7 @@ static bool update_send(rfb_conn_t *c)
     size_t       n;
 
     espix_canvas_lock(cv);
+    t_lock = esp_timer_get_time();
     if (full) {
         rects[0] = (espix_rect_t){ 0, 0, cw, ch };
         n = 1;
@@ -1703,6 +1759,8 @@ static bool update_send(rfb_conn_t *c)
      */
     int jpeg_i = -1;
 
+    t_pick = esp_timer_get_time();
+
     if (c->tight && c->lossy && n > 0) {
         size_t best = 0;
 
@@ -1717,16 +1775,14 @@ static bool update_send(rfb_conn_t *c)
         espix_display_class_t cl;
 
         espix_display_classify(px, cw, r.x, r.y, r.w, r.h, &cl);
+        t_cls = esp_timer_get_time();
 
         if (cl.jpeg) {
             espix_px_t *in = espix_display_jpeg_input((size_t)r.w * (size_t)r.h);
 
             if (in != NULL) {
-                for (int y = 0; y < r.h; y++) {
-                    memcpy(in + (size_t)y * r.w,
-                           px + (size_t)(r.y + y) * cw + r.x,
-                           (size_t)r.w * sizeof(espix_px_t));
-                }
+                /* Packed, so the picture is the rectangle itself. */
+                espix_canvas_copy_rect(cv, r, in, r.w, r.h, r.w, 0, 0);
                 jpeg_i = (int)best;
             }
         }
@@ -1739,24 +1795,32 @@ static bool update_send(rfb_conn_t *c)
             continue;                   /* in the encoder's input already */
         }
 
+        s_phase.stage_rects++;
+        s_phase.stage_px += (uint32_t)r.w * (uint32_t)r.h;
+        if ((uint32_t)r.w * (uint32_t)r.h > s_phase.stage_big_px) {
+            s_phase.stage_big_px = (uint32_t)r.w * (uint32_t)r.h;
+            s_phase.stage_big_w  = (uint16_t)r.w;
+            s_phase.stage_big_h  = (uint16_t)r.h;
+        }
+
         /*
          * A full-width rectangle is one contiguous run of pixels, so the common
          * case -- a game that damages the whole canvas every frame -- is one
          * memcpy rather than one per row. Same bytes, a quarter of the calls.
          */
-        if (r.w == cw) {
-            memcpy(c->stage + (size_t)r.y * cw, px + (size_t)r.y * cw,
-                   (size_t)r.h * cw * sizeof(espix_px_t));
-            continue;
-        }
-        for (int y = 0; y < r.h; y++) {
-            memcpy(c->stage + (size_t)(r.y + y) * cw + r.x,
-                   px + (size_t)(r.y + y) * cw + r.x,
-                   (size_t)r.w * sizeof(espix_px_t));
-        }
+        /* The one copy that is not for a JPEG: hardware where the PPA takes
+         * it, the same rows in software where it does not. */
+        espix_canvas_copy_rect(cv, r, c->stage, cw, ch, cw, r.x, r.y);
     }
     espix_canvas_unlock(cv);
     t_canvas = esp_timer_get_time();
+    if (t_cls == 0) {
+        t_cls = t_pick;                 /* nothing was classified */
+    }
+    s_phase.lock_us += (uint64_t)(t_lock - t0);
+    s_phase.pick_us += (uint64_t)(t_pick - t_lock);
+    s_phase.cls_us  += (uint64_t)(t_cls - t_pick);
+    s_phase.copy_us += (uint64_t)(t_canvas - t_cls);
     RFB_MARK_STOP(RFB_MARK_CANVAS);
     RFB_MARK_START(RFB_MARK_ENCODE);
 
