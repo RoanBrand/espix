@@ -1251,8 +1251,8 @@ static int tight_quality(int level)
 static uint8_t *s_tight_out;
 static size_t   s_tight_cap;
 
-/* A JPEG of whatever the encoder's input holds, or 0 when it will not encode. */
-static size_t tight_jpeg(espix_rect_t r, int level)
+/* Room for a JPEG of a w x h rectangle; false when there is none. */
+static bool tight_room(espix_rect_t r)
 {
     const size_t want = (size_t)r.w * (size_t)r.h * sizeof(espix_px_t) + 4096;
 
@@ -1260,11 +1260,20 @@ static size_t tight_jpeg(espix_rect_t r, int level)
         uint8_t *n = heap_caps_malloc(want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
         if (n == NULL) {
-            return 0;
+            return false;
         }
         heap_caps_free(s_tight_out);
         s_tight_out = n;
         s_tight_cap = want;
+    }
+    return true;
+}
+
+/* A JPEG of whatever the encoder's input holds, or 0 when it will not encode. */
+static size_t tight_jpeg(espix_rect_t r, int level)
+{
+    if (!tight_room(r)) {
+        return 0;
     }
     return espix_display_jpeg_encode(r.w, r.h, tight_quality(level),
                                      s_tight_out, s_tight_cap);
@@ -1538,6 +1547,7 @@ static struct {
     uint64_t pairs;
     bool     lossy;
     uint32_t sent_jpeg;     /* rectangles actually put on the wire as Tight */
+    uint32_t passed;        /* ...of which the picture's own JPEG, not encoded */
     /* And the largest rectangle, whole, because an average over a hundred
      * rectangles hides the one the question is about. */
     uint32_t big_px;
@@ -1669,10 +1679,10 @@ static void send_stat(int64_t us, size_t rects)
 
     if (s_cls.rects > 0) {
         espix_klog(ESPIX_KLOG_INFO, TAG,
-                   "classify: %u rects, %u sent as Tight "
+                   "classify: %u rects, %u sent as Tight, %u passed through "
                    "(client takes lossy: %s)",
                    (unsigned)s_cls.rects, (unsigned)s_cls.sent_jpeg,
-                   s_cls.lossy ? "yes" : "no");
+                   (unsigned)s_cls.passed, s_cls.lossy ? "yes" : "no");
         if (s_cls.big_px > 0) {
             const uint32_t big_edge = s_cls.big_pairs
                 ? (uint32_t)((uint64_t)s_cls.big_edges * 100 / s_cls.big_pairs) : 0;
@@ -1988,7 +1998,8 @@ static bool update_send(rfb_conn_t *c)
      * Off unless the client offered Tight *and* allowed lossy, so a client that
      * speaks only Hextile never reaches any of this.
      */
-    int jpeg_i = -1;
+    int    jpeg_i   = -1;
+    size_t pass_len = 0;               /* the picture's own JPEG, already in s_tight_out */
 
     t_pick = esp_timer_get_time();
 
@@ -2003,11 +2014,18 @@ static bool update_send(rfb_conn_t *c)
         }
 
         /* Where the owner says a picture is, that overlap is the JPEG, unsampled. */
+        const bool         enc   = espix_display_jpeg_can_encode();
         const espix_rect_t photo = espix_canvas_photo(cv);
         const espix_rect_t ov    = rect_meet(rects[best], photo);
+        const bool         whole = ov.w == photo.w && ov.h == photo.h && ov.w > 0;
         bool               hint  = false;
 
-        if (ov.w > 0 && ov.h > 0
+        /* The picture's own bytes first: no copy and no encode, on any target. */
+        if (whole && tight_room(photo)) {
+            pass_len = espix_canvas_photo_jpeg(cv, s_tight_out, s_tight_cap);
+        }
+
+        if ((pass_len > 0 || enc) && ov.w > 0 && ov.h > 0
             && (uint32_t)ov.w * ov.h * 2 >= (uint32_t)photo.w * photo.h) {
             espix_rect_t rest[4];
             const size_t nr = rect_subtract(rects[best], ov, rest);
@@ -2020,16 +2038,22 @@ static bool update_send(rfb_conn_t *c)
                 hint = true;
             }
         }
+        if (pass_len > 0 && !hint) {
+            pass_len = 0;               /* no room to split it out */
+        }
 
         const espix_rect_t    r = rects[best];
         espix_display_class_t cl = { .jpeg = hint };
 
-        if (!hint) {
+        if (pass_len > 0) {
+            jpeg_i  = (int)best;
+            cl.jpeg = false;            /* nothing to copy or encode */
+        } else if (!hint && enc) {
             espix_display_classify(px, cw, r.x, r.y, r.w, r.h, &cl);
         }
         t_cls = esp_timer_get_time();
 
-        if (cl.jpeg) {
+        if (cl.jpeg && enc) {
             espix_px_t *in = espix_display_jpeg_input((size_t)r.w * (size_t)r.h);
 
             if (in != NULL) {
@@ -2085,7 +2109,10 @@ static bool update_send(rfb_conn_t *c)
      */
     size_t jpeg_len = 0;
 
-    if (jpeg_i >= 0) {
+    if (jpeg_i >= 0 && pass_len > 0) {
+        jpeg_len = pass_len;
+        s_cls.passed++;
+    } else if (jpeg_i >= 0) {
         jpeg_len = tight_jpeg(rects[jpeg_i], c->qlevel);
 
         if (jpeg_len == 0) {

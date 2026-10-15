@@ -124,6 +124,8 @@ struct espix_canvas {
     espix_move_t     moves[ESPIX_DISPLAY_MOVE_MAX];
     int              nmoves;
     espix_rect_t     photo;       /* where the owner says a picture is, or empty */
+    espix_canvas_photo_jpeg_fn photo_fn;
+    void            *photo_ctx;
 };
 
 /*
@@ -323,6 +325,7 @@ esp_err_t espix_canvas_resize(espix_canvas_t *c, int w, int h)
     c->ndamage = 0;
     c->nmoves  = 0;
     c->photo   = (espix_rect_t){ 0, 0, 0, 0 };
+    c->photo_fn = NULL;
     espix_canvas_damage(c, (espix_rect_t){ 0, 0, w, h });
 
     espix_canvas_unlock(c);
@@ -628,12 +631,20 @@ void espix_canvas_move_clear(espix_canvas_t *c) { c->nmoves = 0; }
 
 bool espix_canvas_damaged(const espix_canvas_t *c) { return c->ndamage > 0; }
 
-void espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r)
+void espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r,
+                            espix_canvas_photo_jpeg_fn fn, void *ctx)
 {
-    c->photo = rect_clip(c, r);
+    c->photo     = rect_clip(c, r);
+    c->photo_fn  = (c->photo.w > 0) ? fn : NULL;
+    c->photo_ctx = ctx;
 }
 
 espix_rect_t espix_canvas_photo(const espix_canvas_t *c) { return c->photo; }
+
+size_t espix_canvas_photo_jpeg(const espix_canvas_t *c, uint8_t *out, size_t cap)
+{
+    return (c->photo_fn != NULL) ? c->photo_fn(c->photo_ctx, out, cap) : 0;
+}
 
 /* One 2D-DMA user at a time (see espix_dma2d.h); also one PPA completion in flight. */
 static SemaphoreHandle_t s_dma2d_lock;

@@ -116,6 +116,13 @@ typedef void (*espix_window_overlay_fn)(espix_window_t *w, espix_canvas_t *c,
 void espix_window_set_overlay(espix_window_t *w, espix_rect_t r,
                               espix_window_overlay_fn fn);
 
+/* The overlay's picture as its own JPEG, exactly the overlay's size, for a viewer to
+ * take as-is: copies it to `out` and returns its length, or 0. Under the canvas lock. */
+typedef size_t (*espix_window_overlay_jpeg_fn)(espix_window_t *w, void *ctx,
+                                               uint8_t *out, size_t cap);
+
+void espix_window_set_overlay_jpeg(espix_window_t *w, espix_window_overlay_jpeg_fn fn);
+
 /*
  * A new size, and a new surface to go with it -- because the surface is the
  * window, frame included, so a resize cannot be a bigger blit of a smaller
@@ -172,6 +179,12 @@ espix_window_t *espix_settings_window(void);
  * click and a menu click are the same call.
  */
 espix_window_t *espix_browser_open(const char *path);
+
+/* Open a file in whatever handles its extension; false when nothing does. On the desktop task. */
+bool            espix_browser_open_file(const char *path);
+
+/* The same from any task: queued to the desktop task. False when it is not running. */
+bool            espix_desktop_open(const char *path);
 void            espix_browser_forget(void);
 espix_window_t *espix_browser_window(void);
 

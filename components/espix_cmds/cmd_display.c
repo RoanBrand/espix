@@ -508,7 +508,15 @@ static int cmd_desktop(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    espix_eprintf(s, "usage: desktop [start | stop | status]\n");
+    if (strcmp(sub, "open") == 0 && argc >= 3) {
+        if (!espix_desktop_open(argv[2])) {
+            espix_eprintf(s, "desktop: not running\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    espix_eprintf(s, "usage: desktop [start | stop | status | open <path>]\n");
     return 1;
 }
 

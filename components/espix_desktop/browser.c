@@ -460,36 +460,36 @@ static void browser_activate(int row)
         return;
     }
 
-    if (name_is_text(ent->name)) {
-        /* The editor, in a terminal window of its own. Quoted, because this is
-         * the one place a path is handed to a shell -- a name with a space in
-         * it survives that much. */
+    if (!espix_browser_open_file(child)) {
+        /* Nothing here reads the file to decide what it is. */
+        snprintf(s_status, sizeof(s_status), "%.64s: no handler yet", ent->name);
+        espix_window_repaint(s_win);
+    }
+}
+
+bool espix_browser_open_file(const char *path)
+{
+    if (name_is_text(path)) {
+        /* Quoted: the one place a path is handed to a shell. */
         char cmd[ESPIX_PATH_MAX + 8];
 
-        snprintf(cmd, sizeof(cmd), "nano '%.120s'", child);
+        snprintf(cmd, sizeof(cmd), "nano '%.120s'", path);
         espix_desktop_open_terminal(cmd);
-        return;
+        return true;
     }
-
-    if (name_is_image(ent->name)) {
-        espix_desktop_open_image(child);
-        return;
+    if (name_is_image(path)) {
+        espix_desktop_open_image(path);
+        return true;
     }
-
-    if (name_is_audio(ent->name)) {
-        espix_desktop_open_audio(child);
-        return;
+    if (name_is_audio(path)) {
+        espix_desktop_open_audio(path);
+        return true;
     }
-
-    if (name_is_video(ent->name)) {
-        espix_desktop_open_video(child);
-        return;
+    if (name_is_video(path)) {
+        espix_desktop_open_video(path);
+        return true;
     }
-
-    /* Anything else says so. Nothing here reads the file to decide what it is,
-     * so a file with an unknown extension is reported rather than guessed at. */
-    snprintf(s_status, sizeof(s_status), "%.64s: no handler yet", ent->name);
-    espix_window_repaint(s_win);
+    return false;
 }
 
 static void browser_go(const char *path)

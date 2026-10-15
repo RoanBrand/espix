@@ -72,9 +72,13 @@ typedef struct vctx {
     size_t           base, fill;        /* the read window: file offset, bytes */
     size_t           beg;               /* the frame's start within it */
     espix_surface_t *back;              /* decoded, not yet shown */
+    uint8_t         *next_jpg;          /* ...and its JPEG, when a viewer could take it */
+    size_t           next_len, next_cap;
 
     /* Shared, under s_vlock. */
     espix_surface_t *front;             /* what the window shows */
+    uint8_t         *front_jpg;         /* ...and its JPEG, or front_len 0 */
+    size_t           front_len, front_cap;
     espix_surface_t *fit;               /* front scaled to the window, or NULL */
     int              fw, fh;
     int              cur;
@@ -99,6 +103,7 @@ static char              s_err[96];
 static volatile int      s_frame_ms;
 static volatile int      s_fps;
 static int64_t           s_decode_us, s_paint_us;
+static uint32_t          s_dropped;
 static uint32_t          s_done;
 static int64_t           s_stat_at;
 
@@ -128,6 +133,8 @@ static void ctx_free(vctx_t *v)
         fclose(v->f);
     }
     heap_caps_free(v->buf);
+    heap_caps_free(v->next_jpg);
+    heap_caps_free(v->front_jpg);
     espix_surface_free(v->back);
     espix_surface_free(v->front);
     espix_surface_free(v->fit);
@@ -244,6 +251,74 @@ static bool video_read_frame(vctx_t *v, size_t from)
     }
 }
 
+/*
+ * Whether a viewer's own decoder can take this frame as it is: baseline or
+ * extended sequential, with its Huffman tables in the frame. MJPEG from some
+ * cameras leaves the tables out, which only an MJPEG-aware decoder accepts.
+ */
+static bool jpeg_standalone(const uint8_t *p, size_t n)
+{
+    bool   sof = false, dht = false;
+    size_t i   = 2;
+
+    while (i + 4 <= n && p[i] == 0xFF) {
+        const uint8_t m = p[i + 1];
+
+        if (m == 0xFF) {
+            i++;                        /* fill byte */
+            continue;
+        }
+        if (m == 0xDA) {
+            return sof && dht;          /* start of scan: the header is over */
+        }
+        if (m == 0xC0 || m == 0xC1) {
+            sof = true;
+        } else if (m >= 0xC2 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            return false;               /* progressive, lossless or arithmetic */
+        } else if (m == 0xC4) {
+            dht = true;
+        }
+        i += 2 + (((size_t)p[i + 2] << 8) | p[i + 3]);
+    }
+    return false;
+}
+
+/* Keep the frame in hand's bytes beside its pixels, for a viewer to take as-is. */
+static void video_keep_jpeg(vctx_t *v)
+{
+    const uint8_t *p = v->buf + v->beg;
+
+    v->next_len = 0;
+    if (!jpeg_standalone(p, v->len)) {
+        return;
+    }
+    if (v->next_cap < v->len) {
+        uint8_t *nb = heap_caps_realloc(v->next_jpg, v->len,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (nb == NULL) {
+            return;
+        }
+        v->next_jpg = nb;
+        v->next_cap = v->len;
+    }
+    memcpy(v->next_jpg, p, v->len);
+    v->next_len = v->len;
+}
+
+/* The kept bytes become the front's, with the pixels they belong to. */
+static void video_swap_jpeg(vctx_t *v)
+{
+    uint8_t     *b = v->front_jpg;
+    const size_t c = v->front_cap;
+
+    v->front_jpg = v->next_jpg;
+    v->front_len = v->next_len;
+    v->front_cap = v->next_cap;
+    v->next_jpg  = b;
+    v->next_cap  = c;
+    v->next_len  = 0;
+}
+
 /* Decode the frame in hand into the back buffer. */
 static bool video_decode(vctx_t *v)
 {
@@ -296,6 +371,8 @@ static vctx_t *video_load(const char *path)
     v->f = NULL;
 
     /* The first frame is both buffers' shape; the back gets its own copy. */
+    video_keep_jpeg(v);
+    video_swap_jpeg(v);
     v->front = v->back;
     v->back  = NULL;
     v->fw    = espix_surface_width(v->front);
@@ -399,6 +476,25 @@ static void video_overlay(espix_window_t *w, espix_canvas_t *c, int x, int y,
     vunlock();
 }
 
+/* The front frame's own JPEG, when it is shown unscaled; under the canvas lock. */
+static size_t video_overlay_jpeg(espix_window_t *w, void *ctx, uint8_t *out,
+                                 size_t cap)
+{
+    (void)w;
+    (void)ctx;
+
+    size_t n = 0;
+
+    vlock();
+    const vctx_t *v = s_ctx;
+    if (v != NULL && v->fit == NULL && v->front_len > 0 && v->front_len <= cap) {
+        memcpy(out, v->front_jpg, v->front_len);
+        n = v->front_len;
+    }
+    vunlock();
+    return n;
+}
+
 /* Tell the compositor where the picture is now. Under the desktop lock. */
 static void video_place(espix_window_t *w)
 {
@@ -407,6 +503,7 @@ static void video_place(espix_window_t *w)
     vunlock();
 
     espix_window_set_overlay(w, pic, pic.w > 0 ? video_overlay : NULL);
+    espix_window_set_overlay_jpeg(w, video_overlay_jpeg);
 }
 
 /* ------------------------------------------------------------------ */
@@ -564,10 +661,11 @@ static void video_stat(int cur)
     s_fps = (int)((int64_t)s_done * 1000000 / elapsed);
 
     espix_klog(ESPIX_KLOG_INFO, TAG,
-               "frame %d at %d fps (target %d): decode %d ms, swap %d ms",
-               cur, s_fps, s_rate,
+               "frame %d at %d fps (target %d, %u dropped): decode %d ms, swap %d ms",
+               cur, s_fps, s_rate, (unsigned)s_dropped,
                (int)(s_decode_us / n / 1000), (int)(s_paint_us / n / 1000));
 
+    s_dropped   = 0;
     s_decode_us = 0;
     s_paint_us  = 0;
     s_done      = 0;
@@ -645,10 +743,13 @@ static void video_task(void *arg)
             continue;
         }
 
+        video_keep_jpeg(v);
+
         vlock();
         espix_surface_t *shown = v->front;
         v->front = v->back;
         v->back  = shown;
+        video_swap_jpeg(v);
         if (v->fit != NULL) {
             (void)espix_surface_scale(v->fit, v->front);
         }
@@ -678,9 +779,23 @@ static void video_task(void *arg)
         s_frame_ms = (int)((esp_timer_get_time() - t0) / 1000);
         video_stat(cur);
 
-        /* Pace to the target without accumulating a debt. */
-        next += 1000000 / (s_rate > 0 ? s_rate : 1);
-        const int64_t now = esp_timer_get_time();
+        /* Pace to the target; when decode cannot keep up, skip frames to hold time. */
+        const int64_t period = 1000000 / (s_rate > 0 ? s_rate : 1);
+        int64_t       now    = esp_timer_get_time();
+
+        int skipped = 0;
+
+        next += period;
+        while (now - next >= period && video_read_frame(v, v->off + v->len)) {
+            next += period;
+            skipped++;
+        }
+        if (skipped > 0) {
+            s_dropped += (uint32_t)skipped;
+            vlock();
+            v->cur += skipped;
+            vunlock();
+        }
 
         if (next > now) {
             (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((next - now + 999) / 1000));

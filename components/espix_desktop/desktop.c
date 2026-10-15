@@ -88,6 +88,7 @@ struct espix_window {
     espix_rect_t     rest;
     espix_rect_t     ov;        /* the overlay, window coordinates; empty: none */
     espix_window_overlay_fn ov_fn;
+    espix_window_overlay_jpeg_fn ov_jpeg;
 };
 
 /* Bottom first, top last: the array *is* the z-order. */
@@ -241,6 +242,30 @@ bool espix_desktop_post(espix_desktop_fn_t fn, void *arg)
     }
     const desk_msg_t m = { .kind = DESK_CALL, .u.call = { fn, arg } };
     return desk_post(&m);
+}
+
+static void desk_open_call(void *arg)
+{
+    char *path = arg;
+
+    if (desktop_on_screen() && !espix_browser_open_file(path)) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no handler", path);
+    }
+    free(path);
+}
+
+bool espix_desktop_open(const char *path)
+{
+    char *copy = (path != NULL) ? strdup(path) : NULL;
+
+    if (copy == NULL) {
+        return false;
+    }
+    if (!espix_desktop_post(desk_open_call, copy)) {
+        free(copy);
+        return false;
+    }
+    return true;
 }
 
 static void desk_post_pointer(const espix_input_event_t *ev)
@@ -870,21 +895,62 @@ static void window_compose(espix_canvas_t *c, espix_window_t *w, espix_rect_t r)
     }
 }
 
-/* The topmost window's overlay, if it has one: what the encoder may send as a picture. */
-static espix_rect_t photo_rect(void)
+static bool rects_overlap(espix_rect_t a, espix_rect_t b);
+static bool s_menu;
+
+/* The topmost visible window, if its overlay is what the encoder may send as a picture. */
+static espix_window_t *photo_window(void)
 {
     for (int i = s_nwin - 1; i >= 0; i--) {
-        const espix_window_t *w = s_wins[i];
+        espix_window_t *w = s_wins[i];
         if (w->hidden) {
             continue;
         }
-        const espix_rect_t ov = window_ov(w);
-        if (ov.w > 0) {
-            return ov;
-        }
-        return (espix_rect_t){ 0, 0, 0, 0 };   /* something else is on top */
+        return window_ov(w).w > 0 ? w : NULL;
     }
-    return (espix_rect_t){ 0, 0, 0, 0 };
+    return NULL;
+}
+
+/* The canvas's call, under its lock: the overlay's own JPEG, unless the cursor is on it. */
+static size_t photo_jpeg(void *ctx, uint8_t *out, size_t cap)
+{
+    espix_window_t    *w  = ctx;
+    const espix_rect_t ov = window_ov(w);
+    const espix_rect_t cb = { s_cx - 1, s_cy - 1, CUR_BW, CUR_BH };
+
+    if (w->ov_jpeg == NULL || (s_cursor_on && rects_overlap(cb, ov))) {
+        return 0;
+    }
+    return w->ov_jpeg(w, w->ctx, out, cap);
+}
+
+/* Publish the picture the encoder may use, or nothing. Canvas lock held. */
+static void photo_publish(espix_canvas_t *c)
+{
+    espix_window_t *w = photo_window();
+
+    if (w == NULL) {
+        espix_canvas_set_photo(c, (espix_rect_t){ 0, 0, 0, 0 }, NULL, NULL);
+        return;
+    }
+    const espix_rect_t ov = window_ov(w);
+    /* Something drawn over the picture means its own JPEG is not what is shown. */
+    const bool clear = !(s_menu && rects_overlap(menu_rect(), ov))
+                       && !rects_overlap(bar_rect(), ov);
+
+    espix_canvas_set_photo(c, ov, clear ? photo_jpeg : NULL, w);
+}
+
+/* Before a window goes: the canvas must not keep a pointer to it. */
+static void photo_forget(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+
+    if (c != NULL) {
+        espix_canvas_lock(c);
+        espix_canvas_set_photo(c, (espix_rect_t){ 0, 0, 0, 0 }, NULL, NULL);
+        espix_canvas_unlock(c);
+    }
 }
 
 static void desktop_repair_locked(espix_rect_t r)
@@ -931,7 +997,7 @@ static void desktop_repair_locked(espix_rect_t r)
      * the screen goes under the bar, which is what makes it a bar. */
     taskbar_paint(c, r);
     menu_paint(c, r);
-    espix_canvas_set_photo(c, photo_rect());
+    photo_publish(c);
 
     int px = 0, py = 0;
     espix_display_pointer(&px, &py);
@@ -1015,6 +1081,7 @@ void espix_window_free(espix_window_t *w)
     if (w == NULL) {
         return;
     }
+    photo_forget();
     for (int i = 0; i < s_nwin; i++) {
         if (s_wins[i] != w) {
             continue;
@@ -1045,6 +1112,13 @@ void espix_window_set_overlay(espix_window_t *w, espix_rect_t r,
     desk_lock();
     w->ov    = (fn != NULL) ? r : (espix_rect_t){ 0, 0, 0, 0 };
     w->ov_fn = fn;
+    desk_unlock();
+}
+
+void espix_window_set_overlay_jpeg(espix_window_t *w, espix_window_overlay_jpeg_fn fn)
+{
+    desk_lock();
+    w->ov_jpeg = fn;
     desk_unlock();
 }
 
@@ -3541,6 +3615,7 @@ static void windows_create(void)
 
 static void windows_destroy(void)
 {
+    photo_forget();
     /* Before the windows, not with them: the shell task is drawing into the
      * terminal window's surface, and term_stop() is what makes it stop. */
     for (term_win_t *tw = s_terms; tw != NULL; tw = tw->next) {

@@ -113,7 +113,18 @@ static UINT jpeg_out(JDEC *jd, void *bitmap, JRECT *rect)
     return 1;
 }
 
+/*
+ * TJpgDec into `into` when it is exactly the picture's size, or into a new
+ * surface otherwise. Returns the surface it wrote, or NULL.
+ */
+static espix_surface_t *jpeg_sw_to(espix_surface_t *into, const uint8_t *jpg, size_t len);
+
 static espix_surface_t *jpeg_sw(const uint8_t *jpg, size_t len)
+{
+    return jpeg_sw_to(NULL, jpg, len);
+}
+
+static espix_surface_t *jpeg_sw_to(espix_surface_t *into, const uint8_t *jpg, size_t len)
 {
     espix_surface_t *s    = NULL;
     void            *pool = NULL;
@@ -143,7 +154,12 @@ static espix_surface_t *jpeg_sw(const uint8_t *jpg, size_t len)
         goto done;
     }
 
-    s = espix_surface_new((int)jd.width, (int)jd.height);
+    if (into != NULL && espix_surface_width(into) == (int)jd.width
+        && espix_surface_height(into) == (int)jd.height) {
+        s = into;
+    } else {
+        s = espix_surface_new((int)jd.width, (int)jd.height);
+    }
     if (s == NULL) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "no room for a %ux%u image",
                    (unsigned)jd.width, (unsigned)jd.height);
@@ -156,7 +172,9 @@ static espix_surface_t *jpeg_sw(const uint8_t *jpg, size_t len)
     r = jd_decomp(&jd, jpeg_out, 0);        /* 0: no descaling */
     if (r != JDR_OK) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "decode failed (%d)", (int)r);
-        espix_surface_free(s);
+        if (s != into) {
+            espix_surface_free(s);
+        }
         s = NULL;
     }
 
@@ -373,6 +391,11 @@ static size_t   s_enc_in_px;
 static uint8_t *s_enc_out;
 static size_t   s_enc_out_cap;
 
+bool espix_display_jpeg_can_encode(void)
+{
+    return true;
+}
+
 espix_px_t *espix_display_jpeg_input(size_t pixels)
 {
     if (pixels == 0) {
@@ -525,9 +548,10 @@ static esp_err_t jpeg_hw_into(espix_surface_t *dst, const uint8_t *jpg, size_t l
         .conv_std      = JPEG_YUV_RGB_CONV_STD_BT601,
     };
 
-    const uint32_t bytes = (uint32_t)((size_t)espix_surface_width(dst)
-                                      * (size_t)espix_surface_height(dst)
-                                      * sizeof(espix_px_t));
+    /* Whole cache lines, as surfaces are allocated: the codec invalidates the output. */
+    const uint32_t bytes = (uint32_t)(((size_t)espix_surface_width(dst)
+                                       * (size_t)espix_surface_height(dst)
+                                       * sizeof(espix_px_t) + 127) & ~(size_t)127);
     uint32_t got = 0;
 
     if (espix_dma2d_take(pdMS_TO_TICKS(JPEG_DMA_WAIT_MS))) {
@@ -567,6 +591,11 @@ espix_px_t *espix_display_jpeg_input(size_t pixels)
 {
     (void)pixels;
     return NULL;
+}
+
+bool espix_display_jpeg_can_encode(void)
+{
+    return false;
 }
 
 size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
@@ -617,9 +646,12 @@ esp_err_t espix_image_jpeg_into(espix_surface_t *dst, const uint8_t *jpg, size_t
         return ESP_OK;
     }
 
-    espix_surface_t *tmp = jpeg_sw(jpg, len);
+    espix_surface_t *tmp = jpeg_sw_to(dst, jpg, len);
     if (tmp == NULL) {
         return ESP_FAIL;
+    }
+    if (tmp == dst) {
+        return ESP_OK;                      /* decoded in place */
     }
 
     const int w = espix_surface_width(tmp);

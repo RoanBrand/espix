@@ -143,8 +143,14 @@ void   espix_canvas_damage(espix_canvas_t *c, espix_rect_t r);
 typedef void (*espix_display_damage_hook_t)(void);
 
 /* Where the owner knows a moving picture is (canvas coordinates, or empty); under the canvas lock. */
-void         espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r);
+/* The picture's own JPEG, exactly the photo rectangle: copies it to `out` and returns its
+ * length, or 0 when it cannot stand in for the canvas right now. Under the canvas lock. */
+typedef size_t (*espix_canvas_photo_jpeg_fn)(void *ctx, uint8_t *out, size_t cap);
+
+void         espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r,
+                                    espix_canvas_photo_jpeg_fn fn, void *ctx);
 espix_rect_t espix_canvas_photo(const espix_canvas_t *c);
+size_t       espix_canvas_photo_jpeg(const espix_canvas_t *c, uint8_t *out, size_t cap);
 
 void   espix_display_set_damage_hook(espix_display_damage_hook_t fn);
 size_t espix_canvas_damage_take(espix_canvas_t *c, espix_rect_t *out, size_t max);
@@ -320,6 +326,9 @@ esp_err_t espix_image_jpeg_into(espix_surface_t *dst, const uint8_t *jpg,
  * Returns the bytes written, or 0 when there is no encoder on this target.
  */
 espix_px_t *espix_display_jpeg_input(size_t pixels);
+
+/* Whether this target can encode JPEG at all; the S3 cannot. */
+bool        espix_display_jpeg_can_encode(void);
 size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
                                  size_t out_cap);
 
