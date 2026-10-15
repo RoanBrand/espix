@@ -114,6 +114,10 @@
 #define READ_STALL_LIMIT (STALL_LIMIT * POLL_US / TICK_US)
 #define OUT_CAP        (64 * 1024)    /* encode buffer, flushed to the socket */
 
+/* The PPA's cache-line requirement, for the staging buffers it may be asked to
+ * write into. Same number as display.c's BUF_ALIGN, and for the same reason. */
+#define RFB_ALIGN      128
+
 /* VNC uses the first eight characters of a password and ignores the rest. */
 #define VNC_PW_MAX 8
 
@@ -442,6 +446,28 @@ static bool write_start(int fd, const void *buf, size_t n)
     return write_full(fd, (const uint8_t *)buf + w, n - (size_t)w);
 }
 
+/*
+ * Wait until the socket will take at least one byte, or the deadline passes.
+ *
+ * Why not the socket's own send timeout: it is set -- SO_SNDTIMEO, a quarter of
+ * a second, and the setsockopt is checked now -- and it is not honoured on this
+ * path. Measured: a client that asked for a full frame and then stopped reading
+ * left send() inside the stack for thirty-two seconds and counting, so the retry
+ * limit below never saw the EAGAIN that it counts. select() asks the question
+ * the timeout was supposed to answer, and it sleeps rather than spins: a healthy
+ * peer is writable immediately, so this is one extra syscall per send.
+ */
+static bool writable_within(int fd, int us)
+{
+    fd_set         w;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = us };
+
+    FD_ZERO(&w);
+    FD_SET(fd, &w);
+
+    return select(fd + 1, NULL, &w, NULL, &tv) > 0;
+}
+
 static bool write_full(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
@@ -449,6 +475,20 @@ static bool write_full(int fd, const void *buf, size_t n)
     const int64_t  t0 = esp_timer_get_time();
 
     while (n > 0) {
+        if (!writable_within(fd, POLL_US)) {
+            /*
+             * Not draining. Retry while it is merely slow, but only for as long
+             * as the whole write may take -- this task is also the one that
+             * accepts the next client, so a viewer that has stopped reading
+             * must not be able to hold the door shut.
+             */
+            if (!s_run || ++stalls > STALL_LIMIT) {
+                s_q.stalls += (uint32_t)stalls;
+                return false;
+            }
+            continue;
+        }
+
         const ssize_t w = send(fd, p, n, 0);
         if (w > 0) {
             p += w;
@@ -460,8 +500,9 @@ static bool write_full(int fd, const void *buf, size_t n)
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* The peer stopped draining. Retry while it is merely slow. */
+            /* Ready and still refused: count it like a timeout. */
             if (!s_run || ++stalls > STALL_LIMIT) {
+                s_q.stalls += (uint32_t)stalls;
                 return false;
             }
             continue;
@@ -475,6 +516,71 @@ static bool write_full(int fd, const void *buf, size_t n)
         s_q.waited_us += (uint64_t)(esp_timer_get_time() - t0);
     }
     return true;
+}
+
+/*
+ * What the serving task is doing, so that a task which stops making progress
+ * says where it stopped.
+ *
+ * Written by that task and read by a timer of its own, because the one thing a
+ * wedged task cannot do is report on itself. This exists because "the client
+ * cannot reconnect until the board is restarted" reproduced five times and left
+ * no trace whatsoever: the last line in the log was always whatever happened
+ * before the stall, and the stall is invisible by definition. It reports only
+ * the states that are meant to be brief -- a handshake, handling a request,
+ * sending an update -- so a quiet client sitting on an idle connection (which
+ * is normal) says nothing.
+ */
+enum {
+    VNC_IDLE, VNC_ACCEPT, VNC_HANDSHAKE, VNC_WAIT, VNC_HANDLING,
+    VNC_CANVAS, VNC_SENDING,
+};
+
+static volatile int       s_state = VNC_IDLE;
+static volatile int64_t   s_state_at;
+static esp_timer_handle_t s_state_timer;
+
+static const char *const s_state_name[] = {
+    "idle", "waiting to accept", "in the handshake", "waiting for a request",
+    "handling a request", "waiting for the canvas", "sending an update",
+};
+
+static void vnc_state(int st)
+{
+    s_state    = st;
+    s_state_at = esp_timer_get_time();
+}
+
+/* Every five seconds, if the task has been in a state that should be brief for
+ * more than two, say so and how long. */
+static void vnc_state_tick(void *arg)
+{
+    (void)arg;
+
+    const int64_t stuck = esp_timer_get_time() - s_state_at;
+
+    if (s_state != VNC_HANDSHAKE && s_state != VNC_HANDLING
+        && s_state != VNC_CANVAS && s_state != VNC_SENDING) {
+        return;
+    }
+    if (stuck < 2000000) {
+        return;
+    }
+    if (s_state == VNC_CANVAS) {
+        espix_canvas_t *cv = espix_display_canvas();
+        void           *h  = (cv != NULL) ? espix_canvas_holder(cv) : NULL;
+
+        espix_klog(ESPIX_KLOG_WARN, TAG,
+                   "stuck: %s for %lld ms, held by %s (client %s)",
+                   s_state_name[s_state], (long long)(stuck / 1000),
+                   h != NULL ? pcTaskGetName((TaskHandle_t)h) : "nobody",
+                   s_peer[0] != '\0' ? s_peer : "gone");
+        return;
+    }
+
+    espix_klog(ESPIX_KLOG_WARN, TAG, "stuck: %s for %lld ms (client %s)",
+               s_state_name[s_state], (long long)(stuck / 1000),
+               s_peer[0] != '\0' ? s_peer : "gone");
 }
 
 /* An encode buffer that flushes itself, so a rectangle is a handful of sends
@@ -1589,16 +1695,25 @@ static bool send_desktop_size_old(rfb_conn_t *c, int w, int h)
  */
 static bool connection_resize(rfb_conn_t *c, int w, int h)
 {
-    espix_px_t *stage = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
-                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t    *row   = heap_caps_malloc((size_t)w * 4,
-                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /*
+     * Cache-line aligned, because the PPA will not take it otherwise: the
+     * staging copy is the largest single item in an update, and the hardware
+     * does it three times faster than the loop -- but only from an aligned
+     * buffer. See the guard in ppa_blit_rect().
+     */
+    espix_px_t *stage = heap_caps_aligned_alloc(RFB_ALIGN,
+                                                (size_t)w * h * sizeof(espix_px_t),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t    *row   = heap_caps_aligned_alloc(RFB_ALIGN, (size_t)w * 4,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (stage == NULL) {
-        stage = heap_caps_malloc((size_t)w * h * sizeof(espix_px_t),
-                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        stage = heap_caps_aligned_alloc(RFB_ALIGN,
+                                        (size_t)w * h * sizeof(espix_px_t),
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (row == NULL) {
-        row = heap_caps_malloc((size_t)w * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        row = heap_caps_aligned_alloc(RFB_ALIGN, (size_t)w * 4,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (stage == NULL || row == NULL) {
         heap_caps_free(stage);
@@ -1626,6 +1741,8 @@ static bool connection_resize(rfb_conn_t *c, int w, int h)
 
 static bool update_send(rfb_conn_t *c)
 {
+    vnc_state(VNC_CANVAS);              /* the lock and the copy out */
+
     const int64_t  t0 = esp_timer_get_time();
     int64_t        t_canvas;
     int64_t        t_sent;
@@ -1813,6 +1930,7 @@ static bool update_send(rfb_conn_t *c)
         espix_canvas_copy_rect(cv, r, c->stage, cw, ch, cw, r.x, r.y);
     }
     espix_canvas_unlock(cv);
+    vnc_state(VNC_SENDING);             /* now the encoding and the wire */
     t_canvas = esp_timer_get_time();
     if (t_cls == 0) {
         t_cls = t_pick;                 /* nothing was classified */
@@ -2479,6 +2597,8 @@ static void rfb_serve(int fd)
     while (s_run) {
         uint8_t type;
 
+        vnc_state(VNC_WAIT);
+
         /*
          * Owed an update, poll at the tick so a change another task made goes
          * out promptly. Not owed one, sleep on the socket: there is nothing to
@@ -2497,6 +2617,7 @@ static void rfb_serve(int fd)
             }
             break;
         }
+        vnc_state(VNC_HANDLING);
         if (!rfb_handle(&c, type)) {
             break;
         }
@@ -2504,6 +2625,7 @@ static void rfb_serve(int fd)
 
     s_clients = 0;
     s_peer[0] = '\0';
+    vnc_state(VNC_HANDSHAKE);           /* tearing this client down */
     espix_display_viewer_detached();
     espix_klog(ESPIX_KLOG_INFO, TAG, "client disconnected");
     latency_want(false);
@@ -2525,16 +2647,27 @@ static void rfb_task(void *arg)
      * kernel log echoes, so INFO here printed the same line twice. */
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "listening on port %u", s_port);
 
+    if (s_state_timer == NULL) {
+        const esp_timer_create_args_t ta = { .callback = vnc_state_tick,
+                                             .name     = "vnc-state" };
+
+        if (esp_timer_create(&ta, &s_state_timer) == ESP_OK) {
+            (void)esp_timer_start_periodic(s_state_timer, 5 * 1000 * 1000);
+        }
+    }
+
     while (s_run) {
         struct sockaddr_in peer;
         socklen_t          plen = sizeof(peer);
 
+        vnc_state(VNC_ACCEPT);
         const int fd = accept(s_listen_fd, (struct sockaddr *)&peer, &plen);
         if (fd < 0) {
             /* SO_RCVTIMEO makes this the normal idle path, not an error. */
             continue;
         }
 
+        vnc_state(VNC_HANDSHAKE);
         if (espix_shutdown_started()) {
             /* RFB has no "the server is leaving" message -- the protocol has no
              * such notion -- so a close is the whole goodbye. */
@@ -2567,9 +2700,25 @@ static void rfb_task(void *arg)
      * default: the only thing this connection receives is pointer events.
      */
 
+        /*
+         * The socket's timeouts -- and the answers to them.
+         *
+         * These are what the stall handling below rests on: a blocking send()
+         * that never returns EAGAIN cannot be counted, so a client that stops
+         * reading wedges the serving task and the accept loop with it. lwIP
+         * only implements these two when CONFIG_LWIP_SO_RCVTIMEO and
+         * CONFIG_LWIP_SO_SNDTIMEO are set; otherwise it returns an error that
+         * used to go in the bin, and the failure stays silent until a client
+         * dies.
+         */
         const struct timeval io = { .tv_sec = 0, .tv_usec = POLL_US };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io, sizeof(io));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io, sizeof(io));
+
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io, sizeof(io)) != 0
+            || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io, sizeof(io)) != 0) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "socket timeouts refused: a dead client will not be "
+                       "noticed (CONFIG_LWIP_SO_*TIMEO)");
+        }
 
         snprintf(s_peer, sizeof(s_peer), "%s:%u",
                  inet_ntoa(peer.sin_addr), (unsigned)ntohs(peer.sin_port));

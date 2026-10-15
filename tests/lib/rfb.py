@@ -139,6 +139,11 @@ class Rfb:
         # rectangle landed -- which is fine for the question this mode exists to
         # answer, which is what Tight costs the *server* in bytes and updates.
         self.tight = tight
+        # Write each Tight JPEG out where a real decoder can be pointed at it.
+        # The server's bytes are the one thing a client that skips payloads
+        # cannot judge, and a JPEG a viewer cannot decode is a frozen screen.
+        self.dump_jpeg = None
+        self._jpeg_n = 0
         # Set to (w, h) by the ExtendedDesktopSize handler when the server
         # changes the size, so a caller can notice without polling.
         self.resized = None
@@ -363,6 +368,10 @@ class Rfb:
             # have to agree, and a codec working in 16-pixel blocks can make
             # them disagree for a rectangle that is not a multiple of one.
             jw, jh = self._jpeg_size(data)
+            if self.dump_jpeg and self._jpeg_n < 40:
+                with open("%s-%03d.jpg" % (self.dump_jpeg, self._jpeg_n), "wb") as fh:
+                    fh.write(data)
+                self._jpeg_n += 1
             if (jw, jh) != (w, h):
                 self.wire["tight"]["mismatch"] = \
                     self.wire["tight"].get("mismatch", []) + [(w, h, jw, jh)]

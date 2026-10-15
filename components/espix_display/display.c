@@ -345,6 +345,18 @@ void espix_canvas_unlock(espix_canvas_t *c)
     }
 }
 
+/*
+ * Who holds the canvas, or NULL when nobody does.
+ *
+ * For a diagnostic: a task waiting on this lock says nothing about why, and
+ * the answer is always another task. FreeRTOS records the holder for a mutex,
+ * so the question is answerable rather than a guess.
+ */
+void *espix_canvas_holder(const espix_canvas_t *c)
+{
+    return (void *)xSemaphoreGetMutexHolder(c->lock);
+}
+
 /* Called by the process layer when a process died still holding the lock. */
 void espix_canvas_orphan(espix_canvas_t *c)
 {
@@ -717,6 +729,20 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
     /* The guard PPA does not have. An unaligned base is a driver error, and
      * the loop below is the right answer rather than a slow one. */
     if (((uintptr_t)src & (BUF_ALIGN - 1)) != 0) {
+        return false;
+    }
+    /*
+     * And the same guard for the destination, which was missing and mattered.
+     *
+     * The driver does check it -- and logs an error when it does not hold,
+     * which is not the same thing as refusing: espix's own staging buffer was
+     * a plain allocation, every rectangle the server sent went into the PPA
+     * with an unaligned output, and after a few of those the desktop stopped
+     * opening its own Start menu and the board had to be rebooted. Asking the
+     * hardware and being refused is not a fallback; not asking is.
+     */
+    if (((uintptr_t)dst & (BUF_ALIGN - 1)) != 0
+        || (buf_size(dw, dh) & (BUF_ALIGN - 1)) != 0) {
         return false;
     }
     if (!ppa_ready(PPA_OPERATION_SRM, &s_ppa_srm)) {
