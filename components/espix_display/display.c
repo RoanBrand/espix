@@ -665,6 +665,36 @@ static uint32_t rgb565_to_rgb888(espix_px_t v)
             ((b << 3) | (b >> 2));
 }
 
+/*
+ * One PPA engine, one caller at a time.
+ *
+ * The client is not re-entrant and the driver does not say so. It is called
+ * from the desktop -- window-surface blits in window_paint(), canvas fills --
+ * and from the RFB server's staging copy, and those are different tasks whose
+ * locks do not intersect: the canvas lock does not cover a surface blit, which
+ * happens before the repair that takes it. Two blocking transactions
+ * overlapping on one client is the hazard the accelerator's own documentation
+ * warns about, and its shape here was a task that sat inside the canvas phase
+ * for thirty seconds, holding the canvas, with every other task behind it.
+ */
+static SemaphoreHandle_t s_ppa_lock;
+
+static bool ppa_lock_take(void)
+{
+    if (s_ppa_lock == NULL) {
+        s_ppa_lock = xSemaphoreCreateMutex();
+        if (s_ppa_lock == NULL) {
+            return false;               /* no lock: do it in software */
+        }
+    }
+    return xSemaphoreTake(s_ppa_lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void ppa_lock_give(void)
+{
+    xSemaphoreGive(s_ppa_lock);
+}
+
 static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
                           espix_rect_t r, espix_px_t v)
 {
@@ -696,7 +726,13 @@ static bool ppa_fill_rect(espix_px_t *px, int w, int h, int stride,
         .fill_color_val = rgb565_to_rgb888(v),
         .mode           = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_fill(s_ppa_fill, &cfg) == ESP_OK;
+    if (!ppa_lock_take()) {
+        return false;
+    }
+    const bool ok = ppa_do_fill(s_ppa_fill, &cfg) == ESP_OK;
+
+    ppa_lock_give();
+    return ok;
 }
 
 /*
@@ -782,7 +818,13 @@ static bool ppa_blit_rect(espix_px_t *dst, int dw, int dh, int dstride,
         .scale_y        = 1.0f,
         .mode           = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+    if (!ppa_lock_take()) {
+        return false;
+    }
+    const bool ok = ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+
+    ppa_lock_give();
+    return ok;
 }
 
 /*
@@ -817,12 +859,24 @@ bool espix_canvas_copy_rect(const espix_canvas_t *c, espix_rect_t r,
         return false;
     }
 
-#if SOC_PPA_SUPPORTED
-    if (ppa_blit_rect(dst, dw, dh, dstride, dx, dy,
-                      c->px, r.x, r.y, r.w, r.h, c->w)) {
-        return true;
-    }
-#endif
+    /*
+     * Software, and no PPA, and that is a fix rather than a choice.
+     *
+     * This copy used ppa_blit_rect() first: it is three times faster in the
+     * benchmark, and it is a blocking transaction, and on this board it
+     * sometimes never returns. Measured: the server inside this phase for
+     * fifty-five seconds and counting, holding the canvas lock, with the
+     * desktop -- its input handler, its repaints, the Start menu -- behind it
+     * for the whole of it. That is the freeze, and it was mine: the call was
+     * added with the Tight work and it hits any update with a large rectangle,
+     * which is every first frame and every menu.
+     *
+     * The accelerator is still worth having here, but not like this: it needs
+     * the non-blocking mode with a completion callback and a timeout, so a
+     * transaction that does not finish degrades to this loop instead of
+     * taking the board with it. Until that exists, the loop is what runs.
+     */
+    (void)dw; (void)dh; (void)dstride; (void)dx; (void)dy;
 
     for (int y = 0; y < r.h; y++) {
         memcpy(dst + (size_t)(dy + y) * dstride + dx,
@@ -873,7 +927,13 @@ static bool ppa_scale_rect(espix_px_t *dst, int dw, int dh,
         .scale_y        = (float)dh / (float)sh,
         .mode           = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+    if (!ppa_lock_take()) {
+        return false;
+    }
+    const bool ok = ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+
+    ppa_lock_give();
+    return ok;
 }
 
 /*
@@ -923,7 +983,13 @@ static bool ppa_convert_rect(const espix_px_t *src, int w, int h, void *dst)
         .scale_y        = 1.0f,
         .mode           = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+    if (!ppa_lock_take()) {
+        return false;
+    }
+    const bool ok = ppa_do_scale_rotate_mirror(s_ppa_srm, &cfg) == ESP_OK;
+
+    ppa_lock_give();
+    return ok;
 }
 
 /* The conversion as a benchmark row: software expansion against PPA SRM. */

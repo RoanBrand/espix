@@ -23,6 +23,9 @@
 
 #include "esp_timer.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "espix_audio.h"
 #include "espix_audio_sink.h"
 #include "espix_bt.h"
@@ -30,6 +33,7 @@
 #include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
+#include "espix_task.h"
 #include "espix_widgets.h"
 
 #define TAG "settings"
@@ -163,6 +167,10 @@ static void canvas_size(int *w, int *h)
  */
 static esp_timer_handle_t s_state_timer;
 static char               s_state_last[24];
+
+/* The task the panel's data is refreshed on, so the input handler never waits
+ * on another stack; see settings_refresh(). */
+static TaskHandle_t       s_refresh_task;
 
 static void state_tick(void *arg)
 {
@@ -776,6 +784,63 @@ static void settings_key(espix_window_t *w, uint32_t keysym, bool down, void *ct
 /* The window                                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Refreshing the panel's data must not happen in the input handler.
+ *
+ * It did: espix_settings_open() called refresh_network() and
+ * refresh_bluetooth() from menu_activate(), which runs inside
+ * desktop_input_locked() with the desktop lock held. Both are queries into
+ * other stacks, and a query that never answers -- a Bluetooth controller that
+ * has stopped responding, which this board has done before -- took the desktop
+ * with it: the Start menu stayed open because s_menu = false comes after the
+ * call that never returned, the pointer stopped moving because the input
+ * handler owns the lock, no update could be composited, and the client timed
+ * out. Nothing in this code had to change for that to start happening; a query
+ * only had to block once, and then every click on Settings blocks.
+ *
+ * So it is a task of its own, asked for and never waited on. If a query blocks,
+ * the panel shows what it had and the desktop carries on -- which is the whole
+ * difference between a stale row and a dead board.
+ */
+static volatile bool s_refresh_want;
+
+static void settings_refresh_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        if (!s_refresh_want) {
+            continue;
+        }
+        s_refresh_want = false;
+
+        refresh_network();
+        refresh_bluetooth();
+
+        if (s_win != NULL) {
+            espix_window_repaint(s_win);    /* it takes the lock itself */
+        }
+    }
+}
+
+static void settings_refresh(void)
+{
+    if (s_refresh_task == NULL
+        && espix_kthread_start(&(const espix_kthread_t){
+               .name = "espix:set-ref", .fn = settings_refresh_task,
+               .arg = NULL, .stack = 4096, .priority = 2,
+               .core = tskNO_AFFINITY }, &s_refresh_task) != ESP_OK) {
+        /* No task to ask: do it here, which is where it was, and hope. */
+        s_refresh_task = NULL;
+        refresh_network();
+        refresh_bluetooth();
+        return;
+    }
+    s_refresh_want = true;
+}
+
 espix_window_t *espix_settings_open(void)
 {
     if (s_win == NULL) {
@@ -790,8 +855,7 @@ espix_window_t *espix_settings_open(void)
         espix_window_set_key(s_win, settings_key);
         espix_window_set_pointer(s_win, settings_pointer);
 
-        refresh_network();
-        refresh_bluetooth();
+        settings_refresh();             /* on its own task, never here */
         state_timer_start();
         espix_window_repaint(s_win);
     }

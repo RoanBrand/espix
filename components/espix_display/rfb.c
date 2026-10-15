@@ -87,7 +87,10 @@
 
 #define TAG "vnc"
 
-#define LISTEN_BACKLOG 1
+/* More than one: with a single pending connection and nobody accepting it
+ * yet, the stack will not complete another handshake, so a second viewer sits
+ * at "connecting" rather than queueing -- which looks like the network. */
+#define LISTEN_BACKLOG 4
 #define POLL_US        (250 * 1000)   /* send and accept timeout */
 #define STALL_LIMIT    40             /* * POLL_US before a peer is gone */
 
@@ -95,6 +98,11 @@
  * is legitimately quiet, so this is a log line and not a disconnect: what it
  * answers is whether "unreachable board" is a client that never asks again. */
 #define DEFER_LIMIT    40             /* quarter-seconds a frame may stay owed */
+
+/* Answered and then silent for this long means the client is gone; see the
+ * liveness test in the serve loop, which is only sound because an update is
+ * always sent in reply. */
+#define LIVENESS_US    (30 * 1000 * 1000)
 
 /*
  * How long a change made by *another task* may wait to be sent.
@@ -1268,6 +1276,8 @@ typedef struct {
     int       qlevel;         /* the level to use, 0-9; -1 when none was offered */
     bool      pending;        /* an update is owed to the client */
 uint32_t  deferred;       /* frames abandoned because the socket was full */
+int64_t   last_empty_us;  /* when the client was last answered with nothing */
+int64_t   last_rx_us;     /* when anything at all was last heard from it */
     bool      pending_full;   /* ...and it asked for a whole frame */
     bool      copyrect;       /* ...and it can be told to move pixels itself */
     bool      eds;            /* ...and it can be resized without reconnecting */
@@ -1753,6 +1763,36 @@ static bool connection_resize(rfb_conn_t *c, int w, int h)
                   : send_desktop_size_old(c, w, h);
 }
 
+/*
+ * Answer a request for something that has not changed, with an update that
+ * carries no rectangles.
+ *
+ * This is what makes a client's silence mean something. A viewer sends a
+ * request and waits; with nothing to send this server used to say nothing, so
+ * a quiet client and a client that had gone were the same thing from in here:
+ * there was no write that could fail and no read that would return, and the
+ * viewer's own patience ran out first (measured: sixty seconds, then it
+ * disconnects). Four zero bytes say "nothing changed" -- and, twice a second at
+ * worst, they are also the write that fails when the client is no longer
+ * there, which is the liveness signal this loop never had.
+ *
+ * A *full* request never reaches here: that asks for the whole screen and is
+ * answered with the whole screen.
+ */
+static bool update_send_empty(rfb_conn_t *c)
+{
+    const int64_t now = esp_timer_get_time();
+
+    if (now - c->last_empty_us < 500000) {
+        return true;                    /* owed, and answered recently */
+    }
+    c->last_empty_us = now;
+
+    const uint8_t hdr[4] = { 0, 0, 0, 0 };   /* FramebufferUpdate, no rects */
+
+    return write_full(c->fd, hdr, sizeof(hdr));
+}
+
 static bool update_send(rfb_conn_t *c)
 {
     vnc_state(VNC_CANVAS);              /* the lock and the copy out */
@@ -1803,7 +1843,7 @@ static bool update_send(rfb_conn_t *c)
 
     if (n == 0 && nmove == 0) {
         espix_canvas_unlock(cv);
-        return true;                        /* nothing changed; stay owed */
+        return update_send_empty(c);
     }
 
     RFB_MARK_START(RFB_MARK_CANVAS);
@@ -2634,6 +2674,7 @@ static void rfb_serve(int fd)
     espix_canvas_unlock(cv);
 
     s_clients = 1;
+    c.last_rx_us = esp_timer_get_time();
     espix_klog(ESPIX_KLOG_INFO, TAG, "client connected from %s", s_peer);
     latency_want(true);
 
@@ -2663,12 +2704,32 @@ static void rfb_serve(int fd)
                 if (c.pending && !update_send(&c)) {
                     break;
                 }
+
+                /*
+                 * Answered, and then not a word back.
+                 *
+                 * This is a liveness test only because of update_send_empty():
+                 * a viewer keeps a request outstanding and sends the next one
+                 * the moment it is answered, so a client that has been replied
+                 * to and stays silent is not a quiet client, it is a gone one.
+                 * Before empty updates existed this would have been wrong --
+                 * silence was the normal state of a static screen -- and a
+                 * peer whose window swallowed the frame could hold this task,
+                 * and the next client's connection, for ever.
+                 */
+                if (esp_timer_get_time() - c.last_rx_us > LIVENESS_US) {
+                    espix_klog(ESPIX_KLOG_WARN, TAG,
+                               "client silent for %d s after an answer; dropping it",
+                               (int)(LIVENESS_US / 1000000));
+                    break;
+                }
                 continue;
             }
             break;
         }
 
         vnc_state(VNC_HANDLING);
+        c.last_rx_us = esp_timer_get_time();
         if (!rfb_handle(&c, type)) {
             break;
         }
