@@ -804,6 +804,27 @@ BOT_ADDITION = (
 
 MARK_BOT = "espix: the data stage's failure is recorded"
 
+# The data stage in bounded pieces. The class driver's one URB grows to the
+# largest transfer ever asked for, in internal DMA RAM, and never shrinks: a
+# video frame read as one 60 KB fread left 60 KB of internal RAM gone for good,
+# and Bluetooth then could not start. BOT lets the host split the data stage
+# across transfers, each but the last a whole number of packets.
+BOT_CHUNK_ANCHOR = (
+    "        data_err = msc_bulk_transfer(device, (uint8_t *)data, size, ep);\n"
+)
+BOT_CHUNK_ADDITION = (
+    "        /* espix: in pieces, so the URB (internal DMA RAM) stays small. */\n"
+    "#ifndef MSC_XFER_CHUNK\n"
+    "#define MSC_XFER_CHUNK (16 * 1024)\n"
+    "#endif\n"
+    "        for (size_t off = 0; off < size && data_err == ESP_OK; ) {\n"
+    "            const size_t n = (size - off > MSC_XFER_CHUNK) ? MSC_XFER_CHUNK : size - off;\n"
+    "            data_err = msc_bulk_transfer(device, (uint8_t *)data + off, n, ep);\n"
+    "            off += n;\n"
+    "        }\n"
+)
+MARK_BOT_CHUNK = "espix: in pieces, so the URB"
+
 
 def die(msg):
     print(f"patch-msc: {msg}", file=sys.stderr)
@@ -902,6 +923,8 @@ def main():
                      MARK_BDL_WRITE, replacement=BDL_WRITE_ADDITION),
         insert_after(source, BOT_ANCHOR, "", "bot status",
                      MARK_BOT, replacement=BOT_ADDITION),
+        insert_after(source, BOT_CHUNK_ANCHOR, "", "bot data in pieces",
+                     MARK_BOT_CHUNK, replacement=BOT_CHUNK_ADDITION),
     ]
 
     if any(done):

@@ -31,6 +31,8 @@ typedef struct {
 /* Bring the host up. Idempotent; returns ESP_ERR_NOT_SUPPORTED without ESPIX_BT. */
 esp_err_t espix_bt_init(void);
 bool      espix_bt_ready(void);
+/* Why the last espix_bt_init() failed, for a person; "" after success. */
+const char *espix_bt_last_error(void);
 bool      espix_bt_scanning(void);
 
 /* Classic inquiry for now; BLE scanning arrives with the NimBLE path. */

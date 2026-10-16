@@ -154,6 +154,9 @@ class Rfb:
         # motion, which is what this harness did until it was asked why.
         self.fb = None
         self.sock = None
+        # One reader for the connection's life: its recv() can take the start
+        # of the next message, and a reader per update threw those bytes away.
+        self.reader = None
         self.width = 0
         self.height = 0
         # What actually crossed the socket, so a claim about the cost of a frame
@@ -298,7 +301,10 @@ class Rfb:
             self.fb = bytearray(self.width * self.height * 4)
         fb = self.fb
 
-        r = Reader(self.sock)
+        if self.reader is None or self.reader.sock is not self.sock:
+            self.reader = Reader(self.sock)
+        r = self.reader
+        start = r.consumed
         while True:
             mtype = r.byte()
             if mtype == 0:                                  # FramebufferUpdate
@@ -321,7 +327,7 @@ class Rfb:
                         self._extended_desktop_size(r)
                     else:
                         raise RfbError("server sent encoding %d, unasked" % enc)
-                self.wire["bytes"] += r.consumed
+                self.wire["bytes"] += r.consumed - start
                 self.wire["frames"] += 1
                 # self.fb, not fb: an ExtendedDesktopSize rectangle replaces it.
                 return bytearray(self.fb)

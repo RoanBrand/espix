@@ -805,29 +805,96 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     }
 }
 
+/*
+ * Internal RAM the stack takes (measured: 51-54 KB from controller init to "up"),
+ * and what must be left after it: at 24 KB left, ssh key exchange and new VNC
+ * connections failed. The controller library cannot be trusted to fail cleanly
+ * when short -- its own unwind dereferenced NULL -- so it is not asked.
+ */
+#define BT_INTERNAL_NEED (56 * 1024)
+#define BT_INTERNAL_KEEP (24 * 1024)
+#define BT_LARGEST_NEED  (24 * 1024)
+
+static char s_last_error[64];
+
+const char *espix_bt_last_error(void) { return s_last_error; }
+
+/* Undo init down to (not including) stage `upto`; see espix_bt_init(). */
+enum { BT_UP_CTRL = 1, BT_UP_ENABLED, BT_UP_BLUEDROID, BT_UP_BD_ENABLED,
+       BT_UP_PCM, BT_UP_TIMER, BT_UP_AVRC_CT, BT_UP_AVRC_TG, BT_UP_A2D };
+
+static void bt_unwind(int stage)
+{
+    /* AVRCP before A2DP: Bluedroid asks for that order, not the reverse of init. */
+    if (stage >= BT_UP_AVRC_TG)    { (void)esp_avrc_tg_deinit(); }
+    if (stage >= BT_UP_AVRC_CT)    { (void)esp_avrc_ct_deinit(); }
+    if (stage >= BT_UP_A2D)        { (void)esp_a2d_source_deinit(); }
+    if (stage >= BT_UP_TIMER && s_retry != NULL) {
+        esp_timer_delete(s_retry);
+        s_retry = NULL;
+    }
+    if (stage >= BT_UP_PCM && s_pcm_storage != NULL) {
+        heap_caps_free(s_pcm_storage);
+        s_pcm_storage = NULL;
+        s_pcm = NULL;
+    }
+    if (stage >= BT_UP_BD_ENABLED) { (void)esp_bluedroid_disable(); }
+    if (stage >= BT_UP_BLUEDROID)  { (void)esp_bluedroid_deinit(); }
+    if (stage >= BT_UP_ENABLED)    { (void)esp_bt_controller_disable(); }
+    if (stage >= BT_UP_CTRL)       { (void)esp_bt_controller_deinit(); }
+}
+
 esp_err_t espix_bt_init(void)
 {
     if (s_inited) {
         return ESP_OK;
     }
+    s_last_error[0] = '\0';
 
+    const size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t big_int  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "init: internal %u free, %u largest; dma %u free, %u largest",
+               (unsigned)free_int, (unsigned)big_int, (unsigned)free_dma,
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    if (free_int < BT_INTERNAL_NEED + BT_INTERNAL_KEEP || big_int < BT_LARGEST_NEED) {
+        if (big_int < BT_LARGEST_NEED) {
+            snprintf(s_last_error, sizeof(s_last_error),
+                     "needs a %u KB internal block, largest %u KB",
+                     (unsigned)(BT_LARGEST_NEED / 1024), (unsigned)(big_int / 1024));
+        } else {
+            snprintf(s_last_error, sizeof(s_last_error),
+                     "needs %u KB internal RAM, %u KB free",
+                     (unsigned)((BT_INTERNAL_NEED + BT_INTERNAL_KEEP) / 1024),
+                     (unsigned)(free_int / 1024));
+        }
+        espix_klog(ESPIX_KLOG_WARN, TAG, "not started: %s (largest %u)",
+                   s_last_error, (unsigned)big_int);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int stage = 0;
     esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&cfg);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_CTRL;
     err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_ENABLED;
     err = esp_bluedroid_init();
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_BLUEDROID;
     err = esp_bluedroid_enable();
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_BD_ENABLED;
 
     (void)esp_bt_gap_register_callback(gap_cb);
     (void)esp_bt_gap_set_device_name(CONFIG_ESPIX_BT_NAME);
@@ -844,11 +911,14 @@ esp_err_t espix_bt_init(void)
     }
     if (s_pcm_storage == NULL) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "no PCM buffer");
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto fail;
     }
+    stage = BT_UP_PCM;
     s_pcm = xStreamBufferCreateStatic(PCM_BUF, 1, s_pcm_storage, &s_pcm_cb);
     if (s_pcm == NULL) {
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto fail;
     }
 
     const esp_timer_create_args_t retry_args = {
@@ -857,8 +927,9 @@ esp_err_t espix_bt_init(void)
     };
     err = esp_timer_create(&retry_args, &s_retry);
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_TIMER;
 
     /*
      * AVRCP first. Bluedroid refuses the A2DP link with "A2DP Enable without
@@ -867,8 +938,9 @@ esp_err_t espix_bt_init(void)
      */
     err = esp_avrc_ct_init();
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_AVRC_CT;
     (void)esp_avrc_ct_register_callback(avrc_ct_cb);
 
     /*
@@ -879,8 +951,9 @@ esp_err_t espix_bt_init(void)
      */
     err = esp_avrc_tg_init();
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
+    stage = BT_UP_AVRC_TG;
     (void)esp_avrc_tg_register_callback(avrc_tg_cb);
 
     /*
@@ -891,7 +964,7 @@ esp_err_t espix_bt_init(void)
      */
     err = esp_a2d_source_init();
     if (err != ESP_OK) {
-        return err;
+        goto fail;
     }
     (void)esp_a2d_register_callback(a2d_cb);
     (void)esp_a2d_source_register_data_callback(a2d_data_cb);
@@ -921,6 +994,13 @@ esp_err_t espix_bt_init(void)
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "up as '%s' (a2dp source)", CONFIG_ESPIX_BT_NAME);
     return ESP_OK;
+
+fail:
+    espix_klog(ESPIX_KLOG_ERROR, TAG, "init failed at stage %d: %s; unwinding",
+               stage, esp_err_to_name(err));
+    snprintf(s_last_error, sizeof(s_last_error), "failed: %s", esp_err_to_name(err));
+    bt_unwind(stage);
+    return err;
 }
 
 /*
@@ -957,22 +1037,7 @@ esp_err_t espix_bt_shutdown(void)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    (void)esp_a2d_source_deinit();
-    (void)esp_avrc_ct_deinit();
-    (void)esp_bluedroid_disable();
-    (void)esp_bluedroid_deinit();
-    (void)esp_bt_controller_disable();
-    (void)esp_bt_controller_deinit();
-
-    if (s_retry != NULL) {
-        esp_timer_delete(s_retry);
-        s_retry = NULL;
-    }
-    if (s_pcm_storage != NULL) {
-        heap_caps_free(s_pcm_storage);
-        s_pcm_storage = NULL;
-        s_pcm = NULL;
-    }
+    bt_unwind(BT_UP_A2D);
 
     s_inited = false;
     s_a2d_connected = false;
@@ -1360,6 +1425,7 @@ const char *espix_bt_pin(void) { return s_pin; }
 #else  /* !CONFIG_ESPIX_BT */
 
 esp_err_t espix_bt_init(void)                 { return ESP_ERR_NOT_SUPPORTED; }
+const char *espix_bt_last_error(void)         { return ""; }
 bool      espix_bt_ready(void)                { return false; }
 bool      espix_bt_scanning(void)             { return false; }
 bool      espix_bt_a2d_connected(void)        { return false; }

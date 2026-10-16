@@ -1139,6 +1139,13 @@ void espix_window_free(espix_window_t *w)
         return;
     }
     photo_forget();
+    if (s_press_win == w) {
+        s_press_win = NULL;
+    }
+    if (s_drag == w) {
+        s_drag     = NULL;
+        s_dragging = false;
+    }
     if (s_hover == w) {
         s_hover = NULL;
     }
@@ -4013,6 +4020,7 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                      * is not a place to start dragging a window from. */
                     if (s_focus->pointer != NULL) {
                         const uint8_t b = ev->buttons;
+                        s_press_win = s_focus;
                         s_focus->pointer(s_focus, ev->x - s_focus->x,
                                          ev->y - s_focus->y, b, s_focus->ctx);
                     }

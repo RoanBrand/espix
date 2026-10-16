@@ -693,6 +693,9 @@ struct espix_audio_stream {
  * later.
  */
 static espix_audio_stream_t *s_streams[STREAM_MAX];
+/* The stream the mixer is inside; close waits for it to leave before freeing. */
+static espix_audio_stream_t *volatile s_mixing;
+static portMUX_TYPE          s_streams_mux = portMUX_INITIALIZER_UNLOCKED;
 static espix_task_exit_t     s_mixer_exit;
 static volatile bool         s_mixer_stop;
 static volatile bool         s_mixer_up;
@@ -787,7 +790,10 @@ static void mixer_task(void *arg)
 #endif
         bool any = false;
         for (int i = 0; i < STREAM_MAX; i++) {
+            portENTER_CRITICAL(&s_streams_mux);
             espix_audio_stream_t *st = s_streams[i];
+            s_mixing = st;
+            portEXIT_CRITICAL(&s_streams_mux);
             if (st == NULL) {
                 continue;
             }
@@ -813,18 +819,18 @@ static void mixer_task(void *arg)
              */
             const size_t n = xStreamBufferReceive(st->sb, in, MIX_BYTES,
                                                   pdMS_TO_TICKS(4));
-            if (n == 0) {
-                continue;
-            }
-            any = true;
+            if (n > 0) {
+                any = true;
 #if CONFIG_ESPIX_AUDIO_TRACE
-            if (n < MIX_BYTES) {
-                part++;
-            } else {
-                full++;
-            }
+                if (n < MIX_BYTES) {
+                    part++;
+                } else {
+                    full++;
+                }
 #endif
-            mix_add(out, in, n / 4, st->mute ? 0 : st->volume);
+                mix_add(out, in, n / 4, st->mute ? 0 : st->volume);
+            }
+            s_mixing = NULL;
         }
 #if CONFIG_ESPIX_AUDIO_TRACE
         t_recv += esp_timer_get_time() - t_r0;
@@ -1108,10 +1114,17 @@ esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
+    /* Out of the table, then wait out a mixer still inside it: it can be
+     * blocked in this ring's receive, and freeing under it spins on a dead lock. */
+    portENTER_CRITICAL(&s_streams_mux);
     for (int i = 0; i < STREAM_MAX; i++) {
         if (s_streams[i] == st) {
             s_streams[i] = NULL;
         }
+    }
+    portEXIT_CRITICAL(&s_streams_mux);
+    while (s_mixing == st) {
+        vTaskDelay(1);
     }
     vStreamBufferDeleteWithCaps(st->sb);
     audio_asrc_free(st->asrc);
@@ -2411,12 +2424,14 @@ esp_err_t espix_audio_stop(void)
      * use-after-free. The writer's loop ends on the zero that write() then
      * returns, and its owner closes it.
      */
+    portENTER_CRITICAL(&s_streams_mux);
     for (int i = 0; i < STREAM_MAX; i++) {
         if (s_streams[i] != NULL) {
             s_streams[i]->stop = true;
             did = true;
         }
     }
+    portEXIT_CRITICAL(&s_streams_mux);
     if (s_exit.task != NULL) {
         s_stop = true;
         did = true;

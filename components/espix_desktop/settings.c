@@ -173,6 +173,23 @@ static char               s_state_last[24];
 static bool              s_refresh_running;  /* under s_refresh_mux */
 static void               settings_refresh(void);
 
+/* A Bluetooth action for that task: controller init and teardown take seconds
+ * and can fail inside the vendor library, so never on the desktop task. */
+typedef enum {
+    BTA_NONE,
+    BTA_ON,
+    BTA_OFF,
+    BTA_SCAN_ON,
+    BTA_SCAN_OFF,
+    BTA_CONNECT,
+    BTA_DISCONNECT,
+    BTA_UNPAIR,
+} bt_act_t;
+static volatile bt_act_t  s_bt_act;           /* written under s_refresh_mux */
+static uint8_t            s_bt_bda[ESPIX_BDA_LEN];
+static char               s_bt_note[64];      /* under the desktop lock */
+static bool               settings_bt_request(bt_act_t act, const uint8_t *bda);
+
 static void state_tick_desk(void *arg)
 {
     (void)arg;
@@ -466,13 +483,18 @@ static int section_rows(const espix_window_t *w, row_t *rows)
 
     case SEC_BLUETOOTH: {
         const bool ready = espix_bt_ready();
+        const bt_act_t busy = s_bt_act;
+        const char *adapter = busy == BTA_ON  ? "turning on..."
+                            : busy == BTA_OFF ? "turning off..."
+                            : s_bt_note[0] != '\0' ? s_bt_note
+                            : ready ? "ready" : "not started";
 
         rows[n++] = (row_t){ ROW_HEAD, "Audio", NULL, true, false, ACT_NONE, 0 };
-        rows[n++] = (row_t){ ROW_FIELD, "Adapter", ready ? "ready" : "not started",
-                             ready, false, ACT_NONE, 0 };
+        rows[n++] = (row_t){ ROW_FIELD, "Adapter", adapter,
+                             ready && busy == BTA_NONE, false, ACT_NONE, 0 };
         rows[n++] = (row_t){ ROW_BUTTON,
                              ready ? "Turn Bluetooth off" : "Turn Bluetooth on",
-                             NULL, true, false, ACT_BT_POWER, 0 };
+                             NULL, busy == BTA_NONE, false, ACT_BT_POWER, 0 };
         rows[n++] = (row_t){ ROW_FIELD, "Scanning",
                              espix_bt_scanning() ? "yes" : "no", ready, false,
                              ACT_NONE, 0 };
@@ -725,34 +747,28 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             s_dev_sel = (s_dev_sel == rows[i].arg) ? -1 : rows[i].arg;
             break;
         case ACT_SCAN:
-            (void)espix_bt_scan(!espix_bt_scanning());
-            settings_refresh();
+            (void)settings_bt_request(espix_bt_scanning() ? BTA_SCAN_OFF
+                                                          : BTA_SCAN_ON, NULL);
             break;
         case ACT_BT_POWER:
-            if (espix_bt_ready()) {
-                (void)espix_bt_shutdown();
-            } else {
-                (void)espix_bt_init();
+            if (settings_bt_request(espix_bt_ready() ? BTA_OFF : BTA_ON, NULL)) {
+                s_bt_note[0] = '\0';
             }
-            settings_refresh();
             break;
         case ACT_CONNECT:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
-                (void)espix_bt_connect(s_devs[s_dev_sel].bda);
-                settings_refresh();
+                (void)settings_bt_request(BTA_CONNECT, s_devs[s_dev_sel].bda);
             }
             break;
         case ACT_DISCONNECT:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
-                (void)espix_bt_disconnect(s_devs[s_dev_sel].bda);
-                settings_refresh();
+                (void)settings_bt_request(BTA_DISCONNECT, s_devs[s_dev_sel].bda);
             }
             break;
         case ACT_UNPAIR:
-            if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
-                (void)espix_bt_remove(s_devs[s_dev_sel].bda);
+            if (s_dev_sel >= 0 && s_dev_sel < s_ndev &&
+                settings_bt_request(BTA_UNPAIR, s_devs[s_dev_sel].bda)) {
                 s_dev_sel = -1;
-                settings_refresh();
             }
             break;
         case ACT_SINK: {
@@ -842,11 +858,50 @@ static void settings_key(espix_window_t *w, uint32_t keysym, bool down, void *ct
 static portMUX_TYPE  s_refresh_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_refresh_again;
 
+static void bt_perform(void)
+{
+    portENTER_CRITICAL(&s_refresh_mux);
+    const bt_act_t act = s_bt_act;
+    uint8_t bda[ESPIX_BDA_LEN];
+    memcpy(bda, s_bt_bda, sizeof(bda));
+    portEXIT_CRITICAL(&s_refresh_mux);
+    if (act == BTA_NONE) {
+        return;
+    }
+
+    esp_err_t err = ESP_OK;
+    switch (act) {
+    case BTA_ON:         err = espix_bt_ready() ? ESP_OK : espix_bt_init(); break;
+    case BTA_OFF:        err = espix_bt_shutdown();      break;
+    case BTA_SCAN_ON:    err = espix_bt_scan(true);      break;
+    case BTA_SCAN_OFF:   err = espix_bt_scan(false);     break;
+    case BTA_CONNECT:    err = espix_bt_connect(bda);    break;
+    case BTA_DISCONNECT: err = espix_bt_disconnect(bda); break;
+    case BTA_UNPAIR:     err = espix_bt_remove(bda);     break;
+    default:             break;
+    }
+
+    espix_desktop_lock();
+    if (err == ESP_OK) {
+        s_bt_note[0] = '\0';
+    } else if (act == BTA_ON && espix_bt_last_error()[0] != '\0') {
+        snprintf(s_bt_note, sizeof(s_bt_note), "%s", espix_bt_last_error());
+    } else {
+        snprintf(s_bt_note, sizeof(s_bt_note), "failed: %s", esp_err_to_name(err));
+    }
+    espix_desktop_unlock();
+
+    portENTER_CRITICAL(&s_refresh_mux);
+    s_bt_act = BTA_NONE;
+    portEXIT_CRITICAL(&s_refresh_mux);
+}
+
 static void settings_refresh_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
+        bt_perform();
         refresh_network();
         refresh_bluetooth();
 
@@ -886,12 +941,31 @@ static void settings_refresh(void)
 
     if (espix_kthread_start(&(const espix_kthread_t){
             .name = "espix:set-ref", .fn = settings_refresh_task, .arg = NULL,
-            .stack = 4096, .priority = 2, .core = tskNO_AFFINITY }, NULL) != ESP_OK) {
+            .stack = 6144, .priority = 2, .core = tskNO_AFFINITY }, NULL) != ESP_OK) {
         portENTER_CRITICAL(&s_refresh_mux);
         s_refresh_running = false;
+        s_bt_act          = BTA_NONE;
         portEXIT_CRITICAL(&s_refresh_mux);
         espix_klog(ESPIX_KLOG_WARN, TAG, "no task to refresh the panel");
     }
+}
+
+/* Queue one Bluetooth action for the refresh task; false while one is pending. */
+static bool settings_bt_request(bt_act_t act, const uint8_t *bda)
+{
+    portENTER_CRITICAL(&s_refresh_mux);
+    const bool idle = s_bt_act == BTA_NONE;
+    if (idle) {
+        s_bt_act = act;
+        if (bda != NULL) {
+            memcpy(s_bt_bda, bda, sizeof(s_bt_bda));
+        }
+    }
+    portEXIT_CRITICAL(&s_refresh_mux);
+    if (idle) {
+        settings_refresh();
+    }
+    return idle;
 }
 
 espix_window_t *espix_settings_open(void)
