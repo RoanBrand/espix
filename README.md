@@ -1,5 +1,3 @@
-
-
 <p align="center">
   <img width="486" height="239" alt="espix login greeting" src="https://github.com/user-attachments/assets/457b6049-acb2-4080-8ad2-40222d47d782" />
 </p>
@@ -122,25 +120,25 @@ which is also where the one build option hardware decides today is explained.
 | Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
 | Networking | IPv4 routing and NAT | **yes** | `nat on <dev>` masquerades an inside interface out the default route; `ESPIX_NET_ROUTER` is on by default |
 | Networking | L2 bridging | **yes** | `bridge add <port>` then reboot: `br0` owns the address, ports have none; AP↔Ethernet, never a station (802.11 three-address frames) |
-| Networking | DHCP server for the LAN | **partial** | the AP and `usb0` both serve; DNS is the uplink's resolver passed through, not a local one |
+| Networking | DHCP server for the LAN | **partial** | the AP, `usb0` and a bridge in `addr=server` mode all serve; DNS is the uplink's resolver passed through, not a local one |
 | Networking | Isolation and firewall | **planned** | NAT is not a firewall; guest zones and port-forwards are later |
 | Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
 | Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
 | Audio | Play an MP3 or WAV to a Bluetooth speaker | **yes** | S31 only: `bluetoothctl` pairs/connects the sink, then `play <file|url>` streams to it — a real 64 kbps stereo MP3 plays clean at ~16% of one core, ring full, no underruns; [AUDIO.md](docs/AUDIO.md) |
 | Audio | Choose the SBC quality | **yes** | `bluetoothctl quality 0|1|2` (mono ≤35, joint stereo ≤35, joint stereo ≤52); q2 is the default and applies to the next connect |
-| Audio | An I2S codec or the internal DAC | **planned** | the S31 coreboard's amp and mic are phase 2 |
-| Audio | Resampling, volume, mixing | **planned** | so non-44.1 kHz sources and two streams at once wait — [ROADMAP](docs/ROADMAP.md#audio) |
+| Audio | An I2S codec or the internal DAC | **yes** | the S31 coreboard's ES8311 over I2S/I2C both ways — the NS4150B amp out and the on-board mic in (`record`); the internal DAC is not wired up |
+| Audio | Resampling, volume, mixing | **yes** | a mixer sums every stream into the one sink, with per-stream and master volume and mute; a stream forwards, asks the sink to adopt its rate, or converts at its own edge with `esp_asrc`; per-stream sink selection is still the gap — [ROADMAP](docs/ROADMAP.md#audio) |
 | Display | A desktop, served over VNC | **yes** | `vnc start` puts an 800x600 RGB565 framebuffer on port 5900 and speaks RFB (RFC 6143), so any VNC client is the monitor — no panel needed; Hextile keeps a flat first frame near 10 KiB rather than 1.9 MiB; [DISPLAY.md](docs/DISPLAY.md) |
 | Display | The clients people actually use | **yes** | RFB 3.3 and 3.7/3.8, plus VNC authentication for the ones that insist on a password: TigerVNC, RealVNC on Android and macOS Screen Sharing have each painted a full desktop |
 | Display | Authentication | **partial** | VNC auth (DES) with a built-in default password, public on purpose; security type None is still offered to 3.7+ clients, so it is a compatibility mechanism rather than a security boundary — [DISPLAY.md](docs/DISPLAY.md) |
 | Display | A cursor, and a keyboard round-trip | **yes** | a server-side cursor plus a window that echoes keys; input is one entry point, so a viewer and a local keyboard or mouse arrive the same way |
 | Display | PPA and JPEG acceleration | **yes** | the reason the virtual screen exists: a fill/blit/scale path and a JPEG codec, each measured against the CPU path it replaces and kept, because the S3 has neither — [DISPLAY.md](docs/DISPLAY.md#what-it-costs) |
 | Display | Dragging a window | **yes** | CopyRect, so a four-pixel motion costs 8 KB rather than 301 KB — 37x, and the difference between a drag and a slideshow |
-| Display | 2D-DMA for moves and colour conversion | **no** | PPA SRM already does what the desktop needs, so it is unwritten until something needs it |
+| Display | 2D-DMA for moves and colour conversion | **partial** | in use as the JPEG codec's own engine and colour converter, serialised with the PPA by one arbiter (`espix_dma2d.h`); rectangle moves still go to PPA SRM |
 | Display | Testing a physical display | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag, minimise, maximise and close, and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |
 | Display | Fitting a picture to a window | **yes** | `espix_surface_scale` — PPA SRM with the scale factors set, and a nearest-neighbour loop where there is no PPA at all, which is the S3 |
-| Display | Playing a video | **partial** | raw MJPEG only — the one shape every target can decode (the JPEG codec on the S31 and the P4, TJpgDec on the S3); a 640x480 frame decodes in 5-6 ms and the player holds 24 fps, while the RFB encoder is what caps it near 8 updates a second — [DISPLAY.md](docs/DISPLAY.md#known-limitations) |
+| Display | Playing a video | **partial** | MJPEG — raw, or inside an AVI whose 16-bit PCM plays with it; fullscreen, with controls that hide. The S31 runs 1280x720 at 23-24 fps, the S3 drops frames to keep real time, and an unobscured window goes out as the frame's own JPEG in a Tight rectangle (~26 updates/s). No inter-frame codec — [DISPLAY.md](docs/DISPLAY.md#known-limitations) |
 | Display | A terminal you can work in | **yes** | the desktop's terminal window runs a real shell session — the same `espix_term` as the on-screen console, so the motd, the prompt, history, arrows, Ctrl-C and every command work there; a close button sits in the title bar |
 | Services | Scheduled work: a `cron` | **partial** | units with `every <interval>` — `autoupdate` is one, every 6h; crontab syntax, per-user jobs and `at` are not there |
 
