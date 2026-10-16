@@ -230,7 +230,7 @@ flash-all: flash flash-fs
 # over SSH. The address comes from .espix/hosts (tools/espix host); the board
 # must be on the network with SSH reachable. See tools/flash-ota.sh.
 flash-ota: build
-	ESPIX_PROFILE=$(PROFILE) ./tools/flash-ota.sh
+	ESPIX_TARGET=$(TARGET) ESPIX_PROFILE=$(PROFILE) ./tools/flash-ota.sh
 
 # Tag v<version.txt>, build it as a release, and publish the image and manifest
 # to GitHub. The tree must be clean; commit first. See tools/release.sh.

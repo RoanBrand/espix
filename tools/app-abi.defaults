@@ -16,3 +16,12 @@
 # The kernel's value is in sdkconfig.defaults at the top of the tree, and
 # tools/build-apps.sh refuses to stage an app whose value differs.
 CONFIG_FREERTOS_HZ=250
+
+# The socket count, for the same reason and one more. lwIP numbers its sockets
+# from LWIP_SOCKET_OFFSET, which is FD_SETSIZE minus this -- the kernel's own
+# select() and poll() use *its* value when they translate a descriptor. An app's
+# headers also let lwIP define FD_SETSIZE from this number, but only when lwIP's
+# sockets.h wins the include race against newlib's FD_SET; when it does, an app
+# built with IDF's default of 10 passes a two-word fd_set to a kernel filling in
+# one sized for 40. Either way the two builds have to say the same number.
+CONFIG_LWIP_MAX_SOCKETS=40

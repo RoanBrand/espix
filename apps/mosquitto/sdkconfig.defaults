@@ -1,0 +1,17 @@
+# Must match the firmware's setting: the loader writes a relocated image into
+# memory and executes it, which memory protection would block.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+CONFIG_ELF_LOADER=y
+
+# Keep the libc flavour aligned with the firmware -- an app resolves printf()
+# and friends against the tables the firmware exports at load time.
+CONFIG_LIBC_NEWLIB=y
+
+# The broker is linked into the app ELF, so its text and data are loaded (into
+# PSRAM) when the app starts.
+CONFIG_ELF_LOADER_LOAD_PSRAM=y
+
+# CONFIG_LWIP_MAX_SOCKETS is deliberately NOT set here: it is an app-ABI
+# constant, so it lives in tools/app-abi.defaults beside CONFIG_FREERTOS_HZ,
+# where build-apps.sh applies it to every app. See the README, "What the
+# exercise turned up".

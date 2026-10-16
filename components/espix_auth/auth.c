@@ -42,6 +42,10 @@
 
 #define TAG "auth"
 
+/* abi_user.c: the libc names (getpwnam, getgrgid, ...) for the accounts this
+ * file owns. Called from espix_auth_init() once the files are readable. */
+void espix_auth_abi_register(void);
+
 #define PASSWD_PATH     "/etc/passwd"
 #define SUDOERS_PATH    "/etc/sudoers"
 #define GROUP_PATH      "/etc/group"
@@ -1794,6 +1798,14 @@ esp_err_t espix_auth_init(void)
      * finished reading yet.
      */
     espix_fs_set_owner_rule(owner_rule);
+
+    /*
+     * The accounts are known good, so an app may now name them: getpwnam and
+     * friends are published from abi_user.c once the files behind them are
+     * readable and the ownership rule is in place. A lookup before this point
+     * would answer from a half-read /etc/passwd.
+     */
+    espix_auth_abi_register();
 
     if (s_is_default) {
         espix_klog(ESPIX_KLOG_WARN, TAG,

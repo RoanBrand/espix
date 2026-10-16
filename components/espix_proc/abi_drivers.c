@@ -46,6 +46,7 @@
 #include "esp_log.h"
 
 #include <sys/ioctl.h>
+#include <sys/poll.h>
 #include <sys/select.h>
 
 #include "esp_elf.h"
@@ -108,6 +109,18 @@ extern int       __gedf2(double, double);
 extern int       __ledf2(double, double);
 extern float     __truncdfsf2(double);
 
+/* The rest of libgcc a 64-bit-aware or ordered-double app reaches for. */
+extern long long __moddi3(long long, long long);
+extern double    __floatdidf(long long);
+extern int       __unorddf2(double, double);
+
+/* Byte swaps. Xtensa reaches for these where RISC-V with Zbb inlines them, so
+ * the S3 app build needs __bswapsi2 and the S31's does not -- found by building
+ * Mosquitto for esp32s3 and reading its undefined names. Both libgccs carry
+ * them, so neither target has to be guarded out. */
+extern unsigned int       __bswapsi2(unsigned int);
+extern unsigned long long __bswapdi2(unsigned long long);
+
 /*
  * select() with the process's wake eventfd folded in.
  *
@@ -161,6 +174,101 @@ static int espix_select(int nfds, fd_set *readfds, fd_set *writefds,
     }
 
     return rc;
+}
+
+/*
+ * poll(), over espix_select().
+ *
+ * IDF has a poll() of its own, but it calls the libc select() -- not the one
+ * above, which is the only select that folds in the process's wake eventfd. A
+ * poll published as it stands would therefore block uninterruptibly: a broker whose
+ * whole loop is a poll() could not be stopped by a signal until a client
+ * happened to talk to it. So the conversion is IDF's (pollfd to fd_set, an fd
+ * the sets cannot hold answered with POLLNVAL) and the wait is espix_select().
+ */
+static int espix_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    fd_set readfds, writefds, errorfds;
+    struct timeval tv;
+    int max_fd = -1;
+
+    if (fds == NULL) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    FD_ZERO(&readfds);
+    FD_ZERO(&writefds);
+    FD_ZERO(&errorfds);
+
+    for (nfds_t i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+
+        /* A negative descriptor is ignored, as POSIX says. */
+        if (fds[i].fd < 0) {
+            continue;
+        }
+        if (fds[i].fd >= FD_SETSIZE) {
+            fds[i].revents = POLLNVAL;
+            continue;
+        }
+
+        if (fds[i].events & (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI)) {
+            FD_SET(fds[i].fd, &readfds);
+            FD_SET(fds[i].fd, &errorfds);
+            if (fds[i].fd > max_fd) {
+                max_fd = fds[i].fd;
+            }
+        }
+        if (fds[i].events & (POLLOUT | POLLWRNORM | POLLWRBAND)) {
+            FD_SET(fds[i].fd, &writefds);
+            FD_SET(fds[i].fd, &errorfds);
+            if (fds[i].fd > max_fd) {
+                max_fd = fds[i].fd;
+            }
+        }
+    }
+
+    struct timeval  behind;
+    struct timeval *tvp = NULL;
+    if (timeout >= 0) {
+        behind.tv_sec  = timeout / 1000;
+        behind.tv_usec = (timeout % 1000) * 1000;
+        tvp = &behind;
+    }
+
+    const int rc = espix_select(max_fd + 1, &readfds, &writefds, &errorfds, tvp);
+    if (rc < 0) {
+        /* Includes the signal case: espix_select returned EINTR having already
+         * delivered the handler, which is what poll() should report. */
+        return rc;
+    }
+
+    int ready = 0;
+    for (nfds_t i = 0; i < nfds; i++) {
+        if (fds[i].revents != 0) {
+            /* Already POLLNVAL. */
+            ready++;
+            continue;
+        }
+        if (fds[i].fd < 0 || fds[i].fd >= FD_SETSIZE) {
+            continue;
+        }
+        if (FD_ISSET(fds[i].fd, &readfds)) {
+            fds[i].revents |= POLLIN;
+        }
+        if (FD_ISSET(fds[i].fd, &writefds)) {
+            fds[i].revents |= POLLOUT;
+        }
+        if (FD_ISSET(fds[i].fd, &errorfds)) {
+            fds[i].revents |= POLLERR;
+        }
+        if (fds[i].revents != 0) {
+            ready++;
+        }
+    }
+
+    return ready;
 }
 
 static esp_elf_symbol_table_t s_driver_syms[] = {
@@ -231,8 +339,10 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(esp_log),
     ESP_ELFSYM_EXPORT(esp_log_timestamp),
     ESP_ELFSYM_EXPORT(ioctl),
-    /* Wrapped, so a signal can interrupt it (R-P6.6). */
+    /* Wrapped, so a signal can interrupt it (R-P6.6). poll() is the same
+     * wrapper over the same wait, because IDF's own poll is not. */
     { "select", (void *)espix_select },
+    { "poll",   (void *)espix_poll },
     /* The eventfd behind that wake, for an app that wants one of its own. */
     ESP_ELFSYM_EXPORT(eventfd),
     ESP_ELFSYM_EXPORT(__udivdi3),
@@ -255,6 +365,15 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(__gedf2),
     ESP_ELFSYM_EXPORT(__ledf2),
     ESP_ELFSYM_EXPORT(__truncdfsf2),
+    ESP_ELFSYM_EXPORT(__unorddf2),
+
+    /* 64-bit integer arithmetic and conversion, which Mosquitto reaches for.
+     * The firmware already links them (libc's strtod and espix's own commands
+     * use them), so these are names rather than new code. */
+    ESP_ELFSYM_EXPORT(__moddi3),
+    ESP_ELFSYM_EXPORT(__floatdidf),
+    ESP_ELFSYM_EXPORT(__bswapsi2),
+    ESP_ELFSYM_EXPORT(__bswapdi2),
 
 #if CONFIG_IDF_TARGET_ARCH_XTENSA
     /*

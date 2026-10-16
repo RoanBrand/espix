@@ -8,6 +8,7 @@ firmware. Each builds to a relocatable ELF that the device loads at runtime.
 | [hello](hello/) | the minimum: a C app, argv, an exit status |
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
 | [plasma](plasma/) | the graphics/input ABI: a full-screen app the desktop launches from an icon |
+| [mosquitto](mosquitto/) | a real server as an app: the Eclipse Mosquitto MQTT broker, built from upstream with a 372-line platform seam and no patches |
 
 `neopixel` is a normal `setup()`/`loop()` sketch with one addition: a
 `teardown()`, called when someone stops the app. An Arduino sketch never needs

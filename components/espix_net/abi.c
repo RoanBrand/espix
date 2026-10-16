@@ -18,11 +18,13 @@
 #include <errno.h>
 #include <netdb.h>
 #include <signal.h>
+#include <string.h>
 #include <sys/socket.h>
 
 #include "esp_elf.h"
 
 #include "espix_kernel.h"
+#include "espix_net.h"
 #include "espix_net_priv.h"
 #include "espix_proc.h"
 
@@ -92,7 +94,44 @@ static ssize_t espix_lwip_sendto(int fd, const void *data, size_t size,
     return n;
 }
 
+/*
+ * gethostname(), from the one source of truth.
+ *
+ * The name is /etc/hostname, applied to every netif at boot and changed by
+ * `hostname`. A program that asks -- Mosquitto does, for the default $SYS
+ * topic root -- should see what the shell's `hostname` prints, not a second
+ * copy of it.
+ *
+ * POSIX: truncate and NUL-terminate, and report ENAMETOOLONG if it did not fit.
+ */
+static int espix_gethostname(char *name, size_t len)
+{
+    if (name == NULL || len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const char *host = espix_net_hostname();
+    if (host == NULL) {
+        host = "";
+    }
+
+    const size_t n = strlen(host);
+    if (n >= len) {
+        memcpy(name, host, len - 1);
+        name[len - 1] = '\0';
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(name, host, n + 1);
+    return 0;
+}
+
 static esp_elf_symbol_table_t s_net_syms[] = {
+
+    /* The machine's own name, which is not a lookup: /etc/hostname. */
+    { "gethostname", (void *)espix_gethostname },
 
     /* netdb.h — the actual gap. Without these, apps cannot use hostnames. */
     ESP_ELFSYM_EXPORT(lwip_getaddrinfo),

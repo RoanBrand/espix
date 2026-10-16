@@ -98,7 +98,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
+#include <sys/select.h>
 #include <time.h>
+#include <unistd.h>
+
+#include "freertos/FreeRTOS.h"
 
 #include "esp_elf.h"
 
@@ -106,6 +111,36 @@
 #include "espix_proc_priv.h"
 
 #define TAG "abi"
+
+/*
+ * sysconf(), for the few names a program asks about and espix can answer.
+ *
+ * _SC_OPEN_MAX is the one that matters: a program sizing a poll() or select()
+ * array asks for it first, and the answer has to be the descriptor space it
+ * will actually pass, which is FD_SETSIZE -- the same bound the kernel's
+ * select() and poll() check against. mux_poll.c in Mosquitto allocates its
+ * pollfd array from exactly this.
+ *
+ * _SC_CLK_TCK is the kernel's own tick, so a program that converts seconds to
+ * ticks and one that prints a tick count agree.
+ */
+static long espix_sysconf(int name)
+{
+    switch (name) {
+    case _SC_OPEN_MAX:
+        return FD_SETSIZE;
+    case _SC_CLK_TCK:
+        return CONFIG_FREERTOS_HZ;
+    case _SC_NPROCESSORS_ONLN:
+    case _SC_NPROCESSORS_CONF:
+        return portNUM_PROCESSORS;
+    case _SC_PAGESIZE:
+        return 4096;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
 
 static const struct esp_elfsym s_libc_syms[] = {
 
@@ -266,6 +301,8 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(fputc),
     ESP_ELFSYM_EXPORT(fputs),
     ESP_ELFSYM_EXPORT(fwrite),
+    /* freopen reaches the same VFS fopen does, so it needs no wrapper. */
+    ESP_ELFSYM_EXPORT(freopen),
 
     /* time.h, getopt.h and setjmp.h. */
     ESP_ELFSYM_EXPORT(clock_gettime),
@@ -277,6 +314,15 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(optopt),
     ESP_ELFSYM_EXPORT(setjmp),
     ESP_ELFSYM_EXPORT(longjmp),
+
+    /*
+     * Two more names an app reaches for that answer something espix owns: the
+     * size of the descriptor space, and esp_libc's random source (which is a
+     * real one on both targets, not a fallback PRNG). sysconf is a table entry
+     * because it is espix's answer rather than newlib's stub.
+     */
+    { "sysconf", (void *)espix_sysconf },
+    ESP_ELFSYM_EXPORT(getrandom),
 
     ESP_ELFSYM_END
 };

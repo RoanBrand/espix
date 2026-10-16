@@ -1,0 +1,9 @@
+# Fetched by fetch-mosquitto.sh, never committed.
+third_party/
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+build-apps.log
+build.log
