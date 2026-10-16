@@ -376,7 +376,7 @@ static const char *const s_audio_ext[] = { "mp3", "wav", "aac", "flac" };
 /* Raw MJPEG -- JPEG frames written back to back, no container. The one shape of
  * video every target can decode: the JPEG codec on the S31 and the P4, TJpgDec
  * on the S3. */
-static const char *const s_video_ext[] = { "mjpg", "mjpeg" };
+static const char *const s_video_ext[] = { "mjpg", "mjpeg", "avi" };
 #define VIDEO_EXT_N ((int)(sizeof(s_video_ext) / sizeof(s_video_ext[0])))
 
 static bool name_has_ext(const char *name, const char *const *exts, int n)

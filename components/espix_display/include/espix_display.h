@@ -146,6 +146,7 @@ typedef void (*espix_display_damage_hook_t)(void);
 /* The picture's own JPEG, exactly the photo rectangle: copies it to `out` and returns its
  * length, or 0 when it cannot stand in for the canvas right now. Under the canvas lock. */
 typedef size_t (*espix_canvas_photo_jpeg_fn)(void *ctx, uint8_t *out, size_t cap);
+/* With out NULL, the provider returns the size it would copy (0: none to give). */
 
 void         espix_canvas_set_photo(espix_canvas_t *c, espix_rect_t r,
                                     espix_canvas_photo_jpeg_fn fn, void *ctx);
@@ -329,6 +330,9 @@ espix_px_t *espix_display_jpeg_input(size_t pixels);
 
 /* Whether this target can encode JPEG at all; the S3 cannot. */
 bool        espix_display_jpeg_can_encode(void);
+/* The same, without the copy: *out is the encoder's buffer, valid until the next encode. */
+size_t espix_display_jpeg_encode_in_place(int w, int h, int quality, const uint8_t **out);
+
 size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
                                  size_t out_cap);
 

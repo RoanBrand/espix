@@ -1046,6 +1046,35 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   nobody owning it until something claims. `espix_gfx.h` and apps/README used to
   say the process teardown released the screen, which is not true and is now
   corrected there.
+- **The S31's 2D-DMA engine has wedged twice, and nothing reproduces it.** On
+  this board (chip revision v0.0), two coredumps caught it:
+  - A PPA SRM blit never completed.
+  - A JPEG decode spun for ever in `dma2d_hal_rx_reset_channel()` waiting for
+    an RX channel to report reset-available, which ended in an interrupt
+    watchdog.
+
+  What was tried:
+  - `display ppatest` (including the exact hung geometry), `display dmatest`
+    (concurrent and serial) and `tools/vnc-soak.py` all run clean.
+  - Espressif publishes no S31 errata. The P4's (MSPI-750/751) are stale PSRAM
+    reads, not hangs.
+
+  What is in place:
+  - Every PPA operation and every JPEG encode and decode goes through one
+    arbiter (`espix_dma2d.h`).
+  - PPA waits are bounded. A lost transaction switches the PPA off for the boot
+    (`display status` names it) and quarantines its output buffer.
+  - The JPEG path's reset spin is inside IDF and cannot be bounded: a recurrence
+    there is a watchdog reset with a core dump.
+- **1280x720 video plays only fullscreen on a 1280x800 canvas.**
+  - Fullscreen, the frames go to a viewer as the file's own JPEGs, at
+    23-24 fps.
+  - In a window the picture is scaled, which needs a second frame-sized surface
+    and a re-encode. Next to a 2 MB canvas and the VNC stage, the encoder's
+    1.8 MB input buffer does not fit in PSRAM, so the picture goes as Hextile,
+    which is far too slow.
+  - The player opens fullscreen when the picture does not fit a window.
+  - With less memory it decodes in place rather than double-buffered.
 
 ## Building espix
 

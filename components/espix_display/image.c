@@ -425,14 +425,13 @@ espix_px_t *espix_display_jpeg_input(size_t pixels)
     return (espix_px_t *)s_enc_in;
 }
 
-size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
-                                 size_t out_cap)
+/* Encode the input into the encoder's own output buffer; *out points at it until the next call. */
+size_t espix_display_jpeg_encode_in_place(int w, int h, int quality, const uint8_t **out)
 {
     jpeg_encoder_handle_t enc = encoder_get();
 
     if (enc == NULL || s_enc_in == NULL || out == NULL
-        || w <= 0 || h <= 0 || out_cap == 0
-        || (size_t)w * (size_t)h > s_enc_in_px) {
+        || w <= 0 || h <= 0 || (size_t)w * (size_t)h > s_enc_in_px) {
         return 0;
     }
 
@@ -442,7 +441,9 @@ size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
      * allowance is two bytes a pixel plus room for the headers -- measured at
      * q80, a 640x480 photograph comes back at about 9 KB, so this is slack.
      */
-    const size_t want = (size_t)w * (size_t)h * sizeof(espix_px_t) + 1024;
+    /* A byte a pixel: a JPEG at the qualities asked for is far smaller, and an
+     * encode that does not fit fails rather than overrunning. */
+    const size_t want = (size_t)w * (size_t)h + 4096;
 
     if (s_enc_out == NULL || s_enc_out_cap < want) {
         const jpeg_encode_memory_alloc_cfg_t cfg = {
@@ -480,9 +481,7 @@ size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
         ok = (jpeg_encoder_process(enc, &ecfg, s_enc_in,
                                    (uint32_t)((size_t)w * (size_t)h
                                               * sizeof(espix_px_t)),
-                                   s_enc_out,
-                                   (uint32_t)(s_enc_out_cap < out_cap
-                                              ? s_enc_out_cap : out_cap),
+                                   s_enc_out, (uint32_t)s_enc_out_cap,
                                    &got) == ESP_OK);
         espix_dma2d_give();
     }
@@ -491,8 +490,20 @@ size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
     if (!ok) {
         return 0;
     }
-    memcpy(out, s_enc_out, got);
+    *out = s_enc_out;
     return got;
+}
+
+size_t espix_display_jpeg_encode(int w, int h, int quality, void *out, size_t out_cap)
+{
+    const uint8_t *p = NULL;
+    const size_t   n = espix_display_jpeg_encode_in_place(w, h, quality, &p);
+
+    if (n == 0 || n > out_cap) {
+        return 0;
+    }
+    memcpy(out, p, n);
+    return n;
 }
 
 /*
@@ -602,6 +613,12 @@ size_t espix_display_jpeg_encode(int w, int h, int quality, void *out,
                                  size_t out_cap)
 {
     (void)w; (void)h; (void)quality; (void)out; (void)out_cap;
+    return 0;
+}
+
+size_t espix_display_jpeg_encode_in_place(int w, int h, int quality, const uint8_t **out)
+{
+    (void)w; (void)h; (void)quality; (void)out;
     return 0;
 }
 

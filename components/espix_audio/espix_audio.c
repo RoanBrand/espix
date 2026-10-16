@@ -1079,6 +1079,18 @@ size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_
     return chunk;
 }
 
+uint32_t espix_audio_stream_queued_us(espix_audio_stream_t *st)
+{
+    if (st == NULL || st->sb == NULL) {
+        return 0;
+    }
+    const uint32_t rate  = st->ring_fmt.rate ? st->ring_fmt.rate : 1;
+    const uint32_t frame = (uint32_t)st->ring_fmt.channels * (st->ring_fmt.bits / 8);
+    const uint64_t bytes = xStreamBufferBytesAvailable(st->sb) + st->out_pending;
+
+    return frame ? (uint32_t)(bytes * 1000000ULL / ((uint64_t)rate * frame)) : 0;
+}
+
 esp_err_t espix_audio_stream_close(espix_audio_stream_t *st)
 {
     if (st == NULL) {

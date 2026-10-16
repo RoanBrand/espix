@@ -64,6 +64,25 @@ together.
 Use cases:
 - Router, NAS, Audio streaming/server, "nano" server/PC.
 
+## Targets
+
+| | **S3** — verified | **P4** — planned | **S31** — verified |
+|---|---|---|---|
+| ISA | Xtensa | RISC-V | RISC-V |
+| MMU | - | simple: address translation and RISC-V PMP | compliant **Sv32 MMU** |
+| Process isolation | guardrail only | fault isolation between tasks, to confirm | **planned**, `fork()`-shaped |
+| USB | 1x USB1.1 | 1x USB1.1 / 1x **USB2.0** | 1x **USB2.0** |
+| Radio | WiFi 4 / BLE 5.0 | - | WiFi **6** / BT **Classic** / BT 5.4 LE / IEEE 802.15.4 |
+| Ethernet | — | 100M | **1000M** |
+| Display | parallel RGB and i8080 (`LCD_CAM`) | **MIPI DSI (1080p/30)**, RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; **no** MIPI (**weaker than P4**) |
+| Runs today | **yes** | no | **yes** |
+
+The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),
+which is also where the one build option hardware decides today is explained.
+
+*The Unix surface, row by row, with what is deliberate and what is **no** —
+[docs/POSIX.md](docs/POSIX.md).*
+
 ## Long list
 
 <sub>Run on ESP32-S3N16R8 and ESP32-S31 (WROOM-3) with ESP-IDF v6.1; the ESP32-P4 is planned</sub>
@@ -119,29 +138,9 @@ Use cases:
 | Display | Testing a physical display | **planned** | parallel RGB or i8080 on any of the three; MIPI DSI is the P4's |
 | Display | A window system | **yes** | surfaces, z-order, focus, title-bar drag, minimise, maximise and close, and dirty-region repaint, with a taskbar: a launcher, a button per window and a live clock |
 | Display | Fitting a picture to a window | **yes** | `espix_surface_scale` — PPA SRM with the scale factors set, and a nearest-neighbour loop where there is no PPA at all, which is the S3 |
-| Display | A system tray, beyond the clock | **no** | one item is the look; radio status, volume and the rest wait for something to report them |
 | Display | Playing a video | **partial** | raw MJPEG only — the one shape every target can decode (the JPEG codec on the S31 and the P4, TJpgDec on the S3); a 640x480 frame decodes in 5-6 ms and the player holds 24 fps, while the RFB encoder is what caps it near 8 updates a second — [DISPLAY.md](docs/DISPLAY.md#known-limitations) |
 | Display | A terminal you can work in | **yes** | the desktop's terminal window runs a real shell session — the same `espix_term` as the on-screen console, so the motd, the prompt, history, arrows, Ctrl-C and every command work there; a close button sits in the title bar |
 | Services | Scheduled work: a `cron` | **partial** | units with `every <interval>` — `autoupdate` is one, every 6h; crontab syntax, per-user jobs and `at` are not there |
-
-## Targets
-
-| | **S3** — verified | **P4** — planned | **S31** — verified |
-|---|---|---|---|
-| ISA | Xtensa | RISC-V | RISC-V |
-| MMU | - | simple: address translation and RISC-V PMP | compliant **Sv32 MMU** |
-| Process isolation | guardrail only | fault isolation between tasks, to confirm | **planned**, `fork()`-shaped |
-| USB | 1x USB1.1 | 1x USB1.1 / 1x **USB2.0** | 1x **USB2.0** |
-| Radio | WiFi 4 / BLE 5.0 | - | WiFi **6** / BT **Classic** / BT 5.4 LE / IEEE 802.15.4 |
-| Ethernet | — | 100M | **1000M** |
-| Display | parallel RGB and i8080 (`LCD_CAM`) | **MIPI DSI (1080p/30)**, RGB, i8080 and PARLIO | RGB, i8080 and PARLIO; **no** MIPI (**weaker than P4**) |
-| Runs today | **yes** | no | **yes** |
-
-The MMU rows rest on what is written down in [Hardware Targets](#hardware-targets),
-which is also where the one build option hardware decides today is explained.
-
-*The Unix surface, row by row, with what is deliberate and what is **no** —
-[docs/POSIX.md](docs/POSIX.md).*
 
 ## Getting started
 
@@ -250,12 +249,12 @@ is currently active while the project was configured with '.../vY/...'`, which
 names the problem but not where it lives. Both `sdkconfig` files are generated
 from the tracked `sdkconfig.defaults*`, so deleting them loses nothing.
 
-### Board variants
+### S3 Board variants
 
 The default targets an **N16R8** module and covers every flash size of that
 PSRAM: the image is built for 16MB but flashed with the 8MB table, and the
 loader writes the table for the chip it finds. Only PSRAM needs its own build,
-and only the default has been run on hardware.
+and only the default has been run on hardware. Tested only on N16R8, others probably don't work yet.
 
 | File | Module | Flash | PSRAM |
 |---|---|---|---|
@@ -292,14 +291,6 @@ reconnects on its own. `wifi status`, `wifi scan`, `ip addr` and `route` report
 where it got to. The hostname is derived from the MAC — `esp32s3-cb5d74` — and
 `hostname <name>` changes it.
 
-### Ethernet
-
-On the S31 the Gigabit MAC comes up as `eth0` beside `wlan0`, a DHCP client
-like it. It is on by default; when both have an address the default route
-prefers `eth0` and falls back to `wlan0` if the link drops. The reference
-board's YT8531 PHY and its pins are the defaults under `espix networking` in
-`menuconfig`.
-
 ### Logging in over SSH
 
 `sshd` listens on port 22 from boot, as the first unit in `/etc/units`. Once `ip addr` shows an address:
@@ -322,44 +313,6 @@ espix: sshkey: host key SHA256:Sts8sx9+JuATlAMgo/iW1qYjBTbel+wXeXb7E2V2xhg
 `exit` ends an SSH session and takes an optional status; on the console it
 starts a fresh session instead, since there is no login to fall back to and a
 device with no shell would be worse than useless.
-
-### The clock
-
-There is no battery-backed RTC, exactly as on a Raspberry Pi, so real time comes
-from the network. SNTP starts as soon as any interface has an address, taking
-the server from the DHCP lease (option 42) if one is offered and falling back to
-`pool.ntp.org`. Put a `server=` line in `/etc/ntp.conf` to override both.
-
-```
-root:/# date
-Mon 31 Aug 2026 09:12:53 UTC
-root:/# timedatectl
-               Local time: Mon 2026-08-31 11:12:53 SAST
-           Universal time: Mon 2026-08-31 09:12:53 UTC
-                Time zone: SAST-2
-System clock synchronized: yes (4min ago)
-               NTP server: 192.168.110.1 (dhcp)
-```
-
-**Before the first sync the clock reads 1970**, deliberately — an obviously
-wrong date is a better signal than a plausible one, and `timedatectl` says so.
-Files written in that window carry 1970 timestamps, which is the truth about
-them. A `reboot` keeps the time, because ESP-IDF holds it in an RTC register
-that survives a restart; only a power cycle starts over. `date -s` sets it by
-hand where there is no network.
-
-That choice has real costs — every file espix creates for itself is written
-inside that window — and is the sort of thing worth reading the reasoning on
-before changing it; see **Networking and time** in
-[docs/ROADMAP.md](docs/ROADMAP.md#networking-and-time).
-
-**The default zone is UTC**, and there is no `/etc/timezone` until you set one —
-`timedatectl set-timezone` writes the file, the same way `wifi connect` writes
-`/etc/wifi.conf`. It holds a **POSIX TZ string**, not a zoneinfo name, because
-espix ships no tzdata and the rules have to live in the string: `SAST-2`,
-`EST5EDT,M3.2.0,M11.1.0`, or `UTC0` (the offset is not optional). Run
-`timedatectl set-timezone` with no argument for the format, including why the
-sign is inverted.
 
 ### Copying files on and off
 
@@ -393,8 +346,6 @@ Eight connections may be open at once (`ESPIX_SSH_MAX_SESSIONS`), so a transfer
 can run while you are logged in. The serial console stays independent, and `dmesg`
 is how a remote user reads kernel messages.
 
-## Hardware Targets
-
 The chips, and what each one changes, are in the grid at
 [Targets](#targets). What follows is the hardware detail those rows
 rest on.
@@ -426,20 +377,7 @@ quite different things:
   *planned* rather than *no* now.
 - **The P4's is an address-translation MMU**, documented by ESP-IDF as mapping
   physical to virtual so flash and PSRAM can be reached through a pointer. That
-  plus RISC-V PMP gives region-based protection between tasks — an MPU-shaped
-  boundary, not a `fork()`-shaped one. **Still to be confirmed against the P4
-  Technical Reference Manual** rather than promised: what espix would get there
-  is most likely fault isolation between tasks, not copy-on-write.
 
-**The display interfaces, read from `soc_caps.h` rather than from a datasheet.**
-`SOC_LCDCAM_I80_LCD_SUPPORTED` and `SOC_LCDCAM_RGB_LCD_SUPPORTED` are set
-for all three parts, so a parallel panel -- i8080 or RGB -- is drivable on any
-of them, through the same `LCD_CAM` peripheral the camera uses.
-`SOC_MIPI_DSI_SUPPORTED` is the P4's alone, and the S31 has `SOC_PARLIO_LCD_SUPPORTED`
-instead: that is the concrete form of "weaker/limited display output vs P4"
-above, and it is why the grid says what it says.
-`SOC_LCDCAM_CAM_SUPPORTED` is set for all three as well, so the same peripheral
-takes a camera on any of them.
 
 ## A word on the SSH server
 
@@ -507,93 +445,9 @@ What it does **not** do yet — deliberately:
   an opt-in, without requiring a rewrite. S3 stays in "catch and reap" mode
   regardless.
 
-## Why not NuttX or Zephyr?
-
-Read this section first. It is the one most likely to talk you out of espix,
-which is why it comes before the others.
-
-**[Apache NuttX](https://nuttx.apache.org/) already does most of what espix
-does, on this chip, and has for years.** It loads ELF programs off a filesystem
-and runs them by name from its shell (`CONFIG_ELF`, `CONFIG_NSH_FILE_APP`,
-`CONFIG_LIBC_ENVPATH`) — which is espix's headline feature. It supports
-LittleFS. It serves a shell over SSH, via a Dropbear port in `netutils`, with
-password authentication and an ECDSA P-256 host key, which is feature for
-feature what espix's SSH server does. It has WiFi with WPA3, BLE, SMP and most
-ESP32-S3 peripherals. POSIX and ANSI compliance are stated project goals, not
-aspirations.
-
-It was also ahead where espix had written down that it was stuck. With
-`CONFIG_SCHED_USER_IDENTITY` NuttX tracks a task's real and effective UID/GID
-and enforces file permissions in the VFS; espix stored permission bits and
-enforced only the execute one, because an app reached the filesystem through
-libc and the VFS underneath had no idea which process was calling. That gap is
-closed — espix owns the root VFS now, so the question is answerable here too,
-and uid, gid and enforcement all landed on top of it. NuttX keeps the advantage
-on what surrounds it: real groups, `su`, and a task model that was designed for
-this rather than fitted to it.
-
-**The actual difference is that espix is additive to ESP-IDF and NuttX is an
-alternative to it.** Choosing NuttX means leaving `idf.py`, the component
-registry, ESP-IDF's driver model, `esp_event`, NVS and OTA behind, and that is
-not a porting detail: parts of ESP-IDF are written against FreeRTOS
-synchronisation primitives, so IDF drivers and managed components do not travel
-to another RTOS. espix's own dependencies — the ELF loader, the line editor,
-the LittleFS port — are ESP-IDF components and would all have to be replaced.
-
-So the claim espix can defend is narrow: *you already have an ESP-IDF codebase,
-and you want a shell, a filesystem and runtime app loading without re-basing
-onto a different operating system.* If that is not your situation, NuttX is
-probably the better answer, and this README would rather say so than have you
-find out later.
-
-One concrete thing espix does better, for completeness: NuttX's Dropbear port
-implements no SFTP, so file transfer needs `scp -O` and the pre-9.0 protocol.
-espix implements the SFTP subsystem, so a current `scp` works unmodified.
-
-**[Zephyr](https://www.zephyrproject.org/)** is the same trade with a different
-ecosystem. Espressif supports it, and LLEXT gives it runtime-loadable ELF
-extensions, though that path is younger on ESP32 than NuttX's ELF loader.
-Zephyr's shell and filesystem are subsystems of an application rather than a
-Unix userland, which is a different thing to want.
-
-No performance or footprint comparison is offered here, because none has been
-measured.
-
 ## Why not Linux on ESP32?
-
-- **[GrieferPig/esp32-s31-linux](https://github.com/GrieferPig/esp32-s31-linux)**
-  — genuine MMU RV32 Linux 6.18 booting natively on an ESP32-S31, executing in
-  place from flash with a Buildroot rootfs, and experimental WiFi, Bluetooth and
-  dual-core SMP. Self-described as experimental and not for production. It is
-  the strongest evidence that this is possible at all, and it makes espix's case
-  as much as its own: it needs an MMU part and 16MB of PSRAM alongside 16MB of
-  flash to get there. espix targets the S3, which has no MMU.
-- **[nodestark/esp32-running-linux](https://github.com/nodestark/esp32-running-linux)**
-  and **[paulneja/Linux-on-esp32-S3](https://github.com/paulneja/Linux-on-esp32-S3)**
-  — inspiration for the "why not just run something Linux-like on this chip"
-  idea. Neither publishes clear numbers on flash/RAM headroom left for real
-  applications after boot, which is the resource budget espix is explicitly
-  designed around.
-
-espix is deliberately not on this path. It is not a Linux kernel and does not
-try to be binary-compatible with one; the target is a nommu-Linux-*style*
-environment purpose-built for ESP-IDF, on hardware that cannot run the real
-thing.
-
-## Why not Esp32OS?
-
-**[faizannazir/Esp32OS](https://github.com/faizannazir/Esp32OS)** is the nearest
-neighbour — a similar idea (FreeRTOS + ESP-IDF with a Linux-style shell,
-`ps`/`top`/`free`/`dmesg`, process management commands). Good prior art for
-shell ergonomics, but its "processes" are FreeRTOS tasks managed through a shell
-layer, it uses SPIFFS (LittleFS is only a roadmap item there), and it has no ELF
-loader or dynamic native app loading — which is espix's core requirement.
-Because that requirement implies a different architecture (loader, syscall
-boundary, LittleFS from day one) rather than incremental features, espix is
-being built fresh instead of forked. Esp32OS is MIT-licensed with
-attribution/branding requirements (see its `NOTICE.md` / `BRANDING_POLICY.md`);
-any code directly reused from it will retain its license notice and be credited
-here.
+ - Only supports S31. Espix should be able to support all ESP32 models.
+ - Cannot do much with it yet.
 
 ## License
 

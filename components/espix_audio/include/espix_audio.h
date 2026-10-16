@@ -124,6 +124,10 @@ esp_err_t espix_audio_stream_mute(espix_audio_stream_t *st, bool on);
  * and suspended only when the last stream closes. Blocks while it waits. */
 esp_err_t espix_audio_stream_close(espix_audio_stream_t *st);
 
+/* Audio written but not yet taken by the sink, in microseconds: what a player
+ * subtracts from what it wrote to know what has been heard. */
+uint32_t espix_audio_stream_queued_us(espix_audio_stream_t *st);
+
 /* ------------------------------------------------------------- capture -- */
 
 /*

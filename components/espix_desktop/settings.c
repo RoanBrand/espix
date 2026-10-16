@@ -170,7 +170,8 @@ static char               s_state_last[24];
 
 /* The task the panel's data is refreshed on, so the input handler never waits
  * on another stack; see settings_refresh(). */
-static TaskHandle_t       s_refresh_task;
+static bool              s_refresh_running;  /* under s_refresh_mux */
+static void               settings_refresh(void);
 
 static void state_tick_desk(void *arg)
 {
@@ -652,9 +653,9 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
         if (espix_wgt_hit(nav_row(w, i), x, y)) {
             s_sec = (section_t)i;
             if (s_sec == SEC_NETWORK) {
-                refresh_network();
+                settings_refresh();
             } else if (s_sec == SEC_BLUETOOTH) {
-                refresh_bluetooth();
+                settings_refresh();
             }
             espix_window_repaint(w);
             return;
@@ -725,7 +726,7 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             break;
         case ACT_SCAN:
             (void)espix_bt_scan(!espix_bt_scanning());
-            refresh_bluetooth();
+            settings_refresh();
             break;
         case ACT_BT_POWER:
             if (espix_bt_ready()) {
@@ -733,25 +734,25 @@ static void settings_pointer(espix_window_t *w, int x, int y, uint8_t buttons,
             } else {
                 (void)espix_bt_init();
             }
-            refresh_bluetooth();
+            settings_refresh();
             break;
         case ACT_CONNECT:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
                 (void)espix_bt_connect(s_devs[s_dev_sel].bda);
-                refresh_bluetooth();
+                settings_refresh();
             }
             break;
         case ACT_DISCONNECT:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
                 (void)espix_bt_disconnect(s_devs[s_dev_sel].bda);
-                refresh_bluetooth();
+                settings_refresh();
             }
             break;
         case ACT_UNPAIR:
             if (s_dev_sel >= 0 && s_dev_sel < s_ndev) {
                 (void)espix_bt_remove(s_devs[s_dev_sel].bda);
                 s_dev_sel = -1;
-                refresh_bluetooth();
+                settings_refresh();
             }
             break;
         case ACT_SINK: {
@@ -808,9 +809,9 @@ static void settings_key(espix_window_t *w, uint32_t keysym, bool down, void *ct
         return;
     }
     if (s_sec == SEC_NETWORK) {
-        refresh_network();
+        settings_refresh();
     } else if (s_sec == SEC_AUDIO) {
-        refresh_bluetooth();
+        settings_refresh();
     }
     espix_window_repaint(w);
 }
@@ -837,13 +838,15 @@ static void settings_key(espix_window_t *w, uint32_t keysym, bool down, void *ct
  * the panel shows what it had and the desktop carries on -- which is the whole
  * difference between a stale row and a dead board.
  */
+/* One-shot: refreshes until no request is left, then ends. */
+static portMUX_TYPE  s_refresh_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_refresh_again;
+
 static void settings_refresh_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
-        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
         refresh_network();
         refresh_bluetooth();
 
@@ -852,23 +855,43 @@ static void settings_refresh_task(void *arg)
             espix_window_repaint(s_win);
         }
         espix_desktop_unlock();
+
+        portENTER_CRITICAL(&s_refresh_mux);
+        const bool again = s_refresh_again;
+        s_refresh_again  = false;
+        if (!again) {
+            s_refresh_running = false;
+        }
+        portEXIT_CRITICAL(&s_refresh_mux);
+        if (!again) {
+            return;
+        }
     }
 }
 
+/* Ask for fresh network and Bluetooth data; never queries on the caller's task. */
 static void settings_refresh(void)
 {
-    if (s_refresh_task == NULL
-        && espix_kthread_start(&(const espix_kthread_t){
-               .name = "espix:set-ref", .fn = settings_refresh_task,
-               .arg = NULL, .stack = 4096, .priority = 2,
-               .core = tskNO_AFFINITY }, &s_refresh_task) != ESP_OK) {
-        /* No task to ask: do it here, which is where it was, and hope. */
-        s_refresh_task = NULL;
-        refresh_network();
-        refresh_bluetooth();
+    portENTER_CRITICAL(&s_refresh_mux);
+    const bool running = s_refresh_running;
+    if (running) {
+        s_refresh_again = true;
+    } else {
+        s_refresh_running = true;
+    }
+    portEXIT_CRITICAL(&s_refresh_mux);
+    if (running) {
         return;
     }
-    xTaskNotifyGive(s_refresh_task);
+
+    if (espix_kthread_start(&(const espix_kthread_t){
+            .name = "espix:set-ref", .fn = settings_refresh_task, .arg = NULL,
+            .stack = 4096, .priority = 2, .core = tskNO_AFFINITY }, NULL) != ESP_OK) {
+        portENTER_CRITICAL(&s_refresh_mux);
+        s_refresh_running = false;
+        portEXIT_CRITICAL(&s_refresh_mux);
+        espix_klog(ESPIX_KLOG_WARN, TAG, "no task to refresh the panel");
+    }
 }
 
 espix_window_t *espix_settings_open(void)

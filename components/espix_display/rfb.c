@@ -1251,12 +1251,12 @@ static int tight_quality(int level)
 static uint8_t *s_tight_out;
 static size_t   s_tight_cap;
 
-/* Room for a JPEG of a w x h rectangle; false when there is none. */
-static bool tight_room(espix_rect_t r)
+/* Room for `want` bytes of passed-through JPEG; false when there is none. */
+static bool tight_room(size_t want)
 {
-    const size_t want = (size_t)r.w * (size_t)r.h * sizeof(espix_px_t) + 4096;
-
     if (s_tight_out == NULL || s_tight_cap < want) {
+        want += want / 2;               /* headroom: frame sizes wander */
+
         uint8_t *n = heap_caps_malloc(want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
         if (n == NULL) {
@@ -1269,14 +1269,10 @@ static bool tight_room(espix_rect_t r)
     return true;
 }
 
-/* A JPEG of whatever the encoder's input holds, or 0 when it will not encode. */
-static size_t tight_jpeg(espix_rect_t r, int level)
+/* A JPEG of whatever the encoder's input holds, in the encoder's own buffer, or 0. */
+static size_t tight_jpeg(espix_rect_t r, int level, const uint8_t **out)
 {
-    if (!tight_room(r)) {
-        return 0;
-    }
-    return espix_display_jpeg_encode(r.w, r.h, tight_quality(level),
-                                     s_tight_out, s_tight_cap);
+    return espix_display_jpeg_encode_in_place(r.w, r.h, tight_quality(level), out);
 }
 
 /*
@@ -2021,8 +2017,11 @@ static bool update_send(rfb_conn_t *c)
         bool               hint  = false;
 
         /* The picture's own bytes first: no copy and no encode, on any target. */
-        if (whole && tight_room(photo)) {
-            pass_len = espix_canvas_photo_jpeg(cv, s_tight_out, s_tight_cap);
+        if (whole) {
+            const size_t want = espix_canvas_photo_jpeg(cv, NULL, 0);
+            if (want > 0 && tight_room(want)) {
+                pass_len = espix_canvas_photo_jpeg(cv, s_tight_out, s_tight_cap);
+            }
         }
 
         if ((pass_len > 0 || enc) && ov.w > 0 && ov.h > 0
@@ -2109,11 +2108,13 @@ static bool update_send(rfb_conn_t *c)
      */
     size_t jpeg_len = 0;
 
+    const uint8_t *jpeg_buf = s_tight_out;
+
     if (jpeg_i >= 0 && pass_len > 0) {
         jpeg_len = pass_len;
         s_cls.passed++;
     } else if (jpeg_i >= 0) {
-        jpeg_len = tight_jpeg(rects[jpeg_i], c->qlevel);
+        jpeg_len = tight_jpeg(rects[jpeg_i], c->qlevel, &jpeg_buf);
 
         if (jpeg_len == 0) {
             tight_restage(rects[jpeg_i], c->stage, cw);
@@ -2206,7 +2207,7 @@ static bool update_send(rfb_conn_t *c)
 
         if (tight) {
             tight_head(&s, 0x90, jpeg_len);
-            sink_write(&s, s_tight_out, jpeg_len);
+            sink_write(&s, jpeg_buf, jpeg_len);
         } else if (c->hextile) {
             enc_hextile(&s, c->stage, cw, r, &c->pf, c->row);
         } else {

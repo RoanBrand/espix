@@ -123,6 +123,22 @@ typedef size_t (*espix_window_overlay_jpeg_fn)(espix_window_t *w, void *ctx,
 
 void espix_window_set_overlay_jpeg(espix_window_t *w, espix_window_overlay_jpeg_fn fn);
 
+/* Window-surface rectangle drawn over the overlay (controls); empty to hide.
+ * While shown, the overlay's own JPEG is not offered to a viewer. */
+void espix_window_set_overlay_over(espix_window_t *w, espix_rect_t r);
+
+/* Pointer motion over the window (window coordinates), and x = y = -1 when it leaves. */
+typedef void (*espix_window_hover_fn)(espix_window_t *w, int x, int y, void *ctx);
+
+void espix_window_set_hover(espix_window_t *w, espix_window_hover_fn fn);
+
+/* The whole canvas, no frame, no taskbar; off puts the window back. */
+void espix_window_set_fullscreen(espix_window_t *w, bool on);
+bool espix_window_fullscreen(const espix_window_t *w);
+
+/* Hide the pointer until it next moves. */
+void espix_desktop_cursor_conceal(void);
+
 /*
  * A new size, and a new surface to go with it -- because the surface is the
  * window, frame included, so a resize cannot be a bigger blit of a smaller

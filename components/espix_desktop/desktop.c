@@ -89,6 +89,10 @@ struct espix_window {
     espix_rect_t     ov;        /* the overlay, window coordinates; empty: none */
     espix_window_overlay_fn ov_fn;
     espix_window_overlay_jpeg_fn ov_jpeg;
+    espix_rect_t     ov_over;   /* surface drawn over the overlay (controls), or empty */
+    espix_window_hover_fn hover;
+    bool             fs;        /* fullscreen: the whole canvas, no frame, no bar */
+    espix_rect_t     fs_rest;   /* where it was before */
 };
 
 /* Bottom first, top last: the array *is* the z-order. */
@@ -216,6 +220,8 @@ static uint32_t            s_dropped;
 
 static void desktop_input_locked(void *ctx, const espix_input_event_t *ev);
 static void input_stat(const espix_input_event_t *ev, int64_t us);
+static struct espix_window *s_hover;
+static bool rects_overlap(espix_rect_t a, espix_rect_t b);
 static bool desktop_on_screen(void);
 
 static bool desk_post(const desk_msg_t *m)
@@ -542,6 +548,10 @@ static void cursor_show_locked(espix_canvas_t *c, int hx, int hy)
     s_cursor_on = true;
 }
 
+/* Hidden until the pointer next moves: a still cursor over a video costs the
+ * picture its pass-through. */
+static bool s_cursor_concealed;
+
 /* Move it, in one hold of the canvas so no update sees it half moved. */
 static void cursor_put(int hx, int hy)
 {
@@ -550,9 +560,24 @@ static void cursor_put(int hx, int hy)
         return;
     }
     espix_canvas_lock(c);
+    s_cursor_concealed = false;
     cursor_hide_locked(c);
     cursor_show_locked(c, hx, hy);
     espix_canvas_unlock(c);
+}
+
+void espix_desktop_cursor_conceal(void)
+{
+    espix_canvas_t *c = espix_display_canvas();
+    if (c == NULL) {
+        return;
+    }
+    desk_lock();
+    espix_canvas_lock(c);
+    s_cursor_concealed = true;
+    cursor_hide_locked(c);
+    espix_canvas_unlock(c);
+    desk_unlock();
 }
 
 /* ------------------------------------------------------------------ */
@@ -607,6 +632,9 @@ static void input_reset(void)
 
 espix_rect_t espix_window_content(const espix_window_t *w)
 {
+    if (w->fs) {
+        return (espix_rect_t){ 0, 0, w->w, w->h };
+    }
     return (espix_rect_t){ PAD, TITLE_H + PAD,
                            w->w - 2 * PAD, w->h - TITLE_H - 2 * PAD };
 }
@@ -682,17 +710,17 @@ static bool window_button_hit(const espix_window_t *w, espix_rect_t b,
 
 static bool window_close_hit(const espix_window_t *w, int x, int y)
 {
-    return window_button_hit(w, window_close_box(w), x, y);
+    return !w->fs && window_button_hit(w, window_close_box(w), x, y);
 }
 
 static bool window_min_hit(const espix_window_t *w, int x, int y)
 {
-    return window_button_hit(w, window_min_box(w), x, y);
+    return !w->fs && window_button_hit(w, window_min_box(w), x, y);
 }
 
 static bool window_max_hit(const espix_window_t *w, int x, int y)
 {
-    return window_button_hit(w, window_button_box(w, WIN_BTN_MAX), x, y);
+    return !w->fs && window_button_hit(w, window_button_box(w, WIN_BTN_MAX), x, y);
 }
 
 espix_surface_t *espix_window_surface(espix_window_t *w) { return w->surf; }
@@ -717,6 +745,9 @@ static void window_frame(espix_window_t *w, espix_rect_t r)
     espix_surface_t *s = w->surf;
 
     espix_surface_fill(s, r, COL_WIN_BG);
+    if (w->fs) {
+        return;                         /* no title, no outline */
+    }
 
     if (r.y < TITLE_H) {
         const espix_px_t bar = (w == s_focus) ? COL_TITLE_FOC : COL_TITLE;
@@ -828,7 +859,8 @@ static void damage_flush_locked(void)
         const bool in_ov = w->ov_fn != NULL
             && wr.x >= w->ov.x && wr.y >= w->ov.y
             && wr.x + wr.w <= w->ov.x + w->ov.w
-            && wr.y + wr.h <= w->ov.y + w->ov.h;
+            && wr.y + wr.h <= w->ov.y + w->ov.h
+            && !rects_overlap(wr, w->ov_over);
 
         if (wr.w > 0 && wr.h > 0 && !in_ov) {
             window_paint(w, wr);        /* an overlay paints itself, later */
@@ -892,11 +924,31 @@ static void window_compose(espix_canvas_t *c, espix_window_t *w, espix_rect_t r)
     if (oc.w > 0 && oc.h > 0) {
         w->ov_fn(w, c, ov.x, ov.y, oc, w->ctx);
         espix_canvas_damage(c, oc);
+
+        const espix_rect_t over = rect_meet(oc, (espix_rect_t){ w->x + w->ov_over.x,
+                                                                w->y + w->ov_over.y,
+                                                                w->ov_over.w,
+                                                                w->ov_over.h });
+        if (over.w > 0 && over.h > 0) {
+            espix_canvas_blit_surface_rect(c, w->x, w->y, w->surf,
+                                           (espix_rect_t){ over.x - w->x, over.y - w->y,
+                                                           over.w, over.h });
+        }
     }
 }
 
-static bool rects_overlap(espix_rect_t a, espix_rect_t b);
 static bool s_menu;
+
+/* A fullscreen window on top hides the taskbar. */
+static bool top_fullscreen(void)
+{
+    for (int i = s_nwin - 1; i >= 0; i--) {
+        if (!s_wins[i]->hidden) {
+            return s_wins[i]->fs;
+        }
+    }
+    return false;
+}
 
 /* The topmost visible window, if its overlay is what the encoder may send as a picture. */
 static espix_window_t *photo_window(void)
@@ -918,7 +970,8 @@ static size_t photo_jpeg(void *ctx, uint8_t *out, size_t cap)
     const espix_rect_t ov = window_ov(w);
     const espix_rect_t cb = { s_cx - 1, s_cy - 1, CUR_BW, CUR_BH };
 
-    if (w->ov_jpeg == NULL || (s_cursor_on && rects_overlap(cb, ov))) {
+    if (w->ov_jpeg == NULL || w->ov_over.w > 0
+        || (s_cursor_on && rects_overlap(cb, ov))) {
         return 0;
     }
     return w->ov_jpeg(w, w->ctx, out, cap);
@@ -936,7 +989,7 @@ static void photo_publish(espix_canvas_t *c)
     const espix_rect_t ov = window_ov(w);
     /* Something drawn over the picture means its own JPEG is not what is shown. */
     const bool clear = !(s_menu && rects_overlap(menu_rect(), ov))
-                       && !rects_overlap(bar_rect(), ov);
+                       && (w->fs || !rects_overlap(bar_rect(), ov));
 
     espix_canvas_set_photo(c, ov, clear ? photo_jpeg : NULL, w);
 }
@@ -995,13 +1048,17 @@ static void desktop_repair_locked(espix_rect_t r)
     }
     /* Over the windows, not beside them: a window that reaches the bottom of
      * the screen goes under the bar, which is what makes it a bar. */
-    taskbar_paint(c, r);
-    menu_paint(c, r);
+    if (!top_fullscreen()) {
+        taskbar_paint(c, r);
+        menu_paint(c, r);
+    }
     photo_publish(c);
 
     int px = 0, py = 0;
     espix_display_pointer(&px, &py);
-    cursor_show_locked(c, px, py);
+    if (!s_cursor_concealed) {
+        cursor_show_locked(c, px, py);
+    }
     espix_canvas_unlock(c);
 }
 
@@ -1082,6 +1139,9 @@ void espix_window_free(espix_window_t *w)
         return;
     }
     photo_forget();
+    if (s_hover == w) {
+        s_hover = NULL;
+    }
     for (int i = 0; i < s_nwin; i++) {
         if (s_wins[i] != w) {
             continue;
@@ -1115,6 +1175,57 @@ void espix_window_set_overlay(espix_window_t *w, espix_rect_t r,
     desk_unlock();
 }
 
+void espix_window_set_overlay_over(espix_window_t *w, espix_rect_t r)
+{
+    desk_lock();
+    const espix_rect_t was = w->ov_over;
+
+    w->ov_over = (r.w > 0 && r.h > 0) ? r : (espix_rect_t){ 0, 0, 0, 0 };
+    if (was.w > 0) {
+        espix_window_damage(w, was);
+    }
+    if (w->ov_over.w > 0) {
+        espix_window_damage(w, w->ov_over);
+    }
+    desk_unlock();
+}
+
+void espix_window_set_hover(espix_window_t *w, espix_window_hover_fn fn)
+{
+    w->hover = fn;
+}
+
+bool espix_window_fullscreen(const espix_window_t *w)
+{
+    return w != NULL && w->fs;
+}
+
+static bool window_raise_raw(espix_window_t *w);
+
+void espix_window_set_fullscreen(espix_window_t *w, bool on)
+{
+    espix_canvas_t *c = espix_display_canvas();
+
+    if (w == NULL || c == NULL || w->fs == on) {
+        return;
+    }
+    desk_lock();
+    if (on) {
+        w->fs_rest = (espix_rect_t){ w->x, w->y, w->w, w->h };
+        w->fs      = true;
+        (void)window_raise_raw(w);
+        (void)espix_window_resize(w, 0, 0, espix_canvas_width(c),
+                                  espix_canvas_height(c));
+    } else {
+        w->fs = false;
+        (void)espix_window_resize(w, w->fs_rest.x, w->fs_rest.y,
+                                  w->fs_rest.w, w->fs_rest.h);
+    }
+    espix_window_repaint(w);
+    espix_desktop_repaint();            /* the taskbar comes and goes */
+    desk_unlock();
+}
+
 void espix_window_set_overlay_jpeg(espix_window_t *w, espix_window_overlay_jpeg_fn fn)
 {
     desk_lock();
@@ -1145,8 +1256,11 @@ bool espix_window_resize(espix_window_t *w, int x, int y, int width, int height)
     if (width > espix_canvas_width(c)) {
         width = espix_canvas_width(c);
     }
-    if (height > espix_canvas_height(c) - TASKBAR_H) {
+    if (!w->fs && height > espix_canvas_height(c) - TASKBAR_H) {
         height = espix_canvas_height(c) - TASKBAR_H;
+    }
+    if (height > espix_canvas_height(c)) {
+        height = espix_canvas_height(c);
     }
     if (w->x == x && w->y == y && w->w == width && w->h == height) {
         return true;
@@ -3616,6 +3730,7 @@ static void windows_create(void)
 static void windows_destroy(void)
 {
     photo_forget();
+    s_hover = NULL;
     /* Before the windows, not with them: the shell task is drawing into the
      * terminal window's surface, and term_stop() is what makes it stop. */
     for (term_win_t *tw = s_terms; tw != NULL; tw = tw->next) {
@@ -3757,6 +3872,23 @@ static void drag_to(int x, int y)
     espix_window_move(s_drag, nx, ny);
 }
 
+/* s_hover: the window the pointer is over, for hover and leave events. */
+
+static void hover_at(int x, int y)
+{
+    espix_window_t *w = window_at(x, y);
+
+    if (w != s_hover) {
+        if (s_hover != NULL && s_hover->hover != NULL) {
+            s_hover->hover(s_hover, -1, -1, s_hover->ctx);
+        }
+        s_hover = w;
+    }
+    if (w != NULL && w->hover != NULL) {
+        w->hover(w, x - w->x, y - w->y, w->ctx);
+    }
+}
+
 static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
 {
     (void)ctx;
@@ -3766,6 +3898,7 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
         s_buttons = ev->buttons;
 
         cursor_put(ev->x, ev->y);
+        hover_at(ev->x, ev->y);
 
         if (was != 0 && s_buttons == 0) {
             /* To whoever took the press, even if the pointer has left it: a
@@ -3883,7 +4016,8 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
                         s_focus->pointer(s_focus, ev->x - s_focus->x,
                                          ev->y - s_focus->y, b, s_focus->ctx);
                     }
-                } else if (ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
+                } else if (!s_focus->fs
+                           && ev->y >= s_focus->y && ev->y < s_focus->y + TITLE_H) {
                     drag_begin(s_focus, ev->x, ev->y);
                 }
             }
@@ -3904,6 +4038,7 @@ static void desktop_input_locked(void *ctx, const espix_input_event_t *ev)
          * pulling back moves immediately, the way a mouse does.
          */
         cursor_put(s_cx + ev->x, s_cy + ev->y);
+        hover_at(s_cx, s_cy);
 
         /* Only when it changes: a highlight that repaints on every report of a
          * mouse crossing a menu is 132x66 of canvas per motion. */
@@ -4001,6 +4136,10 @@ static void desktop_resized(void *ctx)
 
     for (int i = 0; i < s_nwin; i++) {
         espix_window_t *w = s_wins[i];
+        if (w->fs) {
+            (void)espix_window_resize(w, 0, 0, cw, ch);
+            continue;
+        }
         if (w->x + w->w < 32) { w->x = 32 - w->w; }
         if (w->x > cw - 32)   { w->x = cw - 32; }
         if (w->y < 0)         { w->y = 0; }
