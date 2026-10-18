@@ -34,6 +34,7 @@ void espix_cmds_register_display(void);
 void espix_cmds_register_text(void);
 void espix_cmds_register_edit(void);
 void espix_cmds_register_thread(void);
+void espix_cmds_register_umode(void);
 
 /*
  * The palette the login banner and `top` share, and the helper that colours a

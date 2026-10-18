@@ -25,12 +25,41 @@ things are as they are.
   rather than only that one did (R-P7.7), so the field a handler needs exists;
   Ctrl-Z itself is still missing.
 
-- **User mode on the S31 (R-P8.6, deferred from the process model).** A spike
-  before memory protection (R-P3.2, R-P3.3) is committed to: a two-page Sv32
-  table, `mret` into U-mode, one load, one `ecall`, and a page fault back to the
-  kernel. It answers what the S31 costs -- ASIDs, A/D bits, a TLB miss -- with
-  numbers rather than a datasheet, and it is also what asynchronous signal
-  delivery is waiting for. The S3 has no MMU for it and stays as it is.
+- **User mode on the S31 (R-P8.6).** The spike is done: the `umode` command
+  (S31 only, `cmd_umode.c`) builds a small Sv32 table, `mret`s into U-mode and
+  traps back. Measured on rev v0.0 at 320 MHz:
+
+  | what | result |
+  |---|---|
+  | `mret` into U, `ecall` back to M | 37 cycles |
+  | U-mode page fault to the M handler | 32 cycles |
+  | TLB miss, tables in SRAM or cache-hot PSRAM | +11 cycles (19 vs 8) |
+  | TLB | ~10-entry first level, then ~128 entries at +2 cycles |
+  | `satp` write / plus full `sfence.vma` | 12 / 85 cycles |
+  | ASIDs | 9 bits; entries tagged, kept across switches, ASID-only flush works |
+  | A/D bits | software's (Svade): a clear bit faults |
+  | isolation | unmapped, no-U, W on R-X, X on RW-, M-mode CSRs: all trap |
+
+  What a real implementation has to deal with:
+  - **PMP cannot help**: the IDF locks all 16 working entries at boot.
+    Isolation has to come from the page tables.
+  - **`cpu_apm` closes flash and PSRAM to U-mode.** Region 0
+    (`0x40000000-0x5fffffff`) is TEE-only (`0x7000`), and U-mode is REE: a load
+    is an access fault until REE bits are added. APM state survives a software
+    reset.
+  - **Interrupts reach U-mode regardless of `mintthresh`**, straight into IDF's
+    vector on whatever `sp` U had. FreeRTOS preemption therefore works as is,
+    but the vector must switch to a kernel stack when it comes from U, and the
+    threshold reads back changed after the round trip.
+  - **An M-mode `MPRV` access that meets an invalid PTE stops the hart** without
+    a trap (twice, same instruction); a permission fault traps normally. A
+    kernel reading user pointers that way must check the mapping first.
+  - The page-table walker reads through the D-cache (memory still held zero
+    when the walk found the PTE), so tables in PSRAM need no writeback here,
+    contrary to one Linux port's note.
+
+  Asynchronous signal delivery is waiting for this boundary. The S3 has no MMU
+  for it and stays as it is.
 
 ## Filesystem
 

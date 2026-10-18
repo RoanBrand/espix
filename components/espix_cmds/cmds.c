@@ -122,5 +122,8 @@ void espix_cmds_register_all(void)
     espix_cmds_register_record();
     espix_cmds_register_display();
     espix_cmds_register_thread();
+#if CONFIG_IDF_TARGET_ESP32S31
+    espix_cmds_register_umode();
+#endif
     espix_cmds_register_exec_fallback();
 }

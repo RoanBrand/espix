@@ -25,6 +25,8 @@ idf_component_register(
         "cmd_display.c"
         "cmd_svc.c"
         "cmd_thread.c"
+        "cmd_umode.c"
+        "umode_probe.S"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -61,5 +63,6 @@ idf_component_register(
         esp_system
         esp_timer
         heap
+        esp_mm
         spi_flash
 )
