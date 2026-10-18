@@ -224,10 +224,12 @@ the command exists before mounting does: silence would read as an empty disk.
   Bytes are copied as they stand — a label in a non-ASCII code page is not
   transcoded, because nothing here knows which page that was. An ISO's 32-byte volume identifier is read the same way, from its descriptor — which is the block a hybrid image's partition begins with.
 - **The partition table is walked by espix, not by the library.** The library
-  ends the table at a `0x00` *type byte*; a hybrid ISO image — an Arch or CachyOS
-  installer, whose first entry is typed `0x00` with a real start and size — then
-  loses every entry after it, including the FAT EFI partition that is the only
-  thing on such a stick espix can mount. Measured on a CachyOS 202604 installer:
+  treats a `0x00` *type byte* as an empty entry: before 1.0.0 it ended the table
+  there, and from 1.0.0 it skips the entry. On a hybrid ISO image — an Arch or
+  CachyOS installer, whose first entry is typed `0x00` with a real start and size —
+  that first entry is still lost either way, and before 1.0.0 every entry after it
+  went too, including the FAT EFI partition that is the only thing on such a stick
+  espix can mount. Measured on a CachyOS 202604 installer:
   2.8G of ISO 9660 typed `0x00`, then 23M of EFI FAT typed `0xEF`, and espix
   showed neither. So the walk is espix's, and the table ends when an entry is
   *empty* — no start and no size — which is a different thing. The type table is

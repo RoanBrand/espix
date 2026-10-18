@@ -389,7 +389,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   Nothing espix does reaches it, and nothing stops it either; it is the
   component's, not espix's use of it.
 
-- **Loading an app can fault the cache — latent since XIP, not fixed.**
+- **Loading an app can fault the cache — fixed for the S3 in `elf_loader`
+  1.3.4, the S31 path unchanged.** 1.3.4 replaced the S3's whole-cache
+  write-back with a ranged `esp_cache_msync()` over the app's `.text`, so the
+  ordering below no longer exists there. The S31 still writes back the whole
+  D-cache before taking the flash lock; no fault has been seen on it. The rest
+  of this entry is the S3 history, kept for the record.
+
   Faulting task `app:testapp`, `exccause 0x47 (CacheError)` in
   `Cache_WriteBack_Items` ← `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
   `esp_elf_relocate`, seen once in eight parallel test runs. The `elf_loader`
@@ -408,9 +414,9 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   unproven here is only whether the window is *fully* closed, not whether it
   narrowed.
 
-  It stays here rather than moving to fixed, because the ordering upstream is
-  still wrong and the fault returns the moment XIP is off. The three
-  espix-side ways out, none free, remain the same:
+  Before 1.3.4 it stayed here rather than moving to fixed, because the ordering
+  upstream was wrong and the fault returned the moment XIP was off. The three
+  espix-side ways out it listed, none free, apply now only to the S31:
 
   - Turn off `CONFIG_ELF_LOADER_LOAD_PSRAM`. The flush is not called at all
     then — but every loaded app's image moves into internal RAM, and this board

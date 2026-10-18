@@ -48,7 +48,7 @@ import re
 import sys
 from pathlib import Path
 
-EXPECTED_VERSION = "1.22.3"
+EXPECTED_VERSION = "1.23.0"
 COMPONENT = "joltwallet__littlefs"
 # Each insertion is guarded by a symbol unique to *it*, not one flag per file.
 # A single shared marker breaks the moment one file takes two insertions: the

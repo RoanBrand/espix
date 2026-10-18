@@ -474,6 +474,11 @@ The rule that would be right is "empty" in the sense the comment means it: no
 start *and* no size. A `0x00`-typed entry that names sectors is an unnameable type
 — worth inserting, or at the very least worth flagging.
 
+**Half fixed in 1.0.0:** a `0x00` entry is now skipped with `continue` rather than
+ending the walk, so the entries after it are found again. A `0x00`-typed entry
+that names sectors is still dropped, and still without
+`ESP_EXT_PART_LIST_FLAG_LOSSY`.
+
 espix walks the four entries itself now and calls
 `esp_mbr_parse_default_supported_partition_types()` for the type table, which is
 the part of the parser that assumes nothing about the walk; see
@@ -556,6 +561,14 @@ correct. See the console section of [ARCHITECTURE.md](ARCHITECTURE.md).
 ## `espressif/elf_loader`
 
 ### `esp_elf_arch_flush()` writes back the cache outside the lock it then takes
+
+**Fixed for the S3 in 1.3.4** ("ranged thread-safe cache synchronization"): the
+S3 branch now writes back the loaded `.text` range with `esp_cache_msync()` and
+invalidates the matching instruction-cache range, which is the remedy suggested
+below, and never calls `Cache_WriteBack_All()`. **The S31 branch is unchanged**:
+since 1.3.3 it does a full `Cache_WriteBack_All(CACHE_MAP_L1_DCACHE)` before
+taking the flash lock, the same ordering, though no fault has been seen there.
+What follows is the report as written against 1.3.3.
 
 `esp_elf_adapter.c:129` does, for every target but the S31:
 
@@ -803,7 +816,9 @@ The alignment of FatFs's sector window, an lwext4 buffer or a user's own
 `read()` buffer is therefore immaterial.
 
 What remains worth reporting upstream, and is **P4-only** (nothing fires on the
-S3 because the code is not compiled): on the OUT enqueue path
+S3 because the code is not compiled; from `espressif/usb` 1.6.0 the S31 compiles
+it too when `CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM` is on, which espix
+leaves off): on the OUT enqueue path
 `cache_sync_data_buffer()` passes `ESP_CACHE_MSYNC_FLAG_UNALIGNED` to a
 writeback whose buffer is in fact aligned. That needlessly bypasses the alignment
 check, and an unaligned writeback is exactly what the memory-synchronization

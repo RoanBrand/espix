@@ -517,7 +517,7 @@ function in internal RAM. It works for code linked into the firmware.
 
 Code loaded at runtime is never linked into the firmware. espix's ELF loader
 reads the file and copies it into memory itself, through one allocator for every
-section (`managed_components/espressif__elf_loader/src/esp_elf_adapter.c:33`):
+section (`esp_elf_malloc()` in `managed_components/espressif__elf_loader/src/esp_elf_adapter.c`):
 
 ```c
 void *esp_elf_malloc(uint32_t n, bool exec)

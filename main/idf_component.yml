@@ -8,7 +8,7 @@ dependencies:
     version: ">=6.1"
 
   # Root filesystem. VFS-backed, so apps get plain fopen()/opendir().
-  joltwallet/littlefs: "==1.22.3"
+  joltwallet/littlefs: "==1.23.0"
 
   # Line editing, one instance per session. IDF's own linenoise keeps its
   # history and callbacks in file-scope statics and reads raw descriptors, so it
@@ -20,7 +20,8 @@ dependencies:
   # Runtime ELF loader: relocates and runs natively-compiled apps read off the
   # filesystem, plus dlopen()/dlsym() for shared objects.
   # Supports esp32s3 / esp32p4 / esp32s31, which are espix's three targets.
-  espressif/elf_loader: "~1.3.3"
+  # 1.3.4 is the floor: it stops the S3's app-load cache flush racing a flash op.
+  espressif/elf_loader: "~1.3.5"
 
   # USB-NCM: Ethernet over the USB-OTG port, so the board is reachable over a
   # cable with no network at all. Espressif's own additions to TinyUSB rather
@@ -71,7 +72,7 @@ dependencies:
   # anything can mount: it names the filesystems espix *cannot* drive -- ntfs,
   # iso9660 -- so `lsblk` can say "ntfs, unsupported" where the honest
   # alternative is silence.
-  espressif/esp_ext_part_tables: "^0.5.0"
+  espressif/esp_ext_part_tables: "^1.0.0"
 
   # ext2/3/4 (esp_lwext4) is not here: tools/patch-lwext4.py fetches it at a
   # pinned revision, because the manager's hash of a git dependency with a
