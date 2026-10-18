@@ -779,7 +779,7 @@ EXPOSE_ADD = chr(10).join([
     '    return true;',
     '}',
     '',
-    EXPOSE_ANCHOR,
+    '',
 ])
 MARK_VFS_LAST_ENTRY = "espix: the metadata of the entry the last readdir returned"
 
@@ -860,6 +860,9 @@ def main() -> int:
         source_new = replace_once(source_new, VFS_READDIR_CACHE_OLD,
                                   VFS_READDIR_CACHE_NEW, MARK_VFS_READDIR_CACHE,
                                   str(source.name) + " readdir stat cache")
+        # Repair a doubled signature; the marker alone would leave it in place.
+        source_new = source_new.replace(EXPOSE_ANCHOR + EXPOSE_ANCHOR,
+                                        EXPOSE_ANCHOR)
         source_new = insert_before(source_new, EXPOSE_ANCHOR, EXPOSE_ADD,
                                    MARK_VFS_LAST_ENTRY,
                                    str(source.name) + " last entry info")

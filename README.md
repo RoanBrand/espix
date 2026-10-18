@@ -144,12 +144,32 @@ which is also where the one build option hardware decides today is explained.
 
 ## Getting started
 
-**Requires ESP-IDF v6.1**, checked out by tag. Older releases will not work:
-espix's SSH and password hashing are written against PSA Crypto, which arrives
-with Mbed TLS 4.x in 6.1, and `espix_kernel` names `CHIP_ESP32S31`, added in the
-same release. `main/idf_component.yml` declares `idf: ">=6.1"`, so an older one
-is refused with a single clear line rather than failing halfway through a
-compile.
+**Requires ESP-IDF v6.1.**
+
+- **S3:** the `v6.1` tag or the `release/v6.1` branch -- either works.
+- **S31:** the `release/v6.1` branch. The tag fails to link it (`cannot move
+  location counter backwards`); only the branch's S31 linker script fits
+  `.ext_ram.bss` beside PSRAM.
+
+Older releases will not work: espix's SSH and
+password hashing are written against PSA Crypto, which arrives with Mbed TLS 4.x
+in 6.1, and `espix_kernel` names `CHIP_ESP32S31`, added in the same release.
+`main/idf_component.yml` declares `idf: ">=6.1"`, so an older one is refused
+with a single clear line rather than failing halfway through a compile.
+
+The classic install, if you have no IDF yet (the EIM installer works too). The
+branch covers both targets:
+
+```bash
+git clone -b release/v6.1 --recursive https://github.com/espressif/esp-idf ~/esp/esp-idf
+~/esp/esp-idf/install.sh esp32s3,esp32s31
+```
+
+Nothing needs sourcing afterwards: `tools/idf.sh` finds an IDF in
+`~/.espressif/*/esp-idf`, `~/esp/esp-idf`, `~/esp/*/esp-idf`, `~/esp-idf*` or
+`/opt/esp-idf`, or wherever `IDF_PATH` points, and activates it itself. Build
+through `make`, not a bare `idf.py`: that writes `build/` and `sdkconfig`, which
+nothing here reads.
 
 Choose a target once — `tools/espix` remembers it in `.espix/`, which the
 Makefile and `tools/idf.sh` both read:
@@ -337,48 +357,6 @@ reassembled in memory — though a transfer *offset* past 4 GiB is refused, stdi
 seek being 32 bits, which is a property of the C library espix links against rather
 than of the filesystem. See [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
 
-Downloads run at about 355KB/s over 2.4GHz WiFi. Uploads are much slower, and
-bounded by LittleFS erasing a block per write rather than by the network — see
-[docs/PROFILING.md](docs/PROFILING.md#transfer-throughput-scp-and-the-filesystem)
-for the measurements.
-
-Eight connections may be open at once (`ESPIX_SSH_MAX_SESSIONS`), so a transfer
-can run while you are logged in. The serial console stays independent, and `dmesg`
-is how a remote user reads kernel messages.
-
-The chips, and what each one changes, are in the grid at
-[Targets](#targets). What follows is the hardware detail those rows
-rest on.
-
-
-Support priority and per-chip feature availability (isolation model,
-display, networking) still to be finalized as the design matures.
-
-A second hardware fact decides another: **`SOC_EMAC_SUPPORTED` separates the
-S31 from the S3.** The S31 has a Gigabit Ethernet MAC, so `ESPIX_ETH_ENABLED`
-exists only where the MAC does and the S3 build never sees it. It is on by
-default on the S31 (RGMII, an external YT8531 on the reference board); the P4's
-100M RMII MAC is not brought up yet.
-
-One hardware fact decides a build option today: **`SOC_USB_OTG_PERIPH_NUM` is 1
-on the S3 and the S31, and 2 only on the P4.** The OTG peripheral is either a
-device (USB-NCM, `usb0`) or a host (USB storage), so espix asks which in
-`ESPIX_USB_ROLE` and defaults to **host**. The P4 could do both at once, but
-builds one role like the others until a board file can say which socket reaches
-which controller — [USB-HOST](docs/USB-HOST.md).
-
-What the MMU rows in the matrix above rest on, since "has an MMU" covers two
-quite different things:
-
-- **The S31 has the kind that matters.** Espressif shipped a developer preview
-  of a Linux BSP for it in August 2026, and there are community RV32 Linux ports
-  running on the hardware. If Linux boots, per-process address spaces and
-  therefore `fork()` are available to espix too — which is why those rows say
-  *planned* rather than *no* now.
-- **The P4's is an address-translation MMU**, documented by ESP-IDF as mapping
-  physical to virtual so flash and PSRAM can be reached through a pointer. That
-
-
 ## A word on the SSH server
 
 espix implements SSH itself rather than linking an existing one. The only SSH
@@ -456,7 +434,7 @@ MIT — see [LICENSE](LICENSE).
 Any code directly incorporated from other MIT-licensed projects (e.g. Esp32OS)
 retains its original license notice; see individual file headers / a `NOTICE.md`
 once added. Nothing is incorporated today: everything espix depends on is fetched
-at build time by the IDF component manager rather than vendored into this tree.
+at build time rather than vendored into this tree.
 
 **Five build-time patches, each written to be sent upstream** —
 [tools/README.md](tools/README.md) has the detail, and
@@ -480,8 +458,10 @@ to espix:
 Everything espix depends on is fetched by the IDF component manager at the
 versions in `dependencies.lock` — `espressif/elf_loader`,
 `espressif/esp_linenoise`, `joltwallet/littlefs`, `espressif/esp_tinyusb`,
-`espressif/usb`, `espressif/usb_host_msc`, `espressif/esp_ext_part_tables`, and
-`esp_lwext4` as a git dependency that carries the lwext4 core as its own submodule.
+`espressif/usb`, `espressif/usb_host_msc` and `espressif/esp_ext_part_tables`.
+`esp_lwext4` and its lwext4 core are fetched at pinned commits into the gitignored
+`external/` by `tools/patch-lwext4.py`, because the component manager's hash of a
+git dependency with a submodule only matches on the machine that locked it.
 The patches are applied to the downloaded copies on every configure, so a
 reinstall or an upgrade restores them, and an anchor that has moved stops the build
 by name rather than producing an image that is quietly missing something.

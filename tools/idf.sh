@@ -74,6 +74,14 @@ idf_version() {
     if [ -z "$v" ]; then
         v=$(git -C "$dir" describe --tags 2>/dev/null | head -1)
     fi
+    # A shallow branch clone has neither; version.cmake is in every tree.
+    if [ -z "$v" ] && [ -f "$dir/tools/cmake/version.cmake" ]; then
+        v=$(awk '/IDF_VERSION_(MAJOR|MINOR|PATCH) / {gsub(/[^0-9]/, "", $2); n[$1]=$2}
+                 END {if (n["set(IDF_VERSION_MAJOR"] != "") {
+                          v = "v" n["set(IDF_VERSION_MAJOR"] "." n["set(IDF_VERSION_MINOR"]
+                          if (n["set(IDF_VERSION_PATCH"] != "0") v = v "." n["set(IDF_VERSION_PATCH"]
+                          print v}}' "$dir/tools/cmake/version.cmake")
+    fi
     printf '%s' "$v"
 }
 
@@ -123,7 +131,7 @@ idf_pref() {
 idf_candidates() {
     local stable="" pre="" d v p
     for d in "$HOME"/.espressif/*/esp-idf "$HOME"/esp/*/esp-idf \
-             "$HOME"/esp/esp-idf /opt/esp-idf; do
+             "$HOME"/esp/esp-idf "$HOME"/esp-idf* /opt/esp-idf; do
         idf_valid "$d" || continue
         v=$(idf_version "$d")
         [ -n "$v" ] || continue
@@ -156,7 +164,7 @@ espix_find_idf() {
     if [ -z "$line" ]; then
         printf 'idf.sh: no ESP-IDF v%s.%s found.\n' \
                "$espix_idf_want_major" "$espix_idf_want_minor" >&2
-        printf 'idf.sh: looked in ~/.espressif/*/esp-idf, ~/esp/*/esp-idf, /opt/esp-idf\n' >&2
+        printf 'idf.sh: looked in ~/.espressif/*/esp-idf, ~/esp/*/esp-idf, ~/esp-idf*, /opt/esp-idf\n' >&2
         printf 'idf.sh: set IDF_PATH=... to point at one.\n' >&2
         exit 1
     fi
@@ -169,11 +177,12 @@ espix_find_idf() {
     printf '%s' "$dir"
 }
 
-# The interpreter that carries esptool and pyserial. Convention is
-# ~/.espressif/tools/python/<tag>/venv/bin/python; fall back to python3, which
-# is enough to run idf.py but not to drive a serial port.
+# The interpreter that carries idf.py's own packages, esptool and pyserial: the
+# EIM venv (~/.espressif/tools/python/<tag>/venv), else install.sh's
+# (<IDF_TOOLS_PATH>/python_env/idf<major>.<minor>_py*_env). python3 is the last
+# resort, and fails at idf.py's first import.
 espix_find_python() {
-    local idf="$1" ver p
+    local idf="$1" ver p newest=""
     if [ -n "${IDF_PYTHON_ENV_PATH:-}" ] && [ -x "$IDF_PYTHON_ENV_PATH/bin/python" ]; then
         printf '%s' "$IDF_PYTHON_ENV_PATH/bin/python"
         return 0
@@ -184,6 +193,14 @@ espix_find_python() {
         printf '%s' "$p"
         return 0
     fi
+    for p in "${IDF_TOOLS_PATH:-$HOME/.espressif}"/python_env/idf$espix_idf_want_major.${espix_idf_want_minor}_py*_env/bin/python; do
+        [ -x "$p" ] && newest="$p"
+    done
+    if [ -n "$newest" ]; then
+        printf '%s' "$newest"
+        return 0
+    fi
+    warn "no ESP-IDF Python environment found; falling back to python3"
     command -v python3 2>/dev/null || printf 'python3'
 }
 
@@ -244,12 +261,16 @@ EOF
 elif [ -f "$espix_idf_path/export.sh" ]; then
     # Classic install.sh layout. Sourcing is the only interface it offers, so
     # the positional parameters are cleared first to keep it from taking our
-    # arguments as its own.
+    # arguments as its own -- and put back after, or idf.py gets no action.
+    espix_saved_args=("$@")
     set --
     set +u
     # shellcheck disable=SC1091
     . "$espix_idf_path/export.sh" >/dev/null 2>&1 || true
+    set -- ${espix_saved_args[@]+"${espix_saved_args[@]}"}
     set -u
+    # export.sh names the venv it activated; prefer it to the guess above.
+    espix_python=$(espix_find_python "$espix_idf_path")
 fi
 
 export IDF_PATH="$espix_idf_path"
@@ -321,6 +342,19 @@ esac
 if [ "$espix_project" = main ]; then
     espix_build_dir="$espix_root_dir/build-$espix_target$(espix_profile_suffix)"
     espix_sdkconfig="$espix_root_dir/sdkconfig.$espix_target$(espix_profile_suffix)"
+
+    # A link here outlives its target and breaks every recipe that reads it.
+    for espix_p in "$espix_build_dir" "$espix_sdkconfig"; do
+        if [ -L "$espix_p" ]; then
+            die "$espix_p is a symlink; this tree generates it itself. Remove it: rm '$espix_p'"
+        fi
+    done
+    # What a bare idf.py makes; nothing here reads them.
+    for espix_p in build sdkconfig; do
+        if [ -e "$espix_root_dir/$espix_p" ]; then
+            warn "./$espix_p is unused (this tree builds into $(basename "$espix_build_dir")); safe to delete"
+        fi
+    done
 
     # Defaults land in order: the project's, the target's own (IDF appends
     # sdkconfig.defaults.<target> for every entry named here), then the board's,

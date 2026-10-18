@@ -1,8 +1,30 @@
 # espix — a Unix(-like) kernel/runtime for ESP32, on top of ESP-IDF.
 #
-# Components under components/ are auto-discovered by the IDF build system,
-# so no EXTRA_COMPONENT_DIRS is needed here.
+# Components under components/ are auto-discovered by the IDF build system;
+# EXTRA_COMPONENT_DIRS adds only external/esp_lwext4, fetched below.
 cmake_minimum_required(VERSION 3.22)
+
+# Fetch and patch esp_lwext4 (tools/patch-lwext4.py); before project() so IDF finds it.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-lwext4.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_lwext4_patch_result)
+if(NOT espix_lwext4_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-lwext4.py failed; see the message above")
+endif()
+list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/external/esp_lwext4")
+
+# The core's sub-build caches its source path; one configured from managed_components breaks.
+set(espix_lwext4_sub "${CMAKE_BINARY_DIR}/esp-idf/esp_lwext4")
+if(EXISTS "${espix_lwext4_sub}/lwext4-build/CMakeCache.txt")
+    file(STRINGS "${espix_lwext4_sub}/lwext4-build/CMakeCache.txt" espix_lwext4_home
+         REGEX "^CMAKE_HOME_DIRECTORY:INTERNAL=")
+    if(NOT espix_lwext4_home STREQUAL
+       "CMAKE_HOME_DIRECTORY:INTERNAL=${CMAKE_CURRENT_SOURCE_DIR}/external/esp_lwext4/cmake/lwext4")
+        message(STATUS "espix: removing ${espix_lwext4_sub}, configured from another esp_lwext4")
+        file(REMOVE_RECURSE "${espix_lwext4_sub}")
+    endif()
+endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(espix)
@@ -154,26 +176,6 @@ execute_process(
     RESULT_VARIABLE espix_msc_patch_result)
 if(NOT espix_msc_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-msc.py failed; see the message above")
-endif()
-
-# Teach the lwext4 core the component manager downloads to honour the metadata
-# checksum seed, without which it refuses any ext4 volume made by e2fsprogs 1.47
-# or later -- which is every volume a current Linux creates. See
-# docs/KNOWN-ISSUES.md and tools/lwext4-csum-seed.patch.
-#
-# After project(), same reasoning as the two hooks above: the download happens
-# when the component manager runs, which is inside project(). The patch lands in
-# the core rather than in the port, because that is where the checksum seeding
-# is -- the component carries it as a submodule, so this is the submodule's tree.
-#
-# Temporary by construction: tools/lwext4-csum-seed.patch is the same change
-# ready to send to gkostka/lwext4, and this hook goes when it lands.
-execute_process(
-    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-lwext4.py"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE espix_lwext4_patch_result)
-if(NOT espix_lwext4_patch_result EQUAL 0)
-    message(FATAL_ERROR "tools/patch-lwext4.py failed; see the message above")
 endif()
 
 # Teach GMF to allocate from PSRAM before internal RAM. Its object allocator

@@ -969,8 +969,8 @@ superblock checksum matched exactly, which is also what ruled out a bad read.
 diff: one helper, `ext4_sb_csum_seed()`, returning `s_checksum_seed` when the
 feature is set and `crc32c(~0, uuid, 16)` otherwise — which is exactly the
 kernel's `s_csum_seed` — with the eight sites asking for it and the bit joining
-the supported set. `tools/patch-lwext4.py` applies it to the copy the component
-manager fetches, from a CMake hook beside the other patch scripts.
+the supported set. `tools/patch-lwext4.py` fetches the core at a pinned commit
+and applies it, from a CMake hook ahead of `project()`.
 
 Two details worth having if this is ever redone by hand. The core's
 `struct ext4_sblock` sits inside a `#pragma pack(push, 1)` and mirrors the disk
@@ -980,9 +980,8 @@ the padding in front of `checksum`, which leaves the struct 1024 bytes. And
 and the kernel seeds it from the UUID as well.
 
 **Upstream** it belongs to `gkostka/lwext4`; the port would pick it up by bumping
-its submodule. When it lands, delete `tools/patch-lwext4.py`,
-`tools/lwext4-csum-seed.patch` and the `execute_process()` block in the top-level
-`CMakeLists.txt`, and update the pin in `main/idf_component.yml`.
+its submodule. When it lands, drop `tools/lwext4-csum-seed.patch` and its entry
+in `tools/patch-lwext4.py`, and bump the revisions pinned there.
 
 ## ESP-IDF (newlib)
 

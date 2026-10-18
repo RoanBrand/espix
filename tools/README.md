@@ -120,9 +120,15 @@ delete both files and the `execute_process()` block in the top-level
 
 ## patch-lwext4.py
 
-Teaches the lwext4 core the two things it needs that upstream lacks — both in the
-*core*, which the component carries as a submodule, rather than in the port around
-it.
+Fetches `huming2207/esp_lwext4` and its `gkostka/lwext4` core at pinned commits
+into the gitignored `external/esp_lwext4`, then teaches the core the two things it
+needs that upstream lacks — both in the *core* rather than in the port around it.
+
+It is not a component manager dependency because the manager hashes every file of
+a git dependency, the submodule's `lwext4/.git` file included, and that file holds
+a relative path to the downloader's own cache: the hash in `dependencies.lock`
+matched only on the machine that wrote it, and a fresh clone anywhere else failed
+its first configure with "The downloaded component is corrupted".
 
 `lwext4-csum-seed.patch` is the metadata checksum seed, which is what a volume made
 by e2fsprogs 1.47 or later needs. `mke2fs` enables `metadata_csum_seed` by default
@@ -141,10 +147,11 @@ milestone is staged, and
 [../components/espix_fs/ext.c](../components/espix_fs/ext.c) for why that milestone
 is read-only until this lands.
 
-The firmware build runs it from a CMake hook, after `project()` because that is
-when the download happens. It is idempotent, and it fails the build with a clear
-message rather than skipping if the pinned revision moves or the tree has been
-left half-patched.
+The firmware build runs it from a CMake hook *before* `project()`, so the
+component exists when IDF collects components, and adds the directory to
+`EXTRA_COMPONENT_DIRS`. A stamp naming both commits and both patches makes it a
+no-op on every later configure; change any of them and it fetches and patches
+afresh. Delete `external/` to force the same.
 
 ```bash
 ./tools/patch-lwext4.py        # applied automatically; safe to run by hand
@@ -158,9 +165,8 @@ patch that goes upstream are the same bytes.
 
 **Temporary by construction.** Both are plain diffs, ready to send to
 `gkostka/lwext4` — the core, not the port around it. The port would pick them up by
-bumping its submodule. When they land, delete this script, the two patches and the
-`execute_process()` block in the top-level `CMakeLists.txt`, and update the pin in
-`main/idf_component.yml`.
+bumping its submodule. When they land, drop the patching from this script along
+with the two patches, and bump `PORT_REVISION`/`CORE_REVISION` in it.
 
 ## patch-libc-offt.py
 

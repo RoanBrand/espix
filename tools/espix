@@ -493,6 +493,11 @@ def main(argv):
                     print(aa)
                     return 0
             return 1
+        if args[1] not in HOST_IFACES:
+            hint = " (wifi?)" if args[1].startswith("wl") else ""
+            sys.stderr.write("espix: unknown interface '%s'%s; use one of: %s\n"
+                             % (args[1], hint, " ".join(HOST_IFACES)))
+            return 2
         host_set(m, args[1], args[2])
         return list_hosts(m)
 

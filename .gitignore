@@ -7,6 +7,8 @@ build-*/
 sdkconfig
 sdkconfig.old
 managed_components/
+# esp_lwext4, fetched and patched at configure time by tools/patch-lwext4.py.
+external/
 
 # Per-target configuration is local state, not source: .espix/active says which
 # target this tree builds for, and each target keeps its own generated

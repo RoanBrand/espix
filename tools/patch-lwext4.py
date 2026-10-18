@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Teach the vendored lwext4 core the two things it needs that upstream lacks.
+Fetch esp_lwext4 and its lwext4 core at pinned revisions, and teach the core the
+two things it needs that upstream lacks.
+
+**Why not the component manager.** It hashes every file of a git dependency,
+including the submodule's `lwext4/.git` file -- and that file holds a relative
+path to the downloader's own cache, so the hash in dependencies.lock only ever
+matched on the machine that wrote it. Fetching by commit id here gives the same
+guarantee (git verifies the content) without that. The result goes to the
+gitignored external/esp_lwext4, which CMakeLists.txt adds as a component.
 
 The changes are patch files, applied to the *core* -- the lwext4 submodule the
 component carries, not the port around it. Applying patch files rather than doing
@@ -25,34 +33,30 @@ write can commit its transaction instead of aborting, and the caller is told the
 operation succeeded. That is why the write milestone is read-only until this
 lands, and why it is fixed here rather than worked around: see docs/ROADMAP.md.
 
-Idempotent, and it has to be: CMake runs this on every configure because the
-component manager re-downloads the component whenever it re-resolves, which takes
-the patches with it.
+Runs on every configure. A stamp naming both revisions and both patches makes
+that a no-op; when any of them changes, the tree is fetched and patched afresh.
 
-**Temporary by construction.** Both belong to gkostka/lwext4, and the port would
-pick them up by bumping its submodule. When they land, delete this file, the two
-patch files and the execute_process() block in the top-level CMakeLists.txt.
+**Temporary by construction.** Both patches belong to gkostka/lwext4, and the
+port would pick them up by bumping its submodule. When they land, drop the
+patching here and the two patch files.
 """
 
-import re
+import hashlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-# The component revision this patch was written against, and the revision
-# main/idf_component.yml pins. check_version() refuses anything else, because a
-# patch that no longer matches would otherwise fail as a confusing apply error
-# or, worse, apply to the wrong lines.
-EXPECTED_REVISION = "d774c178f0211d62d3f0d49e9164aa655573ecfe"
 COMPONENT = "esp_lwext4"
+PORT_REPO = "https://github.com/huming2207/esp_lwext4.git"
+PORT_REVISION = "d774c178f0211d62d3f0d49e9164aa655573ecfe"
+# The submodule commit PORT_REVISION records; check it when bumping the port.
+CORE_REPO = "https://github.com/gkostka/lwext4.git"
+CORE_REVISION = "58bcf89a121b72d4fb66334f1693d3b30e4cb9c5"
+
+STAMP = ".espix-stamp"
 
 # (patch file, file in the core, a string that only exists once it is applied).
-#
-# A marker per patch, rather than one test for all of them, and patch(1)'s exit
-# status is not trusted for "already applied": asked to reverse a patch that is not
-# in the tree, patch *asks* rather than failing -- "Unreversed (or previously
-# applied) patch detected! Ignore -R?" -- and answers itself with the default, so it
-# returns success in both cases. A marker cannot be fooled that way.
 PATCHES = [
     # INCOMPAT_CSUM_SEED, without which no current ext4 volume mounts.
     ("lwext4-csum-seed.patch", "include/ext4_super.h", "ext4_sb_csum_seed"),
@@ -61,90 +65,79 @@ PATCHES = [
      "const int released = ext4_fs_put_inode_ref(&ref);"),
 ]
 
+TOOLS = Path(__file__).resolve().parent
+
 
 def die(msg):
     print(f"patch-lwext4: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
-def check_revision(root):
-    """Refuse to patch a revision this was not written against."""
-    lock = root / "dependencies.lock"
-    if not lock.exists():
-        return  # first configure, before the manager has written one
-    text = lock.read_text(encoding="utf-8")
-
-    m = re.search(r"^  esp_lwext4:\n(?:.*?\n)*?^    version: (\S+)$", text, re.M)
-    if m and m.group(1).strip("'\"") != EXPECTED_REVISION:
-        die(
-            f"esp_lwext4 is {m.group(1)}, but this patch was written for\n"
-            f"  {EXPECTED_REVISION}.\n"
-            f"  Check tools/{PATCH} against the new source -- it may still "
-            f"apply -- then update EXPECTED_REVISION, and update the pin in\n"
-            f"  main/idf_component.yml to match."
-        )
+def git(*args, cwd):
+    done = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if done.returncode != 0:
+        die(f"git {' '.join(args)} failed in {cwd}:\n{done.stdout}{done.stderr}")
+    return done.stdout
 
 
-def patch_command(core, name, *flags):
-    """A patch invocation, with the patch file named rather than piped in.
-
-    `--batch` because a build must never wait for an answer: patch asks about
-    anything ambiguous, and its default answer is not always the one a build wants.
-    """
-    return ["patch", "-p1", "-d", str(core), "--batch", *flags, "-i",
-            str(Path(__file__).resolve().parent / name)]
+def fetch(repo, revision, into):
+    into.mkdir(parents=True, exist_ok=True)
+    git("init", "-q", cwd=into)
+    git("fetch", "-q", "--depth", "1", repo, revision, cwd=into)
+    git("-c", "advice.detachedHead=false", "checkout", "-q", "FETCH_HEAD", cwd=into)
+    got = git("rev-parse", "HEAD", cwd=into).strip()
+    if got != revision:
+        die(f"{repo} gave {got}, not {revision}")
 
 
 def apply(core, name):
-    # Dry run first. A tree that is half-patched -- an apply interrupted, or a hand
-    # edit -- is reported rather than made worse, and the way out is named.
-    check = subprocess.run(patch_command(core, name, "--dry-run"),
+    patch = str(TOOLS / name)
+    check = subprocess.run(["git", "apply", "--check", patch], cwd=core,
                            capture_output=True, text=True)
     if check.returncode != 0:
-        die(
-            f"{name} does not apply to this tree:\n{check.stdout}{check.stderr}"
-            f"  Delete managed_components/{COMPONENT} and reconfigure: the manager"
-            f" fetches\n  a clean copy, and this runs again on the way back up."
-        )
-
-    done = subprocess.run(patch_command(core, name, "--forward"),
-                          capture_output=True, text=True)
-    if done.returncode != 0:
-        die(f"{name} failed:\n{done.stdout}{done.stderr}")
-
+        die(f"{name} does not apply to {CORE_REVISION}:\n{check.stderr}")
+    git("apply", patch, cwd=core)
     print(f"patch-lwext4: applied {name} to the lwext4 core")
 
 
+def stamp_text():
+    parts = [PORT_REVISION, CORE_REVISION]
+    for name, _, _ in PATCHES:
+        parts.append(hashlib.sha256((TOOLS / name).read_bytes()).hexdigest())
+    return " ".join(parts) + "\n"
+
+
 def main():
-    root = Path(__file__).resolve().parent.parent
-    comp = root / "managed_components" / COMPONENT
+    root = TOOLS.parent
+    dest = root / "external" / COMPONENT
+    want = stamp_text()
 
-    if not comp.is_dir():
-        # Nothing downloaded yet. Not an error: CMake reconfigures after the
-        # component manager runs, and this will be called again.
-        return 0
+    try:
+        if (dest / STAMP).read_text() == want:
+            return 0
+    except OSError:
+        pass
 
-    check_revision(root)
-
-    core = comp / "lwext4"
-
-    if not (core / "src" / "ext4.c").is_file():
-        die(
-            f"{core} has no src/ext4.c, so the lwext4 submodule did not\n"
-            f"  come with the component. The component manager fetches "
-            f"submodules, so a\n  core that is missing means this tree was "
-            f"assembled some other way."
-        )
+    # Built beside the destination and swapped in, so an interrupted fetch never
+    # leaves a half-patched tree that looks finished.
+    work = dest.with_name(COMPONENT + ".tmp")
+    shutil.rmtree(work, ignore_errors=True)
+    fetch(PORT_REPO, PORT_REVISION, work)
+    core = work / "lwext4"
+    fetch(CORE_REPO, CORE_REVISION, core)
 
     for name, where, marker in PATCHES:
         target = core / where
         if not target.is_file():
             die(f"{core} has no {where}; the core is not the tree this expects.")
+        if marker not in target.read_text(encoding="utf-8"):
+            apply(core, name)
 
-        if marker in target.read_text(encoding="utf-8"):
-            continue  # configure runs every build, so this has to be a no-op
-        apply(core, name)
-
+    (work / STAMP).write_text(want)
+    shutil.rmtree(dest, ignore_errors=True)
+    work.rename(dest)
+    print(f"patch-lwext4: {COMPONENT} {PORT_REVISION[:8]} with lwext4 "
+          f"{CORE_REVISION[:8]} in external/{COMPONENT}")
     return 0
 
 

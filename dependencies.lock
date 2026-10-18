@@ -1,12 +1,4 @@
 dependencies:
-  esp_lwext4:
-    component_hash: fe65e8eb039144df8c6833e1e0952b6538b3d374bf6df165460bab76a80b9cce
-    dependencies: []
-    source:
-      git: https://github.com/huming2207/esp_lwext4.git
-      path: .
-      type: git
-    version: d774c178f0211d62d3f0d49e9164aa655573ecfe
   esphome/micro-mp3:
     component_hash: 51106d6a6ef13d37b598aa06b4a4de39249319110f990950eb123203a9e2eb6d
     dependencies:
@@ -268,7 +260,6 @@ dependencies:
       type: service
     version: 1.22.3
 direct_dependencies:
-- esp_lwext4
 - esphome/micro-mp3
 - espressif/elf_loader
 - espressif/esp_asrc
@@ -286,6 +277,6 @@ direct_dependencies:
 - fugo101/wireguard_lwip
 - idf
 - joltwallet/littlefs
-manifest_hash: 4188ae52d733b0afc2b8a54c45cc457da03f6cb667a82a7c2e48e61df1808f04
+manifest_hash: 736bb9269daa0c5551dcbbce776c52e8dadeb67d5b203a7e4c76beb0986dfb67
 target: esp32s31
 version: 3.0.0

@@ -91,6 +91,14 @@ endif
 port-check:
 	@$(PORT_CHECK)
 
+# Sets $csv to the partition table $(SDKCONF) names, or stops; an empty $csv
+# would leave the awk below reading stdin forever.
+PARTITION_CSV = csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF) 2>/dev/null); \
+	if [ -z "$$csv" ] || [ ! -f "$$csv" ]; then \
+	    echo "make: no partition table named in $(SDKCONF) -- is it missing or a dangling symlink?" >&2; \
+	    exit 1; \
+	fi
+
 .PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release release-all monitor monitor-reset coredump apps test-app test test-panic \
         stress unit clean help
@@ -139,7 +147,7 @@ build: build-idf-check
 # resets once -- into the loader, which then selects the kernel.
 flash: build port-check
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	@$(PARTITION_CSV); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
@@ -157,7 +165,7 @@ flash: build port-check
 # Bootloader, table, otadata and the kernel, without touching the loader -- the
 # common case while iterating on the kernel.
 flash-kernel: build port-check
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	@$(PARTITION_CSV); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$ko" ]; then echo "flash-kernel: no ota_1 in $$csv" >&2; exit 1; fi; \
@@ -174,7 +182,7 @@ flash-kernel: build port-check
 # kernel -- and resetting again would boot the kernel, not the loader.
 flash-monitor: build port-check
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	@$(PARTITION_CSV); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
@@ -195,7 +203,7 @@ flash-monitor: build port-check
 flash-loader: port-check build-idf-check
 
 	$(IDF) -C loader build
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	@$(PARTITION_CSV); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ]; then echo "flash-loader: no ota_0 in $$csv" >&2; exit 1; fi; \
@@ -211,7 +219,7 @@ flash-loader: port-check build-idf-check
 # partition. It packages the *dev* fsroot, test app and local config included.
 flash-fs: build port-check
 	./tools/make-fs-image.sh fsroot $(BUILD)/storage.bin
-	@csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]*\)"/\1/p' $(SDKCONF)); \
+	@$(PARTITION_CSV); \
 	off=$$(awk -F, '/^storage,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	if [ -z "$$off" ]; then \
@@ -331,10 +339,10 @@ stress: test-app
 # `idf.py fullclean` also asks the component manager to remove
 # managed_components/, and it refuses to touch a tree it considers modified --
 # which this one always is, because the top-level CMakeLists patches littlefs,
-# lwext4, fatfs and the rest from a hook after project() has downloaded them.
+# fatfs and the rest from a hook after project() has downloaded them.
 # So remove what fullclean removes and leave the components to their hooks,
 # which are idempotent. Prepend
-#   rm -rf managed_components loader/managed_components
+#   rm -rf managed_components loader/managed_components external
 # when the configure itself, not just the build, should start from nothing.
 clean:
 	rm -rf $(BUILD) $(LOADER_BUILD) $(SDKCONF) $(SDKCONF).old loader/sdkconfig loader/sdkconfig.old loader/sdkconfig.$(TARGET) apps/*/build apps/*/sdkconfig tests/app/build tests/app/sdkconfig
