@@ -98,7 +98,9 @@ idf_version_ok() {
 }
 
 # A pre-release: -beta, -rc, -dev. Usable, but only when nothing else is.
+# vX.Y-N-g<hash> is N commits past a stable tag, i.e. a release branch: stable.
 idf_is_prerelease() {
+    [[ "$1" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?-[0-9]+-g[0-9a-f]+$ ]] && return 1
     case "$1" in *-*) return 0 ;; *) return 1 ;; esac
 }
 

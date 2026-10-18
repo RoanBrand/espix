@@ -167,7 +167,8 @@ git clone -b release/v6.1 --recursive https://github.com/espressif/esp-idf ~/esp
 
 Nothing needs sourcing afterwards: `tools/idf.sh` finds an IDF in
 `~/.espressif/*/esp-idf`, `~/esp/esp-idf`, `~/esp/*/esp-idf`, `~/esp-idf*` or
-`/opt/esp-idf`, or wherever `IDF_PATH` points, and activates it itself. Build
+`/opt/esp-idf`, or wherever `IDF_PATH` points, and activates it itself. With the
+tag and the branch both installed it picks the branch. Build
 through `make`, not a bare `idf.py`: that writes `build/` and `sdkconfig`, which
 nothing here reads.
 
