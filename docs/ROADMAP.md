@@ -20,6 +20,35 @@ things are as they are.
   reaches the fault handler at all. Shipping the easy half alone produces a
   system that limps rather than one that recovers.
 
+- **Unpin apps from core 1.** `exec.c` pins every app to core 1 (`910501e`)
+  because "the toolchain vectorises every translation unit", so an app's first
+  PIE instruction on core 0 would trap, and IDF's migration of the task faulted
+  once (`mcause 0x2` in `rtos_pie_used_cpu0`). Today's binaries contradict the
+  premise: doom, mosquitto, plasma, hello and testapp contain no PIE or
+  hardware-loop instruction, and the firmware holds 34, all in FreeRTOS's own PIE
+  save routine. The `-march` flag permits them; the compiler does not emit them
+  unasked. Unpinned, an app and its threads would use both cores. What to check
+  first: what the old fault really was (IDF's PIE test also matches the base
+  `OP` opcode on core 0), then the suite with apps unpinned, then build apps
+  without `xespv`/`xesploop` so a stray one cannot appear.
+
+- **The kernel on picolibc.** IDF 6 made picolibc its default; espix pinned
+  newlib. IDF's own comparison of a stdio-heavy program: 20% smaller binary, 54%
+  less stack and 77% less heap in I/O. The mask ROM is not lost: the S31's 59
+  basic ROM functions (`str*`, `mem*`, `qsort`...) are linked for either libc,
+  and only 19 newlib-specific ones (stdio internals, `rand`, `strtol`) are
+  newlib's alone. For espix the image saving is likely tens of KiB of a 3.3 MiB
+  image; the stack saving is the larger win, since every task that formats
+  output carries newlib's appetite in its stack.
+  What it takes:
+  - per-process `stdout`, which rides on newlib's per-task state today, rebuilt
+    on picolibc's thread-local streams;
+  - the ABI tables' newlib-specific names (`__getreent`, `_impure_ptr`,
+    `_ctype_`, the `off_t` patch) redone;
+  - every M-mode app rebuilt.
+  Worth doing once U-mode apps (which use picolibc anyway) have shown its
+  behaviour on this chip; then both kinds of app share one libc's headers.
+
 - **A fairer scheduler.** IDF's FreeRTOS is fixed-priority and preemptive,
   with round-robin time slicing between tasks of equal priority, 25 priorities,
   and no way to plug in another policy. Amazon's SMP FreeRTOS kernel is the

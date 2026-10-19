@@ -180,21 +180,27 @@ everything else faulting on state the app cannot see.
   - stubs for espix's own calls: gfx, audio, the drivers that stay.
 - **Headers stay the same**, so app *source* stays the same. The binary changes:
   an app is relinked, and its ELF says it is a U-mode app.
-- **Built without PIE and the hardware loop** (`xespv`, `xesploop`). The
-  firmware's `-march` includes both, and on the S31 both exist only on core 1:
-  an app task that executes one on core 0 traps, and IDF's answer is to pin it
-  to core 1 for good (`vPortTaskUsedPIEOnCPU0`). That migration path faulted
-  under espix once, which is why `exec.c` pins every app to core 1 today, and a
-  multi-threaded app gets one core. A U-mode app built without them runs its
-  threads on either core. An app that wants the SIMD can opt in and be pinned.
+- **Built without PIE and the hardware loop** (`xespv`, `xesploop`). IDF's
+  `-march` for the S31 includes both, and both exist only on core 1: a task that
+  executes one on core 0 traps, and IDF pins it to core 1 for good
+  (`vPortTaskUsedPIEOnCPU0`). The flag only *permits* them -- the firmware holds
+  34 PIE instructions, all in FreeRTOS's own save routine, and today's apps hold
+  none -- but building without it makes the guarantee. A U-mode app's threads
+  then run on either core. An app that wants the SIMD opts in and is pinned.
 
-**The kernel keeps newlib.** `sdkconfig.defaults` pinned it for two reasons:
-the console's linenoise needed a TLS-stdio shim under picolibc, and loaded apps
-resolve libc against the firmware's. The second still holds for M-mode apps --
-they are compiled against newlib's headers and share its structures (`FILE`,
-`struct _reent`, the widened `off_t`), so the kernel's libc is their ABI. A
-U-mode app shares nothing with it but the syscall table, whose structures espix
-defines, so it is free to use picolibc. `libespix-u` converts where the two
+**The kernel keeps newlib, for now.** `sdkconfig.defaults` pinned it for two
+reasons. The first, IDF's console linenoise needing a TLS-stdio shim, no longer
+applies: espix's `esp_linenoise` reads and writes through callbacks. Two that do:
+- **Per-process stdio.** Each process's task gets its own `stdout` in newlib's
+  per-task state. Under picolibc the three streams are global, with thread-local
+  copies only through `CONFIG_LIBC_PICOLIBC_NEWLIB_COMPATIBILITY`.
+- **M-mode apps' ABI.** They are compiled against newlib's headers and share its
+  structures (`FILE`, `struct _reent`, the widened `off_t`), so the kernel's libc
+  is their ABI.
+
+Moving the kernel to picolibc is a separate ROADMAP item. A U-mode app shares
+nothing with the kernel's libc but the syscall table, whose structures espix
+defines, so it uses picolibc either way. `libespix-u` converts where the two
 disagree; errno values are the first thing M1 checks.
 
 **What it costs in size**, measured with the toolchain's libraries, statically
