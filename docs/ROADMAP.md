@@ -58,8 +58,10 @@ things are as they are.
     when the walk found the PTE), so tables in PSRAM need no writeback here,
     contrary to one Linux port's note.
 
-  Asynchronous signal delivery is waiting for this boundary. The S3 has no MMU
-  for it and stays as it is.
+  The design that builds on these is [USER-MODE.md](USER-MODE.md): apps in
+  U-mode in identity-mapped address spaces, linking their own newlib, in seven
+  milestones. Asynchronous signal delivery is waiting for this boundary. The S3
+  has no MMU for it and stays as it is.
 
 ## Filesystem
 

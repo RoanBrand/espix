@@ -91,7 +91,7 @@ decisions, and an **implementation plan in the order it has to happen**.
 
 | id | what | why | done when | status |
 |---|---|---|---|---|
-| R-P3.2 | Design (not build) the `ecall` form: a tiny app-side libespix, a trap handler, and PMP-protected kernel | This is what makes the boundary *enforced* rather than *named*, and it works on S3 and P4 too — it needs no MMU | a written design in ARCHITECTURE.md | parked |
+| R-P3.2 | Design (not build) the `ecall` form: a tiny app-side libespix, a trap handler, and PMP-protected kernel | This is what makes the boundary *enforced* rather than *named*, and it works on S3 and P4 too — it needs no MMU | a written design in ARCHITECTURE.md | done for the S31 -- [USER-MODE.md](USER-MODE.md), with the MMU rather than PMP, which the IDF locks |
 | R-P3.3 | Sv32 page tables + CoW on S31 (`fork`) | Only `fork`-without-`exec` needs it | only if something needs it | parked |
 
 ## R-P4 — scheduling and idle
