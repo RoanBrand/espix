@@ -2,8 +2,8 @@
 
 A design, written before the code (as [APP-MEMORY.md](APP-MEMORY.md) was for
 R-P1). It says how an espix app would run in RISC-V user mode, in an address
-space of its own, on the ESP32-S31, and in what order to build it. Nothing here
-applies to the S3, which has no MMU and keeps today's model.
+space of its own, on the ESP32-S31, and in what order to build it. The S3 keeps
+today's model; [the S3](#the-s3) says what the two builds share.
 
 The numbers come from the `umode` spike (R-P8.6); its results table is in
 [ROADMAP.md](ROADMAP.md#processes). The ABI figures come from an inventory of
@@ -21,7 +21,8 @@ Everything that follows from that is a symptom of one missing thing, a boundary:
 - SIGSTOP parks a process *in itself*, for the same reason;
 - `fork()` is impossible, because an app's state is tangled with kernel frames on
   one stack;
-- stacks are a fixed size chosen up front.
+- stacks are a fixed size chosen up front, and memory an app reserves is memory
+  it holds.
 
 The spike showed the S31 provides the boundary cheaply: 37 cycles from `mret`
 into U-mode to the trap back, 32 cycles for a page fault, 11 cycles for a TLB
@@ -44,18 +45,41 @@ would fix, reading user pointers, has a cheaper answer in M (below).
 the process runs with its `satp`; espix's own tasks run in M-mode, where `satp`
 does not apply.
 
-**Identity-mapped: a virtual address equals its physical one.** The loader
-already relocates an image for the address it loaded it at, so it needs no
-change. A pointer the app passes the kernel is already a physical address once
-it is checked. Isolation does not depend on the addresses, only on which pages
-the table maps. The cost is `fork()` (copy-on-write needs two pages at one
-virtual address), which D2 does not build. Stacks are the planned exception, so
-that they can grow (see Threads and stacks).
+**Every app is linked at the same fixed virtual address**, as a static
+executable is on Linux:
+
+| range | what |
+|---|---|
+| `0x00010000` up | the image: text, rodata, data, bss |
+| above the image | the heap, grown by `brk` |
+| below `0x70000000` | `mmap`, growing down |
+| below `0x80000000` | thread stacks, each with an unmapped guard |
+
+Every process can use the same addresses because each has its own table. The
+loader maps the ELF's segments where they say they go; there is nothing to
+relocate, which makes it simpler than today's.
+
+An earlier draft identity-mapped instead (virtual equal to physical), to keep the
+relocating loader. That rules out everything that saves memory by moving or
+sharing pages: copy-on-write, swap, a page mapped only when touched, one copy of
+a program's text for two instances. Apps are relinked anyway (below), so a fixed
+link address costs nothing that identity mapping saved.
+
+**Physical memory is 4 KiB frames with a reference count**, taken from PSRAM in
+64 KiB chunks so the heap is not fragmented page by page. The count is what lets
+a frame be in two tables at once: shared text, copy-on-write, a page in a swap
+cache. The arena of [APP-MEMORY.md](APP-MEMORY.md) becomes the frames a process
+holds, freed whole when it ends.
+
+**Pages are mapped when touched.** bss, the heap and the stacks start as
+reserved ranges with nothing behind them. The first touch faults, the kernel
+maps a zeroed frame, and the app resumes. Memory an app reserves but never uses
+costs nothing.
 
 **Tables live in PSRAM.** The walker reads through the D-cache: the spike found a
 PTE in the cache while PSRAM still held zero. No writeback after a PTE write, and
-no internal RAM. A process costs a 4 KiB root plus one 4 KiB table per 4 MiB
-region it touches: 8 to 20 KiB.
+no internal RAM. A table costs a 4 KiB root plus one 4 KiB second level per
+4 MiB range used: 16 KiB for a typical app (image and heap, mmap, stacks).
 
 **ASIDs from a small allocator**, 9 bits wide. A switch writes `satp` (12
 cycles) and keeps the TLB. A recycled ASID is flushed with `sfence.vma x0,asid`,
@@ -66,6 +90,26 @@ opposite; the spike tested one entry on one core, so M3 re-tests it under load.
 TEE (M-mode) only, and U-mode is REE: a U-mode load from PSRAM is an access fault
 until it is opened. Opening it hands isolation to the page tables, where it
 belongs. DMA masters go through `hp_apm`, which this does not touch.
+
+## Copy-on-write
+
+A frame shared between two tables is mapped read-only in both, with one of the
+PTE's software bits (RSW) marking it copy-on-write. A write faults; the kernel
+copies the frame, maps the copy writable in the writer's table, and drops the
+original's count. A frame whose count has fallen to one is made writable without
+a copy.
+
+What uses it, in the order it pays:
+
+1. **Two instances of one program share its text**, which is read-only and never
+   copied. Its data starts shared and is copied a page at a time as each
+   instance writes.
+2. **`fork()`** duplicates the table, marking every writable page copy-on-write.
+   D2 keeps fork unbuilt until something needs it, but nothing in this design
+   stands in the way, and the parts it needs exist for (1).
+
+The cost is small: the reference counts (2 bytes a frame, 8 KiB for all of
+PSRAM), one PTE bit, and a fault path that copies 4 KiB.
 
 ## Entering and leaving the kernel
 
@@ -97,7 +141,7 @@ patch routes them before the panic path:
 | cause | goes to |
 |---|---|
 | `ecall` from U (8) | the syscall dispatcher |
-| page fault (12, 13, 15) | stack growth, or SIGSEGV |
+| page fault (12, 13, 15) | map on first touch, copy-on-write, stack growth, or SIGSEGV |
 | access fault (1, 5, 7) | SIGSEGV (or SIGBUS) |
 | illegal instruction (2) | IDF's lazy FPU and PIE save first, as today, else SIGILL |
 | breakpoint, misaligned | SIGTRAP, SIGBUS |
@@ -125,19 +169,38 @@ everything else faulting on state the app cannot see.
 
 **So a U-mode app links a static runtime of its own**, which is the Linux model:
 
-- **The toolchain's newlib**, statically linked. It already ships a `libc.a` for
-  the S31's exact ISA (`rv32imafc_..._zcb_zcmp_zcmt/ilp32f`). It leaves
-  `__getreent` and the `_write`/`_read`/`_open`/`_sbrk`... porting layer to the
-  platform: that is newlib's standard port.
+- **picolibc**, statically linked. The toolchain ships it for the S31's exact ISA
+  (`--specs=picolibc.specs`), and IDF supports it as the firmware's own libc too.
+  Its `errno` is thread-local through `tp`, so there is no per-thread state
+  struct to manage.
 - **`libespix-u`**, espix's half:
   - `crt0`: the entry, argv and environ, which the kernel puts on the user stack;
-  - the porting layer as `ecall` stubs;
-  - a per-thread `struct _reent` behind `__getreent`, through `tp`;
-  - `malloc` on newlib's, over pages the kernel maps on `sbrk`/`mmap`, which
-    become the arena of [APP-MEMORY.md](APP-MEMORY.md);
+  - the porting layer (`read`, `write`, `open`, `sbrk`...) as `ecall` stubs;
+  - thread-local storage through `tp`;
   - stubs for espix's own calls: gfx, audio, the drivers that stay.
 - **Headers stay the same**, so app *source* stays the same. The binary changes:
   an app is relinked, and its ELF says it is a U-mode app.
+
+**What it costs in size**, measured with the toolchain's libraries, statically
+linked, `-Os`, with stub syscalls (text bytes):
+
+| program | newlib | newlib-nano | picolibc |
+|---|---|---|---|
+| `puts` | 4,172 | 4,172 | 240 |
+| `printf` with `%d %s` (hello) | 40,156 | 4,552 | 8,816 |
+| `printf("%f")` and `strtod` | 46,772 | 32,594 | 12,556 |
+| files, `malloc`, time formatting, floats | 84,566 | 46,564 | not measured |
+
+Today's `hello` is 1,356 bytes because it borrows the firmware's libc. With
+picolibc it is about 9 KiB; an app that already uses stdio and floats, like Doom
+(333 KiB) or mosquitto (209 KiB), grows by roughly 10-20 KiB. With 13 MiB of PSRAM
+free that is affordable. Two instances of one app share their text.
+
+A later step could share libc itself: every process has the same layout, so one
+libc linked at a fixed address (say `0x6f000000`) could be mapped read-only into
+all of them, copy-on-write for its data. That is the old a.out shared-library
+trick, with no position-independent code. Not in the milestones; noted because
+the fixed layout makes it possible.
 
 **M-mode apps stay.** The S3 has no other kind, and an app not yet ported keeps
 working on the S31. The loader chooses by the ELF's mark.
@@ -158,18 +221,19 @@ What each app needs, from the inventory:
 Negative errno on failure, turned into `errno` by the stub. The table is espix's
 own, generated from one list, as the ABI tables are now. Linux's RV32 numbers
 were considered: they would let a static musl binary run some day, but they bring
-Linux's struct layouts with them (64-bit `time_t`, its `stat`), which newlib does
-not share. Deferred, not refused.
+Linux's struct layouts with them (64-bit `time_t`, its `stat`). Deferred, not
+refused.
 
 **The dispatcher runs in the calling thread's task, on its kernel stack, with
 interrupts on.** A syscall that blocks is an ordinary FreeRTOS block. FreeRTOS
 sees an M-mode task doing kernel work, and nothing about its scheduling changes.
 
-**User pointers are checked, then used directly.** The check walks the process's
-table in software: two loads a page, confirming V, U and the needed R/W. The
-kernel then reads or writes the physical address. It never uses `MPRV`: on rev
-v0.0 an `MPRV` access to an invalid PTE stops the hart without a trap (the spike
-reproduced it twice). The walk handles identity and non-identity regions alike.
+**User pointers are translated by a software walk, then used.** Two loads a
+page find the frame and confirm V, U and the needed R or W; the kernel then reads
+or writes the frame's physical address, a page at a time. A page not yet touched
+is mapped on the way, as the app's own fault would. The kernel never uses
+`MPRV`: on rev v0.0 an `MPRV` access to an invalid PTE stops the hart without a
+trap (the spike reproduced it twice).
 
 **The surface is smaller than the ABI.** libc's 115 pure and stateful names, and
 getopt, rand, time formatting and strtok, run in the app. What remains is the
@@ -192,16 +256,30 @@ are copied into a buffer the app passes.
 *kernel* stack: small, fixed, used only in syscalls and interrupts. Its *user*
 stack is in the app's address space.
 
-**Thread creation** makes the task, maps a user stack, and starts the task in a
-kernel trampoline that `mret`s into the start routine. A thread that returns
+**The kernel stack starts at 4 KiB, in PSRAM, and M2 measures it.** It holds:
+
+- the trap frame, about 150 bytes, and the lazy FPU/PIE save area at its top,
+  a few hundred more;
+- the deepest syscall: a file call through the VFS into FATFS or lwext4 and
+  down to USB mass storage is the likely winner, 2-3 KiB by estimate; socket
+  calls hand their work to lwIP's thread and stay shallow;
+- an interrupt's frame, before IDF moves to its own interrupt stack.
+
+App pthreads today run app code *and* kernel calls on a 3 KiB internal-RAM stack,
+so kernel paths already fit in under that. Linux gives an RV32 thread 8 KiB. The
+`ps` STACK column is the high-water mark, so M2 sets the number from the test
+suite rather than this estimate. Formatting moves out of the kernel with libc, so
+`printf` no longer runs on it.
+
+**Thread creation** makes the task, reserves a user stack, and starts the task in
+a kernel trampoline that `mret`s into the start routine. A thread that returns
 lands in a `libespix-u` stub that calls `exit_thread`. Keys and destructors are
 the app runtime's business; the kernel never calls back into app code on its own
 task.
 
-**Stacks grow.** Each user stack is a reserved range at a non-identity address,
-with an unmapped guard below it. A page fault inside the range maps a zeroed page
-and resumes; a fault in the guard is SIGSEGV. Doom's fixed 256 KiB becomes what it
-touches. M1 maps a fixed stack; growth is M7.
+**User stacks grow.** Each is a reserved range below `0x80000000` with an
+unmapped guard below it. A fault inside the range maps a zeroed page and resumes;
+a fault in the guard is SIGSEGV. Doom's fixed 256 KiB becomes what it touches.
 
 ## Signals, stopping and faults
 
@@ -223,9 +301,35 @@ frame. That is how Linux does it, and it makes D4's cooperative delivery points
 unnecessary for U-mode apps. D9's default action stays.
 
 **A fault is a signal.** SIGSEGV's default action ends the process. The reaper
-frees its address space, its pages and its fds, and the board keeps running:
+frees its address space, its frames and its fds, and the board keeps running:
 the ROADMAP's "reap a faulted task" is finally sound for U-mode apps, because
-their faults cannot have corrupted kernel memory.
+their faults cannot have corrupted kernel memory. Deleting a thread is safe for
+the same reason when it is in U-mode; one inside a syscall is told to end and
+does so on the way out.
+
+## The S3
+
+**One kernel, two ways in.** The S3 build is not a fork of the code. Everything
+a syscall does -- the VFS, fds, processes, signals, sockets, gfx, audio -- is the
+same code on both chips. What the S31 adds is a layer in front of it:
+
+| part | S3 | S31 |
+|---|---|---|
+| VFS, fds, processes, signals, sockets, gfx, audio | shared | shared |
+| ABI tables: an M-mode app calls kernel functions directly | yes | yes, for apps not yet ported |
+| syscall dispatcher: checks user pointers, then calls the same functions | no | yes |
+| page tables, frames, copy-on-write, the fault paths | no | yes |
+| the vectors patch, `satp`/`mscratch` switching | no | yes |
+| `libespix-u`, picolibc | no | yes |
+
+**An app has one source and two builds**: today's M-mode ELF, which the S3 runs,
+and a U-mode ELF for the S31. They see the same names and the same behaviour.
+
+**What the S3 does not get**, and the docs say so where it matters: isolation (a
+wild write still corrupts the kernel), signal handlers inside a compute loop,
+stopping an app at any instruction, surviving an app's fault, growing stacks,
+copy-on-write and swap. Tests that depend on these skip on the S3, as
+target-specific tests do now.
 
 ## Milestones
 
@@ -233,26 +337,25 @@ Each is a commit that leaves `make test` green on both targets.
 
 | | what | done when |
 |---|---|---|
-| M1 | vectors patch, `satp`/`mscratch` switch, a minimal syscall set (`write`, `exit_group`), `libespix-u` with `crt0` and newlib, the loader's U-mode path, `cpu_apm` opened | `hello` runs in U-mode; a bad pointer in an app is SIGSEGV and the board keeps running; preemption and FPU use in U-mode work |
-| M2 | files, time, env, `brk`; tests/app relinked | the app suites pass with tests/app in U-mode |
+| M1 | vectors patch, `satp`/`mscratch` switch, frame allocator, the fixed-address loader, a minimal syscall set (`write`, `exit_group`), `libespix-u` with `crt0` and picolibc, `cpu_apm` opened | `hello` runs in U-mode; a bad pointer in an app is SIGSEGV and the board keeps running; preemption and FPU use in U-mode work |
+| M2 | files, time, env, `brk` with pages mapped on touch; tests/app relinked; the kernel stack size measured | the app suites pass with tests/app in U-mode |
 | M3 | threads: create and exit, futex wait and wake, TLS; ASIDs under load | the pthread suites pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, fault reaping | a compute loop's handler runs; `kill -STOP` stops it at once; a segfault ends only the app |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
 | M6 | sockets, select, poll | mosquitto runs in U-mode |
-| M7 | growable stacks with a guard; `mmap` | Doom runs without a fixed stack size |
-
-`fork()` and `exec()` in place stay out until something needs them (D2); the
-design does not rule them out.
+| M7 | growable stacks with a guard; `mmap`; shared text and copy-on-write data between instances | Doom runs without a fixed stack size; two instances of one app share text |
+| M8 | `fork()` on copy-on-write, `exec()` in place | when something needs them (D2) |
 
 ## Decisions taken
 
 - M and U only; no S-mode.
-- Identity-mapped address spaces; stacks are the exception.
+- Apps linked at one fixed virtual address; every process has its own table.
+- Refcounted 4 KiB frames; pages mapped on first touch; copy-on-write.
 - Page tables in PSRAM.
 - User pointers through a software walk; never `MPRV`.
 - `cpu_apm` region 0 opened to REE; the MMU isolates.
-- U-mode apps link their own newlib and `libespix-u`; M-mode apps stay, chosen
-  per ELF.
+- U-mode apps link picolibc and `libespix-u`; M-mode apps stay, chosen per ELF.
+- Kernel stacks 4 KiB in PSRAM until M2 measures them.
 - Syscall numbers are espix's own.
 
 ## Open questions
@@ -265,8 +368,9 @@ design does not rule them out.
 - **The app build:** a CMake toolchain fragment apps include, or a second app
   template under `apps/`.
 - **ASIDs under load:** the spike's one-entry test against GrieferPig's report.
-- **Kernel stack size** per U-mode thread. It holds the deepest syscall plus an
-  interrupt frame; measure it in M2 with the watermark.
+- **Where frames come from:** chunks from the PSRAM heap as needed, or a region
+  reserved at boot. Chunks share memory with everything else; a region is
+  simpler to account for and to swap from.
 - **Drivers from U-mode apps:** RMT and GPIO today are MMIO pointers and
   interrupt-time callbacks. They stay M-mode-app features until a driver is
   given a syscall face.

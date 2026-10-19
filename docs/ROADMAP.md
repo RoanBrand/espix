@@ -20,6 +20,18 @@ things are as they are.
   reaches the fault handler at all. Shipping the easy half alone produces a
   system that limps rather than one that recovers.
 
+- **A fairer scheduler.** IDF's FreeRTOS is fixed-priority and preemptive,
+  with round-robin time slicing between tasks of equal priority, 25 priorities,
+  and no way to plug in another policy. Amazon's SMP FreeRTOS kernel is the
+  other variant IDF carries, and it adds `vTaskCoreAffinitySet()`, but IDF
+  enables it only for the original ESP32, marked as under development. So
+  Linux-like fairness would be espix's own: a periodic pass that moves each
+  app's priority within a small band by its recent CPU use, as the 4.4BSD decay
+  scheduler did, with `nice` as the bias. `vTaskPrioritySet()` is all it needs.
+  The same pass could move unpinned tasks between cores, since a task's core
+  cannot be changed after creation; on the S31 apps are pinned to core 1 today
+  because only that core has PIE.
+
 - **Ctrl-Z.** Job control is done for jobs, fg and bg (R-P2.6), but nothing
   stops a foreground process. The transports now report which key arrived
   rather than only that one did (R-P7.7), so the field a handler needs exists;
@@ -834,6 +846,24 @@ matters.
   Not small, and not urgent while `play` holds one stream and the caches are
   small. Worth writing the registration interface early, so caches are born able
   to be evicted instead of retrofitted.
+
+- **Swap, for U-mode apps on the S31.** Once apps run in their own address
+  spaces with refcounted frames ([USER-MODE.md](USER-MODE.md)), an anonymous page
+  can be written out and its PTE cleared; the next touch faults and reads it back
+  into whatever frame is free. Three things it needs:
+  - **A way to see which pages are in use.** The S31 leaves the PTE's A bit to
+    software (the spike found it faults instead of being set), so clearing A on a
+    page and counting the faults that follow is the access sampling a clock
+    algorithm wants. It costs a fault per sampled page.
+  - **A swap device that is fast enough.** A file or partition on USB storage or
+    an SD card, not the internal flash, which wears. A page-in is a 4 KiB read
+    on a fault path, so the fs and USB mass-storage throughput and latency are
+    the limit; they need measuring and probably work first.
+  - **A policy for what never swaps:** kernel memory, page tables, DMA buffers,
+    and pages an app has locked.
+
+  WORKLIST R-P7.5 recorded the earlier view that swap needs an MMU and would be
+  slow; the first half is now answered, the second is the work above.
 
 ## A game as the showcase app
 
