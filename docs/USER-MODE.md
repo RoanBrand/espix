@@ -105,8 +105,8 @@ What uses it, in the order it pays:
    copied. Its data starts shared and is copied a page at a time as each
    instance writes.
 2. **`fork()`** duplicates the table, marking every writable page copy-on-write.
-   D2 keeps fork unbuilt until something needs it, but nothing in this design
-   stands in the way, and the parts it needs exist for (1).
+   The parts it needs exist for (1). mosquitto is the first user: `-d` forks and
+   lets the parent exit, which espix's port answers with `ENOSYS` today.
 
 The cost is small: the reference counts (2 bytes a frame, 8 KiB for all of
 PSRAM), one PTE bit, and a fault path that copies 4 KiB.
@@ -180,6 +180,22 @@ everything else faulting on state the app cannot see.
   - stubs for espix's own calls: gfx, audio, the drivers that stay.
 - **Headers stay the same**, so app *source* stays the same. The binary changes:
   an app is relinked, and its ELF says it is a U-mode app.
+- **Built without PIE and the hardware loop** (`xespv`, `xesploop`). The
+  firmware's `-march` includes both, and on the S31 both exist only on core 1:
+  an app task that executes one on core 0 traps, and IDF's answer is to pin it
+  to core 1 for good (`vPortTaskUsedPIEOnCPU0`). That migration path faulted
+  under espix once, which is why `exec.c` pins every app to core 1 today, and a
+  multi-threaded app gets one core. A U-mode app built without them runs its
+  threads on either core. An app that wants the SIMD can opt in and be pinned.
+
+**The kernel keeps newlib.** `sdkconfig.defaults` pinned it for two reasons:
+the console's linenoise needed a TLS-stdio shim under picolibc, and loaded apps
+resolve libc against the firmware's. The second still holds for M-mode apps --
+they are compiled against newlib's headers and share its structures (`FILE`,
+`struct _reent`, the widened `off_t`), so the kernel's libc is their ABI. A
+U-mode app shares nothing with it but the syscall table, whose structures espix
+defines, so it is free to use picolibc. `libespix-u` converts where the two
+disagree; errno values are the first thing M1 checks.
 
 **What it costs in size**, measured with the toolchain's libraries, statically
 linked, `-Os`, with stub syscalls (text bytes):
@@ -344,7 +360,7 @@ Each is a commit that leaves `make test` green on both targets.
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
 | M6 | sockets, select, poll | mosquitto runs in U-mode |
 | M7 | growable stacks with a guard; `mmap`; shared text and copy-on-write data between instances | Doom runs without a fixed stack size; two instances of one app share text |
-| M8 | `fork()` on copy-on-write, `exec()` in place | when something needs them (D2) |
+| M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises: it forks, the parent exits, and the child carries on as the broker |
 
 ## Decisions taken
 
