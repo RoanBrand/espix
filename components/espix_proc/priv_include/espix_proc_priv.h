@@ -194,6 +194,11 @@ typedef struct {
      * and the only reader that matters is the same task asking about itself.
      */
     volatile bool root_active;
+
+#if CONFIG_ESPIX_UMODE
+    /* A U-mode app's thread and address space (espix_umode.h); NULL for an M-mode app. */
+    void *um;
+#endif
 } espix_proc_app_t;
 
 typedef struct {

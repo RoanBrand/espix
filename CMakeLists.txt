@@ -217,6 +217,22 @@ if(NOT espix_ppa_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-ppa.py failed; see the message above")
 endif()
 
+# Teach IDF's RISC-V trap vectors about U-mode apps: a stack switch on entry
+# from U-mode, and each task's privilege kept in its interrupt frame. All of it
+# is inside #if CONFIG_ESPIX_UMODE, so other targets and projects compile as
+# before. See tools/patch-umode.py and docs/USER-MODE.md.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${IDF_PATH}/components/riscv/vectors.S"
+    "${IDF_PATH}/components/esp_system/port/arch/riscv/esp_ipc_isr_handler.S")
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-umode.py"
+            --idf-path "${IDF_PATH}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_umode_patch_result)
+if(NOT espix_umode_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-umode.py failed; see the message above")
+endif()
+
 # Add READ CAPACITY(16), READ(16) and WRITE(16) to espressif/usb_host_msc,
 # which speaks only the (10) commands and their 32-bit LBAs -- unreadable past
 # 2TiB, and READ CAPACITY(10) itself saturates there rather than reporting the

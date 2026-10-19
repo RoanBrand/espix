@@ -118,6 +118,28 @@ a plain diff, ready to send to joltwallet/esp_littlefs. When it is upstreamed,
 delete both files and the `execute_process()` block in the top-level
 `CMakeLists.txt`, and bump the version in `main/idf_component.yml`.
 
+## build-uapp.sh
+
+Builds a U-mode app for the S31 (docs/USER-MODE.md): the sources, picolibc and
+`user/libespix-u.c`, linked at `0x10000` as a static executable by
+`user/uapp.ld`. The kernel runs any ET_EXEC it loads in U-mode, in an address
+space of its own; relocatable apps stay M-mode.
+
+```bash
+./tools/build-uapp.sh -o hello-u apps/hello/main/hello.c
+```
+
+Built without PIE and the hardware loop, which exist only on core 1.
+
+## patch-umode.py
+
+Patches IDF's three RISC-V trap entries (`vectors.S`'s exception and interrupt
+handlers, and the IPC interrupt's) so a trap from U-mode switches to the task's
+kernel stack, an exit to U switches back, and each task's privilege is kept in
+its interrupt frame. Everything is inside `#if CONFIG_ESPIX_UMODE`, so other
+targets and other projects on the same IDF tree compile as before. Applied by
+the build; `git checkout` the two files in IDF to undo it.
+
 ## patch-lwext4.py
 
 Fetches `huming2207/esp_lwext4` and its `gkostka/lwext4` core at pinned commits

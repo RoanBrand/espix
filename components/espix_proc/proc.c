@@ -15,6 +15,7 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
+#include "espix_umode.h"
 #include "espix_fs.h"
 #include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
 #include "espix_pm.h"       /* ...and espix_pm_task_gone(), for the same reason */
@@ -210,6 +211,10 @@ esp_err_t espix_proc_init(void)
 
     /* Publish the C++ runtime before any app can be loaded. See abi_cxx.cpp:
      * espix itself is C, but a C++ app cannot resolve operator new without it. */
+#if CONFIG_ESPIX_UMODE
+    espix_um_init();
+#endif
+
     /* The resolver first: every table below registers into it. */
     espix_proc_abi_resolver_register();
 
@@ -360,6 +365,9 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     /* An app's image, argv, environment and paths. The block itself goes
      * last: the process's tasks are gone, so nothing reads its paths now. */
     if (slot->app != NULL) {
+#if CONFIG_ESPIX_UMODE
+        espix_um_release(slot);
+#endif
         if (slot->app->elf_valid) {
             esp_elf_deinit(&slot->app->elf);
             slot->app->elf_valid = false;

@@ -1,5 +1,16 @@
 menu "espix processes"
 
+    config ESPIX_UMODE
+        bool "User-mode apps in their own address spaces"
+        depends on IDF_TARGET_ESP32S31
+        default y
+        help
+            Run an app built as a static executable (ET_EXEC) in RISC-V U-mode,
+            in an Sv32 address space of its own, so it cannot reach kernel
+            memory and a fault ends only the app. Relocatable M-mode apps are
+            unaffected. Patches IDF's trap vectors (tools/patch-umode.py).
+            See docs/USER-MODE.md.
+
     config ESPIX_PROC_MAX
         int "Maximum tracked processes"
         range 2 64

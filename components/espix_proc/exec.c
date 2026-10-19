@@ -32,6 +32,7 @@
 #include "espix_task.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
+#include "espix_umode.h"
 #include "espix_shell.h"
 
 #define TAG "exec"
@@ -688,6 +689,24 @@ static void proc_task(void *arg)
             goto done;                          /* status stays 126 */
         }
     }
+
+#if CONFIG_ESPIX_UMODE
+    /* A static executable runs in U-mode in its own address space; exit and faults land at exit_jb. */
+    if (espix_um_is_exec(slot->app->image, slot->info.image_bytes)) {
+        espix_proc_root_arm();
+        ran = true;
+        slot->exit_jmp = &exit_jb;
+        if (setjmp(exit_jb) == 0) {
+            const char *why = espix_um_exec(slot);
+            espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path, why);
+            ran = false;
+        } else {
+            status = slot->exit_status;
+        }
+        slot->exit_jmp = NULL;
+        goto done;
+    }
+#endif
 
     if (esp_elf_init(&slot->app->elf) != 0) {
         espix_eprintf(slot->info.session, "espix: %s: ELF init failed\n",

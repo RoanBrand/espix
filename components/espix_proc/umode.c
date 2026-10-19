@@ -1,0 +1,507 @@
+/*
+ * U-mode apps on the S31 (M1): the boot hook, the trap hooks the patched IDF
+ * vectors call (tools/patch-umode.py), the first syscalls, and exec.
+ * docs/USER-MODE.md has the design.
+ */
+#include "sdkconfig.h"
+
+#if CONFIG_ESPIX_UMODE
+
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_attr.h"
+#include "esp_cache.h"
+#include "esp_cpu.h"
+#include "esp_heap_caps.h"
+#include "esp_private/startup_internal.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "hal/assist_debug_hal.h"
+#include "riscv/csr.h"
+#include "riscv/encoding.h"
+#include "riscv/rvruntime-frames.h"
+#include "soc/cpu_apm_reg.h"
+
+#include "espix_kernel.h"
+#include "espix_shell.h"
+#include "espix_syscall.h"
+#include "espix_umode.h"
+
+#define TAG "umode"
+
+#define PG          4096u
+#define UVA_MIN     0x00010000u
+#define UVA_MAX     0x70000000u
+#define USTACK_TOP  0x80000000u
+#define USTACK_SIZE (64u * 1024u)
+
+/* Each core's current U-mode thread's kernel tp; the patched vectors load it on entry from U. */
+uint32_t espix_um_ktp[portNUM_PROCESSORS];
+
+static uint32_t s_boot_mscratch[portNUM_PROCESSORS];
+
+
+/* ASIDs: one per live process; a freed one is flushed on each core before its next use there. */
+#define ASIDS 512
+static uint32_t    s_asid_used[ASIDS / 32] = { 1 };
+static uint32_t    s_asid_stale[portNUM_PROCESSORS][ASIDS / 32];
+static portMUX_TYPE s_asid_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t asid_alloc(void)
+{
+    uint32_t asid = 0;
+    taskENTER_CRITICAL(&s_asid_lock);
+    for (uint32_t i = 1; i < ASIDS; i++) {
+        if (!(s_asid_used[i / 32] & (1u << (i % 32)))) {
+            s_asid_used[i / 32] |= 1u << (i % 32);
+            asid = i;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_asid_lock);
+    return asid;
+}
+
+static void asid_free(uint32_t asid)
+{
+    taskENTER_CRITICAL(&s_asid_lock);
+    s_asid_used[asid / 32] &= ~(1u << (asid % 32));
+    for (int c = 0; c < portNUM_PROCESSORS; c++) {
+        s_asid_stale[c][asid / 32] |= 1u << (asid % 32);
+    }
+    taskEXIT_CRITICAL(&s_asid_lock);
+}
+
+void espix_um_enter(uint32_t pc, uint32_t usp, uint32_t a0, uint32_t a1, uint32_t a2);
+void espix_um_return(void *frame);
+void espix_um_trap(RvExcFrame *frame, uint32_t cause);
+
+/* mscratch says which side of the boundary a trap came from, so it must start at 0. */
+ESP_SYSTEM_INIT_FN(espix_um_core_init, SECONDARY, ESP_SYSTEM_INIT_ALL_CORES, 100)
+{
+    s_boot_mscratch[esp_cpu_get_core_id()] = RV_SWAP_CSR(mscratch, 0);
+    RV_WRITE_CSR(mcounteren, 0x7);
+    RV_WRITE_CSR(scounteren, 0x7);
+    return ESP_OK;
+}
+
+void espix_um_init(void)
+{
+    /* cpu_apm region 0 (flash and PSRAM) is TEE-only, and U-mode is REE: the page tables isolate instead. */
+    REG_SET_BIT(CPU_APM_REGION0_ATTR_REG, 0x0777);
+    espix_klog(ESPIX_KLOG_INFO, TAG, "user mode on; mscratch at boot 0x%08x 0x%08x",
+               (unsigned)s_boot_mscratch[0], (unsigned)s_boot_mscratch[portNUM_PROCESSORS - 1]);
+}
+
+extern StaticTask_t *port_uxCoprocOwner[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
+RvCoprocSaveArea *pxPortGetCoprocArea(StaticTask_t *task, bool allocate, int coproc);
+RvCoprocSaveArea *pxPortUpdateCoprocOwner(int coreid, int coproc, StaticTask_t *owner);
+void vPortTaskPinToCore(StaticTask_t *task, int coreid);
+
+static IRAM_ATTR void fpu_save(void *area)
+{
+    uint32_t fcsr;
+    asm volatile (
+        "fsw f0, 0(%0)\n"
+        "fsw f1, 4(%0)\n"
+        "fsw f2, 8(%0)\n"
+        "fsw f3, 12(%0)\n"
+        "fsw f4, 16(%0)\n"
+        "fsw f5, 20(%0)\n"
+        "fsw f6, 24(%0)\n"
+        "fsw f7, 28(%0)\n"
+        "fsw f8, 32(%0)\n"
+        "fsw f9, 36(%0)\n"
+        "fsw f10, 40(%0)\n"
+        "fsw f11, 44(%0)\n"
+        "fsw f12, 48(%0)\n"
+        "fsw f13, 52(%0)\n"
+        "fsw f14, 56(%0)\n"
+        "fsw f15, 60(%0)\n"
+        "fsw f16, 64(%0)\n"
+        "fsw f17, 68(%0)\n"
+        "fsw f18, 72(%0)\n"
+        "fsw f19, 76(%0)\n"
+        "fsw f20, 80(%0)\n"
+        "fsw f21, 84(%0)\n"
+        "fsw f22, 88(%0)\n"
+        "fsw f23, 92(%0)\n"
+        "fsw f24, 96(%0)\n"
+        "fsw f25, 100(%0)\n"
+        "fsw f26, 104(%0)\n"
+        "fsw f27, 108(%0)\n"
+        "fsw f28, 112(%0)\n"
+        "fsw f29, 116(%0)\n"
+        "fsw f30, 120(%0)\n"
+        "fsw f31, 124(%0)\n"
+        : : "r"(area) : "memory");
+    asm volatile ("csrr %0, fcsr" : "=r"(fcsr));
+    ((uint32_t *)area)[32] = fcsr;
+}
+
+static IRAM_ATTR void fpu_restore(const void *area)
+{
+    asm volatile (
+        "flw f0, 0(%0)\n"
+        "flw f1, 4(%0)\n"
+        "flw f2, 8(%0)\n"
+        "flw f3, 12(%0)\n"
+        "flw f4, 16(%0)\n"
+        "flw f5, 20(%0)\n"
+        "flw f6, 24(%0)\n"
+        "flw f7, 28(%0)\n"
+        "flw f8, 32(%0)\n"
+        "flw f9, 36(%0)\n"
+        "flw f10, 40(%0)\n"
+        "flw f11, 44(%0)\n"
+        "flw f12, 48(%0)\n"
+        "flw f13, 52(%0)\n"
+        "flw f14, 56(%0)\n"
+        "flw f15, 60(%0)\n"
+        "flw f16, 64(%0)\n"
+        "flw f17, 68(%0)\n"
+        "flw f18, 72(%0)\n"
+        "flw f19, 76(%0)\n"
+        "flw f20, 80(%0)\n"
+        "flw f21, 84(%0)\n"
+        "flw f22, 88(%0)\n"
+        "flw f23, 92(%0)\n"
+        "flw f24, 96(%0)\n"
+        "flw f25, 100(%0)\n"
+        "flw f26, 104(%0)\n"
+        "flw f27, 108(%0)\n"
+        "flw f28, 112(%0)\n"
+        "flw f29, 116(%0)\n"
+        "flw f30, 120(%0)\n"
+        "flw f31, 124(%0)\n"
+        : : "r"(area) : "memory");
+    asm volatile ("csrw fcsr, %0" :: "r"(((const uint32_t *)area)[32]));
+}
+
+static const uint32_t s_fpu_zero[33];
+
+/* The FPU becomes the U-mode thread's before it runs, never through IDF's lazy trap from U-mode. */
+static IRAM_ATTR void fpu_take(uint32_t core)
+{
+    StaticTask_t *const self = (StaticTask_t *)xTaskGetCurrentTaskHandle();
+    RV_SET_CSR(mstatus, 1u << 13);
+    if (port_uxCoprocOwner[core][FPU_COPROC_IDX] == self) {
+        return;
+    }
+    RvCoprocSaveArea *const former = pxPortUpdateCoprocOwner(core, FPU_COPROC_IDX, self);
+    if (former != NULL && former != (void *)-1) {
+        fpu_save(former->sa_coprocs[FPU_COPROC_IDX]);
+    }
+    vPortTaskPinToCore(self, core);
+    RvCoprocSaveArea *const sa = pxPortGetCoprocArea(self, false, FPU_COPROC_IDX);
+    fpu_restore((sa->sa_enable & (1u << FPU_COPROC_IDX)) ? sa->sa_coprocs[FPU_COPROC_IDX] : s_fpu_zero);
+    sa->sa_enable |= 1u << FPU_COPROC_IDX;
+}
+
+/* On every return to U-mode: the thread's table, the kernel tp for the next entry, no stack guard. */
+IRAM_ATTR void espix_um_return(void *frame)
+{
+    (void)frame;
+    const espix_um_thread_t *t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
+    const uint32_t core = esp_cpu_get_core_id();
+    espix_um_ktp[core] = t->ktp;
+    RV_WRITE_CSR(satp, t->satp);
+    const uint32_t asid = (t->satp & SATP32_ASID) >> 22;
+    if (s_asid_stale[core][asid / 32] & (1u << (asid % 32))) {
+        s_asid_stale[core][asid / 32] &= ~(1u << (asid % 32));
+        asm volatile ("sfence.vma zero, %0" :: "r"(asid) : "memory");
+    }
+    fpu_take(core);
+    assist_debug_hal_sp_mon_disable(core);
+}
+
+static int32_t sys_write(espix_um_thread_t *t, int fd, uint32_t uva, uint32_t len)
+{
+    FILE *const out = (fd == 1) ? stdout : (fd == 2) ? stderr : NULL;
+    if (out == NULL) {
+        return -EBADF;
+    }
+    uint32_t done = 0;
+    while (done < len) {
+        const uint32_t va    = uva + done;
+        const uint32_t chunk = MIN(len - done, PG - (va & (PG - 1)));
+        const void *k = espix_um_user_ptr(t->as, va, PTE_R);
+        if (k == NULL) {
+            if (done == 0) {
+                return -EFAULT;
+            }
+            break;
+        }
+        if (fwrite(k, 1, chunk, out) != chunk) {
+            break;
+        }
+        done += chunk;
+    }
+    fflush(out);
+    return (int32_t)done;
+}
+
+/* Where an app's exit or fault ends: plain task context on the kernel stack, as an M-mode app's exit() is. */
+static void __attribute__((noreturn)) exited(int status)
+{
+    espix_proc_exit(status);
+    __builtin_unreachable();
+}
+
+/* Leave the trap into exited() in M-mode rather than back into the app. */
+static void leave_to_kernel(RvExcFrame *f, const espix_um_thread_t *t, int status)
+{
+    extern char __global_pointer$[];
+    f->mepc    = (uint32_t)exited;
+    f->a0      = (uint32_t)status;
+    f->ra      = 0;
+    f->gp      = (uint32_t)__global_pointer$;
+    f->tp      = t->ktp;
+    f->mstatus |= MSTATUS_MPP;
+    /* CLIC mcause: MPP=M, MPIE=1, level 0; mret restores the interrupt level from here. */
+    RV_WRITE_CSR(mcause, (3u << 28) | (1u << 27));
+}
+
+static int32_t syscall_dispatch(espix_um_thread_t *t, RvExcFrame *f)
+{
+    switch (f->a7) {
+    case ESPIX_SYS_EXIT:
+        leave_to_kernel(f, t, (int)f->a0);
+        return (int32_t)f->a0;
+    case ESPIX_SYS_WRITE:
+        return sys_write(t, (int)f->a0, f->a1, f->a2);
+    default:
+        return -ENOSYS;
+    }
+}
+
+static int fault_signal(uint32_t code)
+{
+    switch (code) {
+    case 2:  return SIGILL;
+    case 3:  return SIGTRAP;
+    case 0: case 4: case 6: return SIGBUS;
+    default: return SIGSEGV;
+    }
+}
+
+static void fault(RvExcFrame *f, const espix_um_thread_t *t, uint32_t code)
+{
+    espix_proc_slot_t *const slot = espix_proc_self();
+    const int sig = fault_signal(code);
+    const char *what = (sig == SIGILL) ? "Illegal instruction" : (sig == SIGBUS) ? "Bus error"
+                     : (sig == SIGTRAP) ? "Trace/breakpoint trap" : "Segmentation fault";
+
+    espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d: %s at pc 0x%08x, address 0x%08x (mcause %u)",
+               slot ? (int)slot->info.pid : -1, what, (unsigned)f->mepc,
+               (unsigned)f->mtval, (unsigned)code);
+    if (slot != NULL) {
+        espix_eprintf(slot->info.session, "%s: %s (pc 0x%08x, address 0x%08x)\n",
+                      slot->info.name, what, (unsigned)f->mepc, (unsigned)f->mtval);
+    }
+    leave_to_kernel(f, t, 128 + sig);
+}
+
+/* An exception from U-mode, on the thread's kernel stack with interrupts off. */
+void espix_um_trap(RvExcFrame *f, uint32_t cause)
+{
+    assist_debug_hal_sp_mon_enable(esp_cpu_get_core_id());
+    RV_SET_CSR(mstatus, MSTATUS_MIE);
+
+    espix_um_thread_t *const t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
+    const uint32_t code = cause & 0xfff;
+    if (t == NULL) {
+        abort();
+    }
+    if (code == 8) {
+        f->mepc += 4;
+        f->a0 = (uint32_t)syscall_dispatch(t, f);
+    } else {
+        fault(f, t, code);
+    }
+
+    RV_CLEAR_CSR(mstatus, MSTATUS_MIE);
+}
+
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type, e_machine;
+    uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+} um_ehdr_t;
+
+typedef struct {
+    uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
+} um_phdr_t;
+
+#define ET_EXEC_  2
+#define EM_RISCV_ 243
+#define PT_LOAD_  1
+
+bool espix_um_is_exec(const uint8_t *image, size_t size)
+{
+    const um_ehdr_t *eh = (const um_ehdr_t *)image;
+    return size >= sizeof(*eh) && memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 &&
+           eh->e_ident[4] == 1 && eh->e_type == ET_EXEC_ && eh->e_machine == EM_RISCV_;
+}
+
+static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t size, uint32_t *entry)
+{
+    const um_ehdr_t *eh = (const um_ehdr_t *)image;
+    if (eh->e_phentsize != sizeof(um_phdr_t) ||
+        eh->e_phoff + (size_t)eh->e_phnum * sizeof(um_phdr_t) > size) {
+        return "bad program headers";
+    }
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const um_phdr_t *ph = (const um_phdr_t *)(image + eh->e_phoff) + i;
+        if (ph->p_type != PT_LOAD_ || ph->p_memsz == 0) {
+            continue;
+        }
+        if (ph->p_vaddr < UVA_MIN || ph->p_memsz > UVA_MAX - ph->p_vaddr ||
+            ph->p_filesz > ph->p_memsz || ph->p_offset + ph->p_filesz > size) {
+            return "a segment outside the user range";
+        }
+        const uint32_t flags = ((ph->p_flags & 4) ? PTE_R : 0) | ((ph->p_flags & 2) ? PTE_W : 0) |
+                               ((ph->p_flags & 1) ? PTE_X : 0);
+        const uint32_t end = ph->p_vaddr + ph->p_memsz;
+        for (uint32_t va = ph->p_vaddr & ~(PG - 1); va < end; va += PG) {
+            uint8_t *frame = espix_um_map_new(as, va, flags);
+            if (frame == NULL) {
+                return "out of memory for the image";
+            }
+            const uint32_t lo = MAX(va, ph->p_vaddr);
+            const uint32_t hi = MIN(va + PG, ph->p_vaddr + ph->p_filesz);
+            if (hi > lo) {
+                memcpy(frame + (lo - va), image + ph->p_offset + (lo - ph->p_vaddr), hi - lo);
+            }
+            if (flags & PTE_X) {
+                /* Fetched through the I-cache, which refills from PSRAM and may hold the frame's old lines. */
+                esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+                esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+            }
+        }
+    }
+    if (eh->e_entry < UVA_MIN || eh->e_entry >= UVA_MAX) {
+        return "an entry point outside the image";
+    }
+    *entry = eh->e_entry;
+    return NULL;
+}
+
+static bool put_user(espix_um_as_t *as, uint32_t va, const void *src, size_t n)
+{
+    const uint8_t *p = src;
+    while (n > 0) {
+        uint8_t *k = espix_um_user_ptr(as, va, PTE_W);
+        if (k == NULL) {
+            return false;
+        }
+        const size_t c = MIN(n, PG - (va & (PG - 1)));
+        memcpy(k, p, c);
+        va += c;
+        p  += c;
+        n  -= c;
+    }
+    return true;
+}
+
+/* The user stack: argv and environ strings at the top, then their pointer arrays. */
+static const char *build_stack(espix_um_as_t *as, char **argv, int argc, char **envp,
+                               uint32_t *usp, uint32_t *uargv, uint32_t *uenvp)
+{
+    for (uint32_t va = USTACK_TOP - USTACK_SIZE; va < USTACK_TOP; va += PG) {
+        if (espix_um_map_new(as, va, PTE_R | PTE_W) == NULL) {
+            return "out of memory for the stack";
+        }
+    }
+    int envc = 0;
+    while (envp != NULL && envp[envc] != NULL) {
+        envc++;
+    }
+    const int n = argc + envc;
+    uint32_t *ptrs = calloc((size_t)n + 2, sizeof(uint32_t));
+    if (ptrs == NULL) {
+        return "out of memory";
+    }
+    uint32_t top = USTACK_TOP;
+    for (int i = 0; i < n; i++) {
+        const char *s = (i < argc) ? argv[i] : envp[i - argc];
+        const size_t len = strlen(s) + 1;
+        if (len > USTACK_SIZE / 2 || top - len < USTACK_TOP - USTACK_SIZE / 2) {
+            free(ptrs);
+            return "arguments too long";
+        }
+        top -= len;
+        put_user(as, top, s, len);
+        ptrs[i < argc ? i : i + 1] = top;
+    }
+    /* argv[argc] and envp[envc] are the zeros calloc left. */
+    top = (top - ((uint32_t)n + 2) * sizeof(uint32_t)) & ~15u;
+    put_user(as, top, ptrs, ((size_t)n + 2) * sizeof(uint32_t));
+    free(ptrs);
+
+    *uargv = top;
+    *uenvp = top + ((uint32_t)argc + 1) * sizeof(uint32_t);
+    *usp   = top;
+    return NULL;
+}
+
+const char *espix_um_exec(espix_proc_slot_t *slot)
+{
+    espix_proc_app_t *const app = slot->app;
+    const uint32_t asid = asid_alloc();
+    if (asid == 0) {
+        return "out of address-space ids";
+    }
+
+    espix_um_as_t *as = espix_um_as_new(asid);
+    espix_um_thread_t *t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
+    if (as == NULL || t == NULL) {
+        espix_um_as_free(as);
+        free(t);
+        asid_free(asid);
+        return "out of memory for an address space";
+    }
+    t->as   = as;
+    t->satp = espix_um_as_satp(as);
+    app->um = t;
+
+    uint32_t entry = 0, usp = 0, uargv = 0, uenvp = 0;
+    const char *why = load_segments(as, app->image, slot->info.image_bytes, &entry);
+    if (why == NULL) {
+        why = build_stack(as, app->argv, app->argc, app->envp, &usp, &uargv, &uenvp);
+    }
+    if (why != NULL) {
+        return why;
+    }
+
+    /* The file image has been copied into the address space. */
+    free(app->image);
+    app->image = NULL;
+
+    asm volatile ("mv %0, tp" : "=r"(t->ktp));
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, t);
+
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "pid %d: %s in U-mode, entry 0x%08x, asid %u",
+               (int)slot->info.pid, slot->info.name, (unsigned)entry, (unsigned)asid);
+    espix_um_enter(entry, usp, (uint32_t)app->argc, uargv, uenvp);
+    __builtin_unreachable();
+}
+
+void espix_um_release(espix_proc_slot_t *slot)
+{
+    if (slot->app == NULL || slot->app->um == NULL) {
+        return;
+    }
+    espix_um_thread_t *t = slot->app->um;
+    asid_free((t->satp & SATP32_ASID) >> 22);
+    espix_um_as_free(t->as);
+    free(t);
+    slot->app->um = NULL;
+}
+
+#endif /* CONFIG_ESPIX_UMODE */

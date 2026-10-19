@@ -459,6 +459,20 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   reported in `dmesg` on the next boot, and then the system reboots.
   `espix_fault_request_reap()` exists with no callers.
 
+## U-mode apps (S31)
+
+M1 of [USER-MODE.md](USER-MODE.md): a static executable built with
+`tools/build-uapp.sh` runs in U-mode, in an address space of its own. What it
+cannot do yet:
+
+- **Two syscalls only**, `write` (to fd 1 and 2) and `exit`. No files, no stdin,
+  no time, no threads; those are M2 and M3.
+- **Fixed memory**: a 64 KiB stack and a 64 KiB heap, mapped when it loads.
+- **Pinned to core 1**, as M-mode apps are.
+- **A rare hang**: once in about 120 runs of two FPU-using U-mode apps together,
+  core 1 locked up at an app's syscall; the board reset by watchdog. Not seen
+  since in 80 more runs; recorded in USER-MODE.md under M1.
+
 ## Filesystem
 
 - **An ext listing cannot tell its end from a failure.** lwext4's

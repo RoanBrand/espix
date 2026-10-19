@@ -21,6 +21,9 @@ idf_component_register(
         "abi_time.c"
         "abi_gfx.c"
         "abi_audio.c"
+        "umode.c"
+        "umode_mm.c"
+        "umode_entry.S"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -31,6 +34,8 @@ idf_component_register(
         espix_kernel
     PRIV_REQUIRES
         espix_fs
+        esp_mm
+        hal
         espix_shell
         # abi_gfx.c publishes the screen and its input queue to apps.
         espix_display

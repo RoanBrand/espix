@@ -359,7 +359,7 @@ Each is a commit that leaves `make test` green on both targets.
 
 | | what | done when |
 |---|---|---|
-| M1 | vectors patch, `satp`/`mscratch` switch, frame allocator, the fixed-address loader, a minimal syscall set (`write`, `exit_group`), `libespix-u` with `crt0` and picolibc, `cpu_apm` opened | `hello` runs in U-mode; a bad pointer in an app is SIGSEGV and the board keeps running; preemption and FPU use in U-mode work |
+| M1 | vectors patch, `satp`/`mscratch` switch, frame allocator, the fixed-address loader, a minimal syscall set (`write`, `exit_group`), `libespix-u` with `crt0` and picolibc, `cpu_apm` opened | done: `tests/suites/32-umode.sh`; see [M1](#m1-what-building-it-found) |
 | M2 | files, time, env, `brk` with pages mapped on touch; tests/app relinked; the kernel stack size measured | the app suites pass with tests/app in U-mode |
 | M3 | threads: create and exit, futex wait and wake, TLS; ASIDs under load | the pthread suites pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, fault reaping | a compute loop's handler runs; `kill -STOP` stops it at once; a segfault ends only the app |
@@ -367,6 +367,33 @@ Each is a commit that leaves `make test` green on both targets.
 | M6 | sockets, select, poll | mosquitto runs in U-mode |
 | M7 | growable stacks with a guard; `mmap`; shared text and copy-on-write data between instances | Doom runs without a fixed stack size; two instances of one app share text |
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises: it forks, the parent exits, and the child carries on as the broker |
+
+## M1: what building it found
+
+`hello.c`, unchanged, runs as a U-mode app (`tools/build-uapp.sh`); a write to
+address 0, a read of kernel memory and a jump into the app's own data each end
+the app with SIGSEGV and leave the board running; floating point survives
+preemption, and two U-mode apps share a core. `tests/suites/32-umode.sh` checks
+all of it.
+
+Building it found these, in the order they bit, each on the board:
+
+| what | consequence |
+|---|---|
+| IDF's hardware stack guard checks every write to `sp` | the entry tells U from M by swapping `mscratch` with `t0`, never with `sp`: a transient `sp` of 0 tripped the guard at the first boot |
+| IDF restores the *interrupted* task's `mstatus` after a context switch | the interrupt frame grows to 160 bytes and carries the task's privilege |
+| the CLIC keeps its own MPP, MPIE and interrupt level in `mcause`, and `mret` honours them | every exit writes an `mcause` that agrees with the privilege it returns to; the two hangs that came from it froze a core with every interrupt masked |
+| the ROM `longjmp` restores FP registers, and from inside a trap it hung | an app's exit and its faults leave the trap into M-mode first (`exited()`), then take the ordinary exit path |
+| IDF's lazy FPU trap, taken from U-mode while another task owned the FPU from inside a syscall, locked the core up (the debug-assist lockup monitor recorded an illegal instruction at the app's `fmadd.s`) | the FPU is handed to a U-mode thread eagerly on its way back to U (`fpu_take()`), so U-mode never takes the lazy trap |
+| kernel code ran with the app's `satp` loaded | every entry from U writes `satp` to bare; the exit loads the thread's |
+| ASIDs, under load | they work: two processes at identical virtual addresses, no flush on a switch, 80 rounds clean. GrieferPig's report did not reproduce here. A small allocator gives each live process its own, and a freed one is flushed per core before reuse |
+
+Two things are open:
+- **One hang in about 120 two-app rounds after the FPU change**: core 1 locked
+  at an app's `ecall`, with no panic. It has not recurred in 80 rounds since.
+- **IDF compiles its FLW/FSW decode for the FPU-trap bug on the P4 only**,
+  although `soc_caps.h` says the S31 has the bug too. U-mode apps no longer
+  take that trap; whether M-mode code on the S31 can, has not been checked.
 
 ## Decisions taken
 
