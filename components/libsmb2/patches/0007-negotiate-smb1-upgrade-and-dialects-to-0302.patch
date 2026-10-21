@@ -1,0 +1,149 @@
+diff --git a/include/libsmb2-private.h b/include/libsmb2-private.h
+index a356c85..904f00a 100644
+--- a/include/libsmb2-private.h
++++ b/include/libsmb2-private.h
+@@ -52,6 +52,8 @@ extern "C" {
+ 
+ #define SMB2_SPL_SIZE 4
+ #define SMB2_HEADER_SIZE 64
++/* espix patch 0007: an SMB1 header, WordCount and ByteCount, and no dialects */
++#define SMB1_NEGOTIATE_MIN_SIZE (32 + 1 + 2)
+ 
+ #define SMB2_SIGNATURE_SIZE 16
+ #define SMB2_KEY_SIZE 16
+diff --git a/include/smb2/libsmb2.h b/include/smb2/libsmb2.h
+index c3fbfdf..e66a200 100644
+--- a/include/smb2/libsmb2.h
++++ b/include/smb2/libsmb2.h
+@@ -336,6 +336,8 @@ enum smb2_negotiate_version {
+         SMB2_VERSION_ANY  = 0,
+         SMB2_VERSION_ANY2 = 2,
+         SMB2_VERSION_ANY3 = 3,
++        /* espix patch 0007: 2.0.2 up to 3.0.2, every dialect but 3.1.1 */
++        SMB2_VERSION_UPTO_0302 = 4,
+         SMB2_VERSION_0202 = 0x0202,
+         SMB2_VERSION_0210 = 0x0210,
+         SMB2_VERSION_0300 = 0x0300,
+diff --git a/lib/libsmb2.c b/lib/libsmb2.c
+index d372fa6..2aad325 100644
+--- a/lib/libsmb2.c
++++ b/lib/libsmb2.c
+@@ -1264,6 +1264,13 @@ connect_cb(struct smb2_context *smb2, int status,
+                 req.dialects[1] = SMB2_VERSION_0302;
+                 req.dialects[2] = SMB2_VERSION_0311;
+                 break;
++        case SMB2_VERSION_UPTO_0302:
++                req.dialect_count = 4;
++                req.dialects[0] = SMB2_VERSION_0202;
++                req.dialects[1] = SMB2_VERSION_0210;
++                req.dialects[2] = SMB2_VERSION_0300;
++                req.dialects[3] = SMB2_VERSION_0302;
++                break;
+         case SMB2_VERSION_0202:
+         case SMB2_VERSION_0210:
+         case SMB2_VERSION_0300:
+@@ -5209,6 +5216,20 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
+                 dialects[1] = SMB2_VERSION_0302;
+                 dialects[2] = SMB2_VERSION_0311;
+                 break;
++        /*
++         * espix patch 0007. Everything below 3.1.1, for a server that has to
++         * keep guests working: 3.1.1 makes libsmb2 sign every TREE_CONNECT
++         * reply, which a guest session has no key for, while phones and other
++         * small clients (jcifs-ng stops at 2.1 by default) offer nothing newer
++         * than 2.1.
++         */
++        case SMB2_VERSION_UPTO_0302:
++                dialect_count = 4;
++                dialects[0] = SMB2_VERSION_0202;
++                dialects[1] = SMB2_VERSION_0210;
++                dialects[2] = SMB2_VERSION_0300;
++                dialects[3] = SMB2_VERSION_0302;
++                break;
+         case SMB2_VERSION_0202:
+         case SMB2_VERSION_0210:
+         case SMB2_VERSION_0300:
+@@ -5253,7 +5274,21 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
+                 }
+ 
+                 if (dialect_index < 0) {
+-                        smb2_set_error(smb2, "No common dialects for protocol");
++                        /* espix patch 0007: name what the client offered */
++                        char offered[SMB2_NEGOTIATE_MAX_DIALECTS * 5 + 1];
++                        int pos = 0;
++
++                        offered[0] = '\0';
++                        for (d = 0; d < req->dialect_count &&
++                                    d < SMB2_NEGOTIATE_MAX_DIALECTS; d++) {
++                                pos += snprintf(offered + pos, sizeof(offered) - pos,
++                                                " %04x", req->dialects[d]);
++                                if (pos >= (int)sizeof(offered)) {
++                                        break;
++                                }
++                        }
++                        smb2_set_error(smb2, "No common dialects for protocol "
++                                       "(client offered%s)", offered);
+                         smb2_close_context(smb2);
+                         return;
+                 }
+diff --git a/lib/pdu.c b/lib/pdu.c
+index be3cea7..2f781d9 100644
+--- a/lib/pdu.c
++++ b/lib/pdu.c
+@@ -545,11 +545,9 @@ smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
+         static char smb1sign[4] = {0xFF, 'S', 'M', 'B'};
+         static char smb2sign[4] = {0xFE, 'S', 'M', 'B'};
+ 
+-        if (iov->len < SMB2_HEADER_SIZE) {
+-                smb2_set_error(smb2, "io vector for header is too small");
+-                return -1;
+-        }
+-        if (!memcmp(iov->buf, smb1sign, 4)) {
++        /* espix patch 0007: an SMB1 negotiate may be shorter than an SMB2
++         * header, so look for it first; it needs only its command byte. */
++        if (iov->len >= SMB1_NEGOTIATE_MIN_SIZE && !memcmp(iov->buf, smb1sign, 4)) {
+                 /* an SMBv1 request. if it is a negotiate request
+                  * allow it through, else ingore */
+                 if (iov->buf[4] == SMB1_NEGOTIATE) {
+@@ -561,6 +559,10 @@ smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
+                 smb2_set_error(smb2, "not handling SMBv1 request");
+                 return -1;
+         }
++        if (iov->len < SMB2_HEADER_SIZE) {
++                smb2_set_error(smb2, "io vector for header is too small");
++                return -1;
++        }
+         if (memcmp(iov->buf, smb2sign, 4)) {
+                 smb2_set_error(smb2, "bad SMB signature in header");
+                 return -1;
+diff --git a/lib/socket.c b/lib/socket.c
+index 809b1a4..2766f54 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -470,6 +470,26 @@ read_more_data:
+                  * bare SMB2 header, or that is large enough to be a memory
+                  * exhaustion vector, before we act on it.
+                  */
++                /*
++                 * espix patch 0007. The one PDU allowed to be shorter than an
++                 * SMB2 header is a server's first: an SMB1 NEGOTIATE asking to
++                 * upgrade can be as small as its 32-byte header, three bytes
++                 * of counts and the dialect strings -- "SMB 2.002" and
++                 * "SMB 2.???" alone make 57 bytes, which is what a Samsung
++                 * phone sends. Read exactly that much and let the SMB1 branch
++                 * below answer it.
++                 */
++                if (smb2_is_server(smb2) && smb2->dialect == 0 &&
++                    smb2->spl >= SMB1_NEGOTIATE_MIN_SIZE &&
++                    smb2->spl < SMB2_HEADER_SIZE) {
++                        smb2->recv_state = SMB2_RECV_HEADER;
++                        if (smb2_add_iovector(smb2, &smb2->in, &smb2->header[0],
++                                              smb2->spl, NULL) == NULL) {
++                                smb2_set_error(smb2, "Too many I/O vectors when adding header");
++                                return -1;
++                        }
++                        goto read_more_data;
++                }
+                 if (smb2->spl < SMB2_HEADER_SIZE ||
+                     smb2->spl > smb2_recv_pdu_cap(smb2)) {
+                         smb2_set_error(smb2, "Invalid session packet length "

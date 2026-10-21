@@ -495,6 +495,18 @@ static uint64_t filetime(const time_t t)
     return ((uint64_t)t + 11644473600ULL) * 10000000ULL;
 }
 
+/* littlefs keeps only the modification time: st_atime and st_ctime come
+ * back 0, which every client shows as 1970. Report the mtime for those. */
+static time_t atime_of(const struct stat *st)
+{
+    return (st->st_atime != 0) ? st->st_atime : st->st_mtime;
+}
+
+static time_t ctime_of(const struct stat *st)
+{
+    return (st->st_ctime != 0) ? st->st_ctime : st->st_mtime;
+}
+
 static uint32_t attrs_of(const struct stat *st)
 {
     return S_ISDIR(st->st_mode) ? SMB2_FILE_ATTRIBUTE_DIRECTORY
@@ -773,6 +785,14 @@ static int h_create(struct smb2_server *srvr, struct smb2_context *smb2,
     const bool want_dir = ((req->create_options & SMB2_FILE_DIRECTORY_FILE) != 0) ||
                           (exists && S_ISDIR(st.st_mode));
 
+    /* Clients tell a folder from a file by opening it as a file and being
+     * refused: Samsung's My Files does this before listing a folder. */
+    if (exists && S_ISDIR(st.st_mode) &&
+        (req->create_options & SMB2_FILE_NON_DIRECTORY_FILE) != 0) {
+        return fail(smb2, SMB2_STATUS_FILE_IS_A_DIRECTORY,
+                    "create '%s'", req->name ? req->name : "");
+    }
+
     smbd_open_t *o = open_alloc(c, rep->file_id);
     if (o == NULL) {
         return fail(smb2, SMB2_STATUS_TOO_MANY_OPENED_FILES,
@@ -829,10 +849,10 @@ static int h_create(struct smb2_server *srvr, struct smb2_context *smb2,
     }
 
     if (cached_stat(path, &st) == 0) {
-        rep->creation_time = filetime(st.st_ctime);
-        rep->last_access_time = filetime(st.st_atime);
+        rep->creation_time = filetime(ctime_of(&st));
+        rep->last_access_time = filetime(atime_of(&st));
         rep->last_write_time = filetime(st.st_mtime);
-        rep->change_time = filetime(st.st_ctime);
+        rep->change_time = filetime(ctime_of(&st));
         rep->allocation_size = PAD64((uint64_t)st.st_size);
         rep->end_of_file = (uint64_t)st.st_size;
         rep->file_attributes = attrs_of(&st);
@@ -865,10 +885,10 @@ static int h_close(struct smb2_server *srvr, struct smb2_context *smb2,
 
     struct stat st;
     if (cached_stat(o->path, &st) == 0) {
-        rep->creation_time = filetime(st.st_ctime);
-        rep->last_access_time = filetime(st.st_atime);
+        rep->creation_time = filetime(ctime_of(&st));
+        rep->last_access_time = filetime(atime_of(&st));
         rep->last_write_time = filetime(st.st_mtime);
-        rep->change_time = filetime(st.st_ctime);
+        rep->change_time = filetime(ctime_of(&st));
         rep->allocation_size = PAD64((uint64_t)st.st_size);
         rep->end_of_file = (uint64_t)st.st_size;
         rep->file_attributes = attrs_of(&st);
@@ -927,6 +947,13 @@ static int h_read(struct smb2_server *srvr, struct smb2_context *smb2,
         const int e = errno;
         free(buf);
         return fail(smb2, status_of_errno(e), "read off %llu len %u",
+                    (unsigned long long)req->offset, (unsigned)len);
+    }
+    if (n == 0 && len > 0) {
+        /* MS-SMB2 3.3.5.12: a read at or past the end is END_OF_FILE, not an
+         * empty success. */
+        free(buf);
+        return fail(smb2, SMB2_STATUS_END_OF_FILE, "read off %llu len %u",
                     (unsigned long long)req->offset, (unsigned)len);
     }
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "read off %llu len %u -> %d",
@@ -1058,10 +1085,10 @@ static void dir_entry_fill(struct smb2_fileidbothdirectoryinformation *fsb,
 {
     memset(fsb, 0, sizeof(*fsb));
     fsb->file_index = index;
-    win_time(st->st_ctime, &fsb->creation_time);
-    win_time(st->st_atime, &fsb->last_access_time);
+    win_time(ctime_of(st), &fsb->creation_time);
+    win_time(atime_of(st), &fsb->last_access_time);
     win_time(st->st_mtime, &fsb->last_write_time);
-    win_time(st->st_ctime, &fsb->change_time);
+    win_time(ctime_of(st), &fsb->change_time);
     fsb->end_of_file = (uint64_t)st->st_size;
     fsb->allocation_size = PAD64((uint64_t)st->st_size);
     fsb->file_attributes = attrs_of(st);
@@ -1474,10 +1501,10 @@ static int h_query_info(struct smb2_server *srvr, struct smb2_context *smb2,
     case SMB2_FILE_BASIC_INFORMATION: {
         struct smb2_file_basic_info *fs = (struct smb2_file_basic_info *)(void *)s_dents;
         memset(fs, 0, sizeof(*fs));
-        win_time(st.st_ctime, &fs->creation_time);
-        win_time(st.st_atime, &fs->last_access_time);
+        win_time(ctime_of(&st), &fs->creation_time);
+        win_time(atime_of(&st), &fs->last_access_time);
         win_time(st.st_mtime, &fs->last_write_time);
-        win_time(st.st_ctime, &fs->change_time);
+        win_time(ctime_of(&st), &fs->change_time);
         fs->file_attributes = attrs_of(&st);
         rep->output_buffer = fs;
         rep->output_buffer_length = sizeof(*fs);
@@ -1498,10 +1525,10 @@ static int h_query_info(struct smb2_server *srvr, struct smb2_context *smb2,
         struct smb2_file_network_open_info *fs =
             (struct smb2_file_network_open_info *)(void *)s_dents;
         memset(fs, 0, sizeof(*fs));
-        win_time(st.st_ctime, &fs->creation_time);
-        win_time(st.st_atime, &fs->last_access_time);
+        win_time(ctime_of(&st), &fs->creation_time);
+        win_time(atime_of(&st), &fs->last_access_time);
         win_time(st.st_mtime, &fs->last_write_time);
-        win_time(st.st_ctime, &fs->change_time);
+        win_time(ctime_of(&st), &fs->change_time);
         fs->allocation_size = PAD64((uint64_t)st.st_size);
         fs->end_of_file = (uint64_t)st.st_size;
         fs->file_attributes = attrs_of(&st);
@@ -1512,10 +1539,10 @@ static int h_query_info(struct smb2_server *srvr, struct smb2_context *smb2,
     case SMB2_FILE_ALL_INFORMATION: {
         struct smb2_file_all_info *fs = (struct smb2_file_all_info *)(void *)s_dents;
         memset(fs, 0, sizeof(*fs));
-        win_time(st.st_ctime, &fs->basic.creation_time);
-        win_time(st.st_atime, &fs->basic.last_access_time);
+        win_time(ctime_of(&st), &fs->basic.creation_time);
+        win_time(atime_of(&st), &fs->basic.last_access_time);
         win_time(st.st_mtime, &fs->basic.last_write_time);
-        win_time(st.st_ctime, &fs->basic.change_time);
+        win_time(ctime_of(&st), &fs->basic.change_time);
         fs->basic.file_attributes = attrs_of(&st);
         fs->standard.allocation_size = PAD64((uint64_t)st.st_size);
         fs->standard.end_of_file = (uint64_t)st.st_size;
@@ -1809,20 +1836,20 @@ static void on_new_client(struct smb2_context *smb2, void *cb_data)
         return;
     }
     /*
-     * 3.0.2 at most, not ANY. libsmb2 signs the TREE_CONNECT reply
+     * 2.0.2 up to 3.0.2, never 3.1.1. libsmb2 signs the TREE_CONNECT reply
      * unconditionally when the dialect is 3.1.1 (pdu.c, "SMB2_TREE_CONNECT &&
      * dialect == 0311"), because 3.1.1 folds it into the preauth integrity
      * hash. A guest session has no signing key, so the client is handed a
      * signed reply it cannot verify and drops the connection -- which is
-     * exactly what smbprotocol did ("key must be bytes-like"). 3.0.2 has no
-     * such rule and every current client speaks it. Guest sessions still
-     * exist alongside a credential, so the rule still bites.
+     * exactly what smbprotocol did ("key must be bytes-like"). Guest sessions
+     * still exist alongside a credential, so the rule still bites.
      *
-     * The price is FSCTL_VALIDATE_NEGOTIATE_INFO, which 3.0.x clients send
-     * signed after their first tree connect and which must be answered signed;
-     * libsmb2 patch 0004 is what makes that so.
+     * Not 3.0.2 alone: a Samsung phone offers nothing newer than 2.1 (patch
+     * 0007 adds this set). The price of 3.0.x is FSCTL_VALIDATE_NEGOTIATE_INFO,
+     * which those clients send signed after their first tree connect and
+     * which must be answered signed; libsmb2 patch 0004 is what makes that so.
      */
-    smb2_set_version(smb2, SMB2_VERSION_0302);
+    smb2_set_version(smb2, SMB2_VERSION_UPTO_0302);
     smb2_register_error_callback(smb2, on_error);
 }
 
