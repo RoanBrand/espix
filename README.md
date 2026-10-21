@@ -38,7 +38,7 @@ together.
 - Networking:
   - IP routing, NAT, bridging. Firewall planned.
   - With wifi, eth, USB-NCM, and virtual interfaces.
-  - File sharing with NFS v3 (NFSv4, SMB planned)
+  - File sharing with NFS v3 and SMB 2/3 (NFSv4 planned)
   - Wireguard server (PiVPN shaped), and client.
 - File systems:
   - VFAT, exFAT, ext4 (via lwext4) for USB disks, LittleFS for `/` on internal flash.
@@ -99,6 +99,7 @@ which is also where the one build option hardware decides today is explained.
 | Storage | ext2/3/4 volumes | **yes** | read-only by default, writable with `mount -o rw`; a driver of espix's own, two mount slots. Writes go through the port's experimental extent implementation, and a volume without a journal cannot be mounted writable at all — see [KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) |
 | Storage | `mkfs`: make a filesystem | **planned** | nothing is ever formatted today |
 | Storage | Serve the stick over the network | **yes** | NFSv3: the portmapper, mountd and nfsd, statd so a client needs no lock option, and a write path (writable unless the export says `ro`); a Linux or macOS client mounts it with no options, a 500-entry listing is one directory walk, and 4 MiB copies at ~410 KB/s — [NFS.md](docs/NFS.md) |
+| Storage | Serve files to Windows, macOS and Linux | **partial** | SMB 3.0.2 through [libsmb2](https://github.com/sahlberg/libsmb2)'s server engine with six patches, the files mapped onto the VFS: one share (`/home` by default) described by `/etc/smb.conf`, guest read-write plus one NTLMv2 user whose session signs. Windows 10 opens `\\<board>\home` from Explorer's credential dialog and Notepad and Photos read from it; Finder and `mount_smbfs` list, read, write and delete; a Linux desktop edits and saves. Off by default (`smbd` in `/etc/units`); listing the shares of `\\<board>` itself (srvsvc) is not done yet |
 | Programs | Run a native app: load, argv, exit status | **yes** | cross-compiled on a PC, copied over, run by name |
 | Programs | An app's identity, filesystem and environment | **yes** | the published ABI: `getuid`, `open`/`stat`, `getenv` — an allowlist in `components/espix_proc/abi_*.c`, so a name espix does not publish stops an app loading rather than loading and answering ENOSYS |
 | Programs | A root for one app — `confine` | **yes** | it cannot *name* a path outside |

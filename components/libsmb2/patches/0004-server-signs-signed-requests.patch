@@ -1,0 +1,117 @@
+diff --git a/include/libsmb2-private.h b/include/libsmb2-private.h
+index 3760765..a356c85 100644
+--- a/include/libsmb2-private.h
++++ b/include/libsmb2-private.h
+@@ -380,6 +380,10 @@ struct smb2_pdu {
+          * signed, and before the pdu can be written out and freed.
+          */
+         int update_preauth_hash;
++
++        /* espix patch 0004: a server request that arrived signed, and so a
++         * reply that has to be signed too */
++        int sign_reply;
+         smb2_command_cb cb;
+         void *cb_data;
+         void (*free_cb)(void *);
+diff --git a/include/smb2/libsmb2.h b/include/smb2/libsmb2.h
+index f88e640..c3fbfdf 100644
+--- a/include/smb2/libsmb2.h
++++ b/include/smb2/libsmb2.h
+@@ -454,6 +454,12 @@ const char *smb2_get_user(struct smb2_context *smb2);
+  */
+ int smb2_session_is_authenticated(struct smb2_context *smb2);
+ 
++/*
++ * espix patch 0004: whether signing is required on this connection, because
++ * the client asked for it or the dialect demands it.
++ */
++int smb2_get_signing_required(struct smb2_context *smb2);
++
+ /*
+  * Set the password that we will try to authenticate as.
+  * This function is only needed when libsmb2 is built --without-libkrb5
+diff --git a/lib/libsmb2.c b/lib/libsmb2.c
+index 9cba232..d372fa6 100644
+--- a/lib/libsmb2.c
++++ b/lib/libsmb2.c
+@@ -4906,6 +4906,12 @@ smb2_session_is_authenticated(struct smb2_context *smb2)
+         return smb2 != NULL && smb2->authenticated;
+ }
+ 
++int
++smb2_get_signing_required(struct smb2_context *smb2)
++{
++        return smb2 != NULL && smb2->sign;
++}
++
+ static void
+ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data)
+ {
+@@ -5090,7 +5096,9 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+                 return;
+         }
+ 
+-        if (smb2->sign)  {
++        /* espix patch 0004: an authenticated session signs what it is sent
++         * signed, so it needs the key whether or not signing is required. */
++        if (smb2->sign || smb2->authenticated)  {
+                 /* Derive the signing key from session key
+                 * This is based on negotiated protocol
+                 */
+@@ -5127,6 +5135,12 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
+                                         smb2_close_context(smb2);
+                                         return;
+                                 }
++                                /* espix patch 0004: SMB 3.x signs the final
++                                 * session setup of a session with a key */
++                                if (smb2->authenticated &&
++                                    smb2->dialect >= SMB2_VERSION_0300) {
++                                        pdu->sign_reply = 1;
++                                }
+                         }
+                         else {
+                                 pdu = smb2_cmd_error_reply_async(smb2,
+diff --git a/lib/pdu.c b/lib/pdu.c
+index 059630d..be3cea7 100644
+--- a/lib/pdu.c
++++ b/lib/pdu.c
+@@ -650,6 +650,8 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
+         }  else {
+                 uint16_t credit_grant = req_pdu->header.credit_request_response;
+ 
++                pdu->sign_reply |= req_pdu->sign_reply;
++
+                 /* some clients (lookin at you nautilus) break if their credits
+                  * increment too far (and probably wrap to 0) so limit credits
+                  * to what the client requests only and if the clients charge
+@@ -753,8 +755,17 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
+                         prev_compound_mid = p->header.message_id;
+                 }
+ 
++                /*
++                 * espix patch 0004. A server signs a reply whenever the
++                 * request was signed on an authenticated session, not only
++                 * when signing is required (MS-SMB2 3.3.4.1.1). A client that
++                 * does not require signing still signs
++                 * FSCTL_VALIDATE_NEGOTIATE_INFO and drops the session if the
++                 * reply is not signed, which is how Windows 10 failed.
++                 */
+                 if (smb2->sign ||
+-                    (p->header.command == SMB2_TREE_CONNECT && smb2->dialect == SMB2_VERSION_0311 && !smb2->seal)) {
++                    (p->header.command == SMB2_TREE_CONNECT && smb2->dialect == SMB2_VERSION_0311 && !smb2->seal) ||
++                    (smb2_is_server(smb2) && smb2->authenticated && p->sign_reply)) {
+                         if (smb2_pdu_add_signature(smb2, p) < 0) {
+                                 smb2_set_error(smb2, "Failure to add "
+                                                "signature. %s",
+diff --git a/lib/socket.c b/lib/socket.c
+index bafbfcd..2d49069 100644
+--- a/lib/socket.c
++++ b/lib/socket.c
+@@ -719,6 +719,7 @@ read_more_data:
+                         }
+                         pdu->header.credit_charge = smb2->hdr.credit_charge;
+                         pdu->header.credit_request_response = smb2->hdr.credit_request_response;
++                        pdu->sign_reply = (smb2->hdr.flags & SMB2_FLAGS_SIGNED) != 0;
+                 } else {
+                         if ((smb2->hdr.command != SMB2_OPLOCK_BREAK) ||
+                                         (smb2->hdr.message_id != 0xffffffffffffffffULL)) {

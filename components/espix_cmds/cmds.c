@@ -106,6 +106,7 @@ void espix_cmds_register_all(void)
     espix_cmds_register_vpn();
     espix_cmds_register_nfsd();
     espix_cmds_register_sshd();
+    espix_cmds_register_smbd();
     espix_cmds_register_motd();
     espix_cmds_register_time();
     espix_cmds_register_blk();

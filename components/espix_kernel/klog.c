@@ -235,8 +235,13 @@ static void klog_store(espix_klog_level_t level, const char *line, bool echo)
          * a higher level -- it still takes slots that hold DEBUG, so it is only
          * lost when everything around it matters more. Counted separately from
          * wraparound losses so `dmesg` can say which happened.
+         *
+         * Not once `dmesg -n debug` has asked for DEBUG: a ring that has
+         * wrapped on INFO lines would otherwise drop every DEBUG line, and the
+         * console that was asked for them is fed from this ring.
          */
         if (s_next >= KLOG_LINES && level == ESPIX_KLOG_DEBUG &&
+            s_console_level < ESPIX_KLOG_DEBUG &&
             s_ring[idx].level != ESPIX_KLOG_DEBUG) {
             s_dropped_debug++;
         } else {

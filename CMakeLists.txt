@@ -27,6 +27,19 @@ if(EXISTS "${espix_lwext4_sub}/lwext4-build/CMakeCache.txt")
 endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# Fetch libsmb2 (tools/fetch-libsmb2.py) for components/libsmb2, which registers
+# its sources itself: upstream's ESP glue predates IDF 5 and does not build.
+# Not in EXTRA_COMPONENT_DIRS, unlike esp_lwext4, because what is registered is
+# a component of ours that builds a fetched tree, not the fetched tree itself.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/fetch-libsmb2.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_libsmb2_fetch_result)
+if(NOT espix_libsmb2_fetch_result EQUAL 0)
+    message(FATAL_ERROR "tools/fetch-libsmb2.py failed; see the message above")
+endif()
+
 project(espix)
 
 # Make off_t 64 bits, for every translation unit in the firmware. Before the

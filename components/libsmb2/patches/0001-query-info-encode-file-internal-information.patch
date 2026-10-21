@@ -1,0 +1,25 @@
+diff --git a/lib/smb2-cmd-query-info.c b/lib/smb2-cmd-query-info.c
+index e144a3f..3c0e207 100644
+--- a/lib/smb2-cmd-query-info.c
++++ b/lib/smb2-cmd-query-info.c
+@@ -214,6 +214,20 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
+                                 break;
+                         case SMB2_FILE_ID_INFORMATION:
+                                 break;
++                        /*
++                         * espix patch 0001. The Linux CIFS client asks for
++                         * FILE_INTERNAL_INFORMATION (its inode) whenever it
++                         * opens anything, and smbclient.stat asks for it among
++                         * its probes, so a server without this case makes a
++                         * whole platform answer ENOSYS on open. The wire form
++                         * is one 8-byte index, which is what the handler
++                         * supplies.
++                         */
++                        case SMB2_FILE_INTERNAL_INFORMATION:
++                                smb2_set_uint64(iov, 0,
++                                        *(const uint64_t *)rep->output_buffer);
++                                created_output_buffer_length = 8;
++                                break;
+                         case SMB2_FILE_MODE_INFORMATION:
+                                 break;
+                         case SMB2_FILE_NETWORK_OPEN_INFORMATION:

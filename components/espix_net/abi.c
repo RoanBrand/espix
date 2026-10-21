@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include "esp_elf.h"
 
@@ -102,9 +103,14 @@ static ssize_t espix_lwip_sendto(int fd, const void *data, size_t size,
  * topic root -- should see what the shell's `hostname` prints, not a second
  * copy of it.
  *
+ * A real global symbol rather than a static behind the table below, because it
+ * is not only apps that need it: libsmb2 calls gethostname() from the kernel,
+ * inside smb2_serve_port(), and the link would otherwise have no definition to
+ * find. Publishing the same address to the ABI table keeps one implementation.
+ *
  * POSIX: truncate and NUL-terminate, and report ENAMETOOLONG if it did not fit.
  */
-static int espix_gethostname(char *name, size_t len)
+int gethostname(char *name, size_t len)
 {
     if (name == NULL || len == 0) {
         errno = EINVAL;
@@ -131,7 +137,7 @@ static int espix_gethostname(char *name, size_t len)
 static esp_elf_symbol_table_t s_net_syms[] = {
 
     /* The machine's own name, which is not a lookup: /etc/hostname. */
-    { "gethostname", (void *)espix_gethostname },
+    { "gethostname", (void *)gethostname },
 
     /* netdb.h — the actual gap. Without these, apps cannot use hostnames. */
     ESP_ELFSYM_EXPORT(lwip_getaddrinfo),

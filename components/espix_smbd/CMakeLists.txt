@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "smbd.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "."
+    PRIV_REQUIRES
+        libsmb2
+        espix_fs
+        espix_kernel
+        espix_net
+        lwip
+)

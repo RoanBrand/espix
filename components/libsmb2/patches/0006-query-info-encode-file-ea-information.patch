@@ -1,0 +1,23 @@
+diff --git a/lib/smb2-cmd-query-info.c b/lib/smb2-cmd-query-info.c
+index 3c0e207..ae42949 100644
+--- a/lib/smb2-cmd-query-info.c
++++ b/lib/smb2-cmd-query-info.c
+@@ -208,7 +208,18 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
+                                 break;
+                         case SMB2_FILE_COMPRESSION_INFORMATION:
+                                 break;
++                        /*
++                         * espix patch 0006. Windows' redirector asks for
++                         * FileEaInformation, with FileInternalInformation and
++                         * the volume serial, to answer GetFileInformationByHandle;
++                         * without an encoder a server can only refuse it. The
++                         * wire form is one 4-byte EaSize, which the handler
++                         * supplies.
++                         */
+                         case SMB2_FILE_EA_INFORMATION:
++                                smb2_set_uint32(iov, 0,
++                                        *(const uint32_t *)rep->output_buffer);
++                                created_output_buffer_length = 4;
+                                 break;
+                         case SMB2_FILE_FULL_EA_INFORMATION:
+                                 break;
