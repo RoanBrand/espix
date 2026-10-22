@@ -63,6 +63,24 @@ LOADER_BUILD := loader/build-$(TARGET)
 BOOT_OFF := $(if $(filter esp32s31,$(TARGET)),0x2000,0x0)
 NO_STUB  := $(if $(filter esp32s31,$(TARGET)),--no-stub)
 
+# Baud. More than one speed is in play in this tree, and it is not one number.
+#
+# The S31 goes at 921600, which is what the manual full-flash uses. Note that
+# this tree flashes the S31 with --no-stub (above), so the ROM loader rather
+# than the flasher stub is driving the UART; the manual flash that worked used
+# the stub. If 921600 turns out to be flaky on the ROM path, drop it for one run
+# with ESPBAUD=460800 rather than reaching for a cable. The S3 stays at 460800
+# -- 921600 has not been dependable on that board's bridge, and the write is
+# not the slow half of a build anyway.
+#
+# ESPBAUD is idf.py's own variable for this, so honouring it keeps
+# "ESPBAUD=921600 make flash" behaving the way idf.py would.
+#
+# Reads are a separate question and are deliberately not raised here:
+# tools/coredump.sh stays at 460800 because this link drops bytes reading a
+# coredump, which is a read-side problem the write baud does not touch.
+BAUD ?= $(if $(ESPBAUD),$(ESPBAUD),$(if $(filter esp32s31,$(TARGET)),921600,460800))
+
 # Serial port. Detected late (only when a target needs one) so that `make
 # build` works with no board attached.
 PANIC_LOG ?= serial.log
@@ -155,7 +173,7 @@ flash: build port-check
 	    echo "flash: no ota_0/ota_1 in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 write_flash \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) write_flash \
 	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
 	    0x8000  $(BUILD)/partition_table/partition-table.bin \
 	    0xf000  $(BUILD)/ota_data_initial.bin \
@@ -170,7 +188,7 @@ flash-kernel: build port-check
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$ko" ]; then echo "flash-kernel: no ota_1 in $$csv" >&2; exit 1; fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 write_flash \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) write_flash \
 	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
 	    0x8000  $(BUILD)/partition_table/partition-table.bin \
 	    0xf000  $(BUILD)/ota_data_initial.bin \
@@ -190,7 +208,7 @@ flash-monitor: build port-check
 	    echo "flash-monitor: no ota_0/ota_1 in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 \
+	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) \
 	    write_flash \
 	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
 	    0x8000  $(BUILD)/partition_table/partition-table.bin \
@@ -208,7 +226,7 @@ flash-loader: port-check build-idf-check
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	if [ -z "$$lo" ]; then echo "flash-loader: no ota_0 in $$csv" >&2; exit 1; fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) \
 	    write_flash "$$lo" $(LOADER_BUILD)/espix_loader.bin
 
 # Deliberately separate from `flash`: this replaces the whole rootfs, and
@@ -226,7 +244,7 @@ flash-fs: build port-check
 	    echo "flash-fs: no storage partition in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
-	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b 460800 \
+	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) \
 	    write_flash "$$off" $(BUILD)/storage.bin
 
 fs: flash-fs

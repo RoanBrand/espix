@@ -38,7 +38,7 @@ together.
 - Networking:
   - IP routing, NAT, bridging. Firewall planned.
   - With wifi, eth, USB-NCM, and virtual interfaces.
-  - File sharing with NFS v3 and SMB 2/3 (NFSv4 planned)
+  - File sharing via SMBv2/3 and NFSv3.
   - Wireguard server (PiVPN shaped), and client.
 - File systems:
   - VFAT, exFAT, ext4 (via lwext4) for USB disks, LittleFS for `/` on internal flash.
@@ -47,6 +47,7 @@ together.
 - Simple graphical desktop:
   - Showcase, mostly. very lacking.
   - Simple windows, dragging, min/max/close btns. Taskbar, start btn/menu, and systray.
+  - File browser, image viewer (jpeg), audio player, video player (mjpeg/avi), terminal.
   - Accelerated with PPA/2D-DMA/JPEG hardware, where present (only P4/S31)
 - Remote desktop with VNC(RFB):
   - Access desktop or console, remotely.

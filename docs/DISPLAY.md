@@ -774,3 +774,53 @@ needs across context switches. IDF ships no PIE memcpy for this part.
 Where PIE *would* pay is a pipeline whose per-frame work is a bulk conversion and
 copy rather than a per-pixel analysis -- if frames were ever sent raw, the
 320x200 surface becomes a 128 KiB pack per frame. Worth revisiting then, not now.
+
+## H.264, and what would reopen it
+
+The player reads MJPEG because the JPEG codec is the only *hardware* video
+decoder any target has, and that has not changed. But it is no longer the only
+video decoder: `espressif/esp_h264` ships a software decoder for the S31 and the
+S3 as well as the P4, and its S31 build has an assembly path the portable C build
+does not. So "MJPEG, because nothing else decodes" now deserves a number rather
+than an inheritance, and the number leaves the choice where it is. Three reasons,
+ordered by how hard each would be to remove.
+
+**The profile ceiling is Baseline, and nothing above it decodes.** The decoder is
+tinyH264's h264bsd. It accepts `profile_idc == 66` and errors on every other
+value -- read out of the shipped library rather than the README:
+`h264bsdDecodeSeqParamSet` loads 66 and branches to an error path on anything
+else. That is constrained baseline: CAVLC only, no CABAC, no B-slices. A default
+x264 encode is High profile with CABAC, so a "standard" H.264 file does not
+decode at all. Removing the ceiling means a CABAC arithmetic decoder and the
+B-slice paths, against a prebuilt library whose C source the component does not
+ship -- and CABAC is inherently serial, so it decodes *slower* per bit than the
+CAVLC it would replace. Wrong direction for a trade that has to be won on speed.
+
+**The decode is not the bottleneck here.** The S31's assembly decoder measures
+**15.4 fps at 640x480** and 5.6 at 1280x720 single-task, 16.9 and 6.4 dual-task
+-- against 5-6 ms a frame for the JPEG codec at 640x480. So H.264 in software is
+an order of magnitude behind the path already in use. But the MJPEG player is not
+decode-bound either: it holds 24 fps and the client sees ~8 updates a second,
+because the RFB server costs ~58 ms an update at full size. A slower decoder
+would not move that number; it would move the small-window case, where the
+encoder is not the limit.
+
+**The conversion is free, and that part is new.** PPA SRM takes YUV420 as an
+input color mode -- `PPA_SRM_COLOR_MODE_YUV420` -- and the CSC table in the
+driver binary lists `DMA2D_CSC_RX_YUV420_TO_RGB565_601` and `_709`. The decoder's
+I420 output goes to PPA and comes back RGB565 in one transaction, scaled to the
+canvas: no CPU conversion, and no change to the canvas format. The driver's own
+error strings name the constraint ("YUV420 input does not support odd
+h/w/offset_x/offset_y"), which any H.264 frame satisfies, being macroblock
+aligned. RGB888 would not be easier -- the same conversion in the same engine --
+and it costs 1.44 MB against 960 KiB for an 800x600 canvas, twice over. This is
+the pipeline "A PIE memcpy is not this lever" anticipated: per-frame work that is
+a bulk conversion and copy. PPA turns out to be the answer to it, so the PIE work
+stays unnecessary.
+
+So the deferral is one thing, and it is not the display path: the decoder cannot
+read a file anyone else produced. If esp_h264 ever grows CABAC and High profile
+in its assembly libraries -- the only change on the horizon that would matter --
+the path is already laid: decode to I420, hand it to PPA SRM, present. Until then
+a video on this display means MJPEG, and its limits are the ones listed above.
+

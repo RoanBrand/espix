@@ -308,6 +308,23 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## Platform
 
+- **The S31 can use the flasher stub, and the Makefile should probably say so.**
+  The S31 is a bringup target, so IDF's own Kconfig defaults
+  `ESPTOOLPY_NO_STUB=y` (via `IDF_ENV_BRINGUP`), and `ed789e1` made the
+  Makefile pass `--no-stub` to match. But esptool 5.4.0 and 5.5.0 both ship an
+  S31 stub (`targets/stub_flasher/esp32s31.json`,
+  `STUB_CLASS = ESP32S31StubLoader`), and a manual full-flash at 921600 used it
+  successfully ("Stub flasher running"). So `--no-stub` is an IDF default
+  espix inherited, not an esptool limitation.
+
+  The change is small: drop `NO_STUB` for the S31 in the Makefile and set
+  `CONFIG_ESPTOOLPY_NO_STUB=n` in `sdkconfig.defaults.esp32s31`, after which
+  921600 is the combination actually measured on the bench rather than the
+  untested ROM path. Left undone because it needs one serial flash on hardware
+  to confirm, and the stub is also what allows the compressed download. The
+  Makefile's per-target `BAUD` already carries 921600 for the S31; what is
+  unverified is 921600 over the ROM loader.
+
 - **A power-off that stays off, and a goodbye to whoever is connected.** The
   shutdown sequence refuses new work and stops everything espix controls, but
   it tells nobody: there is no `wall`, and NFSv3 has no message for it. Both
