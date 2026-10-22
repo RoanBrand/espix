@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "smbd.c"
+        "srvsvc.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

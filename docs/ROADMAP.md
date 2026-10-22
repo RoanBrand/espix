@@ -461,6 +461,16 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
     those files carry flash size, PSRAM mode and a partition table, and nothing
     else.
 
+- **OTA headroom on the rootfs.** `flash-ota` stages the new kernel on the 12 MB
+  littlefs beside the system and the running kernel's known-good copy in /boot,
+  and wants room for both plus 64 KB. Since the SMB work that no longer fits:
+  the ceiling is about 3.43 MB of kernel and the kernel is 3.45 MB, so
+  `flash-ota` removes the known-good copy when it must, and says so -- that one
+  flash then has no rollback, and a kernel that does not confirm leaves the
+  loader stalled until a serial flash. The kernel writes a new known-good copy
+  once it boots. The fix belongs to the loader: stage a compressed image, keep
+  one kernel and stream the other, or give the rootfs more of the 16 MB.
+
 ## Networking and time
 
 - **A latency request, so a component that needs the radio can say so.** ssh,
@@ -669,6 +679,20 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   which they are not today -- they are single-threaded by construction and say
   so. Moderate, and only worth it when there are several busy clients.
 
+
+- **SMB: macOS writes `._` files.** Finder keeps extended attributes and
+  resource forks in AppleDouble `._name` files on a server that does not
+  advertise named streams, so browsing from a Mac writes `._*` beside the files
+  it touches and keeps re-reading them (the churn in smbd's DEBUG log). Samba's
+  vfs_fruit answers with streams instead; smbd would need named-stream support
+  (`::$DATA` plus the `AFP_AfpInfo` and `AFP_Resource` streams) to do the same.
+
+- **SMB: what smbd still answers loosely.** CHANGE_NOTIFY is refused, so
+  Explorer and Finder poll a folder instead of being told it changed. LOCK is
+  granted without a lock manager. Security queries get an empty descriptor:
+  espix's owners and permission bits are not mapped onto NT ACLs, so every
+  client sees full access and the VFS decides. One share, one user, and SMB
+  3.0.2 at most (3.1.1 would need preauth-integrity signing and breaks guests).
 
 ## Audio
 

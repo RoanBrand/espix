@@ -122,6 +122,29 @@ case "$avail_kb" in
     ''|*[!0-9]*) ;;                     # unknown: let the push report it
     *)
         avail_bytes=$((avail_kb * 1024))
+        # Two kernels and the system no longer fit the 12 MB rootfs with room
+        # to spare, so when the copy would not fit, the running kernel's
+        # known-good copy goes too. That leaves this one flash without a
+        # rollback: should the new kernel fail to confirm, the loader stalls
+        # and a serial flash is the way back. Once it boots it writes its own
+        # known-good copy, so the next flash has one again.
+        if [ "$avail_bytes" -lt $((img_bytes + 65536)) ]; then
+            good="$(dev_once 'ls /boot' 2>/dev/null | tr -d '\r' | grep '^espix-.*\.bin$' || true)"
+            if [ -n "$good" ]; then
+                printf 'flash-ota: short of room; removing the known-good %s\n' "$good" >&2
+                printf '  this flash has no rollback: if the new kernel fails to boot,\n' >&2
+                printf '  the loader stalls and only a serial flash recovers it\n' >&2
+                for f in $good; do
+                    dev_once "sudo rm /boot/$f" >/dev/null 2>&1 || true
+                done
+                avail_kb="$(dev_once 'df' 2>/dev/null | tr -d '\r' |
+                            awk '$NF == "/" { print $(NF - 2); exit }')"
+                case "$avail_kb" in
+                    ''|*[!0-9]*) avail_kb=0 ;;
+                esac
+                avail_bytes=$((avail_kb * 1024))
+            fi
+        fi
         if [ "$avail_bytes" -lt $((img_bytes + 65536)) ]; then
             printf 'flash-ota: not enough space on the board for the image\n' >&2
             printf '  image %s bytes, free %s bytes (%s kB)\n' \

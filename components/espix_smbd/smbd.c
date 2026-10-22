@@ -39,17 +39,20 @@
 
 #include "smb2.h"
 #include "libsmb2.h"
+#include "libsmb2-raw.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_smbd.h"
+#include "smbd_srvsvc.h"
 
 static const char *TAG = "espix:smbd";
 
 #define SMBD_CONF_PATH     "/etc/smb.conf"
 #define SMBD_MAX_CONNS     16
 #define SMBD_MAX_OPEN      32
+#define SMBD_MAX_TREES     8
 #define SMBD_PATH_MAX      512
 #define SMBD_DEFAULT_PATH  "/home"
 #define SMBD_DEFAULT_SHARE "home"
@@ -82,6 +85,7 @@ typedef struct {
     bool     delete_on_close;
     bool     dir_queried;  /* a search has been made since open or restart */
     uint32_t dir_index;   /* file_index for the next directory entry */
+    smbd_srvsvc_pipe_t *pipe;   /* the srvsvc pipe on IPC$: no fd, no path */
 } smbd_open_t;
 
 typedef struct {
@@ -93,6 +97,12 @@ typedef struct {
     bool                 authed;
     char                 user[64];
     char                 last[80];  /* the last request a handler saw, for the close line */
+    /* The trees connected, by the id libsmb2 patch 0008 shows the handler,
+     * and whether each is IPC$: a create there names a pipe, not a path. */
+    struct {
+        uint32_t id;
+        bool     ipc;
+    }                    trees[SMBD_MAX_TREES];
     smbd_open_t          opens[SMBD_MAX_OPEN];
 } smbd_conn_t;
 
@@ -359,12 +369,49 @@ static void open_clear(smbd_open_t *o)
         (void)(o->is_dir ? rmdir(o->path) : unlink(o->path));
         stat_forget(o->is_dir ? NULL : o->path);
     }
+    if (o->pipe != NULL) {
+        smbd_srvsvc_close(o->pipe);
+        o->pipe = NULL;
+    }
     o->used = false;
     o->is_dir = false;
     o->dir = NULL;
     o->fd = -1;
     o->have_pending = false;
     o->pending[0] = 0;
+}
+
+static bool tree_add(smbd_conn_t *c, uint32_t id, bool ipc)
+{
+    for (size_t i = 0; i < SMBD_MAX_TREES; i++) {
+        if (c->trees[i].id == 0) {
+            c->trees[i].id = id;
+            c->trees[i].ipc = ipc;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tree_remove(smbd_conn_t *c, uint32_t id)
+{
+    for (size_t i = 0; i < SMBD_MAX_TREES; i++) {
+        if (c->trees[i].id == id) {
+            c->trees[i].id = 0;
+        }
+    }
+}
+
+/* Whether the request being handled is on IPC$. */
+static bool tree_is_ipc(smbd_conn_t *c, struct smb2_context *smb2)
+{
+    const uint32_t id = smb2_get_request_tree_id(smb2);
+    for (size_t i = 0; i < SMBD_MAX_TREES; i++) {
+        if (id != 0 && c->trees[i].id == id) {
+            return c->trees[i].ipc;
+        }
+    }
+    return false;
 }
 
 static void conn_free(smbd_conn_t *c)
@@ -676,18 +723,24 @@ static int h_tree_connect(struct smb2_server *srvr, struct smb2_context *smb2,
      * share, for DFS referrals and srvsvc, and treat a refusal as the server
      * being absent rather than as one feature missing. Accept the tree; the
      * pipes inside it are what is not implemented. */
-    if (strcasecmp(name, "IPC$") == 0) {
+    const bool ipc = (strcasecmp(name, "IPC$") == 0);
+    if (!ipc && strcasecmp(name, s_share) != 0) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "tree connect refused '%s' (share is '%s')",
+                   name, s_share);
+        return fail(smb2, SMB2_STATUS_BAD_NETWORK_NAME,
+                    "tree connect '%s'", name);
+    }
+    smbd_conn_t *c = conn_of(smb2);
+    if (c != NULL && !tree_add(c, smb2_get_request_tree_id(smb2), ipc)) {
+        return fail(smb2, SMB2_STATUS_INSUFFICIENT_RESOURCES,
+                    "tree connect '%s'", name);
+    }
+    if (ipc) {
         rep->share_type = SMB2_SHARE_TYPE_PIPE;
         rep->maximal_access = 0x001f00a9;
         rep->share_flags = 0;
         rep->capabilities = 0;
         return 0;
-    }
-    if (strcasecmp(name, s_share) != 0) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "tree connect refused '%s' (share is '%s')",
-                   name, s_share);
-        return fail(smb2, SMB2_STATUS_BAD_NETWORK_NAME,
-                    "tree connect '%s'", name);
     }
     rep->share_type = SMB2_SHARE_TYPE_DISK;
     rep->maximal_access = 0x001f01ff;   /* FILE_ALL_ACCESS */
@@ -699,7 +752,11 @@ static int h_tree_connect(struct smb2_server *srvr, struct smb2_context *smb2,
 static int h_tree_disconnect(struct smb2_server *srvr, struct smb2_context *smb2,
                              const uint32_t tree_id)
 {
-    (void)srvr; (void)smb2; (void)tree_id;
+    (void)srvr;
+    smbd_conn_t *c = conn_of(smb2);
+    if (c != NULL) {
+        tree_remove(c, tree_id);
+    }
     return 0;
 }
 
@@ -742,6 +799,46 @@ static int create_failed(struct smb2_context *smb2, smbd_open_t *o,
     return fail(smb2, status_of_errno(err), "create '%s'", name ? name : "");
 }
 
+/*
+ * A create on IPC$ names a pipe. srvsvc and wkssvc are served (srvsvc.c); any
+ * other name is "no such pipe", which clients take as that service being
+ * absent. Nothing here touches the filesystem.
+ */
+static int create_pipe(smbd_conn_t *c, struct smb2_context *smb2,
+                       struct smb2_create_request *req,
+                       struct smb2_create_reply *rep)
+{
+    const char *name = req->name ? req->name : "";
+    /* "srvsvc", "\srvsvc" and "\PIPE\srvsvc" all name the same pipe. */
+    while (*name == '\\') {
+        name++;
+    }
+    if (strncasecmp(name, "PIPE\\", 5) == 0) {
+        name += 5;
+    }
+    smbd_pipe_kind_t kind;
+    if (strcasecmp(name, "srvsvc") == 0) {
+        kind = SMBD_PIPE_SRVSVC;
+    } else if (strcasecmp(name, "wkssvc") == 0) {
+        kind = SMBD_PIPE_WKSSVC;
+    } else {
+        return fail(smb2, SMB2_STATUS_OBJECT_NAME_NOT_FOUND, "create pipe '%s'", name);
+    }
+    smbd_open_t *o = open_alloc(c, rep->file_id);
+    if (o == NULL) {
+        return fail(smb2, SMB2_STATUS_TOO_MANY_OPENED_FILES, "create pipe '%s'", name);
+    }
+    o->pipe = smbd_srvsvc_open(kind);
+    if (o->pipe == NULL) {
+        open_clear(o);
+        return fail(smb2, SMB2_STATUS_INSUFFICIENT_RESOURCES, "create pipe '%s'", name);
+    }
+    rep->create_action = 1;     /* opened */
+    rep->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "create pipe '%s' ok", name);
+    return 0;
+}
+
 static int h_create(struct smb2_server *srvr, struct smb2_context *smb2,
                     struct smb2_create_request *req,
                     struct smb2_create_reply *rep)
@@ -756,22 +853,10 @@ static int h_create(struct smb2_server *srvr, struct smb2_context *smb2,
                (unsigned)req->create_options, (unsigned)req->desired_access);
     note_request(c, "create '%.60s'", req->name ? req->name : "");
 
-    /*
-     * IPC$ named pipes are not filesystem paths. macOS and Windows open
-     * srvsvc/wkssvc/... at the IPC$ tree, and mapping those onto the share
-     * root would touch the filesystem with names that are not there. Refuse
-     * them here, as "no such pipe", until there is a pipe layer; the default
-     * NOT_IMPLEMENTED is what Windows shows as "Incorrect function".
-     */
-    static const char *const pipes[] = {
-        "srvsvc", "wkssvc", "lsarpc", "samr", "netlogon", "spoolss",
-        "eventlog", "winreg", "mdssvc", "MsFteWds", "dcerpc", "FteWds",
-    };
-    for (size_t pi = 0; pi < sizeof(pipes) / sizeof(pipes[0]); pi++) {
-        if (req->name != NULL && strcasecmp(req->name, pipes[pi]) == 0) {
-            return fail(smb2, SMB2_STATUS_OBJECT_NAME_NOT_FOUND,
-                        "create '%s'", req->name ? req->name : "");
-        }
+    /* A name on IPC$ is a pipe. Its root ("") is not: Finder opens it as a
+     * directory, and it stays the disk share's root, as it always was. */
+    if (tree_is_ipc(c, smb2) && req->name != NULL && req->name[0] != 0) {
+        return create_pipe(c, smb2, req, rep);
     }
 
     char path[SMBD_PATH_MAX];
@@ -882,6 +967,11 @@ static int h_close(struct smb2_server *srvr, struct smb2_context *smb2,
          * with a status the client then blamed on the first half's operation. */
         return 0;
     }
+    if (o->pipe != NULL) {
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "close pipe");
+        open_clear(o);
+        return 0;
+    }
 
     struct stat st;
     if (cached_stat(o->path, &st) == 0) {
@@ -916,6 +1006,60 @@ static int h_flush(struct smb2_server *srvr, struct smb2_context *smb2,
     return 0;
 }
 
+/*
+ * Answer a READ or a TRANSCEIVE with the pipe's next message. Built here, the
+ * way libsmb2's own dcerpcd does it, rather than by the library: a fragment
+ * larger than the client's buffer has to go out with STATUS_BUFFER_OVERFLOW,
+ * which tells the client to read the rest, and a handler's reply cannot carry
+ * a warning status. Returning 1 tells libsmb2 the reply is already queued.
+ */
+static int pipe_reply(struct smb2_context *smb2, smbd_open_t *o, uint16_t cmd,
+                      const smb2_file_id file_id, uint32_t max, uint32_t flags)
+{
+    const uint32_t cap = (max < 0x10000u) ? max : 0x10000u;
+    uint8_t *data = malloc(cap ? cap : 1);
+    if (data == NULL) {
+        return fail(smb2, SMB2_STATUS_INSUFFICIENT_RESOURCES, "pipe reply");
+    }
+    int more = 0;
+    const size_t n = smbd_srvsvc_read(o->pipe, data, cap, &more);
+
+    struct smb2_pdu *pdu;
+    if (cmd == SMB2_READ) {
+        if (n == 0) {
+            free(data);
+            return fail(smb2, SMB2_STATUS_PIPE_EMPTY, "pipe read");
+        }
+        struct smb2_read_reply rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.data = data;            /* the encoder takes it */
+        rep.data_length = (uint32_t)n;
+        pdu = smb2_cmd_read_reply_async(smb2, &rep, NULL, NULL);
+    } else {
+        struct smb2_ioctl_reply rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.ctl_code = SMB2_FSCTL_PIPE_TRANSCEIVE;
+        memcpy(rep.file_id, file_id, SMB2_FD_SIZE);
+        rep.output = data;          /* the encoder copies it */
+        rep.output_count = (uint32_t)n;
+        rep.flags = flags;
+        pdu = smb2_cmd_ioctl_reply_async(smb2, &rep, NULL, NULL);
+        free(data);
+    }
+    if (pdu == NULL) {
+        return -1;
+    }
+    espix_klog(ESPIX_KLOG_DEBUG, TAG, "pipe %s -> %u bytes%s",
+               cmd == SMB2_READ ? "read" : "transceive", (unsigned)n,
+               more ? ", more to read" : "");
+    if (more) {
+        smb2_set_pdu_status(smb2, pdu, SMB2_STATUS_BUFFER_OVERFLOW);
+    }
+    smb2_set_pdu_message_id(smb2, pdu, smb2_get_last_request_message_id(smb2));
+    smb2_queue_pdu(smb2, pdu);
+    return 1;
+}
+
 static int h_read(struct smb2_server *srvr, struct smb2_context *smb2,
                   struct smb2_read_request *req,
                   struct smb2_read_reply *rep)
@@ -930,6 +1074,9 @@ static int h_read(struct smb2_server *srvr, struct smb2_context *smb2,
         return fail(smb2, SMB2_STATUS_FILE_CLOSED,
                     "read off %llu len %u",
                     (unsigned long long)req->offset, (unsigned)req->length);
+    }
+    if (o->pipe != NULL) {
+        return pipe_reply(smb2, o, SMB2_READ, req->file_id, req->length, 0);
     }
     if (o->is_dir || o->fd < 0) {
         return fail(smb2, SMB2_STATUS_INVALID_DEVICE_REQUEST,
@@ -980,6 +1127,14 @@ static int h_write(struct smb2_server *srvr, struct smb2_context *smb2,
                     "write off %llu len %u",
                     (unsigned long long)req->offset, (unsigned)req->length);
     }
+    if (o->pipe != NULL) {
+        if (smbd_srvsvc_write(o->pipe, req->buf, req->length) != 0) {
+            return fail(smb2, SMB2_STATUS_INVALID_PARAMETER, "pipe write: not DCE/RPC");
+        }
+        rep->count = req->length;
+        rep->remaining = 0;
+        return 0;
+    }
     if (o->is_dir || o->fd < 0) {
         return fail(smb2, SMB2_STATUS_INVALID_DEVICE_REQUEST,
                     "write off %llu len %u",
@@ -1017,8 +1172,28 @@ static int h_ioctl(struct smb2_server *srvr, struct smb2_context *smb2,
                    struct smb2_ioctl_request *req,
                    struct smb2_ioctl_reply *rep)
 {
-    (void)srvr; (void)rep;
-    note_request(conn_of(smb2), "ioctl %08x", (unsigned)req->ctl_code);
+    (void)srvr;
+    smbd_conn_t *c = conn_of(smb2);
+    note_request(c, "ioctl %08x", (unsigned)req->ctl_code);
+
+    /* A DCE/RPC call on a pipe: write the request, answer with the reply. */
+    if (req->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE && c != NULL) {
+        smbd_open_t *o = open_find_any(c, req->file_id);
+        if (o == NULL || o->pipe == NULL) {
+            return fail(smb2, SMB2_STATUS_INVALID_HANDLE, "transceive");
+        }
+        if (smbd_srvsvc_write(o->pipe, req->input, req->input_count) != 0) {
+            return fail(smb2, SMB2_STATUS_INVALID_PARAMETER, "transceive: not DCE/RPC");
+        }
+        return pipe_reply(smb2, o, SMB2_IOCTL, req->file_id,
+                          req->max_output_response, req->flags);
+    }
+    /* WaitNamedPipe: the one pipe there is never busy. */
+    if (req->ctl_code == SMB2_FSCTL_PIPE_WAIT) {
+        rep->ctl_code = req->ctl_code;
+        memcpy(rep->file_id, req->file_id, SMB2_FD_SIZE);
+        return 0;
+    }
     return fail(smb2, req->ctl_code == SMB2_FSCTL_DFS_GET_REFERRALS
                           ? SMB2_STATUS_FS_DRIVER_REQUIRED
                           : SMB2_STATUS_INVALID_DEVICE_REQUEST,
@@ -1343,6 +1518,23 @@ static int h_query_info(struct smb2_server *srvr, struct smb2_context *smb2,
 
     char path[SMBD_PATH_MAX];
     smbd_open_t *o = open_find_any(c, req->file_id);
+    if (o != NULL && o->pipe != NULL) {
+        /* A pipe has no file behind it; the standard information is all a
+         * client asks of one. */
+        if (req->info_type != SMB2_0_INFO_FILE ||
+            req->file_info_class != SMB2_FILE_STANDARD_INFORMATION) {
+            return fail(smb2, SMB2_STATUS_INVALID_PARAMETER,
+                        "query_info type %u class %u on a pipe",
+                        (unsigned)req->info_type, (unsigned)req->file_info_class);
+        }
+        struct smb2_file_standard_info *fs = (struct smb2_file_standard_info *)(void *)s_dents;
+        memset(fs, 0, sizeof(*fs));
+        fs->allocation_size = 4096;
+        fs->number_of_links = 1;
+        rep->output_buffer = fs;
+        rep->output_buffer_length = sizeof(*fs);
+        return 0;
+    }
     if (o != NULL) {
         snprintf(path, sizeof(path), "%s", o->path);
     } else if (id_is_zero(req->file_id) || id_is_compound(req->file_id)) {
@@ -1949,6 +2141,8 @@ esp_err_t espix_smbd_run(bool (*keep_going)(void))
     snprintf(s_server.hostname, sizeof(s_server.hostname), "%s",
              (host && host[0]) ? host : "espix");
     snprintf(s_server.domain, sizeof(s_server.domain), "WORKGROUP");
+
+    smbd_srvsvc_config(s_server.hostname, s_share, s_path);
 
     espix_klog(ESPIX_KLOG_INFO, TAG,
                "serving \\\\%s\\%s over %s, guest%s%s, %u KiB buffers",

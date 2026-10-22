@@ -1,0 +1,136 @@
+diff --git a/include/libsmb2-private.h b/include/libsmb2-private.h
+index 904f00a..3ad5351 100644
+--- a/include/libsmb2-private.h
++++ b/include/libsmb2-private.h
+@@ -172,6 +172,9 @@ struct smb2_context {
+         /* espix patch 0003: this session's NTLMv2 proof was verified */
+         int authenticated;
+ 
++        /* espix patch 0008: the tree the request being handled is for */
++        uint32_t request_tree_id;
++
+         t_socket *connecting_fds;
+         size_t connecting_fds_count;
+         struct addrinfo *addrinfos;
+diff --git a/include/smb2/libsmb2.h b/include/smb2/libsmb2.h
+index e66a200..90e33d0 100644
+--- a/include/smb2/libsmb2.h
++++ b/include/smb2/libsmb2.h
+@@ -462,6 +462,14 @@ int smb2_session_is_authenticated(struct smb2_context *smb2);
+  */
+ int smb2_get_signing_required(struct smb2_context *smb2);
+ 
++/*
++ * espix patch 0008: the tree id of the request a server handler is serving.
++ * In tree_connect_cmd it is the id the new tree is about to be given, so a
++ * server can tell its shares apart -- IPC$ from a disk -- for every later
++ * request on them.
++ */
++uint32_t smb2_get_request_tree_id(struct smb2_context *smb2);
++
+ /*
+  * Set the password that we will try to authenticate as.
+  * This function is only needed when libsmb2 is built --without-libkrb5
+diff --git a/lib/libsmb2.c b/lib/libsmb2.c
+index 2aad325..9f88e46 100644
+--- a/lib/libsmb2.c
++++ b/lib/libsmb2.c
+@@ -4323,12 +4323,25 @@ smb2_tree_connect_request_cb(struct smb2_server *server, struct smb2_context *sm
+         struct smb2_pdu *pdu = NULL;
+         int ret = -1;
+ 
++        /*
++         * espix patch 0008. The id is chosen before the handler runs, so the
++         * handler can record what kind of share it is; the reply encoder used
++         * to pick it afterwards, where no handler could see it.
++         */
++        static uint32_t s_server_tree_id = 0x1000;
++        uint32_t tree_id;
++
++        do {
++                tree_id = ++s_server_tree_id;
++        } while (tree_id == 0 || tree_id == 0xffffffff);
++        smb2->request_tree_id = tree_id;
++
+         memset(&rep, 0, sizeof(rep));
+         if (server->handlers && server->handlers->tree_connect_cmd) {
+                 ret = server->handlers->tree_connect_cmd(server, smb2, req, &rep);
+         }
+         if (!ret) {
+-                pdu = smb2_cmd_tree_connect_reply_async(smb2, &rep, 0, NULL, cb_data);
++                pdu = smb2_cmd_tree_connect_reply_async(smb2, &rep, tree_id, NULL, cb_data);
+         }
+         else if (ret < 0) {
+                 memset(&err, 0, sizeof(err));
+@@ -4350,7 +4363,9 @@ smb2_tree_disconnect_request_cb(struct smb2_server *server, struct smb2_context
+         int ret = -1;
+ 
+         if (server->handlers && server->handlers->tree_disconnect_cmd) {
+-                ret = server->handlers->tree_disconnect_cmd(server, smb2, smb2_tree_id(smb2));
++                /* espix patch 0008: the request's tree, not the context's
++                 * current one, which is whatever was connected last */
++                ret = server->handlers->tree_disconnect_cmd(server, smb2, tree_id);
+         }
+         if (!ret) {
+                 pdu = smb2_cmd_tree_disconnect_reply_async(smb2, NULL, cb_data);
+@@ -4818,6 +4833,10 @@ smb2_general_client_request_cb(struct smb2_context *smb2, int status, void *comm
+                 return;
+         }
+ 
++        /* espix patch 0008: what smb2_get_request_tree_id() answers */
++        smb2->request_tree_id = (smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND) ?
++                0 : smb2->hdr.sync.tree_id;
++
+         switch (smb2->pdu->header.command) {
+         case SMB2_SESSION_SETUP:
+                 smb2_session_setup_request_cb(smb2, status, command_data, cb_data);
+@@ -4919,6 +4938,12 @@ smb2_get_signing_required(struct smb2_context *smb2)
+         return smb2 != NULL && smb2->sign;
+ }
+ 
++uint32_t
++smb2_get_request_tree_id(struct smb2_context *smb2)
++{
++        return smb2 != NULL ? smb2->request_tree_id : 0;
++}
++
+ static void
+ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *command_data, void *cb_data)
+ {
+diff --git a/lib/smb2-cmd-ioctl.c b/lib/smb2-cmd-ioctl.c
+index 049273b..b184ea1 100644
+--- a/lib/smb2-cmd-ioctl.c
++++ b/lib/smb2-cmd-ioctl.c
+@@ -209,7 +209,10 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+                         len = SMB2_IOCTL_VALIDIATE_NEGOTIATE_INFO_SIZE;
+                         break;
+                 default:
+-                        if (smb2->passthrough) {
++                        /* espix patch 0008: a pipe's TRANSCEIVE output is
++                         * the pipe's bytes, raw, passthrough or not */
++                        if (smb2->passthrough ||
++                            rep->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE) {
+                                 /* assume the replys output is already coded */
+                                 len = rep->output_count;
+                         }
+@@ -245,7 +248,8 @@ smb2_encode_ioctl_reply(struct smb2_context *smb2,
+                         break;
+                 }
+                 default:
+-                        if (smb2->passthrough) {
++                        if (smb2->passthrough ||
++                            rep->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE) {
+                                 memcpy(buf, rep->output, rep->output_count);
+                                 ioctlv->len = rep->output_count;
+                         }
+@@ -561,7 +565,9 @@ smb2_process_ioctl_request_variable(struct smb2_context *smb2,
+                 req->input_count = sizeof(struct smb2_ioctl_validate_negotiate_info);
+                 break;
+         default:
+-                if (smb2->passthrough) {
++                /* espix patch 0008: and its input is what was written */
++                if (smb2->passthrough ||
++                    req->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE) {
+                         /* dont know how to handle this, let user decode it */
+                         ptr = vec.buf;
+                         req->input_count = vec.len;
