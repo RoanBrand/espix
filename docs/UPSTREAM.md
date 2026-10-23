@@ -998,7 +998,7 @@ and the kernel seeds it from the UUID as well.
 its submodule. When it lands, drop `tools/lwext4-csum-seed.patch` and its entry
 in `tools/patch-lwext4.py`, and bump the revisions pinned there.
 
-## ESP-IDF (newlib)
+## ESP-IDF (libc)
 
 ### `off_t` is 32 bits, and no Kconfig changes it
 
@@ -1038,59 +1038,64 @@ rather than to the nearest, and the whole unit was rounded a second time, so
 coreutils: round the tenths to nearest, truncate the unit, so `3.6T`.
 
 **Fixed**, and not the way this section predicted. It said a patch in the shape of
-the other two — a build-time define on the newlib headers — which would have meant
+the other two — a build-time define on the libc headers — which would have meant
 editing the toolchain, and so changing `off_t` for every project on the machine.
-The toolchain's own header leaves a door open instead:
+The toolchain's own headers leave a door open instead: every one that declares
+`off_t` does it under a guard,
 
-    sys/_types.h:45   #ifndef __machine_off_t_defined
-                      typedef long _off_t;
-                      #endif
-    sys/_types.h:102  typedef _off_t __off_t;
-    sys/types.h:155   typedef __off_t off_t;
+    #ifndef _OFF_T_DECLARED
+    typedef __off_t off_t;
+    #define _OFF_T_DECLARED
+    #endif
 
-So `cmake/offt64.h` is a force-include that defines the guard and the type, and
+so `cmake/offt64.h` is a force-include that declares a 64-bit `off_t` first, and
 `cmake/offt64.cmake` applies it to every translation unit in the firmware and in
 every app — nothing is patched, so nothing drifts, and a toolchain bump that
-renames the guard fails the `_Static_assert` in `components/espix_fs/fs.c` rather
-than quietly reverting every `struct stat` in the image. C and C++ only, not
-`COMPILE_OPTIONS`: the blanket property reaches the assembler, which reads a
-force-included header as instructions.
+renames the guard fails the `_Static_assert`s in `components/espix_fs/fs.c` and
+`components/espix_kernel/kernel.c` rather than quietly reverting it. C and C++
+only, not `COMPILE_OPTIONS`: the blanket property reaches the assembler, which
+reads a force-included header as instructions.
 
-**It is an ABI, and the compiler found the one place that mattered.** `struct stat`
-changes size, so the apps must be built with it too — they are, from the same cmake
-include — and the one real boundary is `_lseek_r`. IDF defines it as an alias for
-`esp_vfs_lseek`, so it followed the type; its callers were built when `off_t` was
-32 bits and still pass 32. Two of them, and neither is source espix can rebuild:
+**It is glibc's large-file scheme, and the split is the point.** Only the public
+`off_t` widens. picolibc's internal `__off_t` stays at the 32 bits the *prebuilt*
+library was compiled with, and every callback that crosses into that library is
+declared with it — a `FILE`'s seek, `funopen`'s `seekfn`, bufio's `lseek`, and
+`fseeko`/`ftello` themselves. Widening `__off_t` too (the first version did, by
+defining the guard one level lower) type-checks perfectly and is silently wrong:
+each of those becomes a call passing 32 bits where 64 are read. And `lseek()`, as
+under `_FILE_OFFSET_BITS=64`, is redirected — every caller compiled with the
+header reaches `lseek64` (`components/espix_fs/fs.c`, straight into
+`esp_vfs_lseek`), while the plain `lseek` symbol stays the 32-bit one the
+prebuilt `fdopen()` and `fseek()` bind to by name.
 
-- newlib's **prebuilt** `stdio.o`, which carries the seek logic `fseek()` ends up in
-  — measured, as a 12 KB SFTP upload failing with `seek failed`, because the write
-  path seeks to the end of the file before each chunk and landed past it;
-- the **ROM's** libc stub table, which `newlib_init.c` installs it into and which
-  declares an int offset, because that is the ABI the ROM's callers were built to.
-
-The type system cannot express the truth here, so the boundary keeps the width it
-has always had and widens inside. `tools/patch-libc-offt.py` turns `_lseek_r` into a
-real 32-bit function that calls the 64-bit `esp_vfs_lseek` — in both the weak
-declaration and the definition — and pins the matching declaration in the
-toolchain's own `reent.h`, which is written in terms of `_off_t`, the very type
-being widened, and so follows it by construction. That last file is outside IDF,
-which is why the hook asks the compiler for its sysroot. Pinning it to `int` is
-correct for any project, widened `off_t` or not — it declares the ABI the library
-was built with, which is what its own compiled callers use — and the cost is a
-shared toolchain: another project built with it gets `int` where it had `long`, the
-same width and ABI and a different declared type.
-[tools/README.md](../tools/README.md) records that as a deliberate deviation, with
-how to undo it. `lseek()`, `pread()` and `pwrite()`
-are untouched and stay 64-bit, which is where a file over 4 GiB is actually reached.
-`tools/esp_libc-lseek-abi.patch` is the IDF half ready to send, and the better fix
-upstream is a **Kconfig knob for 64-bit `off_t`**, which would make the width
+That plain `lseek` is IDF's, in esp_libc, which is why esp_libc alone is compiled
+without the force-include: it *is* the libc glue, so it keeps libc's width, and
+its other callbacks into the prebuilt library — `fopencookie`'s seek,
+`open_memstream`'s, the std streams' `lseek` — stay right by the same stroke. It
+calls `_lseek_r` with a 32-bit offset, and IDF defines `_lseek_r` as an alias for
+`esp_vfs_lseek`, which follows the type. `tools/patch-libc-offt.py` turns it into
+a real 32-bit function that calls the 64-bit one beneath it and answers
+`EOVERFLOW` when the result does not fit, as a 32-bit `lseek()` does on Linux.
+That mismatch was measured under newlib, where the same boundary was crossed by
+the prebuilt `stdio.o`: a 12 KB SFTP upload failing with `seek failed`, because
+the write path seeks to the end of the file before each chunk and landed past it.
+`tools/esp_libc-lseek-abi.patch` is the IDF half ready to send, and the better
+fix upstream is a **Kconfig knob for 64-bit `off_t`**, which would make the width
 explicit rather than implied — there is no such option today.
+
+`struct stat` is laid out identically at either width — `st_size` sits at an
+8-byte-aligned offset, with padding behind a 32-bit one — so the prebuilt
+library's `fstat` calls read it correctly, and this is not where an app and the
+kernel can disagree. Where they can is `lseek`: an app built without the header
+would pass a 32-bit offset to the 64-bit one, which is why every app includes it
+through `cmake/espix-app.cmake` and `tools/check-abi.py` fails the build when one
+does not.
 
 **One knock-on, in the app ABI.** `tests/app`'s hexdump parses its offset with
 `strtoll` now that an offset past 4 GiB is something it gets pointed at, so
 `components/espix_proc/abi_libc.c` had to publish it. An app resolves undefined
 symbols against espix's export tables and not against libc, and that table is also
-what pulls a function out of newlib in the first place: nothing else in the firmware
+what pulls a function out of libc in the first place: nothing else in the firmware
 converts 64-bit text, so the linker had no reason to keep `strtoll` and the app
 failed to *load*. The suite found it the way it was meant to — an app that would not
 load, naming the symbol — which is the argument for a hand-written table rather than
@@ -1104,9 +1109,9 @@ was the measured symptom and no longer lists as `0`.
 
 What it does *not* fix is espix's own transfer path, and that one is in
 [KNOWN-ISSUES.md](KNOWN-ISSUES.md) rather than here: SFTP's read and write
-handlers seek with `fseek()`, which takes a `long`, and whose 64-bit sibling
-`fseeko()` is in the *prebuilt* libc — compiled when `off_t` was 32 bits, so
-calling it with the widened type would hand it half a value. Seeking the
+handlers seek with `fseek()`, which takes a `long`, and whose sibling `fseeko()`
+is in the *prebuilt* libc and declared with its 32-bit `__off_t` — so a widened
+offset is narrowed at the call. Seeking the
 descriptor instead would leave the `FILE`'s buffer holding the old position. So an
 SFTP offset past 4 GiB is refused rather than served from a truncated one, and
 fixing it properly means moving those handlers off `FILE *` and onto the
@@ -1229,12 +1234,13 @@ further in; espix registers none of them.
 Upstream, the fix is to declare the struct's sector parameter as `LBA_t` — and,
 with it, to widen every backend's error of omission into the build error espix's
 patch makes it.
-## Xtensa: islower/toupper misread the ctype table for a runtime argument
+## elf_loader: an Xtensa GLOB_DAT relocation loses its addend
 
-Found 2026-10-06 while chasing "W_GetNumForName: d_introa not found!" on the S3.
+Found 2026-10-06 while chasing "W_GetNumForName: d_introa not found!" on the S3,
+and first misread as a codegen bug in the Xtensa backend.
 
 Reproduction, in an app built for esp32s3 with the v6.1 toolchain
-(xtensa-esp-elf 15.2.0_20251204):
+(xtensa-esp-elf 15.2.0_20251204), under newlib:
 
     extern const char _ctype_[];
     volatile char v = 'a';
@@ -1250,5 +1256,21 @@ hashes 32 higher than the uppercase name it was filed under, and
 W_CheckNumForName() -- which has no linear fallback once its hash table exists --
 reports a lump that is present as missing. The game dies in I_Error at the title.
 
-espix's workaround: build apps with __NO_CTYPE, so the ctype names become calls,
-and publish our own toupper/tolower/is* through the ABI.
+**The cause is the loader, not the compiler.** The code the macro compiles to is
+the same shape under both libcs and is correct: load `table + 1 + c`, mask. The
+difference is in how the table's address reaches the app. The macro indexes from
+`_ctype_ + 1` (picolibc: `_ctype_b + 128`), the offset is folded into a literal-pool
+word, and the linked app carries it as a dynamic relocation *with an addend* --
+`readelf -r` on the S3 mosquitto app shows `R_XTENSA_GLOB_DAT _ctype_b + 80`.
+elf_loader's Xtensa port writes the symbol and drops the addend
+(`src/arch/esp_elf_xtensa.c`), where its RISC-V port adds it and uClibc's Xtensa
+ld.so writes S + A. So the lookup ran one entry early -- `'a'` read the entry for
+`` ` `` -- while the printf's explicit `_ctype_['a' + 1]`, indexed at run time from
+the symbol's start, was right. Every number in the reproduction follows.
+
+Under picolibc the addend is 128, which would misclassify every character in every
+S3 app that uses a ctype macro, so the workaround (Doom built so that toupper and
+friends were calls) is gone and `tools/patch-elf-loader.py` applies the addend;
+`tools/elf_loader-xtensa-addend.patch` is the same change ready to send. Diagnosed
+from the relocations and the loader's source, with the S3 off the bench: confirm on
+hardware with the reproduction above and Doom's title screen.

@@ -49,6 +49,12 @@ static size_t s_table_count;
 static uintptr_t espix_symbol_resolver(const char *sym_name)
 {
     if (sym_name != NULL) {
+        /* Per process, so not a table: see abi_stdio.c. */
+        const uintptr_t stdio_var = espix_abi_stdio_var(sym_name);
+        if (stdio_var != 0) {
+            return stdio_var;
+        }
+
         for (size_t t = 0; t < s_table_count; t++) {
             for (size_t i = 0; i < s_tables[t].count; i++) {
                 if (strcmp(sym_name, s_tables[t].syms[i].name) == 0) {

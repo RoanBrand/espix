@@ -41,7 +41,7 @@ static void test_task_is_set_by_the_thread(void)
     reset();
     TEST_ASSERT_TRUE(espix_threads_add(&t, &a, 7));
     TEST_ASSERT_EQUAL_INT32(-1, espix_threads_tid_of(&t, &ta1));
-    TEST_ASSERT_TRUE(espix_threads_set_task(&t, 7, &ta1, NULL));
+    TEST_ASSERT_TRUE(espix_threads_set_task(&t, 7, &ta1));
     TEST_ASSERT_EQUAL_INT32(7, espix_threads_tid_of(&t, &ta1));
     TEST_ASSERT_EQUAL_INT32(-1, espix_threads_tid_of(&t, NULL));
 }
@@ -51,7 +51,7 @@ static void test_set_task_after_reap_says_gone(void)
     reset();
     TEST_ASSERT_TRUE(espix_threads_add(&t, &a, 7));
     TEST_ASSERT_TRUE(espix_threads_take(&t, &a, NULL));
-    TEST_ASSERT_FALSE(espix_threads_set_task(&t, 7, &ta1, NULL));
+    TEST_ASSERT_FALSE(espix_threads_set_task(&t, 7, &ta1));
 }
 
 static void test_of_and_take_are_per_process(void)
@@ -60,9 +60,9 @@ static void test_of_and_take_are_per_process(void)
     espix_threads_add(&t, &a, 1);
     espix_threads_add(&t, &b, 2);
     espix_threads_add(&t, &a, 3);
-    espix_threads_set_task(&t, 1, &ta1, NULL);
-    espix_threads_set_task(&t, 2, &tb1, NULL);
-    espix_threads_set_task(&t, 3, &ta2, NULL);
+    espix_threads_set_task(&t, 1, &ta1);
+    espix_threads_set_task(&t, 2, &tb1);
+    espix_threads_set_task(&t, 3, &ta2);
 
     espix_thread_t out[CAP];
     TEST_ASSERT_EQUAL_size_t(2, espix_threads_of(&t, &a, out, CAP));
@@ -83,13 +83,12 @@ static void test_remove_copies_the_entry(void)
 {
     reset();
     espix_threads_add(&t, &a, 5);
-    espix_threads_set_task(&t, 5, &ta1, &tb1);
+    espix_threads_set_task(&t, 5, &ta1);
 
     espix_thread_t got;
     TEST_ASSERT_TRUE(espix_threads_remove(&t, 5, &got));
     TEST_ASSERT_EQUAL_PTR(&a, got.slot);
     TEST_ASSERT_EQUAL_PTR(&ta1, got.task);
-    TEST_ASSERT_EQUAL_PTR(&tb1, got.reent);
     TEST_ASSERT_FALSE(espix_threads_remove(&t, 5, NULL));
     TEST_ASSERT_EQUAL_size_t(0, espix_threads_of(&t, &a, NULL, 0));
 }

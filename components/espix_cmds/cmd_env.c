@@ -17,7 +17,7 @@
 #include "espix_shell.h"
 
 /* The system environment, which every process inherits under the session's
- * own variables. newlib's, and on IDF it is lock-protected -- see the note in
+ * own variables. libc's, and on IDF it is lock-protected -- see the note in
  * espix_shell/env.c about why this one global is safe to have a role. */
 extern char **environ;
 

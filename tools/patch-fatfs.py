@@ -736,7 +736,7 @@ esp_err_t esp_vfs_fat_register(const esp_vfs_fat_conf_t* conf, FATFS** out_fs)
 # vfs_fat_stat() consumes it -- so readdir() followed by stat(), which is what a
 # listing does, needs no directory walk at all. But the fill lived only in
 # vfs_fat_readdir(), and every readdir ends up in vfs_fat_readdir_r(): the wrapper
-# calls it. newlib's readdir() reaches the _r form directly, so the cache was
+# calls it. readdir_r() reaches the _r form directly, so the cache was
 # never filled on the path espix uses, and each stat re-walked the directory --
 # a listing of N entries doing N walks. Measured on an exFAT stick: 500 entries,
 # ls -l 31 seconds, where one walk is one second.

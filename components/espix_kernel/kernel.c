@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>      /* off_t, to verify the force-include below */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -16,6 +17,14 @@
 
 #include "espix_kernel.h"
 #include "espix_kernel_priv.h"
+
+/*
+ * cmake/offt64.h widens off_t for the whole firmware by force-include. This is
+ * the second place that checks the chain took (the first is espix_fs/fs.c), so
+ * a toolchain or libc change that loses the guard fails the build in two
+ * components rather than one.
+ */
+_Static_assert(sizeof(off_t) == 8, "off_t is not 64 bits: see cmake/offt64.h");
 
 #define TAG "kernel"
 

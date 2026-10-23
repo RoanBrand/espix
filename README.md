@@ -454,9 +454,8 @@ to espix:
   which a disk past 2TiB is unreadable and its real size never reported.
 - The `lwext4` core gains the metadata checksum seed, without which it refuses
   every ext4 volume e2fsprogs 1.47 or later makes.
-- `esp_libc`, plus one declaration in the toolchain's own `reent.h`, hold
-  `_lseek_r` at the 32-bit ABI the prebuilt C library calls it with, so that
-  `off_t` can be 64 bits.
+- `vfs` holds `_lseek_r` at the 32-bit ABI the prebuilt C library reaches it
+  with, so that `off_t` can be 64 bits.
 
 Everything espix depends on is fetched by the IDF component manager at the
 versions in `dependencies.lock` — `espressif/elf_loader`,

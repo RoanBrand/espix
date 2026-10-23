@@ -223,6 +223,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_exit_register();
     espix_proc_abi_alloc_register();
     espix_proc_abi_pthread_register();
+    espix_proc_abi_stdio_register();
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
     espix_proc_abi_libm_register();
@@ -389,9 +390,8 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     free(slot->sig_handlers);
     slot->sig_handlers = NULL;
 
-    /* Nothing left to put back, and a finished slot must not hold a pointer
-     * into a reent that the next process to use this slot will not own. */
-    slot->reent = NULL;
+    /* A finished slot must not hand its streams to the next process to use it. */
+    slot->std[0] = slot->std[1] = slot->std[2] = NULL;
 
     /*
      * Safe to delete only because the process is already gone by the time this
@@ -1169,14 +1169,15 @@ bool espix_proc_stopping(void)
 /*
  * Let the target out of any libc call it is inside, then delete it.
  *
- * Deleting a task that is blocked *inside newlib stdio* takes the device down,
- * and not subtly: vTaskDelete() frees the TCB and then runs _reclaim_reent()
- * -> esp_cleanup_r() on the killer's task, which fcloses the dead task's
- * streams -- and fclose needs the very FILE lock the deleted task was holding.
- * Measured, with a control: `kill -9` on a process blocked in fgets(stdin)
- * reset the board every time, while the same kill on one blocked in sleep()
- * was harmless, and SIGTERM on the blocked one was harmless too because it
- * unwinds first.
+ * Deleting a task that is blocked *inside stdio* leaves that FILE's lock held
+ * by a task that no longer exists, and the next user of the stream waits on it
+ * forever. Under newlib that next user was the deletion itself -- its teardown
+ * fclosed the dead task's streams -- and the board reset: measured, with a
+ * control, `kill -9` on a process blocked in fgets(stdin) reset it every time,
+ * while the same kill on one blocked in sleep() was harmless, and SIGTERM on
+ * the blocked one was harmless too because it unwinds first. The teardown no
+ * longer touches stdio, but an orphaned lock is still an orphaned lock: on the
+ * console it is the kernel's own stdout.
  *
  * So do what SIGTERM demonstrably does, without making SIGKILL catchable.
  * Setting stop_requested is not a signal -- no handler runs -- but it is what
@@ -1320,19 +1321,9 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
         vTaskSuspend(task);
 
         /*
-         * And before deleting it, take espix's streams out of its reent.
-         *
-         * The delete runs the victim's newlib teardown -- on this task if the
-         * victim is not running, on IDLE if it is -- and that teardown fcloses
-         * the victim's stdout and stderr, which are funopen() streams over the
-         * session. Closing one writes into the SSH channel and takes tx_lock,
-         * which a process killed mid-write is still holding, so whichever task
-         * runs the teardown blocks forever. On this one that strands the
-         * session; on IDLE it takes the board down.
-         *
-         * Restoring the streams is what the process's own exit path does, and
-         * it is the only reason a clean exit was ever safe. See
-         * espix_proc_detach_streams().
+         * And before deleting it, forget its streams. They are not closed --
+         * that needs the FILE lock a process killed mid-write still holds -- but
+         * the slot stops pointing at them. See espix_proc_detach_streams().
          */
         detached = espix_proc_detach_streams(slot);
     }

@@ -1,17 +1,17 @@
 /*
  * getenv, setenv, unsetenv and putenv, for a loaded app.
  *
- * An app must not reach newlib's. newlib keeps one `environ` for the whole
+ * An app must not reach libc's. libc keeps one `environ` for the whole
  * firmware, so an app calling libc's getenv() would read the machine's
  * environment and miss everything its own session exported -- and worse, an app
  * calling libc's setenv() would write into a table every task on the device
  * shares. Per-process is the whole point.
  *
  * Why these are prefixed and mapped by the resolver rather than simply named
- * getenv() and friends: newlib already defines those names in this firmware, so
+ * getenv() and friends: libc already defines those names in this firmware, so
  * defining them here is a duplicate symbol at link time. The same reason
  * abi_signal.c prefixes sleep() and getpid(). And ESP_ELFSYM_EXPORT(getenv)
- * would publish *newlib's* address, which is precisely backwards -- the macro
+ * would publish *libc's* address, which is precisely backwards -- the macro
  * expands to { "getenv", &getenv }.
  *
  * What an app gets is a snapshot. Its environment was packed at spawn by

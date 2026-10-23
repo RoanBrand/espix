@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "esp_littlefs.h"
+#include "esp_vfs.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -33,6 +34,17 @@
 _Static_assert(sizeof(off_t) == 8, "off_t is not 64 bits: see cmake/offt64.h");
 _Static_assert(sizeof(((struct stat *)0)->st_size) == 8,
                "struct stat's size regressed to 32 bits");
+
+/*
+ * lseek64: cmake/offt64.h names every lseek() compiled with it this, so the
+ * definition below emits that symbol. The plain `lseek` is esp_libc's 32-bit
+ * one, kept for the prebuilt picolibc's fdopen/fseek, and reaches this same VFS
+ * call through the 32-bit _lseek_r (tools/patch-libc-offt.py).
+ */
+off_t lseek(int fd, off_t offset, int whence)
+{
+    return esp_vfs_lseek(__getreent(), fd, offset, whence);
+}
 
 /* Created on first boot so a freshly-formatted filesystem still looks sane,
  * even without the baked fsroot image. /mnt is the conventional place to mount

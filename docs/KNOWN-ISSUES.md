@@ -69,11 +69,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   case in the flesh, and `tests/suites/35-signals.sh` covers it. SIGKILL is the answer when it is somebody else's binary.
 
 - **A hard kill will not survive a process inside libc.** `proc_force_kill()`
-  deletes the task, and `vTaskDelete()` then runs newlib's cleanup *on the
-  killer's task* — `_reclaim_reent()` → `esp_cleanup_r()`, which fcloses the
-  dead task's three streams. `fclose` needs each `FILE`'s lock, and the deleted
-  task may have been holding one: it is exactly what `fgets(stdin)` does for as
-  long as it waits.
+  deletes the task, and a task deleted inside stdio leaves that `FILE`'s lock
+  held by nobody: it is exactly what `fgets(stdin)` does for as long as it
+  waits. Under newlib the next taker was the deletion itself — its teardown
+  fclosed the dead task's streams on the killer's task. picolibc's teardown no
+  longer touches stdio, so a process's own streams are merely leaked, but a
+  console app writes through the kernel's own `stdout`, and an orphaned lock
+  there stops every later writer.
 
   That reset the board every time until `proc_force_kill()` learned to let the
   target out first — it sets `stop_requested` (not a signal, so nothing
@@ -359,8 +361,9 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   - **A process killed holding the arena lock.** `s_region_lock` is a plain
     mutex with no orphan treatment, so this was worth testing; an instrument in
     `espix_proc_regions_release()` never reported a foreign holder.
-  - **The victim's stream teardown re-entering the channel.** Already fixed: the
-    kill path prints `[stdio detached]` and the teardown does not reach it.
+  - **The victim's stream teardown re-entering the channel.** Gone: a
+    process's streams are its slot's, and deleting its task closes nothing. The
+    kill path still prints `[stdio detached]` when it forgets them.
   - **PSRAM task stacks with the cache disabled.** Routine flash I/O on the S3
     never calls `spi_flash_disable_interrupts_caches_and_other_cpu()`, and
     relocation already runs on an internal-stacked task for this reason. IDF's
@@ -1081,22 +1084,6 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
     which is far too slow.
   - The player opens fullscreen when the picture does not fit a window.
   - With less memory it decodes in place rather than double-buffered.
-
-## Building espix
-
-- **Building espix changes one line of your toolchain's headers.** `off_t` and
-  `_off_t` are the same type, so widening `off_t` — which is what lets a file over
-  4 GiB be reported and seeked, see [UPSTREAM.md](UPSTREAM.md) — necessarily widens
-  `_off_t`, and the toolchain's own `reent.h` declares `_lseek_r` in terms of it.
-  `tools/patch-libc-offt.py` therefore pins that declaration to its 32-bit width on
-  every configure, in the *toolchain installation* rather than in the IDF tree: the
-  one patch here that touches something espix does not own.
-
-  It matters because that toolchain is shared. Another project built with it on the
-  same machine gets the same declaration — `int` where it was `long`, the same width
-  and an identical ABI, but a different declared type. That is deliberate rather than
-  accidental, and [tools/README.md](../tools/README.md) says why, what the cost is,
-  and how to undo it if you would rather not.
 
 ## Updates
 

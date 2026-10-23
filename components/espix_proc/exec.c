@@ -17,7 +17,6 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/reent.h>      /* _REENT and the stdio a force-kill has to put back */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
@@ -332,7 +331,11 @@ static void relocate_task(void *arg)
 {
     relocate_ctx_t *ctx = arg;
 
+    /* As a thread of the process for the duration, so espix_proc_self() names
+     * it and the resolver hands this process its own stdin/stdout/stderr. */
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, ctx->slot);
     ctx->rc = esp_elf_relocate(&ctx->slot->app->elf, ctx->slot->app->image);
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
 }
@@ -542,40 +545,27 @@ static void proc_task(void *arg)
     espix_shell_set_current(slot->info.session);
 
     /*
-     * Point this task's stdin, stdout and stderr at the session, so an app's
+     * Point this process's stdin, stdout and stderr at the session, so an app's
      * own printf() lands where the user is rather than on the serial console,
      * and its getchar() reads what the user sent rather than the UART.
      *
-     * This works because ESP-IDF gives every task its own struct _reent whose
-     * streams are pre-pointed at the global ones (esp_reent_init), so the
-     * assignment affects this task alone. It is the same trick ESP-IDF's own
-     * console REPL uses.
+     * They are the process's own -- slot->std, which is what the app's
+     * `stdin`, `stdout` and `stderr` resolve to (abi_stdio.c) -- so this affects
+     * this process alone, and every thread it makes shares them.
      *
      * Three separate objects because they genuinely go to different places:
      * over SSH stdout is CHANNEL_DATA, stderr is CHANNEL_EXTENDED_DATA, and
      * stdin is the queue the connection task fills. They had to be distinct
-     * even when two of them landed in the same place, and that reason still
-     * holds: esp_cleanup_r() fcloses whichever of the three differ from the
-     * global ones, so one object behind two of them would be closed twice,
-     * which asserts inside the second fclose.
-     *
-     * We close them ourselves at `done:` rather than leaving them to that
-     * teardown -- see the note there. The previous values are kept so they can
-     * be put back, which is what makes esp_cleanup_r() find nothing to do.
+     * even when two of them landed in the same place: `done:` closes each one
+     * it made, so one object behind two of them would be closed twice.
      *
      * `>` and `2>` are honoured, and for a *foreground* process only -- but
      * never by handing this task the shell's redirect FILE.
      *
      * That is not fastidiousness. It was written that way first, and for
      * `app > f 2>&1` both stdout and stderr then pointed at one object owned
-     * by the shell; esp_cleanup_r() fcloses all three streams independently
-     * when a task is deleted, so a force-killed process closed it twice and
-     * the second close asserted inside newlib on a lock the first had already
-     * destroyed -- `assert failed: spinlock_acquire ... lock->count == 0`,
-     * reached through prvDeleteTCB -> _reclaim_reent. redirects_release()
-     * would then have closed it a third time. A clean exit restores the
-     * globals below before returning, which is exactly why the test suite
-     * never saw it.
+     * by the shell, which the process's teardown and redirects_release() each
+     * closed -- the second close asserting on a lock the first had destroyed.
      *
      * So a foreground process gets funopen() streams of its own over
      * espix_session_write(), which resolves the redirection per write. The
@@ -592,29 +582,12 @@ static void proc_task(void *arg)
      */
     espix_session_t *const session = slot->info.session;
 
-    FILE *const prev_stdin  = stdin;
-    FILE *const prev_stdout = stdout;
-    FILE *const prev_stderr = stderr;
+    /* The kernel's own until something below replaces them: the console. */
+    slot->std[0] = stdin;
+    slot->std[1] = stdout;
+    slot->std[2] = stderr;
 
-    /*
-     * Publish this task's reent before anything replaces its streams.
-     *
-     * A force-kill has to be able to put the global streams back, because
-     * deleting a task runs prvDeleteTCB() -> _reclaim_reent(), which fcloses
-     * every stream in the dead task's reent that is not the global one. The
-     * streams assigned below are funopen() objects over the session, so closing
-     * one writes into the SSH channel. See espix_proc_detach_streams().
-     *
-     * Under the lock, and *before* the assignment below, so a killer sees one
-     * of two decidable states: slot->reent set, meaning this task may have
-     * espix's streams installed; or NULL, meaning it has not reached here and
-     * there is nothing of ours to close.
-     */
-    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-    slot->reent = _REENT;
-    xSemaphoreGive(g_espix_proc_lock);
-
-    bool own_in = false, own_out = false, own_err = false;
+    FILE *own_in = NULL, *own_out = NULL, *own_err = NULL;
 
     if (session != NULL && session->open_stream != NULL) {
         FILE *out = NULL;
@@ -634,18 +607,15 @@ static void proc_task(void *arg)
         }
 
         if (out != NULL) {
-            stdout  = out;
-            own_out = true;
+            slot->std[1] = own_out = out;
         }
         if (err != NULL) {
-            stderr  = err;
-            own_err = true;
+            slot->std[2] = own_err = err;
         }
 
         FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
         if (in != NULL) {
-            stdin  = in;
-            own_in = true;
+            slot->std[0] = own_in = in;
         }
     } else if (session != NULL) {
         /* The console: output stays on the UART; stdin is read so that a
@@ -653,8 +623,7 @@ static void proc_task(void *arg)
         s_console_fd = fileno(stdin);
         FILE *const in = funopen(session, console_stdin_read, NULL, NULL, NULL);
         if (in != NULL) {
-            stdin  = in;
-            own_in = true;
+            slot->std[0] = own_in = in;
         }
     }
 
@@ -818,20 +787,17 @@ static void proc_task(void *arg)
 
 done:
     /*
-     * Close the session's streams here, and put the globals back, so that
-     * esp_cleanup_r() finds nothing of ours to close when this task is deleted.
+     * Close the session's streams here, while the session still exists.
      *
-     * Flushing alone was not enough, and the difference was a use-after-free.
-     * These streams write through the session, whose transport for an SSH
-     * connection is the channel -- and the channel, its transmit lock included,
-     * is freed as soon as the session ends. The session ends when this process
-     * is marked finished, three lines below. So the fclose that esp_cleanup_r()
-     * performs at vTaskDelete() ran *after* the channel had been freed, took a
-     * deleted semaphore handle, and panicked in xQueueReceive with a
-     * LoadProhibited.
+     * Leaving them to anything later was a use-after-free. These streams write
+     * through the session, whose transport for an SSH connection is the channel
+     * -- and the channel, its transmit lock included, is freed as soon as the
+     * session ends. The session ends when this process is marked finished, three
+     * lines below. A close that ran after that took a deleted semaphore handle
+     * and panicked in xQueueReceive with a LoadProhibited.
      *
-     * That is why `ssh host <cmd>` truncated an app's output about a third of
-     * the time: the device rebooted mid-command. It never touched builtins,
+     * That is why `ssh host <cmd>` once truncated an app's output about a third
+     * of the time: the device rebooted mid-command. It never touched builtins,
      * which run on the connection's own task and own no streams, nor an
      * interactive session, which outlives the command, nor the console, whose
      * open_stream is NULL.
@@ -839,27 +805,33 @@ done:
      * Nothing of this process may touch the session after espix_proc_finish().
      */
     {
-        FILE *const in  = stdin;
-        FILE *const out = stdout;
-        FILE *const err = stderr;
+        /* What the app had as stdout and stderr may not be ours -- the console's,
+         * or a stream it opened and assigned -- and returning from main() is
+         * exit(), which flushes them. Ours are flushed by their fclose below. */
+        for (int fd = 1; fd <= 2; fd++) {
+            FILE *const f = slot->std[fd];
+            if (f != NULL && f != own_out && f != own_err) {
+                fflush(f);
+            }
+        }
 
-        /* Restore first, unconditionally, so esp_cleanup_r() finds nothing to
-         * close whether or not anything was opened. Every stream we assigned
-         * is one we made, so each is closed exactly once -- and closing the
+        /* Back to the kernel's first, so nothing still running in the process
+         * -- a thread the reaper has yet to end -- reaches a stream once it is
+         * closed. Each stream we made is closed exactly once, and closing the
          * out/err wrappers flushes them through espix_session_write() while
          * the redirect FILE is still the shell's to close. */
-        stdin  = prev_stdin;
-        stdout = prev_stdout;
-        stderr = prev_stderr;
+        slot->std[0] = stdin;
+        slot->std[1] = stdout;
+        slot->std[2] = stderr;
 
-        if (own_out) {
-            fclose(out);            /* flushes on the way out */
+        if (own_out != NULL) {
+            fclose(own_out);
         }
-        if (own_err) {
-            fclose(err);
+        if (own_err != NULL) {
+            fclose(own_err);
         }
-        if (own_in) {
-            fclose(in);
+        if (own_in != NULL) {
+            fclose(own_in);
         }
     }
 
@@ -868,11 +840,11 @@ done:
     /*
      * Hand the process to the reaper rather than tearing it down here. The
      * reaper runs release_resources() and finish() and then deletes this task,
-     * so prvDeleteTCB -- the PSRAM stack free and _reclaim_reent -- happens on
-     * a normal task instead of on the idle task's small internal stack. This
-     * does not return. See R-P1.6.
+     * so prvDeleteTCB -- the PSRAM stack free -- happens on a normal task
+     * instead of on the idle task's small internal stack. This does not
+     * return. See R-P1.6.
      *
-     * The streams were restored above, before this point, and deliberately so:
+     * The streams were closed above, before this point, and deliberately so:
      * closing a funopen stream writes into the session and can block, which is
      * exactly what must not happen on the reaper.
      */
@@ -882,72 +854,38 @@ done:
 }
 
 /*
- * Take espix's streams out of a process's reent, so that deleting its task does
- * not close them from somebody else's.
+ * Forget a force-killed process's streams, and say whether espix had made any.
  *
- * This is the whole fix for a bug that has now been found three times, and the
- * mechanism is FreeRTOS's, not espix's. Deleting a task eventually runs
- * prvDeleteTCB(), whose configDEINIT_TLS_BLOCK step is _reclaim_reent() ->
- * esp_cleanup_r(), and that fcloses each of the dead task's three std streams
- * which differs from the global one. A process's stdout and stderr are
- * funopen() objects over its session, so that fclose enters the SSH channel's
- * send path -- and a process killed mid-write is still holding both the FILE's
- * own lock and ch->tx_lock. The teardown therefore blocks forever.
+ * Deleting the task closes nothing: the streams are slot->std, not libc's, and
+ * picolibc keeps no per-task stdio for FreeRTOS's teardown to clean up. That
+ * teardown used to fclose them under newlib, from the killer's task or from
+ * IDLE, and a process killed mid-write was still holding the FILE's lock and the
+ * SSH channel's tx_lock -- so the close blocked forever, stranding the session
+ * or, on IDLE, taking the board down.
  *
- * Which task it blocks decides how bad it is, and both have been seen:
+ * They are still deliberately not closed here, for the same reason: a close
+ * needs that lock. So a force-killed process leaks its FILE objects, as a hard
+ * kill leaks everything else the app held; see docs/KNOWN-ISSUES.md. Pointing
+ * the slot back at the kernel's streams is what keeps a thread the reaper has
+ * yet to end from writing into a session that is about to go away.
  *
- *   the killer   vTaskDelete() runs prvDeleteTCB() on the caller when the
- *                victim is not currently running (FreeRTOS-Kernel/tasks.c,
- *                "If the task is currently running, call prvDeleteTCB from
- *                outside of critical section"). The connection task that
- *                killed it strands -- the <<<dead-session>>> cascade.
- *
- *   IDLE         a victim that *was* running goes to xTasksWaitingTermination
- *                and IDLE runs prvDeleteTCB() instead. IDLE tasks are pinned
- *                per core, and prvSelectHighestPriorityTaskSMP() is built on
- *                "we eventually default to the IDLE tasks at priority 0".
- *                Block IDLE1 and core 1 has nothing left to schedule, which
- *                trips its configASSERT(xTaskScheduled == pdTRUE). That is the
- *                board going down.
- *
- * The kernel cannot be told to skip the teardown, so espix removes what it
- * would act on. Restoring the *global* streams rather than the ones this task
- * happened to start with is deliberate: it makes esp_cleanup_r()'s comparison
- * false by construction, whatever anyone does to the globals later.
- *
- * Not a new idea -- the process's own exit path does exactly this before it
- * returns, which is the only reason a clean exit was ever safe. Only a
- * force-kill skipped it.
- *
- * The streams are deliberately not closed: that is the very call that blocks,
- * so a force-killed process leaks its FILE objects. A hard kill already leaks
- * everything the app held; see docs/KNOWN-ISSUES.md.
- *
- * Returns whether espix's streams were actually installed, so the caller can
- * say so once it has dropped the lock -- proof the dangerous path was reached
- * and neutralised, rather than an absence of panics to infer from.
- *
- * Called with the process suspended and the table lock held, so nothing can be
- * inside its reent while this rewrites it. Idempotent: it clears the pointer it
- * used.
+ * Returns whether espix's streams were installed, so the caller can say so once
+ * it has dropped the lock. Called with the process suspended and the table lock
+ * held. Idempotent.
  */
 bool espix_proc_detach_streams(espix_proc_slot_t *slot)
 {
-    if (slot == NULL || slot->reent == NULL) {
+    if (slot == NULL) {
         return false;
     }
 
-    struct _reent *const r = slot->reent;
+    const bool had_ours = (slot->std[0] != NULL && slot->std[0] != stdin)  ||
+                          (slot->std[1] != NULL && slot->std[1] != stdout) ||
+                          (slot->std[2] != NULL && slot->std[2] != stderr);
 
-    const bool had_ours = (_REENT_STDIN(r)  != _REENT_STDIN(_GLOBAL_REENT)) ||
-                          (_REENT_STDOUT(r) != _REENT_STDOUT(_GLOBAL_REENT)) ||
-                          (_REENT_STDERR(r) != _REENT_STDERR(_GLOBAL_REENT));
-
-    _REENT_STDIN(r)  = _REENT_STDIN(_GLOBAL_REENT);
-    _REENT_STDOUT(r) = _REENT_STDOUT(_GLOBAL_REENT);
-    _REENT_STDERR(r) = _REENT_STDERR(_GLOBAL_REENT);
-
-    slot->reent = NULL;
+    slot->std[0] = stdin;
+    slot->std[1] = stdout;
+    slot->std[2] = stderr;
     return had_ours;
 }
 

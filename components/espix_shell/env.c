@@ -3,7 +3,7 @@
  *
  * Three tiers, and the boundaries between them are the whole design:
  *
- *   the system environment   newlib's global `environ`. Machine-wide config --
+ *   the system environment   libc's global `environ`. Machine-wide config --
  *                            TZ above all, which espix_time sets for tzset().
  *                            Read-mostly, one clock, one timezone.
  *

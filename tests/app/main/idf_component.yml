@@ -1,6 +1,6 @@
 dependencies:
-  # Matches the firmware: an app is built against the same libc flavour and
-  # Kconfig surface (CONFIG_LIBC_NEWLIB only exists from 6.x).
+  # Matches the firmware: an app is built against the same libc and Kconfig
+  # surface -- picolibc, IDF 6.x's default.
   idf:
     version: ">=6.1"
 

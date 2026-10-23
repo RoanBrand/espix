@@ -40,9 +40,10 @@
 #define NTP_FALLBACK    "pool.ntp.org"
 
 /*
- * "UTC0", not "UTC": POSIX makes the offset mandatory in a TZ string, and
- * newlib rejects the bare name -- silently, leaving strftime's %Z empty rather
- * than complaining. Measured: TZ=UTC prints no zone, TZ=UTC0 prints "UTC".
+ * "UTC0", not "UTC": POSIX makes the offset mandatory in a TZ string, and a
+ * libc may reject the bare name silently, leaving strftime's %Z empty rather
+ * than complaining. Measured under newlib: TZ=UTC printed no zone, TZ=UTC0
+ * printed "UTC".
  */
 #define TZ_DEFAULT      "UTC0"
 #define TZ_MAX          64
@@ -61,7 +62,7 @@ static bool     s_from_conf;
 /* ------------------------------------------------------------------ */
 
 /*
- * newlib reads the zone out of the TZ environment variable, so "setting the
+ * libc reads the zone out of the TZ environment variable, so "setting the
  * timezone" is setenv() plus tzset(); everything downstream -- localtime(),
  * mktime(), strftime()'s %Z -- follows from there.
  *

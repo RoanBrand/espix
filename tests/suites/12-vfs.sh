@@ -127,8 +127,9 @@ fi
 #    tables stops the app loading at all, while one published over an IDF stub
 #    loads and then answers ENOSYS. abi_libc.c, abi_fs.c and abi_time.c each say
 #    which names are deliberately absent and why -- isatty, dup, dup2, atexit,
-#    perror, access, lstat, clock -- and this is the half of that claim that can be
-#    run. perror is the one that was published first and removed after this ran.
+#    access, lstat, clock -- and this is the half of that claim that can be run.
+#    perror was published first as libc's own and removed after this ran; it is
+#    back, answered per process by abi_stdio.c, and checked below.
 if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
 else
@@ -154,6 +155,10 @@ else
                     "abi utime=ok" "$abi_out"
     assert_contains "the errno an app reads is the one espix set, named" \
                     "abi errno=ENOENT strerror=No such file or directory" "$abi_out"
+    assert_contains "perror reaches the app's own stderr" \
+                    "abi perror: No such file or directory" "$abi_out"
+    assert_contains "the ctype macros read the right table entry" \
+                    "abi ctype=1011 toupper=A" "$abi_out"
 fi
 
 # 8. The permission check reaches an app, not only the shell. Section 1 proves it

@@ -8,29 +8,43 @@
  * `/dev/sda4`, a 23 GiB partition, listed as `0`.
  *
  * This is a force-include (`-include`, applied to every translation unit by
- * `cmake/offt64.cmake`) rather than a patch to anything, because the toolchain's
- * own header leaves the door open:
+ * `cmake/offt64.cmake`) rather than a patch to anything, because picolibc's
+ * headers leave the door open: every one that declares off_t does so as
  *
- *   sys/_types.h:45   #ifndef __machine_off_t_defined
- *                     typedef long _off_t;
- *                     #endif
- *   sys/_types.h:102  typedef _off_t __off_t;
- *   sys/types.h:155   typedef __off_t off_t;
+ *   #ifndef _OFF_T_DECLARED
+ *   typedef __off_t off_t;
+ *   #define _OFF_T_DECLARED
+ *   #endif
  *
- * Defining the guard and the type here means the toolchain's long `_off_t` is
- * never declared, `__off_t` takes this one, and `off_t` follows. Nothing is
- * edited, so nothing drifts: a toolchain bump either keeps this working or fails
- * the assertion in components/espix_fs/fs.c, which is the point of having it.
+ * It is glibc's large-file scheme (_FILE_OFFSET_BITS=64) on a libc that has no
+ * switch for it, and it splits the type the same way glibc does:
  *
- * The alternative -- editing the newlib headers under ~/.espressif/tools -- would
- * change off_t for every project on the machine, which is not espix's to do.
+ *   off_t     the public type, 64 bits. struct stat, lseek, pread, pwrite and
+ *             ftruncate are declared with it, and all of those are implemented
+ *             in source this build compiles -- IDF's VFS and espix -- so caller
+ *             and callee agree.
  *
- * Two consequences worth knowing, both in docs/ROADMAP.md. `struct stat` changes
- * size, so this is an ABI decision and not a preference: an app built without it
- * would disagree with the kernel about every stat. And `fseek`/`ftell` take a
- * `long` and stay 32-bit -- newlib's, and unchangeable here -- so a transfer that
- * seeks with them cannot pass 4 GiB however wide off_t is; espix's SFTP path uses
- * lseek for that reason.
+ *   __off_t   libc's internal type, left at the 32 bits the *prebuilt* picolibc
+ *             was compiled with. Every callback that crosses into it is declared
+ *             with this one: a FILE's seek, funopen's seekfn, bufio's lseek, and
+ *             fseeko/ftello. Widening it too would make each of those a call
+ *             that passes 32 bits where 64 are read -- type-correct and silently
+ *             wrong, which is how fseek() once landed past the end of a file
+ *             during an SFTP upload.
+ *
+ * And lseek, like glibc's, is redirected: every caller compiled with this header
+ * reaches the 64-bit `lseek64` (components/espix_fs/fs.c), while the plain
+ * `lseek` symbol stays the 32-bit one that the prebuilt fdopen/fseek bind to by
+ * name. That one is IDF's, in esp_libc, which is why esp_libc alone is compiled
+ * without this header -- it *is* the libc glue, so it keeps libc's width. See
+ * cmake/offt64.cmake.
+ *
+ * Two consequences worth knowing. `struct stat` is laid out identically at either
+ * width (st_size sits at an 8-byte-aligned offset either way), so this is not
+ * where an app and the kernel can disagree -- but an app built without it would
+ * still pass a 32-bit offset to a 64-bit lseek. And fseeko/ftello stay 32-bit,
+ * being the prebuilt libc's, so a transfer that seeks a FILE cannot pass 4 GiB;
+ * espix's SFTP path uses lseek for that reason.
  */
 #pragma once
 
@@ -41,26 +55,26 @@
  * cmake include now scopes the flag to C and C++; this is the second guard, so
  * that a translation unit which *is* assembly but still sees it stays harmless.
  */
-#ifndef __ASSEMBLER__
-
-#include <stdint.h>
-
-#define __machine_off_t_defined 1
-typedef int64_t _off_t;
+#if !defined(__ASSEMBLER__) && !defined(ESPIX_LIBC_OWN_OFF_T)
 
 /*
- * <sys/types.h> now resolves off_t through the guard above, so including it
- * here is what *verifies* the chain rather than merely using it.
+ * Deliberately no libc header here: one included this early fixes which libc's
+ * sys/_types.h wins before the toolchain's own include order has had its say.
+ * The compiler's own int64 type needs no header, and the width is verified after
+ * a normal <sys/types.h> by the static assertions in components/espix_fs/fs.c
+ * and components/espix_kernel/kernel.c.
  */
-#include <sys/types.h>
+typedef __INT64_TYPE__ off_t;
+#define _OFF_T_DECLARED
 
-/*
- * Asserted where the mechanism is, and not only in the one consumer that
- * thought to check it -- components/espix_fs/fs.c asserts the same thing. A
- * translation unit that has this force-include and still ends up with a 32-bit
- * off_t has found a toolchain change or a lost guard, and what not noticing
- * looks like is a filesystem reporting a 5 GiB file as its low 32 bits.
- */
-_Static_assert(sizeof(off_t) == 8, "off_t is not 64 bits: see cmake/offt64.h");
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#endif /* __ASSEMBLER__ */
+off_t lseek(int fd, off_t offset, int whence) __asm__("lseek64");
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* !__ASSEMBLER__ && !ESPIX_LIBC_OWN_OFF_T */

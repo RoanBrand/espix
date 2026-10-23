@@ -47,10 +47,11 @@
 #define DATE_FMT     "%a %b %e %H:%M:%S %Z %Y"
 
 /*
- * The -u form spells UTC out rather than using %Z, because newlib's %Z reads
+ * The -u form spells UTC out rather than using %Z, because a libc's %Z may read
  * the global tzname that tzset() left behind and not the struct tm it was
  * handed -- so gmtime_r() output formatted with %Z claims the local zone.
- * Measured: `date -u` under TZ=SAST-2 printed the right hour labelled "SAST".
+ * Measured under newlib: `date -u` under TZ=SAST-2 printed the right hour
+ * labelled "SAST".
  */
 #define DATE_FMT_UTC "%a %b %e %H:%M:%S UTC %Y"
 

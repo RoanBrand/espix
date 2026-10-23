@@ -10,7 +10,7 @@
  *
  * Separate from abi_drivers.c on purpose. That file is the *peripheral*
  * surface, and says so at the top; the cost it warns about is linking RMT and
- * GPIO into every build. The cost here is different in kind -- newlib's
+ * GPIO into every build. The cost here is different in kind -- libc's
  * timezone machinery, pulled in by localtime_r() and mktime() -- and belongs
  * where it can be stated and measured on its own.
  *

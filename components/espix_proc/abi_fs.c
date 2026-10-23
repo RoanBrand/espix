@@ -169,7 +169,7 @@ static char *abi_getcwd(char *buf, size_t size)
 
     /*
      * POSIX also allows buf == NULL to mean "allocate one", which glibc
-     * supports and newlib does not. Refusing it rather than half-supporting it:
+     * supports and not every libc does. Refusing it rather than half-supporting it:
      * an app that wants that can pass a buffer.
      */
     if (buf == NULL) {
@@ -191,9 +191,9 @@ static char *abi_getcwd(char *buf, size_t size)
 
 /*
  * These three go through the resolver rather than the table below, because
- * newlib already defines dup() and dup2() (as ENOSYS stubs) and IDF defines
- * fcntl(), and the loader consults its own libc table before any table espix
- * adds. The resolver is the seam that runs first.
+ * IDF defines fcntl(), and the resolver is the seam that runs before any table
+ * -- the one place a name the firmware already defines can be answered by
+ * espix instead. dup() and dup2() travel with it; picolibc defines neither.
  *
  * espix_fs_dup* own the work; see vfs.c for why a duplicate is a second
  * descriptor carrying the same key. fcntl is intercepted only for its two dup
@@ -277,7 +277,9 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
     ESP_ELFSYM_EXPORT(close),
     ESP_ELFSYM_EXPORT(read),
     ESP_ELFSYM_EXPORT(write),
-    ESP_ELFSYM_EXPORT(lseek),
+    /* Under the name an app built with cmake/offt64.h asks for: its lseek is
+     * redirected to the 64-bit one, as glibc's is with _FILE_OFFSET_BITS=64. */
+    { "lseek64", (void *)&lseek },
     ESP_ELFSYM_EXPORT(stat),
     ESP_ELFSYM_EXPORT(fstat),
     ESP_ELFSYM_EXPORT(unlink),

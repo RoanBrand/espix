@@ -3,7 +3,7 @@
 #pragma once
 
 #include <setjmp.h>     /* jmp_buf: how an app's exit() gets home */
-#include <stdio.h>      /* struct _reent, for the stdio a force-kill puts back */
+#include <stdio.h>      /* FILE: the process's own stdin, stdout and stderr */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -248,7 +248,7 @@ typedef struct {
      * espix_proc_snapshot() bulk-copies, and a caller's array of them would
      * carry the lot for nothing.
      *
-     * Bit N is signal N, matching newlib's sigset_t convention exactly, so the
+     * Bit N is signal N, matching libc's sigset_t convention exactly, so the
      * two interchange without a shuffle. uint32_t and not uint8_t: SIGTERM is
      * bit 15 and SIGUSR2 is bit 31, and a narrower field would silently drop
      * every signal above SIGBUS -- `|=` on a uint8_t does not warn.
@@ -314,16 +314,12 @@ typedef struct {
     int64_t           alarm_interval_us;
 
     /*
-     * The task's own struct _reent, published by the process itself before it
-     * replaced any of its stdio.
-     *
-     * Kept so a force-kill can put the global streams back before deleting the
-     * task. Deleting a task runs prvDeleteTCB() -> _reclaim_reent(), which
-     * fcloses every stream in that reent which is not the global one -- and a
-     * process's stdout and stderr are funopen() objects over its session, so
-     * closing one writes into the SSH channel. See espix_proc_detach_streams().
+     * The process's stdin, stdout and stderr: the variables an app's own
+     * `stdin`, `stdout` and `stderr` resolve to, one set per process and shared
+     * by all of its threads, as on any POSIX system. The kernel's are libc's
+     * globals, which stay the console. See abi_stdio.c.
      */
-    struct _reent *reent;
+    FILE             *std[3];
 
     /*
      * The app's arena; see espix_app_region_t above. Empty until the app
@@ -506,11 +502,9 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
 void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,
                           int exit_code) __attribute__((noreturn));
 
-/* Put the global stdio back into the process's reent, so that deleting its task
- * does not close espix's streams from the killer's -- or from IDLE's, which
- * takes the board down. Returns whether espix's streams were installed. Caller
- * must hold the lock and must have suspended the task: see the note in
- * espix_proc_detach_streams(). */
+/* Forget a force-killed process's streams without closing them, and say
+ * whether espix had installed any. Caller must hold the lock and must have
+ * suspended the task: see the note in espix_proc_detach_streams(). */
 bool espix_proc_detach_streams(espix_proc_slot_t *slot);
 
 /* Monotonic pid allocation; pids are never reused. Caller must hold the lock. */
@@ -621,6 +615,17 @@ void espix_proc_abi_alloc_register(void);
  * this is a resolver table because espix does not own the pthread surface and
  * only the resolver runs first. */
 void espix_proc_abi_pthread_register(void);
+
+/* The calling process's stdin (0), stdout (1) or stderr (2), or libc's global
+ * one for a task that is not a process. See abi_stdio.c. */
+FILE *espix_proc_stdio(int fd);
+
+/* The address an app's `stdin`, `stdout` or `stderr` resolves to -- the calling
+ * process's own -- or 0 for any other name. Consulted by the resolver. */
+uintptr_t espix_abi_stdio_var(const char *name);
+
+/* Publish the calls that use a standard stream without naming it. */
+void espix_proc_abi_stdio_register(void);
 
 /*
  * The allocator itself, so abi_cxx.cpp's operator new/delete reach the same one

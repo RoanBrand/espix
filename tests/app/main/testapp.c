@@ -16,6 +16,7 @@
  */
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -982,9 +983,9 @@ static int cmd_sink(void)
  * The environment, from the app's side of the ABI.
  *
  * `env get NAME` is the assertion that matters: it must reach espix's getenv
- * and not newlib's. A variable exported by the session is in the process's own
+ * and not libc's. A variable exported by the session is in the process's own
  * copy and *not* in the firmware's global `environ`, so a value coming back
- * here proves which implementation answered -- newlib's would print nothing.
+ * here proves which implementation answered -- libc's would print nothing.
  *
  * `env set NAME=value` then `env get NAME` proves the app can change its own
  * copy, and the shell checking afterwards proves the change did not leak back.
@@ -1096,15 +1097,30 @@ static int cmd_abi(const char *path)
      * an app normally gets here, so this is the property the other commands lean
      * on: the errno an app reads after a syscall is the one espix's layer set.
      *
-     * Not perror(), which was published and then measured to write nothing: it
-     * sends its line to the firmware's own stderr stream rather than the channel
-     * the app is writing to. See the note in abi_libc.c.
+     * And perror(), which has to reach *this process's* stderr. Published once as
+     * libc's own, it wrote to the firmware's stderr and the line never arrived;
+     * abi_stdio.c answers it per process now.
      */
     FILE *missing = fopen("/nonexistent-abi-probe", "r");
-    printf("abi errno=%s strerror=%s\n", errno_name(errno), strerror(errno));
+    const int open_err = errno;
+    printf("abi errno=%s strerror=%s\n", errno_name(open_err), strerror(open_err));
+    fflush(stdout);
+    errno = open_err;
+    perror("abi perror");
     if (missing != NULL) {
         fclose(missing);
     }
+
+    /*
+     * ctype through the macros, on characters the compiler cannot see. Each
+     * macro indexes a table from an offset into it, which reaches the app as a
+     * relocation with an addend -- and elf_loader's Xtensa port once dropped
+     * that addend, so on the S3 islower('a') answered no and toupper() was the
+     * identity (docs/UPSTREAM.md).
+     */
+    volatile char lc = 'a', dg = '7', sp = ' ';
+    printf("abi ctype=%d%d%d%d toupper=%c\n", islower(lc) != 0, isupper(lc) != 0,
+           isdigit(dg) != 0, isspace(sp) != 0, toupper(lc));
 
     FILE *f = fopen(path, "r");
     if (f == NULL) {

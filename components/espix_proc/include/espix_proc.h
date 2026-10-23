@@ -18,6 +18,11 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* picolibc spells it only with the underscore. */
+#if !defined(NSIG) && defined(_NSIG)
+#define NSIG _NSIG
+#endif
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -49,7 +54,7 @@ extern "C" {
  * a kernel carrying its own table would disagree silently, and the process
  * would receive a signal nobody sent.
  *
- * Signal sets are plain uint32_t: NSIG is 32, and newlib's own sigset_t is a
+ * Signal sets are plain uint32_t: NSIG is 32, and libc's own sigset_t is a
  * 32-bit unsigned with bit N standing for signal N, so the two interchange
  * directly. espix uses its own set operations rather than the <signal.h>
  * macros, because sigaddset() expands to `1 << sig` on a signed int, which for
@@ -387,7 +392,7 @@ size_t espix_proc_history(espix_proc_record_t *out, size_t n);
  * R-P1.6: the reaper as the single teardown point.
  *
  * A process that finishes on its own stops deleting itself. It parks, and the
- * reaper deletes it, which moves the newlib teardown and the PSRAM stack free
+ * reaper deletes it, which moves the task's teardown and the PSRAM stack free
  * off the idle task and onto a task with a real stack. espix_fault's reaper
  * registers here at start; espix_proc must not depend on it, so the direction
  * is a callback rather than a call.

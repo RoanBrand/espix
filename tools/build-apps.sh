@@ -155,15 +155,18 @@ for name in "${names[@]}"; do
         # `idf.py elf` is only available under the Makefiles generator, and
         # set-target is what creates the generator and sdkconfig in the first
         # place, so it runs once per app rather than on every build.
-        have="" app_hz=""
+        have="" app_hz="" app_libc=""
         if [ -f "sdkconfig" ]; then
             have=$(grep '^CONFIG_IDF_TARGET=' sdkconfig 2>/dev/null | head -1 | cut -d'"' -f2)
             app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' sdkconfig 2>/dev/null | cut -d= -f2)
+            app_libc=$(grep -c '^CONFIG_LIBC_PICOLIBC=y' sdkconfig 2>/dev/null || true)
         fi
-        if [ "$have" != "$target" ] || { [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; }; then
+        if [ "$have" != "$target" ] || [ "$app_libc" != 1 ] \
+           || { [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; }; then
             # Another target's sdkconfig is stale, and so is one with the wrong
-            # ABI constants; set-target's implicit fullclean refuses a build dir
-            # left by a failed configure, so start from nothing.
+            # ABI constants or another libc -- a value saved in it outlives the
+            # defaults that chose it; set-target's implicit fullclean refuses a
+            # build dir left by a failed configure, so start from nothing.
             rm -rf build sdkconfig
             "${idf[@]}" -G 'Unix Makefiles' set-target "$target" > build-apps.log 2>&1 \
                 || { echo "build-apps: $name: set-target failed; see $app/build-apps.log" >&2; exit 1; }

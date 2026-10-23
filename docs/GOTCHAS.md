@@ -875,18 +875,22 @@ documented, say that too.
 
 Deleting another task does not tidy up "in the kernel". `prvDeleteTCB()` runs
 **on the caller** when the victim is not currently running, and on **IDLE** when
-it is (`FreeRTOS-Kernel/tasks.c`). Its `configDEINIT_TLS_BLOCK` step is
-`_reclaim_reent()` -> `esp_cleanup_r()`, which fcloses every std stream in the
-dead task's reent that differs from the global one. If those streams write to
-anything that can block -- espix's do, they are `funopen()` objects over the SSH
-channel -- then the *caller* blocks, or IDLE does, and a blocked IDLE takes the
-board down because the scheduler assumes it can always fall back to it.
+it is (`FreeRTOS-Kernel/tasks.c`). Anything in that teardown that can block --
+under newlib it was `_reclaim_reent()` -> `esp_cleanup_r()`, which fclosed the
+dead task's std streams, and espix's write into the SSH channel -- blocks the
+*caller*, or IDLE, and a blocked IDLE takes the board down because the scheduler
+assumes it can always fall back to it. picolibc's teardown only frees the task's
+TLS block, and espix keeps a process's streams in its slot rather than in the
+task, so nothing of the sort runs today; the placement is still worth knowing
+before putting anything into a task's TLS deletion callbacks.
 
 Three consequences worth knowing before deleting any task:
 
-- **Put the global streams back first** if the task replaced its stdio.
-  `espix_proc_detach_streams()` does this; a clean exit always did, which is why
-  only force-kill was ever unsafe.
+- **A FILE whose lock the task held is unusable afterwards.** picolibc's
+  stream locks are mutexes, so the next writer waits forever on a holder that is
+  gone. For a process's own streams that only leaks them; for the console's
+  `stdout`, which a console app writes through, it is the kernel's too. That is
+  why `proc_force_kill()` lets a process leave libc before deleting it.
 - **A mutex held at deletion is not just stuck, it is poison.** Only the owner
   may give a FreeRTOS mutex back, and `xQueueSemaphoreTake()` reaches into the
   recorded holder's TCB for priority inheritance -- freed memory. Bounding the
@@ -897,7 +901,7 @@ Three consequences worth knowing before deleting any task:
   `conn->op_completed`; delete it and close the socket, and `tcpip` signals a
   freed semaphore.
 
-The general form: FreeRTOS owns none of what a process holds -- newlib owns the
+The general form: FreeRTOS owns none of what a process holds -- libc owns the
 FILEs, lwIP the netconn, espix the channel lock -- so `vTaskDelete()` is not a
 SIGKILL. Terminate cooperatively at the syscall boundary and keep the delete for
 a task that demonstrably holds nothing. See `espix_proc_stopping()`.

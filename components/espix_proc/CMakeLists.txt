@@ -14,6 +14,7 @@ idf_component_register(
         "abi_resolver.c"
         "abi_fs.c"
         "abi_libc.c"
+        "abi_stdio.c"
         "abi_libm.c"
         "abi_ident.c"
         "abi_signal.c"

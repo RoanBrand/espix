@@ -10,6 +10,8 @@
  * neither plays nor records pays nothing. The pins default to the S31 function
  * coreboard's, and each is a Kconfig value.
  */
+#include "sdkconfig.h"
+
 #if CONFIG_ESPIX_I2S
 
 #include <string.h>

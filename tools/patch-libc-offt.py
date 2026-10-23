@@ -2,35 +2,24 @@
 """
 Keep _lseek_r's 32-bit ABI, now that off_t is 64 bits.
 
-cmake/offt64.h widens off_t for the whole firmware, which is what lets a file over
-4 GiB be reported and seeked. IDF's `_lseek_r` is an alias for `esp_vfs_lseek`, so
-it follows the type -- but two of its callers do not, and cannot:
+cmake/offt64.h widens the public off_t for the whole firmware, which is what lets a
+file over 4 GiB be reported and seeked -- and redirects every lseek() it compiles to
+espix's 64-bit lseek64. The plain `lseek` symbol has to stay 32-bit, because the
+*prebuilt* picolibc's fdopen() and fseek() bind to it by name and were compiled
+with a 32-bit off_t. That `lseek` is IDF's, in esp_libc's syscalls.c, and esp_libc
+is compiled without the force-include for exactly that reason; it calls
+`_lseek_r` with a 32-bit offset.
 
-  * the **prebuilt** newlib libc. Its stdio.o carries the seek logic that fseek()
-    and fseeko() end up in, and it was compiled when off_t was a 32-bit long, so
-    it passes 32 bits;
-  * the ROM's libc stub table, which declares an int offset for the same reason
-    (esp_rom/<target>/rom/libc_stubs.h).
-
-Followed the type, `_lseek_r` reads 64 bits where those callers wrote 32, and every
-fseek() lands somewhere else. Measured before this was written, on a 12 KB upload:
+IDF defines `_lseek_r` in vfs_calls.c as an alias for `esp_vfs_lseek`, whose
+signature follows off_t -- 64 bits in this build. Left alone, esp_libc's 32-bit
+call would land in a 64-bit function: the offset's high half and the whence would
+be read from registers nobody set, and every fseek() would go somewhere else.
+Measured, under newlib and the same mechanism: a 12 KB SFTP upload failing with
 `sftp: write failed: seek failed`.
 
-So the boundary keeps the width it has always had and the widening happens inside:
-`_lseek_r` takes and returns an int, and calls the 64-bit `esp_vfs_lseek` beneath
-it. espix's own lseek(), pread() and pwrite() are 64-bit and unaffected, which is
-where a file over 4 GiB is actually reached. stdio's seeking stays limited to
-4 GiB -- a fact about the libc this is linked against rather than a choice, and the
-reason espix's SFTP transfer path has to move off FILE* to go beyond it. See
-docs/KNOWN-ISSUES.md.
-
-Three files, not one. The weak declaration has to agree with the strong
-definition, so reent_syscalls.c (a weak alias to syscall_not_implemented, for
-builds without the VFS) and vfs_calls.c (the definition) both carry the width. The
-third is the toolchain's own reent.h, which declares `_lseek_r` in terms of
-`_off_t` — the very type cmake/offt64.h widens — and so has to be pinned to the
-width the library was actually built with. That one is outside IDF and is the
-reason the hook passes --toolchain-root.
+So this turns `_lseek_r` into a real 32-bit function that calls the 64-bit
+`esp_vfs_lseek` beneath it, and fails a result that does not fit with EOVERFLOW,
+as a 32-bit lseek() does on Linux. One file, in IDF; nothing in the toolchain.
 
 **Temporary by construction.** tools/esp_libc-lseek-abi.patch is the same change
 as a plain diff, ready to send to espressif/esp-idf. When it lands, delete both
@@ -41,35 +30,16 @@ import os
 import sys
 from pathlib import Path
 
-EXPECTED_IDF = "6.1.0"
+EXPECTED_IDF = "v6.1"
 
-# The toolchain's own reent.h declares _lseek_r with _off_t, which is the type a
-# project may have widened -- and cannot, because the libc that calls it was built
-# with 32-bit _off_t. Pinning the declaration to the width the library implements
-# is correct for every project, with or without a widened off_t, which is why this
-# one file is worth touching outside IDF.
-TOOLCHAIN = {
-    "include/reent.h": (
-        "extern _off_t _lseek_r (struct _reent *, int, _off_t, int);",
-        "extern int _lseek_r (struct _reent *, int, int, int);",
-    ),
-}
-
-# file -> (old, new). The definition, then the declaration that must match it.
-PATCHES = {
-    "components/vfs/vfs_calls.c": (
-        'off_t _lseek_r(struct _reent *r, int fd, off_t size, int mode)\n'
-        '    __attribute__((alias("esp_vfs_lseek")));',
-        '''/*
+_LSEEK_R = """/*
  * A 32-bit ABI, deliberately, and not an alias for esp_vfs_lseek.
  *
- * _lseek_r is called by the prebuilt newlib libc -- stdio.o carries the seek
- * logic fseek() and fseeko() end up in -- which was compiled when off_t was a
- * 32-bit long, and by the ROM's libc stub table, which declares an int offset for
- * the same reason. A project may widen off_t; if this followed the type, those
- * callers would pass 32 bits where 64 are read and every fseek() would land
- * somewhere else. So the boundary keeps its width, the widening happens here, and
- * espix's own lseek()/pread()/pwrite() are 64-bit and unaffected.
+ * Its caller is esp_libc's lseek(), the one the prebuilt picolibc's fdopen() and
+ * fseek() bind to by name, and that library was compiled with a 32-bit off_t. A
+ * project may widen off_t; if this followed the type, a 32-bit offset would be
+ * read as 64 and every fseek() would land somewhere else. So the boundary keeps
+ * its width and the widening happens here.
  */
 int _lseek_r(struct _reent *r, int fd, int offset, int whence)
 {
@@ -82,13 +52,18 @@ int _lseek_r(struct _reent *r, int fd, int offset, int whence)
         return -1;
     }
     return (int)at;
-}''',
-    ),
-    "components/esp_libc/src/reent_syscalls.c": (
-        "off_t _lseek_r(struct _reent *r, int fd, off_t size, int mode)",
-        "int _lseek_r(struct _reent *r, int fd, int offset, int whence)",
+}"""
+
+# file -> (original, patched, [earlier patched forms to upgrade in place]).
+PATCHES = {
+    "components/vfs/vfs_calls.c": (
+        'off_t _lseek_r(struct _reent *r, int fd, off_t size, int mode)\n'
+        '    __attribute__((alias("esp_vfs_lseek")));',
+        _LSEEK_R,
+        ["/*\n * A 32-bit ABI, deliberately, and not an alias for esp_vfs_lseek.\n *\n * _lseek_r is called by the prebuilt newlib libc -- stdio.o carries the seek\n * logic fseek() and fseeko() end up in -- which was compiled when off_t was a\n * 32-bit long, and by the ROM's libc stub table, which declares an int offset for\n * the same reason. A project may widen off_t; if this followed the type, those\n * callers would pass 32 bits where 64 are read and every fseek() would land\n * somewhere else. So the boundary keeps its width, the widening happens here, and\n * espix's own lseek()/pread()/pwrite() are 64-bit and unaffected.\n */\nint _lseek_r(struct _reent *r, int fd, int offset, int whence)\n{\n    const off_t at = esp_vfs_lseek(r, fd, (off_t)offset, whence);\n\n    /* Round-trip rather than a limit constant: it is the same question, and it\n     * needs no header. */\n    if (at != (off_t)(int)at) {\n        errno = EOVERFLOW;\n        return -1;\n    }\n    return (int)at;\n}"],
     ),
 }
+
 
 def die(msg):
     print(f"patch-libc-offt: {msg}", file=sys.stderr)
@@ -132,7 +107,7 @@ def check_version(idf):
 def main():
     idf = idf_root(sys.argv)
 
-    for rel, (old, new) in PATCHES.items():
+    for rel, (old, new, earlier) in PATCHES.items():
         target = idf / rel
         if not target.is_file():
             die(f"{target} does not exist; is the IDF path right?")
@@ -140,47 +115,22 @@ def main():
         text = target.read_text(encoding="utf-8")
 
         # Already patched? Configure runs this every build, so it has to be a
-        # no-op from the second time on. Tested against the replacement rather
-        # than a marker comment, because one of the two files' replacement is a
-        # declaration line and has nowhere to put a marker.
+        # no-op from the second time on.
         if new in text:
             continue
 
-        if text.count(old) != 1:
+        # Patched by an earlier version of this script: same code, older words.
+        anchor = next((e for e in earlier if e in text), old)
+        if text.count(anchor) != 1:
             die(
                 f"expected exactly one anchor in {rel}, found "
-                f"{text.count(old)}.\n  The file moved; re-read it before "
+                f"{text.count(anchor)}.\n  The file moved; re-read it before "
                 f"changing this script."
             )
 
         check_version(idf)
-        target.write_text(text.replace(old, new), encoding="utf-8")
+        target.write_text(text.replace(anchor, new), encoding="utf-8")
         print(f"patch-libc-offt: gave _lseek_r its 32-bit ABI back in {rel}")
-
-    # The toolchain, when the build hands us its sysroot. Without it the two
-    # above still apply, and the compile then stops on the declaration instead --
-    # which is a clearer failure than a build that links and seeks wrongly.
-    toolchain = arg_path(sys.argv, "--toolchain-root")
-    if toolchain is None:
-        return 0
-
-    for rel, (old, new) in TOOLCHAIN.items():
-        target = toolchain / rel
-        if not target.is_file():
-            die(f"{target} does not exist; is --toolchain-root right?")
-
-        text = target.read_text(encoding="utf-8")
-        if new in text:
-            continue
-        if text.count(old) != 1:
-            die(
-                f"expected exactly one anchor in {rel}, found "
-                f"{text.count(old)}.\n  The file moved; re-read it before "
-                f"changing this script."
-            )
-
-        target.write_text(text.replace(old, new), encoding="utf-8")
-        print(f"patch-libc-offt: pinned _lseek_r's declaration in {rel}")
 
     return 0
 

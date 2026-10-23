@@ -3,7 +3,7 @@
  *
  * An app resolves its undefined symbols against tables of {"name", &name}
  * pairs walked with strcmp -- not against libc. The firmware *contains* all of
- * newlib and calls it constantly, but there is no runtime name-to-address
+ * libc and calls it constantly, but there is no runtime name-to-address
  * directory, so a function is reachable only if somebody typed it into a table.
  * snprintf sits at a known address in this image and was unreachable from an
  * app until this file existed.
@@ -53,8 +53,10 @@
  * off now, and every name they answered for is published by espix, in the file
  * that owns it:
  *
- *   this file    string.h, stdio.h, time.h, setjmp.h, getopt.h, and newlib's
- *                own reent/ctype ABI (__errno, __getreent, _ctype_)
+ *   this file    string.h, stdio.h, time.h, setjmp.h, getopt.h, and errno and
+ *                ctype as picolibc's headers reach them (__errno, _ctype_b)
+ *   abi_stdio.c  stdin/stdout/stderr and the calls that use them unnamed --
+ *                one set per process, via the resolver
  *   abi_fs.c     close, beside the other POSIX file calls
  *   abi_alloc.c  malloc, calloc, realloc, free -- the arena, via the resolver
  *   abi_signal.c sleep and usleep -- interruptible, via the resolver
@@ -88,12 +90,8 @@
  */
 
 #include <ctype.h>
-
-#define _MB_EXTENDED_CHARSETS_ISO  /* the functions, not the macros: docs/UPSTREAM.md */
-#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
-#include <reent.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,6 +140,13 @@ static long espix_sysconf(int name)
     }
 }
 
+/* The calling thread's errno: picolibc's own is thread-local, so &errno here is
+ * the caller's. */
+static int *abi_errno(void)
+{
+    return &errno;
+}
+
 static const struct esp_elfsym s_libc_syms[] = {
 
     /* stdio.h -- formatting into a buffer, and control over buffering.
@@ -153,7 +158,6 @@ static const struct esp_elfsym s_libc_syms[] = {
      * packet per line whether that suits it or not. */
     ESP_ELFSYM_EXPORT(snprintf),
     ESP_ELFSYM_EXPORT(sprintf),
-    ESP_ELFSYM_EXPORT(vprintf),
     ESP_ELFSYM_EXPORT(setvbuf),
     ESP_ELFSYM_EXPORT(setbuf),
     /* fflush is not here: abi_cxx.cpp publishes it, that table is registered
@@ -165,7 +169,6 @@ static const struct esp_elfsym s_libc_syms[] = {
      * plain pair reads espix's stdin, which the SSH channel gives an app. */
     ESP_ELFSYM_EXPORT(fgetc),
     ESP_ELFSYM_EXPORT(getc),
-    ESP_ELFSYM_EXPORT(getchar),
     ESP_ELFSYM_EXPORT(ungetc),
     ESP_ELFSYM_EXPORT(sscanf),
 
@@ -202,7 +205,7 @@ static const struct esp_elfsym s_libc_syms[] = {
      *
      * The 64-bit pair goes with the widened off_t: an app that seeks or reads
      * past 4 GiB has to parse the number first, and strtol cannot hold it. This
-     * table is also what pulls them out of newlib -- nothing else in the
+     * table is also what pulls them out of libc -- nothing else in the
      * firmware converts 64-bit text, so without these two the linker has no
      * reason to keep them and an app calling either fails to *load*, with the
      * failure naming a symbol rather than the gap that let it happen. */
@@ -238,12 +241,12 @@ static const struct esp_elfsym s_libc_syms[] = {
      * through the resolver, which is the only seam that can shadow a name the
      * loader's libc table already defines.
      *
-     * perror() was published here and then measured: it writes to the firmware's
-     * own stderr stream, not the channel the app is writing to, so the line never
-     * arrives. Removed on that evidence rather than kept for the name's sake --
-     * strerror() is the part an app needs, and this file publishes it.
+     * perror() is not here: like printf and puts, it writes to a standard
+     * stream it does not name, so abi_stdio.c answers it per process. Published
+     * here once, it wrote to the firmware's own stderr and the line never
+     * reached the app's user.
      *
-     * ctype.h needs nothing beyond `_ctype_` above: newlib implements it as
+     * ctype.h needs nothing beyond `_ctype_b` above: picolibc implements it as
      * macros over that table.
      *
      * putenv() is not here either: abi_env.c claims it through the resolver,
@@ -267,17 +270,14 @@ static const struct esp_elfsym s_libc_syms[] = {
      * espix owns more tightly (malloc/calloc/realloc/free, sleep/usleep, exit)
      * are already claimed through the resolver and are not repeated.
      */
-#if !CONFIG_LIBC_PICOLIBC
-    /* newlib's reent/ctype ABI rather than a C API: an app built against newlib
-     * references these directly, and the ctype macros index this table. The
-     * loader chose between this spelling and a picolibc one at compile time;
-     * picolibc is off in this tree, so this is the live set. */
-    ESP_ELFSYM_EXPORT(__errno),
-    ESP_ELFSYM_EXPORT(__getreent),
-    ESP_ELFSYM_EXPORT(_ctype_),
+    /* errno and ctype, as an app compiled against picolibc reaches them: errno
+     * through __errno(), which cmake/espix-app.cmake asks for because the loader
+     * cannot relocate a thread-local access, and the ctype macros by indexing
+     * _ctype_b. */
+    { "__errno", (void *)&abi_errno },
+    ESP_ELFSYM_EXPORT(_ctype_b),
     ESP_ELFSYM_EXPORT(toupper),
     ESP_ELFSYM_EXPORT(tolower),
-#endif
 
     /* string.h -- the half that came from below. */
     ESP_ELFSYM_EXPORT(strerror),
@@ -293,11 +293,8 @@ static const struct esp_elfsym s_libc_syms[] = {
     ESP_ELFSYM_EXPORT(strtod),
 
     /* stdio.h -- the output half; the input half is already above. */
-    ESP_ELFSYM_EXPORT(printf),
     ESP_ELFSYM_EXPORT(fprintf),
     ESP_ELFSYM_EXPORT(vfprintf),
-    ESP_ELFSYM_EXPORT(puts),
-    ESP_ELFSYM_EXPORT(putchar),
     ESP_ELFSYM_EXPORT(fputc),
     ESP_ELFSYM_EXPORT(fputs),
     ESP_ELFSYM_EXPORT(fwrite),
@@ -319,7 +316,7 @@ static const struct esp_elfsym s_libc_syms[] = {
      * Two more names an app reaches for that answer something espix owns: the
      * size of the descriptor space, and esp_libc's random source (which is a
      * real one on both targets, not a fallback PRNG). sysconf is a table entry
-     * because it is espix's answer rather than newlib's stub.
+     * because it is espix's answer rather than libc's stub.
      */
     { "sysconf", (void *)espix_sysconf },
     ESP_ELFSYM_EXPORT(getrandom),

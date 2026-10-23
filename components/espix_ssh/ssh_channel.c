@@ -970,9 +970,10 @@ static int chan_stream_read(void *cookie, char *buf, int len)
          *
          * This polled once, with vTaskDelay() between tries, on the theory that
          * a task deleted while blocked here left its handle registered in the
-         * buffer. The theory was wrong: the crash was newlib's FILE lock, held
-         * across fgets() and taken again by esp_cleanup_r() on the killer's
-         * task, and proc_force_kill() lets the process out of libc first now.
+         * buffer. The theory was wrong: the crash was the libc FILE lock, held
+         * across fgets() and taken again by newlib's task teardown on the
+         * killer's task, and proc_force_kill() lets the process out of libc
+         * first now.
          *
          * Polling cost what polling costs. Both sides woke on a 100Hz tick, so
          * the hand-off moved one queue per tick -- 256 bytes per 10ms, 22 KB/s

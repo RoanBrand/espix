@@ -731,15 +731,6 @@ they block.
   What it is not: a general page cache. It holds one stream ahead of the
   decoder, for as long as the stream is open, and frees it after.
 
-- **A truthful `st_blksize` in espix's VFS.** newlib's `fopen` sizes its `FILE`
-  buffer from `fstat`'s `st_blksize`, or its own `BUFSIZ` (1024) when there is
-  none -- and espix's VFS sets neither, while fatfs is configured
-  `CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0`. So every stdio user reads in 1 kB calls,
-  and only the paths that avoid stdio (the `play` engine) read well. Reporting
-  the real block size (4096 for littlefs; the FAT cluster or sector for fatfs) is
-  a few lines and fixes every program at once, not just this one. Cheap, and
-  worth doing before the source layer.
-
 - **Chunk to the medium.** Reads should be a multiple of the filesystem's block,
   and for USB the mass-storage transfer size should be big enough to amortize
   the BOT overhead. The engine's 32 kB is a fixed number today; per-medium (and,
@@ -961,15 +952,6 @@ allocation sizes up to the board's maximum, record where a fresh region falls
 short and by how much, and derive the formula from that. A region would then be
 the right size the first time on every target, with the verify loop kept as an
 assertion rather than as the mechanism.
-
-## The ctype functions, owned by espix
-
-Build apps with  so the ctype names are real calls, and publish our
-own // through the ABI -- newlib's implementations can sit
-behind them. See docs/UPSTREAM.md for the Xtensa macro bug that forces it. The
-same audit belongs on the kernel, which the same backend builds, and on any
-runtime character classification in it ( uses, such as the OTA
-build-id comparison, are the first candidates).
 
 ## The terminal's colour, font and rendering
 

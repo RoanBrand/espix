@@ -465,22 +465,18 @@ survives and the functions do not.
 pthread_cancel is deliberately absent: IDF's implementation is a stub, and
 exporting it would advertise a guarantee that does not exist.
 
-**A thread could not talk.** An app's stdout and stderr are funopen() objects
-over its session, installed in the reent of the task that entered app_main(). A
-new thread gets a *fresh* reent whose streams are the console's, so its printf
-went to the UART and the user saw nothing. The trampoline now copies the
-process's three stream pointers in before the app's routine runs.
+**A thread could not talk.** Under newlib an app's streams lived in the reent of
+the task that entered app_main(), and a new thread got a *fresh* reent whose
+streams were the console's, so its printf went to the UART. Copying the pointers
+in fixed that and opened a worse trap -- FreeRTOS's teardown fcloses whatever a
+dying task's reent holds, so a thread's death closed the process's stream -- which
+needed taking them back out on every exit path.
 
-**And that is where the trap was, so it is worth stating plainly.** FreeRTOS
-deletes a task by running _reclaim_reent() on its reent, and that fcloses every
-stream in it that is not the global one. A thread holding the process's stdout
-therefore makes the *thread's* death close the *process's* stream -- from the
-deleting context, possibly mid-write. The first version of this shipped without
-taking the pointers back and took the board down inside puts() with a spinlock
-assert. espix_proc_detach_streams() had already solved exactly this for the
-process's own task by restoring the globals before deletion; the trampoline now
-does the same on its way out, and pthread_exit is wrapped so a thread that never
-returns through the trampoline is covered too.
+None of that exists now. A process's stdin, stdout and stderr are three pointers in
+its slot, and an app's `stdout` resolves to its process's one at load
+(`abi_stdio.c`), so every thread of the process shares them the way threads of a
+POSIX process do, and no task's death closes anything. The trampoline only sets
+the thread's slot pointer, which it needed anyway.
 
 Tested: four threads each add 5000 to one counter under a mutex and the total is
 20000, every thread prints and its output arrives at the session, and the device

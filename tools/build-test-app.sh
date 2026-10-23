@@ -30,14 +30,18 @@ target="${target:-esp32s3}"
 mkdir -p "$stage_dir"
 
 # `idf.py elf` needs a Makefiles generator, which is what the apps use too.
-have=""
-[ -f "$app/sdkconfig" ] && have=$(grep '^CONFIG_IDF_TARGET=' "$app/sdkconfig" 2>/dev/null | head -1 | cut -d'"' -f2)
-if [ "$have" != "$target" ]; then
+have="" libc=""
+if [ -f "$app/sdkconfig" ]; then
+    have=$(grep '^CONFIG_IDF_TARGET=' "$app/sdkconfig" 2>/dev/null | head -1 | cut -d'"' -f2)
+    libc=$(grep -c '^CONFIG_LIBC_PICOLIBC=y' "$app/sdkconfig" 2>/dev/null || true)
+fi
+if [ "$have" != "$target" ] || [ "$libc" != 1 ]; then
     # A build directory left by a failed configure is not a CMake build
     # directory yet, and set-target's implicit fullclean refuses to touch it --
     # so a (re)configure has to start from nothing. A stale target's config is
-    # the same situation for a different reason.
-    rm -rf "$app/build"
+    # the same situation for a different reason, and so is another libc's: a
+    # value saved in the sdkconfig outlives the defaults that chose it.
+    rm -rf "$app/build" "$app/sdkconfig"
     "$root/tools/idf.sh" -C "$app" -G 'Unix Makefiles' set-target "$target" \
         > "$app/build-test-app.log" 2>&1 \
         || { echo "build-test-app: set-target failed; see $app/build-test-app.log" >&2; exit 1; }

@@ -2,7 +2,6 @@
 # executes it, which memory protection would block.
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
 CONFIG_ELF_LOADER=y
-CONFIG_LIBC_NEWLIB=y
 
 # Arduino is a library here, never the OS: espix owns app_main.
 CONFIG_AUTOSTART_ARDUINO=n

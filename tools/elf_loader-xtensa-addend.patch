@@ -1,0 +1,33 @@
+arch/xtensa: apply the addend of GLOB_DAT and JMP_SLOT relocations
+
+An Xtensa ELF reaches a host data symbol through a literal-pool word, and when the
+reference is to an offset into the symbol rather than its start the linker records
+that offset as the relocation's addend -- for example
+
+    R_XTENSA_GLOB_DAT  _ctype_b + 80
+
+which is how every ctype macro reaches its table under picolibc. The value the
+word must hold is S + A, which is what uClibc's Xtensa ld.so writes and what this
+component's own RISC-V port does for R_RISCV_32. The Xtensa port writes S alone,
+so every such reference lands `addend` bytes early: on an ESP32-S3, islower('a')
+reads the entry for another character entirely, and toupper() returns its
+argument (with newlib the addend is 1, `_ctype_ + 1`).
+
+--- a/elf_loader/src/arch/esp_elf_xtensa.c
++++ b/elf_loader/src/arch/esp_elf_xtensa.c
+@@ -98,10 +98,13 @@
+         break;
+     case R_XTENSA_GLOB_DAT:
+     case R_XTENSA_JMP_SLOT:
++        /* S + A: a reference into a symbol, not to its start, carries the
++         * offset as the addend -- `_ctype_b + 128` is how every ctype macro
++         * reaches its table. */
+ #ifdef CONFIG_ELF_LOADER_CACHE_OFFSET
+-        *where = elf_remap_text(elf, addr);
++        *where = elf_remap_text(elf, addr + rela->addend);
+ #else
+-        *where = addr;
++        *where = addr + rela->addend;
+ #endif
+         break;
+     default:

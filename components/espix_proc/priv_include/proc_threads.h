@@ -20,7 +20,6 @@ extern "C" {
 typedef struct {
     const void *slot;       /* NULL marks a free entry */
     void       *task;
-    void       *reent;      /* its newlib reent, so a kill can take back stdio */
     int32_t     tid;
     bool        caps;       /* espix's own: its stack is deleted WithCaps */
 } espix_thread_t;
@@ -33,10 +32,9 @@ typedef struct {
 /* Reserve an entry for a thread about to start. False when the table is full. */
 bool espix_threads_add(espix_threads_t *t, const void *slot, int32_t tid);
 
-/* Give reserved entry `tid` its task and reent. False when it is gone -- its
- * process ended before the thread got this far. */
-bool espix_threads_set_task(espix_threads_t *t, int32_t tid, void *task,
-                            void *reent);
+/* Give reserved entry `tid` its task. False when it is gone -- its process
+ * ended before the thread got this far. */
+bool espix_threads_set_task(espix_threads_t *t, int32_t tid, void *task);
 
 /* Mark entry `tid` as espix's own, deleted WithCaps. */
 bool espix_threads_set_caps(espix_threads_t *t, int32_t tid);

@@ -148,18 +148,16 @@ struct espix_session {
      * leave the task's streams alone (which is what the console wants — its
      * stdout is already the right place).
      *
-     * An app calls libc printf, which writes to its task's stdout, not through
-     * this struct's write(). espix_proc points that task's streams at what this
-     * returns, which under newlib rebinds only that task; without it, an app run
-     * over SSH would print on the serial console.
+     * An app calls libc printf, which writes to its process's stdout, not
+     * through this struct's write(). espix_proc points that process's streams
+     * at what this returns; without it, an app run over SSH would print on the
+     * serial console.
      *
-     * A factory rather than one shared FILE, because ESP-IDF closes a task's
-     * streams when the task is deleted — esp_cleanup_r() in
-     * components/esp_libc/src/newlib_init.c fcloses stdin, stdout and stderr
-     * whenever they differ from the global ones. A shared stream would be torn
-     * down under the still-live session by the first app to exit, and closed
-     * twice over if stdout and stderr pointed at the same object. Each stream
-     * therefore belongs to one task, and that task's teardown closes it.
+     * A factory rather than one shared FILE, because a process closes the
+     * streams it was given when it ends. A shared stream would be torn down
+     * under the still-live session by the first app to exit, and closed twice
+     * over if stdout and stderr pointed at the same object. Each stream
+     * therefore belongs to one process, and that process's exit closes it.
      *
      * Not a descriptor, despite SSH having a socket: channel output must be
      * wrapped in CHANNEL_DATA and encrypted, so writing to the raw fd would
@@ -648,9 +646,8 @@ int espix_eprintf(espix_session_t *s, const char *fmt, ...)
  * this so an app's printf() and fprintf(stderr, ...) land wherever the shell
  * says, without the process ever *holding* the shell's redirect FILE. It held
  * one once, and a force-killed process then had stdout and stderr pointing at
- * the same object -- which esp_cleanup_r() fclosed twice on task deletion, the
- * second close asserting inside newlib on a lock the first had already
- * destroyed.
+ * the same object -- which the task's teardown fclosed twice, the second close
+ * asserting on a lock the first had already destroyed.
  */
 int espix_session_write(espix_session_t *s, const char *data, size_t len,
                         bool err);

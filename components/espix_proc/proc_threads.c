@@ -24,16 +24,14 @@ bool espix_threads_add(espix_threads_t *t, const void *slot, int32_t tid)
     return false;
 }
 
-bool espix_threads_set_task(espix_threads_t *t, int32_t tid, void *task,
-                            void *reent)
+bool espix_threads_set_task(espix_threads_t *t, int32_t tid, void *task)
 {
     espix_thread_t *const e = find_tid(t, tid);
 
     if (e == NULL) {
         return false;
     }
-    e->task  = task;
-    e->reent = reent;
+    e->task = task;
     return true;
 }
 

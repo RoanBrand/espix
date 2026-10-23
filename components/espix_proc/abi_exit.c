@@ -4,7 +4,7 @@
  *
  * Why this file exists
  * --------------------
- * The firmware's \`exit()\` is newlib's, and on this target it ends at IDF's
+ * The firmware's \`exit()\` is libc's, and on this target it ends at IDF's
  * \`_exit()\`, which is literally \`abort()\` (esp_libc/src/syscalls.c). That panics
  * and reboots. So an app calling the most ordinary function in C reset the
  * device. abi_libc.c also published \`abort\` and \`_Exit\` directly, so those reset
@@ -56,12 +56,12 @@ espix_abi_assert_func(const char *file, int line, const char *func,
                       const char *failedexpr) __attribute__((noreturn));
 
 /* exit(): the buffered streams are flushed first, as C requires. They are the
- * app's own -- funopen() objects over the session -- so this is what puts the
- * last line of output in front of whoever ran the program. */
+ * process's own -- funopen() objects over the session -- so this is what puts
+ * the last line of output in front of whoever ran the program. */
 static void espix_abi_exit(int status)
 {
-    fflush(stdout);
-    fflush(stderr);
+    fflush(espix_proc_stdio(1));
+    fflush(espix_proc_stdio(2));
     espix_proc_exit(status);
 }
 
@@ -74,8 +74,8 @@ static void espix_abi_Exit(int status)
 
 static void espix_abi_abort(void)
 {
-    fflush(stdout);
-    fflush(stderr);
+    fflush(espix_proc_stdio(1));
+    fflush(espix_proc_stdio(2));
     espix_proc_exit(ESPIX_ABORT_STATUS);
 }
 
@@ -90,11 +90,13 @@ static void
 espix_abi_assert_func(const char *file, int line, const char *func,
                       const char *failedexpr)
 {
-    fprintf(stderr,
+    FILE *const err = espix_proc_stdio(2);
+
+    fprintf(err,
             "assertion \"%s\" failed: file \"%s\", function: \"%s\", line %d\n",
             failedexpr != NULL ? failedexpr : "",
             file != NULL ? file : "?", func != NULL ? func : "?", line);
-    fflush(stderr);
+    fflush(err);
     espix_proc_exit(ESPIX_ABORT_STATUS);
 }
 
@@ -103,7 +105,7 @@ static const abi_sym_t s_exit_syms[] = {
      * the whole reason this is a resolver rather than another table. */
     ABI_SYM("exit",          espix_abi_exit),
     ABI_SYM("_Exit",         espix_abi_Exit),
-    /* The POSIX spelling. newlib's exit() calls it, and an app may call it too. */
+    /* The POSIX spelling. libc's exit() calls it, and an app may call it too. */
     ABI_SYM("_exit",         espix_abi_Exit),
     ABI_SYM("abort",         espix_abi_abort),
     ABI_SYM("__assert_func", espix_abi_assert_func),

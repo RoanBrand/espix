@@ -145,17 +145,6 @@ CONFIG_LITTLEFS_FCNTL_GET_PATH=y
 CONFIG_LITTLEFS_OPEN_DIR=y
 
 #
-# libc — pinned to newlib rather than IDF 6.1's new picolibc default.
-#
-# Two reasons: (1) under picolibc stdin/stdout are thread-local and linenoise
-# needs the TLS-stdio shim in components/console/private_include, which we
-# cannot include from outside that component; (2) elf_loader's libc symbol
-# table — how loaded apps resolve printf() and friends against the firmware —
-# is written against newlib.
-#
-CONFIG_LIBC_NEWLIB=y
-
-#
 # Networking. WiFi keeps calibration and its own state in NVS, which is what
 # finally uses the nvs partition reserved in partitions.csv.
 #

@@ -70,6 +70,20 @@ if(NOT espix_littlefs_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-littlefs.py failed; see the message above")
 endif()
 
+# Make elf_loader apply the addend of an Xtensa GLOB_DAT relocation, which it
+# drops: an S3 app's reference to `_ctype_b + 128` -- every ctype macro -- reads
+# 128 bytes early. RISC-V's port already adds it. See tools/patch-elf-loader.py.
+#
+# After project(), for the same reason as littlefs above. Temporary by
+# construction: tools/elf_loader-xtensa-addend.patch is the change ready to send.
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-elf-loader.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_elf_loader_patch_result)
+if(NOT espix_elf_loader_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-elf-loader.py failed; see the message above")
+endif()
+
 # Expose an ESP-IDF FatFs entry point that mounts without registering a base
 # path. Every esp_vfs_fat_*_mount() ends in esp_vfs_register_fs(), and the ops
 # tables are file-scope static, so FatFs cannot otherwise be mounted *under*
@@ -113,36 +127,23 @@ if(NOT espix_fatfs_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-fatfs.py failed; see the message above")
 endif()
 
-# Keep _lseek_r's 32-bit ABI, now that off_t is 64 bits. It is an alias for
-# esp_vfs_lseek and so follows the type, but its callers are prebuilt and do not:
-# newlib's stdio.o carries the seek logic fseek() ends up in and was compiled with
-# a 32-bit off_t, and the ROM's libc stub table declares an int offset for the same
-# reason. Without this, `fseek` seeks somewhere else -- measured, as an SFTP upload
-# failing with "seek failed" -- so the boundary keeps its width and the widening
-# happens inside it. espix's own lseek()/pread()/pwrite() stay 64-bit.
-#
-# Three files, the third outside IDF: the declaration in the toolchain's reent.h is
-# written in terms of _off_t, which is the type being widened, so it has to be
-# pinned to the width the libc was built with -- for the same reason as the
-# definition, and harmlessly for a project that never widens anything.
+# Keep _lseek_r's 32-bit ABI, now that off_t is 64 bits. IDF makes it an alias
+# for esp_vfs_lseek, which follows off_t -- but its caller is esp_libc's lseek(),
+# the 32-bit one the prebuilt picolibc's fdopen() and fseek() bind to by name (see
+# cmake/offt64.h). Without this, `fseek` seeks somewhere else -- measured, as an
+# SFTP upload failing with "seek failed" -- so the boundary keeps its width and
+# the widening happens inside it. Everything else reaches the 64-bit lseek64.
 #
 # See tools/patch-libc-offt.py and docs/UPSTREAM.md.
 #
-# Re-configure when any patched file changes, as for fatfs above: a reinstall or
-# a `git checkout` in the IDF tree reverts them, and reverting one without noticing
-# is a build that fails for a reason that points at espix.
-execute_process(
-    COMMAND "${CMAKE_C_COMPILER}" -print-sysroot
-    OUTPUT_VARIABLE espix_toolchain_sysroot
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
+# Re-configure when the patched file changes, as for fatfs above: a reinstall or
+# a `git checkout` in the IDF tree reverts it, and reverting it without noticing
+# is a build that seeks wrongly for a reason that points at espix.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${IDF_PATH}/components/vfs/vfs_calls.c"
-    "${IDF_PATH}/components/esp_libc/src/reent_syscalls.c"
-    "${espix_toolchain_sysroot}/include/reent.h")
+    "${IDF_PATH}/components/vfs/vfs_calls.c")
 execute_process(
     COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-libc-offt.py"
             --idf-path "${IDF_PATH}"
-            --toolchain-root "${espix_toolchain_sysroot}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     RESULT_VARIABLE espix_libc_offt_patch_result)
 if(NOT espix_libc_offt_patch_result EQUAL 0)
