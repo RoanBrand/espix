@@ -61,6 +61,12 @@ esp_err_t espix_thread_cli(const char *line);
 
 esp_err_t espix_thread_status(espix_thread_status_t *out);
 
+/* Rewrite /etc/thread.conf with the four policy keys (enabled, border_router,
+ * backbone, attach). Runs as the caller, so writing it needs root; the kernel
+ * creates the file the first time, which does not. */
+esp_err_t espix_thread_conf_write(bool enabled, bool border_router,
+                                  const char *backbone, bool attach);
+
 #ifdef __cplusplus
 }
 #endif

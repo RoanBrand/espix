@@ -16,6 +16,8 @@
  * border router and the CLI all come from IDF's openthread component. What
  * espix adds is a Linux name for the interface and a command to drive it.
  */
+#include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "sdkconfig.h"
@@ -288,9 +290,117 @@ esp_err_t espix_thread_status(espix_thread_status_t *out)
     return ESP_OK;
 }
 
+/*
+ * Write /etc/thread.conf. The priv flag writes with the kernel's authority --
+ * it is how the file is created on a board that has none -- and the public
+ * wrapper does not, so a verb run by a user needs the same privilege any other
+ * /etc write needs: root, that is, sudo. A rewrite keeps the file's mode; only
+ * the creating call sets it.
+ */
+static esp_err_t conf_write(bool priv, bool enabled, bool border_router,
+                            const char *backbone, bool attach)
+{
+    if (priv) {
+        espix_fs_priv_begin();
+    }
+    FILE *f = fopen(THREAD_CONF, "w");
+    if (priv) {
+        espix_fs_priv_end();
+    }
+
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot write %s: %s",
+                   THREAD_CONF, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    fprintf(f, "# espix Thread configuration\n");
+    fprintf(f, "#\n");
+    fprintf(f, "# enabled=yes starts the OpenThread stack at boot. 'thread start'\n");
+    fprintf(f, "# starts it by hand instead, and 'thread status' says what it is doing.\n");
+    fprintf(f, "enabled=%s\n\n", enabled ? "yes" : "no");
+    fprintf(f, "#\n");
+    fprintf(f, "# border_router=yes enables border routing: the mesh reaches the backbone\n");
+    fprintf(f, "# through NAT64. The backbone has to exist when Thread starts, while\n");
+    fprintf(f, "# OpenThread is initialised.\n");
+    fprintf(f, "border_router=%s\n\n", border_router ? "yes" : "no");
+    fprintf(f, "#\n");
+    fprintf(f, "# backbone=<interface> is what the border router routes to. eth0 avoids\n");
+    fprintf(f, "# sharing the 2.4 GHz radio with WiFi; wlan0 is possible and coexists.\n");
+    fprintf(f, "backbone=%s\n\n",
+            (backbone != NULL && backbone[0] != '\0') ? backbone : THREAD_BACKBONE);
+    fprintf(f, "#\n");
+    fprintf(f, "# attach=yes joins the stored dataset at boot. The dataset itself is in\n");
+    fprintf(f, "# OpenThread's own NVS storage, not here: this file is espix policy, not\n");
+    fprintf(f, "# protocol state.\n");
+    fprintf(f, "attach=%s\n", attach ? "yes" : "no");
+    fclose(f);
+
+    if (priv) {
+        espix_fs_priv_begin();
+        const esp_err_t err = espix_fs_chmod(THREAD_CONF, 0644);
+        espix_fs_priv_end();
+        if (err != ESP_OK) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "cannot set the mode on %s: %s",
+                       THREAD_CONF, esp_err_to_name(err));
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t espix_thread_conf_write(bool enabled, bool border_router,
+                                  const char *backbone, bool attach)
+{
+    return conf_write(false, enabled, border_router, backbone, attach);
+}
+
+/*
+ * The file has to exist before anyone can be told to edit it, and /etc is not
+ * shipped -- the repo's fsroot is the dev overlay -- so the kernel creates it,
+ * exactly as espix_auth does for /etc/sudoers. Absent means off, but an empty
+ * file would be worse than none: this is also the only place the keys are
+ * written down.
+ */
+static void ensure_conf(void)
+{
+    espix_fs_priv_begin();
+    FILE *probe = fopen(THREAD_CONF, "r");
+    const bool present = (probe != NULL);
+    /*
+     * A zero-byte file is what a failed redirect leaves behind -- a 2>/dev/null
+     * style redirect creates before the command it prefixes runs -- and it is
+     * worse than no file at all, so it gets the default too. A config of only
+     * comments is left alone: that is somebody choosing the defaults.
+     */
+    const bool empty = present && (fgetc(probe) == EOF);
+    if (present) {
+        fclose(probe);
+    }
+    espix_fs_priv_end();
+
+    if (present && !empty) {
+        return;
+    }
+
+    if (conf_write(true, false, false, THREAD_BACKBONE, false) == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "created %s", THREAD_CONF);
+    } else {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot create %s", THREAD_CONF);
+    }
+}
+
 esp_err_t espix_thread_init(void)
 {
     char v[8];
+
+    ensure_conf();
+
+    char want_attach[8] = {0};
+    char want_border[8] = {0};
+    (void)espix_fs_conf_get(THREAD_CONF, "attach", want_attach,
+                            sizeof(want_attach));
+    (void)espix_fs_conf_get(THREAD_CONF, "border_router", want_border,
+                            sizeof(want_border));
 
     if (!(espix_fs_conf_get(THREAD_CONF, "enabled", v, sizeof(v)) &&
           strcmp(v, "yes") == 0)) {
@@ -302,20 +412,30 @@ esp_err_t espix_thread_init(void)
         return err;
     }
 
-    if (espix_fs_conf_get(THREAD_CONF, "border_router", v, sizeof(v)) &&
-        strcmp(v, "yes") == 0) {
-        const esp_err_t br = espix_thread_border_router(true);
-        if (br != ESP_OK) {
-            espix_klog(ESPIX_KLOG_WARN, TAG, "border router: %s",
-                       esp_err_to_name(br));
-        }
-    }
-
-    if (espix_fs_conf_get(THREAD_CONF, "attach", v, sizeof(v)) &&
-        strcmp(v, "yes") == 0) {
+    /*
+     * Attach before border routing. Border routing initialises against the
+     * Thread interface, and that interface is not up until the stack has joined
+     * something; the other order is refused (and once asserted).
+     */
+    const bool using_attach = (strcmp(want_attach, "yes") == 0);
+    if (using_attach) {
         const esp_err_t at = espix_thread_attach();
         if (at != ESP_OK) {
             espix_klog(ESPIX_KLOG_WARN, TAG, "attach: %s", esp_err_to_name(at));
+        }
+    }
+
+    if (strcmp(want_border, "yes") == 0) {
+        if (!using_attach) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "border_router=yes needs attach=yes; set both, or run "
+                       "'thread attach' then 'thread br on'");
+        } else {
+            const esp_err_t br = espix_thread_border_router(true);
+            if (br != ESP_OK) {
+                espix_klog(ESPIX_KLOG_WARN, TAG, "border router: %s",
+                           esp_err_to_name(br));
+            }
         }
     }
     return ESP_OK;

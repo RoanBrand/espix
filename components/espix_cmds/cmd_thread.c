@@ -14,10 +14,15 @@
 #include "sdkconfig.h"
 
 #include "espix_cmds_priv.h"
+#include "espix_fs.h"
 #include "espix_shell.h"
 #include "espix_thread.h"
 
 #if CONFIG_ESPIX_THREAD
+
+/* The kernel creates this file on a board that has none; see espix_thread.c.
+ * The dataset is not here -- OpenThread keeps it in its own NVS. */
+#define THREAD_CONF_PATH "/etc/thread.conf"
 
 static void thread_show_status(espix_session_t *s)
 {
@@ -51,16 +56,142 @@ static void thread_show_status(espix_session_t *s)
     }
 }
 
+static bool conf_yes(const char *key)
+{
+    char v[8];
+    return espix_fs_conf_get(THREAD_CONF_PATH, key, v, sizeof(v)) &&
+           strcmp(v, "yes") == 0;
+}
+
+static bool word_yes(const char *w)
+{
+    return strcmp(w, "yes") == 0 || strcmp(w, "on") == 0;
+}
+
+static bool word_no(const char *w)
+{
+    return strcmp(w, "no") == 0 || strcmp(w, "off") == 0;
+}
+
+static void thread_show_conf(espix_session_t *s)
+{
+    char v[32];
+
+    espix_printf(s, "%s\n", THREAD_CONF_PATH);
+    espix_printf(s, "  enabled        %s\n",
+                 espix_fs_conf_get(THREAD_CONF_PATH, "enabled", v, sizeof(v))
+                     ? v : "(absent: no)");
+    espix_printf(s, "  border_router  %s\n",
+                 espix_fs_conf_get(THREAD_CONF_PATH, "border_router", v, sizeof(v))
+                     ? v : "(absent: no)");
+    espix_printf(s, "  backbone       %s\n",
+                 espix_fs_conf_get(THREAD_CONF_PATH, "backbone", v, sizeof(v))
+                     ? v : "eth0");
+    espix_printf(s, "  attach         %s\n",
+                 espix_fs_conf_get(THREAD_CONF_PATH, "attach", v, sizeof(v))
+                     ? v : "(absent: no)");
+    espix_printf(s, "  (the dataset itself lives in OpenThread's NVS, not here)\n");
+}
+
+/*
+ * thread conf [key value] -- persist the boot policy. Writing /etc is root's,
+ * so this runs unchanged after sudo, the way usb/wifi writers do; the kernel's
+ * first-run creation of the file is the privileged caller.
+ *
+ * enabled and border_router also move the live stack, so 'thread conf enabled
+ * yes' is 'thread start' plus 'and do it again next boot'.
+ */
+static int thread_conf(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 3) {
+        thread_show_conf(s);
+        return 0;
+    }
+
+    const char *key = argv[2];
+
+    bool enabled = conf_yes("enabled");
+    bool border  = conf_yes("border_router");
+    bool attach  = conf_yes("attach");
+    char backbone[16] = "eth0";
+    (void)espix_fs_conf_get(THREAD_CONF_PATH, "backbone", backbone,
+                            sizeof(backbone));
+
+    bool live_enable = false, want_enable = false;
+    bool live_border = false, want_border = false;
+    bool live_attach = false;
+
+    if (strcmp(key, "backbone") == 0) {
+        if (argc < 4) {
+            espix_eprintf(s, "usage: thread conf backbone <interface>\n");
+            return 1;
+        }
+        strlcpy(backbone, argv[3], sizeof(backbone));
+    } else if (strcmp(key, "enabled") == 0 || strcmp(key, "border_router") == 0 ||
+               strcmp(key, "attach") == 0) {
+        if (argc < 4 || (!word_yes(argv[3]) && !word_no(argv[3]))) {
+            espix_eprintf(s, "usage: thread conf %s {yes|no}\n", key);
+            return 1;
+        }
+        const bool on = word_yes(argv[3]);
+        if (strcmp(key, "enabled") == 0) {
+            enabled = on;
+            live_enable = true;
+            want_enable = on;
+        } else if (strcmp(key, "border_router") == 0) {
+            border = on;
+            live_border = true;
+            want_border = on;
+        } else {
+            attach = on;
+            live_attach = on;
+        }
+    } else {
+        espix_eprintf(s, "thread: unknown key '%s'\n", key);
+        espix_eprintf(s, "  keys: enabled, border_router, backbone, attach\n");
+        return 1;
+    }
+
+    const esp_err_t werr = espix_thread_conf_write(enabled, border, backbone, attach);
+    if (werr != ESP_OK) {
+        espix_eprintf(s, "thread: cannot write %s: run it under sudo\n",
+                      THREAD_CONF_PATH);
+        return 1;
+    }
+
+    if (live_enable) {
+        const esp_err_t err = want_enable ? espix_thread_start()
+                                          : espix_thread_stop();
+        if (err != ESP_OK) {
+            espix_eprintf(s, "thread: %s: %s\n",
+                          want_enable ? "start" : "stop", esp_err_to_name(err));
+            return 1;
+        }
+    } else if (live_border) {
+        const esp_err_t err = espix_thread_border_router(want_border);
+        if (err != ESP_OK) {
+            espix_eprintf(s, "thread: border router: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+    } else if (live_attach) {
+        (void)espix_thread_attach();       /* join now; status reports the rest */
+    }
+
+    espix_printf(s, "thread: %s=%s saved to %s\n", key, argv[3], THREAD_CONF_PATH);
+    return 0;
+}
+
 static int cmd_thread(espix_session_t *s, int argc, char **argv)
 {
     if (argc < 2) {
         espix_printf(s, "usage: thread {status|start|stop|attach|br {on|off}|"
-                        "cli <line...>}\n");
+                        "conf [key value]|cli <line...>}\n");
         espix_printf(s, "  status   what thread0 is doing\n");
         espix_printf(s, "  start    bring the OpenThread stack up (native 15.4 radio)\n");
         espix_printf(s, "  stop     take it down\n");
         espix_printf(s, "  attach   join the network in the stored dataset\n");
         espix_printf(s, "  br       border routing, if built in\n");
+        espix_printf(s, "  conf     show or set the boot policy in /etc/thread.conf\n");
         espix_printf(s, "  cli      OpenThread's own CLI; replies go to the console\n");
         return argc < 2 ? 1 : 1;
     }
@@ -120,6 +251,10 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "conf") == 0) {
+        return thread_conf(s, argc, argv);
+    }
+
     if (strcmp(argv[1], "cli") == 0) {
         if (argc < 3) {
             espix_eprintf(s, "usage: thread cli <line...>\n");
@@ -152,7 +287,8 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
 static espix_cmd_t s_thread_cmds[] = {
     { .name = "thread", .fn = cmd_thread,
       .help = "Thread (IEEE 802.15.4): status, up/down, join, border router",
-      .usage = "thread {status|start|stop|attach|br {on|off}|cli <line...>}" },
+      .usage = "thread {status|start|stop|attach|br {on|off}|conf [key value]|"
+               "cli <line...>}" },
 };
 
 #endif /* CONFIG_ESPIX_THREAD */
