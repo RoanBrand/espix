@@ -56,8 +56,20 @@ esp_err_t espix_thread_attach(void);
  * named in /etc/thread.conf (backbone=eth0) and must exist before start. */
 esp_err_t espix_thread_border_router(bool on);
 
-/* One line of OpenThread CLI, e.g. "dataset active". Replies go to the console. */
-esp_err_t espix_thread_cli(const char *line);
+/* Where a CLI reply goes while the line runs. Called once per output chunk;
+ * the text is not NUL-terminated. */
+typedef void (*espix_thread_write_fn)(void *ctx, const char *text, size_t len);
+
+/* One line of OpenThread CLI, e.g. "dataset active". Runs under the OpenThread
+ * lock and answers through write(), so the session that asked sees it; commands
+ * that finish later still answer on the console. */
+esp_err_t espix_thread_cli(const char *line, espix_thread_write_fn write,
+                           void *ctx);
+
+/* The active dataset as hex TLVs -- the form 'thread join' takes -- and the
+ * reverse. The dataset is OpenThread's, in OpenThread's NVS, not in /etc. */
+esp_err_t espix_thread_dataset_hex(char *out, size_t out_len);
+esp_err_t espix_thread_join(const char *hex);
 
 esp_err_t espix_thread_status(espix_thread_status_t *out);
 

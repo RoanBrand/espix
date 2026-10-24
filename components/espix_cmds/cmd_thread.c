@@ -171,6 +171,10 @@ static int thread_conf(espix_session_t *s, int argc, char **argv)
         const esp_err_t err = espix_thread_border_router(want_border);
         if (err != ESP_OK) {
             espix_eprintf(s, "thread: border router: %s\n", esp_err_to_name(err));
+            if (err == ESP_ERR_INVALID_STATE) {
+                espix_eprintf(s, "  the Thread interface must be up: "
+                                "'thread conf attach yes' (or 'thread attach')\n");
+            }
             return 1;
         }
     } else if (live_attach) {
@@ -181,18 +185,29 @@ static int thread_conf(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/* The CLI's reply, into the stream that asked for it. */
+static void cli_to_session(void *ctx, const char *text, size_t len)
+{
+    espix_session_t *s = (espix_session_t *)ctx;
+    (void)len;
+    espix_printf(s, "%s", text);
+}
+
 static int cmd_thread(espix_session_t *s, int argc, char **argv)
 {
     if (argc < 2) {
         espix_printf(s, "usage: thread {status|start|stop|attach|br {on|off}|"
-                        "conf [key value]|cli <line...>}\n");
+                        "conf [key value]|dataset|join {<hex>|-f <file>}|"
+                        "cli <line...>}\n");
         espix_printf(s, "  status   what thread0 is doing\n");
         espix_printf(s, "  start    bring the OpenThread stack up (native 15.4 radio)\n");
         espix_printf(s, "  stop     take it down\n");
         espix_printf(s, "  attach   join the network in the stored dataset\n");
         espix_printf(s, "  br       border routing, if built in\n");
         espix_printf(s, "  conf     show or set the boot policy in /etc/thread.conf\n");
-        espix_printf(s, "  cli      OpenThread's own CLI; replies go to the console\n");
+        espix_printf(s, "  dataset  print the active dataset as hex TLVs\n");
+        espix_printf(s, "  join     join from a hex dataset, or from a file of one\n");
+        espix_printf(s, "  cli      OpenThread's own CLI; the reply comes back here\n");
         return argc < 2 ? 1 : 1;
     }
 
@@ -251,6 +266,74 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "dataset") == 0) {
+        char hex[2 * 256 + 1];
+        const esp_err_t err = espix_thread_dataset_hex(hex, sizeof(hex));
+        if (err == ESP_ERR_NOT_FOUND) {
+            espix_printf(s, "thread: no active dataset\n");
+            return 1;
+        }
+        if (err != ESP_OK) {
+            espix_eprintf(s, "thread: dataset: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "%s\n", hex);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "join") == 0) {
+        char hex[2 * 256 + 1];
+        size_t used = 0;
+
+        if (argc >= 4 && strcmp(argv[2], "-f") == 0) {
+            /*
+             * A dataset is around 500 hex digits and the shell line limit is
+             * 255, so pasting one is not possible; the file form is the one that
+             * fits. 'thread dataset > file' makes the file.
+             */
+            FILE *f = fopen(argv[3], "r");
+            if (f == NULL) {
+                espix_eprintf(s, "thread: cannot read %s\n", argv[3]);
+                return 1;
+            }
+            int c;
+            while ((c = fgetc(f)) != EOF && used < sizeof(hex) - 1) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    continue;
+                }
+                hex[used++] = (char)c;
+            }
+            fclose(f);
+            if (used == 0) {
+                espix_eprintf(s, "thread: %s has no hex in it\n", argv[3]);
+                return 1;
+            }
+        } else {
+            if (argc < 3) {
+                espix_eprintf(s, "usage: thread join <hex-tlvs> | -f <file>\n");
+                return 1;
+            }
+            for (int i = 2; i < argc; i++) {
+                const size_t n = strlen(argv[i]);
+                if (used + n >= sizeof(hex)) {
+                    espix_eprintf(s, "thread: dataset too long\n");
+                    return 1;
+                }
+                memcpy(hex + used, argv[i], n);
+                used += n;
+            }
+        }
+        hex[used] = '\0';
+
+        const esp_err_t err = espix_thread_join(hex);
+        if (err != ESP_OK) {
+            espix_eprintf(s, "thread: join: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        espix_printf(s, "thread: joining\n");
+        return 0;
+    }
+
     if (strcmp(argv[1], "conf") == 0) {
         return thread_conf(s, argc, argv);
     }
@@ -271,13 +354,21 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
             }
             used += (size_t)n;
         }
-        const esp_err_t err = espix_thread_cli(line);
+        const esp_err_t err = espix_thread_cli(line, cli_to_session, s);
         if (err != ESP_OK) {
             espix_eprintf(s, "thread: cli: %s\n", esp_err_to_name(err));
             return 1;
         }
-        espix_printf(s, "thread: '%s' sent; the reply appears on the console\n", line);
-        return 0;
+        return 0;      /* the CLI's own output was the answer */
+    }
+
+    if (strcmp(argv[1], "enabled") == 0 ||
+        strcmp(argv[1], "border_router") == 0 ||
+        strcmp(argv[1], "backbone") == 0 ||
+        strcmp(argv[1], "attach") == 0) {
+        espix_eprintf(s, "thread: '%s' is a config key; try "
+                        "'thread conf %s <value>'\n", argv[1], argv[1]);
+        return 1;
     }
 
     espix_eprintf(s, "thread: unknown verb '%s'\n", argv[1]);
@@ -288,7 +379,7 @@ static espix_cmd_t s_thread_cmds[] = {
     { .name = "thread", .fn = cmd_thread,
       .help = "Thread (IEEE 802.15.4): status, up/down, join, border router",
       .usage = "thread {status|start|stop|attach|br {on|off}|conf [key value]|"
-               "cli <line...>}" },
+               "dataset|join {<hex>|-f <file>}|cli <line...>}" },
 };
 
 #endif /* CONFIG_ESPIX_THREAD */

@@ -17,6 +17,7 @@
  * espix adds is a Linux name for the interface and a command to drive it.
  */
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +32,8 @@
 #include "esp_openthread_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "openthread/cli.h"
+#include "openthread/dataset.h"
 #include "openthread/instance.h"
 #include "openthread/ip6.h"
 #include "openthread/thread.h"
@@ -79,6 +82,8 @@ bool espix_thread_is_started(void)
     return s_started;
 }
 
+static int cli_output(void *context, const char *format, va_list args);
+
 esp_err_t espix_thread_start(void)
 {
     if (s_started) {
@@ -111,6 +116,13 @@ esp_err_t espix_thread_start(void)
         return err;
     }
     s_started = true;
+
+    /*
+     * Point the OpenThread CLI's output at espix's sessions rather than the
+     * console: espix_thread_cli() collects it. IDF installs its own callback
+     * during start, so this has to come after it.
+     */
+    otCliInit(esp_openthread_get_instance(), cli_output, NULL);
 
     esp_netif_t *netif = esp_openthread_get_netif();
     if (netif != NULL) {
@@ -231,12 +243,192 @@ esp_err_t espix_thread_border_router(bool on)
 #endif
 }
 
-esp_err_t espix_thread_cli(const char *line)
+static espix_thread_write_fn s_cli_write;
+static void                *s_cli_ctx;
+static TaskHandle_t         s_cli_wait;
+static char                 s_cli_buf[1024];
+static size_t               s_cli_len;
+
+/*
+ * The CLI's output, wherever it runs. With a line in flight it collects into
+ * s_cli_buf and wakes the waiter when the CLI prints its prompt -- which
+ * ProcessLine() does last, and IDF's own console path uses the same signal.
+ * Without one it goes to the console, which is where unsolicited output (a
+ * late scan result) belongs anyway.
+ */
+static int cli_output(void *context, const char *format, va_list args)
+{
+    (void)context;
+
+    char chunk[260];
+    const int n = vsnprintf(chunk, sizeof(chunk), format, args);
+    if (n <= 0) {
+        return 0;
+    }
+    const size_t len = ((size_t)n < sizeof(chunk)) ? (size_t)n : sizeof(chunk) - 1;
+
+    if (chunk[0] == '>' && chunk[1] == ' ') {       /* the prompt, not output */
+        if (s_cli_wait != NULL) {
+            xTaskNotifyGive(s_cli_wait);
+        }
+        return 0;
+    }
+
+    if (s_cli_wait != NULL) {
+        if (s_cli_len + len < sizeof(s_cli_buf)) {
+            memcpy(s_cli_buf + s_cli_len, chunk, len);
+            s_cli_len += len;
+        }
+    } else {
+        fwrite(chunk, 1, len, stdout);
+    }
+    return 0;
+}
+
+/*
+ * Session-correct CLI output.
+ *
+ * esp_openthread_cli_input() posts the line to the OpenThread task, and the CLI
+ * answers there through the callback installed at start -- the two together are
+ * what a command typed into an SSH session needs to see its own reply. Running
+ * otCliInputLine() here instead would capture the output more directly but
+ * deadlock on any command that waits for the stack: the OT task's mainloop
+ * takes the same lock.
+ *
+ * The timeout is the floor: a command that never answers (a scan with no
+ * network) cannot hold its session open forever, and whatever it prints
+ * afterwards goes to the console.
+ */
+esp_err_t espix_thread_cli(const char *line, espix_thread_write_fn write,
+                           void *ctx)
 {
     if (!s_started || line == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    return esp_openthread_cli_input(line);
+    if (s_cli_wait != NULL) {
+        return ESP_ERR_INVALID_STATE;       /* one line at a time */
+    }
+
+    s_cli_write = write;
+    s_cli_ctx   = ctx;
+    s_cli_len   = 0;
+    s_cli_wait  = xTaskGetCurrentTaskHandle();
+
+    const esp_err_t err = esp_openthread_cli_input(line);
+    if (err != ESP_OK) {
+        s_cli_wait  = NULL;
+        s_cli_write = NULL;
+        s_cli_ctx   = NULL;
+        return err;
+    }
+
+    if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        s_cli_wait  = NULL;
+        s_cli_write = NULL;
+        s_cli_ctx   = NULL;
+        return ESP_ERR_TIMEOUT;
+    }
+    s_cli_wait = NULL;
+
+    if (s_cli_write != NULL && s_cli_len > 0) {
+        s_cli_write(s_cli_ctx, s_cli_buf, s_cli_len);
+    }
+    s_cli_write = NULL;
+    s_cli_ctx   = NULL;
+    return ESP_OK;
+}
+
+/*
+ * The active dataset, as hex TLVs -- the same string 'thread join' takes, and
+ * what OpenThread itself prints with 'dataset active -x'. It lives in
+ * OpenThread's NVS; this only reads it out.
+ */
+esp_err_t espix_thread_dataset_hex(char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    otOperationalDatasetTlvs tlvs;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const otError e = otDatasetGetActiveTlvs(instance, &tlvs);
+    esp_openthread_lock_release();
+
+    if (e != OT_ERROR_NONE || tlvs.mLength == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (out_len < (size_t)tlvs.mLength * 2 + 1) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < tlvs.mLength; i++) {
+        out[i * 2]     = digits[tlvs.mTlvs[i] >> 4];
+        out[i * 2 + 1] = digits[tlvs.mTlvs[i] & 0x0f];
+    }
+    out[tlvs.mLength * 2] = '\0';
+    return ESP_OK;
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+esp_err_t espix_thread_join(const char *hex)
+{
+    if (hex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    otOperationalDatasetTlvs tlvs;
+    memset(&tlvs, 0, sizeof(tlvs));
+
+    size_t bytes = 0;
+    for (size_t i = 0; hex[i] != '\0'; ) {
+        if (hex[i] == ' ' || hex[i] == '\t' || hex[i] == '\n') {
+            i++;
+            continue;
+        }
+        const int hi = hex_nibble(hex[i]);
+        const int lo = (hex[i + 1] != '\0') ? hex_nibble(hex[i + 1]) : -1;
+        if (hi < 0 || lo < 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (bytes >= sizeof(tlvs.mTlvs)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        tlvs.mTlvs[bytes++] = (uint8_t)((hi << 4) | lo);
+        i += 2;
+    }
+    if (bytes == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    tlvs.mLength = (uint8_t)bytes;
+
+    /* auto_start() sets it active and brings the interface up; the same path
+     * 'thread attach' takes, but with a dataset from elsewhere. */
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const esp_err_t err = esp_openthread_auto_start(&tlvs);
+    esp_openthread_lock_release();
+    return err;
 }
 
 esp_err_t espix_thread_status(espix_thread_status_t *out)
