@@ -33,6 +33,7 @@ static const char *kind_flags(espix_if_kind_t kind)
     case ESPIX_IF_LO:  return "LOOPBACK";
     case ESPIX_IF_ETH: return "BROADCAST,MULTICAST";
     case ESPIX_IF_TUN: return "POINTOPOINT,NOARP";
+    case ESPIX_IF_THREAD: return "BROADCAST,MULTICAST";
     default:           return "BROADCAST,MULTICAST";
     }
 }
@@ -192,9 +193,10 @@ static int cmd_ifconfig(espix_session_t *s, int argc, char **argv)
         }
         shown = true;
 
-        const char *encap = (f->kind == ESPIX_IF_LO)  ? "Local Loopback"
-                          : (f->kind == ESPIX_IF_TUN) ? "Tunnel"
-                                                      : "Ethernet";
+        const char *encap = (f->kind == ESPIX_IF_LO)     ? "Local Loopback"
+                          : (f->kind == ESPIX_IF_TUN)    ? "Tunnel"
+                          : (f->kind == ESPIX_IF_THREAD) ? "Thread"
+                                                         : "Ethernet";
         espix_printf(s, "%-9s Link encap:%s", f->name, encap);
         if (f->has_mac) {
             char mac[18];

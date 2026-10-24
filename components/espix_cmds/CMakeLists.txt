@@ -24,6 +24,7 @@ idf_component_register(
         "cmd_record.c"
         "cmd_display.c"
         "cmd_svc.c"
+        "cmd_thread.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

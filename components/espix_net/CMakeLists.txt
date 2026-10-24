@@ -22,6 +22,9 @@ if(CONFIG_ESPIX_MDNS)
     list(APPEND espix_net_srcs "mdns.c")
 list(APPEND espix_net_srcs "vpn/vpn.c")
 endif()
+if(CONFIG_ESPIX_THREAD)
+    list(APPEND espix_net_srcs "thread/espix_thread.c")
+endif()
 
 idf_component_register(
     SRCS
@@ -52,4 +55,10 @@ idf_component_register(
         espressif__esp_tinyusb
         espressif__mdns
         fugo101__wireguard_lwip
+        # Thread: the whole stack lives in IDF's openthread component. Required
+        # unconditionally, even when ESPIX_THREAD is off: IDF resolves
+        # REQUIRES in an early pass where CONFIG_ values do not exist yet, so a
+        # conditional requirement would vanish there (see the NCM note above).
+        openthread
+        esp_coex
 )

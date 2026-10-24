@@ -150,6 +150,28 @@ if(NOT espix_libc_offt_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-libc-offt.py failed; see the message above")
 endif()
 
+# Keep OpenThread's ~144 KB instance buffer out of internal RAM. gInstanceRaw is
+# the whole ot::Instance -- the stack's entire state graph -- and marking it
+# EXT_RAM_BSS_ATTR puts it in .ext_ram.bss, i.e. PSRAM, under the
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY espix already sets. The macro is
+# empty with that off, and the file is only compiled with OpenThread on, so the
+# patch is inert otherwise. See tools/patch-openthread.py for the two caveats
+# (cache freeze during OTA; no ISR access).
+#
+# Re-configure when the patched file changes, as for fatfs above.
+if(CONFIG_OPENTHREAD_ENABLED)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${IDF_PATH}/components/openthread/openthread/src/core/instance/instance.cpp")
+    execute_process(
+        COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-openthread.py"
+                --idf-path "${IDF_PATH}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE espix_openthread_patch_result)
+    if(NOT espix_openthread_patch_result EQUAL 0)
+        message(FATAL_ERROR "tools/patch-openthread.py failed; see the message above")
+    endif()
+endif()
+
 # Stop the PPA blit and scale engines discarding CPU-written pixels.
 #
 # Their output cache sync asks for M2C only, which invalidates without writing

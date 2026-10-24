@@ -20,6 +20,24 @@ entry below still stands and every workaround is still load-bearing.
 
 ## ESP-IDF
 
+### The prebuilt Thread border-router library does not link against newlib
+
+`components/openthread/lib/esp32s31/libopenthread_br.a` is shipped prebuilt, and
+at v6.1 one of its objects references `errno` as a **TLS** symbol -- picolibc's
+`errno`, IDF's default libc. Against newlib, whose `errno` is the non-TLS
+`__errno()` thunk, the link fails:
+
+    ld: errno: TLS reference in .../libopenthread_br.a(esp_openthread_dns_upstream_resolver.cpp.obj)
+        mismatches non-TLS definition in .../libc.a(libc_a-reent.o) section .sbss.errno
+
+**Resolved by espix moving to picolibc**, which it has. Measured 2026-10-23
+against v6.1's `esp32s31` prebuilt: with `ESPIX_THREAD_BORDER_ROUTER` the image
+links, `dns_upstream_resolver` included, once two configuration prerequisites
+are met -- `LWIP_IPV6_NUM_ADDRESSES=12`, which OpenThread's netif glue insists on
+with an `#error`, and `LWIP_NETIF_STATUS_CALLBACK`, which the prebuilt calls (the
+Kconfig option now selects it). What stops it now is size: 3,921,872 bytes against
+the 3.5 MiB kernel slot, 251,856 bytes over.
+
 ### The DHCP server always advertises itself as a DNS server
 
 `dhcps_dns = 0` is documented as "do not offer DNS" and behaves as "offer

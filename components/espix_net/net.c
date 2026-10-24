@@ -19,6 +19,7 @@
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_net_priv.h"
+#include "espix_thread.h"
 
 #define TAG "net"
 
@@ -540,6 +541,18 @@ esp_err_t espix_net_init(void)
      * configuration decided which of them were created as ports.
      */
     (void)espix_net_bridge_apply();
+
+#if CONFIG_ESPIX_THREAD
+    /*
+     * Last of all: OpenThread wants esp_netif and the event loop up, and a
+     * border router wants its backbone (eth0) already registered. Not fatal --
+     * a board with no Thread configured simply never gets here.
+     */
+    const esp_err_t thread_err = espix_thread_init();
+    if (thread_err != ESP_OK) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "thread: %s", esp_err_to_name(thread_err));
+    }
+#endif
 
     return ESP_OK;
 }

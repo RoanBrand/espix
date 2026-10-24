@@ -24,8 +24,15 @@ esp_err_t espix_fs_wake_init(void)
      * One per process, so a full table can still arm every one, plus a little
      * slack for an app that creates its own.
      */
+#if CONFIG_ESPIX_THREAD
+    /* OpenThread's netif glue, its task queue and the native radio driver each
+     * take one, so the thread build keeps three more in reserve. */
+    const int slack = 7;
+#else
+    const int slack = 4;
+#endif
     const esp_vfs_eventfd_config_t config = {
-        .max_fds = CONFIG_ESPIX_PROC_MAX + 4,
+        .max_fds = CONFIG_ESPIX_PROC_MAX + slack,
     };
 
     const esp_err_t err = esp_vfs_eventfd_register(&config);

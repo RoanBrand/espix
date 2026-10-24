@@ -121,5 +121,6 @@ void espix_cmds_register_all(void)
     espix_cmds_register_play();
     espix_cmds_register_record();
     espix_cmds_register_display();
+    espix_cmds_register_thread();
     espix_cmds_register_exec_fallback();
 }

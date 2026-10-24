@@ -172,3 +172,13 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # wedged holding a lock, which is not a fault and so never reaches the panic path.
 # PANIC stays off, so this reports and never resets.
 
+#
+# IPv6 addresses per netif. OpenThread's lwIP netif glue requires this to be
+# *exactly* 12 (esp_openthread_lwip_netif.c is `#if ... != 12 / #error`), and
+# ESPIX_THREAD selects OpenThread. lwIP keeps the array per netif, so 3 -> 12 is
+# about 150 bytes of RAM per interface and no flash -- harmless with Thread off,
+# which is why it is not conditional on the Thread option. Kconfig cannot select
+# an int, so this default is the only place it can live.
+#
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
+

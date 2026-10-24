@@ -1,24 +1,27 @@
-# espix partition table — ESP32-S3, 8MB flash.
+# espix partition table — ESP32-S3, 8MB flash. Single kernel slot + loader.
 #
-# Layout fills the flash exactly; last byte is 0x7FFFFF (ends at 0x800000).
-# The partition table itself lives at 0x8000 (CONFIG_PARTITION_TABLE_OFFSET).
+# The same shape as the S31's: a small loader (ota_0) and one large kernel slot
+# (ota_1). Kernels are files on the rootfs and the loader installs them, so the
+# kernel gets the space a second A/B slot would have used. Blank otadata boots
+# the loader, which puts a kernel file into ota_1 and selects it; the loader is
+# also what the bootloader falls back to when a new kernel does not confirm.
 #
-# The same shape as the 16MB table: a small loader (ota_0) and one large kernel
-# slot (ota_1). Kernels are files on the rootfs and the loader installs them, so
-# the kernel gets the space a second A/B slot would have used.
+# No gaps, and `coredump`, `ota_0` and `ota_1` all sit on 64 KB boundaries, so
+# the table stays valid if Secure Boot v1 is ever enabled. `nvs` is 0x4000, as
+# IDF's two-OTA example uses; that is what lets the first app start at 0x20000
+# with coredump's 64 KB ahead of it.
 #
-# Everything before `storage` is identical to the 16MB table -- loader at
-# 0x20000, kernel at 0x90000, coredump at 0x410000 -- so one kernel and one
-# first-flash image serve both sizes. Only `storage` differs because it is
-# whatever is left. Adopting this table moves `storage` (the old factory layout
-# had it at 0x320000), so an 8MB board reflashes the rootfs once.
+# This table moves `storage` from 0x420000 to 0x4E0000 -- littlefs cannot move,
+# so the rootfs is reflashed once -- and it is now identical to the S31's through
+# `ota_1`, so one kernel and one first-flash image serve both sizes and both
+# targets. Only `storage` differs, because it is whatever is left.
 #
-# Name,     Type, SubType,  Offset,    Size,      Flags
-nvs,        data, nvs,      0x9000,    0x6000,
-otadata,    data, ota,      0xf000,    0x2000,
-phy_init,   data, phy,      0x11000,   0x1000,
+# Name,     Type, SubType,  Offset,   Size,      Flags
+nvs,        data, nvs,      0x9000,   0x4000,
+otadata,    data, ota,      0xd000,   0x2000,
+phy_init,   data, phy,      0xf000,   0x1000,
+coredump,   data, coredump, 0x10000,  0x10000,
 # ota_0 is the loader, which runs first; ota_1 is the kernel it selects.
-ota_0,      app,  ota_0,    0x20000,   0x70000,
-ota_1,      app,  ota_1,    0x90000,   0x380000,
-coredump,   data, coredump, 0x410000,  0x10000,
-storage,    data, littlefs, 0x420000,  0x3E0000,
+ota_0,      app,  ota_0,    0x20000,  0x40000,
+ota_1,      app,  ota_1,    0x60000,  0x480000,
+storage,    data, littlefs, 0x4E0000,  0x320000,

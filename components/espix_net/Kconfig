@@ -275,4 +275,46 @@ menu "espix networking"
             rebuild. Turn the option itself off to leave mDNS out of the image
             entirely.
 
+    #
+    # Thread (IEEE 802.15.4). The S31's radio is on the same die as the
+    # application core, so OpenThread runs in this firmware: no RCP, no Spinel
+    # and no second host. See components/espix_net/thread/.
+    #
+    config ESPIX_THREAD
+        bool "Thread (IEEE 802.15.4 / OpenThread)"
+        depends on SOC_IEEE802154_SUPPORTED
+        select OPENTHREAD_ENABLED
+        select MBEDTLS_SSL_PROTO_DTLS
+        select MBEDTLS_ECJPAKE_C
+        select MBEDTLS_KEY_EXCHANGE_ECJPAKE
+        default n
+        help
+            Runs OpenThread natively on the on-die 802.15.4 radio and presents
+            it as thread0, beside wlan0 and eth0. The \`thread\` command drives
+            it: status, start/stop, attach, and border routing when built in.
+
+            Off by default. /etc/thread.conf with enabled=yes starts it at boot;
+            \`thread start\` starts it by hand. IDF's ot_rcp and ot_br examples
+            default to a UART RCP for a two-SoC host, which is not this shape.
+
+    config ESPIX_THREAD_BORDER_ROUTER
+        bool "Thread border router (NAT64 to the backbone)"
+        depends on ESPIX_THREAD
+        select OPENTHREAD_BORDER_ROUTER
+        select LWIP_IPV6_FORWARD
+        select LWIP_IPV6_AUTOCONFIG
+        select LWIP_NETIF_STATUS_CALLBACK
+        default n
+        help
+            Builds OpenThread's border routing: the Thread mesh reaches the
+            backbone through NAT64. The backbone is named by backbone= in
+            /etc/thread.conf (eth0 by default) and must exist when Thread
+            starts; eth0 is the sane choice on an S31 because it does not share
+            the 2.4 GHz radio with WiFi.
+
+            Also needs lwIP's IPv6 forwarding and more IPv6 addresses than the
+            default three -- OpenThread's netif glue refuses to build with
+            anything but LWIP_IPV6_NUM_ADDRESSES=12 -- and lwIP's netif status
+            callback, which the prebuilt border-router library calls.
+
 endmenu

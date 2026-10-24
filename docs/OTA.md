@@ -56,6 +56,10 @@ for nothing.
 
 ### Proposed 16MB table -- and `/` keeps everything on it
 
+*(Superseded: the loader layout in section 11 is what the tables use now, and it
+moves `storage`. This section is kept for the reasoning that chose the A/B slot
+sizes.)*
+
 The recommended layout holds `storage`, `coredump` and `nvs` at **the exact
 offset and size they have today**, so `/` does not have to be reflashed or
 reformatted:
@@ -202,7 +206,8 @@ against a 1.42 MiB image. On 8MB this is a genuine trade, not a free one.
 
 * **Superseded.** The A/B-era decision was "no OTA, `factory` only" for 8MB,
   because two useful slots did not fit. The loader design (section 11) removed
-  that trade -- one 2MB kernel slot, a 320KB loader and a 5.5MB rootfs fit -- so
+  that trade -- one 4.5MB kernel slot, a 256KB loader and a 3.1MB rootfs fit on
+  8MB -- so
   the 8MB table now uses the same layout as the 16MB one and OTA is on for both.
   The arithmetic above is what set the slot sizes, not whether to have any.
 
@@ -795,22 +800,26 @@ Still open:
 A second shape, prototyped on the `bootloader-and-bigger-kernel-space` branch.
 Instead of two equal A/B slots, a small loader and one big kernel slot. The
 kernel gets the space two slots used to share, the loader goes first so it can
-do its work before a kernel exists, and rootfs does not move.
+do its work before a kernel exists.
 
 ```
 # Name,     Type, SubType,  Offset,    Size,      Flags
-nvs,        data, nvs,      0x9000,    0x6000,
-otadata,    data, ota,      0xf000,    0x2000,
-phy_init,   data, phy,      0x11000,   0x1000,
-ota_0,      app,  ota_0,    0x20000,   0x70000,     # loader, runs first
-ota_1,      app,  ota_1,    0x90000,   0x380000,    # kernel
-coredump,   data, coredump, 0x410000,  0x10000,
-storage,    data, littlefs, 0x420000,  0xBE0000,
+nvs,        data, nvs,      0x9000,    0x4000,
+otadata,    data, ota,      0xd000,    0x2000,
+phy_init,   data, phy,      0xf000,    0x1000,
+coredump,   data, coredump, 0x10000,   0x10000,
+ota_0,      app,  ota_0,    0x20000,   0x40000,     # loader, runs first
+ota_1,      app,  ota_1,    0x60000,   0x480000,    # kernel
+storage,    data, littlefs, 0x4E0000,  0xB20000,
 ```
 
-3.5 MiB for the kernel and 448 KiB for the loader -- the two app slots occupy
-exactly the region two equal A/B slots did -- and `storage` is byte-for-byte
-where it was.
+4.5 MiB for the kernel and 256 KiB for the loader. `nvs` is 0x4000, as IDF's
+own two-OTA example uses, and that is what lets the first app start at 0x20000
+with a 64 KiB coredump ahead of it: no gaps, and `coredump`, `ota_0` and
+`ota_1` all on 64 KiB boundaries, so the table stays valid if Secure Boot v1 is
+ever enabled. The same table now serves the S3 and the S31 -- they differ only
+in `storage` -- and it moves `storage` to 0x4E0000, so the rootfs is reflashed
+once, because littlefs cannot move.
 
 The loader is built with `-Os` (the kernel is on `-Og` and stays there),
 asserts off, nano printf and no err-to-name. It keeps INFO logging, a banner and
@@ -822,8 +831,9 @@ only visible to whoever is watching UART, and that is worth the few kilobytes.
 | `-Os`, INFO logs and banner, asserts off, nano printf | **198 KiB** |
 | plus `-flto` | does not link -- IDF's asm stubs lose `xt_unhandled_exception` |
 
-198 KiB sits in a 448 KiB slot with 57% free, which is the headroom the partition
-tables it will carry are meant to use.
+Around 200-220 KiB sits in a 256 KiB slot -- measured 223,248 bytes on the S31
+and 205,600 on the S3, so 15% and 22% free. That is deliberate margin rather
+than slack: the loader is the recovery path.
 
 **The loader must be an OTA partition, not `factory`.** `factory` is not an
 OTA subtype (`esp_ota_ops.c`, `is_ota_partition()`), so
@@ -963,9 +973,9 @@ The cost is one build-time warning: IDF checks the app against the first OTA
 partition, which here is the *loader*, so it prints
 
     Warning: 1/2 app partitions are too small for binary espix.bin ...
-      - Part 'ota_0' ... size 0x70000 (overflow ...)
+      - Part 'ota_0' ... size 0x40000 (overflow ...)
 
-The kernel goes to `ota_1` (0x380000) and fits; the warning is aimed at the
+The kernel goes to `ota_1` (0x480000) and fits; the warning is aimed at the
 wrong slot and is harmless.
 
 The board identity follows from this: target and PSRAM, with flash size
@@ -976,9 +986,10 @@ is plain `s31`, and one build serves every WROOM-3 module (the image targets
 that module's 16 MB flash).
 
 The S31's table also starts fresh, with no legacy to match: the loader takes
-320 KB, the kernel slot 3.5 MB, and `storage` begins at 0x3F0000 and fills the
-rest -- about 4 MB even on an 8 MB module. There are 8, 16 and 32 MB tables,
-differing only in `storage`'s size, exactly as the S3's pair does.
+256 KB, the kernel slot 4.5 MB, and `storage` begins at 0x4E0000 and fills the
+rest -- 3.125 MB on an 8 MB module, 11.125 MB on a 16 MB one. There are 8, 16
+and 32 MB tables, differing only in `storage`'s size, and they are now the same
+through `ota_1` as the S3's pair.
 
 **Two hashes live in the image, and they answer different questions:**
 
