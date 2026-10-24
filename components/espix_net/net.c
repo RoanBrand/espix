@@ -10,6 +10,8 @@
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"   /* esp_netif_get_netif_impl: the lwIP netif */
+#include "lwip/ip6_addr.h"
 #include "lwip/lwip_napt.h"
 #include "lwip/netdb.h"
 #include "nvs_flash.h"
@@ -54,6 +56,29 @@ int espix_net_prefix_len(uint32_t netmask)
         }
     }
     return bits;
+}
+
+/*
+ * IPv6 addresses from a netif. lwIP tracks which of its address slots are in
+ * use (state) but not the prefix length, so the caller says what to print.
+ */
+static void fill_ip6(struct netif *n, espix_ifinfo_t *out, uint8_t prefix)
+{
+#if LWIP_IPV6
+    for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES && out->n_ip6 < ESPIX_IP6_MAX; i++) {
+        const ip6_addr_t *a = netif_ip6_addr(n, i);
+        if (a == NULL || ip6_addr_isinvalid(netif_ip6_addr_state(n, i))) {
+            continue;
+        }
+        (void)ip6addr_ntoa_r(a, out->ip6[out->n_ip6], ESPIX_IP6STR_MAX);
+        out->ip6_prefix[out->n_ip6] = prefix;
+        out->n_ip6++;
+    }
+#else
+    (void)n;
+    (void)out;
+    (void)prefix;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -170,6 +195,8 @@ static void fill_raw_ifinfo(const char *name, struct netif *n, espix_ifinfo_t *o
         out->netmask  = ip4_addr_get_u32(netif_ip4_netmask(n));
         out->gw       = ip4_addr_get_u32(netif_ip4_gw(n));
     }
+
+    fill_ip6(n, out, 64);
 }
 
 static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
@@ -187,6 +214,9 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
         out->netmask  = 0x000000ff;   /* /8 */
         out->mtu      = 65535;
         out->index    = 1;
+        strlcpy(out->ip6[0], "::1", ESPIX_IP6STR_MAX);
+        out->ip6_prefix[0] = 128;
+        out->n_ip6         = 1;
         return;
     }
 
@@ -221,6 +251,30 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
         out->netmask  = ip.netmask.addr;
         out->gw       = ip.gw.addr;
     }
+
+    struct netif *n = (struct netif *)esp_netif_get_netif_impl(e->netif);
+    if (n != NULL) {
+        fill_ip6(n, out, 64);
+    }
+
+#if CONFIG_ESPIX_THREAD
+    /*
+     * Thread's addresses are OpenThread's: the mesh-local prefix, the RLOC, the
+     * link-local. Ask the stack rather than the glue's netif, which does not
+     * carry all of them.
+     */
+    if (e->kind == ESPIX_IF_THREAD) {
+        espix_thread_status_t st;
+        if (espix_thread_status(&st) == ESP_OK && st.started && st.n_addrs > 0) {
+            out->n_ip6 = 0;
+            for (size_t k = 0; k < st.n_addrs && out->n_ip6 < ESPIX_IP6_MAX; k++) {
+                strlcpy(out->ip6[out->n_ip6], st.addrs[k], ESPIX_IP6STR_MAX);
+                out->ip6_prefix[out->n_ip6] = 64;
+                out->n_ip6++;
+            }
+        }
+    }
+#endif
 }
 
 size_t espix_net_iflist(espix_ifinfo_t *out, size_t n)

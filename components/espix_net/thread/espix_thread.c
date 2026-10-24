@@ -456,7 +456,7 @@ esp_err_t espix_thread_status(espix_thread_status_t *out)
     out->ip6_enabled = otIp6IsEnabled(instance);
     out->rloc16      = otThreadGetRloc16(instance);
     for (const otNetifAddress *a = otIp6GetUnicastAddresses(instance);
-         a != NULL && out->n_addrs < 4; a = a->mNext) {
+         a != NULL && out->n_addrs < ESPIX_THREAD_ADDR_MAX; a = a->mNext) {
         otIp6AddressToString(&a->mAddress, out->addrs[out->n_addrs],
                              sizeof(out->addrs[0]));
         out->n_addrs++;

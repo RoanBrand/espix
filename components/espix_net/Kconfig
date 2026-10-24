@@ -304,6 +304,7 @@ menu "espix networking"
         select LWIP_IPV6_FORWARD
         select LWIP_IPV6_AUTOCONFIG
         select LWIP_NETIF_STATUS_CALLBACK
+        select OPENTHREAD_DNS64_CLIENT
         default n
         help
             Builds OpenThread's border routing: the Thread mesh reaches the
@@ -311,6 +312,13 @@ menu "espix networking"
             /etc/thread.conf (eth0 by default) and must exist when Thread
             starts; eth0 is the sane choice on an S31 because it does not share
             the 2.4 GHz radio with WiFi.
+
+            DNS64 goes with NAT64: a Thread client can only reach an IPv4 name
+            if resolution comes back as a NAT64 address. The DNS64 client points
+            OpenThread's DNS at OPENTHREAD_DNS_SERVER_ADDR encoded into the
+            NAT64 prefix, so that symbol must name an IPv4 resolver the backbone
+            can reach -- 8.8.8.8 by default, which is not reachable from every
+            bench, so set it to the uplink's resolver there.
 
             Also needs lwIP's IPv6 forwarding and more IPv6 addresses than the
             default three -- OpenThread's netif glue refuses to build with

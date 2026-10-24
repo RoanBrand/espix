@@ -28,6 +28,8 @@ extern "C" {
 #define ESPIX_PSK_MAX       65      /* 64 + NUL */
 #define ESPIX_HOSTNAME_MAX  33
 #define ESPIX_IP4STR_MAX    16      /* "255.255.255.255" */
+#define ESPIX_IP6STR_MAX    46      /* "ffff:ffff:...:255.255.255.255" + NUL */
+#define ESPIX_IP6_MAX       6       /* addresses rendered per interface */
 
 typedef enum {
     ESPIX_IF_LO = 0,
@@ -53,6 +55,16 @@ typedef struct {
     uint32_t        ip;
     uint32_t        netmask;
     uint32_t        gw;
+
+    /*
+     * IPv6 addresses, as text. lwIP keeps the addresses but no prefix length,
+     * so each carries the prefix its kind implies: 64 for a mesh or SLAAC
+     * address, 128 for the loopback. Thread's list comes from OpenThread, not
+     * from the glue's lwIP netif, because it is OpenThread that owns them.
+     */
+    char            ip6[ESPIX_IP6_MAX][ESPIX_IP6STR_MAX];
+    uint8_t         ip6_prefix[ESPIX_IP6_MAX];
+    uint8_t         n_ip6;
 
     /*
      * Ethernet only: what the PHY negotiated. Zero speed means no carrier, so

@@ -12,6 +12,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+
 #include "ping/ping_sock.h"
 
 #include "espix_cmds_priv.h"
@@ -82,11 +85,20 @@ static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
         espix_printf(s, "    link/ether %s\n", mac);
     }
 
-    if (with_addr && i->has_addr) {
-        char ip[ESPIX_IP4STR_MAX];
-        espix_printf(s, "    inet %s/%d\n",
-                     espix_net_ip4str(i->ip, ip, sizeof(ip)),
-                     espix_net_prefix_len(i->netmask));
+    if (with_addr) {
+        if (i->has_addr) {
+            char ip[ESPIX_IP4STR_MAX];
+            espix_printf(s, "    inet %s/%d\n",
+                         espix_net_ip4str(i->ip, ip, sizeof(ip)),
+                         espix_net_prefix_len(i->netmask));
+        }
+        for (uint8_t k = 0; k < i->n_ip6; k++) {
+            const char *scope = (strncmp(i->ip6[k], "fe80", 4) == 0) ? "link"
+                              : (strcmp(i->ip6[k], "::1") == 0)     ? "host"
+                                                                    : "global";
+            espix_printf(s, "    inet6 %s/%u scope %s\n", i->ip6[k],
+                         i->ip6_prefix[k], scope);
+        }
     }
 }
 
@@ -133,6 +145,56 @@ static int ip_route(espix_session_t *s)
                                       net, sizeof(net)),
                      espix_net_prefix_len(ifs[i].netmask),
                      ifs[i].name);
+    }
+    return 0;
+}
+
+/*
+ * host: what a name resolves to, in both families. espix's own commands were
+ * IPv4-only -- ping resolves a 32-bit address -- so this is the view that shows
+ * an AAAA at all, and the one that shows what DNS64 hands a Thread client: a v4
+ * name answered as an address in the border router's NAT64 prefix.
+ */
+static int cmd_host(espix_session_t *s, int argc, char **argv)
+{
+    if (argc < 2) {
+        espix_eprintf(s, "usage: host <name>\n");
+        return 1;
+    }
+
+    const struct addrinfo hints = {
+        .ai_family   = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(argv[1], NULL, &hints, &res) != 0 || res == NULL) {
+        espix_eprintf(s, "host: %s: not found\n", argv[1]);
+        return 1;
+    }
+
+    int shown = 0;
+    for (const struct addrinfo *a = res; a != NULL; a = a->ai_next) {
+        char buf[46];               /* enough for the longest IPv6 text */
+
+        if (a->ai_family == AF_INET) {
+            const struct sockaddr_in *in = (const struct sockaddr_in *)a->ai_addr;
+            espix_printf(s, "%s has address %s\n", argv[1],
+                         lwip_inet_ntop(AF_INET, &in->sin_addr, buf, sizeof(buf)));
+            shown++;
+        } else if (a->ai_family == AF_INET6) {
+            const struct sockaddr_in6 *in6 =
+                (const struct sockaddr_in6 *)a->ai_addr;
+            espix_printf(s, "%s has IPv6 address %s\n", argv[1],
+                         lwip_inet_ntop(AF_INET6, &in6->sin6_addr, buf,
+                                        sizeof(buf)));
+            shown++;
+        }
+    }
+    freeaddrinfo(res);
+
+    if (shown == 0) {
+        espix_eprintf(s, "host: %s: no addresses\n", argv[1]);
+        return 1;
     }
     return 0;
 }
@@ -210,6 +272,13 @@ static int cmd_ifconfig(espix_session_t *s, int argc, char **argv)
             espix_printf(s, "          inet addr:%s  Mask:%s\n",
                          espix_net_ip4str(f->ip, ip, sizeof(ip)),
                          espix_net_ip4str(f->netmask, nm, sizeof(nm)));
+        }
+        for (uint8_t k = 0; k < f->n_ip6; k++) {
+            const char *scope = (strncmp(f->ip6[k], "fe80", 4) == 0) ? "Link"
+                              : (strcmp(f->ip6[k], "::1") == 0)     ? "Host"
+                                                                    : "Global";
+            espix_printf(s, "          inet6 addr: %s/%u  Scope:%s\n",
+                         f->ip6[k], f->ip6_prefix[k], scope);
         }
 
         espix_printf(s, "          %s  MTU:%u\n",
@@ -937,6 +1006,9 @@ static espix_cmd_t s_net_cmds[] = {
       .help = "configure and inspect the USB-NCM link",
       .usage = "usb {status|mode {server|client}}" },
 #endif
+    { .name = "host",     .fn = cmd_host,
+      .help = "resolve a name, in both address families",
+      .usage = "host <name>" },
     { .name = "hostname", .fn = cmd_hostname,
       .help = "show or set the hostname",
       .usage = "hostname [name]" },

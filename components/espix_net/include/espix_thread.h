@@ -27,6 +27,10 @@ extern "C" {
 
 #define ESPIX_THREAD_IF_NAME "thread0"
 
+/* Four was not enough: the link-local is the address that proves the interface
+ * has one at all, and it was the one being dropped. */
+#define ESPIX_THREAD_ADDR_MAX 6
+
 typedef struct {
     bool     started;        /* the stack was started */
     bool     if_up;          /* thread0 is administratively up */
@@ -35,7 +39,7 @@ typedef struct {
     char     role[24];       /* "disabled", "detached", "child", ... */
     uint16_t rloc16;
     size_t   n_addrs;        /* how many of addrs[] are filled */
-    char     addrs[4][40];   /* formatted IPv6 addresses */
+    char     addrs[ESPIX_THREAD_ADDR_MAX][40];
     bool     border_router;  /* border routing initialised this boot */
 } espix_thread_status_t;
 
