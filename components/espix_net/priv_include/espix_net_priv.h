@@ -87,3 +87,10 @@ esp_err_t espix_net_napt_netif(struct netif *netif, bool enable);
  */
 void espix_net_register_netif(const char *name, struct netif *netif);
 void espix_net_unregister_netif(struct netif *netif);
+
+/*
+ * Give an interface its IPv6 link-local, as Linux gives every interface one.
+ * Called from the GOT_IP paths because creation needs the netif up. No-op
+ * without IPv6, and harmless when one is already there.
+ */
+esp_err_t espix_net_ip6_linklocal(esp_netif_t *netif);

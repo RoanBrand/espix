@@ -41,6 +41,7 @@ typedef struct {
     size_t   n_addrs;        /* how many of addrs[] are filled */
     char     addrs[ESPIX_THREAD_ADDR_MAX][40];
     bool     border_router;  /* border routing initialised this boot */
+    bool     nat64;          /* the NAT64 prefix manager is publishing */
 } espix_thread_status_t;
 
 /* Called by espix_net_init(): starts the stack only if /etc/thread.conf says

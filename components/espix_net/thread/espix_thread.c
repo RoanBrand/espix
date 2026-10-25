@@ -35,6 +35,7 @@
 #include "openthread/cli.h"
 #include "openthread/dataset.h"
 #include "openthread/instance.h"
+#include "openthread/nat64.h"
 #include "openthread/ip6.h"
 #include "openthread/thread.h"
 
@@ -201,10 +202,19 @@ esp_err_t espix_thread_border_router(bool on)
      */
     esp_openthread_lock_acquire(portMAX_DELAY);
 
+    otInstance *instance = esp_openthread_get_instance();
+
     if (!on) {
         if (!s_border_router) {
             esp_openthread_lock_release();
             return ESP_OK;
+        }
+        /*
+         * NAT64 first: it publishes a route into the Thread network data, and
+         * that route has to go before the routing manager that owns it does.
+         */
+        if (instance != NULL) {
+            otNat64SetEnabled(instance, false);
         }
         const esp_err_t err = esp_openthread_border_router_deinit();
         if (err == ESP_OK) {
@@ -225,7 +235,6 @@ esp_err_t espix_thread_border_router(bool on)
      * ESP_ERR_INVALID_STATE here instead of panicking; the command turns that
      * into "run 'thread attach' first".
      */
-    otInstance *instance = esp_openthread_get_instance();
     if (instance == NULL || !otIp6IsEnabled(instance)) {
         esp_openthread_lock_release();
         return ESP_ERR_INVALID_STATE;
@@ -234,6 +243,18 @@ esp_err_t espix_thread_border_router(bool on)
     const esp_err_t err = esp_openthread_border_router_init();
     if (err == ESP_OK) {
         s_border_router = true;
+
+        /*
+         * NAT64 is what lets the Thread side reach the IPv4 internet, and it is
+         * off until told otherwise. With the prefix manager disabled,
+         * Evaluate() returns immediately, no NAT64 route appears in the Thread
+         * network data, and IDF's DNS64 client -- which reads that route -- has
+         * nothing to encode a resolver into. Measured on the S31: without this
+         * call the BR reports a local prefix of its own (br nat64prefix) but
+         * publishes no route, and 'nat64 state' says Disabled; with it, the
+         * route appears and the DNS64 client sets its server address.
+         */
+        otNat64SetEnabled(instance, true);
     }
     esp_openthread_lock_release();
     return err;
@@ -454,6 +475,9 @@ esp_err_t espix_thread_status(espix_thread_status_t *out)
 
     const otDeviceRole role = otThreadGetDeviceRole(instance);
     out->ip6_enabled = otIp6IsEnabled(instance);
+#if CONFIG_ESPIX_THREAD_BORDER_ROUTER
+    out->nat64 = (otNat64GetPrefixManagerState(instance) == OT_NAT64_STATE_ACTIVE);
+#endif
     out->rloc16      = otThreadGetRloc16(instance);
     for (const otNetifAddress *a = otIp6GetUnicastAddresses(instance);
          a != NULL && out->n_addrs < ESPIX_THREAD_ADDR_MAX; a = a->mNext) {

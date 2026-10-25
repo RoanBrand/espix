@@ -70,7 +70,17 @@ static void fill_ip6(struct netif *n, espix_ifinfo_t *out, uint8_t prefix)
         if (a == NULL || ip6_addr_isinvalid(netif_ip6_addr_state(n, i))) {
             continue;
         }
-        (void)ip6addr_ntoa_r(a, out->ip6[out->n_ip6], ESPIX_IP6STR_MAX);
+        char *text = out->ip6[out->n_ip6];
+        (void)ip6addr_ntoa_r(a, text, ESPIX_IP6STR_MAX);
+
+        /* lwIP prints these in upper case; Linux and OpenThread do not, and the
+         * scope check below spells its link-local prefix in lower case. */
+        for (; *text != '\0'; text++) {
+            if (*text >= 'A' && *text <= 'F') {
+                *text = (char)(*text - 'A' + 'a');
+            }
+        }
+
         out->ip6_prefix[out->n_ip6] = prefix;
         out->n_ip6++;
     }
@@ -133,6 +143,48 @@ const char *espix_net_name_of(esp_netif_t *netif)
         }
     }
     return NULL;
+}
+
+/*
+ * Every interface gets an IPv6 link-local once it is up, the way Linux gives
+ * one to every interface. esp_netif does not, and without it the interface has
+ * no IPv6 at all -- which is also why OpenThread's border router could not send
+ * a Router Solicitation on the backbone ("Failed to send RS", once per
+ * interval) and therefore had no upstream NAT64 prefix to learn.
+ *
+ * Creation only works on an up netif, so this is called from the GOT_IP paths
+ * rather than at registration. Doing it twice is harmless: the getter answers
+ * first.
+ */
+esp_err_t espix_net_ip6_linklocal(esp_netif_t *netif)
+{
+#if CONFIG_LWIP_IPV6
+    if (netif == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *name = espix_net_name_of(netif);
+    if (name == NULL) {
+        name = "?";
+    }
+
+    esp_ip6_addr_t existing;
+    if (esp_netif_get_ip6_linklocal(netif, &existing) == ESP_OK) {
+        return ESP_OK;
+    }
+
+    const esp_err_t err = esp_netif_create_ip6_linklocal(netif);
+    if (err == ESP_OK) {
+        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: IPv6 link-local up", name);
+    } else {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no IPv6 link-local: %s",
+                   name, esp_err_to_name(err));
+    }
+    return err;
+#else
+    (void)netif;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 #define ESPIX_RAW_MAX 4

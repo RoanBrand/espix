@@ -47,6 +47,7 @@ static void thread_show_status(espix_session_t *s)
         espix_printf(s, "  rloc16      0x%04x\n", (unsigned)st.rloc16);
     }
     espix_printf(s, "  border      %s\n", st.border_router ? "on" : "off");
+    espix_printf(s, "  nat64       %s\n", st.nat64 ? "active" : "off");
     for (size_t i = 0; i < st.n_addrs; i++) {
         espix_printf(s, "  %s%s\n", i == 0 ? "inet6      " : "           ",
                      st.addrs[i]);

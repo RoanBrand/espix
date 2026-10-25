@@ -369,6 +369,9 @@ static void on_ip_event(void *arg, esp_event_base_t base,
                        espix_net_ip4str(dns[i], d, sizeof(d)));
         }
 
+        /* The netif is up now, which is the only time this works. */
+        (void)espix_net_ip6_linklocal(ev->esp_netif);
+
         /* Last: the interface is fully up, and this is the message the console
          * has been holding its first prompt for. */
         release_boot_hold();

@@ -162,24 +162,32 @@ NAT64 prefix. That address is an IPv4 resolver reachable from the backbone; the
 default is 8.8.8.8, so set it to the uplink's resolver on a network that does not
 reach it.
 
-The prefix itself comes from the network: the border router learns it from the
-upstream router, and to ask it has to send a Router Solicitation on the backbone
--- which needs an IPv6 link-local on that interface. esp_netif does not create
-one, so on this build the border router logged `BorderRouting: Failed to send
-RS` once per interval and the DNS64 client never had a prefix to work with.
-Creating a link-local when an interface comes up is the next piece of the IPv6
-surface, and it is also what makes `eth0`/ `wlan0` show a `fe80::` address at
-all. On an IPv4-only backbone there is no upstream prefix to learn in any case;
-OT then falls back to the well-known `64:ff9b::/96` only if the build enables
-it.
+The prefix comes from the border router itself. OpenThread generates a local
+NAT64 prefix from the BR ULA (`fd9c:a3f8:cd42:2::/96` on this board) and
+publishes it as a route in the Thread network data -- but not on its own. The
+prefix manager starts disabled, and with it disabled `Evaluate()` returns
+immediately, so no route is published and IDF's DNS64 client, which reads that
+route to learn what to encode a resolver into, stays quiet. espix turns it on
+with `otNat64SetEnabled(instance, true)` as border routing is initialised, and
+off again as it is torn down. Measured before and after: `nat64 state` goes
+from Disabled to Active, `netdata show` gains
+`fd9c:a3f8:cd42:2:0:0::/96 sn low`, and the klog gains
+`Set dns server address: FD9C:A3F8:CD42:2::C0A8:6E01` -- the uplink resolver,
+192.168.110.1, encoded in the prefix. `thread status` shows it as
+`nat64 active`.
+
+The Router Solicitation still matters for the other case: when the network does
+have an IPv6 router, the border router learns a NAT64 prefix from it, and to ask
+it has to send an RS on the backbone -- which needs an IPv6 link-local on that
+interface. espix creates one on every esp_netif interface as it comes up
+(`espix_net_ip6_linklocal()`, called from the GOT_IP path because creation only
+works on an up netif), so `eth0` and `wlan0` carry a `fe80::` address and the
+RS has somewhere to come from.
 
 ## 10. What is not done
 
 - The dataset hex is ~500 digits and the shell caps a line at 255 bytes, which is
   why `thread join` takes `-f <file>`: `thread dataset > f`, then
   `thread join -f f`.
-- `wlan0` and `eth0` have no IPv6 addresses because esp_netif does not create a
-  link-local for them; only `lo` and `thread0` do. That is also why the border
-  router cannot send its Router Solicitation on the backbone.
 - `ping` is IPv4-only; the resolver it uses returns a 32-bit address. `host`
   resolves both families, and the AAAA path is verified against ipv6.google.com.
