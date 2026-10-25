@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include "lwip/inet.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
@@ -21,6 +22,7 @@
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_shell.h"
+#include "espix_thread.h"
 #include "sdkconfig.h"
 
 #define IFLIST_MAX 6
@@ -70,8 +72,19 @@ static bool media_str(const espix_ifinfo_t *i, char *buf, size_t len)
     return true;
 }
 
+static const char *ip6_scope(const char *addr)
+{
+    if (strncmp(addr, "fe80", 4) == 0) {
+        return "link";
+    }
+    if (strcmp(addr, "::1") == 0) {
+        return "host";
+    }
+    return "global";
+}
+
 static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
-                           bool with_addr)
+                           bool with_addr, bool v4, bool v6)
 {
     espix_printf(s, "%d: %s: <%s%s> mtu %u\n",
                  i->index, i->name,
@@ -85,28 +98,64 @@ static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
         espix_printf(s, "    link/ether %s\n", mac);
     }
 
-    if (with_addr) {
-        if (i->has_addr) {
-            char ip[ESPIX_IP4STR_MAX];
-            espix_printf(s, "    inet %s/%d\n",
-                         espix_net_ip4str(i->ip, ip, sizeof(ip)),
-                         espix_net_prefix_len(i->netmask));
-        }
+    if (!with_addr) {
+        return;
+    }
+
+    if (v4 && i->has_addr) {
+        char ip[ESPIX_IP4STR_MAX];
+        espix_printf(s, "    inet %s/%d\n",
+                     espix_net_ip4str(i->ip, ip, sizeof(ip)),
+                     espix_net_prefix_len(i->netmask));
+    }
+    if (v6) {
         for (uint8_t k = 0; k < i->n_ip6; k++) {
-            const char *scope = (strncmp(i->ip6[k], "fe80", 4) == 0) ? "link"
-                              : (strcmp(i->ip6[k], "::1") == 0)     ? "host"
-                                                                    : "global";
             espix_printf(s, "    inet6 %s/%u scope %s\n", i->ip6[k],
-                         i->ip6_prefix[k], scope);
+                         i->ip6_prefix[k], ip6_scope(i->ip6[k]));
         }
     }
+}
+
+/*
+ * ip -br: one line per interface, the shape iproute2's brief mode prints --
+ * state first, then addresses. Trailing spaces are avoided by leading each
+ * address with a space rather than ending with one.
+ */
+static void print_ip_brief(espix_session_t *s, const espix_ifinfo_t *i,
+                           bool with_addr, bool v4, bool v6)
+{
+    espix_printf(s, "%-10s %-5s", i->name, i->up ? "UP" : "DOWN");
+
+    if (!with_addr) {
+        if (i->has_mac) {
+            char mac[18];
+            mac_str(i->mac, mac, sizeof(mac));
+            espix_printf(s, " %s", mac);
+        }
+        espix_printf(s, " mtu %u", (unsigned)i->mtu);
+        espix_puts(s, "\n");
+        return;
+    }
+
+    if (v4 && i->has_addr) {
+        char ip[ESPIX_IP4STR_MAX];
+        espix_printf(s, " %s/%d", espix_net_ip4str(i->ip, ip, sizeof(ip)),
+                     espix_net_prefix_len(i->netmask));
+    }
+    if (v6) {
+        for (uint8_t k = 0; k < i->n_ip6; k++) {
+            espix_printf(s, " %s/%u", i->ip6[k], i->ip6_prefix[k]);
+        }
+    }
+    espix_puts(s, "\n");
 }
 
 /* ------------------------------------------------------------------ */
 /* ip                                                                  */
 /* ------------------------------------------------------------------ */
 
-static int ip_show(espix_session_t *s, const char *dev, bool with_addr)
+static int ip_show(espix_session_t *s, const char *dev, bool with_addr,
+                   bool v4, bool v6, bool brief)
 {
     espix_ifinfo_t ifs[IFLIST_MAX];
     const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
@@ -115,36 +164,105 @@ static int ip_show(espix_session_t *s, const char *dev, bool with_addr)
         if (dev != NULL && strcmp(dev, ifs[i].name) != 0) {
             continue;
         }
-        print_ip_iface(s, &ifs[i], with_addr);
+        if (brief) {
+            print_ip_brief(s, &ifs[i], with_addr, v4, v6);
+        } else {
+            print_ip_iface(s, &ifs[i], with_addr, v4, v6);
+        }
     }
     return 0;
 }
 
-static int ip_route(espix_session_t *s)
+/*
+ * The on-link prefix an address belongs to: the address with every bit past the
+ * prefix length cleared. Linux prints the network, not the host address, and the
+ * two differ whenever the host part is not zero.
+ */
+static bool ip6_net_of(const char *addr, uint8_t prefix, char *out, size_t len)
 {
-    char     dev[ESPIX_IF_NAME_MAX];
-    uint32_t gw = 0;
+    struct in6_addr a6;
 
-    if (espix_net_default_route(dev, sizeof(dev), &gw)) {
-        char g[ESPIX_IP4STR_MAX];
-        espix_printf(s, "default via %s dev %s\n",
-                     espix_net_ip4str(gw, g, sizeof(g)), dev);
+    if (prefix > 128 || lwip_inet_pton(AF_INET6, addr, &a6) != 1) {
+        return false;
     }
+    for (int bit = prefix; bit < 128; bit++) {
+        a6.s6_addr[bit / 8] &= (uint8_t)~(0x80 >> (bit % 8));
+    }
+    if (lwip_inet_ntop(AF_INET6, &a6, out, len) == NULL) {
+        return false;
+    }
+    /* lwIP's text is upper case; Linux's is not, and so is not this. */
+    for (char *c = out; *c != '\0'; c++) {
+        if (*c >= 'A' && *c <= 'F') {
+            *c = (char)(*c - 'A' + 'a');
+        }
+    }
+    return true;
+}
 
-    /* On-link routes, which are implicit in each interface's address/mask. */
+static void ip_route6(espix_session_t *s, const espix_ifinfo_t *ifs, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        char    seen[4][ESPIX_IP6STR_MAX];
+        uint8_t n_seen = 0;
+
+        for (uint8_t k = 0; k < ifs[i].n_ip6; k++) {
+            char net[ESPIX_IP6STR_MAX];
+
+            if (!ip6_net_of(ifs[i].ip6[k], ifs[i].ip6_prefix[k], net,
+                            sizeof(net))) {
+                continue;
+            }
+            /* Addresses that share a prefix are one route, as Linux shows it. */
+            bool dup = false;
+            for (uint8_t d = 0; d < n_seen; d++) {
+                if (strcmp(seen[d], net) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            if (n_seen < sizeof(seen) / sizeof(seen[0])) {
+                strlcpy(seen[n_seen++], net, sizeof(seen[0]));
+            }
+            espix_printf(s, "%s/%u dev %s proto kernel scope link\n", net,
+                         ifs[i].ip6_prefix[k], ifs[i].name);
+        }
+    }
+}
+
+static int ip_route(espix_session_t *s, bool v4, bool v6)
+{
     espix_ifinfo_t ifs[IFLIST_MAX];
     const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
 
-    for (size_t i = 0; i < n; i++) {
-        if (!ifs[i].has_addr || ifs[i].kind == ESPIX_IF_LO) {
-            continue;
+    if (v4) {
+        char     dev[ESPIX_IF_NAME_MAX];
+        uint32_t gw = 0;
+
+        if (espix_net_default_route(dev, sizeof(dev), &gw)) {
+            char g[ESPIX_IP4STR_MAX];
+            espix_printf(s, "default via %s dev %s\n",
+                         espix_net_ip4str(gw, g, sizeof(g)), dev);
         }
-        char net[ESPIX_IP4STR_MAX];
-        espix_printf(s, "%s/%d dev %s scope link\n",
-                     espix_net_ip4str(ifs[i].ip & ifs[i].netmask,
-                                      net, sizeof(net)),
-                     espix_net_prefix_len(ifs[i].netmask),
-                     ifs[i].name);
+
+        /* On-link routes, which are implicit in each address/mask. */
+        for (size_t i = 0; i < n; i++) {
+            if (!ifs[i].has_addr || ifs[i].kind == ESPIX_IF_LO) {
+                continue;
+            }
+            char net[ESPIX_IP4STR_MAX];
+            espix_printf(s, "%s/%d dev %s scope link\n",
+                         espix_net_ip4str(ifs[i].ip & ifs[i].netmask,
+                                          net, sizeof(net)),
+                         espix_net_prefix_len(ifs[i].netmask), ifs[i].name);
+        }
+    }
+
+    if (v6) {
+        ip_route6(s, ifs, n);
     }
     return 0;
 }
@@ -201,8 +319,28 @@ static int cmd_host(espix_session_t *s, int argc, char **argv)
 
 static int cmd_ip(espix_session_t *s, int argc, char **argv)
 {
-    const char *obj = (argc > 1) ? argv[1] : "addr";
-    int         i   = 2;
+    int  fam   = 0;         /* 0: the object's default; 4 or 6: pinned */
+    bool brief = false;
+    int  i     = 1;
+
+    /*
+     * iproute2's flags come before the object: -4, -6, -br, -brief. Anything
+     * else breaks the loop and is taken as the object.
+     */
+    for (; i < argc; i++) {
+        if (strcmp(argv[i], "-6") == 0) {
+            fam = 6;
+        } else if (strcmp(argv[i], "-4") == 0) {
+            fam = 4;
+        } else if (strcmp(argv[i], "-br") == 0 ||
+                   strcmp(argv[i], "-brief") == 0) {
+            brief = true;
+        } else {
+            break;
+        }
+    }
+
+    const char *obj = (i < argc) ? argv[i++] : "addr";
 
     /*
      * Skip `show` and `dev`, which iproute2 accepts and mostly ignores:
@@ -221,18 +359,23 @@ static int cmd_ip(espix_session_t *s, int argc, char **argv)
 
     const char *dev = (i < argc) ? argv[i] : NULL;
 
+    /* addr and link show both families unless one is asked for. */
+    const bool v4 = (fam != 6);
+    const bool v6 = (fam != 4);
+
     /* Accept the usual abbreviations: ip a, ip l, ip r. */
     if (strncmp(obj, "a", 1) == 0) {
-        return ip_show(s, dev, true);
+        return ip_show(s, dev, true, v4, v6, brief);
     }
     if (strncmp(obj, "l", 1) == 0) {
-        return ip_show(s, dev, false);
+        return ip_show(s, dev, false, v4, v6, brief);
     }
     if (strncmp(obj, "r", 1) == 0) {
-        return ip_route(s);
+        /* route follows iproute2: IPv4 unless -6 is given. */
+        return ip_route(s, fam != 6, fam == 6);
     }
 
-    espix_eprintf(s, "usage: ip {addr|link|route} [dev]\n");
+    espix_eprintf(s, "usage: ip [-4|-6] [-br] {addr|link|route} [dev]\n");
     return 1;
 }
 
@@ -975,6 +1118,83 @@ static int cmd_bridge(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* ping6                                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * IPv6 ping is OpenThread's, because it cannot be lwIP's: lwIP's icmp6_input()
+ * answers echo *requests* itself and has no case for echo replies, so a raw
+ * ICMPv6 socket never sees the reply -- the packet falls to its default branch
+ * and is counted as a protocol error. So ping6 is the Thread mesh's ping and it
+ * reaches exactly what thread0 reaches; there is no ICMPv6 ping to delegate a
+ * wlan0 or eth0 address to.
+ */
+#if CONFIG_ESPIX_THREAD
+static void ping6_to_session(void *ctx, const char *text, size_t len)
+{
+    espix_session_t *s = (espix_session_t *)ctx;
+    (void)len;
+    espix_printf(s, "%s", text);
+}
+#endif
+
+static int cmd_ping6(espix_session_t *s, int argc, char **argv)
+{
+    const char *host  = NULL;
+    uint32_t    count = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            count = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else {
+            host = argv[i];
+        }
+    }
+    if (host == NULL) {
+        espix_eprintf(s, "usage: ping6 [-c count] <thread-addr>\n");
+        return 1;
+    }
+
+#if !CONFIG_ESPIX_THREAD
+    espix_eprintf(s, "ping6: no IPv6 ping in this build: it has no Thread\n"
+                    "  (ESPIX_THREAD is off), and lwIP has no ICMPv6 ping.\n");
+    return 1;
+#else
+    if (!espix_thread_is_started()) {
+        espix_eprintf(s, "ping6: no IPv6 ping: lwIP answers echo replies itself\n"
+                        "  and never passes them to a socket, so IPv6 ping is\n"
+                        "  OpenThread's. Start it first: 'thread start', then\n"
+                        "  'thread attach'.\n");
+        return 1;
+    }
+
+    /* ot's ping takes no zone; thread0 is the only interface it can reach. */
+    char addr[ESPIX_IP6STR_MAX];
+    strlcpy(addr, host, sizeof(addr));
+    char *pct = strchr(addr, '%');
+    if (pct != NULL) {
+        *pct = '\0';
+    }
+
+    /* ot's ping takes its arguments positionally: addr, size, count. */
+    unsigned pings = count ? (unsigned)count : 4;
+    if (pings > 8) {
+        pings = 8;      /* the CLI capture waits ten seconds */
+    }
+
+    char line[96];
+    snprintf(line, sizeof(line), "ping %s 32 %u", addr, pings);
+
+    const esp_err_t err = espix_thread_cli(line, ping6_to_session, s);
+    if (err != ESP_OK) {
+        espix_eprintf(s, "ping6: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+#endif
+    return 0;
+}
+
 /* Implemented in cmd_fetch.c: the HTTP(S) client lives there so this file
  * keeps to sockets and interfaces. */
 extern int cmd_fetch(espix_session_t *s, int argc, char **argv);
@@ -982,7 +1202,7 @@ extern int cmd_fetch(espix_session_t *s, int argc, char **argv);
 static espix_cmd_t s_net_cmds[] = {
     { .name = "ip",       .fn = cmd_ip,
       .help = "show addresses, links and routes",
-      .usage = "ip {addr|link|route} [dev]" },
+      .usage = "ip [-4|-6] [-br] {addr|link|route} [dev]" },
     { .name = "ifconfig", .fn = cmd_ifconfig,
       .help = "show interfaces (net-tools style)",
       .usage = "ifconfig [dev]" },
@@ -992,6 +1212,9 @@ static espix_cmd_t s_net_cmds[] = {
     { .name = "ping",     .fn = cmd_ping,
       .help = "send ICMP echo requests",
       .usage = "ping [-c count] <host>" },
+    { .name = "ping6",    .fn = cmd_ping6,
+      .help = "ping over the Thread mesh (OpenThread's ICMPv6)",
+      .usage = "ping6 [-c count] <thread-addr>" },
     { .name = "nat",      .fn = cmd_nat,
       .help = "masquerade an interface behind the default route",
       .usage = "nat [status] | nat {on|off} <dev>" },

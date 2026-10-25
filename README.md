@@ -40,6 +40,7 @@ together.
   - With wifi, eth, USB-NCM, and virtual interfaces.
   - File sharing via SMBv2/3 and NFSv3.
   - Wireguard server (PiVPN shaped), and client.
+  - Thread Border Router (S31)
 - File systems:
   - VFAT, exFAT, ext4 (via lwext4) for USB disks, LittleFS for `/` on internal flash.
   - MBR and GPT partition tables.
@@ -121,6 +122,8 @@ which is also where the one build option hardware decides today is explained.
 | Networking | USB-NCM | **yes** | device role: an Ethernet adapter with no WiFi at all |
 | Networking | Ethernet | **yes** | `eth0` on the S31 (RGMII, DHCP, Ethernet-first route), verified on hardware; the S3 has no wired peripheral |
 | Networking | IPv4 routing and NAT | **yes** | `nat on <dev>` masquerades an inside interface out the default route; `ESPIX_NET_ROUTER` is on by default |
+| Networking | IPv6 | **yes** | every interface gets a link-local as it comes up; `ip -6 addr`, `ip -6 route`, `ip -br`, `host` (A and AAAA) and `ping6` (over the Thread mesh) show and use it, and the Thread border router does NAT64 and DNS64 |
+| Networking | Thread (802.15.4) on the S31 | **yes** | OpenThread runs inside the firmware on the native radio, no RCP and no daemon, with `thread0` beside `wlan0`/`eth0` and the `thread` command to drive it — [THREAD.md](docs/THREAD.md) |
 | Networking | L2 bridging | **yes** | `bridge add <port>` then reboot: `br0` owns the address, ports have none; AP↔Ethernet, never a station (802.11 three-address frames) |
 | Networking | DHCP server for the LAN | **partial** | the AP, `usb0` and a bridge in `addr=server` mode all serve; DNS is the uplink's resolver passed through, not a local one |
 | Networking | Isolation and firewall | **planned** | NAT is not a firewall; guest zones and port-forwards are later |

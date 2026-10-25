@@ -184,10 +184,20 @@ interface. espix creates one on every esp_netif interface as it comes up
 works on an up netif), so `eth0` and `wlan0` carry a `fe80::` address and the
 RS has somewhere to come from.
 
+IPv6 ping is OpenThread's, not lwIP's. lwIP's `icmp6_input()` answers echo
+*requests* itself and has no case for echo replies, so a raw ICMPv6 socket never
+sees one: the reply reaches `icmp6_input()`'s default branch and is counted as a
+protocol error. `ping6` therefore sends OpenThread's ping over the mesh and
+reaches exactly what `thread0` reaches; there is no ICMPv6 ping for a `wlan0`
+or `eth0` address. `ip -6 route` shows each interface's on-link prefixes and
+`ip -br` the brief, one-line-per-interface view -- all rendered from the same
+`espix_ifinfo_t` as `ip addr`, so they cannot drift.
+
 ## 10. What is not done
 
 - The dataset hex is ~500 digits and the shell caps a line at 255 bytes, which is
   why `thread join` takes `-f <file>`: `thread dataset > f`, then
   `thread join -f f`.
-- `ping` is IPv4-only; the resolver it uses returns a 32-bit address. `host`
-  resolves both families, and the AAAA path is verified against ipv6.google.com.
+- `ping` is IPv4-only; `ping6` is the Thread mesh's, because lwIP has no ICMPv6
+  ping to build on (section 9). `host` resolves both families, and the AAAA path
+  is verified against ipv6.google.com.
