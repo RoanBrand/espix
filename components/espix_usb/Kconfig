@@ -15,10 +15,9 @@ menu "espix usb"
             with this off a working enumeration and an empty socket look
             identical -- which is exactly the question it exists to answer.
 
-            Two halves, and both are needed. CONFIG_LOG_MAXIMUM_LEVEL (DEBUG, in
-            sdkconfig.defaults) decides whether the messages exist in the image
-            at all; this option raises the tags that are noisy enough to be worth
-            leaving off by default.
+            The messages are compiled in either way (CONFIG_LOG_MAXIMUM_LEVEL
+            is DEBUG, in sdkconfig.defaults); this raises the tags at boot, as
+            `log <tag> debug` does by hand.
 
             Costs nothing when off, and when on it costs log volume: the kernel
             log ring holds 96 lines (ESPIX_KLOG_LINES) and this will fill it.

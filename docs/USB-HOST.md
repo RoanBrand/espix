@@ -786,7 +786,7 @@ partitions each), so no sequence of attaches can fragment the heap or outgrow it
 | `ESPIX_USB_ROLE_HOST` | the OTG port is a host. **Default.** |
 | `ESPIX_USB_ROLE_DEVICE` | the OTG port is USB-NCM; `usb0` exists and `lsblk` explains that the host was not built |
 | `USB_HOST_HUBS_SUPPORTED` | set to `y` in `sdkconfig.defaults`; defaults to `n` upstream and a hub does nothing without it |
-| `LOG_MAXIMUM_LEVEL_DEBUG` | set to `DEBUG` in `sdkconfig.defaults`, because the USB stack logs almost everything at DEBUG: without it those messages **do not exist in the image**, so "no output" means nothing. The runtime level stays `INFO`, so nothing gets noisier unless a tag is raised — it costs image size, not noise |
+| `LOG_MAXIMUM_LEVEL_DEBUG` | set to `DEBUG` in `sdkconfig.defaults`, because the USB stack logs almost everything at DEBUG: without it those messages **do not exist in the image**, so "no output" means nothing. It is only what is compiled in; the runtime level stays `INFO`, so nothing gets noisier unless a tag is raised — it costs image size, not noise |
 | `ESPIX_USB_VERBOSE` | raises exactly the USB tags (`USBH`, `ENUM`, `EXT_HUB`, `EXT_PORT`, `HUB`, `HCD DWC`, `USB HOST`, `USB_MSC`) to DEBUG at boot. **The switch to reach for when a device does not appear** — with it off, a working enumeration and an empty socket look identical. Costs log volume: the ring holds `ESPIX_KLOG_LINES` (96) lines and this fills it |
 | `ESPIX_USB_NCM_ENABLED` | unchanged, now `depends on ESPIX_USB_ROLE_DEVICE` |
 

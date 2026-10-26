@@ -550,34 +550,115 @@ uint32_t espix_klog_last_echo_ms(void)
 
 static vprintf_like_t s_prev_vprintf;
 
-static espix_klog_level_t level_from_esp_log(const char *line)
+/*
+ * A line written in pieces -- OpenThread's log port and the WiFi driver send the
+ * "W (123) tag:" header, the text and the newline as three writes -- is held per
+ * task until its newline, so it lands as one line at the header's level.
+ */
+#define KLOG_PARTIAL_SLOTS 4
+
+typedef struct {
+    TaskHandle_t task;
+    char         text[ESPIX_KLOG_LINE_MAX + 1];
+} klog_partial_t;
+
+EXT_RAM_BSS_ATTR static klog_partial_t s_partial[KLOG_PARTIAL_SLOTS];
+
+/* ESP_LOG lines may start with a colour escape, not yet stripped here. */
+static const char *skip_escapes(const char *p)
 {
-    /* ESP_LOG lines start with "E (", "W (", "I (", "D (", "V (" — possibly
-     * after a colour escape, which we have not stripped at this point. */
-    for (const char *p = line; *p != '\0'; p++) {
-        if (*p == '\033') {
+    while (*p == '\033') {
+        p++;
+        if (*p == '[') {
             p++;
-            if (*p == '[') {
+            while (*p && (*p < '@' || *p > '~')) {
                 p++;
-                while (*p && (*p < '@' || *p > '~')) {
-                    p++;
-                }
-                if (*p == '\0') {
-                    break;
-                }
             }
-            continue;
-        }
-        switch (*p) {
-        case 'E': return ESPIX_KLOG_ERROR;
-        case 'W': return ESPIX_KLOG_WARN;
-        case 'I': return ESPIX_KLOG_INFO;
-        case 'D':
-        case 'V': return ESPIX_KLOG_DEBUG;
-        default:  return ESPIX_KLOG_INFO;
+            if (*p) {
+                p++;
+            }
         }
     }
-    return ESPIX_KLOG_INFO;
+    return p;
+}
+
+static espix_klog_level_t level_from_esp_log(const char *line)
+{
+    switch (*skip_escapes(line)) {
+    case 'E': return ESPIX_KLOG_ERROR;
+    case 'W': return ESPIX_KLOG_WARN;
+    case 'D':
+    case 'V': return ESPIX_KLOG_DEBUG;
+    default:  return ESPIX_KLOG_INFO;
+    }
+}
+
+/* Past an esp_log "I (123) " header, whose level and time klog keeps itself. */
+static const char *esp_log_body(const char *line)
+{
+    const char *p = skip_escapes(line);
+    if (*p == '\0' || strchr("EWIDV", *p) == NULL) {
+        return line;
+    }
+    p++;
+    if (*p == ' ') {
+        p++;
+    }
+    if (*p != '(' || p[1] < '0' || p[1] > '9') {
+        return line;
+    }
+    p++;
+    while (*p >= '0' && *p <= '9') {
+        p++;
+    }
+    if (*p != ')') {
+        return line;
+    }
+    p++;
+    return (*p == ' ') ? p + 1 : p;
+}
+
+static void klog_take(const char *frag, bool clipped)
+{
+    const size_t       len  = strlen(frag);
+    const bool         done = clipped || (len > 0 && frag[len - 1] == '\n');
+    const TaskHandle_t me   = xTaskGetCurrentTaskHandle();
+    char               whole[ESPIX_KLOG_LINE_MAX + 1];
+    const char        *out  = frag;
+    bool               held = false;
+
+    if (me != NULL) {
+        portENTER_CRITICAL_SAFE(&s_lock);
+        klog_partial_t *mine = NULL;
+        klog_partial_t *spare = NULL;
+        for (size_t i = 0; i < KLOG_PARTIAL_SLOTS; i++) {
+            if (s_partial[i].task == me) {
+                mine = &s_partial[i];
+            } else if (s_partial[i].task == NULL && spare == NULL) {
+                spare = &s_partial[i];
+            }
+        }
+        if (mine != NULL) {
+            strlcpy(whole, mine->text, sizeof(whole));
+            strlcat(whole, frag, sizeof(whole));
+            if (done) {
+                mine->task = NULL;
+                out = whole;
+            } else {
+                strlcpy(mine->text, whole, sizeof(mine->text));
+                held = true;
+            }
+        } else if (!done && spare != NULL) {
+            spare->task = me;
+            strlcpy(spare->text, frag, sizeof(spare->text));
+            held = true;
+        }
+        portEXIT_CRITICAL_SAFE(&s_lock);
+    }
+
+    if (!held) {
+        klog_store(level_from_esp_log(out), esp_log_body(out), true);
+    }
 }
 
 static int klog_vprintf(const char *fmt, va_list ap)
@@ -589,7 +670,7 @@ static int klog_vprintf(const char *fmt, va_list ap)
     char line[ESPIX_KLOG_LINE_MAX + 1];
     const int n = vsnprintf(line, sizeof(line), fmt, ap_copy);
     if (n > 0) {
-        klog_store(level_from_esp_log(line), line, true);
+        klog_take(line, (size_t)n >= sizeof(line));
     }
     va_end(ap_copy);
 

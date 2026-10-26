@@ -746,32 +746,28 @@ espix names the boolean as the opt-*out* where it can: `ESPIX_KLOG_QUIET`
 `ESPIX_KLOG_ECHO_CONSOLE` default `y`. A missing symbol then yields
 the behaviour that was wanted anyway.
 
-The compile-time log maximum is the same class of surprise, and here the tree
-contradicts its own comment. `sdkconfig.defaults` says "leave the
-compile-time maximum at INFO" beside `CONFIG_LOG_DEFAULT_LEVEL_INFO=y`, but
-further down it sets `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y` for the USB stack:
-the stack logs enumeration at DEBUG, and with the maximum at INFO those messages
-are not compiled into the image at all, so "no output" means nothing rather than
-"nothing happened". The effective value is DEBUG, which also compiles in
-espcoredump's `ESP_COREDUMP_LOG` calls (`esp_core_dump_types.h`:
-`if (LOG_LOCAL_LEVEL >= level) { esp_rom_printf(...) }`) — the cost
-described under *A DEBUG log level buries crash reports* below.
-`CONFIG_LOG_DEFAULT_LEVEL` stays INFO, so nothing is noisier unless a tag
-is raised.
+The compile-time log maximum is the same class of surprise. It is meant to
+say only which messages exist in the image, and espix sets it to DEBUG so that
+`log <tag> debug` reaches IDF's DEBUG lines -- the USB stack logs enumeration
+there, and with the maximum at INFO "no output" means nothing rather than
+"nothing happened". `CONFIG_LOG_DEFAULT_LEVEL`, INFO, is what decides what
+prints. Two IDF pieces read the maximum as a level anyway, below; espix undoes
+both, so the maximum changes nothing that prints.
 
 ### A DEBUG log level buries crash reports
 
-Not the runtime level: `CONFIG_LOG_DEFAULT_LEVEL` is INFO in this tree. It
-is the compile-time maximum. `LOG_LOCAL_LEVEL` defaults to
-`CONFIG_LOG_MAXIMUM_LEVEL` (`esp_log_level.h:57`), which espix sets
-to DEBUG so the USB stack's enumeration logging exists in the image at all.
-espcoredump's `ESP_COREDUMP_LOG` then compiles to an
+Not the runtime level: it is the compile-time maximum. `LOG_LOCAL_LEVEL`
+defaults to `CONFIG_LOG_MAXIMUM_LEVEL` (`esp_log_level.h:57`); with that at
+DEBUG, espcoredump's `ESP_COREDUMP_LOG` compiles to an
 `if (LOG_LOCAL_LEVEL >= level)` guard around `esp_rom_printf(...)`
 (`esp_core_dump_types.h:22`), so every `LOGD` call is compiled in
 and writes straight to the console, bypassing the runtime level — and with
 `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH` the per-segment, per-task and
 per-register trace lines are `LOGD` too. A crash arrives under a page of
-core-dump tracing.
+core-dump tracing. espix compiles espcoredump at `CONFIG_LOG_DEFAULT_LEVEL`
+instead (top-level `CMakeLists.txt`). The WiFi driver is the other one:
+`esp_wifi_init()` sets the driver's own level from the maximum, and
+`components/espix_net/wifi.c` sets it back to the default.
 
 ### The panic wrap is dropped without `WHOLE_ARCHIVE`, and its handler cannot run from IRAM
 

@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
+#include "esp_private/wifi.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
@@ -413,6 +414,10 @@ static void quiet_driver_logs(void)
     for (size_t i = 0; i < sizeof(noisy) / sizeof(noisy[0]); i++) {
         esp_log_level_set(noisy[i], ESP_LOG_WARN);
     }
+#if CONFIG_IDF_TARGET_ESP32S31
+    /* Every WARN this driver has printed is a TX power table or a block-ack trace. */
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+#endif
 }
 
 static esp_err_t driver_start(void)
@@ -444,6 +449,8 @@ static esp_err_t driver_start(void)
 
     const wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    /* esp_wifi_init() gives the driver CONFIG_LOG_MAXIMUM_LEVEL; it gets the runtime default. */
+    (void)esp_wifi_internal_set_log_level((wifi_log_level_t)CONFIG_LOG_DEFAULT_LEVEL);
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL));

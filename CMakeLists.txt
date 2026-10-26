@@ -307,3 +307,11 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME}.elf POST_BUILD
     COMMENT "Checking the layer-below symbols are in the image"
     VERBATIM)
 
+
+# Compile espcoredump at the runtime default level. Its macros gate on
+# LOG_LOCAL_LEVEL at compile time and print with esp_rom_printf, past the runtime
+# level, so the DEBUG maximum (sdkconfig.defaults) would otherwise put a page of
+# tracing on the console at every crash, and at every boot that finds a dump.
+idf_component_get_property(espix_coredump_lib espcoredump COMPONENT_LIB)
+target_compile_definitions(${espix_coredump_lib} PRIVATE
+    LOG_LOCAL_LEVEL=${CONFIG_LOG_DEFAULT_LEVEL})
