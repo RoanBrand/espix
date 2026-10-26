@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,6 +26,7 @@
 #include "esp_system.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "psa/crypto.h"
 
 #include "esp_littlefs.h"
 
@@ -74,6 +76,59 @@ static void state_set(nvs_handle_t h, const char *key, const char *val)
         nvs_erase_key(h, key);
     }
     nvs_commit(h);
+}
+
+/*
+ * Check the file before the slot is erased for it: esptool appends the SHA-256
+ * of everything before it. esp_ota_end() checks the slot again once written,
+ * but by then a bad file has already replaced a good kernel. The same check as
+ * espix_ota_verify_file(), which the loader cannot link.
+ */
+static esp_err_t verify_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    esp_image_header_t hdr;
+    struct stat st;
+    if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+        hdr.magic != ESP_IMAGE_HEADER_MAGIC || hdr.hash_appended != 1 ||
+        fstat(fileno(f), &st) != 0 || st.st_size <= (off_t)(sizeof(hdr) + 32)) {
+        fclose(f);
+        return ESP_ERR_INVALID_VERSION;
+    }
+    rewind(f);
+
+    static uint8_t buf[4096];
+    psa_crypto_init();
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
+    bool ok = (psa_hash_setup(&op, PSA_ALG_SHA_256) == PSA_SUCCESS);
+    size_t remain = (size_t)st.st_size - 32;
+    while (ok && remain > 0) {
+        const size_t want = (remain > sizeof(buf)) ? sizeof(buf) : remain;
+        ok = fread(buf, 1, want, f) == want &&
+             psa_hash_update(&op, buf, want) == PSA_SUCCESS;
+        remain -= want;
+    }
+
+    uint8_t want_sha[32];
+    uint8_t got_sha[32];
+    size_t got_len = 0;
+    ok = ok && fread(want_sha, 1, sizeof(want_sha), f) == sizeof(want_sha) &&
+         psa_hash_finish(&op, got_sha, sizeof(got_sha), &got_len) == PSA_SUCCESS &&
+         got_len == sizeof(got_sha);
+    if (!ok) {
+        psa_hash_abort(&op);
+    }
+    fclose(f);
+
+    if (!ok) {
+        return ESP_FAIL;
+    }
+    return (memcmp(want_sha, got_sha, sizeof(got_sha)) == 0) ? ESP_OK
+                                                              : ESP_ERR_INVALID_CRC;
 }
 
 /*
@@ -319,24 +374,43 @@ void app_main(void)
         } else {
             snprintf(path, sizeof(path), "%s/%s", BOOT_DIR, target);
         }
-        FILE *probe = fopen(path, "rb");
-        if (probe == NULL) {
+        /* Every refusal clears pending: a file that cannot be installed now
+         * will not be installable at the next boot either. */
+        const esp_err_t verr = verify_file(path);
+        if (verr == ESP_ERR_NOT_FOUND) {
             if (failed) {
                 /* Nothing to restore. Do not select a failed slot and loop. */
                 stall("the known-good image is missing from /boot");
             }
             ESP_LOGW(TAG, "%s is gone; booting what is installed", path);
-        } else {
-            fclose(probe);
-            if (install_file(path) == ESP_OK) {
-                state_set(nvs, "pending", NULL);
-                nvs_close(nvs);
-                esp_restart();
+            state_set(nvs, "pending", NULL);
+        } else if (verr != ESP_OK) {
+            ESP_LOGE(TAG, "%s does not verify (%s); not installing it", path,
+                     esp_err_to_name(verr));
+            if (failed) {
+                stall("the known-good image in /boot is corrupt");
             }
+            state_set(nvs, "pending", NULL);
+        } else if (install_file(path) == ESP_OK) {
+            state_set(nvs, "pending", NULL);
+            nvs_close(nvs);
+            esp_restart();
+        } else {
             ESP_LOGE(TAG, "install failed; falling back");
             if (failed) {
                 stall("the good image could not be installed");
             }
+            state_set(nvs, "pending", NULL);
+
+            /* The slot was erased for it, so put the good image back. */
+            snprintf(path, sizeof(path), "%s/%s", BOOT_DIR, good);
+            if (good[0] == 0 || strcmp(good, target) == 0 ||
+                verify_file(path) != ESP_OK || install_file(path) != ESP_OK) {
+                stall("the kernel slot was erased and the good image could not "
+                      "be put back");
+            }
+            nvs_close(nvs);
+            esp_restart();
         }
     }
 

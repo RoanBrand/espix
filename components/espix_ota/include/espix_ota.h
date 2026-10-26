@@ -73,7 +73,15 @@ esp_err_t espix_ota_download(const char *url, const char *name,
                              espix_ota_progress_fn progress, void *ctx,
                              char *err, size_t err_len);
 
-/* Record name as pending and select the loader; the caller then reboots. */
+/*
+ * Check an image file on its own: esptool appends the SHA-256 of everything
+ * before it, which the header's hash_appended says. ESP_ERR_INVALID_CRC is a
+ * file whose bytes have changed; ESP_ERR_INVALID_VERSION is not an image.
+ */
+esp_err_t espix_ota_verify_file(const char *path);
+
+/* Record name as pending and select the loader; the caller then reboots. The
+ * file is verified first: the loader writes the kernel slot from it. */
 esp_err_t espix_ota_queue(const char *name, char *err, size_t err_len);
 
 /* Name one of these, if set. */

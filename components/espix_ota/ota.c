@@ -26,6 +26,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "psa/crypto.h"
 #include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
@@ -151,6 +152,110 @@ static void prune_boot(const char *good, const char *previous, const char *pendi
     closedir(d);
 }
 
+esp_err_t espix_ota_verify_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    esp_image_header_t hdr;
+    struct stat st;
+    if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+        hdr.magic != ESP_IMAGE_HEADER_MAGIC || hdr.hash_appended != 1 ||
+        fstat(fileno(f), &st) != 0 || st.st_size <= (off_t)(sizeof(hdr) + 32)) {
+        fclose(f);
+        return ESP_ERR_INVALID_VERSION;
+    }
+    rewind(f);
+
+    uint8_t *buf = malloc(OTA_CHUNK);
+    if (buf == NULL) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+
+    psa_crypto_init();
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
+    bool ok = (psa_hash_setup(&op, PSA_ALG_SHA_256) == PSA_SUCCESS);
+    size_t remain = (size_t)st.st_size - 32;
+    while (ok && remain > 0) {
+        const size_t want = (remain > OTA_CHUNK) ? OTA_CHUNK : remain;
+        ok = fread(buf, 1, want, f) == want &&
+             psa_hash_update(&op, buf, want) == PSA_SUCCESS;
+        remain -= want;
+    }
+
+    uint8_t want_sha[32];
+    uint8_t got_sha[32];
+    size_t got_len = 0;
+    ok = ok && fread(want_sha, 1, sizeof(want_sha), f) == sizeof(want_sha) &&
+         psa_hash_finish(&op, got_sha, sizeof(got_sha), &got_len) == PSA_SUCCESS &&
+         got_len == sizeof(got_sha);
+    if (!ok) {
+        psa_hash_abort(&op);
+    }
+    free(buf);
+    fclose(f);
+
+    if (!ok) {
+        return ESP_FAIL;
+    }
+    return (memcmp(want_sha, got_sha, sizeof(got_sha)) == 0) ? ESP_OK
+                                                              : ESP_ERR_INVALID_CRC;
+}
+
+/* Copy len bytes of the running slot to part, reporting every 10%. */
+static esp_err_t copy_slot(const esp_partition_t *run, uint32_t len,
+                           const char *part, const char *name)
+{
+    FILE *f = fopen(part, "wb");
+    if (f == NULL) {
+        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot write %s: %s", part,
+                   strerror(errno));
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    uint8_t *buf = malloc(OTA_CHUNK);
+    if (buf == NULL) {
+        fclose(f);
+        unlink(part);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Progress every 10% rather than an in-place line -- klog's flusher writes
+     * whole lines, so a \r-updating bar would need the console lock for a
+     * cosmetic gain. */
+    esp_err_t e = ESP_OK;
+    uint32_t off = 0;
+    uint32_t remain = len;
+    uint32_t next_pct = 10;
+
+    while (remain > 0) {
+        const size_t n = (remain > OTA_CHUNK) ? OTA_CHUNK : remain;
+        if (esp_partition_read(run, off, buf, n) != ESP_OK ||
+            fwrite(buf, 1, n, f) != n) {
+            e = ESP_FAIL;
+            break;
+        }
+        off += n;
+        remain -= n;
+
+        const uint32_t pct = (uint32_t)((uint64_t)off * 100 / len);
+        if (pct >= next_pct) {
+            espix_klog(ESPIX_KLOG_INFO, TAG, "archiving %s: %u%%", name,
+                       (unsigned)pct);
+            next_pct = pct + 10;
+        }
+    }
+    free(buf);
+
+    if (fclose(f) != 0 && e == ESP_OK) {
+        e = ESP_FAIL;
+    }
+    return e;
+}
+
 esp_err_t espix_ota_archive_self(char *name, size_t len)
 {
     const esp_partition_t *run = esp_ota_get_running_partition();
@@ -182,57 +287,31 @@ esp_err_t espix_ota_archive_self(char *name, size_t len)
     char part[328];
     snprintf(part, sizeof(part), ESPIX_OTA_BOOT_DIR "/.%s.part", name);
 
-    FILE *f = fopen(part, "wb");
-    if (f == NULL) {
-        espix_klog(ESPIX_KLOG_WARN, TAG, "cannot write %s: %s", part,
-                   strerror(errno));
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint8_t *buf = malloc(OTA_CHUNK);
-    if (buf == NULL) {
-        fclose(f);
-        unlink(part);
-        return ESP_ERR_NO_MEM;
-    }
-
     /*
      * Say what is about to happen before it does: this writes a couple of MB to
      * littlefs, which is a visible pause in boot, and a silent pause reads as a
-     * hang. Progress every 10% rather than an in-place line -- klog's flusher
-     * writes whole lines, so a \r-updating bar would need the console lock for a
-     * cosmetic gain.
+     * hang.
      */
     espix_klog(ESPIX_KLOG_INFO, TAG,
                "archiving this image to /boot/%s (%u bytes); this takes a moment",
                name, (unsigned)meta.image_len);
 
-    esp_err_t e = ESP_OK;
-    uint32_t off = 0;
-    uint32_t remain = meta.image_len;
-    uint32_t next_pct = 10;
-
-    while (remain > 0) {
-        const size_t n = (remain > OTA_CHUNK) ? OTA_CHUNK : remain;
-        if (esp_partition_read(run, off, buf, n) != ESP_OK ||
-            fwrite(buf, 1, n, f) != n) {
-            e = ESP_FAIL;
-            break;
+    /*
+     * The slot verified, but the copy is what the loader will write back into
+     * it, so the copy is checked too. Measured on an S3: one archive in five had
+     * a single bit flipped, and the loader then installed it over the kernel.
+     */
+    esp_err_t e = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3 && e != ESP_OK; attempt++) {
+        e = copy_slot(run, meta.image_len, part, name);
+        if (e == ESP_OK) {
+            e = espix_ota_verify_file(part);
+            if (e != ESP_OK) {
+                espix_klog(ESPIX_KLOG_ERROR, TAG,
+                           "the copy of %s does not verify (%s), attempt %d of 3",
+                           name, esp_err_to_name(e), attempt);
+            }
         }
-        off += n;
-        remain -= n;
-
-        const uint32_t pct = (uint32_t)((uint64_t)off * 100 / meta.image_len);
-        if (pct >= next_pct) {
-            espix_klog(ESPIX_KLOG_INFO, TAG, "archiving %s: %u%%", name,
-                       (unsigned)pct);
-            next_pct = pct + 10;
-        }
-    }
-    free(buf);
-
-    if (fclose(f) != 0 && e == ESP_OK) {
-        e = ESP_FAIL;
     }
     if (e != ESP_OK || rename(part, path) != 0) {
         unlink(part);
@@ -483,14 +562,21 @@ esp_err_t espix_ota_queue(const char *name, char *err, size_t err_len)
     } else {
         snprintf(path, sizeof(path), ESPIX_OTA_BOOT_DIR "/%s", name);
     }
-    FILE *probe = fopen(path, "rb");
-    if (probe == NULL) {
+    const esp_err_t verr = espix_ota_verify_file(path);
+    if (verr == ESP_ERR_NOT_FOUND) {
         if (err != NULL) {
             snprintf(err, err_len, "%s: %s", path, strerror(errno));
         }
-        return ESP_ERR_NOT_FOUND;
+        return verr;
     }
-    fclose(probe);
+    if (verr != ESP_OK) {
+        /* Refused here, because the loader writes the kernel slot from it. */
+        if (err != NULL) {
+            snprintf(err, err_len, "%s does not verify (%s): not a complete, "
+                     "intact image", path, esp_err_to_name(verr));
+        }
+        return verr;
+    }
 
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {

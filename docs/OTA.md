@@ -877,7 +877,11 @@ loader only ever installs a file that is already there.**
 * **Loader, every run:** if `ota_1` is `ABORTED` -- a try failed -- install NVS
   `good`; else if `pending` is set, install that; else do nothing. Select
   `ota_1`, reboot. It never writes `/boot` and never downloads, which is why
-  it needs no TLS and stays under 200 KiB.
+  it needs no TLS and stays small (about 220 KiB of its 256). It checks the file
+  against its appended SHA-256 *before* erasing `ota_1` for it, so a bad file
+  leaves the installed kernel alone: `pending` is cleared and the kernel
+  boots. If a file that verified still fails to install, the slot is already
+  erased, and the loader puts `good` back.
 * **Kernel, on confirm:** `good` becomes itself, `pending` cleared.
 
 The invariant is one line: **every image in `ota_1` has a file in `/boot`, and the
@@ -1008,6 +1012,17 @@ so:
   (A corrupt flash is caught even earlier in practice -- esptool verifies after
   writing and the bootloader verifies before jumping -- but this is the right
   reference and it is cheap.)
+* **The archive itself** is checked too, by `espix_ota_verify_file()`: the
+  file's bytes against the same appended SHA-256, and the copy redone (three
+  tries) if they differ. The slot verifying says nothing about the copy, and
+  measured on an S3, one archive in five came out with a single bit flipped
+  (0xA8 for 0xE8, at 0x11CE1E). Nothing checked the file then; the loader wrote
+  it over the kernel, `esp_ota_end()` refused the result, and with the kernel
+  slot already erased and `pending` still set, the board needed a serial
+  reflash. The cause of the flip is not known.
+* **Queueing any file** -- a download, `upgrade --file`, a rollback -- runs the
+  same check, so a file whose bytes have changed is refused at `upgrade` with a
+  message rather than at the loader.
 * **Installing a download** is where a self-computed hash is exactly right,
   because the manifest is the independent authority: hash the file, compare to
   the manifest's `sha256`, and only then record it as pending. That check

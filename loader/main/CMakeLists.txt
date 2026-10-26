@@ -78,6 +78,7 @@ idf_component_register(
         app_update
         esp_app_format
         bootloader_support
+        mbedtls
         spi_flash
         freertos
         nvs_flash
