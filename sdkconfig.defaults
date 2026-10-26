@@ -154,6 +154,13 @@ CONFIG_ESP_WIFI_NVS_ENABLED=y
 # report. Kept in sync with the generated <target>-<mac> form for consistency.
 CONFIG_LWIP_LOCAL_HOSTNAME="espix"
 
+# IPv6 SLAAC, as a Linux host does by default (accept_ra, autoconf): an interface
+# takes an address in any prefix a router advertises, beside its fe80::, and
+# learns the IPv6 default route from the same RA. Off in IDF, which left espix
+# with link-locals only; the per-interface flag is already set for Ethernet,
+# the station and br0.
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+
 # One socket per SSH connection, plus the listener, plus whatever DHCP and SNTP
 # hold. ESP-IDF's default of 10 was enough while the SSH server accepted four
 # connections; at CONFIG_ESPIX_SSH_MAX_SESSIONS=8 it is not, and the failure
@@ -431,6 +438,13 @@ CONFIG_ESPIX_FS_EXT4=y
 # through the generic ECP path, and the agreement half is a variable-point
 # multiplication that no amount of base-point precomputation helps.
 CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
+
+# mbedtls allocates from PSRAM, not internal RAM. A TLS session is ~40 KB, and
+# two at once (the update check and dynu fire together) exhausted the internal
+# heap -- measured, as an fopen() mutex and an lwIP semaphore failing to
+# allocate and the board faulting. Records are processed in sequence, which is
+# what PSRAM's cache is good at.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 #
 # Moved out of the S31's file: all of these describe how espix uses memory
