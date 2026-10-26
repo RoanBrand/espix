@@ -169,14 +169,15 @@ flash: build port-check
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
-	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
-	    echo "flash: no ota_0/ota_1 in $$csv" >&2; exit 1; \
+	od=$$(awk -F, '/^otadata,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$lo" ] || [ -z "$$ko" ] || [ -z "$$od" ]; then \
+	    echo "flash: no ota_0/ota_1/otadata in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) write_flash \
 	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
 	    0x8000  $(BUILD)/partition_table/partition-table.bin \
-	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$od"  $(BUILD)/ota_data_initial.bin \
 	    "$$lo"  $(LOADER_BUILD)/espix_loader.bin \
 	    "$$ko"  $(BUILD)/espix.bin
 
@@ -186,12 +187,15 @@ flash-kernel: build port-check
 	@$(PARTITION_CSV); \
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
-	if [ -z "$$ko" ]; then echo "flash-kernel: no ota_1 in $$csv" >&2; exit 1; fi; \
+	od=$$(awk -F, '/^otadata,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$ko" ] || [ -z "$$od" ]; then \
+	    echo "flash-kernel: no ota_1/otadata in $$csv" >&2; exit 1; \
+	fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) write_flash \
 	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
 	    0x8000  $(BUILD)/partition_table/partition-table.bin \
-	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$od"  $(BUILD)/ota_data_initial.bin \
 	    "$$ko"  $(BUILD)/espix.bin
 
 # Flash without resetting, then attach with a reset: the one reset is the
@@ -204,15 +208,16 @@ flash-monitor: build port-check
 	tgt=$$(sed -n 's/^CONFIG_IDF_TARGET="\([^"]*\)"/\1/p' $(SDKCONF)); \
 	lo=$$(awk -F, '/^ota_0,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
 	ko=$$(awk -F, '/^ota_1,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
-	if [ -z "$$lo" ] || [ -z "$$ko" ]; then \
-	    echo "flash-monitor: no ota_0/ota_1 in $$csv" >&2; exit 1; \
+	od=$$(awk -F, '/^otadata,/ {gsub(/ /,"",$$4); print $$4}' "$$csv"); \
+	if [ -z "$$lo" ] || [ -z "$$ko" ] || [ -z "$$od" ]; then \
+	    echo "flash-monitor: no ota_0/ota_1/otadata in $$csv" >&2; exit 1; \
 	fi; \
 	eval "$$($(IDF) --env)"; \
 	"$$ESPIX_PYTHON" -m esptool --after no-reset --chip "$$tgt" $(NO_STUB) -p $(PORT_ARG) -b $(BAUD) \
 	    write_flash \
 	    $(BOOT_OFF)     $(BUILD)/bootloader/bootloader.bin \
 	    0x8000  $(BUILD)/partition_table/partition-table.bin \
-	    0xf000  $(BUILD)/ota_data_initial.bin \
+	    "$$od"  $(BUILD)/ota_data_initial.bin \
 	    "$$lo"  $(LOADER_BUILD)/espix_loader.bin \
 	    "$$ko"  $(BUILD)/espix.bin
 	$(IDF) -p $(PORT_ARG) monitor

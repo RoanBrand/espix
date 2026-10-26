@@ -4,9 +4,13 @@
  * This is the espix command, not OpenThread's CLI. Its verbs map to the stack's
  * own API through espix_thread_*(), which is what keeps their output on the
  * invoking session -- a remote shell over SSH sees the same answer the console
- * would. OpenThread's full CLI is still one call away as \`thread cli <line>\`;
- * that path runs on the OT task and writes to the console, so it is a debugging
- * aid rather than the way a script should drive Thread.
+ * would. OpenThread's full CLI is still one call away as \`thread cli <line>\`,
+ * and its reply comes back to the session too, but it is a debugging aid rather
+ * than the way a script should drive Thread.
+ *
+ * Everything but status, and showing the configuration, is root's: the verbs
+ * move the radio and the network, the CLI reaches all of OpenThread (factoryreset
+ * included), and the dataset carries the network key.
  */
 #include <stdio.h>
 #include <string.h>
@@ -27,7 +31,12 @@
 static void thread_show_status(espix_session_t *s)
 {
     espix_thread_status_t st;
-    if (espix_thread_status(&st) != ESP_OK) {
+    const esp_err_t err = espix_thread_status(&st);
+    if (err == ESP_ERR_TIMEOUT) {
+        espix_eprintf(s, "thread: busy starting or stopping; ask again\n");
+        return;
+    }
+    if (err != ESP_OK) {
         espix_eprintf(s, "thread: no status\n");
         return;
     }
@@ -62,6 +71,15 @@ static bool conf_yes(const char *key)
     char v[8];
     return espix_fs_conf_get(THREAD_CONF_PATH, key, v, sizeof(v)) &&
            strcmp(v, "yes") == 0;
+}
+
+static bool require_root(espix_session_t *s, const char *what)
+{
+    if (s == NULL || s->uid == 0) {
+        return true;
+    }
+    espix_eprintf(s, "thread: only root may %s\n", what);
+    return false;
 }
 
 static bool word_yes(const char *w)
@@ -107,6 +125,9 @@ static int thread_conf(espix_session_t *s, int argc, char **argv)
     if (argc < 3) {
         thread_show_conf(s);
         return 0;
+    }
+    if (!require_root(s, "change the Thread configuration")) {
+        return 1;
     }
 
     const char *key = argv[2];
@@ -155,8 +176,7 @@ static int thread_conf(espix_session_t *s, int argc, char **argv)
 
     const esp_err_t werr = espix_thread_conf_write(enabled, border, backbone, attach);
     if (werr != ESP_OK) {
-        espix_eprintf(s, "thread: cannot write %s: run it under sudo\n",
-                      THREAD_CONF_PATH);
+        espix_eprintf(s, "thread: cannot write %s\n", THREAD_CONF_PATH);
         return 1;
     }
 
@@ -186,12 +206,10 @@ static int thread_conf(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
-/* The CLI's reply, into the stream that asked for it. */
+/* The CLI's reply, into the stream that asked for it. Not NUL-terminated. */
 static void cli_to_session(void *ctx, const char *text, size_t len)
 {
-    espix_session_t *s = (espix_session_t *)ctx;
-    (void)len;
-    espix_printf(s, "%s", text);
+    (void)espix_session_write((espix_session_t *)ctx, text, len, false);
 }
 
 static int cmd_thread(espix_session_t *s, int argc, char **argv)
@@ -209,12 +227,19 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
         espix_printf(s, "  dataset  print the active dataset as hex TLVs\n");
         espix_printf(s, "  join     join from a hex dataset, or from a file of one\n");
         espix_printf(s, "  cli      OpenThread's own CLI; the reply comes back here\n");
-        return argc < 2 ? 1 : 1;
+        return 1;
     }
 
     if (strcmp(argv[1], "status") == 0) {
         thread_show_status(s);
         return 0;
+    }
+    if (strcmp(argv[1], "conf") == 0) {
+        return thread_conf(s, argc, argv);
+    }
+
+    if (!require_root(s, "do that")) {
+        return 1;
     }
 
     if (strcmp(argv[1], "start") == 0) {
@@ -335,10 +360,6 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
         return 0;
     }
 
-    if (strcmp(argv[1], "conf") == 0) {
-        return thread_conf(s, argc, argv);
-    }
-
     if (strcmp(argv[1], "cli") == 0) {
         if (argc < 3) {
             espix_eprintf(s, "usage: thread cli <line...>\n");
@@ -356,6 +377,10 @@ static int cmd_thread(espix_session_t *s, int argc, char **argv)
             used += (size_t)n;
         }
         const esp_err_t err = espix_thread_cli(line, cli_to_session, s);
+        if (err == ESP_ERR_INVALID_STATE && espix_thread_is_started()) {
+            espix_eprintf(s, "thread: cli: an earlier line is still running\n");
+            return 1;
+        }
         if (err != ESP_OK) {
             espix_eprintf(s, "thread: cli: %s\n", esp_err_to_name(err));
             return 1;

@@ -31,6 +31,13 @@ extern "C" {
 #define ESPIX_IP6STR_MAX    46      /* "ffff:ffff:...:255.255.255.255" + NUL */
 #define ESPIX_IP6_MAX       6       /* addresses rendered per interface */
 
+/* The most interfaces espix_net_iflist() can return: the named table plus the
+ * raw netifs (tunnels) espix registers itself. Size a full listing by this. */
+#define ESPIX_NET_IF_LIMIT  12
+
+/* espix_ifinfo_t.ip6_flags */
+#define ESPIX_IP6_TENTATIVE 0x01    /* duplicate address detection not done yet */
+
 typedef enum {
     ESPIX_IF_LO = 0,
     ESPIX_IF_WIFI_STA,
@@ -64,6 +71,7 @@ typedef struct {
      */
     char            ip6[ESPIX_IP6_MAX][ESPIX_IP6STR_MAX];
     uint8_t         ip6_prefix[ESPIX_IP6_MAX];
+    uint8_t         ip6_flags[ESPIX_IP6_MAX];
     uint8_t         n_ip6;
 
     /*

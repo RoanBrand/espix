@@ -40,6 +40,7 @@ static esp_eth_netif_glue_handle_t s_glue;
  * Zero speed is "no carrier", so the log line and the query share one source. */
 static uint16_t                    s_link_mbps;
 static bool                        s_link_full;
+static bool                        s_bridge_port;
 
 static bool netif_has_addr(esp_netif_t *n)
 {
@@ -142,6 +143,14 @@ static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *dat
         s_link_full = duplex == ETH_DUPLEX_FULL;
         espix_klog(ESPIX_KLOG_INFO, TAG, "eth0: link up, %u Mbps %s duplex",
                    (unsigned)s_link_mbps, s_link_full ? "full" : "half");
+
+        /* On link, as Linux does it, not on DHCP: an IPv6-only link, or one
+         * whose DHCP fails, still gets its fe80::. The glue's own handler ran
+         * first and brought the netif up. A bridge port has no address: br0's
+         * fe80:: is the same one, from the same MAC. */
+        if (!s_bridge_port) {
+            (void)espix_net_ip6_linklocal(s_netif);
+        }
     } else if (id == ETHERNET_EVENT_DISCONNECTED) {
         s_link_mbps = 0;
         s_link_full = false;
@@ -174,7 +183,7 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
                        espix_net_ip4str(dns[i], d, sizeof(d)));
         }
 
-        /* The netif is up now, which is the only time this works. */
+        /* Normally done on link already; this is the fallback. */
         (void)espix_net_ip6_linklocal(ev->esp_netif);
     } else if (id == IP_EVENT_ETH_LOST_IP) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "eth0: lost address");
@@ -263,7 +272,8 @@ esp_err_t espix_net_eth_start(void)
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_inherent_config_t port_cfg;
-    if (espix_net_bridge_wants("eth0")) {
+    s_bridge_port = espix_net_bridge_wants("eth0");
+    if (s_bridge_port) {
         /*
          * A bridge port carries frames and has no address of its own -- the
          * bridge does. IDF's bridge example asks for flags=0 and no IP, and

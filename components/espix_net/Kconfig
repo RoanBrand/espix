@@ -245,6 +245,16 @@ menu "espix networking"
     # L2 bridging. Ports carry frames and have no address of their own; br0
     # does, exactly as br-lan does on Linux.
     #
+    #
+    # wg0 is a plain lwIP netif whose state is WireGuard's. IDF's esp_netif keeps
+    # its own handle in a netif client-data slot only with ESP_NETIF_BRIDGE_EN;
+    # without it, it reads every netif's state as an esp_netif and faults on wg0.
+    #
+    config ESPIX_NET_ESP_NETIF_SLOT
+        bool
+        default y
+        select ESP_NETIF_BRIDGE_EN
+
     config ESPIX_NET_BRIDGE
         bool "L2 bridging (br0)"
         select ESP_NETIF_BRIDGE_EN
@@ -284,14 +294,27 @@ menu "espix networking"
         bool "Thread (IEEE 802.15.4 / OpenThread)"
         depends on SOC_IEEE802154_SUPPORTED
         select OPENTHREAD_ENABLED
+        select ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF
         select MBEDTLS_SSL_PROTO_DTLS
         select MBEDTLS_ECJPAKE_C
         select MBEDTLS_KEY_EXCHANGE_ECJPAKE
+        select OPENTHREAD_DNS64_CLIENT if !ESPIX_THREAD_BORDER_ROUTER
         default n
         help
             Runs OpenThread natively on the on-die 802.15.4 radio and presents
             it as thread0, beside wlan0 and eth0. The \`thread\` command drives
             it: status, start/stop, attach, and border routing when built in.
+
+            Without the border router this is a Thread device whose way out is
+            the mesh, so IDF's DNS64 client is built in: with thread0 the
+            default route, it resolves an IPv4-only name and synthesizes its
+            address in the mesh's NAT64 prefix. A border router has the
+            backbone's resolver and its own IPv4, and leaves it out.
+
+            DNS servers are kept per interface, and lwIP's resolver follows the
+            default route, as a Linux resolver follows the uplink: the DNS64
+            client sets thread0's resolver, and with one global list that took
+            the whole board's DNS through the mesh.
 
             Off by default. /etc/thread.conf with enabled=yes starts it at boot;
             \`thread start\` starts it by hand. IDF's ot_rcp and ot_br examples
@@ -304,7 +327,6 @@ menu "espix networking"
         select LWIP_IPV6_FORWARD
         select LWIP_IPV6_AUTOCONFIG
         select LWIP_NETIF_STATUS_CALLBACK
-        select OPENTHREAD_DNS64_CLIENT
         default n
         help
             Builds OpenThread's border routing: the Thread mesh reaches the
@@ -313,16 +335,20 @@ menu "espix networking"
             starts; eth0 is the sane choice on an S31 because it does not share
             the 2.4 GHz radio with WiFi.
 
-            DNS64 goes with NAT64: a Thread client can only reach an IPv4 name
-            if resolution comes back as a NAT64 address. The DNS64 client points
-            OpenThread's DNS at OPENTHREAD_DNS_SERVER_ADDR encoded into the
-            NAT64 prefix, so that symbol must name an IPv4 resolver the backbone
-            can reach -- 8.8.8.8 by default, which is not reachable from every
-            bench, so set it to the uplink's resolver there.
+            Thread clients do their own DNS64: they ask the border router,
+            which forwards upstream, and synthesize addresses in the NAT64
+            prefix it publishes. IDF's DNS64 client is for a device whose own
+            lookups go out over thread0, so it is not built here.
 
             Also needs lwIP's IPv6 forwarding and more IPv6 addresses than the
             default three -- OpenThread's netif glue refuses to build with
             anything but LWIP_IPV6_NUM_ADDRESSES=12 -- and lwIP's netif status
             callback, which the prebuilt border-router library calls.
+
+            That library (libopenthread_br.a) is compiled against IDF's own
+            struct netif and reads and writes its fields at fixed offsets, so
+            the layout here has to match it: exactly four client-data slots.
+            tools/patch-lwip.py makes every espix build fit, and espix_thread.c
+            refuses to build one that does not.
 
 endmenu

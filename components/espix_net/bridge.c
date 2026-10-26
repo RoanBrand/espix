@@ -33,7 +33,9 @@
 #define BR_MAX_PORTS 4
 
 static esp_netif_t                *s_br;
+#if CONFIG_ESPIX_NET_BRIDGE
 static esp_netif_br_glue_handle_t  s_glue;
+#endif
 static char                        s_ports[BR_MAX_PORTS][ESPIX_IF_NAME_MAX];
 static size_t                      s_port_count;
 static bool                        s_server;
@@ -96,6 +98,11 @@ static esp_err_t write_conf(const char ports[][ESPIX_IF_NAME_MAX], size_t n,
 
 bool espix_net_bridge_wants(const char *name)
 {
+#if !CONFIG_ESPIX_NET_BRIDGE
+    /* A port without br0 would be an interface with no address at all. */
+    (void)name;
+    return false;
+#endif
     char ports[BR_MAX_PORTS][ESPIX_IF_NAME_MAX];
     const size_t n = conf_ports(ports, BR_MAX_PORTS);
     for (size_t i = 0; i < n; i++) {
@@ -150,7 +157,7 @@ esp_err_t espix_net_bridge_conf_addr(bool server)
 
 esp_err_t espix_net_bridge_apply(void)
 {
-#if !CONFIG_ESP_NETIF_BRIDGE_EN
+#if !CONFIG_ESPIX_NET_BRIDGE
     return ESP_ERR_NOT_SUPPORTED;
 #else
     if (s_br != NULL) {
@@ -217,6 +224,9 @@ esp_err_t espix_net_bridge_apply(void)
         .max_ports           = BR_MAX_PORTS + 1,
     };
     base.bridge_info = &brcfg;
+    /* br0 is the interface on the LAN, so it takes SLAAC as eth0 would; IDF's
+     * bridge defaults leave it out. */
+    base.flags = (esp_netif_flags_t)(base.flags | ESP_NETIF_DEFAULT_IPV6_AUTOCONFIG_FLAGS);
     if (have_mac) {
         memcpy(base.mac, mac, sizeof(mac));
     }

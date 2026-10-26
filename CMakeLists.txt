@@ -150,13 +150,32 @@ if(NOT espix_libc_offt_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-libc-offt.py failed; see the message above")
 endif()
 
+# Two fewer netif client-data slots: ACD reserves one it never uses, and lwIP's
+# bridge finds its ports by search rather than a slot. That is the struct netif
+# IDF's prebuilt Thread border-router library was compiled against, with br0,
+# DHCP's conflict check and wg0 all kept -- docs/THREAD.md, section 10, and
+# tools/patch-lwip.py. tools/lwip-netif-client-data.patch is the same change.
+#
+# Re-configure when either patched file changes, as for fatfs above.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${IDF_PATH}/components/lwip/lwip/src/include/lwip/netif.h"
+    "${IDF_PATH}/components/lwip/lwip/src/netif/bridgeif.c")
+execute_process(
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-lwip.py"
+            --idf-path "${IDF_PATH}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE espix_lwip_patch_result)
+if(NOT espix_lwip_patch_result EQUAL 0)
+    message(FATAL_ERROR "tools/patch-lwip.py failed; see the message above")
+endif()
+
 # Keep OpenThread's ~144 KB instance buffer out of internal RAM. gInstanceRaw is
 # the whole ot::Instance -- the stack's entire state graph -- and marking it
 # EXT_RAM_BSS_ATTR puts it in .ext_ram.bss, i.e. PSRAM, under the
 # CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY espix already sets. The macro is
 # empty with that off, and the file is only compiled with OpenThread on, so the
-# patch is inert otherwise. See tools/patch-openthread.py for the two caveats
-# (cache freeze during OTA; no ISR access).
+# patch is inert otherwise. See tools/patch-openthread.py for why the cache
+# being disabled during flash writes does not reach it.
 #
 # Re-configure when the patched file changes, as for fatfs above.
 if(CONFIG_OPENTHREAD_ENABLED)

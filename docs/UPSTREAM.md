@@ -35,8 +35,55 @@ against v6.1's `esp32s31` prebuilt: with `ESPIX_THREAD_BORDER_ROUTER` the image
 links, `dns_upstream_resolver` included, once two configuration prerequisites
 are met -- `LWIP_IPV6_NUM_ADDRESSES=12`, which OpenThread's netif glue insists on
 with an `#error`, and `LWIP_NETIF_STATUS_CALLBACK`, which the prebuilt calls (the
-Kconfig option now selects it). What stops it now is size: 3,921,872 bytes against
-the 3.5 MiB kernel slot, 251,856 bytes over.
+Kconfig option now selects it). It was also 251,856 bytes too big for the 3.5 MiB
+kernel slot of the time; the slot is 4.5 MiB now (docs/OTA.md), and the Thread +
+border-router image fits.
+
+### The prebuilt border-router library fixes `struct netif`, and nothing checks it
+
+The same library is C compiled against lwIP's `struct netif` as Espressif's own
+configuration lays it out, and reads and writes its fields at those offsets. The
+layout depends on project options -- `client_data[]` grows with
+`CONFIG_LWIP_NUM_NETIF_CLIENT_DATA`, `CONFIG_ESP_NETIF_BRIDGE_EN` and DHCP's
+address-conflict check -- and a project that changes any of them builds, links
+and runs with every field the library touches shifted. The library even carries
+the expected offsets, as `esp_openthread_check_netif_*_offset()`, but nothing in
+IDF calls them, and no Kconfig dependency stops a mismatched configuration.
+
+Seen on espix as "Failed to get LL address, error: Invalid If index" every few
+seconds (the infra-if index read from a byte of the MAC), and from the
+disassembly as the library's NAT64 netif being initialised over the wrong fields
+and overrun by 8 bytes. Workaround: `tools/patch-lwip.py` gives every espix
+build the four slots the library expects (the two lwIP entries below), and
+`espix_thread.c` asserts the offsets at compile time -- docs/THREAD.md, section
+10. Worth reporting: IDF should either run those checks at build time or make the
+border router depend on the layout it was built with.
+
+### lwIP reserves a client-data slot for ACD that nothing uses
+
+`lwip/netif.h` adds `LWIP_NETIF_CLIENT_DATA_INDEX_ACD` to the client-data enum
+whenever `LWIP_ACD` is on -- which DHCP's default ARP check turns on -- but no
+file reads or writes it: `acd.c` keeps its state in `netif->acd_list`. Every
+netif carries a dead pointer, and on espix it was one of the two that put
+`struct netif` out of step with the border-router library. Removed by
+`tools/patch-lwip.py`; `tools/lwip-netif-client-data.patch` is the diff
+(against IDF v6.1's lwIP; upstream lwIP not checked).
+
+### lwIP's bridge takes a client-data slot to find its own ports
+
+`bridgeif.c` stores each port's record in the port netif's client data, allocated
+with `netif_alloc_client_data_id()`, only so `bridgeif_input()` can find the
+record for the netif a frame arrived on. A bridge has at most
+`BRIDGEIF_MAX_PORTS` ports and already holds them in an array, so a search finds
+the same record without growing every netif in the system. Same patch.
+
+### IDF's bridge defaults leave out IPv6 autoconfiguration
+
+`ESP_NETIF_INHERENT_DEFAULT_BR()` has no `ESP_NETIF_DEFAULT_IPV6_AUTOCONFIG_FLAGS`,
+though `..._DEFAULT_ETH()` and `..._DEFAULT_WIFI_STA()` do. The bridge is the
+interface that holds the address once its ports are enslaved, so a board on a
+bridge gets no SLAAC address -- seen on espix as replies leaving by another
+interface that still had one. `components/espix_net/bridge.c` adds the flag.
 
 ### The DHCP server always advertises itself as a DNS server
 

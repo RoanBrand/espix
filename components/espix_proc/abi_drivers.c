@@ -189,7 +189,6 @@ static int espix_select(int nfds, fd_set *readfds, fd_set *writefds,
 static int espix_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     fd_set readfds, writefds, errorfds;
-    struct timeval tv;
     int max_fd = -1;
 
     if (fds == NULL) {

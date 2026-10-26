@@ -22,10 +22,27 @@
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_shell.h"
-#include "espix_thread.h"
 #include "sdkconfig.h"
 
-#define IFLIST_MAX 6
+/* Bridge ports: the bridge never has more members than this. */
+#define BRIDGE_PORTS_MAX 6
+
+/*
+ * Every interface, from the heap: a full listing is ESPIX_NET_IF_LIMIT records
+ * of several hundred bytes each, too much for a command's stack. NULL, having
+ * said why, if it cannot be had.
+ */
+static espix_ifinfo_t *iflist_get(espix_session_t *s, size_t *n)
+{
+    espix_ifinfo_t *ifs = calloc(ESPIX_NET_IF_LIMIT, sizeof(*ifs));
+    if (ifs == NULL) {
+        espix_eprintf(s, "out of memory\n");
+        *n = 0;
+        return NULL;
+    }
+    *n = espix_net_iflist(ifs, ESPIX_NET_IF_LIMIT);
+    return ifs;
+}
 #define SCAN_MAX   24
 
 /* ------------------------------------------------------------------ */
@@ -96,6 +113,8 @@ static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
         char mac[18];
         mac_str(i->mac, mac, sizeof(mac));
         espix_printf(s, "    link/ether %s\n", mac);
+    } else if (i->kind != ESPIX_IF_LO) {
+        espix_puts(s, "    link/none\n");
     }
 
     if (!with_addr) {
@@ -110,8 +129,9 @@ static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
     }
     if (v6) {
         for (uint8_t k = 0; k < i->n_ip6; k++) {
-            espix_printf(s, "    inet6 %s/%u scope %s\n", i->ip6[k],
-                         i->ip6_prefix[k], ip6_scope(i->ip6[k]));
+            espix_printf(s, "    inet6 %s/%u scope %s%s\n", i->ip6[k],
+                         i->ip6_prefix[k], ip6_scope(i->ip6[k]),
+                         (i->ip6_flags[k] & ESPIX_IP6_TENTATIVE) ? " tentative" : "");
         }
     }
 }
@@ -124,7 +144,8 @@ static void print_ip_iface(espix_session_t *s, const espix_ifinfo_t *i,
 static void print_ip_brief(espix_session_t *s, const espix_ifinfo_t *i,
                            bool with_addr, bool v4, bool v6)
 {
-    espix_printf(s, "%-10s %-5s", i->name, i->up ? "UP" : "DOWN");
+    const bool any = !with_addr || (v4 && i->has_addr) || (v6 && i->n_ip6 > 0);
+    espix_printf(s, any ? "%-10s %-5s" : "%-10s %s", i->name, i->up ? "UP" : "DOWN");
 
     if (!with_addr) {
         if (i->has_mac) {
@@ -157,8 +178,11 @@ static void print_ip_brief(espix_session_t *s, const espix_ifinfo_t *i,
 static int ip_show(espix_session_t *s, const char *dev, bool with_addr,
                    bool v4, bool v6, bool brief)
 {
-    espix_ifinfo_t ifs[IFLIST_MAX];
-    const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
+    size_t          n   = 0;
+    espix_ifinfo_t *ifs = iflist_get(s, &n);
+    if (ifs == NULL) {
+        return 1;
+    }
 
     for (size_t i = 0; i < n; i++) {
         if (dev != NULL && strcmp(dev, ifs[i].name) != 0) {
@@ -170,6 +194,7 @@ static int ip_show(espix_session_t *s, const char *dev, bool with_addr,
             print_ip_iface(s, &ifs[i], with_addr, v4, v6);
         }
     }
+    free(ifs);
     return 0;
 }
 
@@ -235,8 +260,11 @@ static void ip_route6(espix_session_t *s, const espix_ifinfo_t *ifs, size_t n)
 
 static int ip_route(espix_session_t *s, bool v4, bool v6)
 {
-    espix_ifinfo_t ifs[IFLIST_MAX];
-    const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
+    size_t          n   = 0;
+    espix_ifinfo_t *ifs = iflist_get(s, &n);
+    if (ifs == NULL) {
+        return 1;
+    }
 
     if (v4) {
         char     dev[ESPIX_IF_NAME_MAX];
@@ -264,6 +292,7 @@ static int ip_route(espix_session_t *s, bool v4, bool v6)
     if (v6) {
         ip_route6(s, ifs, n);
     }
+    free(ifs);
     return 0;
 }
 
@@ -302,9 +331,13 @@ static int cmd_host(espix_session_t *s, int argc, char **argv)
         } else if (a->ai_family == AF_INET6) {
             const struct sockaddr_in6 *in6 =
                 (const struct sockaddr_in6 *)a->ai_addr;
-            espix_printf(s, "%s has IPv6 address %s\n", argv[1],
-                         lwip_inet_ntop(AF_INET6, &in6->sin6_addr, buf,
-                                        sizeof(buf)));
+            lwip_inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf));
+            for (char *c = buf; *c != '\0'; c++) {     /* lwIP's is upper case */
+                if (*c >= 'A' && *c <= 'F') {
+                    *c = (char)(*c - 'A' + 'a');
+                }
+            }
+            espix_printf(s, "%s has IPv6 address %s\n", argv[1], buf);
             shown++;
         }
     }
@@ -387,8 +420,11 @@ static int cmd_ifconfig(espix_session_t *s, int argc, char **argv)
 {
     const char *dev = (argc > 1) ? argv[1] : NULL;
 
-    espix_ifinfo_t ifs[IFLIST_MAX];
-    const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
+    size_t          n   = 0;
+    espix_ifinfo_t *ifs = iflist_get(s, &n);
+    if (ifs == NULL) {
+        return 1;
+    }
     bool           shown = false;
 
     for (size_t i = 0; i < n; i++) {
@@ -436,8 +472,10 @@ static int cmd_ifconfig(espix_session_t *s, int argc, char **argv)
 
     if (dev != NULL && !shown) {
         espix_eprintf(s, "ifconfig: %s: no such interface\n", dev);
+        free(ifs);
         return 1;
     }
+    free(ifs);
     return 0;
 }
 
@@ -457,8 +495,11 @@ static int cmd_route(espix_session_t *s, int argc, char **argv)
                      espix_net_ip4str(gw, g, sizeof(g)), "0.0.0.0", "UG", dev);
     }
 
-    espix_ifinfo_t ifs[IFLIST_MAX];
-    const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
+    size_t          n   = 0;
+    espix_ifinfo_t *ifs = iflist_get(s, &n);
+    if (ifs == NULL) {
+        return 1;
+    }
     for (size_t i = 0; i < n; i++) {
         if (!ifs[i].has_addr || ifs[i].kind == ESPIX_IF_LO) {
             continue;
@@ -471,6 +512,7 @@ static int cmd_route(espix_session_t *s, int argc, char **argv)
                      espix_net_ip4str(ifs[i].netmask, nm, sizeof(nm)),
                      "U", ifs[i].name);
     }
+    free(ifs);
     return 0;
 }
 
@@ -499,9 +541,25 @@ static void ping_success(esp_ping_handle_t hdl, void *args)
     esp_ping_get_profile(hdl, ESP_PING_PROF_SIZE, &size, sizeof(size));
     esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
 
-    espix_printf(c->s, "%u bytes from %s: icmp_seq=%u ttl=%u time=%u ms\n",
-                 (unsigned)size, ipaddr_ntoa(&target),
-                 (unsigned)seqno, (unsigned)ttl, (unsigned)elapsed);
+    /* lwIP spells IPv6 in upper case; Linux's ping does not. */
+    char from[IPADDR_STRLEN_MAX];
+    ipaddr_ntoa_r(&target, from, sizeof(from));
+    for (char *p = from; *p != '\0'; p++) {
+        if (*p >= 'A' && *p <= 'F') {
+            *p = (char)(*p - 'A' + 'a');
+        }
+    }
+
+    /* esp_ping reads the TTL from an IPv4 header only; it never learns an IPv6
+     * reply's hop limit, so there is nothing true to print for one. */
+    if (IP_IS_V6(&target)) {
+        espix_printf(c->s, "%u bytes from %s: icmp_seq=%u time=%u ms\n",
+                     (unsigned)size, from, (unsigned)seqno, (unsigned)elapsed);
+    } else {
+        espix_printf(c->s, "%u bytes from %s: icmp_seq=%u ttl=%u time=%u ms\n",
+                     (unsigned)size, from,
+                     (unsigned)seqno, (unsigned)ttl, (unsigned)elapsed);
+    }
 }
 
 static void ping_timeout(esp_ping_handle_t hdl, void *args)
@@ -533,28 +591,102 @@ static void ping_end(esp_ping_handle_t hdl, void *args)
     xEventGroupSetBits(c->done, PING_DONE_BIT);
 }
 
-static int cmd_ping(espix_session_t *s, int argc, char **argv)
+/*
+ * Where to ping, in either family. An IPv6 literal is recognised by its colon
+ * and may carry a zone (fe80::1%eth0); a name is IPv4 unless -6 asks for its
+ * AAAA, as iputils' ping does with -4/-6. The zone, or -I, binds the socket to
+ * that interface, which is what a link-local destination needs.
+ */
+static bool ping_target(espix_session_t *s, const char *host, int fam,
+                        ip_addr_t *out, char *ifname, size_t ifname_len)
+{
+    memset(out, 0, sizeof(*out));
+
+#if CONFIG_LWIP_IPV6
+    if (fam == 6 || (fam == 0 && strchr(host, ':') != NULL)) {
+        char text[INET6_ADDRSTRLEN + ESPIX_IF_NAME_MAX];
+        strlcpy(text, host, sizeof(text));
+        char *zone = strchr(text, '%');
+        if (zone != NULL) {
+            *zone++ = '\0';
+            strlcpy(ifname, zone, ifname_len);
+        }
+
+        struct in6_addr a6;
+        if (inet_pton(AF_INET6, text, &a6) != 1) {
+            const struct addrinfo hints = { .ai_family = AF_INET6 };
+            struct addrinfo *res = NULL;
+            if (getaddrinfo(text, NULL, &hints, &res) != 0 || res == NULL) {
+                espix_eprintf(s, "ping: %s: Name or service not known\n", host);
+                return false;
+            }
+            a6 = ((const struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
+            freeaddrinfo(res);
+        }
+        IP_SET_TYPE_VAL(*out, IPADDR_TYPE_V6);
+        inet6_addr_to_ip6addr(ip_2_ip6(out), &a6);
+
+        if (ip6_addr_islinklocal(ip_2_ip6(out)) && ifname[0] == '\0') {
+            espix_eprintf(s, "ping: %s is link-local: say which interface, "
+                             "%s%%eth0 or -I eth0\n", host, host);
+            return false;
+        }
+        return true;
+    }
+#endif
+
+    if (fam == 6) {
+        espix_eprintf(s, "ping: IPv6 is not built in\n");
+        return false;
+    }
+    uint32_t addr = 0;
+    if (espix_net_resolve(host, &addr) != ESP_OK) {
+        espix_eprintf(s, "ping: %s: Name or service not known\n", host);
+        return false;
+    }
+    IP_SET_TYPE_VAL(*out, IPADDR_TYPE_V4);
+    ip_2_ip4(out)->addr = addr;
+    return true;
+}
+
+static int ping_run(espix_session_t *s, int argc, char **argv, int fam)
 {
     const char *host  = NULL;
     uint32_t    count = 0;   /* until ^C, as on Linux */
+    char        ifname[ESPIX_IF_NAME_MAX] = "";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             count = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
+            strlcpy(ifname, argv[++i], sizeof(ifname));
+        } else if (strcmp(argv[i], "-4") == 0) {
+            fam = 4;
+        } else if (strcmp(argv[i], "-6") == 0) {
+            fam = 6;
         } else {
             host = argv[i];
         }
     }
 
     if (host == NULL) {
-        espix_eprintf(s, "usage: ping [-c count] <host>\n");
+        espix_eprintf(s, "usage: %s [-4|-6] [-c count] [-I iface] <host>\n", argv[0]);
         return 1;
     }
 
-    uint32_t addr = 0;
-    if (espix_net_resolve(host, &addr) != ESP_OK) {
-        espix_eprintf(s, "ping: %s: Name or service not known\n", host);
+    ip_addr_t target;
+    if (!ping_target(s, host, fam, &target, ifname, sizeof(ifname))) {
         return 1;
+    }
+
+    uint32_t ifindex = 0;
+    if (ifname[0] != '\0') {
+        espix_ifinfo_t info;
+        if (espix_net_ifinfo(ifname, &info) != ESP_OK || info.index <= 0) {
+            espix_eprintf(s, "ping: %s: no such interface\n", ifname);
+            return 1;
+        }
+        ifindex = (uint32_t)info.index;
     }
 
     ping_ctx_t ctx = { .s = s, .host = host, .done = xEventGroupCreate() };
@@ -563,9 +695,9 @@ static int cmd_ping(espix_session_t *s, int argc, char **argv)
     }
 
     esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-    cfg.count             = count;
-    cfg.target_addr.type  = IPADDR_TYPE_V4;
-    cfg.target_addr.u_addr.ip4.addr = addr;
+    cfg.count       = count;
+    cfg.target_addr = target;
+    cfg.interface   = ifindex;
 
     const esp_ping_callbacks_t cbs = {
         .cb_args         = &ctx,
@@ -574,9 +706,14 @@ static int cmd_ping(espix_session_t *s, int argc, char **argv)
         .on_ping_end     = ping_end,
     };
 
-    char ipbuf[ESPIX_IP4STR_MAX];
-    espix_printf(s, "PING %s (%s): %u data bytes\n", host,
-                 espix_net_ip4str(addr, ipbuf, sizeof(ipbuf)),
+    char ipbuf[IPADDR_STRLEN_MAX];
+    ipaddr_ntoa_r(&target, ipbuf, sizeof(ipbuf));
+    for (char *p = ipbuf; *p != '\0'; p++) {
+        if (*p >= 'A' && *p <= 'F') {
+            *p = (char)(*p - 'A' + 'a');
+        }
+    }
+    espix_printf(s, "PING %s (%s): %u data bytes\n", host, ipbuf,
                  (unsigned)cfg.data_size);
 
     esp_ping_handle_t hdl = NULL;
@@ -612,6 +749,17 @@ static int cmd_ping(espix_session_t *s, int argc, char **argv)
     esp_ping_delete_session(hdl);
     vEventGroupDelete(ctx.done);
     return 0;
+}
+
+static int cmd_ping(espix_session_t *s, int argc, char **argv)
+{
+    return ping_run(s, argc, argv, 0);
+}
+
+/* ping6 is ping -6, as iputils has made it. */
+static int cmd_ping6(espix_session_t *s, int argc, char **argv)
+{
+    return ping_run(s, argc, argv, 6);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1028,14 +1176,18 @@ static int cmd_nat(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    espix_ifinfo_t ifs[IFLIST_MAX];
-    const size_t   n = espix_net_iflist(ifs, IFLIST_MAX);
+    size_t          n   = 0;
+    espix_ifinfo_t *ifs = iflist_get(s, &n);
+    if (ifs == NULL) {
+        return 1;
+    }
     for (size_t i = 0; i < n; i++) {
         if (ifs[i].kind == ESPIX_IF_LO) {
             continue;
         }
         espix_printf(s, "%-8s nat %s\n", ifs[i].name, ifs[i].napt ? "on" : "off");
     }
+    free(ifs);
     return 0;
 }
 
@@ -1047,6 +1199,12 @@ static int cmd_nat(espix_session_t *s, int argc, char **argv)
  */
 static int cmd_bridge(espix_session_t *s, int argc, char **argv)
 {
+#if !CONFIG_ESPIX_NET_BRIDGE
+    (void)argc;
+    (void)argv;
+    espix_eprintf(s, "bridge: this image has no L2 bridge (CONFIG_ESPIX_NET_BRIDGE)\n");
+    return 1;
+#endif
     const char *sub = (argc > 1) ? argv[1] : "show";
 
     if (strcmp(sub, "add") == 0 || strcmp(sub, "del") == 0) {
@@ -1108,90 +1266,13 @@ static int cmd_bridge(espix_session_t *s, int argc, char **argv)
                      espix_net_prefix_len(br.netmask));
     }
 
-    char ports[IFLIST_MAX][ESPIX_IF_NAME_MAX];
-    const size_t n = espix_net_bridge_portlist(ports, IFLIST_MAX);
+    char ports[BRIDGE_PORTS_MAX][ESPIX_IF_NAME_MAX];
+    const size_t n = espix_net_bridge_portlist(ports, BRIDGE_PORTS_MAX);
     espix_printf(s, "ports:  ");
     for (size_t i = 0; i < n; i++) {
         espix_printf(s, " %s", ports[i]);
     }
     espix_printf(s, "\n");
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* ping6                                                               */
-/* ------------------------------------------------------------------ */
-
-/*
- * IPv6 ping is OpenThread's, because it cannot be lwIP's: lwIP's icmp6_input()
- * answers echo *requests* itself and has no case for echo replies, so a raw
- * ICMPv6 socket never sees the reply -- the packet falls to its default branch
- * and is counted as a protocol error. So ping6 is the Thread mesh's ping and it
- * reaches exactly what thread0 reaches; there is no ICMPv6 ping to delegate a
- * wlan0 or eth0 address to.
- */
-#if CONFIG_ESPIX_THREAD
-static void ping6_to_session(void *ctx, const char *text, size_t len)
-{
-    espix_session_t *s = (espix_session_t *)ctx;
-    (void)len;
-    espix_printf(s, "%s", text);
-}
-#endif
-
-static int cmd_ping6(espix_session_t *s, int argc, char **argv)
-{
-    const char *host  = NULL;
-    uint32_t    count = 0;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            count = (uint32_t)strtoul(argv[++i], NULL, 10);
-        } else {
-            host = argv[i];
-        }
-    }
-    if (host == NULL) {
-        espix_eprintf(s, "usage: ping6 [-c count] <thread-addr>\n");
-        return 1;
-    }
-
-#if !CONFIG_ESPIX_THREAD
-    espix_eprintf(s, "ping6: no IPv6 ping in this build: it has no Thread\n"
-                    "  (ESPIX_THREAD is off), and lwIP has no ICMPv6 ping.\n");
-    return 1;
-#else
-    if (!espix_thread_is_started()) {
-        espix_eprintf(s, "ping6: no IPv6 ping: lwIP answers echo replies itself\n"
-                        "  and never passes them to a socket, so IPv6 ping is\n"
-                        "  OpenThread's. Start it first: 'thread start', then\n"
-                        "  'thread attach'.\n");
-        return 1;
-    }
-
-    /* ot's ping takes no zone; thread0 is the only interface it can reach. */
-    char addr[ESPIX_IP6STR_MAX];
-    strlcpy(addr, host, sizeof(addr));
-    char *pct = strchr(addr, '%');
-    if (pct != NULL) {
-        *pct = '\0';
-    }
-
-    /* ot's ping takes its arguments positionally: addr, size, count. */
-    unsigned pings = count ? (unsigned)count : 4;
-    if (pings > 8) {
-        pings = 8;      /* the CLI capture waits ten seconds */
-    }
-
-    char line[96];
-    snprintf(line, sizeof(line), "ping %s 32 %u", addr, pings);
-
-    const esp_err_t err = espix_thread_cli(line, ping6_to_session, s);
-    if (err != ESP_OK) {
-        espix_eprintf(s, "ping6: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-#endif
     return 0;
 }
 
@@ -1210,11 +1291,11 @@ static espix_cmd_t s_net_cmds[] = {
       .help = "show the routing table (net-tools style)",
       .usage = "route" },
     { .name = "ping",     .fn = cmd_ping,
-      .help = "send ICMP echo requests",
-      .usage = "ping [-c count] <host>" },
+      .help = "send ICMP echo requests, IPv4 or IPv6",
+      .usage = "ping [-4|-6] [-c count] [-I iface] <host>[%iface]" },
     { .name = "ping6",    .fn = cmd_ping6,
-      .help = "ping over the Thread mesh (OpenThread's ICMPv6)",
-      .usage = "ping6 [-c count] <thread-addr>" },
+      .help = "ping -6",
+      .usage = "ping6 [-c count] [-I iface] <host>[%iface]" },
     { .name = "nat",      .fn = cmd_nat,
       .help = "masquerade an interface behind the default route",
       .usage = "nat [status] | nat {on|off} <dev>" },

@@ -22,6 +22,7 @@ typedef struct {
     espix_if_kind_t kind;
     esp_netif_t    *netif;      /* NULL for synthesised entries */
     bool            napt;       /* espix turned NAPT on for this one */
+    bool            gone;       /* unregistered; the slot waits for its name */
 } espix_if_entry_t;
 
 /*
@@ -31,6 +32,14 @@ typedef struct {
  */
 esp_err_t espix_net_register_if(const char *name, espix_if_kind_t kind,
                                 esp_netif_t *netif);
+
+/*
+ * Take an interface out of the table before its netif is destroyed -- Thread's,
+ * whose stack destroys it on stop. The slot is kept, marked gone, and reused if
+ * the name registers again, so an entry pointer another caller holds never
+ * starts naming a different interface.
+ */
+void espix_net_unregister_if(const char *name);
 
 /* Look up an entry by espix name, or NULL. */
 const espix_if_entry_t *espix_net_find_if(const char *name);
@@ -90,7 +99,8 @@ void espix_net_unregister_netif(struct netif *netif);
 
 /*
  * Give an interface its IPv6 link-local, as Linux gives every interface one.
- * Called from the GOT_IP paths because creation needs the netif up. No-op
- * without IPv6, and harmless when one is already there.
+ * Called on link-up, and from the GOT_IP paths as a fallback, because creation
+ * needs the netif up. No-op without IPv6, and harmless when one is already
+ * there.
  */
 esp_err_t espix_net_ip6_linklocal(esp_netif_t *netif);

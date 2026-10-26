@@ -1,0 +1,86 @@
+
+--- a/components/lwip/lwip/src/include/lwip/netif.h	2026-10-26 11:00:22
++++ b/components/lwip/lwip/src/include/lwip/netif.h	2026-10-26 11:00:22
+@@ -119,9 +119,7 @@
+ #if LWIP_AUTOIP
+    LWIP_NETIF_CLIENT_DATA_INDEX_AUTOIP,
+ #endif
+-#if LWIP_ACD
+-   LWIP_NETIF_CLIENT_DATA_INDEX_ACD,
+-#endif
++   /* No slot for ACD: acd.c keeps its state in acd_list (tools/patch-lwip.py). */
+ #if LWIP_IGMP
+    LWIP_NETIF_CLIENT_DATA_INDEX_IGMP,
+ #endif
+
+--- a/components/lwip/lwip/src/netif/bridgeif.c	2026-10-26 11:00:22
++++ b/components/lwip/lwip/src/netif/bridgeif.c	2026-10-26 11:00:22
+@@ -117,11 +117,28 @@
+   bridgeif_fdb_static_entry_t *fdbs;
+   u16_t             max_fdbd_entries;
+   void             *fdbd;
++  struct bridgeif_private_s *next;
+ } bridgeif_private_t;
+ 
+-/* netif data index to get the bridge on input */
+-static u8_t bridgeif_netif_client_id = 0xff;
++/* Every bridge, so a port finds its own without a client-data slot
++ * (tools/patch-lwip.py). Bridges are never freed. */
++static bridgeif_private_t *bridgeif_list;
+ 
++static bridgeif_port_t *
++bridgeif_port_of(struct netif *portif)
++{
++  bridgeif_private_t *br;
++  u8_t i;
++  for (br = bridgeif_list; br != NULL; br = br->next) {
++    for (i = 0; i < br->num_ports; i++) {
++      if (br->ports[i].port_netif == portif) {
++        return &br->ports[i];
++      }
++    }
++  }
++  return NULL;
++}
++
+ /**
+  * @ingroup bridgeif
+  * Add a static entry to the forwarding database.
+@@ -333,7 +350,7 @@
+   if (p == NULL || netif == NULL) {
+     return ERR_VAL;
+   }
+-  port = (bridgeif_port_t *)netif_get_client_data(netif, bridgeif_netif_client_id);
++  port = bridgeif_port_of(netif);
+   LWIP_ASSERT("port data not set", port != NULL);
+   if (port == NULL || port->bridge == NULL) {
+     return ERR_VAL;
+@@ -425,10 +442,6 @@
+   }
+ #endif
+ 
+-  if (bridgeif_netif_client_id == 0xFF) {
+-    bridgeif_netif_client_id = netif_alloc_client_data_id();
+-  }
+-
+   init_data = (bridgeif_initdata_t *)netif->state;
+   LWIP_ASSERT("init_data != NULL", (init_data != NULL));
+   LWIP_ASSERT("init_data->max_ports <= BRIDGEIF_MAX_PORTS",
+@@ -459,6 +472,8 @@
+     mem_free(br);
+     return ERR_MEM;
+   }
++  br->next = bridgeif_list;
++  bridgeif_list = br;
+ 
+ #if LWIP_NETIF_HOSTNAME
+   /* Initialize interface hostname */
+@@ -552,8 +567,6 @@
+ #else
+   portif->input = bridgeif_tcpip_input;
+ #endif
+-  /* store pointer to bridge in netif */
+-  netif_set_client_data(portif, bridgeif_netif_client_id, port);
+   /* remove ETHARP flag to prevent sending report events on netif-up */
+   netif_clear_flags(portif, NETIF_FLAG_ETHARP);
+ 

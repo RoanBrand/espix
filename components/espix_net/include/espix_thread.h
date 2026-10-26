@@ -7,11 +7,9 @@
  * so ip/ifconfig/route already know how to show it.
  *
  * The control surface is the \`thread\` command (cmd_thread.c). OpenThread's own
- * CLI is available through espix_thread_cli(): IDF has already initialised it
- * in esp_openthread_start(), and espix_thread_cli() posts a line to the OT task
- * queue. Its replies go to the OT task's stdout, i.e. the console; a session
- * gets the answer only for its own commands, which is why the command's own
- * verbs do not depend on the CLI.
+ * CLI is available through espix_thread_cli(), which posts a line to the OT task
+ * and hands its reply back to the caller; output nobody is waiting for goes to
+ * the console. The command's own verbs answer from the stack's API instead.
  */
 #pragma once
 
@@ -61,13 +59,15 @@ esp_err_t espix_thread_attach(void);
  * named in /etc/thread.conf (backbone=eth0) and must exist before start. */
 esp_err_t espix_thread_border_router(bool on);
 
-/* Where a CLI reply goes while the line runs. Called once per output chunk;
- * the text is not NUL-terminated. */
+/* Where a CLI reply goes: called with the whole reply once the line is done
+ * (and once more if it had to be truncated). The text is not NUL-terminated. */
 typedef void (*espix_thread_write_fn)(void *ctx, const char *text, size_t len);
 
-/* One line of OpenThread CLI, e.g. "dataset active". Runs under the OpenThread
- * lock and answers through write(), so the session that asked sees it; commands
- * that finish later still answer on the console. */
+/* One line of OpenThread CLI, e.g. "dataset active", answered through write()
+ * so the session that asked sees it. ESP_ERR_TIMEOUT if the reply did not finish
+ * within ten seconds -- what it had printed is still delivered, the rest goes to
+ * the console -- and ESP_ERR_INVALID_STATE while an earlier line is still
+ * running. */
 esp_err_t espix_thread_cli(const char *line, espix_thread_write_fn write,
                            void *ctx);
 
@@ -76,6 +76,8 @@ esp_err_t espix_thread_cli(const char *line, espix_thread_write_fn write,
 esp_err_t espix_thread_dataset_hex(char *out, size_t out_len);
 esp_err_t espix_thread_join(const char *hex);
 
+/* ESP_ERR_TIMEOUT if a start or stop is in progress and did not finish within
+ * half a second. */
 esp_err_t espix_thread_status(espix_thread_status_t *out);
 
 /* Rewrite /etc/thread.conf with the four policy keys (enabled, border_router,

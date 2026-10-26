@@ -172,13 +172,13 @@ printf 'release: merging flash images\n'
 merge "$minimal" \
     "$boot_off" "$build/bootloader/bootloader.bin" \
     "0x8000" "$build/partition_table/partition-table.bin" \
-    "0xf000" "$build/ota_data_initial.bin" \
+    "$(off_of otadata)" "$build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$loader" \
     "$(off_of ota_1)" "$build/espix.bin"
 merge "$full" \
     "$boot_off" "$build/bootloader/bootloader.bin" \
     "0x8000" "$build/partition_table/partition-table.bin" \
-    "0xf000" "$build/ota_data_initial.bin" \
+    "$(off_of otadata)" "$build/ota_data_initial.bin" \
     "$(off_of ota_0)" "$loader" \
     "$(off_of ota_1)" "$build/espix.bin" \
     "$(off_of storage)" "$factory_fs"

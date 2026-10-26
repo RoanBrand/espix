@@ -23,15 +23,13 @@ What it changes
 1. Include esp_attr.h, which brings EXT_RAM_BSS_ATTR and sdkconfig.h.
 2. Add the attribute to the gInstanceRaw definition.
 
-Two things to respect, both about *when* the bytes must be reachable rather than
-where they live:
-
-  * PSRAM is behind the cache. While the cache is frozen -- esp_partition_mmap()
-    and therefore OTA -- the instance is not addressable: the same hazard espix
-    records for PSRAM task stacks. Do not run an OTA while OpenThread is using it.
-  * The 802.15.4 path must not dereference the instance from an ISR. It posts to
-    a queue and the OpenThread task does the work, so this is expected to hold,
-    but it is the thing to re-check if radio behaviour changes.
+One thing to respect, about *when* the bytes must be reachable rather than
+where they live: PSRAM is behind the flash cache, so the instance is not
+addressable while a flash write has the cache disabled. Every littlefs write does
+that already, and IDF suspends the other core's tasks for it, so the OpenThread
+task cannot run then. What could is an interrupt -- and the radio's IRAM
+callbacks in esp_openthread_radio.c touch only that file's statics in internal
+RAM, never the instance. Re-check that if IDF's radio port changes.
 
 Where this writes
 -----------------

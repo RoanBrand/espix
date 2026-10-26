@@ -44,6 +44,7 @@
 #include "espix_ota.h"
 #include "espix_proc.h"
 #include "espix_svc.h"
+#include "espix_thread.h"
 #include "espix_task.h"
 #include "espix_shell.h"
 #include "espix_time.h"
@@ -187,6 +188,23 @@ static void shutdown_bluetooth(int64_t deadline_us)
     (void)espix_bt_shutdown();
 }
 
+#if CONFIG_ESPIX_THREAD
+static void shutdown_thread(int64_t deadline_us)
+{
+    (void)deadline_us;
+    /*
+     * The radio has to be off before the restart, not merely abandoned by it.
+     * A CPU reset with OpenThread running leaves the next boot unable to tune
+     * PSRAM: every MSPI delay-line setting reads back wrong, the boot spins
+     * until the LP watchdog resets the chip, and a loader started that way
+     * never installs anything. Measured on the S31: reboot with Thread up,
+     * CHIP_LP_WDT_RESET eight seconds later; the same reboot after
+     * 'thread stop', a clean SW_CPU_RESET.
+     */
+    (void)espix_thread_stop();
+}
+#endif
+
 static void shutdown_wiring(void)
 {
     (void)espix_shutdown_add(ESPIX_SHUTDOWN_PROCESSES, shutdown_processes,
@@ -196,6 +214,9 @@ static void shutdown_wiring(void)
     (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_audio, "audio");
     (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_bluetooth,
                              "bluetooth");
+#if CONFIG_ESPIX_THREAD
+    (void)espix_shutdown_add(ESPIX_SHUTDOWN_HARDWARE, shutdown_thread, "thread");
+#endif
 }
 
 void app_main(void)

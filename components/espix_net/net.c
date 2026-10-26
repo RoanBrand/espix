@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -29,6 +32,28 @@
 
 static espix_if_entry_t s_ifs[ESPIX_IF_MAX];
 static size_t           s_if_count;
+
+/*
+ * The table changes after boot -- Thread registers thread0 when it starts and
+ * removes it when it stops, and its stack destroys the netif then -- so a reader
+ * and that removal must not overlap. Recursive, because a reader filling an
+ * entry calls back into the table (espix_net_find_if()).
+ */
+static StaticSemaphore_t s_if_lock_buf;
+static SemaphoreHandle_t s_if_lock;
+
+static void if_lock(void)
+{
+    if (s_if_lock == NULL) {
+        s_if_lock = xSemaphoreCreateRecursiveMutexStatic(&s_if_lock_buf);
+    }
+    xSemaphoreTakeRecursive(s_if_lock, portMAX_DELAY);
+}
+
+static void if_unlock(void)
+{
+    xSemaphoreGiveRecursive(s_if_lock);
+}
 static char             s_hostname[ESPIX_HOSTNAME_MAX];
 static bool             s_inited;
 
@@ -82,6 +107,8 @@ static void fill_ip6(struct netif *n, espix_ifinfo_t *out, uint8_t prefix)
         }
 
         out->ip6_prefix[out->n_ip6] = prefix;
+        out->ip6_flags[out->n_ip6] =
+            ip6_addr_istentative(netif_ip6_addr_state(n, i)) ? ESPIX_IP6_TENTATIVE : 0;
         out->n_ip6++;
     }
 #else
@@ -98,15 +125,33 @@ static void fill_ip6(struct netif *n, espix_ifinfo_t *out, uint8_t prefix)
 esp_err_t espix_net_register_if(const char *name, espix_if_kind_t kind,
                                 esp_netif_t *netif)
 {
-    if (name == NULL || s_if_count >= ESPIX_IF_MAX) {
-        return ESP_ERR_NO_MEM;
+    if (name == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    espix_if_entry_t *e = &s_ifs[s_if_count];
-    strlcpy(e->name, name, sizeof(e->name));
+    if_lock();
+
+    /* A name registers once: again after an unregister, it takes its old slot. */
+    espix_if_entry_t *e = NULL;
+    for (size_t i = 0; i < s_if_count; i++) {
+        if (strcmp(s_ifs[i].name, name) == 0) {
+            e = &s_ifs[i];
+            break;
+        }
+    }
+    if (e == NULL) {
+        if (s_if_count >= ESPIX_IF_MAX) {
+            if_unlock();
+            return ESP_ERR_NO_MEM;
+        }
+        e = &s_ifs[s_if_count++];
+        strlcpy(e->name, name, sizeof(e->name));
+    }
     e->kind  = kind;
     e->netif = netif;
-    s_if_count++;
+    e->napt  = false;
+    e->gone  = false;
+    if_unlock();
 
     /*
      * Apply the hostname here rather than in the WiFi path. lwip stores it per
@@ -122,25 +167,54 @@ esp_err_t espix_net_register_if(const char *name, espix_if_kind_t kind,
     return ESP_OK;
 }
 
+void espix_net_unregister_if(const char *name)
+{
+    if (name == NULL) {
+        return;
+    }
+    if_lock();
+    for (size_t i = 0; i < s_if_count; i++) {
+        if (strcmp(s_ifs[i].name, name) == 0) {
+            s_ifs[i].netif = NULL;
+            s_ifs[i].napt  = false;
+            s_ifs[i].gone  = true;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s: unregistered", name);
+            break;
+        }
+    }
+    if_unlock();
+}
+
 const espix_if_entry_t *espix_net_find_if(const char *name)
 {
     if (name == NULL) {
         return NULL;
     }
+    const espix_if_entry_t *found = NULL;
+    if_lock();
     for (size_t i = 0; i < s_if_count; i++) {
-        if (strcmp(s_ifs[i].name, name) == 0) {
-            return &s_ifs[i];
+        if (!s_ifs[i].gone && strcmp(s_ifs[i].name, name) == 0) {
+            found = &s_ifs[i];
+            break;
         }
     }
-    return NULL;
+    if_unlock();
+    return found;
 }
 
 const char *espix_net_name_of(esp_netif_t *netif)
 {
+    const char *found = NULL;
+    if_lock();
     for (size_t i = 0; i < s_if_count; i++) {
-        if (s_ifs[i].netif == netif) {
-            return s_ifs[i].name;
+        if (!s_ifs[i].gone && netif != NULL && s_ifs[i].netif == netif) {
+            found = s_ifs[i].name;
+            break;
         }
+    }
+    if_unlock();
+    if (found != NULL) {
+        return found;
     }
     return NULL;
 }
@@ -152,9 +226,10 @@ const char *espix_net_name_of(esp_netif_t *netif)
  * a Router Solicitation on the backbone ("Failed to send RS", once per
  * interval) and therefore had no upstream NAT64 prefix to learn.
  *
- * Creation only works on an up netif, so this is called from the GOT_IP paths
- * rather than at registration. Doing it twice is harmless: the getter answers
- * first.
+ * Creation only works on an up netif, so this is called on link-up (with the
+ * GOT_IP paths as a fallback) rather than at registration. Doing it twice is
+ * harmless: the getter answers first, and a netif that is not up yet is left
+ * for the next call rather than reported as a failure.
  */
 esp_err_t espix_net_ip6_linklocal(esp_netif_t *netif)
 {
@@ -171,6 +246,9 @@ esp_err_t espix_net_ip6_linklocal(esp_netif_t *netif)
     esp_ip6_addr_t existing;
     if (esp_netif_get_ip6_linklocal(netif, &existing) == ESP_OK) {
         return ESP_OK;
+    }
+    if (!esp_netif_is_netif_up(netif)) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     const esp_err_t err = esp_netif_create_ip6_linklocal(netif);
@@ -285,7 +363,11 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
         out->mtu = mtu;
     }
 
-    if (esp_netif_get_mac(e->netif, out->mac) == ESP_OK) {
+    /* All zeros is "no link-layer address" -- what Thread's glue netif reports --
+     * not a MAC to print. */
+    static const uint8_t k_no_mac[6] = { 0 };
+    if (esp_netif_get_mac(e->netif, out->mac) == ESP_OK &&
+        memcmp(out->mac, k_no_mac, sizeof(k_no_mac)) != 0) {
         out->has_mac = true;
     }
 
@@ -322,6 +404,7 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
             for (size_t k = 0; k < st.n_addrs && out->n_ip6 < ESPIX_IP6_MAX; k++) {
                 strlcpy(out->ip6[out->n_ip6], st.addrs[k], ESPIX_IP6STR_MAX);
                 out->ip6_prefix[out->n_ip6] = 64;
+                out->ip6_flags[out->n_ip6]  = 0;
                 out->n_ip6++;
             }
         }
@@ -329,11 +412,17 @@ static void fill_ifinfo(const espix_if_entry_t *e, espix_ifinfo_t *out)
 #endif
 }
 
+_Static_assert(ESPIX_IF_MAX + ESPIX_RAW_MAX == ESPIX_NET_IF_LIMIT,
+               "ESPIX_NET_IF_LIMIT must cover the named table and the raw netifs");
+
 size_t espix_net_iflist(espix_ifinfo_t *out, size_t n)
 {
     size_t count = 0;
+    if_lock();
     for (size_t i = 0; i < s_if_count && count < n; i++) {
-        fill_ifinfo(&s_ifs[i], &out[count++]);
+        if (!s_ifs[i].gone) {
+            fill_ifinfo(&s_ifs[i], &out[count++]);
+        }
     }
 
     /* Then the ones espix made itself and registered, so a tunnel shows up
@@ -341,6 +430,7 @@ size_t espix_net_iflist(espix_ifinfo_t *out, size_t n)
     for (size_t i = 0; i < s_raw_count && count < n; i++) {
         fill_raw_ifinfo(s_raw[i].name, s_raw[i].netif, &out[count++]);
     }
+    if_unlock();
     return count;
 }
 
@@ -350,19 +440,23 @@ esp_err_t espix_net_ifinfo(const char *name, espix_ifinfo_t *out)
         return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if_lock();
     const espix_if_entry_t *e = espix_net_find_if(name);
     if (e != NULL) {
         fill_ifinfo(e, out);
-        return ESP_OK;
-    }
-
-    for (size_t i = 0; i < s_raw_count; i++) {
-        if (strcmp(s_raw[i].name, name) == 0) {
-            fill_raw_ifinfo(s_raw[i].name, s_raw[i].netif, out);
-            return ESP_OK;
+        err = ESP_OK;
+    } else {
+        for (size_t i = 0; i < s_raw_count; i++) {
+            if (strcmp(s_raw[i].name, name) == 0) {
+                fill_raw_ifinfo(s_raw[i].name, s_raw[i].netif, out);
+                err = ESP_OK;
+                break;
+            }
         }
     }
-    return ESP_ERR_NOT_FOUND;
+    if_unlock();
+    return err;
 }
 
 /*
@@ -373,21 +467,23 @@ esp_err_t espix_net_ifinfo(const char *name, espix_ifinfo_t *out)
 esp_err_t espix_net_napt(const char *name, bool enable)
 {
 #if CONFIG_LWIP_IPV4_NAPT
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if_lock();
     for (size_t i = 0; i < s_if_count; i++) {
         if (strcmp(s_ifs[i].name, name) != 0) {
             continue;
         }
-        if (s_ifs[i].netif == NULL) {
-            return ESP_ERR_NOT_FOUND;
+        if (s_ifs[i].netif != NULL) {
+            err = enable ? esp_netif_napt_enable(s_ifs[i].netif)
+                         : esp_netif_napt_disable(s_ifs[i].netif);
+            if (err == ESP_OK) {
+                s_ifs[i].napt = enable;
+            }
         }
-        const esp_err_t err = enable ? esp_netif_napt_enable(s_ifs[i].netif)
-                                     : esp_netif_napt_disable(s_ifs[i].netif);
-        if (err == ESP_OK) {
-            s_ifs[i].napt = enable;
-        }
-        return err;
+        break;
     }
-    return ESP_ERR_NOT_FOUND;
+    if_unlock();
+    return err;
 #else
     (void)name;
     (void)enable;
@@ -545,11 +641,13 @@ esp_err_t espix_net_set_hostname(const char *name, bool persist)
     espix_kernel_set_nodename(s_hostname);
 
     /* Every interface, for the reason in espix_net_register_if(). */
+    if_lock();
     for (size_t i = 0; i < s_if_count; i++) {
         if (s_ifs[i].netif != NULL) {
             esp_netif_set_hostname(s_ifs[i].netif, s_hostname);
         }
     }
+    if_unlock();
 
     if (persist) {
         FILE *f = fopen(HOSTNAME_PATH, "w");
