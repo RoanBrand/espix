@@ -13,9 +13,6 @@
 
 #include "espix_proc_priv.h"
 
-/* FreeRTOS TLS pointer index of a U-mode thread's espix_um_thread_t. */
-#define ESPIX_TLS_UM_IDX 2
-
 typedef struct espix_um_as espix_um_as_t;
 
 /* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */

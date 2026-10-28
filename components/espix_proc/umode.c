@@ -221,10 +221,10 @@ IRAM_ATTR void espix_um_return(void *frame)
 
 static int32_t sys_write(espix_um_thread_t *t, int fd, uint32_t uva, uint32_t len)
 {
-    FILE *const out = (fd == 1) ? stdout : (fd == 2) ? stderr : NULL;
-    if (out == NULL) {
+    if (fd != 1 && fd != 2) {
         return -EBADF;
     }
+    FILE *const out = espix_proc_stdio(fd);
     uint32_t done = 0;
     while (done < len) {
         const uint32_t va    = uva + done;
@@ -485,6 +485,10 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
 
     asm volatile ("mv %0, tp" : "=r"(t->ktp));
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, t);
+    if (pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_FSPRIV_IDX) != NULL) {
+        vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, NULL);
+        return "refusing to enter U-mode with filesystem privilege held";
+    }
 
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "pid %d: %s in U-mode, entry 0x%08x, asid %u",
                (int)slot->info.pid, slot->info.name, (unsigned)entry, (unsigned)asid);

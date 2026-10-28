@@ -64,11 +64,6 @@ typedef struct espix_env espix_env_t;
 #define ESPIX_ARGS_MAX 16
 #define ESPIX_SESSION_USER_MAX 17   /* 16 + NUL; matches espix_auth's limit */
 
-/* FreeRTOS TLS slot holding the current session pointer. Index 0 is taken by
- * ESP-IDF's pthread implementation, hence the default of 1. Requires
- * CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS > ESPIX_TLS_SESSION_IDX. */
-#define ESPIX_TLS_SESSION_IDX 1
-
 /*
  * Which of a process's three streams open_stream() is being asked for.
  *

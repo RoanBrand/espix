@@ -40,6 +40,9 @@ CONFIG_SPIRAM_SPEED_250M=y
 #
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_320=y
 
+# U-mode apps take the fifth TLS slot (ESPIX_TLS_UM_IDX, espix_kernel.h).
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=5
+
 #
 # Networking: the S31 has a Gigabit Ethernet MAC. The option lives in
 # components/espix_net/Kconfig and is on by default wherever SOC_EMAC_SUPPORTED.

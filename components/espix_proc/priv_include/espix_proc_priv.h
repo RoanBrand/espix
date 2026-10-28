@@ -26,13 +26,7 @@ extern "C" {
 #define ESPIX_PROC_ENV_ADDED_MAX 8
 
 /*
- * The thread-local slot an app's threads find their process by.
- *
- * TLS indices are a shared, hand-allocated space with no registry, and the
- * build enables four (CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS): 0 is
- * IDF's own pthread bookkeeping (PTHREAD_TLS_INDEX), 1 the shell's session,
- * 2 espix_fs's privilege depth, 3 this. Adding one means changing the count
- * beside them, and this comment is the only place the four are listed.
+ * An app's threads find their process in TLS slot ESPIX_TLS_PROC_IDX (espix_kernel.h).
  *
  * It is the right home for this because the value is per *task*: an app thread
  * cannot be identified by a task handle (a handle is the address of a TCB, and
@@ -40,7 +34,6 @@ extern "C" {
  * read out of the current task's own TLS cannot be another task's at all. See
  * abi_pthread.c.
  */
-#define ESPIX_TLS_PROC_IDX 3
 
 /*
  * How many blocks one process may have escape its arena. A request that cannot
@@ -50,23 +43,6 @@ extern "C" {
  * the reason.
  */
 #define ESPIX_PROC_MAX_ESCAPED 4
-
-/*
- * And the count has to hold it.
- *
- * espix_proc_self() reads this slot out of the calling task's TLS, and reading
- * past the end of FreeRTOS's array does not fail: it returns whatever is next
- * in the block, as a pointer, and the first dereference faults. That is how an
- * S3 build panicked in espix_proc_paths() on the first fopen -- at boot, in the
- * WiFi configuration read -- because sdkconfig.esp32s3 had been generated when
- * the tree kept three TLS pointers and a generated sdkconfig keeps the value it
- * was first written with, whatever a later sdkconfig.defaults says.
- *
- * A build is where that belongs, not the hottest path in the system.
- */
-#if CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS <= ESPIX_TLS_PROC_IDX
-#error "CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS must be greater than ESPIX_TLS_PROC_IDX (the proc TLS slot). Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
-#endif
 
 #if CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES <= ESPIX_NOTIFY_SIG_IDX
 #error "CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES must be greater than ESPIX_NOTIFY_SIG_IDX. Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."

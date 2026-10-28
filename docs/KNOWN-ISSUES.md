@@ -470,8 +470,7 @@ cannot do yet:
 - **Fixed memory**: a 64 KiB stack and a 64 KiB heap, mapped when it loads.
 - **Pinned to core 1**, as M-mode apps are.
 - **A rare hang**: once in about 120 runs of two FPU-using U-mode apps together,
-  core 1 locked up at an app's syscall; the board reset by watchdog. Not seen
-  since in 80 more runs; recorded in USER-MODE.md under M1.
+  core 1 locked up at an app's syscall and the watchdog reset the board.
 
 ## Filesystem
 

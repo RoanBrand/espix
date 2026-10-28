@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +46,23 @@ extern "C" {
  * process table.
  */
 #define ESPIX_NGROUPS_MAX 8
+
+/* FreeRTOS TLS slots, listed here so no two components share one; 0 is IDF's pthread. */
+#define ESPIX_TLS_SESSION_IDX 1     /* espix_shell: the task's session */
+#define ESPIX_TLS_FSPRIV_IDX  2     /* espix_fs: privileged-access depth */
+#define ESPIX_TLS_PROC_IDX    3     /* espix_proc: the task's process */
+#define ESPIX_TLS_UM_IDX      4     /* espix_proc: a U-mode thread (S31) */
+
+#if CONFIG_ESPIX_UMODE
+#define ESPIX_TLS_COUNT 5
+#else
+#define ESPIX_TLS_COUNT 4
+#endif
+
+/* A read past FreeRTOS's array returns a neighbour's word, so a short count must fail the build. */
+#if CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS < ESPIX_TLS_COUNT
+#error "CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS is smaller than ESPIX_TLS_COUNT. Delete sdkconfig.<target> so it is regenerated from sdkconfig.defaults."
+#endif
 
 /*
  * Types shared across the espix component graph live here so that espix_proc

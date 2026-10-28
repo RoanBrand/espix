@@ -48,10 +48,6 @@
 
 #define TAG "fs"
 
-/* Beside ESPIX_TLS_SESSION_IDX, which espix_shell owns; both need
- * CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS to be larger than they are. */
-#define ESPIX_TLS_FSPRIV_IDX 2
-
 void espix_fs_priv_begin(void)
 {
     const uintptr_t depth = (uintptr_t)pvTaskGetThreadLocalStoragePointer(

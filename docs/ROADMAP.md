@@ -32,23 +32,6 @@ things are as they are.
   `OP` opcode on core 0), then the suite with apps unpinned, then build apps
   without `xespv`/`xesploop` so a stray one cannot appear.
 
-- **The kernel on picolibc.** IDF 6 made picolibc its default; espix pinned
-  newlib. IDF's own comparison of a stdio-heavy program: 20% smaller binary, 54%
-  less stack and 77% less heap in I/O. The mask ROM is not lost: the S31's 59
-  basic ROM functions (`str*`, `mem*`, `qsort`...) are linked for either libc,
-  and only 19 newlib-specific ones (stdio internals, `rand`, `strtol`) are
-  newlib's alone. For espix the image saving is likely tens of KiB of a 3.3 MiB
-  image; the stack saving is the larger win, since every task that formats
-  output carries newlib's appetite in its stack.
-  What it takes:
-  - per-process `stdout`, which rides on newlib's per-task state today, rebuilt
-    on picolibc's thread-local streams;
-  - the ABI tables' newlib-specific names (`__getreent`, `_impure_ptr`,
-    `_ctype_`, the `off_t` patch) redone;
-  - every M-mode app rebuilt.
-  Worth doing once U-mode apps (which use picolibc anyway) have shown its
-  behaviour on this chip; then both kinds of app share one libc's headers.
-
 - **A fairer scheduler.** IDF's FreeRTOS is fixed-priority and preemptive,
   with round-robin time slicing between tasks of equal priority, 25 priorities,
   and no way to plug in another policy. Amazon's SMP FreeRTOS kernel is the
@@ -96,13 +79,10 @@ things are as they are.
     a trap (twice, same instruction); a permission fault traps normally. A
     kernel reading user pointers that way must check the mapping first.
   - The page-table walker reads through the D-cache (memory still held zero
-    when the walk found the PTE), so tables in PSRAM need no writeback here,
-    contrary to one Linux port's note.
+    when the walk found the PTE), so tables in PSRAM need no writeback.
 
-  The design that builds on these is [USER-MODE.md](USER-MODE.md): apps in
-  U-mode in identity-mapped address spaces, linking their own newlib, in seven
-  milestones. Asynchronous signal delivery is waiting for this boundary. The S3
-  has no MMU for it and stays as it is.
+  [USER-MODE.md](USER-MODE.md) is the design built on these, and its milestones;
+  M1 is done. The S3 has no MMU for it and stays as it is.
 
 ## Filesystem
 
@@ -472,7 +452,8 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 - **Detect the flash chip and say which cache strategy the board can have.**
   espix ships `CONFIG_SPIRAM_XIP_FROM_PSRAM` because a flash write otherwise
   disables the cache and faults any crypto that is mid-`esp_cache_msync` — see
-  [GOTCHAS.md](GOTCHAS.md). It costs ~1MB of PSRAM and 88ms of boot.
+  [GOTCHAS.md](GOTCHAS.md). It costs PSRAM equal to the kernel's text and
+  rodata, 3.2 MB on the S31 (of 16 MB), and 88ms of boot.
 
   `CONFIG_SPI_FLASH_AUTO_SUSPEND` is the better answer where it is available:
   the flash chip suspends an erase to serve a read, so the cache is never
@@ -487,6 +468,7 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   |---|---|
   | GigaDevice | `0xC84016`, `0xC84017`, `0xC84018`, `0xC84319` |
   | Winbond | `0xEF4017` only |
+  | generic driver | XMC-D (`0x46....`, and `0x20....` when its SFDP says so), FM (`0xA1....`) |
   | everything else, Boya included | none |
 
   So a DevKitC-1 may or may not qualify: the ESP32-S3-WROOM-1 datasheet does not
@@ -494,6 +476,14 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   on the list; a 16MB Winbond is not, because only the 8MB `0xEF4017` appears.
   This board reports `0x68`, Boya, and IDF's driver says "flash-suspend is not
   supported" in a comment before omitting the flag.
+
+  On the S31 the win is largest: the kernel would run from flash and give its
+  3.2 MB back. Flash and PSRAM share one cache there too, so without suspend a
+  write still stalls both cores. The S31 board's flash ID is not yet read; an S31
+  Linux port runs with auto-suspend, and had to turn off the core bus timeouts
+  (`HP_SYSTEM_CORE_IBUS/DBUS_TIMEOUT_CONF`) because a PSRAM miss can wait behind
+  a suspend. Cache misses to flash (DIO, 80 MHz) are also slower than to PSRAM
+  (octal, 250 MHz).
 
   The shape of the work: a `tools/flash-caps.sh` that reads the ID off the
   attached board with `esptool flash-id`, matches it against IDF's own tables —
