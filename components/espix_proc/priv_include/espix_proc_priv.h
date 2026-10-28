@@ -618,6 +618,19 @@ void  *espix_abi_calloc(size_t n, size_t size);
 void  *espix_abi_realloc(void *p, size_t n);
 void   espix_abi_free(void *p);
 
+/* ABI calls the U-mode syscalls share (umode_sys.c): the same function behind both. */
+int   espix_abi_chdir(const char *path);
+char *espix_abi_getcwd(char *buf, size_t size);
+int   espix_abi_chmod(const char *path, mode_t mode);
+int   espix_abi_dup(int fd);
+int   espix_abi_kill(pid_t pid, int sig);
+pid_t espix_abi_getpid(void);
+pid_t espix_abi_getppid(void);
+pid_t espix_abi_getpgrp(void);
+pid_t espix_abi_getsid(pid_t pid);
+struct timespec;
+int   espix_abi_nanosleep(const struct timespec *req, struct timespec *rem);
+
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);
 

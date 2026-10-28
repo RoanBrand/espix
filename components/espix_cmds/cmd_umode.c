@@ -15,6 +15,7 @@
 #include "esp_private/hw_stack_guard.h"
 #include "riscv/csr.h"
 #include "riscv/csr_clic.h"
+#include "riscv/rvruntime-frames.h"
 #include "soc/reg_base.h"
 #include "soc/cpu_apm_reg.h"
 #include "soc/soc.h"
@@ -736,15 +737,67 @@ static uint32_t parse_stages(int argc, char **argv)
     return bits;
 }
 
+typedef struct {
+    espix_task_exit_t exit;
+    bool              store;
+    bool              trapped;
+    float             in, out;
+} flw_probe_t;
+
+extern StaticTask_t *port_uxCoprocOwner[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
+
+/* A fresh task's first FPU instruction is a load or store, with the FPU off: IDF's lazy trap must take it. */
+static void flw_task(void *arg)
+{
+    flw_probe_t *p = arg;
+    RV_CLEAR_CSR(mstatus, 3u << 13);
+    if (p->store) {
+        asm volatile ("fsw f0, 0(%0)" :: "r"(&p->out) : "memory");
+    } else {
+        float v;
+        asm volatile ("flw %0, 0(%1)" : "=f"(v) : "r"(&p->in));
+        p->out = v;
+    }
+    /* Only IDF's lazy trap makes a task the FPU's owner. */
+    p->trapped = port_uxCoprocOwner[xPortGetCoreID()][FPU_COPROC_IDX] == (StaticTask_t *)xTaskGetCurrentTaskHandle();
+    espix_task_exited(&p->exit);
+}
+
+static int probe_flw(espix_session_t *s)
+{
+    for (int store = 0; store <= 1; store++) {
+        flw_probe_t p = { .store = store, .in = 2.5f };
+        if (!espix_task_exit_init(&p.exit)) {
+            return 1;
+        }
+        espix_printf(s, "umode: %s as a task's first FPU instruction... ", store ? "fsw" : "flw");
+        if (espix_kthread_start(&(const espix_kthread_t){
+                .name = "umode-flw", .fn = flw_task, .arg = &p, .stack = 4096,
+                .priority = 5, .core = 0, .internal_stack = true, .thread = true },
+                &p.exit.task) != ESP_OK) {
+            vSemaphoreDelete(p.exit.done);
+            return 1;
+        }
+        espix_task_exit_wait(&p.exit, 0);
+        vSemaphoreDelete(p.exit.done);
+        espix_printf(s, "%s%s\n", p.trapped ? "taken by the lazy FPU trap" : "ran without the trap",
+                     (!store && p.out != 2.5f) ? ", but the value is wrong" : "");
+    }
+    return 0;
+}
+
 static int cmd_umode(espix_session_t *s, int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "last") == 0) {
         report_last(s);
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "flw") == 0) {
+        return probe_flw(s);
+    }
     const uint32_t stages = parse_stages(argc, argv);
     if (stages == 0) {
-        espix_eprintf(s, "usage: umode [last | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]\n");
+        espix_eprintf(s, "usage: umode [last | flw | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]\n");
         return 2;
     }
     if (umode_crumb.magic == CRUMB_RUNNING) {
@@ -809,7 +862,7 @@ out:
 
 static espix_cmd_t s_umode_cmds[] = {
     { .name = "umode", .fn = cmd_umode,
-      .help = "S31 user-mode / Sv32 MMU spike: costs and behaviour", .usage = "umode [last | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]" },
+      .help = "S31 user-mode / Sv32 MMU spike: costs and behaviour", .usage = "umode [last | flw | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]" },
 };
 
 void espix_cmds_register_umode(void)

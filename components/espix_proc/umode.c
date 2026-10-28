@@ -28,7 +28,6 @@
 
 #include "espix_kernel.h"
 #include "espix_shell.h"
-#include "espix_syscall.h"
 #include "espix_umode.h"
 
 #define TAG "umode"
@@ -37,7 +36,8 @@
 #define UVA_MIN     0x00010000u
 #define UVA_MAX     0x70000000u
 #define USTACK_TOP  0x80000000u
-#define USTACK_SIZE (64u * 1024u)
+#define USTACK_MAX  (8u * 1024u * 1024u)    /* reserved, mapped as touched; Linux's ulimit -s */
+#define ARGS_MAX    (64u * 1024u)
 
 /* Each core's current U-mode thread's kernel tp; the patched vectors load it on entry from U. */
 uint32_t espix_um_ktp[portNUM_PROCESSORS];
@@ -219,32 +219,6 @@ IRAM_ATTR void espix_um_return(void *frame)
     assist_debug_hal_sp_mon_disable(core);
 }
 
-static int32_t sys_write(espix_um_thread_t *t, int fd, uint32_t uva, uint32_t len)
-{
-    if (fd != 1 && fd != 2) {
-        return -EBADF;
-    }
-    FILE *const out = espix_proc_stdio(fd);
-    uint32_t done = 0;
-    while (done < len) {
-        const uint32_t va    = uva + done;
-        const uint32_t chunk = MIN(len - done, PG - (va & (PG - 1)));
-        const void *k = espix_um_user_ptr(t->as, va, PTE_R);
-        if (k == NULL) {
-            if (done == 0) {
-                return -EFAULT;
-            }
-            break;
-        }
-        if (fwrite(k, 1, chunk, out) != chunk) {
-            break;
-        }
-        done += chunk;
-    }
-    fflush(out);
-    return (int32_t)done;
-}
-
 /* Where an app's exit or fault ends: plain task context on the kernel stack, as an M-mode app's exit() is. */
 static void __attribute__((noreturn)) exited(int status)
 {
@@ -252,8 +226,7 @@ static void __attribute__((noreturn)) exited(int status)
     __builtin_unreachable();
 }
 
-/* Leave the trap into exited() in M-mode rather than back into the app. */
-static void leave_to_kernel(RvExcFrame *f, const espix_um_thread_t *t, int status)
+void espix_um_leave(RvExcFrame *f, const espix_um_thread_t *t, int status)
 {
     extern char __global_pointer$[];
     f->mepc    = (uint32_t)exited;
@@ -264,19 +237,6 @@ static void leave_to_kernel(RvExcFrame *f, const espix_um_thread_t *t, int statu
     f->mstatus |= MSTATUS_MPP;
     /* CLIC mcause: MPP=M, MPIE=1, level 0; mret restores the interrupt level from here. */
     RV_WRITE_CSR(mcause, (3u << 28) | (1u << 27));
-}
-
-static int32_t syscall_dispatch(espix_um_thread_t *t, RvExcFrame *f)
-{
-    switch (f->a7) {
-    case ESPIX_SYS_EXIT:
-        leave_to_kernel(f, t, (int)f->a0);
-        return (int32_t)f->a0;
-    case ESPIX_SYS_WRITE:
-        return sys_write(t, (int)f->a0, f->a1, f->a2);
-    default:
-        return -ENOSYS;
-    }
 }
 
 static int fault_signal(uint32_t code)
@@ -303,7 +263,7 @@ static void fault(RvExcFrame *f, const espix_um_thread_t *t, uint32_t code)
         espix_eprintf(slot->info.session, "%s: %s (pc 0x%08x, address 0x%08x)\n",
                       slot->info.name, what, (unsigned)f->mepc, (unsigned)f->mtval);
     }
-    leave_to_kernel(f, t, 128 + sig);
+    espix_um_leave(f, t, 128 + sig);
 }
 
 /* An exception from U-mode, on the thread's kernel stack with interrupts off. */
@@ -317,10 +277,11 @@ void espix_um_trap(RvExcFrame *f, uint32_t cause)
     if (t == NULL) {
         abort();
     }
+    const uint32_t need = (code == 12) ? PTE_X : (code == 13) ? PTE_R : (code == 15) ? PTE_W : 0;
     if (code == 8) {
         f->mepc += 4;
-        f->a0 = (uint32_t)syscall_dispatch(t, f);
-    } else {
+        f->a0 = (uint32_t)espix_um_syscall(t, f);
+    } else if (need == 0 || !espix_um_fault(t->proc->as, f->mtval, need)) {
         fault(f, t, code);
     }
 
@@ -356,6 +317,7 @@ static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t
         eh->e_phoff + (size_t)eh->e_phnum * sizeof(um_phdr_t) > size) {
         return "bad program headers";
     }
+    uint32_t image_end = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
         const um_phdr_t *ph = (const um_phdr_t *)(image + eh->e_phoff) + i;
         if (ph->p_type != PT_LOAD_ || ph->p_memsz == 0) {
@@ -368,7 +330,12 @@ static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t
         const uint32_t flags = ((ph->p_flags & 4) ? PTE_R : 0) | ((ph->p_flags & 2) ? PTE_W : 0) |
                                ((ph->p_flags & 1) ? PTE_X : 0);
         const uint32_t end = ph->p_vaddr + ph->p_memsz;
-        for (uint32_t va = ph->p_vaddr & ~(PG - 1); va < end; va += PG) {
+        const uint32_t file_end = (ph->p_vaddr + ph->p_filesz + PG - 1) & ~(PG - 1);
+        if (end > file_end && !espix_um_region_add(as, file_end, end, flags)) {
+            return "too many segments";
+        }
+        image_end = MAX(image_end, end);
+        for (uint32_t va = ph->p_vaddr & ~(PG - 1); va < MIN(end, file_end); va += PG) {
             uint8_t *frame = espix_um_map_new(as, va, flags);
             if (frame == NULL) {
                 return "out of memory for the image";
@@ -388,6 +355,7 @@ static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t
     if (eh->e_entry < UVA_MIN || eh->e_entry >= UVA_MAX) {
         return "an entry point outside the image";
     }
+    espix_um_brk_init(as, image_end);
     *entry = eh->e_entry;
     return NULL;
 }
@@ -413,10 +381,9 @@ static bool put_user(espix_um_as_t *as, uint32_t va, const void *src, size_t n)
 static const char *build_stack(espix_um_as_t *as, char **argv, int argc, char **envp,
                                uint32_t *usp, uint32_t *uargv, uint32_t *uenvp)
 {
-    for (uint32_t va = USTACK_TOP - USTACK_SIZE; va < USTACK_TOP; va += PG) {
-        if (espix_um_map_new(as, va, PTE_R | PTE_W) == NULL) {
-            return "out of memory for the stack";
-        }
+    /* The page below the reservation stays unmapped: a guard. */
+    if (!espix_um_region_add(as, USTACK_TOP - USTACK_MAX, USTACK_TOP, PTE_R | PTE_W)) {
+        return "too many segments";
     }
     int envc = 0;
     while (envp != NULL && envp[envc] != NULL) {
@@ -431,18 +398,24 @@ static const char *build_stack(espix_um_as_t *as, char **argv, int argc, char **
     for (int i = 0; i < n; i++) {
         const char *s = (i < argc) ? argv[i] : envp[i - argc];
         const size_t len = strlen(s) + 1;
-        if (len > USTACK_SIZE / 2 || top - len < USTACK_TOP - USTACK_SIZE / 2) {
+        if (len > ARGS_MAX || top - len < USTACK_TOP - ARGS_MAX) {
             free(ptrs);
             return "arguments too long";
         }
         top -= len;
-        put_user(as, top, s, len);
+        if (!put_user(as, top, s, len)) {
+            free(ptrs);
+            return "out of memory for the stack";
+        }
         ptrs[i < argc ? i : i + 1] = top;
     }
     /* argv[argc] and envp[envc] are the zeros calloc left. */
     top = (top - ((uint32_t)n + 2) * sizeof(uint32_t)) & ~15u;
-    put_user(as, top, ptrs, ((size_t)n + 2) * sizeof(uint32_t));
+    const bool put = put_user(as, top, ptrs, ((size_t)n + 2) * sizeof(uint32_t));
     free(ptrs);
+    if (!put) {
+        return "out of memory for the stack";
+    }
 
     *uargv = top;
     *uenvp = top + ((uint32_t)argc + 1) * sizeof(uint32_t);
@@ -460,13 +433,17 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
 
     espix_um_as_t *as = espix_um_as_new(asid);
     espix_um_thread_t *t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
-    if (as == NULL || t == NULL) {
+    espix_um_proc_t *p = calloc(1, sizeof(*p));
+    if (as == NULL || t == NULL || p == NULL) {
         espix_um_as_free(as);
         free(t);
+        free(p);
         asid_free(asid);
         return "out of memory for an address space";
     }
-    t->as   = as;
+    p->as   = as;
+    espix_um_fds_init(p);
+    t->proc = p;
     t->satp = espix_um_as_satp(as);
     app->um = t;
 
@@ -503,7 +480,8 @@ void espix_um_release(espix_proc_slot_t *slot)
     }
     espix_um_thread_t *t = slot->app->um;
     asid_free((t->satp & SATP32_ASID) >> 22);
-    espix_um_as_free(t->as);
+    espix_um_as_free(t->proc->as);
+    free(t->proc);
     free(t);
     slot->app->um = NULL;
 }

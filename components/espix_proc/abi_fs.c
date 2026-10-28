@@ -59,11 +59,11 @@
  * calls these, so a program that just opens "data.txt" works -- but one that
  * wants to move, or to report where it is, needs them.
  *
- * Named with the abi_ prefix and mapped by string below, following
+ * Named with the espix_abi_ prefix and mapped by string below, following
  * abi_signal.c. Defining a function actually called chdir() here would collide
  * with the libc stub at link time.
  */
-static int abi_chdir(const char *path)
+int espix_abi_chdir(const char *path)
 {
     if (path == NULL) {
         errno = EINVAL;
@@ -86,7 +86,7 @@ static int abi_chdir(const char *path)
      * the target, that stat goes through espix's VFS, and the VFS refuses a
      * path outside the process's root with ENOENT -- so a confined process
      * cannot move out, and gets the same answer it would for a directory that
-     * is not there. abi_chmod() below is the one that needed its own check,
+     * is not there. espix_abi_chmod() below is the one that needed its own check,
      * because espix_fs_chmod() never re-enters the VFS.
      */
     switch (espix_proc_chdir(abs)) {
@@ -126,7 +126,7 @@ static int abi_chdir(const char *path)
  * Without that check a confined process could re-mode any file it owns
  * anywhere on the device.
  */
-static int abi_chmod(const char *path, mode_t mode)
+int espix_abi_chmod(const char *path, mode_t mode)
 {
     if (path == NULL) {
         errno = EINVAL;
@@ -162,7 +162,7 @@ static int abi_chmod(const char *path, mode_t mode)
     }
 }
 
-static char *abi_getcwd(char *buf, size_t size)
+char *espix_abi_getcwd(char *buf, size_t size)
 {
     const char *cwd = espix_proc_cwd();
     const size_t need = strlen(cwd) + 1;
@@ -200,7 +200,7 @@ static char *abi_getcwd(char *buf, size_t size)
  * commands -- F_GETFL and the rest still reach IDF, which dispatches into
  * espix's own VFS op.
  */
-static int espix_abi_dup(int fd)
+int espix_abi_dup(int fd)
 {
     return espix_fs_dup_fd(fd);
 }
@@ -329,9 +329,9 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
      * fails with ENOSYS, getcwd always answers "/", and chmod silently returns
      * success. See the notes on each.
      */
-    { "chdir",  (const void *)abi_chdir },
-    { "getcwd", (const void *)abi_getcwd },
-    { "chmod",  (const void *)abi_chmod },
+    { "chdir",  (const void *)espix_abi_chdir },
+    { "getcwd", (const void *)espix_abi_getcwd },
+    { "chmod",  (const void *)espix_abi_chmod },
 
     ESP_ELFSYM_END
 };

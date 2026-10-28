@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# The C compiler for U-mode apps on the S31, as musl-gcc is for musl: the
+# toolchain's gcc with the S31's flags, picolibc, and libespix as picolibc's OS
+# layer. App source needs only standard headers.
+# docs/USER-MODE.md.
+#
+#   tools/espix-cc -Os -o hello hello.c
+#   tools/espix-cc -c foo.c
+#
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+gcc=$(command -v riscv32-esp-elf-gcc || true)
+if [[ -z "$gcc" ]]; then
+    gcc=$(ls -d "$HOME"/.espressif/tools/riscv32-esp-elf/*/riscv32-esp-elf/bin/riscv32-esp-elf-gcc 2>/dev/null | tail -1)
+fi
+[[ -x "$gcc" ]] || { echo "espix-cc: no riscv32-esp-elf-gcc" >&2; exit 1; }
+ar="${gcc%gcc}ar"
+
+# No PIE or hardware-loop extensions: only core 1 has them.
+arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f)
+# off_t is 64 bits, as in the kernel and M-mode apps (cmake/offt64.h).
+cflags=(--specs=picolibc.specs -ffunction-sections -fdata-sections
+        -I"$root/user/include" -include "$root/cmake/offt64.h")
+
+lib="$root/user/build"
+
+# libespix.a and crt0.o, rebuilt when a source is newer; built aside and moved in, so parallel callers never see half.
+build_lib() {
+    local srcs=("$root"/user/libespix/*.c "$root"/user/libespix/*.h "$root"/user/crt0.S
+                "$root"/user/include "$root"/components/espix_proc/include/espix_syscall.h)
+    if [[ -f "$lib/libespix.a" && -z "$(find "${srcs[@]}" -newer "$lib/libespix.a" 2>/dev/null | head -1)" ]]; then
+        return 0
+    fi
+    mkdir -p "$lib"
+    local tmp
+    tmp=$(mktemp -d "$lib/.build.XXXXXX")
+    local f extra
+    for f in "$root"/user/libespix/*.c; do
+        extra=()
+        # picolibc's own stdio and its lseek must see libc's 32-bit off_t.
+        case $(basename "$f") in lseek32.c|start.c) extra=(-DESPIX_LIBC_OWN_OFF_T) ;; esac
+        "$gcc" "${arch[@]}" "${cflags[@]}" ${extra[@]+"${extra[@]}"} -Os -Wall \
+            -I"$root/components/espix_proc/include" -c "$f" -o "$tmp/$(basename "${f%.c}").o"
+    done
+    "$gcc" "${arch[@]}" -c "$root/user/crt0.S" -o "$tmp/crt0.o"
+    (cd "$tmp" && "$ar" rcs libespix.a $(ls *.o | grep -v '^crt0\.o$'))
+    mv -f "$tmp/crt0.o" "$lib/crt0.o"
+    mv -f "$tmp/libespix.a" "$lib/libespix.a"
+    rm -rf "$tmp"
+}
+
+link=yes
+for a in "$@"; do
+    case "$a" in -c|-S|-E|-M|-MM) link=no ;; esac
+done
+
+if [[ $link == no ]]; then
+    exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@"
+fi
+
+build_lib
+# Whole and ahead of libc: libc.a's weak nosys stubs would otherwise win the archive scan.
+exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
+    -nostartfiles -static -T "$root/user/uapp.ld" -Wl,--gc-sections \
+    "$lib/crt0.o" -Wl,--whole-archive "$lib/libespix.a" -Wl,--no-whole-archive

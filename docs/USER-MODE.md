@@ -44,8 +44,11 @@ on Linux:
 tables: shared text, copy-on-write, a swap cache.
 
 **Pages are mapped when touched.** bss, the heap and the stacks are reserved
-ranges; the first touch maps a zeroed frame. Memory reserved and never used costs
-nothing.
+ranges; the first touch maps a zeroed frame, whether the app or a syscall copying
+into its buffer makes it. Memory reserved and never used costs nothing: a 4 MB
+`malloc` with 64 pages touched costs 256 KB. The heap grows by `brk` up to
+`0x60000000`, and shrinking it frees its frames. Only the pages that hold the
+file's bytes are loaded at exec.
 
 **Tables live in PSRAM.** The walker reads through the D-cache, so a PTE write
 needs no writeback. A typical app's table is 16 KiB.
@@ -89,6 +92,9 @@ from U goes through one entry and every way back through one exit.
   extra work, and the exit returns to whichever privilege the frame says.
 - **Every exit writes an `mcause`** whose MPP, MPIE and level agree with where it
   returns: the CLIC keeps them there, and `mret` uses them.
+- **IDF's lazy FPU trap takes FLW and FSW** as a task's first FPU instruction on
+  this S31 (`umode flw`), although its EXT_ILL workaround is built for the P4
+  only.
 - **The exit to U** loads the thread's `satp`, flushes a stale ASID, and hands the
   FPU to the thread eagerly (`fpu_take()`), so U-mode never takes IDF's lazy FPU
   trap.
@@ -109,17 +115,24 @@ context first (`exited()`), then end the process as an M-mode app's `exit()` doe
 ## The app side
 
 **A U-mode app links its own libc**, as on Linux: picolibc, the same library the
-kernel uses, statically linked, plus `libespix-u`, espix's OS layer under it:
+kernel uses, statically linked, plus `libespix` (`user/libespix/`), espix's OS
+layer under it:
 
 - `crt0`: the entry, with argv and environ on the user stack;
 - the calls picolibc's POSIX layer makes (`read`, `write`, `open`, `sbrk`...) as
   `ecall` wrappers;
-- stdin, stdout and stderr on fds 0-2, and thread-local storage through `tp`.
+- stdin, stdout and stderr on fds 0-2, and thread-local storage through `tp`;
+- headers picolibc lacks (`sys/socket.h`, `netinet/in.h`), and ENOSYS for what
+  is not built yet: sockets, threads.
+
+`tools/espix-cc` compiles and links an app, as `musl-gcc` does for musl, with the
+kernel's 64-bit `off_t`. It links `libespix` whole and ahead of libc, because the
+toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
+archive scan.
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
-memory. picolibc adds about 9 KiB to `hello`, and 10-20 KiB to an app that
-already uses stdio and floats.
+memory. `hello` is 10.8 KiB of text.
 
 **Built without PIE and the hardware loop** (`xespv`, `xesploop`). Only core 1
 has them, and IDF pins a task that uses one to core 1 for good. Without them a
@@ -145,7 +158,15 @@ mapping works wherever the kernel's text lives.
 
 **A number in `a7`, arguments in `a0`-`a5`, the result in `a0`**, negative errno
 on failure, like Linux. The numbers and the structs are espix's own and
-fixed-width.
+fixed-width; flag and errno values are picolibc's, which both sides use. The list
+is `include/espix_syscall.h`, one X-macro that the kernel's dispatch table and
+`libespix`'s numbers are generated from.
+
+**Each process has its own descriptor table**, as on Linux: small numbers from 0,
+the lowest free one for each open, 0-2 the process's streams, and behind each a
+kernel descriptor or directory. An app can name only its own, and `dup2` onto
+0-2 redirects them. The table is closed before the kernel's owned-descriptor
+sweep, while its numbers are still the process's.
 
 **The syscall table is part of espix's ABI.** An M-mode app calls kernel functions
 through the symbol tables (`abi_*.c`); a U-mode app reaches the same functions by
@@ -178,11 +199,12 @@ app's address space. The kernel stack's size comes from the `ps` STACK
 high-water across the test suite (M2).
 
 **Thread creation** makes the task, reserves a user stack, and `mret`s into the
-start routine. A thread that returns lands in a `libespix-u` stub that calls
+start routine. A thread that returns lands in a `libespix` stub that calls
 `exit_thread`.
 
-**User stacks grow** into a reserved range, with an unmapped guard below; a fault
-in the guard is SIGSEGV.
+**User stacks grow** into an 8 MB reservation (Linux's `ulimit -s`), with an
+unmapped guard page below; a fault in the guard is SIGSEGV. No app needs a stack
+size chosen for it.
 
 ## Signals, stopping and faults
 
@@ -210,7 +232,7 @@ One kernel, two ways in:
 | VFS, fds, processes, signals, sockets, gfx, audio | shared | shared |
 | symbol-table ABI for M-mode apps | yes | yes |
 | syscall dispatcher, page tables, fault paths, the vectors patch | no | yes |
-| `libespix-u` | no | yes |
+| `libespix`, `espix-cc` | no | yes |
 
 An app has one source and two builds: an M-mode ELF for the S3 and a U-mode ELF
 for the S31. The S3 does not get isolation, asynchronous signals, surviving an
@@ -222,8 +244,8 @@ Each leaves `make test` green on both targets.
 
 | | what | done when |
 |---|---|---|
-| M1 | vectors patch, address spaces, the loader, `write` and `exit`, `libespix-u` | done: `tests/suites/32-umode.sh` |
-| M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | testapp's modes that need no threads, signals or sockets pass in U-mode |
+| M1 | vectors patch, address spaces, the loader, `write` and `exit`, the app runtime | done: `tests/suites/32-umode.sh` |
+| M2 | files, time, identity; `brk` and pages mapped on touch (done: `32-umode`); testapp relinked; the kernel stack measured | testapp's modes that need no threads, signals or sockets pass in U-mode |
 | M3 | threads, futex wait and wake, TLS; ASIDs under load | the pthread suites pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, fault reaping | a compute loop's handler runs; `kill -STOP` stops it at once |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
@@ -234,9 +256,11 @@ Each leaves `make test` green on both targets.
 Open:
 - **One hang in about 120 two-app rounds**: core 1 locked at an app's `ecall`,
   with no panic.
-- **FLW/FSW and the FPU trap.** On the S31, EXT_ILL cannot identify FLW/FSW, and
-  IDF compiles its decode for the P4 only. U-mode never takes that trap; whether
-  M-mode code can is unchecked.
+- **A null syscall costs 1200 cycles (3.7 µs)** round trip (`uapp bench`); the
+  trap's C half runs from PSRAM.
+- **picolibc's `malloc` zero-fills every block**, so a large allocation is
+  touched in full; a large `malloc` served by `mmap`, as glibc's is, comes with
+  M7.
 
 ## Decisions
 
@@ -245,7 +269,7 @@ Open:
 - Refcounted 4 KiB frames; pages mapped on touch; copy-on-write.
 - Page tables in PSRAM; user pointers through a software walk, never `MPRV`.
 - `cpu_apm` region 0 open to REE; the MMU isolates.
-- U-mode apps link picolibc and `libespix-u`; M-mode apps stay, chosen by ELF type.
+- U-mode apps link picolibc and `libespix`; M-mode apps stay, chosen by ELF type.
 - Syscall numbers and structs are espix's own.
 
 ## Open questions

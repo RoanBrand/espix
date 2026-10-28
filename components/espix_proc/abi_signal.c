@@ -203,7 +203,7 @@ static int kill_group(espix_pid_t pgid, int sig)
     return 0;
 }
 
-static int espix_abi_kill(pid_t pid, int sig)
+int espix_abi_kill(pid_t pid, int sig)
 {
     if (pid == 0) {
         return kill_group(self_pgid(), sig);
@@ -245,19 +245,19 @@ static int espix_abi_killpg(pid_t pgrp, int sig)
 }
 
 /* Its shell, or 0 when espix started it itself. */
-static pid_t espix_abi_getppid(void)
+pid_t espix_abi_getppid(void)
 {
     const espix_proc_slot_t *const slot = espix_proc_self();
     return (slot != NULL && slot->info.ppid != ESPIX_PID_NONE)
                ? (pid_t)slot->info.ppid : 0;
 }
 
-static pid_t espix_abi_getpgrp(void)
+pid_t espix_abi_getpgrp(void)
 {
     return (pid_t)self_pgid();
 }
 
-static pid_t espix_abi_getsid(pid_t pid)
+pid_t espix_abi_getsid(pid_t pid)
 {
     const espix_proc_slot_t *const self = espix_proc_self();
     const espix_pid_t sid = (pid == 0)
@@ -270,7 +270,7 @@ static pid_t espix_abi_getsid(pid_t pid)
     return (pid_t)sid;
 }
 
-static pid_t espix_abi_getpid(void)
+pid_t espix_abi_getpid(void)
 {
     espix_proc_slot_t *slot = espix_proc_self();
 
@@ -404,7 +404,7 @@ static int espix_abi_usleep(useconds_t usec)
     }
 }
 
-static int espix_abi_nanosleep(const struct timespec *req, struct timespec *rem)
+int espix_abi_nanosleep(const struct timespec *req, struct timespec *rem)
 {
     if (req == NULL || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L ||
         req->tv_sec < 0) {

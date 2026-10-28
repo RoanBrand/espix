@@ -1,4 +1,4 @@
-/* A U-mode app: one R-X segment at 0x10000, one RW segment page-aligned after it. */
+/* A U-mode app: one R-X segment at 0x10000, one RW segment page-aligned after it; the heap follows, by brk. */
 ENTRY(_start)
 
 PHDRS
@@ -33,6 +33,7 @@ SECTIONS
         PROVIDE_HIDDEN(__fini_array_start = .);
         KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
         KEEP(*(.fini_array .dtors))
+        KEEP(*(.fini_array*))   /* picolibc's atexit runner is in .fini_array_onexit */
         PROVIDE_HIDDEN(__fini_array_end = .);
     } :text
 
@@ -61,12 +62,6 @@ SECTIONS
         *(.bss .bss.* .gnu.linkonce.b.*)
         *(COMMON)
         . = ALIGN(16);
-    } :data
-
-    .heap (NOLOAD) : {
-        PROVIDE(__heap_start = .);
-        . += 64K;
-        PROVIDE(__heap_end = .);
     } :data
 
     /DISCARD/ : { *(.comment) *(.note.*) *(.riscv.attributes) }

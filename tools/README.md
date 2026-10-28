@@ -118,18 +118,21 @@ a plain diff, ready to send to joltwallet/esp_littlefs. When it is upstreamed,
 delete both files and the `execute_process()` block in the top-level
 `CMakeLists.txt`, and bump the version in `main/idf_component.yml`.
 
-## build-uapp.sh
+## espix-cc
 
-Builds a U-mode app for the S31 (docs/USER-MODE.md): the sources, picolibc and
-`user/libespix-u.c`, linked at `0x10000` as a static executable by
-`user/uapp.ld`. The kernel runs any ET_EXEC it loads in U-mode, in an address
-space of its own; relocatable apps stay M-mode.
+The C compiler for U-mode apps on the S31 (docs/USER-MODE.md), as `musl-gcc` is
+for musl: the toolchain's gcc with picolibc, `libespix` (espix's OS layer under
+it, `user/libespix/`) and `user/uapp.ld`, which links a static executable at
+`0x10000`. The kernel runs any ET_EXEC it loads in U-mode, in an address space
+of its own; relocatable apps stay M-mode.
 
 ```bash
-./tools/build-uapp.sh -o hello-u apps/hello/main/hello.c
+./tools/espix-cc -Os -o hello-u apps/hello/main/hello.c
 ```
 
-Built without PIE and the hardware loop, which exist only on core 1.
+It builds `libespix.a` into `user/build/` when a source is newer. Apps are built
+without PIE and the hardware loop, which exist only on core 1, and with the
+64-bit `off_t` of `cmake/offt64.h`.
 
 ## patch-umode.py
 

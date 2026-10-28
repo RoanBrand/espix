@@ -1,5 +1,5 @@
-# U-mode apps on the S31 (docs/USER-MODE.md, M1): an app in its own address
-# space reaches the kernel only through syscalls, and a fault ends only the app.
+# U-mode apps on the S31 (docs/USER-MODE.md): an app in its own address space
+# reaches the kernel only through syscalls, and a fault ends only the app.
 #
 # RESOURCES: none -- the binaries carry the worker number.
 
@@ -12,9 +12,9 @@ UM_DIR=$(mktemp -d)
 UAPP="/home/$ESPIX_USER/uapp-$ESPIX_WORKER"
 UHELLO="/home/$ESPIX_USER/hello-u-$ESPIX_WORKER"
 
-if ! "$ESPIX_ROOT/tools/build-uapp.sh" -o "$UM_DIR/uapp" "$ESPIX_ROOT/tests/uapp/uapp.c" >/dev/null 2>&1 ||
-   ! "$ESPIX_ROOT/tools/build-uapp.sh" -o "$UM_DIR/hello-u" "$ESPIX_ROOT/apps/hello/main/hello.c" >/dev/null 2>&1; then
-    espix_fail "the U-mode apps build" "tools/build-uapp.sh failed"
+if ! "$ESPIX_ROOT/tools/espix-cc" -Os -o "$UM_DIR/uapp" "$ESPIX_ROOT/tests/uapp/uapp.c" >/dev/null 2>&1 ||
+   ! "$ESPIX_ROOT/tools/espix-cc" -Os -o "$UM_DIR/hello-u" "$ESPIX_ROOT/apps/hello/main/hello.c" >/dev/null 2>&1; then
+    espix_fail "the U-mode apps build" "tools/espix-cc failed"
     rm -rf "$UM_DIR"
     return 0
 fi
@@ -46,6 +46,51 @@ dev_once "$UAPP spin 1" > "$UM_DIR/b" 2>&1 & um_b=$!
 wait "$um_a" "$um_b"
 assert_contains "two U-mode apps run side by side (first)"  "uapp: spun" "$(cat "$UM_DIR/a")"
 assert_contains "two U-mode apps run side by side (second)" "uapp: spun" "$(cat "$UM_DIR/b")"
+
+# Syscalls into the kernel's files, clocks and identities.
+assert_contains "every file syscall, through one file's life" "uapp: files ok" \
+    "$(dev_run "$UAPP files /home/$ESPIX_USER")"
+assert_contains "a U-mode app is refused a root-only file" "Permission denied" \
+    "$(dev_run "$UAPP read /etc/passwd")"
+assert_contains "and reads it under sudo" "uapp: esp:" "$(dev_run "sudo $UAPP read /etc/passwd")"
+assert_contains "chdir and getcwd" "uapp: cwd /tmp" "$(dev_run "$UAPP cwd /tmp")"
+assert_contains "the app knows who it is" "euid=1000" "$(dev_run "$UAPP ids")"
+sleep_out=$(dev_run "$UAPP sleep 200")
+slept=$(printf '%s\n' "$sleep_out" | sed -n 's/.*slept \([0-9]*\) ms.*/\1/p')
+if [ -n "$slept" ] && [ "$slept" -ge 190 ] && [ "$slept" -le 400 ]; then
+    espix_pass "a 200 ms sleep takes about 200 ms on the monotonic clock ($slept ms)"
+else
+    espix_fail "a 200 ms sleep takes about 200 ms on the monotonic clock" "$sleep_out"
+fi
+printf 'alpha\nbeta\n' > "$UM_DIR/in.txt"
+assert_contains "stdin reaches a U-mode app, line by line" "beta" "$(dev_ssh_raw "$UAPP cat" < "$UM_DIR/in.txt")"
+assert_eq "and the end of input ends its read" "" "$(dev_ssh_raw "$UAPP cat" < /dev/null)"
+dev_run "$UAPP redirect /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER" >/dev/null
+assert_contains "dup2 onto stdout redirects printf" "uapp: into the file" \
+    "$(dev_run "cat /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER")"
+# Memory is mapped as it is touched: a heap by brk, and a stack that grows to its guard.
+heap_out=$(dev_run "$UAPP bigheap")
+reserve_kb=$(printf '%s\n' "$heap_out" | sed -n 's/.*reserving cost \(-*[0-9]*\) KB.*/\1/p')
+touch_kb=$(printf '%s\n' "$heap_out" | sed -n 's/.*touching 64 pages \(-*[0-9]*\) KB.*/\1/p')
+if [ -n "$reserve_kb" ] && [ "$reserve_kb" -lt 100 ] && [ -n "$touch_kb" ] &&
+   [ "$touch_kb" -ge 200 ] && [ "$touch_kb" -lt 600 ]; then
+    espix_pass "4 MB of heap costs only the pages touched ($reserve_kb KB, then $touch_kb KB)"
+else
+    espix_fail "4 MB of heap costs only the pages touched" "$heap_out"
+fi
+shrink_out=$(dev_run "$UAPP brkshrink")
+grew_kb=$(printf '%s\n' "$shrink_out" | sed -n 's/.*grew \(-*[0-9]*\) KB.*/\1/p')
+back_kb=$(printf '%s\n' "$shrink_out" | sed -n 's/.*returned \(-*[0-9]*\) KB.*/\1/p')
+if [ -n "$grew_kb" ] && [ "$grew_kb" -ge 1900 ] && [ -n "$back_kb" ] && [ "$back_kb" -ge $((grew_kb - 100)) ]; then
+    espix_pass "shrinking the break returns its frames ($grew_kb KB grown, $back_kb KB back)"
+else
+    espix_fail "shrinking the break returns its frames" "$shrink_out"
+fi
+assert_contains "a megabyte of stack grows on demand" "uapp: deep stack ok" "$(dev_run "$UAPP deepstack")"
+assert_status "the page below the stack is a guard" 139 dev_status "$UAPP guard"
+
+bench_out=$(dev_run "$UAPP bench")
+assert_contains "a null syscall is timed ($bench_out)" "uapp: a syscall takes" "$bench_out"
 rm -rf "$UM_DIR"
 
-dev_run "rm $UAPP $UHELLO" >/dev/null
+dev_run "rm $UAPP $UHELLO /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER" >/dev/null

@@ -347,6 +347,11 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
      * the reaper's task, which is not the process. Before the memory below,
      * because the layer underneath may still need it in order to close.
      */
+#if CONFIG_ESPIX_UMODE
+    if (slot->app != NULL) {
+        espix_um_close_fds(slot);
+    }
+#endif
     espix_fs_fds_close_owned(slot->info.pid);
 
     /* The wake eventfd is espix's, not one the app opened, so the owned-fd
