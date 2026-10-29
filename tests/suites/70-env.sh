@@ -284,7 +284,11 @@ else
         sleep 1
         assert_not_contains "bg resumes it" "stop" "$(dev_run 'jobs')"
 
-        dev_run "kill -9 $pid" >/dev/null
+        dev_run 'kill -9 %1' >/dev/null
+        sleep 1
+        assert_not_contains "kill %1 ends the first job" "$pid" "$(dev_run 'jobs')"
+        assert_contains "kill names a job that is not there" "no such job" \
+            "$(dev_run 'kill %9' 2>&1)"
 
         # `fg` resumes it too, and waits: the job is the shell's again and it is
         # gone from the table once it finishes. The assertion is on that effect

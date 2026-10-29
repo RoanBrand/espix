@@ -496,13 +496,15 @@ static void kill_list(espix_session_t *s)
     }
 }
 
+static espix_job_t *job_pick(espix_session_t *s, const char *arg);
+
 static int cmd_kill(espix_session_t *s, int argc, char **argv)
 {
     int sig   = SIGTERM;
     int first = 1;
 
     if (argc < 2) {
-        espix_eprintf(s, "usage: kill [-s] <pid|-pgid>...\n");
+        espix_eprintf(s, "usage: kill [-s] <pid|-pgid|%%job>...\n");
         return 1;
     }
 
@@ -523,23 +525,32 @@ static int cmd_kill(espix_session_t *s, int argc, char **argv)
     }
 
     if (first >= argc) {
-        espix_eprintf(s, "usage: kill [-s] <pid>...\n");
+        espix_eprintf(s, "usage: kill [-s] <pid|-pgid|%%job>...\n");
         return 1;
     }
 
     int status = 0;
 
     for (int i = first; i < argc; i++) {
-        char      *end = NULL;
-        const long v   = strtol(argv[i], &end, 10);
+        char *end = NULL;
+        long  v;
 
-        /* Previously any unparsable argument became pid 0 and was reported as
-         * "no such process", which is a confusing way to say "that is not a
-         * number" -- and is what every `kill -9` attempt used to produce. */
-        if (end == argv[i] || *end != '\0') {
-            espix_eprintf(s, "kill: %s: arguments must be process ids\n", argv[i]);
-            status = 1;
-            continue;
+        /* %N is the shell's Nth job, as `jobs` lists them. */
+        if (argv[i][0] == '%') {
+            const espix_job_t *const j = job_pick(s, argv[i]);
+            if (j == NULL) {
+                espix_eprintf(s, "kill: %s: no such job\n", argv[i]);
+                status = 1;
+                continue;
+            }
+            v = j->pid;
+        } else {
+            v = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0') {
+                espix_eprintf(s, "kill: %s: arguments must be process ids or %%jobs\n", argv[i]);
+                status = 1;
+                continue;
+            }
         }
 
         /* A negative pid is a process group, as on Unix. */
@@ -761,7 +772,7 @@ static espix_cmd_t s_run_cmds[] = {
       .usage = "type <name>..." },
     { .name = "kill",  .fn = cmd_kill,
       .help = "send a signal to a process",
-      .usage = "kill [-SIG|-l] <pid|-pgid>..." },
+      .usage = "kill [-SIG|-l] <pid|-pgid|%job>..." },
     { .name = "crash", .fn = cmd_crash,
       .help = "fault on purpose, to test fault reporting",
       .usage = "crash [abi]" },

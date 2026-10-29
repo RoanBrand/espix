@@ -368,6 +368,12 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   That is a reasonable shape for a device, but it should be a choice rather than
   what happens because there is no alternative.
 
+- **Commands that take the options and print the output Linux's do.** A script
+  or a habit from Linux should work: `kill %1`, `ps -ef`, `ls -la`, exit
+  statuses and the shapes of error messages. Each gap is cheap on its own; the
+  work is a sweep of every builtin against coreutils, procps and bash, fixing
+  what is cheap and listing what is not.
+
 ## Platform
 
 - **The S31 can use the flasher stub, and the Makefile should probably say so.**
