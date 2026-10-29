@@ -125,16 +125,16 @@ VECTORS_EDITS = [
      "_panic_handler_not_coproc:\n\n#endif /* ( SOC_CPU_COPROC_NUM > 0 ) */\n",
      "_panic_handler_not_coproc:\n\n#endif /* ( SOC_CPU_COPROC_NUM > 0 ) */\n"
      "#if CONFIG_ESPIX_UMODE\n"
-     "    /* An exception from U-mode is the app's, never a panic. */\n"
+     "    /* An exception from U-mode is the app's, never a panic; espix_um_trap leaves it at once. */\n"
      "    bltz  s0, 93f\n"
      "    lw    t0, RV_STK_MSTATUS(sp)\n"
      "    li    t1, ESPIX_UM_FRAME_USER\n"
      "    and   t0, t0, t1\n"
      "    bnez  t0, 93f\n"
+     "    mintthresh_csr_restore s5\n"
      "    mv    a0, sp\n"
      "    mv    a1, s0\n"
-     "    call  espix_um_trap\n"
-     "    j     _return_from_exception\n"
+     "    j     espix_um_trap\n"
      "93:\n"
      "#endif\n"),
 

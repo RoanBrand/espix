@@ -409,15 +409,15 @@ and wants deciding on its own.
 
 Two things changed from the sketch above, both for the better.
 
-**The slot travels in thread-local storage, not a table keyed on task handles.**
+**An app's task and its threads find their slot in thread-local storage, not a table keyed on task handles.**
 A handle is the address of a TCB, and FreeRTOS hands a dead task's TCB to the
 next task created -- which is the whole reason the sketch wanted a generation
 counter. A pointer read out of the *current* task's own TLS cannot be another
 task's at all, so the problem is gone rather than guarded against. espix already
 keeps per-task state this way (the shell's session, espix_fs's privilege depth),
-so this is one more index beside them: ESPIX_TLS_PROC_IDX, with
-CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS raised from 3 to 4. The four are
-listed in one comment in espix_proc_priv.h, because there is no registry.
+so this is one more index beside them: ESPIX_TLS_PROC_IDX. The indices are
+listed in espix_kernel.h. Other processes' tasks (sessions, kernel processes)
+are still found by handle.
 
 What did not change: the free path needed none of it. free() finds the region by
 address and never asks who the caller is -- R-P1.2 had already made that half

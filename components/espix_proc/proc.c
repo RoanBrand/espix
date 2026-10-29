@@ -645,33 +645,31 @@ espix_pid_t espix_proc_group_for(const espix_proc_slot_t *parent,
 
 espix_proc_slot_t *espix_proc_self(void)
 {
-    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    /*
+     * An app's own task and its threads keep their slot in TLS: a pointer read
+     * from the current task cannot belong to another task the way a recycled
+     * handle could. The slot is freed only after its tasks are gone.
+     */
+    espix_proc_slot_t *const mine =
+        (espix_proc_slot_t *)pvTaskGetThreadLocalStoragePointer(NULL,
+                                                               ESPIX_TLS_PROC_IDX);
+    if (mine != NULL && mine->info.state != ESPIX_PROC_FREE) {
+        return mine;
+    }
 
     /*
+     * Any other process's task -- a session, a kernel process -- by its handle.
      * Unlocked, on the same reasoning espix_app_stopping() has always used: the
      * caller is the process itself, so the one slot that matters cannot be
      * recycled while it is asking, and taking the table lock here would let any
      * app stall every other process by blocking inside a delivery point.
      */
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
         if (g_espix_proc_table.slots[i].info.task == self &&
             g_espix_proc_table.slots[i].info.state != ESPIX_PROC_FREE) {
             return &g_espix_proc_table.slots[i];
         }
-    }
-
-    /*
-     * Not the task that entered app_main(), so it may be a thread the process
-     * made: pthread_create put the slot in the thread's own TLS before the
-     * app's routine ran. A pointer read from the current task cannot belong to
-     * another task the way a recycled handle could, which is why it is stored
-     * there rather than in a table keyed on handles. See abi_pthread.c.
-     */
-    espix_proc_slot_t *const thread_slot =
-        (espix_proc_slot_t *)pvTaskGetThreadLocalStoragePointer(NULL,
-                                                               ESPIX_TLS_PROC_IDX);
-    if (thread_slot != NULL && thread_slot->info.state != ESPIX_PROC_FREE) {
-        return thread_slot;
     }
     return NULL;
 }

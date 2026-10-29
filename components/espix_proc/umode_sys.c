@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/param.h>
@@ -17,6 +18,7 @@
 #include <unistd.h>
 #include <utime.h>
 
+#include "esp_attr.h"
 #include "riscv/encoding.h"
 
 #include "espix_kernel.h"
@@ -29,8 +31,10 @@ typedef struct {
     espix_um_thread_t *t;
     espix_um_proc_t   *p;
     RvExcFrame        *f;
-    uint32_t           a[6];
+    const uint32_t    *a;     /* a0-a5, in the frame */
 } um_call_t;
+
+_Static_assert(offsetof(RvExcFrame, a5) - offsetof(RvExcFrame, a0) == 5 * sizeof(uint32_t), "a0-a5 in order");
 
 typedef int32_t (*um_sys_fn)(um_call_t *c);
 
@@ -560,11 +564,11 @@ static int32_t sys_brk(um_call_t *c)
 /* ------------------------------------------------------------------ */
 
 #define UM_SYS_ENTRY(name, lname, nr) [nr] = sys_##lname,
-static const um_sys_fn s_sys[] = { ESPIX_SYSCALLS(UM_SYS_ENTRY) };
+static const DRAM_ATTR um_sys_fn s_sys[] = { ESPIX_SYSCALLS(UM_SYS_ENTRY) };
 
-int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f)
+IRAM_ATTR int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f)
 {
-    um_call_t c = { .t = t, .p = t->proc, .f = f, .a = { f->a0, f->a1, f->a2, f->a3, f->a4, f->a5 } };
+    um_call_t c = { .t = t, .p = t->proc, .f = f, .a = (const uint32_t *)&f->a0 };
     if (f->a7 >= sizeof(s_sys) / sizeof(s_sys[0]) || s_sys[f->a7] == NULL) {
         return -ENOSYS;
     }

@@ -540,6 +540,7 @@ static void proc_task(void *arg)
      */
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     xSemaphoreGive(g_espix_proc_lock);
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, slot);
 
     /* Inherit the launching session so the app's stdio and any espix_printf()
      * from this task reach whoever ran it. */

@@ -23,8 +23,8 @@ espix_um_enter:
     li      t0, (1 << 27)
     csrw    mcause, t0
     csrw    mepc, s0
-    /* The kernel stack top for traps from U-mode: two scratch words above it, then the user frame's slot. */
-    addi    t0, sp, -(16 + RV_STK_FRMSZ)
+    /* The kernel stack top for traps from U-mode, two scratch words above it. */
+    addi    t0, sp, -16
     csrw    mscratch, t0
     mv      sp, s1
     mv      a0, s2
@@ -60,7 +60,31 @@ espix_um_enter:
     mret
     .size   espix_um_enter, . - espix_um_enter
 
-/* void espix_um_resume(RvExcFrame *u, uint32_t ms): back to U-mode with u's registers; ms is mscratch for the next trap */
+/*
+ * An exception from U-mode, jumped to by the patched vector: a0 is the user's saved registers, at the
+ * kernel stack top, a1 the cause, interrupts off. Nothing here may be preempted: this core locks up
+ * when an exception is taken while an earlier one is unretired, even another task's. So the exception
+ * is left at once, into espix_um_kentry(a0, a1, thread) as task code, its stack below the registers.
+ */
+    .global espix_um_trap
+    .type   espix_um_trap, @function
+    .balign 4
+espix_um_trap:
+    csrr    t0, mhartid
+    slli    t0, t0, 2
+    la      t1, espix_um_cur
+    add     t1, t1, t0
+    lw      a2, 0(t1)
+    la      t0, espix_um_kentry
+    csrw    mepc, t0
+    /* CLIC mcause: MPP=M, MPIE=1, interrupt level 0. */
+    li      t0, (3 << 28) | (1 << 27)
+    csrw    mcause, t0
+    li      ra, 0
+    mret
+    .size   espix_um_trap, . - espix_um_trap
+
+/* void espix_um_resume(RvExcFrame *u, uint32_t ms, espix_um_thread_t *t): back to U-mode with u's registers; ms is mscratch for the next trap */
     .global espix_um_resume
     .type   espix_um_resume, @function
     .balign 4
@@ -68,7 +92,8 @@ espix_um_resume:
     csrci   mstatus, 0x8
     mv      s0, a0
     mv      s1, a1
-    call    espix_um_return
+    mv      a1, a2
+    call    espix_um_return_to
     /* CLIC mcause: MPIE=1, MPP=U, interrupt level 0. */
     li      t0, (1 << 27)
     csrw    mcause, t0

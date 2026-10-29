@@ -86,11 +86,12 @@ one exit.
 **No exception is handled where it was taken.** This core locks up when an
 exception arrives while an earlier one is unretired, even another task's: the
 second traps inside the first's handler, the core stops with interrupts dead,
-and the watchdog resets the chip. So the trap handler copies the user's
-registers to a slot above `mscratch` and `mret`s at once into
-`espix_um_kentry()`, which runs the syscall, page fault or fault as ordinary
-task code: it can block, sleep, take the FPU through IDF's lazy trap, or end
-the process. `espix_um_resume()` then `mret`s back to U. After a watchdog reset
+and the watchdog resets the chip. So the vector sends an exception from U to
+`espix_um_trap`, which `mret`s at once into `espix_um_kentry()`, with the
+user's registers where the vector saved them and the stack below them. There
+the syscall, page fault or fault runs as ordinary task code: it can block,
+sleep, take the FPU through IDF's lazy trap, or end the process.
+`espix_um_resume()` then `mret`s back to U. After a watchdog reset
 the boot log shows each core's last two traps, from the debug-assist lockup
 monitor.
 
@@ -253,7 +254,7 @@ two meet the same silicon:
 |---|---|---|
 | leaving a trap | `handle_exception` `sret`s to itself before its handlers: only `sret` lowers the CLIC level | the trap `mret`s into `espix_um_kentry()` before any work: an exception taken inside an unretired one locks the core |
 | interrupt level on return | `sret` restores it only from an interrupt-type `scause` | every exit writes an `mcause` with the level |
-| a null syscall | `getpid` 1.1-1.2 µs, trap code (4.6 KiB) run from SRAM | 5.5 µs, the C half from PSRAM |
+| a null syscall | `getpid` 1.1-1.2 µs, trap code (4.6 KiB) run from SRAM | `getppid` 2.6 µs, trap path in SRAM |
 | FPU | off, soft-float: Linux needs D, which the chip lacks | F for U-mode apps (ilp32f), handed over eagerly; IDF's lazy trap takes FLW/FSW and their compressed forms |
 | new code | `fence.i` leaves stale lines; OpenSBI writes back D and invalidates I | `esp_cache_msync`, D written back then I invalidated, per executable page |
 | isolation | Sv32 for processes, PMP keeps IDF's core out of Linux memory | Sv32 per process, `cpu_apm` open to U, no PMP (IDF locks it) |
@@ -289,8 +290,10 @@ Each leaves `make test` green on both targets.
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
 
 Open:
-- **A null syscall costs 1750 cycles (5.5 µs)** round trip (`uapp bench`),
-  including the second `mret` out of the trap; the C half runs from PSRAM.
+- **A null syscall costs 840 cycles (2.6 µs)** round trip (`uapp bench`): 324
+  instructions, nearly all cache hits. A load or store takes 3 cycles and a CSR
+  write 5 to 6 (`umode cost`), so the 31 registers saved and restored are 190
+  of them.
 - **Deleting a task preempted in U-mode leaks about 1 KB of internal RAM.** A kill
   only comes to that when an app stays over 250 ms inside a syscall that cannot
   be interrupted; otherwise the app leaves on its own.

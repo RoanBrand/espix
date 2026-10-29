@@ -45,6 +45,7 @@ typedef struct {
     uint32_t           ktp;   /* the task's own tp, which kernel code needs back on every entry */
     espix_um_proc_t   *proc;
     espix_proc_slot_t *slot;
+    void              *task;  /* its FreeRTOS task, the FPU owner to compare with */
     int                kick_sig;    /* a fatal signal the next return to U turns into a trap */
 } espix_um_thread_t;
 

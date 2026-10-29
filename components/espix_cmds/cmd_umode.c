@@ -13,6 +13,7 @@
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_private/hw_stack_guard.h"
+#include "hal/assist_debug_hal.h"
 #include "riscv/csr.h"
 #include "riscv/csr_clic.h"
 #include "riscv/rvruntime-frames.h"
@@ -789,8 +790,66 @@ static int probe_flw(espix_session_t *s, int core)
     return 0;
 }
 
+
+/* What each kind of instruction on the trap path costs, interrupts off: 8 in a row, 128 times, less the loop. */
+#define COST_N 128
+#define COST_OP(name, setup, op) do { \
+        uint32_t c0, c1; \
+        const uint32_t mie = RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE; \
+        setup; \
+        asm volatile ("csrr %0, mcycle" : "=r"(c0)); \
+        for (int i_ = 0; i_ < COST_N; i_++) { op; op; op; op; op; op; op; op; } \
+        asm volatile ("csrr %0, mcycle" : "=r"(c1)); \
+        RV_SET_CSR(mstatus, mie); \
+        const uint32_t tenths = (c1 - c0 - loop) * 10 / (8 * COST_N); \
+        espix_printf(s, "  %-24s %3u.%u\n", name, (unsigned)(tenths / 10), (unsigned)(tenths % 10)); \
+    } while (0)
+
+static DRAM_ATTR uint32_t s_cost_word[2];
+
+static int probe_cost(espix_session_t *s)
+{
+    uint32_t *const ps = heap_caps_calloc(2, sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+    if (ps == NULL) {
+        espix_eprintf(s, "umode: out of memory\n");
+        return 1;
+    }
+    ps[0] = (uint32_t)ps;
+    s_cost_word[0] = (uint32_t)s_cost_word;
+
+    uint32_t loop, c0, c1, v = 0;
+    asm volatile ("csrr %0, mcycle" : "=r"(c0));
+    for (int i = 0; i < COST_N; i++) {
+        asm volatile ("" ::: "memory");
+    }
+    asm volatile ("csrr %0, mcycle" : "=r"(c1));
+    loop = c1 - c0;
+
+    const uint32_t core = esp_cpu_get_core_id();
+    espix_printf(s, "umode: cycles each, on core %u\n", (unsigned)core);
+    COST_OP("addi", (void)0, asm volatile ("addi %0, %0, 1" : "+r"(v)));
+    COST_OP("csrr mhartid", (void)0, asm volatile ("csrr %0, mhartid" : "=r"(v) :: "memory"));
+    COST_OP("csrrw mscratch", v = RV_READ_CSR(mscratch), asm volatile ("csrrw %0, mscratch, %0" : "+r"(v) :: "memory"));
+    COST_OP("csrr mepc", (void)0, asm volatile ("csrr %0, mepc" : "=r"(v) :: "memory"));
+    COST_OP("csrw mepc", v = RV_READ_CSR(mepc), asm volatile ("csrw mepc, %0" :: "r"(v) : "memory"));
+    COST_OP("csrw mcause", v = RV_READ_CSR(mcause), asm volatile ("csrw mcause, %0" :: "r"(v) : "memory"));
+    COST_OP("csrs mstatus", v = 0, asm volatile ("csrs mstatus, %0" :: "r"(v) : "memory"));
+    COST_OP("csrw satp", v = 0, asm volatile ("csrw satp, %0" :: "r"(v) : "memory"));
+    COST_OP("lw internal", (void)0, asm volatile ("lw %0, 4(%1)" : "=r"(v) : "r"(s_cost_word) : "memory"));
+    COST_OP("sw internal", (void)0, asm volatile ("sw %0, 4(%1)" :: "r"(v), "r"(s_cost_word) : "memory"));
+    COST_OP("lw PSRAM", (void)0, asm volatile ("lw %0, 4(%1)" : "=r"(v) : "r"(ps) : "memory"));
+    COST_OP("sw PSRAM", (void)0, asm volatile ("sw %0, 4(%1)" :: "r"(v), "r"(ps) : "memory"));
+    COST_OP("lw chain PSRAM", v = (uint32_t)ps, asm volatile ("lw %0, 0(%0)" : "+r"(v) :: "memory"));
+    COST_OP("stack guard off, on", (void)0, (assist_debug_hal_sp_mon_disable(core), assist_debug_hal_sp_mon_enable(core)));
+    heap_caps_free(ps);
+    return 0;
+}
+
 static int cmd_umode(espix_session_t *s, int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "cost") == 0) {
+        return probe_cost(s);
+    }
     if (argc == 2 && strcmp(argv[1], "last") == 0) {
         report_last(s);
         return 0;
@@ -800,7 +859,7 @@ static int cmd_umode(espix_session_t *s, int argc, char **argv)
     }
     const uint32_t stages = parse_stages(argc, argv);
     if (stages == 0) {
-        espix_eprintf(s, "usage: umode [last | flw | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]\n");
+        espix_eprintf(s, "usage: umode [last | flw | cost | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]\n");
         return 2;
     }
     if (umode_crumb.magic == CRUMB_RUNNING) {
@@ -865,7 +924,7 @@ out:
 
 static espix_cmd_t s_umode_cmds[] = {
     { .name = "umode", .fn = cmd_umode,
-      .help = "S31 user-mode / Sv32 MMU spike: costs and behaviour", .usage = "umode [last | flw | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]" },
+      .help = "S31 user-mode / Sv32 MMU spike: costs and behaviour", .usage = "umode [last | flw | cost | csrs traps tlb ad mprv mega asid psram spin mprvhole mprvperm]" },
 };
 
 void espix_cmds_register_umode(void)
