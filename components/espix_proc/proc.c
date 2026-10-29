@@ -70,11 +70,6 @@ static void done_record(const espix_proc_slot_t *slot, espix_proc_state_t state,
     s_done_head = (s_done_head + 1u) % ESPIX_PROC_DONE_MAX;
     s_done_seq++;
 }
-/* The reaper's entry point, registered by espix_fault when its task starts.
- * NULL until then, and the park path falls back to the self-delete it
- * replaced. See espix_proc_reap_self(). */
-static void (*s_reap_task)(TaskHandle_t task);
-
 /* The log entry for this pid, reaped or not, or NULL. Called with the lock
  * held. */
 static espix_proc_record_t *done_find(espix_pid_t pid)
@@ -520,42 +515,22 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
 void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,
                           int exit_code)
 {
-    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
-
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-    const bool ours = (slot->info.task == self);
+    const bool ours = (slot->info.task == xTaskGetCurrentTaskHandle());
     if (ours) {
-        slot->reaping     = true;
-        slot->term_state  = state;
-        slot->exit_status = exit_code;
+        slot->exiting = true;
     }
     xSemaphoreGive(g_espix_proc_lock);
 
-    if (ours && s_reap_task != NULL) {
-        s_reap_task(self);
-
-        /*
-         * The reaper owns the slot now and will delete this task. Suspend
-         * rather than block on something the reaper must hand back: a
-         * suspended task is provably off the ready list, so the reaper's
-         * delete cannot race this task still running. Nothing below may touch
-         * the slot again.
-         */
-        vTaskSuspend(NULL);
-        for (;;) {
-        }
-    }
-
     if (ours) {
         /*
-         * No reaper registered -- a board whose reaper did not start. Do what
-         * this path always did, so the process still ends and its resources
-         * come back.
+         * The teardown runs here, as Linux's do_exit() does. The slot cannot
+         * move underneath: `exiting` refuses a killer, and a spawn only takes a
+         * FREE slot. Then the reaper frees this task's stack.
          */
         espix_proc_release_resources(slot);
         espix_proc_finish(slot, state, exit_code);
-        vTaskDeleteWithCaps(NULL);
-        __builtin_unreachable();
+        espix_task_end();
     }
 
     /*
@@ -566,48 +541,6 @@ void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,
     vTaskSuspend(NULL);
     for (;;) {
     }
-}
-
-void espix_proc_set_reap_task(void (*fn)(TaskHandle_t task))
-{
-    s_reap_task = fn;
-}
-
-bool espix_proc_reaped(TaskHandle_t task)
-{
-    if (task == NULL) {
-        return false;
-    }
-
-    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-
-    espix_proc_slot_t *slot = NULL;
-    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-        if (g_espix_proc_table.slots[i].info.task == task) {
-            slot = &g_espix_proc_table.slots[i];
-            break;
-        }
-    }
-
-    const bool               ours  = (slot != NULL && slot->reaping);
-    const espix_proc_state_t state = ours ? slot->term_state : ESPIX_PROC_FREE;
-    const int                code  = ours ? slot->exit_status : 0;
-
-    xSemaphoreGive(g_espix_proc_lock);
-
-    if (!ours) {
-        return false;
-    }
-
-    /*
-     * Outside the lock: release_resources() takes none itself but frees things
-     * that may, and finish() takes the lock. The slot cannot move underneath:
-     * the task is parked, `reaping` refuses a killer, and a spawn only ever
-     * takes a FREE slot.
-     */
-    espix_proc_release_resources(slot);
-    espix_proc_finish(slot, state, code);
-    return true;
 }
 
 /*
@@ -1276,10 +1209,10 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
     }
 
     /*
-     * Already handed to the reaper: the clean teardown owns the slot and the
-     * task, and a killer that proceeded would free the image under it.
+     * Already tearing itself down: that teardown owns the slot and the task,
+     * and a killer that proceeded would free the image under it.
      */
-    if (slot->reaping) {
+    if (slot->exiting) {
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_INVALID_STATE;
     }

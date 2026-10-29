@@ -321,4 +321,5 @@ void espix_kernel_early_init(void)
     /* Hand the console to a flusher now that there is a scheduler, so no log
      * call in the tree blocks on the UART from here on. */
     espix_klog_start_flusher();
+    espix_reaper_start();
 }

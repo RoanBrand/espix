@@ -12,13 +12,6 @@ things are as they are.
 
 ## Processes
 
-- **Reap a faulted task and keep running.** `espix_fault_request_reap()` is
-  defined and has no callers, and `CONFIG_ESPIX_FAULT_REAP` is off — the reaper
-  task and its queue exist, but nothing feeds them. Skipping the reboot is the
-  easy half. The hard half is the comment block at the top of `reaper.c`: locks
-  held by the dead task, and the fact that without an MMU most corruption never
-  reaches the fault handler at all. Shipping the easy half alone produces a
-  system that limps rather than one that recovers.
 
 - **Unpin apps from core 1.** `exec.c` pins every app to core 1 (`910501e`)
   because "the toolchain vectorises every translation unit", so an app's first

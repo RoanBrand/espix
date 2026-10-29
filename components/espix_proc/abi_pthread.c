@@ -308,7 +308,7 @@ static void kthread_trampoline(void *arg)
         vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
         espix_pthread_unregister(st.slot);
     }
-    vTaskDeleteWithCaps(NULL);
+    espix_task_end();
 }
 
 esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,

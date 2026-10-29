@@ -2,18 +2,12 @@
  * espix fault handling.
  *
  * espix intercepts the ESP-IDF panic path via -Wl,--wrap=esp_panic_handler
- * (the same hook ESP-IDF's own test suite uses). Today the hook is
- * observational: it records who died and why into memory that survives the
- * reset, then delegates to the real handler, so the next boot can report the
- * post-mortem in `dmesg`.
+ * (the same hook ESP-IDF's own test suite uses). The hook is observational: it
+ * records who died and why into memory that survives the reset, then delegates
+ * to the real handler, so the next boot can report the post-mortem in `dmesg`.
  *
- * The long-term goal — reap the faulting task and keep the system up instead of
- * rebooting — is deliberately NOT implemented yet. The panic handler runs with
- * the scheduler frozen and non-IRAM interrupts off, so cleanup has to be
- * deferred to a reaper task; and on a chip without memory protection, a task
- * that dies holding the heap lock or a VFS mutex wedges everything else. The
- * reaper task and its queue exist here so that work has a defined home, but
- * nothing feeds them yet. See CONFIG_ESPIX_FAULT_REAP.
+ * A panic is the kernel's, or an M-mode app's. A U-mode app's fault on the S31
+ * never reaches it: it is a signal (docs/USER-MODE.md).
  */
 #pragma once
 
@@ -58,8 +52,7 @@ typedef struct {
 } espix_fault_record_t;
 
 /*
- * Start the reaper task and, if the previous boot ended in a fault, log the
- * post-mortem to the kernel log. Call early — before the filesystem, so a
+ * If the previous boot ended in a fault, log the post-mortem to the kernel log. Call early — before the filesystem, so a
  * mount that panics is still reported next boot.
  */
 esp_err_t espix_fault_init(void);
@@ -101,13 +94,6 @@ uint32_t espix_fault_wdt_count(void);
  * ISR is not told which one starved.
  */
 const char *espix_fault_wdt_task(int core);
-
-/*
- * Ask for `task` to be torn down from normal context. Safe to call from the
- * panic path (queue send only, no allocation). Currently unused — see the
- * header comment.
- */
-void espix_fault_request_reap(TaskHandle_t task);
 
 /*
  * Core dump stored in flash by the panic handler.

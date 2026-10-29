@@ -22,7 +22,7 @@ espix_shell      sessions, command registry, dispatch, console transport
     ↑
 espix_proc       process table, ELF exec
     ↑
-espix_fault      panic interception, reaper skeleton
+espix_fault      panic interception and the post-mortem
     ↑
 espix_ota        A/B updates: slots, the passive-slot write, the manifest
     ↑
@@ -62,11 +62,10 @@ elsewhere — are the table in
 
 Fault handling follows from the same fact. A panic hook records the core,
 exception, faulting address, task and pid into memory that survives the reset,
-and the next boot reports it. It deliberately does **not** reap and resume:
-locks held by the dead task, no per-process ownership of heap or fds, and the
-fact that most corruption never reaches the fault handler at all.
-[README.md](../README.md#crash-handling-and-isolation) has the behaviour,
-`reaper.c` the reasoning.
+and the next boot reports it. It deliberately does **not** resume: the dead
+task may hold kernel locks, and most corruption never reaches the fault handler
+at all. A U-mode app's fault on the S31 is a signal instead.
+[README.md](../README.md#crash-handling-and-isolation) has the behaviour.
 
 ### Tasks are not processes
 
@@ -103,9 +102,9 @@ Not every process is an app. espix's own code can run as one too
 sessions next (WORKLIST R-P8). A pid is identity, not authority. Only an app is
 ever deleted from outside; espix's own code holds kernel locks by design, so a
 stop is a request it answers, SIGKILL included. Some tasks stay out of the table
-for good: the reaper, which tears processes down; the klog flusher and the
-supervisor, whose death is the system's; the panic path; and the tasks ESP-IDF
-owns.
+for good: the reaper, which frees the stack of a task that ended itself; the
+klog flusher and the supervisor, whose death is the system's; the panic path;
+and the tasks ESP-IDF owns.
 
 A process is per-process and not per-session where it matters: it has its own
 working directory, and its credentials are copied from the session at spawn

@@ -333,15 +333,11 @@ typedef struct {
     uint8_t            nescaped;
 
     /*
-     * True from the moment a process has handed itself to the reaper until its
-     * slot is released. A killer that finds this must stand off: the clean
-     * teardown already owns the slot and the task. See espix_proc_reap_self().
+     * True from the moment a process starts its own teardown until its slot is
+     * released. A killer that finds this must stand off: the teardown already
+     * owns the slot and the task. See espix_proc_reap_self().
      */
-    bool               reaping;
-
-    /* The terminal state espix_proc_finish() should be given when the reaper
-     * runs it, set with reaping. The exit code travels in exit_status. */
-    espix_proc_state_t term_state;
+    bool               exiting;
 
     /* Run time of this process's threads that have already ended, so `ps`
      * charges a process for all of its CPU and not just its live tasks'. */

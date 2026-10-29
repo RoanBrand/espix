@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "fault.c"
-        "reaper.c"
         "coredump.c"
     INCLUDE_DIRS
         "include"

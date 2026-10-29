@@ -94,6 +94,13 @@ typedef struct {
 /* *out is the task, written before it runs. */
 esp_err_t espix_kthread_start(const espix_kthread_t *k, TaskHandle_t *out);
 
+/*
+ * End the calling task, made with xTaskCreate*WithCaps(). A task cannot free the
+ * stack it runs on, so the reaper task frees its stack and TCB; IDF's
+ * vTaskDeleteWithCaps(NULL) would make a temporary task for that each time.
+ */
+void espix_task_end(void) __attribute__((noreturn));
+
 /* espix_proc's side; registering it adopts the tasks started before. */
 typedef struct {
     esp_err_t (*start)(const espix_kthread_t *k, TaskHandle_t *out);

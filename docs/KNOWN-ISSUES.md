@@ -455,9 +455,9 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   captured — which is how the `Corrupted MAC` bug was eventually caught, and for
   the same reason: never debug a transport through itself.
 
-- **The fault handler intercepts but does not recover.** A crash is recorded and
-  reported in `dmesg` on the next boot, and then the system reboots.
-  `espix_fault_request_reap()` exists with no callers.
+- **A fault in the kernel or an M-mode app reboots the board.** It is recorded
+  and reported in `dmesg` on the next boot. A U-mode app's fault on the S31 ends
+  only that app.
 
 ## U-mode apps (S31)
 

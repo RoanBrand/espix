@@ -37,7 +37,7 @@ Two more consequences of the same gap:
    the loader, or by a library that ran during relocation.
 4. The app sees no ABI change: it still calls `malloc`.
 5. A board with no PSRAM still works.
-6. The reaper (R-P1.6) is the single teardown point that invokes it.
+6. `espix_proc_release_resources()` is the single teardown point that invokes it.
 
 ## The mechanism is the resolver, not a table
 

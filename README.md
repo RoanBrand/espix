@@ -407,27 +407,15 @@ What espix does today:
   The `crash` command triggers this on demand. `coredump` inspects the full dump
   ESP-IDF writes alongside it.
 
-What it does **not** do yet — deliberately:
+On the S31, an app built with `tools/espix-cc` runs in U-mode, in an address
+space of its own ([docs/USER-MODE.md](docs/USER-MODE.md)). Its fault is a
+signal: it ends that app, and the board keeps running.
 
-- Reap the faulting task and keep running. The reaper task and its queue exist
-  (`espix_fault_request_reap()`), but nothing feeds them. Skipping the reboot is
-  the easy half; the hard half is below, and shipping the easy half alone would
-  produce a system that limps rather than one that recovers.
-- Known limitations to design around rather than ignore:
-  - It only catches invalid-memory-access faults, not general memory corruption
-    (buffer overflows into valid memory, heap corruption, one task's wild write
-    landing inside another task's stack or the kernel). Those go undetected, same
-    as on nommu Linux.
-  - Locks held by a reaped task (heap/malloc lock, VFS/filesystem mutex, driver
-    mutexes) need explicit handling — timeout-based acquisition and/or per-app
-    heap arenas — or a reaped task can wedge the rest of the system instead of
-    just itself.
-  - Stack overflow is treated as its own fault class; once it happens the task's
-    stack contents can't be trusted, so recovery = reap, not "resume."
-- Longer-term, the syscall/loader boundary should be designed to allow chips with
-  a real MMU (S31) to eventually get actual MPU/MMU-backed process isolation as
-  an opt-in, without requiring a rewrite. S3 stays in "catch and reap" mode
-  regardless.
+A fault in the kernel or in an M-mode app is not recovered, deliberately. The
+task may hold the heap lock, a VFS mutex or a driver's, and without an MMU most
+corruption (an overflow into valid memory, a wild write into another task's
+stack) never reaches the fault handler at all, as on nommu Linux. Rebooting is
+the honest answer.
 
 ## Why not Linux on ESP32?
  - Only supports S31. Espix should be able to support all ESP32 models.

@@ -141,14 +141,7 @@ void __wrap_esp_panic_handler(void *info)
         panic_print_str(") — recorded for next boot\r\n");
     }
 
-    /*
-     * Delegate: print the register dump / backtrace and reboot as usual.
-     *
-     * This is where "reap the task and keep running" will eventually branch in.
-     * It is not a matter of skipping this call — the scheduler is frozen here
-     * and the dying task may hold the heap or VFS lock, so resuming needs the
-     * deferred reaper path plus a story for held locks. See espix_fault.h.
-     */
+    /* Delegate: print the register dump / backtrace and reboot as usual. */
     __real_esp_panic_handler(info);
 }
 
@@ -296,5 +289,5 @@ esp_err_t espix_fault_init(void)
 
     espix_fault_report_coredump();
 
-    return espix_fault_reaper_start();
+    return ESP_OK;
 }

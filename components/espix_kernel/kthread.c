@@ -6,10 +6,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
 
+#include "espix_kernel_priv.h"
 #include "espix_task.h"
 
 /* Started before espix_proc: few, and none of them ends early. */
@@ -48,7 +50,7 @@ static void plain_task(void *arg)
     if (s_ops != NULL) {
         s_ops->gone(xTaskGetCurrentTaskHandle());
     }
-    vTaskDeleteWithCaps(NULL);
+    espix_task_end();
 }
 
 esp_err_t espix_kthread_start(const espix_kthread_t *k, TaskHandle_t *out)
@@ -113,4 +115,47 @@ void espix_kthread_set_ops(const espix_kthread_ops_t *ops)
         }
     }
     s_ops = ops;
+}
+
+/* Tasks that ended themselves, for the reaper to free. */
+static QueueHandle_t s_reap;
+
+static void reaper_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        TaskHandle_t task;
+        if (xQueueReceive(s_reap, &task, portMAX_DELAY) == pdTRUE) {
+            /* Waits until the task is off its core, if it has not suspended yet. */
+            vTaskDeleteWithCaps(task);
+        }
+    }
+}
+
+void espix_reaper_start(void)
+{
+    QueueHandle_t q = xQueueCreate(8, sizeof(TaskHandle_t));
+    if (q == NULL) {
+        return;
+    }
+    s_reap = q;
+    const espix_kthread_t k = {
+        .name = "espix:reaper", .fn = reaper_task, .stack = 2048,
+        .priority = configMAX_PRIORITIES - 2, .core = tskNO_AFFINITY,
+    };
+    if (espix_kthread_start(&k, NULL) != ESP_OK) {
+        s_reap = NULL;
+        vQueueDelete(q);
+    }
+}
+
+void espix_task_end(void)
+{
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    if (s_reap != NULL && xQueueSend(s_reap, &self, portMAX_DELAY) == pdTRUE) {
+        vTaskSuspend(NULL);
+    }
+    vTaskDeleteWithCaps(NULL);
+    for (;;) {
+    }
 }
