@@ -11,6 +11,16 @@ menu "espix processes"
             unaffected. Patches IDF's trap vectors (tools/patch-umode.py).
             See docs/USER-MODE.md.
 
+    config ESPIX_UM_KSTACK
+        int "Kernel stack of a U-mode app's task (bytes)"
+        depends on ESPIX_UMODE
+        range 4096 65536
+        default 8192
+        help
+            A U-mode app runs on a stack in its own address space, which grows
+            as it is touched; its task's stack is used only by syscalls and
+            interrupts, so every U-mode app gets this one size.
+
     config ESPIX_PROC_MAX
         int "Maximum tracked processes"
         range 2 64

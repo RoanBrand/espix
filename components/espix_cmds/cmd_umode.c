@@ -739,41 +739,44 @@ static uint32_t parse_stages(int argc, char **argv)
 
 typedef struct {
     espix_task_exit_t exit;
-    bool              store;
+    int               kind;     /* flw, fsw, c.flw, c.fsw */
     bool              trapped;
     float             in, out;
 } flw_probe_t;
 
 extern StaticTask_t *port_uxCoprocOwner[portNUM_PROCESSORS][SOC_CPU_COPROC_NUM];
 
+static const char *const s_flw_kinds[] = { "flw", "fsw", "c.flw", "c.fsw" };
+
 /* A fresh task's first FPU instruction is a load or store, with the FPU off: IDF's lazy trap must take it. */
 static void flw_task(void *arg)
 {
     flw_probe_t *p = arg;
+    register float *in asm("a0")  = &p->in;
+    register float *out asm("a1") = &p->out;
     RV_CLEAR_CSR(mstatus, 3u << 13);
-    if (p->store) {
-        asm volatile ("fsw f0, 0(%0)" :: "r"(&p->out) : "memory");
-    } else {
-        float v;
-        asm volatile ("flw %0, 0(%1)" : "=f"(v) : "r"(&p->in));
-        p->out = v;
+    switch (p->kind) {
+    case 0: asm volatile (".option push\n.option norvc\nflw fa0, 0(a0)\nfsw fa0, 0(a1)\n.option pop" :: "r"(in), "r"(out) : "fa0", "memory"); break;
+    case 1: asm volatile (".option push\n.option norvc\nfsw fa0, 0(a1)\n.option pop" :: "r"(out) : "memory"); break;
+    case 2: asm volatile (".option push\n.option rvc\nc.flw fa0, 0(a0)\n.option pop\nfsw fa0, 0(a1)" :: "r"(in), "r"(out) : "fa0", "memory"); break;
+    default: asm volatile (".option push\n.option rvc\nc.fsw fa0, 0(a1)\n.option pop" :: "r"(out) : "memory"); break;
     }
     /* Only IDF's lazy trap makes a task the FPU's owner. */
     p->trapped = port_uxCoprocOwner[xPortGetCoreID()][FPU_COPROC_IDX] == (StaticTask_t *)xTaskGetCurrentTaskHandle();
     espix_task_exited(&p->exit);
 }
 
-static int probe_flw(espix_session_t *s)
+static int probe_flw(espix_session_t *s, int core)
 {
-    for (int store = 0; store <= 1; store++) {
-        flw_probe_t p = { .store = store, .in = 2.5f };
+    for (int kind = 0; kind < 4; kind++) {
+        flw_probe_t p = { .kind = kind, .in = 2.5f };
         if (!espix_task_exit_init(&p.exit)) {
             return 1;
         }
-        espix_printf(s, "umode: %s as a task's first FPU instruction... ", store ? "fsw" : "flw");
+        espix_printf(s, "umode: %s on core %d as a task's first FPU instruction... ", s_flw_kinds[kind], core);
         if (espix_kthread_start(&(const espix_kthread_t){
                 .name = "umode-flw", .fn = flw_task, .arg = &p, .stack = 4096,
-                .priority = 5, .core = 0, .internal_stack = true, .thread = true },
+                .priority = 5, .core = core, .internal_stack = true, .thread = true },
                 &p.exit.task) != ESP_OK) {
             vSemaphoreDelete(p.exit.done);
             return 1;
@@ -781,7 +784,7 @@ static int probe_flw(espix_session_t *s)
         espix_task_exit_wait(&p.exit, 0);
         vSemaphoreDelete(p.exit.done);
         espix_printf(s, "%s%s\n", p.trapped ? "taken by the lazy FPU trap" : "ran without the trap",
-                     (!store && p.out != 2.5f) ? ", but the value is wrong" : "");
+                     ((kind == 0 || kind == 2) && p.out != 2.5f) ? ", but the value is wrong" : "");
     }
     return 0;
 }
@@ -792,8 +795,8 @@ static int cmd_umode(espix_session_t *s, int argc, char **argv)
         report_last(s);
         return 0;
     }
-    if (argc == 2 && strcmp(argv[1], "flw") == 0) {
-        return probe_flw(s);
+    if (argc >= 2 && strcmp(argv[1], "flw") == 0) {
+        return probe_flw(s, (argc > 2) ? atoi(argv[2]) : 0);
     }
     const uint32_t stages = parse_stages(argc, argv);
     if (stages == 0) {

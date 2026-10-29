@@ -1,5 +1,6 @@
 /* The first entry into U-mode; every later one is the patched IDF exit (tools/patch-umode.py). */
 #include "sdkconfig.h"
+#include "riscv/rvruntime-frames.h"
 
 #if CONFIG_ESPIX_UMODE
 
@@ -22,8 +23,8 @@ espix_um_enter:
     li      t0, (1 << 27)
     csrw    mcause, t0
     csrw    mepc, s0
-    /* The kernel stack top for traps from U-mode, with two scratch words above it. */
-    addi    t0, sp, -16
+    /* The kernel stack top for traps from U-mode: two scratch words above it, then the user frame's slot. */
+    addi    t0, sp, -(16 + RV_STK_FRMSZ)
     csrw    mscratch, t0
     mv      sp, s1
     mv      a0, s2
@@ -58,5 +59,55 @@ espix_um_enter:
     li      t6, 0
     mret
     .size   espix_um_enter, . - espix_um_enter
+
+/* void espix_um_resume(RvExcFrame *u, uint32_t ms): back to U-mode with u's registers; ms is mscratch for the next trap */
+    .global espix_um_resume
+    .type   espix_um_resume, @function
+    .balign 4
+espix_um_resume:
+    csrci   mstatus, 0x8
+    mv      s0, a0
+    mv      s1, a1
+    call    espix_um_return
+    /* CLIC mcause: MPIE=1, MPP=U, interrupt level 0. */
+    li      t0, (1 << 27)
+    csrw    mcause, t0
+    lw      t0, RV_STK_MEPC(s0)
+    csrw    mepc, t0
+    csrw    mscratch, s1
+    mv      sp, s0
+    lw      ra, RV_STK_RA(sp)
+    lw      gp, RV_STK_GP(sp)
+    lw      tp, RV_STK_TP(sp)
+    lw      t0, RV_STK_T0(sp)
+    lw      t1, RV_STK_T1(sp)
+    lw      t2, RV_STK_T2(sp)
+    lw      s0, RV_STK_S0(sp)
+    lw      s1, RV_STK_S1(sp)
+    lw      a0, RV_STK_A0(sp)
+    lw      a1, RV_STK_A1(sp)
+    lw      a2, RV_STK_A2(sp)
+    lw      a3, RV_STK_A3(sp)
+    lw      a4, RV_STK_A4(sp)
+    lw      a5, RV_STK_A5(sp)
+    lw      a6, RV_STK_A6(sp)
+    lw      a7, RV_STK_A7(sp)
+    lw      s2, RV_STK_S2(sp)
+    lw      s3, RV_STK_S3(sp)
+    lw      s4, RV_STK_S4(sp)
+    lw      s5, RV_STK_S5(sp)
+    lw      s6, RV_STK_S6(sp)
+    lw      s7, RV_STK_S7(sp)
+    lw      s8, RV_STK_S8(sp)
+    lw      s9, RV_STK_S9(sp)
+    lw      s10, RV_STK_S10(sp)
+    lw      s11, RV_STK_S11(sp)
+    lw      t3, RV_STK_T3(sp)
+    lw      t4, RV_STK_T4(sp)
+    lw      t5, RV_STK_T5(sp)
+    lw      t6, RV_STK_T6(sp)
+    lw      sp, RV_STK_SP(sp)
+    mret
+    .size   espix_um_resume, . - espix_um_resume
 
 #endif /* CONFIG_ESPIX_UMODE */

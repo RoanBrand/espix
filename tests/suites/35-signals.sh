@@ -19,6 +19,11 @@ if ! dev_testapp_present; then
     return 0
 fi
 
+# Handlers, alarm, SIGWINCH and Ctrl-C delivery are what these test; 32-umode covers a kill's default action.
+if dev_uapp_lacks "signal handlers and alarm" "M4"; then
+    return 0
+fi
+
 APP="/home/$ESPIX_USER/testapp"
 
 # `ps` prints running tasks, then a `finished:` section -- but that section is

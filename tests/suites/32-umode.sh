@@ -89,6 +89,29 @@ fi
 assert_contains "a megabyte of stack grows on demand" "uapp: deep stack ok" "$(dev_run "$UAPP deepstack")"
 assert_status "the page below the stack is a guard" 139 dev_status "$UAPP guard"
 
+# Syscalls from three apps at once: each runs as task code, never inside the trap (docs/USER-MODE.md).
+for w in 1 2 3; do
+    dev_once "$UAPP sysloop 4" > "$UM_DIR/loop$w" 2>&1 &
+    eval "um_loop$w=\$!"
+done
+wait "$um_loop1" "$um_loop2" "$um_loop3"
+assert_contains "three apps in syscall loops at once (first)"  "syscalls" "$(cat "$UM_DIR/loop1")"
+assert_contains "three apps in syscall loops at once (second)" "syscalls" "$(cat "$UM_DIR/loop2")"
+assert_contains "three apps in syscall loops at once (third)"  "syscalls" "$(cat "$UM_DIR/loop3")"
+
+# A kill ends an app whether it is computing in U or asleep in a syscall.
+um_kill() {
+    local pid
+    pid=$(dev_run "$UAPP $1 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+    sleep 1
+    dev_run "kill -$2 $pid" >/dev/null
+    sleep 1
+    dev_run "ps" | awk -v p="$pid" '$1 == p { print $NF }'
+}
+assert_eq "SIGTERM ends an app asleep in a syscall" "143" "$(um_kill 'sleep 10000' TERM)"
+assert_eq "SIGTERM ends an app computing in U"      "143" "$(um_kill 'spin 30' TERM)"
+assert_eq "SIGKILL ends it with 137"                "137" "$(um_kill 'spin 30' KILL)"
+
 bench_out=$(dev_run "$UAPP bench")
 assert_contains "a null syscall is timed ($bench_out)" "uapp: a syscall takes" "$bench_out"
 rm -rf "$UM_DIR"

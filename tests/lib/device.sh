@@ -724,6 +724,15 @@ dev_console_run() {
 DEV_TESTAPP="/home/$ESPIX_USER/testapp"
 DEV_TESTAPP_SHA="/home/$ESPIX_USER/.testapp.sha"
 
+# ESPIX_UAPP=1 stages testapp's U-mode build in its place (docs/USER-MODE.md).
+# A suite asks this before an assertion that needs what U-mode apps do not
+# have yet, and skips with the milestone that brings it.
+dev_uapp_lacks() {
+    [ "${ESPIX_UAPP:-0}" = 1 ] || return 1
+    espix_skip "$1 in a U-mode app: $2"
+    return 0
+}
+
 # Is the test app on the device? A read, and nothing else.
 #
 # The suites used to call dev_testapp_sync() themselves -- four of them did --

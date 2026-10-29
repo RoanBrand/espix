@@ -1128,6 +1128,12 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     };
 
     uint32_t app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;
+#if CONFIG_ESPIX_UMODE
+    /* A U-mode app's own stack is in its address space; this one is only its kernel stack. */
+    if (espix_um_file_is_exec(abs_path)) {
+        app_stack = CONFIG_ESPIX_UM_KSTACK;
+    } else
+#endif
     {
         const char *slash = strrchr(abs_path, '/');
         const char *base  = (slash != NULL) ? slash + 1 : abs_path;

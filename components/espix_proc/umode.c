@@ -18,9 +18,11 @@
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_private/startup_internal.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/assist_debug_hal.h"
+#include "hal/assist_debug_ll.h"
 #include "riscv/csr.h"
 #include "riscv/encoding.h"
 #include "riscv/rvruntime-frames.h"
@@ -38,6 +40,7 @@
 #define USTACK_TOP  0x80000000u
 #define USTACK_MAX  (8u * 1024u * 1024u)    /* reserved, mapped as touched; Linux's ulimit -s */
 #define ARGS_MAX    (64u * 1024u)
+#define UM_KICK_PC  0x00000ffcu                 /* below the image, never mapped */
 
 /* Each core's current U-mode thread's kernel tp; the patched vectors load it on entry from U. */
 uint32_t espix_um_ktp[portNUM_PROCESSORS];
@@ -80,10 +83,21 @@ void espix_um_enter(uint32_t pc, uint32_t usp, uint32_t a0, uint32_t a1, uint32_
 void espix_um_return(void *frame);
 void espix_um_trap(RvExcFrame *frame, uint32_t cause);
 
+/* Each core's lockup monitor at boot: its last two traps, the second taken inside the first's handler on a lockup. */
+static uint32_t s_lockup[portNUM_PROCESSORS][2][4];
+
 /* mscratch says which side of the boundary a trap came from, so it must start at 0. */
 ESP_SYSTEM_INIT_FN(espix_um_core_init, SECONDARY, ESP_SYSTEM_INIT_ALL_CORES, 100)
 {
-    s_boot_mscratch[esp_cpu_get_core_id()] = RV_SWAP_CSR(mscratch, 0);
+    const uint32_t core = esp_cpu_get_core_id();
+    for (int i = 0; i < 2; i++) {
+        s_lockup[core][i][0] = assist_debug_ll_lockup_get_cause(core, i);
+        s_lockup[core][i][1] = assist_debug_ll_lockup_get_tval(core, i);
+        s_lockup[core][i][2] = assist_debug_ll_lockup_get_iaddr(core, i);
+        s_lockup[core][i][3] = assist_debug_ll_lockup_get_priv(core, i);
+    }
+    assist_debug_ll_lockup_monitor_enable(core, true);
+    s_boot_mscratch[core] = RV_SWAP_CSR(mscratch, 0);
     RV_WRITE_CSR(mcounteren, 0x7);
     RV_WRITE_CSR(scounteren, 0x7);
     return ESP_OK;
@@ -91,6 +105,16 @@ ESP_SYSTEM_INIT_FN(espix_um_core_init, SECONDARY, ESP_SYSTEM_INIT_ALL_CORES, 100
 
 void espix_um_init(void)
 {
+    const esp_reset_reason_t why = esp_reset_reason();
+    if (why == ESP_RST_INT_WDT || why == ESP_RST_TASK_WDT || why == ESP_RST_WDT) {
+        for (int c = 0; c < portNUM_PROCESSORS; c++) {
+            for (int i = 0; i < 2; i++) {
+                espix_klog(ESPIX_KLOG_WARN, TAG, "core %d's trap %d before the reset: cause 0x%x, tval 0x%08x at 0x%08x, priv %u",
+                           c, i, (unsigned)s_lockup[c][i][0], (unsigned)s_lockup[c][i][1],
+                           (unsigned)s_lockup[c][i][2], (unsigned)s_lockup[c][i][3]);
+            }
+        }
+    }
     /* cpu_apm region 0 (flash and PSRAM) is TEE-only, and U-mode is REE: the page tables isolate instead. */
     REG_SET_BIT(CPU_APM_REGION0_ATTR_REG, 0x0777);
     espix_klog(ESPIX_KLOG_INFO, TAG, "user mode on; mscratch at boot 0x%08x 0x%08x",
@@ -205,8 +229,19 @@ static IRAM_ATTR void fpu_take(uint32_t core)
 /* On every return to U-mode: the thread's table, the kernel tp for the next entry, no stack guard. */
 IRAM_ATTR void espix_um_return(void *frame)
 {
-    (void)frame;
-    const espix_um_thread_t *t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
+    espix_um_thread_t *t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
+    /* A fatal signal or a kill: the return lands on an unmapped pc instead, and the trap ends the process.
+     * The first entry has no frame (espix_um_enter); its next return will see the signal. */
+    if (frame != NULL && t->kick_sig == 0) {
+        if (t->slot->stop_requested) {
+            t->kick_sig = SIGKILL;
+        } else if ((t->slot->sig_pending & ~t->slot->sig_blocked) != 0) {
+            t->kick_sig = espix_proc_termsig(t->slot);
+        }
+        if (t->kick_sig != 0) {
+            ((RvExcFrame *)frame)->mepc = UM_KICK_PC;
+        }
+    }
     const uint32_t core = esp_cpu_get_core_id();
     espix_um_ktp[core] = t->ktp;
     RV_WRITE_CSR(satp, t->satp);
@@ -219,24 +254,20 @@ IRAM_ATTR void espix_um_return(void *frame)
     assist_debug_hal_sp_mon_disable(core);
 }
 
+/* The most kernel stack any U-mode task has used, to size CONFIG_ESPIX_UM_KSTACK from. */
+static uint32_t s_kstack_most;
+
 /* Where an app's exit or fault ends: plain task context on the kernel stack, as an M-mode app's exit() is. */
-static void __attribute__((noreturn)) exited(int status)
+void espix_um_exited(int status)
 {
+    const uint32_t used = CONFIG_ESPIX_UM_KSTACK - uxTaskGetStackHighWaterMark(NULL);
+    if (used > s_kstack_most) {
+        s_kstack_most = used;
+        espix_klog(ESPIX_KLOG_INFO, TAG, "kernel stack: %u of %u bytes, the most yet",
+                   (unsigned)used, (unsigned)CONFIG_ESPIX_UM_KSTACK);
+    }
     espix_proc_exit(status);
     __builtin_unreachable();
-}
-
-void espix_um_leave(RvExcFrame *f, const espix_um_thread_t *t, int status)
-{
-    extern char __global_pointer$[];
-    f->mepc    = (uint32_t)exited;
-    f->a0      = (uint32_t)status;
-    f->ra      = 0;
-    f->gp      = (uint32_t)__global_pointer$;
-    f->tp      = t->ktp;
-    f->mstatus |= MSTATUS_MPP;
-    /* CLIC mcause: MPP=M, MPIE=1, level 0; mret restores the interrupt level from here. */
-    RV_WRITE_CSR(mcause, (3u << 28) | (1u << 27));
 }
 
 static int fault_signal(uint32_t code)
@@ -249,7 +280,7 @@ static int fault_signal(uint32_t code)
     }
 }
 
-static void fault(RvExcFrame *f, const espix_um_thread_t *t, uint32_t code)
+static void __attribute__((noreturn)) fault(const RvExcFrame *f, uint32_t code)
 {
     espix_proc_slot_t *const slot = espix_proc_self();
     const int sig = fault_signal(code);
@@ -263,29 +294,57 @@ static void fault(RvExcFrame *f, const espix_um_thread_t *t, uint32_t code)
         espix_eprintf(slot->info.session, "%s: %s (pc 0x%08x, address 0x%08x)\n",
                       slot->info.name, what, (unsigned)f->mepc, (unsigned)f->mtval);
     }
-    espix_um_leave(f, t, 128 + sig);
+    espix_um_exited(128 + sig);
 }
 
-/* An exception from U-mode, on the thread's kernel stack with interrupts off. */
+void espix_um_kentry(RvExcFrame *u, uint32_t cause);
+void espix_um_resume(RvExcFrame *u, uint32_t ms) __attribute__((noreturn));
+
+/*
+ * An exception from U-mode, on the thread's kernel stack with interrupts off.
+ *
+ * Nothing here may be preempted: this core locks up when an exception is taken
+ * while an earlier one is unretired, even another task's. So the user's
+ * registers go to the slot above mscratch and the exception is left at once,
+ * into espix_um_kentry() as ordinary task code.
+ */
 void espix_um_trap(RvExcFrame *f, uint32_t cause)
 {
-    assist_debug_hal_sp_mon_enable(esp_cpu_get_core_id());
-    RV_SET_CSR(mstatus, MSTATUS_MIE);
-
-    espix_um_thread_t *const t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
-    const uint32_t code = cause & 0xfff;
+    extern char __global_pointer$[];
+    const espix_um_thread_t *const t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
     if (t == NULL) {
         abort();
     }
-    const uint32_t need = (code == 12) ? PTE_X : (code == 13) ? PTE_R : (code == 15) ? PTE_W : 0;
-    if (code == 8) {
-        f->mepc += 4;
-        f->a0 = (uint32_t)espix_um_syscall(t, f);
-    } else if (need == 0 || !espix_um_fault(t->proc->as, f->mtval, need)) {
-        fault(f, t, code);
-    }
+    RvExcFrame *const u = (RvExcFrame *)((uint8_t *)f + RV_STK_FRMSZ + 16);
+    memcpy(u, f, sizeof(*u));
+    f->mepc    = (uint32_t)espix_um_kentry;
+    f->a0      = (uint32_t)u;
+    f->a1      = cause;
+    f->ra      = 0;
+    f->gp      = (uint32_t)__global_pointer$;
+    f->tp      = t->ktp;
+    f->mstatus |= MSTATUS_MPP;
+    /* CLIC mcause: MPP=M, MPIE=1, level 0; mret takes them from here. */
+    RV_WRITE_CSR(mcause, (3u << 28) | (1u << 27));
+}
 
-    RV_CLEAR_CSR(mstatus, MSTATUS_MIE);
+/* The exception's work, in task context with interrupts on: it may block, sleep, take the FPU or end the process. */
+void espix_um_kentry(RvExcFrame *u, uint32_t cause)
+{
+    espix_um_thread_t *const t = pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX);
+    const uint32_t code = cause & 0xfff;
+    const uint32_t need = (code == 12) ? PTE_X : (code == 13) ? PTE_R : (code == 15) ? PTE_W : 0;
+
+    assist_debug_hal_sp_mon_enable(esp_cpu_get_core_id());
+    if (code == 12 && u->mepc == UM_KICK_PC && t->kick_sig != 0) {
+        espix_um_exited(128 + t->kick_sig);
+    } else if (code == 8) {
+        u->mepc += 4;
+        u->a0 = (uint32_t)espix_um_syscall(t, u);
+    } else if (need == 0 || !espix_um_fault(t->proc->as, u->mtval, need)) {
+        fault(u, code);
+    }
+    espix_um_resume(u, (uint32_t)u - 16);
 }
 
 typedef struct {
@@ -308,6 +367,18 @@ bool espix_um_is_exec(const uint8_t *image, size_t size)
     const um_ehdr_t *eh = (const um_ehdr_t *)image;
     return size >= sizeof(*eh) && memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 &&
            eh->e_ident[4] == 1 && eh->e_type == ET_EXEC_ && eh->e_machine == EM_RISCV_;
+}
+
+bool espix_um_file_is_exec(const char *path)
+{
+    um_ehdr_t eh;
+    FILE *f = fopen(path, "rb");
+    const bool ok = f != NULL && fread(&eh, 1, sizeof(eh), f) == sizeof(eh) &&
+                    espix_um_is_exec((const uint8_t *)&eh, sizeof(eh));
+    if (f != NULL) {
+        fclose(f);
+    }
+    return ok;
 }
 
 static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t size, uint32_t *entry)
@@ -444,6 +515,7 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
     p->as   = as;
     espix_um_fds_init(p);
     t->proc = p;
+    t->slot = slot;
     t->satp = espix_um_as_satp(as);
     app->um = t;
 

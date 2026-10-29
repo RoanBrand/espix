@@ -471,8 +471,6 @@ stdio, time, sleep and identity. What it cannot do yet:
   block, so a large `malloc` costs its whole size at once; memory reserved with
   `brk`/`sbrk`, bss and the stack cost only the pages touched.
 - **Pinned to core 1**, as M-mode apps are.
-- **A rare hang**: once in about 120 runs of two FPU-using U-mode apps together,
-  core 1 locked up at an app's syscall and the watchdog reset the board.
 
 ## Filesystem
 

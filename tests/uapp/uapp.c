@@ -270,6 +270,19 @@ int main(int argc, char **argv)
         *p = 1;
         return 0;
     }
+    if (strcmp(mode, "sysloop") == 0 && argc > 2) {
+        /* Seconds of back-to-back syscalls, with floating point in flight so this thread owns the FPU. */
+        const unsigned long until = cycles() + (unsigned long)atoi(argv[2]) * 320000000ul;
+        volatile float x = 1.0f;
+        unsigned long n = 0;
+        while ((long)(until - cycles()) > 0) {
+            (void)getppid();
+            x = x * 1.0001f;
+            n++;
+        }
+        printf("uapp: %lu syscalls, x %d\n", n, (int)x);
+        return 0;
+    }
     if (strcmp(mode, "bench") == 0) {
         /* The cost of a syscall that does nothing: getppid, timed with the cycle counter. */
         const int n = 10000;

@@ -286,7 +286,12 @@ if dev_session_start; then
     # The test app goes over once, here, before any worker exists. Four suites
     # used to sync it themselves, which is a race the moment two of them run at
     # the same time.
-    dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp" >/dev/null \
+    testapp_build=testapp
+    if [ "${ESPIX_UAPP:-0}" = 1 ]; then
+        testapp_build=testapp-u
+        printf '  %s testapp is its U-mode build\n' "$(_espix_dim note:)"
+    fi
+    dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/$testapp_build" >/dev/null \
         || printf '  %s test app not staged; suites needing it will skip\n' \
                   "$(_espix_dim note:)"
     dev_session_stop

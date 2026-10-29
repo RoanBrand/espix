@@ -197,7 +197,9 @@ fi
 
 sleep 3
 heap=$(app_heap_bytes "$pid")
-if [ -n "$heap" ] && [ "$heap" -ge 1000000 ] 2>/dev/null; then
+if dev_uapp_lacks "an arena in ps (its heap is its own address space)" "M7, which counts pages"; then
+    :
+elif [ -n "$heap" ] && [ "$heap" -ge 1000000 ] 2>/dev/null; then
     espix_pass "ps shows the app's live arena (HEAP $heap bytes)"
 else
     espix_fail "ps shows the app's live arena" "HEAP read '$heap'"
@@ -248,6 +250,7 @@ fi
 # has to be found by address alone; without that walk this free would reach the
 # global heap on a region pointer -- corruption, not a leak.
 
+if ! dev_uapp_lacks "threads" "M3"; then
 base3=$(psram_free_kb)
 out=$(dev_run "$APP holdthread 1048576")
 assert_contains "a free from the app's own thread finds the arena" \
@@ -264,6 +267,7 @@ fi
 
 assert_contains "the device survives a thread free" "espix" \
     "$(dev_run uname)"
+fi
 
 
 # --- the request list must never fail an ordinary allocation ---------------
@@ -328,6 +332,7 @@ fi
 # went to the global heap -- unowned, and still there after the process ended.
 # The command allocates in a thread, never frees, and returns.
 
+if ! dev_uapp_lacks "threads" "M3"; then
 base6=$(psram_free_kb)
 out=$(dev_run "$APP leakthread 1048576")
 assert_contains "a thread can allocate and never free it" \
@@ -341,6 +346,7 @@ else
     espix_fail "the arena reclaims a thread's allocation" \
         "PSRAM free ${base6}K -> ${back6}K"
 fi
+fi
 
 
 
@@ -351,11 +357,13 @@ fi
 # resolve at all -- an app calling pthread_mutex_lock failed to *load* -- and a
 # thread's printf went to the UART instead of the session.
 
+if ! dev_uapp_lacks "threads" "M3"; then
 out=$(dev_run "$APP threaded 5000")
 assert_contains "a thread's output reaches the session" \
     "thread running for 5000" "$out"
 assert_contains "four threads share a counter under a mutex" \
     "counter 20000 after 4 thread(s) x 5000" "$out"
+fi
 assert_contains "and the device is still up" "espix" "$(dev_run uname)"
 
 

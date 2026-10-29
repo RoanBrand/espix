@@ -41,15 +41,19 @@ typedef struct {
 
 /* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */
 typedef struct {
-    uint32_t         satp;
-    uint32_t         ktp;   /* the task's own tp, which kernel code needs back on every entry */
-    espix_um_proc_t *proc;
+    uint32_t           satp;
+    uint32_t           ktp;   /* the task's own tp, which kernel code needs back on every entry */
+    espix_um_proc_t   *proc;
+    espix_proc_slot_t *slot;
+    int                kick_sig;    /* a fatal signal the next return to U turns into a trap */
 } espix_um_thread_t;
 
 void espix_um_init(void);
 
 /* Whether an image is a U-mode executable (ET_EXEC) rather than a relocatable M-mode app. */
 bool espix_um_is_exec(const uint8_t *image, size_t size);
+/* The same question of a file, from its header alone. */
+bool espix_um_file_is_exec(const char *path);
 
 /* Loads and enters the app; returns only on failure to start, with a message for the session. */
 const char *espix_um_exec(espix_proc_slot_t *slot);
@@ -59,8 +63,8 @@ void espix_um_close_fds(espix_proc_slot_t *slot);
 
 void espix_um_release(espix_proc_slot_t *slot);
 
-/* Ends the trap in exited(status), in M-mode, instead of returning to the app. */
-void espix_um_leave(RvExcFrame *f, const espix_um_thread_t *t, int status);
+/* Ends the process from task context, as an M-mode app's exit() does. */
+void espix_um_exited(int status) __attribute__((noreturn));
 
 /* Syscalls (umode_sys.c): the result for a0. */
 int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f);

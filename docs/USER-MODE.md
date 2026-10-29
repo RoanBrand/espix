@@ -79,14 +79,26 @@ it writable when the count is one. Its users: two instances of one program
 
 ## Entering and leaving the kernel
 
-`tools/patch-umode.py` patches IDF's `vectors.S` and `portasm.S`. Every way in
-from U goes through one entry and every way back through one exit.
+`tools/patch-umode.py` patches IDF's `vectors.S` and the IPC interrupt's
+handler. Every way in from U goes through one entry and every way back through
+one exit.
+
+**No exception is handled where it was taken.** This core locks up when an
+exception arrives while an earlier one is unretired, even another task's: the
+second traps inside the first's handler, the core stops with interrupts dead,
+and the watchdog resets the chip. So the trap handler copies the user's
+registers to a slot above `mscratch` and `mret`s at once into
+`espix_um_kentry()`, which runs the syscall, page fault or fault as ordinary
+task code: it can block, sleep, take the FPU through IDF's lazy trap, or end
+the process. `espix_um_resume()` then `mret`s back to U. After a watchdog reset
+the boot log shows each core's last two traps, from the debug-assist lockup
+monitor.
 
 - **The entry swaps `mscratch` with `t0`**, never with `sp`: IDF's hardware stack
   guard checks every write to `sp`. `mscratch` holds the thread's kernel stack top
   while it runs in U, and 0 in M.
 - **On entry from U**, `satp` is set to bare and `gp`/`tp` are reloaded for the
-  kernel.
+  kernel; the IPC interrupt saves the app's `satp` and puts it back.
 - **Interrupt frames are 160 bytes and carry the task's privilege.** Interrupts
   reach U-mode regardless of `mintthresh`, so FreeRTOS preempts an app with no
   extra work, and the exit returns to whichever privilege the frame says.
@@ -109,8 +121,8 @@ from U goes through one entry and every way back through one exit.
 | illegal instruction (2) | SIGILL |
 | breakpoint, misaligned | SIGTRAP, SIGBUS |
 
-An app's exit and its fatal signals leave the trap into ordinary M-mode task
-context first (`exited()`), then end the process as an M-mode app's `exit()` does.
+An app's exit, its faults and its fatal signals end the process from task
+context, as an M-mode app's `exit()` does.
 
 ## The app side
 
@@ -195,8 +207,10 @@ invalid PTE stops the hart without a trap.
 
 **A thread is a FreeRTOS task with two stacks**: its task stack is the *kernel*
 stack, used only in syscalls and interrupts, and its *user* stack is in the
-app's address space. The kernel stack's size comes from the `ps` STACK
-high-water across the test suite (M2).
+app's address space. Across the test suite the kernel stack's high-water is
+3.8 KB, exec and file I/O included; a U-mode app's task gets 8 KB
+(`CONFIG_ESPIX_UM_KSTACK`), chosen at spawn from the ELF's header, whatever its
+name. Its own stack and heap are sized by what it touches.
 
 **Thread creation** makes the task, reserves a user stack, and `mret`s into the
 start routine. A thread that returns lands in a `libespix` stub that calls
@@ -223,6 +237,27 @@ and `ra` at a `sigreturn` stub, as on Linux.
 **A fault is a signal.** SIGSEGV's default action ends the process and the board
 keeps running; a U-mode fault cannot have touched kernel memory.
 
+**A fatal signal ends an app on its way back to U.** `espix_um_return` finds it
+pending, or a kill's stop request, and sends the return to a pc that is never
+mapped; the fault that follows ends the process from task context. Inside a
+syscall it ends the process at the call's wait, as for an M-mode app. A
+computing app is ended within a tick, and SIGKILL gives 137, as on Linux.
+
+## Beside an S31 Linux port
+
+[annoyedmilk/esp32-s31-linux](https://github.com/annoyedmilk/esp32-s31-linux)
+runs Linux in S-mode on core 1, OpenSBI in M-mode, and IDF on core 0. Where the
+two meet the same silicon:
+
+| | that port | espix |
+|---|---|---|
+| leaving a trap | `handle_exception` `sret`s to itself before its handlers: only `sret` lowers the CLIC level | the trap `mret`s into `espix_um_kentry()` before any work: an exception taken inside an unretired one locks the core |
+| interrupt level on return | `sret` restores it only from an interrupt-type `scause` | every exit writes an `mcause` with the level |
+| a null syscall | `getpid` 1.1-1.2 µs, trap code (4.6 KiB) run from SRAM | 5.5 µs, the C half from PSRAM |
+| FPU | off, soft-float: Linux needs D, which the chip lacks | F for U-mode apps (ilp32f), handed over eagerly; IDF's lazy trap takes FLW/FSW and their compressed forms |
+| new code | `fence.i` leaves stale lines; OpenSBI writes back D and invalidates I | `esp_cache_msync`, D written back then I invalidated, per executable page |
+| isolation | Sv32 for processes, PMP keeps IDF's core out of Linux memory | Sv32 per process, `cpu_apm` open to U, no PMP (IDF locks it) |
+
 ## The S3
 
 One kernel, two ways in:
@@ -245,7 +280,7 @@ Each leaves `make test` green on both targets.
 | | what | done when |
 |---|---|---|
 | M1 | vectors patch, address spaces, the loader, `write` and `exit`, the app runtime | done: `tests/suites/32-umode.sh` |
-| M2 | files, time, identity; `brk` and pages mapped on touch (done: `32-umode`); testapp relinked; the kernel stack measured | testapp's modes that need no threads, signals or sockets pass in U-mode |
+| M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M3, M4 and M7 bring |
 | M3 | threads, futex wait and wake, TLS; ASIDs under load | the pthread suites pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, fault reaping | a compute loop's handler runs; `kill -STOP` stops it at once |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
@@ -254,10 +289,11 @@ Each leaves `make test` green on both targets.
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
 
 Open:
-- **One hang in about 120 two-app rounds**: core 1 locked at an app's `ecall`,
-  with no panic.
-- **A null syscall costs 1200 cycles (3.7 µs)** round trip (`uapp bench`); the
-  trap's C half runs from PSRAM.
+- **A null syscall costs 1750 cycles (5.5 µs)** round trip (`uapp bench`),
+  including the second `mret` out of the trap; the C half runs from PSRAM.
+- **Deleting a task preempted in U-mode leaks about 1 KB of internal RAM.** A kill
+  only comes to that when an app stays over 250 ms inside a syscall that cannot
+  be interrupted; otherwise the app leaves on its own.
 - **picolibc's `malloc` zero-fills every block**, so a large allocation is
   touched in full; a large `malloc` served by `mmap`, as glibc's is, comes with
   M7.

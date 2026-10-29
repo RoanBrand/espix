@@ -535,8 +535,7 @@ static int32_t sys_nanosleep(um_call_t *c)
 
 static int32_t sys_exit(um_call_t *c)
 {
-    espix_um_leave(c->f, c->t, (int)c->a[0]);
-    return (int32_t)c->a[0];
+    espix_um_exited((int)c->a[0]);
 }
 
 static int32_t sys_getpid(um_call_t *c)  { (void)c; return espix_abi_getpid(); }

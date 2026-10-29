@@ -479,8 +479,9 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
   On the S31 the win is largest: the kernel would run from flash and give its
   3.2 MB back. Flash and PSRAM share one cache there too, so without suspend a
-  write still stalls both cores. The S31 board's flash ID is not yet read; an S31
-  Linux port runs with auto-suspend, and had to turn off the core bus timeouts
+  write still stalls both cores. The S31 board here reports `464018` (XMC), which
+  IDF's generic driver treats as able to suspend. An S31 Linux port runs with
+  auto-suspend, and had to turn off the core bus timeouts
   (`HP_SYSTEM_CORE_IBUS/DBUS_TIMEOUT_CONF`) because a PSRAM miss can wait behind
   a suspend. Cache misses to flash (DIO, 80 MHz) are also slower than to PSRAM
   (octal, 250 MHz).

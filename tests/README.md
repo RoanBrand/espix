@@ -87,6 +87,7 @@ The conditions worth skipping on, and who owns each:
 | no serial console | `ESPIX_HAVE_SERIAL=no` — the runner sets it when `--port` was not given, or when the interpreter has no pyserial | `50-console.sh` |
 | needs root | `mount` and `umount` are root-only and the harness runs as `$ESPIX_USER` | `12-vfs.sh` |
 | the board cannot do it at all | the role is device rather than host, or the filesystem is one espix will not mount | `75-usb.sh`, `12-vfs.sh` |
+| the test app is the U-mode build and lacks the feature yet | `dev_uapp_lacks <what> <milestone>` — true under `ESPIX_UAPP=1` | `30-proc.sh`, `35-signals.sh` |
 
 A skip is not a failure, and the summary counts the two separately: a run of all
 skips is the runner saying the *board* could not answer, not that the code is
@@ -388,6 +389,11 @@ changing the test app, either go through `make test` or run `make test-app`
 first. A suite that fails with `command not found`, or with the app printing its
 usage, means the device is holding the old binary rather than that the app is
 missing -- which read as a broken app twice in one evening.
+
+**On the S31 it is built twice**: the M-mode app above, and `testapp-u`, the same
+source through `tools/espix-cc` as a U-mode app (docs/USER-MODE.md).
+`ESPIX_UAPP=1 make test` syncs `testapp-u` to the same path, so every suite runs
+against the U-mode build; what U-mode apps cannot do yet is skipped by name.
 
 `tests/app/` is its own IDF project, so `tools/build-apps.sh` — which globs
 `apps/*/` — leaves it alone and it never lands in a normal rootfs image. `make

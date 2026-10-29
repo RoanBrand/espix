@@ -57,3 +57,11 @@ elf="$app/build/testapp.app.elf"
 
 cp "$elf" "$stage"
 echo "build-test-app: staged $(basename "$stage") ($(wc -c < "$stage" | tr -d ' ') bytes)"
+
+# The S31 also runs it as a U-mode app: the same source through espix-cc (ESPIX_UAPP=1 tests/run.sh).
+if [ "$target" = esp32s31 ]; then
+    "$root/tools/espix-cc" -Os -o "$stage_dir/testapp-u" "$app/main/testapp.c" \
+        >> "$app/build-test-app.log" 2>&1 \
+        || { echo "build-test-app: the U-mode build failed; see $app/build-test-app.log" >&2; exit 1; }
+    echo "build-test-app: staged testapp-u ($(wc -c < "$stage_dir/testapp-u" | tr -d ' ') bytes)"
+fi
