@@ -902,6 +902,20 @@ static uint32_t sig_terminating(const espix_proc_slot_t *slot)
     return mask;
 }
 
+/*
+ * A U-mode process is ended on its way back to U (espix_um_return()), never by a
+ * longjmp out of a kernel call: that would skip the call's own cleanup.
+ */
+static bool ends_in_user_mode(const espix_proc_slot_t *slot)
+{
+#if CONFIG_ESPIX_UMODE
+    return slot->app != NULL && slot->app->um != NULL;
+#else
+    (void)slot;
+    return false;
+#endif
+}
+
 static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
 {
     /*
@@ -918,7 +932,8 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
      * takes the table lock on every pass and starves everyone else of it.
      */
     uint32_t mine = ~slot->sig_blocked;
-    if (!may_terminate || slot->info.task != xTaskGetCurrentTaskHandle()) {
+    if (!may_terminate || slot->info.task != xTaskGetCurrentTaskHandle() ||
+        ends_in_user_mode(slot)) {
         mine &= ~sig_terminating(slot);
     }
 
@@ -1050,7 +1065,8 @@ uint32_t espix_sigcheck_mask(void)
 
     sig_park(slot, true);
 
-    if (slot->stop_requested) {
+    if (slot->stop_requested ||
+        (ends_in_user_mode(slot) && espix_proc_termsig(slot) != 0)) {
         got |= ESPIX_SIG_STOPPING;
     }
     return got;
@@ -1175,6 +1191,14 @@ static esp_err_t sig_kernel_locked(espix_proc_slot_t *slot, int sig)
     slot->stop_requested = true;
     sig_wake_locked(slot);
     return ESP_OK;
+}
+
+void espix_proc_stop_tasks(espix_proc_slot_t *slot)
+{
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    slot->stop_requested = true;
+    sig_wake_locked(slot);
+    xSemaphoreGive(g_espix_proc_lock);
 }
 
 static esp_err_t proc_force_kill(espix_pid_t pid)

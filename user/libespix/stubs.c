@@ -1,9 +1,8 @@
 /*
  * What U-mode apps cannot have yet, failing cleanly: sockets and select (M6),
- * threads (M3), alarm and espix's signal calls (M4). docs/USER-MODE.md.
+ * alarm and espix's signal calls (M4). docs/USER-MODE.md.
  */
 #include <arpa/inet.h>
-#include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -34,19 +33,6 @@ int select(int n, fd_set *r, fd_set *w, fd_set *e, struct timeval *tv)
     (void)n; (void)r; (void)w; (void)e; (void)tv;
     return nosys();
 }
-
-/* One thread until M3: a mutex is always free, and no second thread starts. */
-int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg)
-{
-    (void)t; (void)a; (void)fn; (void)arg;
-    return EAGAIN;
-}
-int pthread_join(pthread_t t, void **ret) { (void)t; (void)ret; return ESRCH; }
-int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a) { (void)m; (void)a; return 0; }
-int pthread_mutex_destroy(pthread_mutex_t *m) { (void)m; return 0; }
-int pthread_mutex_lock(pthread_mutex_t *m) { (void)m; return 0; }
-int pthread_mutex_trylock(pthread_mutex_t *m) { (void)m; return 0; }
-int pthread_mutex_unlock(pthread_mutex_t *m) { (void)m; return 0; }
 
 unsigned alarm(unsigned secs)
 {

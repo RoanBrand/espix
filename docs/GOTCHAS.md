@@ -596,6 +596,37 @@ EBUSY; `pthread_join()` returns and deletes a thread that is still running.
 Wake a task with a notification on an index of its own instead
 (`ESPIX_NOTIFY_SIG_IDX`).
 
+### A `FromISR` notify from a task can strand a task on the other core
+
+Called from task context, `vTaskNotifyGiveIndexedFromISR()` checks whether the
+woken task can be scheduled *now*. If its core has the scheduler suspended at
+that moment, which any queue or semaphore call there does briefly, the task
+goes on the pending-ready list of the *caller's* core, and only that core's next
+`xTaskResumeAll()` moves it on. Meanwhile it is still on the blocked list, so
+`ps` shows it waiting forever (`tasks.c`, `vTaskGenericNotifyGiveFromISR`). Two
+U-mode threads deadlocked on a mutex this way. From a task, use the task call,
+outside any critical section.
+
+### Code built outside IDF must not use `cm.popret`
+
+IDF compiles every Zcmp target with `-mno-cm-popret`, citing GCC bug 126454
+(`components/soc/project_include.cmake`), and flags a popret hardware issue on
+the C5, C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`). On the S31, with
+`cm.popret` in one U-mode function, the slow-path return of libespix's
+`word_lock`, four threads on one mutex deadlocked in 7 of 10 runs; without it,
+in none of 58. The code is equivalent either way, and the lock never had two
+owners. Build anything outside IDF with IDF's `-march` and its `-mno-cm-*` flags.
+
+### In U-mode, read-modify-write with LR/SC, not an AMO
+
+A U-mode AMO is not always atomic against an AMO from the other core: a tight
+two-core `amoadd` loop loses 1 to 5 increments in a million, whatever comes
+before the AMO. The same loop in M-mode, with or without `MPRV` translation,
+loses none, and so does LR/SC in U-mode. libespix writes its exchange and add as
+LR/SC by hand (`pthread.c`), with the `sc` result in its own register: GCC
+15.2's Zalrsc-only exchange reuses the value register for it
+([UPSTREAM](UPSTREAM.md)).
+
 ### Never longjmp out of a stdio callback
 
 A `funopen()` read or write function runs with the `FILE`'s recursive lock

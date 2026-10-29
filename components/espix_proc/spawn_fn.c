@@ -230,7 +230,7 @@ static esp_err_t kthread_start(const espix_kthread_t *k, TaskHandle_t *out)
         espix_proc_slot_t *const owner = espix_proc_self();
         /* Not a process, or a full thread table, leaves it a process of its
          * own: counted either way. */
-        if (owner != NULL && espix_proc_thread_start(owner, k, out) == ESP_OK) {
+        if (owner != NULL && espix_proc_thread_start(owner, k, out, NULL) == ESP_OK) {
             return ESP_OK;
         }
     }

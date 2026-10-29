@@ -1,12 +1,13 @@
 /* The first entry into U-mode; every later one is the patched IDF exit (tools/patch-umode.py). */
 #include "sdkconfig.h"
-#include "riscv/rvruntime-frames.h"
 
 #if CONFIG_ESPIX_UMODE
 
+#include "riscv/rvruntime-frames.h"
+
     .section .iram1.umode_entry, "ax"
 
-/* void espix_um_enter(uint32_t pc, uint32_t usp, uint32_t a0, uint32_t a1, uint32_t a2): does not return */
+/* void espix_um_enter(uint32_t pc, uint32_t usp, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t tp): does not return */
     .global espix_um_enter
     .type   espix_um_enter, @function
     .balign 4
@@ -17,6 +18,7 @@ espix_um_enter:
     mv      s2, a2
     mv      s3, a3
     mv      s4, a4
+    mv      s5, a5
     li      a0, 0
     call    espix_um_return
     /* CLIC mcause: MPIE=1, MPP=U, interrupt level 0. */
@@ -32,7 +34,7 @@ espix_um_enter:
     mv      a2, s4
     li      ra, 0
     li      gp, 0
-    li      tp, 0
+    mv      tp, s5
     li      t0, 0
     li      t1, 0
     li      t2, 0

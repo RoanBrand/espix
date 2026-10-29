@@ -20,9 +20,12 @@ fi
 ar="${gcc%gcc}ar"
 
 # No PIE or hardware-loop extensions: only core 1 has them.
-arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f)
+# No cm.popret, as IDF builds the kernel: with it libespix's mutex deadlocked (docs/GOTCHAS.md).
+arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f -mno-cm-popret)
 # off_t is 64 bits, as in the kernel and M-mode apps (cmake/offt64.h).
+# picolibc's headers declare the pthread subset IDF implements; libespix implements barriers and spinlocks too.
 cflags=(--specs=picolibc.specs -ffunction-sections -fdata-sections
+        -D_POSIX_BARRIERS=200112L -D_POSIX_SPIN_LOCKS=200112L
         -I"$root/user/include" -include "$root/cmake/offt64.h")
 
 lib="$root/user/build"

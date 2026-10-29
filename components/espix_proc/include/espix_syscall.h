@@ -46,13 +46,22 @@
     X(KILL,          kill,          33)        /* (pid, sig) */                                \
     X(GETPGRP,       getpgrp,       34)        /* () */                                        \
     X(GETSID,        getsid,        35)        /* (pid) */                                     \
-    X(BRK,           brk,           36)        /* (addr): the break, moved there if it could be */
+    X(BRK,           brk,           36)        /* (addr): the break, moved there if it could be */ \
+    X(THREAD_CREATE, thread_create, 37)        /* (entry, arg, tls, stack or 0, tid word or 0): the tid */ \
+    X(THREAD_EXIT,   thread_exit,   38)        /* (): its tid word is zeroed and woken */        \
+    X(FUTEX,         futex,         39)        /* (uaddr, op, val, const struct espix_timespec *) */ \
+    X(GETTID,        gettid,        40)        /* () */                                        \
+    X(SCHED_YIELD,   sched_yield,   41)        /* () */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
     ESPIX_SYSCALLS(ESPIX_SYS_ENUM_)
 #undef ESPIX_SYS_ENUM_
 };
+
+/* FUTEX ops: wait while *uaddr == val (a relative timeout, or none), or wake up to val waiters. */
+#define ESPIX_FUTEX_WAIT 0
+#define ESPIX_FUTEX_WAKE 1
 
 struct espix_stat {
     uint64_t size;

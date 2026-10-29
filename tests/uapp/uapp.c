@@ -1,12 +1,15 @@
 /*
  * uapp: the U-mode test app (docs/USER-MODE.md). Each mode checks one thing the
  * boundary must hold: a fault ends only the app, kernel memory is out of reach,
- * preemption and the FPU work in U-mode, exit codes arrive, and the syscalls
- * reach the kernel's files, clocks and identities.
+ * preemption and the FPU work in U-mode, exit codes arrive, the syscalls
+ * reach the kernel's files, clocks and identities, and threads share one
+ * process.
  */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +97,140 @@ static int files(const char *dir)
     CHECK("a closed descriptor is refused", close(fd) != 0 && errno == EBADF);
     printf("uapp: files ok\n");
     return 0;
+}
+
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_cond = PTHREAD_COND_INITIALIZER;
+static long            s_count;
+static int             s_turn;
+
+static void *bump(void *arg)
+{
+    const long n = (long)arg;
+    for (long i = 0; i < n; i++) {
+        pthread_mutex_lock(&s_lock);
+        s_count++;
+        pthread_mutex_unlock(&s_lock);
+    }
+    return (void *)n;
+}
+
+/* Two threads take turns through a condition variable. */
+static void *pingpong(void *arg)
+{
+    const int me = (int)(intptr_t)arg;
+    for (int i = 0; i < 1000; i++) {
+        pthread_mutex_lock(&s_lock);
+        while (s_turn != me) {
+            pthread_cond_wait(&s_cond, &s_lock);
+        }
+        s_turn = !me;
+        pthread_cond_broadcast(&s_cond);
+        pthread_mutex_unlock(&s_lock);
+    }
+    return NULL;
+}
+
+/* Four threads add to one counter under a mutex, two play ping-pong, and a timed wait ends at its time. */
+static int threads(long n)
+{
+    enum { T = 4 };
+    pthread_t t[T];
+    for (int i = 0; i < T; i++) {
+        if (pthread_create(&t[i], NULL, bump, (void *)n) != 0) {
+            printf("uapp: threads: pthread_create failed\n");
+            return 1;
+        }
+    }
+    long want = 0;
+    for (int i = 0; i < T; i++) {
+        void *r;
+        pthread_join(t[i], &r);
+        want += (long)r;
+    }
+    pthread_t a, b;
+    pthread_create(&a, NULL, pingpong, (void *)0);
+    pthread_create(&b, NULL, pingpong, (void *)1);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 100000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_nsec -= 1000000000L;
+        until.tv_sec++;
+    }
+    pthread_mutex_lock(&s_lock);
+    const int r = pthread_cond_timedwait(&s_cond, &s_lock, &until);
+    pthread_mutex_unlock(&s_lock);
+    printf("uapp: threads: counter %ld of %ld, ping-pong done, timed wait %s, tid %s\n", s_count, want,
+           (r == ETIMEDOUT) ? "timed out" : "wrong", (gettid() == getpid()) ? "is the pid" : "wrong");
+    return 0;
+}
+
+static void *exit_from_thread(void *arg)
+{
+    usleep(50000);
+    exit((int)(intptr_t)arg);
+}
+
+static void *finish_late(void *arg)
+{
+    (void)arg;
+    usleep(100000);
+    printf("uapp: the detached thread finished\n");
+    return NULL;
+}
+
+static void *deep_in_thread(void *arg)
+{
+    (void)arg;
+    printf("uapp: deep stack in a thread %s\n", deep(1024) == 1024 ? "ok" : "wrong");
+    return NULL;
+}
+
+static void *churn(void *arg)
+{
+    const int me = (int)(intptr_t)arg;
+    for (int i = 0; i < 2000; i++) {
+        const size_t n = 16 + (size_t)((i * 37 + me * 101) % 4000);
+        char *p = malloc(n);
+        if (p == NULL) {
+            printf("uapp: churn: malloc failed\n");
+            return (void *)1;
+        }
+        memset(p, me, n);
+        free(p);
+        if (i % 500 == 0) {
+            printf("uapp: churn %d at %d\n", me, i);
+        }
+    }
+    return NULL;
+}
+
+/* Asleep for good, in a condition wait or a sleep, until the process is ended. */
+static void *sleep_forever(void *arg)
+{
+    if (arg != NULL) {
+        pthread_mutex_lock(&s_lock);
+        for (;;) {
+            pthread_cond_wait(&s_cond, &s_lock);
+        }
+    }
+    for (;;) {
+        sleep(100);
+    }
+    return NULL;
+}
+
+static void *spin_forever(void *arg)
+{
+    volatile float x = (float)(intptr_t)arg;
+    for (;;) {
+        x = x * 1.0001f;
+    }
+    return NULL;
 }
 
 int main(int argc, char **argv)
@@ -292,6 +429,58 @@ int main(int argc, char **argv)
         }
         const unsigned long per = (cycles() - t0) / (unsigned long)n;
         printf("uapp: a syscall takes %lu cycles, %lu ns\n", per, per * 1000ul / 320ul);
+        return 0;
+    }
+    if (strcmp(mode, "threads") == 0 && argc > 2) {
+        return threads(atol(argv[2]));
+    }
+    if (strcmp(mode, "texit") == 0 && argc > 2) {
+        /* exit() in a thread ends the process, while the main thread waits in a join. */
+        pthread_t t;
+        pthread_create(&t, NULL, exit_from_thread, (void *)(intptr_t)atoi(argv[2]));
+        pthread_join(t, NULL);
+        return 99;
+    }
+    if (strcmp(mode, "tdetach") == 0) {
+        /* The main thread leaves first; the process lives until the detached thread ends. */
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_t t;
+        pthread_create(&t, &a, finish_late, NULL);
+        printf("uapp: the main thread leaves\n");
+        pthread_exit(NULL);
+    }
+    if (strcmp(mode, "tstack") == 0) {
+        pthread_t t;
+        pthread_create(&t, NULL, deep_in_thread, NULL);
+        pthread_join(t, NULL);
+        return 0;
+    }
+    if (strcmp(mode, "tchurn") == 0) {
+        pthread_t t[4];
+        for (int i = 0; i < 4; i++) {
+            pthread_create(&t[i], NULL, churn, (void *)(intptr_t)(i + 1));
+        }
+        int bad = 0;
+        for (int i = 0; i < 4; i++) {
+            void *r;
+            pthread_join(t[i], &r);
+            bad += (r != NULL);
+        }
+        printf("uapp: churn %s\n", bad ? "failed" : "ok");
+        return bad;
+    }
+    if (strcmp(mode, "tsleep") == 0 || strcmp(mode, "tspin") == 0) {
+        /* Threads to end with the process: asleep in the kernel, or computing in U. */
+        void *(*fn)(void *) = (mode[1] == 's' && mode[2] == 'l') ? sleep_forever : spin_forever;
+        pthread_t t[3];
+        for (int i = 0; i < 3; i++) {
+            pthread_create(&t[i], NULL, fn, (void *)(intptr_t)(i & 1));
+        }
+        printf("uapp: %s: 3 threads started\n", mode);
+        fflush(stdout);
+        pthread_join(t[0], NULL);
         return 0;
     }
     fprintf(stderr, "uapp: unknown mode %s\n", mode);

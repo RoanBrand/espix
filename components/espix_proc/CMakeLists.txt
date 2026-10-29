@@ -22,6 +22,7 @@ idf_component_register(
         "abi_gfx.c"
         "abi_audio.c"
         "umode.c"
+        "umode_futex.c"
         "umode_mm.c"
         "umode_sys.c"
         "umode_entry.S"

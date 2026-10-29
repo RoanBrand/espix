@@ -562,9 +562,13 @@ espix_proc_slot_t *espix_proc_self(void);
 /* espix_kthread_start(), as espix_proc does it; registered at init. */
 extern const espix_kthread_ops_t g_espix_kthread_ops;
 
-/* Start k as a thread of `slot`. abi_pthread.c, which owns the table. */
+/* Start k as a thread of `slot`; *tid, if asked for, is written before it runs. abi_pthread.c, which owns the table. */
 esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
-                                  const espix_kthread_t *k, TaskHandle_t *out);
+                                  const espix_kthread_t *k, TaskHandle_t *out,
+                                  espix_pid_t *tid);
+
+/* Ask every task of `slot` to stop, as a kill's grace does, and wake them to see it. */
+void espix_proc_stop_tasks(espix_proc_slot_t *slot);
 
 /* The group a new process `pid` joins: `asked` if set; else a shell's or the
  * kernel's child leads its own job, and anyone else's joins its parent's. */

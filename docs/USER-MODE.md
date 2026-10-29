@@ -38,7 +38,8 @@ on Linux:
 | `0x00010000` up | the image: text, rodata, data, bss |
 | above the image | the heap, grown by `brk` |
 | below `0x70000000` | `mmap`, growing down |
-| below `0x80000000` | thread stacks, each with an unmapped guard |
+| `0x70000000`-`0x7f800000` | 31 thread stacks of 8 MB, an unmapped page at each end |
+| below `0x80000000` | the main thread's stack, 8 MB |
 
 **Frames are 4 KiB of PSRAM with a reference count**, so one frame can be in two
 tables: shared text, copy-on-write, a swap cache.
@@ -135,11 +136,15 @@ layer under it:
 - the calls picolibc's POSIX layer makes (`read`, `write`, `open`, `sbrk`...) as
   `ecall` wrappers;
 - stdin, stdout and stderr on fds 0-2, and thread-local storage through `tp`;
-- headers picolibc lacks (`sys/socket.h`, `netinet/in.h`), and ENOSYS for what
-  is not built yet: sockets, threads.
+- POSIX threads, on the kernel's threads and futexes;
+- headers picolibc lacks (`sys/socket.h`, `netinet/in.h`, `semaphore.h`,
+  `gettid()`), and ENOSYS for what is not built yet: sockets.
 
 `tools/espix-cc` compiles and links an app, as `musl-gcc` does for musl, with the
-kernel's 64-bit `off_t`. It links `libespix` whole and ahead of libc, because the
+kernel's 64-bit `off_t`, no `cm.popret` (as IDF builds the kernel; with it
+libespix's mutex deadlocked, [GOTCHAS](GOTCHAS.md)), and the barriers and
+spinlocks picolibc's headers leave out (their feature macros follow what IDF's
+own pthread implements). It links `libespix` whole and ahead of libc, because the
 toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
 archive scan.
 
@@ -149,7 +154,7 @@ memory. `hello` is 10.8 KiB of text.
 
 **Built without PIE and the hardware loop** (`xespv`, `xesploop`). Only core 1
 has them, and IDF pins a task that uses one to core 1 for good. Without them a
-U-mode app's threads run on either core.
+U-mode app and its threads run on either core.
 
 **M-mode apps stay.** The loader chooses by ELF type: `ET_EXEC` is a U-mode app.
 
@@ -213,13 +218,37 @@ app's address space. Across the test suite the kernel stack's high-water is
 (`CONFIG_ESPIX_UM_KSTACK`), chosen at spawn from the ELF's header, whatever its
 name. Its own stack and heap are sized by what it touches.
 
-**Thread creation** makes the task, reserves a user stack, and `mret`s into the
-start routine. A thread that returns lands in a `libespix` stub that calls
-`exit_thread`.
+**Thread creation** (`THREAD_CREATE`) makes the task as a thread of the
+process, gives it a stack span, and enters U at the start routine with the TLS
+block the app passes in `tp`, as Linux's `clone` with `CLONE_SETTLS` does. The
+thread writes its tid into a word the app names before running, and the kernel
+zeroes that word and wakes it when the thread ends (`CLONE_CHILD_CLEARTID`);
+`pthread_join` waits on it. A thread's task is unpinned until it first runs, and
+then stays on that core for the FPU, so threads spread over both cores.
+
+**`exit()` from any thread ends the process**, with that status. Every thread is
+stopped as a kill stops it, and the main thread tears the process down once the
+others have left. The main thread's `pthread_exit` leaves the process to its
+threads, and it ends with 0 when the last one does, as on Linux.
 
 **User stacks grow** into an 8 MB reservation (Linux's `ulimit -s`), with an
 unmapped guard page below; a fault in the guard is SIGSEGV. No app needs a stack
 size chosen for it.
+
+**Futexes** (`FUTEX`, wait and wake) are private to the process: its own list of
+waiters, under its lock. A waker notifies the waiting task while holding that
+lock, so the waiter cannot leave, and its task cannot end, before the notify
+lands. `libespix` builds mutexes, condition variables, rwlocks, barriers,
+spinlocks, semaphores, once and keys on them, and the locks picolibc's `malloc`
+and stdio take. Its read-modify-writes are LR/SC, never AMOs: a U-mode AMO can
+lose an update against the other core ([KNOWN-ISSUES](KNOWN-ISSUES.md)).
+
+**The tables are shared, so changes to them are locked and flushed everywhere.**
+A page fault on a page another thread just mapped is resumed, not a SIGSEGV.
+An unmap (a shrinking heap, an ended thread's stack) marks the ASID stale on the
+other core, and if that core runs it now, flushes it there by a cross-core
+interrupt before the frames are freed. A frame a syscall is reading or writing
+into is pinned, and an unmap meanwhile frees it when the syscall lets go.
 
 ## Signals, stopping and faults
 
@@ -240,9 +269,10 @@ keeps running; a U-mode fault cannot have touched kernel memory.
 
 **A fatal signal ends an app on its way back to U.** `espix_um_return` finds it
 pending, or a kill's stop request, and sends the return to a pc that is never
-mapped; the fault that follows ends the process from task context. Inside a
-syscall it ends the process at the call's wait, as for an M-mode app. A
-computing app is ended within a tick, and SIGKILL gives 137, as on Linux.
+mapped; the fault that follows ends the process from task context. A blocking
+syscall returns `EINTR` first, never a jump out of the kernel, so nothing it
+holds is left behind. A computing app is ended within a tick, and SIGKILL gives
+137, as on Linux.
 
 ## Beside an S31 Linux port
 
@@ -281,8 +311,8 @@ Each leaves `make test` green on both targets.
 | | what | done when |
 |---|---|---|
 | M1 | vectors patch, address spaces, the loader, `write` and `exit`, the app runtime | done: `tests/suites/32-umode.sh` |
-| M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M3, M4 and M7 bring |
-| M3 | threads, futex wait and wake, TLS; ASIDs under load | the pthread suites pass in U-mode |
+| M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M4 and M7 bring |
+| M3 | threads, futex wait and wake, TLS; shared tables flushed on both cores | done: `32-umode`, and the thread checks of `30-proc` pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, fault reaping | a compute loop's handler runs; `kill -STOP` stops it at once |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
 | M6 | sockets, select, poll | mosquitto runs in U-mode |
@@ -290,13 +320,31 @@ Each leaves `make test` green on both targets.
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
 
 Open:
-- **A null syscall costs 840 cycles (2.6 µs)** round trip (`uapp bench`): 324
-  instructions, nearly all cache hits. A load or store takes 3 cycles and a CSR
-  write 5 to 6 (`umode cost`), so the 31 registers saved and restored are 190
-  of them.
+- **A null syscall costs 890 cycles (2.8 µs)** round trip (`uapp bench`), about
+  330 instructions, nearly all cache hits. A load or store takes 3 cycles and a
+  CSR write 5 to 6 (`umode cost`), so the 31 registers saved and restored are
+  190 of them. The cache controller counts I-cache hits, misses and fills per
+  core (`0x2C000180` on), which tells whether moving code would help before it
+  is moved: the I-cache is 2-way, and three hot lines in one set miss every
+  time.
+- **Why U-mode AMOs lose updates, and why `cm.popret` broke the mutex**, is not
+  known. Neither shows in M-mode; single-thread U-mode code is clean. Leads:
+  whether U-mode AMOs on internal SRAM lose too (every U-mode page is PSRAM,
+  which goes through the shared D-cache; SRAM does not, and M-mode AMOs on both
+  are clean); whether the AMO losses scale with interrupts taken in U-mode;
+  S-mode test code run with `TEE_SUPERVISOR_PRIV_SEL` set and clear, to tell the
+  REE and TEE paths apart; asking Espressif whether the S31 shares the popret
+  issue IDF flags on the C5, C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`).
+- **An app's own atomics compile to AMOs.** A toolchain with GCC's fix for
+  Zalrsc-only exchange ([UPSTREAM](UPSTREAM.md)) lets `espix-cc` drop Zaamo, so
+  every U-mode atomic is LR/SC and libespix's hand-written ones become builtins
+  again. The prebuilt picolibc keeps seven exchanges, in `signal()` and stdio's
+  unget slot, until it is rebuilt the same way.
 - **Deleting a task preempted in U-mode leaks about 1 KB of internal RAM.** A kill
   only comes to that when an app stays over 250 ms inside a syscall that cannot
-  be interrupted; otherwise the app leaves on its own.
+  be interrupted; otherwise the app leaves on its own. A thread deleted that way
+  also leaves its `espix_um_thread_t`; a TLS deletion callback on
+  `ESPIX_TLS_UM_IDX` (IDF calls it as the task is freed) would free both.
 - **picolibc's `malloc` zero-fills every block**, so a large allocation is
   touched in full; a large `malloc` served by `mmap`, as glibc's is, comes with
   M7.

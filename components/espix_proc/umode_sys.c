@@ -60,14 +60,30 @@ static espix_um_fd_t *fd_get(espix_um_proc_t *p, uint32_t fd)
     return (fd < ESPIX_UM_FDS && p->fds[fd].kind != ESPIX_UM_FD_FREE) ? &p->fds[fd] : NULL;
 }
 
-static int fd_lowest(espix_um_proc_t *p, uint32_t from)
+/* e into the lowest free number from `from`; the number, or -EMFILE. The process's threads share the table. */
+static int fd_install(espix_um_proc_t *p, const espix_um_fd_t *e, uint32_t from)
 {
+    int n = -EMFILE;
+    xSemaphoreTake(p->lock, portMAX_DELAY);
     for (uint32_t fd = from; fd < ESPIX_UM_FDS; fd++) {
         if (p->fds[fd].kind == ESPIX_UM_FD_FREE) {
-            return (int)fd;
+            p->fds[fd] = *e;
+            n = (int)fd;
+            break;
         }
     }
-    return -EMFILE;
+    xSemaphoreGive(p->lock);
+    return n;
+}
+
+/* Number n's entry out of the table, to release outside the lock. */
+static espix_um_fd_t fd_take(espix_um_proc_t *p, uint32_t n)
+{
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    const espix_um_fd_t e = p->fds[n];
+    p->fds[n] = (espix_um_fd_t){ 0 };
+    xSemaphoreGive(p->lock);
+    return e;
 }
 
 static int fd_release(espix_um_fd_t *e)
@@ -93,20 +109,35 @@ void espix_um_close_fds(espix_proc_slot_t *slot)
     }
 }
 
-/* A copy of e into slot n: a second kernel descriptor for a file, so each closes its own. */
-static int32_t fd_dup_into(espix_um_proc_t *p, const espix_um_fd_t *e, int n)
+/* A copy of e: a second kernel descriptor for a file, so each closes its own. */
+static int32_t fd_dup(const espix_um_fd_t *e, espix_um_fd_t *d)
 {
-    espix_um_fd_t d = *e;
-    d.cloexec = false;
+    *d = *e;
+    d->cloexec = false;
     if (e->kind == ESPIX_UM_FD_FILE) {
-        d.kfd = espix_abi_dup(e->kfd);
-        if (d.kfd < 0) {
+        d->kfd = espix_abi_dup(e->kfd);
+        if (d->kfd < 0) {
             return -errno;
         }
     } else if (e->kind == ESPIX_UM_FD_DIR) {
         return -EINVAL;
     }
-    p->fds[n] = d;
+    return 0;
+}
+
+/* A copy of e at the lowest free number from `from`. */
+static int32_t fd_dup_from(espix_um_proc_t *p, const espix_um_fd_t *e, uint32_t from, bool cloexec)
+{
+    espix_um_fd_t d;
+    const int32_t r = fd_dup(e, &d);
+    if (r < 0) {
+        return r;
+    }
+    d.cloexec = cloexec;
+    const int n = fd_install(p, &d, from);
+    if (n < 0) {
+        fd_release(&d);
+    }
     return n;
 }
 
@@ -123,21 +154,28 @@ static int32_t path_in(um_call_t *c, uint32_t uva, char *buf)
 /* stdin as a terminal reads it: up to a newline, or what the end of input leaves. */
 static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
 {
+    /* Copied out a chunk at a time: getc() may block, so no user page is held across it. */
+    char buf[256];
     uint32_t done = 0;
-    while (done < len) {
-        char *k = espix_um_user_ptr(c->p->as, uva + done, PTE_W);
-        if (k == NULL) {
+    bool more = true;
+    while (more && done < len) {
+        uint32_t n = 0;
+        while (n < sizeof(buf) && done + n < len) {
+            const int ch = getc(in);
+            if (ch == EOF) {
+                more = false;
+                break;
+            }
+            buf[n++] = (char)ch;
+            if (ch == '\n') {
+                more = false;
+                break;
+            }
+        }
+        if (n > 0 && espix_um_copyout(c->p->as, uva + done, buf, n) < 0) {
             return done ? (int32_t)done : -EFAULT;
         }
-        const int ch = getc(in);
-        if (ch == EOF) {
-            break;
-        }
-        *k = (char)ch;
-        done++;
-        if (ch == '\n') {
-            break;
-        }
+        done += n;
     }
     return (int32_t)done;
 }
@@ -158,12 +196,13 @@ static int32_t sys_read(um_call_t *c)
     uint32_t done = 0;
     while (done < len) {
         const uint32_t va = uva + done;
-        void *k = espix_um_user_ptr(c->p->as, va, PTE_W);
+        void *k = espix_um_user_pin(c->p->as, va, PTE_W);
         if (k == NULL) {
             return done ? (int32_t)done : -EFAULT;
         }
         const uint32_t want = MIN(len - done, PG - (va & (PG - 1)));
         const ssize_t got = read(e->kfd, k, want);
+        espix_um_user_unpin(c->p->as);
         if (got < 0) {
             return done ? (int32_t)done : -errno;
         }
@@ -189,7 +228,7 @@ static int32_t sys_write(um_call_t *c)
     uint32_t done = 0;
     while (done < len) {
         const uint32_t va = uva + done;
-        const void *k = espix_um_user_ptr(c->p->as, va, PTE_R);
+        const void *k = espix_um_user_pin(c->p->as, va, PTE_R);
         if (k == NULL) {
             if (done == 0) {
                 return -EFAULT;
@@ -198,6 +237,7 @@ static int32_t sys_write(um_call_t *c)
         }
         const uint32_t want = MIN(len - done, PG - (va & (PG - 1)));
         const ssize_t put = out ? (ssize_t)fwrite(k, 1, want, out) : write(e->kfd, k, want);
+        espix_um_user_unpin(c->p->as);
         if (put < 0) {
             if (done == 0) {
                 return -errno;
@@ -223,10 +263,6 @@ static int32_t sys_open(um_call_t *c)
     if (r < 0) {
         return r;
     }
-    const int fd = fd_lowest(c->p, 0);
-    if (fd < 0) {
-        return fd;
-    }
     espix_um_fd_t e = { .cloexec = (flags & O_CLOEXEC) != 0 };
     if (flags & O_DIRECTORY) {
         e.kind = ESPIX_UM_FD_DIR;
@@ -241,14 +277,20 @@ static int32_t sys_open(um_call_t *c)
             return -errno;
         }
     }
-    c->p->fds[fd] = e;
+    const int fd = fd_install(c->p, &e, 0);
+    if (fd < 0) {
+        fd_release(&e);
+    }
     return fd;
 }
 
 static int32_t sys_close(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
-    return (e == NULL) ? -EBADF : fd_release(e);
+    if (fd_get(c->p, c->a[0]) == NULL) {
+        return -EBADF;
+    }
+    espix_um_fd_t e = fd_take(c->p, c->a[0]);
+    return fd_release(&e);
 }
 
 static int32_t sys_lseek(um_call_t *c)
@@ -395,8 +437,7 @@ static int32_t sys_dup(um_call_t *c)
     if (e == NULL) {
         return -EBADF;
     }
-    const int n = fd_lowest(c->p, 0);
-    return (n < 0) ? n : fd_dup_into(c->p, e, n);
+    return fd_dup_from(c->p, e, 0, false);
 }
 
 static int32_t sys_dup2(um_call_t *c)
@@ -409,8 +450,17 @@ static int32_t sys_dup2(um_call_t *c)
     if (n == c->a[0]) {
         return (int32_t)n;
     }
-    fd_release(&c->p->fds[n]);
-    return fd_dup_into(c->p, e, (int)n);
+    espix_um_fd_t d;
+    const int32_t r = fd_dup(e, &d);
+    if (r < 0) {
+        return r;
+    }
+    xSemaphoreTake(c->p->lock, portMAX_DELAY);
+    espix_um_fd_t old = c->p->fds[n];
+    c->p->fds[n] = d;
+    xSemaphoreGive(c->p->lock);
+    fd_release(&old);
+    return (int32_t)n;
 }
 
 static int32_t sys_fcntl(um_call_t *c)
@@ -424,12 +474,7 @@ static int32_t sys_fcntl(um_call_t *c)
     switch (cmd) {
     case F_DUPFD:
     case F_DUPFD_CLOEXEC: {
-        const int n = fd_lowest(c->p, arg);
-        const int32_t r = (n < 0) ? n : fd_dup_into(c->p, e, n);
-        if (r >= 0 && cmd == F_DUPFD_CLOEXEC) {
-            c->p->fds[r].cloexec = true;
-        }
-        return r;
+        return (arg >= ESPIX_UM_FDS) ? -EINVAL : fd_dup_from(c->p, e, arg, cmd == F_DUPFD_CLOEXEC);
     }
     case F_GETFD:
         return e->cloexec ? FD_CLOEXEC : 0;
@@ -539,7 +584,58 @@ static int32_t sys_nanosleep(um_call_t *c)
 
 static int32_t sys_exit(um_call_t *c)
 {
-    espix_um_exited((int)c->a[0]);
+    espix_um_exit_group(c->t, (int)c->a[0]);
+}
+
+/* ------------------------------------------------------------------ */
+/* Threads                                                             */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_thread_create(um_call_t *c)
+{
+    return espix_um_thread_create(c->t, c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
+}
+
+static int32_t sys_thread_exit(um_call_t *c)
+{
+    espix_um_thread_exit(c->t);
+}
+
+static int32_t sys_gettid(um_call_t *c)
+{
+    return (int32_t)c->t->tid;
+}
+
+static int32_t sys_sched_yield(um_call_t *c)
+{
+    (void)c;
+    taskYIELD();
+    return 0;
+}
+
+static int32_t sys_futex(um_call_t *c)
+{
+    switch (c->a[1]) {
+    case ESPIX_FUTEX_WAIT: {
+        int64_t us = -1;
+        if (c->a[3] != 0) {
+            struct espix_timespec ts;
+            const int r = espix_um_copyin(c->p->as, &ts, c->a[3], sizeof(ts));
+            if (r < 0) {
+                return r;
+            }
+            if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000) {
+                return -EINVAL;
+            }
+            us = ts.sec * 1000000 + ts.nsec / 1000;
+        }
+        return espix_um_futex_wait(c->p, c->a[0], c->a[2], us);
+    }
+    case ESPIX_FUTEX_WAKE:
+        return espix_um_futex_wake(c->p, c->a[0], (int32_t)c->a[2]);
+    default:
+        return -ENOSYS;
+    }
 }
 
 static int32_t sys_getpid(um_call_t *c)  { (void)c; return espix_abi_getpid(); }

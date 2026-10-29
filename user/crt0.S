@@ -10,3 +10,16 @@ _start:
     call    __espix_start
 1:  j       1b
     .size   _start, . - _start
+
+/* A thread's entry: the kernel passes its descriptor in a0, its TLS in tp and its stack in sp. */
+    .section .text.espix_thread_entry, "ax"
+    .global __espix_thread_entry
+    .type   __espix_thread_entry, @function
+__espix_thread_entry:
+    .option push
+    .option norelax
+    la      gp, __global_pointer$
+    .option pop
+    call    __espix_thread_start
+1:  j       1b
+    .size   __espix_thread_entry, . - __espix_thread_entry

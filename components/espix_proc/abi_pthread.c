@@ -312,7 +312,8 @@ static void kthread_trampoline(void *arg)
 }
 
 esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
-                                  const espix_kthread_t *k, TaskHandle_t *out)
+                                  const espix_kthread_t *k, TaskHandle_t *out,
+                                  espix_pid_t *tid)
 {
     kthread_start_t *const st = malloc(sizeof(*st));
     if (st == NULL) {
@@ -330,7 +331,10 @@ esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
         return ESP_ERR_NO_MEM;
     }
 
-    const espix_pid_t tid = st->tid;
+    const espix_pid_t new_tid = st->tid;
+    if (tid != NULL) {
+        *tid = new_tid;
+    }
     BaseType_t        ok  = pdFAIL;
     if (!k->internal_stack) {
         ok = xTaskCreatePinnedToCoreWithCaps(kthread_trampoline, k->name,
@@ -346,7 +350,7 @@ esp_err_t espix_proc_thread_start(espix_proc_slot_t *slot,
     if (ok != pdPASS) {
         free(st);
         xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-        (void)espix_threads_remove(&s_threads, tid, NULL);
+        (void)espix_threads_remove(&s_threads, new_tid, NULL);
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_ERR_NO_MEM;
     }

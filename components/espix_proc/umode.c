@@ -17,9 +17,11 @@
 #include "esp_cache.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
+#include "esp_ipc_isr.h"
 #include "esp_private/startup_internal.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hal/assist_debug_ll.h"
 #include "riscv/csr.h"
@@ -37,14 +39,16 @@
 #define PG          4096u
 #define UVA_MIN     0x00010000u
 #define UVA_MAX     0x70000000u
-#define USTACK_TOP  0x80000000u
-#define USTACK_MAX  (8u * 1024u * 1024u)    /* reserved, mapped as touched; Linux's ulimit -s */
+#define USTACK_TOP  ESPIX_UM_STACK_TOP
+#define USTACK_MAX  ESPIX_UM_STACK_MAX
 #define ARGS_MAX    (64u * 1024u)
 #define UM_KICK_PC  0x00000ffcu                 /* below the image, never mapped */
 
 /* Each core's current U-mode thread and its kernel tp; the patched vectors read them on entry from U. */
 espix_um_thread_t *espix_um_cur[portNUM_PROCESSORS];
 uint32_t espix_um_ktp[portNUM_PROCESSORS];
+/* The satp each core last returned to U with, for espix_um_asid_shoot(). */
+static uint32_t s_cur_satp[portNUM_PROCESSORS];
 
 static uint32_t s_boot_mscratch[portNUM_PROCESSORS];
 
@@ -75,12 +79,12 @@ static void asid_free(uint32_t asid)
     taskENTER_CRITICAL(&s_asid_lock);
     s_asid_used[asid / 32] &= ~(1u << (asid % 32));
     for (int c = 0; c < portNUM_PROCESSORS; c++) {
-        s_asid_stale[c][asid / 32] |= 1u << (asid % 32);
+        __atomic_fetch_or(&s_asid_stale[c][asid / 32], 1u << (asid % 32), __ATOMIC_SEQ_CST);
     }
     taskEXIT_CRITICAL(&s_asid_lock);
 }
 
-void espix_um_enter(uint32_t pc, uint32_t usp, uint32_t a0, uint32_t a1, uint32_t a2);
+void espix_um_enter(uint32_t pc, uint32_t usp, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t utp);
 void espix_um_return(void *frame);
 void espix_um_return_to(RvExcFrame *frame, espix_um_thread_t *t);
 
@@ -251,7 +255,7 @@ IRAM_ATTR void espix_um_return_to(RvExcFrame *frame, espix_um_thread_t *t)
     /* A fatal signal or a kill: the return lands on an unmapped pc instead, and the trap ends the process.
      * The first entry has no frame (espix_um_enter); its next return will see the signal. */
     if (frame != NULL && t->kick_sig == 0) {
-        if (t->slot->stop_requested) {
+        if (t->slot->stop_requested || t->proc->exiting) {
             t->kick_sig = SIGKILL;
         } else if ((t->slot->sig_pending & ~t->slot->sig_blocked) != 0) {
             t->kick_sig = espix_proc_termsig(t->slot);
@@ -263,21 +267,44 @@ IRAM_ATTR void espix_um_return_to(RvExcFrame *frame, espix_um_thread_t *t)
     const uint32_t core = esp_cpu_get_core_id();
     espix_um_cur[core] = t;
     espix_um_ktp[core] = t->ktp;
+    /* Published before the stale check, which espix_um_asid_shoot() does the other way round. */
+    __atomic_store_n(&s_cur_satp[core], t->satp, __ATOMIC_SEQ_CST);
     RV_WRITE_CSR(satp, t->satp);
     const uint32_t asid = (t->satp & SATP32_ASID) >> 22;
-    if (s_asid_stale[core][asid / 32] & (1u << (asid % 32))) {
-        s_asid_stale[core][asid / 32] &= ~(1u << (asid % 32));
+    const uint32_t bit  = 1u << (asid % 32);
+    if (__atomic_load_n(&s_asid_stale[core][asid / 32], __ATOMIC_SEQ_CST) & bit) {
+        __atomic_fetch_and(&s_asid_stale[core][asid / 32], ~bit, __ATOMIC_SEQ_CST);
         asm volatile ("sfence.vma zero, %0" :: "r"(asid) : "memory");
     }
     fpu_take(core, t);
     sp_mon(core, false);
 }
 
+static IRAM_ATTR void asid_flush_here(void *arg)
+{
+    asm volatile ("sfence.vma zero, %0" :: "r"((uint32_t)arg) : "memory");
+}
+
+void espix_um_asid_shoot(uint32_t asid)
+{
+    const uint32_t me  = esp_cpu_get_core_id();
+    const uint32_t bit = 1u << (asid % 32);
+    for (uint32_t c = 0; c < portNUM_PROCESSORS; c++) {
+        if (c == me) {
+            continue;
+        }
+        __atomic_fetch_or(&s_asid_stale[c][asid / 32], bit, __ATOMIC_SEQ_CST);
+        /* Running it now, or about to without having seen the bit: flush there at once. */
+        if (((__atomic_load_n(&s_cur_satp[c], __ATOMIC_SEQ_CST) & SATP32_ASID) >> 22) == asid) {
+            esp_ipc_isr_call_blocking(asid_flush_here, (void *)asid);
+        }
+    }
+}
+
 /* The most kernel stack any U-mode task has used, to size CONFIG_ESPIX_UM_KSTACK from. */
 static uint32_t s_kstack_most;
 
-/* Where an app's exit or fault ends: plain task context on the kernel stack, as an M-mode app's exit() is. */
-void espix_um_exited(int status)
+static void kstack_note(void)
 {
     const uint32_t used = CONFIG_ESPIX_UM_KSTACK - uxTaskGetStackHighWaterMark(NULL);
     if (used > s_kstack_most) {
@@ -285,8 +312,181 @@ void espix_um_exited(int status)
         espix_klog(ESPIX_KLOG_INFO, TAG, "kernel stack: %u of %u bytes, the most yet",
                    (unsigned)used, (unsigned)CONFIG_ESPIX_UM_KSTACK);
     }
-    espix_proc_exit(status);
+}
+
+/* Every thread of the process is to end, with status unless another already set one. */
+static void stop_all(espix_um_thread_t *t, int status)
+{
+    espix_um_proc_t *const p = t->proc;
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    const bool first = !p->exiting;
+    if (first) {
+        p->exiting     = true;
+        p->exit_status = status;
+    }
+    const bool others = p->threads > 1;
+    xSemaphoreGive(p->lock);
+    if (first && others) {
+        espix_proc_stop_tasks(t->slot);
+    }
+}
+
+#define THREADS_GONE_MS 2000
+
+static int threads_left(espix_um_proc_t *p)
+{
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    const int left = p->threads - 1;
+    xSemaphoreGive(p->lock);
+    return left;
+}
+
+static void __attribute__((noreturn)) main_exit(espix_um_thread_t *t)
+{
+    kstack_note();
+    espix_proc_exit(t->proc->exit_status);
     __builtin_unreachable();
+}
+
+void espix_um_exit_group(espix_um_thread_t *t, int status)
+{
+    stop_all(t, status);
+    if (t->exit_jmp != NULL) {
+        espix_um_thread_exit(t);
+    }
+    /*
+     * The main thread: the others leave at their next return to U, or when
+     * their blocking call sees the stop. One that does not is deleted with the
+     * process's other threads.
+     */
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(THREADS_GONE_MS);
+    int left;
+    while ((left = threads_left(t->proc)) > 0) {
+        const int32_t wait = (int32_t)(deadline - xTaskGetTickCount());
+        if (wait <= 0) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d: %d threads did not end; deleting them",
+                       (int)t->slot->info.pid, left);
+            break;
+        }
+        (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE, (TickType_t)wait);
+    }
+    main_exit(t);
+}
+
+void espix_um_thread_exit(espix_um_thread_t *t)
+{
+    espix_um_as_t *const as = t->proc->as;
+    if (t->clear_tid != 0) {
+        const uint32_t zero = 0;
+        if (espix_um_copyout(as, t->clear_tid, &zero, sizeof(zero)) == 0) {
+            (void)espix_um_futex_wake(t->proc, t->clear_tid, INT32_MAX);
+        }
+    }
+    if (t->exit_jmp != NULL) {
+        if (t->stack != 0) {
+            espix_um_tstack_give(as, t->stack);
+        }
+        kstack_note();
+        longjmp(*t->exit_jmp, 1);
+    }
+    /* The main thread: as on Linux, the process lives until its last thread ends, and then exits 0. */
+    espix_proc_slot_t *const slot = t->slot;
+    for (;;) {
+        (void)espix_sigcheck_mask();
+        if (slot->stop_requested || t->proc->exiting) {
+            espix_um_exit_group(t, 128 + SIGKILL);
+        }
+        const int sig = espix_proc_termsig(slot);
+        if (sig != 0) {
+            espix_um_exit_group(t, 128 + sig);
+        }
+        if (threads_left(t->proc) == 0) {
+            espix_um_exit_group(t, 0);
+        }
+        (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE, portMAX_DELAY);
+    }
+}
+
+/* A thread's kernel side: the task enters U at its start routine, and ends here when it leaves. */
+static void thread_main(void *arg)
+{
+    espix_um_thread_t *const t = arg;
+    espix_um_proc_t *const p = t->proc;
+    jmp_buf jb;
+
+    t->task     = xTaskGetCurrentTaskHandle();
+    t->exit_jmp = &jb;
+    espix_pid_t pid;
+    (void)espix_proc_thread_of_task(t->task, &pid, &t->tid);
+    /* Before any user code runs, so a join never sees the word before the thread has set it. */
+    if (t->clear_tid != 0) {
+        (void)espix_um_copyout(p->as, t->clear_tid, &t->tid, sizeof(uint32_t));
+    }
+    asm volatile ("mv %0, tp" : "=r"(t->ktp));
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, t);
+    if (setjmp(jb) == 0) {
+        espix_um_enter(t->entry, t->usp, t->arg, 0, 0, t->utp);
+    }
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, NULL);
+
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    p->threads--;
+    xSemaphoreGive(p->lock);
+    const TaskHandle_t main_task = t->slot->info.task;
+    if (main_task != NULL) {
+        xTaskNotifyGiveIndexed(main_task, ESPIX_NOTIFY_SIG_IDX);
+    }
+    free(t);
+}
+
+int32_t espix_um_thread_create(espix_um_thread_t *self, uint32_t entry, uint32_t arg, uint32_t utp,
+                               uint32_t ustack, uint32_t ctid)
+{
+    espix_um_proc_t *const p = self->proc;
+    espix_um_thread_t *const t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
+    if (t == NULL) {
+        return -ENOMEM;
+    }
+    *t = (espix_um_thread_t){ .satp = self->satp, .proc = p, .slot = self->slot, .clear_tid = ctid,
+                              .entry = entry, .arg = arg, .utp = utp, .usp = ustack & ~15u };
+    if (ustack == 0) {
+        t->stack = t->usp = espix_um_tstack_take(p->as);
+        if (t->stack == 0) {
+            free(t);
+            return -EAGAIN;
+        }
+    }
+
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    const bool exiting = p->exiting;
+    if (!exiting) {
+        p->threads++;
+    }
+    xSemaphoreGive(p->lock);
+    if (exiting) {
+        if (t->stack != 0) {
+            espix_um_tstack_give(p->as, t->stack);
+        }
+        free(t);
+        return -EAGAIN;
+    }
+
+    const espix_kthread_t k = {
+        .name = self->slot->info.name, .fn = thread_main, .arg = t, .stack = CONFIG_ESPIX_UM_KSTACK,
+        .priority = CONFIG_ESPIX_PROC_PRIORITY, .core = tskNO_AFFINITY,
+    };
+    espix_pid_t tid;
+    if (espix_proc_thread_start(self->slot, &k, NULL, &tid) != ESP_OK) {
+        xSemaphoreTake(p->lock, portMAX_DELAY);
+        p->threads--;
+        xSemaphoreGive(p->lock);
+        if (t->stack != 0) {
+            espix_um_tstack_give(p->as, t->stack);
+        }
+        free(t);
+        return -EAGAIN;
+    }
+    return (int32_t)tid;
 }
 
 static int fault_signal(uint32_t code)
@@ -299,21 +499,18 @@ static int fault_signal(uint32_t code)
     }
 }
 
-static void __attribute__((noreturn)) fault(const RvExcFrame *f, uint32_t code)
+static void __attribute__((noreturn)) fault(espix_um_thread_t *t, const RvExcFrame *f, uint32_t code)
 {
-    espix_proc_slot_t *const slot = espix_proc_self();
+    espix_proc_slot_t *const slot = t->slot;
     const int sig = fault_signal(code);
     const char *what = (sig == SIGILL) ? "Illegal instruction" : (sig == SIGBUS) ? "Bus error"
                      : (sig == SIGTRAP) ? "Trace/breakpoint trap" : "Segmentation fault";
 
     espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d: %s at pc 0x%08x, address 0x%08x (mcause %u)",
-               slot ? (int)slot->info.pid : -1, what, (unsigned)f->mepc,
-               (unsigned)f->mtval, (unsigned)code);
-    if (slot != NULL) {
-        espix_eprintf(slot->info.session, "%s: %s (pc 0x%08x, address 0x%08x)\n",
-                      slot->info.name, what, (unsigned)f->mepc, (unsigned)f->mtval);
-    }
-    espix_um_exited(128 + sig);
+               (int)slot->info.pid, what, (unsigned)f->mepc, (unsigned)f->mtval, (unsigned)code);
+    espix_eprintf(slot->info.session, "%s: %s (pc 0x%08x, address 0x%08x)\n",
+                  slot->info.name, what, (unsigned)f->mepc, (unsigned)f->mtval);
+    espix_um_exit_group(t, 128 + sig);
 }
 
 void espix_um_resume(RvExcFrame *u, uint32_t ms, espix_um_thread_t *t) __attribute__((noreturn));
@@ -329,12 +526,12 @@ IRAM_ATTR void espix_um_kentry(RvExcFrame *u, uint32_t cause, espix_um_thread_t 
 
     sp_mon(esp_cpu_get_core_id(), true);
     if (code == 12 && u->mepc == UM_KICK_PC && t->kick_sig != 0) {
-        espix_um_exited(128 + t->kick_sig);
+        espix_um_exit_group(t, 128 + t->kick_sig);
     } else if (code == 8) {
         u->mepc += 4;
         u->a0 = (uint32_t)espix_um_syscall(t, u);
     } else if (need == 0 || !espix_um_fault(t->proc->as, u->mtval, need)) {
-        fault(u, code);
+        fault(t, u, code);
     }
     espix_um_resume(u, (uint32_t)u + RV_STK_FRMSZ, t);
 }
@@ -427,12 +624,13 @@ static bool put_user(espix_um_as_t *as, uint32_t va, const void *src, size_t n)
 {
     const uint8_t *p = src;
     while (n > 0) {
-        uint8_t *k = espix_um_user_ptr(as, va, PTE_W);
+        uint8_t *k = espix_um_user_pin(as, va, PTE_W);
         if (k == NULL) {
             return false;
         }
         const size_t c = MIN(n, PG - (va & (PG - 1)));
         memcpy(k, p, c);
+        espix_um_user_unpin(as);
         va += c;
         p  += c;
         n  -= c;
@@ -497,17 +695,24 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
     espix_um_as_t *as = espix_um_as_new(asid);
     espix_um_thread_t *t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
     espix_um_proc_t *p = calloc(1, sizeof(*p));
-    if (as == NULL || t == NULL || p == NULL) {
+    SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+    if (as == NULL || t == NULL || p == NULL || lock == NULL) {
         espix_um_as_free(as);
         free(t);
         free(p);
+        if (lock != NULL) {
+            vSemaphoreDelete(lock);
+        }
         asid_free(asid);
         return "out of memory for an address space";
     }
-    p->as   = as;
+    p->as      = as;
+    p->lock    = lock;
+    p->threads = 1;
     espix_um_fds_init(p);
     t->proc = p;
     t->slot = slot;
+    t->tid  = slot->info.pid;
     t->task = xTaskGetCurrentTaskHandle();
     t->satp = espix_um_as_satp(as);
     app->um = t;
@@ -534,7 +739,7 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
 
     espix_klog(ESPIX_KLOG_DEBUG, TAG, "pid %d: %s in U-mode, entry 0x%08x, asid %u",
                (int)slot->info.pid, slot->info.name, (unsigned)entry, (unsigned)asid);
-    espix_um_enter(entry, usp, (uint32_t)app->argc, uargv, uenvp);
+    espix_um_enter(entry, usp, (uint32_t)app->argc, uargv, uenvp, 0);
     __builtin_unreachable();
 }
 
@@ -546,9 +751,11 @@ void espix_um_release(espix_proc_slot_t *slot)
     espix_um_thread_t *t = slot->app->um;
     asid_free((t->satp & SATP32_ASID) >> 22);
     espix_um_as_free(t->proc->as);
+    vSemaphoreDelete(t->proc->lock);
     free(t->proc);
     free(t);
     slot->app->um = NULL;
 }
 
 #endif /* CONFIG_ESPIX_UMODE */
+

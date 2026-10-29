@@ -26,9 +26,10 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   Moving all of them to internal RAM (`CONFIG_ESPIX_INTERNAL_STACKS`) ran the
   board out of memory before the load built up, so it is not settled. Open.
 
-- **`exit()` from a thread the app created ends the thread, not the process.**
-  POSIX says `exit()` in any thread terminates the whole process; espix ends the
-  calling thread and logs a warning. The reason is mechanical rather than a
+- **In an M-mode app, `exit()` from a thread it created ends the thread, not the
+  process.** POSIX says `exit()` in any thread terminates the whole process, and
+  a U-mode app's does; for an M-mode app espix ends the calling thread and logs a
+  warning. The reason is mechanical rather than a
   choice: a process's exit path is a `longjmp` back to `proc_task()`, and
   jumping there from another task's stack would land in a frame that task does
   not own -- undefined behaviour, and it would corrupt the app's own stack.
@@ -463,14 +464,21 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 A static executable built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([USER-MODE.md](USER-MODE.md)). It has files, directories,
-stdio, time, sleep and identity. What it cannot do yet:
+stdio, time, sleep, identity and threads. What it cannot do yet:
 
-- **No threads, sockets, select or signal handlers** (M3, M6, M4): those calls
-  fail with ENOSYS, and a signal's default action is all an app gets.
+- **No sockets, select or signal handlers** (M6, M4): those calls fail with
+  ENOSYS, and a signal's default action is all an app gets.
+- **No process-shared mutexes or condition variables** until there is shared
+  memory (M7).
+- **An app's own atomic read-modify-writes can lose an update** against the
+  other core. In U-mode an AMO is not always atomic: two threads in a tight
+  `amoadd` loop on both cores lose 1 to 5 increments in a million. M-mode code,
+  LR/SC and one thread alone lose none. libespix's locks, joins, semaphores and
+  picolibc's locks use LR/SC; C11 atomics and `__atomic` builtins in an app
+  compile to AMOs ([USER-MODE.md](USER-MODE.md), open).
 - **`malloc` touches what it returns**: picolibc's allocator zero-fills every
   block, so a large `malloc` costs its whole size at once; memory reserved with
   `brk`/`sbrk`, bss and the stack cost only the pages touched.
-- **Pinned to core 1**, as M-mode apps are.
 
 ## Filesystem
 

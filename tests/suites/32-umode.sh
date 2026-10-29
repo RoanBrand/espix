@@ -112,6 +112,20 @@ assert_eq "SIGTERM ends an app asleep in a syscall" "143" "$(um_kill 'sleep 1000
 assert_eq "SIGTERM ends an app computing in U"      "143" "$(um_kill 'spin 30' TERM)"
 assert_eq "SIGKILL ends it with 137"                "137" "$(um_kill 'spin 30' KILL)"
 
+# Threads (M3): one address space, futex-based locks, and the process ends as a whole.
+assert_contains "threads share a counter, take turns and time out" \
+    "counter 8000 of 8000, ping-pong done, timed wait timed out, tid is the pid" \
+    "$(dev_run "$UAPP threads 2000")"
+assert_contains "malloc and printf from four threads at once" "uapp: churn ok" "$(dev_run "$UAPP tchurn")"
+assert_contains "a thread's stack grows" "deep stack in a thread ok" "$(dev_run "$UAPP tstack")"
+assert_status "exit() in a thread ends the process" 5 dev_status "$UAPP texit 5"
+out=$(dev_run "$UAPP tdetach; echo rc=\$?")
+assert_contains "the main thread's pthread_exit leaves the process to its threads" \
+    "the detached thread finished" "$out"
+assert_contains "and it ends with 0 when the last one does" "rc=0" "$out"
+assert_eq "SIGTERM ends threads asleep in the kernel" "143" "$(um_kill tsleep TERM)"
+assert_eq "SIGKILL ends threads computing on both cores" "137" "$(um_kill tspin KILL)"
+
 bench_out=$(dev_run "$UAPP bench")
 assert_contains "a null syscall is timed ($bench_out)" "uapp: a syscall takes" "$bench_out"
 rm -rf "$UM_DIR"

@@ -1129,10 +1129,14 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     };
 
     uint32_t app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;
+    /* Core 1 unless U-mode; see below. */
+    BaseType_t core = 1;
 #if CONFIG_ESPIX_UMODE
     /* A U-mode app's own stack is in its address space; this one is only its kernel stack. */
     if (espix_um_file_is_exec(abs_path)) {
         app_stack = CONFIG_ESPIX_UM_KSTACK;
+        /* No PIE in it; it stays on the core it first runs on, for the FPU. */
+        core = tskNO_AFFINITY;
     } else
 #endif
     {
@@ -1148,7 +1152,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     }
 
     /*
-     * Pinned to core 1, with a PSRAM stack.
+     * An M-mode app pinned to core 1, with a PSRAM stack.
      *
      * Core 1 because of PIE: on the S31 the coprocessor exists only on core 1,
      * and the toolchain builds every translation unit with the vector extension,
@@ -1165,7 +1169,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      */
     const BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
         proc_task, task_name, app_stack, slot,
-        CONFIG_ESPIX_PROC_PRIORITY, &task, 1, ESPIX_STACK_CAPS);
+        CONFIG_ESPIX_PROC_PRIORITY, &task, core, ESPIX_STACK_CAPS);
     if (ok != pdPASS) {
         /* The wake eventfd is live by now, and the memset below would shed the
          * only record of it. Under the load that makes task creation fail in

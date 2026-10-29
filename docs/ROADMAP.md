@@ -12,18 +12,35 @@ things are as they are.
 
 ## Processes
 
+- **A fault in an app's own code ends the app, on chips without U-mode.** The S3,
+  and M-mode apps on the S31, reboot on any fault today. When the faulting pc is
+  inside the app's loaded image, the app holds no kernel lock, and everything it
+  holds is per-process and released at exit (arena, fds, threads). So the
+  exception handler can send the task back out with its pc at the app's exit
+  path, as U-mode's kick does on the S31 (Xtensa: EPC, then `rfe`), and the app
+  ends itself in task context with 139: no reaper task, no reboot. A fault in
+  kernel or IDF code still reboots, and a wild write that does not fault is
+  still unseen, as on nommu Linux. The same redirect, at an interrupt's exit
+  with the pc in app code, would let a kill end a computing M-mode app without
+  deleting its task, and `exit()` from a thread end the whole process. On the
+  S3 the native compare-and-swap does not work on PSRAM (IDF emulates it under a
+  lock, `CONFIG_STDATOMIC_S32C1I_SPIRAM_WORKAROUND`), which any futex-based
+  lock there has to go through.
 
-- **Unpin apps from core 1.** `exec.c` pins every app to core 1 (`910501e`)
-  because "the toolchain vectorises every translation unit", so an app's first
-  PIE instruction on core 0 would trap, and IDF's migration of the task faulted
-  once (`mcause 0x2` in `rtos_pie_used_cpu0`). Today's binaries contradict the
-  premise: doom, mosquitto, plasma, hello and testapp contain no PIE or
-  hardware-loop instruction, and the firmware holds 34, all in FreeRTOS's own PIE
-  save routine. The `-march` flag permits them; the compiler does not emit them
-  unasked. Unpinned, an app and its threads would use both cores. What to check
-  first: what the old fault really was (IDF's PIE test also matches the base
-  `OP` opcode on core 0), then the suite with apps unpinned, then build apps
-  without `xespv`/`xesploop` so a stray one cannot appear.
+- **Unpin M-mode apps from core 1.** `exec.c` pins every M-mode app to core 1
+  (`910501e`) because "the toolchain vectorises every translation unit", so an
+  app's first PIE instruction on core 0 would trap, and IDF's migration of the
+  task faulted once (`mcause 0x2` in `rtos_pie_used_cpu0`). Today's binaries
+  contradict the premise: doom, mosquitto, plasma, hello and testapp contain no
+  PIE or hardware-loop instruction, and the firmware holds 34, all in FreeRTOS's
+  own PIE save routine. The `-march` flag permits them; the compiler does not
+  emit them unasked. Unpinned, an app and its threads would use both cores. IDF
+  documents the migration as supported (a task's first PIE instruction on core 0
+  moves it to core 1 and pins it there), except inside a critical section or an
+  ISR, where it aborts. What to check first: what the old fault really was
+  (IDF's PIE test also matches the base `OP` opcode on core 0), then the suite
+  with apps unpinned, then build apps without `xespv`/`xesploop` so a stray
+  one cannot appear. U-mode apps are built that way and are unpinned.
 
 - **A fairer scheduler.** IDF's FreeRTOS is fixed-priority and preemptive,
   with round-robin time slicing between tasks of equal priority, 25 priorities,

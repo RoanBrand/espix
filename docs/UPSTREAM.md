@@ -1339,3 +1339,20 @@ friends were calls) is gone and `tools/patch-elf-loader.py` applies the addend;
 `tools/elf_loader-xtensa-addend.patch` is the same change ready to send. Diagnosed
 from the relocations and the loader's source, with the S3 off the bench: confirm on
 hardware with the reproduction above and Doom's title screen.
+
+## The toolchain: GCC's LR/SC-only exchange stores the `sc` status on a retry
+
+With `-march` that has Zalrsc and not Zaamo, `riscv32-esp-elf-gcc`
+`esp-15.2.0_20251204` compiles `__atomic_exchange_n` to
+
+    1: lr.w  a4, (a5)
+       sc.w  a0, a0, (a5)
+       bnez  a0, 1b
+
+`sc.w` writes its status into the register that holds the value to store, so
+after a failed `sc` the retry stores 1. Add and compare-and-swap recompute their
+value inside the loop and are correct. On the S31, two threads exchanging unique
+values lost or duplicated some in every run. GCC fixed it in "RISC-V: Use
+scratch reg for loop control" (r16-1541, June 2025), backported to the vendor
+gcc-15 branch in January 2026. Workaround: `espix-cc` keeps Zaamo, and libespix
+writes its LR/SC exchange by hand.

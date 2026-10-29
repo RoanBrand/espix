@@ -1,7 +1,8 @@
 /*
  * U-mode address spaces: one Sv32 table per process, frames from PSRAM, and
  * the kernel's access to user memory. Every frame is its own 4 KiB aligned
- * allocation, owned by one table (docs/USER-MODE.md).
+ * allocation, owned by one table (docs/USER-MODE.md). A process's threads share
+ * the table, so every change to it is under the table's lock.
  */
 #include "sdkconfig.h"
 
@@ -13,6 +14,8 @@
 #include <sys/param.h>
 
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "riscv/encoding.h"
 
 #include "espix_umode.h"
@@ -27,11 +30,25 @@ typedef struct {
 
 #define REGIONS 8
 
+#define TSTACK_SPAN ESPIX_UM_STACK_MAX
+#define TSTACK_HIGH (ESPIX_UM_STACK_TOP - ESPIX_UM_STACK_MAX)
+#define TSTACK_LOW  (TSTACK_HIGH - ESPIX_UM_TSTACKS * TSTACK_SPAN)
+
+/* A frame unmapped while a kernel call still held a pointer into it. */
+typedef struct dead {
+    struct dead *next;
+    void        *frame;
+} dead_t;
+
 struct espix_um_as {
-    uint32_t *root;
-    uint32_t  asid;
-    region_t  regions[REGIONS];
-    uint32_t  brk_base, brk;    /* the heap is regions[0] */
+    uint32_t         *root;
+    uint32_t          asid;
+    SemaphoreHandle_t lock;
+    region_t          regions[REGIONS];
+    uint32_t          brk_base, brk;    /* the heap is regions[0] */
+    uint32_t          tstacks;          /* thread stack spans in use, one bit each */
+    uint32_t          pins;             /* kernel calls holding a pointer into a frame */
+    dead_t           *dead;             /* freed when the last pin goes */
 };
 
 static void *frame_alloc(void)
@@ -56,12 +73,27 @@ espix_um_as_t *espix_um_as_new(uint32_t asid)
         return NULL;
     }
     as->root = frame_alloc();
-    if (as->root == NULL) {
+    as->lock = xSemaphoreCreateMutex();
+    if (as->root == NULL || as->lock == NULL) {
+        heap_caps_free(as->root);
+        if (as->lock != NULL) {
+            vSemaphoreDelete(as->lock);
+        }
         free(as);
         return NULL;
     }
     as->asid = asid & 0x1ff;
     return as;
+}
+
+static void frames_free(dead_t *d)
+{
+    while (d != NULL) {
+        dead_t *const next = d->next;
+        heap_caps_free(d->frame);
+        free(d);
+        d = next;
+    }
 }
 
 void espix_um_as_free(espix_um_as_t *as)
@@ -82,6 +114,8 @@ void espix_um_as_free(espix_um_as_t *as)
         heap_caps_free(l2);
     }
     heap_caps_free(as->root);
+    frames_free(as->dead);
+    vSemaphoreDelete(as->lock);
     free(as);
 }
 
@@ -137,14 +171,22 @@ bool espix_um_region_add(espix_um_as_t *as, uint32_t start, uint32_t end, uint32
     return false;
 }
 
-static const region_t *region_of(const espix_um_as_t *as, uint32_t va)
+/* The PTE flags a reserved page at va gets when touched, or 0 if nothing reserves it. Under the lock. */
+static uint32_t reserved(const espix_um_as_t *as, uint32_t va)
 {
     for (int i = 0; i < REGIONS; i++) {
         if (va >= as->regions[i].start && va < as->regions[i].end) {
-            return &as->regions[i];
+            return as->regions[i].flags;
         }
     }
-    return NULL;
+    if (va >= TSTACK_LOW && va < TSTACK_HIGH) {
+        const uint32_t k   = (TSTACK_HIGH - 1 - va) / TSTACK_SPAN;
+        const uint32_t top = TSTACK_HIGH - k * TSTACK_SPAN - PG;
+        if ((as->tstacks & (1u << k)) && va < top && va >= top - TSTACK_SPAN + 2 * PG) {
+            return PTE_R | PTE_W;
+        }
+    }
+    return 0;
 }
 
 void espix_um_brk_init(espix_um_as_t *as, uint32_t base)
@@ -153,41 +195,101 @@ void espix_um_brk_init(espix_um_as_t *as, uint32_t base)
     as->regions[0] = (region_t){ as->brk_base, as->brk_base, PTE_R | PTE_W };
 }
 
-static void unmap(espix_um_as_t *as, uint32_t va)
+/* Unmaps [start, end) onto *dead. Under the lock; unmapped() finishes the job. */
+static void unmap_range(espix_um_as_t *as, uint32_t start, uint32_t end, dead_t **dead)
 {
-    uint32_t *pte = leaf(as, va, false);
-    if (pte != NULL && (*pte & PTE_V)) {
-        heap_caps_free(pte_frame(*pte));
+    for (uint32_t va = start; va < end; va += PG) {
+        uint32_t *pte = leaf(as, va, false);
+        if (pte == NULL) {
+            va = (va | (0x400000u - 1)) + 1 - PG;   /* no table for this 4 MB */
+            continue;
+        }
+        if (!(*pte & PTE_V)) {
+            continue;
+        }
+        dead_t *const d = malloc(sizeof(*d));
+        if (d == NULL) {
+            continue;       /* left mapped: a leak, never a frame in use freed */
+        }
+        *d = (dead_t){ *dead, pte_frame(*pte) };
+        *dead = d;
         *pte = 0;
         asm volatile ("sfence.vma %0, %1" :: "r"(va), "r"(as->asid) : "memory");
     }
 }
 
-uint32_t espix_um_brk(espix_um_as_t *as, uint32_t want)
+/* The frames of an unmap: no core translates them any more; freed now, or when the last pin goes. */
+static void unmapped(espix_um_as_t *as, dead_t *dead)
 {
-    if (want < as->brk_base || want > ESPIX_UM_BRK_MAX) {
-        return as->brk;
+    if (dead == NULL) {
+        return;
     }
-    const uint32_t old_end = as->regions[0].end;
-    const uint32_t new_end = (want + PG - 1) & ~(PG - 1);
-    for (uint32_t va = new_end; va < old_end; va += PG) {
-        unmap(as, va);
+    espix_um_asid_shoot(as->asid);
+    if (as->pins > 0) {
+        dead_t *tail = dead;
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+        tail->next = as->dead;
+        as->dead   = dead;
+    } else {
+        frames_free(dead);
     }
-    as->regions[0].end = new_end;
-    as->brk = want;
-    return want;
 }
 
-/* The page at va, mapped now if a region reserves it; NULL if the app may not reach it so. */
-void *espix_um_user_ptr(espix_um_as_t *as, uint32_t va, uint32_t need)
+uint32_t espix_um_brk(espix_um_as_t *as, uint32_t want)
+{
+    xSemaphoreTake(as->lock, portMAX_DELAY);
+    if (want >= as->brk_base && want <= ESPIX_UM_BRK_MAX) {
+        const uint32_t old_end = as->regions[0].end;
+        const uint32_t new_end = (want + PG - 1) & ~(PG - 1);
+        dead_t *dead = NULL;
+        unmap_range(as, new_end, old_end, &dead);
+        unmapped(as, dead);
+        as->regions[0].end = new_end;
+        as->brk = want;
+    }
+    const uint32_t brk = as->brk;
+    xSemaphoreGive(as->lock);
+    return brk;
+}
+
+uint32_t espix_um_tstack_take(espix_um_as_t *as)
+{
+    uint32_t top = 0;
+    xSemaphoreTake(as->lock, portMAX_DELAY);
+    for (uint32_t k = 0; k < ESPIX_UM_TSTACKS; k++) {
+        if (!(as->tstacks & (1u << k))) {
+            as->tstacks |= 1u << k;
+            top = TSTACK_HIGH - k * TSTACK_SPAN - PG;
+            break;
+        }
+    }
+    xSemaphoreGive(as->lock);
+    return top;
+}
+
+void espix_um_tstack_give(espix_um_as_t *as, uint32_t top)
+{
+    const uint32_t k = (TSTACK_HIGH - PG - top) / TSTACK_SPAN;
+    dead_t *dead = NULL;
+    xSemaphoreTake(as->lock, portMAX_DELAY);
+    as->tstacks &= ~(1u << k);
+    unmap_range(as, top - TSTACK_SPAN + 2 * PG, top, &dead);
+    unmapped(as, dead);
+    xSemaphoreGive(as->lock);
+}
+
+/* The page at va, mapped now if something reserves it. Under the lock. */
+static uint8_t *page_of(espix_um_as_t *as, uint32_t va, uint32_t need)
 {
     const uint32_t *pte = leaf(as, va, false);
     if (pte == NULL || !(*pte & PTE_V)) {
-        const region_t *r = region_of(as, va);
-        if (r == NULL || (r->flags & need) != need) {
+        const uint32_t flags = reserved(as, va);
+        if (flags == 0 || (flags & need) != need) {
             return NULL;
         }
-        uint8_t *frame = espix_um_map_new(as, va & ~(PG - 1), r->flags);
+        uint8_t *frame = espix_um_map_new(as, va & ~(PG - 1), flags);
         if (frame == NULL) {
             return NULL;
         }
@@ -200,22 +302,52 @@ void *espix_um_user_ptr(espix_um_as_t *as, uint32_t va, uint32_t need)
     return (uint8_t *)pte_frame(*pte) + (va & (PG - 1));
 }
 
+void *espix_um_user_pin(espix_um_as_t *as, uint32_t va, uint32_t need)
+{
+    xSemaphoreTake(as->lock, portMAX_DELAY);
+    uint8_t *const k = page_of(as, va, need);
+    if (k != NULL) {
+        as->pins++;
+    }
+    xSemaphoreGive(as->lock);
+    return k;
+}
+
+void espix_um_user_unpin(espix_um_as_t *as)
+{
+    dead_t *dead = NULL;
+    xSemaphoreTake(as->lock, portMAX_DELAY);
+    if (--as->pins == 0) {
+        dead     = as->dead;
+        as->dead = NULL;
+    }
+    xSemaphoreGive(as->lock);
+    frames_free(dead);
+}
+
 bool espix_um_fault(espix_um_as_t *as, uint32_t va, uint32_t need)
 {
-    const uint32_t *pte = leaf(as, va, false);
-    return (pte == NULL || !(*pte & PTE_V)) && espix_um_user_ptr(as, va, need) != NULL;
+    xSemaphoreTake(as->lock, portMAX_DELAY);
+    /* Mapped already, by another thread since the fault: this core's TLB is just behind. */
+    const bool ok = page_of(as, va, need) != NULL;
+    xSemaphoreGive(as->lock);
+    if (ok) {
+        asm volatile ("sfence.vma %0, %1" :: "r"(va), "r"(as->asid) : "memory");
+    }
+    return ok;
 }
 
 int espix_um_copyin(espix_um_as_t *as, void *dst, uint32_t uva, size_t n)
 {
     uint8_t *d = dst;
     while (n > 0) {
-        const uint8_t *k = espix_um_user_ptr(as, uva, PTE_R);
+        const uint8_t *k = espix_um_user_pin(as, uva, PTE_R);
         if (k == NULL) {
             return -EFAULT;
         }
         const size_t c = MIN(n, PG - (uva & (PG - 1)));
         memcpy(d, k, c);
+        espix_um_user_unpin(as);
         uva += c;
         d   += c;
         n   -= c;
@@ -227,12 +359,13 @@ int espix_um_copyout(espix_um_as_t *as, uint32_t uva, const void *src, size_t n)
 {
     const uint8_t *s = src;
     while (n > 0) {
-        uint8_t *k = espix_um_user_ptr(as, uva, PTE_W);
+        uint8_t *k = espix_um_user_pin(as, uva, PTE_W);
         if (k == NULL) {
             return -EFAULT;
         }
         const size_t c = MIN(n, PG - (uva & (PG - 1)));
         memcpy(k, s, c);
+        espix_um_user_unpin(as);
         uva += c;
         s   += c;
         n   -= c;
@@ -244,16 +377,18 @@ int espix_um_strin(espix_um_as_t *as, char *dst, uint32_t uva, size_t size)
 {
     size_t len = 0;
     while (len < size) {
-        const char *k = espix_um_user_ptr(as, uva, PTE_R);
+        const char *k = espix_um_user_pin(as, uva, PTE_R);
         if (k == NULL) {
             return -EFAULT;
         }
         const size_t c = MIN(size - len, PG - (uva & (PG - 1)));
         for (size_t i = 0; i < c; i++) {
             if ((dst[len++] = k[i]) == '\0') {
+                espix_um_user_unpin(as);
                 return (int)(len - 1);
             }
         }
+        espix_um_user_unpin(as);
         uva += c;
     }
     return -ENAMETOOLONG;
