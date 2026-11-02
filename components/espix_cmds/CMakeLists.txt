@@ -54,6 +54,7 @@ idf_component_register(
         espix_time
         espix_ota
         espix_svc
+        espix_tty
         app_update
         esp_http_client
         mbedtls

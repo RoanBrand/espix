@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "tty.c"
+        "tty_selftest.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espix_kernel
+        vfs
+        heap
+)

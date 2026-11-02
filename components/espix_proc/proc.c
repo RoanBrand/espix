@@ -3,6 +3,7 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>    /* strcasecmp, for `kill -TERM` */
@@ -15,6 +16,7 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
+#include "espix_tty.h"
 #include "espix_umode.h"
 #include "espix_fs.h"
 #include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
@@ -181,6 +183,22 @@ static const espix_shell_proc_ops_t s_shell_ops = {
     .alive    = shell_alive,
 };
 
+static int tty_signal_group(pid_t pgid, int sig)
+{
+    return (espix_proc_signal_group((espix_pid_t)pgid, sig) == ESP_OK) ? 0 : -ESRCH;
+}
+
+static pid_t tty_self_pgid(void)
+{
+    const espix_proc_slot_t *slot = espix_proc_self();
+    return (slot != NULL) ? (pid_t)slot->info.pgid : 0;
+}
+
+static int tty_interrupted(void)
+{
+    return espix_sigcheck_io() ? -EINTR : 0;
+}
+
 esp_err_t espix_proc_init(void)
 {
     if (g_espix_proc_lock != NULL) {
@@ -228,6 +246,15 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_libc_register();
     espix_proc_abi_libm_register();
     espix_proc_abi_posix_register();
+
+    /* A session's terminal signals its foreground group, and a read on it waits where a signal can end it. */
+    static const espix_tty_hooks_t tty_hooks = {
+        .signal_group = tty_signal_group,
+        .self_pgid    = tty_self_pgid,
+        .interrupted  = tty_interrupted,
+    };
+    espix_tty_set_hooks(&tty_hooks);
+    (void)espix_tty_init();
     espix_proc_abi_ident_register();
     espix_proc_abi_gfx_register();
     espix_proc_abi_audio_register();

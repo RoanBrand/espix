@@ -264,6 +264,9 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # Console
 #
 CONFIG_VFS_SUPPORT_DIR=y
+# tcgetattr() and the rest reach the driver behind a descriptor: a session's tty
+# (components/espix_tty) and the UART both answer them.
+CONFIG_VFS_SUPPORT_TERMIOS=y
 # ESP-IDF registers its own nullfs VFS at "/dev/null" by default (nullfs.c,
 # CONFIG_VFS_INITIALIZE_DEV_NULL). That prefix is longer than espix's "", so
 # ESP-IDF routes /dev/null to it before espix sees the path, shadowing espix's

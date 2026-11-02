@@ -25,6 +25,7 @@
 #include "esp_private/flash_mmap.h"
 
 #include "espix_auth.h"
+#include "espix_tty.h"
 #include "espix_cmds_priv.h"
 #include "espix_fault.h"
 #include "espix_kernel.h"
@@ -1735,6 +1736,22 @@ static int cmd_id(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+static void ttytest_say(void *ctx, const char *line)
+{
+    espix_printf(ctx, "%s\n", line);
+}
+
+static int cmd_ttytest(espix_session_t *s, int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (s == NULL || s->uid != 0) {
+        espix_eprintf(s, "ttytest: only root can do that\n");
+        return 1;
+    }
+    return espix_tty_selftest(ttytest_say, s);
+}
+
 /* ------------------------------------------------------------------ */
 /* Accounts and groups                                                 */
 /* ------------------------------------------------------------------ */
@@ -2175,6 +2192,9 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "log",    .fn = cmd_log,
       .help = "show or set a component's log level",
       .usage = "log <tag> [level]" },
+    { .name = "ttytest", .fn = cmd_ttytest,
+      .help = "exercise the terminal line discipline on a tty of its own",
+      .usage = "ttytest" },
     { .name = "kstack", .fn = cmd_kstack,
       .help = "list the code addresses on a task's stack, for addr2line",
       .usage = "kstack <pid>" },

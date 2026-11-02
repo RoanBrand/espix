@@ -59,6 +59,8 @@ idf_component_register(
         vfs
         # umode_net.c: a U-mode app's sockets and name lookups are lwIP's.
         lwip
+        # A session's terminal: proc.c lends it signals and the wait a signal ends.
+        espix_tty
         heap
         esp_driver_rmt
         esp_driver_gpio
