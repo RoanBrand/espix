@@ -401,8 +401,8 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
         slot->app = NULL;
     }
 
-    free(slot->sig_handlers);
-    slot->sig_handlers = NULL;
+    free(slot->sig_actions);
+    slot->sig_actions = NULL;
 
     /* A finished slot must not hand its streams to the next process to use it. */
     slot->std[0] = slot->std[1] = slot->std[2] = NULL;
@@ -914,8 +914,8 @@ static uint32_t sig_terminating(const espix_proc_slot_t *slot)
     uint32_t mask = 0;
 
     for (int sig = 1; sig < NSIG; sig++) {
-        const bool dfl = slot->sig_handlers == NULL ||
-                         slot->sig_handlers[sig] == SIG_DFL;
+        const bool dfl = slot->sig_actions == NULL ||
+                         slot->sig_actions[sig].handler == SIG_DFL;
         if (dfl && !espix_sig_default_ignores(sig) && !espix_sig_default_stops(sig)) {
             mask |= espix_sigbit(sig);
         }
@@ -937,6 +937,28 @@ static bool ends_in_user_mode(const espix_proc_slot_t *slot)
 #endif
 }
 
+/*
+ * A handler, in place, with what sigaction() promises around it: its mask and
+ * the signal itself (unless SA_NODEFER) blocked until it returns, SIG_DFL back
+ * first under SA_RESETHAND, and a siginfo_t under SA_SIGINFO.
+ */
+static void run_handler(espix_proc_slot_t *slot, int sig, const espix_sigact_t *act)
+{
+    if (act->flags & SA_RESETHAND) {
+        slot->sig_actions[sig].handler = SIG_DFL;
+    }
+    const uint32_t saved = slot->sig_blocked;
+    slot->sig_blocked = (saved | act->mask | ((act->flags & SA_NODEFER) ? 0 : espix_sigbit(sig))) &
+                        ~ESPIX_SIG_UNCATCHABLE;
+    if (act->flags & SA_SIGINFO) {
+        siginfo_t info = { .si_signo = sig, .si_code = SI_USER };
+        ((void (*)(int, siginfo_t *, void *))(void *)act->handler)(sig, &info, NULL);
+    } else {
+        act->handler(sig);      /* app code; no lock held, by design */
+    }
+    slot->sig_blocked = saved;
+}
+
 /* sig is at SIG_DFL in slot's process. */
 static bool action_is_default(const espix_proc_slot_t *slot, int sig)
 {
@@ -945,7 +967,7 @@ static bool action_is_default(const espix_proc_slot_t *slot, int sig)
         return ((const espix_um_thread_t *)slot->app->um)->proc->act[sig].handler == 0;
     }
 #endif
-    return slot->sig_handlers == NULL || slot->sig_handlers[sig] == SIG_DFL;
+    return slot->sig_actions == NULL || slot->sig_actions[sig].handler == SIG_DFL;
 }
 
 static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
@@ -996,19 +1018,19 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
         }
 
         /*
-         * sig_handlers is only ever written by this process, from this task, so
+         * sig_actions is only ever written by this process, from this task, so
          * reading it here needs no lock. Another task can free it -- but only
          * after the task is gone, which is to say never while we are here.
          */
-        void (*handler)(int) = (slot->sig_handlers != NULL)
-                                   ? slot->sig_handlers[sig]
-                                   : SIG_DFL;
+        const espix_sigact_t act = (slot->sig_actions != NULL)
+                                       ? slot->sig_actions[sig]
+                                       : (espix_sigact_t){ .handler = SIG_DFL };
 
-        if (handler == SIG_IGN) {
+        if (act.handler == SIG_IGN) {
             continue;
         }
-        if (handler != SIG_DFL) {
-            handler(sig);       /* app code; no lock held, by design */
+        if (act.handler != SIG_DFL) {
+            run_handler(slot, sig, &act);
             caught |= espix_sigbit(sig);
             continue;
         }

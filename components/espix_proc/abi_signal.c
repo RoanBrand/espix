@@ -95,12 +95,12 @@ static void sig_wait(TickType_t ticks)
  * SIG_DFL is 0 and SIG_IGN is 1, so a calloc'd table already reads as "every
  * signal at its default".
  */
-static void (**handler_table(espix_proc_slot_t *slot))(int)
+static espix_sigact_t *action_table(espix_proc_slot_t *slot)
 {
-    if (slot->sig_handlers == NULL) {
-        slot->sig_handlers = calloc(NSIG, sizeof(*slot->sig_handlers));
+    if (slot->sig_actions == NULL) {
+        slot->sig_actions = calloc(NSIG, sizeof(*slot->sig_actions));
     }
-    return slot->sig_handlers;
+    return slot->sig_actions;
 }
 
 static bool catchable(int sig)
@@ -119,23 +119,21 @@ static void (*espix_abi_signal(int sig, void (*handler)(int)))(int)
         return SIG_ERR;
     }
 
-    void (**tab)(int) = handler_table(slot);
+    espix_sigact_t *tab = action_table(slot);
     if (tab == NULL) {
         errno = ENOMEM;
         return SIG_ERR;
     }
 
-    void (*prev)(int) = tab[sig];
-    tab[sig] = handler;
+    void (*prev)(int) = tab[sig].handler;
+    tab[sig] = (espix_sigact_t){ .handler = handler };
     return prev;
 }
 
 /*
- * sa_mask and sa_flags are accepted and ignored. There is no signal frame to
- * apply a mask around and no restartable syscall for SA_RESTART to restart, and
- * SA_SIGINFO would need a siginfo_t espix has nothing to put in. Ignoring them
- * lets ordinary code that fills in a struct sigaction work; pretending to
- * honour them would be worse than either.
+ * sa_mask, SA_NODEFER, SA_RESETHAND and SA_SIGINFO are honoured around the
+ * handler (run_handler() in proc.c). SA_RESTART has nothing to restart: the
+ * calls a signal ends here are sleeps and select(), which POSIX never restarts.
  */
 static int espix_abi_sigaction(int sig, const struct sigaction *act,
                                struct sigaction *old)
@@ -147,7 +145,7 @@ static int espix_abi_sigaction(int sig, const struct sigaction *act,
         return -1;
     }
 
-    void (**tab)(int) = handler_table(slot);
+    espix_sigact_t *tab = action_table(slot);
     if (tab == NULL) {
         errno = ENOMEM;
         return -1;
@@ -155,10 +153,14 @@ static int espix_abi_sigaction(int sig, const struct sigaction *act,
 
     if (old != NULL) {
         memset(old, 0, sizeof(*old));
-        old->sa_handler = tab[sig];
+        old->sa_handler = tab[sig].handler;
+        old->sa_mask    = (sigset_t)tab[sig].mask;
+        old->sa_flags   = tab[sig].flags;
     }
     if (act != NULL) {
-        tab[sig] = act->sa_handler;
+        tab[sig] = (espix_sigact_t){ .handler = act->sa_handler,
+                                     .mask    = (uint32_t)act->sa_mask & ~ESPIX_SIG_UNCATCHABLE,
+                                     .flags   = act->sa_flags };
     }
     return 0;
 }
@@ -331,6 +333,12 @@ static int espix_abi_sigprocmask(int how, const sigset_t *set, sigset_t *old)
     return 0;
 }
 
+/* The process's mask: an M-mode app's threads share one. */
+static int espix_abi_pthread_sigmask(int how, const sigset_t *set, sigset_t *old)
+{
+    return (espix_abi_sigprocmask(how, set, old) == 0) ? 0 : errno;
+}
+
 static int espix_abi_sigpending(sigset_t *set)
 {
     espix_proc_slot_t *slot = espix_proc_self();
@@ -457,6 +465,25 @@ int espix_abi_nanosleep(const struct timespec *req, struct timespec *rem)
         }
         sig_wait((TickType_t)left);
     }
+}
+
+/* Wait under mask until a handler has run, then put the mask back. */
+static int espix_abi_sigsuspend(const sigset_t *mask)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+
+    if (slot == NULL || mask == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    const uint32_t saved = slot->sig_blocked;
+    slot->sig_blocked = (uint32_t)*mask & ~ESPIX_SIG_UNCATCHABLE;
+    while (espix_sigcheck_mask() == 0) {
+        sig_wait(portMAX_DELAY);
+    }
+    slot->sig_blocked = saved;
+    errno = EINTR;
+    return -1;
 }
 
 static int espix_abi_pause(void)
@@ -652,7 +679,9 @@ static const abi_sym_t s_signal_syms[] = {
     /* Masks. sigemptyset and friends are macros in <signal.h>, so an app gets
      * them at compile time and there is nothing to publish. */
     ABI_SYM("sigprocmask", espix_abi_sigprocmask),
+    ABI_SYM("pthread_sigmask", espix_abi_pthread_sigmask),
     ABI_SYM("sigpending",  espix_abi_sigpending),
+    ABI_SYM("sigsuspend",  espix_abi_sigsuspend),
 
     /*
      * The delivery points. These shadow the loader's own libc entries, which is

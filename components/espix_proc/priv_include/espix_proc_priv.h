@@ -177,6 +177,13 @@ typedef struct {
 #endif
 } espix_proc_app_t;
 
+/* An M-mode app's action for one signal: sigaction()'s handler, mask and SA_* flags. */
+typedef struct {
+    void   (*handler)(int);
+    uint32_t mask;
+    int      flags;
+} espix_sigact_t;
+
 typedef struct {
     espix_proc_info_t info;
 
@@ -243,7 +250,7 @@ typedef struct {
      * still at its default, which is the common case and costs one pointer.
      * SIG_DFL is 0 and SIG_IGN is 1, so a zeroed table already reads correctly.
      */
-    void (**sig_handlers)(int);
+    espix_sigact_t *sig_actions;
 
     /*
      * SIGSTOP asked for, and the semaphore the process parks on once it takes

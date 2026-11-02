@@ -34,7 +34,7 @@ merely missing.
 | `ps`, `top` | **yes** | live CPU and memory, per core |
 | Stop a running command — Ctrl-C, `kill` | **yes** | a command is a process like an app; Ctrl-C is SIGINT to the foreground job's group; `kill` asks, then insists |
 | Process tree — `$$`, `getppid`, `getpgrp`, `getsid`, `kill -<pgid>`, `killpg` | **yes** | a shell is a process and its apps' parent; each job is its own group |
-| Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names; an M-mode app takes them when it calls in, a U-mode app (S31) at any instruction, with `sigaction`, per-thread masks and `SA_RESTART` |
+| Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names, with `sigaction`'s mask and flags, `sigsuspend` and `pthread_sigmask`; an M-mode app takes them when it calls in, under one mask per process, and a U-mode app (S31) at any instruction, with per-thread masks and `SA_RESTART` |
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
 | `sed` | **planned** | |

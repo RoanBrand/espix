@@ -426,6 +426,8 @@ else
     espix_fail "and it is a stopped job" "$(dev_run jobs)"
 fi
 
+assert_contains "sigaction's siginfo, mask and reset; sigsuspend; pthread_sigmask" \
+    "siginfo 1, deferred 1, reset 1, sigsuspend 1, pthread_sigmask 1" "$(dev_run "$APP sig action")"
 killself_out=$(dev_run "$APP sig killself; echo rc=\$?")
 assert_contains "an app's SIGKILL to its own group ends it with 137" "rc=137" "$killself_out"
 assert_not_contains "and nothing after it runs" "still here" "$killself_out"

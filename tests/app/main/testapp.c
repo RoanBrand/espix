@@ -895,6 +895,85 @@ static int sig_group(void)
     return (rc == 0 && s_group_seen && probe == 0) ? 0 : 1;
 }
 
+/*
+ * What sigaction() promises: SA_SIGINFO's siginfo_t, sa_mask holding a signal
+ * raised inside the handler until it returns, SA_RESETHAND; and sigsuspend()
+ * and pthread_sigmask(). usleep() is the delivery point an M-mode app needs.
+ */
+static volatile sig_atomic_t s_act_signo, s_act_order, s_act_inside;
+static volatile int s_act_count;
+
+static void on_act_info(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig;
+    (void)uc;
+    s_act_signo = si->si_signo;
+    raise(SIGUSR2);
+    s_act_inside = s_act_order;
+}
+
+static void on_act_usr2(int sig)
+{
+    (void)sig;
+    s_act_order = 1;
+}
+
+static void on_act_count(int sig)
+{
+    (void)sig;
+    s_act_count++;
+}
+
+static int sig_action(void)
+{
+    struct sigaction sa = { .sa_sigaction = on_act_info, .sa_flags = SA_SIGINFO };
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR2);
+    sigaction(SIGUSR1, &sa, NULL);
+    signal(SIGUSR2, on_act_usr2);
+    raise(SIGUSR1);
+    usleep(1000);
+    const bool info     = s_act_signo == SIGUSR1;
+    const bool deferred = s_act_inside == 0 && s_act_order == 1;
+
+    struct sigaction rh = { .sa_handler = on_act_count, .sa_flags = SA_RESETHAND }, now;
+    sigemptyset(&rh.sa_mask);
+    sigaction(SIGHUP, &rh, NULL);
+    raise(SIGHUP);
+    sigaction(SIGHUP, NULL, &now);
+    const bool reset = s_act_count == 1 && now.sa_handler == SIG_DFL;
+
+    sigset_t alrm, during, after;
+    sigemptyset(&alrm);
+    sigaddset(&alrm, SIGALRM);
+    signal(SIGALRM, on_act_count);
+    sigprocmask(SIG_BLOCK, &alrm, NULL);
+    alarm(1);
+    sigprocmask(SIG_BLOCK, NULL, &during);
+    sigdelset(&during, SIGALRM);
+    const int rc = sigsuspend(&during), e = errno;
+    sigprocmask(SIG_BLOCK, NULL, &after);
+    const bool suspend = rc == -1 && e == EINTR && s_act_count == 2 && sigismember(&after, SIGALRM);
+    sigprocmask(SIG_UNBLOCK, &alrm, NULL);
+
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    signal(SIGUSR1, on_act_count);
+    pthread_sigmask(SIG_BLOCK, &usr1, NULL);
+    raise(SIGUSR1);
+    usleep(1000);
+    const int held = s_act_count;
+    pthread_sigmask(SIG_UNBLOCK, &usr1, NULL);
+    usleep(1000);
+    const bool pmask = held == 2 && s_act_count == 3;
+
+    printf("sig: action: siginfo %d, deferred %d, reset %d, sigsuspend %d, pthread_sigmask %d\n",
+           info, deferred, reset, suspend, pmask);
+    fflush(stdout);
+    return (info && deferred && reset && suspend && pmask) ? 0 : 1;
+}
+
 /* SIGKILL to its own group, itself included, ends it with 137 and returns nowhere. */
 static int sig_killself(void)
 {
@@ -944,6 +1023,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "killself") == 0) {
         return sig_killself();
+    }
+    if (strcmp(mode, "action") == 0) {
+        return sig_action();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;
