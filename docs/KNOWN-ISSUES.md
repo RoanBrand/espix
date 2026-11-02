@@ -430,31 +430,13 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
     place to put it, at the cost of a lock across all filesystem I/O.
   - Wait for the component, and pin the version when it is fixed.
 
-- **A session occasionally dies under parallel load, and nothing explains it
-  yet.** Seen in one full `-j 4` run out of two: `35-signals` lost its SSH
-  session partway through and the harness reported seven failures that were one
-  event — `session gone before: ps`, then everything downstream comparing
-  against the dead-session sentinel. The device was fine throughout: no reboot,
-  no core dump, and the very next run was 149 assertions green.
-
-  **It recurred on 2026-09-14.** A `-j 4` run reproduced the signature
-  exactly: `35-signals`, seven failures, `session gone before: ps` first, and
-  the suite green on its own re-run seconds later (15 ok). Device healthy
-  throughout — no reboot, no core dump, 178 of 185 assertions passing around
-  it.
-
-  It is not new and it is not the panics. The same shape turned up early in the
-  parallel work, before any of the fixes: one login failure in nine rounds of
-  "open a session, then open four connections at once", which the login-timeout
-  change did **not** explain — a login measures 4.0s alone and 8.7–11.7s with
-  five at once, nowhere near the 25s budget it was blamed on.
-
-  What is known: the connection goes away rather than hanging, the device does
-  not notice anything, and it is rare enough that a rate needs tens of runs to
-  measure. What would settle it is the serial console open with `dmesg -n debug`
-  while a parallel run goes, so the device's own account of the disconnect is
-  captured — which is how the `Corrupted MAC` bug was eventually caught, and for
-  the same reason: never debug a transport through itself.
+- **A login under parallel load occasionally fails, and nothing explains it
+  yet.** One login in nine rounds of "open a session, then open four
+  connections at once" failed. A login measures 4.0 s alone and 8.7-11.7 s with
+  five at once, nowhere near the 25 s budget it was blamed on. What would
+  settle it is the serial console open with `dmesg -n debug` while a parallel
+  run goes, so the device's own account of the disconnect is captured: never
+  debug a transport through itself.
 
 - **A fault in the kernel or an M-mode app reboots the board.** It is recorded
   and reported in `dmesg` on the next boot. A U-mode app's fault on the S31 ends
@@ -778,14 +760,6 @@ stdio, time, sleep, identity and threads. What it cannot do yet:
   rolled back -- produced by an experiment meant to test something else.
 
 ## SSH
-
-- **Under four test workers a shell can stop taking a typed line.** About one
-  full run in two (`make test`, seed 77726 reproduces it), a session in
-  35-signals stops echoing part way through the line after `kill` ended one of
-  its background apps; the rest of the line never arrives and the shell waits
-  at its prompt until the client gives up. Present on commit B's image too, so
-  it predates the blocking foreground wait; alone the suite passes. The harness
-  now prints `ps` and `dmesg` when a session hangs. Open.
 
 - **SFTP transfers cannot reach past 4 GiB, and say so.** The read and write
   handlers seek with `fseek()`, which takes a `long`; `off_t` is 64 bits now, so

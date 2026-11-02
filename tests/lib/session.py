@@ -37,6 +37,12 @@ import time
 PROMPT = re.compile(rb"[a-zA-Z0-9_.-]+:[^\r\n]*[#$] $")
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]")
 
+# A prompt where a line starts: a background job's output can follow it.
+PROMPT_LINE = re.compile(rb"(?m)^[a-zA-Z0-9_.-]+:[^\r\n]*?[#$] ")
+
+# How long output must stop before a prompt with a background job's output after it counts.
+QUIET = 2.0
+
 # `<<<INTR n>>> command`: run it, and n seconds in press Ctrl-C.
 INTR = re.compile(r"^<<<INTR ([0-9.]+)>>> (.*)$")
 
@@ -127,13 +133,14 @@ class Session:
                     f"got: {self.buf[-400:]!r}")
         return True
 
-    def _wait_prompt(self, timeout=None):
+    def _wait_prompt(self, timeout=None, since=None):
         # The budget goes in the message. A timeout is the one failure whose
         # *size* is the diagnosis -- 26 seconds is a slow command under load,
         # and ten minutes is a device that has stopped -- and the old message
         # said only "no prompt", leaving the reader to guess which.
         limit = self.timeout if timeout is None else timeout
         deadline = time.time() + limit
+        heard = time.time()
         while True:
             tail = strip_ansi(self.buf).rstrip(b"\x00")
             # Trailing CR/LF before the prompt is normal; only the very end
@@ -141,9 +148,20 @@ class Session:
             if PROMPT.search(tail.split(b"\n")[-1] + b" ") or \
                PROMPT.search(tail[-120:]):
                 return
+            # A background job wrote after the prompt, as it may on any terminal, so the
+            # buffer never ends in one: past the echo and gone quiet, a prompt at a line's
+            # start ends the command, and the job's lines after it are dropped.
+            if since is not None and time.time() - heard >= QUIET:
+                m = PROMPT_LINE.search(tail, since)
+                if m:
+                    self.buf = tail[:m.end()]
+                    return
+            before = len(self.buf)
             if not self._read_some(deadline):
                 raise TimeoutError(
                     f"no prompt within {limit}s; got: {self.buf[-400:]!r}")
+            if len(self.buf) != before:
+                heard = time.time()
 
     def _wait_echo(self, command):
         """Wait for the line as submitted -- the editor's last redraw, then the
@@ -154,12 +172,13 @@ class Session:
         _wait_prompt(): the command was taken as finished before it ran, and its
         output arrived inside the next command's frame. An echo that never
         comes -- a line too long for the editor -- costs five seconds, not the
-        run."""
+        run. Returns where the echo ends, in the buffer with its escapes gone."""
         echoed = re.compile(re.escape(command.encode()) + rb"\r*\n")
         deadline = time.time() + min(self.timeout, 5)
         while not echoed.search(strip_ansi(self.buf)):
             if not self._read_some(deadline):
-                return
+                return len(strip_ansi(self.buf))
+        return echoed.search(strip_ansi(self.buf)).end()
 
     def run(self, command):
         """Send one command, return its output with the echo and prompt gone.
@@ -174,13 +193,13 @@ class Session:
 
         self.buf = b""
         os.write(self.fd, command.encode() + b"\r")
-        self._wait_echo(command)
+        since = self._wait_echo(command)
         if intr is not None:
             deadline = time.time() + float(intr.group(1))
             while time.time() < deadline and self._read_some(deadline):
                 pass
             os.write(self.fd, b"\x03")
-        self._wait_prompt()
+        self._wait_prompt(since=since)
 
         text = strip_ansi(self.buf).decode("utf-8", "replace")
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
