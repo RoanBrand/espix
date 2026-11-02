@@ -24,9 +24,20 @@
 
 typedef struct espix_um_as espix_um_as_t;
 
-#define ESPIX_UM_FDS 32
+#define ESPIX_UM_FDS ESPIX_OPEN_MAX
 
-enum { ESPIX_UM_FD_FREE, ESPIX_UM_FD_STD, ESPIX_UM_FD_FILE, ESPIX_UM_FD_DIR };
+enum { ESPIX_UM_FD_FREE, ESPIX_UM_FD_STD, ESPIX_UM_FD_FILE, ESPIX_UM_FD_DIR, ESPIX_UM_FD_SOCK };
+
+/* A socket, shared by the descriptors dup made of it. lwIP's is always non-blocking: the app's blocking is ours. */
+typedef struct {
+    int      kfd;
+    int      refs;          /* atomic */
+    int      type;          /* SOCK_STREAM, SOCK_DGRAM or SOCK_RAW */
+    bool     nonblock;
+    bool     connecting;    /* a blocking connect a signal cut short, finished by the next */
+    bool     connected;     /* once was, so lwIP's ENOTCONN means the peer has gone */
+    int64_t  rcv_us, snd_us;    /* SO_RCVTIMEO, SO_SNDTIMEO; 0 waits for ever */
+} espix_um_sock_t;
 
 /* One of a process's descriptors: a number only it can name, behind which is a kernel object. */
 typedef struct {
@@ -36,6 +47,7 @@ typedef struct {
         int  std;   /* which of the process's three streams */
         int  kfd;   /* the kernel's descriptor */
         DIR *dir;
+        espix_um_sock_t *sock;
     };
 } espix_um_fd_t;
 

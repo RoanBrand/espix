@@ -9,6 +9,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,25 +28,13 @@
 #include "espix_kernel.h"
 #include "espix_syscall.h"
 #include "espix_umode.h"
+#include "umode_sys.h"
 
 #define PG 4096u
-
-typedef struct {
-    espix_um_thread_t *t;
-    espix_um_proc_t   *p;
-    RvExcFrame        *f;
-    const uint32_t    *a;     /* a0-a5, in the frame */
-} um_call_t;
 
 _Static_assert(offsetof(RvExcFrame, a5) - offsetof(RvExcFrame, a0) == 5 * sizeof(uint32_t), "a0-a5 in order");
 
 typedef int32_t (*um_sys_fn)(um_call_t *c);
-
-/* The errno a kernel call left, as a syscall result. */
-static int32_t kret(int r)
-{
-    return (r < 0) ? -errno : r;
-}
 
 /* ------------------------------------------------------------------ */
 /* Descriptors                                                         */
@@ -57,13 +47,13 @@ void espix_um_fds_init(espix_um_proc_t *p)
     }
 }
 
-static espix_um_fd_t *fd_get(espix_um_proc_t *p, uint32_t fd)
+espix_um_fd_t *um_fd_get(espix_um_proc_t *p, uint32_t fd)
 {
     return (fd < ESPIX_UM_FDS && p->fds[fd].kind != ESPIX_UM_FD_FREE) ? &p->fds[fd] : NULL;
 }
 
-/* e into the lowest free number from `from`; the number, or -EMFILE. The process's threads share the table. */
-static int fd_install(espix_um_proc_t *p, const espix_um_fd_t *e, uint32_t from)
+/* The process's threads share the table. */
+int um_fd_install(espix_um_proc_t *p, const espix_um_fd_t *e, uint32_t from)
 {
     int n = -EMFILE;
     xSemaphoreTake(p->lock, portMAX_DELAY);
@@ -88,13 +78,15 @@ static espix_um_fd_t fd_take(espix_um_proc_t *p, uint32_t n)
     return e;
 }
 
-static int fd_release(espix_um_fd_t *e)
+int um_fd_release(espix_um_fd_t *e)
 {
     int r = 0;
     if (e->kind == ESPIX_UM_FD_FILE) {
-        r = kret(close(e->kfd));
+        r = um_kret(close(e->kfd));
     } else if (e->kind == ESPIX_UM_FD_DIR) {
-        r = kret(closedir(e->dir));
+        r = um_kret(closedir(e->dir));
+    } else if (e->kind == ESPIX_UM_FD_SOCK) {
+        r = um_sock_close(e->sock);
     }
     *e = (espix_um_fd_t){ 0 };
     return r;
@@ -107,16 +99,18 @@ void espix_um_close_fds(espix_proc_slot_t *slot)
         return;
     }
     for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
-        fd_release(&t->proc->fds[fd]);
+        um_fd_release(&t->proc->fds[fd]);
     }
 }
 
-/* A copy of e: a second kernel descriptor for a file, so each closes its own. */
+/* A copy of e: a second kernel descriptor for a file, so each closes its own; a socket is shared. */
 static int32_t fd_dup(const espix_um_fd_t *e, espix_um_fd_t *d)
 {
     *d = *e;
     d->cloexec = false;
-    if (e->kind == ESPIX_UM_FD_FILE) {
+    if (e->kind == ESPIX_UM_FD_SOCK) {
+        __atomic_add_fetch(&e->sock->refs, 1, __ATOMIC_RELAXED);
+    } else if (e->kind == ESPIX_UM_FD_FILE) {
         d->kfd = espix_abi_dup(e->kfd);
         if (d->kfd < 0) {
             return -errno;
@@ -136,9 +130,9 @@ static int32_t fd_dup_from(espix_um_proc_t *p, const espix_um_fd_t *e, uint32_t 
         return r;
     }
     d.cloexec = cloexec;
-    const int n = fd_install(p, &d, from);
+    const int n = um_fd_install(p, &d, from);
     if (n < 0) {
-        fd_release(&d);
+        um_fd_release(&d);
     }
     return n;
 }
@@ -189,15 +183,18 @@ static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
     return (int32_t)done;
 }
 
-static int32_t sys_read(um_call_t *c)
+static int32_t um_sys_read(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     const uint32_t uva = c->a[1], len = c->a[2];
     if (e == NULL) {
         return -EBADF;
     }
     if (e->kind == ESPIX_UM_FD_STD) {
         return (e->std == 0) ? read_std(c, espix_proc_stdio(0), uva, len) : -EBADF;
+    }
+    if (e->kind == ESPIX_UM_FD_SOCK) {
+        return um_sock_read(c, c->a[0], uva, len);
     }
     if (e->kind != ESPIX_UM_FD_FILE) {
         return -EISDIR;
@@ -223,15 +220,18 @@ static int32_t sys_read(um_call_t *c)
     return (int32_t)done;
 }
 
-static int32_t sys_write(um_call_t *c)
+static int32_t um_sys_write(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     const uint32_t uva = c->a[1], len = c->a[2];
     if (e == NULL || (e->kind == ESPIX_UM_FD_STD && e->std == 0)) {
         return -EBADF;
     }
     if (e->kind == ESPIX_UM_FD_DIR) {
         return -EISDIR;
+    }
+    if (e->kind == ESPIX_UM_FD_SOCK) {
+        return um_sock_write(c, c->a[0], uva, len);
     }
     FILE *const out = (e->kind == ESPIX_UM_FD_STD) ? espix_proc_stdio(e->std) : NULL;
     uint32_t done = 0;
@@ -264,7 +264,7 @@ static int32_t sys_write(um_call_t *c)
     return (int32_t)done;
 }
 
-static int32_t sys_open(um_call_t *c)
+static int32_t um_sys_open(um_call_t *c)
 {
     char path[ESPIX_PATH_MAX];
     int32_t r = path_in(c, c->a[0], path);
@@ -286,25 +286,25 @@ static int32_t sys_open(um_call_t *c)
             return -errno;
         }
     }
-    const int fd = fd_install(c->p, &e, 0);
+    const int fd = um_fd_install(c->p, &e, 0);
     if (fd < 0) {
-        fd_release(&e);
+        um_fd_release(&e);
     }
     return fd;
 }
 
-static int32_t sys_close(um_call_t *c)
+static int32_t um_sys_close(um_call_t *c)
 {
-    if (fd_get(c->p, c->a[0]) == NULL) {
+    if (um_fd_get(c->p, c->a[0]) == NULL) {
         return -EBADF;
     }
     espix_um_fd_t e = fd_take(c->p, c->a[0]);
-    return fd_release(&e);
+    return um_fd_release(&e);
 }
 
-static int32_t sys_lseek(um_call_t *c)
+static int32_t um_sys_lseek(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     const int64_t off = (int64_t)(((uint64_t)c->a[2] << 32) | c->a[1]);
     const int whence = (int)c->a[3];
     if (e == NULL) {
@@ -337,9 +337,9 @@ static int32_t stat_out(um_call_t *c, uint32_t uva, const struct stat *st)
     return espix_um_copyout(c->p->as, uva, &e, sizeof(e));
 }
 
-static int32_t sys_fstat(um_call_t *c)
+static int32_t um_sys_fstat(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     struct stat st = { 0 };
     if (e == NULL) {
         return -EBADF;
@@ -349,13 +349,14 @@ static int32_t sys_fstat(um_call_t *c)
             return -errno;
         }
     } else {
-        st.st_mode = (e->kind == ESPIX_UM_FD_DIR) ? (S_IFDIR | 0755) : (S_IFCHR | 0620);
+        st.st_mode = (e->kind == ESPIX_UM_FD_DIR)  ? (S_IFDIR | 0755)
+                   : (e->kind == ESPIX_UM_FD_SOCK) ? (S_IFSOCK | 0777) : (S_IFCHR | 0620);
         st.st_nlink = 1;
     }
     return stat_out(c, c->a[1], &st);
 }
 
-static int32_t sys_stat(um_call_t *c)
+static int32_t um_sys_stat(um_call_t *c)
 {
     char path[ESPIX_PATH_MAX];
     struct stat st;
@@ -368,11 +369,11 @@ static int32_t sys_stat(um_call_t *c)
 
 /* A call that takes one path and an int. */
 #define PATH_CALL(name, expr)                       \
-    static int32_t sys_##name(um_call_t *c)         \
+    static int32_t um_sys_##name(um_call_t *c)         \
     {                                               \
         char path[ESPIX_PATH_MAX];                  \
         const int32_t r = path_in(c, c->a[0], path); \
-        return (r < 0) ? r : kret(expr);            \
+        return (r < 0) ? r : um_kret(expr);            \
     }
 
 PATH_CALL(unlink, unlink(path))
@@ -382,35 +383,38 @@ PATH_CALL(chdir,  espix_abi_chdir(path))
 PATH_CALL(chmod,  espix_abi_chmod(path, (mode_t)c->a[1]))
 PATH_CALL(truncate, truncate(path, (off_t)(((uint64_t)c->a[2] << 32) | c->a[1])))
 
-static int32_t sys_rename(um_call_t *c)
+static int32_t um_sys_rename(um_call_t *c)
 {
     char from[ESPIX_PATH_MAX], to[ESPIX_PATH_MAX];
     int32_t r = path_in(c, c->a[0], from);
     if (r == 0) {
         r = path_in(c, c->a[1], to);
     }
-    return (r < 0) ? r : kret(rename(from, to));
+    return (r < 0) ? r : um_kret(rename(from, to));
 }
 
-static int32_t sys_ftruncate(um_call_t *c)
+static int32_t um_sys_ftruncate(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     if (e == NULL || e->kind != ESPIX_UM_FD_FILE) {
         return e ? -EINVAL : -EBADF;
     }
-    return kret(ftruncate(e->kfd, (off_t)(((uint64_t)c->a[2] << 32) | c->a[1])));
+    return um_kret(ftruncate(e->kfd, (off_t)(((uint64_t)c->a[2] << 32) | c->a[1])));
 }
 
-static int32_t sys_fsync(um_call_t *c)
+static int32_t um_sys_fsync(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     if (e == NULL) {
         return -EBADF;
     }
-    return (e->kind == ESPIX_UM_FD_FILE) ? kret(fsync(e->kfd)) : 0;
+    if (e->kind == ESPIX_UM_FD_SOCK) {
+        return -EINVAL;
+    }
+    return (e->kind == ESPIX_UM_FD_FILE) ? um_kret(fsync(e->kfd)) : 0;
 }
 
-static int32_t sys_utime(um_call_t *c)
+static int32_t um_sys_utime(um_call_t *c)
 {
     char path[ESPIX_PATH_MAX];
     int32_t r = path_in(c, c->a[0], path);
@@ -418,15 +422,15 @@ static int32_t sys_utime(um_call_t *c)
         return r;
     }
     if (c->a[1] == 0) {
-        return kret(utime(path, NULL));
+        return um_kret(utime(path, NULL));
     }
     struct espix_utimbuf u;
     r = espix_um_copyin(c->p->as, &u, c->a[1], sizeof(u));
     const struct utimbuf k = { .actime = (time_t)u.actime, .modtime = (time_t)u.modtime };
-    return (r < 0) ? r : kret(utime(path, &k));
+    return (r < 0) ? r : um_kret(utime(path, &k));
 }
 
-static int32_t sys_getcwd(um_call_t *c)
+static int32_t um_sys_getcwd(um_call_t *c)
 {
     char buf[ESPIX_PATH_MAX];
     if (espix_abi_getcwd(buf, sizeof(buf)) == NULL) {
@@ -440,18 +444,18 @@ static int32_t sys_getcwd(um_call_t *c)
     return (r < 0) ? r : (int32_t)n;
 }
 
-static int32_t sys_dup(um_call_t *c)
+static int32_t um_sys_dup(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     if (e == NULL) {
         return -EBADF;
     }
     return fd_dup_from(c->p, e, 0, false);
 }
 
-static int32_t sys_dup2(um_call_t *c)
+static int32_t um_sys_dup2(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     const uint32_t n = c->a[1];
     if (e == NULL || n >= ESPIX_UM_FDS) {
         return -EBADF;
@@ -468,13 +472,13 @@ static int32_t sys_dup2(um_call_t *c)
     espix_um_fd_t old = c->p->fds[n];
     c->p->fds[n] = d;
     xSemaphoreGive(c->p->lock);
-    fd_release(&old);
+    um_fd_release(&old);
     return (int32_t)n;
 }
 
-static int32_t sys_fcntl(um_call_t *c)
+static int32_t um_sys_fcntl(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     const int cmd = (int)c->a[1];
     const uint32_t arg = c->a[2];
     if (e == NULL) {
@@ -491,20 +495,25 @@ static int32_t sys_fcntl(um_call_t *c)
         e->cloexec = (arg & FD_CLOEXEC) != 0;
         return 0;
     case F_GETFL:
+    case F_SETFL:
+        if (e->kind == ESPIX_UM_FD_SOCK) {
+            return um_sock_fcntl(c, c->a[0], cmd, arg);
+        }
+        if (cmd == F_SETFL) {
+            return (e->kind == ESPIX_UM_FD_FILE) ? um_kret(fcntl(e->kfd, F_SETFL, (int)arg)) : 0;
+        }
         if (e->kind == ESPIX_UM_FD_FILE) {
-            return kret(fcntl(e->kfd, F_GETFL));
+            return um_kret(fcntl(e->kfd, F_GETFL));
         }
         return (e->kind == ESPIX_UM_FD_STD && e->std != 0) ? O_WRONLY : O_RDONLY;
-    case F_SETFL:
-        return (e->kind == ESPIX_UM_FD_FILE) ? kret(fcntl(e->kfd, F_SETFL, (int)arg)) : 0;
     default:
         return -EINVAL;
     }
 }
 
-static int32_t sys_getdents(um_call_t *c)
+static int32_t um_sys_getdents(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     const uint32_t uva = c->a[1], len = c->a[2];
     if (e == NULL) {
         return -EBADF;
@@ -547,9 +556,9 @@ static int32_t sys_getdents(um_call_t *c)
     return (int32_t)done;
 }
 
-static int32_t sys_isatty(um_call_t *c)
+static int32_t um_sys_isatty(um_call_t *c)
 {
-    espix_um_fd_t *e = fd_get(c->p, c->a[0]);
+    espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
     if (e == NULL) {
         return -EBADF;
     }
@@ -560,7 +569,7 @@ static int32_t sys_isatty(um_call_t *c)
 /* Time                                                                */
 /* ------------------------------------------------------------------ */
 
-static int32_t sys_clock_gettime(um_call_t *c)
+static int32_t um_sys_clock_gettime(um_call_t *c)
 {
     struct timespec ts;
     if (clock_gettime((clockid_t)c->a[0], &ts) != 0) {
@@ -570,7 +579,7 @@ static int32_t sys_clock_gettime(um_call_t *c)
     return espix_um_copyout(c->p->as, c->a[1], &e, sizeof(e));
 }
 
-static int32_t sys_nanosleep(um_call_t *c)
+static int32_t um_sys_nanosleep(um_call_t *c)
 {
     struct espix_timespec u;
     int32_t r = espix_um_copyin(c->p->as, &u, c->a[0], sizeof(u));
@@ -579,7 +588,7 @@ static int32_t sys_nanosleep(um_call_t *c)
     }
     const struct timespec req = { .tv_sec = (time_t)u.sec, .tv_nsec = u.nsec };
     struct timespec rem = { 0 };
-    r = kret(espix_abi_nanosleep(&req, &rem));
+    r = um_kret(espix_abi_nanosleep(&req, &rem));
     if (r == -EINTR && c->a[1] != 0) {
         const struct espix_timespec left = { .sec = rem.tv_sec, .nsec = (int32_t)rem.tv_nsec };
         espix_um_copyout(c->p->as, c->a[1], &left, sizeof(left));
@@ -591,7 +600,7 @@ static int32_t sys_nanosleep(um_call_t *c)
 /* Processes                                                           */
 /* ------------------------------------------------------------------ */
 
-static int32_t sys_exit(um_call_t *c)
+static int32_t um_sys_exit(um_call_t *c)
 {
     espix_um_exit_group(c->t, (int)c->a[0]);
 }
@@ -600,35 +609,35 @@ static int32_t sys_exit(um_call_t *c)
 /* Threads                                                             */
 /* ------------------------------------------------------------------ */
 
-static int32_t sys_thread_create(um_call_t *c)
+static int32_t um_sys_thread_create(um_call_t *c)
 {
     return espix_um_thread_create(c->t, c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
 }
 
-static int32_t sys_thread_exit(um_call_t *c)
+static int32_t um_sys_thread_exit(um_call_t *c)
 {
     espix_um_thread_exit(c->t);
 }
 
-static int32_t sys_gettid(um_call_t *c)
+static int32_t um_sys_gettid(um_call_t *c)
 {
     return (int32_t)c->t->tid;
 }
 
-static int32_t sys_sched_yield(um_call_t *c)
+static int32_t um_sys_sched_yield(um_call_t *c)
 {
     (void)c;
     taskYIELD();
     return 0;
 }
 
-static int32_t sys_getcpu(um_call_t *c)
+static int32_t um_sys_getcpu(um_call_t *c)
 {
     (void)c;
     return (int32_t)esp_cpu_get_core_id();
 }
 
-static int32_t sys_futex(um_call_t *c)
+static int32_t um_sys_futex(um_call_t *c)
 {
     switch (c->a[1]) {
     case ESPIX_FUTEX_WAIT: {
@@ -653,28 +662,110 @@ static int32_t sys_futex(um_call_t *c)
     }
 }
 
-static int32_t sys_getpid(um_call_t *c)  { (void)c; return espix_abi_getpid(); }
-static int32_t sys_getppid(um_call_t *c) { (void)c; return espix_abi_getppid(); }
-static int32_t sys_getuid(um_call_t *c)  { (void)c; return (int32_t)getuid(); }
-static int32_t sys_geteuid(um_call_t *c) { (void)c; return (int32_t)geteuid(); }
-static int32_t sys_getgid(um_call_t *c)  { (void)c; return (int32_t)getgid(); }
-static int32_t sys_getegid(um_call_t *c) { (void)c; return (int32_t)getegid(); }
-static int32_t sys_getpgrp(um_call_t *c) { (void)c; return espix_abi_getpgrp(); }
-static int32_t sys_getsid(um_call_t *c)  { return kret(espix_abi_getsid((pid_t)c->a[0])); }
-static int32_t sys_kill(um_call_t *c)    { return kret(espix_abi_kill((pid_t)c->a[0], (int)c->a[1])); }
+static int32_t um_sys_getpid(um_call_t *c)  { (void)c; return espix_abi_getpid(); }
+static int32_t um_sys_getppid(um_call_t *c) { (void)c; return espix_abi_getppid(); }
+static int32_t um_sys_getuid(um_call_t *c)  { (void)c; return (int32_t)getuid(); }
+static int32_t um_sys_geteuid(um_call_t *c) { (void)c; return (int32_t)geteuid(); }
+static int32_t um_sys_getgid(um_call_t *c)  { (void)c; return (int32_t)getgid(); }
+static int32_t um_sys_getegid(um_call_t *c) { (void)c; return (int32_t)getegid(); }
+static int32_t um_sys_getpgrp(um_call_t *c) { (void)c; return espix_abi_getpgrp(); }
+static int32_t um_sys_getsid(um_call_t *c)  { return um_kret(espix_abi_getsid((pid_t)c->a[0])); }
+/* A string from the app, cut to size rather than refused: a log line may be long. */
+static int32_t str_in_cut(um_call_t *c, uint32_t uva, char *buf, size_t size)
+{
+    const int r = espix_um_strin(c->p->as, buf, uva, size);
+    if (r == -ENAMETOOLONG) {
+        buf[size - 1] = '\0';
+        return 0;
+    }
+    return (r < 0) ? r : 0;
+}
+
+static int32_t um_sys_syslog(um_call_t *c)
+{
+    char tag[48], msg[ESPIX_KLOG_LINE_MAX + 1];
+    int32_t r = (c->a[1] != 0) ? str_in_cut(c, c->a[1], tag, sizeof(tag)) : 0;
+    if (r == 0) {
+        r = str_in_cut(c, c->a[2], msg, sizeof(msg));
+    }
+    if (r != 0) {
+        return r;
+    }
+    espix_syslog_put((int)c->a[0], c->a[1] ? tag : c->t->slot->info.name, msg);
+    return 0;
+}
+
+/* name, then home and shell, after the ids; -ERANGE when len cannot take them. */
+static int32_t pwent_out(um_call_t *c, uint32_t id, uint32_t gid, const char *const *strs, int n)
+{
+    char rec[sizeof(struct espix_pwent) + 3 * ESPIX_PATH_MAX];
+    struct espix_pwent *e = (struct espix_pwent *)rec;
+    e->id  = id;
+    e->gid = gid;
+    size_t len = sizeof(*e);
+    for (int i = 0; i < n; i++) {
+        const size_t l = strnlen(strs[i], ESPIX_PATH_MAX - 1) + 1;
+        memcpy(rec + len, strs[i], l - 1);
+        rec[len + l - 1] = '\0';
+        len += l;
+    }
+    return (len > c->a[3]) ? -ERANGE : espix_um_copyout(c->p->as, c->a[2], rec, len);
+}
+
+static int32_t um_sys_getpw(um_call_t *c)
+{
+    char name[64], buf[256];
+    struct passwd pw, *res = NULL;
+    int r;
+    if (c->a[0] != 0) {
+        if ((r = espix_um_strin(c->p->as, name, c->a[0], sizeof(name))) < 0) {
+            return r;
+        }
+        r = getpwnam_r(name, &pw, buf, sizeof(buf), &res);
+    } else {
+        r = getpwuid_r((uid_t)c->a[1], &pw, buf, sizeof(buf), &res);
+    }
+    if (r != 0 || res == NULL) {
+        return r ? -r : -ENOENT;
+    }
+    const char *const strs[] = { pw.pw_name, pw.pw_dir, pw.pw_shell ? pw.pw_shell : "" };
+    return pwent_out(c, pw.pw_uid, pw.pw_gid, strs, 3);
+}
+
+static int32_t um_sys_getgr(um_call_t *c)
+{
+    char name[64], buf[256];
+    struct group gr, *res = NULL;
+    int r;
+    if (c->a[0] != 0) {
+        if ((r = espix_um_strin(c->p->as, name, c->a[0], sizeof(name))) < 0) {
+            return r;
+        }
+        r = getgrnam_r(name, &gr, buf, sizeof(buf), &res);
+    } else {
+        r = getgrgid_r((gid_t)c->a[1], &gr, buf, sizeof(buf), &res);
+    }
+    if (r != 0 || res == NULL) {
+        return r ? -r : -ENOENT;
+    }
+    const char *const strs[] = { gr.gr_name };
+    return pwent_out(c, gr.gr_gid, gr.gr_gid, strs, 1);
+}
+
+static int32_t um_sys_kill(um_call_t *c)    { return um_kret(espix_abi_kill((pid_t)c->a[0], (int)c->a[1])); }
 
 /* ------------------------------------------------------------------ */
 /* Signals (umode_sig.c)                                               */
 /* ------------------------------------------------------------------ */
 
-static int32_t sys_sigaction(um_call_t *c)   { return espix_um_sigaction(c->t, (int)c->a[0], c->a[1], c->a[2]); }
-static int32_t sys_sigprocmask(um_call_t *c) { return espix_um_sigprocmask(c->t, (int)c->a[0], c->a[1], c->a[2]); }
-static int32_t sys_sigpending(um_call_t *c)  { return espix_um_sigpending(c->t, c->a[0]); }
-static int32_t sys_sigsuspend(um_call_t *c)  { return espix_um_sigsuspend(c->t, c->a[0]); }
-static int32_t sys_raise(um_call_t *c)       { return espix_um_raise(c->t, (int)c->a[0]); }
+static int32_t um_sys_sigaction(um_call_t *c)   { return espix_um_sigaction(c->t, (int)c->a[0], c->a[1], c->a[2]); }
+static int32_t um_sys_sigprocmask(um_call_t *c) { return espix_um_sigprocmask(c->t, (int)c->a[0], c->a[1], c->a[2]); }
+static int32_t um_sys_sigpending(um_call_t *c)  { return espix_um_sigpending(c->t, c->a[0]); }
+static int32_t um_sys_sigsuspend(um_call_t *c)  { return espix_um_sigsuspend(c->t, c->a[0]); }
+static int32_t um_sys_raise(um_call_t *c)       { return espix_um_raise(c->t, (int)c->a[0]); }
 
 /* espix_um_kentry() takes it before the table: it returns into the frame, not with a result. */
-static int32_t sys_sigreturn(um_call_t *c)
+static int32_t um_sys_sigreturn(um_call_t *c)
 {
     (void)c;
     return -ENOSYS;
@@ -694,7 +785,7 @@ static struct espix_timespec tv_out(const struct timeval *tv)
     return (struct espix_timespec){ .sec = tv->tv_sec, .nsec = (int32_t)tv->tv_usec * 1000 };
 }
 
-static int32_t sys_setitimer(um_call_t *c)
+static int32_t um_sys_setitimer(um_call_t *c)
 {
     struct itimerval nv, ov;
     if (c->a[1] != 0) {
@@ -710,7 +801,7 @@ static int32_t sys_setitimer(um_call_t *c)
             return r;
         }
     }
-    const int32_t r = kret(espix_abi_setitimer((int)c->a[0], c->a[1] ? &nv : NULL, &ov));
+    const int32_t r = um_kret(espix_abi_setitimer((int)c->a[0], c->a[1] ? &nv : NULL, &ov));
     if (r < 0 || c->a[2] == 0) {
         return r;
     }
@@ -718,7 +809,7 @@ static int32_t sys_setitimer(um_call_t *c)
     return espix_um_copyout(c->p->as, c->a[2], &o, sizeof(o));
 }
 
-static int32_t sys_term_size(um_call_t *c)
+static int32_t um_sys_term_size(um_call_t *c)
 {
     int cols, rows;
     if (espix_term_size(&cols, &rows) != 0) {
@@ -732,14 +823,14 @@ static int32_t sys_term_size(um_call_t *c)
 /* Memory                                                              */
 /* ------------------------------------------------------------------ */
 
-static int32_t sys_brk(um_call_t *c)
+static int32_t um_sys_brk(um_call_t *c)
 {
     return (int32_t)espix_um_brk(c->p->as, c->a[0]);
 }
 
 /* ------------------------------------------------------------------ */
 
-#define UM_SYS_ENTRY(name, lname, nr) [nr] = sys_##lname,
+#define UM_SYS_ENTRY(name, lname, nr) [nr] = um_sys_##lname,
 static const DRAM_ATTR um_sys_fn s_sys[] = { ESPIX_SYSCALLS(UM_SYS_ENTRY) };
 
 IRAM_ATTR int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f)

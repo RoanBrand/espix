@@ -80,6 +80,8 @@ merely missing.
 | USB-NCM | **yes** | device role only: `usb0`, plug into a computer and it is an Ethernet adapter, `ssh esp@192.168.7.1` with no WiFi at all — [USB-NETWORKING](USB-NETWORKING.md) |
 | USB host (storage) | **yes** | the OTG port's default role: a stick attaches on its own, `lsblk`/`blkid` report it, `mount sda1 /mnt` mounts its FAT volume, `lsusb` lists everything including hubs, `usbscan`/`usbprobe` claim by hand. Four device slots, for a hub; two FAT volumes at once, bounded by `CONFIG_FATFS_VOLUME_COUNT` — [USB-HOST](USB-HOST.md) |
 | SSH publickey auth, rekeying | **planned** | a long session is dropped today |
+| Apps on sockets — `socket` to `shutdown`, `poll`, `select`, `getaddrinfo` | **yes** | lwIP's BSD sockets. `select` and `poll` take any descriptor, and a handler ends them with EINTR; a signal that does nothing leaves them waiting, and a stop parks them. A U-mode app's (S31) blocking socket calls are cut short the same way, restarted under `SA_RESTART`, and a send to a gone peer raises SIGPIPE |
+| `getifaddrs`, `syslog` | **yes** | the interfaces by the names `ip` prints, with their IPv4 and IPv6 addresses; `syslog` lands in the kernel log `dmesg` reads |
 | Raw lwIP / `netconn` for the SSH transport | **planned** | BSD sockets today, deliberately: apps get the same API. Cut calls before changing API — one `send()` per packet instead of three was worth 1.7× |
 | Time of day, over NTP | **yes** | `date`, `timedatectl`; server from DHCP option 42, else `pool.ntp.org` |
 

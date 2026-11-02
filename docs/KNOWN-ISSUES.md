@@ -62,7 +62,7 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   because it is bookkeeping, and a spawn must never fail for it.
 
 - **A compute loop in an M-mode app never sees a signal.** A U-mode app's does
-  (S31). Delivery happens at the points where an M-mode app calls into espix — the sleep family, `pause`, `select` and a read of
+  (S31). Delivery happens at the points where an M-mode app calls into espix — the sleep family, `pause`, `select`, `poll` and a read of
   stdin. A wait on a lock or a join is deliberately not one, so a signal sent
   then is delivered after it. A loop that blocks on nothing has no delivery
   point and will not run a handler, which is
@@ -446,9 +446,11 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 A static executable built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([USER-MODE.md](USER-MODE.md)). It has files, directories,
-stdio, time, sleep, identity and threads. What it cannot do yet:
+stdio, time, sleep, identity, threads, signals and sockets. What it cannot do yet:
 
-- **No sockets or select** (M6): those calls fail with ENOSYS.
+- **`poll` and `select` report stdin readable** whether or not a line is
+  waiting, so a read after them can block: the SSH and VNC terminal transports have no
+  wake a select can wait on yet.
 - **One thread takes a process's signal**, as on Linux: a sleep in another
   thread is not cut short by it, where an M-mode app's every sleeping thread
   wakes. There is no `pthread_kill` to another thread, `sigwait`, `sigqueue` or

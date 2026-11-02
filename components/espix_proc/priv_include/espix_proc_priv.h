@@ -4,6 +4,7 @@
 
 #include <setjmp.h>     /* jmp_buf: how an app's exit() gets home */
 #include <stdio.h>      /* FILE: the process's own stdin, stdout and stderr */
+#include <sys/select.h> /* fd_set, for espix_abi_select() */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -279,13 +280,19 @@ typedef struct {
     /*
      * The wake eventfd (R-P6.6): a signal writes it so a process blocked in
      * select() returns. -1 when the process has none -- creation failed, or the
-     * caller is not a process. in_select is set by espix_proc_select_begin() so
-     * a signal only bothers to write the fd while someone is waiting on it;
-     * without that, a signal delivered to a running process would leave the
-     * counter armed and the next select() would return spuriously.
+     * caller is not a process. in_select counts its tasks inside
+     * espix_proc_select_begin() and _end(), so a signal only bothers to write
+     * the fd while someone is waiting on it; without that, a signal delivered
+     * to a running process would leave the counter armed and the next select()
+     * would wake for nothing.
      */
     int               wake_fd;
-    volatile bool     in_select;
+    int               in_select;      /* atomic */
+
+    /* openlog() and setlogmask() of an M-mode app: ident is the app's own string, as POSIX keeps it. */
+    const char       *log_ident;
+    int               log_opt;
+    int               log_mask;       /* 0: every priority */
     volatile bool     console_stdin;    /* in a console read: counted in its
                                            session's stdin_readers */
     bool              was_kthread;      /* a KTHREAD that became a login's
@@ -529,6 +536,11 @@ void espix_proc_abi_audio_register(void);
 void espix_proc_abi_ident_register(void);
 void espix_proc_abi_libc_register(void);
 void espix_proc_abi_libm_register(void);
+void espix_proc_abi_posix_register(void);
+/* One syslog() line into the kernel log under tag (abi_posix.c); a U-mode app's arrives by syscall. */
+void espix_syslog_put(int priority, const char *tag, const char *msg);
+/* The interface list espix_net registered, as getifaddrs() entries. */
+size_t espix_proc_ifaddrs(struct espix_ifaddr *out, size_t max);
 
 /* Publish the POSIX signal surface, and interpose the blocking calls that have
  * to become delivery points. See abi_signal.c: this one installs a symbol
@@ -644,6 +656,11 @@ int   espix_abi_nanosleep(const struct timespec *req, struct timespec *rem);
 struct itimerval;
 int   espix_abi_setitimer(int which, const struct itimerval *newv, struct itimerval *oldv);
 int   espix_term_size(int *cols, int *rows);
+/* select() and poll() that a signal can end (abi_drivers.c), over kernel descriptors. */
+struct timeval;
+struct pollfd;
+int   espix_abi_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *errorfds, struct timeval *timeout);
+int   espix_abi_poll(struct pollfd *fds, unsigned int nfds, int timeout);
 
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);

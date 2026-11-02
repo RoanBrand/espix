@@ -407,7 +407,7 @@ static int console_stdin_wait(espix_session_t *s, char *buf, int len)
     const int fd = s_console_fd;
 
     for (;;) {
-        const int wake  = espix_proc_select_begin();
+        const int wake  = espix_proc_select_begin(NULL);
         fd_set    rfds;
 
         FD_ZERO(&rfds);

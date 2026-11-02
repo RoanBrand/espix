@@ -16,18 +16,22 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "esp_elf.h"
 
+#include "espix_gai.h"
 #include "espix_kernel.h"
 #include "espix_net.h"
 #include "espix_net_priv.h"
 #include "espix_proc.h"
+#include "espix_syscall.h"
 
 #define TAG "abi"
 
@@ -134,12 +138,119 @@ int gethostname(char *name, size_t len)
     return 0;
 }
 
+/* lwIP has the codes and not the text. */
+static const char *espix_gai_strerror_abi(int err)
+{
+    return espix_gai_strerror(err);
+}
+
+/*
+ * The interface table as getifaddrs() entries, by the names `ip` prints: one per
+ * address, or one with no address for an interface that has none. Both builds
+ * reach it: an M-mode app through getifaddrs() below, a U-mode app by syscall.
+ */
+static size_t net_ifaddrs(struct espix_ifaddr *out, size_t max)
+{
+    espix_ifinfo_t *ifs = calloc(ESPIX_NET_IF_LIMIT, sizeof(*ifs));
+    if (ifs == NULL) {
+        return 0;
+    }
+    const size_t n = espix_net_iflist(ifs, ESPIX_NET_IF_LIMIT);
+    size_t k = 0;
+    for (size_t i = 0; i < n && k < max; i++) {
+        const espix_ifinfo_t *f = &ifs[i];
+        const uint32_t flags = (f->up ? IFF_UP | IFF_RUNNING : 0) |
+                               ((f->kind == ESPIX_IF_LO) ? IFF_LOOPBACK : IFF_BROADCAST | IFF_MULTICAST);
+        const size_t first = k;
+        if (f->has_addr && f->ip != 0) {
+            struct espix_ifaddr *e = &out[k++];
+            *e = (struct espix_ifaddr){ .flags = flags };
+            strlcpy(e->name, f->name, sizeof(e->name));
+            const struct sockaddr_in a = { .sin_len = sizeof(a), .sin_family = AF_INET, .sin_addr.s_addr = f->ip };
+            const struct sockaddr_in m = { .sin_len = sizeof(m), .sin_family = AF_INET, .sin_addr.s_addr = f->netmask };
+            memcpy(e->addr, &a, sizeof(a));
+            memcpy(e->netmask, &m, sizeof(m));
+        }
+        for (uint8_t j = 0; j < f->n_ip6 && k < max; j++) {
+            struct sockaddr_in6 a = { .sin6_len = sizeof(a), .sin6_family = AF_INET6, .sin6_scope_id = (uint32_t)f->index };
+            if (inet_pton(AF_INET6, f->ip6[j], &a.sin6_addr) != 1) {
+                continue;
+            }
+            struct sockaddr_in6 m = { .sin6_len = sizeof(m), .sin6_family = AF_INET6 };
+            for (int b = 0; b < f->ip6_prefix[j] && b < 128; b++) {
+                m.sin6_addr.s6_addr[b / 8] |= (uint8_t)(0x80 >> (b % 8));
+            }
+            struct espix_ifaddr *e = &out[k++];
+            *e = (struct espix_ifaddr){ .flags = flags };
+            strlcpy(e->name, f->name, sizeof(e->name));
+            memcpy(e->addr, &a, sizeof(a));
+            memcpy(e->netmask, &m, sizeof(m));
+        }
+        if (k == first && k < max) {
+            out[k] = (struct espix_ifaddr){ .flags = flags };
+            strlcpy(out[k++].name, f->name, sizeof(out[0].name));
+        }
+    }
+    free(ifs);
+    return k;
+}
+
+/* One allocation per entry: the node, its name and its two sockaddrs. */
+struct ifa_node {
+    struct ifaddrs          ifa;
+    char                    name[16];
+    struct sockaddr_storage addr, netmask;
+};
+
+static int espix_getifaddrs(struct ifaddrs **ifap)
+{
+    struct espix_ifaddr *e = calloc(32, sizeof(*e));
+    if (e == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    const size_t n = net_ifaddrs(e, 32);
+    struct ifaddrs *head = NULL, **tail = &head;
+    for (size_t i = 0; i < n; i++) {
+        struct ifa_node *x = calloc(1, sizeof(*x));
+        if (x == NULL) {
+            freeifaddrs(head);
+            free(e);
+            errno = ENOMEM;
+            return -1;
+        }
+        memcpy(x->name, e[i].name, sizeof(x->name));
+        memcpy(&x->addr, e[i].addr, sizeof(e[i].addr));
+        memcpy(&x->netmask, e[i].netmask, sizeof(e[i].netmask));
+        x->ifa = (struct ifaddrs){ .ifa_name = x->name, .ifa_flags = e[i].flags };
+        if (x->addr.ss_family != AF_UNSPEC) {
+            x->ifa.ifa_addr    = (struct sockaddr *)&x->addr;
+            x->ifa.ifa_netmask = (struct sockaddr *)&x->netmask;
+        }
+        *tail = &x->ifa;
+        tail = &x->ifa.ifa_next;
+    }
+    free(e);
+    *ifap = head;
+    return 0;
+}
+
+void freeifaddrs(struct ifaddrs *ifa)
+{
+    while (ifa != NULL) {
+        struct ifaddrs *next = ifa->ifa_next;
+        free(ifa);
+        ifa = next;
+    }
+}
+
 static esp_elf_symbol_table_t s_net_syms[] = {
 
     /* The machine's own name, which is not a lookup: /etc/hostname. */
     { "gethostname", (void *)gethostname },
 
     /* netdb.h — the actual gap. Without these, apps cannot use hostnames. */
+    { "gai_strerror", (void *)espix_gai_strerror_abi },
     ESP_ELFSYM_EXPORT(lwip_getaddrinfo),
     ESP_ELFSYM_EXPORT(lwip_freeaddrinfo),
     ESP_ELFSYM_EXPORT(lwip_gethostbyname),
@@ -179,11 +290,17 @@ static esp_elf_symbol_table_t s_net_syms[] = {
     ESP_ELFSYM_EXPORT(lwip_htonl),
     ESP_ELFSYM_EXPORT(ip4addr_ntoa),
 
+    /* ifaddrs.h, from the interface table. */
+    { "getifaddrs",  (void *)espix_getifaddrs },
+    { "freeifaddrs", (void *)freeifaddrs },
+
     ESP_ELFSYM_END
 };
 
 void espix_net_abi_register(void)
 {
+    espix_proc_set_ifaddrs(net_ifaddrs);
+
     if (esp_elf_register_symbol(s_net_syms) != 0) {
         espix_klog(ESPIX_KLOG_WARN, TAG,
                    "could not publish network symbols to apps");

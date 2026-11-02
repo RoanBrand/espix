@@ -142,9 +142,10 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
     return pw_fill_r(&u, pwd, buf, buflen, result);
 }
 
-/* The same for groups, which are a name and a number and nothing else. */
+/* The same for groups, which are a name and a number and nothing else: an empty member list, never NULL. */
 static struct group s_gr;
 static char         s_gr_name[ESPIX_USER_MAX];
+static char        *s_no_members[] = { NULL };
 
 struct group *getgrnam(const char *name)
 {
@@ -160,7 +161,7 @@ struct group *getgrnam(const char *name)
     s_gr.gr_name   = s_gr_name;
     s_gr.gr_passwd = (char *)"x";
     s_gr.gr_gid    = (gid_t)gid;
-    s_gr.gr_mem    = NULL;
+    s_gr.gr_mem    = s_no_members;
     return &s_gr;
 }
 
@@ -189,7 +190,7 @@ static int gr_fill_r(const char *name, espix_gid_t gid, struct group *grp,
         .gr_name   = buf,
         .gr_passwd = (char *)"x",
         .gr_gid    = (gid_t)gid,
-        .gr_mem    = NULL,
+        .gr_mem    = s_no_members,
     };
     *result = grp;
     return 0;

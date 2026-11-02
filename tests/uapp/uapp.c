@@ -3,13 +3,22 @@
  * boundary must hold: a fault ends only the app, kernel memory is out of reach,
  * preemption and the FPU work in U-mode, exit codes arrive, the syscalls
  * reach the kernel's files, clocks and identities, threads share one
- * process, and signals reach handlers wherever the app is.
+ * process, signals reach handlers wherever the app is, and sockets and poll
+ * block until a peer or a signal ends the wait.
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -18,7 +27,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -508,6 +520,286 @@ static int sig_read(bool restart)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Sockets                                                             */
+/* ------------------------------------------------------------------ */
+
+static long ms_since(const struct timespec *t0)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)(t.tv_sec - t0->tv_sec) * 1000 + (t.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+/* A socket bound to 127.0.0.1 and a port the stack picks, listening if it is a stream; its address at a. */
+static int bound_lo(int type, struct sockaddr_in *a)
+{
+    const int fd = socket(AF_INET, type, 0);
+    *a = (struct sockaddr_in){ .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t len = sizeof(*a);
+    if (fd < 0 || bind(fd, (struct sockaddr *)a, sizeof(*a)) != 0 ||
+        (type == SOCK_STREAM && listen(fd, 2) != 0) || getsockname(fd, (struct sockaddr *)a, &len) != 0) {
+        printf("uapp: socket: %s\n", strerror(errno));
+        return -1;
+    }
+    return fd;
+}
+
+/* An accepted loopback connection: the server's end, with the client's at *client. */
+static int pair_lo(int *client)
+{
+    struct sockaddr_in a;
+    const int lfd = bound_lo(SOCK_STREAM, &a);
+    *client = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0 || *client < 0 || connect(*client, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        printf("uapp: connect: %s\n", strerror(errno));
+        return -1;
+    }
+    const int s = accept(lfd, NULL, NULL);
+    close(lfd);
+    return s;
+}
+
+static char s_out[20000], s_in[20000];
+static int  s_tx;
+
+static void *sender(void *arg)
+{
+    const int fd = *(int *)arg;
+    size_t done = 0;
+    while (done < sizeof(s_out)) {
+        const ssize_t n = send(fd, s_out + done, sizeof(s_out) - done, 0);
+        if (n <= 0) {
+            break;
+        }
+        done += (size_t)n;
+    }
+    shutdown(fd, SHUT_WR);
+    return NULL;
+}
+
+/* 20000 bytes across page boundaries, more than the stack buffers: the sender blocks until they drain. */
+static int net_tcp(void)
+{
+    int c;
+    const int s = pair_lo(&c);
+    if (s < 0) {
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(s_out); i++) {
+        s_out[i] = (char)(i * 7 + 3);
+    }
+    pthread_t th;
+    s_tx = c;
+    pthread_create(&th, NULL, sender, &s_tx);
+    size_t got = 0;
+    ssize_t n;
+    while ((n = recv(s, s_in + got, sizeof(s_in) - got, 0)) > 0) {
+        got += (size_t)n;
+    }
+    pthread_join(th, NULL);
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    char ip[INET_ADDRSTRLEN] = "?";
+    if (getpeername(s, (struct sockaddr *)&peer, &plen) == 0) {
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+    }
+    printf("uapp: tcp %u bytes %s, then end of stream %d, peer %s\n", (unsigned)got,
+           (got == sizeof(s_in) && memcmp(s_in, s_out, got) == 0) ? "intact" : "WRONG", (int)n, ip);
+    close(s);
+    close(c);
+    return 0;
+}
+
+/* Non-blocking accept, connect and recv, and poll's readiness and timeout. */
+static int net_nb(void)
+{
+    struct sockaddr_in a;
+    const int lfd = bound_lo(SOCK_STREAM, &a);
+    if (lfd < 0) {
+        return 1;
+    }
+    fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL) | O_NONBLOCK);
+    const int acc = accept(lfd, NULL, NULL);
+    const int acc_err = errno;
+    const int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    const int con = connect(c, (struct sockaddr *)&a, sizeof(a));
+    const int con_err = errno;
+    struct pollfd p[2] = { { .fd = c, .events = POLLOUT }, { .fd = lfd, .events = POLLIN } };
+    const int ready = poll(p, 2, 2000);
+    int soerr = -1;
+    socklen_t len = sizeof(soerr);
+    getsockopt(c, SOL_SOCKET, SO_ERROR, &soerr, &len);
+    const int s = accept4(lfd, NULL, NULL, SOCK_NONBLOCK);
+    char b;
+    const ssize_t r = recv(s, &b, 1, 0);
+    const int r_err = errno;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    struct pollfd q = { .fd = s, .events = POLLIN };
+    const int idle = poll(&q, 1, 300);
+    printf("uapp: nb accept %d/%s, connect %d/%s, poll %d (out %d, in %d), so_error %d, recv %d/%s, "
+           "idle poll %d after %ld ms\n",
+           acc, strerror(acc_err), con, strerror(con_err), ready, !!(p[0].revents & POLLOUT),
+           !!(p[1].revents & POLLIN), soerr, (int)r, strerror(r_err), idle, ms_since(&t0));
+    return 0;
+}
+
+/* Blocks SIGALRM, so the main thread's wait is the one the alarm ends. */
+static void *late_sender(void *arg)
+{
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &m, NULL);
+    usleep(1500 * 1000);
+    send(*(int *)arg, "late", 4, 0);
+    return NULL;
+}
+
+/* A blocking recv or poll and SIGALRM at 1 s: EINTR, or the recv restarted under SA_RESTART. */
+static int net_intr(const char *how)
+{
+    int c;
+    const int s = pair_lo(&c);
+    if (s < 0) {
+        return 1;
+    }
+    const bool restart = strcmp(how, "recv") != 0;
+    struct sigaction sa = { .sa_handler = on_count, .sa_flags = restart ? SA_RESTART : 0 };
+    sigaction(SIGALRM, &sa, NULL);
+    pthread_t th;
+    s_tx = c;
+    pthread_create(&th, NULL, late_sender, &s_tx);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    alarm(1);
+    char buf[8];
+    int rc;
+    if (strcmp(how, "poll") == 0) {
+        struct pollfd p = { .fd = s, .events = POLLIN };
+        rc = poll(&p, 1, 5000);
+    } else {
+        rc = (int)recv(s, buf, sizeof(buf), 0);
+    }
+    const int err = (rc < 0) ? errno : 0;
+    printf("uapp: %s rc=%d errno=%d after %ld ms, handler ran %d\n", how, rc, err, ms_since(&t0), s_got);
+    pthread_join(th, NULL);
+    return 0;
+}
+
+/* A datagram over a page boundary, and who sent it. */
+static int net_udp(void)
+{
+    struct sockaddr_in a, from;
+    const int fd = bound_lo(SOCK_DGRAM, &a);
+    const int c = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0 || c < 0) {
+        return 1;
+    }
+    for (int i = 0; i < 3000; i++) {
+        s_out[4090 + i] = (char)i;
+    }
+    const ssize_t sent = sendto(c, s_out + 4090, 3000, 0, (struct sockaddr *)&a, sizeof(a));
+    socklen_t flen = sizeof(from);
+    const ssize_t got = recvfrom(fd, s_in + 4090, 4000, 0, (struct sockaddr *)&from, &flen);
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+    printf("uapp: udp sent %d, got %d %s from %s\n", (int)sent, (int)got,
+           (got == 3000 && memcmp(s_in + 4090, s_out + 4090, 3000) == 0) ? "intact" : "WRONG", ip);
+    return 0;
+}
+
+/* Name and address conversions, and the identities and entropy that come with them. */
+static int net_names(void)
+{
+    static const char *v6[] = { "fe80::1", "::1", "::", "::ffff:10.0.0.7", "2001:db8::8:800:200c:417a",
+                                "1:2:3:4:5:6:7:8" };
+    for (size_t i = 0; i < sizeof(v6) / sizeof(v6[0]); i++) {
+        struct in6_addr x;
+        char back[INET6_ADDRSTRLEN];
+        const int ok = inet_pton(AF_INET6, v6[i], &x) == 1 && inet_ntop(AF_INET6, &x, back, sizeof(back)) != NULL;
+        printf("uapp: v6 %s -> %s\n", v6[i], ok ? back : "FAILED");
+    }
+    struct in_addr v4;
+    printf("uapp: v4 %s, bad %d\n", inet_pton(AF_INET, "192.168.1.10", &v4) == 1 ? inet_ntoa(v4) : "FAILED",
+           inet_pton(AF_INET, "192.168.01.1", &v4));
+
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res;
+    int r = getaddrinfo("127.0.0.1", "1883", &hints, &res);
+    if (r == 0) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)res->ai_addr;
+        printf("uapp: getaddrinfo port %u type %d\n", ntohs(sin->sin_port), res->ai_socktype);
+        freeaddrinfo(res);
+    } else {
+        printf("uapp: getaddrinfo: %s\n", gai_strerror(r));
+    }
+    hints = (struct addrinfo){ .ai_flags = AI_PASSIVE, .ai_family = AF_INET };
+    int n = 0;
+    if (getaddrinfo(NULL, "8080", &hints, &res) == 0) {
+        for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+            n++;
+        }
+        freeaddrinfo(res);
+    }
+    printf("uapp: passive, any type: %d results\n", n);
+
+    char host[65];
+    gethostname(host, sizeof(host));
+    const struct passwd *pw = getpwuid(getuid());
+    const struct group *gr = getgrgid(getgid());
+    unsigned char rnd[16] = { 0 };
+    int set = 0;
+    getrandom(rnd, sizeof(rnd), 0);
+    for (size_t i = 0; i < sizeof(rnd); i++) {
+        set |= rnd[i];
+    }
+    printf("uapp: host %s, user %s home %s, group %s, random %s\n", host, pw ? pw->pw_name : "?",
+           pw ? pw->pw_dir : "?", gr ? gr->gr_name : "?", set ? "yes" : "zeros");
+    return 0;
+}
+
+/* syslog into the kernel log, the interface list, and a dlopen that says why not. */
+static int net_posix(void)
+{
+    openlog("uapp", LOG_PID, LOG_USER);
+    syslog(LOG_WARNING, "syslog from U-mode %d", 42);
+    closelog();
+    struct ifaddrs *ifs;
+    if (getifaddrs(&ifs) != 0) {
+        printf("uapp: getifaddrs: %s\n", strerror(errno));
+        return 1;
+    }
+    for (struct ifaddrs *i = ifs; i != NULL; i = i->ifa_next) {
+        char a[INET6_ADDRSTRLEN] = "-";
+        if (i->ifa_addr != NULL && i->ifa_addr->sa_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)i->ifa_addr)->sin_addr, a, sizeof(a));
+        } else if (i->ifa_addr != NULL && i->ifa_addr->sa_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)i->ifa_addr)->sin6_addr, a, sizeof(a));
+        }
+        printf("uapp: if %s %s%s %s\n", i->ifa_name, (i->ifa_flags & IFF_UP) ? "up" : "down",
+               (i->ifa_flags & IFF_LOOPBACK) ? " loopback" : "", a);
+    }
+    freeifaddrs(ifs);
+    printf("uapp: dlopen %p: %s\n", dlopen("x.so", RTLD_NOW), dlerror());
+    return 0;
+}
+
+/* Blocks in accept until something ends it: a signal's way into a socket wait. */
+static int net_wait(void)
+{
+    struct sockaddr_in a;
+    const int lfd = bound_lo(SOCK_STREAM, &a);
+    if (lfd < 0) {
+        return 1;
+    }
+    printf("uapp: waiting on port %u\n", ntohs(a.sin_port));
+    fflush(stdout);
+    const int s = accept(lfd, NULL, NULL);
+    printf("uapp: accept %d errno %d\n", s, errno);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = (argc > 1) ? argv[1] : "hello";
@@ -515,6 +807,27 @@ int main(int argc, char **argv)
     if (strcmp(mode, "hello") == 0) {
         printf("uapp: hello from U-mode, argc %d\n", argc);
         return 0;
+    }
+    if (strcmp(mode, "tcp") == 0) {
+        return net_tcp();
+    }
+    if (strcmp(mode, "nb") == 0) {
+        return net_nb();
+    }
+    if (strcmp(mode, "netintr") == 0 && argc > 2) {
+        return net_intr(argv[2]);
+    }
+    if (strcmp(mode, "udp") == 0) {
+        return net_udp();
+    }
+    if (strcmp(mode, "names") == 0) {
+        return net_names();
+    }
+    if (strcmp(mode, "posix") == 0) {
+        return net_posix();
+    }
+    if (strcmp(mode, "acceptwait") == 0) {
+        return net_wait();
     }
     if (strcmp(mode, "exit") == 0) {
         return (argc > 2) ? atoi(argv[2]) : 0;

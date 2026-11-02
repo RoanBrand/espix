@@ -4,7 +4,9 @@
  *
  * A number in a7, arguments in a0-a5, the result in a0: negative is -errno.
  * Flag, mode and errno values are the toolchain picolibc's, which both sides
- * use; structures that cross are the fixed-width ones below.
+ * use; socket and poll values and sockaddrs are lwIP's and IDF's, which the
+ * kernel hands on unchanged and user/include mirrors. Structures that cross
+ * are the fixed-width ones below.
  */
 #pragma once
 
@@ -60,13 +62,37 @@
     X(SIGRETURN,     sigreturn,     47)        /* (): a handler's restorer; its frame is at sp */ \
     X(RAISE,         raise,         48)        /* (sig): to the calling thread */               \
     X(SETITIMER,     setitimer,     49)        /* (which, const struct espix_itimerval *, old) */ \
-    X(TERM_SIZE,     term_size,     50)        /* (int *cols, int *rows) */
+    X(TERM_SIZE,     term_size,     50)        /* (int *cols, int *rows) */                    \
+    X(SOCKET,        socket,        51)        /* (domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol) */ \
+    X(BIND,          bind,          52)        /* (fd, addr, len) */                           \
+    X(LISTEN,        listen,        53)        /* (fd, backlog) */                             \
+    X(ACCEPT,        accept,        54)        /* (fd, addr or 0, socklen_t *len, SOCK_* flags) */ \
+    X(CONNECT,       connect,       55)        /* (fd, addr, len) */                           \
+    X(SENDTO,        sendto,        56)        /* (fd, buf, len, flags, to or 0, tolen) */     \
+    X(RECVFROM,      recvfrom,      57)        /* (fd, buf, len, flags, from or 0, socklen_t *fromlen) */ \
+    X(SHUTDOWN,      shutdown,      58)        /* (fd, how) */                                 \
+    X(GETSOCKOPT,    getsockopt,    59)        /* (fd, level, name, val, socklen_t *len) */    \
+    X(SETSOCKOPT,    setsockopt,    60)        /* (fd, level, name, val, len) */               \
+    X(GETSOCKNAME,   getsockname,   61)        /* (fd, addr, socklen_t *len) */                \
+    X(GETPEERNAME,   getpeername,   62)        /* (fd, addr, socklen_t *len) */                \
+    X(POLL,          poll,          63)        /* (struct pollfd *, nfds, ms or -1) */         \
+    X(GETADDRINFO,   getaddrinfo,   64)        /* (node, service, hints, out, max): a count, -errno or -EAI_* */ \
+    X(GETRANDOM,     getrandom,     65)        /* (buf, len, flags) */                         \
+    X(GETHOSTNAME,   gethostname,   66)        /* (buf, len) */                                \
+    X(IOCTL,         ioctl,         67)        /* (fd, FIONBIO or FIONREAD, int *) */         \
+    X(GETPW,         getpw,         68)        /* (name or 0, uid, struct espix_pwent *, len) */ \
+    X(GETGR,         getgr,         69)        /* (name or 0, gid, struct espix_pwent *, len) */ \
+    X(SYSLOG,        syslog,        70)        /* (priority, ident or 0, message): to the kernel log */ \
+    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
     ESPIX_SYSCALLS(ESPIX_SYS_ENUM_)
 #undef ESPIX_SYS_ENUM_
 };
+
+/* A process's descriptors: sysconf(_SC_OPEN_MAX). */
+#define ESPIX_OPEN_MAX 32
 
 /* FUTEX ops: wait while *uaddr == val (a relative timeout, or none), or wake up to val waiters. */
 #define ESPIX_FUTEX_WAIT 0
@@ -118,4 +144,25 @@ struct espix_dirent {
     uint16_t reclen;
     uint8_t  type;
     char     name[];
+};
+
+/* One getaddrinfo() result, and its hints: addr holds addrlen bytes of a sockaddr. */
+struct espix_addrinfo {
+    int32_t  flags, family, socktype, protocol;
+    uint32_t addrlen;
+    uint8_t  addr[28];
+};
+
+/* A user's or a group's record: its ids, then name, home and shell (a group: its name), each NUL-ended. */
+struct espix_pwent {
+    uint32_t id, gid;
+    char     strs[];
+};
+
+/* One getifaddrs() entry: an interface and one of its addresses (an AF_UNSPEC addr: none). */
+struct espix_ifaddr {
+    char     name[16];
+    uint32_t flags;             /* IFF_* */
+    uint8_t  addr[28];          /* sockaddrs, lwIP's layout */
+    uint8_t  netmask[28];
 };

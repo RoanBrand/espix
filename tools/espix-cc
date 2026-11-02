@@ -7,6 +7,7 @@
 #
 #   tools/espix-cc -Os -o hello hello.c
 #   tools/espix-cc -c foo.c
+#   tools/espix-cc --strip hello hello.staged
 #
 set -euo pipefail
 
@@ -26,7 +27,7 @@ arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f -m
 # picolibc's headers declare the pthread subset IDF implements; libespix implements barriers and spinlocks too.
 cflags=(--specs=picolibc.specs -ffunction-sections -fdata-sections
         -D_POSIX_BARRIERS=200112L -D_POSIX_SPIN_LOCKS=200112L
-        -I"$root/user/include" -include "$root/cmake/offt64.h")
+        -I"$root/user/include" -I"$root/user/include/common" -include "$root/cmake/offt64.h")
 
 lib="$root/user/build"
 
@@ -54,6 +55,11 @@ build_lib() {
     mv -f "$tmp/libespix.a" "$lib/libespix.a"
     rm -rf "$tmp"
 }
+
+# espix-cc --strip <in> <out>: a copy without debug info, for staging onto the board.
+if [[ ${1:-} == --strip ]]; then
+    exec "${gcc%gcc}strip" --strip-debug -o "$3" "$2"
+fi
 
 link=yes
 for a in "$@"; do

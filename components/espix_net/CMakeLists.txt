@@ -33,6 +33,8 @@ idf_component_register(
         "include"
     PRIV_INCLUDE_DIRS
         "priv_include"
+        # ifaddrs.h and net/if.h, the same headers the apps on both sides see.
+        "../../user/include/common"
     REQUIRES
         esp_common
     PRIV_REQUIRES

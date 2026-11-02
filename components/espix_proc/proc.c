@@ -227,6 +227,7 @@ esp_err_t espix_proc_init(void)
     espix_proc_abi_fs_register();
     espix_proc_abi_libc_register();
     espix_proc_abi_libm_register();
+    espix_proc_abi_posix_register();
     espix_proc_abi_ident_register();
     espix_proc_abi_gfx_register();
     espix_proc_abi_audio_register();
@@ -311,6 +312,17 @@ static void sig_wake_locked(espix_proc_slot_t *slot)
         (void)xTaskNotifyGiveIndexed(task, ESPIX_NOTIFY_SIG_IDX);
     }
     espix_pthread_wake_locked(slot);
+    /*
+     * And any of them in esp_vfs_select(), waiting on a semaphore no notify
+     * reaches: the wake eventfd is the only way in. Written only while one is
+     * there, so a signal to a running process does not arm it and make its next
+     * select() wake for nothing; and under the lock, which keeps it open. The
+     * fence pairs with select_begin()'s: the pending bit, then in_select.
+     */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (slot->in_select > 0 && slot->wake_fd >= 0) {
+        (void)espix_fs_wake_notify(slot->wake_fd);
+    }
 #if CONFIG_ESPIX_UMODE
     /* And a thread computing in U on the other core, now rather than at its next tick. */
     if (slot->app != NULL && slot->app->um != NULL) {
@@ -356,10 +368,14 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     espix_fs_fds_close_owned(slot->info.pid);
 
     /* The wake eventfd is espix's, not one the app opened, so the owned-fd
-     * sweep above does not know about it. */
-    espix_fs_wake_close(slot->wake_fd);
-    slot->wake_fd  = -1;
-    slot->in_select = false;
+     * sweep above does not know about it. Taken out under the lock, which its
+     * writers hold. */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const int wake_fd = slot->wake_fd;
+    slot->wake_fd   = -1;
+    slot->in_select = 0;
+    xSemaphoreGive(g_espix_proc_lock);
+    espix_fs_wake_close(wake_fd);
 
     /* Here and not at fclose(), which a force-kill may never reach. */
     if (slot->console_stdin && slot->info.session != NULL) {
@@ -1243,7 +1259,6 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
     if (cont != NULL) {
         (void)xSemaphoreGive(cont);
     }
-
     /*
      * Finished on its own is the good outcome, and the common one. Observing
      * only: the kill did not ask for the status and must not consume it, or
@@ -1509,9 +1524,7 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         }
     }
 
-    SemaphoreHandle_t cont      = slot->sig_cont;
-    const int         wake_fd   = slot->wake_fd;
-    const bool        in_select = slot->in_select;
+    SemaphoreHandle_t cont = slot->sig_cont;
 
     /*
      * Wake it, and its threads. The pending bits are already set and a notify
@@ -1528,23 +1541,15 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         (void)xSemaphoreGive(cont);
     }
 
-    /*
-     * And the wake fd, when the target is waiting on one. A process blocked in
-     * esp_vfs_select() is waiting on a semaphore no notify reaches, so the
-     * eventfd is the only way in. Written only while in_select is
-     * set, so a signal to a running process does not arm the counter and make
-     * its next select() return for no reason.
-     */
-    if (sig != SIGSTOP && in_select && wake_fd >= 0) {
-        (void)espix_fs_wake_notify(wake_fd);
-    }
-
     return ESP_OK;
 }
 
-int espix_proc_select_begin(void)
+int espix_proc_select_begin(uint32_t *got)
 {
     espix_proc_slot_t *slot = espix_proc_self();
+    if (got != NULL) {
+        *got = 0;
+    }
     if (slot == NULL) {
         return -1;
     }
@@ -1554,14 +1559,17 @@ int espix_proc_select_begin(void)
         slot->wake_fd = espix_fs_wake_create();
     }
 
-    slot->in_select = true;
+    __atomic_add_fetch(&slot->in_select, 1, __ATOMIC_SEQ_CST);
 
     /*
      * Deliver whatever is pending before blocking. A signal that arrives after
      * this line finds in_select set and writes the fd, so there is no window in
      * which a signal is set but nobody is coming to write it.
      */
-    (void)espix_sigcheck();
+    const uint32_t r = espix_sigcheck_mask();
+    if (got != NULL) {
+        *got = r;
+    }
 
     return slot->wake_fd;
 }
@@ -1570,7 +1578,7 @@ void espix_proc_select_end(void)
 {
     espix_proc_slot_t *slot = espix_proc_self();
     if (slot != NULL) {
-        slot->in_select = false;
+        __atomic_sub_fetch(&slot->in_select, 1, __ATOMIC_SEQ_CST);
     }
 }
 

@@ -16,6 +16,7 @@ idf_component_register(
         "abi_libc.c"
         "abi_stdio.c"
         "abi_libm.c"
+        "abi_posix.c"
         "abi_ident.c"
         "abi_signal.c"
         "abi_time.c"
@@ -26,11 +27,14 @@ idf_component_register(
         "umode_mm.c"
         "umode_sig.c"
         "umode_sys.c"
+        "umode_net.c"
         "umode_entry.S"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
         "priv_include"
+        # syslog.h and the rest, the same headers the apps on both sides see.
+        "../../user/include/common"
     REQUIRES
         esp_common
         freertos
@@ -53,6 +57,8 @@ idf_component_register(
         # abi_drivers.c wraps select() around esp_vfs_select() and names
         # eventfd().
         vfs
+        # umode_net.c: a U-mode app's sockets and name lookups are lwIP's.
+        lwip
         heap
         esp_driver_rmt
         esp_driver_gpio

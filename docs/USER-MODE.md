@@ -139,8 +139,11 @@ layer under it:
 - POSIX threads, on the kernel's threads and futexes;
 - signals: `sigaction`, masks, `alarm` and `setitimer`, and the restorer a
   handler returns through;
-- headers picolibc lacks (`sys/socket.h`, `netinet/in.h`, `semaphore.h`,
-  `gettid()`), and ENOSYS for what is not built yet: sockets.
+- sockets, `poll` and `select` (over `poll`), name lookup, `getifaddrs`, the
+  user and group database, `getrandom`, and `syslog` into the kernel log;
+- headers picolibc lacks (`sys/socket.h`, `netinet/in.h`, `netdb.h`,
+  `semaphore.h`, `gettid()`), and in `user/include/common` the ones M-mode apps
+  get from espix too (`syslog.h`, `ifaddrs.h`, `dlfcn.h`, `poll.h`).
 
 `tools/espix-cc` compiles and links an app, as `musl-gcc` does for musl, with the
 kernel's 64-bit `off_t`, no `cm.popret` (as IDF builds the kernel; with it
@@ -178,15 +181,29 @@ mapping works wherever the kernel's text lives.
 
 **A number in `a7`, arguments in `a0`-`a5`, the result in `a0`**, negative errno
 on failure, like Linux. The numbers and the structs are espix's own and
-fixed-width; flag and errno values are picolibc's, which both sides use. The list
-is `include/espix_syscall.h`, one X-macro that the kernel's dispatch table and
+fixed-width; flag and errno values are picolibc's, which both sides use. Socket
+options, flags and sockaddrs are lwIP's and poll's values IDF's, which M-mode
+apps see too: the kernel passes them to lwIP unchanged, `user/include` mirrors
+them, and `umode_net.c` asserts each at build time. The list is
+`include/espix_syscall.h`, one X-macro that the kernel's dispatch table and
 `libespix`'s numbers are generated from.
 
 **Each process has its own descriptor table**, as on Linux: small numbers from 0,
 the lowest free one for each open, 0-2 the process's streams, and behind each a
-kernel descriptor or directory. An app can name only its own, and `dup2` onto
-0-2 redirects them. The table is closed before the kernel's owned-descriptor
-sweep, while its numbers are still the process's.
+kernel descriptor, directory or socket. An app can name only its own, and `dup2`
+onto 0-2 redirects them; a socket's descriptors share it, and its `O_NONBLOCK`.
+The table is closed before the kernel's owned-descriptor sweep, while its
+numbers are still the process's.
+
+**A blocking call waits where a signal can end it.** lwIP's socket is always
+non-blocking; a call the app made blocking waits in `esp_vfs_select()` beside the
+process's wake eventfd, the same wait an M-mode app's `select` and `poll` use. A
+signal writes the eventfd, and then a handler that is due ends the call with
+EINTR (restarted under `SA_RESTART`, except `poll`, as on Linux), a stop parks
+the thread inside the wait, and a signal whose action is nothing leaves it
+waiting. `SO_RCVTIMEO` and `SO_SNDTIMEO` are the kernel's to keep. A regular
+file in `poll` is always ready; stdin is reported readable until the transports
+have a wake a select can wait on.
 
 **The syscall table is part of espix's ABI.** An M-mode app calls kernel functions
 through the symbol tables (`abi_*.c`); a U-mode app reaches the same functions by

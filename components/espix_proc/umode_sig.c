@@ -170,7 +170,8 @@ static void __attribute__((noreturn)) bad_frame(espix_um_thread_t *t, uint32_t s
 /* What SA_RESTART restarts: not the sleeps and waits whose time would start again, as on Linux. */
 static bool restartable(uint32_t nr)
 {
-    return nr != ESPIX_SYS_NANOSLEEP && nr != ESPIX_SYS_SIGSUSPEND && nr != ESPIX_SYS_FUTEX;
+    return nr != ESPIX_SYS_NANOSLEEP && nr != ESPIX_SYS_SIGSUSPEND && nr != ESPIX_SYS_FUTEX &&
+           nr != ESPIX_SYS_POLL;
 }
 
 void espix_um_sig_deliver(espix_um_thread_t *t, RvExcFrame *u)

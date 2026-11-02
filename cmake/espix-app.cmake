@@ -41,3 +41,9 @@ if(NOT CONFIG_LIBC_PICOLIBC)
     message(FATAL_ERROR "espix apps are built against picolibc, IDF's default; "
                         "delete this app's sdkconfig so it is regenerated")
 endif()
+
+# The POSIX headers IDF lacks and espix answers in both builds (syslog, getifaddrs,
+# dlopen, poll.h), and the declarations IDF's own headers leave out. After IDF's
+# include directories, so nothing of IDF's is shadowed.
+idf_build_set_property(COMPILE_OPTIONS "-I${ESPIX_ROOT}/user/include/common" APPEND)
+idf_build_set_property(COMPILE_OPTIONS "-include${ESPIX_ROOT}/cmake/espix-app.h" APPEND)

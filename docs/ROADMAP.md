@@ -45,6 +45,17 @@ things are as they are.
   the process carries on as init's child, so `mosquitto -d` would daemonise on
   the S3 as M8 makes it on the S31.
 
+- **Credentials and the process calls a daemon makes.** `setuid()`,
+  `setgid()` and `setgroups()` for a process running as root, a per-process
+  `umask()` that every create applies, and `setsid()`. They are what is left of
+  mosquitto's seam (`apps/mosquitto/components/mosquitto_espix/`).
+
+- **`dlopen()` for M-mode apps.** elf_loader has one
+  (`CONFIG_ELF_DYNAMIC_LOAD_SHARED_OBJECT`, off today), which loads a module
+  and resolves it against the ABI tables. A plugin also calls back into the app
+  that loaded it, so the app's own symbols would have to resolve too; then
+  mosquitto's plugins load as they do on Linux.
+
 - **`mmap()` as nommu Linux has it.** An anonymous mapping is a page-aligned
   block of the app's arena; a private file mapping is the file read into one;
   `MAP_SHARED` writes back on `msync()` and `munmap()`. Nothing is mapped on
@@ -303,12 +314,14 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## Signals
 
-- **A blocking call that is not a delivery point.** A signal ends the sleep
-  family, `pause()`, `select()` (through the per-process wake eventfd) and a
-  read of stdin. A blocking socket `recv()` or `accept()` waits on in lwIP until
-  data comes; the fix is the same eventfd, behind the socket calls espix already
-  wraps. A U-mode app on the S31 takes a signal at any instruction; an M-mode
-  app could at an interrupt's exit in its own code (Processes, above).
+- **An M-mode app's blocking socket calls.** A signal ends the sleep family,
+  `pause()`, `select()` and `poll()` (through the per-process wake eventfd) and
+  a read of stdin. An M-mode app's blocking `recv()` or `accept()` waits on in
+  lwIP until data comes. A U-mode app's does not: `umode_net.c` keeps lwIP's
+  socket non-blocking and waits in `espix_abi_select()`, and the same wrappers,
+  published for `lwip_recv` and the rest, would give the S3 the same. A U-mode
+  app takes a signal at any instruction; an M-mode app could at an interrupt's
+  exit in its own code (Processes, above).
 
 ## SSH
 
@@ -379,6 +392,16 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   blunt one.
 
 ## Shell and console
+
+- **A session's terminal as a device.** stdin reaches an app through each
+  transport's own queue (SSH, the VNC terminal, the console), which `esp_vfs_select()`
+  cannot wait on, so `poll()` reports stdin readable whether or not a line is
+  there, and Ctrl-C and Ctrl-Z are found by the foreground wait polling the
+  transport. A pty-like VFS device per session, backed by a ring buffer
+  (FreeRTOS's), that every transport writes into: its select hooks make stdin
+  pollable, a blocking read waits beside the wake eventfd as a socket's does,
+  and Ctrl-C and Ctrl-Z become line discipline, a signal to the foreground
+  group the moment they arrive.
 
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style

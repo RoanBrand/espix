@@ -580,6 +580,13 @@ means lwIP's descriptors start *lower*, in the range the VFS was using — not
 that new ones appear on top. Harmless when everything is recompiled together,
 and confusing the moment an fd number is stored or logged.
 
+### picolibc's error text is newlib's, not glibc's
+
+`strerror(EINPROGRESS)` is "Connection already in progress" and EALREADY's is
+"Socket already connected"; EAGAIN's is "No more processes". A non-blocking
+`connect()` that says "already in progress" has returned EINPROGRESS, as it
+should. Compare errno numbers, never the text.
+
 ### The FreeRTOS run-time counter is 32-bit microseconds by default
 
 `xPortGetRunTimeCounterValue()` is `(configRUN_TIME_COUNTER_TYPE)

@@ -46,6 +46,7 @@
 #include "esp_log.h"
 
 #include <sys/ioctl.h>
+#include <sys/param.h>
 #include <sys/poll.h>
 #include <sys/select.h>
 
@@ -126,67 +127,128 @@ extern unsigned long long __bswapdi2(unsigned long long);
  *
  * A process blocked in lwip_select() cannot be reached: the only thing lwIP's
  * select waits on is its own sockets, so a signal has nothing to disturb. The
- * VFS select waits on sockets and VFS fds alike, so this wrapper adds the
- * process's wake eventfd (R-P6.6) to the caller's read set, calls
- * esp_vfs_select(), and on return delivers whatever wrote it and reports EINTR,
- * which is what POSIX says a signal does to select().
+ * VFS select waits on sockets and VFS fds alike, so this adds the process's
+ * wake eventfd (R-P6.6) to the read set and calls esp_vfs_select(). A signal
+ * writes it, and then: one that ran a handler (or, for a U-mode thread, is due
+ * to) ends the call with EINTR, as POSIX says; a stop parks the caller inside
+ * the wait; one whose action is nothing leaves it waiting, with the time left.
  *
  * The eventfd stays internal: it is in the set this call builds, and the bit is
- * cleared again before the caller sees it.
+ * cleared again before the caller sees it. The kernel's own U-mode syscalls
+ * wait here too.
  */
-static int espix_select(int nfds, fd_set *readfds, fd_set *writefds,
-                        fd_set *errorfds, struct timeval *timeout)
+int espix_abi_select(int nfds, fd_set *readfds, fd_set *writefds,
+                     fd_set *errorfds, struct timeval *timeout)
 {
-    const int wake = espix_proc_select_begin();
+    const int64_t end = (timeout != NULL)
+        ? esp_timer_get_time() + (int64_t)timeout->tv_sec * 1000000 + timeout->tv_usec
+        : -1;
+    fd_set r0, w0, e0, own;
+    if (readfds != NULL) {
+        r0 = *readfds;
+    }
+    if (writefds != NULL) {
+        w0 = *writefds;
+    }
+    if (errorfds != NULL) {
+        e0 = *errorfds;
+    }
 
-    /* Only a read set can be watched this way. A caller that waits on writes
-     * alone still blocks uninterruptibly, which is the old behaviour. */
-    if (wake >= 0 && readfds != NULL && wake < FD_SETSIZE) {
-        FD_SET(wake, readfds);
-        if (nfds <= wake) {
-            nfds = wake + 1;
+    for (;;) {
+        uint32_t got;
+        const int wake = espix_proc_select_begin(&got);
+        if (got != 0) {
+            espix_proc_select_end();
+            errno = EINTR;
+            return -1;
+        }
+
+        /* A caller that waits on writes alone gets a read set of its own, to carry the wake fd. */
+        fd_set *rd = readfds;
+        int n = nfds;
+        if (wake >= 0 && wake < FD_SETSIZE) {
+            if (rd == NULL) {
+                FD_ZERO(&own);
+                rd = &own;
+            }
+            FD_SET(wake, rd);
+            n = MAX(n, wake + 1);
+        }
+
+        struct timeval left, *tvp = NULL;
+        if (end >= 0) {
+            const int64_t us = MAX(end - esp_timer_get_time(), 0);
+            left = (struct timeval){ .tv_sec = us / 1000000, .tv_usec = us % 1000000 };
+            tvp = &left;
+        }
+
+        int rc = esp_vfs_select(n, rd, writefds, errorfds, tvp);
+        const int err = errno;
+
+        bool woken = false;
+        if (rc > 0 && rd != NULL && wake >= 0 && wake < FD_SETSIZE && FD_ISSET(wake, rd)) {
+            FD_CLR(wake, rd);
+            (void)espix_fs_wake_drain(wake);
+            woken = true;
+            rc--;
+        }
+
+        /* Cleared before delivery: a handler may call select() again. */
+        espix_proc_select_end();
+
+        if (!woken) {
+            errno = err;
+            return rc;
+        }
+        /*
+         * Deliver here, on the app's own task: a default-terminating signal ends
+         * the process now instead of waiting for a delivery point that a
+         * program blocked in select() would never reach.
+         */
+        if (espix_sigcheck_mask() != 0) {
+            errno = EINTR;
+            return -1;
+        }
+        if (rc > 0) {
+            return rc;
+        }
+
+        /* Nothing to report: wait on, from the caller's sets, for what is left. */
+        if (readfds != NULL) {
+            *readfds = r0;
+        }
+        if (writefds != NULL) {
+            *writefds = w0;
+        }
+        if (errorfds != NULL) {
+            *errorfds = e0;
+        }
+        if (end >= 0 && esp_timer_get_time() >= end) {
+            if (readfds != NULL) {
+                FD_ZERO(readfds);
+            }
+            if (writefds != NULL) {
+                FD_ZERO(writefds);
+            }
+            if (errorfds != NULL) {
+                FD_ZERO(errorfds);
+            }
+            return 0;
         }
     }
-
-    const int rc = esp_vfs_select(nfds, readfds, writefds, errorfds, timeout);
-
-    bool woken = false;
-    if (wake >= 0 && readfds != NULL && wake < FD_SETSIZE &&
-        FD_ISSET(wake, readfds)) {
-        FD_CLR(wake, readfds);
-        (void)espix_fs_wake_drain(wake);
-        woken = true;
-    }
-
-    /* Cleared before delivery: a handler may call select() again. */
-    espix_proc_select_end();
-
-    if (woken) {
-        /*
-         * Deliver here, on the app's own task. This is the point of the whole
-         * exercise: a default-terminating signal ends the process now instead
-         * of waiting for a espix_sigcheck() that a program blocked in select()
-         * would never make.
-         */
-        (void)espix_sigcheck();
-        errno = EINTR;
-        return -1;
-    }
-
-    return rc;
 }
 
 /*
- * poll(), over espix_select().
+ * poll(), over espix_abi_select().
  *
  * IDF has a poll() of its own, but it calls the libc select() -- not the one
  * above, which is the only select that folds in the process's wake eventfd. A
  * poll published as it stands would therefore block uninterruptibly: a broker whose
  * whole loop is a poll() could not be stopped by a signal until a client
  * happened to talk to it. So the conversion is IDF's (pollfd to fd_set, an fd
- * the sets cannot hold answered with POLLNVAL) and the wait is espix_select().
+ * the sets cannot hold answered with POLLNVAL) and the wait is espix_abi_select().
  */
-static int espix_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+int espix_abi_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     fd_set readfds, writefds, errorfds;
     int max_fd = -1;
@@ -236,9 +298,9 @@ static int espix_poll(struct pollfd *fds, nfds_t nfds, int timeout)
         tvp = &behind;
     }
 
-    const int rc = espix_select(max_fd + 1, &readfds, &writefds, &errorfds, tvp);
+    const int rc = espix_abi_select(max_fd + 1, &readfds, &writefds, &errorfds, tvp);
     if (rc < 0) {
-        /* Includes the signal case: espix_select returned EINTR having already
+        /* Includes the signal case: espix_abi_select returned EINTR having already
          * delivered the handler, which is what poll() should report. */
         return rc;
     }
@@ -340,8 +402,8 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     ESP_ELFSYM_EXPORT(ioctl),
     /* Wrapped, so a signal can interrupt it (R-P6.6). poll() is the same
      * wrapper over the same wait, because IDF's own poll is not. */
-    { "select", (void *)espix_select },
-    { "poll",   (void *)espix_poll },
+    { "select", (void *)espix_abi_select },
+    { "poll",   (void *)espix_abi_poll },
     /* The eventfd behind that wake, for an app that wants one of its own. */
     ESP_ELFSYM_EXPORT(eventfd),
     ESP_ELFSYM_EXPORT(__udivdi3),

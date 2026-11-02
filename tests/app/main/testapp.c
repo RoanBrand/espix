@@ -763,6 +763,23 @@ static int sig_select(void)
     return (rc < 0 && s_alarm_seen) ? 0 : 1;
 }
 
+/* A signal whose action is nothing leaves select() waiting: the alarm at 1 s, ignored, and select runs its 3 s. */
+static int sig_select_ignored(void)
+{
+    signal(SIGALRM, SIG_IGN);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    alarm(1);
+    struct timeval tv = { 3, 0 };
+    const int rc = select(0, NULL, NULL, NULL, &tv);
+    const int err = (rc < 0) ? errno : 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("selign: rc=%d errno=%d after %ld ms\n", rc, err,
+           (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+    fflush(stdout);
+    return rc == 0 ? 0 : 1;
+}
+
 static int ms_since(const struct timespec *t0)
 {
     struct timespec t1;
@@ -1011,6 +1028,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "select") == 0) {
         return sig_select();
+    }
+    if (strcmp(mode, "selign") == 0) {
+        return sig_select_ignored();
     }
     if (strcmp(mode, "mutex") == 0) {
         return sig_mutex();

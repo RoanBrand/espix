@@ -780,7 +780,7 @@ esp_err_t espix_ssh_run(bool (*keep_going)(void))
                CONFIG_ESPIX_SSH_PORT);
 
     while (keep_going()) {
-        const int wake = espix_proc_select_begin();
+        const int wake = espix_proc_select_begin(NULL);
         fd_set    rfds;
 
         FD_ZERO(&rfds);

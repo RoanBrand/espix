@@ -483,10 +483,16 @@ espix_pid_t espix_proc_self_pid(void);
  * wake fd to fold into the read set, or -1 for a caller with none. The pair
  * exists so a signal can reach a process that is waiting on a socket, which is
  * otherwise unreachable (R-P6.6). Pending signals are delivered by begin(),
- * before the block, so nothing is left unhandled. select_end() clears it.
+ * before the block, and *got (if not NULL) is what espix_sigcheck_mask() said
+ * of them. select_end() disarms it.
  */
-int  espix_proc_select_begin(void);
+int  espix_proc_select_begin(uint32_t *got);
 void espix_proc_select_end(void);
+
+/* espix_net's interface list, for a U-mode app's getifaddrs(): how many entries it wrote. */
+struct espix_ifaddr;
+typedef size_t (*espix_proc_ifaddrs_fn)(struct espix_ifaddr *out, size_t max);
+void espix_proc_set_ifaddrs(espix_proc_ifaddrs_fn fn);
 
 /*
  * Move the calling process's working directory. `abs_path` must be absolute

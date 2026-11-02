@@ -181,6 +181,62 @@ dev_run "kill -9 $pid" >/dev/null
 sleep 1
 assert_eq "SIGKILL ends a stopped app" "137" "$(dev_run ps | awk -v p="$pid" '$1 == p { print $NF }')"
 
+# Sockets and poll (M6): lwIP's, behind the process's descriptors; a blocking call waits where a signal can end it.
+assert_contains "TCP over loopback, across pages and past the stack's buffers" \
+    "tcp 20000 bytes intact, then end of stream 0, peer 127.0.0.1" "$(dev_run "$UAPP tcp")"
+nb_out=$(dev_run "$UAPP nb")
+assert_contains "a non-blocking accept and recv would block (EAGAIN)" "accept -1/No more processes" "$nb_out"
+assert_contains "a non-blocking connect is in progress, and poll sees it and the accept" \
+    "poll 2 (out 1, in 1), so_error 0" "$nb_out"
+idle_ms=$(printf '%s' "$nb_out" | sed -n 's/.*idle poll 0 after \([0-9]*\) ms.*/\1/p')
+if [ -n "$idle_ms" ] && [ "$idle_ms" -ge 300 ] && [ "$idle_ms" -lt 2000 ]; then
+    espix_pass "poll times out with nothing to read ($idle_ms ms of 300)"
+else
+    espix_fail "poll times out with nothing to read" "got: $nb_out"
+fi
+assert_contains "a datagram over a page boundary, and its sender" \
+    "udp sent 3000, got 3000 intact from 127.0.0.1" "$(dev_run "$UAPP udp")"
+names_out=$(dev_run "$UAPP names")
+assert_contains "IPv6 text both ways" "v6 2001:db8::8:800:200c:417a -> 2001:db8::8:800:200c:417a" "$names_out"
+assert_contains "and a v4-mapped address" "v6 ::ffff:10.0.0.7 -> ::ffff:10.0.0.7" "$names_out"
+assert_contains "getaddrinfo answers a number" "getaddrinfo port 1883 type 1" "$names_out"
+assert_contains "and no socket type asked for is each of them" "any type: 2 results" "$names_out"
+assert_contains "the user and group records, and the RNG" \
+    "user $ESPIX_USER home /home/$ESPIX_USER, group $ESPIX_USER, random yes" "$names_out"
+assert_contains "a handler ends a blocking recv with EINTR" "recv rc=-1 errno=4" "$(dev_run "$UAPP netintr recv")"
+rr_out=$(dev_run "$UAPP netintr recvr")
+rr_ms=$(printf '%s' "$rr_out" | sed -n 's/.*after \([0-9]*\) ms.*/\1/p')
+if [ -n "$rr_ms" ] && [ "$rr_ms" -ge 1400 ] && printf '%s' "$rr_out" | grep -q "rc=4 errno=0"; then
+    espix_pass "and SA_RESTART restarts it until the data comes ($rr_ms ms)"
+else
+    espix_fail "and SA_RESTART restarts it until the data comes" "got: $rr_out"
+fi
+assert_contains "poll is not restarted" "poll rc=-1 errno=4" "$(dev_run "$UAPP netintr poll")"
+pid=$(dev_run "$UAPP acceptwait &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+sleep 1
+dev_run "kill -STOP $pid" >/dev/null
+sleep 1
+assert_eq "kill -STOP stops an app blocked in accept" "T" "$(dev_run ps | awk -v p="$pid" '$1 == p { print $3 }')"
+dev_run "kill -CONT $pid" >/dev/null
+sleep 1
+st=$(dev_run ps | awk -v p="$pid" '$1 == p { print $3 }')
+if [ -n "$st" ] && [ "$st" != T ] && [ "$st" != exit ]; then
+    espix_pass "and SIGCONT puts it back in its wait ($st)"
+else
+    espix_fail "and SIGCONT puts it back in its wait" "state: '$st'"
+fi
+dev_run "kill -9 $pid" >/dev/null
+assert_eq "SIGTERM ends an app blocked in accept" "143" "$(um_kill acceptwait TERM)"
+assert_eq "and SIGKILL" "137" "$(um_kill acceptwait KILL)"
+posix_out=$(dev_run "$UAPP posix")
+assert_contains "getifaddrs lists the loopback" "if lo up loopback 127.0.0.1" "$posix_out"
+assert_contains "and the address this suite reaches the board on" " $ESPIX_HOST" "$posix_out"
+assert_contains "dlopen says why it cannot" "Dynamic loading not supported" "$posix_out"
+assert_contains "syslog lands in the kernel log" "uapp[" "$(dev_run "dmesg | grep 'syslog from U-mode 42'")"
+z_out=$(dev_run "<<<SUSP 1>>> $UAPP acceptwait; echo st=\$?")
+assert_contains "Ctrl-Z stops an app blocked in accept, as a job" "st=146" "$z_out"
+dev_run "kill %1" >/dev/null
+
 bench_out=$(dev_run "$UAPP bench")
 assert_contains "a null syscall is timed ($bench_out)" "uapp: a syscall takes" "$bench_out"
 rm -rf "$UM_DIR"
