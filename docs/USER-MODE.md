@@ -224,7 +224,8 @@ block the app passes in `tp`, as Linux's `clone` with `CLONE_SETTLS` does. The
 thread writes its tid into a word the app names before running, and the kernel
 zeroes that word and wakes it when the thread ends (`CLONE_CHILD_CLEARTID`);
 `pthread_join` waits on it. A thread's task is unpinned until it first runs, and
-then stays on that core for the FPU, so threads spread over both cores.
+then stays on that core for the FPU, so threads spread over both cores;
+`sched_getcpu()` (`GETCPU`) says which.
 
 **`exit()` from any thread ends the process**, with that status. Every thread is
 stopped as a kill stops it, and the main thread tears the process down once the
@@ -327,19 +328,23 @@ Open:
   core (`0x2C000180` on), which tells whether moving code would help before it
   is moved: the I-cache is 2-way, and three hot lines in one set miss every
   time.
-- **Why U-mode AMOs lose updates, and why `cm.popret` broke the mutex**, is not
-  known. Neither shows in M-mode; single-thread U-mode code is clean. Leads:
-  whether U-mode AMOs on internal SRAM lose too (every U-mode page is PSRAM,
-  which goes through the shared D-cache; SRAM does not, and M-mode AMOs on both
-  are clean); whether the AMO losses scale with interrupts taken in U-mode;
-  S-mode test code run with `TEE_SUPERVISOR_PRIV_SEL` set and clear, to tell the
-  REE and TEE paths apart; asking Espressif whether the S31 shares the popret
-  issue IDF flags on the C5, C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`).
-- **An app's own atomics compile to AMOs.** A toolchain with GCC's fix for
-  Zalrsc-only exchange ([UPSTREAM](UPSTREAM.md)) lets `espix-cc` drop Zaamo, so
-  every U-mode atomic is LR/SC and libespix's hand-written ones become builtins
-  again. The prebuilt picolibc keeps seven exchanges, in `signal()` and stdio's
-  unget slot, until it is rebuilt the same way.
+- **Why a U-mode AMO is not atomic across cores, and why `cm.popret` broke the
+  mutex**, are not known; both look like rev v0.0 silicon. The AMO needs U-mode
+  execution: data translated at U privilege (`MPRV`) is clean, which leaves
+  translated instruction fetch or the core's mode ([GOTCHAS](GOTCHAS.md)). A
+  lead: S-mode code with `TEE_SUPERVISOR_PRIV_SEL` set and clear, to tell the
+  bus's REE path from the core. Espressif's own U-mode world, ESP-TEE, runs on
+  single-core chips only. For Espressif: both, with `uapp amo` as the
+  reproducer, and whether the S31 shares the popret issue IDF flags on the C5,
+  C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`).
+- **An app's own atomics are AMOs**, and so are libstdc++'s reference counts and
+  seven exchanges in picolibc (stdio's unget slot, `signal()`). Three ways out:
+  `espix-cc` without Zaamo once the toolchain has GCC's Zalrsc-only exchange
+  fix ([UPSTREAM](UPSTREAM.md)), with picolibc and libstdc++ rebuilt the same
+  way, free at run time; the loader rewriting each AMO in U-mode text to its
+  RV64-only `.d` form, which traps as illegal, for the kernel to perform in
+  M-mode, any binary at about 2.6 µs an atomic; or a process's threads on one
+  core, no cost per atomic and no parallelism within a process.
 - **Deleting a task preempted in U-mode leaks about 1 KB of internal RAM.** A kill
   only comes to that when an app stays over 250 ms inside a syscall that cannot
   be interrupted; otherwise the app leaves on its own. A thread deleted that way

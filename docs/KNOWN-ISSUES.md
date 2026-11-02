@@ -471,11 +471,12 @@ stdio, time, sleep, identity and threads. What it cannot do yet:
 - **No process-shared mutexes or condition variables** until there is shared
   memory (M7).
 - **An app's own atomic read-modify-writes can lose an update** against the
-  other core. In U-mode an AMO is not always atomic: two threads in a tight
-  `amoadd` loop on both cores lose 1 to 5 increments in a million. M-mode code,
-  LR/SC and one thread alone lose none. libespix's locks, joins, semaphores and
-  picolibc's locks use LR/SC; C11 atomics and `__atomic` builtins in an app
-  compile to AMOs ([USER-MODE.md](USER-MODE.md), open).
+  other core. In U-mode an AMO is not always atomic against an AMO on the same
+  word from the other core: up to 3 in a million are lost, at a rate set by code
+  layout and timing (`uapp amo` measures it). LR/SC and M-mode AMOs lose none.
+  libespix's locks, joins and semaphores, and picolibc's locks, use LR/SC; C11
+  atomics and `__atomic` builtins in an app, libstdc++'s reference counts and
+  seven exchanges in picolibc are AMOs ([USER-MODE.md](USER-MODE.md), open).
 - **`malloc` touches what it returns**: picolibc's allocator zero-fills every
   block, so a large `malloc` costs its whole size at once; memory reserved with
   `brk`/`sbrk`, bss and the stack cost only the pages touched.

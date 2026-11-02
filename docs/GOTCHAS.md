@@ -619,13 +619,17 @@ owners. Build anything outside IDF with IDF's `-march` and its `-mno-cm-*` flags
 
 ### In U-mode, read-modify-write with LR/SC, not an AMO
 
-A U-mode AMO is not always atomic against an AMO from the other core: a tight
-two-core `amoadd` loop loses 1 to 5 increments in a million, whatever comes
-before the AMO. The same loop in M-mode, with or without `MPRV` translation,
-loses none, and so does LR/SC in U-mode. libespix writes its exchange and add as
-LR/SC by hand (`pthread.c`), with the `sc` result in its own register: GCC
-15.2's Zalrsc-only exchange reuses the value register for it
-([UPSTREAM](UPSTREAM.md)).
+A U-mode AMO is not always atomic against an AMO on the same word from the
+other core: a two-core `amoadd` loop loses up to 3 in a million. Running in
+U-mode is what matters: the same code in M-mode, with or without `MPRV`
+translation, loses none at 16 layouts, and one U-mode thread against an M-mode
+loop is enough. Internal SRAM loses as PSRAM does; an interrupt storm and the
+`cpu_apm` filter change nothing; whether the result is used, and where the loop
+sits, move the rate between 0 and 3 per million, so a clean run proves nothing
+without the threads on both cores (`sched_getcpu()`). LR/SC loses none at 17
+layouts. libespix writes its exchange and add as LR/SC by hand (`pthread.c`),
+with the `sc` result in its own register: GCC 15.2's Zalrsc-only exchange reuses
+the value register for it ([UPSTREAM](UPSTREAM.md)).
 
 ### Never longjmp out of a stdio callback
 

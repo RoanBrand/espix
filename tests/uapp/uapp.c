@@ -5,10 +5,12 @@
  * reach the kernel's files, clocks and identities, and threads share one
  * process.
  */
+#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +224,76 @@ static void *sleep_forever(void *arg)
         sleep(100);
     }
     return NULL;
+}
+
+/*
+ * An add on one word from two cores, as an AMO and as LR/SC. A U-mode AMO is not
+ * always atomic on this S31; LR/SC is (docs/KNOWN-ISSUES.md). The loops are their own
+ * functions so their layout, which sets the AMO's loss rate, stays fixed.
+ */
+void uapp_amo_loop(volatile uint32_t *w, long n);
+void uapp_lrsc_loop(volatile uint32_t *w, long n);
+__asm__("    .text\n"
+        "    .balign 64\n"
+        "    .global uapp_amo_loop\n"
+        "uapp_amo_loop:\n"
+        "    li t1, 1\n"
+        "1:  amoadd.w.aqrl zero, t1, (a0)\n"
+        "    addi a1, a1, -1\n"
+        "    bnez a1, 1b\n"
+        "    ret\n"
+        "    .balign 64\n"
+        "    .global uapp_lrsc_loop\n"
+        "uapp_lrsc_loop:\n"
+        "1:  lr.w.aqrl t2, (a0)\n"
+        "    addi t2, t2, 1\n"
+        "    sc.w.rl t3, t2, (a0)\n"
+        "    bnez t3, 1b\n"
+        "    addi a1, a1, -1\n"
+        "    bnez a1, 1b\n"
+        "    ret\n");
+
+static volatile uint32_t s_amo_word __attribute__((aligned(64)));
+static volatile int s_amo_go, s_amo_ready;
+static long s_amo_n;
+static void (*s_amo_fn)(volatile uint32_t *, long);
+
+static void *amo_thread(void *arg)
+{
+    *(int *)arg = sched_getcpu();
+    __atomic_fetch_add(&s_amo_ready, 1, __ATOMIC_SEQ_CST);
+    while (s_amo_go == 0) {
+    }
+    if (s_amo_go == 1) {
+        s_amo_fn(&s_amo_word, s_amo_n);
+    }
+    return NULL;
+}
+
+/* The words lost from 2n increments, with the two threads on different cores; -1 if they never were. */
+static long amo_lost(void (*fn)(volatile uint32_t *, long), int cpu[2])
+{
+    for (int tries = 0; tries < 50; tries++) {
+        pthread_t t[2];
+        s_amo_word = 0;
+        s_amo_go = 0;
+        s_amo_ready = 0;
+        s_amo_fn = fn;
+        for (int i = 0; i < 2; i++) {
+            pthread_create(&t[i], NULL, amo_thread, &cpu[i]);
+        }
+        while (s_amo_ready < 2) {
+        }
+        const int split = cpu[0] != cpu[1];
+        s_amo_go = split ? 1 : 2;
+        for (int i = 0; i < 2; i++) {
+            pthread_join(t[i], NULL);
+        }
+        if (split) {
+            return 2 * s_amo_n - (long)s_amo_word;
+        }
+    }
+    return -1;
 }
 
 static void *spin_forever(void *arg)
@@ -456,6 +528,15 @@ int main(int argc, char **argv)
         pthread_create(&t, NULL, deep_in_thread, NULL);
         pthread_join(t, NULL);
         return 0;
+    }
+    if (strcmp(mode, "amo") == 0) {
+        s_amo_n = (argc > 2) ? atol(argv[2]) : 10000000;
+        int cpu[2];
+        const long amo = amo_lost(uapp_amo_loop, cpu);
+        const long lrsc = amo_lost(uapp_lrsc_loop, cpu);
+        printf("uapp: adds on cores %d and %d, %ld each: amoadd lost %ld, lr/sc lost %ld\n",
+               cpu[0], cpu[1], s_amo_n, amo, lrsc);
+        return lrsc != 0;
     }
     if (strcmp(mode, "tchurn") == 0) {
         pthread_t t[4];

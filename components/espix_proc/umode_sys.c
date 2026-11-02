@@ -19,6 +19,7 @@
 #include <utime.h>
 
 #include "esp_attr.h"
+#include "esp_cpu.h"
 #include "riscv/encoding.h"
 
 #include "espix_kernel.h"
@@ -611,6 +612,12 @@ static int32_t sys_sched_yield(um_call_t *c)
     (void)c;
     taskYIELD();
     return 0;
+}
+
+static int32_t sys_getcpu(um_call_t *c)
+{
+    (void)c;
+    return (int32_t)esp_cpu_get_core_id();
 }
 
 static int32_t sys_futex(um_call_t *c)

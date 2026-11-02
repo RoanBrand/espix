@@ -51,7 +51,8 @@
     X(THREAD_EXIT,   thread_exit,   38)        /* (): its tid word is zeroed and woken */        \
     X(FUTEX,         futex,         39)        /* (uaddr, op, val, const struct espix_timespec *) */ \
     X(GETTID,        gettid,        40)        /* () */                                        \
-    X(SCHED_YIELD,   sched_yield,   41)        /* () */
+    X(SCHED_YIELD,   sched_yield,   41)        /* () */                                        \
+    X(GETCPU,        getcpu,        42)        /* (): the core the caller runs on */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,

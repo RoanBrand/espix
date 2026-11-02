@@ -353,6 +353,7 @@ int pthread_equal(pthread_t a, pthread_t b) { return a == b; }
 int sched_yield(void)                      { return (int)espix_sys0(ESPIX_SYS_SCHED_YIELD); }
 void pthread_yield(void)                   { sched_yield(); }
 pid_t gettid(void)                         { return (pid_t)espix_sys0(ESPIX_SYS_GETTID); }
+int sched_getcpu(void)                     { return (int)espix_sys0(ESPIX_SYS_GETCPU); }
 int pthread_setconcurrency(int level)      { (void)level; return 0; }
 int pthread_getconcurrency(void)           { return 0; }
 
