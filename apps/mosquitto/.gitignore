@@ -7,3 +7,5 @@ managed_components/
 dependencies.lock
 build-apps.log
 build.log
+build-u/
+build-u.log

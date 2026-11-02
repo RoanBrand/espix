@@ -151,7 +151,9 @@ libespix's mutex deadlocked, [GOTCHAS](GOTCHAS.md)), and the barriers and
 spinlocks picolibc's headers leave out (their feature macros follow what IDF's
 own pthread implements). It links `libespix` whole and ahead of libc, because the
 toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
-archive scan.
+archive scan. `cmake/espix-uapp.cmake` is the CMake toolchain file over it: an
+app with a `uapp/` CMake project (mosquitto's) is built that way by
+`tools/build-apps.sh` and staged as `<name>-u`.
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
@@ -168,7 +170,7 @@ U-mode app and its threads run on either core.
 | hello | nothing beyond the relink |
 | plasma | the surface mapped into the app |
 | doom | gfx as plasma; audio writes become syscalls |
-| mosquitto | sockets and poll as syscalls |
+| mosquitto | runs in U-mode as `mosquitto-u`: the same sources and seam, through `uapp/` |
 | neopixel | stays M-mode: its RMT callbacks run in an interrupt |
 
 **Built-in programs.** espix's own commands and daemons are processes too, and
@@ -361,7 +363,7 @@ Each leaves `make test` green on both targets.
 | M3 | threads, futex wait and wake, TLS; shared tables flushed on both cores | done: `32-umode`, and the thread checks of `30-proc` pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | done: `32-umode`, and `35-signals` in U-mode |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
-| M6 | sockets, select, poll | mosquitto runs in U-mode |
+| M6 | sockets, select, poll | done: `32-umode`, and `62-mqtt` runs `mosquitto-u` |
 | M7 | growable stacks; `mmap`; shared text between instances | Doom runs without a fixed stack; two instances share text |
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
 

@@ -1,6 +1,4 @@
-# The platform seam: the few Unix host facilities the broker needs that espix
-# does not have, answered here so that not one line of mosquitto is patched.
+# The platform seam: the host facilities espix does not have yet (credentials,
+# fork, umask), answered here so that not one line of mosquitto is patched.
 idf_component_register(SRCS "espix_platform.c"
-                       INCLUDE_DIRS "include"
-                       REQUIRES lwip
-                       PRIV_REQUIRES esp_timer)
+                       INCLUDE_DIRS "include")
