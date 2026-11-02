@@ -406,6 +406,26 @@ fi
 
 assert_contains "kill(0) reaches the caller's own group, the caller included" \
     "rc=0 seen=1 probe=0" "$(dev_run "$APP sig group")"
+# Ctrl-Z: the foreground app stops and becomes a job; fg brings it back, and ^C ends it there.
+z_out=$(dev_run "<<<SUSP 2>>> $APP sleep 30; echo st=\$?")
+assert_contains "Ctrl-Z stops a foreground app" "Stopped" "$z_out"
+assert_contains "and the shell's status is 128 + SIGTSTP" "st=146" "$z_out"
+zpid=$(dev_run jobs | awk '$3 == "stop" && $4 == "testapp" { p = $2 } END { print p }')
+if [ -n "$zpid" ]; then
+    espix_pass "and it is a stopped job ($zpid)"
+    t0=$(date +%s)
+    dev_run "<<<INTR 2>>> fg" >/dev/null
+    t1=$(date +%s)
+    if [ $((t1 - t0)) -lt 10 ] && wait_gone "$zpid"; then
+        espix_pass "fg resumes it, and ^C then ends it ($((t1 - t0)) s)"
+    else
+        espix_fail "fg resumes it, and ^C then ends it" "took $((t1 - t0)) s; $(ps_running)"
+        dev_run "kill -9 $zpid" >/dev/null
+    fi
+else
+    espix_fail "and it is a stopped job" "$(dev_run jobs)"
+fi
+
 killself_out=$(dev_run "$APP sig killself; echo rc=\$?")
 assert_contains "an app's SIGKILL to its own group ends it with 137" "rc=137" "$killself_out"
 assert_not_contains "and nothing after it runs" "still here" "$killself_out"

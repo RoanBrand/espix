@@ -758,6 +758,8 @@ static bool console_poll_interrupt(espix_session_t *s)
         for (ssize_t i = 0; i < n; i++) {
             if (buf[i] == 0x03) {       /* ETX, which is what Ctrl-C sends */
                 hit = true;
+            } else if (buf[i] == 0x1a) {
+                s->susp = true;
             } else {
                 s->last_key = (int)buf[i];
             }

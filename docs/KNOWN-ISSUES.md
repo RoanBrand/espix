@@ -452,7 +452,7 @@ stdio, time, sleep, identity and threads. What it cannot do yet:
 - **One thread takes a process's signal**, as on Linux: a sleep in another
   thread is not cut short by it, where an M-mode app's every sleeping thread
   wakes. There is no `pthread_kill` to another thread, `sigwait`, `sigqueue` or
-  `sigaltstack` yet, and Ctrl-Z does not stop a job yet (M4).
+  `sigaltstack` yet.
 - **No process-shared mutexes or condition variables** until there is shared
   memory (M7).
 - **An app's AMOs cost a trap each**, about 1,150 cycles (3.6 µs) instead of a

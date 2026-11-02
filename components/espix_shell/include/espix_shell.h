@@ -223,6 +223,9 @@ struct espix_session {
     volatile int  stdin_readers;
     volatile bool intr;
 
+    /* ^Z typed while a job ran, on any transport: the foreground wait stops the job. */
+    volatile bool susp;
+
     /*
      * The terminal's size, for an app that has just been sent SIGWINCH. NULL
      * when the transport has no answer -- the serial console is the case -- and

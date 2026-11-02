@@ -43,8 +43,9 @@ PROMPT_LINE = re.compile(rb"(?m)^[a-zA-Z0-9_.-]+:[^\r\n]*?[#$] ")
 # How long output must stop before a prompt with a background job's output after it counts.
 QUIET = 2.0
 
-# `<<<INTR n>>> command`: run it, and n seconds in press Ctrl-C.
-INTR = re.compile(r"^<<<INTR ([0-9.]+)>>> (.*)$")
+# `<<<INTR n>>> command`: run it, and n seconds in press Ctrl-C; SUSP presses Ctrl-Z.
+INTR = re.compile(r"^<<<(INTR|SUSP) ([0-9.]+)>>> (.*)$")
+KEYS = {"INTR": b"\x03", "SUSP": b"\x1a"}
 
 
 def strip_ansi(data):
@@ -189,16 +190,16 @@ class Session:
         the guard is gone rather than left to reject working syntax."""
         intr = INTR.match(command)
         if intr is not None:
-            command = intr.group(2)
+            command = intr.group(3)
 
         self.buf = b""
         os.write(self.fd, command.encode() + b"\r")
         since = self._wait_echo(command)
         if intr is not None:
-            deadline = time.time() + float(intr.group(1))
+            deadline = time.time() + float(intr.group(2))
             while time.time() < deadline and self._read_some(deadline):
                 pass
-            os.write(self.fd, b"\x03")
+            os.write(self.fd, KEYS[intr.group(1)])
         self._wait_prompt(since=since)
 
         text = strip_ansi(self.buf).decode("utf-8", "replace")

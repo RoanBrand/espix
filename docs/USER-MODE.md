@@ -298,7 +298,9 @@ the board keeps running.
 
 **SIGSTOP** parks each thread as it next returns to U or wakes in a blocking
 call, holding nothing; SIGCONT lets them go, and SIGKILL wakes a stopped process
-to end it. **A fatal signal** ends the process from the thread that takes it,
+to end it. SIGTSTP, SIGTTIN and SIGTTOU stop it the same way unless caught, so
+Ctrl-Z stops a computing app at once and the shell makes it a job for `fg` and
+`bg`. **A fatal signal** ends the process from the thread that takes it,
 as `exit()` does; SIGKILL gives 137, as on Linux.
 
 ## Beside an S31 Linux port
@@ -340,7 +342,7 @@ Each leaves `make test` green on both targets.
 | M1 | vectors patch, address spaces, the loader, `write` and `exit`, the app runtime | done: `tests/suites/32-umode.sh` |
 | M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M4 and M7 bring |
 | M3 | threads, futex wait and wake, TLS; shared tables flushed on both cores | done: `32-umode`, and the thread checks of `30-proc` pass in U-mode |
-| M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | handlers, masks, faults and SIGSTOP done: `32-umode`, and `35-signals` in U-mode; Ctrl-Z to come |
+| M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | done: `32-umode`, and `35-signals` in U-mode |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
 | M6 | sockets, select, poll | mosquitto runs in U-mode |
 | M7 | growable stacks; `mmap`; shared text between instances | Doom runs without a fixed stack; two instances share text |

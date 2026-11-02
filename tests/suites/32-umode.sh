@@ -162,6 +162,17 @@ if [ -n "$pause" ] && [ "$pause" -ge 1500 ]; then
 else
     espix_fail "and it does not run until SIGCONT" "pause: '$pause'"
 fi
+# Ctrl-Z stops it the same way, as a job; fg runs it to its end.
+z_out=$(dev_run "<<<SUSP 1>>> $UAPP pauses 4 $PZ; echo st=\$?")
+assert_contains "Ctrl-Z stops a computing app, as a job" "st=146" "$z_out"
+sleep 2
+dev_run "fg" >/dev/null
+pause=$(dev_run "cat $PZ" | sed -n 's/.*longest pause \([0-9]*\) ms.*/\1/p')
+if [ -n "$pause" ] && [ "$pause" -ge 1500 ]; then
+    espix_pass "and fg resumes it (paused $pause ms)"
+else
+    espix_fail "and fg resumes it" "pause: '$pause'"
+fi
 pid=$(dev_run "$UAPP pauses 5 $PZ &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 sleep 1
 dev_run "kill -STOP $pid" >/dev/null

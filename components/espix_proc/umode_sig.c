@@ -59,7 +59,7 @@ static uint32_t terminating(const espix_um_proc_t *p)
 {
     uint32_t m = 0;
     for (int sig = 1; sig < NSIG; sig++) {
-        if (p->act[sig].handler == H_DFL && !espix_sig_default_ignores(sig)) {
+        if (p->act[sig].handler == H_DFL && !espix_sig_default_ignores(sig) && !espix_sig_default_stops(sig)) {
             m |= espix_sigbit(sig);
         }
     }
@@ -193,6 +193,10 @@ void espix_um_sig_deliver(espix_um_thread_t *t, RvExcFrame *u)
         }
         const struct espix_sigaction act = action_of(p, sig);
         if (does_nothing(act.handler, sig)) {
+            continue;
+        }
+        if (act.handler == H_DFL && espix_sig_default_stops(sig)) {
+            (void)espix_proc_signal(slot->info.pid, SIGSTOP);
             continue;
         }
         if (act.handler == H_DFL) {

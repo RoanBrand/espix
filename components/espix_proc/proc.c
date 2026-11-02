@@ -452,6 +452,29 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     espix_gfx_recover(slot->info.pid);
 }
 
+/* SIGCHLD to slot's parent, and its wake: a shell's foreground wait sees an exit or a stop. Under the lock. */
+static void parent_wake_locked(espix_proc_slot_t *slot)
+{
+    if (slot->info.ppid == ESPIX_PID_NONE) {
+        return;
+    }
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        espix_proc_slot_t *const p = &g_espix_proc_table.slots[i];
+        if (p != slot && p->info.state != ESPIX_PROC_FREE &&
+            p->info.pid == slot->info.ppid) {
+            p->sig_pending |= espix_sigbit(SIGCHLD);
+            sig_wake_locked(p);
+            /* A shell waiting in select() hears it here instead. */
+            espix_session_t *const ps = p->info.session;
+            if (p->info.kind == ESPIX_PROC_SESSION && ps != NULL &&
+                ps->wake != NULL) {
+                ps->wake(ps);
+            }
+            return;
+        }
+    }
+}
+
 void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
                        int exit_code)
 {
@@ -472,23 +495,7 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      * and the reader clears it under its own delivery point, so no lock beyond
      * the one already held is needed.
      */
-    if (slot->info.ppid != ESPIX_PID_NONE) {
-        for (int i = 0; i < ESPIX_PROC_MAX; i++) {
-            espix_proc_slot_t *const p = &g_espix_proc_table.slots[i];
-            if (p != slot && p->info.state != ESPIX_PROC_FREE &&
-                p->info.pid == slot->info.ppid) {
-                p->sig_pending |= espix_sigbit(SIGCHLD);
-                sig_wake_locked(p);
-                /* A shell waiting in select() hears it here instead. */
-                espix_session_t *const ps = p->info.session;
-                if (p->info.kind == ESPIX_PROC_SESSION && ps != NULL &&
-                    ps->wake != NULL) {
-                    ps->wake(ps);
-                }
-                break;
-            }
-        }
-    }
+    parent_wake_locked(slot);
 
     /*
      * Into the log, then the slot straight back. Under one lock, so no one can
@@ -873,12 +880,20 @@ bool espix_sig_default_ignores(int sig)
     }
 }
 
+bool espix_sig_default_stops(int sig)
+{
+    return sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+}
+
 static void set_state(espix_proc_slot_t *slot, espix_proc_state_t st)
 {
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     /* Never walk a finished process back to life: it may be mid-teardown. */
     if (!state_is_finished(slot->info.state)) {
         slot->info.state = st;
+        if (st == ESPIX_PROC_STOPPED) {
+            parent_wake_locked(slot);
+        }
     }
     xSemaphoreGive(g_espix_proc_lock);
 }
@@ -901,7 +916,7 @@ static uint32_t sig_terminating(const espix_proc_slot_t *slot)
     for (int sig = 1; sig < NSIG; sig++) {
         const bool dfl = slot->sig_handlers == NULL ||
                          slot->sig_handlers[sig] == SIG_DFL;
-        if (dfl && !espix_sig_default_ignores(sig)) {
+        if (dfl && !espix_sig_default_ignores(sig) && !espix_sig_default_stops(sig)) {
             mask |= espix_sigbit(sig);
         }
     }
@@ -920,6 +935,17 @@ static bool ends_in_user_mode(const espix_proc_slot_t *slot)
     (void)slot;
     return false;
 #endif
+}
+
+/* sig is at SIG_DFL in slot's process. */
+static bool action_is_default(const espix_proc_slot_t *slot, int sig)
+{
+#if CONFIG_ESPIX_UMODE
+    if (ends_in_user_mode(slot)) {
+        return ((const espix_um_thread_t *)slot->app->um)->proc->act[sig].handler == 0;
+    }
+#endif
+    return slot->sig_handlers == NULL || slot->sig_handlers[sig] == SIG_DFL;
 }
 
 static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
@@ -984,6 +1010,10 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
         if (handler != SIG_DFL) {
             handler(sig);       /* app code; no lock held, by design */
             caught |= espix_sigbit(sig);
+            continue;
+        }
+        if (espix_sig_default_stops(sig)) {
+            (void)espix_proc_signal(slot->info.pid, SIGSTOP);
             continue;
         }
         if (!espix_sig_default_ignores(sig)) {
@@ -1182,6 +1212,9 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
         if (slot->sig_stop_req) {
             slot->sig_stop_req = false;
             cont = slot->sig_cont;
+            if (slot->info.state == ESPIX_PROC_STOPPED) {
+                slot->info.state = ESPIX_PROC_RUNNING;
+            }
         }
     }
     xSemaphoreGive(g_espix_proc_lock);
@@ -1208,7 +1241,8 @@ static esp_err_t sig_kernel_locked(espix_proc_slot_t *slot, int sig)
     /* A shell is not asked either: a stop request would mute it for good, and
      * logging out is how it ends. */
     if (slot->info.kind == ESPIX_PROC_KTHREAD ||
-        slot->info.kind == ESPIX_PROC_SESSION || sig == SIGSTOP) {
+        slot->info.kind == ESPIX_PROC_SESSION || sig == SIGSTOP ||
+        espix_sig_default_stops(sig)) {
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (espix_sig_default_ignores(sig)) {
@@ -1421,6 +1455,11 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         return r;
     }
 
+    /* Ctrl-Z's stop, and a terminal's: SIGSTOP's action, unless the app catches them. */
+    if (espix_sig_default_stops(sig) && action_is_default(slot, sig)) {
+        sig = SIGSTOP;
+    }
+
     const bool was_stopped = slot->sig_stop_req;
 
     if (sig == SIGSTOP) {
@@ -1436,13 +1475,16 @@ esp_err_t espix_proc_signal(espix_pid_t pid, int sig)
         slot->sig_pending |= espix_sigbit(sig);
 
         /*
-         * Any other signal lifts a stop. POSIX would leave the process stopped
-         * with the signal pending until SIGCONT, but espix has no `fg` to
-         * deliver that: a stopped process left holding a SIGTERM would sit on
-         * it until the grace ran out and then be deleted, cleanup and all. So a
-         * stop here yields to anything else, and the process gets to act.
+         * Any other signal lifts a stop, as bash's `kill` follows one to a
+         * stopped job with SIGCONT: a stopped process left holding a SIGTERM
+         * would sit on it until the grace ran out and then be deleted, cleanup
+         * and all. Running from now, not from when it wakes: `fg` waits next
+         * and must not see it stopped.
          */
         slot->sig_stop_req = false;
+        if (was_stopped && slot->info.state == ESPIX_PROC_STOPPED) {
+            slot->info.state = ESPIX_PROC_RUNNING;
+        }
     }
 
     SemaphoreHandle_t cont      = slot->sig_cont;

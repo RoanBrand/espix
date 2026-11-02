@@ -431,16 +431,19 @@ static int console_stdin_wait(espix_session_t *s, char *buf, int len)
                 return -1;
             }
             int  kept = 0;
-            bool intr = false;
+            bool intr = false, susp = false;
             for (ssize_t i = 0; i < n; i++) {
                 if (buf[i] == 0x03) {
                     intr = true;
+                } else if (buf[i] == 0x1a) {
+                    susp = true;
                 } else {
                     buf[kept++] = buf[i];
                 }
             }
-            if (intr) {
-                s->intr = true;
+            if (intr || susp) {
+                s->intr = s->intr || intr;
+                s->susp = s->susp || susp;
                 if (s->wake != NULL) {
                     s->wake(s);
                 }

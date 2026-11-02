@@ -982,10 +982,15 @@ static int term_stream_read(void *cookie, char *buf, int len)
             }
             continue;
         }
-        /* ISIG: Ctrl-C is an interrupt for term_poll_interrupt(), not input,
-         * as SSH's transport treats it. */
+        /* ISIG: Ctrl-C and ^Z are signals for the foreground wait, not input,
+         * as SSH's transport treats them. */
         if (ch == 0x03) {
             t->intr = true;
+            term_wake(t);
+            continue;
+        }
+        if (ch == 0x1a) {
+            t->session.susp = true;
             term_wake(t);
             continue;
         }
@@ -1171,6 +1176,8 @@ static bool term_poll_interrupt(espix_session_t *s)
     while (t->stdin_readers == 0 && xQueueReceive(t->keys, &ch, 0) == pdTRUE) {
         if (ch == 0x03) {
             interrupted = true;
+        } else if (ch == 0x1a) {
+            s->susp = true;
         } else {
             s->last_key = ch;           /* q at top, and the like (R-P7.7) */
         }

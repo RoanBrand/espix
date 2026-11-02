@@ -27,6 +27,30 @@ things are as they are.
   lock, `CONFIG_STDATOMIC_S32C1I_SPIRAM_WORKAROUND`), which any futex-based
   lock there has to go through.
 
+- **Signals at any instruction for M-mode apps.** U-mode's detour (M4) needs
+  no MMU, only a test that the app holds nothing: at an interrupt's exit with the
+  interrupted pc inside the app's image, the return can go to a trampoline that
+  saves the whole context on the app's stack, runs the delivery as task code and
+  restores it. A compute loop's handler, SIGSTOP and Ctrl-Z, and a kill without
+  deleting the task would then work on the S3 too; a pc in libc or the kernel
+  keeps today's delivery points. RISC-V parts (M-mode apps on the S31, the C and
+  P series) can reuse U-mode's frame; on Xtensa the register windows must be
+  spilled first, as FreeRTOS's context switch does.
+
+- **`vfork()` and `daemon()` without `fork()`.** Copy-on-write needs the MMU,
+  but the two common uses of `fork()` do not. `vfork()` then `exec()` can run as
+  nommu Linux runs it: the child borrows the parent's task until it execs or
+  exits, which a `setjmp` at the `vfork()` and a spawn at the `exec()` give.
+  `daemon()` needs only to leave the session: the shell sees an exit 0 while
+  the process carries on as init's child, so `mosquitto -d` would daemonise on
+  the S3 as M8 makes it on the S31.
+
+- **`mmap()` as nommu Linux has it.** An anonymous mapping is a page-aligned
+  block of the app's arena; a private file mapping is the file read into one;
+  `MAP_SHARED` writes back on `msync()` and `munmap()`. Nothing is mapped on
+  touch and nothing is shared between processes, but code written for
+  `mmap()` runs.
+
 - **Unpin M-mode apps from core 1.** `exec.c` pins every M-mode app to core 1
   (`910501e`) because "the toolchain vectorises every translation unit", so an
   app's first PIE instruction on core 0 would trap, and IDF's migration of the
@@ -53,11 +77,6 @@ things are as they are.
   The same pass could move unpinned tasks between cores, since a task's core
   cannot be changed after creation; on the S31 apps are pinned to core 1 today
   because only that core has PIE.
-
-- **Ctrl-Z.** Job control is done for jobs, fg and bg (R-P2.6), but nothing
-  stops a foreground process. The transports now report which key arrived
-  rather than only that one did (R-P7.7), so the field a handler needs exists;
-  Ctrl-Z itself is still missing.
 
 - **User mode on the S31 (R-P8.6).** The spike is done: the `umode` command
   (S31 only, `cmd_umode.c`) builds a small Sv32 table, `mret`s into U-mode and
@@ -288,8 +307,8 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   family, `pause()`, `select()` (through the per-process wake eventfd) and a
   read of stdin. A blocking socket `recv()` or `accept()` waits on in lwIP until
   data comes; the fix is the same eventfd, behind the socket calls espix already
-  wraps. Asynchronous delivery itself needs the U-mode boundary: see the process
-  model in [WORKLIST.md](WORKLIST.md) (R-P8).
+  wraps. A U-mode app on the S31 takes a signal at any instruction; an M-mode
+  app could at an interrupt's exit in its own code (Processes, above).
 
 ## SSH
 

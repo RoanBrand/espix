@@ -211,6 +211,7 @@ typedef struct {
     size_t      pending_len;
     /* The last key drained by the poll, for the command that reads it. */
     volatile int last_key;
+    volatile bool susp;         /* a ^Z the poll drained, for the session */
     size_t      pending_pos;
     bool        last_was_cr;    /* for collapsing CR LF into one newline */
 
@@ -631,7 +632,7 @@ static esp_err_t chan_pump(ssh_chan_t *ch);
  * the buffer's lock, and one byte per call meant ~2048 lock acquisitions per
  * packet for `prog < file`.
  *
- * The two channel kinds genuinely differ, and the difference is Ctrl-C:
+ * The two channel kinds genuinely differ, and the difference is Ctrl-C (and ^Z):
  *
  *   pty    0x03 is a signal, not data, so the whole buffer has to be scanned
  *          for it even when the queue is full -- a full queue is exactly when
@@ -648,7 +649,7 @@ static bool drain_pending_to_stdin(ssh_chan_t *ch, bool *hit)
         size_t run = ch->pending_pos;
 
         if (ch->has_pty) {
-            while (run < ch->pending_len && ch->pending[run] != 0x03) {
+            while (run < ch->pending_len && ch->pending[run] != 0x03 && ch->pending[run] != 0x1a) {
                 run++;
             }
         } else {
@@ -708,6 +709,9 @@ static bool drain_pending_to_stdin(ssh_chan_t *ch, bool *hit)
         if (run < ch->pending_len && ch->pending[run] == 0x03) {
             *hit = true;
             ch->pending_pos = run + 1;
+        } else if (run < ch->pending_len && ch->pending[run] == 0x1a) {
+            ch->susp = true;
+            ch->pending_pos = run + 1;
         }
     }
 
@@ -752,10 +756,14 @@ static bool chan_poll_interrupt(espix_session_t *s)
             continue;
         }
 
-        /* Hand up the last key that was not a Ctrl-C (R-P7.7). */
+        /* Hand up the last key that was not a Ctrl-C (R-P7.7), and a ^Z. */
         if (ch->last_key != 0) {
             s->last_key = ch->last_key;
             ch->last_key = 0;
+        }
+        if (ch->susp) {
+            ch->susp = false;
+            s->susp  = true;
         }
 
         /*

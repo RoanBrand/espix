@@ -127,7 +127,7 @@ static int run_program(espix_session_t *s, const char *abs, int argc,
     if (status < 0) {
         return 1;
     }
-    if (status != 0) {
+    if (status != 0 && !fg.stopped) {
         espix_printf(s, "[exit %d]\n", status);
     }
     return status;
@@ -441,7 +441,7 @@ static int cmd_timeout(espix_session_t *s, int argc, char **argv)
     if (status < 0) {
         return 125;
     }
-    if (status != 0) {
+    if (status != 0 && !fg.stopped) {
         espix_printf(s, "[exit %d]\n", status);
     }
     return status;
@@ -635,9 +635,6 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
 /* jobs, fg, bg                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Ctrl-Z is still missing: the transports report only that a key arrived and
- * not which one -- see R-P7.7. */
-
 static bool job_live(const espix_job_t *j)
 {
     return j->pid > 0;
@@ -749,6 +746,9 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
     /* The foreground wait, so ^C reaches it as it would any job. */
     espix_proc_fg_t fg   = { .who = "fg" };
     const int       code = espix_proc_wait_fg(s, pid, &fg);
+    if (fg.stopped) {
+        return code;                    /* stopped again: still a job */
+    }
     espix_shell_job_clear(s, slot);
 
     if (code < 0) {

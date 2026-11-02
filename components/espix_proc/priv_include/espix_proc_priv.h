@@ -362,8 +362,9 @@ uint32_t espix_sigcheck_mask(void);
 /* A pending signal that would terminate the process now, or 0. */
 int espix_proc_termsig(const espix_proc_slot_t *slot);
 
-/* SIG_DFL does nothing for sig. */
+/* SIG_DFL does nothing for sig, or stops the process. */
 bool espix_sig_default_ignores(int sig);
+bool espix_sig_default_stops(int sig);
 
 /*
  * Begin enforcing the calling process's root. Called once by proc_task(), after

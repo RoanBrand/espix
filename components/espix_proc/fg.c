@@ -1,5 +1,5 @@
 /*
- * The foreground wait: a shell's job, run to its end, with ^C.
+ * The foreground wait: a shell's job, run to its end or until it stops, with ^C and ^Z.
  *
  * Nothing else reads the terminal while a job runs, so the shell does. It
  * blocks in the transport's wait_input() until a key arrives or the job ends;
@@ -49,6 +49,30 @@ static void say(espix_session_t *s, bool err, const char *fmt, ...)
     }
 }
 
+/* A stopped job into the session's jobs, unless `fg` brought it from there, and said as bash says it. */
+static void stopped_job(espix_session_t *s, espix_pid_t pid)
+{
+    char name[ESPIX_JOB_NAME_MAX] = "?";
+    (void)espix_proc_name_of(pid, name, sizeof(name));
+    espix_shell_jobs_prune(s);
+    bool listed = false;
+    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
+        listed = listed || s->jobs[i].pid == pid;
+    }
+    if (!listed && !espix_shell_job_add(s, pid, name)) {
+        say(s, true, "espix: %d: no job slot; it stays stopped, untracked\n", (int)pid);
+        return;
+    }
+    int n = 0;
+    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
+        n += s->jobs[i].pid > 0;
+        if (s->jobs[i].pid == pid) {
+            break;
+        }
+    }
+    say(s, false, "[%d]+  Stopped  %s\n", n, name);
+}
+
 int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
 {
     espix_proc_fg_t none = { 0 };
@@ -57,6 +81,7 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
     }
     const char *const who = (fg->who != NULL) ? fg->who : "espix";
     fg->timed_out = false;
+    fg->stopped   = false;
 
     const espix_proc_slot_t *const self  = espix_proc_self();
     const bool                     shell = self != NULL &&
@@ -143,6 +168,16 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
                 (void)espix_proc_signal_group(pgid, SIGKILL);
             }
         }
+        if (poll && s->susp) {
+            s->susp = false;
+            say(s, false, "^Z\n");
+            (void)espix_proc_signal_group(pgid, SIGTSTP);
+        }
+        /* Stopped, by ^Z or a signal from elsewhere: a background job now, as in any shell. */
+        if (shell && kind == ESPIX_PROC_APP && espix_proc_state_of(pid) == ESPIX_PROC_STOPPED) {
+            fg->stopped = true;
+            break;
+        }
         if (push) {
             s->wait_input(s, ms);
         }
@@ -154,6 +189,10 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
     }
     if (shell) {
         s->fg_pgid = ESPIX_PID_NONE;
+    }
+    if (fg->stopped) {
+        stopped_job(s, pid);
+        return 128 + SIGTSTP;
     }
 
     if (err != ESP_OK) {
