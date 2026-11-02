@@ -405,7 +405,9 @@ What espix does today:
   ```
 
   The `crash` command triggers this on demand. `coredump` inspects the full dump
-  ESP-IDF writes alongside it.
+  ESP-IDF writes alongside it. For a task that is stuck rather than crashed,
+  `sudo kstack <pid>` lists the code addresses on its stack, innermost first,
+  for `addr2line -e build-<target>/espix.elf` on the host: no serial needed.
 
 On the S31, an app built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([docs/USER-MODE.md](docs/USER-MODE.md)). Its fault is a

@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/freertos_debug.h"
 #include "freertos/task.h"
 
 #include "esp_chip_info.h"
@@ -1525,6 +1526,68 @@ static int cmd_coredump(espix_session_t *s, int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+extern char _iram_text_start[], _iram_text_end[], _text_start[], _text_end[];
+
+/* A word on a stack as the code address it would be; Xtensa keeps the window size in a return address's top bits. */
+static uintptr_t code_addr(uint32_t w)
+{
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
+    w = (w & 0x3fffffffu) | 0x40000000u;
+#endif
+    const bool iram  = w >= (uintptr_t)_iram_text_start && w < (uintptr_t)_iram_text_end;
+    const bool flash = w >= (uintptr_t)_text_start && w < (uintptr_t)_text_end;
+    return (iram || flash) ? w : 0;
+}
+
+/* The code addresses on a task's stack, innermost first: its call chain, for addr2line on the host. */
+static int cmd_kstack(espix_session_t *s, int argc, char **argv)
+{
+    char *end = NULL;
+    const long want = (argc == 2) ? strtol(argv[1], &end, 10) : 0;
+    if (argc != 2 || end == argv[1] || *end != '\0' || want <= 0) {
+        espix_eprintf(s, "usage: kstack <pid>\n");
+        return 2;
+    }
+    if (s != NULL && s->uid != 0) {
+        espix_eprintf(s, "kstack: only root may read a task's stack\n");
+        return 1;
+    }
+
+    const UBaseType_t capacity = uxTaskGetNumberOfTasks() + 4;
+    TaskStatus_t *tasks = calloc(capacity, sizeof(*tasks));
+    if (tasks == NULL) {
+        espix_eprintf(s, "kstack: out of memory\n");
+        return 1;
+    }
+    const UBaseType_t n = uxTaskGetSystemState(tasks, capacity, NULL);
+    TaskSnapshot_t snap = { 0 };
+    char name[configMAX_TASK_NAME_LEN] = "";
+    for (UBaseType_t i = 0; i < n; i++) {
+        if (espix_proc_pid_of_task(tasks[i].xHandle) == (espix_pid_t)want) {
+            vTaskGetSnapshot(tasks[i].xHandle, &snap);
+            strlcpy(name, tasks[i].pcTaskName, sizeof(name));
+            break;
+        }
+    }
+    free(tasks);
+    if (snap.pxTopOfStack == NULL) {
+        espix_eprintf(s, "kstack: no task has pid %ld\n", want);
+        return 1;
+    }
+
+    espix_printf(s, "pid %ld (%s), sp 0x%08" PRIxPTR ":", want, name, (uintptr_t)snap.pxTopOfStack);
+    for (const uint32_t *p = (const uint32_t *)snap.pxTopOfStack; p < (const uint32_t *)snap.pxEndOfStack; p++) {
+        const uintptr_t a = code_addr(*p);
+        if (a != 0) {
+            espix_printf(s, " %08" PRIxPTR, a);
+        }
+    }
+    espix_printf(s, "\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+
 static int cmd_passwd(espix_session_t *s, int argc, char **argv)
 {
     const char *user = (argc > 1) ? argv[1] : "esp";
@@ -2078,6 +2141,9 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "log",    .fn = cmd_log,
       .help = "show or set a component's log level",
       .usage = "log <tag> [level]" },
+    { .name = "kstack", .fn = cmd_kstack,
+      .help = "list the code addresses on a task's stack, for addr2line",
+      .usage = "kstack <pid>" },
     { .name = "coredump", .fn = cmd_coredump,
       .help = "show or erase the stored core dump",
       .usage = "coredump [erase]",
