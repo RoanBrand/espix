@@ -619,22 +619,76 @@ static int cmd_cat(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
+/* The flags mkdir and rmdir share: -p, and -- to end them. Index of the first operand, or -1 after an error. */
+static int dir_opts(espix_session_t *s, const char *cmd, int argc, char **argv, bool *parents)
+{
+    *parents = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            i++;
+            break;
+        }
+        for (const char *p = argv[i] + 1; *p != '\0'; p++) {
+            if (*p != 'p') {
+                espix_eprintf(s, "%s: unknown option -%c\n", cmd, *p);
+                espix_eprintf(s, "usage: %s [-p] [--] <dir>...\n", cmd);
+                return -1;
+            }
+            *parents = true;
+        }
+    }
+    if (i >= argc) {
+        espix_eprintf(s, "usage: %s [-p] [--] <dir>...\n", cmd);
+        return -1;
+    }
+    return i;
+}
+
+/* Each missing directory on the way to abs, then abs; one that is there already is fine, as -p has it. */
+static int mkdir_parents(char *abs)
+{
+    for (char *p = abs + 1; ; p++) {
+        if (*p != '/' && *p != '\0') {
+            continue;
+        }
+        const char c = *p;
+        *p = '\0';
+        struct stat st;
+        int r = 0;
+        if (stat(abs, &st) == 0) {
+            if (!S_ISDIR(st.st_mode)) {
+                errno = (c == '\0') ? EEXIST : ENOTDIR;
+                r = -1;
+            }
+        } else if (mkdir(abs, 0755) != 0 && !(errno == EEXIST && stat(abs, &st) == 0 && S_ISDIR(st.st_mode))) {
+            r = -1;
+        }
+        *p = c;
+        if (r != 0 || c == '\0') {
+            return r;
+        }
+    }
+}
+
+/* mkdir [-p] [--] <dir>...: -p makes the parents too, and does not mind a directory that exists. */
 static int cmd_mkdir(espix_session_t *s, int argc, char **argv)
 {
-    if (argc < 2) {
-        espix_eprintf(s, "usage: mkdir <dir>...\n");
+    bool parents;
+    const int first = dir_opts(s, "mkdir", argc, argv, &parents);
+    if (first < 0) {
         return 1;
     }
 
     int status = 0;
 
-    for (int i = 1; i < argc; i++) {
+    for (int i = first; i < argc; i++) {
         char abs[ESPIX_PATH_MAX];
         if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
             status = 1;
             continue;
         }
-        if (mkdir(abs, 0755) != 0) {
+        if ((parents ? mkdir_parents(abs) : mkdir(abs, 0755)) != 0) {
             espix_eprintf(s, "mkdir: %s: %s\n", abs, strerror(errno));
             status = 1;
         }
@@ -643,31 +697,62 @@ static int cmd_mkdir(espix_session_t *s, int argc, char **argv)
     return status;
 }
 
-/* Empty directories only, which is what rmdir(2) does -- `rm -r` is the way to
- * take a tree, and keeping the two apart is the point of having both. No -p:
- * mkdir here has none either, and one flag in a pair is worse than none. */
+/* One empty directory, refusing / and /media; false, having said why, when it is not removed. */
+static bool rmdir_one(espix_session_t *s, const char *path)
+{
+    char abs[ESPIX_PATH_MAX];
+    if (!espix_cmd_path(s, path, abs, sizeof(abs))) {
+        return false;
+    }
+    if (strcmp(abs, "/") == 0 || strcmp(abs, "/media") == 0) {
+        espix_eprintf(s, "rmdir: refusing to remove %s\n", abs);
+        return false;
+    }
+    if (rmdir(abs) != 0) {
+        espix_eprintf(s, "rmdir: %s: %s\n", abs, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* path less its last component, as written; false when there is none left to take. */
+static bool strip_last(char *path)
+{
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') {
+        path[--n] = '\0';
+    }
+    char *slash = strrchr(path, '/');
+    while (slash != NULL && slash > path && slash[-1] == '/') {
+        slash--;
+    }
+    if (slash == NULL || slash == path) {
+        return false;
+    }
+    *slash = '\0';
+    return true;
+}
+
+/* rmdir [-p] [--] <dir>...: empty directories only, as rmdir(2) -- `rm -r` takes a tree. -p then takes each
+ * parent the operand names, as written, until one cannot go, as GNU rmdir does. */
 static int cmd_rmdir(espix_session_t *s, int argc, char **argv)
 {
-    if (argc < 2) {
-        espix_eprintf(s, "usage: rmdir <dir>...\n");
+    bool parents;
+    const int first = dir_opts(s, "rmdir", argc, argv, &parents);
+    if (first < 0) {
         return 1;
     }
 
     int status = 0;
 
-    for (int i = 1; i < argc; i++) {
-        char abs[ESPIX_PATH_MAX];
-        if (!espix_cmd_path(s, argv[i], abs, sizeof(abs))) {
-            status = 1;
-            continue;
+    for (int i = first; i < argc; i++) {
+        char path[ESPIX_PATH_MAX];
+        strlcpy(path, argv[i], sizeof(path));
+        bool ok = rmdir_one(s, path);
+        while (ok && parents && strip_last(path)) {
+            ok = rmdir_one(s, path);
         }
-        if (strcmp(abs, "/") == 0 || strcmp(abs, "/media") == 0) {
-            espix_eprintf(s, "rmdir: refusing to remove %s\n", abs);
-            status = 1;
-            continue;
-        }
-        if (rmdir(abs) != 0) {
-            espix_eprintf(s, "rmdir: %s: %s\n", abs, strerror(errno));
+        if (!ok) {
             status = 1;
         }
     }
@@ -1469,10 +1554,10 @@ static espix_cmd_t s_fs_cmds[] = {
       .help = "print files",                     .usage = "cat <file>...",
       .stack = 8192 },
     { .name = "mkdir", .fn = cmd_mkdir,
-      .help = "create directories",              .usage = "mkdir <dir>...",
+      .help = "create directories",              .usage = "mkdir [-p] [--] <dir>...",
       .stack = 8192 },
     { .name = "rmdir", .fn = cmd_rmdir,
-      .help = "remove empty directories",        .usage = "rmdir <dir>...",
+      .help = "remove empty directories",        .usage = "rmdir [-p] [--] <dir>...",
       .stack = 8192 },
     { .name = "rm",    .fn = cmd_rm,
       .help = "remove files or directories",     .usage = "rm [-rRf] [--] <path>...",

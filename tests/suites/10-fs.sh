@@ -15,6 +15,13 @@ TNAME=espix-test-fs-$ESPIX_WORKER
 dev_run "rm -r $T" >/dev/null 2>&1
 dev_run "mkdir $T" >/dev/null
 assert_contains "mkdir creates a directory" "$TNAME" "$(dev_run 'ls -l /tmp')"
+assert_status "mkdir -p makes the parents" 0 dev_status "mkdir -p $T/p/q/r && ls $T/p/q/r"
+assert_status "and does not mind one that is there" 0 dev_status "mkdir -p $T/p/q"
+# The parents the operand names, as written: from inside $T, p/q/r is three and no more.
+assert_contains "rmdir -p takes the parents the operand names" "st=0" \
+    "$(dev_run "cd $T && rmdir -p p/q/r; echo st=\$?; cd /home/$ESPIX_USER")"
+assert_status "and leaves the directory it was run in" 0 dev_status "ls $T"
+assert_not_contains "having taken p" "p/" "$(dev_run "ls $T")"
 
 dev_run "echo hello-espix > $T/a.txt" >/dev/null
 assert_eq "a file round-trips through the shell" "hello-espix" "$(dev_run "cat $T/a.txt")"
@@ -143,6 +150,39 @@ assert_contains     "and still prints its count"            "entries" "$ls_ok"
 assert_not_contains "the synthetic /dev listing is quiet too" "stopped after" \
     "$(dev_run 'ls -l /dev')"
 
+# ------------------------------------------------------- a stick's volume ---
+#
+# Both truncates, which nothing else in the suite calls (cp reaches truncation by
+# opening with O_TRUNC, which is the open path), on whatever volume the stick
+# has: FAT first, then exFAT, then ext. Mounted for the session's user, so the
+# file is its to write; and left as it was found, the file removed and the
+# mount undone. Skips loudly with no stick.
+if ! vol=$(dev_stick_part vfat exfat ext4 ext3 ext2); then
+    espix_skip "no FAT, exFAT or ext volume attached -- needs a stick on the OTG port"
+elif ! dev_testapp_present; then
+    espix_skip "test app not built -- run 'make test-app'"
+else
+    vol_part=${vol% *} vol_type=${vol#* }
+    vol_mnt=/mnt/espix-vol-$ESPIX_WORKER
+    vol_file=$vol_mnt/espix-trunc-$ESPIX_WORKER.txt
+    dev_run "sudo mkdir -p $vol_mnt" >/dev/null 2>&1
+    mount_out=$(dev_run "sudo mount -o uid=$(dev_run 'id -u'),gid=$(dev_run 'id -g') $vol_part $vol_mnt 2>&1")
+    if [ -n "$mount_out" ]; then
+        espix_skip "could not mount $vol_part ($vol_type): $mount_out"
+    else
+        # An ext volume keeps its own owners, so the file is made the session's there.
+        dev_run "sudo touch $vol_file; sudo chown $ESPIX_USER $vol_file" >/dev/null 2>&1
+        trunc_out=$(dev_run "$DEV_TESTAPP truncate $vol_file 2000 2>&1")
+        assert_contains "truncate() reaches a file on $vol_type" "truncate $vol_file 2000 ok" "$trunc_out"
+        assert_contains "and ftruncate() takes it to half" "ftruncate $vol_file 1000 ok" "$trunc_out"
+        assert_contains "the volume reports what they left" "1000" "$(dev_run "ls -l $vol_file")"
+        dev_run "sudo rm $vol_file" >/dev/null 2>&1
+        assert_status "and the file is gone again" 1 dev_status "ls $vol_file"
+        dev_run "sudo umount $vol_mnt" >/dev/null 2>&1
+    fi
+    dev_run "sudo rmdir $vol_mnt" >/dev/null 2>&1
+fi
+
 # ------------------------------------------------- ext: the inodes are the rules ---
 #
 # ext keeps modes and owners in its inodes, so espix reads them rather than its own
@@ -150,67 +190,30 @@ assert_not_contains "the synthetic /dev listing is quiet too" "stopped after" \
 # filesystem that carries its own. `lost+found` is what makes that decisive without
 # creating anything on the volume -- mke2fs always makes it 0700 and root-owned,
 # where the rule would have said 0755 for a directory and given it to the mount's
-# owner.
-#
-# Needs an ext volume attached and root to mount it, so it skips loudly otherwise
-# rather than passing against nothing.
-ext_part=$(dev_run 'lsblk' | awk 'NR > 1 && $3 == "part" && $4 ~ /^ext/ { print $1; exit }')
-if [ -z "$ext_part" ]; then
-    espix_skip "no ext volume attached -- needs the stick on the OTG port"
+# owner. Mounted read-only, so nobody's ext volume is written; and with the owner
+# options a metadata-less volume needs, which one that keeps its own must ignore.
+if ! ext=$(dev_stick_part ext4 ext3 ext2); then
+    espix_skip "no ext volume attached -- needs a stick with one on the OTG port"
 else
+    ext_part=${ext% *}
     ext_mnt=/mnt/espix-ext-$ESPIX_WORKER
     dev_run "sudo mkdir -p $ext_mnt" >/dev/null 2>&1
-
-    # Mounted with the options a metadata-less volume needs, deliberately: one that
-    # keeps its own must ignore them, and that is half the point.
-    mount_out=$(dev_run "sudo mount -o uid=1000,gid=1000 $ext_part $ext_mnt 2>&1")
+    mount_out=$(dev_run "sudo mount -o ro,uid=1000,gid=1000 $ext_part $ext_mnt 2>&1")
     if [ -n "$mount_out" ]; then
         espix_skip "could not mount $ext_part: $mount_out"
     else
         listing=$(dev_run "ls -l $ext_mnt 2>&1")
-
         assert_contains "an ext volume's modes come from its inodes, not the rule" \
                         "drwx------" "$listing"
         assert_contains "and its owner is the inode's, not whoever mounted it" \
                         "root root" "$listing"
 
         # 0700 root, so the rule's 0755 for a directory would have let this through.
-        opened=$(dev_run "ls $ext_mnt/lost+found 2>&1")
         assert_contains "a directory the volume keeps private is refused to esp" \
-                        "cannot open" "$opened"
-
-        # Changing one needs a writable mount, which is the next milestone rather
-        # than this one -- so this is a refusal by status, not by message.
-        assert_status "chmod on an ext volume refuses, having nowhere to write yet" \
-                      1 dev_status "chmod $ext_mnt/lost+found 0755"
-
-        # Both truncates, which nothing else in the suite calls: cp reaches
-        # truncation by opening with O_TRUNC, which is the open path. The file is
-        # root's, so it is made writable first -- and that exercises chmod's success
-        # path on a writable volume while it is there.
-        if ! dev_testapp_present; then
-            espix_skip "test app not built -- run 'make test-app'"
-        elif ! dev_status 'ls /bin/hello'; then
-            espix_skip "truncate tests need /bin/hello to seed the file (make apps && make fs)"
-        else
-            app=/home/$ESPIX_USER/testapp
-            dev_run "sudo cp /bin/hello $ext_mnt/trunc.txt" >/dev/null 2>&1
-            dev_run "sudo chmod 0666 $ext_mnt/trunc.txt" >/dev/null 2>&1
-
-            trunc_out=$(dev_run "$app truncate $ext_mnt/trunc.txt 2000 2>&1")
-            assert_contains "truncate() reaches an ext inode" \
-                            "truncate $ext_mnt/trunc.txt 2000 ok" "$trunc_out"
-            assert_contains "and ftruncate() takes it to half" \
-                            "ftruncate $ext_mnt/trunc.txt 1000 ok" "$trunc_out"
-            assert_contains "the inode reports what they left" "1000" \
-                            "$(dev_run "ls -l $ext_mnt/trunc.txt")"
-
-            dev_run "sudo rm $ext_mnt/trunc.txt" >/dev/null 2>&1
-        fi
-
+                        "cannot open" "$(dev_run "ls $ext_mnt/lost+found 2>&1")"
         dev_run "sudo umount $ext_mnt" >/dev/null 2>&1
-        dev_run "sudo rmdir $ext_mnt" >/dev/null 2>&1
     fi
+    dev_run "sudo rmdir $ext_mnt" >/dev/null 2>&1
 fi
 
 # ---------------------------------------------------------------------------

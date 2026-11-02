@@ -152,12 +152,16 @@ else
         #
         # Only mounts something nothing else is using: this suite runs alone, and
         # an example mount point is created and removed around it.
-        if [ -n "$part" ]; then
+        ro=$(dev_stick_part vfat exfat ext4 ext3 ext2)
+        if [ -z "$ro" ]; then
+            espix_skip "no FAT, exFAT or ext partition to mount read-only"
+        else
+            ropart=${ro% *}
             ros=/tmp/espix-ro-test
 
             if ! dev_run "mkdir -p $ros" >/dev/null 2>&1; then
                 espix_skip "could not make a mount point for the read-only check"
-            elif dev_status "sudo mount -o ro /dev/$part $ros" ; then
+            elif dev_status "sudo mount -o ro /dev/$ropart $ros" ; then
                 espix_pass "a volume mounts read-only"
 
                 assert_contains "mount names it read-only" "(ro)" "$(dev_run 'mount')"
@@ -175,7 +179,7 @@ else
                 dev_run "sudo umount $ros" >/dev/null 2>&1
                 assert_not_contains "and unmounts cleanly" "$ros" "$(dev_run 'mount')"
             else
-                espix_skip "could not mount /dev/$part read-only to check it"
+                espix_skip "could not mount /dev/$ropart read-only to check it"
             fi
 
             dev_run "rmdir $ros" >/dev/null 2>&1

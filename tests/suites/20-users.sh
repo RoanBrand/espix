@@ -5,6 +5,9 @@
 # unaffected. It was marked unsafe on the assumption that it was not.
 
 assert_contains "id names the user"  "($ESPIX_USER)" "$(dev_run 'id')"
+assert_eq "id -un is the name alone" "$ESPIX_USER" "$(dev_run 'id -un')"
+assert_eq "id -u is the number" "$(dev_run 'id' | sed -n 's/^uid=\([0-9]*\).*/\1/p')" "$(dev_run 'id -u')"
+assert_eq "id -g is the group's" "$(dev_run 'id' | sed -n 's/.*gid=\([0-9]*\).*/\1/p')" "$(dev_run 'id -g')"
 assert_contains "groups lists a group" "$ESPIX_USER" "$(dev_run 'groups')"
 
 # sudo is gated by /etc/sudoers, which ships seeded with %sudo the way Debian

@@ -724,6 +724,23 @@ dev_console_run() {
 DEV_TESTAPP="/home/$ESPIX_USER/testapp"
 DEV_TESTAPP_SHA="/home/$ESPIX_USER/.testapp.sha"
 
+# A USB stick's partition whose filesystem is one of the arguments, in that
+# order of preference: "<name> <type>" (sda1 vfat), or nothing and status 1. Any
+# stick will do; a suite skips when there is none it can use.
+dev_stick_part() {
+    local list t p
+    list=$(dev_run 'lsblk')
+    for t in "$@"; do
+        p=$(printf '%s\n' "$list" | awk -v t="$t" 'NR > 1 && $3 == "part" && $4 == t { print $1; exit }' |
+            sed 's/^[^[:alnum:]]*//')
+        if [ -n "$p" ]; then
+            printf '%s %s\n' "$p" "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ESPIX_UAPP=1 stages testapp's U-mode build in its place (docs/USER-MODE.md).
 # A suite asks this before an assertion that needs what U-mode apps do not
 # have yet, and skips with the milestone that brings it.

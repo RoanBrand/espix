@@ -1680,10 +1680,33 @@ static int cmd_whoami(espix_session_t *s, int argc, char **argv)
  * filesystem checks, so if these two ever disagree the output says so rather
  * than hiding it behind one of them.
  */
+/* id [-u|-g] [-n]: the session's ids, or with -u or -g just the one, by name with -n, as coreutils' id. */
 static int cmd_id(espix_session_t *s, int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    bool want_u = false, want_g = false, by_name = false;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        for (const char *p = a + 1; a[0] == '-' && *p != '\0'; p++) {
+            switch (*p) {
+            case 'u': want_u  = true; break;
+            case 'g': want_g  = true; break;
+            case 'n': by_name = true; break;
+            default:
+                espix_eprintf(s, "id: unknown option -%c\n", *p);
+                espix_eprintf(s, "usage: id [-u|-g] [-n]\n");
+                return 1;
+            }
+        }
+        if (a[0] != '-' || a[1] == '\0') {
+            espix_eprintf(s, "usage: id [-u|-g] [-n]\n");
+            return 1;
+        }
+    }
+    if ((want_u && want_g) || (by_name && !want_u && !want_g)) {
+        espix_eprintf(s, "id: -n needs one of -u or -g\n");
+        return 1;
+    }
 
     if (s == NULL) {
         return 1;
@@ -1693,11 +1716,22 @@ static int cmd_id(espix_session_t *s, int argc, char **argv)
     char        ubuf[ESPIX_USER_MAX];
     strlcpy(ubuf, (uname != NULL) ? uname : s->user, sizeof(ubuf));
 
-    const char *gname = espix_auth_name_for_uid(s->gid);
+    const char *gname = espix_auth_group_name(s->gid);
+    if (gname == NULL) {
+        gname = ubuf;
+    }
 
-    espix_printf(s, "uid=%u(%s) gid=%u(%s)\n",
-                 (unsigned)s->uid, ubuf,
-                 (unsigned)s->gid, (gname != NULL) ? gname : ubuf);
+    if (want_u && by_name) {
+        espix_printf(s, "%s\n", ubuf);
+    } else if (want_u) {
+        espix_printf(s, "%u\n", (unsigned)s->uid);
+    } else if (want_g && by_name) {
+        espix_printf(s, "%s\n", gname);
+    } else if (want_g) {
+        espix_printf(s, "%u\n", (unsigned)s->gid);
+    } else {
+        espix_printf(s, "uid=%u(%s) gid=%u(%s)\n", (unsigned)s->uid, ubuf, (unsigned)s->gid, gname);
+    }
     return 0;
 }
 
@@ -2167,7 +2201,7 @@ static espix_cmd_t s_sys_cmds[] = {
       .usage = "whoami" },
     { .name = "id",     .fn = cmd_id,
       .help = "print the current user and group ids",
-      .usage = "id" },
+      .usage = "id [-u|-g] [-n]" },
     { .name = "useradd", .fn = cmd_useradd,
       .help = "create a user account",
       .usage = "useradd [-m] [-r] [-G group,...] <name>" },
