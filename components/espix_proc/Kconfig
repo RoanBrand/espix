@@ -21,6 +21,17 @@ menu "espix processes"
             as it is touched; its task's stack is used only by syscalls and
             interrupts, so every U-mode app gets this one size.
 
+    config ESPIX_UM_AMO_TRAP
+        bool "Do U-mode apps' AMOs in the kernel"
+        depends on ESPIX_UMODE
+        default y
+        help
+            On this S31 a U-mode AMO is not always atomic against an AMO from
+            the other core; LR/SC is. The loader rewrites each AMO in an app's
+            code to a form that traps, and the kernel does it as LR/SC, at the
+            cost of a trap per atomic. Turn it off only to measure the
+            hardware (uapp amo). See docs/GOTCHAS.md.
+
     config ESPIX_PROC_MAX
         int "Maximum tracked processes"
         range 2 64

@@ -228,8 +228,9 @@ static void *sleep_forever(void *arg)
 
 /*
  * An add on one word from two cores, as an AMO and as LR/SC. A U-mode AMO is not
- * always atomic on this S31; LR/SC is (docs/KNOWN-ISSUES.md). The loops are their own
- * functions so their layout, which sets the AMO's loss rate, stays fixed.
+ * always atomic on this S31, so the kernel does them (CONFIG_ESPIX_UM_AMO_TRAP); with
+ * that off this measures the hardware. The loops are their own functions so their
+ * layout, which sets the AMO's loss rate, stays fixed.
  */
 void uapp_amo_loop(volatile uint32_t *w, long n);
 void uapp_lrsc_loop(volatile uint32_t *w, long n);
@@ -530,13 +531,17 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(mode, "amo") == 0) {
-        s_amo_n = (argc > 2) ? atol(argv[2]) : 10000000;
+        s_amo_n = (argc > 2) ? atol(argv[2]) : 200000;
         int cpu[2];
+        const unsigned long c0 = cycles();
         const long amo = amo_lost(uapp_amo_loop, cpu);
+        const unsigned long c1 = cycles();
         const long lrsc = amo_lost(uapp_lrsc_loop, cpu);
-        printf("uapp: adds on cores %d and %d, %ld each: amoadd lost %ld, lr/sc lost %ld\n",
-               cpu[0], cpu[1], s_amo_n, amo, lrsc);
-        return lrsc != 0;
+        const unsigned long c2 = cycles();
+        printf("uapp: adds on cores %d and %d, %ld each: amoadd lost %ld (%lu cycles each), "
+               "lr/sc lost %ld (%lu cycles each)\n", cpu[0], cpu[1], s_amo_n, amo, (c1 - c0) / s_amo_n,
+               lrsc, (c2 - c1) / s_amo_n);
+        return amo != 0 || lrsc != 0;
     }
     if (strcmp(mode, "tchurn") == 0) {
         pthread_t t[4];

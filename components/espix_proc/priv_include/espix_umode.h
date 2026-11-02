@@ -48,6 +48,8 @@ typedef struct {
     bool               exiting;     /* every thread is ending; the main one ends the process */
     int                exit_status;
     espix_um_waiter_t *futex_waiters;
+    uint32_t          *amos;        /* each AMO the loader replaced: its pc and the instruction, by pc */
+    uint32_t           amo_count;
 } espix_um_proc_t;
 
 /* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */

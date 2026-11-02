@@ -120,7 +120,7 @@ monitor.
 | `ecall` from U (8) | the syscall dispatcher |
 | page fault (12, 13, 15) | map on touch, copy-on-write, stack growth, or SIGSEGV |
 | access fault (1, 5, 7) | SIGSEGV or SIGBUS |
-| illegal instruction (2) | SIGILL |
+| illegal instruction (2) | an AMO the loader replaced, done here; else SIGILL |
 | breakpoint, misaligned | SIGTRAP, SIGBUS |
 
 An app's exit, its faults and its fatal signals end the process from task
@@ -241,8 +241,16 @@ waiters, under its lock. A waker notifies the waiting task while holding that
 lock, so the waiter cannot leave, and its task cannot end, before the notify
 lands. `libespix` builds mutexes, condition variables, rwlocks, barriers,
 spinlocks, semaphores, once and keys on them, and the locks picolibc's `malloc`
-and stdio take. Its read-modify-writes are LR/SC, never AMOs: a U-mode AMO can
-lose an update against the other core ([KNOWN-ISSUES](KNOWN-ISSUES.md)).
+and stdio take. Its read-modify-writes are LR/SC, never AMOs.
+
+**The kernel does an app's AMOs.** A U-mode AMO on this S31 can lose an update
+against an AMO on the same word from the other core ([GOTCHAS](GOTCHAS.md));
+LR/SC and M-mode never do. So the loader replaces each AMO in the image's code
+sections with `unimp` and keeps a table of their addresses and instructions;
+the illegal-instruction exception looks `mepc` up there, does the operation on
+the user's word as LR/SC, puts the old value in `rd` and resumes. One costs
+about 1,150 cycles, a null syscall's worth. `uapp amo` checks it from both
+cores; with `CONFIG_ESPIX_UM_AMO_TRAP` off it measures the hardware instead.
 
 **The tables are shared, so changes to them are locked and flushed everywhere.**
 A page fault on a page another thread just mapped is resumed, not a SIGSEGV.
@@ -250,6 +258,9 @@ An unmap (a shrinking heap, an ended thread's stack) marks the ASID stale on the
 other core, and if that core runs it now, flushes it there by a cross-core
 interrupt before the frames are freed. A frame a syscall is reading or writing
 into is pinned, and an unmap meanwhile frees it when the syscall lets go.
+Pinning a page that is mapped already takes no lock: the pinner counts itself
+before it reads the PTE, and an unmap clears the PTE before it reads the count,
+so one of them sees the other.
 
 ## Signals, stopping and faults
 
@@ -337,14 +348,10 @@ Open:
   single-core chips only. For Espressif: both, with `uapp amo` as the
   reproducer, and whether the S31 shares the popret issue IDF flags on the C5,
   C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`).
-- **An app's own atomics are AMOs**, and so are libstdc++'s reference counts and
-  seven exchanges in picolibc (stdio's unget slot, `signal()`). Three ways out:
-  `espix-cc` without Zaamo once the toolchain has GCC's Zalrsc-only exchange
-  fix ([UPSTREAM](UPSTREAM.md)), with picolibc and libstdc++ rebuilt the same
-  way, free at run time; the loader rewriting each AMO in U-mode text to its
-  RV64-only `.d` form, which traps as illegal, for the kernel to perform in
-  M-mode, any binary at about 2.6 µs an atomic; or a process's threads on one
-  core, no cost per atomic and no parallelism within a process.
+- **An app's atomics cost a trap each** while the kernel does them. A toolchain
+  with GCC's Zalrsc-only exchange fix ([UPSTREAM](UPSTREAM.md)) lets `espix-cc`
+  build without Zaamo, and picolibc and libstdc++ rebuilt the same way, so that
+  apps carry no AMOs and pay nothing.
 - **Deleting a task preempted in U-mode leaks about 1 KB of internal RAM.** A kill
   only comes to that when an app stays over 250 ms inside a syscall that cannot
   be interrupted; otherwise the app leaves on its own. A thread deleted that way

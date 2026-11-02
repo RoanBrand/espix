@@ -47,7 +47,7 @@ struct espix_um_as {
     region_t          regions[REGIONS];
     uint32_t          brk_base, brk;    /* the heap is regions[0] */
     uint32_t          tstacks;          /* thread stack spans in use, one bit each */
-    uint32_t          pins;             /* kernel calls holding a pointer into a frame */
+    uint32_t          pins;             /* kernel calls holding a pointer into a frame; atomic */
     dead_t           *dead;             /* freed when the last pin goes */
 };
 
@@ -135,7 +135,7 @@ static uint32_t *leaf(espix_um_as_t *as, uint32_t va, bool create)
         if (l2 == NULL) {
             return NULL;
         }
-        *l1 = pte_of(l2, PTE_V);
+        __atomic_store_n(l1, pte_of(l2, PTE_V), __ATOMIC_RELEASE);     /* for user_pin()'s walk */
     }
     return &((uint32_t *)pte_frame(*l1))[(va >> 12) & 0x3ff];
 }
@@ -156,7 +156,7 @@ void *espix_um_map_new(espix_um_as_t *as, uint32_t va, uint32_t pte_flags)
     if (frame == NULL) {
         return NULL;
     }
-    *pte = pte_of(frame, flags);
+    __atomic_store_n(pte, pte_of(frame, flags), __ATOMIC_RELEASE);
     return frame;
 }
 
@@ -213,26 +213,36 @@ static void unmap_range(espix_um_as_t *as, uint32_t start, uint32_t end, dead_t 
         }
         *d = (dead_t){ *dead, pte_frame(*pte) };
         *dead = d;
-        *pte = 0;
+        __atomic_store_n(pte, 0, __ATOMIC_SEQ_CST);
         asm volatile ("sfence.vma %0, %1" :: "r"(va), "r"(as->asid) : "memory");
     }
 }
 
-/* The frames of an unmap: no core translates them any more; freed now, or when the last pin goes. */
+/*
+ * The frames of an unmap: no core translates them any more; freed now, or when the last pin goes.
+ * The PTEs were cleared before pins is read, and a pinner counts itself before reading a PTE:
+ * either the pinner saw the clear, or this sees its pin.
+ */
 static void unmapped(espix_um_as_t *as, dead_t *dead)
 {
     if (dead == NULL) {
         return;
     }
     espix_um_asid_shoot(as->asid);
-    if (as->pins > 0) {
-        dead_t *tail = dead;
-        while (tail->next != NULL) {
-            tail = tail->next;
-        }
-        tail->next = as->dead;
-        as->dead   = dead;
-    } else {
+    if (__atomic_load_n(&as->pins, __ATOMIC_SEQ_CST) == 0) {
+        frames_free(dead);
+        return;
+    }
+    dead_t *tail = dead;
+    while (tail->next != NULL) {
+        tail = tail->next;
+    }
+    tail->next = as->dead;
+    __atomic_store_n(&as->dead, dead, __ATOMIC_SEQ_CST);
+    /* The last pin let go after the check above: it may have missed the list. */
+    if (__atomic_load_n(&as->pins, __ATOMIC_SEQ_CST) == 0) {
+        dead     = as->dead;
+        as->dead = NULL;
         frames_free(dead);
     }
 }
@@ -304,20 +314,33 @@ static uint8_t *page_of(espix_um_as_t *as, uint32_t va, uint32_t need)
 
 void *espix_um_user_pin(espix_um_as_t *as, uint32_t va, uint32_t need)
 {
+    /* A page mapped already needs no lock: the tables only grow, and unmapped() honours the pin. */
+    __atomic_add_fetch(&as->pins, 1, __ATOMIC_SEQ_CST);
+    const uint32_t l1 = __atomic_load_n(&as->root[va >> 22], __ATOMIC_ACQUIRE);
+    if (l1 & PTE_V) {
+        const uint32_t pte = __atomic_load_n(&((uint32_t *)pte_frame(l1))[(va >> 12) & 0x3ff], __ATOMIC_SEQ_CST);
+        if ((pte & (PTE_V | PTE_U | need)) == (PTE_V | PTE_U | need)) {
+            return (uint8_t *)pte_frame(pte) + (va & (PG - 1));
+        }
+    }
     xSemaphoreTake(as->lock, portMAX_DELAY);
     uint8_t *const k = page_of(as, va, need);
-    if (k != NULL) {
-        as->pins++;
-    }
     xSemaphoreGive(as->lock);
+    if (k == NULL) {
+        espix_um_user_unpin(as);
+    }
     return k;
 }
 
 void espix_um_user_unpin(espix_um_as_t *as)
 {
+    if (__atomic_sub_fetch(&as->pins, 1, __ATOMIC_SEQ_CST) != 0 ||
+        __atomic_load_n(&as->dead, __ATOMIC_SEQ_CST) == NULL) {
+        return;
+    }
     dead_t *dead = NULL;
     xSemaphoreTake(as->lock, portMAX_DELAY);
-    if (--as->pins == 0) {
+    if (__atomic_load_n(&as->pins, __ATOMIC_SEQ_CST) == 0) {
         dead     = as->dead;
         as->dead = NULL;
     }

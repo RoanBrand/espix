@@ -629,7 +629,16 @@ sits, move the rate between 0 and 3 per million, so a clean run proves nothing
 without the threads on both cores (`sched_getcpu()`). LR/SC loses none at 17
 layouts. libespix writes its exchange and add as LR/SC by hand (`pthread.c`),
 with the `sc` result in its own register: GCC 15.2's Zalrsc-only exchange reuses
-the value register for it ([UPSTREAM](UPSTREAM.md)).
+the value register for it ([UPSTREAM](UPSTREAM.md)). Every other AMO in an app
+is done by the kernel (`CONFIG_ESPIX_UM_AMO_TRAP`).
+
+### An instruction RV32 lacks need not trap
+
+On the S31, `amoadd.d` and the other RV64-only AMO forms execute in U-mode
+instead of raising an illegal-instruction exception: they return garbage and
+clobber a register. Something meant to trap must be architecturally illegal on
+every RV32 core, such as `unimp` (`csrrw x0, cycle, x0`, a write to a
+read-only CSR).
 
 ### Never longjmp out of a stdio callback
 

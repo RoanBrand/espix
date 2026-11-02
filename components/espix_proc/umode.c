@@ -514,6 +514,9 @@ static void __attribute__((noreturn)) fault(espix_um_thread_t *t, const RvExcFra
 }
 
 void espix_um_resume(RvExcFrame *u, uint32_t ms, espix_um_thread_t *t) __attribute__((noreturn));
+#if CONFIG_ESPIX_UM_AMO_TRAP
+static bool amo_emulate(espix_um_thread_t *t, RvExcFrame *u);
+#endif
 
 /*
  * An exception from U-mode, as task code with interrupts on: it may block, sleep, take the FPU or end the process.
@@ -530,6 +533,9 @@ IRAM_ATTR void espix_um_kentry(RvExcFrame *u, uint32_t cause, espix_um_thread_t 
     } else if (code == 8) {
         u->mepc += 4;
         u->a0 = (uint32_t)espix_um_syscall(t, u);
+#if CONFIG_ESPIX_UM_AMO_TRAP
+    } else if (code == 2 && amo_emulate(t, u)) {
+#endif
     } else if (need == 0 || !espix_um_fault(t->proc->as, u->mtval, need)) {
         fault(t, u, code);
     }
@@ -547,9 +553,21 @@ typedef struct {
     uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
 } um_phdr_t;
 
-#define ET_EXEC_  2
-#define EM_RISCV_ 243
-#define PT_LOAD_  1
+typedef struct {
+    uint32_t sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize;
+} um_shdr_t;
+
+#define ET_EXEC_       2
+#define EM_RISCV_      243
+#define PT_LOAD_       1
+#define SHT_PROGBITS_  1
+#define SHF_CODE_      0x6      /* SHF_ALLOC | SHF_EXECINSTR */
+
+/* An AMO .w, the funct5 values of the ones the kernel does, and what replaces them: csrrw x0, cycle, x0. */
+#define AMO_MASK   0x707fu
+#define AMO_W      0x202fu
+#define AMO_OPS    0x11111113u      /* add, swap, xor, or, and, min, max, minu, maxu: bit = funct5 */
+#define UNIMP      0xc0001073u
 
 bool espix_um_is_exec(const uint8_t *image, size_t size)
 {
@@ -569,6 +587,113 @@ bool espix_um_file_is_exec(const char *path)
     }
     return ok;
 }
+
+#if CONFIG_ESPIX_UM_AMO_TRAP
+static int amo_cmp(const void *a, const void *b)
+{
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Each AMO in the image's code, or every one if table is NULL; recorded and replaced by UNIMP otherwise. */
+static uint32_t amo_scan(uint8_t *image, size_t size, uint32_t *table)
+{
+    const um_ehdr_t *eh = (const um_ehdr_t *)image;
+    if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(um_shdr_t) ||
+        eh->e_shoff + (size_t)eh->e_shnum * sizeof(um_shdr_t) > size) {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        um_shdr_t sh;
+        memcpy(&sh, image + eh->e_shoff + i * sizeof(sh), sizeof(sh));
+        if (sh.sh_type != SHT_PROGBITS_ || (sh.sh_flags & SHF_CODE_) != SHF_CODE_ ||
+            sh.sh_offset > size || sh.sh_size > size - sh.sh_offset) {
+            continue;
+        }
+        for (uint32_t off = 0; off + 2 <= sh.sh_size;) {
+            uint8_t *const p = image + sh.sh_offset + off;
+            if ((p[0] & 3) != 3) {
+                off += 2;
+                continue;
+            }
+            if (off + 4 > sh.sh_size) {
+                break;
+            }
+            const uint32_t insn = p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+            if ((insn & AMO_MASK) == AMO_W && ((AMO_OPS >> (insn >> 27)) & 1)) {
+                if (table != NULL) {
+                    table[2 * n]     = sh.sh_addr + off;
+                    table[2 * n + 1] = insn;
+                    memcpy(p, &(uint32_t){ UNIMP }, 4);
+                }
+                n++;
+            }
+            off += 4;
+        }
+    }
+    return n;
+}
+
+/* The image's AMOs become UNIMP, for amo_emulate() to do as LR/SC (docs/GOTCHAS.md). */
+static bool amo_rewrite(espix_um_proc_t *p, uint8_t *image, size_t size)
+{
+    const uint32_t n = amo_scan(image, size, NULL);
+    if (n == 0) {
+        return true;
+    }
+    p->amos = malloc(n * 2 * sizeof(uint32_t));
+    if (p->amos == NULL) {
+        return false;
+    }
+    p->amo_count = amo_scan(image, size, p->amos);
+    qsort(p->amos, p->amo_count, 2 * sizeof(uint32_t), amo_cmp);
+    return true;
+}
+
+/* An AMO the loader replaced, done on the user's word as LR/SC with the old value into rd. */
+static bool amo_emulate(espix_um_thread_t *t, RvExcFrame *u)
+{
+    espix_um_proc_t *const p = t->proc;
+    const uint32_t *const e = bsearch(&u->mepc, p->amos, p->amo_count, 2 * sizeof(uint32_t), amo_cmp);
+    if (e == NULL) {
+        return false;
+    }
+    const uint32_t insn = e[1];
+    uint32_t *const x = (uint32_t *)u;      /* x1-x31 at their numbers; slot 0 is mepc */
+    const uint32_t rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
+    const uint32_t va = (rs1 != 0) ? x[rs1] : 0, src = (rs2 != 0) ? x[rs2] : 0;
+    if (va & 3) {
+        u->mtval = va;
+        fault(t, u, 6);
+    }
+    volatile uint32_t *const k = espix_um_user_pin(p->as, va, PTE_W);
+    if (k == NULL) {
+        u->mtval = va;
+        fault(t, u, 15);
+    }
+    uint32_t old = *k, new;
+    do {
+        switch (insn >> 27) {
+        case 0x00: new = old + src; break;
+        case 0x04: new = old ^ src; break;
+        case 0x08: new = old | src; break;
+        case 0x0c: new = old & src; break;
+        case 0x10: new = ((int32_t)old < (int32_t)src) ? old : src; break;
+        case 0x14: new = ((int32_t)old > (int32_t)src) ? old : src; break;
+        case 0x18: new = (old < src) ? old : src; break;
+        case 0x1c: new = (old > src) ? old : src; break;
+        default:   new = src; break;      /* 0x01: swap */
+        }
+    } while (!__atomic_compare_exchange_n(k, &old, new, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    espix_um_user_unpin(p->as);
+    if (rd != 0) {
+        x[rd] = old;
+    }
+    u->mepc += 4;
+    return true;
+}
+#endif
 
 static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t size, uint32_t *entry)
 {
@@ -718,6 +843,15 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
     app->um = t;
 
     uint32_t entry = 0, usp = 0, uargv = 0, uenvp = 0;
+#if CONFIG_ESPIX_UM_AMO_TRAP
+    if (!amo_rewrite(p, app->image, slot->info.image_bytes)) {
+        return "out of memory for the AMO table";
+    }
+    if (p->amo_count > 0) {
+        espix_klog(ESPIX_KLOG_DEBUG, TAG, "pid %d: %u AMOs done in the kernel", (int)slot->info.pid,
+                   (unsigned)p->amo_count);
+    }
+#endif
     const char *why = load_segments(as, app->image, slot->info.image_bytes, &entry);
     if (why == NULL) {
         why = build_stack(as, app->argv, app->argc, app->envp, &usp, &uargv, &uenvp);
@@ -752,6 +886,7 @@ void espix_um_release(espix_proc_slot_t *slot)
     asid_free((t->satp & SATP32_ASID) >> 22);
     espix_um_as_free(t->proc->as);
     vSemaphoreDelete(t->proc->lock);
+    free(t->proc->amos);
     free(t->proc);
     free(t);
     slot->app->um = NULL;

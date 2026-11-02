@@ -125,9 +125,10 @@ assert_contains "the main thread's pthread_exit leaves the process to its thread
 assert_contains "and it ends with 0 when the last one does" "rc=0" "$out"
 assert_eq "SIGTERM ends threads asleep in the kernel" "143" "$(um_kill tsleep TERM)"
 assert_eq "SIGKILL ends threads computing on both cores" "137" "$(um_kill tspin KILL)"
-# libespix's locks are LR/SC because a U-mode AMO here can lose an update; the AMO count is reported.
+# A U-mode AMO here can lose an update, so the kernel does them; LR/SC is native.
 amo_out=$(dev_run "$UAPP amo")
-assert_contains "an LR/SC add from both cores loses nothing (${amo_out#uapp: })" "lr/sc lost 0" "$amo_out"
+assert_contains "an AMO add from both cores loses nothing (${amo_out#uapp: })" "amoadd lost 0 " "$amo_out"
+assert_contains "and an LR/SC add" "lr/sc lost 0 " "$amo_out"
 
 bench_out=$(dev_run "$UAPP bench")
 assert_contains "a null syscall is timed ($bench_out)" "uapp: a syscall takes" "$bench_out"

@@ -470,13 +470,13 @@ stdio, time, sleep, identity and threads. What it cannot do yet:
   ENOSYS, and a signal's default action is all an app gets.
 - **No process-shared mutexes or condition variables** until there is shared
   memory (M7).
-- **An app's own atomic read-modify-writes can lose an update** against the
-  other core. In U-mode an AMO is not always atomic against an AMO on the same
-  word from the other core: up to 3 in a million are lost, at a rate set by code
-  layout and timing (`uapp amo` measures it). LR/SC and M-mode AMOs lose none.
-  libespix's locks, joins and semaphores, and picolibc's locks, use LR/SC; C11
-  atomics and `__atomic` builtins in an app, libstdc++'s reference counts and
-  seven exchanges in picolibc are AMOs ([USER-MODE.md](USER-MODE.md), open).
+- **An app's AMOs cost a trap each**, about 1,150 cycles (3.6 µs) instead of a
+  few: a U-mode AMO on this S31 can lose an update against the other core, so
+  the loader replaces each one in the app's code and the kernel does it as LR/SC
+  ([USER-MODE.md](USER-MODE.md)). That covers C11 atomics and `__atomic`
+  builtins, libstdc++'s reference counts and seven exchanges in picolibc's stdio
+  and `signal()`. LR/SC, which libespix's locks use, runs natively. Code an app
+  generates at run time is not rewritten, and its AMOs are not safe.
 - **`malloc` touches what it returns**: picolibc's allocator zero-fills every
   block, so a large `malloc` costs its whole size at once; memory reserved with
   `brk`/`sbrk`, bss and the stack cost only the pages touched.
