@@ -51,6 +51,9 @@ typedef struct {
  */
 bool espix_task_exit_init(espix_task_exit_t *t);
 
+/* Its semaphore freed, once the task has exited and nothing will wait again: the owner's teardown. */
+void espix_task_exit_deinit(espix_task_exit_t *t);
+
 /* The exiting task's last act: clear the handle, then wake the waiter. */
 void espix_task_exited(espix_task_exit_t *t);
 

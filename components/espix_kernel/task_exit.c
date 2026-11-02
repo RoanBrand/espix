@@ -23,6 +23,15 @@ bool espix_task_exit_init(espix_task_exit_t *t)
     return true;
 }
 
+void espix_task_exit_deinit(espix_task_exit_t *t)
+{
+    if (t->done != NULL) {
+        vSemaphoreDelete(t->done);
+        t->done = NULL;
+    }
+    t->task = NULL;
+}
+
 void espix_task_exited(espix_task_exit_t *t)
 {
     t->task = NULL;

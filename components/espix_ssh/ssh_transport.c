@@ -347,6 +347,7 @@ esp_err_t ssh_rx_start(ssh_conn_t *c)
             .name = "sshd:rx", .fn = ssh_reader_task, .arg = c,
             .stack = SSH_RX_STACK, .priority = CONFIG_ESPIX_SSH_TASK_PRIO,
             .core = tskNO_AFFINITY, .thread = true }, &c->rx_exit.task) != ESP_OK) {
+        espix_task_exit_deinit(&c->rx_exit);
         vSemaphoreDelete(c->rx_data);
         c->rx_data = NULL;
         heap_caps_free(c->rx_buf);
@@ -400,6 +401,7 @@ void ssh_rx_stop(ssh_conn_t *c)
         }
     }
 
+    espix_task_exit_deinit(&c->rx_exit);
     if (c->rx_data != NULL) {
         vSemaphoreDelete(c->rx_data);
         c->rx_data = NULL;

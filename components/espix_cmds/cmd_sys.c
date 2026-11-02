@@ -26,6 +26,9 @@
 
 #include "espix_auth.h"
 #include "espix_tty.h"
+#if CONFIG_HEAP_TASK_TRACKING
+#include "esp_heap_task_info.h"
+#endif
 #include "espix_cmds_priv.h"
 #include "espix_fault.h"
 #include "espix_kernel.h"
@@ -1736,6 +1739,99 @@ static int cmd_id(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+#if CONFIG_HEAP_TASK_TRACKING
+/* Live tasks by handle: a handle not among them belongs to a deleted task, which must not be followed. */
+static bool task_live(TaskHandle_t h, const TaskSnapshot_t *snap, UBaseType_t n)
+{
+    for (UBaseType_t i = 0; i < n; i++) {
+        if ((TaskHandle_t)snap[i].pxTCB == h) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Heap held per task, by handle (IDF's own printer follows deleted tasks' freed TCBs). */
+static int cmd_heaptasks(espix_session_t *s, int argc, char **argv)
+{
+    if (s == NULL || s->uid != 0) {
+        espix_eprintf(s, "heaptasks: only root can do that\n");
+        return 1;
+    }
+    enum { TOTALS = 64, BLOCKS = 48, SNAPS = 64 };
+    heap_task_totals_t *totals = calloc(TOTALS, sizeof(*totals));
+    heap_task_block_t  *blocks = calloc(BLOCKS, sizeof(*blocks));
+    TaskSnapshot_t     *snap   = calloc(SNAPS, sizeof(*snap));
+    if (totals == NULL || blocks == NULL || snap == NULL) {
+        free(totals);
+        free(blocks);
+        free(snap);
+        return 1;
+    }
+    UBaseType_t tcb_sz;
+    const UBaseType_t live = uxTaskGetSnapshotAll(snap, SNAPS, &tcb_sz);
+
+    size_t ntot = 0;
+    heap_task_info_params_t p = { 0 };
+    p.caps[0] = MALLOC_CAP_INTERNAL;
+    p.mask[0] = MALLOC_CAP_INTERNAL;
+    p.caps[1] = MALLOC_CAP_SPIRAM;
+    p.mask[1] = MALLOC_CAP_SPIRAM;
+    p.totals = totals;
+    p.num_totals = &ntot;
+    p.max_totals = TOTALS;
+    (void)heap_caps_get_per_task_info(&p);
+
+    espix_printf(s, "%-10s %-16s %12s %12s\n", "TASK", "NAME", "INTERNAL", "PSRAM");
+    TaskHandle_t dead[TOTALS];
+    size_t ndead = 0;
+    for (size_t i = 0; i < ntot; i++) {
+        const bool alive = totals[i].task == NULL || task_live(totals[i].task, snap, live);
+        if (!alive) {
+            dead[ndead++] = totals[i].task;
+        }
+        espix_printf(s, "%p %-16s %6u/%-5u %6u/%-5u\n", (void *)totals[i].task,
+                     totals[i].task == NULL ? "(before tasks)" : alive ? pcTaskGetName(totals[i].task) : "(deleted)",
+                     (unsigned)totals[i].size[0], (unsigned)totals[i].count[0],
+                     (unsigned)totals[i].size[1], (unsigned)totals[i].count[1]);
+    }
+
+    /* `heaptasks <handle>`: that task's blocks alone, with their first bytes, which usually say what they are. */
+    if (argc > 1) {
+        dead[0] = (TaskHandle_t)strtoul(argv[1], NULL, 16);
+        ndead   = 1;
+    }
+    if (argc > 1 && ndead > 0) {
+        size_t nb = 0;
+        heap_task_info_params_t q = { 0 };
+        q.caps[0] = MALLOC_CAP_INTERNAL;
+        q.mask[0] = MALLOC_CAP_INTERNAL;
+        q.tasks = dead;
+        q.num_tasks = ndead;
+        q.totals = totals;
+        q.num_totals = &nb;
+        q.max_totals = TOTALS;
+        q.blocks = blocks;
+        q.max_blocks = BLOCKS;
+        const size_t n = heap_caps_get_per_task_info(&q);
+        espix_printf(s, "blocks of %p:\n", (void *)dead[0]);
+        for (size_t i = 0; i < n && i < BLOCKS; i++) {
+            const uint8_t *b = blocks[i].address;
+            espix_printf(s, "  %p by %p, %u bytes:", blocks[i].address, (void *)blocks[i].task,
+                         (unsigned)blocks[i].size);
+            for (size_t k = 0; k < 32 && k < blocks[i].size; k++) {
+                espix_printf(s, " %02x", b[k]);
+            }
+            espix_printf(s, "\n");
+        }
+    }
+    free(totals);
+    free(blocks);
+    free(snap);
+    return 0;
+}
+#endif
+
 static void ttytest_say(void *ctx, const char *line)
 {
     espix_printf(ctx, "%s\n", line);
@@ -2192,6 +2288,11 @@ static espix_cmd_t s_sys_cmds[] = {
     { .name = "log",    .fn = cmd_log,
       .help = "show or set a component's log level",
       .usage = "log <tag> [level]" },
+#if CONFIG_HEAP_TASK_TRACKING
+    { .name = "heaptasks", .fn = cmd_heaptasks,
+      .help = "heap held per task, deleted ones included (heap-debug builds)",
+      .usage = "heaptasks [task handle]" },
+#endif
     { .name = "ttytest", .fn = cmd_ttytest,
       .help = "exercise the terminal line discipline on a tty of its own",
       .usage = "ttytest" },
