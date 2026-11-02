@@ -131,7 +131,7 @@ RvCoprocSaveArea *pxPortGetCoprocArea(StaticTask_t *task, bool allocate, int cop
 RvCoprocSaveArea *pxPortUpdateCoprocOwner(int coreid, int coproc, StaticTask_t *owner);
 void vPortTaskPinToCore(StaticTask_t *task, int coreid);
 
-static IRAM_ATTR void fpu_save(void *area)
+IRAM_ATTR void espix_um_fpu_save(void *area)
 {
     uint32_t fcsr;
     asm volatile (
@@ -172,7 +172,7 @@ static IRAM_ATTR void fpu_save(void *area)
     ((uint32_t *)area)[32] = fcsr;
 }
 
-static IRAM_ATTR void fpu_restore(const void *area)
+IRAM_ATTR void espix_um_fpu_restore(const void *area)
 {
     asm volatile (
         "flw f0, 0(%0)\n"
@@ -223,11 +223,11 @@ static IRAM_ATTR void fpu_take(uint32_t core, const espix_um_thread_t *t)
     }
     RvCoprocSaveArea *const former = pxPortUpdateCoprocOwner(core, FPU_COPROC_IDX, self);
     if (former != NULL && former != (void *)-1) {
-        fpu_save(former->sa_coprocs[FPU_COPROC_IDX]);
+        espix_um_fpu_save(former->sa_coprocs[FPU_COPROC_IDX]);
     }
     vPortTaskPinToCore(self, core);
     RvCoprocSaveArea *const sa = pxPortGetCoprocArea(self, false, FPU_COPROC_IDX);
-    fpu_restore((sa->sa_enable & (1u << FPU_COPROC_IDX)) ? sa->sa_coprocs[FPU_COPROC_IDX] : s_fpu_zero);
+    espix_um_fpu_restore((sa->sa_enable & (1u << FPU_COPROC_IDX)) ? sa->sa_coprocs[FPU_COPROC_IDX] : s_fpu_zero);
     sa->sa_enable |= 1u << FPU_COPROC_IDX;
 }
 
@@ -252,16 +252,21 @@ IRAM_ATTR void espix_um_return(void *frame)
 
 IRAM_ATTR void espix_um_return_to(RvExcFrame *frame, espix_um_thread_t *t)
 {
-    /* A fatal signal or a kill: the return lands on an unmapped pc instead, and the trap ends the process.
-     * The first entry has no frame (espix_um_enter); its next return will see the signal. */
-    if (frame != NULL && t->kick_sig == 0) {
-        if (t->slot->stop_requested || t->proc->exiting) {
-            t->kick_sig = SIGKILL;
-        } else if ((t->slot->sig_pending & ~t->slot->sig_blocked) != 0) {
-            t->kick_sig = espix_proc_termsig(t->slot);
-        }
-        if (t->kick_sig != 0) {
+    /* A signal, a stop or a kill: the return lands on an unmapped pc instead, and the trap acts on it as
+     * task code (espix_um_sig_deliver). The first entry has no frame; its next return will see it. */
+    if (frame != NULL && !t->diverted) {
+        const espix_proc_slot_t *const s = t->slot;
+        if (s->stop_requested || t->proc->exiting || s->sig_stop_req ||
+            ((s->sig_pending | t->sig_pending) & ~t->sig_blocked) != 0) {
+            t->diverted = true;
+            t->sig_pc   = frame->mepc;
             frame->mepc = UM_KICK_PC;
+        } else {
+            t->sys_intr = false;
+            if (t->suspended) {
+                t->suspended   = false;
+                t->sig_blocked = t->sig_saved;
+            }
         }
     }
     const uint32_t core = esp_cpu_get_core_id();
@@ -297,6 +302,17 @@ void espix_um_asid_shoot(uint32_t asid)
         /* Running it now, or about to without having seen the bit: flush there at once. */
         if (((__atomic_load_n(&s_cur_satp[c], __ATOMIC_SEQ_CST) & SATP32_ASID) >> 22) == asid) {
             esp_ipc_isr_call_blocking(asid_flush_here, (void *)asid);
+        }
+    }
+}
+
+/* A yield request, not an IPC call: only an ordinary interrupt's exit runs espix_um_return(). */
+void espix_um_sig_nudge(uint32_t satp)
+{
+    const uint32_t me = esp_cpu_get_core_id();
+    for (uint32_t c = 0; c < portNUM_PROCESSORS; c++) {
+        if (c != me && __atomic_load_n(&s_cur_satp[c], __ATOMIC_SEQ_CST) == satp) {
+            vPortYieldOtherCore((BaseType_t)c);
         }
     }
 }
@@ -389,16 +405,14 @@ void espix_um_thread_exit(espix_um_thread_t *t)
         kstack_note();
         longjmp(*t->exit_jmp, 1);
     }
-    /* The main thread: as on Linux, the process lives until its last thread ends, and then exits 0. */
+    /* The main thread: as on Linux, the process lives until its last thread ends, and then exits 0.
+     * Its signals go to the threads left; one that ends the process stops this wait too. */
     espix_proc_slot_t *const slot = t->slot;
+    t->gone = true;
     for (;;) {
         (void)espix_sigcheck_mask();
         if (slot->stop_requested || t->proc->exiting) {
             espix_um_exit_group(t, 128 + SIGKILL);
-        }
-        const int sig = espix_proc_termsig(slot);
-        if (sig != 0) {
-            espix_um_exit_group(t, 128 + sig);
         }
         if (threads_left(t->proc) == 0) {
             espix_um_exit_group(t, 0);
@@ -448,7 +462,8 @@ int32_t espix_um_thread_create(espix_um_thread_t *self, uint32_t entry, uint32_t
         return -ENOMEM;
     }
     *t = (espix_um_thread_t){ .satp = self->satp, .proc = p, .slot = self->slot, .clear_tid = ctid,
-                              .entry = entry, .arg = arg, .utp = utp, .usp = ustack & ~15u };
+                              .entry = entry, .arg = arg, .utp = utp, .usp = ustack & ~15u,
+                              .sig_blocked = self->sig_blocked };
     if (ustack == 0) {
         t->stack = t->usp = espix_um_tstack_take(p->as);
         if (t->stack == 0) {
@@ -499,10 +514,14 @@ static int fault_signal(uint32_t code)
     }
 }
 
-static void __attribute__((noreturn)) fault(espix_um_thread_t *t, const RvExcFrame *f, uint32_t code)
+/* To the app's handler for the fault's signal, or the end of the process. */
+static void fault(espix_um_thread_t *t, RvExcFrame *f, uint32_t code)
 {
     espix_proc_slot_t *const slot = t->slot;
     const int sig = fault_signal(code);
+    if (espix_um_sig_fault(t, f, sig)) {
+        return;
+    }
     const char *what = (sig == SIGILL) ? "Illegal instruction" : (sig == SIGBUS) ? "Bus error"
                      : (sig == SIGTRAP) ? "Trace/breakpoint trap" : "Segmentation fault";
 
@@ -528,11 +547,18 @@ IRAM_ATTR void espix_um_kentry(RvExcFrame *u, uint32_t cause, espix_um_thread_t 
     const uint32_t need = (code == 12) ? PTE_X : (code == 13) ? PTE_R : (code == 15) ? PTE_W : 0;
 
     sp_mon(esp_cpu_get_core_id(), true);
-    if (code == 12 && u->mepc == UM_KICK_PC && t->kick_sig != 0) {
-        espix_um_exit_group(t, 128 + t->kick_sig);
+    if (code == 12 && u->mepc == UM_KICK_PC && t->diverted) {
+        t->diverted = false;
+        u->mepc     = t->sig_pc;
+        espix_um_sig_deliver(t, u);
+    } else if (code == 8 && u->a7 == ESPIX_SYS_SIGRETURN) {
+        espix_um_sig_return(t, u);
     } else if (code == 8) {
+        t->sys_nr = u->a7;
+        t->sys_a0 = u->a0;
         u->mepc += 4;
         u->a0 = (uint32_t)espix_um_syscall(t, u);
+        t->sys_intr = (int32_t)u->a0 == -EINTR;
 #if CONFIG_ESPIX_UM_AMO_TRAP
     } else if (code == 2 && amo_emulate(t, u)) {
 #endif
@@ -663,14 +689,11 @@ static bool amo_emulate(espix_um_thread_t *t, RvExcFrame *u)
     uint32_t *const x = (uint32_t *)u;      /* x1-x31 at their numbers; slot 0 is mepc */
     const uint32_t rd = (insn >> 7) & 31, rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
     const uint32_t va = (rs1 != 0) ? x[rs1] : 0, src = (rs2 != 0) ? x[rs2] : 0;
-    if (va & 3) {
-        u->mtval = va;
-        fault(t, u, 6);
-    }
-    volatile uint32_t *const k = espix_um_user_pin(p->as, va, PTE_W);
+    volatile uint32_t *const k = (va & 3) ? NULL : espix_um_user_pin(p->as, va, PTE_W);
     if (k == NULL) {
         u->mtval = va;
-        fault(t, u, 15);
+        fault(t, u, (va & 3) ? 6 : 15);
+        return true;
     }
     uint32_t old = *k, new;
     do {

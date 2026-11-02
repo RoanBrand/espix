@@ -137,6 +137,8 @@ layer under it:
   `ecall` wrappers;
 - stdin, stdout and stderr on fds 0-2, and thread-local storage through `tp`;
 - POSIX threads, on the kernel's threads and futexes;
+- signals: `sigaction`, masks, `alarm` and `setitimer`, and the restorer a
+  handler returns through;
 - headers picolibc lacks (`sys/socket.h`, `netinet/in.h`, `semaphore.h`,
   `gettid()`), and ENOSYS for what is not built yet: sockets.
 
@@ -264,27 +266,40 @@ so one of them sees the other.
 
 ## Signals, stopping and faults
 
-A thread interrupted in U-mode holds no kernel lock, so:
+A thread in U-mode holds no kernel lock, so a signal may reach it at any
+instruction. Every return to U checks for one: a signal pending that the thread
+does not block, a stop or a kill. If there is one, the return goes to a pc that
+is never mapped instead (`espix_um_return_to()`). The fault that follows hands
+the work to `espix_um_sig_deliver()` as the thread's own task code, where it may
+block and touch user memory; nothing of it runs inside an interrupt.
 
-| the target is | what happens |
+| the target is | it takes the signal |
 |---|---|
-| running in U on this core | delivered at the interrupt's exit |
-| running in U on the other core | a cross-core interrupt, then the same |
-| inside a syscall | pending; a blocking call ends with `EINTR`, delivered on the way back to U |
-| stopped by SIGSTOP or Ctrl-Z | its task is suspended |
+| running in U on this core | at the next interrupt's exit |
+| running in U on the other core | at once, by a cross-core yield: 42 µs from `kill` to the handler (`uapp sigasync`) |
+| inside a syscall | on the way back to U; a blocking call a caught signal ends returns `EINTR`, or restarts under `SA_RESTART` |
 
-**A handler** gets a signal frame pushed on the user stack, `mepc` at the handler
-and `ra` at a `sigreturn` stub, as on Linux.
+**A handler** gets a frame pushed onto the stack it was running on
+(`struct espix_sigframe`): the `siginfo_t`, the mask to go back to, pc and
+x1-x31, and f0-f31 with `fcsr`. It is entered with the signal in `a0`, the
+`siginfo_t` in `a1`, the frame in `a2` and `ra` at libespix's restorer, whose
+`SIGRETURN` puts everything back. `SA_SIGINFO`, `SA_RESTART`, `SA_RESETHAND` and
+`SA_NODEFER` work; reads and writes restart, sleeps and futex waits return
+`EINTR`, as on Linux.
 
-**A fault is a signal.** SIGSEGV's default action ends the process and the board
-keeps running; a U-mode fault cannot have touched kernel memory.
+**Actions are the process's, masks each thread's.** A process's signal goes to
+one thread that does not block it: the first back to U, or the first blocking
+call to claim it, so only that call ends early. `raise()` and a fault go to the
+calling thread.
 
-**A fatal signal ends an app on its way back to U.** `espix_um_return` finds it
-pending, or a kill's stop request, and sends the return to a pc that is never
-mapped; the fault that follows ends the process from task context. A blocking
-syscall returns `EINTR` first, never a jump out of the kernel, so nothing it
-holds is left behind. A computing app is ended within a tick, and SIGKILL gives
-137, as on Linux.
+**A fault is a signal.** It goes to the thread's handler with `si_addr` set; if
+the signal is blocked or not caught, the process ends with 128 + the signal, and
+the board keeps running.
+
+**SIGSTOP** parks each thread as it next returns to U or wakes in a blocking
+call, holding nothing; SIGCONT lets them go, and SIGKILL wakes a stopped process
+to end it. **A fatal signal** ends the process from the thread that takes it,
+as `exit()` does; SIGKILL gives 137, as on Linux.
 
 ## Beside an S31 Linux port
 
@@ -296,7 +311,7 @@ two meet the same silicon:
 |---|---|---|
 | leaving a trap | `handle_exception` `sret`s to itself before its handlers: only `sret` lowers the CLIC level | the trap `mret`s into `espix_um_kentry()` before any work: an exception taken inside an unretired one locks the core |
 | interrupt level on return | `sret` restores it only from an interrupt-type `scause` | every exit writes an `mcause` with the level |
-| a null syscall | `getpid` 1.1-1.2 µs, trap code (4.6 KiB) run from SRAM | `getppid` 2.6 µs, trap path in SRAM |
+| a null syscall | `getpid` 1.1-1.2 µs, trap code (4.6 KiB) run from SRAM | `getppid` 2.9 µs, trap path in SRAM |
 | FPU | off, soft-float: Linux needs D, which the chip lacks | F for U-mode apps (ilp32f), handed over eagerly; IDF's lazy trap takes FLW/FSW and their compressed forms |
 | new code | `fence.i` leaves stale lines; OpenSBI writes back D and invalidates I | `esp_cache_msync`, D written back then I invalidated, per executable page |
 | isolation | Sv32 for processes, PMP keeps IDF's core out of Linux memory | Sv32 per process, `cpu_apm` open to U, no PMP (IDF locks it) |
@@ -325,14 +340,14 @@ Each leaves `make test` green on both targets.
 | M1 | vectors patch, address spaces, the loader, `write` and `exit`, the app runtime | done: `tests/suites/32-umode.sh` |
 | M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M4 and M7 bring |
 | M3 | threads, futex wait and wake, TLS; shared tables flushed on both cores | done: `32-umode`, and the thread checks of `30-proc` pass in U-mode |
-| M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, fault reaping | a compute loop's handler runs; `kill -STOP` stops it at once |
+| M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | handlers, masks, faults and SIGSTOP done: `32-umode`, and `35-signals` in U-mode; Ctrl-Z to come |
 | M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
 | M6 | sockets, select, poll | mosquitto runs in U-mode |
 | M7 | growable stacks; `mmap`; shared text between instances | Doom runs without a fixed stack; two instances share text |
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
 
 Open:
-- **A null syscall costs 890 cycles (2.8 µs)** round trip (`uapp bench`), about
+- **A null syscall costs 920 cycles (2.9 µs)** round trip (`uapp bench`), about
   330 instructions, nearly all cache hits. A load or store takes 3 cycles and a
   CSR write 5 to 6 (`umode cost`), so the 31 registers saved and restored are
   190 of them. The cache controller counts I-cache hits, misses and fills per
@@ -357,6 +372,9 @@ Open:
   be interrupted; otherwise the app leaves on its own. A thread deleted that way
   also leaves its `espix_um_thread_t`; a TLS deletion callback on
   `ESPIX_TLS_UM_IDX` (IDF calls it as the task is freed) would free both.
+- **Signals are a set per process, not a queue**: two of one kind before
+  delivery are one, and there are no real-time signals, `sigqueue`, `sigwait`
+  or `sigaltstack` yet, nor `pthread_kill` to another thread.
 - **picolibc's `malloc` zero-fills every block**, so a large allocation is
   touched in full; a large `malloc` served by `mmap`, as glibc's is, comes with
   M7.

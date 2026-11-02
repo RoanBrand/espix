@@ -1,7 +1,4 @@
-/*
- * What U-mode apps cannot have yet, failing cleanly: sockets and select (M6),
- * alarm and espix's signal calls (M4). docs/USER-MODE.md.
- */
+/* What U-mode apps cannot have yet, failing cleanly: sockets and select (M6). docs/USER-MODE.md. */
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -33,13 +30,3 @@ int select(int n, fd_set *r, fd_set *w, fd_set *e, struct timeval *tv)
     (void)n; (void)r; (void)w; (void)e; (void)tv;
     return nosys();
 }
-
-unsigned alarm(unsigned secs)
-{
-    (void)secs;
-    return 0;
-}
-
-/* espix's own calls an M-mode app makes; a U-mode app gets signals asynchronously instead (M4). */
-int espix_sigcheck(void) { return 0; }
-int espix_term_size(int *cols, int *rows) { (void)cols; (void)rows; return nosys(); }

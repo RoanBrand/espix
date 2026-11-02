@@ -24,6 +24,7 @@ idf_component_register(
         "umode.c"
         "umode_futex.c"
         "umode_mm.c"
+        "umode_sig.c"
         "umode_sys.c"
         "umode_entry.S"
     INCLUDE_DIRS

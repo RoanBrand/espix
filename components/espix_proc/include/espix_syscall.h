@@ -52,7 +52,15 @@
     X(FUTEX,         futex,         39)        /* (uaddr, op, val, const struct espix_timespec *) */ \
     X(GETTID,        gettid,        40)        /* () */                                        \
     X(SCHED_YIELD,   sched_yield,   41)        /* () */                                        \
-    X(GETCPU,        getcpu,        42)        /* (): the core the caller runs on */
+    X(GETCPU,        getcpu,        42)        /* (): the core the caller runs on */          \
+    X(SIGACTION,     sigaction,     43)        /* (sig, const struct espix_sigaction *, old) */  \
+    X(SIGPROCMASK,   sigprocmask,   44)        /* (how, const uint32_t *set, uint32_t *old): the thread's */ \
+    X(SIGPENDING,    sigpending,    45)        /* (uint32_t *): pending and blocked */          \
+    X(SIGSUSPEND,    sigsuspend,    46)        /* (const uint32_t *mask): -EINTR once a handler is due */ \
+    X(SIGRETURN,     sigreturn,     47)        /* (): a handler's restorer; its frame is at sp */ \
+    X(RAISE,         raise,         48)        /* (sig): to the calling thread */               \
+    X(SETITIMER,     setitimer,     49)        /* (which, const struct espix_itimerval *, old) */ \
+    X(TERM_SIZE,     term_size,     50)        /* (int *cols, int *rows) */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
@@ -78,6 +86,30 @@ struct espix_timespec {
 
 struct espix_utimbuf {
     int64_t actime, modtime;
+};
+
+struct espix_itimerval {
+    struct espix_timespec interval, value;
+};
+
+/* SA_* flags; the handler is SIG_DFL (0), SIG_IGN (1) or a function, which returns to restorer. */
+struct espix_sigaction {
+    uint32_t handler, flags, mask, restorer;
+};
+
+/* picolibc's siginfo_t, field for field. */
+struct espix_siginfo {
+    int32_t  signo, code, err, pid, uid;
+    uint32_t addr;
+    int32_t  status, value;
+};
+
+/* What a handler finds at sp, and SIGRETURN puts back. */
+struct espix_sigframe {
+    struct espix_siginfo info;
+    uint32_t mask;          /* the thread's mask before the handler */
+    uint32_t regs[32];      /* pc, then x1-x31 */
+    uint32_t fregs[33];     /* f0-f31, fcsr */
 };
 
 /* One getdents record; the next starts reclen bytes on, 4-aligned. */

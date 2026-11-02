@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -164,6 +165,13 @@ static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
         while (n < sizeof(buf) && done + n < len) {
             const int ch = getc(in);
             if (ch == EOF) {
+                /* A signal for this thread ended the wait, not the input. */
+                if ((c->t->sig_pending & ~c->t->sig_blocked) != 0) {
+                    clearerr(in);
+                    if (done + n == 0) {
+                        return -EINTR;
+                    }
+                }
                 more = false;
                 break;
             }
@@ -654,6 +662,71 @@ static int32_t sys_getegid(um_call_t *c) { (void)c; return (int32_t)getegid(); }
 static int32_t sys_getpgrp(um_call_t *c) { (void)c; return espix_abi_getpgrp(); }
 static int32_t sys_getsid(um_call_t *c)  { return kret(espix_abi_getsid((pid_t)c->a[0])); }
 static int32_t sys_kill(um_call_t *c)    { return kret(espix_abi_kill((pid_t)c->a[0], (int)c->a[1])); }
+
+/* ------------------------------------------------------------------ */
+/* Signals (umode_sig.c)                                               */
+/* ------------------------------------------------------------------ */
+
+static int32_t sys_sigaction(um_call_t *c)   { return espix_um_sigaction(c->t, (int)c->a[0], c->a[1], c->a[2]); }
+static int32_t sys_sigprocmask(um_call_t *c) { return espix_um_sigprocmask(c->t, (int)c->a[0], c->a[1], c->a[2]); }
+static int32_t sys_sigpending(um_call_t *c)  { return espix_um_sigpending(c->t, c->a[0]); }
+static int32_t sys_sigsuspend(um_call_t *c)  { return espix_um_sigsuspend(c->t, c->a[0]); }
+static int32_t sys_raise(um_call_t *c)       { return espix_um_raise(c->t, (int)c->a[0]); }
+
+/* espix_um_kentry() takes it before the table: it returns into the frame, not with a result. */
+static int32_t sys_sigreturn(um_call_t *c)
+{
+    (void)c;
+    return -ENOSYS;
+}
+
+static int32_t tv_in(struct timeval *tv, const struct espix_timespec *e)
+{
+    if (e->sec < 0 || e->nsec < 0 || e->nsec >= 1000000000) {
+        return -EINVAL;
+    }
+    *tv = (struct timeval){ .tv_sec = (time_t)e->sec, .tv_usec = e->nsec / 1000 };
+    return 0;
+}
+
+static struct espix_timespec tv_out(const struct timeval *tv)
+{
+    return (struct espix_timespec){ .sec = tv->tv_sec, .nsec = (int32_t)tv->tv_usec * 1000 };
+}
+
+static int32_t sys_setitimer(um_call_t *c)
+{
+    struct itimerval nv, ov;
+    if (c->a[1] != 0) {
+        struct espix_itimerval u;
+        int32_t r = espix_um_copyin(c->p->as, &u, c->a[1], sizeof(u));
+        if (r == 0) {
+            r = tv_in(&nv.it_interval, &u.interval);
+        }
+        if (r == 0) {
+            r = tv_in(&nv.it_value, &u.value);
+        }
+        if (r != 0) {
+            return r;
+        }
+    }
+    const int32_t r = kret(espix_abi_setitimer((int)c->a[0], c->a[1] ? &nv : NULL, &ov));
+    if (r < 0 || c->a[2] == 0) {
+        return r;
+    }
+    const struct espix_itimerval o = { .interval = tv_out(&ov.it_interval), .value = tv_out(&ov.it_value) };
+    return espix_um_copyout(c->p->as, c->a[2], &o, sizeof(o));
+}
+
+static int32_t sys_term_size(um_call_t *c)
+{
+    int cols, rows;
+    if (espix_term_size(&cols, &rows) != 0) {
+        return -errno;
+    }
+    const int32_t r = espix_um_copyout(c->p->as, c->a[0], &cols, sizeof(cols));
+    return (r != 0) ? r : espix_um_copyout(c->p->as, c->a[1], &rows, sizeof(rows));
+}
 
 /* ------------------------------------------------------------------ */
 /* Memory                                                              */

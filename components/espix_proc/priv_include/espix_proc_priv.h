@@ -362,6 +362,9 @@ uint32_t espix_sigcheck_mask(void);
 /* A pending signal that would terminate the process now, or 0. */
 int espix_proc_termsig(const espix_proc_slot_t *slot);
 
+/* SIG_DFL does nothing for sig. */
+bool espix_sig_default_ignores(int sig);
+
 /*
  * Begin enforcing the calling process's root. Called once by proc_task(), after
  * the ELF is loaded and before the entry point runs; see root_active above.
@@ -630,6 +633,9 @@ pid_t espix_abi_getpgrp(void);
 pid_t espix_abi_getsid(pid_t pid);
 struct timespec;
 int   espix_abi_nanosleep(const struct timespec *req, struct timespec *rem);
+struct itimerval;
+int   espix_abi_setitimer(int which, const struct itimerval *newv, struct itimerval *oldv);
+int   espix_term_size(int *cols, int *rows);
 
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);

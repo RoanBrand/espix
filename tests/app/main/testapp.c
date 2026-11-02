@@ -895,6 +895,15 @@ static int sig_group(void)
     return (rc == 0 && s_group_seen && probe == 0) ? 0 : 1;
 }
 
+/* SIGKILL to its own group, itself included, ends it with 137 and returns nowhere. */
+static int sig_killself(void)
+{
+    kill(0, SIGKILL);
+    printf("sig: still here after SIGKILL\n");
+    fflush(stdout);
+    return 1;
+}
+
 static int cmd_sig(const char *mode)
 {
     if (mode == NULL || strcmp(mode, "handlers") == 0) {
@@ -932,6 +941,9 @@ static int cmd_sig(const char *mode)
     }
     if (strcmp(mode, "group") == 0) {
         return sig_group();
+    }
+    if (strcmp(mode, "killself") == 0) {
+        return sig_killself();
     }
     printf("sig: unknown mode '%s'\n", mode);
     return 2;

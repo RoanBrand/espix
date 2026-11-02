@@ -130,8 +130,48 @@ amo_out=$(dev_run "$UAPP amo")
 assert_contains "an AMO add from both cores loses nothing (${amo_out#uapp: })" "amoadd lost 0 " "$amo_out"
 assert_contains "and an LR/SC add" "lr/sc lost 0 " "$amo_out"
 
+# Signals (M4): a handler runs wherever the thread is, and its frame puts every register back.
+async_out=$(dev_run "$UAPP sigasync 50")
+assert_contains "a handler runs in a loop that never calls in (${async_out#uapp: })" \
+    "50 of 50 handlers ran in a compute loop, 0 wrong results, 0 on another thread" "$async_out"
+assert_contains "a blocked signal waits; SA_RESETHAND; sigsuspend" ": ok" "$(dev_run "$UAPP sigmask")"
+fault_out=$(dev_run "$UAPP sigfault; echo rc=\$?")
+assert_contains "a fault reaches its SIGSEGV handler, with the address" "caught SIGSEGV at 0x10" "$fault_out"
+assert_contains "and one while SIGSEGV is blocked ends the app" "rc=139" "$fault_out"
+assert_contains "SA_RESTART restarts a read a handler interrupted" "read 'hi', handler ran 1" \
+    "$( (sleep 3; echo hi) | dev_ssh_raw "$UAPP sigread restart")"
+assert_contains "and without it the read fails with EINTR" "read -1 errno 4, handler ran 1" \
+    "$( (sleep 3; echo hi) | dev_ssh_raw "$UAPP sigread intr")"
+
+# SIGSTOP stops a loop that never calls in, and the loop's own clock sees the pause.
+PZ="/home/$ESPIX_USER/uapp-pz-$ESPIX_WORKER"
+pid=$(dev_run "$UAPP pauses 5 $PZ &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+sleep 1
+dev_run "kill -STOP $pid" >/dev/null
+sleep 1
+assert_eq "kill -STOP stops a computing app" "T" "$(dev_run ps | awk -v p="$pid" '$1 == p { print $3 }')"
+sleep 1
+dev_run "kill -CONT $pid" >/dev/null
+for i in 1 2 3 4 5 6 7 8; do
+    [ "$(dev_run ps | awk -v p="$pid" '$1 == p { print $3 }')" = exit ] && break
+    sleep 1
+done
+pause=$(dev_run "cat $PZ" | sed -n 's/.*longest pause \([0-9]*\) ms.*/\1/p')
+if [ -n "$pause" ] && [ "$pause" -ge 1500 ]; then
+    espix_pass "and it does not run until SIGCONT (paused $pause ms)"
+else
+    espix_fail "and it does not run until SIGCONT" "pause: '$pause'"
+fi
+pid=$(dev_run "$UAPP pauses 5 $PZ &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+sleep 1
+dev_run "kill -STOP $pid" >/dev/null
+sleep 1
+dev_run "kill -9 $pid" >/dev/null
+sleep 1
+assert_eq "SIGKILL ends a stopped app" "137" "$(dev_run ps | awk -v p="$pid" '$1 == p { print $NF }')"
+
 bench_out=$(dev_run "$UAPP bench")
 assert_contains "a null syscall is timed ($bench_out)" "uapp: a syscall takes" "$bench_out"
 rm -rf "$UM_DIR"
 
-dev_run "rm $UAPP $UHELLO /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER" >/dev/null
+dev_run "rm $UAPP $UHELLO /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER $PZ" >/dev/null

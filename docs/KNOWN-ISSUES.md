@@ -61,8 +61,8 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   table, so a ninth exit pushes the oldest out of the `finished:` list. A ring
   because it is bookkeeping, and a spawn must never fail for it.
 
-- **A compute loop never sees a signal.** Delivery happens at the points where
-  an app calls into espix — the sleep family, `pause`, `select` and a read of
+- **A compute loop in an M-mode app never sees a signal.** A U-mode app's does
+  (S31). Delivery happens at the points where an M-mode app calls into espix — the sleep family, `pause`, `select` and a read of
   stdin. A wait on a lock or a join is deliberately not one, so a signal sent
   then is delivered after it. A loop that blocks on nothing has no delivery
   point and will not run a handler, which is
@@ -466,16 +466,18 @@ A static executable built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([USER-MODE.md](USER-MODE.md)). It has files, directories,
 stdio, time, sleep, identity and threads. What it cannot do yet:
 
-- **No sockets, select or signal handlers** (M6, M4): those calls fail with
-  ENOSYS, and a signal's default action is all an app gets.
+- **No sockets or select** (M6): those calls fail with ENOSYS.
+- **One thread takes a process's signal**, as on Linux: a sleep in another
+  thread is not cut short by it, where an M-mode app's every sleeping thread
+  wakes. There is no `pthread_kill` to another thread, `sigwait`, `sigqueue` or
+  `sigaltstack` yet, and Ctrl-Z does not stop a job yet (M4).
 - **No process-shared mutexes or condition variables** until there is shared
   memory (M7).
 - **An app's AMOs cost a trap each**, about 1,150 cycles (3.6 µs) instead of a
   few: a U-mode AMO on this S31 can lose an update against the other core, so
   the loader replaces each one in the app's code and the kernel does it as LR/SC
   ([USER-MODE.md](USER-MODE.md)). That covers C11 atomics and `__atomic`
-  builtins, libstdc++'s reference counts and seven exchanges in picolibc's stdio
-  and `signal()`. LR/SC, which libespix's locks use, runs natively. Code an app
+  builtins, libstdc++'s reference counts and the exchanges in picolibc's stdio. LR/SC, which libespix's locks use, runs natively. Code an app
   generates at run time is not rewritten, and its AMOs are not safe.
 - **`malloc` touches what it returns**: picolibc's allocator zero-fills every
   block, so a large `malloc` costs its whole size at once; memory reserved with

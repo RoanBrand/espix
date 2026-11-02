@@ -9,6 +9,7 @@
 
 #include <dirent.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@
 #include "riscv/rvruntime-frames.h"
 
 #include "espix_proc_priv.h"
+#include "espix_syscall.h"
 
 typedef struct espix_um_as espix_um_as_t;
 
@@ -50,6 +52,7 @@ typedef struct {
     espix_um_waiter_t *futex_waiters;
     uint32_t          *amos;        /* each AMO the loader replaced: its pc and the instruction, by pc */
     uint32_t           amo_count;
+    struct espix_sigaction act[NSIG];   /* under lock */
 } espix_um_proc_t;
 
 /* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */
@@ -59,7 +62,15 @@ typedef struct {
     espix_um_proc_t   *proc;
     espix_proc_slot_t *slot;
     void              *task;  /* its FreeRTOS task, the FPU owner to compare with */
-    int                kick_sig;    /* a fatal signal the next return to U turns into a trap */
+    bool               diverted;    /* the return to U went to UM_KICK_PC instead of sig_pc */
+    bool               gone;        /* the main thread after pthread_exit: takes no signal */
+    bool               suspended;   /* in sigsuspend, with sig_saved the mask to go back to */
+    bool               sys_intr;    /* the syscall just made returned -EINTR */
+    uint32_t           sig_pc;
+    uint32_t           sig_blocked;
+    uint32_t           sig_pending; /* this thread's alone: raised, or claimed from the process's */
+    uint32_t           sig_saved;
+    uint32_t           sys_nr, sys_a0;  /* the last syscall, to restart it under SA_RESTART */
     espix_pid_t        tid;
     uint32_t           clear_tid;   /* holds the tid while the thread runs, zeroed and woken when it ends */
     uint32_t           stack;       /* the top of the stack the kernel gave it, or 0 */
@@ -92,11 +103,31 @@ int32_t espix_um_thread_create(espix_um_thread_t *t, uint32_t entry, uint32_t ar
 
 /* After an unmap: every other core drops asid's translations before the frames go. */
 void espix_um_asid_shoot(uint32_t asid);
+/* A thread of the address space satp, in U on the other core, takes a signal now rather than at its next tick. */
+void espix_um_sig_nudge(uint32_t satp);
 
 /* Futexes (umode_futex.c), private to a process: 0, -EAGAIN, -EINTR or -ETIMEDOUT. */
 int32_t espix_um_futex_wait(espix_um_proc_t *p, uint32_t uaddr, uint32_t val, int64_t timeout_us);
 /* How many waiters on uaddr were woken, at most n. */
 int32_t espix_um_futex_wake(espix_um_proc_t *p, uint32_t uaddr, int32_t n);
+
+/* Signals (umode_sig.c). Run on the thread's own task, in the trap a diverted return to U takes. */
+void espix_um_sig_deliver(espix_um_thread_t *t, RvExcFrame *u);
+void espix_um_sig_return(espix_um_thread_t *t, RvExcFrame *u);
+/* A fault's signal to its handler; false when it is blocked or not caught, and ends the process. */
+bool espix_um_sig_fault(espix_um_thread_t *t, RvExcFrame *u, int sig);
+/* For proc.c's blocking calls: what ends the caller's wait, claimed from the process's pending set. */
+uint32_t espix_um_sig_claim(espix_proc_slot_t *slot);
+int      espix_um_termsig(const espix_proc_slot_t *slot);
+int32_t  espix_um_sigaction(espix_um_thread_t *t, int sig, uint32_t uact, uint32_t uold);
+int32_t  espix_um_sigprocmask(espix_um_thread_t *t, int how, uint32_t uset, uint32_t uold);
+int32_t  espix_um_sigpending(espix_um_thread_t *t, uint32_t uout);
+int32_t  espix_um_sigsuspend(espix_um_thread_t *t, uint32_t umask);
+int32_t  espix_um_raise(espix_um_thread_t *t, int sig);
+
+/* The FPU's registers and fcsr, 33 words. */
+void espix_um_fpu_save(void *area);
+void espix_um_fpu_restore(const void *area);
 
 /* Syscalls (umode_sys.c): the result for a0. */
 int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f);

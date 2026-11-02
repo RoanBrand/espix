@@ -311,6 +311,12 @@ static void sig_wake_locked(espix_proc_slot_t *slot)
         (void)xTaskNotifyGiveIndexed(task, ESPIX_NOTIFY_SIG_IDX);
     }
     espix_pthread_wake_locked(slot);
+#if CONFIG_ESPIX_UMODE
+    /* And a thread computing in U on the other core, now rather than at its next tick. */
+    if (slot->app != NULL && slot->app->um != NULL) {
+        espix_um_sig_nudge(((const espix_um_thread_t *)slot->app->um)->satp);
+    }
+#endif
 }
 
 void espix_proc_release_resources(espix_proc_slot_t *slot)
@@ -854,7 +860,7 @@ int espix_signal_from_name(const char *name)
  * defaults to terminating, which here means setting stop_requested and letting
  * the process leave on its own.
  */
-static bool sig_default_ignores(int sig)
+bool espix_sig_default_ignores(int sig)
 {
     switch (sig) {
     case SIGCHLD:       /* there are no children to report on */
@@ -895,7 +901,7 @@ static uint32_t sig_terminating(const espix_proc_slot_t *slot)
     for (int sig = 1; sig < NSIG; sig++) {
         const bool dfl = slot->sig_handlers == NULL ||
                          slot->sig_handlers[sig] == SIG_DFL;
-        if (dfl && !sig_default_ignores(sig)) {
+        if (dfl && !espix_sig_default_ignores(sig)) {
             mask |= espix_sigbit(sig);
         }
     }
@@ -931,9 +937,13 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
      * returns without taking it. One that retries an EINTR in a loop otherwise
      * takes the table lock on every pass and starves everyone else of it.
      */
+#if CONFIG_ESPIX_UMODE
+    if (ends_in_user_mode(slot)) {
+        return espix_um_sig_claim(slot);    /* its handlers run in U, on the way back */
+    }
+#endif
     uint32_t mine = ~slot->sig_blocked;
-    if (!may_terminate || slot->info.task != xTaskGetCurrentTaskHandle() ||
-        ends_in_user_mode(slot)) {
+    if (!may_terminate || slot->info.task != xTaskGetCurrentTaskHandle()) {
         mine &= ~sig_terminating(slot);
     }
 
@@ -976,7 +986,7 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
             caught |= espix_sigbit(sig);
             continue;
         }
-        if (!sig_default_ignores(sig)) {
+        if (!espix_sig_default_ignores(sig)) {
             /*
              * POSIX's default action for this signal is "terminate", and a
              * default action is defined by needing nothing from the process --
@@ -1085,14 +1095,21 @@ bool espix_sigcheck_io(void)
         return false;
     }
 
-    (void)sig_dispatch(slot, false);
+    const uint32_t got = sig_dispatch(slot, false);
     sig_park(slot, false);
 
-    return slot->stop_requested || espix_proc_termsig(slot) != 0;
+    /* A U-mode thread's caught signal ends the read too: its handler runs in U, after it. */
+    return slot->stop_requested || espix_proc_termsig(slot) != 0 ||
+           (ends_in_user_mode(slot) && got != 0);
 }
 
 int espix_proc_termsig(const espix_proc_slot_t *slot)
 {
+#if CONFIG_ESPIX_UMODE
+    if (ends_in_user_mode(slot)) {
+        return espix_um_termsig(slot);
+    }
+#endif
     const uint32_t due = slot->sig_pending & ~slot->sig_blocked &
                          sig_terminating(slot);
 
@@ -1157,11 +1174,20 @@ static void kill_unwind(espix_pid_t pid, TaskHandle_t task)
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
     espix_proc_slot_t *slot = espix_proc_find(pid);
+    SemaphoreHandle_t cont = NULL;
     if (slot != NULL) {
         slot->stop_requested = true;
         sig_wake_locked(slot);
+        /* A stopped process wakes to leave, as SIGKILL wakes one on Linux. */
+        if (slot->sig_stop_req) {
+            slot->sig_stop_req = false;
+            cont = slot->sig_cont;
+        }
     }
     xSemaphoreGive(g_espix_proc_lock);
+    if (cont != NULL) {
+        (void)xSemaphoreGive(cont);
+    }
 
     /*
      * Finished on its own is the good outcome, and the common one. Observing
@@ -1185,7 +1211,7 @@ static esp_err_t sig_kernel_locked(espix_proc_slot_t *slot, int sig)
         slot->info.kind == ESPIX_PROC_SESSION || sig == SIGSTOP) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (sig_default_ignores(sig)) {
+    if (espix_sig_default_ignores(sig)) {
         return ESP_OK;
     }
     slot->stop_requested = true;
@@ -1215,21 +1241,37 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
         xSemaphoreGive(g_espix_proc_lock);
         return r;
     }
+    /*
+     * An app killing itself, never torn down under its own call: its main task leaves as exit() does, a
+     * U-mode app on its way back to U, and an M-mode thread's process at its next delivery point.
+     */
+    if (pre != NULL && pre == espix_proc_self()) {
+        pre->stop_requested = true;
+        sig_wake_locked(pre);
+        const bool main_task = !ends_in_user_mode(pre) && pre->info.task == xTaskGetCurrentTaskHandle();
+        xSemaphoreGive(g_espix_proc_lock);
+        if (main_task) {
+            espix_proc_exit(128 + SIGKILL);
+        }
+        return ESP_OK;
+    }
     TaskHandle_t       pre_task = (pre != NULL) ? pre->info.task : NULL;
+    const bool         pre_live = pre != NULL && !state_is_finished(pre->info.state);
     xSemaphoreGive(g_espix_proc_lock);
 
     kill_unwind(pid, pre_task);
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
 
+    /* Gone during the unwind is this kill done, as it is for any app that leaves when asked. */
     espix_proc_slot_t *slot = espix_proc_find(pid);
     if (slot == NULL) {
         xSemaphoreGive(g_espix_proc_lock);
-        return ESP_ERR_NOT_FOUND;
+        return pre_live ? ESP_OK : ESP_ERR_NOT_FOUND;
     }
     if (state_is_finished(slot->info.state)) {
         xSemaphoreGive(g_espix_proc_lock);
-        return ESP_ERR_INVALID_STATE;
+        return pre_live ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
 
     /*
@@ -1493,11 +1535,19 @@ esp_err_t espix_proc_signal_group(espix_pid_t pgid, int sig)
     if (sig == 0) {
         return ESP_OK;              /* kill(-pgid, 0): the group exists */
     }
-    esp_err_t err = ESP_ERR_INVALID_STATE;
+    /* The caller last: a signal that ends it may not return. */
+    const espix_pid_t self = espix_proc_self_pid();
+    bool              mine = false;
+    esp_err_t         err  = ESP_ERR_INVALID_STATE;
     for (size_t i = 0; i < n; i++) {
-        if (espix_proc_signal(pids[i], sig) == ESP_OK) {
+        if (pids[i] == self) {
+            mine = true;
+        } else if (espix_proc_signal(pids[i], sig) == ESP_OK) {
             err = ESP_OK;
         }
+    }
+    if (mine && espix_proc_signal(self, sig) == ESP_OK) {
+        err = ESP_OK;
     }
     return err;
 }

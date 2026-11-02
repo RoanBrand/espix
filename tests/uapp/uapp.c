@@ -2,8 +2,8 @@
  * uapp: the U-mode test app (docs/USER-MODE.md). Each mode checks one thing the
  * boundary must hold: a fault ends only the app, kernel memory is out of reach,
  * preemption and the FPU work in U-mode, exit codes arrive, the syscalls
- * reach the kernel's files, clocks and identities, and threads share one
- * process.
+ * reach the kernel's files, clocks and identities, threads share one
+ * process, and signals reach handlers wherever the app is.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -11,6 +11,9 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +27,17 @@ static unsigned long cycles(void)
     unsigned long c;
     __asm__ volatile ("rdcycle %0" : "=r"(c));
     return c;
+}
+
+static uint64_t cycles64(void)
+{
+    uint32_t hi, lo, again;
+    do {
+        __asm__ volatile ("rdcycleh %0" : "=r"(hi));
+        __asm__ volatile ("rdcycle %0" : "=r"(lo));
+        __asm__ volatile ("rdcycleh %0" : "=r"(again));
+    } while (hi != again);
+    return ((uint64_t)hi << 32) | lo;
 }
 
 static long psram_free_kb(void)
@@ -306,6 +320,194 @@ static void *spin_forever(void *arg)
     return NULL;
 }
 
+/* ------------------------------------------------------------------ signals */
+
+static volatile int s_got, s_wrong_thread, s_main_cpu, s_sender_cpu, s_sender_any_cpu;
+static volatile unsigned long s_sent_at, s_worst, s_total;
+static volatile float s_sink;
+
+/* Runs between any two instructions of the loop it interrupts, and clobbers what its frame must restore. */
+static unsigned long now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long)ts.tv_sec * 1000000ul + (unsigned long)ts.tv_nsec / 1000ul;
+}
+
+static void on_async(int sig)
+{
+    const unsigned long late = now_us() - s_sent_at;
+    if (late > s_worst) {
+        s_worst = late;
+    }
+    s_total += late;
+    volatile float f = 3.0f;
+    for (int i = 0; i < 50; i++) {
+        f = f * 1.5f - 1.0f;
+    }
+    s_sink = f;
+    if (gettid() != getpid()) {
+        s_wrong_thread++;
+    }
+    s_got++;
+    (void)sig;
+}
+
+/* The sender: on the other core, and blocking the signal itself, so only the main thread, computing, can take it. */
+static void *send_usr1(void *arg)
+{
+    const int n = (int)(intptr_t)arg;
+    s_sender_cpu = sched_getcpu();
+    if (s_sender_cpu == s_main_cpu && !s_sender_any_cpu) {
+        return NULL;
+    }
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &m, NULL);
+    for (int i = 0; i < n; i++) {
+        const int before = s_got;
+        s_sent_at = now_us();
+        kill(getpid(), SIGUSR1);
+        for (int ms = 0; s_got == before && ms < 1000; ms++) {
+            usleep(1000);
+        }
+    }
+    return NULL;
+}
+
+/* An FNV hash and a float count: what a handler that broke a register would change. */
+static int sig_async(int n)
+{
+    signal(SIGUSR1, on_async);
+    uint32_t want = 0;
+    int wrong = 0, rounds = 0;
+    pthread_t t;
+    s_main_cpu = sched_getcpu();
+    for (int tries = 0;; tries++) {
+        s_sender_cpu     = -1;
+        s_sender_any_cpu = tries == 20;
+        pthread_create(&t, NULL, send_usr1, (void *)(intptr_t)n);
+        while (s_sender_cpu < 0) {
+        }
+        if (s_sender_cpu != s_main_cpu || s_sender_any_cpu) {
+            break;
+        }
+        pthread_join(t, NULL);
+    }
+    while (s_got < n && rounds < 200000) {
+        uint32_t h = 2166136261u;
+        float f = 0.0f;
+        for (int i = 0; i < 4096; i++) {
+            h = (h ^ (uint32_t)i) * 16777619u;
+            f += 1.0f;
+        }
+        if (rounds++ == 0) {
+            want = h;
+        }
+        wrong += (h != want || f != 4096.0f);
+    }
+    pthread_join(t, NULL);
+    printf("uapp: %d of %d handlers ran in a compute loop, %d wrong results, %d on another thread, "
+           "%lu us on average and at most %lu after a kill from core %d to core %d\n", s_got, n, wrong,
+           s_wrong_thread, s_got ? s_total / (unsigned long)s_got : 0, s_worst, s_sender_cpu, s_main_cpu);
+    return (s_got == n && wrong == 0 && s_wrong_thread == 0) ? 0 : 1;
+}
+
+static void on_count(int sig)
+{
+    (void)sig;
+    s_got++;
+}
+
+static sigset_t only(int sig)
+{
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, sig);
+    return m;
+}
+
+/* A blocked signal waits; unblocked, it runs before sigprocmask returns; SA_RESETHAND; sigsuspend. */
+static int sig_mask(void)
+{
+    const sigset_t usr1 = only(SIGUSR1), alrm = only(SIGALRM);
+    signal(SIGUSR1, on_count);
+    sigprocmask(SIG_BLOCK, &usr1, NULL);
+    raise(SIGUSR1);
+    const int held = s_got;
+    sigset_t p;
+    sigpending(&p);
+    sigprocmask(SIG_UNBLOCK, &usr1, NULL);
+    const int ran = s_got;
+
+    struct sigaction sa = { .sa_handler = on_count, .sa_flags = SA_RESETHAND }, now;
+    sigaction(SIGUSR2, &sa, NULL);
+    raise(SIGUSR2);
+    sigaction(SIGUSR2, NULL, &now);
+
+    signal(SIGALRM, on_count);
+    sigprocmask(SIG_BLOCK, &alrm, NULL);
+    alarm(1);
+    sigset_t during, after;
+    sigprocmask(SIG_BLOCK, NULL, &during);
+    sigdelset(&during, SIGALRM);
+    const int before = s_got;
+    const int rc = sigsuspend(&during), e = errno;
+    sigprocmask(SIG_BLOCK, NULL, &after);
+
+    const bool ok = held == 0 && sigismember(&p, SIGUSR1) && ran == 1 && now.sa_handler == SIG_DFL &&
+                    rc == -1 && e == EINTR && s_got == before + 1 && sigismember(&after, SIGALRM);
+    printf("uapp: mask: held %d, pending %d, ran %d, reset %d, suspend %d errno %d woke %d, mask back %d: %s\n",
+           held, sigismember(&p, SIGUSR1), ran, now.sa_handler == SIG_DFL, rc, e, s_got - before,
+           sigismember(&after, SIGALRM), ok ? "ok" : "wrong");
+    return ok ? 0 : 1;
+}
+
+static jmp_buf s_jb;
+static volatile uintptr_t s_fault_at, s_bad_addr = 16;
+
+static void on_segv(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig;
+    (void)uc;
+    s_fault_at = (uintptr_t)si->si_addr;
+    longjmp(s_jb, 1);
+}
+
+/* A fault reaches its handler with the address; with SIGSEGV still blocked, the next one ends the app. */
+static int sig_fault(void)
+{
+    struct sigaction sa = { .sa_sigaction = on_segv, .sa_flags = SA_SIGINFO };
+    sigaction(SIGSEGV, &sa, NULL);
+    if (setjmp(s_jb) == 0) {
+        *(volatile int *)s_bad_addr = 1;
+        printf("uapp: the fault did not happen\n");
+        return 1;
+    }
+    printf("uapp: caught SIGSEGV at 0x%x\n", (unsigned)s_fault_at);
+    fflush(stdout);
+    *(volatile int *)s_bad_addr = 1;
+    return 0;
+}
+
+/* A read interrupted by a handler: restarted under SA_RESTART, EINTR otherwise. */
+static int sig_read(bool restart)
+{
+    struct sigaction sa = { .sa_handler = on_count, .sa_flags = restart ? SA_RESTART : 0 };
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(1);
+    char buf[32];
+    const ssize_t n = read(0, buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[strcspn(buf, "\n")] = '\0';
+        printf("uapp: read '%.*s', handler ran %d\n", (int)n, buf, s_got);
+    } else {
+        printf("uapp: read %d errno %d, handler ran %d\n", (int)n, errno, s_got);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = (argc > 1) ? argv[1] : "hello";
@@ -349,6 +551,26 @@ int main(int argc, char **argv)
             printf("uapp: spun %lu iterations, x %d\n", n, (int)x);
         }
         return (int)(n & 1);
+    }
+    if (strcmp(mode, "pauses") == 0 && argc > 3) {
+        /* Computes for secs with no syscall, then writes the longest it went without running: a stop's length. */
+        const uint64_t start = cycles64(), end = start + (uint64_t)atoi(argv[2]) * 320000000u;
+        uint64_t prev = start, worst = 0;
+        volatile float x = 1.0f;
+        for (uint64_t now = start; now < end; prev = now) {
+            x = x * 1.0001f;
+            now = cycles64();
+            if (now - prev > worst) {
+                worst = now - prev;
+            }
+        }
+        FILE *f = fopen(argv[3], "w");
+        if (f == NULL) {
+            return 1;
+        }
+        fprintf(f, "uapp: longest pause %lu ms\n", (unsigned long)(worst / 320000u));
+        fclose(f);
+        return 0;
     }
     if (strcmp(mode, "ispin") == 0 || strcmp(mode, "ispinp") == 0) {
         /* The spin without floating point. */
@@ -503,6 +725,18 @@ int main(int argc, char **argv)
         const unsigned long per = (cycles() - t0) / (unsigned long)n;
         printf("uapp: a syscall takes %lu cycles, %lu ns\n", per, per * 1000ul / 320ul);
         return 0;
+    }
+    if (strcmp(mode, "sigasync") == 0) {
+        return sig_async((argc > 2) ? atoi(argv[2]) : 50);
+    }
+    if (strcmp(mode, "sigmask") == 0) {
+        return sig_mask();
+    }
+    if (strcmp(mode, "sigfault") == 0) {
+        return sig_fault();
+    }
+    if (strcmp(mode, "sigread") == 0 && argc > 2) {
+        return sig_read(strcmp(argv[2], "restart") == 0);
     }
     if (strcmp(mode, "threads") == 0 && argc > 2) {
         return threads(atol(argv[2]));

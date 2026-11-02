@@ -640,6 +640,14 @@ clobber a register. Something meant to trap must be architecturally illegal on
 every RV32 core, such as `unimp` (`csrrw x0, cycle, x0`, a write to a
 read-only CSR).
 
+### An IPC call does not go through the return to U
+
+`esp_ipc_isr_call()` runs its function from a handler of its own, which the
+vectors patch makes safe to enter from U-mode but which returns without
+`espix_um_return()`. So it cannot deliver a signal: it ran on the other core and
+the handler still waited for that core's tick. `vPortYieldOtherCore()` raises an
+ordinary interrupt, whose exit is the patched one (`espix_um_sig_nudge()`).
+
 ### Never longjmp out of a stdio callback
 
 A `funopen()` read or write function runs with the `FILE`'s recursive lock

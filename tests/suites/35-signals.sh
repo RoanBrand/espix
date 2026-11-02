@@ -19,11 +19,6 @@ if ! dev_testapp_present; then
     return 0
 fi
 
-# Handlers, alarm, SIGWINCH and Ctrl-C delivery are what these test; 32-umode covers a kill's default action.
-if dev_uapp_lacks "signal handlers and alarm" "M4"; then
-    return 0
-fi
-
 APP="/home/$ESPIX_USER/testapp"
 
 # `ps` prints running tasks, then a `finished:` section -- but that section is
@@ -139,8 +134,14 @@ fi
 log=$(dev_run 'dmesg')
 assert_contains "the grace expired before it was deleted" \
     "pid $pid did not stop when asked" "$log"
-assert_contains "and then the task was deleted, so no cleanup ran" \
-    "killed pid $pid" "$log"
+if [ "${ESPIX_UAPP:-0}" = 1 ]; then
+    # Not deleted: it ends itself on its way back to U, its handlers skipped, as SIGKILL does.
+    assert_eq "and then it ended as SIGKILL ends it, so no cleanup ran" "exit 137" \
+        "$(dev_run 'ps' | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p {print $3, $4}')"
+else
+    assert_contains "and then the task was deleted, so no cleanup ran" \
+        "killed pid $pid" "$log"
+fi
 
 # SIGKILL takes the same route with no grace at all.
 pid=$(bg_start ignore)
@@ -252,20 +253,24 @@ assert_contains "and the handler can read the size" "cols=" "$winch_out"
 # SIGPIPE when a send finds the connection gone: the trigger is a loopback peer
 # that closes, and the send wrapper turns the stack's error into the signal.
 # R-P6.5.
-assert_contains "a send to a gone peer raises SIGPIPE" "seen=1" \
-    "$(dev_run "$APP sig pipe")"
+if ! dev_uapp_lacks "SIGPIPE from a send" "sockets, M6"; then
+    assert_contains "a send to a gone peer raises SIGPIPE" "seen=1" \
+        "$(dev_run "$APP sig pipe")"
+fi
 
 # A signal must interrupt a process blocked in select(), which is R-P6.6's whole
 # point. The alarm is the signal; the elapsed time is how we know select() did
 # not run its full 60 seconds.
-sel_out=$(dev_run "$APP sig select")
-assert_contains "a signal interrupts select" "seen=1" "$sel_out"
-assert_contains "and select reports EINTR" "errno=4" "$sel_out"
-sel_ms=$(printf '%s' "$sel_out" | sed -n 's/.*after \([0-9][0-9]*\) ms.*/\1/p')
-if [ -n "$sel_ms" ] && [ "$sel_ms" -lt 5000 ]; then
-    espix_pass "and it returned at the alarm ($sel_ms ms, not 60 s)"
-else
-    espix_fail "and it returned at the alarm" "got: $sel_out"
+if ! dev_uapp_lacks "a signal interrupting select" "select, M6"; then
+    sel_out=$(dev_run "$APP sig select")
+    assert_contains "a signal interrupts select" "seen=1" "$sel_out"
+    assert_contains "and select reports EINTR" "errno=4" "$sel_out"
+    sel_ms=$(printf '%s' "$sel_out" | sed -n 's/.*after \([0-9][0-9]*\) ms.*/\1/p')
+    if [ -n "$sel_ms" ] && [ "$sel_ms" -lt 5000 ]; then
+        espix_pass "and it returned at the alarm ($sel_ms ms, not 60 s)"
+    else
+        espix_fail "and it returned at the alarm" "got: $sel_out"
+    fi
 fi
 
 # A signal ends only a wait that is waiting for one. A lock wait and a join are
@@ -276,7 +281,12 @@ assert_contains "a signal does not break a lock wait" "mutex rc=0" \
     "$(dev_run "$APP sig mutex")"
 ts_out=$(dev_run "$APP sig threadsleep")
 assert_contains "a signal reaches a thread asleep in sleep()" "handler ran" "$ts_out"
-assert_contains "and cuts its sleep short, while the join waits" "4 left" "$ts_out"
+if [ "${ESPIX_UAPP:-0}" = 1 ]; then
+    # One thread takes a process's signal, as on Linux: here the main one, in its join (32-umode's sigasync aims one).
+    espix_skip "a U-mode process's signal goes to one thread, not to each sleeper"
+else
+    assert_contains "and cuts its sleep short, while the join waits" "4 left" "$ts_out"
+fi
 
 # An app's thread is listed under its process: tid in the PID column, the
 # process's name in braces, the process as its parent.
@@ -396,6 +406,9 @@ fi
 
 assert_contains "kill(0) reaches the caller's own group, the caller included" \
     "rc=0 seen=1 probe=0" "$(dev_run "$APP sig group")"
+killself_out=$(dev_run "$APP sig killself; echo rc=\$?")
+assert_contains "an app's SIGKILL to its own group ends it with 137" "rc=137" "$killself_out"
+assert_not_contains "and nothing after it runs" "still here" "$killself_out"
 
 # `ssh host cmd` is a session too, so what it leaves running is hung up when
 # it ends rather than outliving it. Under a name of its own, as above.
