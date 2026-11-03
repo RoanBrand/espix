@@ -184,6 +184,7 @@ esp_err_t espix_tty_init(void)
 static void defaults(espix_tty_t *t)
 {
     memset(&t->tio, 0, sizeof(t->tio));
+    t->tio.c_cc[VMIN] = 1;      /* a read waits for a byte, a pipe's included */
     if (t->pipe) {
         return;
     }
@@ -357,12 +358,15 @@ static void signal_fg(espix_tty_t *t, int sig)
     }
 }
 
-/* One input byte; false when it cannot be taken yet (the input is full). */
+/* One input byte; false when it cannot be taken yet (a pipe's input is full). */
 static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
 {
     const tcflag_t lf = t->tio.c_lflag, inf = t->tio.c_iflag;
     if (t->pipe) {
         return ring_put_locked(t, &c, 1);
+    }
+    if (t->ops.key != NULL) {
+        t->ops.key(t->ops.ctx, c);
     }
     if (inf & ISTRIP) {
         c &= 0x7f;
@@ -382,7 +386,8 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
         const cc_t *cc = t->tio.c_cc;
         int s = 0;
         if (c != 0 && c == cc[VINTR]) {
-            s = (++t->intrs >= 3) ? SIGKILL : SIGINT;
+            /* The third ^C at a group that is still there insists, unless the session handles the keys itself. */
+            s = (t->ops.signal == NULL && ++t->intrs >= 3) ? SIGKILL : SIGINT;
         } else if (c != 0 && c == cc[VQUIT]) {
             s = SIGQUIT;
         } else if (c != 0 && c == cc[VSUSP]) {
@@ -400,10 +405,10 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
     t->intrs = 0;
 
     if (!(lf & ICANON)) {
-        if (!ring_put_locked(t, &c, 1)) {
-            return false;
+        /* A terminal drops what does not fit, as Linux's does; it never holds the transport back. */
+        if (ring_put_locked(t, &c, 1)) {
+            echo_char(t, e, c);
         }
-        echo_char(t, e, c);
         return true;
     }
 
@@ -423,7 +428,7 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
         }
     } else if (c == cc[VEOF] && c != 0) {
         if (!commit_line_locked(t)) {
-            return false;
+            t->llen = 0;
         }
     } else if (c == '\n' || (c == cc[VEOL] && c != 0)) {
         if (t->llen == LINE_CAP) {
@@ -431,8 +436,7 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
         }
         t->line[t->llen++] = c;
         if (!commit_line_locked(t)) {
-            t->llen--;
-            return false;
+            t->llen = 0;    /* a terminal whose reader is not keeping up: the line goes, as Linux's would */
         }
         if ((lf & ECHO) || (lf & ECHONL)) {
             echo_add(e, "\n", 1);
@@ -442,6 +446,25 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
         echo_char(t, e, c);
     }
     return true;
+}
+
+/* Echo through output processing, to the transport's non-blocking path where it has one. */
+static void echo_out(espix_tty_t *t, const char *buf, size_t len)
+{
+    if (t->ops.echo == NULL) {
+        (void)espix_tty_write(t, buf, len);
+        return;
+    }
+    const bool onlcr = (t->tio.c_oflag & (OPOST | ONLCR)) == (OPOST | ONLCR);
+    char out[ECHO_CHUNK * 6];
+    size_t n = 0;
+    for (size_t i = 0; i < len && n < sizeof(out) - 1; i++) {
+        if (buf[i] == '\n' && onlcr) {
+            out[n++] = '\r';
+        }
+        out[n++] = buf[i];
+    }
+    t->ops.echo(t->ops.ctx, out, n);
 }
 
 size_t espix_tty_input(espix_tty_t *t, const void *buf, size_t len)
@@ -470,9 +493,11 @@ size_t espix_tty_input(espix_tty_t *t, const void *buf, size_t len)
         const pid_t fg = t->fg;
         xSemaphoreGive(t->lock);
         if (e.n > 0) {
-            espix_tty_write(t, e.buf, e.n);
+            echo_out(t, e.buf, e.n);
         }
-        if (sig != 0 && fg > 0 && s_hooks.signal_group != NULL) {
+        if (sig != 0 && t->ops.signal != NULL) {
+            t->ops.signal(t->ops.ctx, sig);
+        } else if (sig != 0 && fg > 0 && s_hooks.signal_group != NULL) {
             s_hooks.signal_group(fg, sig);
         }
         if (stopped) {
@@ -529,7 +554,16 @@ ssize_t espix_tty_read(espix_tty_t *t, void *buf, size_t len, bool nonblock)
     uint8_t *dst = buf;
     size_t got = 0;
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    const pid_t me = (!t->pipe && s_hooks.self_pgid != NULL) ? s_hooks.self_pgid() : 0;
     for (;;) {
+        /* Job control: a background group's read stops it, and is tried again once it is continued. */
+        if (me > 0 && t->fg > 0 && me != t->fg && !t->hung) {
+            const int r = s_hooks.background ? s_hooks.background() : -EIO;
+            if (r != 0) {
+                return got ? (ssize_t)got : r;
+            }
+            continue;
+        }
         xSemaphoreTake(t->lock, portMAX_DELAY);
         const bool canon = canonical(t);
         const cc_t vmin = t->tio.c_cc[VMIN], vtime = t->tio.c_cc[VTIME];
@@ -587,33 +621,50 @@ size_t espix_tty_readable(espix_tty_t *t)
     return n;
 }
 
-ssize_t espix_tty_write(espix_tty_t *t, const void *buf, size_t len)
+/* Output processing, then one call to fn: one write reaches the transport as one burst. */
+static ssize_t output(espix_tty_t *t, const void *buf, size_t len,
+                      ssize_t (*fn)(void *ctx, const void *buf, size_t len))
 {
     if (t->hung) {
         return -EIO;
     }
+    void *const ctx = t->ops.ctx;
     const bool onlcr = !t->pipe && (t->tio.c_oflag & (OPOST | ONLCR)) == (OPOST | ONLCR);
-    if (!onlcr) {
-        return t->ops.write(t->ops.ctx, buf, len);
-    }
     const char *p = buf;
-    char out[256];
-    size_t done = 0, n = 0;
-    while (done < len) {
-        const char c = p[done++];
-        if (c == '\n') {
+    size_t nl = 0;
+    for (size_t i = 0; onlcr && i < len; i++) {
+        nl += p[i] == '\n';
+    }
+    if (nl == 0) {
+        return fn(ctx, buf, len);
+    }
+    char stack[256];
+    char *out = (len + nl <= sizeof(stack)) ? stack : malloc(len + nl);
+    if (out == NULL) {
+        return -ENOMEM;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '\n') {
             out[n++] = '\r';
         }
-        out[n++] = c;
-        if (n >= sizeof(out) - 1 || done == len) {
-            const ssize_t w = t->ops.write(t->ops.ctx, out, n);
-            if (w < 0) {
-                return w;
-            }
-            n = 0;
-        }
+        out[n++] = p[i];
     }
-    return (ssize_t)len;
+    const ssize_t w = fn(ctx, out, n);
+    if (out != stack) {
+        free(out);
+    }
+    return (w < 0) ? w : (ssize_t)len;
+}
+
+ssize_t espix_tty_write(espix_tty_t *t, const void *buf, size_t len)
+{
+    return output(t, buf, len, t->ops.write);
+}
+
+ssize_t espix_tty_write_err(espix_tty_t *t, const void *buf, size_t len)
+{
+    return output(t, buf, len, t->ops.write_err ? t->ops.write_err : t->ops.write);
 }
 
 /* ------------------------------------------------------------------ */

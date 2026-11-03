@@ -19,6 +19,7 @@
 
 #include "espix_proc_priv.h"
 #include "espix_shell.h"
+#include "espix_tty.h"
 
 #define FG_POLL_MS 50
 
@@ -73,6 +74,14 @@ static void stopped_job(espix_session_t *s, espix_pid_t pid)
     say(s, false, "[%d]+  Stopped  %s\n", n, name);
 }
 
+void espix_proc_set_fg(espix_session_t *s, espix_pid_t pgid)
+{
+    s->fg_pgid = pgid;
+    if (s->tty != NULL) {
+        espix_tty_set_fg(s->tty, (pid_t)((pgid != ESPIX_PID_NONE) ? pgid : s->pid));
+    }
+}
+
 int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
 {
     espix_proc_fg_t none = { 0 };
@@ -104,7 +113,7 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
         pgid = pid;
     }
     if (shell) {
-        s->fg_pgid = pgid;
+        espix_proc_set_fg(s, pgid);
     }
 
     const int64_t deadline = (fg->limit_us > 0) ? esp_timer_get_time() + fg->limit_us
@@ -188,7 +197,7 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
         (void)s->poll_interrupt(s);
     }
     if (shell) {
-        s->fg_pgid = ESPIX_PID_NONE;
+        espix_proc_set_fg(s, ESPIX_PID_NONE);
     }
     if (fg->stopped) {
         stopped_job(s, pid);

@@ -103,6 +103,13 @@ int espix_um_termsig(const espix_proc_slot_t *slot)
     return lowest(pending & ~blocked & terminating(p));
 }
 
+bool espix_um_sig_refused(const espix_proc_slot_t *slot, int sig)
+{
+    const espix_um_thread_t *const t = self_of(slot);
+    const espix_um_proc_t *const p = ((const espix_um_thread_t *)slot->app->um)->proc;
+    return (t != NULL && (t->sig_blocked & espix_sigbit(sig))) || p->act[sig].handler == H_IGN;
+}
+
 /* The thread's own first, then the process's. */
 static int take(espix_um_thread_t *t)
 {

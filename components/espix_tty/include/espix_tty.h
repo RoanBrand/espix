@@ -48,6 +48,14 @@ typedef struct espix_tty espix_tty_t;
 typedef struct {
     /* Bytes for the terminal, after output processing; may block. Never called with the tty locked. */
     ssize_t (*write)(void *ctx, const void *buf, size_t len);
+    /* The same for standard error, where the transport keeps it apart; NULL: write. */
+    ssize_t (*write_err)(void *ctx, const void *buf, size_t len);
+    /* What the line discipline echoes, from inside espix_tty_input(): must not block on the reader. NULL: write. */
+    void    (*echo)(void *ctx, const void *buf, size_t len);
+    /* A signal key, for a session that acts on them itself; NULL: the foreground group is signalled. */
+    void    (*signal)(void *ctx, int sig);
+    /* Each input byte as it arrives, before the line discipline. May be NULL. */
+    void    (*key)(void *ctx, int c);
     /* Room in the input again after it filled: a transport that held input back resumes. May be NULL. */
     void    (*room)(void *ctx);
     void     *ctx;
@@ -60,6 +68,8 @@ typedef struct {
     pid_t (*self_pgid)(void);
     /* After each wake of a blocked read: 0 to wait on, or -EINTR (a handler is due, or the process ends). */
     int   (*interrupted)(void);
+    /* A read from outside the foreground group: SIGTTIN, then 0 once continued, -EINTR, or -EIO if it cannot stop. */
+    int   (*background)(void);
 } espix_tty_hooks_t;
 
 void espix_tty_set_hooks(const espix_tty_hooks_t *hooks);
@@ -75,7 +85,8 @@ void espix_tty_hangup(espix_tty_t *t);
 espix_tty_t *espix_tty_get(espix_tty_t *t);
 void         espix_tty_put(espix_tty_t *t);
 
-/* The producer: through the line discipline into the input; how many bytes it took (the rest: try again on room). */
+/* The producer: through the line discipline into the input. A terminal takes every byte, dropping what does not
+ * fit as Linux does; a pipe returns how many it took, and the rest is the producer's to retry on room. */
 size_t espix_tty_input(espix_tty_t *t, const void *buf, size_t len);
 /* The end of input (an exec channel's EOF): readers see it once what is buffered is read. */
 void   espix_tty_input_eof(espix_tty_t *t);
@@ -83,6 +94,7 @@ void   espix_tty_input_eof(espix_tty_t *t);
 /* The consumers. A blocking read ends with -EINTR when a handler is due; 0 is the end of input. */
 ssize_t espix_tty_read(espix_tty_t *t, void *buf, size_t len, bool nonblock);
 ssize_t espix_tty_write(espix_tty_t *t, const void *buf, size_t len);
+ssize_t espix_tty_write_err(espix_tty_t *t, const void *buf, size_t len);
 /* Whether a read would return now, and how many bytes it could. */
 size_t  espix_tty_readable(espix_tty_t *t);
 
@@ -95,7 +107,7 @@ void  espix_tty_setattr(espix_tty_t *t, int when, const struct termios *tio);
 /* A terminal for a program that does its own editing: no echo, no canonical lines, no signal keys. */
 void  espix_tty_makeraw(struct termios *tio);
 
-/* The foreground process group: its readers read, and the signal keys signal it. */
+/* The foreground process group: its readers read, any other group's get SIGTTIN, and the signal keys signal it. */
 void  espix_tty_set_fg(espix_tty_t *t, pid_t pgid);
 pid_t espix_tty_get_fg(const espix_tty_t *t);
 /* The window size; a change sends SIGWINCH to the foreground group. */

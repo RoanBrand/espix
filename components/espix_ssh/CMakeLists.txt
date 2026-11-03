@@ -19,6 +19,7 @@ idf_component_register(
         espix_shell
         espressif__esp_linenoise
         espix_proc
+        espix_tty
         espix_fs
         espix_net
         lwip

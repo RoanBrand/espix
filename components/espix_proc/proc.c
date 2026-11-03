@@ -128,6 +128,7 @@ static void shell_begin(espix_session_t *s)
         espix_klog(ESPIX_KLOG_WARN, TAG, "%s: no process slot for the session",
                    s->user);
     }
+    espix_proc_set_fg(s, ESPIX_PID_NONE);
 }
 
 static size_t shell_end(espix_session_t *s)
@@ -199,6 +200,27 @@ static int tty_interrupted(void)
     return espix_sigcheck_io() ? -EINTR : 0;
 }
 
+static bool action_is_default(const espix_proc_slot_t *slot, int sig);
+static bool sig_refused(const espix_proc_slot_t *slot, int sig);
+
+/* A read of its terminal from a background group, as Linux answers it: EIO for a reader that cannot stop. */
+static int tty_background(void)
+{
+    espix_proc_slot_t *slot = espix_proc_self();
+    if (slot == NULL) {
+        return 0;
+    }
+    if (slot->info.kind != ESPIX_PROC_APP || sig_refused(slot, SIGTTIN)) {
+        return -EIO;
+    }
+    const bool caught = !action_is_default(slot, SIGTTIN);
+    if (espix_proc_signal_group(slot->info.pgid, SIGTTIN) != ESP_OK) {
+        return -EIO;
+    }
+    /* The stop parks here until SIGCONT; a handler instead ends the read. */
+    return (espix_sigcheck_io() || caught) ? -EINTR : 0;
+}
+
 esp_err_t espix_proc_init(void)
 {
     if (g_espix_proc_lock != NULL) {
@@ -252,6 +274,7 @@ esp_err_t espix_proc_init(void)
         .signal_group = tty_signal_group,
         .self_pgid    = tty_self_pgid,
         .interrupted  = tty_interrupted,
+        .background   = tty_background,
     };
     espix_tty_set_hooks(&tty_hooks);
     (void)espix_tty_init();
@@ -1011,6 +1034,18 @@ static bool action_is_default(const espix_proc_slot_t *slot, int sig)
     }
 #endif
     return slot->sig_actions == NULL || slot->sig_actions[sig].handler == SIG_DFL;
+}
+
+/* Blocked by the caller, or ignored by its process. */
+static bool sig_refused(const espix_proc_slot_t *slot, int sig)
+{
+#if CONFIG_ESPIX_UMODE
+    if (ends_in_user_mode(slot)) {
+        return espix_um_sig_refused(slot, sig);
+    }
+#endif
+    return (slot->sig_blocked & espix_sigbit(sig)) ||
+           (slot->sig_actions != NULL && slot->sig_actions[sig].handler == SIG_IGN);
 }
 
 static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)

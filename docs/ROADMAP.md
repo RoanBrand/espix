@@ -325,32 +325,13 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## SSH
 
-- **More than one channel per connection.** `direct-tcpip` landed, so
-  `ssh -N -L` works -- but the server carries exactly one channel for the life
-  of a connection, which is why `ssh -L` (a shell *and* a forward) is refused.
-  Closing that gap changes the shape of `ssh_channel.c`: a table of channels, a
-  receive loop that dispatches on the recipient channel id instead of assuming
-  there is one, and per-channel windows. The blocking I/O the shell depends on
-  (`chan_read_line`, the editor's own callbacks) makes that more than a
-  refactor -- today the connection task *is* the channel.
-- **Split the connection task from the session task.** Today one task reads
-  the wire, runs the shell, runs a foreground command and pumps a program's
-  stdin, and it is the only task that decrypts. The socket reader already wakes
-  the foreground wait (R-P8.7); a reader that also parsed would turn more into a
-  push: chan_poll_interrupt's bounded drains could become a real recv or
-  select; the transport's vTaskDelay(1) retries in ssh_transport.c would have
-  somewhere to block (R-P7.1 item 5); Ctrl-Z and q need the key reported rather
-  than consumed (R-P7.7); and the orphaned transmit lock a force-killed writer
-  leaves behind (R-P7.9) is the same task doing the writing while being
-  deletable. It is also what the multi-channel bullet above runs into from the
-  other side. Not scheduled: the reasons are piling up, and this is where they
-  land if one more arrives.
-
-  **First stage landed.** A per-connection reader task now owns recv() and
-  fills a ring; the connection task blocks on it. That removes the read
-  half of R-P7.1 item 5. What item 2 still needs is not the task but the
-  event plumbing: one object the reader (bytes) and the process finish
-  (the child) can both set, so cmd_run() can block on either.
+- **More than one channel per connection.** `ssh -N -L` works, but a
+  connection carries one channel for its life: `ssh -L` with a shell is
+  refused, and each forwarded TCP connection takes an SSH connection of its
+  own. The reader task already decrypts every packet and dispatches it
+  (`ssh_rx_handoff()`), and each channel's input is its own tty or pipe; what
+  is left is a table of channels keyed by the recipient id, a window each, and
+  a task per channel beside the session's.
 - **`ssh -R`, and `ssh -D`.** The other two directions. `-R` is a client
   asking espix to *listen*: the global `tcpip-forward` request plus
   `forwarded-tcpip`, and the listener side has no equivalent here at all. `-D`

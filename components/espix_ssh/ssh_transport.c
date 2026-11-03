@@ -258,25 +258,52 @@ static void rx_arrived(ssh_conn_t *c)
     }
 }
 
+/* Every whole packet in the ring to the dispatcher, until it holds or stops; under rx_parse. */
+static void dispatch_ready(ssh_conn_t *c)
+{
+    while (!c->rx_held && c->rx_dispatch != NULL) {
+        const esp_err_t err = ssh_packet_try(c);
+        if (err == ESP_ERR_NOT_FINISHED) {
+            return;
+        }
+        int r;
+        if (err != ESP_OK) {
+            c->rx_err = true;
+            r = c->rx_dispatch(c->rx_ctx, NULL, SSH_RX_GONE);
+        } else {
+            r = c->rx_dispatch(c->rx_ctx, c->in_payload, c->in_len);
+        }
+        if (r == SSH_RX_HOLD) {
+            c->rx_held = true;
+        } else if (r != SSH_RX_OK || err != ESP_OK) {
+            c->rx_dispatch = NULL;
+        }
+    }
+}
+
 static void ssh_reader_task(void *arg)
 {
     ssh_conn_t *c = arg;
     uint8_t     tmp[512];
 
     while (!c->rx_stop) {
+        if (c->rx_dispatch != NULL) {
+            xSemaphoreTake(c->rx_parse, portMAX_DELAY);
+            if (c->rx_held && c->rx_dispatch != NULL &&
+                c->rx_dispatch(c->rx_ctx, NULL, SSH_RX_RESUME) != SSH_RX_HOLD) {
+                c->rx_held = false;
+            }
+            dispatch_ready(c);
+            xSemaphoreGive(c->rx_parse);
+        }
+
         /*
-         * A full ring is the connection task not having taken bytes yet.
-         *
-         * Timed, not forever. Teardown shuts the socket down, which ends
-         * recv(), but nothing reaches a task waiting here -- so a client that
-         * stopped reading pinned this task, its stack and its receive buffer
-         * for the life of the board, and the teardown then had to abandon them
-         * rather than free memory a live task was reading. That is the leak
-         * that filled internal RAM and stopped transfers completing. Waking on
-         * room is the notification or this timeout, whichever comes first.
+         * A full ring is a consumer not having taken bytes yet: the connection
+         * task before the handoff, or a held dispatcher after it. Both wake this
+         * when there is room, and so does teardown.
          */
-        if (rx_used(c) >= SSH_RX_RING) {
-            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+        if (rx_used(c) >= SSH_RX_RING || (c->rx_held && c->rx_dispatch != NULL)) {
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
 
@@ -291,26 +318,56 @@ static void ssh_reader_task(void *arg)
             rx_arrived(c);
             continue;
         }
-        if (n == 0) {
-            c->rx_eof = true;
-            rx_arrived(c);
-            break;
-        }
-        if (errno == EINTR) {
+        if (n < 0 && errno == EINTR) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             /* Only possible before SO_RCVTIMEO is cleared below, or if
              * something set O_NONBLOCK on the descriptor. */
             vTaskDelay(1);
             continue;
         }
-        c->rx_err = true;
+        if (n == 0) {
+            c->rx_eof = true;
+        } else {
+            c->rx_err = true;
+        }
         rx_arrived(c);
+        if (c->rx_dispatch != NULL) {
+            xSemaphoreTake(c->rx_parse, portMAX_DELAY);
+            dispatch_ready(c);      /* what arrived before the end */
+            if (c->rx_dispatch != NULL) {
+                (void)c->rx_dispatch(c->rx_ctx, NULL, SSH_RX_GONE);
+                c->rx_dispatch = NULL;
+            }
+            xSemaphoreGive(c->rx_parse);
+        }
         break;
     }
 
     espix_task_exited(&c->rx_exit);
+}
+
+void ssh_rx_handoff(ssh_conn_t *c, int (*fn)(void *ctx, const uint8_t *payload, size_t len), void *ctx)
+{
+    /* What is already whole in the ring is dispatched here: the reader may be in recv() with nothing new to come. */
+    xSemaphoreTake(c->rx_parse, portMAX_DELAY);
+    c->rx_ctx      = ctx;
+    c->rx_dispatch = fn;
+    dispatch_ready(c);
+    if (c->rx_dispatch != NULL && (c->rx_eof || c->rx_err)) {
+        (void)c->rx_dispatch(c->rx_ctx, NULL, SSH_RX_GONE);
+        c->rx_dispatch = NULL;
+    }
+    xSemaphoreGive(c->rx_parse);
+    ssh_rx_resume(c);
+}
+
+void ssh_rx_resume(ssh_conn_t *c)
+{
+    if (c->rx_exit.task != NULL) {
+        (void)xTaskNotifyGive(c->rx_exit.task);
+    }
 }
 
 esp_err_t ssh_rx_start(ssh_conn_t *c)
@@ -328,11 +385,16 @@ esp_err_t ssh_rx_start(ssh_conn_t *c)
         return ESP_ERR_NO_MEM;
     }
 
-    c->rx_data = xSemaphoreCreateBinary();
-    if (c->rx_data == NULL || !espix_task_exit_init(&c->rx_exit)) {
+    c->rx_data  = xSemaphoreCreateBinary();
+    c->rx_parse = xSemaphoreCreateMutex();
+    if (c->rx_data == NULL || c->rx_parse == NULL || !espix_task_exit_init(&c->rx_exit)) {
         if (c->rx_data != NULL) {
             vSemaphoreDelete(c->rx_data);
             c->rx_data = NULL;
+        }
+        if (c->rx_parse != NULL) {
+            vSemaphoreDelete(c->rx_parse);
+            c->rx_parse = NULL;
         }
         heap_caps_free(c->rx_buf);
         c->rx_buf = NULL;
@@ -350,6 +412,8 @@ esp_err_t ssh_rx_start(ssh_conn_t *c)
         espix_task_exit_deinit(&c->rx_exit);
         vSemaphoreDelete(c->rx_data);
         c->rx_data = NULL;
+        vSemaphoreDelete(c->rx_parse);
+        c->rx_parse = NULL;
         heap_caps_free(c->rx_buf);
         c->rx_buf = NULL;
         return ESP_ERR_NO_MEM;
@@ -405,6 +469,10 @@ void ssh_rx_stop(ssh_conn_t *c)
     if (c->rx_data != NULL) {
         vSemaphoreDelete(c->rx_data);
         c->rx_data = NULL;
+    }
+    if (c->rx_parse != NULL) {
+        vSemaphoreDelete(c->rx_parse);
+        c->rx_parse = NULL;
     }
     if (c->rx_buf != NULL) {
         heap_caps_free(c->rx_buf);
@@ -976,6 +1044,24 @@ esp_err_t ssh_packet_read(ssh_conn_t *c)
         return ESP_ERR_INVALID_SIZE;    /* every packet carries a message id */
     }
     return ESP_OK;
+}
+
+esp_err_t ssh_packet_try(ssh_conn_t *c)
+{
+    if (rx_used(c) < 4) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    uint8_t h[4];
+    for (int i = 0; i < 4; i++) {
+        h[i] = c->rx_buf[(c->rx_tail + (uint32_t)i) % SSH_RX_RING];
+    }
+    const uint32_t len = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | h[3];
+    /* A bad length is ssh_packet_read()'s to refuse; it reads no further than the header to do it. */
+    const size_t total = 4 + (size_t)len + (c->rx.active ? SSH_MAC_LEN : 0);
+    if (len <= SSH_MAX_PACKET - 4 && rx_used(c) < total) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    return ssh_packet_read(c);
 }
 
 /*

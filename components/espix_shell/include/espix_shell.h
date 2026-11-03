@@ -226,6 +226,9 @@ struct espix_session {
     /* ^Z typed while a job ran, on any transport: the foreground wait stops the job. */
     volatile bool susp;
 
+    /* The session's terminal (components/espix_tty), on a transport that has moved onto one; else NULL. */
+    struct espix_tty *tty;
+
     /*
      * The terminal's size, for an app that has just been sent SIGWINCH. NULL
      * when the transport has no answer -- the serial console is the case -- and

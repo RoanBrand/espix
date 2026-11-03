@@ -206,6 +206,9 @@ typedef struct {
 
 int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg);
 
+/* The session's foreground group, ESPIX_PID_NONE for its shell: tcsetpgrp(), before a stopped job is continued. */
+void espix_proc_set_fg(espix_session_t *s, espix_pid_t pgid);
+
 /* Sleep up to `ms`, ending at once when the calling process is signalled. True
  * when it has been asked to stop. For espix's own code; an app has sleep(). */
 bool espix_proc_sleep(uint32_t ms);

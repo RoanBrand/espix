@@ -271,12 +271,37 @@ typedef struct {
     volatile bool     rx_stop;      /* teardown asked the reader to finish */
     espix_task_exit_t rx_exit;      /* the reader, announced as it leaves */
     TaskHandle_t      rx_wake;      /* the connection task, notified on arrival */
+
+    /*
+     * After ssh_rx_handoff() the reader decrypts each packet itself and hands it
+     * to rx_dispatch on its own task, so one task owns the inbound protocol.
+     * rx_parse is held by whoever is decrypting: the connection task at the
+     * handoff, the reader after it.
+     */
+    int             (*rx_dispatch)(void *ctx, const uint8_t *payload, size_t len);
+    void             *rx_ctx;
+    SemaphoreHandle_t rx_parse;
+    volatile bool     rx_held;      /* the dispatcher could not take a packet's data yet */
+    void             *chan;         /* the channel, for sftp's raw calls */
 } ssh_conn_t;
 
-/* The reader's ring and stack. 3072 is what a recv() loop and its memcpy need;
- * the connection task keeps the 8192 because commands run inline on it. */
+/* The reader's ring and stack. The stack decrypts, dispatches, and sends what
+ * the line discipline echoes; the connection task keeps the 8192 because
+ * commands run inline on it. */
 #define SSH_RX_RING   4096
-#define SSH_RX_STACK  3072
+#define SSH_RX_STACK  6144
+
+/* What a dispatcher returns, and the payload-less calls it can get. */
+#define SSH_RX_OK      0
+#define SSH_RX_HOLD    1    /* keep the rest; carry on after ssh_rx_resume() */
+#define SSH_RX_STOP    2    /* the channel is done: nothing more to dispatch */
+#define SSH_RX_RESUME  0    /* payload NULL: retry what was held */
+#define SSH_RX_GONE    1    /* payload NULL: the connection has ended */
+
+/* From here the reader decrypts and dispatches every packet; the caller reads no more. */
+void ssh_rx_handoff(ssh_conn_t *c, int (*fn)(void *ctx, const uint8_t *payload, size_t len), void *ctx);
+/* A held dispatcher can take more: wake the reader. */
+void ssh_rx_resume(ssh_conn_t *c);
 
 /* Start and stop the connection's reader task. ssh_rx_start() is called once
  * the fd is known; ssh_rx_stop() before the fd is drained and closed. */
@@ -302,6 +327,8 @@ void ssh_mac_prepare(const uint8_t *key, size_t key_len,
 
 esp_err_t ssh_transport_banner(ssh_conn_t *c);
 esp_err_t ssh_packet_read(ssh_conn_t *c);
+/* ssh_packet_read() when the whole packet is already in the ring; ESP_ERR_NOT_FINISHED when it is not. */
+esp_err_t ssh_packet_try(ssh_conn_t *c);
 esp_err_t ssh_packet_write(ssh_conn_t *c, ssh_buf_t *b);
 esp_err_t ssh_send_disconnect(ssh_conn_t *c, uint32_t reason, const char *text);
 

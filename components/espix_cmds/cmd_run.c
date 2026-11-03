@@ -741,6 +741,9 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
     const espix_pid_t pid = j->pid;
     const int         slot = (int)(j - s->jobs);
 
+    /* The terminal first, as a shell's tcsetpgrp() before SIGCONT: a reader that wakes sees it is in front. */
+    const espix_pid_t pgid = espix_proc_pgid_of(pid);
+    espix_proc_set_fg(s, (pgid != ESPIX_PID_NONE) ? pgid : pid);
     (void)espix_proc_signal(pid, SIGCONT);
 
     /* The foreground wait, so ^C reaches it as it would any job. */

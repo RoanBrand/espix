@@ -200,6 +200,23 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   still leave, down from +45 blocks before. Both suites also write files and
   run `sftp -b`, which is where to look next.
 
+- **A connection's teardown faulted once deleting its reader thread.** Seen
+  once, on the S31 with 32-umode running beside three loops of one-shot
+  `ssh` execs: three connections closed in the same millisecond and one
+  `sshd:conn` took a load fault at address 4 in `uxListRemove()`, from
+  `vTaskSuspend()` in `vTaskDeleteWithCaps()`, from `espix_pthread_reap()` in
+  its `espix_proc_release_resources()`. That is the path that ends a
+  `{sshd:rx}` still registered when its connection ends ("ending thread N,
+  which its process left behind"), and a list item with no list means the
+  task it named was already gone. 252 connections under six such loops did
+  not repeat it.
+
+- **An SSH session whose client vanishes leaks about 500 bytes of PSRAM.**
+  Ten `ssh -tt` clients killed mid-session leave +5K and +9 PSRAM blocks that
+  `free` still shows minutes later; ten logouts, execs or refused logins leave
+  nothing. So it is the peer-drop teardown. The heap-debug profile
+  (`profiles/heapdebug.conf`) and `heaptasks` name the allocating task.
+
 - **A force-killed process leaks its `funopen` streams.** They are the
   victim's stdout and stderr, `funopen()` objects over the SSH channel, and a
   hard kill detaches them rather than closing them, because closing them is
@@ -784,31 +801,9 @@ stdio, time, sleep, identity, threads, signals and sockets. What it cannot do ye
   file over 4 GiB reports its real size in `stat` and in the long listing, because
   those read the same widened `struct stat`.
 
-- **Only a foreground process reads stdin.** `chan_poll_interrupt()` is the
-  single consumer of the channel's receive buffer and the thing that fills a
-  process's stdin queue, and it runs from the foreground wait loop
-  (`espix_proc/fg.c`). So a backgrounded app's `stdin` is open but nothing arrives on
-  it — it blocks until the session ends. `chan_pump()` overwrites that buffer
-  rather than appending, so a second reader is not a small change: it needs
-  the buffer to become a ring first.
-
-- **Two concurrent SFTP transfers break.** Reproducible, and not new: two
-  `scp` downloads started at the same time end with one connection failing
-  (rc=255, a partial file) and the other hanging until it is killed. `ps` during
-  the hang shows an `sshd:conn` task sitting at priority 18 — the tcpip task's
-  priority, inherited — so tcpip is waiting on a mutex that connection holds.
-
-  The control matters, because this was first noticed through `/dev/factory`
-  and looked like a bug in it: two concurrent downloads of an ordinary file
-  (`/bin/neopixel`) fail exactly the same way, and a single 4MB `/dev/factory`
-  download succeeds every time. So it is SFTP concurrency, not the device.
-
-  One transfer at a time is the working configuration, which is what the test
-  suite does and probably what anyone does by hand.
-
 - **A client that decides to rekey hangs the session.** espix reads
   `SSH_MSG_KEXINIT` exactly once, during the handshake; one arriving mid-session
-  falls through to the channel loop's `default:` case and is ignored. The client
+  falls through to the channel dispatcher's `default:` case and is ignored. The client
   has by then stopped sending ordinary traffic and is waiting for the server's
   KEXINIT, so the connection stalls and dies. Rarely reached rather than
   harmless: OpenSSH's default is 2^32 blocks, which for `aes256-ctr` is 64 GiB,

@@ -215,19 +215,19 @@ if dev_testapp_present; then
     fi
     wait "$victim" 2>/dev/null
 
-    # A process killed while blocked reading stdin left its task handle
-    # registered in the channel's stream buffer. The next blocking reader on
-    # the same channel then trips FreeRTOS's own
-    # configASSERT(xTaskWaitingToReceive == NULL) -- and before that, any send
-    # from the connection task notifies a freed TCB.
+    # A stdin reader killed inside its read, then a second one: the terminal
+    # must forget the first reader's task, or the next wake notifies a freed TCB.
     #
-    # Backgrounded on purpose: nothing pumps input for a background process, so
-    # `cat` is guaranteed to be sitting in the read when the kill lands.
+    # Backgrounded on purpose: a background reader stops on SIGTTIN inside its
+    # read, as on Linux, so `cat` is in the read when the kill lands, and the
+    # prompt keeps the keys.
     pid=$(dev_run "$APP cat &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
     if [ -z "$pid" ]; then
         espix_fail "a stdin reader is running to be killed" "no [pid] line"
     else
         sleep 2
+        assert_contains "a background stdin reader stops on SIGTTIN" "stop" \
+            "$(dev_run 'jobs' | grep " $pid ")"
         dev_run "kill -9 $pid" >/dev/null
         sleep 1
 

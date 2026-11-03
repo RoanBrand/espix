@@ -131,6 +131,8 @@ bool espix_um_sig_fault(espix_um_thread_t *t, RvExcFrame *u, int sig);
 /* For proc.c's blocking calls: what ends the caller's wait, claimed from the process's pending set. */
 uint32_t espix_um_sig_claim(espix_proc_slot_t *slot);
 int      espix_um_termsig(const espix_proc_slot_t *slot);
+/* Whether the calling thread blocks sig or its process ignores it. */
+bool     espix_um_sig_refused(const espix_proc_slot_t *slot, int sig);
 int32_t  espix_um_sigaction(espix_um_thread_t *t, int sig, uint32_t uact, uint32_t uold);
 int32_t  espix_um_sigprocmask(espix_um_thread_t *t, int how, uint32_t uset, uint32_t uold);
 int32_t  espix_um_sigpending(espix_um_thread_t *t, uint32_t uout);
