@@ -68,6 +68,23 @@ wait_gone() {
     return 1
 }
 
+# The same wait, and how the pid ended ("exit 137"), read from the ps that first shows it gone:
+# ps keeps only the last 8 that ended, and load pushes it out of those within the wait.
+GONE_STATUS=""
+wait_gone_status() {
+    local i out
+    GONE_STATUS=""
+    for i in $(seq 40); do
+        out=$(dev_run 'ps')
+        if [ -z "$(printf '%s\n' "$out" | sed -n '1,/^finished:/p' | awk -v p="$1" '$1 == p')" ]; then
+            GONE_STATUS=$(printf '%s\n' "$out" | sed -n '/^finished:/,$p' | awk -v p="$1" '$1 == p {print $3, $4}')
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # A handled signal: the app runs its cleanup and returns.
 #
@@ -134,7 +151,7 @@ wait_gone "$pid" || espix_fail "cleanup: pid $pid would not stop"
 pid=$(bg_start ignore)
 sleep 1
 dev_run "kill $pid" >/dev/null
-if wait_gone "$pid"; then
+if wait_gone_status "$pid"; then
     espix_pass "a process ignoring SIGTERM is stopped anyway, after the grace"
 else
     espix_fail "a process ignoring SIGTERM is stopped anyway, after the grace" \
@@ -147,8 +164,7 @@ assert_contains "the grace expired before it was deleted" \
     "pid $pid did not stop when asked" "$log"
 if [ "${ESPIX_UAPP:-0}" = 1 ]; then
     # Not deleted: it ends itself on its way back to U, its handlers skipped, as SIGKILL does.
-    assert_eq "and then it ended as SIGKILL ends it, so no cleanup ran" "exit 137" \
-        "$(dev_run 'ps' | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p {print $3, $4}')"
+    assert_eq "and then it ended as SIGKILL ends it, so no cleanup ran" "exit 137" "$GONE_STATUS"
 else
     assert_contains "and then the task was deleted, so no cleanup ran" \
         "killed pid $pid" "$log"
@@ -348,19 +364,13 @@ for i in 1 2 3 4 5 6; do
 done
 if [ -n "$pid" ]; then
     dev_run "kill -INT $pid" >/dev/null
-    gone=no
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        [ -z "$(ps_running | awk -v p="$pid" '$1 == p')" ] && { gone=yes; break; }
-        sleep 1
-    done
-    if [ "$gone" = yes ]; then
+    if wait_gone_status "$pid"; then
         espix_pass "SIGINT ends an app blocked reading stdin"
     else
         espix_fail "SIGINT ends an app blocked reading stdin" "$(ps_running)"
     fi
     assert_eq "and the board stayed up" "ok" "$(dev_run 'echo ok')"
-    assert_eq "and it exited as SIGINT does" "exit 130" \
-        "$(dev_run 'ps' | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p {print $3, $4}')"
+    assert_eq "and it exited as SIGINT does" "exit 130" "$GONE_STATUS"
 else
     espix_fail "an app reading stdin over its own connection starts" "$(ps_running)"
 fi

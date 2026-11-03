@@ -510,8 +510,7 @@ fi
 # comes from the completed log rather than from racing a backgrounded app: the
 # foreground run is reaped by the shell and stays listed in the log, so this is
 # deterministic and costs three round trips instead of a poll loop.
-dev_run "$APP exit 0" >/dev/null 2>&1
-gone=$(dev_run ps | sed -n '/^finished:/,$p' | awk '$2 == "testapp" { p = $1 } END { print p }')
+gone=$(dev_run "$APP exit 0; ps" | sed -n '/^finished:/,$p' | awk '$2 == "testapp" { p = $1 } END { print p }')
 if [ -z "$gone" ]; then
     espix_fail "a finished process stops being signallable" "no testapp pid in the log"
 else

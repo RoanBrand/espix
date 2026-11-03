@@ -186,14 +186,20 @@ if [ -n "$pause" ] && [ "$pause" -ge 1500 ]; then
 else
     espix_fail "and fg resumes it" "pause: '$pause'"
 fi
-# Backgrounded, as a stopped foreground app would become a job; the status is read on the same
-# line as the kill, which returns once the app is gone, before load pushes it out of ps's last 8.
+# Backgrounded, as a stopped foreground app would become a job; its status is polled from the kill
+# on: the reaper records it a moment later, and load pushes it out of ps's last 8 if the check waits.
 pid=$(dev_run "$UAPP pauses 5 $PZ &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 sleep 1
 dev_run "kill -STOP $pid" >/dev/null
 sleep 1
-assert_eq "SIGKILL ends a stopped app" "137" \
-    "$(dev_run "kill -9 $pid; ps" | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $NF }')"
+dev_run "kill -9 $pid" >/dev/null
+killed=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    killed=$(dev_run ps | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $NF }')
+    [ -n "$killed" ] && break
+    sleep 0.2
+done
+assert_eq "SIGKILL ends a stopped app" "137" "$killed"
 
 # Sockets and poll (M6): lwIP's, behind the process's descriptors; a blocking call waits where a signal can end it.
 assert_contains "TCP over loopback, across pages and past the stack's buffers" \
