@@ -634,6 +634,45 @@ static size_t tid_comm(char *buf, size_t cap, int32_t tid)
 }
 
 /*
+ * /proc/<pid>/statm: the seven numbers Linux reports, in pages.
+ *
+ * htop treats a missing statm as "this process cannot be read" and skips it,
+ * so this is not optional in practice even though the information is thin.
+ * espix knows the image size, not which of its pages are resident; reporting
+ * the image as both size and resident is closer than zero for an app, and
+ * kernel tasks have no image at all.
+ */
+static size_t proc_statm(char *buf, size_t cap, const espix_proc_info_t *info)
+{
+    const unsigned long pages =
+        (unsigned long)((info->image_bytes + 4095) / 4096);
+    return (size_t)snprintf(buf, cap, "%lu %lu 0 0 0 0 0\n", pages, pages);
+}
+
+static size_t pid_statm(char *buf, size_t cap, int32_t pid)
+{
+    espix_proc_info_t info;
+    if (!proc_info(pid, &info)) {
+        return 0;
+    }
+    return proc_statm(buf, cap, &info);
+}
+
+static size_t tid_statm(char *buf, size_t cap, int32_t tid)
+{
+    TaskStatus_t ts;
+    espix_pid_t  owner;
+    if (!proc_tid_task(tid, &ts, &owner)) {
+        return 0;
+    }
+    espix_proc_info_t info;
+    if (!proc_info(owner, &info)) {
+        return 0;
+    }
+    return proc_statm(buf, cap, &info);
+}
+
+/*
  * A path below /proc, taken apart: /proc/<pid>[/status | /task[/<tid>[/status]]].
  * `what` is the part after the last number, "" for a directory itself.
  */
@@ -752,8 +791,9 @@ static const synth_node_t *proc_dyn_lookup(const char *abs_path)
     }
     const bool is_status = strcmp(pp.what, "status") == 0;
     const bool is_stat   = strcmp(pp.what, "stat") == 0;
+    const bool is_statm  = strcmp(pp.what, "statm") == 0;
     const bool is_comm   = strcmp(pp.what, "comm") == 0;
-    if (!is_status && !is_stat && !is_comm) {
+    if (!is_status && !is_stat && !is_statm && !is_comm) {
         return NULL;
     }
 
@@ -765,6 +805,7 @@ static const synth_node_t *proc_dyn_lookup(const char *abs_path)
         size_t (*gen)(char *, size_t, int32_t) =
             is_status ? (main_task ? pid_status : tid_status)
           : is_stat   ? (main_task ? pid_stat   : tid_stat)
+          : is_statm  ? tid_statm
                       : (main_task ? pid_comm   : tid_comm);
         return pool_node(abs_path, SYNTH_TEXT, S_IFREG | 0444, gen, pp.tid);
     }
@@ -774,7 +815,10 @@ static const synth_node_t *proc_dyn_lookup(const char *abs_path)
         return NULL;
     }
     size_t (*gen)(char *, size_t, int32_t) =
-        is_status ? pid_status : is_stat ? pid_stat : pid_comm;
+        is_status ? pid_status
+      : is_stat   ? pid_stat
+      : is_statm  ? pid_statm
+                  : pid_comm;
     return pool_node(abs_path, SYNTH_TEXT, S_IFREG | 0444, gen, pp.pid);
 }
 
@@ -832,7 +876,8 @@ static const synth_node_t *proc_dyn_dir_at(const char *abs_path, int nth)
         switch (nth) {
         case 0:  return list_node(abs_path, "status", SYNTH_TEXT, S_IFREG | 0444);
         case 1:  return list_node(abs_path, "stat",   SYNTH_TEXT, S_IFREG | 0444);
-        case 2:  return list_node(abs_path, "comm",   SYNTH_TEXT, S_IFREG | 0444);
+        case 2:  return list_node(abs_path, "statm",  SYNTH_TEXT, S_IFREG | 0444);
+        case 3:  return list_node(abs_path, "comm",   SYNTH_TEXT, S_IFREG | 0444);
         default: return NULL;
         }
     }
@@ -840,8 +885,9 @@ static const synth_node_t *proc_dyn_dir_at(const char *abs_path, int nth)
         switch (nth) {
         case 0:  return list_node(abs_path, "status", SYNTH_TEXT, S_IFREG | 0444);
         case 1:  return list_node(abs_path, "stat",   SYNTH_TEXT, S_IFREG | 0444);
-        case 2:  return list_node(abs_path, "comm",   SYNTH_TEXT, S_IFREG | 0444);
-        case 3:  return list_node(abs_path, "task", SYNTH_DIR, S_IFDIR | 0555);
+        case 2:  return list_node(abs_path, "statm",  SYNTH_TEXT, S_IFREG | 0444);
+        case 3:  return list_node(abs_path, "comm",   SYNTH_TEXT, S_IFREG | 0444);
+        case 4:  return list_node(abs_path, "task", SYNTH_DIR, S_IFDIR | 0555);
         default: return NULL;
         }
     }

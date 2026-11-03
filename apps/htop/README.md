@@ -1,16 +1,19 @@
 # htop on espix
 
 [htop](https://github.com/htop-dev/htop), the real one, built as a U-mode espix
-app. This directory is a **build spike**, not an integrated app: the ELF links
-and the kernel side is now in the same branch -- /proc/stat, per-process stat
-and comm, load average, the two /sys CPU directories, cpufreq and a thermal
-zone. It has not yet been run on a board: the serial port was held by another
-reader while this was built.
+app. This directory is a **build spike**, not an integrated app, but it has
+run on an S31: htop 3.5.3 drew both cores, eleven processes, 320 MHz and 30 C,
+with the frequency and temperature columns enabled in `htoprc`.
 
     ./build.sh
-    # build/htop: 377 KB, ET_EXEC, entry 0x10000
+    # build/htop: 382 KB, ET_EXEC, entry 0x10000
     scp build/htop esp@<host>:/bin/htop
     htop
+
+The first frame's CPU meter includes htop's own startup work and can read
+100% on the core it landed on. After one refresh it settles: the same run
+measured 2.5% and 10.7% across the two cores. That is htop paying for its own
+screen, not the kernel reporting a busy hart.
 
 The point of the exercise is the kernel side. htop reads Linux's interfaces,
 and every gap it finds is a small, real thing espix should have anyway: a
@@ -35,13 +38,13 @@ htop itself is unmodified. ncurses is unmodified.
 |---|---|
 | htop | 3.5.3 |
 | ncurses | 6.4, narrow (--disable-widec), static |
-| text | 200 KB |
+| text | 201 KB |
 | data | 95 KB |
 | bss | 4 KB |
-| stripped ELF | 377 KB |
+| stripped ELF | 382 KB |
 | of which terminfo | ~9 KB, xterm entry compiled in by --with-fallbacks=xterm |
 
-A 377 KB file in /bin is unremarkable on the 3.2 MB rootfs an 8 MB S31 has, and
+A 382 KB file in /bin is unremarkable on the 3.2 MB rootfs an 8 MB S31 has, and
 it is one file: there is no libncurses.so or terminfo tree to install beside
 it.
 
@@ -86,6 +89,12 @@ Two espix things had to be true first:
   that is now in user/include/common/espix_termios.h.
 - tcgetattr() is in libespix, not libc, so the configure test is told
   cf_cv_have_tcgetattr=yes and every link test includes libespix.
+- select() and poll() are libespix too. Passing LIBS=libespix.a to ncurses'
+  configure is not optional: without it HAVE_SELECT is 0, halfdelay() returns
+  immediately, and htop busy-spins at 100% on one core. With it the same htop
+  settles to a few percent between frames. This is the layer doing its job --
+  picolibc stays the C library, libespix supplies the OS calls -- but the
+  configure probes have to be told where they live.
 
 --with-fallbacks=xterm compiles the terminfo entry into libncurses, so the app
 needs no /usr/share/terminfo. espix sets TERM=xterm for an ANSI session
@@ -282,20 +291,19 @@ Each phase leaves the ELF loadable and "make test" green.
 1. **Make it start.** Done: /proc/stat, /sys/.../cpuN, _SC_CLK_TCK.
 2. **Make the process list real.** Done: /proc/<pid>/stat with 39 fields,
    comm, ownership, per-core cpu MHz.
-3. **Make Temp work.** Done in the kernel and the shim: the thermal zone,
-   esp_driver_tsens, seven-function libsensors, --enable-sensors. Not run on
-   a board yet.
-4. **Make it pleasant.** Partly: /proc/loadavg and the meminfo keys are in.
-   Still open: colors, TERM/terminfo check on the real console, resize, and
-   saving htoprc under $HOME.
+3. **Make Temp work.** Done and seen on the board: 320 MHz and 30 C in the
+   header, with the thermal zone, esp_driver_tsens and the seven-function
+   libsensors.
+4. **Make it pleasant.** Mostly: loadavg and the meminfo keys are in; TERM and
+   the embedded xterm entry work on a real pty; htoprc was read from
+   $HOME/.config/htop. Resize and the smaller cosmetic settings are untested.
 5. **Integrate.** Not done: a uapp/CMakeLists.txt and a targets file so
    tools/build-apps.sh stages /bin/htop, and a test that runs htop on a pty.
 6. **Optional, M8.** fork/exec/pipe for lsof, strace and the systemd meter.
 
 Phases 1-3 are the interesting kernel work and are independent of M7/M8.
-Phase 4 is polish. Phase 5 is how it stops being a spike. The board test is
-blocked only by the serial reader someone else had open; the firmware builds
-and the host unit tests pass.
+Phase 4 is polish. Phase 5 is how it stops being a spike. The firmware builds
+and the host unit tests pass; the device suite was not run in this sitting.
 
 ## Decisions
 

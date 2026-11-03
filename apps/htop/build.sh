@@ -60,6 +60,7 @@ echo "== ncurses"
 cd "$build/ncurses"
 cf_cv_have_tcgetattr=yes \
 CC="$gcc" CFLAGS="$CFLAGS_COMMON" CPPFLAGS="$CPPFLAGS_COMMON" \
+LIBS="$root/user/build/libespix.a" \
 "$here/third_party/ncurses/configure" \
     --host=riscv32-esp-elf --disable-widec --without-cxx --without-ada \
     --without-progs --without-tests --without-manpages --with-termlib \
