@@ -818,6 +818,11 @@ static void proc_task(void *arg)
     slot->exit_jmp = NULL;
 
 done:
+    /* A killer stands off from here: the flushes below hold the streams' locks, and a redirect's, the filesystem's. */
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    slot->exiting = true;
+    xSemaphoreGive(g_espix_proc_lock);
+
     /*
      * Close the session's streams here, while the session still exists.
      *

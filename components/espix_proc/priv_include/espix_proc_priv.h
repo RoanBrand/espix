@@ -349,7 +349,7 @@ typedef struct {
     /*
      * True from the moment a process starts its own teardown until its slot is
      * released. A killer that finds this must stand off: the teardown already
-     * owns the slot and the task. See espix_proc_reap_self().
+     * owns the slot and the task. Set at proc_task()'s done: and espix_proc_reap_self().
      */
     bool               exiting;
 

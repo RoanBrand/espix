@@ -1409,11 +1409,12 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
 
     /*
      * Already tearing itself down: that teardown owns the slot and the task,
-     * and a killer that proceeded would free the image under it.
+     * and a killer that proceeded would free the image under it, or leave the
+     * locks its flushes hold for good. It is ending, which is what was asked.
      */
     if (slot->exiting) {
         xSemaphoreGive(g_espix_proc_lock);
-        return ESP_ERR_INVALID_STATE;
+        return ESP_OK;
     }
 
     /* Still loading: deleted now, it would keep the filesystem's locks. It leaves when the load is done. */
