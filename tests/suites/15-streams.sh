@@ -187,7 +187,12 @@ if dev_testapp_present; then
     # FILE -- the shell's. A clean exit restores the globals first, so this only
     # bites on a kill: esp_cleanup_r() fclosed it twice and redirects_release()
     # then closed it a third time.
-    ( _ssh "$APP sleep 20 > $T/killed 2>&1" >/dev/null 2>&1 ) &
+    # A copy under a name of this worker's own: ps is the whole board's, and the first testapp in it
+    # may be another suite's.
+    VICTIM="$T/victim$ESPIX_WORKER"
+    dev_run "cp $APP $VICTIM" >/dev/null 2>&1
+    dev_run "chmod 755 $VICTIM" >/dev/null 2>&1
+    ( _ssh "$VICTIM sleep 20 > $T/killed 2>&1" >/dev/null 2>&1 ) &
     victim=$!
 
     # Wait for it to appear rather than sleeping a guess at how long a login
@@ -197,7 +202,7 @@ if dev_testapp_present; then
     pid=""
     wait_i=0
     while [ "$wait_i" -lt 20 ]; do
-        pid=$(dev_run 'ps' | sed -n '1,/^finished:/p' | sed -n 's/^ *\([0-9][0-9]*\) testapp.*/\1/p' | head -1)
+        pid=$(dev_run 'ps' | sed -n '1,/^finished:/p' | awk -v n="victim$ESPIX_WORKER" '$2 == n { print $1; exit }')
         [ -n "$pid" ] && break
         sleep 1
         wait_i=$((wait_i + 1))
@@ -205,7 +210,7 @@ if dev_testapp_present; then
 
     if [ -z "$pid" ]; then
         espix_fail "a redirected foreground app is running to be killed" \
-                   "no testapp in ps; nothing was killed, so the next" \
+                   "no victim$ESPIX_WORKER in ps; nothing was killed, so the next" \
                    "assertion would pass without testing anything"
     else
         dev_run "kill -9 $pid" >/dev/null

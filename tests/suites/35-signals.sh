@@ -33,10 +33,21 @@ APP="/home/$ESPIX_USER/testapp"
 #   "killed pid N"                  the task was deleted, so no cleanup ran
 ps_running() { dev_run 'ps' | sed -n '1,/^finished:/p'; }
 
-# Start `testapp sig <mode>` in the background and echo its pid, which the
-# shell reports as `[13] /home/esp/testapp`.
+# Start `testapp sig <mode>` in the background and echo its pid, which the shell reports as
+# `[13] /home/esp/testapp` -- once a mode that says so is ready ("sig: pid N, ..."): a signal
+# sent while the app still loads finds no handler, and its default action ends it.
 bg_start() {
-    dev_run "$APP sig $1 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p'
+    local out pid i
+    out=$(dev_run "$APP sig $1 & ; sleep 1")
+    pid=$(printf '%s\n' "$out" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+    case "$1" in
+        handlers|ignore|spin)
+            for i in 1 2 3 4 5; do
+                case "$out" in *"sig: pid $pid,"*) break ;; esac
+                out=$(dev_run 'sleep 1')
+            done ;;
+    esac
+    echo "$pid"
 }
 
 is_running() {

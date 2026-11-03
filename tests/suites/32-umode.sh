@@ -99,14 +99,27 @@ assert_contains "three apps in syscall loops at once (first)"  "syscalls" "$(cat
 assert_contains "three apps in syscall loops at once (second)" "syscalls" "$(cat "$UM_DIR/loop2")"
 assert_contains "three apps in syscall loops at once (third)"  "syscalls" "$(cat "$UM_DIR/loop3")"
 
-# A kill ends an app whether it is computing in U or asleep in a syscall.
+# A kill from another session ends an app whether it is computing in U or asleep in a syscall. The
+# status is its own shell's, from an exec of its own: ps keeps only the last 8 that ended, and load
+# pushes it out of those.
 um_kill() {
-    local pid
-    pid=$(dev_run "$UAPP $1 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
-    sleep 1
-    dev_run "kill -$2 $pid" >/dev/null
-    sleep 1
-    dev_run "ps" | awk -v p="$pid" '$1 == p { print $NF }'
+    local name pid="" i=0 bg
+    name=$(basename "$UAPP")
+    dev_once "$UAPP $1; echo rc=\$?" > "$UM_DIR/kill" 2>&1 &
+    bg=$!
+    while [ -z "$pid" ] && [ "$i" -lt 20 ]; do
+        sleep 0.5
+        pid=$(dev_run "ps" | sed -n '1,/^finished:/p' | awk -v n="$name" '$2 == n { print $1; exit }')
+        i=$((i + 1))
+    done
+    if [ -n "$pid" ]; then
+        sleep 1
+        dev_run "kill -$2 $pid" >/dev/null
+    else
+        kill "$bg" 2>/dev/null
+    fi
+    wait "$bg"
+    sed -n 's/^rc=//p' "$UM_DIR/kill"
 }
 assert_eq "SIGTERM ends an app asleep in a syscall" "143" "$(um_kill 'sleep 10000' TERM)"
 assert_eq "SIGTERM ends an app computing in U"      "143" "$(um_kill 'spin 30' TERM)"
@@ -173,13 +186,14 @@ if [ -n "$pause" ] && [ "$pause" -ge 1500 ]; then
 else
     espix_fail "and fg resumes it" "pause: '$pause'"
 fi
+# Backgrounded, as a stopped foreground app would become a job; the status is read on the same
+# line as the kill, which returns once the app is gone, before load pushes it out of ps's last 8.
 pid=$(dev_run "$UAPP pauses 5 $PZ &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 sleep 1
 dev_run "kill -STOP $pid" >/dev/null
 sleep 1
-dev_run "kill -9 $pid" >/dev/null
-sleep 1
-assert_eq "SIGKILL ends a stopped app" "137" "$(dev_run ps | awk -v p="$pid" '$1 == p { print $NF }')"
+assert_eq "SIGKILL ends a stopped app" "137" \
+    "$(dev_run "kill -9 $pid; ps" | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $NF }')"
 
 # Sockets and poll (M6): lwIP's, behind the process's descriptors; a blocking call waits where a signal can end it.
 assert_contains "TCP over loopback, across pages and past the stack's buffers" \

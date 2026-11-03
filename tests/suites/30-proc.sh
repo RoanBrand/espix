@@ -541,9 +541,8 @@ if [ -z "$pid" ]; then
     espix_fail "a live app and its finished entry share a name" "no pid"
 else
     live=$(dev_run ps | sed -n '1,/^finished:/p' | awk -v p="$pid" '$1 == p { print $2; exit }')
-    dev_run "kill -9 $pid" >/dev/null 2>&1
-    sleep 1
-    ended=$(dev_run ps | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $2; exit }')
+    # On the kill's line, which returns once the app is gone: load pushes it out of ps's last 8.
+    ended=$(dev_run "kill -9 $pid; ps" | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $2; exit }')
     assert_eq "a live app reads as its process name" "testapp" "$live"
     assert_eq "and its finished entry agrees" "testapp" "$ended"
 fi

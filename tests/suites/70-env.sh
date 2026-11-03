@@ -265,6 +265,17 @@ if ! dev_testapp_present; then
 else
     APP="/home/$ESPIX_USER/testapp"
 
+    # The table holds four, and the sections above leave jobs running (sleep 5 &, apps still
+    # loading): this starts from none, or the job below may find no slot.
+    for p in $(dev_run 'jobs' | sed -n 's/^\[[0-9]*\] *\([0-9][0-9]*\) .*/\1/p'); do
+        dev_run "kill -9 $p" >/dev/null 2>&1
+    done
+    wait_i=0
+    while [ "$wait_i" -lt 10 ] && ! dev_run 'jobs' | grep -q 'no jobs'; do
+        sleep 0.5
+        wait_i=$((wait_i + 1))
+    done
+
     j=$(dev_run "$APP hold 20 1000 &")
     pid=$(printf '%s' "$j" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
     if [ -z "$pid" ]; then

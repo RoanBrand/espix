@@ -2,7 +2,7 @@
 # comes back through it, and SIGTERM ends it in its poll. The M-mode build on
 # both targets; on the S31 the U-mode one too (docs/USER-MODE.md).
 #
-# RESOURCES: a TCP port per worker, 18830 + the worker number.
+# RESOURCES: none -- a TCP port per worker, 18830 + the worker number.
 
 MQ_BIN="$ESPIX_ROOT/fsroot/bin"
 if [ ! -f "$MQ_BIN/mosquitto" ]; then
@@ -16,12 +16,19 @@ MQ_DIR=$(mktemp -d)
 printf 'listener %s 0.0.0.0\nallow_anonymous true\n' "$MQ_PORT" > "$MQ_DIR/mq.conf"
 dev_push "$MQ_DIR/mq.conf" "$MQ_CONF" >/dev/null
 
-# The broker $1 in the background, a client's round trip from here, then SIGTERM; $2 names it.
+# The broker $1 in an exec of its own, a client's round trip from here, then SIGTERM from the
+# suite's session; $2 names it. Its status is its shell's: ps keeps only the last 8 that ended.
 mq_check() {
-    local bin="/home/$ESPIX_USER/$1-$ESPIX_WORKER" pid got st
+    local bin="/home/$ESPIX_USER/$1-$ESPIX_WORKER" pid="" got st bg i=0
     dev_push "$MQ_BIN/$1" "$bin" >/dev/null
     dev_run "chmod +x $bin" >/dev/null
-    pid=$(dev_run "$bin -c $MQ_CONF &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+    dev_once "$bin -c $MQ_CONF; echo rc=\$?" > "$MQ_DIR/run" 2>&1 &
+    bg=$!
+    while [ -z "$pid" ] && [ "$i" -lt 20 ]; do
+        sleep 0.5
+        pid=$(dev_run ps | sed -n '1,/^finished:/p' | awk -v n="$1-$ESPIX_WORKER" '$2 == n { print $1; exit }')
+        i=$((i + 1))
+    done
     got=""
     for _ in 1 2 3 4 5; do
         sleep 1
@@ -29,11 +36,15 @@ mq_check() {
         case $got in got*) break ;; esac
     done
     assert_eq "$2: a client's message comes back through it" "got hello" "$got"
-    dev_run "kill $pid" >/dev/null
-    sleep 1
-    st=$(dev_run ps | awk -v p="$pid" '$1 == p { print $NF }')
+    if [ -n "$pid" ]; then
+        dev_run "kill $pid" >/dev/null
+    else
+        kill "$bg" 2>/dev/null
+    fi
+    wait "$bg"
+    st=$(sed -n 's/^rc=//p' "$MQ_DIR/run")
     assert_eq "$2: SIGTERM ends it in its poll, cleanly" "0" "$st"
-    dev_run "kill -9 $pid; rm $bin" >/dev/null 2>&1
+    dev_run "rm $bin" >/dev/null 2>&1
 }
 
 mq_check mosquitto "the M-mode broker"

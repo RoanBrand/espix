@@ -1646,10 +1646,15 @@ static int cmd_dup(const char *path, const char *mode)
         rc = 1;
     }
 
-    const int d2 = dup2(d, 10);         /* POSIX: land on exactly 10 */
+    /* POSIX: land on exactly the number asked, here a free one above d (M-mode's table is the system's). */
+    const int want = fcntl(d, F_DUPFD, d + 1);
+    if (want >= 0) {
+        close(want);
+    }
+    const int d2 = dup2(d, want);
     close(d);
-    if (d2 != 10) {
-        printf("dup2: returned %d, not 10\n", d2);
+    if (want < 0 || d2 != want) {
+        printf("dup2: returned %d, not %d\n", d2, want);
         rc = 1;
     } else {
         (void)lseek(d2, 0, SEEK_SET);
