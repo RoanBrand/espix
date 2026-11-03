@@ -25,6 +25,7 @@
 #include "esp_private/esp_clk.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "espix_kernel.h"
@@ -36,6 +37,106 @@
 /* The two pools espix reports, and the same masks free uses. */
 #define PROC_INTERNAL_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #define PROC_PSRAM_CAPS    (MALLOC_CAP_SPIRAM)
+
+/* ------------------------------------------------------------ cache */
+/*
+ * /proc is generated on every read, and htop reads a process's stat, statm,
+ * comm and status back to back.  Without a cache each of those files takes its
+ * own uxTaskGetSystemState() and espix_proc_snapshot(); a scan of eleven
+ * processes becomes dozens of full task walks.  One 500 ms snapshot shared by
+ * all of them is enough for the /proc contract (a process may be up to half a
+ * second stale) and removes the repeated walks.
+ *
+ * The arrays live in PSRAM, not internal RAM: they are read often but are not
+ * touched by an ISR.  The task array is sized from the live task count and
+ * grown when needed; the process array is the process table's fixed size.
+ */
+#define PROC_CACHE_TTL_US 500000
+
+static SemaphoreHandle_t s_cache_lock;
+static TaskStatus_t     *s_task_cache;
+static UBaseType_t       s_task_cap, s_task_n;
+static int64_t           s_task_at;
+static espix_proc_info_t *s_info_cache;
+static size_t            s_info_n;
+static int64_t           s_info_at;
+
+static void *proc_cache_alloc(size_t n)
+{
+    void *p = heap_caps_calloc(1, n, PROC_PSRAM_CAPS | MALLOC_CAP_8BIT);
+    return (p != NULL) ? p : calloc(1, n);
+}
+
+static bool proc_cache_tasks_locked(int64_t now)
+{
+    if (s_task_cache != NULL && now - s_task_at < PROC_CACHE_TTL_US) {
+        return true;
+    }
+
+    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 8;
+    if (cap > s_task_cap) {
+        TaskStatus_t *p = heap_caps_realloc(s_task_cache, cap * sizeof(*p),
+                                            PROC_PSRAM_CAPS | MALLOC_CAP_8BIT);
+        if (p == NULL) {
+            return false;
+        }
+        s_task_cache = p;
+        s_task_cap   = cap;
+    }
+
+    s_task_n  = uxTaskGetSystemState(s_task_cache, s_task_cap, NULL);
+    s_task_at  = now;
+    return true;
+}
+
+static bool proc_cache_infos_locked(int64_t now)
+{
+    if (s_info_cache != NULL && now - s_info_at < PROC_CACHE_TTL_US) {
+        return true;
+    }
+    if (s_info_cache == NULL) {
+        return false;
+    }
+    s_info_n  = espix_proc_snapshot(s_info_cache, CONFIG_ESPIX_PROC_MAX);
+    s_info_at = now;
+    return true;
+}
+
+static bool proc_cache_acquire_tasks(const TaskStatus_t **out, UBaseType_t *n)
+{
+    if (s_cache_lock == NULL ||
+        xSemaphoreTake(s_cache_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    if (!proc_cache_tasks_locked(esp_timer_get_time())) {
+        xSemaphoreGive(s_cache_lock);
+        return false;
+    }
+    *out = s_task_cache;
+    *n   = s_task_n;
+    return true;
+}
+
+static bool proc_cache_acquire_infos(const espix_proc_info_t **out, size_t *n)
+{
+    if (s_cache_lock == NULL ||
+        xSemaphoreTake(s_cache_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    if (!proc_cache_infos_locked(esp_timer_get_time())) {
+        xSemaphoreGive(s_cache_lock);
+        return false;
+    }
+    *out = s_info_cache;
+    *n   = s_info_n;
+    return true;
+}
+
+static void proc_cache_release(void)
+{
+    xSemaphoreGive(s_cache_lock);
+}
+
 
 /* Linux spells meminfo as "Key: value kB". The pool names are espix's, because
  * a single total would hide which pool is nearly gone -- the thing this file
@@ -166,14 +267,13 @@ static int proc_task_core(const TaskStatus_t *t)
 
 static size_t proc_stat(char *buf, size_t cap)
 {
-    const UBaseType_t capacity = uxTaskGetNumberOfTasks() + 8;
-    TaskStatus_t     *tasks    = calloc(capacity, sizeof(*tasks));
-    if (tasks == NULL) {
+    const TaskStatus_t *tasks;
+    UBaseType_t         got;
+    if (!proc_cache_acquire_tasks(&tasks, &got)) {
         return 0;
     }
 
-    const UBaseType_t got    = uxTaskGetSystemState(tasks, capacity, NULL);
-    const int64_t     now_us = esp_timer_get_time();
+    const int64_t  now_us = esp_timer_get_time();
     const uint64_t    total  = proc_ticks(now_us);
 
     uint64_t idle_us[portNUM_PROCESSORS] = { 0 };
@@ -250,7 +350,7 @@ static size_t proc_stat(char *buf, size_t cap)
 
 #undef PROC_APPEND
 
-    free(tasks);
+    proc_cache_release();
     return len;
 }
 
@@ -285,13 +385,12 @@ static unsigned s_load_running;
 static void proc_load_sample(void *arg)
 {
     (void)arg;
-    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 8;
-    TaskStatus_t     *ts  = calloc(cap, sizeof(*ts));
-    if (ts == NULL) {
+    const TaskStatus_t *ts;
+    UBaseType_t         got;
+    if (!proc_cache_acquire_tasks(&ts, &got)) {
         return;
     }
-    const UBaseType_t got = uxTaskGetSystemState(ts, cap, NULL);
-    unsigned          n   = 0;
+    unsigned n = 0;
     for (UBaseType_t i = 0; i < got; i++) {
         if (strncmp(ts[i].pcTaskName, "IDLE", 4) == 0) {
             continue;
@@ -300,7 +399,7 @@ static void proc_load_sample(void *arg)
             n++;
         }
     }
-    free(ts);
+    proc_cache_release();
     s_load_running = n;
     s_load1  = (uint32_t)(((uint64_t)s_load1  * LOAD_1M)  / LOAD_SCALE +
                           (uint64_t)n * (LOAD_SCALE - LOAD_1M));
@@ -314,6 +413,13 @@ static esp_timer_handle_t s_load_timer;
 
 void espix_fs_proc_init(void)
 {
+    if (s_cache_lock == NULL) {
+        s_cache_lock = xSemaphoreCreateMutex();
+    }
+    if (s_info_cache == NULL) {
+        s_info_cache = proc_cache_alloc(CONFIG_ESPIX_PROC_MAX * sizeof(*s_info_cache));
+    }
+
     if (s_load_timer != NULL) {
         return;
     }
@@ -381,11 +487,11 @@ static const char *kind_str(espix_proc_kind_t kind)
 
 static bool proc_info(espix_pid_t pid, espix_proc_info_t *out)
 {
-    espix_proc_info_t *const live = calloc(CONFIG_ESPIX_PROC_MAX, sizeof(*live));
-    if (live == NULL) {
+    const espix_proc_info_t *live;
+    size_t                   n;
+    if (!proc_cache_acquire_infos(&live, &n)) {
         return false;
     }
-    const size_t n = espix_proc_snapshot(live, CONFIG_ESPIX_PROC_MAX);
     bool found = false;
     for (size_t i = 0; i < n && !found; i++) {
         if (live[i].pid == pid) {
@@ -393,7 +499,7 @@ static bool proc_info(espix_pid_t pid, espix_proc_info_t *out)
             found = true;
         }
     }
-    free(live);
+    proc_cache_release();
     return found;
 }
 
@@ -408,12 +514,11 @@ static size_t proc_tasks(espix_pid_t pid, TaskHandle_t own, espix_pid_t *tids,
         n++;
     }
 
-    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
-    TaskStatus_t     *ts  = calloc(cap, sizeof(*ts));
-    if (ts == NULL) {
+    const TaskStatus_t *ts;
+    UBaseType_t         got;
+    if (!proc_cache_acquire_tasks(&ts, &got)) {
         return n;
     }
-    const UBaseType_t got = uxTaskGetSystemState(ts, cap, NULL);
     for (UBaseType_t i = 0; i < got && n < max; i++) {
         espix_pid_t owner = ESPIX_PID_NONE, tid = ESPIX_PID_NONE;
         if (espix_proc_thread_of_task(ts[i].xHandle, &owner, &tid) &&
@@ -423,7 +528,7 @@ static size_t proc_tasks(espix_pid_t pid, TaskHandle_t own, espix_pid_t *tids,
             n++;
         }
     }
-    free(ts);
+    proc_cache_release();
     return n;
 }
 
@@ -460,13 +565,12 @@ static size_t pid_status(char *buf, size_t cap, int32_t pid)
 /* A thread's own: its task's name and state, and the process it belongs to. */
 static size_t tid_status(char *buf, size_t cap, int32_t tid)
 {
-    const UBaseType_t cap_t = uxTaskGetNumberOfTasks() + 4;
-    TaskStatus_t     *ts    = calloc(cap_t, sizeof(*ts));
-    if (ts == NULL) {
+    const TaskStatus_t *ts;
+    UBaseType_t         got;
+    if (!proc_cache_acquire_tasks(&ts, &got)) {
         return 0;
     }
-    size_t            len = 0;
-    const UBaseType_t got = uxTaskGetSystemState(ts, cap_t, NULL);
+    size_t len = 0;
     for (UBaseType_t i = 0; i < got; i++) {
         espix_pid_t owner = ESPIX_PID_NONE, t = ESPIX_PID_NONE;
         if (espix_proc_thread_of_task(ts[i].xHandle, &owner, &t) && t == tid) {
@@ -476,7 +580,7 @@ static size_t tid_status(char *buf, size_t cap, int32_t tid)
             break;
         }
     }
-    free(ts);
+    proc_cache_release();
     return len;
 }
 
@@ -496,13 +600,12 @@ static bool proc_task_status(TaskHandle_t task, TaskStatus_t *out)
     if (task == NULL) {
         return false;
     }
-    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
-    TaskStatus_t     *ts  = calloc(cap, sizeof(*ts));
-    if (ts == NULL) {
+    const TaskStatus_t *ts;
+    UBaseType_t         got;
+    if (!proc_cache_acquire_tasks(&ts, &got)) {
         return false;
     }
-    bool              found = false;
-    const UBaseType_t got   = uxTaskGetSystemState(ts, cap, NULL);
+    bool found = false;
     for (UBaseType_t i = 0; i < got; i++) {
         if (ts[i].xHandle == task) {
             *out  = ts[i];
@@ -510,20 +613,19 @@ static bool proc_task_status(TaskHandle_t task, TaskStatus_t *out)
             break;
         }
     }
-    free(ts);
+    proc_cache_release();
     return found;
 }
 
 /* The task for a tid, and the process it belongs to. */
 static bool proc_tid_task(espix_pid_t tid, TaskStatus_t *out, espix_pid_t *pid)
 {
-    const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
-    TaskStatus_t     *ts  = calloc(cap, sizeof(*ts));
-    if (ts == NULL) {
+    const TaskStatus_t *ts;
+    UBaseType_t         got;
+    if (!proc_cache_acquire_tasks(&ts, &got)) {
         return false;
     }
-    bool              found = false;
-    const UBaseType_t got   = uxTaskGetSystemState(ts, cap, NULL);
+    bool found = false;
     for (UBaseType_t i = 0; i < got; i++) {
         const espix_pid_t owner = espix_proc_pid_of_task(ts[i].xHandle);
         if (owner == ESPIX_PID_NONE) {
@@ -543,7 +645,7 @@ static bool proc_tid_task(espix_pid_t tid, TaskStatus_t *out, espix_pid_t *pid)
             break;
         }
     }
-    free(ts);
+    proc_cache_release();
     return found;
 }
 
@@ -861,18 +963,18 @@ static const synth_node_t *list_node(const char *dir, const char *name,
 /* /proc itself: one directory per live process, after the static files. */
 static const synth_node_t *proc_dyn_at(int nth)
 {
-    espix_proc_info_t *const live = calloc(CONFIG_ESPIX_PROC_MAX, sizeof(*live));
-    if (live == NULL) {
+    const espix_proc_info_t *live;
+    size_t                   n;
+    if (!proc_cache_acquire_infos(&live, &n)) {
         return NULL;
     }
-    const size_t        n   = espix_proc_snapshot(live, CONFIG_ESPIX_PROC_MAX);
     const synth_node_t *out = NULL;
     if (nth >= 0 && (size_t)nth < n) {
         char num[12];
         snprintf(num, sizeof(num), "%d", (int)live[nth].pid);
         out = list_node("/proc", num, SYNTH_DIR, S_IFDIR | 0555);
     }
-    free(live);
+    proc_cache_release();
     return out;
 }
 

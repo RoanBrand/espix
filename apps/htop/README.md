@@ -223,6 +223,14 @@ allocation, no process-table walk and no extra timer. The first htop frame uses
 the since-boot totals, so a syscall-heavy startup can look mostly red; the next
 refresh uses the interval and the red is just the system tip.
 
+The other hot spot was the repeated task/process snapshot itself. htop reads
+four files per process, and each file used to take its own
+uxTaskGetSystemState()/espix_proc_snapshot(). A 500 ms cache now shares one of
+each across the whole scan; the arrays are in PSRAM (about 8 KB) and are read
+under one mutex. Measured on the S31, the first Machine_scanTables went from
+362.6 ms to 79.4 ms, and htop's steady share from roughly 22% to 14% of a core.
+The remaining cost is mostly the VFS/synth formatting of the 44 small files.
+
 /proc/<pid>/stat similarly gets utime + stime from the task's
 ulRunTimeCounter, and starttime from started_us, both at 100 Hz.
 
