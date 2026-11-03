@@ -75,13 +75,17 @@ if [ $# -gt 0 ]; then
 else
     names=()
     for d in "$apps_dir"/*/; do
-        [ -f "${d}CMakeLists.txt" ] && names+=("$(basename "$d")")
+        { [ -f "${d}CMakeLists.txt" ] || [ -f "${d}build.sh" ]; } &&
+            names+=("$(basename "$d")")
     done
 fi
 
 for name in "${names[@]}"; do
     app="$apps_dir/$name"
-    if [ ! -f "$app/CMakeLists.txt" ]; then
+    manual=0
+    if [ -f "$app/build.sh" ] && [ ! -f "$app/CMakeLists.txt" ]; then
+        manual=1
+    elif [ ! -f "$app/CMakeLists.txt" ]; then
         echo "build-apps: $name: not an app project" >&2
         exit 1
     fi
@@ -115,6 +119,7 @@ for name in "${names[@]}"; do
         newer=$(find "$app" -type f \
                     -not -path "*/build/*" \
                     -not -path "*/build-u/*" \
+                    -not -path "*/third_party/*" \
                     -not -path "*/managed_components/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
         if [ -z "$newer" ]; then
@@ -122,6 +127,27 @@ for name in "${names[@]}"; do
             echo "build-apps: $name is up to date"
             continue
         fi
+    fi
+
+    # An app with its own cross build (htop: ncurses plus upstream htop)
+    # instead of an ESP-IDF project. It produces build/<name> itself and is
+    # staged like any other ELF; the firmware does not compile it.
+    if [ "$manual" = 1 ]; then
+        echo "build-apps: building $name"
+        ( cd "$app" && ./build.sh ) || {
+            echo "build-apps: $name: build failed; see apps/$name/build" >&2
+            exit 1
+        }
+        if [ ! -f "$app/build/$name" ]; then
+            echo "build-apps: $name: expected apps/$name/build/$name" >&2
+            exit 1
+        fi
+        cp "$app/build/$name" "$staged"
+        chmod 755 "$staged"
+        printf '%s\n' "$target" > "$stamp"
+        stage_manifest
+        echo "build-apps: staged $name ($(wc -c < "$staged" | tr -d ' ') bytes)"
+        continue
     fi
 
     # Per-app build environment, for anything that cannot be expressed in

@@ -1,7 +1,9 @@
 # espix example apps
 
-Each directory here is a **standalone ESP-IDF project**, not part of the espix
+Most directories here are **standalone ESP-IDF projects**, not part of the espix
 firmware. Each builds to a relocatable ELF that the device loads at runtime.
+`htop` is the exception: upstream htop and ncurses are cross-built by
+`apps/htop/build.sh`, because neither belongs in an IDF component.
 
 | app | shows |
 |---|---|
@@ -9,6 +11,7 @@ firmware. Each builds to a relocatable ELF that the device loads at runtime.
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
 | [plasma](plasma/) | the graphics/input ABI: a full-screen app the desktop launches from an icon |
 | [mosquitto](mosquitto/) | a real server as an app: the Eclipse Mosquitto MQTT broker, built from upstream with a 372-line platform seam and no patches |
+| [htop](htop/) | a real interactive program: htop on ncurses, two cores, CPU frequency and the on-die temperature, built from upstream |
 
 `neopixel` is a normal `setup()`/`loop()` sketch with one addition: a
 `teardown()`, called when someone stops the app. An Arduino sketch never needs

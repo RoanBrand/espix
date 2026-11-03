@@ -1,13 +1,12 @@
 # htop on espix
 
 [htop](https://github.com/htop-dev/htop), the real one, built as a U-mode espix
-app. This directory is a **build spike**, not an integrated app, but it has
-run on an S31: htop 3.5.3 drew both cores, eleven processes, 320 MHz and 30 C,
-with the frequency and temperature columns enabled in `htoprc`.
+app. It runs on an S31: htop 3.5.3 drew both cores, eleven processes, 320 MHz
+and 30 C, with the frequency and temperature columns enabled in `htoprc`.
 
-    ./build.sh
-    # build/htop: 382 KB, ET_EXEC, entry 0x10000
-    scp build/htop esp@<host>:/bin/htop
+    ./tools/build-apps.sh htop      # stages fsroot/bin/htop, mode 755
+    # or: ./build.sh && scp build/htop esp@<host>:/bin/htop
+    # or: make flash-fs, which packages the staged /bin/htop
     htop
 
 The first frame's CPU meter includes htop's own startup work and can read
@@ -104,6 +103,22 @@ keep the ELF smaller.
 
 The host needs a tic able to parse ncurses 6.4's terminfo.src. macOS's
 /usr/bin/tic (6.0) cannot; Homebrew's can, and build.sh prefers it.
+
+## Colors on the espix terminal
+
+htop's default scheme draws the right-hand meter values (the CPU frequency and
+temperature) with `A_BOLD | cyan`. The espix terminal renders that combination
+as black on its black background, so the text disappears. Black night
+(`color_scheme=5`) uses plain green for the same values and is readable. Set it
+once in `~/.config/htop/htoprc`:
+
+    show_cpu_frequency=1
+    show_cpu_temperature=1
+    color_scheme=5
+
+or choose it interactively with F2 -> Colors -> Black night. The bars and the
+rest of the screen are unaffected; this is a colour-attribute difference, not
+a missing colour.
 
 ## libsensors, and the temperature
 
@@ -297,8 +312,9 @@ Each phase leaves the ELF loadable and "make test" green.
 4. **Make it pleasant.** Mostly: loadavg and the meminfo keys are in; TERM and
    the embedded xterm entry work on a real pty; htoprc was read from
    $HOME/.config/htop. Resize and the smaller cosmetic settings are untested.
-5. **Integrate.** Not done: a uapp/CMakeLists.txt and a targets file so
-   tools/build-apps.sh stages /bin/htop, and a test that runs htop on a pty.
+5. **Integrate.** Done: apps/htop has a targets file naming esp32s31, and
+   tools/build-apps.sh runs its build.sh and stages /bin/htop (incremental,
+   like the ESP-IDF apps). Still open: a test suite that runs htop on a pty.
 6. **Optional, M8.** fork/exec/pipe for lsof, strace and the systemd meter.
 
 Phases 1-3 are the interesting kernel work and are independent of M7/M8.
