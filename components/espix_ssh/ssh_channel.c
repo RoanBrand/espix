@@ -125,7 +125,6 @@ typedef struct {
     espix_tty_t     *tty;           /* the channel's input, and its output's line discipline */
     espix_session_t *session;       /* the session on this channel, once there is one */
     TaskHandle_t     shell;         /* the connection task, woken for a signal key */
-    volatile bool    intr;          /* ^C, for the session's foreground wait */
 
     /* Data the tty could not take yet (a pipe that is full), handed over when it has room. */
     uint8_t     hold[SSH_CHANNEL_MAX_PACKET];
@@ -370,33 +369,6 @@ static void tty_echo(void *ctx, const void *buf, size_t len)
     }
 }
 
-/* ^C and ^Z: the session's foreground wait acts on them, with its messages and its escalation (fg.c). */
-static bool tty_signal(void *ctx, int sig)
-{
-    ssh_chan_t *ch = ctx;
-    espix_session_t *s = ch->session;
-    if (sig == SIGTSTP && s != NULL) {
-        s->susp = true;
-    } else if (sig == SIGINT) {
-        ch->intr = true;
-    } else {
-        return false;
-    }
-    if (ch->shell != NULL) {
-        (void)xTaskNotifyGiveIndexed(ch->shell, ESPIX_NOTIFY_SIG_IDX);
-    }
-    return true;
-}
-
-/* Each key, for a command that asks for the last one (espix_shell_take_key()). */
-static void tty_key(void *ctx, int c)
-{
-    ssh_chan_t *ch = ctx;
-    if (ch->session != NULL) {
-        ch->session->last_key = c;
-    }
-}
-
 static void tty_room(void *ctx)
 {
     ssh_rx_resume(((ssh_chan_t *)ctx)->conn);
@@ -446,12 +418,12 @@ static int hand_over(ssh_chan_t *ch)
 static void set_term_size(ssh_chan_t *ch, uint32_t cols, uint32_t rows);
 static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in);
 
-/* The connection is over or the channel closed: readers see the end, writers stop, the shell wakes. */
+/* The connection is over or the channel closed: readers see the end, writers stop, the job hears SIGHUP. */
 static void chan_gone(ssh_chan_t *ch)
 {
     chan_closed(ch);
     if (ch->tty != NULL) {
-        espix_tty_input_eof(ch->tty);
+        espix_tty_carrier_lost(ch->tty);
     }
     if (ch->shell != NULL) {
         (void)xTaskNotifyGiveIndexed(ch->shell, ESPIX_NOTIFY_SIG_IDX);
@@ -578,28 +550,6 @@ static int chan_write_err(espix_session_t *s, const char *data, size_t len)
         return -1;
     }
     return (espix_tty_write_err(ch->tty, data, len) < 0) ? -1 : (int)len;
-}
-
-/* ^C reached the terminal while a foreground job ran (tty_signal()). */
-static bool chan_poll_interrupt(espix_session_t *s)
-{
-    ssh_chan_t *ch = s->transport;
-    if (ch->closed) {
-        return true;
-    }
-    const bool hit = ch->intr;
-    ch->intr = false;
-    return hit;
-}
-
-static void chan_wait_input(espix_session_t *s, uint32_t ms)
-{
-    ssh_chan_t *ch = s->transport;
-    if (ch == NULL || ch->closed || ch->intr || s->susp) {
-        return;
-    }
-    (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
-                                  (ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(ms));
 }
 
 static void chan_term_size(espix_session_t *s, int *cols, int *rows)
@@ -1153,7 +1103,7 @@ static esp_err_t chan_start_input(ssh_chan_t *ch, bool pipe)
 {
     const espix_tty_ops_t ops = {
         .write = tty_out, .write_err = tty_out_err, .echo = tty_echo,
-        .signal = tty_signal, .key = tty_key, .room = tty_room, .ctx = ch,
+        .room = tty_room, .ctx = ch,
     };
     ch->tty = espix_tty_create(&ops, pipe ? TTY_INPUT_PIPE : TTY_INPUT_PTY, pipe);
     if (ch->tty == NULL) {
@@ -1588,9 +1538,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .cwd       = "/",
             .write     = chan_write,
             .write_err = chan_write_err,
-            .poll_interrupt = chan_poll_interrupt,
-            .wait_input     = chan_wait_input,
-            .term_size      = chan_term_size,
+                    .term_size      = chan_term_size,
             .task_gone      = chan_task_gone,
             .transport = ch,
             /* Overwritten by apply_account(); nobody rather than 0 so that a
@@ -1706,8 +1654,6 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .read_line = chan_read_line,
         .write     = chan_write,
         .write_err = chan_write_err,
-        .poll_interrupt = chan_poll_interrupt,
-        .wait_input     = chan_wait_input,
         .term_size      = chan_term_size,
         .task_gone      = chan_task_gone,
         .transport = ch,

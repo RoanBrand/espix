@@ -465,9 +465,6 @@ A static executable built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([USER-MODE.md](USER-MODE.md)). It has files, directories,
 stdio, time, sleep, identity, threads, signals and sockets. What it cannot do yet:
 
-- **`poll` and `select` report stdin readable** whether or not a line is
-  waiting, so a read after them can block: the SSH and VNC terminal transports have no
-  wake a select can wait on yet.
 - **One thread takes a process's signal**, as on Linux: a sleep in another
   thread is not cut short by it, where an M-mode app's every sleeping thread
   wakes. There is no `pthread_kill` to another thread, `sigwait`, `sigqueue` or
@@ -1066,10 +1063,12 @@ stdio, time, sleep, identity, threads, signals and sockets. What it cannot do ye
   image actually exposes. Which slot is *running* is `upgrade --slots`, not the
   directory listing.
 
-- **A builtin has no stdin.** Its input is a file or `<`: the foreground wait
-  pumps the SSH channel into an app's stdin queue, and a builtin has none. This
-  is why `upgrade --stdin` does not exist and `make flash-ota` copies the image
-  to `/tmp` and queues it with `--file`.
+- **`cat`, `wc` and the other file builtins read files, not stdin.**
+  `printf x | ssh host cat` prints the usage. A builtin running as a process can
+  read the session's stdin (`espix_proc_stdin_open()`), so that, and an
+  `upgrade --stdin`, are changes to those commands rather than a missing
+  mechanism; `make flash-ota` copies the image to `/tmp` and queues it with
+  `--file` meanwhile.
 
 - **The update cache is root's to write.** The background check records what it
   found in `/var/lib/espix/update`, and `/var` is root-owned, so `upgrade --check`

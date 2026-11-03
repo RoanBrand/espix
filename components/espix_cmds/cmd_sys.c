@@ -1873,6 +1873,139 @@ static int cmd_ttytest(espix_session_t *s, int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* stty                                                                */
+/* ------------------------------------------------------------------ */
+
+/* The flags stty names: which word of the termios, and the bit. */
+typedef struct {
+    const char *name;
+    uint8_t     word;           /* 0 iflag, 1 oflag, 3 lflag */
+    tcflag_t    bit;
+} stty_flag_t;
+
+static const stty_flag_t k_stty_flags[] = {
+    { "icrnl", 0, ICRNL }, { "inlcr", 0, INLCR }, { "igncr", 0, IGNCR }, { "istrip", 0, ISTRIP }, { "ixon", 0, IXON },
+    { "opost", 1, OPOST }, { "onlcr", 1, ONLCR },
+    { "isig", 3, ISIG }, { "icanon", 3, ICANON }, { "iexten", 3, IEXTEN }, { "echo", 3, ECHO },
+    { "echoe", 3, ECHOE }, { "echok", 3, ECHOK }, { "echonl", 3, ECHONL }, { "noflsh", 3, NOFLSH },
+    { "tostop", 3, TOSTOP },
+};
+
+static tcflag_t *stty_word(struct termios *t, uint8_t w)
+{
+    return (w == 0) ? &t->c_iflag : (w == 1) ? &t->c_oflag : &t->c_lflag;
+}
+
+/* ^C for 0x03, ^? for DEL, <undef> for none. */
+static void stty_cc(char *buf, size_t len, cc_t c)
+{
+    if (c == 0) {
+        strlcpy(buf, "<undef>", len);
+    } else if (c == 0x7f) {
+        strlcpy(buf, "^?", len);
+    } else if (c < 0x20) {
+        snprintf(buf, len, "^%c", c + '@');
+    } else {
+        snprintf(buf, len, "%c", c);
+    }
+}
+
+/* As GNU's: the size, then the flags that differ from sane, or with -a every one and the control characters. */
+static void stty_show(espix_session_t *s, espix_tty_t *tty, const struct termios *t, bool all)
+{
+    int cols = 0, rows = 0;
+    espix_tty_get_winsize(tty, &cols, &rows);
+    espix_printf(s, "rows %d; columns %d;\n", rows, cols);
+    if (all) {
+        static const struct { const char *name; int idx; } cc[] = {
+            { "intr", VINTR }, { "quit", VQUIT }, { "erase", VERASE }, { "kill", VKILL }, { "eof", VEOF },
+            { "start", VSTART }, { "stop", VSTOP }, { "susp", VSUSP },
+        };
+        for (size_t i = 0; i < sizeof(cc) / sizeof(cc[0]); i++) {
+            char c[12];
+            stty_cc(c, sizeof(c), t->c_cc[cc[i].idx]);
+            espix_printf(s, "%s = %s; ", cc[i].name, c);
+        }
+        espix_printf(s, "min = %u; time = %u;\n", t->c_cc[VMIN], t->c_cc[VTIME]);
+    }
+    struct termios sane;
+    espix_tty_sane(&sane);
+    struct termios copy = *t;
+    bool any = false;
+    for (size_t i = 0; i < sizeof(k_stty_flags) / sizeof(k_stty_flags[0]); i++) {
+        const stty_flag_t *f = &k_stty_flags[i];
+        const bool on = (*stty_word(&copy, f->word) & f->bit) != 0;
+        if (all || on != ((*stty_word(&sane, f->word) & f->bit) != 0)) {
+            espix_printf(s, "%s%s ", on ? "" : "-", f->name);
+            any = true;
+        }
+    }
+    if (any) {
+        espix_printf(s, "\n");
+    }
+}
+
+static int cmd_stty(espix_session_t *s, int argc, char **argv)
+{
+    espix_tty_t *const tty = (s != NULL) ? s->tty : NULL;
+    if (tty == NULL || espix_tty_is_pipe(tty)) {
+        espix_eprintf(s, "stty: standard input: not a terminal\n");
+        return 1;
+    }
+    struct termios t;
+    espix_tty_getattr(tty, &t);
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "-a") == 0)) {
+        stty_show(s, tty, &t, argc == 2);
+        return 0;
+    }
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "size") == 0) {
+            int cols = 0, rows = 0;
+            espix_tty_get_winsize(tty, &cols, &rows);
+            espix_printf(s, "%d %d\n", rows, cols);
+        } else if (strcmp(a, "raw") == 0) {
+            espix_tty_makeraw(&t);
+        } else if (strcmp(a, "-raw") == 0 || strcmp(a, "cooked") == 0) {
+            t.c_iflag |= ICRNL;
+            t.c_oflag |= OPOST;
+            t.c_lflag |= ISIG | ICANON;
+        } else if (strcmp(a, "sane") == 0) {
+            espix_tty_sane(&t);
+        } else if ((strcmp(a, "rows") == 0 || strcmp(a, "cols") == 0 || strcmp(a, "columns") == 0) && i + 1 < argc) {
+            int cols = 0, rows = 0;
+            espix_tty_get_winsize(tty, &cols, &rows);
+            const int n = atoi(argv[++i]);
+            if (n <= 0) {
+                espix_eprintf(s, "stty: invalid integer argument '%s'\n", argv[i]);
+                return 1;
+            }
+            if (a[0] == 'r') {
+                rows = n;
+            } else {
+                cols = n;
+            }
+            espix_tty_set_winsize(tty, cols, rows);
+        } else {
+            const bool off = a[0] == '-';
+            const char *name = off ? a + 1 : a;
+            size_t j = 0;
+            while (j < sizeof(k_stty_flags) / sizeof(k_stty_flags[0]) && strcmp(k_stty_flags[j].name, name) != 0) {
+                j++;
+            }
+            if (j == sizeof(k_stty_flags) / sizeof(k_stty_flags[0])) {
+                espix_eprintf(s, "stty: invalid argument '%s'\n", a);
+                return 1;
+            }
+            tcflag_t *w = stty_word(&t, k_stty_flags[j].word);
+            *w = off ? (tcflag_t)(*w & ~k_stty_flags[j].bit) : (tcflag_t)(*w | k_stty_flags[j].bit);
+        }
+    }
+    espix_tty_setattr(tty, TCSADRAIN, &t);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Accounts and groups                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -2317,6 +2450,9 @@ static espix_cmd_t s_sys_cmds[] = {
       .help = "heap held per task, deleted ones included (heap-debug builds)",
       .usage = "heaptasks [task handle]" },
 #endif
+    { .name = "stty", .fn = cmd_stty,
+      .help = "show or change the terminal's settings",
+      .usage = "stty [-a] | stty [raw|cooked|sane|size|rows N|cols N|[-]echo|[-]icanon|[-]isig|...]..." },
     { .name = "ttytest", .fn = cmd_ttytest,
       .help = "exercise the terminal line discipline on a tty of its own",
       .usage = "ttytest" },

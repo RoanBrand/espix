@@ -240,7 +240,7 @@ decision with a reason rather than a convenience.
 |---|---|---|
 | **published** | the call reaches espix — its VFS, its fd table, its signal delivery — or reaches nothing but the caller's memory | libc's `open()`, `stat()` and `read()`, which arrive in espix's VFS on the way in, so the permission check is not something they can skip |
 | **overridden** | the libc or IDF implementation lies, bypasses espix, or has to become a delivery point | `chdir`, `getcwd` and `chmod` under libc's names because IDF's are stubs; `sleep` and `usleep` so a signal can cut them short |
-| **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `isatty`, `atexit` — each with the reason written beside the table it is absent from |
+| **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `atexit` — each with the reason written beside the table it is absent from |
 | **carried elsewhere** | the surface is large, or belongs to a runtime rather than to the kernel | an app's own libraries, or a loadable module: see the Arduino item under **Further out** |
 
 The layering matters as much as the list. elf_loader's own tables used to answer
@@ -374,15 +374,22 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## Shell and console
 
-- **A session's terminal as a device.** stdin reaches an app through each
-  transport's own queue (SSH, the VNC terminal, the console), which `esp_vfs_select()`
-  cannot wait on, so `poll()` reports stdin readable whether or not a line is
-  there, and Ctrl-C and Ctrl-Z are found by the foreground wait polling the
-  transport. A pty-like VFS device per session, backed by a ring buffer
-  (FreeRTOS's), that every transport writes into: its select hooks make stdin
-  pollable, a blocking read waits beside the wake eventfd as a socket's does,
-  and Ctrl-C and Ctrl-Z become line discipline, a signal to the foreground
-  group the moment they arrive.
+- **`ls` lists only its last operand**, where Linux lists each; and `fstat`
+  reports the filesystem's own permission bits, where `stat` reports espix's
+  (a descriptor carries no path for the rule to answer from).
+
+- **`kill -9` lets the app run to its exit.** espix asks first and deletes only
+  a process that has not left 250 ms later, so a killed `cat` still prints its
+  count on the way out; Linux's SIGKILL ends it where it stands.
+
+- **App start-up costs about 300 ms**, for a 25 KB app: resolving the command,
+  the spawn and reading the image take about 80 ms each, and a file builtin
+  (`cat`, `ls -l`) costs 50-70 ms more than `true`. The permission and account
+  lookups are the first place to measure.
+
+- **An SSH key exchange starves apps.** Connections run at priority 4 and apps
+  at 3, so a login's key exchange (~200 ms of CPU) delays a woken app; under a
+  loop of logins a 200 ms sleep took 500 ms.
 
 - **A text editor.** There is none. `echo >` and `>>` cover `key=value` config,
   which is why it has not bitten yet, but anything larger wants an `ed`-style

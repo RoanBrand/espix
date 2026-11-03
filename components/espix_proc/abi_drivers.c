@@ -22,9 +22,12 @@
  */
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/termios.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -59,6 +62,7 @@
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_shell.h"
+#include "espix_tty.h"
 #include "espix_proc_priv.h"
 
 #define TAG "abi"
@@ -332,6 +336,113 @@ int espix_abi_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     return ready;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* An app's terminal                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * An M-mode app's fds 0-2 are numbers in the system's table, where they are the
+ * console's; its terminal is its session's tty (espix_proc_std_tty()). These
+ * give it that terminal under the numbers it knows, as a U-mode app's syscalls
+ * do. A process without one keeps the system's.
+ */
+int espix_abi_tty_fd(int fd)
+{
+    espix_tty_t *const t = (fd >= 0 && fd <= 2) ? espix_proc_std_tty() : NULL;
+    const int tfd = (t != NULL) ? espix_tty_fileno(t) : -1;
+    return (tfd >= 0) ? tfd : fd;
+}
+
+static int abi_app_isatty(int fd)
+{
+    if (fd >= 0 && fd <= 2) {
+        const espix_tty_t *const t = espix_proc_std_tty();
+        if (t != NULL) {
+            return !espix_tty_is_pipe(t);
+        }
+    }
+    return isatty(fd);
+}
+
+static int abi_app_ioctl(int fd, int req, ...)
+{
+    va_list ap;
+    va_start(ap, req);
+    void *const arg = va_arg(ap, void *);
+    va_end(ap);
+    return ioctl(espix_abi_tty_fd(fd), req, arg);
+}
+
+static int abi_app_tcgetattr(int fd, struct termios *p)
+{
+    return tcgetattr(espix_abi_tty_fd(fd), p);
+}
+
+static int abi_app_tcsetattr(int fd, int act, const struct termios *p)
+{
+    return tcsetattr(espix_abi_tty_fd(fd), act, p);
+}
+
+static int abi_app_tcflush(int fd, int sel)
+{
+    return tcflush(espix_abi_tty_fd(fd), sel);
+}
+
+static int abi_app_tcdrain(int fd)
+{
+    return tcdrain(espix_abi_tty_fd(fd));
+}
+
+static pid_t abi_app_tcgetpgrp(int fd)
+{
+    pid_t pg = -1;
+    return (ioctl(espix_abi_tty_fd(fd), TIOCGPGRP, &pg) == 0) ? pg : -1;
+}
+
+static int abi_app_tcsetpgrp(int fd, pid_t pg)
+{
+    return ioctl(espix_abi_tty_fd(fd), TIOCSPGRP, &pg);
+}
+
+/* stdin, as a set holds it, swapped for its tty and back. */
+static int abi_app_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *errorfds, struct timeval *timeout)
+{
+    const int tfd = espix_abi_tty_fd(0);
+    const bool swap = tfd != 0 && readfds != NULL && nfds > 0 && FD_ISSET(0, readfds);
+    if (swap) {
+        FD_CLR(0, readfds);
+        FD_SET(tfd, readfds);
+        nfds = (tfd + 1 > nfds) ? tfd + 1 : nfds;
+    }
+    const int r = espix_abi_select(nfds, readfds, writefds, errorfds, timeout);
+    if (swap && r >= 0) {
+        const bool ready = FD_ISSET(tfd, readfds);
+        FD_CLR(tfd, readfds);
+        if (ready) {
+            FD_SET(0, readfds);
+        }
+    }
+    return r;
+}
+
+static int abi_app_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    const int tfd = espix_abi_tty_fd(0);
+    for (nfds_t i = 0; tfd != 0 && fds != NULL && i < nfds; i++) {
+        if (fds[i].fd == 0) {
+            fds[i].fd = tfd;
+        }
+    }
+    const int r = espix_abi_poll(fds, nfds, timeout);
+    for (nfds_t i = 0; tfd != 0 && fds != NULL && i < nfds; i++) {
+        if (fds[i].fd == tfd) {
+            fds[i].fd = 0;
+        }
+    }
+    return r;
+}
+
 static esp_elf_symbol_table_t s_driver_syms[] = {
 
     /* RMT. The WS2812 waveform is generated here rather than bit-banged, which
@@ -399,11 +510,24 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
      * global pool *plus* what its arena can still serve. */
     ESP_ELFSYM_EXPORT(esp_log),
     ESP_ELFSYM_EXPORT(esp_log_timestamp),
-    ESP_ELFSYM_EXPORT(ioctl),
     /* Wrapped, so a signal can interrupt it (R-P6.6). poll() is the same
      * wrapper over the same wait, because IDF's own poll is not. */
-    { "select", (void *)espix_abi_select },
-    { "poll",   (void *)espix_abi_poll },
+    { "select", (void *)abi_app_select },
+    { "poll",   (void *)abi_app_poll },
+    /* fds 0-2 as the app's terminal: its session's tty. */
+    { "ioctl",       (void *)abi_app_ioctl },
+    { "isatty",      (void *)abi_app_isatty },
+    { "tcgetattr",   (void *)abi_app_tcgetattr },
+    { "tcsetattr",   (void *)abi_app_tcsetattr },
+    { "tcflush",     (void *)abi_app_tcflush },
+    { "tcdrain",     (void *)abi_app_tcdrain },
+    { "tcgetpgrp",   (void *)abi_app_tcgetpgrp },
+    { "tcsetpgrp",   (void *)abi_app_tcsetpgrp },
+    { "cfmakeraw",   (void *)espix_tty_makeraw },
+    ESP_ELFSYM_EXPORT(cfgetispeed),
+    ESP_ELFSYM_EXPORT(cfgetospeed),
+    ESP_ELFSYM_EXPORT(cfsetispeed),
+    ESP_ELFSYM_EXPORT(cfsetospeed),
     /* The eventfd behind that wake, for an app that wants one of its own. */
     ESP_ELFSYM_EXPORT(eventfd),
     ESP_ELFSYM_EXPORT(__udivdi3),

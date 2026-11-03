@@ -157,30 +157,6 @@ static ssize_t console_tty_out(void *ctx, const void *buf, size_t len)
 #endif
 }
 
-static void console_wake(espix_session_t *s);
-
-/* ^C and ^Z: the foreground wait says them and escalates (fg.c); any other signal key goes to the group. */
-static bool console_tty_signal(void *ctx, int sig)
-{
-    (void)ctx;
-    if (sig == SIGINT) {
-        s_console.intr = true;
-    } else if (sig == SIGTSTP) {
-        s_console.susp = true;
-    } else {
-        return false;
-    }
-    console_wake(&s_console);
-    return true;
-}
-
-/* Each key, for a command that asks for the last one (espix_shell_take_key()). */
-static void console_tty_key(void *ctx, int c)
-{
-    (void)ctx;
-    s_console.last_key = c;
-}
-
 /* The wire's one reader: everything that arrives, into the tty. */
 static void console_rx_task(void *arg)
 {
@@ -866,57 +842,6 @@ static int console_read_line(espix_session_t *s, const char *prompt,
     return (int)strlen(buf);
 }
 
-/* ^C reached the terminal while a foreground job ran (console_tty_signal()). */
-static bool console_poll_interrupt(espix_session_t *s)
-{
-    const bool hit = s->intr;
-    s->intr = false;
-    return hit;
-}
-
-/* End a console_wait_input(); under the process table's lock, and the eventfd
- * write does not block. */
-static void console_wake(espix_session_t *s)
-{
-    (void)s;
-    if (s_wake_fd >= 0) {
-        const uint64_t one = 1;
-        (void)write(s_wake_fd, &one, sizeof(one));
-    }
-}
-
-/*
- * The foreground wait's sleep: the eventfd a child's exit and a signal key
- * write. Without it an exit cannot reach this, so the wait is capped.
- */
-static void console_wait_input(espix_session_t *s, uint32_t ms)
-{
-    if (s->intr || s->susp) {
-        return;
-    }
-    if (s_wake_fd < 0) {
-        vTaskDelay(pdMS_TO_TICKS((ms > 50) ? 50 : ms));
-        return;
-    }
-    const int maxfd = s_wake_fd;
-    fd_set    rfds;
-    FD_ZERO(&rfds);
-    FD_SET(s_wake_fd, &rfds);
-
-    struct timeval  tv;
-    struct timeval *tvp = NULL;
-    if (ms != UINT32_MAX) {
-        tv.tv_sec  = (time_t)(ms / 1000);
-        tv.tv_usec = (suseconds_t)((ms % 1000) * 1000);
-        tvp        = &tv;
-    }
-    if (select(maxfd + 1, &rfds, NULL, NULL, tvp) > 0 && s_wake_fd >= 0 &&
-        FD_ISSET(s_wake_fd, &rfds)) {
-        uint64_t sink = 0;
-        (void)read(s_wake_fd, &sink, sizeof(sink));
-    }
-}
-
 static int console_write(espix_session_t *s, const char *data, size_t len)
 {
     (void)s;
@@ -982,8 +907,6 @@ esp_err_t espix_console_session_start(void)
     /* The terminal, and the task that is the wire's only reader, before the editor's probe reads its answer. */
     static const espix_tty_ops_t tty_ops = {
         .write  = console_tty_out,
-        .signal = console_tty_signal,
-        .key    = console_tty_key,
     };
     s_tty = espix_tty_create(&tty_ops, CONSOLE_TTY_INPUT, false);
     if (s_tty == NULL) {
@@ -1137,9 +1060,6 @@ esp_err_t espix_console_session_start(void)
         .login     = false,
         .read_line = console_read_line,
         .write     = console_write,
-        .poll_interrupt = console_poll_interrupt,
-        .wait_input     = console_wait_input,
-        .wake           = console_wake,
         .fg_pgid    = ESPIX_PID_NONE,
         .ansi      = ansi,
         /* An app's streams are the tty's, as an SSH session's are. */

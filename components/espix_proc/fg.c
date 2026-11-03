@@ -1,10 +1,10 @@
 /*
- * The foreground wait: a shell's job, run to its end or until it stops, with ^C and ^Z.
+ * The foreground wait: a shell's job, run to its end or until it stops.
  *
- * Nothing else reads the terminal while a job runs, so the shell does. It
- * blocks in the transport's wait_input() until a key arrives or the job ends;
- * a transport without one is polled every 50 ms. A waiter that is not a
- * shell, or a job that reads the terminal itself, waits for the exit alone.
+ * ^C and ^Z are the session's tty's: its line discipline signals the job's
+ * group (and a third ^C insists with SIGKILL), so this only waits -- on the
+ * notification a child's exit or stop sends its parent, or, for a job another
+ * process started, by checking every 50 ms.
  */
 
 #include <signal.h>
@@ -22,14 +22,6 @@
 #include "espix_tty.h"
 
 #define FG_POLL_MS 50
-
-/*
- * Ctrl-C presses before the shell stops asking and starts insisting. SIGINT is
- * all a press sends, so an app may catch it and tidy up; but espix may have one
- * console and no second terminal to run `kill -9` from, so the third press
- * forces it, and says so first.
- */
-#define FG_INTERRUPTS_TO_KILL 3
 
 /* After a time limit's SIGTERM, how long before SIGKILL. */
 #define FG_KILL_GRACE_MS 2000
@@ -102,15 +94,9 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
     const espix_proc_slot_t *const self  = espix_proc_self();
     const bool                     shell = self != NULL &&
                                            self->info.kind == ESPIX_PROC_SESSION;
-    const bool poll = shell && !fg->tty && s->poll_interrupt != NULL;
 
-    /*
-     * Blocking rather than polling needs both wakes: the transport's for a key,
-     * and the exit notification, which goes to the job's parent -- so not for a
-     * job some other process started, such as `fg` of one sudo backgrounded.
-     */
-    const bool push = poll && s->wait_input != NULL &&
-                      espix_proc_parent_of(pid) == self->info.pid;
+    /* A child's exit and its stop notify its parent; a job some other process started is checked instead. */
+    const bool notified = self != NULL && espix_proc_parent_of(pid) == self->info.pid;
 
     espix_proc_kind_t kind = ESPIX_PROC_APP;
     (void)espix_proc_kind_of(pid, &kind);
@@ -132,7 +118,6 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
                                                 : 0;
     int       exit_code  = -1;
     esp_err_t err        = ESP_ERR_TIMEOUT;
-    unsigned  interrupts = 0;
     bool      killed     = false;
     int64_t   term_at    = 0;
 
@@ -161,60 +146,38 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
         const uint32_t ms = (until == 0) ? UINT32_MAX
                           : (uint32_t)((until > now ? until - now : 0) / 1000 + 1);
 
-        TickType_t ticks;
-        if (push) {
-            ticks = 0;
-        } else if (poll) {
-            ticks = pdMS_TO_TICKS(FG_POLL_MS);
-        } else {
-            ticks = (ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(ms);
-        }
-
-        err = espix_proc_wait(pid, &exit_code, ticks);
+        err = espix_proc_wait(pid, &exit_code, 0);
         if (err != ESP_ERR_TIMEOUT) {
             break;
-        }
-        if (poll && s->poll_interrupt(s)) {
-            /* A tty's line discipline has echoed the ^C already; the newline is the shell's. */
-            say(s, false, (s->tty != NULL) ? "\n" : "^C\n");
-            interrupts++;
-
-            if (interrupts < FG_INTERRUPTS_TO_KILL) {
-                (void)espix_proc_signal_group(pgid, SIGINT);
-                if (interrupts + 1 == FG_INTERRUPTS_TO_KILL) {
-                    say(s, true, "%s: pid %d has not stopped; press Ctrl-C "
-                                 "again to force it\n", who, (int)pid);
-                }
-            } else if (interrupts == FG_INTERRUPTS_TO_KILL) {
-                say(s, true, "%s: killing pid %d\n", who, (int)pid);
-                (void)espix_proc_signal_group(pgid, SIGKILL);
-            }
-        }
-        if (poll && s->susp) {
-            s->susp = false;
-            say(s, false, (s->tty != NULL) ? "\n" : "^Z\n");
-            (void)espix_proc_signal_group(pgid, SIGTSTP);
         }
         /* Stopped, by ^Z or a signal from elsewhere: a background job now, as in any shell. */
         if (shell && kind == ESPIX_PROC_APP && espix_proc_state_of(pid) == ESPIX_PROC_STOPPED) {
             fg->stopped = true;
             break;
         }
-        if (push) {
-            s->wait_input(s, ms);
+        if (notified) {
+            (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
+                                          (ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(ms));
+        } else {
+            const TickType_t ticks = shell ? pdMS_TO_TICKS(FG_POLL_MS)
+                                   : (ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(ms);
+            err = espix_proc_wait(pid, &exit_code, ticks);
+            if (err != ESP_ERR_TIMEOUT) {
+                break;
+            }
         }
     }
 
-    /* Whatever was typed at a job that did not read it goes with it. */
-    if (poll) {
-        (void)s->poll_interrupt(s);
-    }
     if (shell) {
         espix_proc_set_fg(s, ESPIX_PID_NONE);
     }
     /* A job a signal ended can leave the terminal as it set it, raw or silent: the shell's back, as bash does. */
     if (keep_tty && !fg->stopped && (killed || exit_code > 128)) {
         espix_tty_setattr(s->tty, TCSANOW, &before);
+    }
+    /* After a stop or a signal's end -- ^C, ^Z, a third ^C's SIGKILL, all echoed -- the next line is the shell's. */
+    if (shell && s->tty != NULL && (fg->stopped || exit_code > 128)) {
+        say(s, false, "\n");
     }
     if (fg->stopped) {
         stopped_job(s, pid);
@@ -224,10 +187,6 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
     if (err != ESP_OK) {
         say(s, true, "%s: pid %d: %s\n", who, (int)pid, esp_err_to_name(err));
         return -1;
-    }
-    /* A command has no handler to choose another status: ^C ended it. */
-    if (interrupts > 0 && kind != ESPIX_PROC_APP) {
-        return 128 + SIGINT;
     }
     return exit_code;
 }

@@ -26,9 +26,13 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <termios.h>
 #include <time.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -1587,6 +1591,39 @@ static int cmd_fdprobe(const char *path, const char *hold_s)
  * or above its argument. Finally everything is closed and the same number is
  * reopened, which fails if a descriptor leaked out of the fixed pool.
  */
+/*
+ * stdin as a terminal: isatty, its termios and size, and a poll that waits for
+ * a key rather than reporting one that is not there. Raw mode is set and put
+ * back, and what tcgetattr reads after says whether the set reached the tty.
+ */
+static int cmd_tty(void)
+{
+    struct termios t, raw, seen;
+    const int got = tcgetattr(0, &t);
+    struct winsize ws = { 0 };
+    const int sz = ioctl(0, TIOCGWINSZ, &ws);
+    printf("tty: isatty %d %d, termios %s, canon %d echo %d, size %s %ux%u\n", isatty(0), isatty(1),
+           got == 0 ? "ok" : "none", got == 0 && (t.c_lflag & ICANON) != 0, got == 0 && (t.c_lflag & ECHO) != 0,
+           sz == 0 ? "ok" : "none", ws.ws_col, ws.ws_row);
+    if (got == 0) {
+        raw = t;
+        cfmakeraw(&raw);
+        tcsetattr(0, TCSANOW, &raw);
+        tcgetattr(0, &seen);
+        tcsetattr(0, TCSANOW, &t);
+        printf("tty: raw reached it %d\n", (seen.c_lflag & (ICANON | ECHO)) == 0);
+    }
+    fflush(stdout);
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+    struct pollfd p = { .fd = 0, .events = POLLIN };
+    const int r = poll(&p, 1, 300);
+    gettimeofday(&t1, NULL);
+    const long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000;
+    printf("tty: poll %d after %s\n", r, ms >= 250 ? "the timeout" : "less");
+    return 0;
+}
+
 /* dup2 onto a number the app did not open: its own table's in U-mode, the system's (and refused) in M-mode. */
 static int cmd_dup_onto(const char *path, int target)
 {
@@ -1879,6 +1916,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "fdprobe") == 0 && argc > 3) {
         return cmd_fdprobe(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "tty") == 0) {
+        return cmd_tty();
     }
     if (strcmp(cmd, "dup") == 0 && argc > 4 && strcmp(argv[3], "onto") == 0) {
         return cmd_dup_onto(argv[2], atoi(argv[4]));

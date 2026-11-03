@@ -164,10 +164,9 @@ static esp_err_t shell_spawn(espix_session_t *s, espix_shell_spawn_t *sp,
     return err;
 }
 
-static int shell_wait(espix_session_t *s, espix_pid_t pid, bool tty)
+static int shell_wait(espix_session_t *s, espix_pid_t pid)
 {
-    espix_proc_fg_t fg = { .tty = tty };
-    return espix_proc_wait_fg(s, pid, &fg);
+    return espix_proc_wait_fg(s, pid, NULL);
 }
 
 static bool shell_alive(espix_pid_t pid)
@@ -524,12 +523,6 @@ static void parent_wake_locked(espix_proc_slot_t *slot)
             p->info.pid == slot->info.ppid) {
             p->sig_pending |= espix_sigbit(SIGCHLD);
             sig_wake_locked(p);
-            /* A shell waiting in select() hears it here instead. */
-            espix_session_t *const ps = p->info.session;
-            if (p->info.kind == ESPIX_PROC_SESSION && ps != NULL &&
-                ps->wake != NULL) {
-                ps->wake(ps);
-            }
             return;
         }
     }
@@ -1341,6 +1334,9 @@ static esp_err_t sig_kernel_locked(espix_proc_slot_t *slot, int sig)
     if (espix_sig_default_ignores(sig)) {
         return ESP_OK;
     }
+    if (slot->stop_sig == 0) {
+        slot->stop_sig = sig;
+    }
     slot->stop_requested = true;
     sig_wake_locked(slot);
     return ESP_OK;
@@ -2013,6 +2009,12 @@ const char *espix_proc_root(void)
 
     espix_proc_paths(NULL, &root);
     return root;
+}
+
+struct espix_tty *espix_proc_std_tty(void)
+{
+    const espix_proc_slot_t *slot = espix_proc_self();
+    return (slot != NULL) ? slot->std_tty : NULL;
 }
 
 bool espix_proc_loaded(void)

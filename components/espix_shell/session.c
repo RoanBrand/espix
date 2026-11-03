@@ -615,7 +615,7 @@ static int run_as_process(espix_session_t *s, const espix_cmd_t *cmd,
         return 1;
     }
     /* Returns only once the process has ended, so `c` outlives it. */
-    const int status = s_proc->wait(s, pid, cmd->tty);
+    const int status = s_proc->wait(s, pid);
     return (status < 0) ? 1 : status;
 }
 
@@ -724,14 +724,8 @@ int espix_shell_take_key(espix_session_t *s)
     if (s == NULL) {
         return 0;
     }
-    if (s->tty != NULL) {
-        uint8_t c;
-        return (!espix_tty_is_pipe(s->tty) && espix_tty_read(s->tty, &c, 1, true) == 1) ? c : 0;
-    }
-
-    const int key = s->last_key;
-    s->last_key = 0;
-    return key;
+    uint8_t c;
+    return (s->tty != NULL && !espix_tty_is_pipe(s->tty) && espix_tty_read(s->tty, &c, 1, true) == 1) ? c : 0;
 }
 
 bool espix_shell_keys_begin(espix_session_t *s, struct termios *saved)
@@ -1326,7 +1320,7 @@ static int run_pipeline(espix_session_t *s, char *line)
     int status = 2;
     for (int i = n - 1; i >= 0; i--) {
         if (pids[i] > 0) {
-            const int st_status = s_proc->wait(s, pids[i], false);
+            const int st_status = s_proc->wait(s, pids[i]);
             if (i == n - 1) {
                 status = (st_status < 0) ? 1 : st_status;
             }

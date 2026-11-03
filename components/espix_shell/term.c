@@ -79,7 +79,6 @@ struct espix_term {
     espix_tty_t      *tty;      /* the keys, and the line discipline between them and readers */
     SemaphoreHandle_t lock;     /* recursive: a write, which the viewer's echo can race */
     volatile bool quit;
-    volatile bool intr;         /* ^C while a job ran, for the foreground wait */
 
     /* Our answer to the editor's last query, read ahead of the keys typed before it; an app's goes into the tty. */
     bool    editor_out;
@@ -1143,59 +1142,11 @@ static int term_read_line(espix_session_t *s, const char *prompt,
     return (int)strlen(buf);
 }
 
-/* The foreground wait's sleep: a signal key, the viewer leaving, or a child's
- * exit all notify the shell's task. */
-static void term_wait_input(espix_session_t *s, uint32_t ms)
-{
-    (void)s;
-    (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE,
-                                  (ms == UINT32_MAX) ? portMAX_DELAY
-                                                     : pdMS_TO_TICKS(ms));
-}
-
-static bool term_poll_interrupt(espix_session_t *s)
-{
-    espix_term_t *t = term_of(s);
-
-    /*
-     * The viewer is gone. A running command never sees t->quit -- this callback
-     * is the only thing the shell consults while one runs -- so without this,
-     * `top` sat there for ever and the task could never be joined.
-     */
-    if (t->quit) {
-        return true;
-    }
-    /* ^C reached the tty while a job ran (term_tty_signal()). */
-    const bool interrupted = t->intr;
-    t->intr = false;
-    return interrupted;
-}
-
 /* The tty's output, and its echo from the viewer's task: both a write under the terminal's lock. */
 static ssize_t term_tty_out(void *ctx, const void *buf, size_t len)
 {
     espix_term_write((espix_term_t *)ctx, buf, len);
     return (ssize_t)len;
-}
-
-/* ^C and ^Z: the foreground wait says them and escalates (fg.c); any other signal key goes to the group. */
-static bool term_tty_signal(void *ctx, int sig)
-{
-    espix_term_t *t = ctx;
-    if (sig == SIGINT) {
-        t->intr = true;
-    } else if (sig == SIGTSTP) {
-        t->session.susp = true;
-    } else {
-        return false;
-    }
-    term_wake(t);
-    return true;
-}
-
-static void term_tty_key(void *ctx, int c)
-{
-    ((espix_term_t *)ctx)->session.last_key = c;
 }
 
 espix_session_t *espix_term_session(espix_term_t *t)
@@ -1206,8 +1157,6 @@ espix_session_t *espix_term_session(espix_term_t *t)
         .cwd            = "/",
         .read_line      = term_read_line,
         .write          = term_write,
-        .poll_interrupt = term_poll_interrupt,
-        .wait_input     = term_wait_input,
         .open_stream    = term_open_stream,
         .tty            = t->tty,
         .transport      = t,
@@ -1271,7 +1220,7 @@ void espix_term_stop(espix_term_t *t)
 {
     if (t != NULL) {
         t->quit = true;
-        espix_tty_input_eof(t->tty);    /* readers see the end */
+        espix_tty_carrier_lost(t->tty);  /* readers see the end, a job hears SIGHUP */
         term_wake(t);
     }
 }
@@ -1329,8 +1278,6 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
     /* Before the editor, not after it: its probe writes through the lock and reads through the tty. */
     const espix_tty_ops_t tty_ops = {
         .write  = term_tty_out,
-        .signal = term_tty_signal,
-        .key    = term_tty_key,
         .ctx    = t,
     };
     t->lock = xSemaphoreCreateRecursiveMutex();

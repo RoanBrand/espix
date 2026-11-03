@@ -15,3 +15,20 @@ const char *gai_strerror(int err);
 #define EAI_OVERFLOW 208
 #define EAI_SYSTEM   209
 #endif
+
+/* A terminal's requests on fds 0-2, Linux's numbers, which espix's tty answers; IDF's sys/ioctl.h has none. */
+#ifndef TIOCGWINSZ
+#define TIOCGPGRP  0x540F
+#define TIOCSPGRP  0x5410
+#define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+#endif
+#ifndef _ESPIX_WINSIZE_DEFINED
+#define _ESPIX_WINSIZE_DEFINED
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+#endif

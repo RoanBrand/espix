@@ -181,27 +181,33 @@ esp_err_t espix_tty_init(void)
     return err;
 }
 
+void espix_tty_sane(struct termios *tio)
+{
+    memset(tio, 0, sizeof(*tio));
+    tio->c_iflag = ICRNL;
+    tio->c_oflag = OPOST | ONLCR;
+    tio->c_cflag = CREAD | CLOCAL;
+    tio->c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
+    tio->c_cc[VINTR]  = 0x03;
+    tio->c_cc[VQUIT]  = 0x1c;
+    tio->c_cc[VERASE] = 0x7f;
+    tio->c_cc[VKILL]  = 0x15;
+    tio->c_cc[VEOF]   = 0x04;
+    tio->c_cc[VSTART] = 0x11;
+    tio->c_cc[VSTOP]  = 0x13;
+    tio->c_cc[VSUSP]  = 0x1a;
+    tio->c_cc[VMIN]   = 1;
+    tio->c_cc[VTIME]  = 0;
+}
+
 static void defaults(espix_tty_t *t)
 {
-    memset(&t->tio, 0, sizeof(t->tio));
-    t->tio.c_cc[VMIN] = 1;      /* a read waits for a byte, a pipe's included */
     if (t->pipe) {
+        memset(&t->tio, 0, sizeof(t->tio));
+        t->tio.c_cc[VMIN] = 1;      /* a read waits for a byte */
         return;
     }
-    t->tio.c_iflag = ICRNL;
-    t->tio.c_oflag = OPOST | ONLCR;
-    t->tio.c_cflag = CREAD | CLOCAL;
-    t->tio.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
-    t->tio.c_cc[VINTR]  = 0x03;
-    t->tio.c_cc[VQUIT]  = 0x1c;
-    t->tio.c_cc[VERASE] = 0x7f;
-    t->tio.c_cc[VKILL]  = 0x15;
-    t->tio.c_cc[VEOF]   = 0x04;
-    t->tio.c_cc[VSTART] = 0x11;
-    t->tio.c_cc[VSTOP]  = 0x13;
-    t->tio.c_cc[VSUSP]  = 0x1a;
-    t->tio.c_cc[VMIN]   = 1;
-    t->tio.c_cc[VTIME]  = 0;
+    espix_tty_sane(&t->tio);
 }
 
 espix_tty_t *espix_tty_create(const espix_tty_ops_t *ops, size_t inbuf, bool pipe)
@@ -365,9 +371,6 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
     if (t->pipe) {
         return ring_put_locked(t, &c, 1);
     }
-    if (t->ops.key != NULL) {
-        t->ops.key(t->ops.ctx, c);
-    }
     if (inf & ISTRIP) {
         c &= 0x7f;
     }
@@ -512,6 +515,15 @@ void espix_tty_input_eof(espix_tty_t *t)
     t->eof_in = true;
     wake_locked(t);
     xSemaphoreGive(t->lock);
+}
+
+void espix_tty_carrier_lost(espix_tty_t *t)
+{
+    espix_tty_input_eof(t);
+    const pid_t fg = t->fg;
+    if (fg > 0 && s_hooks.signal_group != NULL) {
+        s_hooks.signal_group(fg, SIGHUP);
+    }
 }
 
 /* ------------------------------------------------------------------ */

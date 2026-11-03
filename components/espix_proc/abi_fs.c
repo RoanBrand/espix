@@ -227,6 +227,25 @@ static int espix_abi_fcntl(int fd, int cmd, ...)
     return fcntl(fd, cmd, arg);
 }
 
+/* stdin is the app's terminal; stdout and stderr its own streams, which honour a redirect and keep stderr apart. */
+static ssize_t abi_app_read(int fd, void *buf, size_t n)
+{
+    return read((fd == 0) ? espix_abi_tty_fd(0) : fd, buf, n);
+}
+
+static ssize_t abi_app_write(int fd, const void *buf, size_t n)
+{
+    if ((fd == 1 || fd == 2) && espix_proc_self() != NULL) {
+        FILE *const f = espix_proc_stdio(fd);
+        if (f != ((fd == 1) ? stdout : stderr)) {
+            const size_t put = fwrite(buf, 1, n, f);
+            fflush(f);
+            return (put == 0 && n > 0) ? -1 : (ssize_t)put;
+        }
+    }
+    return write(fd, buf, n);
+}
+
 static const abi_sym_t s_fs_resolver_syms[] = {
     ABI_SYM("dup",   espix_abi_dup),
     ABI_SYM("dup2",  espix_abi_dup2),
@@ -275,8 +294,9 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
     /* close() came from elf_loader's table until R-P3.1; it is libc's, and it
      * enters the same VFS the calls below do. */
     ESP_ELFSYM_EXPORT(close),
-    ESP_ELFSYM_EXPORT(read),
-    ESP_ELFSYM_EXPORT(write),
+    /* fds 0-2 as the app's own rather than the system's (the console's). */
+    { "read",  (void *)abi_app_read },
+    { "write", (void *)abi_app_write },
     /* Under the name an app built with cmake/offt64.h asks for: its lseek is
      * redirected to the 64-bit one, as glibc's is with _FILE_OFFSET_BITS=64. */
     { "lseek64", (void *)&lseek },

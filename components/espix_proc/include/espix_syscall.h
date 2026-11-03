@@ -94,6 +94,15 @@ enum {
 /* A process's descriptors: sysconf(_SC_OPEN_MAX). */
 #define ESPIX_OPEN_MAX 32
 
+/* A terminal's ioctls on fds 0-2, Linux's numbers; the termios they carry is IDF's layout (user/include/sys/termios.h). */
+#define ESPIX_TCGETS     0x5401
+#define ESPIX_TCSETS     0x5402      /* +1 TCSADRAIN, +2 TCSAFLUSH */
+#define ESPIX_TCFLSH     0x540B
+#define ESPIX_TIOCGPGRP  0x540F
+#define ESPIX_TIOCSPGRP  0x5410
+#define ESPIX_TIOCGWINSZ 0x5413
+#define ESPIX_TIOCSWINSZ 0x5414
+
 /* FUTEX ops: wait while *uaddr == val (a relative timeout, or none), or wake up to val waiters. */
 #define ESPIX_FUTEX_WAIT 0
 #define ESPIX_FUTEX_WAKE 1

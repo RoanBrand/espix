@@ -175,8 +175,9 @@ if [ -n "$pause" ] && [ "$pause" -ge 1500 ]; then
 else
     espix_fail "and it does not run until SIGCONT" "pause: '$pause'"
 fi
-# Ctrl-Z stops it the same way, as a job; fg runs it to its end.
-z_out=$(dev_run "<<<SUSP 1>>> $UAPP pauses 4 $PZ; echo st=\$?")
+# Ctrl-Z stops it the same way, as a job; fg runs it to its end. The key goes to whoever is in front when it
+# is typed, as on Linux -- the shell, if the app has not started yet -- so it comes well after the start.
+z_out=$(dev_run "<<<SUSP 2>>> $UAPP pauses 6 $PZ; echo st=\$?")
 assert_contains "Ctrl-Z stops a computing app, as a job" "st=146" "$z_out"
 sleep 2
 dev_run "fg" >/dev/null

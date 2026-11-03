@@ -27,6 +27,7 @@
 
 #include "espix_kernel.h"
 #include "espix_syscall.h"
+#include "espix_tty.h"
 #include "espix_umode.h"
 #include "umode_sys.h"
 
@@ -562,7 +563,12 @@ static int32_t um_sys_isatty(um_call_t *c)
     if (e == NULL) {
         return -EBADF;
     }
-    return (e->kind == ESPIX_UM_FD_STD) || (e->kind == ESPIX_UM_FD_FILE && isatty(e->kfd));
+    /* fds 0-2 are a terminal when the session's tty is one; an exec's pipe is not. */
+    if (e->kind == ESPIX_UM_FD_STD) {
+        const espix_tty_t *const t = c->t->slot->std_tty;
+        return t != NULL && !espix_tty_is_pipe(t);
+    }
+    return e->kind == ESPIX_UM_FD_FILE && isatty(e->kfd);
 }
 
 /* ------------------------------------------------------------------ */

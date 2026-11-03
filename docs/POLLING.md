@@ -75,11 +75,11 @@ reclaimer), rather than to move these.
 **Converted:** item 1 (task-exit notification, three modules), item 3 (boot
 barrier and log flusher), item 4 (job-stop), and the read half of item 5 --
 the per-connection reader task, which is also the SSH task split the roadmap
-entry asked for. Item 2 (R-P8.7): the foreground wait blocks in the transport's
-wait_input() on the second notification the deferral asked for -- index 1, which
-a child's exit already sends its shell and the socket reader and the terminal's
-keys now send too; the console waits on its eventfd. Pipe ends and console
-stdin block the same way, and top's frame slice is espix_proc_sleep().
+entry asked for. Item 2 (R-P8.7): the foreground wait blocks on the second notification the
+deferral asked for -- index 1, which a child's exit or stop sends its shell; ^C
+and ^Z are the session's tty's, which signals the job itself. Stdin is that tty
+on every transport, so a read and a select on it block, and top's frame slice
+is espix_proc_sleep().
 
 **Deferred, with the reason:**
 

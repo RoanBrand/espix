@@ -187,43 +187,8 @@ struct espix_session {
      */
     int (*write_err)(espix_session_t *s, const char *data, size_t len);
 
-    /*
-     * Non-blocking: has the user pressed Ctrl-C? Polled while a foreground
-     * process runs, which is the one time nothing else is reading input.
-     *
-     * The transport consumes whatever is waiting either way. Anything typed at
-     * a program that is not reading has nowhere to go, and leaving it queued
-     * means it lands on the shell's next prompt instead — which is exactly what
-     * used to happen: a handful of unanswered Ctrl-Cs arriving as blank lines
-     * the moment the app exited.
-     *
-     * NULL for a transport that cannot poll; the foreground wait then simply
-     * cannot be interrupted.
-     */
-    bool (*poll_interrupt)(espix_session_t *s);
 
-    /*
-     * The foreground wait's sleep: block until input may be waiting, a child of
-     * the shell has finished, or `ms` pass (UINT32_MAX: no limit), so ^C is
-     * seen the moment it is typed. NULL: the wait polls every 50 ms instead.
-     */
-    void (*wait_input)(espix_session_t *s, uint32_t ms);
-
-    /*
-     * End a wait_input(): a child of the shell has finished, or an app reading
-     * stdin saw ^C. Called under the process table's lock, so it must not
-     * block. NULL where the notification a child's exit sends the shell's task
-     * already does it.
-     */
-    void (*wake)(espix_session_t *s);
-
-    /* ^C typed while a job ran: the foreground wait signals the job (fg.c). */
-    volatile bool intr;
-
-    /* ^Z typed while a job ran, on any transport: the foreground wait stops the job. */
-    volatile bool susp;
-
-    /* The session's terminal (components/espix_tty), on a transport that has moved onto one; else NULL. */
+    /* The session's terminal (components/espix_tty): its line discipline signals the foreground job. */
     struct espix_tty *tty;
 
     /*
@@ -272,17 +237,6 @@ struct espix_session {
     /* Background jobs, in the order `&` started them. See
      * espix_shell_job_add(). */
     espix_job_t jobs[ESPIX_SESSION_JOBS];
-
-    /*
-     * The last key a transport saw while polling, or 0.
-     *
-     * poll_interrupt() answers only *whether* something arrived, and the
-     * transport drains what it read looking for Ctrl-C -- so a q typed at top
-     * was seen and thrown away. A transport sets this for a key it is not
-     * turning into a signal, and espix_shell_take_key() reads and clears it
-     * (R-P7.7).
-     */
-    volatile int last_key;
 
     int         last_status;               /* $? */
     bool        want_exit;
@@ -392,12 +346,6 @@ typedef struct espix_cmd {
      * small to be worth a process (echo, true). Must fit the session's stack.
      */
     bool             shell;
-
-    /*
-     * Reads the terminal itself -- a y/N prompt. The shell leaves the terminal
-     * to it while it runs, so ^C is not seen until it finishes.
-     */
-    bool             tty;
 
     struct espix_cmd *next;                /* registry-owned; do not set */
 } espix_cmd_t;
@@ -580,8 +528,7 @@ void espix_shell_job_clear(espix_session_t *s, int slot);
 bool espix_shell_stopping(const espix_session_t *s);
 
 /* A key typed at the command, or 0: read from the session's terminal, which
- * espix_shell_keys_begin() puts in its keys mode; the last one a transport
- * reported where there is no tty. A pipe gives none. */
+ * espix_shell_keys_begin() puts in its keys mode. A pipe gives none. */
 int espix_shell_take_key(espix_session_t *s);
 
 /* The terminal in keys mode for a command that reads single keys (top, dmesg -w): no echo or line buffering, ^C
@@ -696,7 +643,7 @@ typedef struct {
                        espix_pid_t *pid);
     /* Wait for a foreground job and reap it, ^C included; its status, or -1.
      * tty: the job reads the terminal, so the wait does not. */
-    int    (*wait)(espix_session_t *s, espix_pid_t pid, bool tty);
+    int    (*wait)(espix_session_t *s, espix_pid_t pid);
     /* The process has not been reaped. */
     bool   (*alive)(espix_pid_t pid);
 } espix_shell_proc_ops_t;

@@ -19,6 +19,7 @@ merely missing.
 | Error redirection `2>` `2>>` `2>&1` | **yes** | attached or separated (`2>file`); diagnostics are their own stream, and over SSH they arrive as `CHANNEL_EXTENDED_DATA`, so the client's `2>` separates them too |
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
+| A session's terminal, termios, `stty` | **yes** | every login has a tty (SSH, the serial console, a VNC terminal): echo, line editing and the signal keys are its line discipline's. An app's fds 0-2 are it in both builds -- `isatty`, `tcgetattr`/`tcsetattr`, `cfmakeraw`, `TIOCGWINSZ`, and `poll`/`select` that wait for a key; an exec without a pty gives a pipe. `stty` shows and sets it |
 | Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`, Ctrl-Z stops the foreground app into a job; a job that reads the terminal stops on SIGTTIN (EIO if it ignores or blocks it), over SSH, on the serial console and in a VNC terminal; a job still dies at logout by design |
 | Pipes <code>&#124;</code> | **yes** | builtins only; one StreamBuffer per pipe, and a writer fails once its reader is done (`cat f \| head -1`) |
 | Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |

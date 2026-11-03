@@ -209,6 +209,7 @@ typedef struct {
      * false.
      */
     volatile bool stop_requested;
+    int           stop_sig;     /* the signal that asked a kernel process to stop; its status is 128 + it */
 
     /*
      * How exit() gets home.
@@ -314,6 +315,10 @@ typedef struct {
      */
     FILE             *std[3];
 
+    /* The tty behind std[0] when stdin is its session's (a terminal, or an exec's pipe): fds 0-2's
+     * termios, window size and readiness. NULL otherwise. */
+    struct espix_tty *std_tty;
+
     /*
      * The app's arena; see espix_app_region_t above. Empty until the app
      * allocates, and emptied again by espix_proc_regions_release() -- which is
@@ -389,6 +394,12 @@ bool espix_sig_default_stops(int sig);
  * hangup came during the load: the process ends instead of running.
  */
 bool espix_proc_loaded(void);
+
+/* The calling process's std_tty, or NULL. */
+struct espix_tty *espix_proc_std_tty(void);
+
+/* An M-mode app's fd 0-2 as its terminal's descriptor, when it has one; any other fd as it is. */
+int espix_abi_tty_fd(int fd);
 
 /* Spawn, under the table lock: a foreground job of the session's shell takes the terminal before its first
  * instruction, as the tcsetpgrp() a shell's child makes before exec, so a read it starts at once is not a

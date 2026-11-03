@@ -42,7 +42,7 @@ mq_check() {
         kill "$bg" 2>/dev/null
     fi
     wait "$bg"
-    st=$(sed -n 's/^rc=//p' "$MQ_DIR/run")
+    st=$(sed -n 's/^rc=//p' "$MQ_DIR/run" | tr -d '\r')
     assert_eq "$2: SIGTERM ends it in its poll, cleanly" "0" "$st"
     dev_run "rm $bin" >/dev/null 2>&1
 }

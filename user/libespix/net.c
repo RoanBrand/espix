@@ -102,15 +102,6 @@ int ioctl(int fd, unsigned long req, ...)
     va_start(ap, req);
     void *arg = va_arg(ap, void *);
     va_end(ap);
-    if (req == TIOCGWINSZ) {
-        int cols, rows;
-        if (!isatty(fd) || espix_sys2(ESPIX_SYS_TERM_SIZE, &cols, &rows) != 0) {
-            errno = ENOTTY;
-            return -1;
-        }
-        *(struct winsize *)arg = (struct winsize){ .ws_row = (unsigned short)rows, .ws_col = (unsigned short)cols };
-        return 0;
-    }
     return (int)espix_ret(espix_sys3(ESPIX_SYS_IOCTL, fd, req, arg));
 }
 

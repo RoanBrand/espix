@@ -37,7 +37,9 @@ static void fn_task(void *arg)
     void *const           fn_arg = slot->fn_arg;
     xSemaphoreGive(g_espix_proc_lock);
 
-    espix_proc_reap_self(slot, ESPIX_PROC_EXITED, fn(fn_arg));
+    const int status = fn(fn_arg);
+    /* Ended by a signal it was asked to stop by, as a process a signal ends reports it. */
+    espix_proc_reap_self(slot, ESPIX_PROC_EXITED, (slot->stop_sig != 0) ? 128 + slot->stop_sig : status);
 }
 
 esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pid)

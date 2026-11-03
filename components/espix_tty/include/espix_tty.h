@@ -52,10 +52,9 @@ typedef struct {
     ssize_t (*write_err)(void *ctx, const void *buf, size_t len);
     /* What the line discipline echoes, from inside espix_tty_input(): must not block on the reader. NULL: write. */
     void    (*echo)(void *ctx, const void *buf, size_t len);
-    /* A signal key, for a session that acts on some itself: true when it took it; else the foreground group is signalled. */
+    /* A signal key, for a session that acts on some itself: true when it took it; NULL or false, the
+     * foreground group is signalled, and a third ^C at a group still there is SIGKILL. */
     bool    (*signal)(void *ctx, int sig);
-    /* Each input byte as it arrives, before the line discipline. May be NULL. */
-    void    (*key)(void *ctx, int c);
     /* Room in the input again after it filled: a transport that held input back resumes. May be NULL. */
     void    (*room)(void *ctx);
     void     *ctx;
@@ -90,6 +89,9 @@ void         espix_tty_put(espix_tty_t *t);
 size_t espix_tty_input(espix_tty_t *t, const void *buf, size_t len);
 /* The end of input (an exec channel's EOF): readers see it once what is buffered is read. */
 void   espix_tty_input_eof(espix_tty_t *t);
+/* The far end has gone (a closed channel, a viewer that left): the end of input, and SIGHUP to the foreground
+ * group, as a hung-up line gives it. */
+void   espix_tty_carrier_lost(espix_tty_t *t);
 
 /* The consumers. A blocking read ends with -EINTR when a handler is due; 0 is the end of input. */
 ssize_t espix_tty_read(espix_tty_t *t, void *buf, size_t len, bool nonblock);
@@ -104,6 +106,8 @@ bool espix_tty_is_pipe(const espix_tty_t *t);
 
 void  espix_tty_getattr(espix_tty_t *t, struct termios *tio);
 void  espix_tty_setattr(espix_tty_t *t, int when, const struct termios *tio);
+/* A terminal's settings as it starts: canonical lines, echo, the signal keys, CR read as NL and NL out as CR LF. */
+void  espix_tty_sane(struct termios *tio);
 /* A terminal for a program that does its own editing: no echo, no canonical lines, no signal keys. */
 void  espix_tty_makeraw(struct termios *tio);
 /* A line editor's mode: keys one at a time, no echo and no signal keys, but CR still reads as NL and output keeps CR LF. */

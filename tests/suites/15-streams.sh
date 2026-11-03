@@ -253,8 +253,23 @@ if dev_testapp_present; then
     else
         espix_pass "the device did not reboot during the kill tests"
     fi
+
+    # An app's fds 0-2 are its session's terminal -- isatty, termios, the size, and a poll that waits for a
+    # key -- in either build; over an exec without a pty, stdin is a pipe and not a terminal.
+    out=$(dev_run "$APP tty")
+    assert_contains "an app's stdin is a terminal, with termios and a size" \
+        "isatty 1 1, termios ok, canon 1 echo 1, size ok" "$out"
+    assert_contains "and the termios it sets reaches the terminal" "raw reached it 1" "$out"
+    assert_contains "and poll on stdin waits for a key" "poll 0 after the timeout" "$out"
+    assert_contains "over an exec without a pty, stdin is not a terminal" "isatty 0 0, termios none" \
+        "$(dev_once "$APP tty")"
 else
     espix_skip "test app not built -- run 'make test-app'"
 fi
+
+# stty changes the session's terminal, and needs one.
+assert_contains "stty shows a flag it changed" "-echo" "$(dev_run 'stty -echo; stty; stty sane')"
+assert_not_contains "and stty sane puts it back" "-echo" "$(dev_run 'stty')"
+assert_contains "stty without a terminal says so" "not a terminal" "$(dev_once 'stty')"
 
 dev_run "rm -r $T" >/dev/null 2>&1

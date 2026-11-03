@@ -200,7 +200,6 @@ espix_pid_t espix_proc_sid_of(espix_pid_t pid);
 typedef struct {
     const char *who;            /* names the messages; "espix" when NULL */
     int64_t     limit_us;       /* SIGTERM at this, SIGKILL a grace later; 0: none */
-    bool        tty;            /* the job reads the terminal: leave it alone */
     bool        timed_out;      /* out: the limit was reached */
     bool        stopped;        /* out: the job stopped and is in the session's jobs */
 } espix_proc_fg_t;

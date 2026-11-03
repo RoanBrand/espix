@@ -26,8 +26,14 @@
 #include "riscv/encoding.h"
 
 #include "espix_kernel.h"
+#include "espix_syscall.h"
+#include "espix_tty.h"
 #include "espix_umode.h"
 #include "umode_sys.h"
+
+/* An app's struct termios is IDF's, as user/include/sys/termios.h declares it. */
+_Static_assert(sizeof(struct termios) == 28 && offsetof(struct termios, c_cc) == 8 && NCCS == 11 &&
+               offsetof(struct termios, c_ispeed) == 20, "user/include/sys/termios.h mirrors IDF's layout");
 
 #define PG 4096u
 
@@ -612,10 +618,74 @@ static int32_t sock_name(um_call_t *c, int (*fn)(int, struct sockaddr *, socklen
 int32_t um_sys_getsockname(um_call_t *c) { return sock_name(c, lwip_getsockname); }
 int32_t um_sys_getpeername(um_call_t *c) { return sock_name(c, lwip_getpeername); }
 
+/* A terminal's requests on fds 0-2, answered by the session's tty; a pipe (an exec's stdin) is not a terminal. */
+static int32_t tty_ioctl(um_call_t *c, espix_tty_t *t, uint32_t req, uint32_t arg)
+{
+    espix_um_as_t *const as = c->p->as;
+    if (req == (uint32_t)FIONREAD) {
+        const int n = (int)espix_tty_readable(t);
+        return espix_um_copyout(as, arg, &n, sizeof(n));
+    }
+    if (espix_tty_is_pipe(t)) {
+        return -ENOTTY;
+    }
+    struct termios tio;
+    struct winsize ws;
+    int32_t r;
+    switch (req) {
+    case ESPIX_TCGETS:
+        espix_tty_getattr(t, &tio);
+        return espix_um_copyout(as, arg, &tio, sizeof(tio));
+    case ESPIX_TCSETS:
+    case ESPIX_TCSETS + 1:
+    case ESPIX_TCSETS + 2:
+        r = espix_um_copyin(as, &tio, arg, sizeof(tio));
+        if (r == 0) {
+            espix_tty_setattr(t, (int)(req - ESPIX_TCSETS), &tio);
+        }
+        return r;
+    case ESPIX_TCFLSH:
+        espix_tty_getattr(t, &tio);
+        espix_tty_setattr(t, TCSAFLUSH, &tio);
+        return 0;
+    case ESPIX_TIOCGWINSZ: {
+        int cols, rows;
+        espix_tty_get_winsize(t, &cols, &rows);
+        ws = (struct winsize){ .ws_row = (unsigned short)rows, .ws_col = (unsigned short)cols };
+        return espix_um_copyout(as, arg, &ws, sizeof(ws));
+    }
+    case ESPIX_TIOCSWINSZ:
+        r = espix_um_copyin(as, &ws, arg, sizeof(ws));
+        if (r == 0) {
+            espix_tty_set_winsize(t, ws.ws_col, ws.ws_row);
+        }
+        return r;
+    case ESPIX_TIOCGPGRP: {
+        const int pg = (int)espix_tty_get_fg(t);
+        return espix_um_copyout(as, arg, &pg, sizeof(pg));
+    }
+    case ESPIX_TIOCSPGRP: {
+        int pg;
+        r = espix_um_copyin(as, &pg, arg, sizeof(pg));
+        if (r == 0) {
+            espix_tty_set_fg(t, (pid_t)pg);
+        }
+        return r;
+    }
+    default:
+        return -ENOTTY;
+    }
+}
+
 int32_t um_sys_ioctl(um_call_t *c)
 {
     const uint32_t req = c->a[1];
     int32_t r;
+    const espix_um_fd_t *std = um_fd_get(c->p, c->a[0]);
+    if (std != NULL && std->kind == ESPIX_UM_FD_STD) {
+        espix_tty_t *const t = c->t->slot->std_tty;
+        return (t != NULL) ? tty_ioctl(c, t, req, c->a[2]) : -ENOTTY;
+    }
     espix_um_sock_t *s = sock_get(c, c->a[0], &r);
     if (s == NULL) {
         return (r == -ENOTSOCK) ? -ENOTTY : r;
@@ -645,9 +715,8 @@ int32_t um_sys_ioctl(um_call_t *c)
 #define POLL_ANY (POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM)
 
 /*
- * Sockets and devices wait in espix_abi_poll(); a regular file or directory is always ready, as
- * POSIX has it, and so is stdout. stdin is reported readable: the transports have no wake a
- * select can wait on yet (docs/KNOWN-ISSUES.md).
+ * Sockets, devices and stdin's tty wait in espix_abi_poll(); a regular file or directory is always
+ * ready, as POSIX has it, and so is stdout. stdin with no tty behind it (a redirect) is ready too.
  */
 int32_t um_sys_poll(um_call_t *c)
 {
@@ -683,6 +752,9 @@ int32_t um_sys_poll(um_call_t *c)
             files[i] = e->kfd;
         } else if (e->kind == ESPIX_UM_FD_STD && e->std != 0) {
             u[i].revents = u[i].events & (POLLOUT | POLLWRNORM);
+        } else if (e->kind == ESPIX_UM_FD_STD && c->t->slot->std_tty != NULL &&
+                   espix_tty_fileno(c->t->slot->std_tty) >= 0) {
+            k[i].fd = espix_tty_fileno(c->t->slot->std_tty);
         } else {
             u[i].revents = u[i].events & POLL_ANY;
         }

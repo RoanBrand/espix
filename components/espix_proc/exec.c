@@ -515,7 +515,8 @@ static void proc_task(void *arg)
 
         FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
         if (in != NULL) {
-            slot->std[0] = own_in = in;
+            slot->std[0]   = own_in = in;
+            slot->std_tty  = session->tty;
         }
     }
 
@@ -743,9 +744,10 @@ done:
          * closed. Each stream we made is closed exactly once, and closing the
          * out/err wrappers flushes them through espix_session_write() while
          * the redirect FILE is still the shell's to close. */
-        slot->std[0] = stdin;
-        slot->std[1] = stdout;
-        slot->std[2] = stderr;
+        slot->std[0]  = stdin;
+        slot->std[1]  = stdout;
+        slot->std[2]  = stderr;
+        slot->std_tty = NULL;
 
         if (own_out != NULL) {
             fclose(own_out);
