@@ -32,7 +32,8 @@ espix_cmds       the actual commands
 ```
 
 `espix_net` sits outside this chain, as do the components that grew on top of
-it since — SSH, USB, display, services. The arrows above are the core whose
+it since — SSH, USB, display, services — and `espix_tty`, a leaf the shell, the
+process layer and SSH all build on. The arrows above are the core whose
 order must stay acyclic, not the whole tree.
 
 ## How espix differs from Unix
@@ -153,8 +154,13 @@ boundary only where an MMU exists.
 
 ### A session is a transport; the shell is one dispatch
 
-The serial console and an SSH session are the same shell: one command registry
-and dispatch, with a session supplying `{read_line, write, cwd}`. Redirection is
+The serial console, an SSH session and a VNC terminal are the same shell: one
+command registry and dispatch, with a session supplying `{read_line, write, cwd}`.
+Between each transport and whatever reads it is the session's tty
+(`components/espix_tty`), as on Linux: its line discipline does echo, line
+editing and the signal keys, which go to the foreground group; a background
+group's read stops on SIGTTIN; and an app's fds 0-2 are it, termios and window
+size included. An exec without a pty gets a pipe instead. Redirection is
 handled once in dispatch rather than per command, and a pipe is a
 StreamBuffer whose writer fails once its reader's command has returned. ESP-IDF's `esp_console_run()` is not used because it copies every
 line through one shared static buffer and is not reentrant — invisible with one
