@@ -15,6 +15,7 @@ idf_component_register(
         espressif__esp_linenoise
     PRIV_REQUIRES
         console
+        esp_pm
         esp_timer
         espix_fs
         espix_display

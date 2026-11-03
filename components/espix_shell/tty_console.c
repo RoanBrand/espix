@@ -36,6 +36,9 @@
 #include "esp_timer.h"
 #include "esp_vfs_eventfd.h"
 #include "sdkconfig.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
 #if CONFIG_ESP_CONSOLE_UART
 #include "driver/uart.h"
@@ -900,9 +903,45 @@ static void wait_for_boot_settled(void)
     vTaskDelay(pdMS_TO_TICKS(SETTLE_TAIL_MS));
 }
 
+#if CONFIG_PM_ENABLE
+/*
+ * DFS is started here, after the console's UART driver exists, rather than by
+ * PM_DFS_INIT_AUTO: the automatic path runs before the driver and leaves the
+ * console silent.  The APB lock keeps the UART divisor valid while the CPU
+ * frequency moves; the CPU itself is free to scale between 80 and 320 MHz.
+ */
+static void console_pm_start(void)
+{
+    static esp_pm_lock_handle_t apb_lock;
+    if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "console_uart",
+                           &apb_lock) == ESP_OK) {
+        (void)esp_pm_lock_acquire(apb_lock);
+    }
+
+    esp_pm_config_t cfg = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    const esp_err_t err = esp_pm_configure(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DFS unavailable: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "DFS %d..%d MHz", cfg.min_freq_mhz, cfg.max_freq_mhz);
+#ifdef CONFIG_PM_PROFILING
+        esp_pm_dump_locks(stdout);
+#endif
+    }
+}
+#endif
+
 esp_err_t espix_console_session_start(void)
 {
     ESP_RETURN_ON_ERROR(console_hw_init(), TAG, "console hw init failed");
+
+#if CONFIG_PM_ENABLE
+    console_pm_start();
+#endif
 
     /* The terminal, and the task that is the wire's only reader, before the editor's probe reads its answer. */
     static const espix_tty_ops_t tty_ops = {

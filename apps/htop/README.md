@@ -38,12 +38,12 @@ htop itself is unmodified. ncurses is unmodified.
 | htop | 3.5.3 |
 | ncurses | 6.4, narrow (--disable-widec), static |
 | text | 201 KB |
-| data | 95 KB |
+| data | 99 KB |
 | bss | 4 KB |
-| stripped ELF | 382 KB |
+| stripped ELF | 384 KB |
 | of which terminfo | ~9 KB, xterm entry compiled in by --with-fallbacks=xterm |
 
-A 382 KB file in /bin is unremarkable on the 3.2 MB rootfs an 8 MB S31 has, and
+A 384 KB file in /bin is unremarkable on the 3.2 MB rootfs an 8 MB S31 has, and
 it is one file: there is no libncurses.so or terminfo tree to install beside
 it.
 
@@ -104,21 +104,45 @@ keep the ELF smaller.
 The host needs a tic able to parse ncurses 6.4's terminfo.src. macOS's
 /usr/bin/tic (6.0) cannot; Homebrew's can, and build.sh prefers it.
 
-## Colors on the espix terminal
+## Colors: 256, not 8
 
-htop's default scheme draws the right-hand meter values (the CPU frequency and
-temperature) with `A_BOLD | cyan`. The espix terminal renders that combination
-as black on its black background, so the text disappears. Black night
-(`color_scheme=5`) uses plain green for the same values and is readable. Set it
-once in `~/.config/htop/htoprc`:
+htop's default theme is a 256-colour theme. On an 8-colour `xterm`, the
+unfilled part of a meter uses colour 8 for its shadow; with only eight colours
+that index falls back to black, and the frequency/temperature text drawn over it
+disappears. That is also why the bars looked different from the Mac: the Mac
+has 256 colours and a grey shadow, the 8-colour board has a black one.
 
-    show_cpu_frequency=1
-    show_cpu_temperature=1
-    color_scheme=5
+The app therefore carries an `xterm-256color` terminfo entry, built into
+ncurses by `--with-fallbacks=xterm,xterm-256color`, and the shell publishes
+`TERM=xterm-256color` for an ANSI session. The stock entry has `pairs#65536`,
+which is larger than ncurses' `short`; `build.sh` patches that one generated
+field to 256, otherwise `start_color()` reports zero colours. With that in
+place the default scheme is the Mac's default scheme, including the blue/cyan
+function bar and the grey bar shadow. No `color_scheme=` override is needed;
+if an old `htoprc` still says 5, remove it or set it to 0.
 
-or choose it interactively with F2 -> Colors -> Black night. The bars and the
-rest of the screen are unaffected; this is a colour-attribute difference, not
-a missing colour.
+## DFS: what it would take
+
+The experiment went as far as a working PM/DFS configuration, and then hit an
+observability problem, not a frequency-scaling one.
+
+- `CONFIG_PM_ENABLE=y` plus a late `esp_pm_configure(80, 320, no light sleep)`
+  works. The call lives in `components/espix_shell/tty_console.c`, after the
+  console's UART driver exists. `CONFIG_PM_DFS_INIT_AUTO=y` is the wrong place:
+  it runs before that driver and leaves the console silent on this board.
+- With PM profiling on, the mode statistics show the CPU really moving:
+  APB_MAX/80 MHz about 83% of the time, CPU_MAX/320 MHz about 12%, APB_MIN/80
+  about 3%. No crash, no coredump.
+- htop still reads 320 MHz. A read of `/sys/.../scaling_cur_freq` is itself an
+  interrupt and a task wake, and PM raises the CPU before the file is generated;
+  the read therefore samples the post-wake frequency. To show 80 in htop you
+  need a different observable -- a last-mode/low-water marker or Linux's
+  `stats/time_in_state` -- rather than a direct current-frequency read.
+
+The code is compiled only under `CONFIG_PM_ENABLE` and that option is off by
+default in `sdkconfig.defaults.esp32s31`, because it costs interrupt latency and
+changes the timing of every driver. Add it there to run the experiment; the
+`esp_pm_dump_locks` call is under `CONFIG_PM_PROFILING` and is diagnostic only.
 
 ## libsensors, and the temperature
 

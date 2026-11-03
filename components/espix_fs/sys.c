@@ -24,6 +24,9 @@
 #endif
 #include "esp_private/esp_clk.h"
 #include "esp_log.h"
+#if CONFIG_PM_ENABLE
+#include "soc/rtc.h"
+#endif
 
 #include "espix_fs_priv.h"
 
@@ -92,11 +95,20 @@ static size_t sys_temp(char *buf, size_t cap)
 
 static size_t sys_freq(char *buf, size_t cap)
 {
+#if CONFIG_PM_ENABLE
+    /* esp_clk_cpu_freq() is the ROM's cached ticks-per-us, which DFS does not
+     * necessarily refresh on this target.  The RTC clock configuration is the
+     * source of truth for what the CPU is running at now. */
+    rtc_cpu_freq_config_t cfg;
+    rtc_clk_cpu_freq_get_config(&cfg);
+    return (size_t)snprintf(buf, cap, "%u\n", (unsigned)(cfg.freq_mhz * 1000));
+#else
     int hz = esp_clk_cpu_freq();
     if (hz <= 0) {
         hz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000;
     }
     return (size_t)snprintf(buf, cap, "%d\n", hz / 1000);
+#endif
 }
 
 static size_t sys_freq_max(char *buf, size_t cap)

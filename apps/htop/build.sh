@@ -64,8 +64,30 @@ LIBS="$root/user/build/libespix.a" \
 "$here/third_party/ncurses/configure" \
     --host=riscv32-esp-elf --disable-widec --without-cxx --without-ada \
     --without-progs --without-tests --without-manpages --with-termlib \
-    --enable-termcap=no --with-fallbacks=xterm --disable-db-install \
+    --enable-termcap=no --enable-ext-colors \
+    --with-fallbacks=xterm,xterm-256color --disable-db-install \
     --without-debug --disable-stripping > "$build/ncurses.log" 2>&1
+
+make -j"$jobs" AR="$ar" RANLIB="$ranlib" >> "$build/ncurses.log" 2>&1
+
+# The stock xterm-256color entry has pairs#65536, which overflows ncurses'
+# short and makes start_color() report zero colours.  htop uses 64 pairs;
+# 256 is plenty for a terminal.  The fallback table is generated during the
+# first make, so patch it and rebuild that one object.
+python3 - "$build/ncurses/ncurses/fallback.c" <<'PY'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+old = "/*  14: pairs    */\t65536,"
+new = "/*  14: pairs    */\t256,"
+if old in text:
+    with open(path, "w") as f:
+        f.write(text.replace(old, new, 1))
+elif new not in text:
+    raise SystemExit("fallback.c: xterm-256color pairs entry not found")
+PY
+touch "$build/ncurses/ncurses/fallback.c"
 make -j"$jobs" AR="$ar" RANLIB="$ranlib" >> "$build/ncurses.log" 2>&1
 
 NC="$build/ncurses"
