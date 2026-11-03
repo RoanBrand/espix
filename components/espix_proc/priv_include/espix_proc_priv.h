@@ -353,6 +353,10 @@ typedef struct {
      */
     bool               exiting;
 
+    /* True from spawn until the program is loaded (espix_proc_loaded()): the loader holds filesystem
+     * locks, so a kill marks the process and it leaves once the load is done, never deleted mid-load. */
+    bool               loading;
+
     /* Run time of this process's threads that have already ended, so `ps`
      * charges a process for all of its CPU and not just its live tasks'. */
     uint64_t           cpu_threads_done;
@@ -381,10 +385,12 @@ bool espix_sig_default_ignores(int sig);
 bool espix_sig_default_stops(int sig);
 
 /*
- * Begin enforcing the calling process's root. Called once by proc_task(), after
- * the ELF is loaded and before the entry point runs; see root_active above.
+ * The program is loaded and about to run: the calling process's root is
+ * enforced from here (see root_active above), and a kill may delete its task.
+ * Called once by proc_task(), before the entry point. False when a kill or a
+ * hangup came during the load: the process ends instead of running.
  */
-void espix_proc_root_arm(void);
+bool espix_proc_loaded(void);
 
 /* Table access. The lock covers slot allocation and state transitions; readers
  * that must not block (the fault path) read without it and tolerate a torn

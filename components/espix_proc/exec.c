@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -697,8 +698,11 @@ static void proc_task(void *arg)
 #if CONFIG_ESPIX_UMODE
     /* A static executable runs in U-mode in its own address space; exit and faults land at exit_jb. */
     if (espix_um_is_exec(slot->app->image, slot->info.image_bytes)) {
-        espix_proc_root_arm();
         ran = true;
+        if (!espix_proc_loaded()) {
+            status = 128 + SIGKILL;     /* killed while it loaded: ends as a kill does */
+            goto done;
+        }
         slot->exit_jmp = &exit_jb;
         if (setjmp(exit_jb) == 0) {
             const char *why = espix_um_exec(slot);
@@ -766,8 +770,13 @@ static void proc_task(void *arg)
      * espix loading a program, and everything below it is the program running.
      * See root_active in espix_proc_priv.h -- arming any earlier means the
      * loader cannot read a binary from outside the root, which is every binary.
+     * A kill that came during the load ends it here; from here one may delete it.
      */
-    espix_proc_root_arm();
+    if (!espix_proc_loaded()) {
+        status = 128 + SIGKILL;         /* killed while it loaded: ends as a kill does */
+        ran    = true;
+        goto done;
+    }
 
     /*
      * Called directly rather than through esp_elf_request(), which is
@@ -1020,6 +1029,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
      * process that has none. A failure only costs interruptible select(). */
     slot->wake_fd = espix_fs_wake_create();
     slot->foreground      = foreground;
+    slot->loading         = true;
 
     /*
      * Credentials, copied now rather than followed later. A session with no

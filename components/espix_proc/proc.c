@@ -1416,6 +1416,13 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Still loading: deleted now, it would keep the filesystem's locks. It leaves when the load is done. */
+    if (slot->loading) {
+        slot->stop_requested = true;
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_OK;
+    }
+
     /*
      * A second kill of the same process -- or a kill racing the session hangup
      * that lands on the same slot -- must not run the teardown below twice. The
@@ -2013,13 +2020,20 @@ const char *espix_proc_root(void)
     return root;
 }
 
-void espix_proc_root_arm(void)
+bool espix_proc_loaded(void)
 {
     espix_proc_slot_t *slot = espix_proc_self();
-
-    if (slot != NULL && slot->app != NULL) {
+    if (slot == NULL) {
+        return true;
+    }
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    slot->loading = false;
+    const bool stop = slot->stop_requested;
+    xSemaphoreGive(g_espix_proc_lock);
+    if (slot->app != NULL) {
         slot->app->root_active = true;
     }
+    return !stop;
 }
 
 esp_err_t espix_proc_chdir(const char *abs_path)

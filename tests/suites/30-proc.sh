@@ -416,6 +416,16 @@ fi
 assert_contains "a shell cannot be signalled" "cannot be signalled" \
     "$(dev_run "kill -TERM $ids_ppid" 2>&1)"
 
+# kill -9 while an app is still loading: the loader holds the filesystem's locks, so the app
+# leaves once it is loaded rather than being deleted holding them.
+for _ in 1 2 3 4 5; do
+    lpid=$(dev_run "$APP exit 0 &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+    [ -n "$lpid" ] && dev_run "kill -9 $lpid" >/dev/null
+done
+sleep 2
+assert_contains "a kill during loading leaves logins and the filesystem working" \
+    "$(dev_run 'cat /etc/hostname')" "$(dev_once 'cat /etc/hostname')"
+
 # A builtin is a process too: a child of its shell, in a group of its own.
 bpid=$(dev_run 'sleep 20 &' | sed -n 's/^\[\([0-9][0-9]*\)\] sleep.*/\1/p')
 if [ -n "$bpid" ]; then
