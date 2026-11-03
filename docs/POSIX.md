@@ -38,7 +38,7 @@ merely missing.
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |
 | A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
 | `sed` | **planned** | |
-| Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`; `stat` reports the same mode and owner `ls -l` shows |
+| Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`, `dup`, `dup2`; `stat` reports the same mode and owner `ls -l` shows. An M-mode app's descriptors are numbers in the system's table, so `dup2` replaces only one the app opened and refuses another's with `EBUSY`; a U-mode app's table is its own |
 | Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |
 | `fork()` / `exec()` | **no** on S3, **planned** on S31 | needs an MMU for copy-on-write; the S31 has one |
 | MMU-backed process isolation | **no** on S3, **planned** on S31 | see [hardware targets](../README.md#hardware-targets) and [crash handling](../README.md#crash-handling-and-isolation) |
@@ -60,7 +60,7 @@ merely missing.
 | `mount`, `umount` | **yes** | `mount sda1 /mnt` puts a FAT32/FAT16 volume from a USB device into the namespace, reached through espix's own VFS so the permission check applies to it. Root only; nothing is ever formatted; unplug while mounted is a gap; `mount -o uid=,gid=` hands the volume to a user without root, and `-o ro` mounts it read-only — [USB-HOST](USB-HOST.md#stage-2--mounting) |
 | `/etc/fstab` | **yes** | applied on attach and undone on removal: the device column takes a name, a wildcard, or an identity from `blkid` (`LABEL=`, `UUID=`, `PARTUUID=`); the owner column — or `uid=`/`gid=` in the Linux-style options column, which also takes `noauto` and `ro` — becomes the volume's owner, and an entry naming none mounts as `esp` — [USB-HOST](USB-HOST.md) |
 | `lsblk`, `blkid` | **yes** | USB storage is enumerated, identified and its partition table read — including the filesystems espix has no driver for, and disks with no partition table at all (a superfloppy's own volume is named). **Four device slots**, which is what a hub needs; two FAT volumes at once — [USB-HOST](USB-HOST.md) |
-| Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing |
+| Mode bits, `chmod` | **yes** | all twelve, octal or symbolic; `ls -l` and `sftp ls -l` show the same thing; `open` and `mkdir` apply their mode through a `022` umask, so `cp` keeps a program runnable and a private file private |
 | An executable bit | **yes** | enforced — `chmod -x` stops a program running. A new binary is executable without anyone setting it |
 | Read and write bits enforced | **yes** | in espix's root VFS, so builtins, loaded apps and SFTP are all checked the same way |
 | `chown`, `chgrp`, owner and group | **yes** | stored per file, plus a rule so an unstamped rootfs still answers |

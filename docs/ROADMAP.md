@@ -240,7 +240,7 @@ decision with a reason rather than a convenience.
 |---|---|---|
 | **published** | the call reaches espix — its VFS, its fd table, its signal delivery — or reaches nothing but the caller's memory | libc's `open()`, `stat()` and `read()`, which arrive in espix's VFS on the way in, so the permission check is not something they can skip |
 | **overridden** | the libc or IDF implementation lies, bypasses espix, or has to become a delivery point | `chdir`, `getcwd` and `chmod` under libc's names because IDF's are stubs; `sleep` and `usleep` so a signal can cut them short |
-| **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `isatty`, `dup`, `dup2`, `atexit`, `perror` — each with the reason written beside the table it is absent from |
+| **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `isatty`, `atexit` — each with the reason written beside the table it is absent from |
 | **carried elsewhere** | the surface is large, or belongs to a runtime rather than to the kernel | an app's own libraries, or a loadable module: see the Arduino item under **Further out** |
 
 The layering matters as much as the list. elf_loader's own tables used to answer

@@ -376,6 +376,16 @@ assert_status "dup/dup2/F_DUPFD share one open file correctly" 0 \
 assert_contains "and the run leaves no descriptor behind" "dup ok:" \
     "$(dev_run "$APP dup $DUPFILE")"
 
+# dup2 onto a number the app did not open. A U-mode app's table is its own, so its stdin is
+# replaced as on Linux; an M-mode app's is the system's, and 0 is the console's: busy, not closed.
+if [ "${ESPIX_UAPP:-0}" = 1 ]; then
+    assert_contains "dup2 onto an app's own stdin replaces it" "dup2 onto 0: rc=0" \
+        "$(dev_run "$APP dup $DUPFILE onto 0")"
+else
+    assert_contains "dup2 onto a descriptor another holds is refused, not closed" \
+        "dup2 onto 0: rc=-1 errno=16" "$(dev_run "$APP dup $DUPFILE onto 0")"
+fi
+
 dev_run "rm $DUPFILE" >/dev/null 2>&1
 
 # --- the process tree: a shell is a process, and an app is its child -------

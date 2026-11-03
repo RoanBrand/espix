@@ -335,7 +335,7 @@ int espix_fs_admin_check(const char *abs_path, bool changing_owner)
     return (who.uid == f_uid) ? 0 : EPERM;
 }
 
-void espix_fs_claim(const char *abs_path)
+void espix_fs_claim(const char *abs_path, mode_t mode)
 {
     subject_t who;
 
@@ -350,9 +350,9 @@ void espix_fs_claim(const char *abs_path)
 
     /*
      * Ask the rule before writing anything. A user creating a file in their own
-     * home -- which is very nearly every file anyone creates -- is already
-     * owned correctly by the rule, so there is nothing to store and no reason
-     * to reach into the filesystem's metadata at all.
+     * home with 0666 or 0777 -- which is very nearly every file anyone creates
+     * -- is already owned and moded as the rule says, so there is nothing to
+     * store and no reason to reach into the filesystem's metadata at all.
      *
      * That is not only an optimisation. This runs from inside vfs_open(), with
      * the file the caller just created still open, and a littlefs attribute
@@ -370,11 +370,17 @@ void espix_fs_claim(const char *abs_path)
      * the overwhelmingly common case and it costs a metadata write to get the
      * same answer.
      */
+    struct stat st;
+    if (stat(abs_path, &st) != 0) {
+        return;
+    }
     uint16_t rule_uid = 0;
     uint16_t rule_gid = 0;
-    espix_fs_owner(abs_path, NULL, &rule_uid, &rule_gid);
+    espix_fs_owner(abs_path, &st, &rule_uid, &rule_gid);
 
-    if (rule_uid == who.uid && rule_gid == who.gid) {
+    /* The creator's mode through the umask every espix process has, 022, as open(2) and mkdir(2) apply it. */
+    const mode_t want = mode & ESPIX_MODE_BITS & ~(mode_t)022;
+    if (rule_uid == who.uid && rule_gid == who.gid && want == espix_fs_mode(abs_path, &st)) {
         return;
     }
 
@@ -384,7 +390,7 @@ void espix_fs_claim(const char *abs_path)
      * now refuses the latter to anyone but root.
      */
     espix_fs_priv_begin();
-    (void)espix_fs_chown(abs_path, who.uid, who.gid);
+    (void)espix_fs_stamp(abs_path, want, who.uid, who.gid);
     espix_fs_priv_end();
 }
 

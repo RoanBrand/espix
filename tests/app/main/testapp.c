@@ -1587,6 +1587,22 @@ static int cmd_fdprobe(const char *path, const char *hold_s)
  * or above its argument. Finally everything is closed and the same number is
  * reopened, which fails if a descriptor leaked out of the fixed pool.
  */
+/* dup2 onto a number the app did not open: its own table's in U-mode, the system's (and refused) in M-mode. */
+static int cmd_dup_onto(const char *path, int target)
+{
+    const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        printf("dup: open: errno %d\n", errno);
+        return 1;
+    }
+    errno = 0;
+    const int rc = dup2(fd, target);
+    printf("dup2 onto %d: rc=%d errno=%d\n", target, rc, (rc < 0) ? errno : 0);
+    fflush(stdout);
+    close(fd);
+    return 0;
+}
+
 static int cmd_dup(const char *path, const char *mode)
 {
     /*
@@ -1727,6 +1743,7 @@ static void usage(void)
            "  threaded <n>        four threads add n each under a mutex\n"
            "  fdprobe <path> <hold>  report fd capacity, then hold some\n"
            "  dup <path> [hold]   dup/dup2/fcntl(F_DUPFD); hold exits holding them\n"
+           "  dup <path> onto <n> dup2 onto a number the app did not open\n"
            "  env get <NAME>      print a variable as the app sees it\n"
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
@@ -1862,6 +1879,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "fdprobe") == 0 && argc > 3) {
         return cmd_fdprobe(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "dup") == 0 && argc > 4 && strcmp(argv[3], "onto") == 0) {
+        return cmd_dup_onto(argv[2], atoi(argv[4]));
     }
     if (strcmp(cmd, "dup") == 0 && argc > 2) {
         return cmd_dup(argv[2], (argc > 3) ? argv[3] : NULL);

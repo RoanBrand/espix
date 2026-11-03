@@ -50,7 +50,8 @@ int espix_fs_access_check(const char *abs_path, espix_fs_access_t op, int flags)
 int espix_fs_admin_check(const char *abs_path, bool changing_owner);
 
 /*
- * Give a just-created path the caller's ownership.
+ * Give a just-created path the caller's ownership, and the mode it was created
+ * with (open(2)'s or mkdir(2)'s, through the umask).
  *
  * The ownership rule covers the ordinary case -- files under a home belong to
  * whoever lives there -- and this covers the rest: a file created in a
@@ -58,9 +59,12 @@ int espix_fs_admin_check(const char *abs_path, bool changing_owner);
  * born belonging to root, and its own creator could not then write it.
  *
  * A no-op for espix itself and cheap when the rule already agrees, because
- * espix_fs_chown() stores nothing it would derive anyway.
+ * espix_fs_stamp() stores nothing it would derive anyway.
  */
-void espix_fs_claim(const char *abs_path);
+void espix_fs_claim(const char *abs_path, mode_t mode);
+
+/* A new file's record as its creator made it, in one write; nothing stored where the rule agrees. */
+esp_err_t espix_fs_stamp(const char *abs_path, mode_t mode, uint16_t uid, uint16_t gid);
 
 /*
  * May the calling process name `abs_path` at all?

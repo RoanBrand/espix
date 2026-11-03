@@ -664,8 +664,8 @@ int espix_fs_dup_min_fd(int fd, int min)
 }
 
 /*
- * dup2(2): the same, but landing on a *named* number after closing whatever
- * was already there.
+ * dup2(2): the same, but landing on a *named* number after closing what the
+ * caller had there.
  *
  * A number above newfd would satisfy the floor but not the call, so it is given
  * back and reported EMFILE -- the only honest answer when the exact number was
@@ -686,8 +686,27 @@ int espix_fs_dup2_fd(int oldfd, int newfd)
         return newfd;
     }
 
-    /* POSIX closes the target first; the duplicate then takes its number. */
+    /*
+     * POSIX closes the target first; the duplicate then takes its number. In a
+     * table of its own the target is always the caller's, and here the table is
+     * the system's: only a file the caller opened is closed. A number anyone
+     * else holds -- another process's file, a socket, a terminal, the console's
+     * 0-2 -- is busy rather than closed under them.
+     */
+    const espix_fd_entry_t *const t = get_fd_entry(newfd);
     if (get_vfs_for_fd(newfd) != NULL) {
+        const int         tkey = get_local_fd(get_vfs_for_fd(newfd), newfd);
+        const espix_pid_t self = espix_proc_self_pid();
+        bool              mine = false;
+        if (t != NULL && t->vfs_index == e->vfs_index && fd_ours(tkey) && self != ESPIX_PID_NONE) {
+            portENTER_CRITICAL(&s_mount_lock);
+            mine = s_fds[tkey].lower_fd >= 0 && s_fds[tkey].owner == self;
+            portEXIT_CRITICAL(&s_mount_lock);
+        }
+        if (!mine) {
+            errno = EBUSY;
+            return -1;
+        }
         (void)close(newfd);
     }
 
@@ -933,7 +952,7 @@ static int vfs_open(void *ctx, const char *path, int flags, int mode)
     }
 
     if (creating) {
-        espix_fs_claim(p);
+        espix_fs_claim(p, (mode_t)mode);
     }
     return key;
 }
@@ -1391,7 +1410,7 @@ static int vfs_mkdir(void *ctx, const char *name, mode_t mode)
 
     const int rc = l->dir->mkdir_p(l->ctx, p, mode);
     if (rc == 0) {
-        espix_fs_claim(p);
+        espix_fs_claim(p, mode);
     }
     return rc;
 }

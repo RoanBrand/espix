@@ -935,7 +935,10 @@ static int cmd_cp(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 
-    const int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    /* A new file takes the source's permissions, as cp(1) gives them: a copied program stays executable. */
+    struct stat sst;
+    const mode_t mode = (stat(src, &sst) == 0) ? (sst.st_mode & 0777) : 0644;
+    const int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (out < 0) {
         espix_eprintf(s, "cp: %s: %s\n", dst, strerror(errno));
         close(in);

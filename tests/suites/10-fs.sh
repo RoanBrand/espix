@@ -37,6 +37,19 @@ assert_contains "chmod is visible in ls -l" "-rw-------" "$(dev_run "ls -l $T/a.
 dev_run "chmod 644 $T/a.txt" >/dev/null
 assert_contains "chmod back to the rule's answer" "-rw-r--r--" "$(dev_run "ls -l $T/a.txt")"
 
+# A new file has the mode its creator asked for, through the umask (022), as open(2) gives it:
+# cp asks for the source's, so a private file stays private and a program stays runnable.
+dev_run "chmod 600 $T/a.txt" >/dev/null
+dev_run "cp $T/a.txt $T/private.txt" >/dev/null
+assert_contains "cp of a 0600 file makes a 0600 file" "-rw-------" "$(dev_run "ls -l $T/private.txt")"
+dev_run "chmod 644 $T/a.txt" >/dev/null
+if dev_testapp_present; then
+    dev_run "cp /home/$ESPIX_USER/testapp $T/prog" >/dev/null
+    assert_contains "and of a program, a program that runs" "rc=4" "$(dev_run "$T/prog exit 4; echo rc=\$?")"
+    dev_run "rm $T/prog" >/dev/null
+fi
+dev_run "rm $T/private.txt" >/dev/null
+
 # Permissions are enforced, not decorative -- this is what the prompt sigil
 # now depends on being true.
 assert_contains "an ordinary account cannot read /etc/passwd" "denied" \

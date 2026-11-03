@@ -422,6 +422,16 @@ esp_err_t espix_fs_chmod(const char *abs_path, mode_t mode)
     return attr_store(abs_path, &st, &attr);
 }
 
+esp_err_t espix_fs_stamp(const char *abs_path, mode_t mode, uint16_t uid, uint16_t gid)
+{
+    struct stat st;
+    if (abs_path == NULL || stat(abs_path, &st) != 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    espix_fs_posix_attr_t attr = { .mode = (uint16_t)(mode & ESPIX_MODE_BITS), .uid = uid, .gid = gid };
+    return attr_store(abs_path, &st, &attr);
+}
+
 esp_err_t espix_fs_ensure_mode(const char *abs_path, mode_t mode)
 {
     struct stat st;

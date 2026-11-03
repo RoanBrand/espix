@@ -136,7 +136,9 @@ attribute and no mount owner belongs to the account whose home directory
 contains it, longest home winning, and to root otherwise — the rootfs is root's
 and `/home/esp` is esp's with nothing written to flash to say so. The mode rule
 gives directories `0755` (`/tmp` is `01777`), a file whose first bytes are the
-ELF magic `0755`, and everything else `0644`.
+ELF magic `0755`, and everything else `0644`. A file or directory created with
+another mode keeps it: `open(2)` and `mkdir(2)` apply theirs through a `022`
+umask, and one that differs from the rule's answer is stored.
 
 The design means a freshly flashed rootfs is executable with nothing written to
 flash, and a `chmod` back to the rule's answer removes the attribute rather than
