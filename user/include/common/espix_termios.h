@@ -79,12 +79,39 @@ extern "C" {
 #define TCIOFLUSH 1
 #define TCOFLUSH  2
 
-#define B0      0
-#define B9600   13
-#define B19200  14
-#define B38400  15
-#define B57600  16
-#define B115200 17
+/* The CBAUD range B0-B38400, then CBAUDEX from B57600; IDF's values, which the
+ * kernel's tty speaks. ncurses compiles a table over all of them. */
+#define B0          0
+#define B50         1
+#define B75         2
+#define B110        3
+#define B134        4
+#define B150        5
+#define B200        6
+#define B300        7
+#define B600        8
+#define B1200       9
+#define B1800      10
+#define B2400      11
+#define B4800      12
+#define B9600      13
+#define B19200     14
+#define B38400     15
+#define B57600     16
+#define B115200    17
+#define B230400    18
+#define B460800    19
+#define B500000    20
+#define B576000    21
+#define B921600    22
+#define B1000000   23
+#define B1152000   24
+#define B1500000   25
+#define B2000000   26
+#define B2500000   27
+#define B3000000   28
+#define B3500000   29
+#define B4000000   30
 
 typedef uint8_t  cc_t;
 typedef uint32_t speed_t;

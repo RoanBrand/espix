@@ -758,6 +758,30 @@ static int32_t um_sys_getgr(um_call_t *c)
     return pwent_out(c, gr.gr_gid, gr.gr_gid, strs, 1);
 }
 
+/*
+ * uname(2): the same five fields uname(1) prints, from the same places. The
+ * release is the version a person quotes and the version is which build of it
+ * is running, as Linux splits them (see espix_uname()).
+ */
+static int32_t um_sys_uname(um_call_t *c)
+{
+    struct espix_utsname u = { 0 };
+
+    strlcpy(u.sysname, "espix", sizeof(u.sysname));
+    strlcpy(u.nodename, espix_nodename(), sizeof(u.nodename));
+    strlcpy(u.release, espix_version(), sizeof(u.release));
+    if (espix_build_is_release()) {
+        strlcpy(u.version, "#1", sizeof(u.version));
+    } else {
+        char v[16];
+        snprintf(v, sizeof(v), "#%s", espix_build_id());
+        strlcpy(u.version, v, sizeof(u.version));
+    }
+    strlcpy(u.machine, "riscv32", sizeof(u.machine));
+
+    return espix_um_copyout(c->p->as, c->a[0], &u, sizeof(u));
+}
+
 static int32_t um_sys_kill(um_call_t *c)    { return um_kret(espix_abi_kill((pid_t)c->a[0], (int)c->a[1])); }
 
 /* ------------------------------------------------------------------ */

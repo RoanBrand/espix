@@ -83,7 +83,8 @@
     X(GETPW,         getpw,         68)        /* (name or 0, uid, struct espix_pwent *, len) */ \
     X(GETGR,         getgr,         69)        /* (name or 0, gid, struct espix_pwent *, len) */ \
     X(SYSLOG,        syslog,        70)        /* (priority, ident or 0, message): to the kernel log */ \
-    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */
+    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */ \
+    X(UNAME,         uname,         72)        /* (struct espix_utsname *): the five fields */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
@@ -166,6 +167,16 @@ struct espix_addrinfo {
 struct espix_pwent {
     uint32_t id, gid;
     char     strs[];
+};
+
+/* uname(2)'s five fields, fixed-width as they cross. The lengths are Linux's. */
+#define ESPIX_UTS_LEN 65
+struct espix_utsname {
+    char sysname[ESPIX_UTS_LEN];
+    char nodename[ESPIX_UTS_LEN];
+    char release[ESPIX_UTS_LEN];
+    char version[ESPIX_UTS_LEN];
+    char machine[ESPIX_UTS_LEN];
 };
 
 /* One getifaddrs() entry: an interface and one of its addresses (an AF_UNSPEC addr: none). */
