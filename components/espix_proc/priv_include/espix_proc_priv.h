@@ -293,8 +293,6 @@ typedef struct {
     const char       *log_ident;
     int               log_opt;
     int               log_mask;       /* 0: every priority */
-    volatile bool     console_stdin;    /* in a console read: counted in its
-                                           session's stdin_readers */
     bool              was_kthread;      /* a KTHREAD that became a login's
                                            shell, and is one again after */
 
@@ -391,6 +389,11 @@ bool espix_sig_default_stops(int sig);
  * hangup came during the load: the process ends instead of running.
  */
 bool espix_proc_loaded(void);
+
+/* Spawn, under the table lock: a foreground job of the session's shell takes the terminal before its first
+ * instruction, as the tcsetpgrp() a shell's child makes before exec, so a read it starts at once is not a
+ * background one. */
+void espix_proc_fg_spawned_locked(espix_session_t *s, const espix_proc_slot_t *parent, espix_pid_t pgid);
 
 /* Table access. The lock covers slot allocation and state transitions; readers
  * that must not block (the fault path) read without it and tolerate a torn

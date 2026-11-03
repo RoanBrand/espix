@@ -111,6 +111,9 @@ esp_err_t espix_proc_spawn_fn(const espix_proc_fn_opts_t *o, espix_pid_t *out_pi
 
     slot->info.task  = task;
     slot->info.state = ESPIX_PROC_RUNNING;
+    if (o->foreground) {
+        espix_proc_fg_spawned_locked(o->session, espix_proc_self(), slot->info.pgid);
+    }
     if (out_pid != NULL) {
         *out_pid = slot->info.pid;
     }

@@ -17,6 +17,7 @@
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_tty.h"
 #include "espix_task.h"
 
 #define TAG "shell"
@@ -588,7 +589,7 @@ static int cmd_proc(void *arg)
 
 /* Under the real session, whatever c->s is, so a hangup reaches it. */
 static esp_err_t cmd_spawn(espix_session_t *s, const espix_cmd_t *cmd,
-                           cmd_proc_t *c, espix_pid_t *pid)
+                           cmd_proc_t *c, espix_pid_t *pid, bool foreground)
 {
     espix_shell_spawn_t sp = {
         .name           = cmd->name,
@@ -596,6 +597,7 @@ static esp_err_t cmd_spawn(espix_session_t *s, const espix_cmd_t *cmd,
         .arg            = c,
         .stack          = (cmd->stack != 0) ? cmd->stack : ESPIX_CMD_STACK,
         .internal_stack = cmd->internal_stack,
+        .foreground     = foreground,
     };
     return s_proc->spawn(s, &sp, pid);
 }
@@ -606,7 +608,7 @@ static int run_as_process(espix_session_t *s, const espix_cmd_t *cmd,
     cmd_proc_t  c   = { .s = s, .fn = cmd->fn, .argc = argc, .argv = argv };
     espix_pid_t pid = ESPIX_PID_NONE;
 
-    const esp_err_t err = cmd_spawn(s, cmd, &c, &pid);
+    const esp_err_t err = cmd_spawn(s, cmd, &c, &pid, true);
     if (err != ESP_OK) {
         espix_eprintf(s, "espix: %s: cannot start: %s\n", cmd->name,
                       esp_err_to_name(err));
@@ -701,7 +703,7 @@ static int start_background_job(espix_session_t *s, const espix_cmd_t *cmd,
                        .owned = true };
 
     espix_pid_t     pid = ESPIX_PID_NONE;
-    const esp_err_t err = cmd_spawn(s, cmd, c, &pid);
+    const esp_err_t err = cmd_spawn(s, cmd, c, &pid, false);
     if (err != ESP_OK) {
         free(c);
         espix_eprintf(s, "espix: %s: cannot start: %s\n", argv[0],
@@ -722,10 +724,33 @@ int espix_shell_take_key(espix_session_t *s)
     if (s == NULL) {
         return 0;
     }
+    if (s->tty != NULL) {
+        uint8_t c;
+        return (!espix_tty_is_pipe(s->tty) && espix_tty_read(s->tty, &c, 1, true) == 1) ? c : 0;
+    }
 
     const int key = s->last_key;
     s->last_key = 0;
     return key;
+}
+
+bool espix_shell_keys_begin(espix_session_t *s, struct termios *saved)
+{
+    if (s == NULL || s->tty == NULL || espix_tty_is_pipe(s->tty)) {
+        return false;
+    }
+    espix_tty_getattr(s->tty, saved);
+    struct termios keys = *saved;
+    espix_tty_make_keys(&keys);
+    espix_tty_setattr(s->tty, TCSANOW, &keys);
+    return true;
+}
+
+void espix_shell_keys_end(espix_session_t *s, const struct termios *saved)
+{
+    if (s != NULL && s->tty != NULL) {
+        espix_tty_setattr(s->tty, TCSANOW, saved);
+    }
 }
 
 /*
@@ -1276,6 +1301,7 @@ static int run_pipeline(espix_session_t *s, char *line)
             .stack          = stack,
             .internal_stack = cmd != NULL && cmd->internal_stack,
             .pgid           = pgid,
+            .foreground     = true,
         };
         if (s_proc->spawn(s, &sp, &pids[i]) != ESP_OK) {
             break;

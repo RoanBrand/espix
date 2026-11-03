@@ -22,4 +22,5 @@ idf_component_register(
         vfs
         esp_driver_uart
         esp_driver_usb_serial_jtag
+        espix_tty
 )

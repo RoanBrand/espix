@@ -153,6 +153,7 @@ typedef struct {
     espix_session_t   *session;         /* credentials, and who a hangup ends;
                                            NULL is espix itself, as root */
     espix_pid_t        pgid;            /* a group to join; 0 for a new one */
+    bool               foreground;      /* the shell's job: its group in front of the terminal before it runs */
 } espix_proc_fn_opts_t;
 
 /*

@@ -19,7 +19,7 @@ merely missing.
 | Error redirection `2>` `2>>` `2>&1` | **yes** | attached or separated (`2>file`); diagnostics are their own stream, and over SSH they arrive as `CHANNEL_EXTENDED_DATA`, so the client's `2>` separates them too |
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
-| Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`, Ctrl-Z stops the foreground app into a job; over SSH a job that reads the terminal stops on SIGTTIN (EIO if it ignores or blocks it); a job still dies at logout by design |
+| Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`, Ctrl-Z stops the foreground app into a job; a job that reads the terminal stops on SIGTTIN (EIO if it ignores or blocks it), over SSH, on the serial console and in a VNC terminal; a job still dies at logout by design |
 | Pipes <code>&#124;</code> | **yes** | builtins only; one StreamBuffer per pipe, and a writer fails once its reader is done (`cat f \| head -1`) |
 | Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |
 | Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv` |

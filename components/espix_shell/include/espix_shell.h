@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/termios.h>
 
 #include "esp_err.h"
 #include "esp_linenoise.h"
@@ -216,11 +217,7 @@ struct espix_session {
      */
     void (*wake)(espix_session_t *s);
 
-    /*
-     * The console only: apps reading its stdin directly, which the shell's poll
-     * then leaves alone, and a ^C one of them read on the shell's behalf.
-     */
-    volatile int  stdin_readers;
+    /* ^C typed while a job ran: the foreground wait signals the job (fg.c). */
     volatile bool intr;
 
     /* ^Z typed while a job ran, on any transport: the foreground wait stops the job. */
@@ -582,9 +579,15 @@ void espix_shell_job_clear(espix_session_t *s, int slot);
  */
 bool espix_shell_stopping(const espix_session_t *s);
 
-/* The last key a transport reported while polling, and clear it. 0 when there
- * was none. The transport sets it, the command reads it. */
+/* A key typed at the command, or 0: read from the session's terminal, which
+ * espix_shell_keys_begin() puts in its keys mode; the last one a transport
+ * reported where there is no tty. A pipe gives none. */
 int espix_shell_take_key(espix_session_t *s);
+
+/* The terminal in keys mode for a command that reads single keys (top, dmesg -w): no echo or line buffering, ^C
+ * and ^Z still signal. False, and nothing to undo, without one. */
+bool espix_shell_keys_begin(espix_session_t *s, struct termios *saved);
+void espix_shell_keys_end(espix_session_t *s, const struct termios *saved);
 
 /*
  * Run one command line in the context of `s`. Returns the command's status,
@@ -670,6 +673,7 @@ typedef struct {
     uint32_t     stack;
     bool         internal_stack;
     espix_pid_t  pgid;          /* in: 0 for the default group; out: its group */
+    bool         foreground;    /* a job the shell waits for: in front of the terminal from its start */
 } espix_shell_spawn_t;
 
 /*

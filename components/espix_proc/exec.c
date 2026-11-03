@@ -343,121 +343,15 @@ static void relocate_task(void *arg)
 }
 
 /*
- * An app's stdin on the serial console. The global stream blocks in the UART
- * driver with portMAX_DELAY, holding the driver's read lock and the FILE's, so
- * nothing could get a process out of it but deletion -- and deleted there, it
- * leaves both locks held by a dead task. Waiting in select() instead holds
- * neither, and the process's wake fd lets a signal end it.
- *
- * While an app is reading, the shell's poll leaves the console to it, so a ^C
- * arrives here: it goes to the shell, as a terminal's ISIG would send it, and
- * is not input. Counted on the slot, so a force-kill mid-read is uncounted by
- * the teardown.
- */
-static int s_console_fd = -1;
-
-static int console_stdin_wait(espix_session_t *s, char *buf, int len);
-
-static int console_stdin_read(void *cookie, char *buf, int len)
-{
-    espix_session_t *const   s    = cookie;
-    espix_proc_slot_t *const self = espix_proc_self();
-
-    if (self != NULL) {
-        __atomic_fetch_add(&s->stdin_readers, 1, __ATOMIC_RELAXED);
-        self->console_stdin = true;
-    }
-    const int n = console_stdin_wait(s, buf, len);
-    if (self != NULL) {
-        self->console_stdin = false;
-        __atomic_fetch_sub(&s->stdin_readers, 1, __ATOMIC_RELAXED);
-    }
-    return n;
-}
-
-/*
  * The terminal a program reads, whether it came from /bin or is compiled into
- * the kernel. An ELF app has had stdin set to this since spawn; a builtin that
- * runs as a process never went through that path, so without this it could only
- * ask for a whole line (read_line, i.e. the shell's editor) and never a key.
- *
- * SSH and the desktop terminal own their stream, and that stream is already the
- * right one. The serial console has none -- exec's spawn path gives apps a
- * reader directly -- so it is opened here over the same console_stdin_read(), as
- * root or not, which is what makes ^C reach the shell instead of the program.
+ * the kernel: the session's own stream, a tty's on every transport that has one.
+ * An ELF app has had stdin set to this since spawn; a builtin that runs as a
+ * process never went through that path, so without this it could only ask for a
+ * whole line (read_line, i.e. the shell's editor) and never a key.
  */
 FILE *espix_proc_stdin_open(espix_session_t *s)
 {
-    if (s == NULL) {
-        return NULL;
-    }
-    if (s->open_stream != NULL) {
-        return s->open_stream(s, ESPIX_STREAM_IN);
-    }
-    if (s_console_fd < 0) {
-        s_console_fd = fileno(stdin);
-    }
-    if (s_console_fd < 0) {
-        return NULL;
-    }
-    return funopen(s, console_stdin_read, NULL, NULL, NULL);
-}
-
-static int console_stdin_wait(espix_session_t *s, char *buf, int len)
-{
-    const int fd = s_console_fd;
-
-    for (;;) {
-        const int wake  = espix_proc_select_begin(NULL);
-        fd_set    rfds;
-
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        if (wake >= 0) {
-            FD_SET(wake, &rfds);
-        }
-        const int ready = select(((wake > fd) ? wake : fd) + 1, &rfds, NULL,
-                                 NULL, NULL);
-        espix_proc_select_end();
-
-        if (ready < 0 && errno != EINTR) {
-            return -1;
-        }
-        if (ready > 0 && wake >= 0 && FD_ISSET(wake, &rfds)) {
-            (void)espix_fs_wake_drain(wake);
-        }
-        if (ready > 0 && FD_ISSET(fd, &rfds)) {
-            const ssize_t n = read(fd, buf, (size_t)len);
-            if (n < 0) {
-                return -1;
-            }
-            int  kept = 0;
-            bool intr = false, susp = false;
-            for (ssize_t i = 0; i < n; i++) {
-                if (buf[i] == 0x03) {
-                    intr = true;
-                } else if (buf[i] == 0x1a) {
-                    susp = true;
-                } else {
-                    buf[kept++] = buf[i];
-                }
-            }
-            if (intr || susp) {
-                s->intr = s->intr || intr;
-                s->susp = s->susp || susp;
-                if (s->wake != NULL) {
-                    s->wake(s);
-                }
-            }
-            if (kept > 0) {
-                return kept;
-            }
-        }
-        /* No EINTR through fgets(), so a signal ends the read as EOF would. */
-        if (espix_sigcheck_io()) {
-            return 0;
-        }
-    }
+    return (s != NULL && s->open_stream != NULL) ? s->open_stream(s, ESPIX_STREAM_IN) : NULL;
 }
 
 /*
@@ -583,8 +477,8 @@ static void proc_task(void *arg)
      * A backgrounded process outlives redirects_release(), so it must not
      * consult the redirection at all: it keeps the transport's own streams.
      *
-     * All of it is gated on open_stream, so the console -- which deliberately
-     * has none, its apps writing to the real UART -- is untouched.
+     * All of it is gated on open_stream, which every transport with a terminal
+     * has.
      */
     espix_session_t *const session = slot->info.session;
 
@@ -620,14 +514,6 @@ static void proc_task(void *arg)
         }
 
         FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
-        if (in != NULL) {
-            slot->std[0] = own_in = in;
-        }
-    } else if (session != NULL) {
-        /* The console: output stays on the UART; stdin is read so that a
-         * signal can end the read. */
-        s_console_fd = fileno(stdin);
-        FILE *const in = funopen(session, console_stdin_read, NULL, NULL, NULL);
         if (in != NULL) {
             slot->std[0] = own_in = in;
         }
@@ -1201,6 +1087,9 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
 
     slot->info.task  = task;
     slot->info.state = ESPIX_PROC_RUNNING;
+    if (foreground) {
+        espix_proc_fg_spawned_locked(session, espix_proc_self(), slot->info.pgid);
+    }
 
     if (out_pid != NULL) {
         *out_pid = slot->info.pid;

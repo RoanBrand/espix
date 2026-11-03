@@ -117,20 +117,19 @@ every query answered is one fewer way to hang.
 
 Three preconditions when starting the editor here, each of which cost a bug:
 
-- **The key queue must exist before `esp_linenoise_create_instance()`.** The
-  instance sends its query at creation and reads the reply back through the
-  transport's read callback, which pulls from that queue -- so creating the
-  editor first was an `xQueueReceive(NULL)` assert on the RFB task the moment a
-  viewer connected, which is where the console is started from.
+- **The tty and its lock must exist before `esp_linenoise_create_instance()`.**
+  The instance sends its query at creation, and the reply is read back ahead
+  of any key: a query the editor itself sent is answered from a buffer its read
+  callback drains first, and one an app sent goes into the tty as typed input.
 - **Never call `esp_linenoise_probe()`.** It `fcntl()`s the descriptor, and the
   descriptor here is a key rather than a terminal: both callbacks are supplied
   and nothing reads or writes it.
-- **ICRNL is the transport's job.** A terminal sends CR for Enter and
-  `esp_linenoise` tests for LF, so without it Enter does nothing at all. The
-  UART gets this from IDF's VFS and SSH does it in its own read callback; espix
-  *is* the pty here, so it is the console's job too. And `Ctrl-C` is the
-  editor's `EAGAIN` -- abandon the line -- not end of input; treating the two
-  alike drops the console on Ctrl-C, which no other shell does.
+- **The terminal is a tty** (`components/espix_tty`), as the serial console's
+  and an SSH session's are: the viewer's keys go into it, its line discipline
+  does ICRNL, echo and the signal keys, and the editor reads it in its own mode
+  around each prompt. `Ctrl-C` at the prompt is the editor's `EAGAIN` --
+  abandon the line -- not end of input; treating the two alike drops the
+  console on Ctrl-C, which no other shell does.
 
 ## What the S31 gives us
 

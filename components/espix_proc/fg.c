@@ -82,6 +82,13 @@ void espix_proc_set_fg(espix_session_t *s, espix_pid_t pgid)
     }
 }
 
+void espix_proc_fg_spawned_locked(espix_session_t *s, const espix_proc_slot_t *parent, espix_pid_t pgid)
+{
+    if (s != NULL && s->tty != NULL && parent != NULL && parent->info.kind == ESPIX_PROC_SESSION) {
+        espix_proc_set_fg(s, pgid);
+    }
+}
+
 int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
 {
     espix_proc_fg_t none = { 0 };
@@ -114,6 +121,11 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
     }
     if (shell) {
         espix_proc_set_fg(s, pgid);
+    }
+    struct termios before;
+    const bool keep_tty = shell && s->tty != NULL;
+    if (keep_tty) {
+        espix_tty_getattr(s->tty, &before);
     }
 
     const int64_t deadline = (fg->limit_us > 0) ? esp_timer_get_time() + fg->limit_us
@@ -163,7 +175,8 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
             break;
         }
         if (poll && s->poll_interrupt(s)) {
-            say(s, false, "^C\n");
+            /* A tty's line discipline has echoed the ^C already; the newline is the shell's. */
+            say(s, false, (s->tty != NULL) ? "\n" : "^C\n");
             interrupts++;
 
             if (interrupts < FG_INTERRUPTS_TO_KILL) {
@@ -179,7 +192,7 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
         }
         if (poll && s->susp) {
             s->susp = false;
-            say(s, false, "^Z\n");
+            say(s, false, (s->tty != NULL) ? "\n" : "^Z\n");
             (void)espix_proc_signal_group(pgid, SIGTSTP);
         }
         /* Stopped, by ^Z or a signal from elsewhere: a background job now, as in any shell. */
@@ -198,6 +211,10 @@ int espix_proc_wait_fg(espix_session_t *s, espix_pid_t pid, espix_proc_fg_t *fg)
     }
     if (shell) {
         espix_proc_set_fg(s, ESPIX_PID_NONE);
+    }
+    /* A job a signal ended can leave the terminal as it set it, raw or silent: the shell's back, as bash does. */
+    if (keep_tty && !fg->stopped && (killed || exit_code > 128)) {
+        espix_tty_setattr(s->tty, TCSANOW, &before);
     }
     if (fg->stopped) {
         stopped_job(s, pid);

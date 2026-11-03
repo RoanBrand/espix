@@ -881,7 +881,7 @@ static void top_header(espix_session_t *s, UBaseType_t count, unsigned running,
                  (unsigned)count, running);
 }
 
-static int cmd_top(espix_session_t *s, int argc, char **argv)
+static int top_frames(espix_session_t *s, int argc, char **argv)
 {
     /*
      * `-n <count>` stops after that many frames; without it top runs until
@@ -1144,6 +1144,18 @@ static int cmd_top(espix_session_t *s, int argc, char **argv)
     return 0;
 }
 
+/* top reads q as Linux's does: from the terminal, in a mode that neither echoes nor waits for Enter. */
+static int cmd_top(espix_session_t *s, int argc, char **argv)
+{
+    struct termios saved;
+    const bool keys = espix_shell_keys_begin(s, &saved);
+    const int rc = top_frames(s, argc, argv);
+    if (keys) {
+        espix_shell_keys_end(s, &saved);
+    }
+    return rc;
+}
+
 #else  /* !configUSE_TRACE_FACILITY */
 
 static int cmd_ps(espix_session_t *s, int argc, char **argv)
@@ -1276,7 +1288,7 @@ static int dmesg_level(espix_session_t *s, const char *arg)
  * what a rolling ring wants -- a reader that keeps up never has to see a line
  * dropped, and one that falls behind is told how many it missed.
  */
-static int dmesg_follow(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
+static int follow_lines(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
 {
     /*
      * One line at a time, deliberately: an entry carries its text, so a batch of
@@ -1312,6 +1324,18 @@ static int dmesg_follow(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
         }
     }
     return 0;
+}
+
+/* q from the terminal in keys mode, as top reads it. */
+static int dmesg_follow(espix_session_t *s, dmesg_ctx_t *ctx, uint32_t seq)
+{
+    struct termios saved;
+    const bool keys = espix_shell_keys_begin(s, &saved);
+    const int rc = follow_lines(s, ctx, seq);
+    if (keys) {
+        espix_shell_keys_end(s, &saved);
+    }
+    return rc;
 }
 
 static int cmd_dmesg(espix_session_t *s, int argc, char **argv)

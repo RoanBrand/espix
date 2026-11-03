@@ -386,7 +386,7 @@ static bool input_one_locked(espix_tty_t *t, uint8_t c, echo_t *e, int *sig)
         const cc_t *cc = t->tio.c_cc;
         int s = 0;
         if (c != 0 && c == cc[VINTR]) {
-            /* The third ^C at a group that is still there insists, unless the session handles the keys itself. */
+            /* The third ^C at a group that is still there insists, unless the session handles ^C itself. */
             s = (t->ops.signal == NULL && ++t->intrs >= 3) ? SIGKILL : SIGINT;
         } else if (c != 0 && c == cc[VQUIT]) {
             s = SIGQUIT;
@@ -495,9 +495,8 @@ size_t espix_tty_input(espix_tty_t *t, const void *buf, size_t len)
         if (e.n > 0) {
             echo_out(t, e.buf, e.n);
         }
-        if (sig != 0 && t->ops.signal != NULL) {
-            t->ops.signal(t->ops.ctx, sig);
-        } else if (sig != 0 && fg > 0 && s_hooks.signal_group != NULL) {
+        const bool taken = sig != 0 && t->ops.signal != NULL && t->ops.signal(t->ops.ctx, sig);
+        if (sig != 0 && !taken && fg > 0 && s_hooks.signal_group != NULL) {
             s_hooks.signal_group(fg, sig);
         }
         if (stopped) {
@@ -702,6 +701,21 @@ void espix_tty_makeraw(struct termios *tio)
     tio->c_lflag &= ~(tcflag_t)(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
     tio->c_cflag &= ~(tcflag_t)(CSIZE | PARENB);
     tio->c_cflag |= CS8;
+    tio->c_cc[VMIN]  = 1;
+    tio->c_cc[VTIME] = 0;
+}
+
+void espix_tty_make_editing(struct termios *tio)
+{
+    tio->c_lflag &= ~(tcflag_t)(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG | IEXTEN);
+    tio->c_cc[VMIN]  = 1;
+    tio->c_cc[VTIME] = 0;
+}
+
+void espix_tty_make_keys(struct termios *tio)
+{
+    tio->c_lflag &= ~(tcflag_t)(ICANON | ECHO | ECHOE | ECHOK | ECHONL | IEXTEN);
+    tio->c_lflag |= ISIG;
     tio->c_cc[VMIN]  = 1;
     tio->c_cc[VTIME] = 0;
 }

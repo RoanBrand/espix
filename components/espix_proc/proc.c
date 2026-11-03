@@ -154,6 +154,7 @@ static esp_err_t shell_spawn(espix_session_t *s, espix_shell_spawn_t *sp,
         .internal_stack = sp->internal_stack,
         .session        = s,
         .pgid           = sp->pgid,
+        .foreground     = sp->foreground,
     };
     const esp_err_t err = espix_proc_spawn_fn(&o, pid);
     if (err == ESP_OK) {
@@ -426,13 +427,6 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
     slot->in_select = 0;
     xSemaphoreGive(g_espix_proc_lock);
     espix_fs_wake_close(wake_fd);
-
-    /* Here and not at fclose(), which a force-kill may never reach. */
-    if (slot->console_stdin && slot->info.session != NULL) {
-        __atomic_fetch_sub(&slot->info.session->stdin_readers, 1,
-                           __ATOMIC_RELAXED);
-        slot->console_stdin = false;
-    }
 
     /* An app's image, argv, environment and paths. The block itself goes
      * last: the process's tasks are gone, so nothing reads its paths now. */

@@ -52,8 +52,8 @@ typedef struct {
     ssize_t (*write_err)(void *ctx, const void *buf, size_t len);
     /* What the line discipline echoes, from inside espix_tty_input(): must not block on the reader. NULL: write. */
     void    (*echo)(void *ctx, const void *buf, size_t len);
-    /* A signal key, for a session that acts on them itself; NULL: the foreground group is signalled. */
-    void    (*signal)(void *ctx, int sig);
+    /* A signal key, for a session that acts on some itself: true when it took it; else the foreground group is signalled. */
+    bool    (*signal)(void *ctx, int sig);
     /* Each input byte as it arrives, before the line discipline. May be NULL. */
     void    (*key)(void *ctx, int c);
     /* Room in the input again after it filled: a transport that held input back resumes. May be NULL. */
@@ -106,6 +106,10 @@ void  espix_tty_getattr(espix_tty_t *t, struct termios *tio);
 void  espix_tty_setattr(espix_tty_t *t, int when, const struct termios *tio);
 /* A terminal for a program that does its own editing: no echo, no canonical lines, no signal keys. */
 void  espix_tty_makeraw(struct termios *tio);
+/* A line editor's mode: keys one at a time, no echo and no signal keys, but CR still reads as NL and output keeps CR LF. */
+void  espix_tty_make_editing(struct termios *tio);
+/* A program that reads single keys and lets ^C and ^Z signal: no echo, no canonical lines, signal keys kept. */
+void  espix_tty_make_keys(struct termios *tio);
 
 /* The foreground process group: its readers read, any other group's get SIGTTIN, and the signal keys signal it. */
 void  espix_tty_set_fg(espix_tty_t *t, pid_t pgid);

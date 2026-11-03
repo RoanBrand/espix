@@ -8,16 +8,22 @@
  * answers to the Device Status and Device Attributes queries -- which are not
  * optional, because esp_linenoise probes for a terminal and turns line editing
  * off if nobody answers.
+ *
+ * Its input is a tty (components/espix_tty): the viewer's keys go into it, and
+ * the editor, the shell and apps read it, as they do over SSH and on the serial
+ * console. Output can then come from the viewer's task too -- the echo -- so a
+ * write takes the terminal's lock.
  */
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
 #include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
@@ -30,6 +36,10 @@
 #include "espix_display.h"
 #include "espix_task.h"
 #include "espix_term.h"
+#include "espix_tty.h"
+
+/* The terminal's input: keys the viewer sent, waiting for the editor or an app. */
+#define TERM_TTY_INPUT 512
 
 #define TAG "term"
 
@@ -66,12 +76,17 @@ struct espix_term {
     int    cols, rows;
     char  *grid;                /* rows * cols, PSRAM */
     int    row, col;
-    QueueHandle_t keys;         /* chars from the input callback */
+    espix_tty_t      *tty;      /* the keys, and the line discipline between them and readers */
+    SemaphoreHandle_t lock;     /* recursive: a write, which the viewer's echo can race */
     volatile bool quit;
-    /* A process is reading the terminal, so the keys are its; and a Ctrl-C
-     * it read, which is the shell's to act on rather than data. */
-    volatile int  stdin_readers;
-    volatile bool intr;
+    volatile bool intr;         /* ^C while a job ran, for the foreground wait */
+
+    /* Our answer to the editor's last query, read ahead of the keys typed before it; an app's goes into the tty. */
+    bool    editor_out;
+    char    reply[24];
+    uint8_t reply_len, reply_pos;
+    char    app_reply[24];
+    uint8_t app_reply_len;
     int    esc;                 /* 0 outside an escape, 1 after ESC, 2 inside CSI */
 
     uint16_t params[8];
@@ -436,6 +451,20 @@ static void term_sgr(espix_term_t *t, int n)
  * are implemented; everything else is parsed and dropped, which is the
  * property that keeps this robust rather than exhaustive.
  */
+/* An answer to a query: the editor's own, read ahead of typed keys; an app's, into the tty once this write ends. */
+static void term_reply(espix_term_t *t, const char *s, size_t n)
+{
+    if (t->editor_out) {
+        n = (n < sizeof(t->reply)) ? n : sizeof(t->reply);
+        memcpy(t->reply, s, n);
+        t->reply_len = (uint8_t)n;
+        t->reply_pos = 0;
+    } else if (t->app_reply_len + n <= sizeof(t->app_reply)) {
+        memcpy(t->app_reply + t->app_reply_len, s, n);
+        t->app_reply_len = (uint8_t)(t->app_reply_len + n);
+    }
+}
+
 static void term_csi(espix_term_t *t, char final)
 {
     if (t->nparam < 8) {
@@ -485,16 +514,14 @@ static void term_csi(espix_term_t *t, char final)
              * editing and history OFF. So this reply is what makes arrows,
              * history and completion work at all.
              */
-            for (const char *p = "\x1b[0n"; *p != '\0'; p++) {
-                (void)xQueueSend(t->keys, p, 0);
-            }
+            term_reply(t, "\x1b[0n", 4);
         } else if (a == 6) {
             /* Cursor position, the other thing a program may ask for. */
             char reply[16];
             const int n = snprintf(reply, sizeof(reply), "\x1b[%d;%dR",
                                    t->row + 1, t->col + 1);
-            for (int i = 0; i < n; i++) {
-                (void)xQueueSend(t->keys, &reply[i], 0);
+            if (n > 0 && (size_t)n < sizeof(reply)) {
+                term_reply(t, reply, (size_t)n);
             }
         }
         break;
@@ -505,9 +532,7 @@ static void term_csi(espix_term_t *t, char final)
          * does not answer is a terminal something will wait on -- and every
          * query answered is one fewer way to hang.
          */
-        for (const char *p = "\x1b[?1;2c"; *p != '\0'; p++) {
-            (void)xQueueSend(t->keys, p, 0);
-        }
+        term_reply(t, "\x1b[?1;2c", 7);
         break;
 
     case 'm': term_sgr(t, (int)t->nparam); break;
@@ -736,6 +761,8 @@ bool espix_term_resize(espix_term_t *t, int cols, int rows)
     }
     memset(attr, TERM_ATTR_DEFAULT, cells);
 
+    (void)xSemaphoreTakeRecursive(t->lock, portMAX_DELAY);
+
     /* Same row, same column, for as much of both grids as exists. */
     const int keep_rows = rows < t->rows ? rows : t->rows;
     const int keep_cols = cols < t->cols ? cols : t->cols;
@@ -760,6 +787,8 @@ bool espix_term_resize(espix_term_t *t, int cols, int rows)
     if (t->col < 0)     { t->col = 0; }
 
     term_repaint(t);
+    (void)xSemaphoreGiveRecursive(t->lock);
+    espix_tty_set_winsize(t->tty, cols, rows);
     return true;
 }
 
@@ -841,10 +870,7 @@ void espix_term_key(espix_term_t *t, uint32_t keysym, bool down)
 
         for (size_t i = 0; i < sizeof(s_key_seq) / sizeof(s_key_seq[0]); i++) {
             if (s_key_seq[i].keysym == keysym) {
-                for (const char *p = s_key_seq[i].seq; *p != '\0'; p++) {
-                    (void)xQueueSend(t->keys, p, 0);
-                }
-                term_wake(t);
+                (void)espix_tty_input(t->tty, s_key_seq[i].seq, strlen(s_key_seq[i].seq));
                 return;
             }
         }
@@ -865,8 +891,7 @@ void espix_term_key(espix_term_t *t, uint32_t keysym, bool down)
         }
     }
 
-    (void)xQueueSend(t->keys, &ch, 0);
-    term_wake(t);
+    (void)espix_tty_input(t->tty, &ch, 1);
 }
 
 void espix_term_write(espix_term_t *t, const char *data, size_t len)
@@ -874,6 +899,7 @@ void espix_term_write(espix_term_t *t, const char *data, size_t len)
     if (t == NULL) {
         return;
     }
+    (void)xSemaphoreTakeRecursive(t->lock, portMAX_DELAY);
 
     /* A nested write keeps the outer batch open; only the outermost flushes. */
     const bool batched = t->defer;
@@ -889,11 +915,22 @@ void espix_term_write(espix_term_t *t, const char *data, size_t len)
     }
 
     if (batched) {
+        (void)xSemaphoreGiveRecursive(t->lock);
         return;
     }
 
     t->defer = false;
     term_flush(t);
+
+    /* An app's query answered as typed input, outside the parse its echo would re-enter. */
+    char          reply[sizeof(t->app_reply)];
+    const uint8_t n = t->app_reply_len;
+    memcpy(reply, t->app_reply, n);
+    t->app_reply_len = 0;
+    (void)xSemaphoreGiveRecursive(t->lock);
+    if (n > 0) {
+        (void)espix_tty_input(t->tty, reply, n);
+    }
 }
 
 void espix_term_feed(espix_term_t *t, const char *line)
@@ -961,44 +998,16 @@ static int term_stream_write(void *cookie, const char *buf, int len)
 static int term_stream_read(void *cookie, char *buf, int len)
 {
     espix_term_t *t = term_of((espix_session_t *)cookie);
-
-    /* While it reads, the keys are its own; see term_poll_interrupt(). */
-    __atomic_fetch_add(&t->stdin_readers, 1, __ATOMIC_RELAXED);
-
-    /*
-     * Blocks until there is something, then takes whatever else is already
-     * queued: waiting for a full request would leave an interactive reader
-     * stuck behind a buffer that will not fill. End of input only when the
-     * viewer has gone or the process is asked to stop -- an idle keyboard is
-     * not EOF.
-     */
-    int n = 0;
-    while (n < len) {
-        char ch;
-        if (xQueueReceive(t->keys, &ch,
-                          n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
-            if (n > 0 || t->quit || espix_shell_sigcheck()) {
-                break;
-            }
-            continue;
-        }
-        /* ISIG: Ctrl-C and ^Z are signals for the foreground wait, not input,
-         * as SSH's transport treats them. */
-        if (ch == 0x03) {
-            t->intr = true;
-            term_wake(t);
-            continue;
-        }
-        if (ch == 0x1a) {
-            t->session.susp = true;
-            term_wake(t);
-            continue;
-        }
-        /* ICRNL, as term_edit_read() does: Enter arrives as CR. */
-        buf[n++] = (ch == '\r') ? '\n' : ch;
+    if (len <= 0) {
+        return 0;
     }
-    __atomic_fetch_sub(&t->stdin_readers, 1, __ATOMIC_RELAXED);
-    return n;
+    /* The tty's, so a signal ends a blocked read and the viewer leaving reads as the end of input. */
+    const ssize_t n = espix_tty_read(t->tty, buf, (size_t)len, false);
+    if (n < 0) {
+        errno = (int)-n;
+        return -1;
+    }
+    return (int)n;
 }
 
 static FILE *term_open_stream(espix_session_t *s, espix_stream_t which)
@@ -1029,39 +1038,19 @@ static FILE *term_open_stream(espix_session_t *s, espix_stream_t which)
 static ssize_t term_edit_read(int fd, void *buf, size_t count)
 {
     espix_term_t *t = term_slot_get(fd);
-    if (t == NULL) {
+    if (t == NULL || count == 0) {
         return 0;
     }
-
-    char *p = buf;
-    size_t n = 0;
-
-    while (n < count) {
-        char ch;
-        if (xQueueReceive(t->keys, &ch,
-                          n == 0 ? pdMS_TO_TICKS(100) : 0) != pdTRUE) {
-            if (t->quit) {
-                break;                      /* the viewer is gone: EOF */
-            }
-            if (n > 0) {
-                break;
-            }
-            continue;
-        }
-
-        /*
-         * ICRNL. A terminal sends CR for Enter and esp_linenoise tests for LF,
-         * so without this Enter does nothing at all. The serial console gets it
-         * from IDF's UART VFS (ESP_LINE_ENDINGS_CR) and SSH does it in its own
-         * read callback -- "espix *is* the pty here, so the line discipline's
-         * job is ours". Same job, same place.
-         */
-        if (ch == '\r') {
-            ch = '\n';
-        }
-        p[n++] = ch;
+    if (t->reply_pos < t->reply_len) {
+        const size_t n = (count < (size_t)(t->reply_len - t->reply_pos)) ? count
+                                                                         : (size_t)(t->reply_len - t->reply_pos);
+        memcpy(buf, t->reply + t->reply_pos, n);
+        t->reply_pos = (uint8_t)(t->reply_pos + n);
+        return (ssize_t)n;
     }
-    return (ssize_t)n;
+    /* Anything but a key (the viewer gone, the shell being stopped) ends the line, and with it the session. */
+    const ssize_t n = espix_tty_read(t->tty, buf, count, false);
+    return (n < 0) ? 0 : n;
 }
 
 static ssize_t term_edit_write(int fd, const void *buf, size_t count)
@@ -1070,7 +1059,11 @@ static ssize_t term_edit_write(int fd, const void *buf, size_t count)
     if (t == NULL) {
         return 0;
     }
+    (void)xSemaphoreTakeRecursive(t->lock, portMAX_DELAY);
+    t->editor_out = true;
     espix_term_write(t, buf, count);
+    t->editor_out = false;
+    (void)xSemaphoreGiveRecursive(t->lock);
     return (ssize_t)count;
 }
 
@@ -1114,7 +1107,21 @@ static int term_read_line(espix_session_t *s, const char *prompt,
      * so anything left from last time would be run as a command. */
     buf[0] = '\0';
 
-    if (esp_linenoise_get_line(t->editor, buf, len) != ESP_OK) {
+    /* The editor's mode for the prompt, the terminal's own for what runs after. */
+    struct termios cooked, edit;
+    espix_tty_getattr(t->tty, &cooked);
+    edit = cooked;
+    espix_tty_make_editing(&edit);
+    espix_tty_setattr(t->tty, TCSANOW, &edit);
+    const esp_err_t err = esp_linenoise_get_line(t->editor, buf, len);
+    const int saved = errno;
+    espix_tty_setattr(t->tty, TCSANOW, &cooked);
+    if (t->quit) {
+        return -1;
+    }
+
+    if (err != ESP_OK) {
+        errno = saved;
         /*
          * Two different keys land here, exactly as they do over SSH: the editor
          * sets EAGAIN for Ctrl-C, which abandons the line and should leave a
@@ -1136,14 +1143,8 @@ static int term_read_line(espix_session_t *s, const char *prompt,
     return (int)strlen(buf);
 }
 
-/*
- * Called by the shell between writes while a command runs. It is the only
- * reader of the key queue during a command, which is what makes Ctrl-C work --
- * and what stops typed keys from piling up and then being replayed as a line
- * the moment the command exits.
- */
-/* The foreground wait's sleep: a key, the viewer leaving, or a child's exit
- * all notify the shell's task. */
+/* The foreground wait's sleep: a signal key, the viewer leaving, or a child's
+ * exit all notify the shell's task. */
 static void term_wait_input(espix_session_t *s, uint32_t ms)
 {
     (void)s;
@@ -1159,30 +1160,42 @@ static bool term_poll_interrupt(espix_session_t *s)
     /*
      * The viewer is gone. A running command never sees t->quit -- this callback
      * is the only thing the shell consults while one runs -- so without this,
-     * `top` sat there for ever and the task could never be joined. That is what
-     * left the screen owned by a console nobody could see, and what made the
-     * next connection get nothing at all.
+     * `top` sat there for ever and the task could never be joined.
      */
     if (t->quit) {
         return true;
     }
-
-    bool interrupted = t->intr;
+    /* ^C reached the tty while a job ran (term_tty_signal()). */
+    const bool interrupted = t->intr;
     t->intr = false;
-    char ch;
-
-    /* A process reading stdin owns the keys; draining them here would steal
-     * its input. It passes a Ctrl-C on through t->intr instead. */
-    while (t->stdin_readers == 0 && xQueueReceive(t->keys, &ch, 0) == pdTRUE) {
-        if (ch == 0x03) {
-            interrupted = true;
-        } else if (ch == 0x1a) {
-            s->susp = true;
-        } else {
-            s->last_key = ch;           /* q at top, and the like (R-P7.7) */
-        }
-    }
     return interrupted;
+}
+
+/* The tty's output, and its echo from the viewer's task: both a write under the terminal's lock. */
+static ssize_t term_tty_out(void *ctx, const void *buf, size_t len)
+{
+    espix_term_write((espix_term_t *)ctx, buf, len);
+    return (ssize_t)len;
+}
+
+/* ^C and ^Z: the foreground wait says them and escalates (fg.c); any other signal key goes to the group. */
+static bool term_tty_signal(void *ctx, int sig)
+{
+    espix_term_t *t = ctx;
+    if (sig == SIGINT) {
+        t->intr = true;
+    } else if (sig == SIGTSTP) {
+        t->session.susp = true;
+    } else {
+        return false;
+    }
+    term_wake(t);
+    return true;
+}
+
+static void term_tty_key(void *ctx, int c)
+{
+    ((espix_term_t *)ctx)->session.last_key = c;
 }
 
 espix_session_t *espix_term_session(espix_term_t *t)
@@ -1196,6 +1209,7 @@ espix_session_t *espix_term_session(espix_term_t *t)
         .poll_interrupt = term_poll_interrupt,
         .wait_input     = term_wait_input,
         .open_stream    = term_open_stream,
+        .tty            = t->tty,
         .transport      = t,
         .term_size      = term_term_size,
         .fg_pgid         = ESPIX_PID_NONE,
@@ -1257,6 +1271,7 @@ void espix_term_stop(espix_term_t *t)
 {
     if (t != NULL) {
         t->quit = true;
+        espix_tty_input_eof(t->tty);    /* readers see the end */
         term_wake(t);
     }
 }
@@ -1311,20 +1326,25 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
     memset(t->attr, TERM_ATTR_DEFAULT, cells);
     term_sgr_reset(t);
 
-    /*
-     * Before the editor, not after it. esp_linenoise issues a cursor-position
-     * query when it starts and reads the reply back through term_edit_read(),
-     * which pulls from this queue -- so creating the editor first was an
-     * xQueueReceive(NULL) assert the moment a viewer connected, on the RFB
-     * task, which is where a console is started from.
-     */
-    t->keys = xQueueCreate(64, sizeof(char));
-    if (t->keys == NULL) {
+    /* Before the editor, not after it: its probe writes through the lock and reads through the tty. */
+    const espix_tty_ops_t tty_ops = {
+        .write  = term_tty_out,
+        .signal = term_tty_signal,
+        .key    = term_tty_key,
+        .ctx    = t,
+    };
+    t->lock = xSemaphoreCreateRecursiveMutex();
+    t->tty  = (t->lock != NULL) ? espix_tty_create(&tty_ops, TERM_TTY_INPUT, false) : NULL;
+    if (t->tty == NULL) {
+        if (t->lock != NULL) {
+            vSemaphoreDelete(t->lock);
+        }
         heap_caps_free(t->grid);
         heap_caps_free(t->attr);
         free(t);
         return NULL;
     }
+    espix_tty_set_winsize(t->tty, cols, rows);
 
     /*
      * The same editor the UART and SSH consoles run, so history, arrows and
@@ -1336,7 +1356,8 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
     const int slot = term_slot_take(t);
     if (slot < 0) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "no editor slot for another terminal");
-        vQueueDelete(t->keys);
+        espix_tty_hangup(t->tty);
+        vSemaphoreDelete(t->lock);
         heap_caps_free(t->grid);
         heap_caps_free(t->attr);
         free(t);
@@ -1360,7 +1381,8 @@ espix_term_t *espix_term_new(const espix_term_view_t *view, int cols, int rows,
     if (esp_linenoise_create_instance(&ed, &t->editor) != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "cannot create the line editor");
         s_edit_slot[slot] = NULL;
-        vQueueDelete(t->keys);
+        espix_tty_hangup(t->tty);
+        vSemaphoreDelete(t->lock);
         heap_caps_free(t->grid);
         heap_caps_free(t->attr);
         free(t);
@@ -1384,9 +1406,13 @@ void espix_term_free(espix_term_t *t)
         esp_linenoise_delete_instance(t->editor);
         t->editor = NULL;
     }
-    if (t->keys != NULL) {
-        vQueueDelete(t->keys);
-        t->keys = NULL;
+    if (t->tty != NULL) {
+        espix_tty_hangup(t->tty);       /* an app still holding a stream keeps it until it lets go */
+        t->tty = NULL;
+    }
+    if (t->lock != NULL) {
+        vSemaphoreDelete(t->lock);
+        t->lock = NULL;
     }
     if (t->grid != NULL) {
         heap_caps_free(t->grid);

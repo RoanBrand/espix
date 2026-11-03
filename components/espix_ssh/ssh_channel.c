@@ -370,23 +370,22 @@ static void tty_echo(void *ctx, const void *buf, size_t len)
     }
 }
 
-/* A signal key: the session's foreground wait acts on it, with its messages and its escalation (fg.c). */
-static void tty_signal(void *ctx, int sig)
+/* ^C and ^Z: the session's foreground wait acts on them, with its messages and its escalation (fg.c). */
+static bool tty_signal(void *ctx, int sig)
 {
     ssh_chan_t *ch = ctx;
     espix_session_t *s = ch->session;
-    if (sig == SIGTSTP) {
-        if (s != NULL) {
-            s->susp = true;
-        }
+    if (sig == SIGTSTP && s != NULL) {
+        s->susp = true;
     } else if (sig == SIGINT) {
         ch->intr = true;
-    } else if (s != NULL && s->fg_pgid != ESPIX_PID_NONE) {
-        (void)espix_proc_signal_group(s->fg_pgid, sig);
+    } else {
+        return false;
     }
     if (ch->shell != NULL) {
         (void)xTaskNotifyGiveIndexed(ch->shell, ESPIX_NOTIFY_SIG_IDX);
     }
+    return true;
 }
 
 /* Each key, for a command that asks for the last one (espix_shell_take_key()). */
@@ -791,15 +790,6 @@ static ssize_t ssh_edit_write(int fd, const void *buf, size_t count)
     return (espix_tty_write(ch->tty, buf, count) < 0) ? -1 : (ssize_t)count;
 }
 
-/* The editor's mode: keys one at a time and no echo or signal keys, with CR as Enter and LF as CR LF out. */
-static void editing_mode(const struct termios *cooked, struct termios *edit)
-{
-    *edit = *cooked;
-    edit->c_lflag &= ~(tcflag_t)(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG | IEXTEN);
-    edit->c_cc[VMIN]  = 1;
-    edit->c_cc[VTIME] = 0;
-}
-
 static int chan_read_line(espix_session_t *s, const char *prompt, char *buf, size_t len)
 {
     ssh_chan_t *ch = s->transport;
@@ -809,7 +799,8 @@ static int chan_read_line(espix_session_t *s, const char *prompt, char *buf, siz
     }
     struct termios cooked, edit;
     espix_tty_getattr(ch->tty, &cooked);
-    editing_mode(&cooked, &edit);
+    edit = cooked;
+    espix_tty_make_editing(&edit);
     espix_tty_setattr(ch->tty, TCSANOW, &edit);
 
     esp_linenoise_set_prompt(ch->editor, prompt);

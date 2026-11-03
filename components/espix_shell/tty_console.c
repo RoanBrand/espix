@@ -11,9 +11,15 @@
  * console and an SSH session get the same editing with separate histories.
  * IDF's own linenoise could not do that: its history and callbacks are
  * file-scope statics and it reads raw file descriptors.
+ *
+ * The session's terminal is a tty (components/espix_tty), fed by one task that
+ * reads the wire: the editor, the shell and apps read the tty, as they do over
+ * SSH, and ^C and ^Z reach the foreground wait from its line discipline.
  */
 
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -41,10 +47,15 @@
 
 #include "espix_kernel.h"
 #include "espix_shell.h"
+#include "espix_task.h"
+#include "espix_tty.h"
 
 #define TAG "console"
 
 #define CONSOLE_RX_BUF 512
+
+/* The console's terminal: what the pump task has read, waiting for the editor or an app. */
+#define CONSOLE_TTY_INPUT 1024
 
 static espix_session_t s_console;
 
@@ -108,6 +119,130 @@ static esp_err_t console_hw_init(void)
                "no console driver for this backend; line editing disabled");
     return ESP_OK;
 #endif
+}
+
+/* ------------------------------------------------------------------ */
+/* The terminal                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The console's tty (components/espix_tty): the pump task below is the wire's
+ * only reader and feeds it, and the editor, the shell and apps all read the
+ * tty. Its output goes to the driver raw: the tty has done the line endings,
+ * which the VFS would do a second time. The editor and the kernel log keep
+ * writing through stdout.
+ */
+static espix_tty_t *s_tty;
+
+static ssize_t console_tty_out(void *ctx, const void *buf, size_t len)
+{
+    (void)ctx;
+#if CONFIG_ESP_CONSOLE_UART
+    const int n = uart_write_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buf, len);
+    return (n < 0) ? -EIO : (ssize_t)n;
+#elif CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    size_t done = 0;
+    while (done < len) {
+        const int n = usb_serial_jtag_write_bytes((const uint8_t *)buf + done, len - done, portMAX_DELAY);
+        if (n <= 0) {
+            return done ? (ssize_t)done : -EIO;
+        }
+        done += (size_t)n;
+    }
+    return (ssize_t)len;
+#else
+    const size_t n = fwrite(buf, 1, len, stdout);
+    fflush(stdout);
+    return (ssize_t)n;
+#endif
+}
+
+static void console_wake(espix_session_t *s);
+
+/* ^C and ^Z: the foreground wait says them and escalates (fg.c); any other signal key goes to the group. */
+static bool console_tty_signal(void *ctx, int sig)
+{
+    (void)ctx;
+    if (sig == SIGINT) {
+        s_console.intr = true;
+    } else if (sig == SIGTSTP) {
+        s_console.susp = true;
+    } else {
+        return false;
+    }
+    console_wake(&s_console);
+    return true;
+}
+
+/* Each key, for a command that asks for the last one (espix_shell_take_key()). */
+static void console_tty_key(void *ctx, int c)
+{
+    (void)ctx;
+    s_console.last_key = c;
+}
+
+/* The wire's one reader: everything that arrives, into the tty. */
+static void console_rx_task(void *arg)
+{
+    (void)arg;
+    uint8_t buf[64];
+    for (;;) {
+#if CONFIG_ESP_CONSOLE_UART
+        int n = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buf, 1, portMAX_DELAY);
+        if (n == 1) {
+            const int more = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buf + 1, sizeof(buf) - 1, 0);
+            n += (more > 0) ? more : 0;
+        }
+#elif CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+        const int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), portMAX_DELAY);
+#else
+        const int n = (int)read(fileno(stdin), buf, sizeof(buf));
+#endif
+        if (n > 0) {
+            (void)espix_tty_input(s_tty, buf, (size_t)n);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));      /* a detached USB host, not a stream of nothing */
+        }
+    }
+}
+
+/* An app's streams over the tty, as an SSH channel's are: a read is the tty's, so a signal ends it. */
+static int console_stream_read(void *cookie, char *buf, int len)
+{
+    (void)cookie;
+    if (len <= 0) {
+        return 0;
+    }
+    const ssize_t n = espix_tty_read(s_tty, buf, (size_t)len, false);
+    if (n < 0) {
+        errno = (int)-n;
+        return -1;
+    }
+    return (int)n;
+}
+
+static int console_stream_write(void *cookie, const char *data, int len)
+{
+    (void)cookie;
+    if (len <= 0) {
+        return 0;
+    }
+    return (espix_tty_write(s_tty, data, (size_t)len) < 0) ? -1 : len;
+}
+
+static FILE *console_open_stream(espix_session_t *s, espix_stream_t which)
+{
+    (void)s;
+    FILE *f = (which == ESPIX_STREAM_IN) ? funopen(s, console_stream_read, NULL, NULL, NULL)
+                                         : funopen(s, NULL, console_stream_write, NULL, NULL);
+    if (f != NULL) {
+        if (which == ESPIX_STREAM_IN) {
+            setvbuf(f, NULL, _IONBF, 0);
+        } else {
+            setvbuf(f, NULL, _IOLBF, 128);
+        }
+    }
+    return f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -322,7 +457,7 @@ static void console_klog_output_done(void)
  */
 static bool console_klog_output_wanted(void)
 {
-    return s_console.fg_pgid <= 0 && s_console.stdin_readers == 0;
+    return s_console.fg_pgid <= 0;
 }
 
 static const espix_klog_console_hooks_t k_console_hooks = {
@@ -604,12 +739,16 @@ static ssize_t console_read_bytes(int fd, void *buf, size_t count)
             }
         }
 
-        n = read(fd, buf, count);
+        /* The tty, which select() just found readable; another reader may have been quicker. */
+        n = espix_tty_read(s_tty, buf, count, true);
+        if (n == -EAGAIN) {
+            continue;
+        }
         break;
     }
 
     if (n <= 0) {
-        return n;
+        return (n < 0) ? -1 : 0;
     }
 
     if (s_expect_report) {
@@ -679,6 +818,13 @@ static int console_read_line(espix_session_t *s, const char *prompt,
      * so anything left here from last time would be run as a command. */
     buf[0] = '\0';
 
+    /* The editor's mode for the prompt, the terminal's own for whatever runs after. */
+    struct termios cooked, edit;
+    espix_tty_getattr(s_tty, &cooked);
+    edit = cooked;
+    espix_tty_make_editing(&edit);
+    espix_tty_setattr(s_tty, TCSANOW, &edit);
+
     /*
      * Between these two the prompt is on screen and this task is blocked in
      * read(), so kernel output from anywhere else has to be fitted around it --
@@ -687,6 +833,7 @@ static int console_read_line(espix_session_t *s, const char *prompt,
     s_editing = true;
     const esp_err_t line_err = esp_linenoise_get_line(s_editor, buf, len);
     s_editing = false;
+    espix_tty_setattr(s_tty, TCSANOW, &cooked);
 
     /* The editor has consumed the line either way; whatever was typed on it is
      * gone from the screen, so the next message has nothing to protect. */
@@ -719,52 +866,12 @@ static int console_read_line(espix_session_t *s, const char *prompt,
     return (int)strlen(buf);
 }
 
-/*
- * Ctrl-C while a foreground process runs. Nothing else is reading the console
- * at that point -- the shell is blocked waiting on the process -- so this is
- * the only thing standing between the user and a program they cannot stop.
- *
- * Everything waiting is consumed, not just the Ctrl-C: input typed at a program
- * that is not reading has nowhere to go, and leaving it queued means it arrives
- * on the next prompt instead.
- */
+/* ^C reached the terminal while a foreground job ran (console_tty_signal()). */
 static bool console_poll_interrupt(espix_session_t *s)
 {
-    const int fd  = fileno(stdin);
-    bool      hit = s->intr;
-
-    /* An app reading stdin owns the keys, and passes ^C on through intr. */
+    const bool hit = s->intr;
     s->intr = false;
-    if (s->stdin_readers > 0) {
-        return hit;
-    }
-
-    for (;;) {
-        fd_set         rfds;
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
-
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-
-        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
-            return hit;                 /* nothing waiting */
-        }
-
-        uint8_t     buf[32];
-        const ssize_t n = read(fd, buf, sizeof(buf));
-        if (n <= 0) {
-            return hit;
-        }
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] == 0x03) {       /* ETX, which is what Ctrl-C sends */
-                hit = true;
-            } else if (buf[i] == 0x1a) {
-                s->susp = true;
-            } else {
-                s->last_key = (int)buf[i];
-            }
-        }
-    }
+    return hit;
 }
 
 /* End a console_wait_input(); under the process table's lock, and the eventfd
@@ -779,31 +886,22 @@ static void console_wake(espix_session_t *s)
 }
 
 /*
- * The foreground wait's sleep: a key, or the eventfd a child's exit and a
- * reading app's ^C write. Stdin is left out while an app reads it. Without the
- * eventfd an exit cannot reach this, so the wait is capped.
+ * The foreground wait's sleep: the eventfd a child's exit and a signal key
+ * write. Without it an exit cannot reach this, so the wait is capped.
  */
 static void console_wait_input(espix_session_t *s, uint32_t ms)
 {
-    const int fd    = fileno(stdin);
-    int       maxfd = -1;
-    fd_set    rfds;
-
-    FD_ZERO(&rfds);
-    if (s->stdin_readers == 0) {
-        FD_SET(fd, &rfds);
-        maxfd = fd;
-    }
-    if (s_wake_fd >= 0) {
-        FD_SET(s_wake_fd, &rfds);
-        maxfd = (s_wake_fd > maxfd) ? s_wake_fd : maxfd;
-    } else if (ms > 50) {
-        ms = 50;
-    }
-    if (maxfd < 0) {
-        vTaskDelay(pdMS_TO_TICKS(ms));
+    if (s->intr || s->susp) {
         return;
     }
+    if (s_wake_fd < 0) {
+        vTaskDelay(pdMS_TO_TICKS((ms > 50) ? 50 : ms));
+        return;
+    }
+    const int maxfd = s_wake_fd;
+    fd_set    rfds;
+    FD_ZERO(&rfds);
+    FD_SET(s_wake_fd, &rfds);
 
     struct timeval  tv;
     struct timeval *tvp = NULL;
@@ -822,10 +920,7 @@ static void console_wait_input(espix_session_t *s, uint32_t ms)
 static int console_write(espix_session_t *s, const char *data, size_t len)
 {
     (void)s;
-
-    const size_t n = fwrite(data, 1, len, stdout);
-    fflush(stdout);
-    return (int)n;
+    return (espix_tty_write(s_tty, data, len) < 0) ? -1 : (int)len;
 }
 
 /* ------------------------------------------------------------------ */
@@ -884,17 +979,27 @@ esp_err_t espix_console_session_start(void)
 {
     ESP_RETURN_ON_ERROR(console_hw_init(), TAG, "console hw init failed");
 
-    /* The editor reads this task's stdin; unbuffered, or it would sit on a
-     * full line before we ever see a keystroke. */
-    setvbuf(stdin, NULL, _IONBF, 0);
+    /* The terminal, and the task that is the wire's only reader, before the editor's probe reads its answer. */
+    static const espix_tty_ops_t tty_ops = {
+        .write  = console_tty_out,
+        .signal = console_tty_signal,
+        .key    = console_tty_key,
+    };
+    s_tty = espix_tty_create(&tty_ops, CONSOLE_TTY_INPUT, false);
+    if (s_tty == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    espix_tty_set_winsize(s_tty, REPORT_COLS, REPORT_ROWS);
+    ESP_RETURN_ON_ERROR(espix_kthread_start(&(const espix_kthread_t){
+                            .name = "console:rx", .fn = console_rx_task, .stack = 3072,
+                            .priority = 5, .core = tskNO_AFFINITY }, NULL),
+                        TAG, "no console reader task");
 
     /*
-     * One editor instance, owned by this session. The default read/write
-     * callbacks are right here: the console genuinely is a pair of file
-     * descriptors, so the library's select()/eventfd path applies unchanged.
-     * An SSH session supplies its own callbacks instead — that per-instance
-     * split is the whole reason espix uses this rather than IDF's linenoise,
-     * whose history and callbacks are file-scope statics.
+     * One editor instance, owned by this session, reading the tty and writing
+     * the console's stdout. The per-instance callbacks are the whole reason
+     * espix uses this rather than IDF's linenoise, whose history and callbacks
+     * are file-scope statics.
      */
     esp_linenoise_config_t cfg;
     esp_linenoise_get_instance_config_default(&cfg);
@@ -907,7 +1012,7 @@ esp_err_t espix_console_session_start(void)
      * terminal probe all at once. IDF's own linenoise uses fileno() throughout
      * for exactly this reason.
      */
-    cfg.in_fd               = fileno(stdin);
+    cfg.in_fd               = espix_tty_fileno(s_tty);
     cfg.out_fd              = fileno(stdout);
     cfg.max_cmd_line_length = ESPIX_LINE_MAX;
     cfg.history_max_length  = 32;
@@ -918,14 +1023,16 @@ esp_err_t espix_console_session_start(void)
     cfg.read_bytes_cb       = console_read_bytes;
     cfg.write_bytes_cb      = console_write_bytes;
 
-    /* Supplying a read callback means create_instance() no longer forces
-     * blocking mode for us, and the editor must block waiting for a key. */
-    const int flags = fcntl(cfg.in_fd, F_GETFL, 0);
-    fcntl(cfg.in_fd, F_SETFL, flags & ~O_NONBLOCK);
-
+    /* The probe's answer is a reply with no newline: the editor's mode, or it would wait for one. */
+    struct termios cooked, edit;
+    espix_tty_getattr(s_tty, &cooked);
+    edit = cooked;
+    espix_tty_make_editing(&edit);
+    espix_tty_setattr(s_tty, TCSANOW, &edit);
     s_probe_in_progress = true;
     const esp_err_t ed_err = esp_linenoise_create_instance(&cfg, &s_editor);
     s_probe_in_progress = false;
+    espix_tty_setattr(s_tty, TCSANOW, &cooked);
     ESP_RETURN_ON_ERROR(ed_err, TAG, "cannot create the line editor");
 
     /*
@@ -1035,10 +1142,9 @@ esp_err_t espix_console_session_start(void)
         .wake           = console_wake,
         .fg_pgid    = ESPIX_PID_NONE,
         .ansi      = ansi,
-        /* No stdio rebinding: the editor owns stdin and output goes through
-         * stdio, so a spawned app inherits the global streams — which for the
-         * console is already the right place. */
-        .open_stream = NULL,
+        /* An app's streams are the tty's, as an SSH session's are. */
+        .open_stream = console_open_stream,
+        .tty         = s_tty,
     };
 
     espix_klog(ESPIX_KLOG_INFO, TAG, "console session on %s",
