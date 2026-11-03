@@ -136,6 +136,14 @@ typedef struct {
 
 esp_err_t espix_proc_init(void);
 
+/*
+ * CPU-time accounting for /proc/stat.  The tick hook is registered once; the
+ * getter returns the M-mode time sampled for that core since boot.  Both are
+ * cheap: one tick callback and one uint64_t per core.
+ */
+esp_err_t espix_cpu_acct_init(void);
+uint64_t espix_cpu_system_us(int core);
+
 /* A kernel process's body. What it returns is the process's exit status. */
 typedef int (*espix_proc_fn_t)(void *arg);
 

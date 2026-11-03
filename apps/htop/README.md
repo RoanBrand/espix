@@ -204,17 +204,24 @@ On espix both cores run the kernel's tasks, so:
   processes, procs_running, procs_blocked. htop reads exactly existingCPUs + 1
   leading cpu lines and calls CRT_fatalError() if the file is missing.
 
-The per-core numbers do not need new tick accounting. FreeRTOS already keeps a
-cumulative run-time counter per task (CONFIG_FREERTOS_RUN_TIME_STATS=y,
-..._USING_ESP_TIMER=y), and the idle task on each core is pinned there. So:
+Idle still comes from the IDLE task's cumulative run-time counter
+(CONFIG_FREERTOS_RUN_TIME_STATS=y, ..._USING_ESP_TIMER=y):
 
     total_ticks(core) = esp_timer_get_time() / 10000
     idle_ticks(core)  = IDLEn.ulRunTimeCounter / 10000
     busy_ticks(core)  = total - idle
 
-at USER_HZ 100. That is the same data top already uses for its per-core
-figures; only the formatting is new. uxTaskGetSystemState() is already called
-from /proc and from top, so there is no new periodic work.
+at USER_HZ 100. The user/system split is the part FreeRTOS does not already
+have, so a tick hook samples it: when the tick arrives, mstatus.MPP says
+whether the interrupted code was U-mode (an app) or M-mode (a syscall, an ISR
+or a kernel task), and the current TCB excludes the IDLE task. Each system
+tick adds 4 ms to a per-core counter. user = busy - system.
+
+That is 32 bytes of RAM (two uint64_t per core) and one pointer comparison per
+idle tick; /proc/stat reads the two counters under a short spinlock. There is no
+allocation, no process-table walk and no extra timer. The first htop frame uses
+the since-boot totals, so a syscall-heavy startup can look mostly red; the next
+refresh uses the interval and the red is just the system tip.
 
 /proc/<pid>/stat similarly gets utime + stime from the task's
 ulRunTimeCounter, and starttime from started_us, both at 100 Hz.

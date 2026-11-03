@@ -54,6 +54,20 @@ case "$stat" in
     *)             espix_fail "the cpu lines are in order" "got: $(printf '%s' "$stat" | head -n 3)" ;;
 esac
 
+# Linux's ten fields, including system.  htop uses that field for the red part
+# of the meter; until it was sampled from mstatus.MPP it was always zero.
+cpu_fields=$(printf '%s\n' "$stat" | awk '/^cpu / { print NF; exit }')
+if [ "$cpu_fields" = 11 ]; then
+    espix_pass "the aggregate cpu line has ten fields"
+else
+    espix_fail "the aggregate cpu line has ten fields" "got $cpu_fields: $(printf '%s\n' "$stat" | head -n 1)"
+fi
+system_ticks=$(printf '%s\n' "$stat" | awk '/^cpu / { print $4; exit }')
+case "$system_ticks" in
+    ''|*[!0-9]*) espix_fail "stat reports system time" "got: '$system_ticks'" ;;
+    *)           espix_pass "stat reports system time ($system_ticks ticks)" ;;
+esac
+
 # A process's stat, comm and directory ownership, from the shell's own pid.
 pid=$(dev_run 'echo $$')
 case "$pid" in

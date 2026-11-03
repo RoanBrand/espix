@@ -197,16 +197,23 @@ static size_t proc_stat(char *buf, size_t cap)
     }
 
     uint64_t user[portNUM_PROCESSORS] = { 0 };
+    uint64_t system[portNUM_PROCESSORS] = { 0 };
     uint64_t idle[portNUM_PROCESSORS] = { 0 };
-    uint64_t all_user = 0, all_idle = 0;
+    uint64_t all_user = 0, all_system = 0, all_idle = 0;
 
     for (int c = 0; c < portNUM_PROCESSORS; c++) {
         idle[c] = proc_ticks((int64_t)idle_us[c]);
         if (idle[c] > total) {
             idle[c] = total;
         }
-        user[c] = total - idle[c];
+        const uint64_t busy = total - idle[c];
+        system[c] = proc_ticks((int64_t)espix_cpu_system_us(c));
+        if (system[c] > busy) {
+            system[c] = busy;
+        }
+        user[c] = busy - system[c];
         all_user += user[c];
+        all_system += system[c];
         all_idle += idle[c];
     }
 
@@ -224,11 +231,14 @@ static size_t proc_stat(char *buf, size_t cap)
         }                                                                  \
     } while (0)
 
-    PROC_APPEND("cpu  %llu 0 0 %llu 0 0 0 0 0 0\n",
-                (unsigned long long)all_user, (unsigned long long)all_idle);
+    PROC_APPEND("cpu  %llu 0 %llu %llu 0 0 0 0 0 0\n",
+                (unsigned long long)all_user,
+                (unsigned long long)all_system,
+                (unsigned long long)all_idle);
     for (int c = 0; c < portNUM_PROCESSORS; c++) {
-        PROC_APPEND("cpu%d %llu 0 0 %llu 0 0 0 0 0 0\n", c,
+        PROC_APPEND("cpu%d %llu 0 %llu %llu 0 0 0 0 0 0\n", c,
                     (unsigned long long)user[c],
+                    (unsigned long long)system[c],
                     (unsigned long long)idle[c]);
     }
     const time_t    wall   = time(NULL);

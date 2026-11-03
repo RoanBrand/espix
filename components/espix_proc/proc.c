@@ -239,6 +239,11 @@ esp_err_t espix_proc_init(void)
     /* The canary, set once the table is clean. See espix_proc_table_t. */
     g_espix_proc_table.guard = ESPIX_PROC_GUARD_MAGIC;
 
+    /* Two uint64_t per core, sampled from the tick; not a per-read scan. */
+    if (espix_cpu_acct_init() != ESP_OK) {
+        ESP_LOGW(TAG, "CPU time accounting unavailable");
+    }
+
     /* The loader announces its version and entry address on every single load.
      * That is startup chatter, not something a user running an app wants to
      * see, so lift its threshold to warnings. */
