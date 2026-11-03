@@ -287,9 +287,14 @@ else
             "$(dev_run 'jobs')"
 
         dev_run "kill -STOP $pid" >/dev/null
-        sleep 1
-        assert_contains "a stopped job shows as stopped" "stop" \
-            "$(dev_run 'jobs')"
+        # Polled: the stop lands at the app's next call into the kernel, later under load.
+        jobs_out=""
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            jobs_out=$(dev_run 'jobs')
+            case $jobs_out in *stop*) break ;; esac
+            sleep 0.5
+        done
+        assert_contains "a stopped job shows as stopped" "stop" "$jobs_out"
 
         dev_run 'bg' >/dev/null
         sleep 1

@@ -551,8 +551,15 @@ if [ -z "$pid" ]; then
     espix_fail "a live app and its finished entry share a name" "no pid"
 else
     live=$(dev_run ps | sed -n '1,/^finished:/p' | awk -v p="$pid" '$1 == p { print $2; exit }')
-    # On the kill's line, which returns once the app is gone: load pushes it out of ps's last 8.
-    ended=$(dev_run "kill -9 $pid; ps" | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $2; exit }')
+    # Polled from the kill on: the reaper records it a moment after, and load pushes it out of
+    # ps's last 8 if the check waits long.
+    dev_run "kill -9 $pid" >/dev/null 2>&1
+    ended=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        ended=$(dev_run ps | sed -n '/^finished:/,$p' | awk -v p="$pid" '$1 == p { print $2; exit }')
+        [ -n "$ended" ] && break
+        sleep 0.2
+    done
     assert_eq "a live app reads as its process name" "testapp" "$live"
     assert_eq "and its finished entry agrees" "testapp" "$ended"
 fi
