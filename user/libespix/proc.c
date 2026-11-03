@@ -35,8 +35,8 @@ long sysconf(int name)
     case _SC_CLK_TCK:
         /* The clock /proc's jiffies count in, not FreeRTOS's tick: htop and
          * every other Linux reader divides by this to turn a stat field into
-         * seconds. /proc generates its numbers at 100 Hz to match. */
-        return 100;
+         * seconds.  /proc generates at the same rate. */
+        return ESPIX_USER_HZ;
     case _SC_NPROCESSORS_ONLN:
     case _SC_NPROCESSORS_CONF:
         return 2;   /* the S31's cores, the one U-mode target */

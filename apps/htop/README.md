@@ -2,14 +2,15 @@
 
 [htop](https://github.com/htop-dev/htop), the real one, built as a U-mode espix
 app. This directory is a **build spike**, not an integrated app: the ELF links
-and is the right kind of object for the loader, but the kernel does not yet
-publish enough of /proc and /sys for it to draw a screen.
+and the kernel side is now in the same branch -- /proc/stat, per-process stat
+and comm, load average, the two /sys CPU directories, cpufreq and a thermal
+zone. It has not yet been run on a board: the serial port was held by another
+reader while this was built.
 
     ./build.sh
     # build/htop: 377 KB, ET_EXEC, entry 0x10000
     scp build/htop esp@<host>:/bin/htop
     htop
-    # cannot open /proc/stat          <- until the kernel side lands
 
 The point of the exercise is the kernel side. htop reads Linux's interfaces,
 and every gap it finds is a small, real thing espix should have anyway: a
@@ -175,37 +176,41 @@ interface; htop divides those fields by sysconf(_SC_CLK_TCK). The U-mode
 sysconf() now answers 100 and /proc generates at 100, so the two agree and the
 kernel's tick rate stays an internal detail.
 
-## The /proc and /sys gap
+## What /proc and /sys now publish
 
-What exists today:
+Implemented in this branch:
 
-    /proc/meminfo /proc/cpuinfo /proc/uptime /proc/version
-    /proc/<pid>/status /proc/<pid>/task/<tid>/status  (and the directories)
+    /proc/stat                    aggregate, cpu0..cpuN, btime, procs_running/blocked
+    /proc/<pid>/stat              39 Linux fields; task/<tid>/stat too
+    /proc/<pid>/comm              the process or thread name
+    /proc/loadavg                 1/5/15 minute, sampled every 5 s
+    /proc/cpuinfo                 one processor block per core, with cpu MHz
+    /proc/meminfo                 Linux MemTotal/Free/Available/Buffers/Cached/Swap keys
+    /proc/<pid>                   directory owned by the process, for htop USER column
+    /sys/devices/system/cpu/cpuN  online and cpufreq/{scaling_cur_freq,cpuinfo_max_freq}
+    /sys/class/thermal/thermal_zone0/{temp,type}
 
-What htop needs for a useful screen:
+/proc/stat and /proc/<pid>/stat are the mandatory two; htop calls
+CRT_fatalError() if the first cannot be opened. Everything below is optional
+and degrades rather than fails:
 
-| path | state | work |
-|---|---|---|
-| /proc/stat | missing | generator from idle counters + uptime; mandatory |
-| /proc/<pid>/stat | missing | 39 fields from espix_proc_info_t + TaskStatus_t; mandatory |
-| /proc/<pid>/comm | missing | optional; htop falls back to stat's comm |
-| /proc/<pid>/cmdline | missing | optional; argv is not in espix_proc_info_t |
-| /proc/<pid>/io | missing | optional; IO columns stay blank |
-| /proc/loadavg | missing | optional; load meter stays blank |
-| /proc/cpuinfo | one "processor : 0" | per-core blocks, and cpu MHz |
-| /proc/meminfo | espix keys + MemTotal/Free/Available | add Buffers/Cached/Swap* as zero |
-| /sys/devices/system/cpu/cpuN | missing | two empty directories |
-| /sys/class/thermal/thermal_zone0/temp | missing | generator over the temp sensor |
+    /proc/<pid>/cmdline           argv is not in espix_proc_info_t
+    /proc/<pid>/io                no per-process I/O counters
+    /proc/<pid>/smaps, maps, statm, cgroup
+    /proc/self/...                no symlinks in the VFS
+    /proc/diskstats, /proc/net/dev
 
-/proc/stat must be at most 512 bytes today (SYNTH_TEXT_MAX). Three CPU lines
-plus the summary fit; four cores would not. Either raise the cap for /proc/stat
-or make the generator aware of the limit.
+The synth text buffer went from 512 to 1024 bytes: /proc/stat for two cores,
+meminfo with the Linux keys, and loadavg all fit. Four cores would still fit;
+something much larger would not.
 
-htop's process list also reads the **owner of /proc/<pid>** with stat() to fill
-the USER column. Every synth node currently reports uid 0, so every row would
-say root. Adding uid/gid to synth_node_t and setting them on the per-pid
-directory is a small, honest fix; otherwise the USER column is wrong even
-though the processes are not.
+Ownership is a dyn_stat callback on the synth tree rather than a uid/gid in
+every synth_node_t. /proc/<pid> and /proc/<pid>/task/<tid> fill it from
+espix_proc_info_t, so htop stat() sees the real owner.
+
+tests/suites/78-proc.sh checks the two CPU lines and their order, a process
+stat and comm, the /sys CPU directories, a numeric cpufreq, and the three
+loadavg fields.
 
 ## What htop links that espix lacks
 
@@ -274,25 +279,23 @@ syscall table: UNAME is additive and rebases trivially.
 
 Each phase leaves the ELF loadable and "make test" green.
 
-1. **Make it start.** /proc/stat (aggregate + per-core), /sys/.../cpuN
-   directories, _SC_CLK_TCK. htop draws two CPU meters and an empty process
-   list.
-2. **Make the process list real.** /proc/<pid>/stat with 39 fields,
-   /proc/<pid>/comm, ownership on /proc/<pid>, cpu MHz per processor. htop
-   lists processes, CPU%, TIME+, USER, FREQ.
-3. **Make Temp work.** /sys/class/thermal/thermal_zone0/{temp,type},
-   esp_driver_tsens in the fs component, the sensors/ shim, build with
-   --enable-sensors. Enable "Also show CPU temperature" in htop's Display
-   Options.
-4. **Make it pleasant.** /proc/loadavg, /proc/meminfo standard keys, colors,
-   TERM/terminfo, terminal resize, config save under $HOME.
-5. **Integrate.** A uapp/CMakeLists.txt and a targets file so
-   tools/build-apps.sh stages /bin/htop; add a test suite that checks
-   /proc/stat advances, cpu0/cpu1 exist, and htop starts with a pty.
+1. **Make it start.** Done: /proc/stat, /sys/.../cpuN, _SC_CLK_TCK.
+2. **Make the process list real.** Done: /proc/<pid>/stat with 39 fields,
+   comm, ownership, per-core cpu MHz.
+3. **Make Temp work.** Done in the kernel and the shim: the thermal zone,
+   esp_driver_tsens, seven-function libsensors, --enable-sensors. Not run on
+   a board yet.
+4. **Make it pleasant.** Partly: /proc/loadavg and the meminfo keys are in.
+   Still open: colors, TERM/terminfo check on the real console, resize, and
+   saving htoprc under $HOME.
+5. **Integrate.** Not done: a uapp/CMakeLists.txt and a targets file so
+   tools/build-apps.sh stages /bin/htop, and a test that runs htop on a pty.
 6. **Optional, M8.** fork/exec/pipe for lsof, strace and the systemd meter.
 
 Phases 1-3 are the interesting kernel work and are independent of M7/M8.
-Phase 4 is polish. Phase 5 is how it stops being a spike.
+Phase 4 is polish. Phase 5 is how it stops being a spike. The board test is
+blocked only by the serial reader someone else had open; the firmware builds
+and the host unit tests pass.
 
 ## Decisions
 

@@ -229,6 +229,9 @@ typedef struct synth_tree {
     /* Optional directories below the tree's own: /proc/<pid>/task. */
     bool                (*dyn_isdir)(const char *abs_path);
     const synth_node_t *(*dyn_dir_at)(const char *abs_path, int nth);
+    /* Optional: the owner of a directory the tree answers for, e.g.
+     * /proc/<pid>. Files get their uid from their node. */
+    bool                (*dyn_stat)(const char *abs_path, struct stat *st);
 } synth_tree_t;
 
 #define ESPIX_SYNTH_FD_BASE   240
@@ -241,6 +244,9 @@ void        espix_synth_ensure_mounts(void);
 void        espix_synth_register_tree(const synth_tree_t *tree);
 const synth_tree_t *espix_fs_dev_tree(void);
 const synth_tree_t *espix_fs_proc_tree(void);
+const synth_tree_t *espix_fs_sys_tree(void);
+void                espix_fs_sys_init(void);
+void                espix_fs_proc_init(void);
 
 /* NULL when the path is not a device. The handle is opaque to vfs.c. */
 const void *espix_synth_lookup(const char *abs_path);
@@ -253,6 +259,10 @@ int         espix_synth_open(const void *handle, int flags);
  */
 bool        espix_synth_isdir(const char *abs_path);
 bool        espix_synth_under(const char *abs_path);
+
+/* A directory's own stat, when its tree supplies one (dyn_stat); false when
+ * this is not a tree path or the tree has nothing to say about it. */
+bool        espix_synth_stat_path(const char *abs_path, struct stat *st);
 bool        espix_synth_mode(const char *abs_path, mode_t *out);
 void        espix_synth_dir_stat(struct stat *st);
 

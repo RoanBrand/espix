@@ -95,6 +95,15 @@ enum {
 /* A process's descriptors: sysconf(_SC_OPEN_MAX). */
 #define ESPIX_OPEN_MAX 32
 
+/*
+ * The clock /proc's jiffies count in, and the answer to sysconf(_SC_CLK_TCK).
+ * It is a user-visible ABI constant, not the kernel's tick: Linux keeps it at
+ * 100 even when CONFIG_HZ is 250 or 1000, so a program built against one kernel
+ * still reads another's /proc correctly. Changing it is an ABI break; changing
+ * CONFIG_FREERTOS_HZ is not.
+ */
+#define ESPIX_USER_HZ 100
+
 /* A terminal's ioctls on fds 0-2, Linux's numbers; the termios they carry is IDF's layout (user/include/sys/termios.h). */
 #define ESPIX_TCGETS     0x5401
 #define ESPIX_TCSETS     0x5402      /* +1 TCSADRAIN, +2 TCSAFLUSH */
