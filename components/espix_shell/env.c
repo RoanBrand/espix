@@ -362,7 +362,11 @@ void espix_env_set_login_defaults(espix_session_t *s)
     /*
      * The transport already decided this: `ansi` is what esp_linenoise probed
      * on the console and what an SSH session always has. Publishing it as TERM
-     * is how a program that is not the shell gets to know.
+     * is how a program that is not the shell gets to know.  The 256-colour
+     * name matters: curses apps use the extra depth for a visible shadow and
+     * for colour 8, which is black in an 8-colour xterm.  A terminal that only
+     * does 16 colours reduces the 256-colour sequences (components/espix_shell/
+     * term.c does exactly that) instead of failing.
      */
-    (void)espix_env_set(s, "TERM", s->ansi ? "xterm" : "dumb", true);
+    (void)espix_env_set(s, "TERM", s->ansi ? "xterm-256color" : "dumb", true);
 }

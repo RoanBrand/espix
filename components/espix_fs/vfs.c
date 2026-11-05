@@ -1157,6 +1157,10 @@ static int vfs_stat(void *ctx, const char *path, struct stat *st)
 {
     RESOLVE_OR_FAIL(path, -1);
 
+    if (espix_synth_stat_path(p, st)) {
+        return 0;
+    }
+
     const void *dev = espix_synth_lookup(p);
     if (dev != NULL) {
         espix_synth_stat(dev, st);

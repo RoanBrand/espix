@@ -13,6 +13,7 @@
 #include <pwd.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -23,9 +24,12 @@
 
 #include "esp_attr.h"
 #include "esp_cpu.h"
+#include "esp_heap_caps.h"
 #include "riscv/encoding.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_syscall.h"
 #include "espix_tty.h"
 #include "espix_umode.h"
@@ -86,6 +90,7 @@ int um_fd_release(espix_um_fd_t *e)
         r = um_kret(close(e->kfd));
     } else if (e->kind == ESPIX_UM_FD_DIR) {
         r = um_kret(closedir(e->dir));
+        heap_caps_free(e->dir_path);
     } else if (e->kind == ESPIX_UM_FD_SOCK) {
         r = um_sock_close(e->sock);
     }
@@ -102,6 +107,44 @@ void espix_um_close_fds(espix_proc_slot_t *slot)
     for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
         um_fd_release(&t->proc->fds[fd]);
     }
+}
+
+/*
+ * The absolute path behind a directory descriptor.  Open-at is not a hot
+ * path, so PSRAM is the right heap; a small internal fallback keeps a full
+ * PSRAM from making directories unusable.
+ */
+static char *fd_path_store(const char *path)
+{
+    const size_t len = strlen(path) + 1;
+    char *p = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == NULL) {
+        p = malloc(len);
+    }
+    if (p != NULL) {
+        memcpy(p, path, len);
+    }
+    return p;
+}
+
+/* Copy e's directory path under the process lock, for a caller that must not
+ * hold it across open()/opendir(). */
+static int fd_dir_path(espix_um_proc_t *p, uint32_t fd, char *buf, size_t len)
+{
+    int r = 0;
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    espix_um_fd_t *e = um_fd_get(p, fd);
+    if (e == NULL) {
+        r = -EBADF;
+    } else if (e->kind != ESPIX_UM_FD_DIR) {
+        r = -ENOTDIR;
+    } else if (e->dir_path == NULL) {
+        r = -ENOTSUP;
+    } else {
+        strlcpy(buf, e->dir_path, len);
+    }
+    xSemaphoreGive(p->lock);
+    return r;
 }
 
 /* A copy of e: a second kernel descriptor for a file, so each closes its own; a socket is shared. */
@@ -265,24 +308,23 @@ static int32_t um_sys_write(um_call_t *c)
     return (int32_t)done;
 }
 
-static int32_t um_sys_open(um_call_t *c)
+static int32_t um_open_path(um_call_t *c, const char *path, int flags, int mode,
+                            const char *dir_path)
 {
-    char path[ESPIX_PATH_MAX];
-    int32_t r = path_in(c, c->a[0], path);
-    const int flags = (int)c->a[1];
-    if (r < 0) {
-        return r;
-    }
     espix_um_fd_t e = { .cloexec = (flags & O_CLOEXEC) != 0 };
+
     if (flags & O_DIRECTORY) {
         e.kind = ESPIX_UM_FD_DIR;
         e.dir  = opendir(path);
         if (e.dir == NULL) {
             return -errno;
         }
+        /* A directory opened before the path can be stored still works, but
+         * openat() relative to it will report ENOTSUP instead of guessing. */
+        e.dir_path = (dir_path != NULL) ? fd_path_store(dir_path) : NULL;
     } else {
         e.kind = ESPIX_UM_FD_FILE;
-        e.kfd  = open(path, flags & ~(O_CLOEXEC | O_DIRECTORY), (int)c->a[2]);
+        e.kfd  = open(path, flags & ~(O_CLOEXEC | O_DIRECTORY), mode);
         if (e.kfd < 0) {
             return -errno;
         }
@@ -292,6 +334,62 @@ static int32_t um_sys_open(um_call_t *c)
         um_fd_release(&e);
     }
     return fd;
+}
+
+static int32_t um_sys_open(um_call_t *c)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = path_in(c, c->a[0], path);
+    const int flags = (int)c->a[1];
+    if (r < 0) {
+        return r;
+    }
+
+    char abs[ESPIX_PATH_MAX];
+    const char *stored = NULL;
+    if ((flags & O_DIRECTORY) &&
+        espix_fs_resolve(espix_proc_cwd(), path, abs, sizeof(abs)) == ESP_OK) {
+        stored = abs;
+    }
+    return um_open_path(c, path, flags, (int)c->a[2], stored);
+}
+
+static int32_t um_sys_openat(um_call_t *c)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = path_in(c, c->a[1], path);
+    if (r < 0) {
+        return r;
+    }
+
+    const int dirfd = (int)c->a[0];
+    const int flags = (int)c->a[2];
+    char abs[ESPIX_PATH_MAX];
+
+    if (path[0] == '\0') {
+        return -ENOENT;
+    }
+
+    /* An absolute path ignores dirfd, as it does on Linux. */
+    if (path[0] == '/') {
+        if (espix_fs_resolve(NULL, path, abs, sizeof(abs)) != ESP_OK) {
+            return -ENAMETOOLONG;
+        }
+    } else if (dirfd == AT_FDCWD) {
+        if (espix_fs_resolve(espix_proc_cwd(), path, abs, sizeof(abs)) != ESP_OK) {
+            return -ENAMETOOLONG;
+        }
+    } else {
+        char base[ESPIX_PATH_MAX];
+        r = fd_dir_path(c->p, (uint32_t)dirfd, base, sizeof(base));
+        if (r < 0) {
+            return r;
+        }
+        if (espix_fs_resolve(base, path, abs, sizeof(abs)) != ESP_OK) {
+            return -ENAMETOOLONG;
+        }
+    }
+    return um_open_path(c, abs, flags, (int)c->a[3], abs);
 }
 
 static int32_t um_sys_close(um_call_t *c)
@@ -756,6 +854,76 @@ static int32_t um_sys_getgr(um_call_t *c)
     }
     const char *const strs[] = { gr.gr_name };
     return pwent_out(c, gr.gr_gid, gr.gr_gid, strs, 1);
+}
+
+/*
+ * readlink(2) for the one family espix has: /proc/<pid>/exe and
+ * /proc/self/exe.  The VFS has no symlink nodes, so this is procfs knowledge
+ * in the syscall rather than a general path resolver.
+ */
+static int32_t um_sys_readlink(um_call_t *c)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = path_in(c, c->a[0], path);
+    if (r < 0) {
+        return r;
+    }
+
+    espix_pid_t pid = ESPIX_PID_NONE;
+    if (strncmp(path, "/proc/", 6) == 0) {
+        const char *p = path + 6;
+        if (strcmp(p, "self/exe") == 0) {
+            const espix_proc_slot_t *const self = espix_proc_self();
+            pid = (self != NULL) ? self->info.pid : ESPIX_PID_NONE;
+        } else {
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            if (v > 0 && end != p && strcmp(end, "/exe") == 0) {
+                pid = (espix_pid_t)v;
+            }
+        }
+    }
+    if (pid == ESPIX_PID_NONE) {
+        return -EINVAL;
+    }
+
+    char target[ESPIX_PATH_MAX];
+    const size_t len = espix_proc_exe(pid, target, sizeof(target));
+    if (len == 0) {
+        return -ENOENT;
+    }
+    if (c->a[2] > 0) {
+        r = espix_um_copyout(c->p->as, c->a[1], target,
+                             (len < c->a[2]) ? len : c->a[2]);
+        if (r != 0) {
+            return r;
+        }
+    }
+    return (int32_t)len;
+}
+
+/*
+ * uname(2): the same five fields uname(1) prints, from the same places. The
+ * release is the version a person quotes and the version is which build of it
+ * is running, as Linux splits them (see espix_uname()).
+ */
+static int32_t um_sys_uname(um_call_t *c)
+{
+    struct espix_utsname u = { 0 };
+
+    strlcpy(u.sysname, "espix", sizeof(u.sysname));
+    strlcpy(u.nodename, espix_nodename(), sizeof(u.nodename));
+    strlcpy(u.release, espix_version(), sizeof(u.release));
+    if (espix_build_is_release()) {
+        strlcpy(u.version, "#1", sizeof(u.version));
+    } else {
+        char v[16];
+        snprintf(v, sizeof(v), "#%s", espix_build_id());
+        strlcpy(u.version, v, sizeof(u.version));
+    }
+    strlcpy(u.machine, "riscv32", sizeof(u.machine));
+
+    return espix_um_copyout(c->p->as, c->a[0], &u, sizeof(u));
 }
 
 static int32_t um_sys_kill(um_call_t *c)    { return um_kret(espix_abi_kill((pid_t)c->a[0], (int)c->a[1])); }

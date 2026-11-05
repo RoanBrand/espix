@@ -26,6 +26,7 @@
 #define TAG "proc"
 
 espix_proc_table_t  g_espix_proc_table;
+static volatile uint32_t s_proc_generation;
 SemaphoreHandle_t  g_espix_proc_lock;
 EventGroupHandle_t g_espix_proc_events;
 
@@ -239,6 +240,11 @@ esp_err_t espix_proc_init(void)
     /* The canary, set once the table is clean. See espix_proc_table_t. */
     g_espix_proc_table.guard = ESPIX_PROC_GUARD_MAGIC;
 
+    /* Two uint64_t per core, sampled from the tick; not a per-read scan. */
+    if (espix_cpu_acct_init() != ESP_OK) {
+        ESP_LOGW(TAG, "CPU time accounting unavailable");
+    }
+
     /* The loader announces its version and entry address on every single load.
      * That is startup chatter, not something a user running an app wants to
      * see, so lift its threshold to warnings. */
@@ -342,6 +348,7 @@ espix_proc_slot_t *espix_proc_alloc_slot(void)
         espix_proc_slot_t *s = &g_espix_proc_table.slots[i];
 
         if (s->info.state == ESPIX_PROC_FREE) {
+            __atomic_add_fetch(&s_proc_generation, 1, __ATOMIC_RELAXED);
             return s;
         }
     }
@@ -565,6 +572,7 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
         done_record(slot, state, exit_code);
     }
     memset(slot, 0, sizeof(*slot));
+    __atomic_add_fetch(&s_proc_generation, 1, __ATOMIC_RELAXED);
 
     /*
      * Wake every waiter. One global bit rather than the old per-slot one: the
@@ -576,6 +584,57 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      */
     xEventGroupSetBits(g_espix_proc_events, ESPIX_PROC_EVENT_FINISH);
     xSemaphoreGive(g_espix_proc_lock);
+}
+
+uint32_t espix_proc_generation(void)
+{
+    return __atomic_load_n(&s_proc_generation, __ATOMIC_RELAXED);
+}
+
+size_t espix_proc_cmdline(espix_pid_t pid, char *buf, size_t cap)
+{
+    if (buf == NULL || cap == 0) {
+        return 0;
+    }
+    size_t n = 0;
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *const slot = espix_proc_find(pid);
+    if (slot != NULL && slot->app != NULL && slot->app->argv != NULL) {
+        for (int i = 0; i < slot->app->argc && n < cap; i++) {
+            const char *arg = slot->app->argv[i];
+            if (arg == NULL) {
+                break;
+            }
+            const size_t len = strlen(arg);
+            if (n + len >= cap) {
+                break;
+            }
+            memcpy(buf + n, arg, len);
+            n += len;
+            buf[n++] = '\0';
+        }
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return n;
+}
+
+size_t espix_proc_exe(espix_pid_t pid, char *buf, size_t cap)
+{
+    if (buf == NULL || cap == 0) {
+        return 0;
+    }
+    size_t n = 0;
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    const espix_proc_slot_t *const slot = espix_proc_find(pid);
+    if (slot != NULL && slot->app != NULL) {
+        n = strlen(slot->app->path);
+        if (n >= cap) {
+            n = cap - 1;
+        }
+        memcpy(buf, slot->app->path, n);
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return n;
 }
 
 void espix_proc_reap_self(espix_proc_slot_t *slot, espix_proc_state_t state,

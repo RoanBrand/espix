@@ -30,6 +30,18 @@ int open(const char *path, int flags, ...)
     return espix_ret(espix_sys3(ESPIX_SYS_OPEN, path, flags, mode));
 }
 
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    int mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return espix_ret(espix_sys5(ESPIX_SYS_OPENAT, dirfd, path, flags, mode, 0));
+}
+
 int creat(const char *path, mode_t mode)
 {
     return open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
@@ -76,10 +88,16 @@ int stat(const char *path, struct stat *st)
     return to_stat(espix_sys2(ESPIX_SYS_STAT, path, &e), &e, st);
 }
 
-/* No symlinks in espix. */
+/* No symlinks in espix; lstat is stat.  readlink covers procfs's exe. */
 int lstat(const char *path, struct stat *st)
 {
     return stat(path, st);
+}
+
+ssize_t readlink(const char *path, char *buf, size_t len)
+{
+    const long r = espix_sys3(ESPIX_SYS_READLINK, path, buf, len);
+    return (r < 0) ? espix_ret(r) : (ssize_t)r;
 }
 
 int unlink(const char *path)

@@ -185,3 +185,8 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 #
 CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
 
+
+# DFS experiment: add CONFIG_PM_ENABLE=y here to enable the late start in
+# components/espix_shell/tty_console.c.  It is off by default; see apps/htop/README.md.
+# CONFIG_FREERTOS_USE_IDLE_HOOK is not set
+# CONFIG_PM_PROFILING is not set

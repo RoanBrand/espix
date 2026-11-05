@@ -83,7 +83,10 @@
     X(GETPW,         getpw,         68)        /* (name or 0, uid, struct espix_pwent *, len) */ \
     X(GETGR,         getgr,         69)        /* (name or 0, gid, struct espix_pwent *, len) */ \
     X(SYSLOG,        syslog,        70)        /* (priority, ident or 0, message): to the kernel log */ \
-    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */
+    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */ \
+    X(UNAME,         uname,         72)        /* (struct espix_utsname *): the five fields */ \
+    X(READLINK,      readlink,      73)        /* (path, buf, len): target length, no NUL */ \
+    X(OPENAT,        openat,        74)        /* (dirfd, path, flags, mode): relative to a dir fd */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
@@ -93,6 +96,15 @@ enum {
 
 /* A process's descriptors: sysconf(_SC_OPEN_MAX). */
 #define ESPIX_OPEN_MAX 32
+
+/*
+ * The clock /proc's jiffies count in, and the answer to sysconf(_SC_CLK_TCK).
+ * It is a user-visible ABI constant, not the kernel's tick: Linux keeps it at
+ * 100 even when CONFIG_HZ is 250 or 1000, so a program built against one kernel
+ * still reads another's /proc correctly. Changing it is an ABI break; changing
+ * CONFIG_FREERTOS_HZ is not.
+ */
+#define ESPIX_USER_HZ 100
 
 /* A terminal's ioctls on fds 0-2, Linux's numbers; the termios they carry is IDF's layout (user/include/sys/termios.h). */
 #define ESPIX_TCGETS     0x5401
@@ -166,6 +178,16 @@ struct espix_addrinfo {
 struct espix_pwent {
     uint32_t id, gid;
     char     strs[];
+};
+
+/* uname(2)'s five fields, fixed-width as they cross. The lengths are Linux's. */
+#define ESPIX_UTS_LEN 65
+struct espix_utsname {
+    char sysname[ESPIX_UTS_LEN];
+    char nodename[ESPIX_UTS_LEN];
+    char release[ESPIX_UTS_LEN];
+    char version[ESPIX_UTS_LEN];
+    char machine[ESPIX_UTS_LEN];
 };
 
 /* One getifaddrs() entry: an interface and one of its addresses (an AF_UNSPEC addr: none). */

@@ -16,6 +16,34 @@ typedef struct {
     char          buf[512] __attribute__((aligned(4)));
 } espix_dir_t;
 
+int dirfd(DIR *dir)
+{
+    if (dir == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    return ((espix_dir_t *)dir)->fd;
+}
+
+DIR *fdopendir(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return NULL;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return NULL;
+    }
+    espix_dir_t *d = calloc(1, sizeof(*d));
+    if (d == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    d->fd = fd;
+    return &d->dir;
+}
+
 DIR *opendir(const char *path)
 {
     const int fd = open(path, O_RDONLY | O_DIRECTORY);

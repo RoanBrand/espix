@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "proc.c"
+        "cpu_acct.c"
         "exec.c"
         "abi_cxx.cpp"
         "abi_drivers.c"
@@ -37,6 +38,7 @@ idf_component_register(
         "../../user/include/common"
     REQUIRES
         esp_common
+        esp_system
         freertos
         espix_kernel
     PRIV_REQUIRES
@@ -64,5 +66,6 @@ idf_component_register(
         heap
         esp_driver_rmt
         esp_driver_gpio
+        riscv
         soc
 )

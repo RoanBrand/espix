@@ -32,6 +32,11 @@ long sysconf(int name)
         return ESPIX_OPEN_MAX;
     case _SC_PAGESIZE:
         return 4096;
+    case _SC_CLK_TCK:
+        /* The clock /proc's jiffies count in, not FreeRTOS's tick: htop and
+         * every other Linux reader divides by this to turn a stat field into
+         * seconds.  /proc generates at the same rate. */
+        return ESPIX_USER_HZ;
     case _SC_NPROCESSORS_ONLN:
     case _SC_NPROCESSORS_CONF:
         return 2;   /* the S31's cores, the one U-mode target */
@@ -77,4 +82,24 @@ _Noreturn void _exit(int status)
     espix_sys1(ESPIX_SYS_EXIT, status);
     for (;;) {
     }
+}
+
+/* No Unix priority exists to read or set yet. Reporting 0 is what Linux does
+ * for a process it cannot find (with errno cleared), and a set fails with
+ * EPERM: htop's NICE column is truthful, and an attempt to change it says so. */
+int getpriority(int which, id_t who)
+{
+    (void)which;
+    (void)who;
+    errno = 0;
+    return 0;
+}
+
+int setpriority(int which, id_t who, int prio)
+{
+    (void)which;
+    (void)who;
+    (void)prio;
+    errno = EPERM;
+    return -1;
 }

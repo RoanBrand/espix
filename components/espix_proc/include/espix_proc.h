@@ -136,6 +136,26 @@ typedef struct {
 
 esp_err_t espix_proc_init(void);
 
+/*
+ * CPU-time accounting for /proc/stat.  The tick hook is registered once; the
+ * getter returns the M-mode time sampled for that core since boot.  Both are
+ * cheap: one tick callback and one uint64_t per core.
+ */
+esp_err_t espix_cpu_acct_init(void);
+uint64_t espix_cpu_system_us(int core);
+
+/* A counter bumped whenever a process slot is claimed or returned; /proc uses
+ * it to invalidate its snapshot cache, not to identify a process. */
+uint32_t espix_proc_generation(void);
+
+/*
+ * Linux-shaped process metadata.  cmdline returns the NUL-separated argv
+ * block (including its trailing NUL); exe returns the app's absolute path.
+ * Both return the number of bytes written, or 0 for a kernel task / no argv.
+ */
+size_t espix_proc_cmdline(espix_pid_t pid, char *buf, size_t cap);
+size_t espix_proc_exe(espix_pid_t pid, char *buf, size_t cap);
+
 /* A kernel process's body. What it returns is the process's exit status. */
 typedef int (*espix_proc_fn_t)(void *arg);
 
