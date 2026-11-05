@@ -351,14 +351,16 @@ Each phase leaves the ELF loadable and "make test" green.
 4. **Make it pleasant.** Mostly: loadavg and the meminfo keys are in; TERM and
    the embedded xterm entry work on a real pty; htoprc was read from
    $HOME/.config/htop. Resize and the smaller cosmetic settings are untested.
-5. **Integrate.** Done: apps/htop has a targets file naming esp32s31, and
+5. **Integrate.** Done: apps/htop has a targets file naming esp32s31,
    tools/build-apps.sh runs its build.sh and stages /bin/htop (incremental,
-   like the ESP-IDF apps). Still open: a test suite that runs htop on a pty.
+   like the ESP-IDF apps), and tests/suites/80-htop-screen.sh runs one frame
+   on a pty and checks the Tasks/PID screen.
 6. **Optional, M8.** fork/exec/pipe for lsof, strace and the systemd meter.
 
 Phases 1-3 are the interesting kernel work and are independent of M7/M8.
-Phase 4 is polish. Phase 5 is how it stops being a spike. The firmware builds
-and the host unit tests pass; the device suite was not run in this sitting.
+Phase 4 is polish. Phase 5 is how it stops being a spike. The firmware builds,
+make unit passes, and 78-proc/79-htop/80-htop-screen pass on the board; the
+full device suite was not run end to end in this sitting.
 
 ## Decisions
 
