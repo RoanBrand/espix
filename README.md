@@ -1,13 +1,18 @@
-<p align="center">
-  <img width="486" height="239" alt="espix login greeting" src="https://github.com/user-attachments/assets/457b6049-acb2-4080-8ad2-40222d47d782" />
-</p>
-
 <table align="center">
   <tr>
-    <td width="440">
+    <td width="50%">
+      <img src="https://github.com/user-attachments/assets/457b6049-acb2-4080-8ad2-40222d47d782" alt="espix login greeting" width="100%">
+    </td>
+    <td width="50%">
+      <img src="https://github.com/user-attachments/assets/9d68036e-e244-4c0e-b438-5796b72993e9" alt="espix htop" width="100%">
+    </td>
+  </tr>
+
+  <tr>
+    <td width="50%">
       <video src="https://github.com/user-attachments/assets/0b059eef-5a10-493a-bd1c-50b411b0b9d6"></video>
     </td>
-    <td width="440">
+    <td width="50%">
       <video src="https://github.com/user-attachments/assets/0d29384d-b44a-4fc5-8c46-e333b48fac86"></video>
     </td>
   </tr>
@@ -420,14 +425,16 @@ stack) never reaches the fault handler at all, as on nommu Linux. Rebooting is
 the honest answer.
 
 ## Why not Linux on ESP32?
- - Only supports S31. Espix should be able to support all ESP32 models.
+ - Only supports S31. espix should be able to support all ESP32 models.
  - Cannot do much with it yet.
+ - espix kernel and apps can fully use both CPU cores.
+ - Sticks to the ESP-IDF and its ecosystem.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-Any code directly incorporated from other MIT-licensed projects (e.g. Esp32OS)
+Any code directly incorporated from other MIT-licensed projects
 retains its original license notice; see individual file headers / a `NOTICE.md`
 once added. Nothing is incorporated today: everything espix depends on is fetched
 at build time rather than vendored into this tree.
@@ -463,10 +470,9 @@ by name rather than producing an image that is quietly missing something.
 
 ## Acknowledgements
 
+- [annoyedmilk/esp32-s31-linux](https://github.com/annoyedmilk/esp32-s31-linux)
+- [GrieferPig/esp32-s31-linux](https://github.com/GrieferPig/esp32-s31-linux)
+- [paulneja/Linux-on-esp32-S3](https://github.com/paulneja/Linux-on-esp32-S3)
+- Espressif ESP-IDF / FreeRTOS
 - [Apache NuttX](https://nuttx.apache.org/) — prior art for nearly all of this,
   and the honest first stop for anyone who does not need to stay on ESP-IDF
-- [GrieferPig/esp32-s31-linux](https://github.com/GrieferPig/esp32-s31-linux)
-- [nodestark/esp32-running-linux](https://github.com/nodestark/esp32-running-linux)
-- [paulneja/Linux-on-esp32-S3](https://github.com/paulneja/Linux-on-esp32-S3)
-- [faizannazir/Esp32OS](https://github.com/faizannazir/Esp32OS)
-- Espressif ESP-IDF / FreeRTOS
