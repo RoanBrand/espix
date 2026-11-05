@@ -76,10 +76,16 @@ int stat(const char *path, struct stat *st)
     return to_stat(espix_sys2(ESPIX_SYS_STAT, path, &e), &e, st);
 }
 
-/* No symlinks in espix. */
+/* No symlinks in espix; lstat is stat.  readlink covers procfs's exe. */
 int lstat(const char *path, struct stat *st)
 {
     return stat(path, st);
+}
+
+ssize_t readlink(const char *path, char *buf, size_t len)
+{
+    const long r = espix_sys3(ESPIX_SYS_READLINK, path, buf, len);
+    return (r < 0) ? espix_ret(r) : (ssize_t)r;
 }
 
 int unlink(const char *path)

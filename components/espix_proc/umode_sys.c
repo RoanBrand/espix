@@ -13,6 +13,7 @@
 #include <pwd.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -756,6 +757,52 @@ static int32_t um_sys_getgr(um_call_t *c)
     }
     const char *const strs[] = { gr.gr_name };
     return pwent_out(c, gr.gr_gid, gr.gr_gid, strs, 1);
+}
+
+/*
+ * readlink(2) for the one family espix has: /proc/<pid>/exe and
+ * /proc/self/exe.  The VFS has no symlink nodes, so this is procfs knowledge
+ * in the syscall rather than a general path resolver.
+ */
+static int32_t um_sys_readlink(um_call_t *c)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = path_in(c, c->a[0], path);
+    if (r < 0) {
+        return r;
+    }
+
+    espix_pid_t pid = ESPIX_PID_NONE;
+    if (strncmp(path, "/proc/", 6) == 0) {
+        const char *p = path + 6;
+        if (strcmp(p, "self/exe") == 0) {
+            const espix_proc_slot_t *const self = espix_proc_self();
+            pid = (self != NULL) ? self->info.pid : ESPIX_PID_NONE;
+        } else {
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            if (v > 0 && end != p && strcmp(end, "/exe") == 0) {
+                pid = (espix_pid_t)v;
+            }
+        }
+    }
+    if (pid == ESPIX_PID_NONE) {
+        return -EINVAL;
+    }
+
+    char target[ESPIX_PATH_MAX];
+    const size_t len = espix_proc_exe(pid, target, sizeof(target));
+    if (len == 0) {
+        return -ENOENT;
+    }
+    if (c->a[2] > 0) {
+        r = espix_um_copyout(c->p->as, c->a[1], target,
+                             (len < c->a[2]) ? len : c->a[2]);
+        if (r != 0) {
+            return r;
+        }
+    }
+    return (int32_t)len;
 }
 
 /*

@@ -225,11 +225,14 @@ refresh uses the interval and the red is just the system tip.
 
 The other hot spot was the repeated task/process snapshot itself. htop reads
 four files per process, and each file used to take its own
-uxTaskGetSystemState()/espix_proc_snapshot(). A 500 ms cache now shares one of
+uxTaskGetSystemState()/espix_proc_snapshot(). A 200 ms cache now shares one of
 each across the whole scan; the arrays are in PSRAM (about 8 KB) and are read
-under one mutex. Measured on the S31, the first Machine_scanTables went from
-362.6 ms to 79.4 ms, and htop's steady share from roughly 22% to 14% of a core.
-The remaining cost is mostly the VFS/synth formatting of the 44 small files.
+under one mutex. A process generation counter, bumped whenever a slot is
+claimed or returned, invalidates it immediately, so an exit or a new process
+is not hidden by the TTL. Measured on the S31, the first Machine_scanTables
+went from 362.6 ms to 79.4 ms, and htop's steady share from roughly 22% to 14%
+of a core. The remaining cost is mostly the VFS/synth formatting of the 44
+small files.
 
 /proc/<pid>/stat similarly gets utime + stime from the task's
 ulRunTimeCounter, and starttime from started_us, both at 100 Hz.
@@ -257,10 +260,9 @@ Implemented in this branch:
 CRT_fatalError() if the first cannot be opened. Everything below is optional
 and degrades rather than fails:
 
-    /proc/<pid>/cmdline           argv is not in espix_proc_info_t
     /proc/<pid>/io                no per-process I/O counters
-    /proc/<pid>/smaps, maps, statm, cgroup
-    /proc/self/...                no symlinks in the VFS
+    /proc/<pid>/smaps, maps, cgroup
+    /proc/self/fd, cwd, ns/pid    only exe has a readlink target
     /proc/diskstats, /proc/net/dev
 
 The synth text buffer went from 512 to 1024 bytes: /proc/stat for two cores,
@@ -284,7 +286,7 @@ Found by linking, not guessed. espix_compat.c answers them:
 | pipe | ENOSYS | lsof/strace/systemd/OpenRC screens cannot start |
 | execlp | ENOSYS | same |
 | waitpid | ECHILD | same |
-| readlink | EINVAL | /proc/<pid>/exe, cwd, ns/pid columns are blank |
+| readlink | EINVAL | only /proc/<pid>/exe and /proc/self/exe exist |
 | openat | ENOTSUP | process-lock screen unavailable |
 | dirfd, fdopendir | ENOTSUP | /proc/<pid>/fd walking unavailable |
 | umask | returns 022 | htop's config is opened 0600 anyway |
@@ -294,12 +296,14 @@ Only realpath is on the normal startup path (the config file); everything else
 belongs to a screen htop opens on a keypress. fork is not in the link because
 picolibc's weak stub satisfies it, and the same screens are the only callers.
 
-Two calls are worth growing properly rather than stubbing:
+readlink now covers `/proc/<pid>/exe` and `/proc/self/exe`; `/proc/<pid>/cmdline`
+is generated from the app's copied argv, so htop's Command column shows the real
+command line instead of only `comm`.
 
-- readlink: espix's VFS has no symlinks. /proc/<pid>/exe is a link on Linux, so
-  this waits for procfs to grow links.
-- openat/dirfd: useful for any program that walks a directory tree by
-  descriptor; not needed for htop's main screen.
+openat/dirfd/fdopendir are still worth growing properly: useful for any program
+that walks a directory tree by descriptor, and the missing pieces for htop's
+process-lock/lsof screens. They need directory-fd paths and a DIR-to-fd mapping
+in the VFS/libc seam; not needed for htop's main screen.
 
 ## uname, and the small ABI additions
 

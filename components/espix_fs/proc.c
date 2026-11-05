@@ -51,15 +51,17 @@
  * touched by an ISR.  The task array is sized from the live task count and
  * grown when needed; the process array is the process table's fixed size.
  */
-#define PROC_CACHE_TTL_US 500000
+#define PROC_CACHE_TTL_US 200000
 
 static SemaphoreHandle_t s_cache_lock;
 static TaskStatus_t     *s_task_cache;
 static UBaseType_t       s_task_cap, s_task_n;
 static int64_t           s_task_at;
+static uint32_t          s_task_generation;
 static espix_proc_info_t *s_info_cache;
 static size_t            s_info_n;
 static int64_t           s_info_at;
+static uint32_t          s_info_generation;
 
 static void *proc_cache_alloc(size_t n)
 {
@@ -69,7 +71,9 @@ static void *proc_cache_alloc(size_t n)
 
 static bool proc_cache_tasks_locked(int64_t now)
 {
-    if (s_task_cache != NULL && now - s_task_at < PROC_CACHE_TTL_US) {
+    const uint32_t generation = espix_proc_generation();
+    if (s_task_cache != NULL && generation == s_task_generation &&
+        now - s_task_at < PROC_CACHE_TTL_US) {
         return true;
     }
 
@@ -84,21 +88,25 @@ static bool proc_cache_tasks_locked(int64_t now)
         s_task_cap   = cap;
     }
 
-    s_task_n  = uxTaskGetSystemState(s_task_cache, s_task_cap, NULL);
-    s_task_at  = now;
+    s_task_n          = uxTaskGetSystemState(s_task_cache, s_task_cap, NULL);
+    s_task_at         = now;
+    s_task_generation = generation;
     return true;
 }
 
 static bool proc_cache_infos_locked(int64_t now)
 {
-    if (s_info_cache != NULL && now - s_info_at < PROC_CACHE_TTL_US) {
+    const uint32_t generation = espix_proc_generation();
+    if (s_info_cache != NULL && generation == s_info_generation &&
+        now - s_info_at < PROC_CACHE_TTL_US) {
         return true;
     }
     if (s_info_cache == NULL) {
         return false;
     }
-    s_info_n  = espix_proc_snapshot(s_info_cache, CONFIG_ESPIX_PROC_MAX);
-    s_info_at = now;
+    s_info_n          = espix_proc_snapshot(s_info_cache, CONFIG_ESPIX_PROC_MAX);
+    s_info_at         = now;
+    s_info_generation = generation;
     return true;
 }
 
@@ -745,6 +753,23 @@ static size_t tid_comm(char *buf, size_t cap, int32_t tid)
     return (size_t)snprintf(buf, cap, "%s\n", ts.pcTaskName);
 }
 
+/* Linux's NUL-separated argv block, trailing NUL included. */
+static size_t pid_cmdline(char *buf, size_t cap, int32_t pid)
+{
+    return espix_proc_cmdline(pid, buf, cap);
+}
+
+/* The exe link's target as text; readlink() uses espix_proc_exe() directly. */
+static size_t pid_exe(char *buf, size_t cap, int32_t pid)
+{
+    size_t n = espix_proc_exe(pid, buf, cap > 1 ? cap - 1 : 0);
+    if (n > 0 && n + 1 < cap) {
+        buf[n++] = '\n';
+        buf[n]   = '\0';
+    }
+    return n;
+}
+
 /*
  * /proc/<pid>/statm: the seven numbers Linux reports, in pages.
  *
@@ -901,11 +926,14 @@ static const synth_node_t *proc_dyn_lookup(const char *abs_path)
     if (!parse(abs_path, &pp)) {
         return NULL;
     }
-    const bool is_status = strcmp(pp.what, "status") == 0;
-    const bool is_stat   = strcmp(pp.what, "stat") == 0;
-    const bool is_statm  = strcmp(pp.what, "statm") == 0;
-    const bool is_comm   = strcmp(pp.what, "comm") == 0;
-    if (!is_status && !is_stat && !is_statm && !is_comm) {
+    const bool is_status  = strcmp(pp.what, "status") == 0;
+    const bool is_stat    = strcmp(pp.what, "stat") == 0;
+    const bool is_statm   = strcmp(pp.what, "statm") == 0;
+    const bool is_comm    = strcmp(pp.what, "comm") == 0;
+    const bool is_cmdline = strcmp(pp.what, "cmdline") == 0;
+    const bool is_exe     = strcmp(pp.what, "exe") == 0;
+    if (!is_status && !is_stat && !is_statm && !is_comm &&
+        !is_cmdline && !is_exe) {
         return NULL;
     }
 
@@ -915,11 +943,13 @@ static const synth_node_t *proc_dyn_lookup(const char *abs_path)
         }
         const bool main_task = (pp.tid == pp.pid);
         size_t (*gen)(char *, size_t, int32_t) =
-            is_status ? (main_task ? pid_status : tid_status)
-          : is_stat   ? (main_task ? pid_stat   : tid_stat)
-          : is_statm  ? tid_statm
-                      : (main_task ? pid_comm   : tid_comm);
-        return pool_node(abs_path, SYNTH_TEXT, S_IFREG | 0444, gen, pp.tid);
+            is_status  ? (main_task ? pid_status : tid_status)
+          : is_stat    ? (main_task ? pid_stat   : tid_stat)
+          : is_statm   ? tid_statm
+          : is_cmdline ? pid_cmdline
+          : is_exe     ? pid_exe
+                       : (main_task ? pid_comm   : tid_comm);
+        return pool_node(abs_path, SYNTH_TEXT, S_IFREG | 0444, gen, pp.pid);
     }
 
     espix_proc_info_t info;
@@ -927,10 +957,12 @@ static const synth_node_t *proc_dyn_lookup(const char *abs_path)
         return NULL;
     }
     size_t (*gen)(char *, size_t, int32_t) =
-        is_status ? pid_status
-      : is_stat   ? pid_stat
-      : is_statm  ? pid_statm
-                  : pid_comm;
+        is_status  ? pid_status
+      : is_stat    ? pid_stat
+      : is_statm   ? pid_statm
+      : is_cmdline ? pid_cmdline
+      : is_exe     ? pid_exe
+                   : pid_comm;
     return pool_node(abs_path, SYNTH_TEXT, S_IFREG | 0444, gen, pp.pid);
 }
 
@@ -990,6 +1022,8 @@ static const synth_node_t *proc_dyn_dir_at(const char *abs_path, int nth)
         case 1:  return list_node(abs_path, "stat",   SYNTH_TEXT, S_IFREG | 0444);
         case 2:  return list_node(abs_path, "statm",  SYNTH_TEXT, S_IFREG | 0444);
         case 3:  return list_node(abs_path, "comm",   SYNTH_TEXT, S_IFREG | 0444);
+        case 4:  return list_node(abs_path, "cmdline", SYNTH_TEXT, S_IFREG | 0444);
+        case 5:  return list_node(abs_path, "exe",    SYNTH_TEXT, S_IFREG | 0444);
         default: return NULL;
         }
     }
@@ -999,7 +1033,9 @@ static const synth_node_t *proc_dyn_dir_at(const char *abs_path, int nth)
         case 1:  return list_node(abs_path, "stat",   SYNTH_TEXT, S_IFREG | 0444);
         case 2:  return list_node(abs_path, "statm",  SYNTH_TEXT, S_IFREG | 0444);
         case 3:  return list_node(abs_path, "comm",   SYNTH_TEXT, S_IFREG | 0444);
-        case 4:  return list_node(abs_path, "task", SYNTH_DIR, S_IFDIR | 0555);
+        case 4:  return list_node(abs_path, "cmdline", SYNTH_TEXT, S_IFREG | 0444);
+        case 5:  return list_node(abs_path, "exe",    SYNTH_TEXT, S_IFREG | 0444);
+        case 6:  return list_node(abs_path, "task", SYNTH_DIR, S_IFDIR | 0555);
         default: return NULL;
         }
     }

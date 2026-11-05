@@ -53,17 +53,6 @@ pid_t waitpid(pid_t pid, int *status, int options)
     return -1;
 }
 
-/* /proc/<pid>/exe, /proc/<pid>/cwd and /proc/self/ns/pid are links on Linux;
- * espix's /proc has no symlinks, so there is nothing to read. */
-ssize_t readlink(const char *path, char *buf, size_t size)
-{
-    (void)path;
-    (void)buf;
-    (void)size;
-    errno = EINVAL;
-    return -1;
-}
-
 /* A directory's descriptor and fdopendir() would let htop walk /proc/<pid>/fd.
  * espix keeps no such directory, and its VFS does not expose a DIR's fd. */
 int dirfd(DIR *dir)
