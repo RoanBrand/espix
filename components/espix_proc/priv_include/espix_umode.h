@@ -43,6 +43,10 @@ typedef struct {
 typedef struct {
     uint8_t kind;
     bool    cloexec;
+    /* Absolute path behind a directory descriptor, in PSRAM when possible.
+     * openat() resolves relative paths against it; files and sockets leave it
+     * NULL.  Owned by this entry, not shared: fd_dup() refuses directories. */
+    char   *dir_path;
     union {
         int  std;   /* which of the process's three streams */
         int  kfd;   /* the kernel's descriptor */

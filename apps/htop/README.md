@@ -286,24 +286,30 @@ Found by linking, not guessed. espix_compat.c answers them:
 | pipe | ENOSYS | lsof/strace/systemd/OpenRC screens cannot start |
 | execlp | ENOSYS | same |
 | waitpid | ECHILD | same |
-| readlink | EINVAL | only /proc/<pid>/exe and /proc/self/exe exist |
-| openat | ENOTSUP | process-lock screen unavailable |
-| dirfd, fdopendir | ENOTSUP | /proc/<pid>/fd walking unavailable |
+| readlink | procfs-only | /proc/<pid>/exe and /proc/self/exe work; nothing else is a link |
+| openat | real | relative to a directory fd, AT_FDCWD, or an absolute path |
+| dirfd, fdopendir | real | /proc/<pid>/fd walking can use them |
 | umask | returns 022 | htop's config is opened 0600 anyway |
 | realpath | lexical resolver | htop can make its config path absolute |
 
-Only realpath is on the normal startup path (the config file); everything else
-belongs to a screen htop opens on a keypress. fork is not in the link because
-picolibc's weak stub satisfies it, and the same screens are the only callers.
+realpath is used once for the config path, and openat/dirfd/fdopendir are now
+on htop's normal /proc scan. readlink is only reached for exe/cwd. The pipe,
+execlp and waitpid calls belong to screens htop opens on a keypress. fork is not
+in the link because picolibc's weak stub satisfies it, and the same screens are
+the only callers.
 
 readlink now covers `/proc/<pid>/exe` and `/proc/self/exe`; `/proc/<pid>/cmdline`
 is generated from the app's copied argv, so htop's Command column shows the real
 command line instead of only `comm`.
 
-openat/dirfd/fdopendir are still worth growing properly: useful for any program
-that walks a directory tree by descriptor, and the missing pieces for htop's
-process-lock/lsof screens. They need directory-fd paths and a DIR-to-fd mapping
-in the VFS/libc seam; not needed for htop's main screen.
+openat/dirfd/fdopendir are now real in libespix. A directory descriptor keeps
+its absolute path in PSRAM (a fallback to internal RAM if PSRAM is full), copied
+under the descriptor-table lock and freed with the descriptor. htop detects
+HAVE_OPENAT and now takes that path during its normal /proc scan; the
+process-lock screen still needs the external-command pipe/fork side.
+
+The VFS has no symlink nodes: `readlink` is procfs-specific rather than a
+general path resolver. That is deliberate and keeps the common path cheap.
 
 ## uname, and the small ABI additions
 

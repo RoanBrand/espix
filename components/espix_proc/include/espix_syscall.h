@@ -85,7 +85,8 @@
     X(SYSLOG,        syslog,        70)        /* (priority, ident or 0, message): to the kernel log */ \
     X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */ \
     X(UNAME,         uname,         72)        /* (struct espix_utsname *): the five fields */ \
-    X(READLINK,      readlink,      73)        /* (path, buf, len): target length, no NUL */
+    X(READLINK,      readlink,      73)        /* (path, buf, len): target length, no NUL */ \
+    X(OPENAT,        openat,        74)        /* (dirfd, path, flags, mode): relative to a dir fd */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,

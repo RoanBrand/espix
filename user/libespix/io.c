@@ -30,6 +30,18 @@ int open(const char *path, int flags, ...)
     return espix_ret(espix_sys3(ESPIX_SYS_OPEN, path, flags, mode));
 }
 
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    int mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return espix_ret(espix_sys5(ESPIX_SYS_OPENAT, dirfd, path, flags, mode, 0));
+}
+
 int creat(const char *path, mode_t mode)
 {
     return open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);

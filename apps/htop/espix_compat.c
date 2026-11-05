@@ -53,31 +53,6 @@ pid_t waitpid(pid_t pid, int *status, int options)
     return -1;
 }
 
-/* A directory's descriptor and fdopendir() would let htop walk /proc/<pid>/fd.
- * espix keeps no such directory, and its VFS does not expose a DIR's fd. */
-int dirfd(DIR *dir)
-{
-    (void)dir;
-    errno = ENOTSUP;
-    return -1;
-}
-
-DIR *fdopendir(int fd)
-{
-    (void)fd;
-    errno = ENOTSUP;
-    return NULL;
-}
-
-int openat(int dirfd_, const char *path, int flags, ...)
-{
-    (void)dirfd_;
-    (void)path;
-    (void)flags;
-    errno = ENOTSUP;
-    return -1;
-}
-
 /* espix applies the same 022 on every create (docs/USER-MODE.md); there is no
  * per-process mask to read or set. htop only narrows it while writing its
  * config, and opens that file 0600 anyway. */
