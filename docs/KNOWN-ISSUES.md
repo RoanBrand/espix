@@ -455,9 +455,12 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   run goes, so the device's own account of the disconnect is captured: never
   debug a transport through itself.
 
-- **A fault in the kernel or an M-mode app reboots the board.** It is recorded
-  and reported in `dmesg` on the next boot. A U-mode app's fault on the S31 ends
-  only that app.
+- **A fault in a kernel task reboots the board.** It is recorded and reported in
+  `dmesg` on the next boot. An app's fault ends only the app, with what an MMU
+  would have prevented left as it is: an M-mode app's wild writes before it
+  faulted, and a kernel lock its task held when the fault came inside a kernel
+  call. A blown M-mode stack, and on Xtensa a `break` (`__builtin_trap()`), still
+  reboot.
 
 ## U-mode apps (S31)
 

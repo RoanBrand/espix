@@ -296,6 +296,8 @@ esp_err_t espix_proc_init(void)
     espix_um_init();
 #endif
 
+    espix_app_fault_init();
+
     /* The resolver first: every table below registers into it. */
     espix_proc_abi_resolver_register();
 
@@ -1231,7 +1233,7 @@ static bool ends_in_user_mode(const espix_proc_slot_t *slot)
  * the signal itself (unless SA_NODEFER) blocked until it returns, SIG_DFL back
  * first under SA_RESETHAND, and a siginfo_t under SA_SIGINFO.
  */
-static void run_handler(espix_proc_slot_t *slot, int sig, const espix_sigact_t *act)
+static void run_handler_at(espix_proc_slot_t *slot, int sig, const espix_sigact_t *act, void *addr)
 {
     if (act->flags & SA_RESETHAND) {
         slot->sig_actions[sig].handler = SIG_DFL;
@@ -1240,12 +1242,30 @@ static void run_handler(espix_proc_slot_t *slot, int sig, const espix_sigact_t *
     slot->sig_blocked = (saved | act->mask | ((act->flags & SA_NODEFER) ? 0 : espix_sigbit(sig))) &
                         ~ESPIX_SIG_UNCATCHABLE;
     if (act->flags & SA_SIGINFO) {
-        siginfo_t info = { .si_signo = sig, .si_code = SI_USER };
+        siginfo_t info = { .si_signo = sig, .si_code = addr ? 0 : SI_USER, .si_addr = addr };
         ((void (*)(int, siginfo_t *, void *))(void *)act->handler)(sig, &info, NULL);
     } else {
         act->handler(sig);      /* app code; no lock held, by design */
     }
     slot->sig_blocked = saved;
+}
+
+static void run_handler(espix_proc_slot_t *slot, int sig, const espix_sigact_t *act)
+{
+    run_handler_at(slot, sig, act, NULL);
+}
+
+bool espix_proc_fault_handler(espix_proc_slot_t *slot, int sig, uintptr_t addr)
+{
+    if (slot->sig_actions == NULL || (slot->sig_blocked & espix_sigbit(sig))) {
+        return false;
+    }
+    const espix_sigact_t act = slot->sig_actions[sig];
+    if (act.handler == SIG_DFL || act.handler == SIG_IGN) {
+        return false;
+    }
+    run_handler_at(slot, sig, &act, (void *)addr);
+    return true;
 }
 
 /* sig is at SIG_DFL in slot's process. */
@@ -1759,8 +1779,9 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
     espix_klog(ESPIX_KLOG_WARN, TAG, "killed pid %d (%s)%s", (int)pid, name,
                detached ? " [stdio detached]" : "");
 
+    const int code = 128 + ((slot->term_sig != 0) ? slot->term_sig : SIGKILL);
     espix_proc_release_resources(slot);
-    espix_proc_finish(slot, ESPIX_PROC_KILLED, -1);
+    espix_proc_finish(slot, ESPIX_PROC_KILLED, code);
 
     return ESP_OK;
 }

@@ -714,6 +714,11 @@ int  espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *pid)
 int  espix_proc_exec_commit(espix_proc_slot_t *slot, const char *abs_path, int argc, char *const argv[],
                             char *const envp[]);
 
+/* A fault in an M-mode app ends the app, not the board (app_fault.c); at boot. */
+void espix_app_fault_init(void);
+/* An M-mode app's handler for a fault's signal, run where the fault left it; false when there is none. */
+bool espix_proc_fault_handler(espix_proc_slot_t *slot, int sig, uintptr_t addr);
+
 /* Pipes (pipe.c): two kernel descriptors, fds[0] read and fds[1] written; O_NONBLOCK in flags. */
 esp_err_t espix_pipe_init(void);
 int       espix_pipe(int fds[2], int flags);

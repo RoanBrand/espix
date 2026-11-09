@@ -132,7 +132,7 @@ which is also where the one build option hardware decides today is explained.
 | Networking | L2 bridging | **yes** | `bridge add <port>` then reboot: `br0` owns the address, ports have none; AP↔Ethernet, never a station (802.11 three-address frames) |
 | Networking | DHCP server for the LAN | **partial** | the AP, `usb0` and a bridge in `addr=server` mode all serve; DNS is the uplink's resolver passed through, not a local one |
 | Networking | Isolation and firewall | **planned** | NAT is not a firewall; guest zones and port-forwards are later |
-| Faults | Interception and reporting | **partial** | recorded for the next boot, not reaped — [Crash handling](#crash-handling-and-isolation) |
+| Faults | Interception and reporting | **yes** | an app's fault ends that app, in both modes and on both targets; a kernel fault is recorded for the next boot — [Crash handling](#crash-handling-and-isolation) |
 | Faults | Watchdogs | **yes** | the panic names itself in `dmesg`, without the UART |
 | Audio | Play an MP3 or WAV to a Bluetooth speaker | **yes** | S31 only: `bluetoothctl` pairs/connects the sink, then `play <file|url>` streams to it — a real 64 kbps stereo MP3 plays clean at ~16% of one core, ring full, no underruns; [AUDIO.md](docs/AUDIO.md) |
 | Audio | Choose the SBC quality | **yes** | `bluetoothctl quality 0|1|2` (mono ≤35, joint stereo ≤35, joint stereo ≤52); q2 is the default and applies to the next connect |
@@ -418,11 +418,25 @@ On the S31, an app built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([docs/USER-MODE.md](docs/USER-MODE.md)). Its fault is a
 signal: it ends that app, and the board keeps running.
 
-A fault in the kernel or in an M-mode app is not recovered, deliberately. The
-task may hold the heap lock, a VFS mutex or a driver's, and without an MMU most
-corruption (an overflow into valid memory, a wild write into another task's
-stack) never reaches the fault handler at all, as on nommu Linux. Rebooting is
-the honest answer.
+An M-mode app's fault, on either target, ends that app too, as an oops ends the
+process on nommu Linux. When an app's task takes a load, store, fetch,
+alignment, illegal-instruction or divide fault outside a critical section and
+an interrupt, the exception resumes as task code in `espix_app_fault()`
+(`components/espix_proc/app_fault.c`):
+- the fault is reported, with whether it was in the app's code or the kernel's;
+- the app's handler for the signal runs if it has one, and may `longjmp` out;
+- otherwise the process ends with 128 + the signal, as `exit()` ends it. A
+  thread's fault ends the whole process.
+
+Xtensa reaches it through the exception table (`xt_set_exception_handler`),
+RISC-V through a wrap of the vectors' panic entry. What it cannot save is
+memory the app wrote before it faulted, a lock its task held inside the kernel,
+a blown stack, and on Xtensa a `break` (what `__builtin_trap()` emits): those
+still reboot.
+
+A fault in the kernel's own tasks is not recovered, deliberately. A task may
+hold the heap lock, a VFS mutex or a driver's, and rebooting is the honest
+answer.
 
 ## Why not Linux on ESP32?
  - Only supports S31. espix should be able to support all ESP32 models.

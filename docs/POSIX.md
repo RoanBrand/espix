@@ -37,7 +37,7 @@ merely missing.
 | Process tree — `$$`, `getppid`, `getpgrp`, `getsid`, `kill -<pgid>`, `killpg` | **yes** | a shell is a process and its apps' parent; each job is its own group |
 | Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names, with `sigaction`'s mask and flags, `sigsuspend` and `pthread_sigmask`; an M-mode app takes them when it calls in, under one mask per process, and a U-mode app (S31) at any instruction, with per-thread masks and `SA_RESTART` |
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |
-| A crashing app not taking the system down | **planned** | intercepts and reports; does not yet reap |
+| A crashing app not taking the system down | **yes** | a fault ends the app with 128 + its signal, or runs its handler, in both modes and on both targets; what it wrote before the fault, a lock it held in the kernel and a blown stack are not undone ([crash handling](../README.md#crash-handling-and-isolation)) |
 | `sed` | **planned** | |
 | Apps using the filesystem | **yes** | `fopen`, `opendir`, `stat`, `chmod`, `dup`, `dup2`; `stat` reports the same mode and owner `ls -l` shows. An M-mode app's descriptors are numbers in the system's table, so `dup2` replaces only one the app opened and refuses another's with `EBUSY`; a U-mode app's table is its own |
 | Per-process working directory | **yes** | an app's `chdir()` does not move the shell that ran it |

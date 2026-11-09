@@ -22,9 +22,10 @@ mq_check() {
     local bin="/home/$ESPIX_USER/$1-$ESPIX_WORKER" pid="" got st bg i=0
     dev_push "$MQ_BIN/$1" "$bin" >/dev/null
     dev_run "chmod +x $bin" >/dev/null
-    dev_once "$bin -c $MQ_CONF; echo rc=\$?" > "$MQ_DIR/run" 2>&1 &
+    # Room under load for the start, the probe and the kill: a cut session would lose rc.
+    ESPIX_SSH_TIMEOUT=90 dev_once "$bin -c $MQ_CONF; echo rc=\$?" > "$MQ_DIR/run" 2>&1 &
     bg=$!
-    while [ -z "$pid" ] && [ "$i" -lt 20 ]; do
+    while [ -z "$pid" ] && [ "$i" -lt 40 ]; do
         sleep 0.5
         pid=$(dev_run ps | sed -n '1,/^finished:/p' | awk -v n="$1-$ESPIX_WORKER" '$2 == n { print $1; exit }')
         i=$((i + 1))

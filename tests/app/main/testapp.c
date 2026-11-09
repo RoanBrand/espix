@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -1742,6 +1743,65 @@ static int cmd_dup(const char *path, const char *mode)
     return rc;
 }
 
+/* ------------------------------------------------------------------ faults */
+
+static jmp_buf s_fault_jb;
+
+static void on_segv(int sig)
+{
+    longjmp(s_fault_jb, sig);
+}
+
+static void *fault_thread(void *arg)
+{
+    (void)arg;
+    *(volatile int *)0 = 1;
+    return NULL;
+}
+
+/* A fault of each kind: the app ends with 128 + its signal, and the board keeps running. */
+static int fault(const char *kind)
+{
+    static uint32_t code[2];
+    volatile int zero = 0;
+    printf("faulting: %s\n", kind);
+    fflush(stdout);
+    if (strcmp(kind, "null") == 0) {
+        *(volatile int *)0 = 1;
+    } else if (strcmp(kind, "read") == 0) {
+        printf("read %d\n", *(volatile int *)4);
+    } else if (strcmp(kind, "ill") == 0) {
+#if defined(__XTENSA__)
+        __asm__ volatile ("ill");
+#else
+        __asm__ volatile ("unimp");
+#endif
+    } else if (strcmp(kind, "div") == 0) {
+        printf("quotient %d\n", 1 / zero);
+    } else if (strcmp(kind, "exec") == 0) {
+        ((void (*)(void))(void *)code)();
+    } else if (strcmp(kind, "kernel") == 0) {
+        printf("length %d\n", (int)strlen((const char *)(uintptr_t)(8 + zero)));
+    } else if (strcmp(kind, "handler") == 0) {
+        signal(SIGSEGV, on_segv);
+        const int sig = setjmp(s_fault_jb);
+        if (sig == 0) {
+            *(volatile int *)0 = 1;
+        }
+        printf("recovered from signal %d\n", sig);
+        return 0;
+    } else if (strcmp(kind, "thread") == 0) {
+        pthread_t th;
+        pthread_create(&th, NULL, fault_thread, NULL);
+        pthread_join(th, NULL);
+        for (;;) {
+            sleep(1);
+        }
+    }
+    printf("no fault\n");
+    return 1;
+}
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -1749,6 +1809,7 @@ static void usage(void)
            "  exitcall <n>        call exit(n) -- the library path, not a return\n"
            "  _Exit <n>           call _Exit(n)\n"
            "  abort               call abort(); ends the app, not the board\n"
+           "  fault <kind>        null | read | ill | div | exec | kernel | handler | thread\n"
            "  assert              fail an assertion, which reaches __assert_func\n"
            "  argv [args...]      echo argc and each argument\n"
            "  probe <path>...     open each path, report ok or errno\n"
@@ -1818,6 +1879,9 @@ int main(int argc, char **argv)
         printf("calling _Exit(%d)\n", n);
         fflush(stdout);
         _Exit(n);
+    }
+    if (strcmp(cmd, "fault") == 0 && argc > 2) {
+        return fault(argv[2]);
     }
     if (strcmp(cmd, "abort") == 0) {
         printf("calling abort()\n");

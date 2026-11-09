@@ -10,7 +10,8 @@ An M-mode app shares the kernel's privilege and address space
 ([ARCHITECTURE.md](ARCHITECTURE.md#there-is-no-mmu-so-there-is-one-address-space)),
 so:
 
-- a wild write corrupts the kernel, and a fault reboots the board;
+- a wild write corrupts the kernel, and a fault in a kernel call can leave a lock
+  held;
 - a signal handler runs only when the app calls in, and SIGSTOP parks a process
   in itself, because at any other moment its task may hold a kernel lock;
 - `fork()` is impossible;
@@ -478,8 +479,9 @@ One kernel, two ways in:
 | `libespix`, `espix-cc` | no | yes |
 
 An app has one source and two builds: an M-mode ELF for the S3 and a U-mode ELF
-for the S31. The S3 does not get isolation, asynchronous signals, surviving an
-app's fault, growing stacks or copy-on-write; tests that need them skip there.
+for the S31. The S3 does not get isolation, asynchronous signals, growing stacks
+or copy-on-write; tests that need them skip there. An app's fault ends only the
+app on both (`37-faults`).
 
 ## Milestones
 

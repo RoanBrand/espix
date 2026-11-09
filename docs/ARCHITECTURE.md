@@ -61,11 +61,12 @@ elsewhere — are the table in
 [ROADMAP.md](ROADMAP.md#the-app-abi-what-an-app-may-name-and-who-answers-for-it);
 [POSIX.md](POSIX.md) tracks the surface against Unix.
 
-Fault handling follows from the same fact. A panic hook records the core,
-exception, faulting address, task and pid into memory that survives the reset,
-and the next boot reports it. It deliberately does **not** resume: the dead
-task may hold kernel locks, and most corruption never reaches the fault handler
-at all. A U-mode app's fault on the S31 is a signal instead.
+Fault handling follows from the same fact. An M-mode app's fault on its own
+task resumes as task code that ends the app (or runs its handler), as an oops
+ends the process on nommu Linux; a U-mode app's fault on the S31 is a signal.
+A kernel task's fault is not resumed: it may hold kernel locks. A panic hook
+records the core, exception, faulting address, task and pid into memory that
+survives the reset, and the next boot reports it.
 [README.md](../README.md#crash-handling-and-isolation) has the behaviour.
 
 ### Tasks are not processes

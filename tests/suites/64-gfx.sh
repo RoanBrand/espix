@@ -92,10 +92,14 @@ GFX_WAD=yes GFX_WAD_STAGED=""
 case $(dev_run "ls /var/lib/doom/doom1.wad") in
     *"no such"*|"")
         GFX_WAD=""
+        # A new filesystem has no /var/lib/doom; the WAD counts only once it is there.
         if [ -f "$ESPIX_ROOT/apps/doom/third_party/doom1.wad" ] &&
-           ESPIX_SCP_TIMEOUT=120 dev_push "$ESPIX_ROOT/apps/doom/third_party/doom1.wad" "$GFX_HOME/doom1.wad-$ESPIX_WORKER" >/dev/null &&
-           dev_run "sudo mv $GFX_HOME/doom1.wad-$ESPIX_WORKER /var/lib/doom/doom1.wad" >/dev/null; then
-            GFX_WAD=yes GFX_WAD_STAGED=yes
+           ESPIX_SCP_TIMEOUT=120 dev_push "$ESPIX_ROOT/apps/doom/third_party/doom1.wad" "$GFX_HOME/doom1.wad-$ESPIX_WORKER" >/dev/null; then
+            dev_run "sudo mkdir -p /var/lib/doom; sudo mv $GFX_HOME/doom1.wad-$ESPIX_WORKER /var/lib/doom/doom1.wad" >/dev/null
+            case $(dev_run "ls /var/lib/doom/doom1.wad") in
+                *"no such"*|"") dev_run "rm $GFX_HOME/doom1.wad-$ESPIX_WORKER" >/dev/null ;;
+                *) GFX_WAD=yes GFX_WAD_STAGED=yes ;;
+            esac
         fi
         ;;
 esac

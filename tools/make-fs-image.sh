@@ -47,7 +47,9 @@ venv="$root/build/littlefs_py_venv"
 tool="$venv/bin/littlefs-python"
 req="$root/managed_components/joltwallet__littlefs/image-building-requirements.txt"
 
-if [ ! -x "$tool" ]; then
+# Made again when its Python has gone, as a toolchain upgrade leaves it.
+if [ ! -x "$tool" ] || ! "$venv/bin/python" -c '' 2>/dev/null; then
+    rm -rf "$venv"
     eval "$("$root/tools/idf.sh" --env)"
     "$ESPIX_PYTHON" -m venv "$venv"
     "$venv/bin/pip" install -q -r "$req"

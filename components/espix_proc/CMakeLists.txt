@@ -11,6 +11,8 @@ idf_component_register(
         "spawn_fn.c"
         "fg.c"
         "pipe.c"
+        "app_fault.c"
+        "app_fault_xtensa.S"
         "abi_exit.c"
         "abi_resolver.c"
         "abi_fs.c"
@@ -67,4 +69,11 @@ idf_component_register(
         esp_driver_rmt
         esp_driver_gpio
         soc
+        # app_fault.c asks whether the cache is on before it touches PSRAM.
+        spi_flash
 )
+
+# A fault in an M-mode app: the RISC-V vectors' panic entry, wrapped (app_fault.c).
+if(CONFIG_IDF_TARGET_ARCH_RISCV)
+    target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=xt_unhandled_exception")
+endif()
