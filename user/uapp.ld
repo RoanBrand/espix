@@ -36,6 +36,8 @@ SECTIONS
         KEEP(*(.fini_array*))   /* picolibc's atexit runner is in .fini_array_onexit */
         PROVIDE_HIDDEN(__fini_array_end = .);
     } :text
+    PROVIDE(etext = .);
+    PROVIDE(_etext = .);
 
     . = ALIGN(4096);
 

@@ -132,7 +132,8 @@ of its own; relocatable apps stay M-mode.
 
 It builds `libespix.a` into `user/build/` when a source is newer. Apps are built
 without PIE and the hardware loop, which exist only on core 1, and with the
-64-bit `off_t` of `cmake/offt64.h`. An app on the screen or audio adds
+64-bit `off_t` of `cmake/offt64.h`, and with `libespix`'s allocator wrapped over
+picolibc's, so a `malloc` of 128 KiB or more is a mapping. An app on the screen or audio adds
 `components/espix_{proc,display,audio}/include` for their headers, as its M-mode
 build does.
 

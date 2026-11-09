@@ -76,6 +76,8 @@ fi
 
 build_lib
 # Whole and ahead of libc: libc.a's weak nosys stubs would otherwise win the archive scan.
+# The allocator wrapped, so large blocks are mappings (user/libespix/malloc.c).
 exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
     -nostartfiles -static -T "$root/user/uapp.ld" -Wl,--gc-sections \
+    -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc,--wrap=malloc_usable_size \
     "$lib/crt0.o" -Wl,--whole-archive "$lib/libespix.a" -Wl,--no-whole-archive

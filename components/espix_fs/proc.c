@@ -48,7 +48,7 @@ static size_t proc_meminfo(char *buf, size_t cap)
     const size_t total    = in_total + ps_total;
     const size_t free_b   = in.total_free_bytes + ps.total_free_bytes;
 
-    return (size_t)snprintf(
+    size_t n = (size_t)snprintf(
         buf, cap,
         "MemTotal:        %8u kB\n"
         "MemFree:         %8u kB\n"
@@ -70,6 +70,17 @@ static size_t proc_meminfo(char *buf, size_t cap)
         (unsigned)(ps_total / 1024),
         (unsigned)(ps.total_free_bytes / 1024),
         (unsigned)(ps.largest_free_block / 1024));
+#if CONFIG_ESPIX_UMODE
+    uint32_t pages, shared;
+    espix_proc_user_mem(&pages, &shared);
+    if (n < cap) {
+        n += (size_t)snprintf(buf + n, cap - n,
+                              "UserMem:         %8u kB\n"
+                              "UserShared:      %8u kB\n",
+                              (unsigned)(pages * 4), (unsigned)(shared * 4));
+    }
+#endif
+    return n;
 }
 
 static size_t proc_cpuinfo(char *buf, size_t cap)

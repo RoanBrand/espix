@@ -1336,8 +1336,7 @@ static int cmd_hold(int argc, char **argv)
             printf("hold: malloc(%u) returned NULL\n", (unsigned)want);
             break;
         }
-        ((volatile char *)p)[0]        = 1;
-        ((volatile char *)p)[want - 1] = 1;
+        memset(p, 1, want);     /* held, not just reserved: a U-mode app's untouched pages cost nothing */
         s_hold[s_hold_count++] = p;
         total += want;
     }

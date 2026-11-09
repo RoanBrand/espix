@@ -197,9 +197,7 @@ fi
 
 sleep 3
 heap=$(app_heap_bytes "$pid")
-if dev_uapp_lacks "an arena in ps (its heap is its own address space)" "M7, which counts pages"; then
-    :
-elif [ -n "$heap" ] && [ "$heap" -ge 1000000 ] 2>/dev/null; then
+if [ -n "$heap" ] && [ "$heap" -ge 1000000 ] 2>/dev/null; then
     espix_pass "ps shows the app's live arena (HEAP $heap bytes)"
 else
     espix_fail "ps shows the app's live arena" "HEAP read '$heap'"

@@ -94,13 +94,36 @@
     X(AUDIO_WRITE,   audio_write,   79)        /* (handle, buf, len): bytes taken, blocking while the ring is full */ \
     X(AUDIO_CTL,     audio_ctl,     80)        /* (handle, ESPIX_AUDIO_*, arg) */               \
     X(AUDIO_CLOSE,   audio_close,   81)        /* (handle): what is queued plays out */        \
-    X(MEMINFO,       meminfo,       82)        /* (struct espix_meminfo *) */
+    X(MEMINFO,       meminfo,       82)        /* (struct espix_meminfo *) */ \
+    X(MMAP,          mmap,          83)        /* (addr, len, prot, flags, fd, offset in pages) */ \
+    X(MUNMAP,        munmap,        84)        /* (addr, len) */                               \
+    X(MPROTECT,      mprotect,      85)        /* (addr, len, prot) */                         \
+    X(MSYNC,         msync,         86)        /* (addr, len, flags) */                        \
+    X(MADVISE,       madvise,       87)        /* (addr, len, advice) */                       \
+    X(PREAD,         pread,         88)        /* (fd, buf, len, off_lo, off_hi) */            \
+    X(PWRITE,        pwrite,        89)        /* (fd, buf, len, off_lo, off_hi) */            \
+    X(MINCORE,       mincore,       90)        /* (addr, len, uint8_t *vec): 1 a page resident */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
     ESPIX_SYSCALLS(ESPIX_SYS_ENUM_)
 #undef ESPIX_SYS_ENUM_
 };
+
+/* mmap's protections and flags, and madvise's advice: Linux's (user/include/sys/mman.h). */
+#define ESPIX_PROT_READ           0x1
+#define ESPIX_PROT_WRITE          0x2
+#define ESPIX_PROT_EXEC           0x4
+#define ESPIX_MAP_SHARED          0x01
+#define ESPIX_MAP_PRIVATE         0x02
+#define ESPIX_MAP_SHARED_VALIDATE 0x03
+#define ESPIX_MAP_TYPE            0x0f
+#define ESPIX_MAP_FIXED           0x10
+#define ESPIX_MAP_ANONYMOUS       0x20
+#define ESPIX_MAP_POPULATE        0x8000
+#define ESPIX_MAP_FIXED_NOREPLACE 0x100000
+#define ESPIX_MADV_DONTNEED       4
+#define ESPIX_MADV_FREE           8
 
 /* A process's descriptors: sysconf(_SC_OPEN_MAX). */
 #define ESPIX_OPEN_MAX 32

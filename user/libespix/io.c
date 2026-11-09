@@ -18,6 +18,16 @@ ssize_t write(int fd, const void *buf, size_t n)
     return espix_ret(espix_sys3(ESPIX_SYS_WRITE, fd, buf, n));
 }
 
+ssize_t pread(int fd, void *buf, size_t n, off_t off)
+{
+    return espix_ret(espix_sys5(ESPIX_SYS_PREAD, fd, buf, n, (uint32_t)off, (uint32_t)((uint64_t)off >> 32)));
+}
+
+ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
+{
+    return espix_ret(espix_sys5(ESPIX_SYS_PWRITE, fd, buf, n, (uint32_t)off, (uint32_t)((uint64_t)off >> 32)));
+}
+
 int open(const char *path, int flags, ...)
 {
     int mode = 0;

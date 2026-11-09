@@ -52,6 +52,10 @@ typedef struct {
 } espix_um_fd_t;
 
 typedef struct espix_um_waiter espix_um_waiter_t;
+struct espix_um_text;
+
+/* The read-only segments of a process's image it shares with others running it. */
+#define ESPIX_UM_TEXTS 2
 
 enum { ESPIX_UM_OBJ_FREE, ESPIX_UM_OBJ_SURFACE, ESPIX_UM_OBJ_AUDIO };
 
@@ -80,6 +84,8 @@ typedef struct {
     struct espix_sigaction act[NSIG];   /* under lock */
     espix_um_obj_t     objs[ESPIX_UM_OBJS];     /* under lock */
     void              *gfx;         /* the screen (espix_gfx_t), while it holds it */
+    struct espix_um_text *text[ESPIX_UM_TEXTS];
+    uint8_t            ntext;
 } espix_um_proc_t;
 
 /* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */
@@ -177,10 +183,18 @@ void    espix_um_fds_init(espix_um_proc_t *p);
 void           espix_um_frames_init(void);
 /* Frames carved and not in use, which the heap counts as taken. */
 uint32_t       espix_um_frames_spare(void);
+/* One table fewer maps frame; it is freed with the last. */
+void           espix_um_frame_put(void *frame);
+/* A frame a shared text keeps, or no longer: copied before it is written, whoever maps it. */
+void           espix_um_frame_text(void *frame, bool on);
 espix_um_as_t *espix_um_as_new(uint32_t asid);
+/* Where the table keeps its count of resident pages, which outlives it: the process's slot. */
+void           espix_um_as_count(espix_um_as_t *as, uint32_t *pages);
 void           espix_um_as_free(espix_um_as_t *as);
 uint32_t       espix_um_as_satp(const espix_um_as_t *as);
 void          *espix_um_map_new(espix_um_as_t *as, uint32_t va, uint32_t pte_flags);
+/* An existing frame mapped at va too, its count raised: an image's shared text. */
+bool           espix_um_map_frame(espix_um_as_t *as, uint32_t va, void *frame, uint32_t pte_flags);
 
 /*
  * Kernel memory lent to the app: len bytes from page-aligned k, mapped whole at a free address
@@ -190,8 +204,25 @@ void          *espix_um_map_new(espix_um_as_t *as, uint32_t va, uint32_t pte_fla
 uint32_t espix_um_map_lent(espix_um_as_t *as, void *k, size_t len, uint32_t pte_flags);
 bool     espix_um_unmap_lent(espix_um_as_t *as, uint32_t va, void (*release)(void *), void *obj);
 
-/* A range mapped zeroed page by page as it is touched; false when the table of them is full. */
+/* A range mapped zeroed page by page as it is touched, after any region its first page is in. */
 bool     espix_um_region_add(espix_um_as_t *as, uint32_t start, uint32_t end, uint32_t pte_flags);
+
+/*
+ * mmap's work, on PTE permissions: how holds ESPIX_MAP_* flags; kfd, the region's own descriptor, or
+ * -1 for zero pages. The address, or -errno. A file's pages are read in as touched, and a shared
+ * writable one's written back by msync, munmap and the process's end.
+ */
+int32_t espix_um_mmap(espix_um_as_t *as, uint32_t addr, uint32_t len, uint32_t pte_flags, uint32_t how,
+                      int kfd, uint64_t off);
+int32_t espix_um_munmap(espix_um_as_t *as, uint32_t start, uint32_t len);
+int32_t espix_um_mprotect(espix_um_as_t *as, uint32_t start, uint32_t len, uint32_t pte_flags);
+/* With drop, the pages go and are refilled when next touched (MADV_DONTNEED). */
+int32_t espix_um_madvise(espix_um_as_t *as, uint32_t start, uint32_t len, bool drop);
+int32_t espix_um_msync(espix_um_as_t *as, uint32_t start, uint32_t len);
+/* vec[i] 1 for each of npages from start a frame backs; -ENOMEM at a page nothing reserves. */
+int32_t espix_um_mincore(espix_um_as_t *as, uint32_t start, uint32_t npages, uint8_t *vec);
+/* At the process's end, before the owned-fd sweep: shared files written back, their descriptors closed. */
+void    espix_um_unmap_files(espix_um_as_t *as);
 void     espix_um_brk_init(espix_um_as_t *as, uint32_t base);
 /* Moves the break to want if it can; the break either way, as Linux's brk returns it. */
 uint32_t espix_um_brk(espix_um_as_t *as, uint32_t want);

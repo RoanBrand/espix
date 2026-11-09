@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -55,13 +56,16 @@ static uint64_t cycles64(void)
     return ((uint64_t)hi << 32) | lo;
 }
 
-static long psram_free_kb(void)
+/* A /proc/meminfo line's kB, by its key with the colon. */
+static long meminfo_kb(const char *key)
 {
     FILE *f = fopen("/proc/meminfo", "r");
     char line[64];
     long kb = -1;
+    const size_t n = strlen(key);
     while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
-        if (sscanf(line, "PsramFree: %ld", &kb) == 1) {
+        if (strncmp(line, key, n) == 0) {
+            kb = atol(line + n);
             break;
         }
     }
@@ -70,6 +74,7 @@ static long psram_free_kb(void)
     }
     return kb;
 }
+
 
 /* A kilobyte of stack a level, so 1024 levels need a megabyte. */
 static int deep(int n)
@@ -803,6 +808,162 @@ static int net_wait(void)
     return 0;
 }
 
+/* Never called: its first word is what textpoke overwrites and textpeek reads. */
+__attribute__((noinline, used)) static int poke_target(int x)
+{
+    return x * 3 + 1;
+}
+
+/* This process's resident pages in [p, p + len), or -1 when part of it is not mapped. */
+static long resident(const void *p, size_t len)
+{
+    static unsigned char vec[2048];
+    const uintptr_t start = (uintptr_t)p & ~(uintptr_t)4095;
+    const size_t n = ((uintptr_t)p + len - start + 4095) / 4096;
+    if (n > sizeof(vec) || mincore((void *)start, n * 4096, vec) != 0) {
+        return -1;
+    }
+    long k = 0;
+    for (size_t i = 0; i < n; i++) {
+        k += vec[i] & 1;
+    }
+    return k;
+}
+
+static int mmap_fail(const char *what)
+{
+    printf("uapp: mmap: %s (errno %d)\n", what, errno);
+    return 1;
+}
+
+/* Every mapping kind and call, each checked; the first wrong answer is the output. dir holds a scratch file. */
+static int mmap_all(const char *dir)
+{
+    enum { PG = 4096 };
+    char path[96];
+    snprintf(path, sizeof(path), "%s/uapp-mmap-%d", dir, (int)getpid());
+
+    /* Anonymous: reserving costs nothing, each page written costs one, and munmap takes them all. */
+    char *a = mmap(NULL, 4 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) {
+        return mmap_fail("anonymous map");
+    }
+    const long r0 = resident(a, 4 << 20);
+    for (int i = 0; i < 16; i++) {
+        a[i * 65536] = (char)i;
+    }
+    const long r1 = resident(a, 4 << 20);
+    if (r0 != 0 || r1 != 16) {
+        printf("uapp: mmap: anonymous %ld pages resident reserved, %ld after 16 written\n", r0, r1);
+        return 1;
+    }
+    if (munmap(a, 4 << 20) != 0 || resident(a, 4096) != -1) {
+        return mmap_fail("munmap left the range mapped");
+    }
+
+    /* A file: private pages are its bytes and keep their own writes; shared ones are written back. */
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return mmap_fail("open");
+    }
+    static char buf[3 * PG];
+    for (int i = 0; i < (int)sizeof(buf); i++) {
+        buf[i] = (char)('a' + i % 26);
+    }
+    if (write(fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+        return mmap_fail("write");
+    }
+    char *pv = mmap(NULL, sizeof(buf), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, PG);
+    if (pv == MAP_FAILED) {
+        return mmap_fail("private file map");
+    }
+    if (memcmp(pv, buf + PG, 2 * PG) != 0 || pv[2 * PG] != 0) {
+        return mmap_fail("private pages are not the file's bytes at the offset, zero past its end");
+    }
+    pv[0] = '#';
+    char *sh = mmap(NULL, sizeof(buf), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (sh == MAP_FAILED) {
+        return mmap_fail("shared file map");
+    }
+    if (sh[PG] != buf[PG]) {
+        return mmap_fail("a private write reached the file");
+    }
+    sh[5] = '!';
+    if (msync(sh, sizeof(buf), MS_SYNC) != 0) {
+        return mmap_fail("msync");
+    }
+    char c = 0;
+    if (pread(fd, &c, 1, 5) != 1 || c != '!') {
+        return mmap_fail("msync did not write the shared page back");
+    }
+    sh[6] = '?';
+    munmap(sh, sizeof(buf));
+    munmap(pv, sizeof(buf));
+    if (pread(fd, &c, 1, 6) != 1 || c != '?') {
+        return mmap_fail("munmap did not write the shared page back");
+    }
+    close(fd);
+    unlink(path);
+
+    /* Protections: a page made inaccessible keeps its bytes for when it is opened again. */
+    char *m = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        return mmap_fail("map for mprotect");
+    }
+    m[0] = 'x';
+    if (mprotect(m, PG, PROT_NONE) != 0 || mprotect(m, PG, PROT_READ | PROT_WRITE) != 0 || m[0] != 'x') {
+        return mmap_fail("PROT_NONE and back lost the page");
+    }
+    if (mprotect((char *)0x5fff0000, PG, PROT_READ) == 0) {
+        return mmap_fail("mprotect took an unmapped range");
+    }
+
+    /* MAP_FIXED replaces what is there; MAP_FIXED_NOREPLACE refuses to. */
+    char *fx = mmap(m + PG, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (fx != m + PG) {
+        return mmap_fail("MAP_FIXED");
+    }
+    if (mmap(m, PG, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) != MAP_FAILED ||
+        errno != EEXIST) {
+        return mmap_fail("MAP_FIXED_NOREPLACE over a mapping");
+    }
+
+    /* MADV_DONTNEED: the page is zero when next touched. */
+    if (madvise(m, PG, MADV_DONTNEED) != 0 || m[0] != 0) {
+        return mmap_fail("MADV_DONTNEED kept the page");
+    }
+    munmap(m, 2 * PG);
+
+    /* A large malloc is a mapping: it costs what is touched, and free unmaps it. */
+    char *big = malloc(4 << 20);
+    const long b0 = big ? resident(big, 4 << 20) : -1;
+    if (big == NULL || b0 < 0 || b0 > 1) {
+        printf("uapp: mmap: malloc(4 MB) %s, %ld pages resident\n", big ? "ok" : "failed", b0);
+        return 1;
+    }
+    big[0] = 1;
+    big[(4 << 20) - 1] = 1;
+    if (resident(big, 4 << 20) != 2) {
+        return mmap_fail("a mapped block's touched pages");
+    }
+    char *big2 = realloc(big, 5 << 20);
+    if (big2 == NULL || big2[0] != 1) {
+        return mmap_fail("realloc of a mapped block");
+    }
+    volatile uintptr_t gone = (uintptr_t)big2;
+    free(big2);
+    if (resident((const void *)gone, 4096) != -1) {
+        return mmap_fail("free left the block mapped");
+    }
+    char *z = calloc(1, 1 << 20);
+    if (z == NULL || z[12345] != 0) {
+        return mmap_fail("calloc of a mapped block");
+    }
+    free(z);
+    printf("uapp: mmap ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = (argc > 1) ? argv[1] : "hello";
@@ -1038,39 +1199,82 @@ int main(int argc, char **argv)
         }
         return 0;
     }
+    if (strcmp(mode, "mmap") == 0 && argc > 2) {
+        return mmap_all(argv[2]);
+    }
+    if (strcmp(mode, "shared") == 0) {
+        /* Run beside another instance: its text is ours, so it counts as shared. */
+        extern char etext[];
+        printf("uapp: text %ld KB, shared %ld KB\n", (long)(((uintptr_t)etext - 0x10000 + 4095) / 4096 * 4),
+               meminfo_kb("UserShared:"));
+        return 0;
+    }
+    if (strcmp(mode, "textpoke") == 0) {
+        /* Our text made writable and written: another instance's must not change. */
+        const uintptr_t pg = (uintptr_t)poke_target & ~(uintptr_t)4095;
+        if (mprotect((void *)pg, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            printf("uapp: textpoke: mprotect errno %d\n", errno);
+            return 1;
+        }
+        *(volatile uint32_t *)(void *)poke_target = 0xdeadbeefu;
+        printf("uapp: poked %08x\n", (unsigned)*(volatile uint32_t *)(void *)poke_target);
+        return 0;
+    }
+    if (strcmp(mode, "textpeek") == 0) {
+        if (argc > 2) {
+            usleep((useconds_t)atoi(argv[2]) * 1000);
+        }
+        printf("uapp: text word %08x\n", (unsigned)*(volatile uint32_t *)(void *)poke_target);
+        return 0;
+    }
+    if (strcmp(mode, "mmapsegv") == 0 && argc > 2) {
+        /* Each ends in SIGSEGV: a page unmapped, a page made read-only written, a PROT_NONE page read. */
+        volatile char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p[0] = 1;
+        if (strcmp(argv[2], "gone") == 0) {
+            munmap((void *)p, 4096);
+            p[0] = 2;
+        } else if (strcmp(argv[2], "ro") == 0) {
+            mprotect((void *)p, 4096, PROT_READ);
+            p[0] = 2;
+        } else if (strcmp(argv[2], "none") == 0) {
+            mprotect((void *)p, 4096, PROT_NONE);
+            printf("uapp: read %d\n", p[0]);
+        }
+        printf("uapp: mmapsegv: still running\n");
+        return 0;
+    }
     if (strcmp(mode, "bigheap") == 0) {
-        /* 4 MB reserved by brk, 64 pages touched: only what is touched may cost memory.
-         * Not malloc: picolibc's zero-fills every block it returns, which touches it all. */
-        const long before = psram_free_kb();
-        volatile char *p = sbrk(4 << 20);
-        const long reserved = psram_free_kb();
+        /* 4 MB reserved by brk, 64 pages touched: only what is touched is resident. */
+        char *const p = sbrk(4 << 20);
         if (p == (void *)-1) {
             printf("uapp: bigheap: sbrk failed\n");
             return 1;
         }
-        for (unsigned off = 0; off < (4u << 20); off += 64u << 10) {
-            p[off] = 1;
+        volatile char *const q = (char *)(((uintptr_t)p + 4095) & ~(uintptr_t)4095);
+        const size_t span = (3u << 20);
+        const long before = resident((const void *)q, span);
+        for (unsigned off = 0; off < span; off += 48u << 10) {
+            q[off] = 1;
         }
-        const long touched = psram_free_kb();
-        printf("uapp: bigheap: reserving cost %ld KB, touching 64 pages %ld KB\n",
-               before - reserved, reserved - touched);
+        printf("uapp: bigheap: %ld pages resident reserved, %ld after 64 touched\n",
+               before, resident((const void *)q, span));
         return 0;
     }
     if (strcmp(mode, "brkshrink") == 0) {
-        /* 2 MB grown and touched, then given back: the frames return with it. */
-        const long before = psram_free_kb();
-        volatile char *p = sbrk(2 << 20);
+        /* 2 MB grown and touched, then given back: its pages are unmapped with it. */
+        char *const p = sbrk(2 << 20);
         if (p == (void *)-1) {
             printf("uapp: brkshrink: sbrk failed\n");
             return 1;
         }
-        for (unsigned off = 0; off < (2u << 20); off += 4096) {
-            p[off] = 1;
+        volatile char *const q = (char *)(((uintptr_t)p + 4095) & ~(uintptr_t)4095);
+        for (unsigned off = 0; off < (1u << 20); off += 4096) {
+            q[off] = 1;
         }
-        const long grown = psram_free_kb();
+        const long grown = resident((const void *)q, 1u << 20);
         sbrk(-(2 << 20));
-        const long after = psram_free_kb();
-        printf("uapp: brkshrink: grew %ld KB, returned %ld KB\n", before - grown, after - grown);
+        printf("uapp: brkshrink: %ld pages resident grown, %ld after\n", grown, resident((const void *)q, 4096));
         return 0;
     }
     if (strcmp(mode, "deepstack") == 0) {

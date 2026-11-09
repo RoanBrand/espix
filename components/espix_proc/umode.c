@@ -19,6 +19,7 @@
 #include "esp_heap_caps.h"
 #include "esp_ipc_isr.h"
 #include "esp_private/startup_internal.h"
+#include "esp_rom_crc.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -58,6 +59,9 @@ static uint32_t s_boot_mscratch[portNUM_PROCESSORS];
 static uint32_t    s_asid_used[ASIDS / 32] = { 1 };
 static uint32_t    s_asid_stale[portNUM_PROCESSORS][ASIDS / 32];
 static portMUX_TYPE s_asid_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* The images' shared text (load_segments). */
+static SemaphoreHandle_t s_texts_lock;
 
 static uint32_t asid_alloc(void)
 {
@@ -121,6 +125,7 @@ void espix_um_init(void)
         }
     }
     espix_um_frames_init();
+    s_texts_lock = xSemaphoreCreateMutex();
     /* cpu_apm region 0 (flash and PSRAM) is TEE-only, and U-mode is REE: the page tables isolate instead. */
     REG_SET_BIT(CPU_APM_REGION0_ATTR_REG, 0x0777);
     espix_klog(ESPIX_KLOG_INFO, TAG, "user mode on; mscratch at boot 0x%08x 0x%08x",
@@ -719,8 +724,105 @@ static bool amo_emulate(espix_um_thread_t *t, RvExcFrame *u)
 }
 #endif
 
-static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t size, uint32_t *entry)
+/*
+ * An image's read-only segment, shared by the processes running that image: found by its address,
+ * size and CRC, and checked byte for byte. It lives while a process maps it, and a process gives it
+ * up before its table goes, so the frames it names are always mapped by someone.
+ */
+struct espix_um_text {
+    struct espix_um_text *next;
+    uint32_t              vaddr, filesz, crc, npages;
+    int                   users;
+    void                 *frames[];
+};
+
+static struct espix_um_text *s_texts;
+
+/* Read-only, no zeroed tail, and no page shared with another segment. */
+static bool text_shareable(const uint8_t *image, const um_ehdr_t *eh, const um_phdr_t *ph)
 {
+    if ((ph->p_flags & 2) || ph->p_filesz == 0 || ph->p_filesz != ph->p_memsz) {
+        return false;
+    }
+    const uint32_t lo = ph->p_vaddr & ~(PG - 1), hi = (ph->p_vaddr + ph->p_memsz + PG - 1) & ~(PG - 1);
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const um_phdr_t *q = (const um_phdr_t *)(image + eh->e_phoff) + i;
+        if (q != ph && q->p_type == PT_LOAD_ && q->p_memsz > 0 &&
+            (q->p_vaddr & ~(PG - 1)) < hi && q->p_vaddr + q->p_memsz > lo) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void text_put(struct espix_um_text *t)
+{
+    if (t == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_texts_lock, portMAX_DELAY);
+    const bool last = --t->users == 0;
+    for (struct espix_um_text **pp = &s_texts; last && *pp != NULL; pp = &(*pp)->next) {
+        if (*pp == t) {
+            *pp = t->next;
+            break;
+        }
+    }
+    xSemaphoreGive(s_texts_lock);
+    if (last) {
+        for (uint32_t i = 0; i < t->npages; i++) {
+            espix_um_frame_text(t->frames[i], false);
+        }
+        free(t);
+    }
+}
+
+/* The cached copy of ph's bytes, its users counted up, or NULL. */
+static struct espix_um_text *text_find(const um_phdr_t *ph, const uint8_t *bytes, uint32_t crc)
+{
+    xSemaphoreTake(s_texts_lock, portMAX_DELAY);
+    struct espix_um_text *t = s_texts;
+    while (t != NULL && !(t->vaddr == ph->p_vaddr && t->filesz == ph->p_filesz && t->crc == crc)) {
+        t = t->next;
+    }
+    if (t != NULL) {
+        t->users++;
+    }
+    xSemaphoreGive(s_texts_lock);
+    const uint32_t lo = ph->p_vaddr & ~(PG - 1);
+    for (uint32_t i = 0; t != NULL && i < t->npages; i++) {
+        const uint32_t va = lo + i * PG;
+        const uint32_t from = MAX(va, ph->p_vaddr), to = MIN(va + PG, ph->p_vaddr + ph->p_filesz);
+        if (memcmp((const uint8_t *)t->frames[i] + (from - va), bytes + (from - ph->p_vaddr), to - from) != 0) {
+            text_put(t);
+            t = NULL;
+        }
+    }
+    return t;
+}
+
+static struct espix_um_text *text_add(const um_phdr_t *ph, uint32_t crc, void *const *frames, uint32_t npages)
+{
+    struct espix_um_text *t = malloc(sizeof(*t) + npages * sizeof(void *));
+    if (t == NULL) {
+        return NULL;
+    }
+    *t = (struct espix_um_text){ .vaddr = ph->p_vaddr, .filesz = ph->p_filesz, .crc = crc,
+                                 .npages = npages, .users = 1 };
+    memcpy(t->frames, frames, npages * sizeof(void *));
+    for (uint32_t i = 0; i < npages; i++) {
+        espix_um_frame_text(t->frames[i], true);
+    }
+    xSemaphoreTake(s_texts_lock, portMAX_DELAY);
+    t->next = s_texts;
+    s_texts = t;
+    xSemaphoreGive(s_texts_lock);
+    return t;
+}
+
+static const char *load_segments(espix_um_proc_t *p, const uint8_t *image, size_t size, uint32_t *entry)
+{
+    espix_um_as_t *const as = p->as;
     const um_ehdr_t *eh = (const um_ehdr_t *)image;
     if (eh->e_phentsize != sizeof(um_phdr_t) ||
         eh->e_phoff + (size_t)eh->e_phnum * sizeof(um_phdr_t) > size) {
@@ -740,14 +842,33 @@ static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t
                                ((ph->p_flags & 1) ? PTE_X : 0);
         const uint32_t end = ph->p_vaddr + ph->p_memsz;
         const uint32_t file_end = (ph->p_vaddr + ph->p_filesz + PG - 1) & ~(PG - 1);
-        if (end > file_end && !espix_um_region_add(as, file_end, end, flags)) {
-            return "too many segments";
+        if (!espix_um_region_add(as, ph->p_vaddr, end, flags)) {
+            return "overlapping segments";
         }
         image_end = MAX(image_end, end);
-        for (uint32_t va = ph->p_vaddr & ~(PG - 1); va < MIN(end, file_end); va += PG) {
+
+        const uint32_t lo = ph->p_vaddr & ~(PG - 1), npages = (file_end - lo) / PG;
+        const bool share = p->ntext < ESPIX_UM_TEXTS && text_shareable(image, eh, ph);
+        const uint32_t crc = share ? esp_rom_crc32_le(0, image + ph->p_offset, ph->p_filesz) : 0;
+        struct espix_um_text *t = share ? text_find(ph, image + ph->p_offset, crc) : NULL;
+        if (t != NULL) {
+            p->text[p->ntext++] = t;
+            for (uint32_t i = 0; i < npages; i++) {
+                if (!espix_um_map_frame(as, lo + i * PG, t->frames[i], flags)) {
+                    return "out of memory for the image";
+                }
+            }
+            continue;
+        }
+        void **frames = share ? malloc(npages * sizeof(void *)) : NULL;
+        for (uint32_t va = lo; va < MIN(end, file_end); va += PG) {
             uint8_t *frame = espix_um_map_new(as, va, flags);
             if (frame == NULL) {
+                free(frames);
                 return "out of memory for the image";
+            }
+            if (frames != NULL) {
+                frames[(va - lo) / PG] = frame;
             }
             const uint32_t lo = MAX(va, ph->p_vaddr);
             const uint32_t hi = MIN(va + PG, ph->p_vaddr + ph->p_filesz);
@@ -760,6 +881,10 @@ static const char *load_segments(espix_um_as_t *as, const uint8_t *image, size_t
                 esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
             }
         }
+        if (frames != NULL && (t = text_add(ph, crc, frames, npages)) != NULL) {
+            p->text[p->ntext++] = t;
+        }
+        free(frames);
     }
     if (eh->e_entry < UVA_MIN || eh->e_entry >= UVA_MAX) {
         return "an entry point outside the image";
@@ -857,6 +982,7 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
     }
     p->as      = as;
     p->lock    = lock;
+    espix_um_as_count(as, &slot->um_pages);
     p->threads = 1;
     espix_um_fds_init(p);
     t->proc = p;
@@ -876,7 +1002,7 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
                    (unsigned)p->amo_count);
     }
 #endif
-    const char *why = load_segments(as, app->image, slot->info.image_bytes, &entry);
+    const char *why = load_segments(p, app->image, slot->info.image_bytes, &entry);
     if (why == NULL) {
         why = build_stack(as, app->argv, app->argc, app->envp, &usp, &uargv, &uenvp);
     }
@@ -908,6 +1034,9 @@ void espix_um_release(espix_proc_slot_t *slot)
     }
     espix_um_thread_t *t = slot->app->um;
     asid_free((t->satp & SATP32_ASID) >> 22);
+    for (int i = 0; i < t->proc->ntext; i++) {
+        text_put(t->proc->text[i]);     /* before the table: a cached text's frames are always mapped */
+    }
     espix_um_as_free(t->proc->as);
     vSemaphoreDelete(t->proc->lock);
     free(t->proc->amos);

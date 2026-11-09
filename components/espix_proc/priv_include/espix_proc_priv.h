@@ -328,6 +328,7 @@ typedef struct {
     espix_app_region_t *regions;      /* the index; grown on demand */
     uint16_t            nregions;
     uint16_t            region_cap;
+    uint32_t            um_pages;     /* a U-mode app's resident pages, its table's to keep; read unlocked */
 
     /*
      * free() calls that named memory outside every region, counted so the

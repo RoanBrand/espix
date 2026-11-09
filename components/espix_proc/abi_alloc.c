@@ -717,9 +717,10 @@ size_t espix_proc_heap_used(espix_pid_t pid)
     xSemaphoreTake(s_region_lock, portMAX_DELAY);
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
         const espix_proc_slot_t *const s = &g_espix_proc_table.slots[i];
-        if (s->nregions == 0 || s->info.pid != pid) {
+        if (s->info.pid != pid) {
             continue;
         }
+        total += (size_t)__atomic_load_n(&s->um_pages, __ATOMIC_RELAXED) * 4096;
         for (int j = 0; j < s->nregions; j++) {
             multi_heap_info_t info;
             multi_heap_get_info(s->regions[j].heap, &info);

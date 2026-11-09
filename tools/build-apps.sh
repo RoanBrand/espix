@@ -117,6 +117,12 @@ for name in "${names[@]}"; do
                     -not -path "*/build-u/*" \
                     -not -path "*/managed_components/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
+        # A U-mode build links libespix whole: a runtime newer than it is a reason too.
+        if [ -z "$newer" ] && [ -f "$staged-u" ]; then
+            newer=$(find "$root/user/libespix" "$root/user/include" "$root/user/crt0.S" "$root/user/uapp.ld" \
+                        "$root/components/espix_proc/include/espix_syscall.h" "$root/tools/espix-cc" \
+                        -type f -newer "$staged-u" -print -quit 2>/dev/null || true)
+        fi
         if [ -z "$newer" ]; then
             stage_manifest
             echo "build-apps: $name is up to date"

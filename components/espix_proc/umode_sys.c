@@ -104,6 +104,7 @@ void espix_um_close_fds(espix_proc_slot_t *slot)
         um_fd_release(&t->proc->fds[fd]);
     }
     espix_um_objs_release(t->proc);
+    espix_um_unmap_files(t->proc->as);
 }
 
 /* A copy of e: a second kernel descriptor for a file, so each closes its own; a socket is shared. */
@@ -266,6 +267,46 @@ static int32_t um_sys_write(um_call_t *c)
     }
     return (int32_t)done;
 }
+
+/* pread and pwrite: a file's bytes at an offset, a page of the app's buffer at a time, its own offset untouched. */
+static int32_t file_at(um_call_t *c, bool out)
+{
+    const espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
+    const uint32_t uva = c->a[1], len = c->a[2];
+    const int64_t off = (int64_t)((uint64_t)c->a[4] << 32 | c->a[3]);
+    if (e == NULL) {
+        return -EBADF;
+    }
+    if (e->kind != ESPIX_UM_FD_FILE) {
+        return (e->kind == ESPIX_UM_FD_DIR) ? -EISDIR : -ESPIPE;
+    }
+    if (off < 0) {
+        return -EINVAL;
+    }
+    uint32_t done = 0;
+    while (done < len) {
+        const uint32_t va = uva + done;
+        void *k = espix_um_user_pin(c->p->as, va, out ? PTE_R : PTE_W);
+        if (k == NULL) {
+            return done ? (int32_t)done : -EFAULT;
+        }
+        const uint32_t want = MIN(len - done, PG - (va & (PG - 1)));
+        const ssize_t n = out ? pwrite(e->kfd, k, want, (off_t)(off + done))
+                              : pread(e->kfd, k, want, (off_t)(off + done));
+        espix_um_user_unpin(c->p->as);
+        if (n < 0) {
+            return done ? (int32_t)done : -errno;
+        }
+        done += (uint32_t)n;
+        if ((uint32_t)n < want) {
+            break;
+        }
+    }
+    return (int32_t)done;
+}
+
+static int32_t um_sys_pread(um_call_t *c)  { return file_at(c, false); }
+static int32_t um_sys_pwrite(um_call_t *c) { return file_at(c, true); }
 
 static int32_t um_sys_open(um_call_t *c)
 {
@@ -834,6 +875,102 @@ static int32_t um_sys_term_size(um_call_t *c)
 static int32_t um_sys_brk(um_call_t *c)
 {
     return (int32_t)espix_um_brk(c->p->as, c->a[0]);
+}
+
+static uint32_t prot_flags(uint32_t prot)
+{
+    return ((prot & ESPIX_PROT_READ) ? PTE_R : 0) | ((prot & ESPIX_PROT_WRITE) ? PTE_R | PTE_W : 0) |
+           ((prot & ESPIX_PROT_EXEC) ? PTE_X : 0);
+}
+
+static int32_t um_sys_mmap(um_call_t *c)
+{
+    const uint32_t addr = c->a[0], len = c->a[1], prot = c->a[2], fl = c->a[3];
+    const uint32_t type = fl & ESPIX_MAP_TYPE;
+    if (len == 0 || (addr & (PG - 1)) || (prot & ~7u) ||
+        (type != ESPIX_MAP_SHARED && type != ESPIX_MAP_PRIVATE && type != ESPIX_MAP_SHARED_VALIDATE)) {
+        return -EINVAL;
+    }
+    int kfd = -1;
+    if (!(fl & ESPIX_MAP_ANONYMOUS)) {
+        const espix_um_fd_t *e = um_fd_get(c->p, c->a[4]);
+        if (e == NULL) {
+            return -EBADF;
+        }
+        if (e->kind != ESPIX_UM_FD_FILE) {
+            return -ENODEV;
+        }
+        /* Readable, and writable too for a shared mapping that writes; a filesystem without F_GETFL is trusted. */
+        const int acc = fcntl(e->kfd, F_GETFL);
+        if (acc >= 0 && ((acc & O_ACCMODE) == O_WRONLY ||
+                         (type != ESPIX_MAP_PRIVATE && (prot & ESPIX_PROT_WRITE) && (acc & O_ACCMODE) != O_RDWR))) {
+            return -EACCES;
+        }
+        kfd = espix_abi_dup(e->kfd);
+        if (kfd < 0) {
+            return -errno;
+        }
+    }
+    const int32_t r = espix_um_mmap(c->p->as, addr, len, prot_flags(prot), fl, kfd, (uint64_t)c->a[5] * PG);
+    if (r < 0 && kfd >= 0) {
+        close(kfd);
+    }
+    return r;
+}
+
+static int32_t um_sys_munmap(um_call_t *c)
+{
+    return (c->a[0] & (PG - 1)) ? -EINVAL : espix_um_munmap(c->p->as, c->a[0], c->a[1]);
+}
+
+static int32_t um_sys_mprotect(um_call_t *c)
+{
+    if ((c->a[0] & (PG - 1)) || (c->a[2] & ~7u)) {
+        return -EINVAL;
+    }
+    return espix_um_mprotect(c->p->as, c->a[0], c->a[1], prot_flags(c->a[2]));
+}
+
+/* MS_ASYNC 1, MS_INVALIDATE 2, MS_SYNC 4: the write-back is done before it returns either way. */
+static int32_t um_sys_msync(um_call_t *c)
+{
+    if ((c->a[0] & (PG - 1)) || (c->a[2] & ~7u) || (c->a[2] & 5) == 5) {
+        return -EINVAL;
+    }
+    return espix_um_msync(c->p->as, c->a[0], c->a[1]);
+}
+
+/* The advice that changes nothing here is taken; DONTNEED and FREE drop the pages. */
+static int32_t um_sys_madvise(um_call_t *c)
+{
+    const uint32_t advice = c->a[2];
+    if ((c->a[0] & (PG - 1)) || (advice > 4 && advice != ESPIX_MADV_FREE)) {
+        return -EINVAL;
+    }
+    return espix_um_madvise(c->p->as, c->a[0], c->a[1],
+                            advice == ESPIX_MADV_DONTNEED || advice == ESPIX_MADV_FREE);
+}
+
+/* A chunk of the vector at a time, copied out after the table's lock is let go. */
+static int32_t um_sys_mincore(um_call_t *c)
+{
+    const uint32_t start = c->a[0], npages = (c->a[1] + PG - 1) / PG;
+    if (start & (PG - 1)) {
+        return -EINVAL;
+    }
+    uint8_t vec[256];
+    for (uint32_t done = 0; done < npages;) {
+        const uint32_t n = MIN(npages - done, (uint32_t)sizeof(vec));
+        int32_t r = espix_um_mincore(c->p->as, start + done * PG, n, vec);
+        if (r == 0) {
+            r = espix_um_copyout(c->p->as, c->a[2] + done, vec, n);
+        }
+        if (r < 0) {
+            return r;
+        }
+        done += n;
+    }
+    return 0;
 }
 
 /* Frames come from PSRAM. */

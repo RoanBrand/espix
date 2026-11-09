@@ -481,6 +481,9 @@ void espix_proc_paths(const char **cwd, const char **root);
  */
 espix_pid_t espix_proc_self_pid(void);
 
+/* U-mode apps' memory, in pages: what their tables map, and of it what more than one maps (S31). */
+void espix_proc_user_mem(uint32_t *pages, uint32_t *shared);
+
 /*
  * A process about to block in select(): arms the wake path and returns the
  * wake fd to fold into the read set, or -1 for a caller with none. The pair

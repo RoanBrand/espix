@@ -470,17 +470,21 @@ streams. What it cannot do yet:
   thread is not cut short by it, where an M-mode app's every sleeping thread
   wakes. There is no `pthread_kill` to another thread, `sigwait`, `sigqueue` or
   `sigaltstack` yet.
-- **No process-shared mutexes or condition variables** until there is shared
-  memory (M7).
+- **No process-shared mutexes or condition variables** yet: shared anonymous
+  memory is shared with no one until `fork()` (M8), and there is no `shm_open`.
+- **A file mapped shared is written back, not shared**: `msync`, `munmap` and the
+  process's end write its pages to the file, but two processes mapping one file
+  each see their own pages until then. `MAP_FIXED` works only in the mapping
+  range above the heap's limit.
 - **An app's AMOs cost a trap each**, about 1,150 cycles (3.6 µs) instead of a
   few: a U-mode AMO on this S31 can lose an update against the other core, so
   the loader replaces each one in the app's code and the kernel does it as LR/SC
   ([USER-MODE.md](USER-MODE.md)). That covers C11 atomics and `__atomic`
   builtins, libstdc++'s reference counts and the exchanges in picolibc's stdio. LR/SC, which libespix's locks use, runs natively. Code an app
   generates at run time is not rewritten, and its AMOs are not safe.
-- **`malloc` touches what it returns**: picolibc's allocator zero-fills every
-  block, so a large `malloc` costs its whole size at once; memory reserved with
-  `brk`/`sbrk`, bss and the stack cost only the pages touched.
+- **A `malloc` under 128 KiB costs its whole size at once**: picolibc's allocator
+  zero-fills every block. From 128 KiB a block is a mapping of its own and costs
+  only the pages touched, as memory reserved with `brk`, bss and the stack do.
 
 ## Filesystem
 

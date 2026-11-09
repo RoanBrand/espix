@@ -37,7 +37,7 @@ on Linux:
 |---|---|
 | `0x00010000` up | the image: text, rodata, data, bss |
 | above the image | the heap, grown by `brk` |
-| below `0x70000000` | kernel memory lent to the app (a gfx surface), and `mmap`, growing down |
+| below `0x70000000` | `mmap`, and kernel memory lent to the app (a gfx surface), growing down |
 | `0x70000000`-`0x7f800000` | 31 thread stacks of 8 MB, an unmapped page at each end |
 | below `0x80000000` | the main thread's stack, 8 MB |
 
@@ -45,15 +45,17 @@ on Linux:
 block aligned to 4 KiB leaves the heap's header in the page before it, so frames
 allocated one by one cost two pages each and an app could map only half of what
 was free. A chunk is smaller when the heap has no room for a whole one, and goes
-back when its last frame does. A frame is owned by one table; a reference count,
-for shared text and copy-on-write, comes with M7.
+back when its last frame does. Each frame counts the tables mapping it.
 
-**Pages are mapped when touched.** bss, the heap and the stacks are reserved
-ranges; the first touch maps a zeroed frame, whether the app or a syscall copying
-into its buffer makes it. Memory reserved and never used costs nothing: a 4 MB
-`malloc` with 64 pages touched costs 256 KB. The heap grows by `brk` up to
-`0x60000000`, and shrinking it frees its frames. Only the pages that hold the
-file's bytes are loaded at exec.
+**Pages are mapped when touched.** Every range is a region: the image's segments,
+bss, the heap, the stacks and each mapping. A page read before it is written is
+one zero frame, shared read-only; the first write, by the app or by a syscall
+copying into its buffer, gives it a frame of its own. Memory reserved and never
+written costs nothing: a 4 MB `malloc` with 64 pages touched costs 256 KB. The
+heap grows by `brk` up to `0x60000000`, and shrinking it frees its frames. Only
+the pages that hold the file's bytes are loaded at exec. A process's resident
+pages, the zero frame and lent memory aside, are its `HEAP` in `ps`, and
+`/proc/meminfo`'s `UserMem` and `UserShared` count them over all apps.
 
 **Tables live in PSRAM.** The walker reads through the D-cache, so a PTE write
 needs no writeback. A typical app's table is 16 KiB.
@@ -74,13 +76,43 @@ stays as it is.
 page-aligned, so it cannot execute in place; with the MMU, loading means mapping
 what is touched. Running the *kernel* from flash is a roadmap item.
 
-## Copy-on-write
+## Copy-on-write and shared text
 
-A shared frame is read-only in both tables, marked copy-on-write in a PTE
-software bit. A write faults; the kernel copies the frame for the writer, or makes
-it writable when the count is one. Its users: two instances of one program
-(shared text, data copied as written), then `fork()`. mosquitto `-d` is the first
-`fork()` user.
+**A page its region lets the app write but its PTE does not is copy-on-write.**
+A write faults; the kernel copies the frame for the writer, or makes it writable
+when the writer's table is the only one mapping it. The zero frame is always
+copied. `fork()` (M8) is the next user; mosquitto `-d` its first.
+
+**Two instances of one program share its text.** A read-only segment that shares
+no page with another is kept while a process maps it, found by its address, size
+and CRC, and checked byte for byte; the next instance maps the same frames. A
+process gives it up before its table goes, so the frames it names are always
+mapped by someone, and a page of it written is the writer's copy. Data is each
+instance's own.
+
+## Mappings
+
+**`mmap` takes anonymous and file memory, private or shared**, Linux's flags and
+values (`user/include/sys/mman.h`), placed top-down below `0x70000000` with a
+guard page between mappings:
+
+- **A file's pages are read in as touched**, through a descriptor of the
+  mapping's own, so the app may close its own. Past the file's end a page is zero.
+- **A private page keeps its writes**; a shared writable one is written back by
+  `msync`, `munmap` and the process's end. Two processes mapping one file each
+  see their own pages until then.
+- **`mprotect`** changes a range's permissions; `PROT_NONE` keeps the frame for
+  when the range is opened again (a PTE software bit with V clear).
+- **`MAP_FIXED`** replaces what is there, and `MAP_FIXED_NOREPLACE` refuses to,
+  in the mapping range only. **`MADV_DONTNEED`** drops the pages, refilled when
+  next touched. `MAP_POPULATE` maps them at once, and `mincore` says which are.
+- **The brk heap and the thread stacks** are not the app's to unmap or protect.
+
+**A `malloc` of 128 KiB or more is a mapping of its own**, as glibc's is: it costs
+the pages touched, and `free` gives all of them back. `espix-cc` links
+`libespix`'s allocator over picolibc's with `--wrap`, so libc's own allocations
+take the same path. Doom's 6 MiB zone costs what it touches: `doom-u` holds about
+3.5 MB while it plays.
 
 ## Entering and leaving the kernel
 
@@ -390,7 +422,7 @@ Each leaves `make test` green on both targets.
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | done: `32-umode`, and `35-signals` in U-mode |
 | M5 | gfx surfaces mapped into the app; audio writes | done: `64-gfx` runs `plasma-u` and `doom-u` |
 | M6 | sockets, select, poll | done: `32-umode`, and `62-mqtt` runs `mosquitto-u` |
-| M7 | growable stacks; `mmap`; shared text between instances | Doom runs without a fixed stack; two instances share text |
+| M7 | growable stacks; `mmap`; shared text between instances | done: `32-umode`; `doom-u` grows its stack and maps its zone |
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
 
 Open:
@@ -422,9 +454,6 @@ Open:
 - **Signals are a set per process, not a queue**: two of one kind before
   delivery are one, and there are no real-time signals, `sigqueue`, `sigwait`
   or `sigaltstack` yet, nor `pthread_kill` to another thread.
-- **picolibc's `malloc` zero-fills every block**, so a large allocation is
-  touched in full; a large `malloc` served by `mmap`, as glibc's is, comes with
-  M7.
 
 ## Decisions
 

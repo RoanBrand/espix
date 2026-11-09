@@ -71,23 +71,43 @@ dev_run "$UAPP redirect /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER" >/dev/null
 assert_contains "dup2 onto stdout redirects printf" "uapp: into the file" \
     "$(dev_run "cat /home/$ESPIX_USER/uapp-redir-$ESPIX_WORKER")"
 # Memory is mapped as it is touched: a heap by brk, and a stack that grows to its guard.
-heap_out=$(dev_run "$UAPP bigheap")
-reserve_kb=$(printf '%s\n' "$heap_out" | sed -n 's/.*reserving cost \(-*[0-9]*\) KB.*/\1/p')
-touch_kb=$(printf '%s\n' "$heap_out" | sed -n 's/.*touching 64 pages \(-*[0-9]*\) KB.*/\1/p')
-if [ -n "$reserve_kb" ] && [ "$reserve_kb" -lt 100 ] && [ -n "$touch_kb" ] &&
-   [ "$touch_kb" -ge 200 ] && [ "$touch_kb" -lt 600 ]; then
-    espix_pass "4 MB of heap costs only the pages touched ($reserve_kb KB, then $touch_kb KB)"
+# Its own pages, counted by mincore: what other processes do meanwhile cannot move them.
+assert_contains "4 MB of heap costs only the pages touched" "0 pages resident reserved, 64 after 64 touched" \
+    "$(dev_run "$UAPP bigheap")"
+assert_contains "shrinking the break unmaps its pages" "256 pages resident grown, -1 after" \
+    "$(dev_run "$UAPP brkshrink")"
+assert_contains "mmap, munmap, mprotect, msync and madvise, and a large malloc as a mapping" "uapp: mmap ok" \
+    "$(dev_run "$UAPP mmap /home/$ESPIX_USER")"
+assert_status "a page unmapped is gone" 139 dev_status "$UAPP mmapsegv gone"
+assert_status "a page made read-only refuses a write" 139 dev_status "$UAPP mmapsegv ro"
+assert_status "a PROT_NONE page refuses a read" 139 dev_status "$UAPP mmapsegv none"
+
+# Two instances of one program share its text: run beside a sleeping one, uapp's pages are all shared.
+dev_once "$UAPP sleep 5000" > "$UM_DIR/sleeper" 2>&1 &
+um_sleeper=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    dev_run ps | sed -n '1,/^finished:/p' | grep -q "uapp-$ESPIX_WORKER" && break
+    sleep 0.3
+done
+share_out=$(dev_run "$UAPP shared")
+wait "$um_sleeper"
+text_kb=$(printf '%s\n' "$share_out" | sed -n 's/.*text \([0-9]*\) KB.*/\1/p')
+shared_kb=$(printf '%s\n' "$share_out" | sed -n 's/.*shared \([0-9]*\) KB.*/\1/p')
+if [ -n "$text_kb" ] && [ -n "$shared_kb" ] && [ "$shared_kb" -ge "$text_kb" ]; then
+    espix_pass "two instances share their text ($text_kb KB of text, $shared_kb KB shared)"
 else
-    espix_fail "4 MB of heap costs only the pages touched" "$heap_out"
+    espix_fail "two instances share their text" "$share_out"
 fi
-shrink_out=$(dev_run "$UAPP brkshrink")
-grew_kb=$(printf '%s\n' "$shrink_out" | sed -n 's/.*grew \(-*[0-9]*\) KB.*/\1/p')
-back_kb=$(printf '%s\n' "$shrink_out" | sed -n 's/.*returned \(-*[0-9]*\) KB.*/\1/p')
-if [ -n "$grew_kb" ] && [ "$grew_kb" -ge 1900 ] && [ -n "$back_kb" ] && [ "$back_kb" -ge $((grew_kb - 100)) ]; then
-    espix_pass "shrinking the break returns its frames ($grew_kb KB grown, $back_kb KB back)"
-else
-    espix_fail "shrinking the break returns its frames" "$shrink_out"
-fi
+
+# A shared text page written by one instance is its own copy: the other still reads the original.
+word=$(dev_run "$UAPP textpeek" | sed -n 's/.*text word \([0-9a-f]*\).*/\1/p')
+dev_once "$UAPP textpeek 2500" > "$UM_DIR/peek" 2>&1 &
+um_peek=$!
+sleep 1
+assert_contains "an instance can write its own text" "poked deadbeef" "$(dev_run "$UAPP textpoke")"
+wait "$um_peek"
+assert_contains "and another instance's stays as it was" "text word $word" "$(cat "$UM_DIR/peek")"
+
 assert_contains "a megabyte of stack grows on demand" "uapp: deep stack ok" "$(dev_run "$UAPP deepstack")"
 assert_status "the page below the stack is a guard" 139 dev_status "$UAPP guard"
 
@@ -153,10 +173,11 @@ assert_contains "a blocked signal waits; SA_RESETHAND; sigsuspend" ": ok" "$(dev
 fault_out=$(dev_run "$UAPP sigfault; echo rc=\$?")
 assert_contains "a fault reaches its SIGSEGV handler, with the address" "caught SIGSEGV at 0x10" "$fault_out"
 assert_contains "and one while SIGSEGV is blocked ends the app" "rc=139" "$fault_out"
+# The line is sent well after the app's alarm at 1 s: a login under load takes seconds before it runs.
 assert_contains "SA_RESTART restarts a read a handler interrupted" "read 'hi', handler ran 1" \
-    "$( (sleep 3; echo hi) | dev_ssh_raw "$UAPP sigread restart")"
+    "$( (sleep 6; echo hi) | dev_ssh_raw "$UAPP sigread restart")"
 assert_contains "and without it the read fails with EINTR" "read -1 errno 4, handler ran 1" \
-    "$( (sleep 3; echo hi) | dev_ssh_raw "$UAPP sigread intr")"
+    "$( (sleep 6; echo hi) | dev_ssh_raw "$UAPP sigread intr")"
 
 # SIGSTOP stops a loop that never calls in, and the loop's own clock sees the pause.
 PZ="/home/$ESPIX_USER/uapp-pz-$ESPIX_WORKER"

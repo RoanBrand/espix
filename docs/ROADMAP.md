@@ -56,8 +56,8 @@ things are as they are.
   that loaded it, so the app's own symbols would have to resolve too; then
   mosquitto's plugins load as they do on Linux.
 
-- **`mmap()` as nommu Linux has it.** An anonymous mapping is a page-aligned
-  block of the app's arena; a private file mapping is the file read into one;
+- **`mmap()` for M-mode apps, as nommu Linux has it** (U-mode apps have the
+  real one). An anonymous mapping is a page-aligned block of the app's arena; a private file mapping is the file read into one;
   `MAP_SHARED` writes back on `msync()` and `munmap()`. Nothing is mapped on
   touch and nothing is shared between processes, but code written for
   `mmap()` runs.
@@ -154,7 +154,7 @@ layer it belongs to, or a choice and the reason.
 | `link()`, `symlink()` | unsupported | the VFS, then the lower filesystems |
 | `select()` on a file | `ENOSYS` | a select in the VFS, or owning the syscalls (option C above) |
 | `dup()`, `fcntl()` | partial | the VFS |
-| `mmap()`, `statvfs()` | absent | the VFS |
+| `mmap()` in an M-mode app, `statvfs()` | absent | the VFS |
 | `/dev/<device>` opened as a file | `EOPNOTSUPP` (a name, not a stream) | raw block I/O as its own feature |
 | a volume whose device was pulled | `ENOSYS` from every operation | deliberate; `EIO` would need a refusing helper per op |
 | `chmod`/`chown` on metadata-less FAT | refused | deliberate: there is nowhere to store it. `-o fmode=`/`dmode=` would *declare* a mode rather than store one — the item below |
