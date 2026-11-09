@@ -16,6 +16,7 @@
 
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
+#include "espix_posix.h"
 
 #define TAG "abi"
 
@@ -137,6 +138,8 @@ static esp_elf_symbol_table_t s_posix_syms[] = {
     { "dlsym",      (void *)k_dlsym },
     { "dlclose",    (void *)k_dlclose },
     { "dlerror",    (void *)k_dlerror },
+    /* The syscalls a POSIX app built by espix-cc makes, a U-mode app's by number, called directly. */
+    { "espix_syscall", (void *)espix_posix_syscall },
     ESP_ELFSYM_END
 };
 

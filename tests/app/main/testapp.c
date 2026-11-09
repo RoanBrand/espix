@@ -1763,7 +1763,7 @@ static void *fault_thread(void *arg)
 static int fault(const char *kind)
 {
     static uint32_t code[2];
-    volatile int zero = 0;
+    volatile int zero = 0, seven = 7;   /* both unknown, or 1 / x is folded into compares */
     printf("faulting: %s\n", kind);
     fflush(stdout);
     if (strcmp(kind, "null") == 0) {
@@ -1777,7 +1777,7 @@ static int fault(const char *kind)
         __asm__ volatile ("unimp");
 #endif
     } else if (strcmp(kind, "div") == 0) {
-        printf("quotient %d\n", 1 / zero);
+        printf("quotient %d\n", seven / zero);
     } else if (strcmp(kind, "exec") == 0) {
         ((void (*)(void))(void *)code)();
     } else if (strcmp(kind, "kernel") == 0) {

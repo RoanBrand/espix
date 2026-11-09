@@ -1,10 +1,9 @@
 /*
- * U-mode syscalls (docs/USER-MODE.md): each checks the app's pointers and
- * descriptors, then calls the function an M-mode app reaches for the same call.
+ * The syscalls (docs/USER-MODE.md): each checks the app's pointers and descriptors,
+ * then calls the function an M-mode app reaches for the same call. A U-mode app
+ * makes them by ecall; an app without an address space calls espix_posix_syscall().
  */
 #include "sdkconfig.h"
-
-#if CONFIG_ESPIX_UMODE
 
 #include <dirent.h>
 #include <errno.h>
@@ -25,18 +24,20 @@
 #include "esp_attr.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
-#include "riscv/encoding.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_syscall.h"
 #include "espix_tty.h"
-#include "espix_umode.h"
+#include "espix_posix.h"
 #include "umode_sys.h"
 
-#define PG 4096u
-
+#if CONFIG_ESPIX_UMODE
+#include "espix_umode.h"
 _Static_assert(offsetof(RvExcFrame, a5) - offsetof(RvExcFrame, a0) == 5 * sizeof(uint32_t), "a0-a5 in order");
+#endif
+
+#define PG 4096u
 
 typedef int32_t (*um_sys_fn)(um_call_t *c);
 
@@ -96,6 +97,44 @@ int um_fd_release(espix_um_fd_t *e)
     return r;
 }
 
+/* The session's stream behind std descriptor i: the process's own, or the console's, never one routed back through the table. */
+FILE *um_std_stream(const um_call_t *c, int i)
+{
+    FILE *const own = c->t->slot->own_std[i];
+    return (own != NULL) ? own : (i == 0) ? stdin : (i == 1) ? stdout : stderr;
+}
+
+static int32_t um_sys_read(um_call_t *c);
+static int32_t um_sys_write(um_call_t *c);
+
+/* Descriptor fd's read or write for the process's routed stdio, outside the dispatcher: no delivery point inside a FILE's lock. */
+int32_t espix_posix_rw(espix_um_thread_t *t, int fd, void *buf, size_t len, bool out)
+{
+    const uint32_t a[3] = { (uint32_t)fd, (uint32_t)buf, (uint32_t)len };
+    um_call_t c = { .t = t, .p = t->proc, .f = NULL, .a = a };
+    return out ? um_sys_write(&c) : um_sys_read(&c);
+}
+
+void um_raise(um_call_t *c, int sig)
+{
+#if CONFIG_ESPIX_UMODE
+    if (!um_nommu(c)) {
+        (void)espix_um_raise(c->t, sig);
+        return;
+    }
+#endif
+    (void)espix_proc_signal(c->t->slot->info.pid, sig);
+}
+
+bool um_sig_due(const um_call_t *c)
+{
+    if (um_nommu(c)) {
+        const espix_proc_slot_t *const s = c->t->slot;
+        return (s->sig_pending & ~s->sig_blocked) != 0 || s->stop_requested;
+    }
+    return (c->t->sig_pending & ~c->t->sig_blocked) != 0;
+}
+
 void espix_um_fds_drop(espix_um_proc_t *p)
 {
     for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
@@ -114,16 +153,18 @@ void espix_um_fds_cloexec(espix_um_proc_t *p)
 
 void espix_um_close_fds(espix_proc_slot_t *slot)
 {
-    espix_um_thread_t *t = (slot->app != NULL) ? slot->app->um : NULL;
+    espix_um_thread_t *t = espix_posix_thread_of(slot);
     if (t == NULL) {
         return;
     }
     espix_um_fds_drop(t->proc);
     espix_um_objs_release(t->proc);
+#if CONFIG_ESPIX_UMODE
     /* A vfork's child leaves its parent's mappings alone. */
     if (t->proc->vfork == NULL && t->proc->as != NULL) {
         espix_um_unmap_files(t->proc->as);
     }
+#endif
 }
 
 /* A copy of e: a second kernel descriptor for a file, so each closes its own; a socket is shared. */
@@ -211,7 +252,7 @@ static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
             const int ch = getc(in);
             if (ch == EOF) {
                 /* A signal for this thread ended the wait, not the input. */
-                if ((c->t->sig_pending & ~c->t->sig_blocked) != 0) {
+                if (um_sig_due(c)) {
                     clearerr(in);
                     if (done + n == 0) {
                         return -EINTR;
@@ -259,7 +300,7 @@ static int32_t pipe_io(um_call_t *c, int kfd, uint32_t uva, uint32_t len, bool o
         const ssize_t put = write(kfd, buf, n);
         if (put < 0) {
             if (errno == EPIPE) {
-                (void)espix_um_raise(c->t, SIGPIPE);
+                um_raise(c, SIGPIPE);
             }
             return done ? (int32_t)done : -errno;
         }
@@ -279,7 +320,7 @@ static int32_t um_sys_read(um_call_t *c)
         return -EBADF;
     }
     if (e->kind == ESPIX_UM_FD_STD) {
-        return (e->std == 0) ? read_std(c, espix_proc_stdio(0), uva, len) : -EBADF;
+        return (e->std == 0) ? read_std(c, um_std_stream(c, 0), uva, len) : -EBADF;
     }
     if (e->kind == ESPIX_UM_FD_SOCK) {
         return um_sock_read(c, c->a[0], uva, len);
@@ -327,7 +368,7 @@ static int32_t um_sys_write(um_call_t *c)
     if (e->kind == ESPIX_UM_FD_FILE && espix_pipe_is(e->kfd)) {
         return pipe_io(c, e->kfd, uva, len, true);
     }
-    FILE *const out = (e->kind == ESPIX_UM_FD_STD) ? espix_proc_stdio(e->std) : NULL;
+    FILE *const out = (e->kind == ESPIX_UM_FD_STD) ? um_std_stream(c, e->std) : NULL;
     uint32_t done = 0;
     while (done < len) {
         const uint32_t va = uva + done;
@@ -741,13 +782,19 @@ static int32_t um_sys_nanosleep(um_call_t *c)
 
 static int32_t um_sys_exit(um_call_t *c)
 {
-    espix_um_exit_group(c->t, (int)c->a[0]);
+#if CONFIG_ESPIX_UMODE
+    if (c->p->as != NULL) {
+        espix_um_exit_group(c->t, (int)c->a[0]);
+    }
+#endif
+    espix_proc_exit((int)c->a[0]);
 }
 
 /* ------------------------------------------------------------------ */
 /* Threads                                                             */
 /* ------------------------------------------------------------------ */
 
+#if CONFIG_ESPIX_UMODE
 static int32_t um_sys_thread_create(um_call_t *c)
 {
     return espix_um_thread_create(c->t, c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
@@ -757,6 +804,8 @@ static int32_t um_sys_thread_exit(um_call_t *c)
 {
     espix_um_thread_exit(c->t);
 }
+
+#endif
 
 static int32_t um_sys_gettid(um_call_t *c)
 {
@@ -776,6 +825,7 @@ static int32_t um_sys_getcpu(um_call_t *c)
     return (int32_t)esp_cpu_get_core_id();
 }
 
+#if CONFIG_ESPIX_UMODE
 static int32_t um_sys_futex(um_call_t *c)
 {
     switch (c->a[1]) {
@@ -800,6 +850,7 @@ static int32_t um_sys_futex(um_call_t *c)
         return -ENOSYS;
     }
 }
+#endif
 
 static int32_t um_sys_getpid(um_call_t *c)  { (void)c; return espix_abi_getpid(); }
 static int32_t um_sys_getppid(um_call_t *c) { (void)c; return espix_abi_getppid(); }
@@ -939,8 +990,9 @@ static int32_t um_sys_setsid(um_call_t *c)  { (void)c; return espix_proc_setsid(
 static int32_t um_sys_setpgid(um_call_t *c) { return espix_proc_setpgid((pid_t)c->a[0], (pid_t)c->a[1]); }
 static int32_t um_sys_getpgid(um_call_t *c) { return espix_proc_getpgid((pid_t)c->a[0]); }
 static int32_t um_sys_umask(um_call_t *c)   { return espix_proc_umask_set((int)c->a[0]); }
-static int32_t um_sys_fork(um_call_t *c)    { return espix_um_fork(c->t, c->f, false); }
-static int32_t um_sys_vfork(um_call_t *c)   { return espix_um_fork(c->t, c->f, true); }
+#if CONFIG_ESPIX_UMODE
+static int32_t um_sys_fork(um_call_t *c)    { return espix_um_fork(c->t, (RvExcFrame *)c->f, false); }
+static int32_t um_sys_vfork(um_call_t *c)   { return espix_um_fork(c->t, (RvExcFrame *)c->f, true); }
 
 /* A NULL-terminated array of strings from the app, packed as copy_argv packs one: the pointers, then the strings. */
 static int32_t vec_in(um_call_t *c, uint32_t uvec, char ***out, int *count, size_t *room)
@@ -1031,11 +1083,13 @@ static int32_t um_sys_execve(um_call_t *c)
     }
     return r;
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Signals (umode_sig.c)                                               */
 /* ------------------------------------------------------------------ */
 
+#if CONFIG_ESPIX_UMODE
 static int32_t um_sys_sigaction(um_call_t *c)   { return espix_um_sigaction(c->t, (int)c->a[0], c->a[1], c->a[2]); }
 static int32_t um_sys_sigprocmask(um_call_t *c) { return espix_um_sigprocmask(c->t, (int)c->a[0], c->a[1], c->a[2]); }
 static int32_t um_sys_sigpending(um_call_t *c)  { return espix_um_sigpending(c->t, c->a[0]); }
@@ -1048,6 +1102,7 @@ static int32_t um_sys_sigreturn(um_call_t *c)
     (void)c;
     return -ENOSYS;
 }
+#endif
 
 static int32_t tv_in(struct timeval *tv, const struct espix_timespec *e)
 {
@@ -1101,6 +1156,7 @@ static int32_t um_sys_term_size(um_call_t *c)
 /* Memory                                                              */
 /* ------------------------------------------------------------------ */
 
+#if CONFIG_ESPIX_UMODE
 static int32_t um_sys_brk(um_call_t *c)
 {
     return (int32_t)espix_um_brk(c->p->as, c->a[0]);
@@ -1201,23 +1257,48 @@ static int32_t um_sys_mincore(um_call_t *c)
     }
     return 0;
 }
+#endif
 
 /* Frames come from PSRAM. */
 static int32_t um_sys_meminfo(um_call_t *c)
 {
+    uint32_t spare = 0;
+#if CONFIG_ESPIX_UMODE
+    spare = espix_um_frames_spare();
+#endif
     const struct espix_meminfo m = {
         .page_size = PG,
         .total     = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / PG,
-        .free      = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / PG + espix_um_frames_spare(),
+        .free      = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / PG + spare,
     };
     return espix_um_copyout(c->p->as, c->a[0], &m, sizeof(m));
 }
 
 /* ------------------------------------------------------------------ */
 
+/* What needs an address space, or is the kernel's own API for an app without one (its threads and signals). */
+#define UM_MMU_ONLY(X) \
+    X(THREAD_CREATE, thread_create) X(THREAD_EXIT, thread_exit) X(FUTEX, futex) X(SIGACTION, sigaction) \
+    X(SIGPROCMASK, sigprocmask) X(SIGPENDING, sigpending) X(SIGSUSPEND, sigsuspend) X(SIGRETURN, sigreturn) \
+    X(RAISE, raise) X(BRK, brk) X(MMAP, mmap) X(MUNMAP, munmap) X(MPROTECT, mprotect) X(MSYNC, msync) \
+    X(MADVISE, madvise) X(MINCORE, mincore) X(FORK, fork) X(VFORK, vfork) X(EXECVE, execve) \
+    X(GFX_OPEN, gfx_open) X(GFX_CLOSE, gfx_close) X(GFX_SURFACE, gfx_surface) X(GFX_FREE, gfx_free) \
+    X(GFX_PRESENT, gfx_present) X(GFX_POLL, gfx_poll) X(AUDIO_OPEN, audio_open) X(AUDIO_WRITE, audio_write) \
+    X(AUDIO_CTL, audio_ctl) X(AUDIO_CLOSE, audio_close)
+
+#if !CONFIG_ESPIX_UMODE
+#define UM_NOSYS(name, lname) static int32_t um_sys_##lname(um_call_t *c) { (void)c; return -ENOSYS; }
+UM_MMU_ONLY(UM_NOSYS)
+#undef UM_NOSYS
+#endif
+
 #define UM_SYS_ENTRY(name, lname, nr) [nr] = um_sys_##lname,
 static const DRAM_ATTR um_sys_fn s_sys[] = { ESPIX_SYSCALLS(UM_SYS_ENTRY) };
 
+#define UM_MMU_ENTRY(name, lname) [ESPIX_SYS_##name] = true,
+static const bool s_mmu_only[sizeof(s_sys) / sizeof(s_sys[0])] = { UM_MMU_ONLY(UM_MMU_ENTRY) };
+
+#if CONFIG_ESPIX_UMODE
 IRAM_ATTR int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f)
 {
     um_call_t c = { .t = t, .p = t->proc, .f = f, .a = (const uint32_t *)&f->a0 };
@@ -1226,5 +1307,22 @@ IRAM_ATTR int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f)
     }
     return s_sys[f->a7](&c);
 }
+#endif
 
-#endif /* CONFIG_ESPIX_UMODE */
+int32_t espix_posix_syscall(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
+                            uint32_t a5)
+{
+    espix_um_thread_t *const t = espix_posix_self();
+    if (t == NULL) {
+        return -ENOMEM;
+    }
+    const uint32_t a[6] = { a0, a1, a2, a3, a4, a5 };
+    um_call_t c = { .t = t, .p = t->proc, .f = NULL, .a = a };
+    if (nr >= sizeof(s_sys) / sizeof(s_sys[0]) || s_sys[nr] == NULL || s_mmu_only[nr]) {
+        return -ENOSYS;
+    }
+    const int32_t r = s_sys[nr](&c);
+    /* The delivery point an M-mode app's calls in are: its handlers run here, on its own stack. */
+    (void)espix_sigcheck_mask();
+    return r;
+}

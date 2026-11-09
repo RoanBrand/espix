@@ -1,11 +1,9 @@
 /*
- * U-mode sockets, poll and name lookup (docs/USER-MODE.md): lwIP's calls behind the process's
+ * Sockets, poll and name lookup as syscalls (docs/USER-MODE.md): lwIP's calls behind the process's
  * descriptors, its option values and sockaddrs passed through unchanged. lwIP's socket is always
  * non-blocking; a call the app made blocking waits in espix_abi_select(), which a signal ends.
  */
 #include "sdkconfig.h"
-
-#if CONFIG_ESPIX_UMODE
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,12 +21,11 @@
 
 #include "esp_random.h"
 #include "esp_timer.h"
-#include "riscv/encoding.h"
 
 #include "espix_kernel.h"
 #include "espix_syscall.h"
 #include "espix_tty.h"
-#include "espix_umode.h"
+#include "espix_posix.h"
 #include "umode_sys.h"
 
 /* An app's struct termios is IDF's, as user/include/sys/termios.h declares it. */
@@ -188,7 +185,7 @@ static int32_t send_failed(um_call_t *c, espix_um_sock_t *s, int err, int flags)
         err = EPIPE;
     }
     if ((err == EPIPE || err == ECONNRESET || err == ECONNABORTED) && !(flags & MSG_NOSIGNAL)) {
-        (void)espix_um_raise(c->t, SIGPIPE);
+        um_raise(c, SIGPIPE);
     }
     return -err;
 }
@@ -882,5 +879,3 @@ int32_t um_sys_gethostname(um_call_t *c)
     const size_t n = strlen(name) + 1;
     return (n > c->a[1]) ? -ENAMETOOLONG : espix_um_copyout(c->p->as, c->a[0], name, n);
 }
-
-#endif /* CONFIG_ESPIX_UMODE */

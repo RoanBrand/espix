@@ -1,10 +1,18 @@
-/* libespix's ecall and the -errno convention (docs/USER-MODE.md). */
+/* libespix's syscall and the -errno convention (docs/USER-MODE.md): an ecall, or without an MMU a direct call. */
 #pragma once
 
 #include <errno.h>
 
 #include "espix_syscall.h"
 
+#if ESPIX_NOMMU_APP
+long espix_syscall(long n, long a, long b, long c, long d, long e, long f);
+
+static inline long espix_sys6(long n, long a, long b, long c, long d, long e, long f)
+{
+    return espix_syscall(n, a, b, c, d, e, f);
+}
+#else
 static inline long espix_sys6(long n, long a, long b, long c, long d, long e, long f)
 {
     register long a0 __asm__("a0") = a;
@@ -20,6 +28,7 @@ static inline long espix_sys6(long n, long a, long b, long c, long d, long e, lo
                       : "memory");
     return a0;
 }
+#endif
 
 #define espix_sys0(n)             espix_sys6((n), 0, 0, 0, 0, 0, 0)
 #define espix_sys1(n, a)          espix_sys6((n), (long)(a), 0, 0, 0, 0, 0)

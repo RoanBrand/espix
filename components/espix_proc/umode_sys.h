@@ -4,15 +4,32 @@
 #pragma once
 
 #include <errno.h>
+#include <signal.h>
 
-#include "espix_umode.h"
+#include "espix_posix.h"
 
 typedef struct {
     espix_um_thread_t *t;
     espix_um_proc_t   *p;
-    RvExcFrame        *f;
-    const uint32_t    *a;     /* a0-a5, in the frame */
+    void              *f;     /* a U-mode app's frame (RvExcFrame); NULL without an address space */
+    const uint32_t    *a;     /* a0-a5 */
 } um_call_t;
+
+/* An app without an address space: its signals are an M-mode app's, delivered as each call returns. */
+static inline bool um_nommu(const um_call_t *c)
+{
+    return c->p->as == NULL;
+}
+
+#include <stdio.h>
+
+/* The session's stream behind std descriptor i, for its reads and writes. */
+FILE *um_std_stream(const um_call_t *c, int i);
+
+/* A signal for the calling thread: SIGPIPE from a write that found no reader. */
+void um_raise(um_call_t *c, int sig);
+/* A signal is due that should end the caller's wait. */
+bool um_sig_due(const um_call_t *c);
 
 /* The errno a kernel call left, as a syscall result. */
 static inline int32_t um_kret(int r)
@@ -50,7 +67,8 @@ UM_NET_SYS_DECL_(getrandom)
 UM_NET_SYS_DECL_(gethostname)
 UM_NET_SYS_DECL_(ioctl)
 UM_NET_SYS_DECL_(getifaddrs)
-/* The screen and audio (umode_gfx.c). */
+/* The screen and audio (umode_gfx.c): U-mode's; an app without an address space calls espix_gfx itself. */
+#if CONFIG_ESPIX_UMODE
 UM_NET_SYS_DECL_(gfx_open)
 UM_NET_SYS_DECL_(gfx_close)
 UM_NET_SYS_DECL_(gfx_surface)
@@ -61,4 +79,5 @@ UM_NET_SYS_DECL_(audio_open)
 UM_NET_SYS_DECL_(audio_write)
 UM_NET_SYS_DECL_(audio_ctl)
 UM_NET_SYS_DECL_(audio_close)
+#endif
 #undef UM_NET_SYS_DECL_

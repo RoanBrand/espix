@@ -7,112 +7,9 @@
 
 #if CONFIG_ESPIX_UMODE
 
-#include <dirent.h>
-#include <setjmp.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-
 #include "riscv/rvruntime-frames.h"
 
-#include "espix_proc_priv.h"
-#include "espix_syscall.h"
-
-typedef struct espix_um_as espix_um_as_t;
-
-#define ESPIX_UM_FDS ESPIX_OPEN_MAX
-
-enum { ESPIX_UM_FD_FREE, ESPIX_UM_FD_STD, ESPIX_UM_FD_FILE, ESPIX_UM_FD_DIR, ESPIX_UM_FD_SOCK };
-
-/* A socket, shared by the descriptors dup made of it. lwIP's is always non-blocking: the app's blocking is ours. */
-typedef struct {
-    int      kfd;
-    int      refs;          /* atomic */
-    int      type;          /* SOCK_STREAM, SOCK_DGRAM or SOCK_RAW */
-    bool     nonblock;
-    bool     connecting;    /* a blocking connect a signal cut short, finished by the next */
-    bool     connected;     /* once was, so lwIP's ENOTCONN means the peer has gone */
-    int64_t  rcv_us, snd_us;    /* SO_RCVTIMEO, SO_SNDTIMEO; 0 waits for ever */
-} espix_um_sock_t;
-
-/* One of a process's descriptors: a number only it can name, behind which is a kernel object. */
-typedef struct {
-    uint8_t kind;
-    bool    cloexec;
-    union {
-        int  std;   /* which of the process's three streams */
-        int  kfd;   /* the kernel's descriptor */
-        DIR *dir;
-        espix_um_sock_t *sock;
-    };
-} espix_um_fd_t;
-
-typedef struct espix_um_waiter espix_um_waiter_t;
-struct espix_um_text;
-
-/* The read-only segments of a process's image it shares with others running it. */
-#define ESPIX_UM_TEXTS 2
-
-enum { ESPIX_UM_OBJ_FREE, ESPIX_UM_OBJ_SURFACE, ESPIX_UM_OBJ_AUDIO };
-
-/* A gfx surface or an audio stream the process holds, by handle; a call using it holds a reference. */
-typedef struct {
-    uint8_t  kind;
-    bool     closed;    /* its handle is gone; the last reference ends it */
-    int      refs;
-    void    *obj;
-    uint32_t va;        /* a surface's pixels in the app */
-} espix_um_obj_t;
-
-#define ESPIX_UM_OBJS 8
-
-/* A U-mode process: what its threads share. */
-typedef struct {
-    espix_um_as_t     *as;
-    SemaphoreHandle_t  lock;        /* the descriptor table, the futex waiters, the thread count and the exit */
-    espix_um_fd_t      fds[ESPIX_UM_FDS];
-    int                threads;     /* live, the main one included; a leaving thread notifies the main one */
-    bool               exiting;     /* every thread is ending; the main one ends the process */
-    int                exit_status;
-    uint8_t            exit_sig;    /* the signal behind exit_status, or 0 */
-    bool               exec;        /* the exit is an exec: the main thread loads the new image */
-    struct espix_um_vfork *vfork;   /* a vfork's child: its parent waits until this process lets go of its memory */
-    espix_um_waiter_t *futex_waiters;
-    uint32_t          *amos;        /* each AMO the loader replaced: its pc and the instruction, by pc */
-    uint32_t           amo_count;
-    struct espix_sigaction act[NSIG];   /* under lock */
-    espix_um_obj_t     objs[ESPIX_UM_OBJS];     /* under lock */
-    void              *gfx;         /* the screen (espix_gfx_t), while it holds it */
-    struct espix_um_text *text[ESPIX_UM_TEXTS];
-    uint8_t            ntext;
-} espix_um_proc_t;
-
-/* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */
-typedef struct {
-    uint32_t           satp;
-    uint32_t           ktp;   /* the task's own tp, which kernel code needs back on every entry */
-    espix_um_proc_t   *proc;
-    espix_proc_slot_t *slot;
-    void              *task;  /* its FreeRTOS task, the FPU owner to compare with */
-    bool               diverted;    /* the return to U went to UM_KICK_PC instead of sig_pc */
-    bool               gone;        /* the main thread after pthread_exit: takes no signal */
-    bool               suspended;   /* in sigsuspend, with sig_saved the mask to go back to */
-    bool               sys_intr;    /* the syscall just made returned -EINTR */
-    uint32_t           sig_pc;
-    uint32_t           sig_blocked;
-    uint32_t           sig_pending; /* this thread's alone: raised, or claimed from the process's */
-    uint32_t           sig_saved;
-    uint32_t           sys_nr, sys_a0;  /* the last syscall, to restart it under SA_RESTART */
-    espix_pid_t        tid;
-    uint32_t           clear_tid;   /* holds the tid while the thread runs, zeroed and woken when it ends */
-    uint32_t           stack;       /* the top of the stack the kernel gave it, or 0 */
-    jmp_buf           *exit_jmp;    /* a thread's way out; NULL for the main thread, which ends the process */
-    uint32_t           entry, arg, usp, utp;    /* where a new thread starts */
-} espix_um_thread_t;
+#include "espix_posix.h"
 
 void espix_um_init(void);
 
@@ -138,10 +35,6 @@ void        espix_um_exec_go(espix_um_thread_t *t) __attribute__((noreturn));
 /* After an exec's jump home: the old image gone, close-on-exec descriptors closed, caught signals default. */
 void        espix_um_exec_reset(espix_proc_slot_t *slot);
 
-/* Before the owned-fd sweep: the process's descriptors, closed while their numbers are still its own. */
-void espix_um_close_fds(espix_proc_slot_t *slot);
-/* Its surfaces and audio streams, ended once its threads are gone (umode_gfx.c). */
-void espix_um_objs_release(espix_um_proc_t *p);
 
 void espix_um_release(espix_proc_slot_t *slot);
 
@@ -189,12 +82,6 @@ void espix_um_fpu_restore(const void *area);
 
 /* Syscalls (umode_sys.c): the result for a0. */
 int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f);
-void    espix_um_fds_init(espix_um_proc_t *p);
-/* A fork's descriptors: each file its own kernel descriptor, sockets and pipes shared; 0 or -errno. */
-int32_t espix_um_fds_fork(espix_um_proc_t *from, espix_um_proc_t *to);
-/* Every descriptor of p closed; those marked close-on-exec. */
-void    espix_um_fds_drop(espix_um_proc_t *p);
-void    espix_um_fds_cloexec(espix_um_proc_t *p);
 /* exec's signal state: caught signals back to their default. */
 void    espix_um_sig_exec(espix_um_proc_t *p);
 
@@ -265,18 +152,8 @@ uint32_t espix_um_brk(espix_um_as_t *as, uint32_t want);
 uint32_t espix_um_tstack_take(espix_um_as_t *as);
 void     espix_um_tstack_give(espix_um_as_t *as, uint32_t top);
 
-/*
- * The kernel's pointer to user va, mapping a reserved page on the way; NULL if need is not allowed.
- * The frame stays allocated, even if another thread unmaps it, until espix_um_user_unpin().
- */
-void *espix_um_user_pin(espix_um_as_t *as, uint32_t va, uint32_t need);
-void  espix_um_user_unpin(espix_um_as_t *as);
 /* A page fault the app took: true when it was a reserved page, now mapped, and the app can resume. */
 bool  espix_um_fault(espix_um_as_t *as, uint32_t va, uint32_t need);
 
-/* User memory, a page at a time: 0 or -EFAULT; a string's length, or -EFAULT or -ENAMETOOLONG. */
-int espix_um_copyin(espix_um_as_t *as, void *dst, uint32_t uva, size_t n);
-int espix_um_copyout(espix_um_as_t *as, uint32_t uva, const void *src, size_t n);
-int espix_um_strin(espix_um_as_t *as, char *dst, uint32_t uva, size_t size);
 
 #endif /* CONFIG_ESPIX_UMODE */

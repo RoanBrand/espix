@@ -172,6 +172,9 @@ typedef struct {
      */
     volatile bool root_active;
 
+    /* An M-mode app's syscall state once it makes one, as a POSIX app built by espix-cc does (posix.c). */
+    void *posix;
+
 #if CONFIG_ESPIX_UMODE
     /* A U-mode app's thread and address space (espix_umode.h); NULL for an M-mode app. */
     void *um;

@@ -59,6 +59,7 @@ long sysconf(int name)
     }
 }
 
+#if !ESPIX_NOMMU_APP
 static uintptr_t s_brk;
 
 int brk(void *addr)
@@ -83,6 +84,7 @@ void *sbrk(ptrdiff_t incr)
     }
     return (void *)old;
 }
+#endif
 
 _Noreturn void _exit(int status)
 {

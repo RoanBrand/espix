@@ -284,6 +284,8 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
      * needs the descriptor under a stdio stream can get at it. */
     ESP_ELFSYM_EXPORT(fileno),
     ESP_ELFSYM_EXPORT(fdopen),
+    /* A stream over the app's own calls: how a POSIX app's libespix makes FILEs over its descriptors. */
+    ESP_ELFSYM_EXPORT(funopen),
 
     /*
      * POSIX file calls. Unwrapped: each of these enters espix's VFS, which

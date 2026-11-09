@@ -18,9 +18,11 @@ _Static_assert(ESPIX_SYS_VFORK == 98, "vfork.S names the number");
 
 extern char **environ;
 
+#if !ESPIX_NOMMU_APP
 void __espix_fork_prepare(void);
 void __espix_fork_parent(void);
 void __espix_fork_child(void);
+#endif
 
 /* vfork.S's way out on an error: errno, and -1. */
 long __espix_errno_ret(long r)
@@ -29,6 +31,20 @@ long __espix_errno_ret(long r)
     return -1;
 }
 
+#if ESPIX_NOMMU_APP
+/* Without an MMU there is no copy to make, as on a Linux without one: vfork and exec, or posix_spawn. */
+pid_t fork(void)
+{
+    errno = ENOSYS;
+    return -1;
+}
+
+pid_t vfork(void)
+{
+    errno = ENOSYS;
+    return -1;
+}
+#else
 pid_t fork(void)
 {
     __espix_fork_prepare();
@@ -40,6 +56,7 @@ pid_t fork(void)
     }
     return (pid_t)espix_ret(r);
 }
+#endif
 
 int execve(const char *path, char *const argv[], char *const envp[])
 {

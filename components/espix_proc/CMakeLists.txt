@@ -11,6 +11,8 @@ idf_component_register(
         "spawn_fn.c"
         "fg.c"
         "pipe.c"
+        "posix_uaccess.c"
+        "posix.c"
         "app_fault.c"
         "app_fault_xtensa.S"
         "abi_exit.c"

@@ -1243,6 +1243,9 @@ espix_um_as_t *espix_um_as_fork(espix_um_as_t *src, uint32_t asid)
 
 void *espix_um_user_pin(espix_um_as_t *as, uint32_t va, uint32_t need)
 {
+    if (as == NULL) {
+        return espix_posix_pin(va);
+    }
     /* A page mapped already needs no lock: unmapped() honours the pin. */
     __atomic_add_fetch(&as->pins, 1, __ATOMIC_SEQ_CST);
     const uint32_t l1 = __atomic_load_n(&as->root[va >> 22], __ATOMIC_ACQUIRE);
@@ -1263,6 +1266,9 @@ void *espix_um_user_pin(espix_um_as_t *as, uint32_t va, uint32_t need)
 
 void espix_um_user_unpin(espix_um_as_t *as)
 {
+    if (as == NULL) {
+        return;
+    }
     if (__atomic_sub_fetch(&as->pins, 1, __ATOMIC_SEQ_CST) != 0 ||
         __atomic_load_n(&as->dead, __ATOMIC_SEQ_CST) == NULL) {
         return;
@@ -1291,6 +1297,9 @@ bool espix_um_fault(espix_um_as_t *as, uint32_t va, uint32_t need)
 
 int espix_um_copyin(espix_um_as_t *as, void *dst, uint32_t uva, size_t n)
 {
+    if (as == NULL) {
+        return espix_posix_copyin(dst, uva, n);
+    }
     uint8_t *d = dst;
     while (n > 0) {
         const uint8_t *k = espix_um_user_pin(as, uva, PTE_R);
@@ -1309,6 +1318,9 @@ int espix_um_copyin(espix_um_as_t *as, void *dst, uint32_t uva, size_t n)
 
 int espix_um_copyout(espix_um_as_t *as, uint32_t uva, const void *src, size_t n)
 {
+    if (as == NULL) {
+        return espix_posix_copyout(uva, src, n);
+    }
     const uint8_t *s = src;
     while (n > 0) {
         uint8_t *k = espix_um_user_pin(as, uva, PTE_W);
@@ -1327,6 +1339,9 @@ int espix_um_copyout(espix_um_as_t *as, uint32_t uva, const void *src, size_t n)
 
 int espix_um_strin(espix_um_as_t *as, char *dst, uint32_t uva, size_t size)
 {
+    if (as == NULL) {
+        return espix_posix_strin(dst, uva, size);
+    }
     size_t len = 0;
     while (len < size) {
         const char *k = espix_um_user_pin(as, uva, PTE_R);

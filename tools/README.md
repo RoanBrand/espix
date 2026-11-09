@@ -120,22 +120,29 @@ delete both files and the `execute_process()` block in the top-level
 
 ## espix-cc
 
-The C compiler for U-mode apps on the S31 (docs/USER-MODE.md), as `musl-gcc` is
-for musl: the toolchain's gcc with picolibc, `libespix` (espix's OS layer under
-it, `user/libespix/`) and `user/uapp.ld`, which links a static executable at
-`0x10000`. The kernel runs any ET_EXEC it loads in U-mode, in an address space
-of its own; relocatable apps stay M-mode.
+The C compiler for POSIX apps (docs/USER-MODE.md), as `musl-gcc` is for musl:
+the toolchain's gcc with picolibc's headers and `libespix` (espix's OS layer,
+`user/libespix/`). Every build defines `ESPIX_POSIX_APP`, and `ESPIX_UMODE_APP`
+or `ESPIX_NOMMU_APP` for the kind.
 
 ```bash
-./tools/espix-cc -Os -o hello-u apps/hello/main/hello.c
+./tools/espix-cc -Os -o hello-u apps/hello/main/hello.c                    # the S31
+./tools/espix-cc --target=esp32s3 -Os -o hello-p apps/hello/main/hello.c   # the S3
 ```
 
-It builds `libespix.a` into `user/build/` when a source is newer. Apps are built
-without PIE and the hardware loop, which exist only on core 1, and with the
-64-bit `off_t` of `cmake/offt64.h`, and with `libespix`'s allocator wrapped over
-picolibc's, so a `malloc` of 128 KiB or more is a mapping. An app on the screen or audio adds
-`components/espix_{proc,display,audio}/include` for their headers, as its M-mode
-build does.
+- **The S31** (the default): a static executable at `0x10000`, linked with
+  picolibc and `user/uapp.ld`, run in U-mode in an address space of its own.
+  Built without PIE and the hardware loop, which exist only on core 1, and with
+  `libespix`'s allocator wrapped over picolibc's, so a `malloc` of 128 KiB or
+  more is a mapping.
+- **The S3** (`--target=esp32s3`): a shared object the loader relocates, as an
+  M-mode app is, linked with no libc: what it leaves undefined (libc, `malloc`,
+  threads, signals) the kernel answers. Its syscalls are direct calls.
+
+`libespix.a` is built into `user/build/` (or `user/build-<target>/`) when a
+source is newer. Both use the 64-bit `off_t` of `cmake/offt64.h`. An app on the
+screen or audio adds `components/espix_{proc,display,audio}/include` for their
+headers, as its M-mode build does.
 
 ## patch-umode.py
 

@@ -467,21 +467,40 @@ two meet the same silicon:
 | new code | `fence.i` leaves stale lines; OpenSBI writes back D and invalidates I | `esp_cache_msync`, D written back then I invalidated, per executable page |
 | isolation | Sv32 for processes, PMP keeps IDF's core out of Linux memory | Sv32 per process, `cpu_apm` open to U, no PMP (IDF locks it) |
 
-## The S3
+## The S3: POSIX apps without an MMU
 
-One kernel, two ways in:
+A POSIX app is one source and one interface on both chips: `espix-cc` builds it,
+`libespix` is its OS layer, and its syscalls are the same numbers and structs.
+The S3 has no MMU, so there it runs as Linux runs a program without one:
 
 | part | S3 | S31 |
 |---|---|---|
-| VFS, fds, processes, signals, sockets, gfx, audio | shared | shared |
-| symbol-table ABI for M-mode apps | yes | yes |
-| syscall dispatcher, page tables, fault paths, the vectors patch | no | yes |
-| `libespix`, `espix-cc` | no | yes |
+| build | `espix-cc --target=esp32s3`: a shared object the loader relocates | `espix-cc`: a static executable |
+| a syscall | a direct call to `espix_syscall()` | `ecall` |
+| descriptors, files, sockets, `poll`, pipes, `wait`, sessions, `umask` | the process's own table, the same code (`umode_sys.c`, `umode_net.c`) | the same |
+| user pointers | range-checked and used as they are (`posix_uaccess.c`) | walked through the table |
+| libc, `malloc`, threads, signals, the screen and audio | the kernel's, shared by every app | linked into the app; threads, signals and surfaces by syscall |
+| `fork` | ENOSYS, as on a Linux without an MMU | copy-on-write |
 
-An app has one source and two builds: an M-mode ELF for the S3 and a U-mode ELF
-for the S31. The S3 does not get isolation, asynchronous signals, growing stacks
-or copy-on-write; tests that need them skip there. An app's fault ends only the
-app on both (`37-faults`).
+**libc's code is shared from the kernel.** picolibc's S3 `libc.a` keeps errno and
+its other state in thread-local storage, which the loader does not relocate, so
+an S3 app links no libc at all: `printf`, `strtod`, `qsort`, math and the rest
+resolve to the kernel's one copy, and the app carries only `libespix`'s calls
+(`hello` is 2.9 KB). Its `stdin`, `stdout` and `stderr` are the process's,
+routed through descriptors 0-2 once its first syscall has made the table, so
+`dup2` onto them redirects `printf`; `fopen` and `fdopen` are `libespix`'s,
+`funopen` streams over the app's own descriptors.
+
+**Threads and signals are an M-mode app's**: IDF's pthreads behind the ABI, and
+handlers run when the app calls in, which every syscall's return is.
+
+The S3 does not get isolation, asynchronous signals, growing stacks or
+copy-on-write; tests that need them skip there. An app's fault ends only the app
+on both (`37-faults`). `ESPIX_UAPP=1 tests/run.sh` runs the suites with the test
+app's `espix-cc` build on either chip.
+
+Apps that drive the hardware themselves (neopixel's RMT) stay M-mode apps built
+by IDF, against the symbol tables.
 
 ## Milestones
 

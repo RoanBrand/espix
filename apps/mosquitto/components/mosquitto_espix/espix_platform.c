@@ -49,7 +49,7 @@ int initgroups(const char *user, gid_t group)
  * setsid() and umask() from libespix; an M-mode app has no fork, as on a Linux
  * without an MMU, so there -d fails loudly instead of half-working.
  */
-#if !ESPIX_UMODE_APP
+#if !ESPIX_POSIX_APP
 pid_t fork(void)
 {
     errno = ENOSYS;
