@@ -35,6 +35,7 @@
 #include "espix_proc_priv.h"
 #include "espix_umode.h"
 #include "espix_shell.h"
+#include "espix_tty.h"
 
 #define TAG "exec"
 
@@ -311,6 +312,51 @@ static int proc_write_err(void *cookie, const char *data, int len)
     return (espix_session_write(cookie, data, (size_t)len, true) < 0) ? -1 : len;
 }
 
+static int tty_stream_read(void *cookie, char *buf, int len)
+{
+    const ssize_t n = (len > 0) ? espix_tty_read(cookie, buf, (size_t)len, false) : 0;
+    return (n < 0) ? (errno = (int)-n, -1) : (int)n;
+}
+
+static int tty_stream_write(void *cookie, const char *buf, int len)
+{
+    const ssize_t n = (len > 0) ? espix_tty_write(cookie, buf, (size_t)len) : 0;
+    return (n < 0) ? (errno = (int)-n, -1) : (int)n;
+}
+
+static int tty_stream_write_err(void *cookie, const char *buf, int len)
+{
+    const ssize_t n = (len > 0) ? espix_tty_write_err(cookie, buf, (size_t)len) : 0;
+    return (n < 0) ? (errno = (int)-n, -1) : (int)n;
+}
+
+static int tty_stream_close(void *cookie)
+{
+    espix_tty_put(cookie);
+    return 0;
+}
+
+/* Stream fd of the terminal t, holding a reference: after a hangup it reads the end and writes fail. */
+static FILE *tty_stream(espix_tty_t *t, int fd)
+{
+    FILE *f = funopen(espix_tty_get(t), (fd == 0) ? tty_stream_read : NULL,
+                      (fd == 1) ? tty_stream_write : (fd == 2) ? tty_stream_write_err : NULL,
+                      NULL, tty_stream_close);
+    if (f == NULL) {
+        espix_tty_put(t);
+        return NULL;
+    }
+    setvbuf(f, NULL, (fd == 0) ? _IONBF : _IOLBF, (fd == 0) ? 0 : 128);
+    return f;
+}
+
+/* fd's stream for a process that left its session: its terminal's, or /dev/null. */
+static FILE *detached_stream(espix_proc_slot_t *slot, int fd)
+{
+    FILE *f = (slot->std_tty != NULL) ? tty_stream(slot->std_tty, fd) : NULL;
+    return (f != NULL) ? f : fopen("/dev/null", (fd == 0) ? "r" : "w");
+}
+
 /*
  * The relocation, on a stack that can survive it.
  *
@@ -487,9 +533,15 @@ static void proc_task(void *arg)
     slot->std[1] = stdout;
     slot->std[2] = stderr;
 
-    FILE *own_in = NULL, *own_out = NULL, *own_err = NULL;
-
-    if (session != NULL && session->open_stream != NULL) {
+    if (slot->detached) {
+        /* A fork's child of a process that left its session: the same streams its parent has. */
+        for (int fd = 0; fd < 3; fd++) {
+            slot->own_std[fd] = detached_stream(slot, fd);
+            if (slot->own_std[fd] != NULL) {
+                slot->std[fd] = slot->own_std[fd];
+            }
+        }
+    } else if (session != NULL && session->open_stream != NULL) {
         FILE *out = NULL;
         FILE *err = NULL;
 
@@ -507,15 +559,15 @@ static void proc_task(void *arg)
         }
 
         if (out != NULL) {
-            slot->std[1] = own_out = out;
+            slot->std[1] = slot->own_std[1] = out;
         }
         if (err != NULL) {
-            slot->std[2] = own_err = err;
+            slot->std[2] = slot->own_std[2] = err;
         }
 
         FILE *const in = session->open_stream(session, ESPIX_STREAM_IN);
         if (in != NULL) {
-            slot->std[0]   = own_in = in;
+            slot->std[0]   = slot->own_std[0] = in;
             slot->std_tty  = session->tty;
         }
     }
@@ -528,11 +580,18 @@ static void proc_task(void *arg)
      * exit status at all: it shows as `[exit -1]` locally and as 255 over SSH,
      * where it is indistinguishable from ssh's own transport failures.
      */
-    int  status = 126;
-    bool ran    = false;
+    volatile int  status = 126;
+    volatile bool ran    = false;
 
     /* exit()'s landing site while the app runs; see the call below. */
     jmp_buf exit_jb;
+
+#if CONFIG_ESPIX_UMODE
+    /* A fork's child has its parent's image already. */
+    if (slot->app->fork != NULL) {
+        goto umode;
+    }
+#endif
 
     esp_err_t err = load_image(slot->app->path, &slot->app->image,
                                &slot->info.image_bytes);
@@ -585,18 +644,36 @@ static void proc_task(void *arg)
 #if CONFIG_ESPIX_UMODE
     /* A static executable runs in U-mode in its own address space; exit and faults land at exit_jb. */
     if (espix_um_is_exec(slot->app->image, slot->info.image_bytes)) {
+umode:
         ran = true;
-        if (!espix_proc_loaded()) {
-            status = 128 + SIGKILL;     /* killed while it loaded: ends as a kill does */
-            goto done;
-        }
-        slot->exit_jmp = &exit_jb;
-        if (setjmp(exit_jb) == 0) {
-            const char *why = espix_um_exec(slot);
-            espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path, why);
-            ran = false;
-        } else {
-            status = slot->exit_status;
+        for (;;) {
+            if (!espix_proc_loaded()) {
+                status = 128 + SIGKILL;     /* killed while it loaded: ends as a kill does */
+                slot->term_sig = SIGKILL;
+                break;
+            }
+            slot->exit_jmp = &exit_jb;
+            const int how = setjmp(exit_jb);
+            if (how == 0) {
+                const char *why = (slot->app->fork != NULL) ? espix_um_fork_run(slot) : espix_um_exec(slot);
+                espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path, why);
+                ran = false;
+                break;
+            }
+            if (how != ESPIX_UM_EXEC_JUMP) {
+                status = slot->exit_status;
+                break;
+            }
+            /* An exec: the same process, its new program loaded on this task. */
+            slot->exit_jmp = NULL;
+            espix_um_exec_reset(slot);
+            err = load_image(slot->app->path, &slot->app->image, &slot->info.image_bytes);
+            if (err != ESP_OK || !espix_um_is_exec(slot->app->image, slot->info.image_bytes)) {
+                espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path,
+                              (err != ESP_OK) ? esp_err_to_name(err) : "not a U-mode executable");
+                status = (err != ESP_OK) ? 127 : 126;
+                break;
+            }
         }
         slot->exit_jmp = NULL;
         goto done;
@@ -661,6 +738,7 @@ static void proc_task(void *arg)
      */
     if (!espix_proc_loaded()) {
         status = 128 + SIGKILL;         /* killed while it loaded: ends as a kill does */
+        slot->term_sig = SIGKILL;
         ran    = true;
         goto done;
     }
@@ -697,6 +775,7 @@ static void proc_task(void *arg)
         const int sig = espix_proc_termsig(slot);
         if (sig != 0) {
             status = 128 + sig;
+            slot->term_sig = (uint8_t)sig;
         }
     } else {
         status = slot->exit_status;
@@ -734,7 +813,7 @@ done:
          * exit(), which flushes them. Ours are flushed by their fclose below. */
         for (int fd = 1; fd <= 2; fd++) {
             FILE *const f = slot->std[fd];
-            if (f != NULL && f != own_out && f != own_err) {
+            if (f != NULL && f != slot->own_std[1] && f != slot->own_std[2]) {
                 fflush(f);
             }
         }
@@ -747,16 +826,17 @@ done:
         slot->std[0]  = stdin;
         slot->std[1]  = stdout;
         slot->std[2]  = stderr;
+        if (slot->std_tty_ref) {
+            espix_tty_put(slot->std_tty);
+            slot->std_tty_ref = false;
+        }
         slot->std_tty = NULL;
 
-        if (own_out != NULL) {
-            fclose(own_out);
-        }
-        if (own_err != NULL) {
-            fclose(own_err);
-        }
-        if (own_in != NULL) {
-            fclose(own_in);
+        for (int fd = 2; fd >= 0; fd--) {
+            if (slot->own_std[fd] != NULL) {
+                fclose(slot->own_std[fd]);
+                slot->own_std[fd] = NULL;
+            }
         }
     }
 
@@ -776,6 +856,40 @@ done:
     espix_proc_reap_self(slot,
                          ran ? ESPIX_PROC_EXITED : ESPIX_PROC_FAULTED,
                          status);
+}
+
+void espix_proc_streams_leave(espix_proc_slot_t *slot)
+{
+    espix_tty_t *const t = slot->std_tty;
+    if (slot->detached) {
+        return;
+    }
+    if (t != NULL && !slot->std_tty_ref) {
+        espix_tty_get(t);
+        slot->std_tty_ref = true;
+    }
+    slot->detached = true;
+    for (int fd = 0; fd < 3; fd++) {
+        FILE *const old = slot->own_std[fd];
+        if (old == NULL) {
+            continue;
+        }
+        FILE *const f = detached_stream(slot, fd);
+        if (slot->std[fd] == old) {
+            slot->std[fd] = (f != NULL) ? f : (fd == 0) ? stdin : (fd == 1) ? stdout : stderr;
+        }
+        slot->own_std[fd] = f;
+        fflush(old);
+        /* A thread may hold it still; then it stays, flushed and unreachable. */
+        espix_pid_t tids[1];
+        TaskHandle_t tasks[1];
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        const bool alone = espix_pthread_list_locked(slot, tids, tasks, 1) == 0;
+        xSemaphoreGive(g_espix_proc_lock);
+        if (alone) {
+            fclose(old);
+        }
+    }
 }
 
 /*
@@ -913,6 +1027,7 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
         slot->info.ppid = (parent != NULL) ? parent->info.pid : ESPIX_PID_NONE;
         slot->info.pgid = espix_proc_group_for(parent, 0, slot->info.pid);
         slot->info.sid  = (parent != NULL) ? parent->info.sid : slot->info.pid;
+        slot->umask     = (parent != NULL) ? parent->umask : 022;
     }
 
     slot->info.state      = ESPIX_PROC_READY;
@@ -1099,4 +1214,178 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
 
     xSemaphoreGive(g_espix_proc_lock);
     return ESP_OK;
+}
+
+/* n strings packed as copy_argv() packs them: the pointers, a NULL, then the strings; one free(). */
+static char **pack_vec(int n, char *const *v)
+{
+    size_t bytes = sizeof(char *) * (size_t)(n + 1);
+    for (int i = 0; i < n; i++) {
+        bytes += strlen(v[i]) + 1;
+    }
+    char **vec = malloc(bytes);
+    if (vec == NULL) {
+        return NULL;
+    }
+    char *strings = (char *)(vec + n + 1);
+    for (int i = 0; i < n; i++) {
+        const size_t len = strlen(v[i]) + 1;
+        memcpy(strings, v[i], len);
+        vec[i] = strings;
+        strings += len;
+    }
+    vec[n] = NULL;
+    return vec;
+}
+
+static int vec_count(char *const *v)
+{
+    int n = 0;
+    while (v != NULL && v[n] != NULL) {
+        n++;
+    }
+    return n;
+}
+
+int espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *out_pid)
+{
+#if CONFIG_ESPIX_UMODE
+    if (espix_shutdown_started()) {
+        return -EAGAIN;
+    }
+    const espix_proc_app_t *const pa = parent->app;
+    espix_proc_app_t *const app = heap_caps_calloc(1, sizeof(*app), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (app == NULL) {
+        return -ENOMEM;
+    }
+    app->argv_block = pack_vec(pa->argc, pa->argv);
+    app->env_block  = (pa->envp != NULL) ? pack_vec(vec_count(pa->envp), pa->envp) : NULL;
+    if (app->argv_block == NULL || (pa->envp != NULL && app->env_block == NULL)) {
+        free(app->argv_block);
+        free(app->env_block);
+        free(app);
+        return -ENOMEM;
+    }
+    app->argv        = app->argv_block;
+    app->argc        = pa->argc;
+    app->envp        = app->env_block;
+    app->root_active = pa->root_active;
+    app->fork        = um_fork;
+    strlcpy(app->path, pa->path, sizeof(app->path));
+    strlcpy(app->cwd, pa->cwd, sizeof(app->cwd));
+    strlcpy(app->root, pa->root, sizeof(app->root));
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    espix_proc_slot_t *const slot = espix_proc_alloc_slot();
+    if (slot == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        app->fork = NULL;
+        free(app->argv_block);
+        free(app->env_block);
+        free(app);
+        return -EAGAIN;
+    }
+    slot->app          = app;
+    slot->info.kind    = ESPIX_PROC_APP;
+    slot->info.pid     = espix_proc_next_pid();
+    slot->info.ppid    = parent->info.pid;
+    slot->info.pgid    = parent->info.pgid;
+    slot->info.sid     = parent->info.sid;
+    slot->info.session = parent->info.session;
+    slot->info.uid     = parent->info.uid;
+    slot->info.gid     = parent->info.gid;
+    slot->info.ngroups = parent->info.ngroups;
+    memcpy(slot->info.groups, parent->info.groups, sizeof(slot->info.groups));
+    strlcpy(slot->info.name, parent->info.name, sizeof(slot->info.name));
+    slot->info.state      = ESPIX_PROC_READY;
+    slot->info.started_us = esp_timer_get_time();
+    slot->foreground = parent->foreground;
+    slot->umask      = parent->umask;
+    slot->loading    = true;
+    slot->wake_fd    = espix_fs_wake_create();
+    slot->detached   = parent->detached;
+    if (parent->std_tty_ref) {
+        slot->std_tty     = espix_tty_get(parent->std_tty);
+        slot->std_tty_ref = true;
+    }
+
+    char task_name[configMAX_TASK_NAME_LEN];
+    snprintf(task_name, sizeof(task_name), "app:%.*s", (int)(sizeof(task_name) - sizeof("app:")), slot->info.name);
+    TaskHandle_t task = NULL;
+    if (xTaskCreatePinnedToCoreWithCaps(proc_task, task_name, CONFIG_ESPIX_UM_KSTACK, slot,
+                                        CONFIG_ESPIX_PROC_PRIORITY, &task, tskNO_AFFINITY,
+                                        ESPIX_STACK_CAPS) != pdPASS) {
+        espix_fs_wake_close(slot->wake_fd);
+        if (slot->std_tty_ref) {
+            espix_tty_put(slot->std_tty);
+        }
+        app->fork = NULL;           /* the caller still owns it */
+        spawn_abandon(slot);
+        xSemaphoreGive(g_espix_proc_lock);
+        return -EAGAIN;
+    }
+    slot->info.task  = task;
+    slot->info.state = ESPIX_PROC_RUNNING;
+    *out_pid = slot->info.pid;
+    xSemaphoreGive(g_espix_proc_lock);
+    return 0;
+#else
+    (void)parent;
+    (void)um_fork;
+    (void)out_pid;
+    return -ENOSYS;
+#endif
+}
+
+int espix_proc_exec_commit(espix_proc_slot_t *slot, const char *abs_path, int argc, char *const argv[],
+                           char *const envp[])
+{
+    char **const av = pack_vec(argc, argv);
+    const int envc  = vec_count(envp);
+    char **const ev = (envc > 0) ? pack_vec(envc, envp) : NULL;
+    if (av == NULL || (envc > 0 && ev == NULL)) {
+        free(av);
+        free(ev);
+        return -ENOMEM;
+    }
+
+    /* The new program's set-id bits, as at spawn. */
+    uint16_t uid = slot->info.uid, gid = slot->info.gid;
+    struct stat st;
+    if (stat(abs_path, &st) == 0) {
+        const mode_t m = espix_fs_mode(abs_path, &st);
+        if (m & S_ISUID) {
+            espix_fs_owner(abs_path, &st, &uid, NULL);
+        }
+        if (m & S_ISGID) {
+            espix_fs_owner(abs_path, &st, NULL, &gid);
+        }
+    }
+
+    const char *base = strrchr(abs_path, '/');
+    base = (base != NULL) ? base + 1 : abs_path;
+    espix_proc_app_t *const app = slot->app;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    char **const old_av = app->argv_block, **const old_ev = app->env_block;
+    app->argv_block = app->argv = av;
+    app->argc       = argc;
+    app->env_block  = app->envp = ev;
+    strlcpy(app->path, abs_path, sizeof(app->path));
+    strlcpy(slot->info.name, base, sizeof(slot->info.name));
+    if (gid != slot->info.gid && slot->info.ngroups < ESPIX_NGROUPS_MAX) {
+        slot->info.groups[slot->info.ngroups++] = gid;
+    }
+    slot->info.uid = uid;
+    slot->info.gid = gid;
+    xSemaphoreGive(g_espix_proc_lock);
+
+    free(old_av);
+    free(old_ev);
+    for (int i = 0; i < app->env_added_count; i++) {
+        free(app->env_added[i]);
+        app->env_added[i] = NULL;
+    }
+    app->env_added_count = 0;
+    return 0;
 }

@@ -109,6 +109,42 @@ wait "$um_peek"
 assert_contains "and another instance's stays as it was" "text word $word" "$(cat "$UM_DIR/peek")"
 
 assert_contains "a megabyte of stack grows on demand" "uapp: deep stack ok" "$(dev_run "$UAPP deepstack")"
+
+# fork on copy-on-write, vfork, exec in place, wait, pipes and posix_spawn, each checked from inside.
+procs_out=$(dev_run "$UAPP procs $UAPP /home/$ESPIX_USER")
+assert_contains "fork, vfork, exec, wait, pipes, spawn, setsid and umask" "uapp: procs ok" "$procs_out"
+assert_contains "a forked child's output reaches the client" "uapp: the child speaks" "$procs_out"
+exec_out=$(dev_run "$UAPP exec $UAPP /home/$ESPIX_USER")
+exec_pids=$(printf '%s\n' "$exec_out" | sed -n 's/.*pid \([0-9]*\) then \([0-9]*\);.*/\1 \2/p')
+if [ -n "$exec_pids" ] && [ "${exec_pids% *}" = "${exec_pids#* }" ]; then
+    espix_pass "exec in place keeps the pid ($exec_pids)"
+else
+    espix_fail "exec in place keeps the pid" "$exec_out"
+fi
+assert_contains "and the descriptors, but not close-on-exec ones or handlers" \
+    "kept open, cloexec closed, handler default" "$exec_out"
+assert_contains "exec from a thread ends the others and runs the program" "hello from U-mode" \
+    "$(dev_run "$UAPP execthread $UAPP")"
+UDAEMON="/home/$ESPIX_USER/uapp-daemon-$ESPIX_WORKER"
+dev_run "rm -f $UDAEMON; $UAPP daemon $UDAEMON" >/dev/null
+sleep 1.5
+assert_contains "daemon() leaves a child of init in a session of its own" "ppid 1 sid own" \
+    "$(dev_run "cat $UDAEMON; rm -f $UDAEMON")"
+UVFK="/home/$ESPIX_USER/uapp-vfk-$ESPIX_WORKER"
+vfk_out=$(dev_run "rm -f $UVFK; $UAPP vforkkill $UVFK; echo rc=\$?; sleep 3; cat $UVFK; rm -f $UVFK")
+assert_contains "a vfork's parent killed while it waits" "rc=137" "$vfk_out"
+assert_contains "and its child, on the parent's memory, carries on to the end" "survived" "$vfk_out"
+many_out=$(dev_run "$UAPP forkmany 40")
+many=$(printf '%s\n' "$many_out" | sed -n 's/.*forked \([0-9]*\), refused \([0-9]*\), reaped \([0-9]*\).*/\1 \2 \3/p')
+many_made=${many%% *}
+many_refused=$(printf '%s\n' "$many" | awk '{ print $2 }')
+many_reaped=${many##* }
+if [ -n "$many" ] && [ "$many_refused" -gt 0 ] && [ "$many_made" = "$many_reaped" ]; then
+    espix_pass "forks past a full table are refused with EAGAIN, and every child is reaped ($many)"
+else
+    espix_fail "forks past a full table are refused with EAGAIN, and every child is reaped" "$many_out"
+fi
+assert_contains "the board is still up after them" "up " "$(dev_run uptime)"
 assert_status "the page below the stack is a guard" 139 dev_status "$UAPP guard"
 
 # Syscalls from three apps at once: each runs as task code, never inside the trap (docs/USER-MODE.md).

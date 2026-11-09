@@ -47,10 +47,38 @@ mq_check() {
     dev_run "rm $bin" >/dev/null 2>&1
 }
 
+# mosquitto -d: the broker forks, its parent exits 0 at once, and the child serves on in a session of its own.
+mq_daemon() {
+    local bin="/home/$ESPIX_USER/$1-$ESPIX_WORKER" out row pid ppid got
+    dev_push "$MQ_BIN/$1" "$bin" >/dev/null
+    dev_run "chmod +x $bin" >/dev/null
+    out=$(dev_run "$bin -d -c $MQ_CONF; echo rc=\$?")
+    assert_contains "$2: -d returns at once, with 0" "rc=0" "$out"
+    row=$(dev_run ps | sed -n '1,/^finished:/p' | awk -v n="$1-$ESPIX_WORKER" '$2 == n { print $1, $8; exit }')
+    pid=${row%% *}
+    ppid=${row##* }
+    assert_eq "$2: the daemon is a child of init" "1" "$ppid"
+    got=""
+    for _ in 1 2 3 4 5; do
+        got=$("${ESPIX_PYTHON:-python3}" "$ESPIX_ROOT/tests/lib/mqtt_probe.py" "$ESPIX_HOST" "$MQ_PORT" "hello" 2>&1)
+        case $got in got*) break ;; esac
+        sleep 1
+    done
+    assert_eq "$2: and serves after the session that started it ended" "got hello" "$got"
+    if [ -n "$pid" ]; then
+        dev_run "kill $pid" >/dev/null
+        sleep 1
+    fi
+    assert_eq "$2: SIGTERM ends the daemon" "" \
+        "$(dev_run ps | sed -n '1,/^finished:/p' | awk -v n="$1-$ESPIX_WORKER" '$2 == n { print $1 }')"
+    dev_run "rm $bin" >/dev/null 2>&1
+}
+
 mq_check mosquitto "the M-mode broker"
 if [ "$ESPIX_TARGET" = esp32s31 ]; then
     if [ -f "$MQ_BIN/mosquitto-u" ]; then
         mq_check mosquitto-u "the U-mode broker"
+        mq_daemon mosquitto-u "the U-mode broker daemonised"
     else
         espix_skip "mosquitto-u not built -- run 'make apps'"
     fi

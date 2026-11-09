@@ -357,10 +357,58 @@ int sched_getcpu(void)                     { return (int)espix_sys0(ESPIX_SYS_GE
 int pthread_setconcurrency(int level)      { (void)level; return 0; }
 int pthread_getconcurrency(void)           { return 0; }
 
+#define ATFORK_MAX 16
+
+static struct {
+    void (*prepare)(void), (*parent)(void), (*child)(void);
+} s_atfork[ATFORK_MAX];
+static int s_natfork;
+
 int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void))
 {
-    (void)prepare; (void)parent; (void)child;
-    return 0;       /* no fork() yet (M8), so nothing to run */
+    lock_recursive(&__lock___libc_recursive_mutex);
+    const bool room = s_natfork < ATFORK_MAX;
+    if (room) {
+        s_atfork[s_natfork].prepare = prepare;
+        s_atfork[s_natfork].parent  = parent;
+        s_atfork[s_natfork].child   = child;
+        s_natfork++;
+    }
+    unlock_recursive(&__lock___libc_recursive_mutex);
+    return room ? 0 : ENOMEM;
+}
+
+/* Around fork(): the handlers, last registered first to prepare, and libc's lock held across it. */
+void __espix_fork_prepare(void)
+{
+    for (int i = s_natfork - 1; i >= 0; i--) {
+        if (s_atfork[i].prepare != NULL) {
+            s_atfork[i].prepare();
+        }
+    }
+    lock_recursive(&__lock___libc_recursive_mutex);
+}
+
+void __espix_fork_parent(void)
+{
+    unlock_recursive(&__lock___libc_recursive_mutex);
+    for (int i = 0; i < s_natfork; i++) {
+        if (s_atfork[i].parent != NULL) {
+            s_atfork[i].parent();
+        }
+    }
+}
+
+/* The child has the calling thread alone. */
+void __espix_fork_child(void)
+{
+    s_live = 1;
+    unlock_recursive(&__lock___libc_recursive_mutex);
+    for (int i = 0; i < s_natfork; i++) {
+        if (s_atfork[i].child != NULL) {
+            s_atfork[i].child();
+        }
+    }
 }
 
 int pthread_setname_np(pthread_t th, const char *name) { (void)th; (void)name; return 0; }

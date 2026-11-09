@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/types.h>
 
 /* picolibc spells it only with the underscore. */
 #if !defined(NSIG) && defined(_NSIG)
@@ -96,9 +97,11 @@ typedef enum {
 typedef struct {
     espix_pid_t        pid;
     espix_pid_t        ppid;
+    espix_pid_t        pgid;        /* for waitpid(0) and waitpid(-pgid) */
     char               name[ESPIX_PROC_NAME_MAX];
     espix_proc_state_t state;       /* EXITED, FAULTED or KILLED */
     int                exit_code;
+    uint8_t            term_sig;    /* the signal that ended it, or 0 for an exit */
     int64_t            started_us;
     int64_t            ended_us;
     bool               reaped;      /* wait() has already returned this status */
@@ -480,6 +483,9 @@ void espix_proc_paths(const char **cwd, const char **root);
  * killed process left open.
  */
 espix_pid_t espix_proc_self_pid(void);
+
+/* The calling process's file creation mask; 022 outside a process. */
+mode_t espix_proc_umask(void);
 
 /* U-mode apps' memory, in pages: what their tables map, and of it what more than one maps (S31). */
 void espix_proc_user_mem(uint32_t *pages, uint32_t *shared);

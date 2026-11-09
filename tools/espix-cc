@@ -25,7 +25,7 @@ ar="${gcc%gcc}ar"
 arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f -mno-cm-popret)
 # off_t is 64 bits, as in the kernel and M-mode apps (cmake/offt64.h).
 # picolibc's headers declare the pthread subset IDF implements; libespix implements barriers and spinlocks too.
-cflags=(--specs=picolibc.specs -ffunction-sections -fdata-sections
+cflags=(--specs=picolibc.specs -ffunction-sections -fdata-sections -DESPIX_UMODE_APP=1
         -D_POSIX_BARRIERS=200112L -D_POSIX_SPIN_LOCKS=200112L
         -I"$root/user/include" -I"$root/user/include/common" -include "$root/cmake/offt64.h")
 
@@ -33,7 +33,7 @@ lib="$root/user/build"
 
 # libespix.a and crt0.o, rebuilt when a source is newer; built aside and moved in, so parallel callers never see half.
 build_lib() {
-    local srcs=("$root"/user/libespix/*.c "$root"/user/libespix/*.h "$root"/user/crt0.S
+    local srcs=("$root"/user/libespix/*.c "$root"/user/libespix/*.h "$root"/user/libespix/*.S "$root"/user/crt0.S
                 "$root"/user/include "$root"/components/espix_proc/include/espix_syscall.h
                 "$root"/components/espix_proc/include/espix_gfx.h
                 "$root"/components/espix_display/include/espix_display.h
@@ -52,6 +52,9 @@ build_lib() {
         "$gcc" "${arch[@]}" "${cflags[@]}" ${extra[@]+"${extra[@]}"} -Os -Wall \
             -I"$root/components/espix_proc/include" -I"$root/components/espix_display/include" \
             -I"$root/components/espix_audio/include" -c "$f" -o "$tmp/$(basename "${f%.c}").o"
+    done
+    for f in "$root"/user/libespix/*.S; do
+        "$gcc" "${arch[@]}" -c "$f" -o "$tmp/$(basename "${f%.S}")_S.o"
     done
     "$gcc" "${arch[@]}" -c "$root/user/crt0.S" -o "$tmp/crt0.o"
     (cd "$tmp" && "$ar" rcs libespix.a $(ls *.o | grep -v '^crt0\.o$'))

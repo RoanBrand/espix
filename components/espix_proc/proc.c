@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>    /* strcasecmp, for `kill -TERM` */
+#include <sys/param.h>
 #include <sys/stat.h>   /* stat, for chdir's directory check */
+#include <sys/wait.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -48,29 +50,72 @@ static espix_pid_t s_next_pid = 2;     /* 1 is init's; see spawn_fn */
  * out.
  *
  * A reaped entry stays listed: this is a history as well as the zombie store,
- * and 'reaped' only decides whether espix_proc_wait() will return it again.
- * The whole design is recorded in docs/WORKLIST.md under R-P1.5.
+ * and 'reaped' only decides whether a wait will return it again. The oldest
+ * entry is written over, except one a living app has yet to wait for, which
+ * goes last. The whole design is recorded in docs/WORKLIST.md under R-P1.5.
  */
 static espix_proc_record_t s_done[ESPIX_PROC_DONE_MAX];
-static unsigned            s_done_head;   /* next write; oldest once wrapped */
-static uint32_t            s_done_seq;    /* total finishes, for ordering */
+static uint32_t            s_done_seq;    /* total finishes */
 
-/* Write one completion into the ring. Called with the table lock held. */
+static bool ignores_children(const espix_proc_slot_t *p);
+
+/* A status a living app has yet to wait for: written over only when every entry is one. Under the lock. */
+static bool done_kept(const espix_proc_record_t *r)
+{
+    if (r->pid <= 0 || r->reaped) {
+        return false;
+    }
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        const espix_proc_slot_t *const p = &g_espix_proc_table.slots[i];
+        if (p->info.state != ESPIX_PROC_FREE && p->info.pid == r->ppid) {
+            return p->info.kind == ESPIX_PROC_APP;
+        }
+    }
+    return false;
+}
+
+/* Write one completion into the log, over the oldest entry nobody will reap. Called with the table lock held. */
 static void done_record(const espix_proc_slot_t *slot, espix_proc_state_t state,
                         int exit_code)
 {
-    espix_proc_record_t *const r = &s_done[s_done_head];
+    unsigned victim = 0, oldest = 0;
+    bool     found  = false;
+    for (unsigned i = 0; i < ESPIX_PROC_DONE_MAX; i++) {
+        if (s_done[i].pid == 0) {
+            victim = i;
+            found  = true;
+            break;
+        }
+        if (s_done[i].ended_us < s_done[oldest].ended_us) {
+            oldest = i;
+        }
+        if (!done_kept(&s_done[i]) && (!found || s_done[i].ended_us < s_done[victim].ended_us)) {
+            victim = i;
+            found  = true;
+        }
+    }
+    espix_proc_record_t *const r = &s_done[found ? victim : oldest];
+
+    /* Nobody waits for an orphan, nor for the child of a parent that ignores SIGCHLD. */
+    bool unwaited = slot->orphan;
+    for (int i = 0; !unwaited && i < ESPIX_PROC_MAX; i++) {
+        const espix_proc_slot_t *const p = &g_espix_proc_table.slots[i];
+        if (p != slot && p->info.state != ESPIX_PROC_FREE && p->info.pid == slot->info.ppid) {
+            unwaited = ignores_children(p);
+            break;
+        }
+    }
 
     r->pid        = slot->info.pid;
     r->ppid       = slot->info.ppid;
+    r->pgid       = slot->info.pgid;
     r->state      = state;
     r->exit_code  = exit_code;
+    r->term_sig   = (slot->term_sig != 0) ? slot->term_sig : (state == ESPIX_PROC_KILLED) ? SIGKILL : 0;
     r->started_us = slot->info.started_us;
     r->ended_us   = esp_timer_get_time();
-    r->reaped     = false;
+    r->reaped     = unwaited;
     strlcpy(r->name, slot->info.name, sizeof(r->name));
-
-    s_done_head = (s_done_head + 1u) % ESPIX_PROC_DONE_MAX;
     s_done_seq++;
 }
 /* The log entry for this pid, reaped or not, or NULL. Called with the lock
@@ -279,6 +324,7 @@ esp_err_t espix_proc_init(void)
     };
     espix_tty_set_hooks(&tty_hooks);
     (void)espix_tty_init();
+    (void)espix_pipe_init();
     espix_proc_abi_ident_register();
     espix_proc_abi_gfx_register();
     espix_proc_abi_audio_register();
@@ -343,6 +389,7 @@ espix_proc_slot_t *espix_proc_alloc_slot(void)
         espix_proc_slot_t *s = &g_espix_proc_table.slots[i];
 
         if (s->info.state == ESPIX_PROC_FREE) {
+            s->umask = 022;
             return s;
         }
     }
@@ -466,6 +513,11 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
 
     /* A finished slot must not hand its streams to the next process to use it. */
     slot->std[0] = slot->std[1] = slot->std[2] = NULL;
+    if (slot->std_tty_ref) {
+        espix_tty_put(slot->std_tty);
+        slot->std_tty_ref = false;
+        slot->std_tty     = NULL;
+    }
 
     /*
      * Safe to delete only because the process is already gone by the time this
@@ -515,7 +567,7 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
 /* SIGCHLD to slot's parent, and its wake: a shell's foreground wait sees an exit or a stop. Under the lock. */
 static void parent_wake_locked(espix_proc_slot_t *slot)
 {
-    if (slot->info.ppid == ESPIX_PID_NONE) {
+    if (slot->info.ppid == ESPIX_PID_NONE || slot->orphan) {
         return;
     }
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
@@ -550,6 +602,20 @@ void espix_proc_finish(espix_proc_slot_t *slot, espix_proc_state_t state,
      * the one already held is needed.
      */
     parent_wake_locked(slot);
+
+    /* Its children are init's now, as on Linux; nobody reaps them. */
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        espix_proc_slot_t *const c = &g_espix_proc_table.slots[i];
+        if (c != slot && c->info.state != ESPIX_PROC_FREE && c->info.ppid == slot->info.pid) {
+            c->info.ppid = 1;
+            c->orphan    = true;
+        }
+    }
+    for (unsigned i = 0; i < ESPIX_PROC_DONE_MAX; i++) {
+        if (s_done[i].pid > 0 && s_done[i].ppid == slot->info.pid) {
+            s_done[i].reaped = true;
+        }
+    }
 
     /*
      * Into the log, then the slot straight back. Under one lock, so no one can
@@ -758,6 +824,174 @@ esp_err_t espix_proc_wait(espix_pid_t pid, int *out_exit_code, TickType_t timeou
     return proc_wait_common(pid, out_exit_code, timeout, true);
 }
 
+/* SIGCHLD ignored, or SA_NOCLDWAIT: its children are reaped as they end. Under the lock. */
+static bool ignores_children(const espix_proc_slot_t *p)
+{
+#if CONFIG_ESPIX_UMODE
+    if (p->app != NULL && p->app->um != NULL) {
+        return espix_um_ignores_children(p);
+    }
+#endif
+    return p->sig_actions != NULL && (p->sig_actions[SIGCHLD].handler == SIG_IGN ||
+                                      (p->sig_actions[SIGCHLD].flags & SA_NOCLDWAIT));
+}
+
+/* Whether a child of self, in group cpgid, is one waitpid(want) asks for. */
+static bool wait_match(const espix_proc_slot_t *self, espix_pid_t ppid, espix_pid_t cpid,
+                       espix_pid_t cpgid, pid_t want)
+{
+    if (ppid != self->info.pid) {
+        return false;
+    }
+    return (want > 0) ? cpid == (espix_pid_t)want : (want == -1) ? true
+         : (want == 0) ? cpgid == self->info.pgid : cpgid == (espix_pid_t)-want;
+}
+
+int espix_proc_waitpid(pid_t want, int *status, int options)
+{
+    espix_proc_slot_t *const self = espix_proc_self();
+    if (self == NULL) {
+        return -ECHILD;
+    }
+    if (options & ~(WNOHANG | WUNTRACED)) {
+        return -EINVAL;
+    }
+    for (;;) {
+        bool any = false;
+        espix_pid_t got = 0;
+        int st = 0;
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        for (int i = 0; i < ESPIX_PROC_MAX && got == 0; i++) {
+            espix_proc_slot_t *const c = &g_espix_proc_table.slots[i];
+            if (c->info.state == ESPIX_PROC_FREE || state_is_finished(c->info.state) ||
+                !wait_match(self, c->info.ppid, c->info.pid, c->info.pgid, want)) {
+                continue;
+            }
+            any = true;
+            if ((options & WUNTRACED) && c->info.state == ESPIX_PROC_STOPPED && !c->stop_reported) {
+                c->stop_reported = true;
+                got = c->info.pid;
+                st  = (SIGSTOP << 8) | 0x7f;
+            }
+        }
+        espix_proc_record_t *pick = NULL;
+        for (unsigned i = 0; i < ESPIX_PROC_DONE_MAX && got == 0; i++) {
+            espix_proc_record_t *const r = &s_done[i];
+            if (r->pid > 0 && !r->reaped && wait_match(self, r->ppid, r->pid, r->pgid, want) &&
+                (pick == NULL || r->ended_us < pick->ended_us)) {
+                pick = r;
+            }
+        }
+        if (pick != NULL) {
+            pick->reaped = true;
+            got = pick->pid;
+            st  = (pick->term_sig != 0) ? pick->term_sig : (pick->exit_code & 0xff) << 8;
+        }
+        xSemaphoreGive(g_espix_proc_lock);
+
+        if (got != 0) {
+            if (status != NULL) {
+                *status = st;
+            }
+            return (int)got;
+        }
+        if (!any) {
+            return -ECHILD;
+        }
+        if (options & WNOHANG) {
+            return 0;
+        }
+        /* A child's end or stop wakes its parent's tasks, as a signal does. */
+        if (espix_sigcheck_mask() != 0) {
+            return -EINTR;
+        }
+        (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE, pdMS_TO_TICKS(1000));
+    }
+}
+
+int espix_proc_setsid(void)
+{
+    espix_proc_slot_t *const self = espix_proc_self();
+    if (self == NULL || self->info.kind != ESPIX_PROC_APP) {
+        return -EPERM;
+    }
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+        const espix_proc_slot_t *const s = &g_espix_proc_table.slots[i];
+        if (s->info.state != ESPIX_PROC_FREE && s->info.pgid == self->info.pid) {
+            xSemaphoreGive(g_espix_proc_lock);
+            return -EPERM;      /* a group leader already, or its group lives on */
+        }
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    /* While it is still the session's, so its terminal is there to take a reference to. */
+    espix_proc_streams_leave(self);
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    self->info.sid = self->info.pgid = self->info.pid;
+    self->info.session = NULL;
+    self->foreground   = false;
+    xSemaphoreGive(g_espix_proc_lock);
+    return (int)self->info.pid;
+}
+
+int espix_proc_setpgid(pid_t pid, pid_t pgid)
+{
+    espix_proc_slot_t *const self = espix_proc_self();
+    if (self == NULL || pgid < 0) {
+        return (self == NULL) ? -ESRCH : -EINVAL;
+    }
+    int r = 0;
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    espix_proc_slot_t *const t = (pid == 0) ? self : espix_proc_find((espix_pid_t)pid);
+    const espix_pid_t want = (pgid == 0) ? ((t != NULL) ? t->info.pid : 0) : (espix_pid_t)pgid;
+    if (t == NULL || (t != self && t->info.ppid != self->info.pid)) {
+        r = -ESRCH;
+    } else if (t->info.sid != self->info.sid) {
+        r = -EPERM;
+    } else if (t->info.sid == t->info.pid) {
+        r = -EPERM;     /* a session leader keeps its group */
+    } else if (want != t->info.pid) {
+        r = -EPERM;
+        for (int i = 0; i < ESPIX_PROC_MAX; i++) {
+            const espix_proc_slot_t *const s = &g_espix_proc_table.slots[i];
+            if (s->info.state != ESPIX_PROC_FREE && s->info.pgid == want && s->info.sid == self->info.sid) {
+                r = 0;
+                break;
+            }
+        }
+    }
+    if (r == 0) {
+        t->info.pgid = want;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return r;
+}
+
+int espix_proc_getpgid(pid_t pid)
+{
+    const espix_proc_slot_t *const self = espix_proc_self();
+    const espix_pid_t g = (pid == 0) ? ((self != NULL) ? self->info.pgid : ESPIX_PID_NONE)
+                                     : espix_proc_pgid_of((espix_pid_t)pid);
+    return (g == ESPIX_PID_NONE) ? -ESRCH : (int)g;
+}
+
+int espix_proc_umask_set(int mask)
+{
+    espix_proc_slot_t *const self = espix_proc_self();
+    if (self == NULL) {
+        return 022;
+    }
+    const int old = self->umask;
+    self->umask = (uint16_t)(mask & 0777);
+    return old;
+}
+
+mode_t espix_proc_umask(void)
+{
+    const espix_proc_slot_t *const self = espix_proc_self();
+    return (self != NULL) ? (mode_t)self->umask : 022;
+}
+
 /* Wait for a process to be gone without taking its exit status. Used where
  * espix is not the parent; see the note on proc_wait_common(). */
 static esp_err_t proc_wait_gone(espix_pid_t pid, TickType_t timeout)
@@ -945,6 +1179,7 @@ static void set_state(espix_proc_slot_t *slot, espix_proc_state_t st)
     /* Never walk a finished process back to life: it may be mid-teardown. */
     if (!state_is_finished(slot->info.state)) {
         slot->info.state = st;
+        slot->stop_reported = slot->stop_reported && st == ESPIX_PROC_STOPPED;
         if (st == ESPIX_PROC_STOPPED) {
             parent_wake_locked(slot);
         }
@@ -1127,6 +1362,7 @@ static uint32_t sig_dispatch(espix_proc_slot_t *slot, bool may_terminate)
              * 128+sig, and that status reaches whoever ran it. The same door an
              * app's own exit() uses.
              */
+            slot->term_sig = (uint8_t)sig;
             espix_proc_exit(128 + sig);
         }
     }
@@ -1371,6 +1607,7 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
      */
     if (pre != NULL && pre == espix_proc_self()) {
         pre->stop_requested = true;
+        pre->term_sig       = SIGKILL;
         sig_wake_locked(pre);
         const bool main_task = !ends_in_user_mode(pre) && pre->info.task == xTaskGetCurrentTaskHandle();
         xSemaphoreGive(g_espix_proc_lock);
@@ -1816,33 +2053,31 @@ size_t espix_proc_snapshot(espix_proc_info_t *out, size_t n)
     return count;
 }
 
-/*
- * The completed log, oldest first. s_done_head is the next write, which is the
- * oldest entry once the ring has wrapped; before that the entries run from
- * zero and the head is simply one past the newest.
- */
+/* The completed log, oldest first. */
 size_t espix_proc_history(espix_proc_record_t *out, size_t n)
 {
     if (out == NULL || n == 0) {
         return 0;
     }
 
+    espix_proc_record_t all[ESPIX_PROC_DONE_MAX];
     size_t count = 0;
 
     xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
-
-    const uint32_t wrapped = (s_done_seq >= (uint32_t)ESPIX_PROC_DONE_MAX);
-    const unsigned total   = wrapped ? (unsigned)ESPIX_PROC_DONE_MAX
-                                     : (unsigned)s_done_seq;
-    unsigned       idx     = wrapped ? s_done_head : 0u;
-
-    for (unsigned i = 0; i < total && count < n; i++) {
-        out[count++] = s_done[idx];
-        idx = (idx + 1u) % ESPIX_PROC_DONE_MAX;
+    for (unsigned i = 0; i < ESPIX_PROC_DONE_MAX; i++) {
+        if (s_done[i].pid <= 0) {
+            continue;
+        }
+        size_t at = count++;
+        for (; at > 0 && all[at - 1].ended_us > s_done[i].ended_us; at--) {
+            all[at] = all[at - 1];
+        }
+        all[at] = s_done[i];
     }
-
     xSemaphoreGive(g_espix_proc_lock);
 
+    count = MIN(count, n);
+    memcpy(out, all, count * sizeof(*out));
     return count;
 }
 

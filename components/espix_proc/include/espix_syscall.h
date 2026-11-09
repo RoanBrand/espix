@@ -102,7 +102,16 @@
     X(MADVISE,       madvise,       87)        /* (addr, len, advice) */                       \
     X(PREAD,         pread,         88)        /* (fd, buf, len, off_lo, off_hi) */            \
     X(PWRITE,        pwrite,        89)        /* (fd, buf, len, off_lo, off_hi) */            \
-    X(MINCORE,       mincore,       90)        /* (addr, len, uint8_t *vec): 1 a page resident */
+    X(MINCORE,       mincore,       90)        /* (addr, len, uint8_t *vec): 1 a page resident */ \
+    X(PIPE2,         pipe2,         91)        /* (int fds[2], O_NONBLOCK | O_CLOEXEC) */       \
+    X(WAIT4,         wait4,         92)        /* (pid, int *status or 0, WNOHANG | WUNTRACED): a child's pid, 0 for none yet */ \
+    X(SETSID,        setsid,        93)        /* (): the new session's id */                  \
+    X(SETPGID,       setpgid,       94)        /* (pid, pgid) */                               \
+    X(GETPGID,       getpgid,       95)        /* (pid) */                                     \
+    X(UMASK,         umask,         96)        /* (mask): the old one */                       \
+    X(FORK,          fork,          97)        /* (): the child's pid, and 0 in the child */   \
+    X(VFORK,         vfork,         98)        /* (): fork, the child borrowing the caller's memory and the caller waiting until it execs or ends */ \
+    X(EXECVE,        execve,        99)        /* (path, argv, envp): returns only with an error */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,

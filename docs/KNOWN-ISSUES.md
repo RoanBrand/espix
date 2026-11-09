@@ -464,14 +464,21 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 A static executable built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([USER-MODE.md](USER-MODE.md)). It has files, directories,
 stdio, time, sleep, identity, threads, signals, sockets, the screen and audio
-streams. What it cannot do yet:
+streams, `fork`, `vfork`, `exec`, `wait` and pipes. What it cannot do yet:
 
 - **One thread takes a process's signal**, as on Linux: a sleep in another
   thread is not cut short by it, where an M-mode app's every sleeping thread
   wakes. There is no `pthread_kill` to another thread, `sigwait`, `sigqueue` or
   `sigaltstack` yet.
-- **No process-shared mutexes or condition variables** yet: shared anonymous
-  memory is shared with no one until `fork()` (M8), and there is no `shm_open`.
+- **No process-shared mutexes or condition variables** yet: memory a `fork()`
+  shares is shared, but futexes are private to a process, so a waiter in one is
+  never woken from the other. There is no `shm_open`.
+- **A `fork()`'s child inherits no surface, audio stream or directory stream**:
+  they stay the parent's. A U-mode `exec` of an M-mode program fails with
+  `ENOEXEC`, because its task would need an M-mode app's stack.
+- **`system()` and `popen()` run a command's words directly** when there is no
+  `/bin/sh`, and espix's shell is not yet a program: a line with quoting, globs
+  or operators is not parsed.
 - **A file mapped shared is written back, not shared**: `msync`, `munmap` and the
   process's end write its pages to the file, but two processes mapping one file
   each see their own pages until then. `MAP_FIXED` works only in the mapping

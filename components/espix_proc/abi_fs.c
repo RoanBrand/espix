@@ -202,7 +202,7 @@ char *espix_abi_getcwd(char *buf, size_t size)
  */
 int espix_abi_dup(int fd)
 {
-    return espix_fs_dup_fd(fd);
+    return espix_pipe_is(fd) ? espix_pipe_dup(fd) : espix_fs_dup_fd(fd);
 }
 
 static int espix_abi_dup2(int oldfd, int newfd)

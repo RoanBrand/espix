@@ -378,8 +378,8 @@ void espix_fs_claim(const char *abs_path, mode_t mode)
     uint16_t rule_gid = 0;
     espix_fs_owner(abs_path, &st, &rule_uid, &rule_gid);
 
-    /* The creator's mode through the umask every espix process has, 022, as open(2) and mkdir(2) apply it. */
-    const mode_t want = mode & ESPIX_MODE_BITS & ~(mode_t)022;
+    /* The creator's mode through its umask, as open(2) and mkdir(2) apply it. */
+    const mode_t want = mode & ESPIX_MODE_BITS & ~espix_proc_umask();
     if (rule_uid == who.uid && rule_gid == who.gid && want == espix_fs_mode(abs_path, &st)) {
         return;
     }

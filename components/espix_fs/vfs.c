@@ -557,6 +557,20 @@ void espix_fs_fds_close_owned(int32_t pid)
     }
 }
 
+/* The file behind fd is no single process's: the sweep at a process's end leaves it to its holders. */
+void espix_fs_fd_disown(int fd)
+{
+    const int key = get_local_fd(get_vfs_for_fd(fd), fd);
+    if (!fd_ours(key)) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mount_lock);
+    if (s_fds[key].lower_fd >= 0) {
+        s_fds[key].owner = ESPIX_PID_NONE;
+    }
+    portEXIT_CRITICAL(&s_mount_lock);
+}
+
 /* ------------------------------------------------------------------ */
 /* dup(), dup2() and the F_DUPFD family                                 */
 /* ------------------------------------------------------------------ */

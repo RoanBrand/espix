@@ -81,7 +81,8 @@ what is touched. Running the *kernel* from flash is a roadmap item.
 **A page its region lets the app write but its PTE does not is copy-on-write.**
 A write faults; the kernel copies the frame for the writer, or makes it writable
 when the writer's table is the only one mapping it. The zero frame is always
-copied. `fork()` (M8) is the next user; mosquitto `-d` its first.
+copied, and a shared mapping's page never is. A `fork()`'s child starts with its
+parent's pages this way.
 
 **Two instances of one program share its text.** A read-only segment that shares
 no page with another is kept while a process maps it, found by its address, size
@@ -113,6 +114,69 @@ the pages touched, and `free` gives all of them back. `espix-cc` links
 `libespix`'s allocator over picolibc's with `--wrap`, so libc's own allocations
 take the same path. Doom's 6 MiB zone costs what it touches: `doom-u` holds about
 3.5 MB while it plays.
+
+## Processes: fork, vfork, exec, wait
+
+**`fork()` copies the table, not the memory.** Each page the parent maps is
+mapped in the child too, read-only where it was writable, so whichever writes
+first gets its own copy. A shared mapping is filled first and then mapped
+writable in both, so the two see each other's writes. The child gets:
+- a copy of each descriptor: a file's shares its offset with the parent's, as on
+  Linux, and a socket or pipe is the same one;
+- the signal actions and the calling thread's mask;
+- one thread, the caller's, returning 0 from the syscall with the caller's
+  registers and FPU;
+- streams made from the parent's session as the parent's were, so it writes
+  where the parent does.
+
+A surface, an audio stream, the screen and a directory stream stay the parent's.
+
+**`vfork()` lends the parent's address space.** The child runs on the parent's
+table until it calls `exec` or ends; until then the parent's calling thread
+waits in the syscall, and its other threads go on. The table is counted: a
+parent killed meanwhile ends, and its child keeps the memory and carries on
+(`uapp vforkkill`). libespix's `vfork` is a stub with no stack frame of its own,
+because the child returns on the parent's stack. `posix_spawn`, `system` and
+`popen` are built on `vfork`, as musl's and uClibc's are.
+
+**`exec` replaces the image in place**: the same pid, task and descriptor table.
+Every other thread ends first, as at an exit. Then the main thread jumps back to
+its task's start and:
+- releases the old image: its texts, table, AMO list and surfaces;
+- closes the close-on-exec descriptors;
+- sets caught signals back to their default;
+- loads the new program.
+
+The mask, pending and ignored signals, the cwd and the credentials stay, and a
+set-id binary's owner becomes the credentials, as at spawn. An M-mode ELF needs
+a task of its own size, so an `exec` of one from U-mode fails with `ENOEXEC`.
+Errors (`ENOENT`, `EACCES`, `ENOEXEC`, `E2BIG`) come back before anything has
+changed.
+
+**`waitpid()` sees the caller's children**, by pid, by group or any, with
+`WNOHANG` and `WUNTRACED`. Statuses are Linux's encoding: a child a signal ends
+is `WIFSIGNALED`, apart from one that calls `exit(128 + n)`. A child's end
+raises SIGCHLD in its parent; under `SIG_IGN` or `SA_NOCLDWAIT` nobody waits for
+it. The finished list keeps eight, and a status a living parent has not taken is
+the last written over. A process's children pass to init (pid 1) when it ends,
+their statuses unclaimed.
+
+**`setsid()` leaves the shell's session.** The process's streams become its
+terminal's own, or `/dev/null` without one, which outlive the session, and the
+session's hangup no longer reaches it. That is how `mosquitto-u -d` serves on
+after the `ssh` command that started it (`62-mqtt`). `setpgid`, `getpgid` and
+`umask` work as on Linux. The umask is per process, inherited, and applied by
+every create.
+
+**A pipe is a kernel object for both kinds of app** (`pipe.c`):
+- a 4 KB ring between two descriptors;
+- a read waits for data or the last writer's close, and a write for room or the
+  last reader's close (EPIPE, and SIGPIPE to the writer);
+- a signal ends either wait, and a write of `PIPE_BUF` (512) or less is never
+  split.
+
+A U-mode app's pipe I/O goes through a kernel buffer, so no user page is held
+while it waits.
 
 ## Entering and leaving the kernel
 
@@ -177,9 +241,16 @@ layer under it:
   handler returns through;
 - sockets, `poll` and `select` (over `poll`), name lookup, `getifaddrs`, the
   user and group database, `getrandom`, and `syslog` into the kernel log;
+- processes: `fork` (with `pthread_atfork` and libc's lock held across it),
+  `vfork`, the `exec` family with a `PATH` search, `wait`, pipes, sessions and
+  groups, `umask`, `posix_spawn`, `system`, `popen` and `daemon`; the last four
+  are weak, for an app that brings its own;
 - headers picolibc lacks (`sys/socket.h`, `netinet/in.h`, `netdb.h`,
-  `semaphore.h`, `gettid()`), and in `user/include/common` the ones M-mode apps
-  get from espix too (`syslog.h`, `ifaddrs.h`, `dlfcn.h`, `poll.h`).
+  `semaphore.h`, `gettid()`, `popen()`), and in `user/include/common` the ones
+  M-mode apps get from espix too (`syslog.h`, `ifaddrs.h`, `dlfcn.h`, `poll.h`).
+
+`espix-cc` defines `ESPIX_UMODE_APP`, for source shared with an M-mode build
+that must tell the two apart (mosquitto's seam defines `fork` only for M-mode).
 
 `tools/espix-cc` compiles and links an app, as `musl-gcc` does for musl, with the
 kernel's 64-bit `off_t`, no `cm.popret` (as IDF builds the kernel; with it
@@ -423,7 +494,7 @@ Each leaves `make test` green on both targets.
 | M5 | gfx surfaces mapped into the app; audio writes | done: `64-gfx` runs `plasma-u` and `doom-u` |
 | M6 | sockets, select, poll | done: `32-umode`, and `62-mqtt` runs `mosquitto-u` |
 | M7 | growable stacks; `mmap`; shared text between instances | done: `32-umode`; `doom-u` grows its stack and maps its zone |
-| M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
+| M8 | `fork()` on copy-on-write, `vfork()`, `exec()` in place, `wait`, pipes, sessions | done: `32-umode`, and `62-mqtt` daemonises `mosquitto-u -d` |
 
 Open:
 - **A null syscall costs 920 cycles (2.9 µs)** round trip (`uapp bench`), about
@@ -451,6 +522,10 @@ Open:
   be interrupted; otherwise the app leaves on its own. A thread deleted that way
   also leaves its `espix_um_thread_t`; a TLS deletion callback on
   `ESPIX_TLS_UM_IDX` (IDF calls it as the task is freed) would free both.
+- **Futexes are private to a process**, so a mutex in memory shared across
+  `fork()` cannot be waited on from both sides: a shared futex keyed by the
+  frame would make process-shared mutexes, condition variables and semaphores
+  work.
 - **Signals are a set per process, not a queue**: two of one kind before
   delivery are one, and there are no real-time signals, `sigqueue`, `sigwait`
   or `sigaltstack` yet, nor `pthread_kill` to another thread.

@@ -418,6 +418,8 @@ void espix_fs_act_as_none(void);
  * below -- see the note in vfs.c, which is the whole reason this exists.
  */
 void espix_fs_fds_close_owned(int32_t pid);
+/* The file behind fd is shared by processes that close it themselves (a fork's): no sweep closes it. */
+void espix_fs_fd_disown(int fd);
 
 /*
  * dup(2) and dup2(2) for app descriptors.

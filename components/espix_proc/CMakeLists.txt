@@ -10,6 +10,7 @@ idf_component_register(
         "proc_threads.c"
         "spawn_fn.c"
         "fg.c"
+        "pipe.c"
         "abi_exit.c"
         "abi_resolver.c"
         "abi_fs.c"

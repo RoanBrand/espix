@@ -27,10 +27,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
@@ -964,6 +966,415 @@ static int mmap_all(const char *dir)
     return 0;
 }
 
+
+/* ------------------------------------------------------------------ processes */
+
+extern char **environ;
+
+static int s_fails;
+static volatile int s_chld;
+
+#define PCHECK(cond, what)                                                       \
+    do {                                                                        \
+        if (cond) {                                                             \
+            printf("uapp: %s ok\n", what);                                      \
+        } else {                                                                \
+            printf("uapp: %s FAILED (errno %d)\n", what, errno);                \
+            s_fails++;                                                          \
+        }                                                                       \
+    } while (0)
+
+static void on_chld(int sig)
+{
+    (void)sig;
+    s_chld++;
+}
+
+static void *idle_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        usleep(100000);
+    }
+    return NULL;
+}
+
+/* fork, vfork, exec, wait, pipes and spawn, each from a process's own point of view. */
+static int procs(const char *self, const char *dir)
+{
+    static volatile int g = 1;
+    int st = 0;
+    pid_t c, w;
+
+    fflush(stdout);
+    c = fork();
+    if (c == 0) {
+        g = 2;
+        printf("uapp: the child speaks\n");
+        exit(7);
+    }
+    w = waitpid(c, &st, 0);
+    PCHECK(c > 0 && w == c && WIFEXITED(st) && WEXITSTATUS(st) == 7 && g == 1, "fork: the child's status and its own copy");
+
+    /* 64 pages touched, then rewritten by the child: the parent's stay. */
+    enum { N = 64 * 4096 };
+    unsigned char *buf = malloc(N);
+    memset(buf, 0x5a, N);
+    if ((c = fork()) == 0) {
+        memset(buf, 0xa5, N);
+        _exit(buf[N - 1] == 0xa5 ? 0 : 1);
+    }
+    waitpid(c, &st, 0);
+    bool same = true;
+    for (int i = 0; i < N; i += 4096) {
+        same = same && buf[i] == 0x5a;
+    }
+    PCHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0 && same, "copy-on-write: the child's writes are its own");
+    free(buf);
+
+    int *sh = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *sh = 5;
+    if ((c = fork()) == 0) {
+        *sh += 10;
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    PCHECK(*sh == 15, "a shared mapping stays shared across fork");
+    munmap(sh, 4096);
+
+    char path[160];
+    snprintf(path, sizeof(path), "%s/uapp-fork-%d", dir, (int)getpid());
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    write(fd, "a", 1);
+    if ((c = fork()) == 0) {
+        write(fd, "b", 1);
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    write(fd, "c", 1);
+    char got[8] = { 0 };
+    pread(fd, got, sizeof(got) - 1, 0);
+    close(fd);
+    unlink(path);
+    PCHECK(strcmp(got, "abc") == 0, "a descriptor's offset is shared with the child");
+
+    volatile int v = 0;
+    if ((c = vfork()) == 0) {
+        v = 42;
+        _exit(3);
+    }
+    waitpid(c, &st, 0);
+    PCHECK(c > 0 && v == 42 && WIFEXITED(st) && WEXITSTATUS(st) == 3, "vfork: the child borrows its parent's memory");
+
+    int p[2];
+    pipe(p);
+    if ((c = fork()) == 0) {
+        close(p[0]);
+        const char msg[] = "through a pipe";
+        write(p[1], msg, sizeof(msg) - 1);
+        _exit(0);
+    }
+    close(p[1]);
+    char line[64] = { 0 };
+    size_t n = 0;
+    for (ssize_t r; (r = read(p[0], line + n, sizeof(line) - 1 - n)) > 0;) {
+        n += (size_t)r;
+    }
+    close(p[0]);
+    waitpid(c, &st, 0);
+    PCHECK(strcmp(line, "through a pipe") == 0, "a pipe carries the child's words, then its end");
+
+    /* 64 KB in odd-sized writes, round the 4 KB ring many times: every byte in order. */
+    pipe(p);
+    if ((c = fork()) == 0) {
+        close(p[0]);
+        unsigned char chunk[1000];
+        uint32_t k = 0;
+        for (uint32_t sent = 0; sent < 65536;) {
+            const uint32_t n = (65536 - sent < sizeof(chunk)) ? 65536 - sent : sizeof(chunk);
+            for (uint32_t i = 0; i < n; i++) {
+                chunk[i] = (unsigned char)(k++ * 7);
+            }
+            write(p[1], chunk, n);
+            sent += n;
+        }
+        _exit(0);
+    }
+    close(p[1]);
+    uint32_t k = 0;
+    bool order = true;
+    unsigned char in[733];
+    for (ssize_t r; (r = read(p[0], in, sizeof(in))) > 0;) {
+        for (ssize_t i = 0; i < r; i++) {
+            order = order && in[i] == (unsigned char)(k++ * 7);
+        }
+    }
+    close(p[0]);
+    waitpid(c, &st, 0);
+    PCHECK(order && k == 65536, "64 KB through a pipe, every byte in order");
+
+    if ((c = fork()) == 0) {
+        usleep(300000);
+        _exit(0);
+    }
+    w = waitpid(c, &st, WNOHANG);
+    PCHECK(w == 0, "WNOHANG while the child runs");
+    waitpid(c, &st, 0);
+    errno = 0;
+    w = waitpid(-1, &st, WNOHANG);
+    PCHECK(w < 0 && errno == ECHILD, "no children left: ECHILD");
+
+    if ((c = fork()) == 0) {
+        for (;;) {
+            sleep(1);
+        }
+    }
+    usleep(100000);
+    kill(c, SIGTERM);
+    waitpid(c, &st, 0);
+    PCHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM, "a child a signal ends is WIFSIGNALED");
+
+    /* Ended before anyone waits: each status is kept until it is taken. */
+    pid_t kids[3];
+    for (int i = 0; i < 3; i++) {
+        if ((kids[i] = fork()) == 0) {
+            _exit(i + 1);
+        }
+    }
+    usleep(300000);
+    bool kept = true;
+    for (int i = 2; i >= 0; i--) {
+        kept = kept && waitpid(kids[i], &st, 0) == kids[i] && WEXITSTATUS(st) == i + 1;
+    }
+    PCHECK(kept, "zombies keep their statuses until waited for");
+
+    signal(SIGCHLD, on_chld);
+    s_chld = 0;
+    if ((c = fork()) == 0) {
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    for (int i = 0; i < 20 && s_chld == 0; i++) {
+        usleep(10000);
+    }
+    PCHECK(s_chld == 1, "SIGCHLD reaches its handler");
+    signal(SIGCHLD, SIG_DFL);
+
+    if ((c = fork()) == 0) {
+        execl(self, self, "exit", "9", (char *)NULL);
+        _exit(100);
+    }
+    waitpid(c, &st, 0);
+    PCHECK(WIFEXITED(st) && WEXITSTATUS(st) == 9, "fork and exec");
+
+    if ((c = vfork()) == 0) {
+        execl(self, self, "exit", "11", (char *)NULL);
+        _exit(100);
+    }
+    waitpid(c, &st, 0);
+    PCHECK(WIFEXITED(st) && WEXITSTATUS(st) == 11, "vfork and exec");
+
+    /* The child's exec leaves the memory it borrowed as it was: a file mapping of the parent's still writes back. */
+    snprintf(path, sizeof(path), "%s/uapp-vmap-%d", dir, (int)getpid());
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fd, 4096);
+    char *fm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if ((c = vfork()) == 0) {
+        execl(self, self, "exit", "0", (char *)NULL);
+        _exit(100);
+    }
+    waitpid(c, &st, 0);
+    memcpy(fm, "kept", 4);
+    msync(fm, 4096, MS_SYNC);
+    munmap(fm, 4096);
+    memset(got, 0, sizeof(got));
+    fd = open(path, O_RDONLY);
+    read(fd, got, 4);
+    close(fd);
+    unlink(path);
+    PCHECK(strcmp(got, "kept") == 0, "a vfork child's exec leaves its parent's file mapping");
+
+    errno = 0;
+    PCHECK(execl("/no/such/program", "x", (char *)NULL) < 0 && errno == ENOENT, "exec of nothing: ENOENT, and the caller goes on");
+    errno = 0;
+    PCHECK(execl(dir, dir, (char *)NULL) < 0 && errno == EACCES, "exec of a directory: EACCES");
+
+    pipe(p);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+    posix_spawn_file_actions_addclose(&fa, p[0]);
+    char *const sargv[] = { (char *)self, "hello", NULL };
+    const int sr = posix_spawn(&c, self, &fa, NULL, sargv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(p[1]);
+    memset(line, 0, sizeof(line));
+    n = 0;
+    for (ssize_t r; (r = read(p[0], line + n, sizeof(line) - 1 - n)) > 0;) {
+        n += (size_t)r;
+    }
+    close(p[0]);
+    waitpid(c, &st, 0);
+    PCHECK(sr == 0 && strstr(line, "hello from U-mode") != NULL, "posix_spawn with stdout on a pipe");
+
+    char *const bad[] = { "nothing", NULL };
+    PCHECK(posix_spawn(&c, "/no/such/program", NULL, NULL, bad, environ) == ENOENT, "posix_spawn says why it failed");
+
+    if ((c = fork()) == 0) {
+        const pid_t me = getpid();
+        _exit((setsid() == me && getsid(0) == me && getpgrp() == me) ? 0 : 1);
+    }
+    waitpid(c, &st, 0);
+    PCHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "setsid makes a session and a group of its own");
+    errno = 0;
+    PCHECK(setsid() < 0 && errno == EPERM, "a group leader cannot setsid");
+
+    const mode_t old = umask(077);
+    snprintf(path, sizeof(path), "%s/uapp-umask-%d", dir, (int)getpid());
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    struct stat sb = { 0 };
+    fstat(fd, &sb);
+    close(fd);
+    stat(path, &sb);
+    unlink(path);
+    umask(old);
+    PCHECK(old == 022 && (sb.st_mode & 0777) == 0600, "umask applies to a new file");
+
+    pthread_t th;
+    pthread_create(&th, NULL, idle_thread, NULL);
+    if ((c = fork()) == 0) {
+        _exit(5);
+    }
+    waitpid(c, &st, 0);
+    PCHECK(WIFEXITED(st) && WEXITSTATUS(st) == 5, "fork from a process with threads");
+
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "%s hello", self);
+    FILE *pf = popen(cmd, "r");
+    memset(line, 0, sizeof(line));
+    if (pf != NULL) {
+        fgets(line, sizeof(line), pf);
+    }
+    const int pst = (pf != NULL) ? pclose(pf) : -1;
+    PCHECK(strstr(line, "hello from U-mode") != NULL && pst == 0, "popen reads a command's output");
+
+    printf("uapp: procs %s\n", s_fails ? "FAILED" : "ok");
+    return s_fails ? 1 : 0;
+}
+
+/* exec in place: the same pid, close-on-exec descriptors closed and the others kept. */
+static int exec_self(const char *self, const char *dir)
+{
+    char path[160], a[12], b[12], pid[12];
+    snprintf(path, sizeof(path), "%s/uapp-exec-%d", dir, (int)getpid());
+    const int keep = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    const int shut = open(path, O_RDONLY | O_CLOEXEC);
+    unlink(path);
+    snprintf(a, sizeof(a), "%d", keep);
+    snprintf(b, sizeof(b), "%d", shut);
+    snprintf(pid, sizeof(pid), "%d", (int)getpid());
+    printf("uapp: before exec, pid %s\n", pid);
+    fflush(stdout);
+    signal(SIGUSR1, on_chld);
+    execl(self, self, "execd", pid, a, b, (char *)NULL);
+    printf("uapp: exec failed, errno %d\n", errno);
+    return 1;
+}
+
+static int execd(char **argv)
+{
+    struct sigaction sa;
+    sigaction(SIGUSR1, NULL, &sa);
+    const bool kept = fcntl(atoi(argv[3]), F_GETFD) >= 0, shut = fcntl(atoi(argv[4]), F_GETFD) < 0;
+    printf("uapp: execd, pid %s then %d; kept %s, cloexec %s, handler %s\n", argv[2], (int)getpid(),
+           kept ? "open" : "closed", shut ? "closed" : "open", sa.sa_handler == SIG_DFL ? "default" : "kept");
+    return 0;
+}
+
+/* daemon(): the parent gone at once, the child in a session of its own, writing to file. */
+static int daemonize(const char *file)
+{
+    const pid_t parent = getpid();
+    if (daemon(0, 0) != 0) {
+        printf("uapp: daemon failed, errno %d\n", errno);
+        return 1;
+    }
+    usleep(500000);
+    FILE *f = fopen(file, "w");
+    if (f != NULL) {
+        fprintf(f, "uapp: daemon pid %d (was %d) ppid %d sid %s\n", (int)getpid(), (int)parent, (int)getppid(),
+                getsid(0) == getpid() ? "own" : "shared");
+        fclose(f);
+    }
+    return 0;
+}
+
+
+/* A vfork's parent killed while its child borrows its memory: the child carries on, and finishes. */
+static int vfork_kill(const char *marker)
+{
+    const pid_t parent = getpid();
+    if (fork() == 0) {
+        usleep(500000);
+        kill(parent, SIGKILL);
+        _exit(0);
+    }
+    if (vfork() == 0) {
+        sleep(2);
+        const int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        write(fd, "survived\n", 9);
+        close(fd);
+        _exit(0);
+    }
+    printf("uapp: vfork returned before the kill\n");
+    return 1;
+}
+
+/* Children until the table is full: the rest refused with EAGAIN, and every one reaped. */
+static int fork_many(int n)
+{
+    int made = 0, refused = 0, reaped = 0;
+    for (int i = 0; i < n; i++) {
+        const pid_t c = fork();
+        if (c == 0) {
+            usleep(1500000);
+            _exit(0);
+        }
+        if (c > 0) {
+            made++;
+        } else if (errno == EAGAIN) {
+            refused++;
+        }
+    }
+    while (wait(NULL) > 0) {
+        reaped++;
+    }
+    printf("uapp: forked %d, refused %d, reaped %d\n", made, refused, reaped);
+    return (made > 0 && reaped == made) ? 0 : 1;
+}
+
+static const char *s_exec_self;
+
+static void *exec_thread(void *arg)
+{
+    (void)arg;
+    execl(s_exec_self, s_exec_self, "hello", (char *)NULL);
+    return NULL;
+}
+
+/* exec from a thread that is not the main one: the main thread goes too, and the process becomes the program. */
+static int exec_thread_mode(const char *self)
+{
+    s_exec_self = self;
+    pthread_t th;
+    pthread_create(&th, NULL, exec_thread, NULL);
+    for (;;) {
+        sleep(1);
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = (argc > 1) ? argv[1] : "hello";
@@ -995,6 +1406,27 @@ int main(int argc, char **argv)
     }
     if (strcmp(mode, "exit") == 0) {
         return (argc > 2) ? atoi(argv[2]) : 0;
+    }
+    if (strcmp(mode, "procs") == 0 && argc > 3) {
+        return procs(argv[2], argv[3]);
+    }
+    if (strcmp(mode, "exec") == 0 && argc > 3) {
+        return exec_self(argv[2], argv[3]);
+    }
+    if (strcmp(mode, "execd") == 0 && argc > 4) {
+        return execd(argv);
+    }
+    if (strcmp(mode, "daemon") == 0 && argc > 2) {
+        return daemonize(argv[2]);
+    }
+    if (strcmp(mode, "vforkkill") == 0 && argc > 2) {
+        return vfork_kill(argv[2]);
+    }
+    if (strcmp(mode, "forkmany") == 0 && argc > 2) {
+        return fork_many(atoi(argv[2]));
+    }
+    if (strcmp(mode, "execthread") == 0 && argc > 2) {
+        return exec_thread_mode(argv[2]);
     }
     if (strcmp(mode, "null") == 0) {
         volatile int *p = NULL;

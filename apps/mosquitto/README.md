@@ -48,7 +48,7 @@ registry component's layout.
 | the broker asks | the seam answers |
 |---|---|
 | `setuid`, `setgid`, `setgroups`, `initgroups` | "already that user": no process credential is writable yet, and an app runs as the user that started it |
-| `fork`, `setsid`, `umask` | `fork` fails, so `-d` does not half-work; there is no umask yet |
+| `fork`, `setsid`, `umask` | for the M-mode build only: `fork` fails there, as on a Linux without an MMU, so `-d` does not half-work. `mosquitto-u` has all three from libespix and daemonises |
 
 Everything else is espix's, the same in both builds: the M-mode ABI tables for
 an M-mode app, libespix and syscalls for a U-mode one.

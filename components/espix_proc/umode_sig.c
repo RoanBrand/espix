@@ -110,6 +110,23 @@ bool espix_um_sig_refused(const espix_proc_slot_t *slot, int sig)
     return (t != NULL && (t->sig_blocked & espix_sigbit(sig))) || p->act[sig].handler == H_IGN;
 }
 
+void espix_um_sig_exec(espix_um_proc_t *p)
+{
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (p->act[sig].handler > H_IGN) {
+            p->act[sig] = (struct espix_sigaction){ .handler = H_DFL };
+        }
+    }
+    xSemaphoreGive(p->lock);
+}
+
+bool espix_um_ignores_children(const espix_proc_slot_t *slot)
+{
+    const espix_um_proc_t *const p = ((const espix_um_thread_t *)slot->app->um)->proc;
+    return p->act[SIGCHLD].handler == H_IGN || (p->act[SIGCHLD].flags & SA_NOCLDWAIT);
+}
+
 /* The thread's own first, then the process's. */
 static int take(espix_um_thread_t *t)
 {
@@ -171,7 +188,7 @@ static void __attribute__((noreturn)) bad_frame(espix_um_thread_t *t, uint32_t s
 {
     espix_klog(ESPIX_KLOG_WARN, TAG, "pid %d: no signal frame at sp 0x%08x", (int)t->slot->info.pid,
                (unsigned)sp);
-    espix_um_exit_group(t, 128 + SIGSEGV);
+    espix_um_exit_sig(t, SIGSEGV);
 }
 
 /* What SA_RESTART restarts: not the sleeps and waits whose time would start again, as on Linux. */
@@ -189,7 +206,7 @@ void espix_um_sig_deliver(espix_um_thread_t *t, RvExcFrame *u)
     t->sys_intr = false;
     for (;;) {
         if (slot->stop_requested || p->exiting) {
-            espix_um_exit_group(t, 128 + SIGKILL);
+            espix_um_exit_sig(t, SIGKILL);
         }
         if (slot->sig_stop_req) {
             (void)espix_sigcheck_mask();    /* parks until the stop is lifted */
@@ -208,7 +225,7 @@ void espix_um_sig_deliver(espix_um_thread_t *t, RvExcFrame *u)
             continue;
         }
         if (act.handler == H_DFL) {
-            espix_um_exit_group(t, 128 + sig);
+            espix_um_exit_sig(t, sig);
         }
         if (intr && (act.flags & SA_RESTART) && restartable(t->sys_nr)) {
             u->mepc -= 4;
@@ -334,7 +351,7 @@ int32_t espix_um_raise(espix_um_thread_t *t, int sig)
         return -EINVAL;
     }
     if (sig == SIGKILL) {
-        espix_um_exit_group(t, 128 + SIGKILL);
+        espix_um_exit_sig(t, SIGKILL);
     }
     if (sig == SIGSTOP) {
         return (espix_proc_signal(t->slot->info.pid, SIGSTOP) == ESP_OK) ? 0 : -ESRCH;

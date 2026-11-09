@@ -76,6 +76,10 @@ static void espix_abi_abort(void)
 {
     fflush(espix_proc_stdio(1));
     fflush(espix_proc_stdio(2));
+    espix_proc_slot_t *const slot = espix_proc_self();
+    if (slot != NULL) {
+        slot->term_sig = SIGABRT;
+    }
     espix_proc_exit(ESPIX_ABORT_STATUS);
 }
 

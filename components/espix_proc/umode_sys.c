@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #include "esp_heap_caps.h"
 #include "riscv/encoding.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_syscall.h"
 #include "espix_tty.h"
@@ -94,17 +96,34 @@ int um_fd_release(espix_um_fd_t *e)
     return r;
 }
 
+void espix_um_fds_drop(espix_um_proc_t *p)
+{
+    for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
+        um_fd_release(&p->fds[fd]);
+    }
+}
+
+void espix_um_fds_cloexec(espix_um_proc_t *p)
+{
+    for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
+        if (p->fds[fd].cloexec) {
+            um_fd_release(&p->fds[fd]);
+        }
+    }
+}
+
 void espix_um_close_fds(espix_proc_slot_t *slot)
 {
     espix_um_thread_t *t = (slot->app != NULL) ? slot->app->um : NULL;
     if (t == NULL) {
         return;
     }
-    for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
-        um_fd_release(&t->proc->fds[fd]);
-    }
+    espix_um_fds_drop(t->proc);
     espix_um_objs_release(t->proc);
-    espix_um_unmap_files(t->proc->as);
+    /* A vfork's child leaves its parent's mappings alone. */
+    if (t->proc->vfork == NULL && t->proc->as != NULL) {
+        espix_um_unmap_files(t->proc->as);
+    }
 }
 
 /* A copy of e: a second kernel descriptor for a file, so each closes its own; a socket is shared. */
@@ -123,6 +142,34 @@ static int32_t fd_dup(const espix_um_fd_t *e, espix_um_fd_t *d)
         return -EINVAL;
     }
     return 0;
+}
+
+int32_t espix_um_fds_fork(espix_um_proc_t *from, espix_um_proc_t *to)
+{
+    int32_t r = 0;
+    xSemaphoreTake(from->lock, portMAX_DELAY);
+    for (int fd = 0; fd < ESPIX_UM_FDS && r == 0; fd++) {
+        const espix_um_fd_t *e = &from->fds[fd];
+        /* A directory stream stays its opener's. */
+        if (e->kind == ESPIX_UM_FD_FREE || e->kind == ESPIX_UM_FD_DIR) {
+            continue;
+        }
+        r = fd_dup(e, &to->fds[fd]);
+        if (r == 0) {
+            to->fds[fd].cloexec = e->cloexec;
+            /* Both processes close it themselves; the sweep at either's end must not. */
+            if (e->kind == ESPIX_UM_FD_FILE) {
+                espix_fs_fd_disown(e->kfd);
+            }
+        } else {
+            to->fds[fd] = (espix_um_fd_t){ 0 };
+        }
+    }
+    xSemaphoreGive(from->lock);
+    if (r != 0) {
+        espix_um_fds_drop(to);
+    }
+    return r;
 }
 
 /* A copy of e at the lowest free number from `from`. */
@@ -187,6 +234,43 @@ static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
     return (int32_t)done;
 }
 
+/*
+ * A pipe through a buffer of the kernel's: a read returns what one wait brings, and a write of
+ * PIPE_BUF or less goes in whole, neither holding a user page while it waits.
+ */
+#define PIPE_CHUNK 512
+
+static int32_t pipe_io(um_call_t *c, int kfd, uint32_t uva, uint32_t len, bool out)
+{
+    char buf[PIPE_CHUNK];
+    if (!out) {
+        const ssize_t got = read(kfd, buf, MIN(len, sizeof(buf)));
+        if (got <= 0) {
+            return (got < 0) ? -errno : 0;
+        }
+        return (espix_um_copyout(c->p->as, uva, buf, (size_t)got) < 0) ? -EFAULT : (int32_t)got;
+    }
+    uint32_t done = 0;
+    while (done < len) {
+        const uint32_t n = MIN(len - done, (uint32_t)sizeof(buf));
+        if (espix_um_copyin(c->p->as, buf, uva + done, n) < 0) {
+            return done ? (int32_t)done : -EFAULT;
+        }
+        const ssize_t put = write(kfd, buf, n);
+        if (put < 0) {
+            if (errno == EPIPE) {
+                (void)espix_um_raise(c->t, SIGPIPE);
+            }
+            return done ? (int32_t)done : -errno;
+        }
+        done += (uint32_t)put;
+        if ((uint32_t)put < n) {
+            break;
+        }
+    }
+    return (int32_t)done;
+}
+
 static int32_t um_sys_read(um_call_t *c)
 {
     espix_um_fd_t *e = um_fd_get(c->p, c->a[0]);
@@ -202,6 +286,9 @@ static int32_t um_sys_read(um_call_t *c)
     }
     if (e->kind != ESPIX_UM_FD_FILE) {
         return -EISDIR;
+    }
+    if (espix_pipe_is(e->kfd)) {
+        return pipe_io(c, e->kfd, uva, len, false);
     }
     uint32_t done = 0;
     while (done < len) {
@@ -236,6 +323,9 @@ static int32_t um_sys_write(um_call_t *c)
     }
     if (e->kind == ESPIX_UM_FD_SOCK) {
         return um_sock_write(c, c->a[0], uva, len);
+    }
+    if (e->kind == ESPIX_UM_FD_FILE && espix_pipe_is(e->kfd)) {
+        return pipe_io(c, e->kfd, uva, len, true);
     }
     FILE *const out = (e->kind == ESPIX_UM_FD_STD) ? espix_proc_stdio(e->std) : NULL;
     uint32_t done = 0;
@@ -802,6 +892,145 @@ static int32_t um_sys_getgr(um_call_t *c)
 }
 
 static int32_t um_sys_kill(um_call_t *c)    { return um_kret(espix_abi_kill((pid_t)c->a[0], (int)c->a[1])); }
+
+static int32_t um_sys_pipe2(um_call_t *c)
+{
+    const uint32_t flags = c->a[1];
+    if (flags & ~(uint32_t)(O_NONBLOCK | O_CLOEXEC)) {
+        return -EINVAL;
+    }
+    int k[2];
+    if (espix_pipe(k, (int)(flags & O_NONBLOCK)) != 0) {
+        return -errno;
+    }
+    int32_t n[2] = { -1, -1 };
+    for (int i = 0; i < 2; i++) {
+        const espix_um_fd_t e = { .kind = ESPIX_UM_FD_FILE, .cloexec = (flags & O_CLOEXEC) != 0, .kfd = k[i] };
+        n[i] = um_fd_install(c->p, &e, 0);
+    }
+    int32_t r = (n[0] < 0) ? n[0] : (n[1] < 0) ? n[1] : espix_um_copyout(c->p->as, c->a[0], n, sizeof(n));
+    if (r != 0) {
+        for (int i = 0; i < 2; i++) {
+            if (n[i] >= 0) {
+                espix_um_fd_t e = fd_take(c->p, (uint32_t)n[i]);
+                um_fd_release(&e);
+            } else {
+                close(k[i]);
+            }
+        }
+    }
+    return r;
+}
+
+static int32_t um_sys_wait4(um_call_t *c)
+{
+    int st = 0;
+    const int32_t r = espix_proc_waitpid((pid_t)c->a[0], &st, (int)c->a[2]);
+    if (r > 0 && c->a[1] != 0) {
+        const int32_t w = espix_um_copyout(c->p->as, c->a[1], &st, sizeof(st));
+        if (w != 0) {
+            return w;
+        }
+    }
+    return r;
+}
+
+static int32_t um_sys_setsid(um_call_t *c)  { (void)c; return espix_proc_setsid(); }
+static int32_t um_sys_setpgid(um_call_t *c) { return espix_proc_setpgid((pid_t)c->a[0], (pid_t)c->a[1]); }
+static int32_t um_sys_getpgid(um_call_t *c) { return espix_proc_getpgid((pid_t)c->a[0]); }
+static int32_t um_sys_umask(um_call_t *c)   { return espix_proc_umask_set((int)c->a[0]); }
+static int32_t um_sys_fork(um_call_t *c)    { return espix_um_fork(c->t, c->f, false); }
+static int32_t um_sys_vfork(um_call_t *c)   { return espix_um_fork(c->t, c->f, true); }
+
+/* A NULL-terminated array of strings from the app, packed as copy_argv packs one: the pointers, then the strings. */
+static int32_t vec_in(um_call_t *c, uint32_t uvec, char ***out, int *count, size_t *room)
+{
+    char **v = NULL;
+    int n = 0;
+    for (uint32_t i = 0;; i++) {
+        uint32_t ustr = 0;
+        if (uvec != 0 && espix_um_copyin(c->p->as, &ustr, uvec + i * 4, 4) != 0) {
+            free(v);
+            return -EFAULT;
+        }
+        char **const nv = realloc(v, (size_t)(n + 1) * sizeof(char *));
+        if (nv == NULL) {
+            free(v);
+            return -ENOMEM;
+        }
+        v = nv;
+        if (uvec == 0 || ustr == 0) {
+            v[n] = NULL;
+            break;
+        }
+        char tmp[ESPIX_PATH_MAX];
+        int len = espix_um_strin(c->p->as, tmp, ustr, sizeof(tmp));
+        char *s = NULL;
+        if (len == -ENAMETOOLONG) {
+            /* Longer than a path: measured, then copied whole. */
+            size_t cap = 2 * sizeof(tmp);
+            for (;;) {
+                s = malloc(cap);
+                len = (s != NULL) ? espix_um_strin(c->p->as, s, ustr, cap) : -ENOMEM;
+                if (len != -ENAMETOOLONG || cap >= *room) {
+                    break;
+                }
+                free(s);
+                s = NULL;
+                cap *= 2;
+            }
+        } else if (len >= 0) {
+            s = strdup(tmp);
+            len = (s != NULL) ? len : -ENOMEM;
+        }
+        if (len < 0 || (size_t)len + 1 > *room) {
+            free(s);
+            for (int j = 0; j < n; j++) {
+                free(v[j]);
+            }
+            free(v);
+            return (len == -ENAMETOOLONG || len >= 0) ? -E2BIG : len;
+        }
+        *room -= (size_t)len + 1;
+        v[n++] = s;
+    }
+    *out = v;
+    *count = n;
+    return 0;
+}
+
+static void vec_free(char **v)
+{
+    for (int i = 0; v != NULL && v[i] != NULL; i++) {
+        free(v[i]);
+    }
+    free(v);
+}
+
+static int32_t um_sys_execve(um_call_t *c)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = path_in(c, c->a[0], path);
+    if (r < 0) {
+        return r;
+    }
+    char **argv = NULL, **envp = NULL;
+    int argc = 0, envc = 0;
+    size_t room = 64 * 1024;
+    r = vec_in(c, c->a[1], &argv, &argc, &room);
+    if (r == 0) {
+        r = vec_in(c, c->a[2], &envp, &envc, &room);
+    }
+    if (r == 0) {
+        r = espix_um_exec_prepare(c->t, path, argc, argv, envp);
+    }
+    vec_free(argv);
+    vec_free(envp);
+    if (r == 0) {
+        espix_um_exec_go(c->t);
+    }
+    return r;
+}
 
 /* ------------------------------------------------------------------ */
 /* Signals (umode_sig.c)                                               */

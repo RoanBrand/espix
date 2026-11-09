@@ -175,6 +175,8 @@ typedef struct {
 #if CONFIG_ESPIX_UMODE
     /* A U-mode app's thread and address space (espix_umode.h); NULL for an M-mode app. */
     void *um;
+    /* A fork's child until it first runs: what it starts from (umode.c). */
+    void *fork;
 #endif
 } espix_proc_app_t;
 
@@ -210,6 +212,10 @@ typedef struct {
      */
     volatile bool stop_requested;
     int           stop_sig;     /* the signal that asked a kernel process to stop; its status is 128 + it */
+    uint8_t       term_sig;     /* the signal that ended it, for wait()'s status; 0 for an exit */
+    bool          stop_reported;    /* this stop has been reported to a waitpid(WUNTRACED) */
+    bool          orphan;       /* its parent ended first: nobody will reap it */
+    uint16_t      umask;
 
     /*
      * How exit() gets home.
@@ -314,10 +320,14 @@ typedef struct {
      * globals, which stay the console. See abi_stdio.c.
      */
     FILE             *std[3];
+    /* The streams espix made for it, closed at its end or when it leaves its session. */
+    FILE             *own_std[3];
 
     /* The tty behind std[0] when stdin is its session's (a terminal, or an exec's pipe): fds 0-2's
      * termios, window size and readiness. NULL otherwise. */
     struct espix_tty *std_tty;
+    bool              std_tty_ref;  /* held by a reference of its own: it left the session (setsid) */
+    bool              detached;     /* left its session: its streams are its terminal's, or /dev/null */
 
     /*
      * The app's arena; see espix_app_region_t above. Empty until the app
@@ -687,6 +697,29 @@ struct timeval;
 struct pollfd;
 int   espix_abi_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *errorfds, struct timeval *timeout);
 int   espix_abi_poll(struct pollfd *fds, unsigned int nfds, int timeout);
+
+/* Processes, for both kinds of app: the result, or -errno. */
+/* waitpid(): the child's pid, 0 under WNOHANG with none ready; ECHILD, EINTR. Status is Linux's encoding. */
+int  espix_proc_waitpid(pid_t pid, int *status, int options);
+int  espix_proc_setsid(void);
+int  espix_proc_setpgid(pid_t pid, pid_t pgid);
+int  espix_proc_getpgid(pid_t pid);
+/* The old mask. */
+int  espix_proc_umask_set(int mask);
+/* Off its session's streams, onto its terminal's own (or /dev/null), which outlive the session. */
+void espix_proc_streams_leave(espix_proc_slot_t *slot);
+/* A child of parent that starts from um_fork (umode.c): its pid in *pid; 0 or -errno. */
+int  espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *pid);
+/* An exec's new program: its path, arguments, environment, name and set-id credentials. 0 or -errno. */
+int  espix_proc_exec_commit(espix_proc_slot_t *slot, const char *abs_path, int argc, char *const argv[],
+                            char *const envp[]);
+
+/* Pipes (pipe.c): two kernel descriptors, fds[0] read and fds[1] written; O_NONBLOCK in flags. */
+esp_err_t espix_pipe_init(void);
+int       espix_pipe(int fds[2], int flags);
+bool      espix_pipe_is(int fd);
+/* A second descriptor for the same end. */
+int       espix_pipe_dup(int fd);
 
 /* True once this state means the process is over. */
 bool espix_proc_state_is_finished(espix_proc_state_t s);

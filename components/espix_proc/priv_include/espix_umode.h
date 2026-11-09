@@ -78,6 +78,9 @@ typedef struct {
     int                threads;     /* live, the main one included; a leaving thread notifies the main one */
     bool               exiting;     /* every thread is ending; the main one ends the process */
     int                exit_status;
+    uint8_t            exit_sig;    /* the signal behind exit_status, or 0 */
+    bool               exec;        /* the exit is an exec: the main thread loads the new image */
+    struct espix_um_vfork *vfork;   /* a vfork's child: its parent waits until this process lets go of its memory */
     espix_um_waiter_t *futex_waiters;
     uint32_t          *amos;        /* each AMO the loader replaced: its pc and the instruction, by pc */
     uint32_t           amo_count;
@@ -121,6 +124,20 @@ bool espix_um_file_is_exec(const char *path);
 /* Loads and enters the app; returns only on failure to start, with a message for the session. */
 const char *espix_um_exec(espix_proc_slot_t *slot);
 
+/* proc_task()'s exit_jmp value for an exec in place: the old image is released and the new one loaded. */
+#define ESPIX_UM_EXEC_JUMP 2
+
+/* fork and vfork from thread t at its syscall's frame f: the child's pid, or -errno. */
+int32_t     espix_um_fork(espix_um_thread_t *t, RvExcFrame *f, bool vfork);
+/* A fork's child entering U where its parent's syscall returns; only a failure to start returns. */
+const char *espix_um_fork_run(espix_proc_slot_t *slot);
+/* exec's first half: path checked, and its program, arguments and environment the process's next; 0 or -errno. */
+int32_t     espix_um_exec_prepare(espix_um_thread_t *t, const char *path, int argc, char **argv, char **envp);
+/* The second: the process becomes that program. */
+void        espix_um_exec_go(espix_um_thread_t *t) __attribute__((noreturn));
+/* After an exec's jump home: the old image gone, close-on-exec descriptors closed, caught signals default. */
+void        espix_um_exec_reset(espix_proc_slot_t *slot);
+
 /* Before the owned-fd sweep: the process's descriptors, closed while their numbers are still its own. */
 void espix_um_close_fds(espix_proc_slot_t *slot);
 /* Its surfaces and audio streams, ended once its threads are gone (umode_gfx.c). */
@@ -130,6 +147,8 @@ void espix_um_release(espix_proc_slot_t *slot);
 
 /* Ends the process with status: the calling thread leaves, and the main one tears the process down. */
 void espix_um_exit_group(espix_um_thread_t *t, int status) __attribute__((noreturn));
+/* The same for a signal: status 128 + sig, and wait() sees the signal. */
+void espix_um_exit_sig(espix_um_thread_t *t, int sig) __attribute__((noreturn));
 /* Ends the calling thread only, as pthread_exit() does; the main thread waits for the others first. */
 void espix_um_thread_exit(espix_um_thread_t *t) __attribute__((noreturn));
 /* A new thread of t's process; its tid, or -errno. */
@@ -156,6 +175,8 @@ uint32_t espix_um_sig_claim(espix_proc_slot_t *slot);
 int      espix_um_termsig(const espix_proc_slot_t *slot);
 /* Whether the calling thread blocks sig or its process ignores it. */
 bool     espix_um_sig_refused(const espix_proc_slot_t *slot, int sig);
+/* SIGCHLD ignored or SA_NOCLDWAIT: no zombies. Under the table lock. */
+bool     espix_um_ignores_children(const espix_proc_slot_t *slot);
 int32_t  espix_um_sigaction(espix_um_thread_t *t, int sig, uint32_t uact, uint32_t uold);
 int32_t  espix_um_sigprocmask(espix_um_thread_t *t, int how, uint32_t uset, uint32_t uold);
 int32_t  espix_um_sigpending(espix_um_thread_t *t, uint32_t uout);
@@ -169,6 +190,13 @@ void espix_um_fpu_restore(const void *area);
 /* Syscalls (umode_sys.c): the result for a0. */
 int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f);
 void    espix_um_fds_init(espix_um_proc_t *p);
+/* A fork's descriptors: each file its own kernel descriptor, sockets and pipes shared; 0 or -errno. */
+int32_t espix_um_fds_fork(espix_um_proc_t *from, espix_um_proc_t *to);
+/* Every descriptor of p closed; those marked close-on-exec. */
+void    espix_um_fds_drop(espix_um_proc_t *p);
+void    espix_um_fds_cloexec(espix_um_proc_t *p);
+/* exec's signal state: caught signals back to their default. */
+void    espix_um_sig_exec(espix_um_proc_t *p);
 
 /* The heap grows by brk up to here; lent memory, and mmap, live above it. */
 #define ESPIX_UM_BRK_MAX 0x60000000u
@@ -188,6 +216,12 @@ void           espix_um_frame_put(void *frame);
 /* A frame a shared text keeps, or no longer: copied before it is written, whoever maps it. */
 void           espix_um_frame_text(void *frame, bool on);
 espix_um_as_t *espix_um_as_new(uint32_t asid);
+/* A copy for a fork's child: private pages copy-on-write, shared ones the same frames. NULL without memory. */
+espix_um_as_t *espix_um_as_fork(espix_um_as_t *src, uint32_t asid);
+/* Another process on it (a vfork's child); put is true when that freed it, its ASID then the caller's to free. */
+espix_um_as_t *espix_um_as_get(espix_um_as_t *as);
+bool           espix_um_as_put(espix_um_as_t *as, uint32_t *pages);
+uint32_t       espix_um_as_asid(const espix_um_as_t *as);
 /* Where the table keeps its count of resident pages, which outlives it: the process's slot. */
 void           espix_um_as_count(espix_um_as_t *as, uint32_t *pages);
 void           espix_um_as_free(espix_um_as_t *as);

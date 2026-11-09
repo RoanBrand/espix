@@ -27,6 +27,7 @@
 #include "freertos/semphr.h"
 #include "riscv/encoding.h"
 
+#include "espix_fs.h"
 #include "espix_proc.h"
 #include "espix_umode.h"
 
@@ -75,6 +76,7 @@ struct espix_um_as {
     dead_t           *dead;             /* freed when the last pin goes */
     uint32_t         *pages;            /* resident, the zero frame and lent memory aside; the slot's */
     uint32_t          nopages;          /* where pages points until it is told */
+    int               users;            /* processes on it: a vfork child borrows its parent's; atomic */
 };
 
 static void resident(espix_um_as_t *as, int n)
@@ -339,13 +341,44 @@ espix_um_as_t *espix_um_as_new(uint32_t asid)
     }
     as->asid  = asid & 0x1ff;
     as->pages = &as->nopages;
+    as->users = 1;
     return as;
 }
 
 void espix_um_as_count(espix_um_as_t *as, uint32_t *pages)
 {
-    *pages    = 0;
+    const uint32_t n = *as->pages;
     as->pages = pages;
+    *pages    = n;
+}
+
+espix_um_as_t *espix_um_as_get(espix_um_as_t *as)
+{
+    __atomic_add_fetch(&as->users, 1, __ATOMIC_RELAXED);
+    return as;
+}
+
+uint32_t espix_um_as_asid(const espix_um_as_t *as)
+{
+    return as->asid;
+}
+
+bool espix_um_as_put(espix_um_as_t *as, uint32_t *pages)
+{
+    if (as == NULL) {
+        return false;
+    }
+    if (__atomic_sub_fetch(&as->users, 1, __ATOMIC_ACQ_REL) == 0) {
+        espix_um_as_free(as);
+        return true;
+    }
+    /* Still borrowed: its count leaves with the process that kept it. */
+    if (as->pages == pages) {
+        as->nopages = *pages;
+        as->pages   = &as->nopages;
+        *pages      = 0;
+    }
+    return false;
 }
 
 static void frames_free(dead_t *d)
@@ -822,7 +855,7 @@ static uint8_t *map_zero(espix_um_as_t *as, uint32_t va, const region_t *r)
 static uint8_t *cow(espix_um_as_t *as, uint32_t va, uint32_t *pte, const region_t *r)
 {
     uint8_t *const old = pte_frame(*pte);
-    if (frame_refs(old) == 1) {
+    if (frame_refs(old) == 1 || (r->shared && old != s_zero)) {
         __atomic_store_n(pte, *pte | PTE_W | PTE_D, __ATOMIC_SEQ_CST);
         return old;
     }
@@ -863,8 +896,9 @@ static uint8_t *page_of(espix_um_as_t *as, uint32_t va, uint32_t need)
             (r.flags & need) != need) {
             return NULL;
         }
-        uint8_t *frame = (r.kind == R_ANON && !(need & PTE_W)) ? map_zero(as, va & ~(PG - 1), &r)
-                                                              : fill(as, va & ~(PG - 1), &r);
+        /* A shared page is the same frame in every process mapping it, so never the zero frame. */
+        uint8_t *frame = (r.kind == R_ANON && !r.shared && !(need & PTE_W)) ? map_zero(as, va & ~(PG - 1), &r)
+                                                                          : fill(as, va & ~(PG - 1), &r);
         if (frame == NULL) {
             return NULL;
         }
@@ -1005,8 +1039,10 @@ int32_t espix_um_mprotect(espix_um_as_t *as, uint32_t start, uint32_t len, uint3
         if ((pte_flags & PTE_X) && !(*pte & PTE_X)) {
             make_exec(frame);
         }
-        /* A frame other tables map stays read-only here, to be copied when written. */
-        const uint32_t f = (frame_refs(frame) > 1) ? (pte_flags & ~PTE_W) : pte_flags;
+        /* A frame other tables map stays read-only here, to be copied when written; a shared mapping's is shared. */
+        const int m = map_find(as, va);
+        const bool shared = m >= 0 && as->maps[m].shared;
+        const uint32_t f = (frame_refs(frame) > 1 && !shared) ? (pte_flags & ~PTE_W) : pte_flags;
         __atomic_store_n(pte, f ? pte_of(frame, leaf_flags(f)) : (pte_of(frame, 0) | PTE_HELD), __ATOMIC_SEQ_CST);
     }
     espix_um_asid_shoot(as->asid);
@@ -1032,6 +1068,9 @@ int32_t espix_um_madvise(espix_um_as_t *as, uint32_t start, uint32_t len, bool d
     }
     for (int i = map_lower(as, start); r == 0 && drop && i < as->nmaps && as->maps[i].start < end; i++) {
         const region_t *m = &as->maps[i];
+        if (m->shared && m->kind == R_ANON) {
+            continue;       /* its pages are its contents, as shared memory's are on Linux */
+        }
         writeback(as, m, start, end);
         unmap_range(as, MAX(start, m->start), MIN(end, m->end), &dead);
     }
@@ -1086,6 +1125,116 @@ void espix_um_unmap_files(espix_um_as_t *as)
         }
     }
     xSemaphoreGive(as->lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* fork                                                                */
+/* ------------------------------------------------------------------ */
+
+/* A copy of region r for the child: a file's with a descriptor of its own. */
+static bool region_copy(espix_um_as_t *as, const region_t *r)
+{
+    region_t c = *r;
+    if (c.kind == R_FILE && c.kfd >= 0) {
+        c.kfd = espix_abi_dup(r->kfd);
+        if (c.kfd < 0) {
+            return false;
+        }
+        espix_fs_fd_disown(c.kfd);
+    }
+    if (!map_insert(as, &c)) {
+        if (c.kind == R_FILE && c.kfd >= 0) {
+            close(c.kfd);
+        }
+        return false;
+    }
+    return true;
+}
+
+espix_um_as_t *espix_um_as_fork(espix_um_as_t *src, uint32_t asid)
+{
+    espix_um_as_t *as = espix_um_as_new(asid);
+    if (as == NULL) {
+        return NULL;
+    }
+    bool ok = true;
+    xSemaphoreTake(src->lock, portMAX_DELAY);
+    as->heap     = src->heap;
+    as->brk_base = src->brk_base;
+    as->brk      = src->brk;
+    as->tstacks  = src->tstacks;
+    for (int i = 0; ok && i < src->nmaps; i++) {
+        const region_t *m = &src->maps[i];
+        if (m->kind == R_LENT) {
+            continue;       /* a surface stays its holder's */
+        }
+        ok = region_copy(as, m);
+        /* Every page of a shared mapping is a frame of its own before both map it. */
+        for (uint32_t va = m->start; ok && m->shared && m->flags != 0 && va < m->end; va += PG) {
+            const uint32_t *pte = leaf(src, va, false);
+            if (pte == NULL || (!(*pte & (PTE_V | PTE_HELD))) || ((*pte & PTE_V) && pte_frame(*pte) == s_zero)) {
+                ok = page_of(src, va, (m->flags & PTE_W) ? PTE_W : PTE_R) != NULL;
+            }
+        }
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; ok && i < 1024; i++) {
+        if (!(src->root[i] & PTE_V)) {
+            continue;
+        }
+        uint32_t *const l2 = pte_frame(src->root[i]);
+        for (uint32_t j = 0; ok && j < 1024; j++) {
+            uint32_t pte = l2[j];
+            if (!(pte & (PTE_V | PTE_HELD)) || (pte & PTE_LENT)) {
+                continue;
+            }
+            const uint32_t va = (i << 22) | (j << 12);
+            const int m = map_find(src, va);
+            if (m >= 0 && src->maps[m].kind == R_LENT) {
+                continue;
+            }
+            /* Private and writable: read-only in both now, each writer's copy made when it writes. */
+            if (!(m >= 0 && src->maps[m].shared) && (pte & PTE_W)) {
+                pte &= ~PTE_W;
+                __atomic_store_n(&l2[j], pte, __ATOMIC_SEQ_CST);
+            }
+            uint8_t *frame = pte_frame(pte);
+            uint32_t cpte = pte;
+            if (!frame_get(frame)) {
+                /* Counted as far as it goes: this one is the child's own copy. */
+                uint8_t *const copy = frame_alloc();
+                ok = copy != NULL;
+                if (ok) {
+                    memcpy(copy, frame, PG);
+                    if (pte & PTE_X) {
+                        make_exec(copy);
+                    }
+                    cpte  = pte_of(copy, pte & 0x3ffu);
+                    frame = copy;
+                }
+            }
+            uint32_t *const c = ok ? leaf(as, va, true) : NULL;
+            if (c == NULL) {
+                if (ok) {
+                    frame_free(frame);
+                }
+                ok = false;
+                break;
+            }
+            __atomic_store_n(c, cpte, __ATOMIC_RELEASE);
+            n += frame != s_zero;
+        }
+    }
+    *as->pages = n;
+    /* No core may write through a translation that predates the copy. */
+    asm volatile ("sfence.vma x0, %0" :: "r"(src->asid) : "memory");
+    espix_um_asid_shoot(src->asid);
+    xSemaphoreGive(src->lock);
+    if (!ok) {
+        espix_um_as_free(as);
+        return NULL;
+    }
+    return as;
 }
 
 /* ------------------------------------------------------------------ */

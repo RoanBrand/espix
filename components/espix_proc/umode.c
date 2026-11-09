@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "esp_attr.h"
 #include "esp_cache.h"
@@ -31,6 +32,7 @@
 #include "soc/bus_monitor_reg.h"
 #include "soc/cpu_apm_reg.h"
 
+#include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_shell.h"
 #include "espix_umode.h"
@@ -60,8 +62,9 @@ static uint32_t    s_asid_used[ASIDS / 32] = { 1 };
 static uint32_t    s_asid_stale[portNUM_PROCESSORS][ASIDS / 32];
 static portMUX_TYPE s_asid_lock = portMUX_INITIALIZER_UNLOCKED;
 
-/* The images' shared text (load_segments). */
+/* The images' shared text (load_segments), and vfork's handshake. */
 static SemaphoreHandle_t s_texts_lock;
+static SemaphoreHandle_t s_vfork_lock;
 
 static uint32_t asid_alloc(void)
 {
@@ -126,6 +129,7 @@ void espix_um_init(void)
     }
     espix_um_frames_init();
     s_texts_lock = xSemaphoreCreateMutex();
+    s_vfork_lock = xSemaphoreCreateMutex();
     /* cpu_apm region 0 (flash and PSRAM) is TEE-only, and U-mode is REE: the page tables isolate instead. */
     REG_SET_BIT(CPU_APM_REGION0_ATTR_REG, 0x0777);
     espix_klog(ESPIX_KLOG_INFO, TAG, "user mode on; mscratch at boot 0x%08x 0x%08x",
@@ -336,8 +340,8 @@ static void kstack_note(void)
     }
 }
 
-/* Every thread of the process is to end, with status unless another already set one. */
-static void stop_all(espix_um_thread_t *t, int status)
+/* Every thread of the process is to end, with status (and the signal behind it) unless another already set one. */
+static void stop_all(espix_um_thread_t *t, int status, int sig, bool exec)
 {
     espix_um_proc_t *const p = t->proc;
     xSemaphoreTake(p->lock, portMAX_DELAY);
@@ -345,6 +349,8 @@ static void stop_all(espix_um_thread_t *t, int status)
     if (first) {
         p->exiting     = true;
         p->exit_status = status;
+        p->exit_sig    = (uint8_t)sig;
+        p->exec        = exec;
     }
     const bool others = p->threads > 1;
     xSemaphoreGive(p->lock);
@@ -363,16 +369,33 @@ static int threads_left(espix_um_proc_t *p)
     return left;
 }
 
+/* The main thread, the others gone: the process ends, or an exec has it load its new image (proc_task()). */
 static void __attribute__((noreturn)) main_exit(espix_um_thread_t *t)
 {
     kstack_note();
+    if (t->proc->exec) {
+        longjmp(*t->slot->exit_jmp, ESPIX_UM_EXEC_JUMP);
+    }
+    t->slot->term_sig = t->proc->exit_sig;
     espix_proc_exit(t->proc->exit_status);
     __builtin_unreachable();
 }
 
+static void __attribute__((noreturn)) exit_group(espix_um_thread_t *t, int status, int sig, bool exec);
+
 void espix_um_exit_group(espix_um_thread_t *t, int status)
 {
-    stop_all(t, status);
+    exit_group(t, status, 0, false);
+}
+
+void espix_um_exit_sig(espix_um_thread_t *t, int sig)
+{
+    exit_group(t, 128 + sig, sig, false);
+}
+
+static void exit_group(espix_um_thread_t *t, int status, int sig, bool exec)
+{
+    stop_all(t, status, sig, exec);
     if (t->exit_jmp != NULL) {
         espix_um_thread_exit(t);
     }
@@ -418,7 +441,7 @@ void espix_um_thread_exit(espix_um_thread_t *t)
     for (;;) {
         (void)espix_sigcheck_mask();
         if (slot->stop_requested || t->proc->exiting) {
-            espix_um_exit_group(t, 128 + SIGKILL);
+            espix_um_exit_sig(t, SIGKILL);
         }
         if (threads_left(t->proc) == 0) {
             espix_um_exit_group(t, 0);
@@ -535,7 +558,7 @@ static void fault(espix_um_thread_t *t, RvExcFrame *f, uint32_t code)
                (int)slot->info.pid, what, (unsigned)f->mepc, (unsigned)f->mtval, (unsigned)code);
     espix_eprintf(slot->info.session, "%s: %s (pc 0x%08x, address 0x%08x)\n",
                   slot->info.name, what, (unsigned)f->mepc, (unsigned)f->mtval);
-    espix_um_exit_group(t, 128 + sig);
+    espix_um_exit_sig(t, sig);
 }
 
 void espix_um_resume(RvExcFrame *u, uint32_t ms, espix_um_thread_t *t) __attribute__((noreturn));
@@ -966,31 +989,40 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
         return "out of address-space ids";
     }
 
+    /* After an exec the process keeps its thread, descriptors and signal state; only the image is new. */
     espix_um_as_t *as = espix_um_as_new(asid);
-    espix_um_thread_t *t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
-    espix_um_proc_t *p = calloc(1, sizeof(*p));
-    SemaphoreHandle_t lock = xSemaphoreCreateMutex();
-    if (as == NULL || t == NULL || p == NULL || lock == NULL) {
-        espix_um_as_free(as);
-        free(t);
-        free(p);
-        if (lock != NULL) {
-            vSemaphoreDelete(lock);
+    espix_um_thread_t *t = app->um;
+    espix_um_proc_t *p = (t != NULL) ? t->proc : NULL;
+    if (t == NULL) {
+        t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
+        p = calloc(1, sizeof(*p));
+        SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+        if (t == NULL || p == NULL || lock == NULL) {
+            free(t);
+            free(p);
+            if (lock != NULL) {
+                vSemaphoreDelete(lock);
+            }
+            t = NULL;
+        } else {
+            p->lock    = lock;
+            p->threads = 1;
+            espix_um_fds_init(p);
+            t->proc = p;
+            t->slot = slot;
+            t->tid  = slot->info.pid;
+            app->um = t;
         }
+    }
+    if (as == NULL || t == NULL) {
+        espix_um_as_free(as);
         asid_free(asid);
         return "out of memory for an address space";
     }
-    p->as      = as;
-    p->lock    = lock;
+    p->as   = as;
     espix_um_as_count(as, &slot->um_pages);
-    p->threads = 1;
-    espix_um_fds_init(p);
-    t->proc = p;
-    t->slot = slot;
-    t->tid  = slot->info.pid;
     t->task = xTaskGetCurrentTaskHandle();
     t->satp = espix_um_as_satp(as);
-    app->um = t;
 
     uint32_t entry = 0, usp = 0, uargv = 0, uenvp = 0;
 #if CONFIG_ESPIX_UM_AMO_TRAP
@@ -1027,22 +1059,311 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
     __builtin_unreachable();
 }
 
+/* ------------------------------------------------------------------ */
+/* fork, vfork and exec                                                */
+/* ------------------------------------------------------------------ */
+
+/* A vfork's parent waits on this until its child execs or ends. Under s_vfork_lock, which a waker holds across its notify. */
+typedef struct espix_um_vfork {
+    int          refs;
+    bool         done;
+    TaskHandle_t waiter;
+} vfork_done_t;
+
+static void vfork_put(vfork_done_t *v)
+{
+    xSemaphoreTake(s_vfork_lock, portMAX_DELAY);
+    const bool last = --v->refs == 0;
+    xSemaphoreGive(s_vfork_lock);
+    if (last) {
+        free(v);
+    }
+}
+
+/* The child lets go of its parent's memory: the parent's vfork returns. */
+static void vfork_release(espix_um_proc_t *p)
+{
+    vfork_done_t *const v = p->vfork;
+    if (v == NULL) {
+        return;
+    }
+    p->vfork = NULL;
+    xSemaphoreTake(s_vfork_lock, portMAX_DELAY);
+    v->done = true;
+    if (v->waiter != NULL) {
+        xTaskNotifyGiveIndexed(v->waiter, ESPIX_NOTIFY_SIG_IDX);
+    }
+    xSemaphoreGive(s_vfork_lock);
+    vfork_put(v);
+}
+
+/* The image's part of a process: its texts, its table (unless another process still borrows it) and its AMOs. */
+static void image_release(espix_um_proc_t *p, uint32_t *pages)
+{
+    for (int i = 0; i < p->ntext; i++) {
+        text_put(p->text[i]);     /* before the table: a cached text's frames are always mapped */
+    }
+    p->ntext = 0;
+    vfork_release(p);
+    if (p->as != NULL) {
+        const uint32_t asid = espix_um_as_asid(p->as);
+        if (espix_um_as_put(p->as, pages)) {
+            asid_free(asid);
+        }
+        p->as = NULL;
+    }
+    free(p->amos);
+    p->amos      = NULL;
+    p->amo_count = 0;
+}
+
+static void proc_free(espix_um_proc_t *p, uint32_t *pages)
+{
+    image_release(p, pages);
+    vSemaphoreDelete(p->lock);
+    free(p);
+}
+
+/* What a fork's child starts from: the parent's registers at its syscall, and its FPU. */
+typedef struct espix_um_fork {
+    RvExcFrame       frame;
+    uint32_t         fpu[33];
+    espix_um_proc_t *proc;
+    uint32_t         sig_blocked;
+    bool             vfork;
+} um_fork_t;
+
+static void fork_drop(um_fork_t *ctx)
+{
+    uint32_t none = 0;
+    espix_um_fds_drop(ctx->proc);
+    proc_free(ctx->proc, &none);
+    free(ctx);
+}
+
 void espix_um_release(espix_proc_slot_t *slot)
 {
-    if (slot->app == NULL || slot->app->um == NULL) {
+    if (slot->app == NULL) {
+        return;
+    }
+    if (slot->app->fork != NULL) {
+        fork_drop(slot->app->fork);     /* a child that never ran */
+        slot->app->fork = NULL;
+    }
+    if (slot->app->um == NULL) {
         return;
     }
     espix_um_thread_t *t = slot->app->um;
-    asid_free((t->satp & SATP32_ASID) >> 22);
-    for (int i = 0; i < t->proc->ntext; i++) {
-        text_put(t->proc->text[i]);     /* before the table: a cached text's frames are always mapped */
-    }
-    espix_um_as_free(t->proc->as);
-    vSemaphoreDelete(t->proc->lock);
-    free(t->proc->amos);
-    free(t->proc);
+    proc_free(t->proc, &slot->um_pages);
     free(t);
     slot->app->um = NULL;
+}
+
+int32_t espix_um_fork(espix_um_thread_t *t, RvExcFrame *f, bool vfork)
+{
+    espix_um_proc_t *const p = t->proc;
+    um_fork_t *const ctx = calloc(1, sizeof(*ctx));
+    espix_um_proc_t *const cp = calloc(1, sizeof(*cp));
+    SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+    vfork_done_t *const vd = vfork ? calloc(1, sizeof(*vd)) : NULL;
+    if (ctx == NULL || cp == NULL || lock == NULL || (vfork && vd == NULL)) {
+        free(ctx);
+        free(cp);
+        free(vd);
+        if (lock != NULL) {
+            vSemaphoreDelete(lock);
+        }
+        return -ENOMEM;
+    }
+    espix_um_fpu_save(ctx->fpu);
+    ctx->frame       = *f;
+    ctx->frame.a0    = 0;
+    ctx->sig_blocked = t->sig_blocked;
+    ctx->vfork       = vfork;
+    ctx->proc        = cp;
+    cp->lock    = lock;
+    cp->threads = 1;
+
+    uint32_t none = 0;
+    int32_t r = espix_um_fds_fork(p, cp);
+    if (r == 0 && p->amo_count > 0) {
+        cp->amos = malloc(p->amo_count * 2 * sizeof(uint32_t));
+        if (cp->amos != NULL) {
+            memcpy(cp->amos, p->amos, p->amo_count * 2 * sizeof(uint32_t));
+            cp->amo_count = p->amo_count;
+        } else {
+            r = -ENOMEM;
+        }
+    }
+    if (r == 0 && vfork) {
+        cp->as = espix_um_as_get(p->as);
+    } else if (r == 0) {
+        const uint32_t asid = asid_alloc();
+        cp->as = (asid != 0) ? espix_um_as_fork(p->as, asid) : NULL;
+        if (cp->as == NULL) {
+            if (asid != 0) {
+                asid_free(asid);
+            }
+            r = (asid != 0) ? -ENOMEM : -EAGAIN;
+        }
+    }
+    if (r == 0 && !vfork) {
+        xSemaphoreTake(s_texts_lock, portMAX_DELAY);
+        for (int i = 0; i < p->ntext; i++) {
+            p->text[i]->users++;
+            cp->text[i] = p->text[i];
+        }
+        cp->ntext = p->ntext;
+        xSemaphoreGive(s_texts_lock);
+    }
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    memcpy(cp->act, p->act, sizeof(cp->act));
+    xSemaphoreGive(p->lock);
+
+    espix_pid_t pid = 0;
+    if (r == 0) {
+        if (vfork) {
+            vd->refs  = 2;
+            cp->vfork = vd;
+        }
+        r = espix_proc_fork(t->slot, ctx, &pid);
+    }
+    if (r != 0) {
+        cp->vfork = NULL;
+        espix_um_fds_drop(cp);
+        proc_free(cp, &none);
+        free(ctx);
+        free(vd);
+        return r;
+    }
+    if (!vfork) {
+        return (int32_t)pid;
+    }
+
+    /* Until the child execs or ends: it runs on this thread's stack. Only an end of the process comes first. */
+    espix_proc_slot_t *const slot = t->slot;
+    xSemaphoreTake(s_vfork_lock, portMAX_DELAY);
+    vd->waiter = xTaskGetCurrentTaskHandle();
+    xSemaphoreGive(s_vfork_lock);
+    for (;;) {
+        xSemaphoreTake(s_vfork_lock, portMAX_DELAY);
+        const bool done = vd->done;
+        if (done || slot->stop_requested || p->exiting) {
+            vd->waiter = NULL;
+        }
+        xSemaphoreGive(s_vfork_lock);
+        if (done) {
+            break;
+        }
+        if (slot->stop_requested || p->exiting) {
+            vfork_put(vd);
+            espix_um_exit_sig(t, SIGKILL);
+        }
+        (void)ulTaskNotifyTakeIndexed(ESPIX_NOTIFY_SIG_IDX, pdTRUE, pdMS_TO_TICKS(1000));
+    }
+    vfork_put(vd);
+    return (int32_t)pid;
+}
+
+const char *espix_um_fork_run(espix_proc_slot_t *slot)
+{
+    um_fork_t *const ctx = slot->app->fork;
+    espix_um_thread_t *const t = heap_caps_calloc(1, sizeof(*t), MALLOC_CAP_INTERNAL);
+    if (t == NULL) {
+        return "out of memory for a thread";
+    }
+    espix_um_proc_t *const p = ctx->proc;
+    t->proc        = p;
+    t->slot        = slot;
+    t->tid         = slot->info.pid;
+    t->task        = xTaskGetCurrentTaskHandle();
+    t->satp        = espix_um_as_satp(p->as);
+    t->sig_blocked = ctx->sig_blocked;
+    slot->app->um   = t;
+    slot->app->fork = NULL;
+    if (!ctx->vfork) {
+        espix_um_as_count(p->as, &slot->um_pages);
+    }
+
+    /* The parent's FPU registers are this thread's, restored as it first enters U. */
+    RvCoprocSaveArea *const sa = pxPortGetCoprocArea(t->task, true, FPU_COPROC_IDX);
+    memcpy(sa->sa_coprocs[FPU_COPROC_IDX], ctx->fpu, sizeof(ctx->fpu));
+    sa->sa_enable |= 1u << FPU_COPROC_IDX;
+
+    /* The frame at the kernel stack top for later traps, two scratch words above it. */
+    uint32_t area[RV_STK_FRMSZ / 4 + 8] __attribute__((aligned(16)));
+    memcpy(area, &ctx->frame, sizeof(ctx->frame));
+    free(ctx);
+
+    asm volatile ("mv %0, tp" : "=r"(t->ktp));
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, t);
+    if (pvTaskGetThreadLocalStoragePointer(NULL, ESPIX_TLS_FSPRIV_IDX) != NULL) {
+        vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, NULL);
+        return "refusing to enter U-mode with filesystem privilege held";
+    }
+    espix_um_resume((RvExcFrame *)area, (uint32_t)area + RV_STK_FRMSZ, t);
+}
+
+int32_t espix_um_exec_prepare(espix_um_thread_t *t, const char *path, int argc, char **argv, char **envp)
+{
+    char abs[ESPIX_PATH_MAX];
+    struct stat st;
+    if (espix_fs_resolve(espix_proc_cwd(), path, abs, sizeof(abs)) != ESP_OK) {
+        return -ENAMETOOLONG;
+    }
+    if (stat(abs, &st) != 0) {
+        return -errno;
+    }
+    if (!S_ISREG(st.st_mode) || !(st.st_mode & S_IXUSR)) {
+        return -EACCES;
+    }
+    /* An M-mode image needs a task of its own size: not yet from U-mode. */
+    if (!espix_um_file_is_exec(abs)) {
+        return -ENOEXEC;
+    }
+    espix_proc_slot_t *const slot = t->slot;
+    if (slot->stop_requested || t->proc->exiting) {
+        return -EINTR;
+    }
+    return espix_proc_exec_commit(slot, abs, argc, argv, envp);
+}
+
+void espix_um_exec_go(espix_um_thread_t *t)
+{
+    /* No way back: every other thread ends, and the main one loads the image in proc_task(). */
+    exit_group(t, 0, 0, true);
+}
+
+void espix_um_exec_reset(espix_proc_slot_t *slot)
+{
+    espix_um_thread_t *const t = slot->app->um;
+    espix_um_proc_t *const p = t->proc;
+    espix_um_objs_release(p);
+    /* A vfork's child leaves its parent's mappings alone. */
+    if (p->vfork == NULL) {
+        espix_um_unmap_files(p->as);
+    }
+    image_release(p, &slot->um_pages);
+    espix_um_fds_cloexec(p);
+    espix_um_sig_exec(p);
+    p->exiting     = false;
+    p->exec        = false;
+    p->exit_status = 0;
+    p->exit_sig    = 0;
+    p->threads     = 1;
+    t->diverted    = false;
+    t->gone        = false;
+    t->suspended   = false;
+    t->sys_intr    = false;
+    t->clear_tid   = 0;
+    t->stack       = 0;
+    t->exit_jmp    = NULL;
+    vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_UM_IDX, NULL);
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    slot->stop_requested = false;
+    slot->stop_sig       = 0;
+    slot->loading        = true;
+    xSemaphoreGive(g_espix_proc_lock);
 }
 
 #endif /* CONFIG_ESPIX_UMODE */
