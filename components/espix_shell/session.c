@@ -465,11 +465,12 @@ static bool expand_token(const espix_session_t *s, const char *in,
             continue;
         }
 
-        /* $? -- the status of the last command; $$ -- the shell's pid. */
-        if (p[1] == '?' || p[1] == '$') {
+        /* $? -- the status of the last command; $$ -- the shell's pid; $! -- the last background job's. */
+        if (p[1] == '?' || p[1] == '$' || p[1] == '!') {
             int v = 0;
             if (s != NULL) {
                 v = (p[1] == '?') ? s->last_status
+                  : (p[1] == '!') ? (int)s->last_bg
                                   : (s->pid > 0 ? (int)s->pid : 0);
             }
             char num[12];
@@ -637,6 +638,7 @@ bool espix_shell_job_add(espix_session_t *s, espix_pid_t pid, const char *name)
     if (s == NULL || pid <= 0) {
         return false;
     }
+    s->last_bg = pid;
     espix_shell_jobs_prune(s);
 
     for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
@@ -987,7 +989,7 @@ static int exec_one(espix_session_t *s, const char *line)
 }
 
 /*
- * `;`, `&&` and `||` as operators rather than words.
+ * `;`, `&`, `&&` and `||` as operators rather than words.
  *
  * A full shell parses the line into a tree before running anything; espix
  * splits it into one flat sequence, which is all these three need and costs no
@@ -995,9 +997,9 @@ static int exec_one(espix_session_t *s, const char *line)
  * only an operator when it is unquoted -- `echo 'a;b'` is one command, and the
  * `&` in `2>&1` is not `&&`.
  *
- * The result is a shell's: each segment runs in turn, `&&` skips the next when
- * the last status was non-zero, `||` skips it when the status was zero, and the
- * line's status is the last segment's. A blank segment is skipped, so `a ;; b`
+ * The result is a shell's: each segment runs in turn, one ending in `&` in the
+ * background, `&&` skips the next when the last status was non-zero, `||` skips
+ * it when the status was zero, and the line's status is the last segment's. A blank segment is skipped, so `a ;; b`
  * is `a` then `b`, and a line of nothing but separators runs nothing -- which
  * leaves $? alone, as an empty line does.
  */
@@ -1377,11 +1379,21 @@ int espix_shell_exec(espix_session_t *s, const char *line)
                 (*p == '|' && p[1] == '|')) {
                 break;
             }
+            /* A word of its own with more after it: `a & b` starts a in the background, then runs b. */
+            if (*p == '&' && (p == seg || p[-1] == ' ' || p[-1] == '\t') && (p[1] == ' ' || p[1] == '\t') &&
+                !blank_segment(p + 1)) {
+                break;
+            }
             p++;
         }
 
         const char op = *p;
-        *p = '\0';
+        const bool bg = op == '&' && p[1] != '&';
+        if (bg) {
+            p[1] = '\0';     /* the & stays the segment's last word, which runs it in the background */
+        } else {
+            *p = '\0';
+        }
 
         const bool skip = (pending == 1) ? (ran && status != 0)
                                          : (pending == 2 ? (ran && status == 0)
@@ -1406,7 +1418,7 @@ int espix_shell_exec(espix_session_t *s, const char *line)
             break;
         }
         p += (op == ';') ? 1 : 2;
-        pending = (op == '&') ? 1 : ((op == '|') ? 2 : 0);
+        pending = bg ? 0 : (op == '&') ? 1 : ((op == '|') ? 2 : 0);
         seg = p;
     }
 

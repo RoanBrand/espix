@@ -763,6 +763,71 @@ static int cmd_fg(espix_session_t *s, int argc, char **argv)
     return code;
 }
 
+#define WAIT_POLL_MS 100
+
+/* One pid's end and its status, the job reaped; 128 + SIGINT when the wait is interrupted. */
+static int wait_one(espix_session_t *s, espix_pid_t pid, bool *intr)
+{
+    int code = 0;
+    for (;;) {
+        const esp_err_t err = espix_proc_wait(pid, &code, 0);
+        if (err == ESP_OK) {
+            break;
+        }
+        if (err != ESP_ERR_TIMEOUT) {
+            espix_eprintf(s, "wait: pid %d is not a child of this shell\n", (int)pid);
+            return 127;
+        }
+        if (espix_proc_sleep(WAIT_POLL_MS)) {
+            *intr = true;
+            return 128 + SIGINT;
+        }
+    }
+    for (int i = 0; i < ESPIX_SESSION_JOBS; i++) {
+        if (s->jobs[i].pid == pid) {
+            espix_shell_job_clear(s, i);
+        }
+    }
+    return code;
+}
+
+/* wait: every job, or the ones named, to their end, in the background still; the last one's status. */
+static int cmd_wait(espix_session_t *s, int argc, char **argv)
+{
+    bool intr = false;
+    if (argc < 2) {
+        espix_shell_jobs_prune(s);
+        for (int i = 0; i < ESPIX_SESSION_JOBS && !intr; i++) {
+            if (s->jobs[i].pid > 0) {
+                (void)wait_one(s, s->jobs[i].pid, &intr);
+            }
+        }
+        return intr ? 128 + SIGINT : 0;
+    }
+    int code = 0;
+    for (int a = 1; a < argc && !intr; a++) {
+        espix_pid_t pid;
+        if (argv[a][0] == '%') {
+            const espix_job_t *const j = job_pick_process(s, "wait", argv[a]);
+            if (j == NULL) {
+                code = 127;
+                continue;
+            }
+            pid = j->pid;
+        } else {
+            char *end = NULL;
+            const long n = strtol(argv[a], &end, 10);
+            if (end == argv[a] || *end != '\0' || n <= 0) {
+                espix_eprintf(s, "wait: %s: not a pid or %%job\n", argv[a]);
+                return 2;
+            }
+            pid = (espix_pid_t)n;
+        }
+        code = wait_one(s, pid, &intr);
+    }
+    return code;
+}
+
 static espix_cmd_t s_run_cmds[] = {
     { .name = "timeout", .fn = cmd_timeout, .shell = true,
       .help = "run a program, ending it if it overruns",
@@ -788,6 +853,9 @@ static espix_cmd_t s_run_cmds[] = {
     { .name = "bg", .fn = cmd_bg, .shell = true,
       .help = "resume a stopped background job",
       .usage = "bg [%n|pid]" },
+    { .name = "wait", .fn = cmd_wait, .shell = true,
+      .help = "wait for background jobs to end; the last one's status",
+      .usage = "wait [%n|pid]..." },
 };
 
 void espix_cmds_register_run(void)

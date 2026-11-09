@@ -20,7 +20,7 @@ merely missing.
 | Quoting and backslash escapes | **yes** | |
 | Exit status | **yes** | `exit 3` reaches an SSH client's `$?` |
 | A session's terminal, termios, `stty` | **yes** | every login has a tty (SSH, the serial console, a VNC terminal): echo, line editing and the signal keys are its line discipline's. An app's fds 0-2 are it in both builds -- `isatty`, `tcgetattr`/`tcsetattr`, `cfmakeraw`, `TIOCGWINSZ`, and `poll`/`select` that wait for a key; an exec without a pty gives a pipe. `stty` shows and sets it |
-| Background jobs `&` | **yes** | `&`, `jobs`/`fg`/`bg`, Ctrl-Z stops the foreground app into a job; a job that reads the terminal stops on SIGTTIN (EIO if it ignores or blocks it), over SSH, on the serial console and in a VNC terminal; a job still dies at logout by design |
+| Background jobs `&` | **yes** | `&`, `$!`, `jobs`/`fg`/`bg`/`wait`, Ctrl-Z stops the foreground app into a job; a job that reads the terminal stops on SIGTTIN (EIO if it ignores or blocks it), over SSH, on the serial console and in a VNC terminal; a job still dies at logout by design |
 | Pipes <code>&#124;</code> | **yes** | builtins only; one StreamBuffer per pipe, and a writer fails once its reader is done (`cat f \| head -1`) |
 | Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |
 | Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv` |
@@ -34,7 +34,7 @@ merely missing.
 | Run a cross-compiled native app by name | **yes** | `/bin` search, argv, exit status |
 | `ps`, `top` | **yes** | live CPU and memory, per core |
 | Stop a running command — Ctrl-C, `kill` | **yes** | a command is a process like an app; Ctrl-C is SIGINT to the foreground job's group; `kill` asks, then insists |
-| Process tree — `$$`, `getppid`, `getpgrp`, `getsid`, `kill -<pgid>`, `killpg` | **yes** | a shell is a process and its apps' parent; each job is its own group |
+| Process tree — `$$`, `$!`, `getppid`, `getpgrp`, `getsid`, `kill -<pgid>`, `killpg` | **yes** | a shell is a process and its apps' parent; each job is its own group |
 | Signals and handlers — `signal()`, `kill -9`, `-STOP`/`-CONT` | **yes** | real POSIX names, with `sigaction`'s mask and flags, `sigsuspend` and `pthread_sigmask`; an M-mode app takes them when it calls in, under one mask per process, and a U-mode app (S31) at any instruction, with per-thread masks and `SA_RESTART` |
 | `kill -l`, `ps` showing `T` for stopped | **yes** | |
 | A crashing app not taking the system down | **yes** | a fault ends the app with 128 + its signal, or runs its handler, in both modes and on both targets; what it wrote before the fault, a lock it held in the kernel and a blown stack are not undone ([crash handling](../README.md#crash-handling-and-isolation)) |

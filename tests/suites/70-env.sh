@@ -328,6 +328,18 @@ assert_eq "\$? follows the last segment, not the first" "0" \
 assert_eq "\$? after an && skip and an || run" "1" \
     "$(dev_run 'false && echo no || echo $?')"
 
+# & ends a command as ; does, starting it as a job; $! names it and wait reaps it.
+bg_out=$(dev_run 'sleep 1 & echo pid=$!; wait $!; echo st=$?')
+bg_pid=$(printf '%s\n' "$bg_out" | sed -n 's/^pid=\([0-9]*\)$/\1/p')
+if [ -n "$bg_pid" ] && [ "$bg_pid" -gt 0 ]; then
+    espix_pass "\$! names the job a mid-line & started ($bg_pid)"
+else
+    espix_fail "\$! names the job a mid-line & started" "$bg_out"
+fi
+assert_contains "wait \$! returns its status" "st=0" "$bg_out"
+assert_contains "a bare wait waits for every job" "no jobs" "$(dev_run 'sleep 1 & sleep 1 & wait; jobs')"
+assert_contains "wait on a pid that is no child of the shell" "st=127" "$(dev_run 'wait 99999; echo st=$?' 2>&1)"
+
 # A line past the limit is refused whole. It used to be cut and run: an rm of
 # twelve files removed nine.
 long="echo $(printf 'x%.0s' $(seq 1 300))"

@@ -239,6 +239,7 @@ struct espix_session {
     espix_job_t jobs[ESPIX_SESSION_JOBS];
 
     int         last_status;               /* $? */
+    espix_pid_t last_bg;                   /* $!: the last job started with & */
     bool        want_exit;
 
     /*
