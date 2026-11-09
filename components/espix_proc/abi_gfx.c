@@ -57,12 +57,12 @@ static struct espix_gfx s_gfx;
  * rather than a stuck picture. The gfx handle is firmware memory and outlives
  * the app, so it can remember the holder and orphan the lock once the process
  * is gone; see espix_gfx_recover(). Keyed on the pid, never the task handle,
- * because a deleted task's TCB is freed.
+ * because a deleted task's TCB is freed; a thread's is its process's.
  */
 static void gfx_canvas_take(espix_canvas_t *c)
 {
     espix_canvas_lock(c);
-    s_gfx.lock_pid      = espix_proc_pid_of_task(xTaskGetCurrentTaskHandle());
+    s_gfx.lock_pid      = espix_proc_self_pid();
     s_gfx.canvas_locked = true;
 }
 
@@ -290,6 +290,23 @@ void espix_gfx_present_surface(espix_gfx_t *g, const espix_gfx_surface_t *s)
     gfx_canvas_take(c);
     espix_canvas_scale_surface(c, s->s);
     gfx_canvas_give(c);
+}
+
+bool espix_gfx_present_rect_of(const espix_surface_t *s, int x, int y, int w, int h)
+{
+    espix_canvas_t *c;
+
+    if (!s_gfx.open || s == NULL || (c = espix_display_canvas()) == NULL) {
+        return false;
+    }
+    gfx_canvas_take(c);
+    if (w == 0) {
+        espix_canvas_scale_surface(c, s);
+    } else {
+        espix_canvas_blit_surface_rect(c, 0, 0, s, (espix_rect_t){ x, y, w, h });
+    }
+    gfx_canvas_give(c);
+    return true;
 }
 
 bool espix_gfx_poll_event(espix_gfx_t *g, espix_input_event_t *ev)

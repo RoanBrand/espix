@@ -646,14 +646,22 @@ size_t espix_canvas_photo_jpeg(const espix_canvas_t *c, uint8_t *out, size_t cap
     return (c->photo_fn != NULL) ? c->photo_fn(c->photo_ctx, out, cap) : 0;
 }
 
-/* One 2D-DMA user at a time (see espix_dma2d.h); also one PPA completion in flight. */
+/*
+ * One 2D-DMA user at a time (see espix_dma2d.h); also one PPA completion in flight. A binary
+ * semaphore and a holder of its own, not a mutex: only a mutex's holder may give it, and a task
+ * deleted holding one leaves later waiters walking its freed TCB.
+ */
 static SemaphoreHandle_t s_dma2d_lock;
+static TaskHandle_t      s_dma2d_holder;
 static portMUX_TYPE      s_dma2d_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool espix_dma2d_take(TickType_t wait)
 {
     if (s_dma2d_lock == NULL) {
-        SemaphoreHandle_t m = xSemaphoreCreateMutex();
+        SemaphoreHandle_t m = xSemaphoreCreateBinary();
+        if (m != NULL) {
+            xSemaphoreGive(m);
+        }
         portENTER_CRITICAL(&s_dma2d_mux);
         if (s_dma2d_lock == NULL) {
             s_dma2d_lock = m;
@@ -667,12 +675,34 @@ bool espix_dma2d_take(TickType_t wait)
             return false;
         }
     }
-    return xSemaphoreTake(s_dma2d_lock, wait) == pdTRUE;
+    if (xSemaphoreTake(s_dma2d_lock, wait) == pdTRUE) {
+        s_dma2d_holder = xTaskGetCurrentTaskHandle();
+        return true;
+    }
+    TaskHandle_t holder = s_dma2d_holder;
+    espix_klog(ESPIX_KLOG_WARN, TAG, "2D-DMA busy for %u ms: held by %s, wanted by %s",
+               (unsigned)pdTICKS_TO_MS(wait), holder ? pcTaskGetName(holder) : "nobody", pcTaskGetName(NULL));
+    return false;
 }
 
 void espix_dma2d_give(void)
 {
+    s_dma2d_holder = NULL;
     xSemaphoreGive(s_dma2d_lock);
+}
+
+void espix_display_task_gone(void *task)
+{
+    portENTER_CRITICAL(&s_dma2d_mux);
+    const bool held = task != NULL && s_dma2d_holder == task;
+    if (held) {
+        s_dma2d_holder = NULL;
+    }
+    portEXIT_CRITICAL(&s_dma2d_mux);
+    if (held) {
+        xSemaphoreGive(s_dma2d_lock);
+        espix_klog(ESPIX_KLOG_WARN, TAG, "2D-DMA given back for a task deleted holding it");
+    }
 }
 
 #if SOC_PPA_SUPPORTED
@@ -1629,7 +1659,7 @@ void espix_canvas_scale_surface(espix_canvas_t *c, const espix_surface_t *s)
 /* Surfaces                                                            */
 /* ------------------------------------------------------------------ */
 
-espix_surface_t *espix_surface_new(int w, int h)
+static espix_surface_t *surface_new(int w, int h, size_t align)
 {
     if (w <= 0 || h <= 0) {
         return NULL;
@@ -1640,7 +1670,10 @@ espix_surface_t *espix_surface_new(int w, int h)
         return NULL;
     }
 
-    s->px = buf_alloc((size_t)w * h * sizeof(espix_px_t));
+    const size_t bytes = (size_t)w * h * sizeof(espix_px_t);
+    s->px = (align == 0) ? buf_alloc(bytes)
+                         : heap_caps_aligned_calloc(align, 1, (bytes + align - 1) & ~(align - 1),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s->px == NULL) {
         free(s);
         return NULL;
@@ -1657,6 +1690,16 @@ espix_surface_t *espix_surface_new(int w, int h)
     s->h = h;
     s->stride = w;
     return s;
+}
+
+espix_surface_t *espix_surface_new(int w, int h)
+{
+    return surface_new(w, h, 0);
+}
+
+espix_surface_t *espix_surface_new_aligned(int w, int h, size_t align)
+{
+    return (align >= BUF_ALIGN && (align & (align - 1)) == 0) ? surface_new(w, h, align) : NULL;
 }
 
 void espix_surface_free(espix_surface_t *s)

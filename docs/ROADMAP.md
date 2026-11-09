@@ -380,7 +380,9 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 - **`kill -9` lets the app run to its exit.** espix asks first and deletes only
   a process that has not left 250 ms later, so a killed `cat` still prints its
-  count on the way out; Linux's SIGKILL ends it where it stands.
+  count on the way out; Linux's SIGKILL ends it where it stands. A process deleted
+  that way ends with status 1 (`ps`: `kill -1`), not 137: an M-mode app in a loop
+  that never calls in, such as Doom's timedemo, gets there from any kill.
 
 - **App start-up costs about 300 ms**, for a 25 KB app: resolving the command,
   the spawn and reading the image take about 80 ms each, and a file builtin

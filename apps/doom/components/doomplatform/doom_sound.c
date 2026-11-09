@@ -18,9 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_timer.h"
+#include <time.h>
+#include <unistd.h>
 
 #include "deh_str.h"
 #include "i_sound.h"
@@ -139,19 +138,23 @@ static sfx_cache_t *sfx_cache(sfxinfo_t *sfx)
 }
 
 /*
- * Every wait in this file goes through here, because pdMS_TO_TICKS() floors and
- * this app's tick is 10 ms (CONFIG_FREERTOS_HZ=100, where the firmware's is
- * 250). A wait of one millisecond therefore converts to *zero* ticks, and
- * vTaskDelay(0) does not sleep -- it yields -- which on a task above the game's
- * priority is a hot spin. That is what made the mixer produce at 169206 frames
- * a second where 44100 was wanted: the audio ran nearly four times too fast,
- * heard as distortion, and the game along with it.
+ * Every wait in this file goes through here, and it always sleeps: a wait that
+ * only yields is a hot spin on a task above the game's priority, which is what
+ * once made the mixer produce at 169206 frames a second where 44100 was wanted.
  */
 static void sfx_delay_ms(int ms)
 {
-    TickType_t ticks = pdMS_TO_TICKS(ms);
-    vTaskDelay(ticks == 0 ? 1 : ticks);
+    usleep((useconds_t)(ms > 0 ? ms : 1) * 1000);
 }
+
+#if ESPIX_SFX_TRACE
+static int64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+#endif
 
 static void sfx_set_params(int channel, int vol, int sep)
 {
@@ -207,7 +210,7 @@ static void *sfx_thread(void *arg)
      * frames a second where 44100 was wanted, so they stay reachable.
      */
     int64_t  stat_mix_us = 0, stat_wr_us = 0, stat_sleep_us = 0;
-    int64_t  stat_win = esp_timer_get_time();
+    int64_t  stat_win = now_us();
     uint32_t stat_blocks = 0, stat_short = 0;
 #endif
 
@@ -215,7 +218,7 @@ static void *sfx_thread(void *arg)
         /* Mix a block, then hand it to the stream and block on it. The block
          * itself is the loop; there is no pacing here by design, see above. */
 #if ESPIX_SFX_TRACE
-        const int64_t t_a = esp_timer_get_time();
+        const int64_t t_a = now_us();
 #endif
 
         memset(s_acc, 0, sizeof(s_acc));
@@ -247,7 +250,7 @@ static void *sfx_thread(void *arg)
         }
 
 #if ESPIX_SFX_TRACE
-        const int64_t t_b = esp_timer_get_time();
+        const int64_t t_b = now_us();
 #endif
 
         if (!any) {
@@ -257,12 +260,12 @@ static void *sfx_thread(void *arg)
 #if ESPIX_SFX_TRACE
             stat_mix_us += (t_b - t_a);
             if (++stat_blocks >= 256) {
-                const int64_t wall = esp_timer_get_time() - stat_win;
+                const int64_t wall = now_us() - stat_win;
                 printf("sfx idle %u blk: %lld ms wall, mix %lld sleep %lld ms\n",
                        (unsigned)stat_blocks, (long long)(wall / 1000),
                        (long long)(stat_mix_us / 1000),
                        (long long)(stat_sleep_us / 1000));
-                stat_win = esp_timer_get_time();
+                stat_win = now_us();
                 stat_blocks = 0; stat_mix_us = 0;
                 stat_wr_us = 0; stat_sleep_us = 0; stat_short = 0;
             }
@@ -287,7 +290,7 @@ static void *sfx_thread(void *arg)
         }
 
 #if ESPIX_SFX_TRACE
-        const int64_t t_c = esp_timer_get_time();
+        const int64_t t_c = now_us();
         stat_mix_us += (t_b - t_a);
         stat_wr_us  += (t_c - t_b);
         if (++stat_blocks >= 256) {
@@ -297,7 +300,7 @@ static void *sfx_thread(void *arg)
              * The rate is what a listener hears -- 44100 frames a second is
              * right, more is the audio running fast, less is it starving.
              */
-            const int64_t  wall   = esp_timer_get_time() - stat_win;
+            const int64_t  wall   = now_us() - stat_win;
             const uint64_t frames = (uint64_t)stat_blocks * MIX_FRAMES;
             const uint64_t rate   = (wall > 0) ? frames * 1000000ULL / (uint64_t)wall : 0;
             printf("sfx %u blk: %lld ms wall, mix %lld write %lld sleep %lld ms, "
@@ -306,7 +309,7 @@ static void *sfx_thread(void *arg)
                    (long long)(stat_mix_us / 1000), (long long)(stat_wr_us / 1000),
                    (long long)(stat_sleep_us / 1000),
                    (unsigned long long)rate, OUT_RATE, (unsigned)stat_short);
-            stat_win = esp_timer_get_time();
+            stat_win = now_us();
             stat_blocks = 0; stat_mix_us = 0; stat_wr_us = 0;
             stat_sleep_us = 0; stat_short = 0;
         }
@@ -363,7 +366,7 @@ static void I_Espix_ShutdownSound(void)
      */
     s_running = false;
     for (int i = 0; i < 200 && !s_thread_done; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        sfx_delay_ms(10);
     }
     if (s_thread_up) {
         pthread_join(s_thread, NULL);

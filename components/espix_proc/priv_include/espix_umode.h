@@ -53,6 +53,19 @@ typedef struct {
 
 typedef struct espix_um_waiter espix_um_waiter_t;
 
+enum { ESPIX_UM_OBJ_FREE, ESPIX_UM_OBJ_SURFACE, ESPIX_UM_OBJ_AUDIO };
+
+/* A gfx surface or an audio stream the process holds, by handle; a call using it holds a reference. */
+typedef struct {
+    uint8_t  kind;
+    bool     closed;    /* its handle is gone; the last reference ends it */
+    int      refs;
+    void    *obj;
+    uint32_t va;        /* a surface's pixels in the app */
+} espix_um_obj_t;
+
+#define ESPIX_UM_OBJS 8
+
 /* A U-mode process: what its threads share. */
 typedef struct {
     espix_um_as_t     *as;
@@ -65,6 +78,8 @@ typedef struct {
     uint32_t          *amos;        /* each AMO the loader replaced: its pc and the instruction, by pc */
     uint32_t           amo_count;
     struct espix_sigaction act[NSIG];   /* under lock */
+    espix_um_obj_t     objs[ESPIX_UM_OBJS];     /* under lock */
+    void              *gfx;         /* the screen (espix_gfx_t), while it holds it */
 } espix_um_proc_t;
 
 /* What the trap exit needs to resume a thread in U-mode; internal RAM, read on the interrupt path. */
@@ -102,6 +117,8 @@ const char *espix_um_exec(espix_proc_slot_t *slot);
 
 /* Before the owned-fd sweep: the process's descriptors, closed while their numbers are still its own. */
 void espix_um_close_fds(espix_proc_slot_t *slot);
+/* Its surfaces and audio streams, ended once its threads are gone (umode_gfx.c). */
+void espix_um_objs_release(espix_um_proc_t *p);
 
 void espix_um_release(espix_proc_slot_t *slot);
 
@@ -147,7 +164,7 @@ void espix_um_fpu_restore(const void *area);
 int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f);
 void    espix_um_fds_init(espix_um_proc_t *p);
 
-/* The heap grows by brk up to here; mmap will live above it. */
+/* The heap grows by brk up to here; lent memory, and mmap, live above it. */
 #define ESPIX_UM_BRK_MAX 0x60000000u
 
 /* The main thread's stack: 8 MB reserved under the top, mapped as touched; Linux's ulimit -s. */
@@ -157,10 +174,21 @@ void    espix_um_fds_init(espix_um_proc_t *p);
 #define ESPIX_UM_TSTACKS    31
 
 /* Address spaces (umode_mm.c). Frames are 4 KiB of PSRAM; a physical address is the pointer. */
+void           espix_um_frames_init(void);
+/* Frames carved and not in use, which the heap counts as taken. */
+uint32_t       espix_um_frames_spare(void);
 espix_um_as_t *espix_um_as_new(uint32_t asid);
 void           espix_um_as_free(espix_um_as_t *as);
 uint32_t       espix_um_as_satp(const espix_um_as_t *as);
 void          *espix_um_map_new(espix_um_as_t *as, uint32_t va, uint32_t pte_flags);
+
+/*
+ * Kernel memory lent to the app: len bytes from page-aligned k, mapped whole at a free address
+ * above the heap's limit; the address, or 0. Unmapped, release(obj) runs once no kernel call
+ * holds a pointer into it; false if nothing is lent at va.
+ */
+uint32_t espix_um_map_lent(espix_um_as_t *as, void *k, size_t len, uint32_t pte_flags);
+bool     espix_um_unmap_lent(espix_um_as_t *as, uint32_t va, void (*release)(void *), void *obj);
 
 /* A range mapped zeroed page by page as it is touched; false when the table of them is full. */
 bool     espix_um_region_add(espix_um_as_t *as, uint32_t start, uint32_t end, uint32_t pte_flags);

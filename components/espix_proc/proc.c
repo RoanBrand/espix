@@ -22,6 +22,7 @@
 #include "espix_shell.h"   /* session->task_gone, told when a kill orphans a lock */
 #include "espix_pm.h"       /* ...and espix_pm_task_gone(), for the same reason */
 #include "espix_audio.h"    /* ...and espix_audio_streams_recover(), likewise */
+#include "espix_display.h"  /* ...and espix_display_task_gone() */
 
 #define TAG "proc"
 
@@ -1511,6 +1512,7 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
          * again -- and the sink never suspends while it is "open".
          */
         espix_audio_streams_recover((void *)task);
+        espix_display_task_gone((void *)task);
     }
 
     /* Said out loud, and only once the lock is down. "stdio detached" means this

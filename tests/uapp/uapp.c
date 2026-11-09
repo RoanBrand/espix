@@ -34,6 +34,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "espix_audio.h"
+#include "espix_gfx.h"
+
 static unsigned long cycles(void)
 {
     unsigned long c;
@@ -968,6 +971,71 @@ int main(int argc, char **argv)
         }
         close(fd);
         printf("uapp: into the file\n");
+        return 0;
+    }
+    if (strcmp(mode, "gfx") == 0) {
+        /* A surface drawn red and presented, then freed: its pixels are gone from the app. */
+        espix_gfx_t *g = espix_gfx_open();
+        espix_gfx_surface_t *s = (g != NULL) ? espix_gfx_surface_new(64, 48) : NULL;
+        if (s == NULL) {
+            printf("uapp: gfx: no display\n");
+            return 1;
+        }
+        espix_gfx_fb_t fb = espix_gfx_surface_lock(s);
+        for (int i = 0; i < fb.h * fb.stride; i++) {
+            fb.pixels[i] = 0xF800;
+        }
+        espix_gfx_surface_unlock(s);
+        espix_gfx_present_surface(g, s);
+        printf("uapp: gfx: %dx%d stride %d presented\n", fb.w, fb.h, fb.stride);
+        if (argc > 2) {
+            sleep((unsigned)atoi(argv[2]));
+        }
+        espix_gfx_surface_free(s);
+        printf("uapp: gfx: freed\n");
+        fflush(stdout);
+        fb.pixels[0] = 1;
+        printf("uapp: gfx: still mapped\n");
+        return 0;
+    }
+    if (strcmp(mode, "audio") == 0 && argc > 2) {
+        /* ms of silence written to a stream: the sink paces the writes. */
+        const espix_audio_format_t fmt = { 44100, 2, 16 };
+        espix_audio_stream_t *st = espix_audio_stream_open(&fmt);
+        if (st == NULL) {
+            printf("uapp: audio: no sink\n");
+            return 1;
+        }
+        static int16_t block[2048];
+        const size_t want = (size_t)atoi(argv[2]) * 44100 / 1000 * 4;
+        size_t done = 0;
+        const unsigned long t0 = now_us();
+        while (done < want) {
+            const size_t n = (want - done < sizeof(block)) ? want - done : sizeof(block);
+            const size_t w = espix_audio_stream_write(st, block, n);
+            done += w;
+            if (w == 0) {
+                usleep(10000);
+            }
+        }
+        const unsigned long t1 = now_us();
+        const uint32_t queued = espix_audio_stream_queued_us(st);
+        espix_audio_stream_close(st);
+        printf("uapp: audio: wrote %u bytes in %lu ms, %u us queued, closed in %lu ms\n",
+               (unsigned)done, (t1 - t0) / 1000, (unsigned)queued, (now_us() - t1) / 1000);
+        return 0;
+    }
+    if (strcmp(mode, "gfxkeep") == 0) {
+        /* Ends holding a surface, and an audio stream if there is a sink, for the kernel to give back. */
+        espix_gfx_t *g = espix_gfx_open();
+        espix_gfx_surface_t *s = (g != NULL) ? espix_gfx_surface_new(320, 240) : NULL;
+        const espix_audio_format_t fmt = { 44100, 2, 16 };
+        espix_audio_stream_t *st = espix_audio_stream_open(&fmt);
+        printf("uapp: gfxkeep: surface %s, stream %s\n", s ? "held" : "none", st ? "held" : "none");
+        fflush(stdout);
+        if (argc > 2) {
+            sleep((unsigned)atoi(argv[2]));
+        }
         return 0;
     }
     if (strcmp(mode, "bigheap") == 0) {

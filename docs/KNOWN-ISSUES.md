@@ -463,7 +463,8 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
 A static executable built with `tools/espix-cc` runs in U-mode, in an address
 space of its own ([USER-MODE.md](USER-MODE.md)). It has files, directories,
-stdio, time, sleep, identity, threads, signals and sockets. What it cannot do yet:
+stdio, time, sleep, identity, threads, signals, sockets, the screen and audio
+streams. What it cannot do yet:
 
 - **One thread takes a process's signal**, as on Linux: a sleep in another
   thread is not cut short by it, where an M-mode app's every sleeping thread
@@ -979,6 +980,15 @@ stdio, time, sleep, identity, threads, signals and sockets. What it cannot do ye
   but it was never the fix for this.
 
 ## Display and desktop
+
+- **Each run of the M-mode Doom leaks about 8 KB of internal RAM**, whether it
+  ends on its own or is killed; twenty runs left too little for an SSH key
+  exchange. `doom-u`, plasma, an M-mode app's threads and audio streams leak
+  nothing, so it is something only the M-mode Doom does. Not found yet.
+
+- **The bottom row of a scaled surface is noise**: Doom's 320x200 surface on its
+  320x240 canvas ends in a row of stray pixels, in both builds, so the PPA's
+  scale reads or writes past its last row.
 
 - **On a freshly created 320x240 desktop the icons cannot be clicked.** The
   terminal window is 76 columns wide, which is 616 pixels, and

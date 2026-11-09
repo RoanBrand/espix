@@ -120,6 +120,7 @@ void espix_um_init(void)
             }
         }
     }
+    espix_um_frames_init();
     /* cpu_apm region 0 (flash and PSRAM) is TEE-only, and U-mode is REE: the page tables isolate instead. */
     REG_SET_BIT(CPU_APM_REGION0_ATTR_REG, 0x0777);
     espix_klog(ESPIX_KLOG_INFO, TAG, "user mode on; mscratch at boot 0x%08x 0x%08x",

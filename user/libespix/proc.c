@@ -25,9 +25,21 @@ int kill(pid_t pid, int sig)
     return espix_ret(espix_sys2(ESPIX_SYS_KILL, pid, sig));
 }
 
+static long mem_pages(int name)
+{
+    struct espix_meminfo m;
+    if (espix_ret(espix_sys1(ESPIX_SYS_MEMINFO, &m)) < 0) {
+        return -1;
+    }
+    return (name == _SC_PHYS_PAGES) ? (long)m.total : (long)m.free;
+}
+
 long sysconf(int name)
 {
     switch (name) {
+    case _SC_PHYS_PAGES:
+    case _SC_AVPHYS_PAGES:
+        return mem_pages(name);
     case _SC_OPEN_MAX:
         return ESPIX_OPEN_MAX;
     case _SC_PAGESIZE:

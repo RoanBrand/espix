@@ -12,7 +12,9 @@ UM_DIR=$(mktemp -d)
 UAPP="/home/$ESPIX_USER/uapp-$ESPIX_WORKER"
 UHELLO="/home/$ESPIX_USER/hello-u-$ESPIX_WORKER"
 
-if ! "$ESPIX_ROOT/tools/espix-cc" -Os -o "$UM_DIR/uapp" "$ESPIX_ROOT/tests/uapp/uapp.c" >/dev/null 2>&1 ||
+if ! "$ESPIX_ROOT/tools/espix-cc" -Os -I"$ESPIX_ROOT/components/espix_proc/include" \
+        -I"$ESPIX_ROOT/components/espix_display/include" -I"$ESPIX_ROOT/components/espix_audio/include" \
+        -o "$UM_DIR/uapp" "$ESPIX_ROOT/tests/uapp/uapp.c" >/dev/null 2>&1 ||
    ! "$ESPIX_ROOT/tools/espix-cc" -Os -o "$UM_DIR/hello-u" "$ESPIX_ROOT/apps/hello/main/hello.c" >/dev/null 2>&1; then
     espix_fail "the U-mode apps build" "tools/espix-cc failed"
     rm -rf "$UM_DIR"

@@ -226,6 +226,8 @@ typedef struct espix_surface espix_surface_t;
 
 /* PSRAM first, internal as a fallback, NULL when neither fits. */
 espix_surface_t *espix_surface_new(int w, int h);
+/* PSRAM only and zeroed, the pixels starting on an align boundary and filling whole multiples of it. */
+espix_surface_t *espix_surface_new_aligned(int w, int h, size_t align);
 void             espix_surface_free(espix_surface_t *s);
 
 int         espix_surface_width(const espix_surface_t *s);
@@ -436,6 +438,9 @@ void espix_display_pointer(int *x, int *y);
  * console cannot disagree about what a key produces.
  */
 char espix_keysym_char(uint32_t keysym);
+
+/* A task deleted mid-call (the process reaper): the 2D-DMA engine is given back if it held it. */
+void espix_display_task_gone(void *task);
 
 /* ------------------------------------------------------------------ */
 /* The screen's owner                                                  */

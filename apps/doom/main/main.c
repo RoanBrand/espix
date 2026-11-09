@@ -12,7 +12,6 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#include "esp_heap_caps.h"
 #include "espix_gfx.h"
 
 #include "doomgeneric.h"
@@ -59,6 +58,31 @@ static const char *const wad_paths[] = {
     "/mnt/sda1/doom1.wad",
 };
 
+#if __has_include("esp_heap_caps.h")
+#include "esp_heap_caps.h"
+
+/*
+ * An M-mode app's zone is one block of its arena, so the question is the
+ * largest free block. espix's heap_caps_get_largest_free_block() answers for
+ * this process (its arenas plus the global pool), so it is asked rather than
+ * probed: a probe that mallocs 6, 5, 4 ... MiB makes the arena carve a region
+ * the size of the probe, which the zone then neither fits nor sees past.
+ */
+static size_t zone_room(void)
+{
+    return heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+}
+#else
+#include <unistd.h>
+
+/* A U-mode app's heap is mapped a page at a time, so what is free is what it can have. */
+static size_t zone_room(void)
+{
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    return (pages > 0) ? (size_t)pages * (size_t)sysconf(_SC_PAGESIZE) : 0;
+}
+#endif
+
 static const char *find_wad(void)
 {
     for (size_t i = 0; i < sizeof(wad_paths) / sizeof(wad_paths[0]); i++) {
@@ -78,7 +102,7 @@ static const char *find_wad(void)
  * the WAD is named here and the engine parses its arguments in one pass
  * wherever they sit.
  */
-void app_main(int app_argc, char **app_argv)
+int main(int app_argc, char **app_argv)
 {
     /*
      * 320x240, not the 320x200 the engine renders into: Doom's pixels are not
@@ -91,50 +115,36 @@ void app_main(int app_argc, char **app_argv)
     doom_gfx = espix_gfx_open_mode(320, 240);
     if (doom_gfx == NULL) {
         printf("doom: no display up (start it with 'vnc start')\n");
-        return;
+        return 1;
     }
 
     doom_surface = espix_gfx_surface_new(320, 200);
     if (doom_surface == NULL) {
         printf("doom: no surface\n");
         espix_gfx_close(doom_gfx);
-        return;
+        return 1;
     }
 
     const char *wad = find_wad();
     if (wad == NULL) {
         printf("doom: no doom1.wad in /var/lib/doom or on the stick\n");
-        return;
+        return 1;
     }
 
     printf("doom: starting with %s\n", wad);
 
     /*
      * The engine asks for a single 6 MiB zone block (i_system.c DEFAULT_RAM),
-     * and that request sits right at the edge of the largest block PSRAM has
-     * left once the app is loaded -- so it succeeds some boots and aborts
-     * others. Report what is actually available before asking.
+     * which can be more than is left once the app is loaded. Report what is
+     * available before asking.
      */
-    /*
-     * Ask, do not probe.
-     *
-     * The probe used to malloc 6, 5, 4 ... MiB until one succeeded: answering
-     * the question by *taking* the biggest block and handing it back. Under the
-     * arena that is not free -- the successful probe makes the arena carve a
-     * region for it, and that region is exactly the size of the probe, so the
-     * engine's own zone then neither fits in it nor can see the block it split.
-     * espix's heap_caps_get_largest_free_block() answers for this process now
-     * (its arenas plus the global pool), so the question can be asked without
-     * disturbing the answer.
-     */
-    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    const size_t largest = zone_room();
     int          avail   = (int)(largest / (1024 * 1024));
 
     if (avail > 6) {
         avail = 6;      /* the engine's own default; more is not useful here */
     }
-    printf("doom: psram free %u KB, largest block %d MiB\n",
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), avail);
+    printf("doom: %u KB for the zone, %d MiB asked\n", (unsigned)(largest / 1024), avail);
 
     /*
      * Give the engine what there is, not what a guess says it needs.
@@ -153,10 +163,10 @@ void app_main(int app_argc, char **app_argv)
      * cleanly now, an I_Error inside it is a report and not a reset.
      */
     if (avail < 1) {
-        printf("doom: not enough PSRAM for a zone (largest block %u KB) -- not starting\n",
+        printf("doom: not enough memory for a zone (%u KB) -- not starting\n",
                (unsigned)(largest / 1024));
         fflush(stdout);
-        return;
+        return 1;
     }
 
     char  mb_arg[8];
@@ -204,4 +214,5 @@ void app_main(int app_argc, char **app_argv)
      */
     printf("doom: quit\n");
     fflush(stdout);
+    return 0;
 }

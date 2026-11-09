@@ -202,6 +202,12 @@ esp_err_t espix_audio_null_sink_register(void);
  */
 void espix_audio_streams_recover(void *task);
 
+/* For a U-mode app's streams, which its process closes rather than a task's death:
+ * a write that waits at most ms for the ring, and a stream no task owns. */
+size_t espix_audio_stream_write_ms(espix_audio_stream_t *st, const void *pcm, size_t len,
+                                   uint32_t ms);
+void   espix_audio_stream_disown(espix_audio_stream_t *st);
+
 #ifdef __cplusplus
 }
 #endif

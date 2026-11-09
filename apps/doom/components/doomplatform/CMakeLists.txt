@@ -16,7 +16,7 @@ idf_component_register(SRCS "doom_espix.c" "doom_sound.c"
                            "${CMAKE_SOURCE_DIR}/../../components/espix_proc/include"
                            "${CMAKE_SOURCE_DIR}/../../components/espix_display/include"
                            "${CMAKE_SOURCE_DIR}/../../components/espix_audio/include"
-                       REQUIRES doomgeneric esp_timer)
+                       REQUIRES doomgeneric)
 
 # The Doom sound mixer's wall-clock counters, off by default. See doom_sound.c:
 # they are timestamps in a realtime loop, and what found the audio running at

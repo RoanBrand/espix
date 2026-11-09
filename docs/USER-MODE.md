@@ -37,12 +37,16 @@ on Linux:
 |---|---|
 | `0x00010000` up | the image: text, rodata, data, bss |
 | above the image | the heap, grown by `brk` |
-| below `0x70000000` | `mmap`, growing down |
+| below `0x70000000` | kernel memory lent to the app (a gfx surface), and `mmap`, growing down |
 | `0x70000000`-`0x7f800000` | 31 thread stacks of 8 MB, an unmapped page at each end |
 | below `0x80000000` | the main thread's stack, 8 MB |
 
-**Frames are 4 KiB of PSRAM with a reference count**, so one frame can be in two
-tables: shared text, copy-on-write, a swap cache.
+**Frames are 4 KiB of PSRAM, carved from 256 KiB chunks of the heap.** A 4 KiB
+block aligned to 4 KiB leaves the heap's header in the page before it, so frames
+allocated one by one cost two pages each and an app could map only half of what
+was free. A chunk is smaller when the heap has no room for a whole one, and goes
+back when its last frame does. A frame is owned by one table; a reference count,
+for shared text and copy-on-write, comes with M7.
 
 **Pages are mapped when touched.** bss, the heap and the stacks are reserved
 ranges; the first touch maps a zeroed frame, whether the app or a syscall copying
@@ -152,8 +156,8 @@ spinlocks picolibc's headers leave out (their feature macros follow what IDF's
 own pthread implements). It links `libespix` whole and ahead of libc, because the
 toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
 archive scan. `cmake/espix-uapp.cmake` is the CMake toolchain file over it: an
-app with a `uapp/` CMake project (mosquitto's) is built that way by
-`tools/build-apps.sh` and staged as `<name>-u`.
+app with a `uapp/` CMake project (mosquitto's, plasma's, Doom's) is built that
+way by `tools/build-apps.sh` and staged as `<name>-u`.
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
@@ -168,8 +172,8 @@ U-mode app and its threads run on either core.
 | app | what changes |
 |---|---|
 | hello | nothing beyond the relink |
-| plasma | the surface mapped into the app |
-| doom | gfx as plasma; audio writes become syscalls |
+| plasma | runs in U-mode as `plasma-u`: the same source, its surface lent to it |
+| doom | runs in U-mode as `doom-u`: the same engine, seam and entry; its sound through audio syscalls |
 | mosquitto | runs in U-mode as `mosquitto-u`: the same sources and seam, through `uapp/` |
 | neopixel | stays M-mode: its RMT callbacks run in an interrupt |
 
@@ -222,6 +226,28 @@ the table holds only kernel work:
 
 A result the kernel would point into its own memory for (getpw*, name lookup) is
 copied into a buffer the app passes.
+
+**The screen and audio are `espix_gfx.h` and `espix_audio.h` in both builds.** An
+M-mode app calls the kernel's functions; a U-mode app's `libespix` makes them
+syscalls on handles its process holds, eight at most, each a surface or a
+stream. A call using a handle holds a reference, so a handle one thread frees
+goes when another's call on it returns, and what a process ends holding is freed
+or closed at its teardown, however it ends.
+
+- **A surface's pixels are lent to the app.** The kernel allocates them
+  page-aligned in PSRAM, zeroed, and maps them whole below `0x70000000`, with
+  their PTEs marked lent (a software bit) so the table never frees them. The app
+  draws where the PPA reads, and a present is one syscall. Freed, the surface is
+  unmapped at once and released once no kernel call holds a pointer into it, as
+  an unmapped frame is.
+- **The screen's own lock** (`espix_gfx_lock`) is a surface the screen's size,
+  copied to the canvas on present.
+- **An audio write waits while the ring is full**, 50 ms at a time with a look
+  for a signal between, so a kill ends it at once; after a second with no room it
+  returns 0, as an M-mode write does. A stream belongs to the process, not to the
+  task that opened it.
+- **Doom's timedemo** (demo1, 5026 tics, both builds at `-Og`) runs at 39-41 fps
+  in U-mode and 43.5 in M-mode.
 
 **The dispatcher runs in the calling thread's task, on its kernel stack, with
 interrupts on.** A syscall that blocks is an ordinary FreeRTOS block.
@@ -362,7 +388,7 @@ Each leaves `make test` green on both targets.
 | M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M4 and M7 bring |
 | M3 | threads, futex wait and wake, TLS; shared tables flushed on both cores | done: `32-umode`, and the thread checks of `30-proc` pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | done: `32-umode`, and `35-signals` in U-mode |
-| M5 | gfx surfaces mapped into the app; audio writes | plasma and Doom run in U-mode |
+| M5 | gfx surfaces mapped into the app; audio writes | done: `64-gfx` runs `plasma-u` and `doom-u` |
 | M6 | sockets, select, poll | done: `32-umode`, and `62-mqtt` runs `mosquitto-u` |
 | M7 | growable stacks; `mmap`; shared text between instances | Doom runs without a fixed stack; two instances share text |
 | M8 | `fork()` on copy-on-write, `exec()` in place | `mosquitto -d` daemonises |
@@ -412,9 +438,5 @@ Open:
 
 ## Open questions
 
-- **The app build for `apps/*`:** a CMake toolchain file sharing the flags of the
-  U-mode compiler wrapper.
-- **Where frames come from:** the PSRAM heap as needed, or a region reserved at
-  boot, which is simpler to account for and to swap from.
 - **Drivers from U-mode apps:** RMT and GPIO are MMIO and interrupt callbacks,
   M-mode-app features until a driver gets a syscall face.

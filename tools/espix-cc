@@ -34,7 +34,10 @@ lib="$root/user/build"
 # libespix.a and crt0.o, rebuilt when a source is newer; built aside and moved in, so parallel callers never see half.
 build_lib() {
     local srcs=("$root"/user/libespix/*.c "$root"/user/libespix/*.h "$root"/user/crt0.S
-                "$root"/user/include "$root"/components/espix_proc/include/espix_syscall.h)
+                "$root"/user/include "$root"/components/espix_proc/include/espix_syscall.h
+                "$root"/components/espix_proc/include/espix_gfx.h
+                "$root"/components/espix_display/include/espix_display.h
+                "$root"/components/espix_audio/include/espix_audio.h)
     if [[ -f "$lib/libespix.a" && -z "$(find "${srcs[@]}" -newer "$lib/libespix.a" 2>/dev/null | head -1)" ]]; then
         return 0
     fi
@@ -47,7 +50,8 @@ build_lib() {
         # picolibc's own stdio and its lseek must see libc's 32-bit off_t.
         case $(basename "$f") in lseek32.c|start.c) extra=(-DESPIX_LIBC_OWN_OFF_T) ;; esac
         "$gcc" "${arch[@]}" "${cflags[@]}" ${extra[@]+"${extra[@]}"} -Os -Wall \
-            -I"$root/components/espix_proc/include" -c "$f" -o "$tmp/$(basename "${f%.c}").o"
+            -I"$root/components/espix_proc/include" -I"$root/components/espix_display/include" \
+            -I"$root/components/espix_audio/include" -c "$f" -o "$tmp/$(basename "${f%.c}").o"
     done
     "$gcc" "${arch[@]}" -c "$root/user/crt0.S" -o "$tmp/crt0.o"
     (cd "$tmp" && "$ar" rcs libespix.a $(ls *.o | grep -v '^crt0\.o$'))

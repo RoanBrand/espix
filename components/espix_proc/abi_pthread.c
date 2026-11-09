@@ -42,6 +42,8 @@
 
 #include "pthread.h"
 
+#include "espix_audio.h"
+#include "espix_display.h"
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
 #include "proc_threads.h"
@@ -191,6 +193,8 @@ void espix_pthread_reap(espix_proc_slot_t *slot)
             } else {
                 vTaskDelete((TaskHandle_t)victim.task);
             }
+            espix_audio_streams_recover(victim.task);
+            espix_display_task_gone(victim.task);
         }
     }
 }

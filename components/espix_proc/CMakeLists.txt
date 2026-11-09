@@ -28,6 +28,7 @@ idf_component_register(
         "umode_sig.c"
         "umode_sys.c"
         "umode_net.c"
+        "umode_gfx.c"
         "umode_entry.S"
     INCLUDE_DIRS
         "include"

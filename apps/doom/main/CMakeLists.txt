@@ -3,4 +3,4 @@ idf_component_register(SRCS "main.c"
                            "."
                            "${CMAKE_SOURCE_DIR}/../../components/espix_proc/include"
                            "${CMAKE_SOURCE_DIR}/../../components/espix_display/include"
-                       REQUIRES doomgeneric esp_timer)
+                       REQUIRES doomgeneric)

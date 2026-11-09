@@ -83,7 +83,18 @@
     X(GETPW,         getpw,         68)        /* (name or 0, uid, struct espix_pwent *, len) */ \
     X(GETGR,         getgr,         69)        /* (name or 0, gid, struct espix_pwent *, len) */ \
     X(SYSLOG,        syslog,        70)        /* (priority, ident or 0, message): to the kernel log */ \
-    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */
+    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */ \
+    X(GFX_OPEN,      gfx_open,      72)        /* (full_w, full_h): claims the screen; 0,0 keeps its size */ \
+    X(GFX_CLOSE,     gfx_close,     73)        /* () */                                        \
+    X(GFX_SURFACE,   gfx_surface,   74)        /* (w, h, struct espix_gfx_fb *): a handle; 0,0 is the screen's size */ \
+    X(GFX_FREE,      gfx_free,      75)        /* (handle): its pixels are unmapped */         \
+    X(GFX_PRESENT,   gfx_present,   76)        /* (handle, x, y, w, h): w 0 scales it to fill the screen */ \
+    X(GFX_POLL,      gfx_poll,      77)        /* (struct espix_input *): 1 with an event, 0 without */ \
+    X(AUDIO_OPEN,    audio_open,    78)        /* (const struct espix_audio_fmt *): a handle */  \
+    X(AUDIO_WRITE,   audio_write,   79)        /* (handle, buf, len): bytes taken, blocking while the ring is full */ \
+    X(AUDIO_CTL,     audio_ctl,     80)        /* (handle, ESPIX_AUDIO_*, arg) */               \
+    X(AUDIO_CLOSE,   audio_close,   81)        /* (handle): what is queued plays out */        \
+    X(MEMINFO,       meminfo,       82)        /* (struct espix_meminfo *) */
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
@@ -174,4 +185,31 @@ struct espix_ifaddr {
     uint32_t flags;             /* IFF_* */
     uint8_t  addr[28];          /* sockaddrs, lwIP's layout */
     uint8_t  netmask[28];
+};
+
+/* A surface's pixels, mapped into the app: stride is in pixels. */
+struct espix_gfx_fb {
+    int32_t  w, h, stride;
+    uint32_t pixels;
+};
+
+/* espix_input_event_t, fixed-width. */
+struct espix_input {
+    uint32_t kind;
+    int16_t  x, y;
+    uint32_t buttons, keysym, down;
+};
+
+struct espix_audio_fmt {
+    uint32_t rate, channels, bits;
+};
+
+/* AUDIO_CTL ops: a volume of 0-100, mute on or off, or the microseconds queued. */
+#define ESPIX_AUDIO_VOLUME 0
+#define ESPIX_AUDIO_MUTE   1
+#define ESPIX_AUDIO_QUEUED 2
+
+/* Pages of the memory apps are given, and of it what is free. */
+struct espix_meminfo {
+    uint32_t page_size, total, free;
 };

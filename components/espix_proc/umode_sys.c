@@ -23,6 +23,7 @@
 
 #include "esp_attr.h"
 #include "esp_cpu.h"
+#include "esp_heap_caps.h"
 #include "riscv/encoding.h"
 
 #include "espix_kernel.h"
@@ -102,6 +103,7 @@ void espix_um_close_fds(espix_proc_slot_t *slot)
     for (int fd = 0; fd < ESPIX_UM_FDS; fd++) {
         um_fd_release(&t->proc->fds[fd]);
     }
+    espix_um_objs_release(t->proc);
 }
 
 /* A copy of e: a second kernel descriptor for a file, so each closes its own; a socket is shared. */
@@ -832,6 +834,17 @@ static int32_t um_sys_term_size(um_call_t *c)
 static int32_t um_sys_brk(um_call_t *c)
 {
     return (int32_t)espix_um_brk(c->p->as, c->a[0]);
+}
+
+/* Frames come from PSRAM. */
+static int32_t um_sys_meminfo(um_call_t *c)
+{
+    const struct espix_meminfo m = {
+        .page_size = PG,
+        .total     = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / PG,
+        .free      = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / PG + espix_um_frames_spare(),
+    };
+    return espix_um_copyout(c->p->as, c->a[0], &m, sizeof(m));
 }
 
 /* ------------------------------------------------------------------ */

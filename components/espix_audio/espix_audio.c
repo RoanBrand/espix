@@ -1013,8 +1013,11 @@ espix_audio_stream_t *espix_audio_stream_open(const espix_audio_format_t *fmt)
     return st;
 }
 
-size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_t len)
+size_t espix_audio_stream_write_ms(espix_audio_stream_t *st, const void *pcm, size_t len,
+                                   uint32_t ms)
 {
+    const TickType_t wait = pdMS_TO_TICKS(ms);
+
     if (st == NULL || pcm == NULL || len == 0) {
         return 0;
     }
@@ -1035,7 +1038,7 @@ size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_
      * way, and looping on a short write is the caller's.
      */
     if (st->asrc == NULL) {
-        return xStreamBufferSend(st->sb, pcm, len, pdMS_TO_TICKS(1000));
+        return xStreamBufferSend(st->sb, pcm, len, wait);
     }
 
     /*
@@ -1052,7 +1055,7 @@ size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_
 
     while (st->out_pending > 0) {
         const size_t w = xStreamBufferSend(st->sb, (uint8_t *)a->out + st->out_off,
-                                           st->out_pending, pdMS_TO_TICKS(1000));
+                                           st->out_pending, wait);
         if (w == 0) {
             return 0;
         }
@@ -1076,13 +1079,24 @@ size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_
     st->out_off     = 0;
     st->out_pending = (size_t)out_samples * a->out_frame_bytes;
 
-    const size_t w = xStreamBufferSend(st->sb, a->out, st->out_pending,
-                                       pdMS_TO_TICKS(1000));
+    const size_t w = xStreamBufferSend(st->sb, a->out, st->out_pending, wait);
     st->out_off     = w;
     st->out_pending -= w;
 
     /* The caller counts in its own bytes: this much in, whatever it became. */
     return chunk;
+}
+
+size_t espix_audio_stream_write(espix_audio_stream_t *st, const void *pcm, size_t len)
+{
+    return espix_audio_stream_write_ms(st, pcm, len, 1000);
+}
+
+void espix_audio_stream_disown(espix_audio_stream_t *st)
+{
+    if (st != NULL) {
+        st->owner = NULL;
+    }
 }
 
 uint32_t espix_audio_stream_queued_us(espix_audio_stream_t *st)

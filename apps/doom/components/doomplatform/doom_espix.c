@@ -1,6 +1,6 @@
 /*
  * The platform seam: the six functions doomgeneric asks for, over espix_gfx
- * and the RTOS.
+ * and POSIX time, so one source builds as an M-mode and a U-mode app.
  *
  * Nothing here is Doom-specific except the key map. An engine that wants
  * "pixels, keys and milliseconds" is the shape espix_gfx was built for, so the
@@ -11,11 +11,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "espix_gfx.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 #include "d_event.h"    /* event_t, ev_mouse, D_PostEvent */
 #include "doomgeneric.h"
@@ -110,13 +111,15 @@ void DG_DrawFrame(void)
 
 void DG_SleepMs(uint32_t ms)
 {
-    /* A zero delay still has to yield, or the idle task never gets a turn. */
-    vTaskDelay(pdMS_TO_TICKS(ms ? ms : 1));
+    /* A zero delay still has to wait, or the idle task never gets a turn. */
+    usleep((useconds_t)(ms ? ms : 1) * 1000);
 }
 
 uint32_t DG_GetTicksMs(void)
 {
-    return (uint32_t)(esp_timer_get_time() / 1000);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000);
 }
 
 /*

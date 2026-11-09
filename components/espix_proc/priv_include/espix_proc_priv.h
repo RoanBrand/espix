@@ -542,6 +542,11 @@ void espix_proc_abi_gfx_register(void);
  * rest of the process's resources; see abi_gfx.c. */
 void espix_gfx_recover(espix_pid_t pid);
 
+/* A U-mode app's present: w 0 scales s to fill the screen, else that rectangle is copied to the
+ * same place on it. False when no app holds the screen. */
+struct espix_surface;
+bool espix_gfx_present_rect_of(const struct espix_surface *s, int x, int y, int w, int h);
+
 /* Publish the filesystem an app needs: fopen, open, stat, opendir and the rest,
  * plus espix's own chdir/getcwd because IDF's are stubs. See abi_fs.c -- almost
  * all of it is unwrapped libc, because those calls already dispatch into

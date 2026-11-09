@@ -1,5 +1,5 @@
 /*
- * What the syscall files share (umode_sys.c, umode_net.c): a call's context and the descriptor table.
+ * What the syscall files share (umode_sys.c, umode_net.c, umode_gfx.c): a call's context and the descriptor table.
  */
 #pragma once
 
@@ -50,4 +50,15 @@ UM_NET_SYS_DECL_(getrandom)
 UM_NET_SYS_DECL_(gethostname)
 UM_NET_SYS_DECL_(ioctl)
 UM_NET_SYS_DECL_(getifaddrs)
+/* The screen and audio (umode_gfx.c). */
+UM_NET_SYS_DECL_(gfx_open)
+UM_NET_SYS_DECL_(gfx_close)
+UM_NET_SYS_DECL_(gfx_surface)
+UM_NET_SYS_DECL_(gfx_free)
+UM_NET_SYS_DECL_(gfx_present)
+UM_NET_SYS_DECL_(gfx_poll)
+UM_NET_SYS_DECL_(audio_open)
+UM_NET_SYS_DECL_(audio_write)
+UM_NET_SYS_DECL_(audio_ctl)
+UM_NET_SYS_DECL_(audio_close)
 #undef UM_NET_SYS_DECL_
