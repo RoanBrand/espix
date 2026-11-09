@@ -386,6 +386,22 @@ fi
 
 dev_run "rm $DUPFILE" >/dev/null 2>&1
 
+# mmap, munmap, mprotect, msync, madvise: by pages on the S31, by heap blocks without an MMU.
+if [ "${ESPIX_UAPP:-0}" = 1 ]; then
+    assert_contains "the mapping calls keep their contract" "mmap ok" "$(dev_run "$APP mmap /tmp")"
+    assert_contains "exec keeps the process, its plain descriptors and ignored signals" \
+        "execd: pid same, kept open, cloexec closed, handler default, ignored kept, env passed" \
+        "$(dev_run "$APP exec /tmp")"
+    assert_contains "and twenty in a row each replace the last" "execn: done" "$(dev_run "$APP execn 20")"
+    assert_contains "vfork's child exits, execs, is killed or faults alone; spawn, system, popen, from two threads" \
+        "vfork ok" "$(dev_run "$APP vfork")"
+    VFK=/tmp/espix-vfk-$ESPIX_WORKER
+    vfk_out=$(dev_run "rm -f $VFK; $APP vforkhold 2 $VFK; echo rc=\$?; sleep 5; cat $VFK; rm -f $VFK")
+    assert_contains "a vfork's parent killed by its child ends as killed" "rc=137" "$vfk_out"
+    assert_contains "and the child, on its memory, carries on to the end" "survived" "$vfk_out"
+    assert_not_contains "and the parent never runs again" "parent resumed" "$vfk_out"
+fi
+
 # --- the process tree: a shell is a process, and an app is its child -------
 #
 # The shell this suite talks through is the parent of what it starts; the app

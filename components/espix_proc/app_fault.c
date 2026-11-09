@@ -96,8 +96,8 @@ static bool app_task(void)
         return false;
     }
 #endif
-    /* Its threads carry the slot too; the loader's helper does so only while loading. */
-    return slot->info.task != xTaskGetCurrentTaskHandle() || slot->exit_jmp != NULL;
+    /* Its threads carry the slot too; the loader's helper does so only while loading. A vfork's child ends as it exits. */
+    return slot->info.task != xTaskGetCurrentTaskHandle() || slot->exit_jmp != NULL || slot->app->vfork_jb != NULL;
 }
 
 #if CONFIG_IDF_TARGET_ARCH_XTENSA

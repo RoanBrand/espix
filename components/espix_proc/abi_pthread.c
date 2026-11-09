@@ -41,6 +41,7 @@
 #include "freertos/idf_additions.h"
 
 #include "pthread.h"
+#include "esp_pthread.h"
 
 #include "espix_audio.h"
 #include "espix_display.h"
@@ -161,10 +162,11 @@ uint64_t espix_proc_cpu_threads_done(espix_pid_t pid)
  * vTaskDelete() from another task is what FreeRTOS offers. The process's
  * streams are its slot's, not the thread's, so deleting one closes nothing.
  */
-void espix_pthread_reap(espix_proc_slot_t *slot)
+int espix_pthread_reap(espix_proc_slot_t *slot, bool quiet)
 {
+    int ended = 0;
     if (slot == NULL) {
-        return;
+        return 0;
     }
     for (;;) {
         espix_thread_t victim;
@@ -180,14 +182,17 @@ void espix_pthread_reap(espix_proc_slot_t *slot)
         xSemaphoreGive(g_espix_proc_lock);
 
         if (!got) {
-            return;
+            return ended;
         }
         /* A reservation whose thread never started finds its entry gone and
          * returns without running anything. */
         if (victim.task != NULL) {
-            espix_klog(ESPIX_KLOG_WARN, TAG,
-                       "ending thread %d, which its process left behind",
-                       (int)victim.tid);
+            ended++;
+            if (!quiet) {
+                espix_klog(ESPIX_KLOG_WARN, TAG,
+                           "ending thread %d, which its process left behind",
+                           (int)victim.tid);
+            }
             if (victim.caps) {
                 vTaskDeleteWithCaps((TaskHandle_t)victim.task);
             } else {
@@ -243,6 +248,9 @@ static void *espix_pthread_trampoline(void *arg)
     return ret;
 }
 
+/* What a POSIX app's syscalls need of a thread's stack, beyond the size it asked for. */
+#define POSIX_KSTACK 8192
+
 static int espix_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                                 void *(*start_routine)(void *), void *arg)
 {
@@ -273,8 +281,42 @@ static int espix_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         return EAGAIN;
     }
 
+    /*
+     * A POSIX app's syscalls run on the calling thread's stack, where Linux's run on a kernel stack
+     * beside it: its threads get the main task's room, in PSRAM, and a size it asks for that much more.
+     */
+    pthread_attr_t    a;
+    esp_pthread_cfg_t was;
+    bool              had = false;
+    const bool        posix = slot->app != NULL && slot->app->posix != NULL;
+    if (posix) {
+        size_t asked = CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT;
+        if (attr != NULL) {
+            a = *attr;
+            (void)pthread_attr_getstacksize(attr, &asked);
+        } else {
+            (void)pthread_attr_init(&a);
+        }
+        (void)pthread_attr_setstacksize(&a, (asked == CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT)
+                                                ? CONFIG_ESPIX_PROC_STACK_SIZE
+                                                : asked + POSIX_KSTACK);
+        attr = &a;
+        /* The task's own config, if it has one: IDF zeroes the struct when it has not. */
+        had = esp_pthread_get_cfg(&was) == ESP_OK;
+        esp_pthread_cfg_t cfg = had ? was : esp_pthread_get_default_config();
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+        cfg.inherit_cfg      = false;
+        (void)esp_pthread_set_cfg(&cfg);
+    }
+
     const espix_pid_t tid = st->tid;
     const int rc = pthread_create(thread, attr, espix_pthread_trampoline, st);
+    if (posix) {
+        if (!had) {
+            was = esp_pthread_get_default_config();
+        }
+        (void)esp_pthread_set_cfg(&was);
+    }
     if (rc != 0) {
         free(st);       /* the trampoline will never run to free it */
         xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);

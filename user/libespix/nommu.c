@@ -27,6 +27,22 @@ int __espix_main(int argc, char **argv, char **envp)
     return main(argc, argv, envp);
 }
 
+/* vfork(): the child's state and the parent's resume point, then the child on this task (unistd.h). */
+jmp_buf *__espix_vfork_prepare(void)
+{
+    const long r = espix_sys1(ESPIX_SYS_VFORK, 0);
+    if (r < 0 && r > -4096) {
+        errno = (int)-r;
+        return NULL;
+    }
+    return (jmp_buf *)r;
+}
+
+void __espix_vfork_enter(jmp_buf *jb)
+{
+    (void)espix_sys1(ESPIX_SYS_VFORK, (long)(uintptr_t)jb);
+}
+
 /* ------------------------------------------------------------------ streams */
 
 #define STREAMS_MAX 16

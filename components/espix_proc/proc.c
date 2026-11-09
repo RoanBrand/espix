@@ -451,7 +451,11 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
      * still left a pthread at 98% of a core. This is the function both exits
      * run, so this is where the threads have to be ended. See abi_pthread.c.
      */
-    espix_pthread_reap(slot);
+    /* A vfork's child still runs this process's code on one of its threads: its memory waits for the exec or exit. */
+    while (__atomic_load_n(&slot->vfork_lent, __ATOMIC_ACQUIRE) > 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    (void)espix_pthread_reap(slot, false);
 
     /*
      * First, whatever it left open. A process killed with files open never
@@ -836,6 +840,15 @@ static bool ignores_children(const espix_proc_slot_t *p)
 #endif
     return p->sig_actions != NULL && (p->sig_actions[SIGCHLD].handler == SIG_IGN ||
                                       (p->sig_actions[SIGCHLD].flags & SA_NOCLDWAIT));
+}
+
+void espix_proc_sig_exec(espix_proc_slot_t *slot)
+{
+    for (int sig = 1; slot->sig_actions != NULL && sig < NSIG; sig++) {
+        if (slot->sig_actions[sig].handler != SIG_IGN) {
+            slot->sig_actions[sig] = (espix_sigact_t){ .handler = SIG_DFL };
+        }
+    }
 }
 
 /* Whether a child of self, in group cpgid, is one waitpid(want) asks for. */
@@ -1668,6 +1681,17 @@ static esp_err_t proc_force_kill(espix_pid_t pid)
     /* Still loading: deleted now, it would keep the filesystem's locks. It leaves when the load is done. */
     if (slot->loading) {
         slot->stop_requested = true;
+        xSemaphoreGive(g_espix_proc_lock);
+        return ESP_OK;
+    }
+
+    /* Half of a vfork: one task is both processes'. Each leaves at its next syscall; the parent once the child is done. */
+    if (slot->vfork_lent > 0 || (slot->app != NULL && slot->app->vfork_jb != NULL)) {
+        slot->stop_requested = true;
+        if (slot->term_sig == 0) {
+            slot->term_sig = SIGKILL;
+        }
+        sig_wake_locked(slot);
         xSemaphoreGive(g_espix_proc_lock);
         return ESP_OK;
     }

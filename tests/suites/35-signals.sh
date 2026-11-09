@@ -162,8 +162,8 @@ fi
 log=$(dev_run 'dmesg')
 assert_contains "the grace expired before it was deleted" \
     "pid $pid did not stop when asked" "$log"
-if [ "${ESPIX_UAPP:-0}" = 1 ] && [ "$ESPIX_TARGET" = esp32s31 ]; then
-    # Not deleted: it ends itself on its way back to U, its handlers skipped, as SIGKILL does.
+if [ "${ESPIX_UAPP:-0}" = 1 ]; then
+    # Not deleted: a POSIX app ends itself as SIGKILL ends it, on its way back to U or at its next syscall.
     assert_eq "and then it ended as SIGKILL ends it, so no cleanup ran" "exit 137" "$GONE_STATUS"
 else
     assert_contains "and then the task was deleted, so no cleanup ran" \

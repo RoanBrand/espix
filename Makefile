@@ -25,6 +25,7 @@
 #   make test-panic       same, with the UART captured to serial.log --
 #                         use when hunting a panic; console suites skip
 #   make stress           transport regression check, expects zero failures [N=30]
+#   make test-apps        the suites that run apps/ (mosquitto, plasma, doom), one at a time
 #   make unit             host unit tests: no board, seconds (tools/unit.sh)
 #   make clean            fullclean, firmware and apps
 #
@@ -119,7 +120,7 @@ PARTITION_CSV = csv=$$(sed -n 's/^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="\([^"]
 
 .PHONY: all menu build flash flash-kernel flash-loader flash-monitor flash-fs fs flash-all \
         release release-all monitor monitor-reset coredump apps test-app test test-panic \
-        stress unit clean help
+        stress test-apps unit clean help
 
 all: build
 
@@ -354,6 +355,14 @@ test-panic: test-app
 # tests/suites/90-stress.sh. Separate from `make test` on purpose: a check that
 # fails a few times in thirty would make the default run intermittently red for
 # a bug that is already documented and open.
+# The app suites, apart: a program from apps/ holds memory and the screen that the kernel's
+# suites would contend for. Each runs alone.
+test-apps: test-app
+	@eval "$$(./tools/idf.sh --env)"; rc=0; \
+	for s in mqtt gfx; do \
+	    ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh --apps --suite $$s || rc=1; \
+	done; exit $$rc
+
 stress: test-app
 	@eval "$$(./tools/idf.sh --env)"; \
 	ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh --suite stress --stress \

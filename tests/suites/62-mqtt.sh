@@ -1,8 +1,15 @@
 # The broker apps/mosquitto builds, as an app on sockets: a client's message
-# comes back through it, and SIGTERM ends it in its poll. The M-mode build on
-# both targets; on the S31 the U-mode one too (docs/USER-MODE.md).
+# comes back through it, and SIGTERM ends it in its poll. The M-mode build and the
+# POSIX one (mosquitto-u), on both targets (docs/USER-MODE.md).
 #
 # RESOURCES: none -- a TCP port per worker, 18830 + the worker number.
+
+# The kernel's suites reach it through the shell and the test app; this one runs a program
+# from apps/, which holds memory and the screen the others would then contend for.
+if [ "${ESPIX_APPS:-0}" != 1 ]; then
+    espix_skip "app suites need --apps (or 'make test-apps')"
+    return 0
+fi
 
 MQ_BIN="$ESPIX_ROOT/fsroot/bin"
 if [ ! -f "$MQ_BIN/mosquitto" ]; then
@@ -76,13 +83,14 @@ mq_daemon() {
 }
 
 mq_check mosquitto "the M-mode broker"
-if [ "$ESPIX_TARGET" = esp32s31 ]; then
-    if [ -f "$MQ_BIN/mosquitto-u" ]; then
-        mq_check mosquitto-u "the U-mode broker"
-        mq_daemon mosquitto-u "the U-mode broker daemonised"
-    else
-        espix_skip "mosquitto-u not built -- run 'make apps'"
+# The POSIX build: U-mode on the S31; on the S3 without an MMU, where -d needs the fork it has not.
+if [ -f "$MQ_BIN/mosquitto-u" ]; then
+    mq_check mosquitto-u "the POSIX broker"
+    if [ "$ESPIX_TARGET" = esp32s31 ]; then
+        mq_daemon mosquitto-u "the POSIX broker daemonised"
     fi
+else
+    espix_skip "mosquitto-u not built -- run 'make apps'"
 fi
 
 dev_run "rm $MQ_CONF" >/dev/null

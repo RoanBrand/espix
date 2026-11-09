@@ -39,7 +39,8 @@ pid_t fork(void)
     return -1;
 }
 
-pid_t vfork(void)
+/* vfork() is unistd.h's macro, a setjmp in the caller's frame; called through a pointer it has none to return to. */
+pid_t (vfork)(void)
 {
     errno = ENOSYS;
     return -1;
@@ -454,7 +455,7 @@ __attribute__((weak)) int system(const char *cmd)
     if (cmd == NULL) {
         return 1;
     }
-    pid_t pid;
+    pid_t pid = -1;
     const int r = run_line(&pid, cmd, NULL);
     if (r != 0) {
         return 127 << 8;
@@ -495,7 +496,7 @@ __attribute__((weak)) FILE *popen(const char *cmd, const char *mode)
         return NULL;
     }
     posix_spawn_file_actions_t fa;
-    pid_t pid;
+    pid_t pid = -1;
     int r = posix_spawn_file_actions_init(&fa);
     if (r == 0) {
         r = posix_spawn_file_actions_adddup2(&fa, rd ? p[1] : p[0], rd ? 1 : 0);

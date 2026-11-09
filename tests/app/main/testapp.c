@@ -1802,6 +1802,275 @@ static int fault(const char *kind)
     return 1;
 }
 
+#if ESPIX_POSIX_APP
+#include <spawn.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+
+static int mmap_fail(const char *what)
+{
+    printf("mmap: %s (%s)\n", what, errno_name(errno));
+    return 1;
+}
+
+/* The mmap contract both builds keep; what an app without an MMU sees differently is checked under its own name. */
+static int cmd_mmap(const char *dir)
+{
+    enum { PG = 4096, FLEN = 6000, ALEN = 10000 };
+    char *a = mmap(NULL, ALEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) {
+        return mmap_fail("anonymous map");
+    }
+    for (int i = 0; i < ALEN; i++) {
+        if (a[i] != 0) {
+            return mmap_fail("anonymous map not zero");
+        }
+    }
+    memset(a, 0x5a, ALEN);
+    if (mprotect(a, ALEN, PROT_READ) != 0 || mprotect(a, ALEN, PROT_READ | PROT_WRITE) != 0) {
+        return mmap_fail("mprotect");
+    }
+    if (msync(a, 3 * PG, MS_SYNC) != 0) {
+        return mmap_fail("msync over the last page's end");
+    }
+    if (madvise(a + PG, PG, MADV_DONTNEED) != 0 || a[PG] != 0 || a[2 * PG - 1] != 0 || a[0] != 0x5a ||
+        a[2 * PG] != 0x5a) {
+        return mmap_fail("MADV_DONTNEED zeroes its pages only");
+    }
+#if ESPIX_NOMMU_APP
+    errno = 0;
+    if (munmap(a + PG, PG) == 0 || errno != EINVAL) {
+        return mmap_fail("part of a block unmapped");
+    }
+    unsigned char vec[3];
+    if (mincore(a, ALEN, vec) != 0 || vec[0] != 1 || vec[2] != 1) {
+        return mmap_fail("mincore");
+    }
+    errno = 0;
+    if (mmap(a, PG, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED || errno != EINVAL) {
+        return mmap_fail("MAP_FIXED taken");
+    }
+    if (munmap(a, 3 * PG) != 0) {
+        return mmap_fail("munmap by pages");
+    }
+#else
+    if (munmap(a, ALEN) != 0) {
+        return mmap_fail("munmap");
+    }
+#endif
+    errno = 0;
+    if (mprotect(a, PG, PROT_READ) == 0 || errno != ENOMEM) {
+        return mmap_fail("mprotect took an unmapped range");
+    }
+
+    char path[96], buf[FLEN], back[16];
+    snprintf(path, sizeof(path), "%s/testapp-mmap-%d", dir, (int)getpid());
+    for (int i = 0; i < FLEN; i++) {
+        buf[i] = (char)('a' + i % 26);
+    }
+    const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || write(fd, buf, FLEN) != FLEN) {
+        return mmap_fail("file");
+    }
+    char *pv = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, PG);
+    if (pv == MAP_FAILED) {
+        return mmap_fail("private file map");
+    }
+    if (memcmp(pv, buf + PG, FLEN - PG) != 0 || pv[FLEN - PG] != 0 || pv[PG - 1] != 0) {
+        return mmap_fail("private map is not the file's bytes at the offset, zero past its end");
+    }
+    char *sh = mmap(NULL, FLEN, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (sh == MAP_FAILED) {
+        return mmap_fail("shared file map");
+    }
+    pv[0] = 'P';
+    sh[1] = 'S';
+    if (msync(sh, FLEN, MS_SYNC) != 0 || pread(fd, back, 2, PG) != 2 || back[0] != buf[PG] ||
+        pread(fd, back, 2, 0) != 2 || back[1] != 'S') {
+        return mmap_fail("msync wrote the shared map back, and only it");
+    }
+    sh[FLEN - 1] = 'E';
+    if (munmap(sh, FLEN) != 0 || pread(fd, back, 1, FLEN - 1) != 1 || back[0] != 'E') {
+        return mmap_fail("munmap wrote the shared map back");
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size != FLEN) {
+        return mmap_fail("the file's size changed");
+    }
+    if (munmap(pv, PG) != 0) {
+        return mmap_fail("munmap of the private map");
+    }
+    close(fd);
+    unlink(path);
+    printf("mmap ok\n");
+    return 0;
+}
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+}
+
+/* exec in place: the process, its plain descriptors and ignored signals stay; the rest is the new program's. */
+static int cmd_exec(const char *self, const char *dir)
+{
+    errno = 0;
+    if (execl("/nonexistent/prog", "prog", (char *)NULL) != -1 || errno != ENOENT) {
+        printf("exec: a missing program did not fail with ENOENT (%s)\n", errno_name(errno));
+        return 1;
+    }
+    char path[96], pid[12], a[12], b[12];
+    snprintf(path, sizeof(path), "%s/testapp-exec-%d", dir, (int)getpid());
+    const int keep = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    const int shut = open(path, O_RDONLY | O_CLOEXEC);
+    unlink(path);
+    snprintf(pid, sizeof(pid), "%d", (int)getpid());
+    snprintf(a, sizeof(a), "%d", keep);
+    snprintf(b, sizeof(b), "%d", shut);
+    signal(SIGUSR1, on_usr1);
+    signal(SIGUSR2, SIG_IGN);
+    setenv("TESTAPP_EXEC", "passed", 1);
+    printf("exec: pid %s\n", pid);
+    fflush(stdout);
+    execl(self, self, "execd", pid, a, b, (char *)NULL);
+    printf("exec: failed (%s)\n", errno_name(errno));
+    return 1;
+}
+
+static int cmd_execd(char **argv)
+{
+    struct sigaction u1, u2;
+    sigaction(SIGUSR1, NULL, &u1);
+    sigaction(SIGUSR2, NULL, &u2);
+    const char *env = getenv("TESTAPP_EXEC");
+    printf("execd: pid %s, kept %s, cloexec %s, handler %s, ignored %s, env %s\n",
+           atoi(argv[2]) == (int)getpid() ? "same" : "new", fcntl(atoi(argv[3]), F_GETFD) >= 0 ? "open" : "closed",
+           fcntl(atoi(argv[4]), F_GETFD) < 0 ? "closed" : "open", u1.sa_handler == SIG_DFL ? "default" : "kept",
+           u2.sa_handler == SIG_IGN ? "kept" : "default", env != NULL ? env : "unset");
+    return 0;
+}
+
+static int vfork_fail(const char *what, int st)
+{
+    printf("vfork: %s (status 0x%x, %s)\n", what, st, errno_name(errno));
+    return 1;
+}
+
+/* posix_spawn, system and popen from a second thread: its task is the one a child borrows. */
+static void *vfork_thread(void *arg)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "%s exit 4", (const char *)arg);
+    const int st = system(cmd);
+    return (void *)(intptr_t)((WIFEXITED(st) && WEXITSTATUS(st) == 4) ? 0 : 1);
+}
+
+/* vfork: the child is a process of its own on the parent's memory until it execs or exits. */
+static int cmd_vfork(const char *self)
+{
+    extern char **environ;
+    volatile pid_t seen = 0;
+    const pid_t me = getpid();
+    int st = 0;
+    pid_t c = vfork();
+    if (c == 0) {
+        seen = getpid();
+        _exit(7);
+    }
+    if (c <= 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 7) {
+        return vfork_fail("a child's _exit(7)", st);
+    }
+    if (seen != c || getpid() != me) {
+        return vfork_fail("the child's pid is its own, the parent's unchanged", (int)seen);
+    }
+    c = vfork();
+    if (c == 0) {
+        execl(self, self, "exit", "3", (char *)NULL);
+        _exit(127);
+    }
+    if (c <= 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 3) {
+        return vfork_fail("a child's exec", st);
+    }
+    c = vfork();
+    if (c == 0) {
+        kill(getpid(), SIGKILL);
+        _exit(1);
+    }
+    if (c <= 0 || waitpid(c, &st, 0) != c || !WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) {
+        return vfork_fail("a child that kills itself ends by SIGKILL", st);
+    }
+    c = vfork();
+    if (c == 0) {
+        *(volatile int *)0 = 1;
+        _exit(1);
+    }
+    if (c <= 0 || waitpid(c, &st, 0) != c || !WIFSIGNALED(st) || WTERMSIG(st) != SIGSEGV) {
+        return vfork_fail("a child's fault ends only it, by SIGSEGV", st);
+    }
+    pid_t p;
+    char *const nope[] = { "nope", NULL };
+    errno = posix_spawn(&p, "/nonexistent/nope", NULL, NULL, nope, environ);
+    if (errno != ENOENT) {
+        return vfork_fail("posix_spawn of a missing program", 0);
+    }
+    char cmd[128], line[64];
+    snprintf(cmd, sizeof(cmd), "%s exit 5", self);
+    st = system(cmd);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 5) {
+        return vfork_fail("system", st);
+    }
+    snprintf(cmd, sizeof(cmd), "%s argv hello", self);
+    FILE *const f = popen(cmd, "r");
+    bool got = false;
+    while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+        got = got || strcmp(line, "argv[2] hello\n") == 0;
+    }
+    st = (f != NULL) ? pclose(f) : -1;
+    if (!got || st != 0) {
+        return vfork_fail("popen", st);
+    }
+    pthread_t th;
+    void *r = (void *)1;
+    if (pthread_create(&th, NULL, vfork_thread, (void *)self) != 0 || pthread_join(th, &r) != 0 || r != NULL) {
+        return vfork_fail("system from a thread", (int)(intptr_t)r);
+    }
+    printf("vfork ok\n");
+    return 0;
+}
+
+/* A parent killed, by its child, while the child runs on its memory: the child finishes, and the parent ends. */
+static int cmd_vforkhold(const char *secs, const char *marker)
+{
+    const pid_t c = vfork();
+    if (c == 0) {
+        kill(getppid(), SIGKILL);
+        sleep((unsigned)atoi(secs));
+        const int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        write(fd, "survived\n", 9);
+        close(fd);
+        _exit(0);
+    }
+    printf("vforkhold: parent resumed\n");
+    return 0;
+}
+
+/* The same program n more times over: each exec leaves nothing of the last behind. */
+static int cmd_execn(const char *self, int n)
+{
+    if (n <= 0) {
+        printf("execn: done, pid %d\n", (int)getpid());
+        return 0;
+    }
+    char next[12];
+    snprintf(next, sizeof(next), "%d", n - 1);
+    void *const hold = malloc(16 * 1024);
+    memset(hold, 1, 16 * 1024);
+    execl(self, self, "execn", next, (char *)NULL);
+    printf("execn: failed (%s)\n", errno_name(errno));
+    return 1;
+}
+#endif
+
 static void usage(void)
 {
     printf("usage: testapp <command> [args]\n"
@@ -1842,7 +2111,12 @@ static void usage(void)
            "  env set <N=V>       setenv in this process, then read it back\n"
            "  env unset <NAME>    unsetenv, then read it back\n"
            "  abi <path>          call the published ABI by name, on a readable file\n"
-           "  truncate <path> <n> truncate(2) then ftruncate(2), to n and n/2\n");
+           "  truncate <path> <n> truncate(2) then ftruncate(2), to n and n/2\n"
+           "  mmap <dir>          the mapping calls, as a POSIX app\n"
+           "  exec <dir>          exec in place: what stays and what goes\n"
+           "  execn <n>           exec itself n more times\n"
+           "  vfork               vfork, posix_spawn, system and popen\n"
+           "  vforkhold <s> <file>  a vfork's child kills its parent, sleeps, then writes file\n");
 }
 
 int main(int argc, char **argv)
@@ -1987,6 +2261,26 @@ int main(int argc, char **argv)
         return cmd_dup(argv[2], (argc > 3) ? argv[3] : NULL);
     }
 
+#if ESPIX_POSIX_APP
+    if (strcmp(cmd, "mmap") == 0 && argc > 2) {
+        return cmd_mmap(argv[2]);
+    }
+    if (strcmp(cmd, "exec") == 0 && argc > 2) {
+        return cmd_exec(argv[0], argv[2]);
+    }
+    if (strcmp(cmd, "execd") == 0 && argc > 4) {
+        return cmd_execd(argv);
+    }
+    if (strcmp(cmd, "execn") == 0 && argc > 2) {
+        return cmd_execn(argv[0], atoi(argv[2]));
+    }
+    if (strcmp(cmd, "vfork") == 0) {
+        return cmd_vfork(argv[0]);
+    }
+    if (strcmp(cmd, "vforkhold") == 0 && argc > 3) {
+        return cmd_vforkhold(argv[2], argv[3]);
+    }
+#endif
     if (strcmp(cmd, "abi") == 0 && argc > 2) {
         return cmd_abi(argv[2]);
     }

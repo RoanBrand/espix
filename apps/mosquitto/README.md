@@ -25,12 +25,13 @@ configuration binds only 127.0.0.1. The minimum that works is
     listener 1883 0.0.0.0
     allow_anonymous true
 
-Both targets build from these sources. On the S31, `tools/build-apps.sh` also
-builds it as a U-mode app, in an address space of its own, and stages it as
-`/bin/mosquitto-u` beside the M-mode `/bin/mosquitto` (208 KB; the U-mode one
-is 271 KB, its libc linked in): the same sources and the same seam, compiled by
-`tools/espix-cc` through `uapp/CMakeLists.txt`. `sources.cmake` is the one
-source list both builds use.
+Both targets build from these sources. `tools/build-apps.sh` also builds it as a
+POSIX app and stages it as `/bin/mosquitto-u` beside the M-mode `/bin/mosquitto`:
+the same sources and the same seam, compiled by `tools/espix-cc` through
+`uapp/CMakeLists.txt`. On the S31 it runs in U-mode, in an address space of its
+own (271 KB, its libc linked in); on the S3 without an MMU, its libc the kernel's
+(216 KB, against the IDF build's 232 KB), where `-d` fails as `fork` does on a
+Linux without an MMU. `sources.cmake` is the one source list every build uses.
 
 ## The point of this port
 
@@ -48,10 +49,10 @@ registry component's layout.
 | the broker asks | the seam answers |
 |---|---|
 | `setuid`, `setgid`, `setgroups`, `initgroups` | "already that user": no process credential is writable yet, and an app runs as the user that started it |
-| `fork`, `setsid`, `umask` | for the M-mode build only: `fork` fails there, as on a Linux without an MMU, so `-d` does not half-work. `mosquitto-u` has all three from libespix and daemonises |
+| `fork`, `setsid`, `umask` | for the M-mode build only: `fork` fails there, as on a Linux without an MMU, so `-d` does not half-work. `mosquitto-u` has all three from libespix, and daemonises on the S31 |
 
 Everything else is espix's, the same in both builds: the M-mode ABI tables for
-an M-mode app, libespix and syscalls for a U-mode one.
+an M-mode app, libespix and syscalls for a POSIX one.
 
 | name | M-mode | U-mode |
 |---|---|---|

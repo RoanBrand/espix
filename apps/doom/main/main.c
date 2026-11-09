@@ -58,8 +58,14 @@ static const char *const wad_paths[] = {
     "/mnt/sda1/doom1.wad",
 };
 
+#if __has_include("esp_heap_caps.h") || ESPIX_NOMMU_APP
 #if __has_include("esp_heap_caps.h")
 #include "esp_heap_caps.h"
+#else
+/* Without an MMU the zone is one block of the arena too: the kernel's answer, as the IDF build has it. */
+size_t heap_caps_get_largest_free_block(uint32_t caps);
+#define MALLOC_CAP_SPIRAM (1 << 10)
+#endif
 
 /*
  * An M-mode app's zone is one block of its arena, so the question is the

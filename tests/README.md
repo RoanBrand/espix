@@ -267,6 +267,19 @@ matches the positive form, `core dump: N bytes at flash`, and reports an
 unanswered query as an unanswered query. A check that invents findings is worse
 than no check, because the next real one gets waved away with it.
 
+## App suites, and why they are not in the default run
+
+```bash
+make test-apps              # 62-mqtt and 64-gfx, each alone
+./tests/run.sh --apps --suite gfx
+```
+
+The default run reaches the kernel through the shell, over SSH and the serial
+console, and through the test app. `62-mqtt` and `64-gfx` run programs from
+`apps/` (mosquitto, plasma, Doom, and their POSIX builds), which hold megabytes
+and the screen; beside the kernel's suites they make those fail for want of
+memory. They run with `--apps`, one at a time.
+
 ## Stress, and why it is not in the default run
 
 ```bash

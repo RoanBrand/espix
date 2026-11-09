@@ -28,8 +28,12 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
+#include "espix_audio.h"
+#include "espix_display.h"
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_pm.h"
+#include "espix_posix.h"
 #include "espix_task.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
@@ -38,6 +42,8 @@
 #include "espix_tty.h"
 
 #define TAG "exec"
+
+static void app_task_shape(const char *abs_path, uint32_t *app_stack, BaseType_t *core);
 
 /* Largest app image we will read into RAM. Guards against running something
  * that is not an app at all. */
@@ -418,6 +424,12 @@ void espix_proc_exit(int status)
 {
     espix_proc_slot_t *const slot = espix_proc_self();
 
+    /* A vfork's child on its parent's task: it ends, and the task goes back to the parent. */
+    if (slot != NULL && slot->app != NULL && slot->app->vfork_jb != NULL &&
+        slot->info.task == xTaskGetCurrentTaskHandle()) {
+        espix_posix_vfork_exit(slot, status);
+    }
+
     /*
      * Being *a task of the process* is no longer the same as being the task the
      * jmp_buf belongs to. Since R-P1.10 a thread resolves to the same slot
@@ -460,6 +472,28 @@ void espix_proc_exit(int status)
      * cannot know that vTaskDelete(NULL) is terminal. Reaching it would be a
      * FreeRTOS bug, so it is unreachable rather than a spin. */
     __builtin_unreachable();
+}
+
+/* An exec's end of the old program on the process's own task: its image, memory and handles go; the process stays. */
+static void mmode_exec_reset(espix_proc_slot_t *slot)
+{
+    TaskHandle_t const task = xTaskGetCurrentTaskHandle();
+    espix_posix_exec_reset(slot);
+    espix_proc_sig_exec(slot);
+    if (slot->app->elf_valid) {
+        esp_elf_deinit(&slot->app->elf);
+        slot->app->elf_valid = false;
+    }
+    free(slot->app->image);
+    slot->app->image = NULL;
+    espix_proc_regions_release(slot);
+    espix_gfx_recover(slot->info.pid);
+    espix_audio_streams_recover((void *)task);
+    espix_display_task_gone((void *)task);
+    espix_pm_task_gone((void *)task);
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    slot->loading = true;
+    xSemaphoreGive(g_espix_proc_lock);
 }
 
 static void proc_task(void *arg)
@@ -572,6 +606,9 @@ static void proc_task(void *arg)
         }
     }
 
+    /* A vfork's child that exec'd keeps its descriptors: its stdio goes through them, not to the session. */
+    espix_posix_std_reroute(slot);
+
     /*
      * 126 unless something says otherwise, which is what a shell answers for
      * "found it and could not run it" -- cmd_run.c already returns 126 for a
@@ -593,8 +630,9 @@ static void proc_task(void *arg)
     }
 #endif
 
-    esp_err_t err = load_image(slot->app->path, &slot->app->image,
-                               &slot->info.image_bytes);
+    esp_err_t err;
+load:
+    err = load_image(slot->app->path, &slot->app->image, &slot->info.image_bytes);
     if (err != ESP_OK) {
         espix_klog(ESPIX_KLOG_ERROR, TAG, "pid %d: cannot load %s: %s",
                    (int)slot->info.pid, slot->app->path, esp_err_to_name(err));
@@ -660,7 +698,7 @@ umode:
                 ran = false;
                 break;
             }
-            if (how != ESPIX_UM_EXEC_JUMP) {
+            if (how != ESPIX_PROC_EXEC_JUMP) {
                 status = slot->exit_status;
                 break;
             }
@@ -767,8 +805,12 @@ umode:
     ran = true;
     slot->exit_jmp = &exit_jb;
 
-    if (setjmp(exit_jb) == 0) {
-        status = slot->app->elf.entry(slot->app->argc, slot->app->argv);
+    const int how = setjmp(exit_jb);
+    if (how == 0) {
+        /* envp too, which a POSIX app's entry sets environ from; an IDF app's app_main() takes two. */
+        int (*const entry)(int, char **, char **) =
+            (int (*)(int, char **, char **))(void (*)(void))slot->app->elf.entry;
+        status = entry(slot->app->argc, slot->app->argv, slot->app->envp);
 
         /* Returned with a terminating signal still pending -- one that ended a
          * read as EOF rather than jump out of it. It is what ended the app. */
@@ -777,6 +819,11 @@ umode:
             status = 128 + sig;
             slot->term_sig = (uint8_t)sig;
         }
+    } else if (how == ESPIX_PROC_EXEC_JUMP) {
+        /* An exec: the same process, its new program loaded on this task. */
+        slot->exit_jmp = NULL;
+        mmode_exec_reset(slot);
+        goto load;
     } else {
         status = slot->exit_status;
     }
@@ -1129,48 +1176,9 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
 
     TaskHandle_t task = NULL;
 
-    /*
-     * How much stack the app gets.
-     *
-     * One default for every app, and a name-keyed override for the one that
-     * needs a quarter of a megabyte. The default used to *be* the quarter
-     * megabyte, so hello and neopixel each committed 256 KB of PSRAM for their
-     * whole life to run a few hundred bytes of work.
-     *
-     * The honest shape is an app declaring its own requirement -- an exported
-     * symbol the loader reads, or a line in the manifest that already ships
-     * beside it -- and this table is where that goes once it exists. A basename
-     * is at least the thing a person edits.
-     */
-    static const struct {
-        const char *name;
-        uint32_t    stack;
-    } app_stacks[] = {
-        { "doom", 262144 },     /* the engine's zone allocator and the WAD walk */
-    };
-
-    uint32_t app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;
-    /* Core 1 unless U-mode; see below. */
-    BaseType_t core = 1;
-#if CONFIG_ESPIX_UMODE
-    /* A U-mode app's own stack is in its address space; this one is only its kernel stack. */
-    if (espix_um_file_is_exec(abs_path)) {
-        app_stack = CONFIG_ESPIX_UM_KSTACK;
-        /* No PIE in it; it stays on the core it first runs on, for the FPU. */
-        core = tskNO_AFFINITY;
-    } else
-#endif
-    {
-        const char *slash = strrchr(abs_path, '/');
-        const char *base  = (slash != NULL) ? slash + 1 : abs_path;
-
-        for (size_t i = 0; i < sizeof(app_stacks) / sizeof(app_stacks[0]); i++) {
-            if (strcmp(app_stacks[i].name, base) == 0) {
-                app_stack = app_stacks[i].stack;
-                break;
-            }
-        }
-    }
+    uint32_t   app_stack;
+    BaseType_t core;
+    app_task_shape(abs_path, &app_stack, &core);
 
     /*
      * An M-mode app pinned to core 1, with a PSRAM stack.
@@ -1216,6 +1224,54 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
     return ESP_OK;
 }
 
+/* The task an app at abs_path runs on: its stack size and core. */
+static void app_task_shape(const char *abs_path, uint32_t *app_stack, BaseType_t *core)
+{
+    /*
+     * How much stack the app gets.
+     *
+     * One default for every app, and a name-keyed override for the one that
+     * needs a quarter of a megabyte. The default used to *be* the quarter
+     * megabyte, so hello and neopixel each committed 256 KB of PSRAM for their
+     * whole life to run a few hundred bytes of work.
+     *
+     * The honest shape is an app declaring its own requirement -- an exported
+     * symbol the loader reads, or a line in the manifest that already ships
+     * beside it -- and this table is where that goes once it exists. A basename
+     * is at least the thing a person edits.
+     */
+    static const struct {
+        const char *name;
+        uint32_t    stack;
+    } app_stacks[] = {
+        { "doom", 262144 },     /* the engine's zone allocator and the WAD walk */
+        { "doom-u", 262144 },   /* its POSIX build; on the S31 a U-mode stack grows instead */
+    };
+
+    *app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;
+    /* Core 1 unless U-mode; see espix_proc_spawn_elf(). */
+    *core = 1;
+#if CONFIG_ESPIX_UMODE
+    /* A U-mode app's own stack is in its address space; this one is only its kernel stack. */
+    if (espix_um_file_is_exec(abs_path)) {
+        *app_stack = CONFIG_ESPIX_UM_KSTACK;
+        /* No PIE in it; it stays on the core it first runs on, for the FPU. */
+        *core = tskNO_AFFINITY;
+    } else
+#endif
+    {
+        const char *slash = strrchr(abs_path, '/');
+        const char *base  = (slash != NULL) ? slash + 1 : abs_path;
+
+        for (size_t i = 0; i < sizeof(app_stacks) / sizeof(app_stacks[0]); i++) {
+            if (strcmp(app_stacks[i].name, base) == 0) {
+                *app_stack = app_stacks[i].stack;
+                break;
+            }
+        }
+    }
+}
+
 /* n strings packed as copy_argv() packs them: the pointers, a NULL, then the strings; one free(). */
 static char **pack_vec(int n, char *const *v)
 {
@@ -1247,16 +1303,12 @@ static int vec_count(char *const *v)
     return n;
 }
 
-int espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *out_pid)
+/* A child's copy of its parent's program: argv, environment and paths. */
+static espix_proc_app_t *child_app(const espix_proc_app_t *pa)
 {
-#if CONFIG_ESPIX_UMODE
-    if (espix_shutdown_started()) {
-        return -EAGAIN;
-    }
-    const espix_proc_app_t *const pa = parent->app;
     espix_proc_app_t *const app = heap_caps_calloc(1, sizeof(*app), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (app == NULL) {
-        return -ENOMEM;
+        return NULL;
     }
     app->argv_block = pack_vec(pa->argc, pa->argv);
     app->env_block  = (pa->envp != NULL) ? pack_vec(vec_count(pa->envp), pa->envp) : NULL;
@@ -1264,26 +1316,24 @@ int espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *out_p
         free(app->argv_block);
         free(app->env_block);
         free(app);
-        return -ENOMEM;
+        return NULL;
     }
     app->argv        = app->argv_block;
     app->argc        = pa->argc;
     app->envp        = app->env_block;
     app->root_active = pa->root_active;
-    app->fork        = um_fork;
     strlcpy(app->path, pa->path, sizeof(app->path));
     strlcpy(app->cwd, pa->cwd, sizeof(app->cwd));
     strlcpy(app->root, pa->root, sizeof(app->root));
+    return app;
+}
 
-    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+/* A slot for parent's child, as fork and vfork make one: its identity and place in the tree. Under the lock. */
+static espix_proc_slot_t *child_slot_locked(espix_proc_slot_t *parent, espix_proc_app_t *app)
+{
     espix_proc_slot_t *const slot = espix_proc_alloc_slot();
     if (slot == NULL) {
-        xSemaphoreGive(g_espix_proc_lock);
-        app->fork = NULL;
-        free(app->argv_block);
-        free(app->env_block);
-        free(app);
-        return -EAGAIN;
+        return NULL;
     }
     slot->app          = app;
     slot->info.kind    = ESPIX_PROC_APP;
@@ -1301,9 +1351,39 @@ int espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *out_p
     slot->info.started_us = esp_timer_get_time();
     slot->foreground = parent->foreground;
     slot->umask      = parent->umask;
-    slot->loading    = true;
     slot->wake_fd    = espix_fs_wake_create();
     slot->detached   = parent->detached;
+    return slot;
+}
+
+static void child_app_free(espix_proc_app_t *app)
+{
+    free(app->argv_block);
+    free(app->env_block);
+    free(app);
+}
+
+int espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *out_pid)
+{
+#if CONFIG_ESPIX_UMODE
+    if (espix_shutdown_started()) {
+        return -EAGAIN;
+    }
+    espix_proc_app_t *const app = child_app(parent->app);
+    if (app == NULL) {
+        return -ENOMEM;
+    }
+    app->fork = um_fork;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    espix_proc_slot_t *const slot = child_slot_locked(parent, app);
+    if (slot == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        app->fork = NULL;
+        child_app_free(app);
+        return -EAGAIN;
+    }
+    slot->loading = true;
     if (parent->std_tty_ref) {
         slot->std_tty     = espix_tty_get(parent->std_tty);
         slot->std_tty_ref = true;
@@ -1335,6 +1415,84 @@ int espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *out_p
     (void)out_pid;
     return -ENOSYS;
 #endif
+}
+
+int espix_proc_vfork_child(espix_proc_slot_t *parent, void *posix, void *jb, espix_proc_slot_t **out)
+{
+    if (espix_shutdown_started()) {
+        return -EAGAIN;
+    }
+    espix_proc_app_t *const app = child_app(parent->app);
+    espix_sigact_t *const acts = (parent->sig_actions != NULL) ? malloc(NSIG * sizeof(*acts)) : NULL;
+    if (app == NULL || (parent->sig_actions != NULL && acts == NULL)) {
+        if (app != NULL) {
+            child_app_free(app);
+        }
+        free(acts);
+        return -ENOMEM;
+    }
+    if (acts != NULL) {
+        memcpy(acts, parent->sig_actions, NSIG * sizeof(*acts));
+    }
+    app->posix      = posix;
+    app->vfork_jb   = jb;
+    app->vfork_from = parent;
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    espix_proc_slot_t *const slot = child_slot_locked(parent, app);
+    if (slot == NULL) {
+        xSemaphoreGive(g_espix_proc_lock);
+        child_app_free(app);
+        free(acts);
+        return -EAGAIN;
+    }
+    /* On the parent's task, with its streams and terminal borrowed until an exec gives it its own. */
+    slot->info.task   = xTaskGetCurrentTaskHandle();
+    slot->info.state  = ESPIX_PROC_RUNNING;
+    slot->sig_actions = acts;
+    slot->sig_blocked = parent->sig_blocked;
+    slot->std_tty     = parent->std_tty;
+    for (int fd = 0; fd < 3; fd++) {
+        slot->own_std[fd] = parent->own_std[fd];
+        slot->std[fd]     = parent->std[fd];
+    }
+    parent->vfork_lent++;
+    *out = slot;
+    xSemaphoreGive(g_espix_proc_lock);
+    return 0;
+}
+
+int espix_proc_vfork_start(espix_proc_slot_t *slot)
+{
+    uint32_t   stack;
+    BaseType_t core;
+    app_task_shape(slot->app->path, &stack, &core);
+    char task_name[configMAX_TASK_NAME_LEN];
+    snprintf(task_name, sizeof(task_name), "app:%.*s", (int)(sizeof(task_name) - sizeof("app:")), slot->info.name);
+
+    xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+    TaskHandle_t task = NULL;
+    if (xTaskCreatePinnedToCoreWithCaps(proc_task, task_name, stack, slot, CONFIG_ESPIX_PROC_PRIORITY, &task, core,
+                                        ESPIX_STACK_CAPS) != pdPASS) {
+        xSemaphoreGive(g_espix_proc_lock);
+        return -EAGAIN;
+    }
+    /* proc_task() waits for this lock, then makes the streams its own. */
+    slot->info.task       = task;
+    slot->loading         = true;
+    const espix_proc_slot_t *const parent = slot->app->vfork_from;
+    slot->app->vfork_jb   = NULL;
+    slot->app->vfork_from = NULL;
+    slot->std_tty         = NULL;
+    if (parent->std_tty_ref) {
+        slot->std_tty     = espix_tty_get(parent->std_tty);
+        slot->std_tty_ref = true;
+    }
+    for (int fd = 0; fd < 3; fd++) {
+        slot->own_std[fd] = NULL;
+    }
+    xSemaphoreGive(g_espix_proc_lock);
+    return 0;
 }
 
 int espix_proc_exec_commit(espix_proc_slot_t *slot, const char *abs_path, int argc, char *const argv[],

@@ -187,6 +187,8 @@ static const struct esp_elfsym s_libc_syms[] = {
      * is searched first, because an app's allocation has to be one espix can
      * find again. The checker caught the duplicate this created. */
     ESP_ELFSYM_EXPORT(strnlen),
+    ESP_ELFSYM_EXPORT(strlcpy),        /* POSIX.1-2024 */
+    ESP_ELFSYM_EXPORT(strlcat),
     ESP_ELFSYM_EXPORT(strndup),
     ESP_ELFSYM_EXPORT(memmove),
     ESP_ELFSYM_EXPORT(memcmp),

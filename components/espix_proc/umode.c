@@ -374,7 +374,7 @@ static void __attribute__((noreturn)) main_exit(espix_um_thread_t *t)
 {
     kstack_note();
     if (t->proc->exec) {
-        longjmp(*t->slot->exit_jmp, ESPIX_UM_EXEC_JUMP);
+        longjmp(*t->slot->exit_jmp, ESPIX_PROC_EXEC_JUMP);
     }
     t->slot->term_sig = t->proc->exit_sig;
     espix_proc_exit(t->proc->exit_status);

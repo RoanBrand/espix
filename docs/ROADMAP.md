@@ -363,6 +363,12 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   `ESPIX_FS_EXT4`'s Kconfig help) — but it is now below the suite's own floor of
   20 KB free at eight connections.
 
+  A full S31 run at `-j 4` takes the internal heap to 27-31 KB, from 115 KB at
+  boot. Then sshd resets a few logins at key exchange (status 255), a spawn fails
+  with `ESP_ERR_NO_MEM`, and an exec is refused as "Permission denied": the
+  ELF-magic check in `espix_fs_mode()` cannot `fopen` the binary, so the file
+  reads as not executable. That last one should say ENOMEM.
+
   Which memory matters, because the fix differs. This is **internal DRAM**, not
   IRAM: IRAM is instruction memory and is already at its whole 16 KB, while what a
   session costs is stack and buffers from the internal heap — the figure `ps`

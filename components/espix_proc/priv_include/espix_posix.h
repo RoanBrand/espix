@@ -152,6 +152,28 @@ espix_um_thread_t *espix_posix_thread_of(espix_proc_slot_t *slot);
 espix_um_thread_t *espix_posix_self(void);
 /* An M-mode POSIX app's, after its descriptors are closed. */
 void               espix_posix_release(espix_proc_slot_t *slot);
+/*
+ * mmap without an MMU (posix.c): a zeroed block of the process's arena, a file's bytes read into it; a
+ * shared writable file's written back by msync, munmap and the process's end. kfd is the mapping's own.
+ */
+int32_t espix_posix_mmap(espix_um_thread_t *t, uint32_t len, bool shared, bool writable, int kfd, uint64_t off);
+int32_t espix_posix_munmap(espix_um_thread_t *t, uint32_t addr, uint32_t len);
+/* msync with sync; madvise(DONTNEED) with drop; and with neither, whether the range is mapped. */
+int32_t espix_posix_mrange(espix_um_thread_t *t, uint32_t addr, uint32_t len, bool sync, bool drop);
+void    espix_posix_unmap_all(espix_um_thread_t *t);
+
+/* exec in place without an MMU: checked and committed, then the old program ends and proc_task() loads the new one. */
+int32_t espix_posix_exec_prepare(espix_um_thread_t *t, const char *path, int argc, char **argv, char **envp);
+void    espix_posix_exec_go(espix_um_thread_t *t) __attribute__((noreturn));
+void    espix_posix_exec_reset(espix_proc_slot_t *slot);
+
+/* vfork without an MMU: the child's state and the parent's resume point; the child on the parent's task; its end. */
+int32_t espix_posix_vfork_prepare(espix_um_thread_t *t);
+int32_t espix_posix_vfork_enter(espix_um_thread_t *t, uint32_t jb);
+void    espix_posix_vfork_exit(espix_proc_slot_t *slot, int status) __attribute__((noreturn));
+/* A process's stdio back onto its descriptors 0-2, once proc_task() has made its session streams. */
+void    espix_posix_std_reroute(espix_proc_slot_t *slot);
+
 /* Descriptor fd's read (or with out, write) of len bytes, for stdio routed through the table; bytes or -errno. */
 int32_t espix_posix_rw(espix_um_thread_t *t, int fd, void *buf, size_t len, bool out);
 /* The syscall an app without an address space makes: a direct call, the number then a0-a5. */

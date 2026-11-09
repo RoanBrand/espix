@@ -111,10 +111,10 @@ for name in "${names[@]}"; do
     # to do. -newer is portable in a way that `find -newermt` and stat(1) are
     # not, macOS and Linux disagreeing on both.
     if [ "$force" = 0 ] && [ -f "$staged" ] &&
-       { [ "$target" != esp32s31 ] || [ ! -f "$app/uapp/CMakeLists.txt" ] || [ -f "$staged-u" ]; }; then
+       { [ ! -f "$app/uapp/CMakeLists.txt" ] || [ -f "$staged-u" ]; }; then
         newer=$(find "$app" -type f \
                     -not -path "*/build/*" \
-                    -not -path "*/build-u/*" \
+                    -not -path "*/build-u*" \
                     -not -path "*/managed_components/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
         # A U-mode build links libespix whole: a runtime newer than it is a reason too.
@@ -201,16 +201,17 @@ for name in "${names[@]}"; do
 
     cp "$elf" "$staged"
 
-    # On the S31, an app with a uapp/ project is also built as a U-mode app,
-    # staged beside the M-mode one as <name>-u (docs/USER-MODE.md).
-    if [ "$target" = esp32s31 ] && [ -f "$app/uapp/CMakeLists.txt" ]; then
-        echo "build-apps: building $name for U-mode"
-        { cmake -S "$app/uapp" -B "$app/build-u" -DCMAKE_TOOLCHAIN_FILE="$root/cmake/espix-uapp.cmake" \
-              > "$app/build-u.log" 2>&1 \
-          && cmake --build "$app/build-u" -j >> "$app/build-u.log" 2>&1; } \
-            || { echo "build-apps: $name: the U-mode build failed; see $app/build-u.log" >&2; exit 1; }
-        # Staged without debug info (picolibc's is most of the file); build-u/ keeps it for addr2line.
-        "$root/tools/espix-cc" --strip "$app/build-u/$name" "$staged-u"
+    # An app with a uapp/ project is also built by espix-cc as a POSIX app, staged beside the
+    # M-mode one as <name>-u: U-mode on the S31, without an MMU on the S3 (docs/USER-MODE.md).
+    if [ -f "$app/uapp/CMakeLists.txt" ]; then
+        echo "build-apps: building $name as a POSIX app"
+        bu="$app/build-u-$target"
+        { cmake -S "$app/uapp" -B "$bu" -DCMAKE_TOOLCHAIN_FILE="$root/cmake/espix-uapp.cmake" \
+              -DESPIX_TARGET="$target" > "$app/build-u.log" 2>&1 \
+          && cmake --build "$bu" -j >> "$app/build-u.log" 2>&1; } \
+            || { echo "build-apps: $name: the POSIX build failed; see $app/build-u.log" >&2; exit 1; }
+        # Staged without debug info (picolibc's is most of the file); the build keeps it for addr2line.
+        "$root/tools/espix-cc" --target="$target" --strip "$bu/$name" "$staged-u"
         echo "build-apps: staged $name-u ($(wc -c < "$staged-u" | tr -d ' ') bytes)"
     else
         rm -f "$staged-u"

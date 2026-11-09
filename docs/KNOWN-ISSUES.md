@@ -496,6 +496,24 @@ streams, `fork`, `vfork`, `exec`, `wait` and pipes. What it cannot do yet:
   zero-fills every block. From 128 KiB a block is a mapping of its own and costs
   only the pages touched, as memory reserved with `brk`, bss and the stack do.
 
+## POSIX apps without an MMU (S3)
+
+An app built with `tools/espix-cc --target=esp32s3` makes the same syscalls as a
+U-mode app and runs as Linux runs a program without an MMU
+([USER-MODE.md](USER-MODE.md#the-s3-posix-apps-without-an-mmu)). Beyond what that
+rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
+
+- **`exec` from a thread other than the process's first**: it fails with
+  `ENOTSUP`, because the new program loads on the frame the first thread keeps.
+  A `vfork()`'s child may `exec` from any thread.
+- **Be killed at once while a `vfork()` is in progress**: the parent and the
+  child share one task, so neither is deleted. Each ends at its next syscall, and
+  the parent only once the child has called `exec` or `_exit`. A child that loops
+  without a syscall holds both off.
+- **Map a file coherently**: a shared mapping is the file's bytes copied in, and
+  written back by `msync`, `munmap` and the end; `read`, `write` and other
+  mappings of the file do not see it in between.
+
 ## Filesystem
 
 - **An ext listing cannot tell its end from a failure.** lwext4's

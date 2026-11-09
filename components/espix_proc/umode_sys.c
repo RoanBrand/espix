@@ -992,7 +992,20 @@ static int32_t um_sys_getpgid(um_call_t *c) { return espix_proc_getpgid((pid_t)c
 static int32_t um_sys_umask(um_call_t *c)   { return espix_proc_umask_set((int)c->a[0]); }
 #if CONFIG_ESPIX_UMODE
 static int32_t um_sys_fork(um_call_t *c)    { return espix_um_fork(c->t, (RvExcFrame *)c->f, false); }
-static int32_t um_sys_vfork(um_call_t *c)   { return espix_um_fork(c->t, (RvExcFrame *)c->f, true); }
+#endif
+
+/* Without an MMU, two calls around libespix's setjmp: the child's state with a resume point, then the child on this task. */
+static int32_t um_sys_vfork(um_call_t *c)
+{
+    if (um_nommu(c)) {
+        return (c->a[0] == 0) ? espix_posix_vfork_prepare(c->t) : espix_posix_vfork_enter(c->t, c->a[0]);
+    }
+#if CONFIG_ESPIX_UMODE
+    return espix_um_fork(c->t, (RvExcFrame *)c->f, true);
+#else
+    return -ENOSYS;
+#endif
+}
 
 /* A NULL-terminated array of strings from the app, packed as copy_argv packs one: the pointers, then the strings. */
 static int32_t vec_in(um_call_t *c, uint32_t uvec, char ***out, int *count, size_t *room)
@@ -1074,16 +1087,25 @@ static int32_t um_sys_execve(um_call_t *c)
         r = vec_in(c, c->a[2], &envp, &envc, &room);
     }
     if (r == 0) {
-        r = espix_um_exec_prepare(c->t, path, argc, argv, envp);
+#if CONFIG_ESPIX_UMODE
+        r = um_nommu(c) ? espix_posix_exec_prepare(c->t, path, argc, argv, envp)
+                        : espix_um_exec_prepare(c->t, path, argc, argv, envp);
+#else
+        r = espix_posix_exec_prepare(c->t, path, argc, argv, envp);
+#endif
     }
     vec_free(argv);
     vec_free(envp);
     if (r == 0) {
-        espix_um_exec_go(c->t);
+#if CONFIG_ESPIX_UMODE
+        if (!um_nommu(c)) {
+            espix_um_exec_go(c->t);
+        }
+#endif
+        espix_posix_exec_go(c->t);
     }
     return r;
 }
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Signals (umode_sig.c)                                               */
@@ -1167,6 +1189,13 @@ static uint32_t prot_flags(uint32_t prot)
     return ((prot & ESPIX_PROT_READ) ? PTE_R : 0) | ((prot & ESPIX_PROT_WRITE) ? PTE_R | PTE_W : 0) |
            ((prot & ESPIX_PROT_EXEC) ? PTE_X : 0);
 }
+#endif
+
+/* An address a mapping call names: a page's start in U-mode; without an MMU, any block's. */
+static bool map_aligned(const um_call_t *c, uint32_t addr)
+{
+    return um_nommu(c) || (addr & (PG - 1)) == 0;
+}
 
 static int32_t um_sys_mmap(um_call_t *c)
 {
@@ -1174,6 +1203,10 @@ static int32_t um_sys_mmap(um_call_t *c)
     const uint32_t type = fl & ESPIX_MAP_TYPE;
     if (len == 0 || (addr & (PG - 1)) || (prot & ~7u) ||
         (type != ESPIX_MAP_SHARED && type != ESPIX_MAP_PRIVATE && type != ESPIX_MAP_SHARED_VALIDATE)) {
+        return -EINVAL;
+    }
+    /* Without an MMU nothing can be put at an address of the app's choosing, as on Linux without one. */
+    if (um_nommu(c) && (fl & (ESPIX_MAP_FIXED | ESPIX_MAP_FIXED_NOREPLACE))) {
         return -EINVAL;
     }
     int kfd = -1;
@@ -1196,53 +1229,104 @@ static int32_t um_sys_mmap(um_call_t *c)
             return -errno;
         }
     }
-    const int32_t r = espix_um_mmap(c->p->as, addr, len, prot_flags(prot), fl, kfd, (uint64_t)c->a[5] * PG);
+    const uint64_t off = (uint64_t)c->a[5] * PG;
+    if (um_nommu(c)) {
+        return espix_posix_mmap(c->t, len, type != ESPIX_MAP_PRIVATE, (prot & ESPIX_PROT_WRITE) != 0, kfd, off);
+    }
+#if CONFIG_ESPIX_UMODE
+    const int32_t r = espix_um_mmap(c->p->as, addr, len, prot_flags(prot), fl, kfd, off);
     if (r < 0 && kfd >= 0) {
         close(kfd);
     }
     return r;
+#else
+    return -ENOSYS;
+#endif
 }
 
 static int32_t um_sys_munmap(um_call_t *c)
 {
-    return (c->a[0] & (PG - 1)) ? -EINVAL : espix_um_munmap(c->p->as, c->a[0], c->a[1]);
-}
-
-static int32_t um_sys_mprotect(um_call_t *c)
-{
-    if ((c->a[0] & (PG - 1)) || (c->a[2] & ~7u)) {
+    if (!map_aligned(c, c->a[0])) {
         return -EINVAL;
     }
+    if (um_nommu(c)) {
+        return espix_posix_munmap(c->t, c->a[0], c->a[1]);
+    }
+#if CONFIG_ESPIX_UMODE
+    return espix_um_munmap(c->p->as, c->a[0], c->a[1]);
+#else
+    return -ENOSYS;
+#endif
+}
+
+/* Without an MMU a range's permissions cannot be changed, and are taken as asked where it is mapped. */
+static int32_t um_sys_mprotect(um_call_t *c)
+{
+    if (!map_aligned(c, c->a[0]) || (c->a[2] & ~7u)) {
+        return -EINVAL;
+    }
+    if (um_nommu(c)) {
+        return espix_posix_mrange(c->t, c->a[0], c->a[1], false, false);
+    }
+#if CONFIG_ESPIX_UMODE
     return espix_um_mprotect(c->p->as, c->a[0], c->a[1], prot_flags(c->a[2]));
+#else
+    return -ENOSYS;
+#endif
 }
 
 /* MS_ASYNC 1, MS_INVALIDATE 2, MS_SYNC 4: the write-back is done before it returns either way. */
 static int32_t um_sys_msync(um_call_t *c)
 {
-    if ((c->a[0] & (PG - 1)) || (c->a[2] & ~7u) || (c->a[2] & 5) == 5) {
+    if (!map_aligned(c, c->a[0]) || (c->a[2] & ~7u) || (c->a[2] & 5) == 5) {
         return -EINVAL;
     }
+    if (um_nommu(c)) {
+        return espix_posix_mrange(c->t, c->a[0], c->a[1], true, false);
+    }
+#if CONFIG_ESPIX_UMODE
     return espix_um_msync(c->p->as, c->a[0], c->a[1]);
+#else
+    return -ENOSYS;
+#endif
 }
 
 /* The advice that changes nothing here is taken; DONTNEED and FREE drop the pages. */
 static int32_t um_sys_madvise(um_call_t *c)
 {
     const uint32_t advice = c->a[2];
-    if ((c->a[0] & (PG - 1)) || (advice > 4 && advice != ESPIX_MADV_FREE)) {
+    if (!map_aligned(c, c->a[0]) || (advice > 4 && advice != ESPIX_MADV_FREE)) {
         return -EINVAL;
     }
-    return espix_um_madvise(c->p->as, c->a[0], c->a[1],
-                            advice == ESPIX_MADV_DONTNEED || advice == ESPIX_MADV_FREE);
+    const bool drop = advice == ESPIX_MADV_DONTNEED || advice == ESPIX_MADV_FREE;
+    if (um_nommu(c)) {
+        return espix_posix_mrange(c->t, c->a[0], c->a[1], false, drop);
+    }
+#if CONFIG_ESPIX_UMODE
+    return espix_um_madvise(c->p->as, c->a[0], c->a[1], drop);
+#else
+    return -ENOSYS;
+#endif
 }
 
-/* A chunk of the vector at a time, copied out after the table's lock is let go. */
+/* A chunk of the vector at a time, copied out after the table's lock is let go; without an MMU all of a mapping is resident. */
 static int32_t um_sys_mincore(um_call_t *c)
 {
     const uint32_t start = c->a[0], npages = (c->a[1] + PG - 1) / PG;
-    if (start & (PG - 1)) {
+    if (!map_aligned(c, start)) {
         return -EINVAL;
     }
+    if (um_nommu(c)) {
+        const int32_t r = espix_posix_mrange(c->t, start, c->a[1], false, false);
+        for (uint32_t i = 0; r == 0 && i < npages; i++) {
+            const uint8_t one = 1;
+            if (espix_um_copyout(NULL, c->a[2] + i, &one, 1) < 0) {
+                return -EFAULT;
+            }
+        }
+        return r;
+    }
+#if CONFIG_ESPIX_UMODE
     uint8_t vec[256];
     for (uint32_t done = 0; done < npages;) {
         const uint32_t n = MIN(npages - done, (uint32_t)sizeof(vec));
@@ -1256,8 +1340,10 @@ static int32_t um_sys_mincore(um_call_t *c)
         done += n;
     }
     return 0;
-}
+#else
+    return -ENOSYS;
 #endif
+}
 
 /* Frames come from PSRAM. */
 static int32_t um_sys_meminfo(um_call_t *c)
@@ -1280,8 +1366,7 @@ static int32_t um_sys_meminfo(um_call_t *c)
 #define UM_MMU_ONLY(X) \
     X(THREAD_CREATE, thread_create) X(THREAD_EXIT, thread_exit) X(FUTEX, futex) X(SIGACTION, sigaction) \
     X(SIGPROCMASK, sigprocmask) X(SIGPENDING, sigpending) X(SIGSUSPEND, sigsuspend) X(SIGRETURN, sigreturn) \
-    X(RAISE, raise) X(BRK, brk) X(MMAP, mmap) X(MUNMAP, munmap) X(MPROTECT, mprotect) X(MSYNC, msync) \
-    X(MADVISE, madvise) X(MINCORE, mincore) X(FORK, fork) X(VFORK, vfork) X(EXECVE, execve) \
+    X(RAISE, raise) X(BRK, brk) X(FORK, fork) \
     X(GFX_OPEN, gfx_open) X(GFX_CLOSE, gfx_close) X(GFX_SURFACE, gfx_surface) X(GFX_FREE, gfx_free) \
     X(GFX_PRESENT, gfx_present) X(GFX_POLL, gfx_poll) X(AUDIO_OPEN, audio_open) X(AUDIO_WRITE, audio_write) \
     X(AUDIO_CTL, audio_ctl) X(AUDIO_CLOSE, audio_close)
@@ -1324,5 +1409,13 @@ int32_t espix_posix_syscall(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2, 
     const int32_t r = s_sys[nr](&c);
     /* The delivery point an M-mode app's calls in are: its handlers run here, on its own stack. */
     (void)espix_sigcheck_mask();
+    /* A kill asks first: the task that is the process leaves here, holding nothing, as exit() does. vfork may have changed which. */
+    espix_proc_slot_t *const now = espix_proc_self();
+    if (now != NULL && now->stop_requested && !now->exiting && now->info.task == xTaskGetCurrentTaskHandle()) {
+        if (now->term_sig == 0) {
+            now->term_sig = SIGKILL;
+        }
+        espix_proc_exit(128 + now->term_sig);
+    }
     return r;
 }

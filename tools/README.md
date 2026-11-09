@@ -91,6 +91,11 @@ iterating on the firmware alone:
 idf.py -DESPIX_BUILD_APPS=OFF build
 ```
 
+An app with a `uapp/` CMake project is also built by `espix-cc` as a POSIX app
+and staged as `<name>-u`: U-mode on the S31, without an MMU on the S3. Its
+build directory is `apps/<name>/build-u-<target>/`, which keeps the symbols for
+`addr2line`; the staged copy is stripped.
+
 An app needing build-time environment beyond `sdkconfig.defaults` puts it in
 `apps/<name>/build.env`; `apps/neopixel/build.env` is the example, carrying the
 `ARDUINO_SKIP_TICK_CHECK` that Arduino's 1000Hz assertion requires.
@@ -138,6 +143,12 @@ or `ESPIX_NOMMU_APP` for the kind.
 - **The S3** (`--target=esp32s3`): a shared object the loader relocates, as an
   M-mode app is, linked with no libc: what it leaves undefined (libc, `malloc`,
   threads, signals) the kernel answers. Its syscalls are direct calls.
+
+`espix-cc --strip <in> <out>` (with the same `--target`) makes the copy to stage:
+without debug info on the S31, and on the S3 without anything the loader does
+not read, which leaves it the size of the same app built by IDF.
+`cmake/espix-uapp.cmake` is the CMake toolchain file over it, its chip chosen
+with `-DESPIX_TARGET`.
 
 `libespix.a` is built into `user/build/` (or `user/build-<target>/`) when a
 source is newer. Both use the 64-bit `off_t` of `cmake/offt64.h`. An app on the

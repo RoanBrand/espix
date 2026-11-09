@@ -22,7 +22,6 @@ bool espix_um_file_is_exec(const char *path);
 const char *espix_um_exec(espix_proc_slot_t *slot);
 
 /* proc_task()'s exit_jmp value for an exec in place: the old image is released and the new one loaded. */
-#define ESPIX_UM_EXEC_JUMP 2
 
 /* fork and vfork from thread t at its syscall's frame f: the child's pid, or -errno. */
 int32_t     espix_um_fork(espix_um_thread_t *t, RvExcFrame *f, bool vfork);

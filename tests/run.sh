@@ -10,6 +10,7 @@
 #   tests/run.sh --host 10.0.0.5     a different device
 #   tests/run.sh --port /dev/ttyUSB0 enable the console suites
 #   tests/run.sh --stress [--stress-n 50]   include the stress suites
+#   tests/run.sh --apps              include the suites that run apps/ (62-mqtt, 64-gfx)
 #   tests/run.sh --overlap-transfers        let transfers run concurrently
 #
 # bash 3.2 throughout -- macOS ships it and always will (GPLv3), so a bash-4-ism
@@ -53,12 +54,14 @@ SUITE_FILTER=""
 # answer while tools/soak.sh finds out why.
 : "${ESPIX_JOBS:=4}"
 : "${ESPIX_SEED:=}"
-export ESPIX_STRESS ESPIX_STRESS_N ESPIX_STRESS_LINES ESPIX_STRESS_LIMIT
+: "${ESPIX_APPS:=0}"
+export ESPIX_STRESS ESPIX_STRESS_N ESPIX_STRESS_LINES ESPIX_STRESS_LIMIT ESPIX_APPS
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --suite) SUITE_FILTER="$2"; shift 2 ;;
         --stress) ESPIX_STRESS=1; shift ;;
+        --apps) ESPIX_APPS=1; shift ;;
         --stress-n) ESPIX_STRESS_N="$2"; shift 2 ;;
         --stress-lines) ESPIX_STRESS_LINES="$2"; shift 2 ;;
         --stress-limit) ESPIX_STRESS_LIMIT="$2"; shift 2 ;;

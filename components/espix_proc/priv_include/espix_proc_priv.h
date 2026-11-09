@@ -175,6 +175,10 @@ typedef struct {
     /* An M-mode app's syscall state once it makes one, as a POSIX app built by espix-cc does (posix.c). */
     void *posix;
 
+    /* A vfork's child while it runs on its parent's task: where the parent resumes, and the parent (posix.c). */
+    void *vfork_jb;
+    void *vfork_from;
+
 #if CONFIG_ESPIX_UMODE
     /* A U-mode app's thread and address space (espix_umode.h); NULL for an M-mode app. */
     void *um;
@@ -331,6 +335,7 @@ typedef struct {
     struct espix_tty *std_tty;
     bool              std_tty_ref;  /* held by a reference of its own: it left the session (setsid) */
     bool              detached;     /* left its session: its streams are its terminal's, or /dev/null */
+    uint8_t           vfork_lent;   /* its tasks a vfork's child runs on now; under the lock */
 
     /*
      * The app's arena; see espix_app_region_t above. Empty until the app
@@ -488,9 +493,15 @@ espix_proc_slot_t *espix_proc_alloc_slot(void);
  * NOT hold the lock. */
 void espix_proc_release_resources(espix_proc_slot_t *slot);
 
-/* End any thread this process still has running. See abi_pthread.c: a thread
- * outliving its process is the one resource the reaper used to leave behind. */
-void espix_pthread_reap(espix_proc_slot_t *slot);
+/* End any thread this process still has running, and say how many. See abi_pthread.c: a thread
+ * outliving its process is the one resource the reaper used to leave behind. Quiet for an exec's. */
+int espix_pthread_reap(espix_proc_slot_t *slot, bool quiet);
+
+/* What exit_jmp is taken with for an exec: the process's task loads the new program. */
+#define ESPIX_PROC_EXEC_JUMP 2
+
+/* An exec's signals: a handler is the old program's, so its signal goes back to the default; ignored stays ignored. */
+void espix_proc_sig_exec(espix_proc_slot_t *slot);
 
 /* If the caller is an app's thread, end it as pthread_exit() would; otherwise
  * return. For exit() reached on a thread. */
@@ -713,6 +724,9 @@ int  espix_proc_umask_set(int mask);
 void espix_proc_streams_leave(espix_proc_slot_t *slot);
 /* A child of parent that starts from um_fork (umode.c): its pid in *pid; 0 or -errno. */
 int  espix_proc_fork(espix_proc_slot_t *parent, void *um_fork, espix_pid_t *pid);
+/* A vfork's child on the parent's task, its syscall state posix; and, at its exec, a task of its own (posix.c). */
+int  espix_proc_vfork_child(espix_proc_slot_t *parent, void *posix, void *jb, espix_proc_slot_t **out);
+int  espix_proc_vfork_start(espix_proc_slot_t *slot);
 /* An exec's new program: its path, arguments, environment, name and set-id credentials. 0 or -errno. */
 int  espix_proc_exec_commit(espix_proc_slot_t *slot, const char *abs_path, int argc, char *const argv[],
                             char *const envp[]);

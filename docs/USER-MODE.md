@@ -261,7 +261,8 @@ own pthread implements). It links `libespix` whole and ahead of libc, because th
 toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
 archive scan. `cmake/espix-uapp.cmake` is the CMake toolchain file over it: an
 app with a `uapp/` CMake project (mosquitto's, plasma's, Doom's) is built that
-way by `tools/build-apps.sh` and staged as `<name>-u`.
+way by `tools/build-apps.sh` and staged as `<name>-u`, on the S3 too
+(`-DESPIX_TARGET=esp32s3`).
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
@@ -480,7 +481,10 @@ The S3 has no MMU, so there it runs as Linux runs a program without one:
 | descriptors, files, sockets, `poll`, pipes, `wait`, sessions, `umask` | the process's own table, the same code (`umode_sys.c`, `umode_net.c`) | the same |
 | user pointers | range-checked and used as they are (`posix_uaccess.c`) | walked through the table |
 | libc, `malloc`, threads, signals, the screen and audio | the kernel's, shared by every app | linked into the app; threads, signals and surfaces by syscall |
+| `mmap` | a block of the process's own memory, the size asked; no `MAP_FIXED` | pages, mapped on touch |
 | `fork` | ENOSYS, as on a Linux without an MMU | copy-on-write |
+| `vfork` | the child runs on the parent's task until it execs or exits | the child borrows the address space |
+| `exec` | the new program loads on the process's own task, in place | the same, in a fresh address space |
 
 **libc's code is shared from the kernel.** picolibc's S3 `libc.a` keeps errno and
 its other state in thread-local storage, which the loader does not relocate, so
@@ -491,14 +495,41 @@ routed through descriptors 0-2 once its first syscall has made the table, so
 `dup2` onto them redirects `printf`; `fopen` and `fdopen` are `libespix`'s,
 `funopen` streams over the app's own descriptors.
 
+**A mapping is a block of the process's memory**, as on Linux without an MMU:
+exactly the length asked, aligned as `malloc`'s, and given back whole by
+`munmap` (a part is EINVAL). A file's bytes are read in when it is mapped; a
+shared writable mapping is written back by `msync`, `munmap` and exit, and is not
+coherent with `read`, `write` or another mapping of the file between those.
+`mprotect` changes nothing it could enforce, `MADV_DONTNEED` zeroes a private
+anonymous range, and `mincore` reports every page resident.
+
+**`exec` and `vfork` keep a process what it is on Linux.** `exec` ends the
+process's other threads, keeps its pid, parent, descriptors not marked
+close-on-exec and ignored signals, gives back its arena, mappings and image, and
+loads the new program on the same task. `environ` is the app's own, so what
+`setenv` changed is what `execv` passes on. `vfork()` is a macro in `unistd.h`: a
+`setjmp` in the caller's frame, then a syscall that makes the child a process of
+its own (pid, descriptors, signal actions) running on the parent's task and
+memory. The child's `exec` starts its program on a task of its own, its `_exit`
+ends it, and either way the parent resumes at the `setjmp` with the child's pid.
+`posix_spawn`, `system` and `popen` are `libespix`'s, over `vfork` and `exec`.
+
 **Threads and signals are an M-mode app's**: IDF's pthreads behind the ABI, and
-handlers run when the app calls in, which every syscall's return is.
+handlers run when the app calls in, which every syscall's return is. A syscall
+runs on the calling thread's own stack, where Linux has a kernel stack beside
+it, so a thread gets the main task's 16 KB in PSRAM unless the app asks for a
+size, and a size it asks for gets 8 KB more. A kill the app does not answer
+ends it at its next syscall, as SIGKILL would, rather than by deleting its task.
 
 The S3 does not get isolation, asynchronous signals, growing stacks or
 copy-on-write; tests that need them skip there. An app's fault ends only the app
 on both (`37-faults`). `ESPIX_UAPP=1 tests/run.sh` runs the suites with the test
 app's `espix-cc` build on either chip.
 
+mosquitto, plasma and Doom are built for the S3 from the same `uapp/` projects,
+as `<name>-u`, the size of their IDF builds (`mosquitto-u` 216 KB against 232 KB);
+`64-gfx` and `62-mqtt` run them on both chips. `mosquitto-u -d` fails there with
+"Error in fork: Function not implemented", as it would on a Linux without an MMU.
 Apps that drive the hardware themselves (neopixel's RMT) stay M-mode apps built
 by IDF, against the symbol tables.
 

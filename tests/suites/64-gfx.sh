@@ -1,10 +1,16 @@
 # The screen, from apps: plasma draws and quits on a key from the viewer, and
-# Doom's timedemo plays through. On the S31 the same apps run as U-mode builds,
-# whose surfaces are mapped into them, unmapped when freed, and given back when
-# the app ends however it ends; an audio stream is paced by its sink
-# (docs/USER-MODE.md).
+# Doom's timedemo plays through, and so do their POSIX builds. On the S31 a U-mode
+# app's surfaces are mapped into it, unmapped when freed, and given back when the
+# app ends however it ends; an audio stream is paced by its sink (docs/USER-MODE.md).
 #
 # RESOURCES: exclusive -- one app owns the screen at a time, and a timedemo is a measurement.
+
+# The kernel's suites reach it through the shell and the test app; this one runs a program
+# from apps/, which holds memory and the screen the others would then contend for.
+if [ "${ESPIX_APPS:-0}" != 1 ]; then
+    espix_skip "app suites need --apps (or 'make test-apps')"
+    return 0
+fi
 
 GFX_BIN="$ESPIX_ROOT/fsroot/bin"
 if [ ! -f "$GFX_BIN/plasma" ]; then
@@ -109,16 +115,17 @@ else
     espix_skip "no doom1.wad for the device -- build apps/doom to fetch it"
 fi
 
-if [ "$ESPIX_TARGET" = esp32s31 ]; then
-    if [ -f "$GFX_BIN/plasma-u" ]; then
-        gfx_plasma plasma-u
-    else
-        espix_skip "plasma-u not built -- run 'make apps'"
-    fi
-    if [ -n "$GFX_WAD" ] && [ -f "$GFX_BIN/doom-u" ]; then
-        gfx_doom doom-u whole
-    fi
+# The POSIX builds, U-mode on the S31 and without an MMU on the S3.
+if [ -f "$GFX_BIN/plasma-u" ]; then
+    gfx_plasma plasma-u
+else
+    espix_skip "plasma-u not built -- run 'make apps'"
+fi
+if [ -n "$GFX_WAD" ] && [ -f "$GFX_BIN/doom-u" ]; then
+    gfx_doom doom-u whole
+fi
 
+if [ "$ESPIX_TARGET" = esp32s31 ]; then
     UAPP="$GFX_HOME/uapp-gfx-$ESPIX_WORKER"
     if "$ESPIX_ROOT/tools/espix-cc" -Os -I"$ESPIX_ROOT/components/espix_proc/include" \
            -I"$ESPIX_ROOT/components/espix_display/include" -I"$ESPIX_ROOT/components/espix_audio/include" \
