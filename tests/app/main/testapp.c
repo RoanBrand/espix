@@ -1699,11 +1699,8 @@ static int cmd_dup(const char *path, const char *mode)
         rc = 1;
     }
 
-    /* POSIX: land on exactly the number asked, here a free one above d (M-mode's table is the system's). */
+    /* POSIX: land on exactly the number asked, here one above d the app holds (M-mode's table is the system's). */
     const int want = fcntl(d, F_DUPFD, d + 1);
-    if (want >= 0) {
-        close(want);
-    }
     const int d2 = dup2(d, want);
     close(d);
     if (want < 0 || d2 != want) {
