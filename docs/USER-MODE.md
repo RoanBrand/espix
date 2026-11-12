@@ -229,14 +229,16 @@ context, as an M-mode app's `exit()` does.
 
 ## The app side
 
-**A U-mode app links its own libc**, as on Linux: picolibc, the same library the
-kernel uses, statically linked, plus `libespix` (`user/libespix/`), espix's OS
-layer under it:
+**A U-mode app has a libc of its own**, as on Linux: espix's build of picolibc
+(`tools/build-libc.sh`), its state linked into the app and its code shared from
+`/lib/libc.so` ([below](#the-s3-posix-apps-without-an-mmu)), plus `libespix`
+(`user/libespix/`), espix's OS layer under it:
 
 - `crt0`: the entry, with argv and environ on the user stack;
 - the calls picolibc's POSIX layer makes (`read`, `write`, `open`, `sbrk`...) as
   `ecall` wrappers;
-- stdin, stdout and stderr on fds 0-2, and thread-local storage through `tp`;
+- stdin, stdout and stderr on fds 0-2, and thread-local storage through `tp`,
+  `errno` in it;
 - POSIX threads, on the kernel's threads and futexes;
 - signals: `sigaction`, masks, `alarm` and `setitimer`, and the restorer a
   handler returns through;
@@ -257,16 +259,15 @@ for source that must tell the two chips apart.
 kernel's 64-bit `off_t`, no `cm.popret` (as IDF builds the kernel; with it
 libespix's mutex deadlocked, [GOTCHAS](GOTCHAS.md)), and the barriers and
 spinlocks picolibc's headers leave out (their feature macros follow what IDF's
-own pthread implements). It links `libespix` whole and ahead of libc, because the
-toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
-archive scan. `cmake/espix-uapp.cmake` is the CMake toolchain file over it: every
+own pthread implements). It links `libespix` whole and ahead of libc.
+`cmake/espix-uapp.cmake` is the CMake toolchain file over it: every
 app under `apps/` is a plain CMake project built that way by `tools/build-apps.sh`
 and staged as `<name>`, for either chip (`-DESPIX_TARGET=esp32s3`). The test app
 is built the same way.
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
-memory. `hello` is 10.8 KiB of text.
+memory. `hello` is 3.1 KiB of text, 10.6 KiB with `-static`.
 
 **Built without PIE and the hardware loop** (`xespv`, `xesploop`). Only core 1
 has them, and IDF pins a task that uses one to core 1 for good. Without them a
@@ -476,27 +477,36 @@ The S3 has no MMU, so there it runs as Linux runs a program without one:
 | a syscall | a direct call to `espix_syscall()` | `ecall` |
 | descriptors, files, sockets, `poll`, pipes, `wait`, sessions, `umask` | the process's own table, the same code (`umode_sys.c`, `umode_net.c`) | the same |
 | user pointers | range-checked and used as they are (`posix_uaccess.c`) | walked through the table |
-| libc | the app's own state, its shared code in `/lib/libc.so` | linked into the app |
+| libc | the app's own state, its code in `/lib/libc.so`, bound by name at load | the app's own state, its code in `/lib/libc.so`, mapped at a fixed address |
 | `malloc`, threads, signals, the screen and audio | the kernel's, per process | `malloc` in the app; threads, signals and surfaces by syscall |
 | `mmap` | a block of the process's own memory, the size asked; no `MAP_FIXED` | pages, mapped on touch |
 | `fork` | ENOSYS, as on a Linux without an MMU | copy-on-write |
 | `vfork` | the child runs on the parent's task until it execs or exits | the child borrows the address space |
 | `exec` | the new program loads on the process's own task, in place | the same, in a fresh address space |
 
-**An app's libc state is its own; its code is shared.** The apps' picolibc
-(`tools/build-libc.sh`) is split. What owns data or allocates (stdio's streams,
-`getopt`, `TZ` and `localtime`, `atexit`, `environ`, `fopen`) links into each app,
-so two apps never share it. Pure code (the `printf` and `scanf` engines, strings,
-math, `qsort`) is one `/lib/libc.so`, loaded when the first app starts and kept 30
-seconds after the last. `errno` is a call, answered per thread by the kernel; the
-allocator is the kernel's per-process arena; libc's locks, its libc-wide one
-included, are mutexes of the process, freed with it; `stdin`, `stdout` and
-`stderr` are streams over descriptors 0-2. An app's `.note.espix` names the `libc.so` build it
-was linked against, and another build is refused at `exec`; `espix-cc -static`
-links all of libc instead and needs no `libc.so`. An app's own libc and libespix
-are linked hidden, so its names bind inside it; what it leaves undefined resolves
-to `libc.so` first, then the kernel's tables.
-`hello` is 4.6 KB.
+**An app's libc state is its own; its code is shared, on both chips.** The apps'
+picolibc (`tools/build-libc.sh`) is split. What owns data or allocates (stdio's
+streams, `getopt`, `TZ` and `localtime`, `atexit`, `environ`, `fopen`) links into
+each app, so two apps never share it. Pure code (the `printf` and `scanf`
+engines, strings, math, `qsort`) is one `/lib/libc.so`, loaded when the first app
+starts and kept 30 seconds after the last. An app's `.note.espix` names the
+`libc.so` build it was linked against, and another build is refused at `exec`;
+`espix-cc -static` links all of libc instead and needs no `libc.so`. `stdin`,
+`stdout` and `stderr` are streams over descriptors 0-2.
+
+- **S3:** `libc.so` is a shared object. An app's own libc and libespix are linked
+  hidden, so its names bind inside it; what it leaves undefined resolves to
+  `libc.so` first, then the kernel's tables. `errno` is a call the kernel answers
+  per thread; the allocator is the kernel's per-process arena; libc's locks, its
+  libc-wide one included, are mutexes of the process, freed with it. `hello` is
+  4.4 KB.
+- **S31:** `libc.so` is one read-only image at `0x6FC00000`
+  (`user/libc-image.ld`), loaded once into frames and mapped into every app there.
+  An app is linked against its addresses (`libc-provide.ld`, which binds only what
+  the app does not define itself). Where libc's code calls back into the app, for
+  `errno` and libc's locks, it calls hook slots at the app's first text address,
+  `0x10000` (`libespix/libc_hooks.S`); `errno` lives in the thread's TLS and the
+  allocator is the app's own, as on Linux.
 
 **A mapping is a block of the process's memory**, as on Linux without an MMU:
 exactly the length asked, aligned as `malloc`'s, and given back whole by

@@ -21,6 +21,7 @@ sdkconfig.*
 
 # The test app, built by tools/build-test-app.sh.
 tests/app/testapp
+tests/app/testapp-static
 tests/app/build-test-app.log
 
 # Host unit-test apps (make unit) are separate IDF projects too.

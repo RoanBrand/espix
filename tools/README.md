@@ -127,8 +127,8 @@ delete both files and the `execute_process()` block in the top-level
 ## espix-cc
 
 The C compiler for POSIX apps (docs/USER-MODE.md), as `musl-gcc` is for musl:
-the toolchain's gcc with picolibc's headers and `libespix` (espix's OS layer,
-`user/libespix/`). Every build defines `ESPIX_POSIX_APP`, and `ESPIX_UMODE_APP`
+the toolchain's gcc with espix's picolibc (`build-libc.sh`, below) and `libespix`
+(espix's OS layer, `user/libespix/`). Every build defines `ESPIX_POSIX_APP`, and `ESPIX_UMODE_APP`
 or `ESPIX_NOMMU_APP` for the kind.
 
 ```bash
@@ -136,15 +136,17 @@ or `ESPIX_NOMMU_APP` for the kind.
 ./tools/espix-cc --target=esp32s3 -Os -o hello apps/hello/main/hello.c    # the S3
 ```
 
-- **The S31** (the default): a static executable at `0x10000`, linked with
-  picolibc and `user/uapp.ld`, run in U-mode in an address space of its own.
-  Built without PIE and the hardware loop, which exist only on core 1, and with
-  `libespix`'s allocator wrapped over picolibc's, so a `malloc` of 128 KiB or
-  more is a mapping.
-- **The S3** (`--target=esp32s3`): a shared object the loader relocates, linked
-  with its own libc's per-app part and the note naming the `/lib/libc.so` build its
-  shared part comes from; `malloc`, threads and signals are the kernel's. `-static`
-  links all of libc instead. Its syscalls are direct calls.
+Either chip's app links libc's per-app part and the note naming the `/lib/libc.so`
+build its shared part comes from; `-static` links all of libc instead.
+
+- **The S31** (the default): an executable at `0x10000` (`user/uapp.ld`), run in
+  U-mode in an address space of its own, bound to `libc.so`'s fixed addresses by
+  `split/libc-provide.ld`. Built without PIE and the hardware loop, which exist
+  only on core 1, and with `libespix`'s allocator wrapped over picolibc's, so a
+  `malloc` of 128 KiB or more is a mapping.
+- **The S3** (`--target=esp32s3`): a shared object the loader relocates and binds
+  to `libc.so` by name; `malloc`, threads and signals are the kernel's. Its
+  syscalls are direct calls.
 
 `espix-cc --strip <in> <out>` (with the same `--target`) makes the copy to stage:
 without debug info on the S31, and on the S3 without anything the loader does
@@ -162,27 +164,34 @@ headers, as its M-mode build does.
 
 The apps' own picolibc: the source the toolchain's was built from (Espressif's
 `esp-1.8.10_20251204`), with espix's options, into `build-libc-<target>/`.
-`espix-cc` builds it when it is missing, and S3 apps link it; `build-apps.sh`
-stages `libc.so` as `fsroot/lib/libc.so`.
+`espix-cc` builds it when it is missing, and every app links it; `build-apps.sh`
+stages the target's `libc.so` as `fsroot/lib/libc.so`.
 
 ```bash
-./tools/build-libc.sh esp32s3     # fetches the source and meson once, under build-libc-src/
+./tools/build-libc.sh esp32s31    # fetches the source and meson once, under build-libc-src/
 ```
 
 - errno is a call (`__errno`) and nothing is thread-local, so an app's libc
   state is plain data in the app and errno is the one variable both halves of
   libc share. stdin, stdout and stderr are streams over fds 0-2; math sets errno;
   `%b` formats. UTF-8 is off: in this picolibc it makes the double printf read the
-  locale, and a printf that reads per-process state cannot be shared.
+  locale, and a printf that reads per-process state cannot be shared. Atomic
+  `ungetc` is off too: stdio locks anyway, and the S31 cannot have AMOs in shared
+  code.
 - `libc-split.py` sorts `libc.a` into `split/libc-app.a`, what each app links
   (members that own data, allocate, call the OS, or need one that does), and
   `split/libc-shared.a`, pure code with no data at all. The OS is libespix plus
   what the kernel provides (`user/libc-os.<target>`): picolibc's version of those
-  is never used. `--why <name>` prints the chain that makes a function private.
-- On the S3 the shared part is linked as `split/libc.so`, one copy for every app
-  (`split/libc.syms` lists its names). It reaches outside itself only for
-  `__errno`, stdio's locks and libgcc's helpers, which the kernel answers.
-  `split/abi-note.o` is the note an app links, naming that build.
+  is never used; on the S31 libc's allocator is the app's own (`--own-alloc`).
+  `--why <name>` prints the chain that makes a function private.
+- The shared part is linked as `split/libc.so`, one copy for every app
+  (`split/libc.syms` lists its names), and `split/abi-note.o` is the note an app
+  links, naming that build. It reaches outside itself only for `__errno` and
+  libc's locks, plus libgcc's helpers on the S3. On the S3 it is a shared object
+  and the kernel answers those. On the S31 it is an image at `0x6FC00000`
+  (`user/libc-image.ld`) holding libgcc too; it calls the app's hook slots at
+  `0x10000` (`libespix/libc_hooks.S`), and the build fails on writable data or an
+  AMO in it. `split/libc-provide.ld` binds an app to its addresses.
 
 ## patch-umode.py
 

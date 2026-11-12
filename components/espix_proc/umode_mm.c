@@ -48,13 +48,14 @@ typedef struct {
     uint64_t off;       /* R_FILE: the file offset at start */
 } region_t;
 
-/* Lent memory and mmap live between the heap's limit and the thread stacks. */
+/* Lent memory and mmap live between the heap's limit and libc.so's window, under the thread stacks. */
 #define MAP_LOW  ESPIX_UM_BRK_MAX
 
 #define TSTACK_SPAN ESPIX_UM_STACK_MAX
 #define TSTACK_HIGH (ESPIX_UM_STACK_TOP - ESPIX_UM_STACK_MAX)
 #define TSTACK_LOW  (TSTACK_HIGH - ESPIX_UM_TSTACKS * TSTACK_SPAN)
-#define MAP_HIGH    TSTACK_LOW
+#define MAP_HIGH    ESPIX_UM_LIBC_VA
+_Static_assert(ESPIX_UM_LIBC_VA + ESPIX_UM_LIBC_MAX <= TSTACK_LOW, "libc.so's window overlaps the thread stacks");
 
 /* A frame unmapped while a kernel call still held a pointer into it; lent memory goes back by release. */
 typedef struct dead {

@@ -11,9 +11,10 @@
 #   tools/espix-cc --target=esp32s3 --build-lib                prints the path of libespix.a
 #   tools/espix-cc --target=esp32s3 -static -o hello hello.c  libc linked in whole
 #
-# The S31's app is a static executable with picolibc linked in. An app without an
-# MMU is a shared object the kernel's loader relocates: it links libc's state
-# (libc-app.a) and binds the rest to the one /lib/libc.so every app shares.
+# Both chips' apps link libc's state (libc-app.a) and share the rest, one
+# /lib/libc.so (tools/build-libc.sh), or link all of libc with -static. On the
+# S31 an app is a static executable bound to libc.so's fixed address; without an
+# MMU it is a shared object the kernel's loader binds to libc.so by name.
 #
 set -euo pipefail
 
@@ -51,8 +52,10 @@ if [[ $target == esp32s31 ]]; then
     # No PIE or hardware-loop extensions: only core 1 has them.
     # No cm.popret, as IDF builds the kernel: with it libespix's mutex deadlocked (docs/GOTCHAS.md).
     arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f -mno-cm-popret)
-    # off_t is 64 bits, as in the kernel and M-mode apps (cmake/offt64.h).
-    cflags=(--specs=picolibc.specs -ffunction-sections -fdata-sections -DESPIX_UMODE_APP=1 "${posix[@]}" "${incs[@]}")
+    # The app's own picolibc (tools/build-libc.sh); off_t is 64 bits, as in the kernel (cmake/offt64.h).
+    libc="$root/build-libc-$target"
+    cflags=(-isystem "$libc/include" -ffunction-sections -fdata-sections -ftls-model=local-exec
+            -DESPIX_UMODE_APP=1 "${posix[@]}" "${incs[@]}")
     lib="$root/user/build"
     skip=()
 else
@@ -65,12 +68,12 @@ else
             -DESPIX_NOMMU_APP=1 "${posix[@]}" "${incs[@]}")
     lib="$root/user/build-$target"
     # The kernel's: the allocator, threads, signals, the screen and audio.
-    skip=(start.c malloc.c pthread.c signal.c gfx.c audio.c)
+    skip=(start.c malloc.c pthread.c signal.c gfx.c audio.c tls.c)
 fi
 
 # libespix.a (and crt0.o for the S31), rebuilt when a source is newer; built aside and moved in, so parallel callers never see half.
 build_lib() {
-    if [[ $target == esp32s3 && ! -f "$libc/include/picolibc.h" ]]; then
+    if [[ ! -f "$libc/include/picolibc.h" ]]; then
         "$root/tools/build-libc.sh" "$target" >&2
     fi
     local srcs=("$root"/user/libespix/*.c "$root"/user/libespix/*.h "$root"/user/libespix/*.S "$root"/user/crt0.S
@@ -143,23 +146,27 @@ if [[ $link == no ]]; then
 fi
 
 build_lib
-if [[ $target == esp32s31 ]]; then
-    # Whole and ahead of libc: libc.a's weak nosys stubs would otherwise win the archive scan.
-    # The allocator wrapped, so large blocks are mappings (user/libespix/malloc.c).
-    exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
-        -nostartfiles -static -T "$root/user/uapp.ld" -Wl,--gc-sections \
-        -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc,--wrap=malloc_usable_size \
-        "$lib/crt0.o" -Wl,--whole-archive "$lib/libespix.a" -Wl,--no-whole-archive
-fi
-# A shared object for the loader: libc's state and allocation in the app, the rest from /lib/libc.so
-# (or all of libc in the app, -static), and the note naming which. What is left, the kernel answers.
+# libc's state and allocation in the app, the rest from /lib/libc.so (or all of libc in the app,
+# -static), and the note naming which.
 "$root/tools/build-libc.sh" "$target" >/dev/null
 split="$libc/split"
 if [[ $static == yes ]]; then
-    libs=("$libc/lib/libc.a"); note="$split/abi-note-static.o"
+    # Both halves of the split: all of libc but what the OS layer provides (an S3 app's allocator is the kernel's).
+    libs=("$split/libc-app.a" "$split/libc-shared.a"); note=("$split/abi-note-static.o")
 else
-    libs=("$split/libc-app.a"); note="$split/abi-note.o"
+    libs=("$split/libc-app.a"); note=("$split/abi-note.o")
 fi
+if [[ $target == esp32s31 ]]; then
+    # libespix whole, ahead of libc; the allocator wrapped, so large blocks are mappings (malloc.c).
+    # libc-provide.ld binds what the app does not define itself to libc.so's fixed addresses.
+    [[ $static == yes ]] || note+=("$split/libc-provide.ld")
+    exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
+        -nostdlib -nostartfiles -static -T "$root/user/uapp.ld" -Wl,--gc-sections \
+        -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc,--wrap=malloc_usable_size \
+        "$lib/crt0.o" -Wl,--whole-archive "$lib/libespix.a" -Wl,--no-whole-archive \
+        -Wl,--start-group "${libs[@]}" -lgcc -Wl,--end-group "${note[@]}"
+fi
+# A shared object for the loader; what libc.so does not answer, the kernel does.
 exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
     -nostartfiles -nostdlib -shared -e __espix_main -Wl,--gc-sections -Wl,--exclude-libs,ALL \
-    -Wl,--start-group "$lib/libespix.a" "${libs[@]}" -Wl,--end-group "$note"
+    -Wl,--start-group "$lib/libespix.a" "${libs[@]}" -Wl,--end-group "${note[@]}"

@@ -7,8 +7,10 @@
 #
 # -> build-libc-<target>/include, lib/libc.a     the whole library (-static)
 #    build-libc-<target>/split/libc-app.a        what each app links: state and allocation
-#    build-libc-<target>/split/libc.so           what every app shares (S3)
+#    build-libc-<target>/split/libc.so           what every app shares: a shared object on the
+#                                                S3, an image at a fixed address on the S31
 #    build-libc-<target>/split/libc.syms         the shared part's names
+#    build-libc-<target>/split/libc-provide.ld   the S31's: binds an app to libc.so's addresses
 #
 # errno is a call (__errno) and nothing is thread-local: an app's libc state is
 # plain data in the app, and errno is the one variable both halves share.
@@ -31,6 +33,8 @@ case "$target" in
         # As espix-cc builds a U-mode app.
         arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f -mno-cm-popret)
         dtors=.fini_array
+        # The allocator is the app's own (nano-malloc, wrapped by libespix), not the kernel's.
+        split_opts=(--own-alloc)
         ;;
     esp32s3)
         triple=xtensa-esp-elf; gname=xtensa-esp32s3-elf-gcc; tool=xtensa-esp-elf-
@@ -39,6 +43,7 @@ case "$target" in
         arch=(-mlongcalls -fPIC)
         # GCC for Xtensa emits the legacy .dtors, run in name order: atexit's runner goes first.
         dtors=.dtors.00000
+        split_opts=()
         ;;
     *) echo "build-libc: no target $target (esp32s31, esp32s3)" >&2; exit 1 ;;
 esac
@@ -106,7 +111,8 @@ EOF
 
     # UTF-8 (mb-capable) is off: in this picolibc it forces wide %ls into the
     # double printf, which then reads the locale, a per-process variable, and
-    # could no longer be shared.
+    # could no longer be shared. Atomic ungetc is off: stdio locks anyway, and its
+    # AMOs would be in shared code the S31's loader cannot rewrite per app.
     echo "build-libc: building picolibc $tag for $target"
     PATH="$(dirname "$ninja"):$PATH" "$cache/venv/bin/meson" setup "$work/build" "$src" \
         --cross-file "$work/cross.txt" --prefix "$out" --libdir lib --includedir include \
@@ -116,38 +122,62 @@ EOF
         -Dposix-console=true -Dnewlib-have-fcntl=true -Dstdio-locking=true \
         -Dformat-default=double -Dio-long-long=true -Dio-pos-args=true -Dio-percent-b=true \
         -Dprintf-percent-n=false -Dio-wchar=false -Dmb-capable=false \
-        -Dwant-math-errno=true -Dassert-verbose=true \
+        -Dwant-math-errno=true -Dassert-verbose=true -Datomic-ungetc=false \
         > "$work/setup.log"
     PATH="$(dirname "$ninja"):$PATH" "$cache/venv/bin/meson" install -C "$work/build" > "$work/build.log"
     touch "$stamp"
 fi
-
-# The S31's shared part is an image at a fixed address, built elsewhere.
-[[ $target == esp32s3 ]] || { echo "build-libc: $target -> $out/lib/libc.a"; exit 0; }
 
 # The split needs the OS layer under libc: libespix, and what the kernel provides.
 espix_lib=$("$root/tools/espix-cc" --target="$target" --build-lib)
 os_names="$root/user/libc-os.$target"
 split="$out/split"
 if [[ -f "$split/libc.so" && -z "$(find "$out/lib/libc.a" "$espix_lib" "$os_names" \
-          "$root/tools/libc-split.py" -newer "$split/libc.so" 2>/dev/null | head -1)" ]]; then
+          "$root/tools/libc-split.py" "$root/user/libc-image.ld" -newer "$split/libc.so" 2>/dev/null | head -1)" ]]; then
     echo "build-libc: $target is up to date ($tag)"
     exit 0
 fi
 "$py" -I "$root/tools/libc-split.py" --tool "$bin/$tool" --libc "$out/lib/libc.a" \
-    --os "$espix_lib" --os-names "$os_names" --dtors "$dtors" \
+    --os "$espix_lib" --os-names "$os_names" --dtors "$dtors" ${split_opts[@]+"${split_opts[@]}"} \
     --rt "$("$gcc" "${arch[@]}" -print-libgcc-file-name)" --out "$split"
 
-# libgcc stays out: its S3 build is not position-independent, so the kernel answers its helpers.
-if ! "$gcc" "${arch[@]}" -shared -nostdlib -Wl,--gc-sections -Wl,-soname=libc.so -Wl,--build-id=sha1 \
-        -Wl,--whole-archive "$split/libc-shared.a" -Wl,--no-whole-archive -o "$split/libc.so.tmp" \
-        > "$split/link.log" 2>&1; then
-    cat "$split/link.log" >&2
-    exit 1
+if [[ $target == esp32s3 ]]; then
+    # libgcc stays out: its S3 build is not position-independent, so the kernel answers its helpers.
+    if ! "$gcc" "${arch[@]}" -shared -nostdlib -Wl,--gc-sections -Wl,-soname=libc.so -Wl,--build-id=sha1 \
+            -Wl,--whole-archive "$split/libc-shared.a" -Wl,--no-whole-archive -o "$split/libc.so.tmp" \
+            > "$split/link.log" 2>&1; then
+        cat "$split/link.log" >&2
+        exit 1
+    fi
+    mv -f "$split/libc.so.tmp" "$split/libc.so"
+    "$bin/${tool}strip" --strip-all -R .xt.prop -R .xt.lit -R .comment -R .xtensa.info \
+        -o "$split/libc.so.staged" "$split/libc.so"
+else
+    # The calls back into the app go to its hook slots, at fixed addresses (libespix/libc_hooks.S).
+    hooks=()
+    while read -r off name; do
+        hooks+=("-Wl,--defsym=${name#__espix_hook_}=$((0x10000 + 0x$off))")
+    done < <("$bin/${tool}nm" "$espix_lib" | awk '$3 ~ /^__espix_hook_/ {print $1, $3}')
+    [[ ${#hooks[@]} -gt 0 ]] || { echo "build-libc: no hooks in $espix_lib" >&2; exit 1; }
+    if ! "$gcc" "${arch[@]}" -nostdlib -static -T "$root/user/libc-image.ld" -Wl,--build-id=sha1 \
+            "${hooks[@]}" -Wl,--whole-archive "$split/libc-shared.a" -Wl,--no-whole-archive -lgcc \
+            -o "$split/libc.so.tmp" > "$split/link.log" 2>&1; then
+        cat "$split/link.log" >&2
+        exit 1
+    fi
+    # The S31's loader rewrites an app's AMOs per process; shared pages cannot have any.
+    if "$bin/${tool}objdump" -d "$split/libc.so.tmp" | grep -qE '[[:space:]]amo[a-z]+\.[wd]'; then
+        echo "build-libc: libc.so has AMO instructions:" >&2
+        "$bin/${tool}objdump" -d "$split/libc.so.tmp" | grep -E '[[:space:]]amo[a-z]+\.[wd]' >&2
+        exit 1
+    fi
+    mv -f "$split/libc.so.tmp" "$split/libc.so"
+    "$bin/${tool}strip" --strip-all -o "$split/libc.so.staged" "$split/libc.so"
+    # What an app does not define itself binds to libc.so's address; the hooks are the app's own.
+    "$bin/${tool}nm" -g --defined-only "$split/libc.so" \
+        | awk 'NR == FNR {want[$1] = 1; next} $2 != "A" && ($3 in want) {printf "PROVIDE(%s = 0x%s);\n", $3, $1}' \
+              "$split/libc.syms" - > "$split/libc-provide.ld"
 fi
-mv -f "$split/libc.so.tmp" "$split/libc.so"
-"$bin/${tool}strip" --strip-all -R .xt.prop -R .xt.lit -R .comment -R .xtensa.info \
-    -o "$split/libc.so.staged" "$split/libc.so"
 
 # The note an app carries: its ABI (2: its own libc) and the libc.so build it needs, none when static.
 id=$("$bin/${tool}readelf" -n "$split/libc.so" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')

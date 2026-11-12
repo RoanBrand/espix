@@ -175,11 +175,18 @@ for name in "${names[@]}"; do
         bu="$app/build-$target"
         out="$bu/$name"
         rm -f "$out"            # relinked: CMake cannot see libespix or libc change under espix-cc
+        # Nor the compiler's own headers: a new espix-cc or libc means compiling everything again.
+        built="$bu/.espix-built"
+        if [ -f "$built" ] && [ -n "$(find "$root/tools/espix-cc" "$root/cmake/espix-uapp.cmake" \
+                "$root/build-libc-$target/include/picolibc.h" -newer "$built" -print -quit 2>/dev/null)" ]; then
+            rm -rf "$bu"
+        fi
         { cmake -S "$app" -B "$bu" -DCMAKE_TOOLCHAIN_FILE="$root/cmake/espix-uapp.cmake" \
               -DESPIX_TARGET="$target" > "$app/build.log" 2>&1 \
           && cmake --build "$bu" -j "$jobs" >> "$app/build.log" 2>&1; } \
             || { echo "build-apps: $name: build failed; see $app/build.log" >&2; exit 1; }
         [ -f "$out" ] || { echo "build-apps: $name: expected $out, which the build did not produce" >&2; exit 1; }
+        touch "$built"
         # Staged without debug info; the build keeps it for addr2line.
         "$root/tools/espix-cc" --target="$target" --strip "$out" "$staged"
     else
@@ -190,8 +197,9 @@ for name in "${names[@]}"; do
     echo "build-apps: staged $name ($(wc -c < "$staged" | tr -d ' ') bytes)"
 done
 
-# The S3's POSIX apps share one /lib/libc.so (tools/build-libc.sh).
-if [ "$target" = esp32s3 ] && [ -f "$root/build-libc-$target/split/libc.so.staged" ]; then
+# Every app shares one /lib/libc.so (tools/build-libc.sh), this target's.
+if [ -f "$root/build-libc-$target/split/libc.so.staged" ]; then
     mkdir -p "$root/fsroot/lib"
     cp "$root/build-libc-$target/split/libc.so.staged" "$root/fsroot/lib/libc.so"
+    printf '%s\n' "$target" > "$root/fsroot/lib/.espix-target-libc.so"
 fi

@@ -33,3 +33,9 @@ mkdir -p "$stage_dir"
     || { echo "build-test-app: build failed; see $app/build-test-app.log" >&2; exit 1; }
 "$root/tools/espix-cc" --target="$target" --strip "$app/testapp" "$stage"
 echo "build-test-app: staged $(basename "$stage") ($(wc -c < "$stage" | tr -d ' ') bytes)"
+# And with all of libc linked in, the path an app takes without /lib/libc.so.
+"$root/tools/espix-cc" --target="$target" -static -Os -I"$root/components/espix_proc/include" \
+    -o "$app/testapp-static" "$app/testapp.c" >> "$app/build-test-app.log" 2>&1 \
+    || { echo "build-test-app: -static build failed; see $app/build-test-app.log" >&2; exit 1; }
+"$root/tools/espix-cc" --target="$target" --strip "$app/testapp-static" "$stage-static"
+echo "build-test-app: staged $(basename "$stage")-static ($(wc -c < "$stage-static" | tr -d ' ') bytes)"

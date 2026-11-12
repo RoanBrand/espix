@@ -93,6 +93,22 @@ void    espix_um_sig_exec(espix_um_proc_t *p);
 /* Thread stacks: as many 8 MB spans below it, each with an unmapped page at both ends. */
 #define ESPIX_UM_TSTACKS    31
 
+/* /lib/libc.so's window, under the thread stacks and above every mmap (user/libc-image.ld). */
+#define ESPIX_UM_LIBC_VA    0x6FC00000u
+#define ESPIX_UM_LIBC_MAX   (4u * 1024u * 1024u)
+
+/*
+ * A read-only image at a fixed address, one copy for every process (/lib/libc.so): its frames kept
+ * in an address space of the kernel's own while loaded, and mapped into each process that holds it.
+ */
+typedef struct espix_um_image espix_um_image_t;
+espix_um_image_t *espix_um_image_load(const uint8_t *elf, size_t size, uint32_t vaddr, uint32_t max,
+                                      const char **why);
+void              espix_um_image_drop(espix_um_image_t *img);
+/* Another holder, the kernel's own counted: a process that maps it, or one about to. */
+void              espix_um_image_hold(espix_um_image_t *img);
+int               espix_um_image_holders(espix_um_image_t *img);
+
 /* Address spaces (umode_mm.c). Frames are 4 KiB of PSRAM; a physical address is the pointer. */
 void           espix_um_frames_init(void);
 /* Frames carved and not in use, which the heap counts as taken. */

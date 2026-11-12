@@ -53,8 +53,8 @@ typedef struct {
 typedef struct espix_um_waiter espix_um_waiter_t;
 struct espix_um_text;
 
-/* The read-only segments of a process's image it shares with others running it. */
-#define ESPIX_UM_TEXTS 2
+/* The read-only segments a process shares: its image's with others running it, and libc.so's. */
+#define ESPIX_UM_TEXTS 3
 
 enum { ESPIX_UM_OBJ_FREE, ESPIX_UM_OBJ_SURFACE, ESPIX_UM_OBJ_AUDIO };
 

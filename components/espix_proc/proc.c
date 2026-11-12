@@ -485,9 +485,9 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
         if (slot->app->elf_valid) {
             slot->app->elf.init_done = false;     /* no app code runs in teardown */
             esp_elf_deinit(&slot->app->elf);
-            espix_libc_release(slot);
             slot->app->elf_valid = false;
         }
+        espix_libc_release(slot);
 
         free(slot->app->image);
         slot->app->image = NULL;

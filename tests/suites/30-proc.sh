@@ -401,6 +401,17 @@ assert_eq "atexit handlers run on exit(), last first" \
     "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "and on a return from main" \
     "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit return" | tr '\n' ' ' | sed 's/ $//')"
+# The same libc linked whole (-static): its state is the app's own there too.
+SAPP="/home/$ESPIX_USER/testapp-static"
+if dev_status "ls $SAPP"; then
+    assert_contains "a -static app's getopt state is its own" "opts: a=A b=B optind=5" \
+        "$(dev_run "$SAPP opts -a A -b B")"
+    assert_eq "and its atexit handlers run" "atexit: registered atexit: first atexit: second" \
+        "$(dev_run "$SAPP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
+else
+    espix_skip "a -static app's getopt state is its own: no testapp-static (make test-app)"
+fi
+
 # libc's own lock is each app's: one killed holding it leaves every other app's libc alone.
 pid=$(dev_run "$APP libclock &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 if [ -n "$pid" ]; then

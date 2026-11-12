@@ -656,7 +656,12 @@ void espix_libc_init(void);
 void espix_libc_app_init(espix_proc_slot_t *slot);
 /* Take a reference on /lib/libc.so, loading it if needed; NULL, or why not. */
 const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN]);
+/* After a process's image went: lets the last holder's going start the linger. */
 void espix_libc_release(espix_proc_slot_t *slot);
+#if CONFIG_ESPIX_UMODE
+/* The S31's: the image a U-mode app maps, a hold on it taken for the caller; NULL and why not. */
+struct espix_um_image *espix_libc_hold(const uint8_t id[ESPIX_LIBC_ID_LEN], const char **why);
+#endif
 /* A name for an app with its own libc: libc.so's, else the kernel's. */
 uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *name));
 

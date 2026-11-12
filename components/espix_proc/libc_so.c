@@ -1,5 +1,5 @@
 /* /lib/libc.so, the part of an app's libc every app shares: loaded for the first app, kept LINGER_MS after the last. */
-/* Such an app's libc names are its own (linked hidden) or libc.so's, asked first; the rest are the kernel's. */
+/* On the S3 a shared object an app binds to by name, then the kernel's; on the S31 an image at a fixed address. */
 
 #include <errno.h>
 #include <stdio.h>
@@ -17,6 +17,9 @@
 
 #include "espix_kernel.h"
 #include "espix_proc_priv.h"
+#if CONFIG_ESPIX_UMODE
+#include "espix_umode.h"
+#endif
 
 #define TAG        "libc"
 #define LIBC_PATH  "/lib/libc.so"
@@ -28,13 +31,17 @@
 
 
 static SemaphoreHandle_t s_lock;
-static esp_elf_t         s_elf;
 static bool              s_loaded;
+static uint8_t           s_id[ESPIX_LIBC_ID_LEN];
+static bool              s_lingering;
+#if CONFIG_ESPIX_UMODE
+static espix_um_image_t *s_img;         /* its holders count the processes mapping it */
+#else
+static esp_elf_t         s_elf;
 static esp_symtab_t     *s_more;        /* what the loader's table leaves out: data, and weak functions */
 static unsigned          s_more_num;
-static uint8_t           s_id[ESPIX_LIBC_ID_LEN];
 static unsigned          s_refs;
-static bool              s_lingering;
+#endif
 
 static uint32_t rd32(const uint8_t *p)
 {
@@ -122,6 +129,7 @@ static bool file_build_id(FILE *f, uint8_t id[ESPIX_LIBC_ID_LEN])
     return false;
 }
 
+#if !CONFIG_ESPIX_UMODE
 /* What an app's libc calls in the kernel beyond the rest of the app ABI: errno and its locks (below), and libgcc. */
 extern void __ashldi3(void), __ashrdi3(void), __lshrdi3(void), __umoddi3(void), __ffsdi2(void),
             __fixdfdi(void), __floatundidf(void), __nedf2(void);
@@ -209,12 +217,14 @@ static void more_free(void)
     s_more_num = 0;
 }
 
-/* Read, check and relocate the file, with s_lock held. NULL, or why it could not be had. */
+#endif
+
+/* Read, check and load the file, with s_lock held. NULL, or why it could not be had. */
 static const char *load(const uint8_t id[ESPIX_LIBC_ID_LEN])
 {
     FILE *const f = fopen(LIBC_PATH, "rb");
     if (f == NULL) {
-        return "cannot open it";
+        return LIBC_PATH ": cannot open it";
     }
     const bool have = file_build_id(f, s_id);
     long size = -1;
@@ -227,35 +237,56 @@ static const char *load(const uint8_t id[ESPIX_LIBC_ID_LEN])
 
     const char *why = NULL;
     if (!have) {
-        why = "it has no build ID";
+        why = LIBC_PATH ": it has no build ID";
     } else if (memcmp(s_id, id, ESPIX_LIBC_ID_LEN) != 0) {
-        why = "a different build from the one this app was linked against";
+        why = LIBC_PATH ": a different build from the one this app was linked against";
     } else if (!read) {
-        why = "cannot read it";
-    } else if (esp_elf_init(&s_elf) != 0 || esp_elf_relocate(&s_elf, buf, (size_t)size) != 0) {
-        esp_elf_deinit(&s_elf);
-        why = "it does not load";
-    } else if (!more_symbols(buf, (size_t)size)) {
-        more_free();
-        esp_elf_deinit(&s_elf);
-        why = "its symbol table does not read";
+        why = LIBC_PATH ": cannot read it";
     } else {
-        s_loaded = true;
-        espix_klog(ESPIX_KLOG_INFO, TAG, "%s loaded: %u names", LIBC_PATH,
-                   (unsigned)(s_elf.num + s_more_num));
+#if CONFIG_ESPIX_UMODE
+        const char *detail = NULL;
+        s_img = espix_um_image_load(buf, (size_t)size, ESPIX_UM_LIBC_VA, ESPIX_UM_LIBC_MAX, &detail);
+        if (s_img == NULL) {
+            espix_klog(ESPIX_KLOG_WARN, TAG, "%s: %s", LIBC_PATH, detail);
+            why = LIBC_PATH ": it does not load (dmesg says why)";
+        } else {
+            s_loaded = true;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s loaded: %ld KB at 0x%08x", LIBC_PATH, size / 1024,
+                       (unsigned)ESPIX_UM_LIBC_VA);
+        }
+#else
+        if (esp_elf_init(&s_elf) != 0 || esp_elf_relocate(&s_elf, buf, (size_t)size) != 0) {
+            esp_elf_deinit(&s_elf);
+            why = LIBC_PATH ": it does not load";
+        } else if (!more_symbols(buf, (size_t)size)) {
+            more_free();
+            esp_elf_deinit(&s_elf);
+            why = LIBC_PATH ": its symbol table does not read";
+        } else {
+            s_loaded = true;
+            espix_klog(ESPIX_KLOG_INFO, TAG, "%s loaded: %u names", LIBC_PATH,
+                       (unsigned)(s_elf.num + s_more_num));
+        }
+#endif
     }
-    free(buf);      /* the loaded image is its own copy, names included */
+    free(buf);      /* the loaded image is its own copy */
     return why;
 }
 
 static void unload(void)
 {
+#if CONFIG_ESPIX_UMODE
+    espix_um_image_drop(s_img);
+    s_img = NULL;
+#else
     more_free();
     esp_elf_deinit(&s_elf);
+#endif
     s_loaded = false;
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s unloaded", LIBC_PATH);
 }
 
+#if !CONFIG_ESPIX_UMODE
 /* The calling thread's errno: the kernel's picolibc keeps it thread-local, and an app reaches it through this call. */
 static int *app_errno(void)
 {
@@ -424,6 +455,100 @@ static const struct esp_elfsym s_libc_hooks[] = {
     ESP_ELFSYM_END
 };
 
+#endif
+
+/* Unused: nothing holds it, so it goes after LINGER_MS, unless an app takes it first. With s_lock held. */
+static bool unused(void)
+{
+#if CONFIG_ESPIX_UMODE
+    return s_loaded && espix_um_image_holders(s_img) == 1;
+#else
+    return s_loaded && s_refs == 0;
+#endif
+}
+
+static void linger_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(LINGER_MS));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (unused()) {
+        unload();
+    }
+    s_lingering = false;
+    xSemaphoreGive(s_lock);
+    vTaskDelete(NULL);
+}
+
+/* Linger, once nothing holds it. With s_lock held. */
+static void linger_if_unused(void)
+{
+    if (unused() && !s_lingering &&
+        xTaskCreate(linger_task, "libc:linger", 3072, NULL, tskIDLE_PRIORITY + 1, NULL) == pdPASS) {
+        s_lingering = true;
+    }
+}
+
+/* The loaded copy, if it is the build id names; a lingering copy nobody uses gives way to the file. With s_lock held. */
+static const char *have(const uint8_t id[ESPIX_LIBC_ID_LEN])
+{
+    if (unused() && memcmp(s_id, id, ESPIX_LIBC_ID_LEN) != 0) {
+        unload();
+    }
+    if (!s_loaded) {
+        return load(id);
+    }
+    return (memcmp(s_id, id, ESPIX_LIBC_ID_LEN) != 0)
+        ? LIBC_PATH ": a different build from the one this app was linked against" : NULL;
+}
+
+#if CONFIG_ESPIX_UMODE
+
+void espix_libc_init(void)
+{
+    s_lock = xSemaphoreCreateMutex();
+}
+
+void espix_libc_app_init(espix_proc_slot_t *slot)
+{
+    (void)slot;
+}
+
+espix_um_image_t *espix_libc_hold(const uint8_t id[ESPIX_LIBC_ID_LEN], const char **why)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    *why = have(id);
+    espix_um_image_t *const img = (*why == NULL) ? s_img : NULL;
+    if (img != NULL) {
+        espix_um_image_hold(img);
+    }
+    xSemaphoreGive(s_lock);
+    return img;
+}
+
+const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN])
+{
+    (void)slot;
+    (void)id;
+    return LIBC_PATH ": on this chip it serves U-mode apps only";
+}
+
+/* After the process's mappings went: a hold is a mapping, so all that is left is to notice the last. */
+void espix_libc_release(espix_proc_slot_t *slot)
+{
+    (void)slot;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    linger_if_unused();
+    xSemaphoreGive(s_lock);
+}
+
+uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *name))
+{
+    return kernel(name);
+}
+
+#else
+
 void espix_libc_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
@@ -440,36 +565,14 @@ void espix_libc_app_init(espix_proc_slot_t *slot)
 
 const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN])
 {
-    const char *why = NULL;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    /* A lingering copy nobody uses gives way to the file, which may have been replaced. */
-    if (s_loaded && s_refs == 0 && memcmp(s_id, id, ESPIX_LIBC_ID_LEN) != 0) {
-        unload();
-    }
-    if (!s_loaded) {
-        why = load(id);
-    } else if (memcmp(s_id, id, ESPIX_LIBC_ID_LEN) != 0) {
-        why = "a different build from the one this app was linked against";
-    }
+    const char *const why = have(id);
     if (why == NULL) {
         s_refs++;
         slot->app->libc_held = true;
     }
     xSemaphoreGive(s_lock);
     return why;
-}
-
-static void linger_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(LINGER_MS));
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_refs == 0 && s_loaded) {
-        unload();
-    }
-    s_lingering = false;
-    xSemaphoreGive(s_lock);
-    vTaskDelete(NULL);
 }
 
 void espix_libc_release(espix_proc_slot_t *slot)
@@ -483,10 +586,8 @@ void espix_libc_release(espix_proc_slot_t *slot)
     }
     slot->app->libc_held = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (--s_refs == 0 && !s_lingering &&
-        xTaskCreate(linger_task, "libc:linger", 3072, NULL, tskIDLE_PRIORITY + 1, NULL) == pdPASS) {
-        s_lingering = true;
-    }
+    s_refs--;
+    linger_if_unused();
     xSemaphoreGive(s_lock);
 }
 
@@ -507,3 +608,5 @@ uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *n
     }
     return kernel(name);
 }
+
+#endif

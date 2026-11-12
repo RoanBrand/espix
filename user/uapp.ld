@@ -1,4 +1,5 @@
 /* A U-mode app: one R-X segment at 0x10000, one RW segment page-aligned after it; the heap follows, by brk. */
+/* The segment starts with the hooks /lib/libc.so calls (libespix/libc_hooks.S), at a fixed address. */
 ENTRY(_start)
 
 PHDRS
@@ -13,6 +14,7 @@ SECTIONS
     . = 0x00010000;
 
     .text : {
+        KEEP(*(.text.espix_hooks))
         KEEP(*(.text.init.enter))
         *(.text.unlikely .text.unlikely.*)
         *(.text.startup .text.startup.*)
@@ -36,6 +38,7 @@ SECTIONS
         KEEP(*(.fini_array*))   /* picolibc's atexit runner is in .fini_array_onexit */
         PROVIDE_HIDDEN(__fini_array_end = .);
     } :text
+    .note.espix : { KEEP(*(.note.espix)) } :text
     PROVIDE(etext = .);
     PROVIDE(_etext = .);
 
@@ -75,3 +78,5 @@ PROVIDE(__tbss_size = SIZEOF(.tbss));
 PROVIDE(__tbss_offset = ADDR(.tbss) - ADDR(.tdata));
 PROVIDE(__tls_size = ADDR(.tbss) + SIZEOF(.tbss) - ADDR(.tdata));
 PROVIDE(__tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss)));
+
+ASSERT(!DEFINED(__espix_hooks) || __espix_hooks == 0x10000, "libc.so's hooks must be first, at 0x10000")

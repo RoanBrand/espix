@@ -843,6 +843,145 @@ static struct espix_um_text *text_add(const um_phdr_t *ph, uint32_t crc, void *c
     return t;
 }
 
+/* Frames just written that the I-cache will fetch, refilling from PSRAM: drop its old lines. */
+static void text_sync(void *frame)
+{
+    esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+}
+
+struct espix_um_image {
+    espix_um_as_t        *as;       /* the kernel's own: it keeps the frames while no process maps them */
+    uint32_t              asid, pages;
+    struct espix_um_text *text;     /* its users: the kernel, and every process that maps it */
+};
+
+espix_um_image_t *espix_um_image_load(const uint8_t *elf, size_t size, uint32_t vaddr, uint32_t max,
+                                      const char **why)
+{
+    const um_ehdr_t *const eh = (const um_ehdr_t *)elf;
+    const um_phdr_t *seg = NULL;
+    *why = "not an image for this kernel";
+    if (!espix_um_is_exec(elf, size) || eh->e_phentsize != sizeof(um_phdr_t) ||
+        eh->e_phoff + (size_t)eh->e_phnum * sizeof(um_phdr_t) > size) {
+        return NULL;
+    }
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const um_phdr_t *ph = (const um_phdr_t *)(elf + eh->e_phoff) + i;
+        if (ph->p_type == PT_LOAD_ && ph->p_memsz > 0) {
+            if (seg != NULL) {
+                return NULL;
+            }
+            seg = ph;
+        }
+    }
+    if (seg == NULL || seg->p_vaddr != vaddr || (seg->p_flags & 2) || seg->p_filesz != seg->p_memsz ||
+        seg->p_filesz > max || seg->p_offset + seg->p_filesz > size) {
+        *why = "not one read-only segment at its address";
+        return NULL;
+    }
+
+    *why = "out of memory for it";
+    const uint32_t lo = vaddr & ~(PG - 1);
+    const uint32_t npages = (vaddr + seg->p_filesz + PG - 1 - lo) / PG;
+    espix_um_image_t *const img = calloc(1, sizeof(*img));
+    struct espix_um_text *const t = malloc(sizeof(*t) + npages * sizeof(void *));
+    const uint32_t asid = (img != NULL && t != NULL) ? asid_alloc() : 0;
+    espix_um_as_t *const as = (asid != 0) ? espix_um_as_new(asid) : NULL;
+    if (as == NULL) {
+        if (asid != 0) {
+            asid_free(asid);
+        }
+        free(t);
+        free(img);
+        return NULL;
+    }
+    *img = (espix_um_image_t){ .as = as, .asid = asid, .text = t };
+    espix_um_as_count(as, &img->pages);
+    *t = (struct espix_um_text){ .vaddr = vaddr, .filesz = seg->p_filesz, .npages = npages, .users = 1 };
+    for (uint32_t i = 0; i < npages; i++) {
+        const uint32_t va = lo + i * PG;
+        uint8_t *const frame = espix_um_map_new(as, va, PTE_R | PTE_X);
+        if (frame == NULL) {
+            t->npages = i;
+            espix_um_image_drop(img);
+            return NULL;
+        }
+        const uint32_t from = MAX(va, vaddr), to = MIN(va + PG, vaddr + seg->p_filesz);
+        memcpy(frame + (from - va), elf + seg->p_offset + (from - vaddr), to - from);
+        text_sync(frame);
+        t->frames[i] = frame;
+        espix_um_frame_text(frame, true);
+    }
+    *why = NULL;
+    return img;
+}
+
+void espix_um_image_drop(espix_um_image_t *img)
+{
+    if (img == NULL) {
+        return;
+    }
+    text_put(img->text);        /* the kernel's use, last of all: its frames are mapped here until now */
+    if (espix_um_as_put(img->as, &img->pages)) {
+        asid_free(img->asid);
+    }
+    free(img);
+}
+
+void espix_um_image_hold(espix_um_image_t *img)
+{
+    xSemaphoreTake(s_texts_lock, portMAX_DELAY);
+    img->text->users++;
+    xSemaphoreGive(s_texts_lock);
+}
+
+int espix_um_image_holders(espix_um_image_t *img)
+{
+    xSemaphoreTake(s_texts_lock, portMAX_DELAY);
+    const int n = img->text->users;
+    xSemaphoreGive(s_texts_lock);
+    return n;
+}
+
+/* An image a hold was taken on, mapped into p: p owns that hold from here, and its release puts it. */
+static bool image_map(espix_um_proc_t *p, espix_um_image_t *img)
+{
+    struct espix_um_text *const t = img->text;
+    if (p->ntext >= ESPIX_UM_TEXTS) {
+        text_put(t);
+        return false;
+    }
+    p->text[p->ntext++] = t;
+    const uint32_t lo = t->vaddr & ~(PG - 1);
+    if (!espix_um_region_add(p->as, lo, lo + t->npages * PG, PTE_R | PTE_X)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < t->npages; i++) {
+        if (!espix_um_map_frame(p->as, lo + i * PG, t->frames[i], PTE_R | PTE_X)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* An app built against /lib/libc.so maps it, a build the note in its image names; a static one does not. */
+static const char *libc_map(espix_proc_slot_t *slot, espix_um_proc_t *p)
+{
+    static const uint8_t none[ESPIX_LIBC_ID_LEN];
+    uint8_t id[ESPIX_LIBC_ID_LEN];
+    slot->app->abi = (uint8_t)espix_app_abi(slot->app->image, slot->info.image_bytes, id);
+    if (slot->app->abi < ESPIX_ABI_LIBC || memcmp(id, none, sizeof(id)) == 0) {
+        return NULL;
+    }
+    const char *why = NULL;
+    espix_um_image_t *const img = espix_libc_hold(id, &why);
+    if (img == NULL) {
+        return why;
+    }
+    return image_map(p, img) ? NULL : "out of memory for /lib/libc.so";
+}
+
 static const char *load_segments(espix_um_proc_t *p, const uint8_t *image, size_t size, uint32_t *entry)
 {
     espix_um_as_t *const as = p->as;
@@ -899,9 +1038,7 @@ static const char *load_segments(espix_um_proc_t *p, const uint8_t *image, size_
                 memcpy(frame + (lo - va), image + ph->p_offset + (lo - ph->p_vaddr), hi - lo);
             }
             if (flags & PTE_X) {
-                /* Fetched through the I-cache, which refills from PSRAM and may hold the frame's old lines. */
-                esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
-                esp_cache_msync(frame, PG, ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+                text_sync(frame);
             }
         }
         if (frames != NULL && (t = text_add(ph, crc, frames, npages)) != NULL) {
@@ -1035,6 +1172,9 @@ const char *espix_um_exec(espix_proc_slot_t *slot)
     }
 #endif
     const char *why = load_segments(p, app->image, slot->info.image_bytes, &entry);
+    if (why == NULL) {
+        why = libc_map(slot, p);
+    }
     if (why == NULL) {
         why = build_stack(as, app->argv, app->argc, app->envp, &usp, &uargv, &uenvp);
     }

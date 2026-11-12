@@ -737,6 +737,7 @@ umode:
             /* An exec: the same process, its new program loaded on this task. */
             slot->exit_jmp = NULL;
             espix_um_exec_reset(slot);
+            espix_libc_release(slot);
             err = load_image(slot->app->path, &slot->app->image, &slot->info.image_bytes);
             if (err != ESP_OK || !espix_um_is_exec(slot->app->image, slot->info.image_bytes)) {
                 espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path,
@@ -782,7 +783,7 @@ umode:
     vSemaphoreDelete(rctx.done);
 
     if (rctx.libc_why != NULL) {
-        espix_eprintf(slot->info.session, "espix: %s: /lib/libc.so: %s\n", slot->app->path, rctx.libc_why);
+        espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path, rctx.libc_why);
         goto done;
     }
     if (rctx.rc != 0) {

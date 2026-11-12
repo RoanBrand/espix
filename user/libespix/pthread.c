@@ -6,7 +6,7 @@
  */
 #include <errno.h>
 #include <limits.h>
-#include <picotls.h>
+#include "tls.h"
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
@@ -146,22 +146,30 @@ struct __lock {
 
 struct __lock __lock___libc_recursive_mutex;
 
+/* libc.so's shared code names the libc-wide lock by a slot address (libc_hooks.S); it is this app's. */
+extern char __espix_hook___lock___libc_recursive_mutex[];
+
+static struct __lock *lock_of(_LOCK_T l)
+{
+    return ((void *)l == (void *)__espix_hook___lock___libc_recursive_mutex) ? &__lock___libc_recursive_mutex : l;
+}
+
 void __retarget_lock_init(_LOCK_T *l)           { *l = calloc(1, sizeof(struct __lock)); }
 void __retarget_lock_init_recursive(_LOCK_T *l) { *l = calloc(1, sizeof(struct __lock)); }
-void __retarget_lock_close(_LOCK_T l)           { free(l); }
-void __retarget_lock_close_recursive(_LOCK_T l) { free(l); }
+void __retarget_lock_close(_LOCK_T l)           { if (lock_of(l) == l) free(l); }
+void __retarget_lock_close_recursive(_LOCK_T l) { if (lock_of(l) == l) free(l); }
 
 void __retarget_lock_acquire(_LOCK_T l)
 {
     if (l != NULL) {
-        word_lock(&l->word, CLOCK_MONOTONIC, NULL);
+        word_lock(&lock_of(l)->word, CLOCK_MONOTONIC, NULL);
     }
 }
 
 void __retarget_lock_release(_LOCK_T l)
 {
     if (l != NULL) {
-        word_unlock(&l->word);
+        word_unlock(&lock_of(l)->word);
     }
 }
 
@@ -188,14 +196,14 @@ static void unlock_recursive(struct __lock *l)
 void __retarget_lock_acquire_recursive(_LOCK_T l)
 {
     if (l != NULL) {
-        lock_recursive(l);
+        lock_recursive(lock_of(l));
     }
 }
 
 void __retarget_lock_release_recursive(_LOCK_T l)
 {
     if (l != NULL) {
-        unlock_recursive(l);
+        unlock_recursive(lock_of(l));
     }
 }
 

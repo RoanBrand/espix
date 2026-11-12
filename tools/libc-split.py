@@ -2,14 +2,15 @@
 """Split the apps' libc.a into the part every app shares and the part each app keeps.
 
     tools/libc-split.py --tool <prefix> --libc <libc.a> --os <libespix.a>
-                        [--os-names user/libc-os.<target>] --out <dir> [--why NAME]
+                        [--os-names user/libc-os.<target>] [--own-alloc] --out <dir> [--why NAME]
 
 A member is *private* (linked into each app) when it owns writable data, calls
 the allocator, calls the OS layer, or needs a private member. Everything else is
 *shared*: pure code, one copy for every app. The OS layer is libespix plus what
 the kernel provides (--os-names): what it defines is never taken from libc, and
 calling it makes a member private, except the hooks the shared part may call
-(SHARED_HOOKS).
+(SHARED_HOOKS). The allocator is the OS layer's, unless --own-alloc keeps libc's
+in each app; either way a member that allocates is private.
 
 Writes <dir>/libc-app.a (private), <dir>/libc-shared.a (shared), and
 <dir>/libc.syms (the shared part's names: the ABI apps bind to).
@@ -129,12 +130,16 @@ def main():
     ap.add_argument('--rt', required=True, help="the compiler's runtime (libgcc.a), linked wherever needed")
     ap.add_argument('--out', required=True)
     ap.add_argument('--why', metavar='NAME', help='say why NAME is private, and stop')
+    ap.add_argument('--own-alloc', action='store_true',
+                    help="libc's allocator is the app's own (S31), not the OS layer's")
     ap.add_argument('--dtors', default='.fini_array',
                     help="the section destructors go in: .fini_array, or Xtensa's .dtors.00000 (first to run)")
     a = ap.parse_args()
 
     libc = members(a.tool, a.libc)
-    os_defs = set().union(*(d for d, _, _ in members(a.tool, a.os).values())) | ALLOC
+    os_defs = set().union(*(d for d, _, _ in members(a.tool, a.os).values()))
+    if not a.own_alloc:
+        os_defs |= ALLOC
     if a.os_names:
         with open(a.os_names) as f:
             os_defs |= {n for line in f for n in line.split('#', 1)[0].split()}

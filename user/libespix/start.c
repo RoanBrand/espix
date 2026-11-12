@@ -1,5 +1,5 @@
 /* A U-mode app's start: TLS, the standard streams, constructors, then main(). */
-#include <picotls.h>
+#include "tls.h"
 #include <stdio-bufio.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +19,7 @@ FILE *stderr = &s_stderr.xfile.cfile.file;
 
 char **environ;
 
-/* The main thread's TLS block; picolibc keeps errno there. */
+/* The main thread's TLS block; libespix keeps errno there (tls.c). */
 static char s_tls[256] __attribute__((aligned(16)));
 
 int main(int argc, char **argv, char **envp);

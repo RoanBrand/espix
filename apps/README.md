@@ -32,11 +32,11 @@ tools/espix-cc --strip apps/hello/build/hello hello.staged
 scp hello.staged esp@<host>:/bin/hello
 ```
 
-The same source builds for both chips. On the S31 it is a static U-mode
-executable. On the S3 it is a shared object the kernel relocates: it carries
-libc's state (getopt, the environment, stdio, atexit) and binds libc's code to
-the one `/lib/libc.so` every app shares. `-static` links all of libc into the
-app instead. docs/USER-MODE.md has the details.
+The same source builds for both chips: a U-mode executable on the S31, a shared
+object the kernel relocates on the S3. Either way it carries libc's state
+(getopt, the environment, stdio, atexit) and shares libc's code, the one
+`/lib/libc.so` every app uses. `-static` links all of libc into the app instead.
+docs/USER-MODE.md has the details.
 
 espix's own calls (graphics, audio, `espix_proc.h`) are headers in
 `components/*/include`; `apps/plasma/CMakeLists.txt` shows the include lines.
