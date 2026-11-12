@@ -30,12 +30,15 @@ case "$target" in
         family=riscv32; cpu=riscv
         # As espix-cc builds a U-mode app.
         arch=(-march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_zcb_zcmp_zcmt -mabi=ilp32f -mno-cm-popret)
+        dtors=.fini_array
         ;;
     esp32s3)
         triple=xtensa-esp-elf; gname=xtensa-esp32s3-elf-gcc; tool=xtensa-esp-elf-
         family=xtensa; cpu=esp32s3
         # As espix-cc builds an app without an MMU: a shared object.
         arch=(-mlongcalls -fPIC)
+        # GCC for Xtensa emits the legacy .dtors, run in name order: atexit's runner goes first.
+        dtors=.dtors.00000
         ;;
     *) echo "build-libc: no target $target (esp32s31, esp32s3)" >&2; exit 1 ;;
 esac
@@ -45,6 +48,21 @@ gcc=$(command -v "$gname" || ls -d "$HOME"/.espressif/tools/"$triple"/*/"$triple
 bin=$(dirname "$gcc")
 ninja=$(command -v ninja || ls -d "$HOME"/.espressif/tools/ninja/*/ninja 2>/dev/null | tail -1)
 [[ -x "$ninja" ]] || { echo "build-libc: no ninja" >&2; exit 1; }
+# IDF's Python has venv everywhere; a distribution's python3 may not (Debian splits it out).
+py=python3
+if eval "$("$root/tools/idf.sh" --env 2>/dev/null)" 2>/dev/null && [[ -x "${ESPIX_PYTHON:-}" ]]; then
+    py=$ESPIX_PYTHON
+fi
+
+# One build at a time: espix-cc runs this on every link. mkdir is atomic on macOS and Linux alike.
+lock="$out.lock"
+mkdir -p "$(dirname "$out")"
+for _ in $(seq 1 600); do
+    mkdir "$lock" 2>/dev/null && break
+    sleep 1
+done
+[[ -d "$lock" ]] || { echo "build-libc: $lock is held; remove it if no build is running" >&2; exit 1; }
+trap 'rmdir "$lock" 2>/dev/null' EXIT
 
 # The library, rebuilt when this script changes.
 stamp="$out/.built-$tag"
@@ -57,7 +75,7 @@ if [[ ! -f "$stamp" || ! -f "$out/lib/libc.a" || "$0" -nt "$stamp" ]]; then
     fi
     if [[ ! -x "$cache/venv/bin/meson" ]]; then
         echo "build-libc: installing meson $meson_version"
-        python3 -m venv "$cache/venv"
+        "$py" -m venv "$cache/venv"
         "$cache/venv/bin/pip" install -q "meson==$meson_version"
     fi
 
@@ -116,8 +134,8 @@ if [[ -f "$split/libc.so" && -z "$(find "$out/lib/libc.a" "$espix_lib" "$os_name
     echo "build-libc: $target is up to date ($tag)"
     exit 0
 fi
-python3 -I "$root/tools/libc-split.py" --tool "$bin/$tool" --libc "$out/lib/libc.a" \
-    --os "$espix_lib" --os-names "$os_names" \
+"$py" -I "$root/tools/libc-split.py" --tool "$bin/$tool" --libc "$out/lib/libc.a" \
+    --os "$espix_lib" --os-names "$os_names" --dtors "$dtors" \
     --rt "$("$gcc" "${arch[@]}" -print-libgcc-file-name)" --out "$split"
 
 # libgcc stays out: its S3 build is not position-independent, so the kernel answers its helpers.
@@ -128,4 +146,17 @@ if ! "$gcc" "${arch[@]}" -shared -nostdlib -Wl,--gc-sections -Wl,-soname=libc.so
     exit 1
 fi
 mv -f "$split/libc.so.tmp" "$split/libc.so"
-echo "build-libc: $target -> $split/libc.so ($("$bin/${tool}size" "$split/libc.so" | awk 'NR==2 {print $1}') bytes of code)"
+"$bin/${tool}strip" --strip-all -R .xt.prop -R .xt.lit -R .comment -R .xtensa.info \
+    -o "$split/libc.so.staged" "$split/libc.so"
+
+# The note an app carries: its ABI (2: its own libc) and the libc.so build it needs, none when static.
+id=$("$bin/${tool}readelf" -n "$split/libc.so" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
+[[ ${#id} == 40 ]] || { echo "build-libc: libc.so has no build ID" >&2; exit 1; }
+note() {
+    { printf '.section .note.espix,"a",@note\n.balign 4\n.4byte 6, 24, 1\n.asciz "espix"\n.balign 4\n.4byte 2\n'
+      printf '.byte %s\n' "$(echo "$1" | sed 's/../0x&,/g; s/,$//')"; } > "$split/$2.S"
+    "$gcc" "${arch[@]}" -c "$split/$2.S" -o "$split/$2.o"
+}
+note "$id" abi-note
+note "$(printf '%040d' 0)" abi-note-static
+echo "build-libc: $target -> $split/libc.so ($("$bin/${tool}size" "$split/libc.so" | awk 'NR==2 {print $1}') bytes of code, build $id)"

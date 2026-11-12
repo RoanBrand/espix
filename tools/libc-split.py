@@ -37,6 +37,9 @@ SHARED_HOOKS = {'__errno', '__lock___libc_recursive_mutex',
 
 WRITABLE = re.compile(r'^\.(s?data|s?bss)(\.|$)')
 
+# Members holding picolibc's atexit runner (members() fills it).
+ONEXIT = set()
+
 
 def run(*cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
@@ -61,21 +64,32 @@ def members(tool, archive):
             cur = m.group(1)
             continue
         m = re.match(r'^\s*\d+\s+(\S+)\s+([0-9a-fA-F]+)\s', line)
-        if m and cur and int(m.group(2), 16) and WRITABLE.match(m.group(1)):
-            writable.add(cur)
+        if m and cur and int(m.group(2), 16):
+            if WRITABLE.match(m.group(1)):
+                writable.add(cur)
+            if m.group(1) == '.fini_array_onexit':
+                ONEXIT.add(cur)
     names = set(defs) | set(undefs)
     return {n: (defs[n], undefs[n], n in writable) for n in names}
 
 
 def split(libc, os_defs, rt_defs):
-    # Members that only define what the OS layer provides are never used, and their names are the OS's.
-    dropped = {m for m, (d, _, _) in libc.items() if d and d <= os_defs}
+    # A member defining anything the OS layer provides is never linked (picolibc's own heap), nor one
+    # that needs a name only a dropped member defines (its mallinfo).
+    dropped = {m for m, (d, _, _) in libc.items() if d & os_defs}
+    changed = True
+    while changed:
+        live = {n for m, (d, _, _) in libc.items() if m not in dropped for n in d}
+        dropped_names = {n for m in dropped for n in libc[m][0]} - live - os_defs
+        more = {m for m, (_, u, _) in libc.items() if m not in dropped and u & dropped_names}
+        changed = bool(more)
+        dropped |= more
     owner = {}
     for mem, (d, _, _) in libc.items():
         if mem not in dropped:
             for name in d - os_defs:
                 owner.setdefault(name, mem)
-    os_calls = os_defs - SHARED_HOOKS
+    os_calls = os_defs - SHARED_HOOKS - rt_defs
     # A name neither libc, the OS nor libgcc defines comes from the app's own link (its init arrays).
     def app_only(u):
         return any(n not in owner and n not in os_defs and n not in rt_defs for n in u)
@@ -92,10 +106,14 @@ def split(libc, os_defs, rt_defs):
     return shared, private, dropped
 
 
-def pack(tool, archive, chosen, path, tmp):
+def pack(tool, archive, chosen, path, tmp, onexit=(), onexit_to='.fini_array'):
     os.makedirs(tmp, exist_ok=True)
     subprocess.run([tool + 'ar', 'x', os.path.abspath(archive)], cwd=tmp, check=True)
     objs = sorted(chosen)
+    # atexit's runner is a destructor in a section only picolibc's own linker script folds in.
+    for obj in sorted(set(onexit) & set(objs)):
+        subprocess.run([tool + 'objcopy', '--rename-section', '.fini_array_onexit=' + onexit_to, obj],
+                       cwd=tmp, check=True)
     if os.path.exists(path):
         os.remove(path)
     if objs:
@@ -111,6 +129,8 @@ def main():
     ap.add_argument('--rt', required=True, help="the compiler's runtime (libgcc.a), linked wherever needed")
     ap.add_argument('--out', required=True)
     ap.add_argument('--why', metavar='NAME', help='say why NAME is private, and stop')
+    ap.add_argument('--dtors', default='.fini_array',
+                    help="the section destructors go in: .fini_array, or Xtensa's .dtors.00000 (first to run)")
     a = ap.parse_args()
 
     libc = members(a.tool, a.libc)
@@ -134,8 +154,9 @@ def main():
             if u & ALLOC:
                 print(f'{name}: {mem} allocates ({", ".join(sorted(u & ALLOC))})')
                 break
-            if u & (os_defs - SHARED_HOOKS):
-                print(f'{name}: {mem} calls the OS layer ({", ".join(sorted(u & (os_defs - SHARED_HOOKS)))})')
+            calls = u & (os_defs - SHARED_HOOKS - rt_defs)
+            if calls:
+                print(f'{name}: {mem} calls the OS layer ({", ".join(sorted(calls))})')
                 break
             nxt = sorted(n for n in u if owner.get(n) in private)
             print(f'{name}: {mem} needs {", ".join(nxt)}')
@@ -145,7 +166,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         pack(a.tool, a.libc, shared, os.path.join(a.out, 'libc-shared.a'), os.path.join(tmp, 's'))
-        pack(a.tool, a.libc, private, os.path.join(a.out, 'libc-app.a'), os.path.join(tmp, 'p'))
+        pack(a.tool, a.libc, private, os.path.join(a.out, 'libc-app.a'), os.path.join(tmp, 'p'), ONEXIT, a.dtors)
     names = sorted(set().union(*(libc[m][0] for m in shared)) if shared else [])
     with open(os.path.join(a.out, 'libc.syms'), 'w') as f:
         f.write(''.join(n + '\n' for n in names))

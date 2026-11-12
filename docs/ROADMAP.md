@@ -1045,7 +1045,7 @@ other way round.
   runtime.** `elf_loader` ships a dynamic-module API — `dlmod_relocate`,
   `dlmod_insert`, `dlmod_getaddr`, `dlmod_listname` — which espix uses none of.
   espix's resolver leaves loaded modules out of app lookup, so a shared runtime
-  would be bound on purpose, the way `/lib/libc.so` is planned to be: that is the
+  would be bound on purpose, the way the S3's `/lib/libc.so` is: that is the
   "Arduino as a runtime environment" idea. The gate is memory
   rather than API. The loader relocates a module into RAM exactly as it does an
   app, so a shared runtime would pin its resident size for the system's lifetime,

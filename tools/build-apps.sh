@@ -32,6 +32,8 @@ apps_dir="$root/apps"
 # Normally the dev tree. A release sets ESPIX_APPS_STAGE to a clean directory so
 # that only apps/ -- never whatever else is in the local fsroot -- is packaged.
 stage_dir="${ESPIX_APPS_STAGE:-$root/fsroot/bin}"
+# One compiler per CPU: a bare `make -j` starts one per source file, which runs out of RAM.
+jobs="${ESPIX_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 
 # tools/idf.sh finds the SDK, puts the toolchain on PATH and sets the variables
 # idf.py needs, so nothing has to be sourced first. It used to be duplicated
@@ -121,6 +123,7 @@ for name in "${names[@]}"; do
         if [ -z "$newer" ] && [ -f "$staged-u" ]; then
             newer=$(find "$root/user/libespix" "$root/user/include" "$root/user/crt0.S" "$root/user/uapp.ld" \
                         "$root/components/espix_proc/include/espix_syscall.h" "$root/tools/espix-cc" \
+                        "$root/build-libc-$target/split/libc-app.a" "$root/build-libc-$target/split/abi-note.o" \
                         -type f -newer "$staged-u" -print -quit 2>/dev/null || true)
         fi
         if [ -z "$newer" ]; then
@@ -206,9 +209,10 @@ for name in "${names[@]}"; do
     if [ -f "$app/uapp/CMakeLists.txt" ]; then
         echo "build-apps: building $name as a POSIX app"
         bu="$app/build-u-$target"
+        rm -f "$bu/$name"       # relinked: CMake cannot see libespix or libc change under espix-cc
         { cmake -S "$app/uapp" -B "$bu" -DCMAKE_TOOLCHAIN_FILE="$root/cmake/espix-uapp.cmake" \
               -DESPIX_TARGET="$target" > "$app/build-u.log" 2>&1 \
-          && cmake --build "$bu" -j >> "$app/build-u.log" 2>&1; } \
+          && cmake --build "$bu" -j "$jobs" >> "$app/build-u.log" 2>&1; } \
             || { echo "build-apps: $name: the POSIX build failed; see $app/build-u.log" >&2; exit 1; }
         # Staged without debug info (picolibc's is most of the file); the build keeps it for addr2line.
         "$root/tools/espix-cc" --target="$target" --strip "$bu/$name" "$staged-u"
@@ -220,3 +224,9 @@ for name in "${names[@]}"; do
     stage_manifest
     echo "build-apps: staged $name ($(wc -c < "$staged" | tr -d ' ') bytes)"
 done
+
+# The S3's POSIX apps share one /lib/libc.so (tools/build-libc.sh).
+if [ "$target" = esp32s3 ] && [ -f "$root/build-libc-$target/split/libc.so.staged" ]; then
+    mkdir -p "$root/fsroot/lib"
+    cp "$root/build-libc-$target/split/libc.so.staged" "$root/fsroot/lib/libc.so"
+fi

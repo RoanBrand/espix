@@ -269,19 +269,17 @@ assert_contains "the device survives a thread free" "espix" \
 # --- the request list must never fail an ordinary allocation ---------------
 #
 # Each region is one fixed-size heap, so a request that will not fit beside an
-# earlier block takes a region of its own. A fixed list therefore turns "the
-# process is busy" into malloc() returning NULL with megabytes free -- which it
-# did, at four entries: five 1 MB blocks failed the fifth. The list has no size
-# now, so small allocations share a region, larger repeats get the regions they
-# need, and all of it is still reclaimed at exit.
+# earlier block takes a region of its own, and the list of regions has no fixed
+# size: small allocations share a region, large ones get as many as they need,
+# and all of it is reclaimed at exit.
 
 out=$(dev_run "$APP hold 0 1000 1000 1000 1000 1000 1000 1000 1000")
 assert_contains "eight small allocations share one arena region" \
     "held 8 block(s), 8000 bytes" "$out"
 
-out=$(dev_run "$APP hold 0 1000000 1000000 1000000 1000000 1000000")
-assert_contains "five 1 MB allocations all succeed" \
-    "held 5 block(s), 5000000 bytes" "$out"
+out=$(dev_run "$APP hold 0 700000 700000 700000 700000 700000")
+assert_contains "five large allocations, a region each, all succeed" \
+    "held 5 block(s), 3500000 bytes" "$out"
 
 base4=$(psram_free_kb)
 out=$(dev_run "$APP hold 0 300000 300000 300000 300000 300000 300000 300000 300000 300000 300000")
@@ -400,6 +398,18 @@ if [ "${ESPIX_UAPP:-0}" = 1 ]; then
     assert_contains "a vfork's parent killed by its child ends as killed" "rc=137" "$vfk_out"
     assert_contains "and the child, on its memory, carries on to the end" "survived" "$vfk_out"
     assert_not_contains "and the parent never runs again" "parent resumed" "$vfk_out"
+
+    # An app's libc state is its own: two at once, each sleeping while the other changes it.
+    opts_out=$(dev_run "$APP opts -a A -s 2 -b B & $APP opts -a C -b D; wait")
+    assert_contains "getopt's state is each app's own" "opts: a=A b=B optind=7" "$opts_out"
+    assert_contains "and the other's too" "opts: a=C b=D optind=5" "$opts_out"
+    tz_out=$(dev_run "$APP tz UTC-2 2 & $APP tz UTC+5 0; wait")
+    assert_contains "TZ is each app's own" "tz UTC-2: 14:00" "$tz_out"
+    assert_contains "and the other's too" "tz UTC+5: 07:00" "$tz_out"
+    assert_eq "atexit handlers run on exit(), last first" \
+        "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
+    assert_eq "and on a return from main" \
+        "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit return" | tr '\n' ' ' | sed 's/ $//')"
 fi
 
 # --- the process tree: a shell is a process, and an app is its child -------

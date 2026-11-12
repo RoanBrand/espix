@@ -2069,6 +2069,59 @@ static int cmd_execn(const char *self, int n)
     printf("execn: failed (%s)\n", errno_name(errno));
     return 1;
 }
+
+/* getopt's state is this process's: -s sleeps between options, so another instance parses meanwhile. */
+static int cmd_opts(int argc, char **argv)
+{
+    char seen[64] = "";
+    int  n = 0, c;
+    while ((c = getopt(argc, argv, "a:b:s:")) != -1) {
+        if (c == 's') {
+            sleep((unsigned)atoi(optarg));
+        } else if (c == '?') {
+            return 1;
+        } else {
+            n += snprintf(seen + n, sizeof(seen) - (size_t)n, "%c=%s ", c, optarg);
+        }
+    }
+    printf("opts: %soptind=%d\n", seen, optind);
+    return 0;
+}
+
+/* TZ is this process's: another instance's TZ, set while this one sleeps, does not move its clock. */
+static int cmd_tz(const char *tz, const char *secs)
+{
+    setenv("TZ", tz, 1);
+    tzset();
+    sleep((unsigned)atoi(secs));
+    const time_t noon = 12 * 3600;
+    struct tm tm;
+    localtime_r(&noon, &tm);
+    printf("tz %s: %02d:00\n", tz, tm.tm_hour);
+    return 0;
+}
+
+static void at_second(void)
+{
+    printf("atexit: second\n");
+}
+
+static void at_first(void)
+{
+    printf("atexit: first\n");
+}
+
+/* atexit handlers run, last registered first, on exit() and on a return from main. */
+static int cmd_atexit(const char *how)
+{
+    atexit(at_second);
+    atexit(at_first);
+    printf("atexit: registered\n");
+    if (strcmp(how, "exit") == 0) {
+        exit(0);
+    }
+    return 0;
+}
 #endif
 
 static void usage(void)
@@ -2116,7 +2169,10 @@ static void usage(void)
            "  exec <dir>          exec in place: what stays and what goes\n"
            "  execn <n>           exec itself n more times\n"
            "  vfork               vfork, posix_spawn, system and popen\n"
-           "  vforkhold <s> <file>  a vfork's child kills its parent, sleeps, then writes file\n");
+           "  vforkhold <s> <file>  a vfork's child kills its parent, sleeps, then writes file\n"
+           "  opts [-a x] [-s secs] [-b y]  getopt, sleeping at -s; prints what it parsed\n"
+           "  tz <TZ> <secs>      set TZ, sleep, print noon UTC in it\n"
+           "  atexit exit|return  two atexit handlers, then exit() or a return from main\n");
 }
 
 int main(int argc, char **argv)
@@ -2279,6 +2335,15 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "vforkhold") == 0 && argc > 3) {
         return cmd_vforkhold(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "opts") == 0) {
+        return cmd_opts(argc - 1, argv + 1);
+    }
+    if (strcmp(cmd, "tz") == 0 && argc > 3) {
+        return cmd_tz(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "atexit") == 0 && argc > 2) {
+        return cmd_atexit(argv[2]);
     }
 #endif
     if (strcmp(cmd, "abi") == 0 && argc > 2) {

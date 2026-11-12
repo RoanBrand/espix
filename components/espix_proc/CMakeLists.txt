@@ -17,6 +17,7 @@ idf_component_register(
         "app_fault_xtensa.S"
         "abi_exit.c"
         "abi_resolver.c"
+        "libc_so.c"
         "abi_fs.c"
         "abi_libc.c"
         "abi_stdio.c"
@@ -74,6 +75,24 @@ idf_component_register(
         # app_fault.c asks whether the cache is on before it touches PSRAM.
         spi_flash
 )
+
+# The kernel names an app's own libc may call (user/libc-os.<target>), for libc_so.c.
+set(espix_libc_os "${CMAKE_CURRENT_LIST_DIR}/../../user/libc-os.${IDF_TARGET}")
+set(espix_libc_os_inc "${CMAKE_CURRENT_BINARY_DIR}/libc_os_names.inc")
+set(espix_libc_os_names "")
+if(EXISTS "${espix_libc_os}")
+    file(STRINGS "${espix_libc_os}" espix_libc_os_lines)
+    foreach(line IN LISTS espix_libc_os_lines)
+        string(REGEX REPLACE "#.*" "" line "${line}")
+        string(REGEX MATCHALL "[^ \t]+" names "${line}")
+        foreach(name IN LISTS names)
+            string(APPEND espix_libc_os_names "\"${name}\",\n")
+        endforeach()
+    endforeach()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${espix_libc_os}")
+endif()
+file(CONFIGURE OUTPUT "${espix_libc_os_inc}" CONTENT "${espix_libc_os_names}\"\"\n")
+target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # A fault in an M-mode app: the RISC-V vectors' panic entry, wrapped (app_fault.c).
 if(CONFIG_IDF_TARGET_ARCH_RISCV)

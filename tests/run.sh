@@ -297,6 +297,12 @@ if dev_session_start; then
     dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/$testapp_build" >/dev/null \
         || printf '  %s test app not staged; suites needing it will skip\n' \
                   "$(_espix_dim note:)"
+    # The S3's POSIX apps share one libc.so.
+    libc_so="$ESPIX_ROOT/build-libc-esp32s3/split/libc.so.staged"
+    if [ "$(head -n1 "$ESPIX_ROOT/.espix/active" 2>/dev/null)" = esp32s3 ] && [ -f "$libc_so" ]; then
+        dev_libc_sync "$libc_so" >/dev/null \
+            || printf '  %s /lib/libc.so not staged; POSIX apps will not start\n' "$(_espix_dim note:)"
+    fi
     dev_session_stop
 else
     printf '  %s no preflight session; health baseline taken over one-shots\n' \

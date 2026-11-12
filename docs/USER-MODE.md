@@ -480,20 +480,25 @@ The S3 has no MMU, so there it runs as Linux runs a program without one:
 | a syscall | a direct call to `espix_syscall()` | `ecall` |
 | descriptors, files, sockets, `poll`, pipes, `wait`, sessions, `umask` | the process's own table, the same code (`umode_sys.c`, `umode_net.c`) | the same |
 | user pointers | range-checked and used as they are (`posix_uaccess.c`) | walked through the table |
-| libc, `malloc`, threads, signals, the screen and audio | the kernel's, shared by every app | linked into the app; threads, signals and surfaces by syscall |
+| libc | the app's own state, its shared code in `/lib/libc.so` | linked into the app |
+| `malloc`, threads, signals, the screen and audio | the kernel's, per process | `malloc` in the app; threads, signals and surfaces by syscall |
 | `mmap` | a block of the process's own memory, the size asked; no `MAP_FIXED` | pages, mapped on touch |
 | `fork` | ENOSYS, as on a Linux without an MMU | copy-on-write |
 | `vfork` | the child runs on the parent's task until it execs or exits | the child borrows the address space |
 | `exec` | the new program loads on the process's own task, in place | the same, in a fresh address space |
 
-**libc's code is shared from the kernel.** picolibc's S3 `libc.a` keeps errno and
-its other state in thread-local storage, which the loader does not relocate, so
-an S3 app links no libc at all: `printf`, `strtod`, `qsort`, math and the rest
-resolve to the kernel's one copy, and the app carries only `libespix`'s calls
-(`hello` is 2.9 KB). Its `stdin`, `stdout` and `stderr` are the process's,
-routed through descriptors 0-2 once its first syscall has made the table, so
-`dup2` onto them redirects `printf`; `fopen` and `fdopen` are `libespix`'s,
-`funopen` streams over the app's own descriptors.
+**An app's libc state is its own; its code is shared.** The apps' picolibc
+(`tools/build-libc.sh`) is split. What owns data or allocates (stdio's streams,
+`getopt`, `TZ` and `localtime`, `atexit`, `environ`, `fopen`) links into each app,
+so two apps never share it. Pure code (the `printf` and `scanf` engines, strings,
+math, `qsort`) is one `/lib/libc.so`, loaded when the first app starts and kept 30
+seconds after the last. `errno` is a call, answered per thread by the kernel; the
+allocator is the kernel's per-process arena; `stdin`, `stdout` and `stderr` are
+streams over descriptors 0-2. An app's `.note.espix` names the `libc.so` build it
+was linked against, and another build is refused at `exec`; `espix-cc -static`
+links all of libc instead and needs no `libc.so`. An app resolves `libc.so`'s names
+and the kernel names its libc calls (`user/libc-os.esp32s3`), nothing else.
+`hello` is 4.6 KB.
 
 **A mapping is a block of the process's memory**, as on Linux without an MMU:
 exactly the length asked, aligned as `malloc`'s, and given back whole by
@@ -527,7 +532,7 @@ on both (`37-faults`). `ESPIX_UAPP=1 tests/run.sh` runs the suites with the test
 app's `espix-cc` build on either chip.
 
 mosquitto, plasma and Doom are built for the S3 from the same `uapp/` projects,
-as `<name>-u`, the size of their IDF builds (`mosquitto-u` 216 KB against 232 KB);
+as `<name>-u`, the size of their IDF builds (`mosquitto-u` 230 KB against 237 KB);
 `64-gfx` and `62-mqtt` run them on both chips. `mosquitto-u -d` fails there with
 "Error in fork: Function not implemented", as it would on a Linux without an MMU.
 Apps that drive the hardware themselves (neopixel's RMT) stay M-mode apps built

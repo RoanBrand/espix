@@ -49,26 +49,37 @@ static struct {
 
 static size_t s_table_count;
 
-static uintptr_t espix_symbol_resolver(const char *sym_name)
+/* The kernel's tables: the resolver's own first, then every registered one. */
+static uintptr_t kernel_lookup(const char *sym_name)
 {
-    if (sym_name != NULL) {
-        /* Per process, so not a table: see abi_stdio.c. */
-        const uintptr_t stdio_var = espix_abi_stdio_var(sym_name);
-        if (stdio_var != 0) {
-            return stdio_var;
-        }
-
-        for (size_t t = 0; t < s_table_count; t++) {
-            for (size_t i = 0; i < s_tables[t].count; i++) {
-                if (strcmp(sym_name, s_tables[t].syms[i].name) == 0) {
-                    return s_tables[t].syms[i].addr;
-                }
+    for (size_t t = 0; t < s_table_count; t++) {
+        for (size_t i = 0; i < s_tables[t].count; i++) {
+            if (strcmp(sym_name, s_tables[t].syms[i].name) == 0) {
+                return s_tables[t].syms[i].addr;
             }
         }
     }
-
-    /* Everything else, including the whole libc and IDF surface, unchanged. */
     return esp_elf_find_symbol(sym_name);
+}
+
+static uintptr_t espix_symbol_resolver(const char *sym_name)
+{
+    if (sym_name == NULL) {
+        return 0;
+    }
+
+    /* An app with its own libc gets libc.so and the kernel names that libc calls, nothing else. */
+    const espix_proc_slot_t *const self = espix_proc_self();
+    if (self != NULL && self->app != NULL && self->app->abi >= ESPIX_ABI_LIBC) {
+        return espix_libc_resolve(sym_name, kernel_lookup);
+    }
+
+    /* Per process, so not a table: see abi_stdio.c. */
+    const uintptr_t stdio_var = espix_abi_stdio_var(sym_name);
+    if (stdio_var != 0) {
+        return stdio_var;
+    }
+    return kernel_lookup(sym_name);
 }
 
 void espix_abi_resolver_add(const abi_sym_t *syms, size_t count)

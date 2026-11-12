@@ -140,9 +140,10 @@ or `ESPIX_NOMMU_APP` for the kind.
   Built without PIE and the hardware loop, which exist only on core 1, and with
   `libespix`'s allocator wrapped over picolibc's, so a `malloc` of 128 KiB or
   more is a mapping.
-- **The S3** (`--target=esp32s3`): a shared object the loader relocates, as an
-  M-mode app is, linked with no libc: what it leaves undefined (libc, `malloc`,
-  threads, signals) the kernel answers. Its syscalls are direct calls.
+- **The S3** (`--target=esp32s3`): a shared object the loader relocates, linked
+  with its own libc's per-app part and the note naming the `/lib/libc.so` build its
+  shared part comes from; `malloc`, threads and signals are the kernel's. `-static`
+  links all of libc instead. Its syscalls are direct calls.
 
 `espix-cc --strip <in> <out>` (with the same `--target`) makes the copy to stage:
 without debug info on the S31, and on the S3 without anything the loader does
@@ -160,7 +161,8 @@ headers, as its M-mode build does.
 
 The apps' own picolibc: the source the toolchain's was built from (Espressif's
 `esp-1.8.10_20251204`), with espix's options, into `build-libc-<target>/`.
-Nothing links it yet.
+`espix-cc` builds it when it is missing, and S3 apps link it; `build-apps.sh`
+stages `libc.so` as `fsroot/lib/libc.so`.
 
 ```bash
 ./tools/build-libc.sh esp32s3     # fetches the source and meson once, under build-libc-src/
@@ -179,6 +181,7 @@ Nothing links it yet.
 - On the S3 the shared part is linked as `split/libc.so`, one copy for every app
   (`split/libc.syms` lists its names). It reaches outside itself only for
   `__errno`, stdio's locks and libgcc's helpers, which the kernel answers.
+  `split/abi-note.o` is the note an app links, naming that build.
 
 ## patch-umode.py
 

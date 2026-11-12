@@ -55,7 +55,8 @@ The consequence sets the tone of the whole system: running code is trusted code,
 compiled by whoever flashed the board. Permissions, `confine` and setuid are
 **guardrails against mistakes**, not a sandbox; a wild write can corrupt the
 kernel. The one boundary that is real is the ELF loader's export table, because
-an app links no libc at all and can call only what espix publishes to it. The
+an M-mode app can call only what espix publishes to it (and, for a POSIX app on
+the S3, `/lib/libc.so`'s pure code; [USER-MODE.md](USER-MODE.md)). The
 four answers a name can have — publish it, override it, leave it out, carry it
 elsewhere — are the table in
 [ROADMAP.md](ROADMAP.md#the-app-abi-what-an-app-may-name-and-who-answers-for-it);

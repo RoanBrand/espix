@@ -179,6 +179,10 @@ typedef struct {
     void *vfork_jb;
     void *vfork_from;
 
+    /* Whose libc the app links: the kernel's, or its own over /lib/libc.so (libc_so.c). */
+    uint8_t abi;
+    bool    libc_held;
+
 #if CONFIG_ESPIX_UMODE
     /* A U-mode app's thread and address space (espix_umode.h); NULL for an M-mode app. */
     void *um;
@@ -656,6 +660,17 @@ void espix_proc_exit(int status) __attribute__((noreturn));
 
 /* Run an M-mode app's destructors once, if `slot` is the calling task's own process. */
 void espix_proc_app_fini(espix_proc_slot_t *slot);
+
+/* An app's ABI, from its espix note: the kernel's libc (no note), or its own (libc_so.c). */
+#define ESPIX_LIBC_ID_LEN 20
+enum { ESPIX_ABI_KERNEL = 0, ESPIX_ABI_LIBC = 2 };
+int espix_app_abi(const uint8_t *img, size_t len, uint8_t libc_id[ESPIX_LIBC_ID_LEN]);
+void espix_libc_init(void);
+/* Take a reference on /lib/libc.so, loading it if needed; NULL, or why not. */
+const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN]);
+void espix_libc_release(espix_proc_slot_t *slot);
+/* A name for an app with its own libc: libc.so's, else the kernel's if its libc may call it. */
+uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *name));
 
 /* Publish exit()/_Exit()/_exit()/abort()/__assert_func to apps (abi_exit.c). */
 void espix_proc_abi_exit_register(void);

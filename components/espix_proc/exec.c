@@ -381,6 +381,8 @@ typedef struct {
     espix_proc_slot_t *slot;
     int                rc;
     SemaphoreHandle_t  done;
+    const uint8_t     *libc_id;     /* the libc.so build the app needs, or NULL */
+    const char        *libc_why;    /* why that could not be had */
 } relocate_ctx_t;
 
 static void relocate_task(void *arg)
@@ -390,7 +392,12 @@ static void relocate_task(void *arg)
     /* As a thread of the process for the duration, so espix_proc_self() names
      * it and the resolver hands this process its own stdin/stdout/stderr. */
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, ctx->slot);
-    ctx->rc = esp_elf_relocate(&ctx->slot->app->elf, ctx->slot->app->image,
+    /* libc.so first, here for the same reason: its load flushes the cache too. */
+    if (ctx->libc_id != NULL) {
+        ctx->libc_why = espix_libc_acquire(ctx->slot, ctx->libc_id);
+    }
+    ctx->rc = (ctx->libc_why != NULL) ? -1
+            : esp_elf_relocate(&ctx->slot->app->elf, ctx->slot->app->image,
                                ctx->slot->info.image_bytes);
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
     xSemaphoreGive(ctx->done);
@@ -504,6 +511,7 @@ static void mmode_exec_reset(espix_proc_slot_t *slot)
     TaskHandle_t const task = xTaskGetCurrentTaskHandle();
     espix_posix_exec_reset(slot);
     espix_proc_sig_exec(slot);
+    espix_libc_release(slot);
     if (slot->app->elf_valid) {
         slot->app->elf.init_done = false;     /* an exec runs no destructors */
         esp_elf_deinit(&slot->app->elf);
@@ -750,7 +758,14 @@ umode:
     }
     slot->app->elf_valid = true;
 
-    relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary() };
+    /* An app built with its own libc names the libc.so it was linked against; a static one, none. */
+    static const uint8_t k_no_libc[ESPIX_LIBC_ID_LEN];
+    uint8_t libc_id[ESPIX_LIBC_ID_LEN];
+    slot->app->abi = (uint8_t)espix_app_abi(slot->app->image, slot->info.image_bytes, libc_id);
+    const bool wants_libc = slot->app->abi >= ESPIX_ABI_LIBC &&
+                            memcmp(libc_id, k_no_libc, sizeof(libc_id)) != 0;
+
+    relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary(), wants_libc ? libc_id : NULL, NULL };
     if (rctx.done == NULL ||
         xTaskCreate(relocate_task, "espix:elfreloc", 8192, &rctx,
                     CONFIG_ESPIX_PROC_PRIORITY, NULL) != pdPASS) {
@@ -764,6 +779,10 @@ umode:
     (void)xSemaphoreTake(rctx.done, portMAX_DELAY);
     vSemaphoreDelete(rctx.done);
 
+    if (rctx.libc_why != NULL) {
+        espix_eprintf(slot->info.session, "espix: %s: /lib/libc.so: %s\n", slot->app->path, rctx.libc_why);
+        goto done;
+    }
     if (rctx.rc != 0) {
         missing_sym_t     missing;
         const char *const sym = missing_symbol_name(&missing);

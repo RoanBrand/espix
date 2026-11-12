@@ -1,8 +1,9 @@
 # What the S3's kernel provides an app, per process, under libc's own names.
 # picolibc's version of each is never linked into an app (tools/libc-split.py).
 
-# The allocator: the process's arena (abi_alloc.c).
+# The allocator: the process's arena (abi_alloc.c), and what it can tell an app about memory.
 malloc calloc realloc free
+heap_caps_get_free_size heap_caps_get_largest_free_block
 
 # Leaving: the process ends (abi_exit.c). exit() itself is libc's, so atexit runs.
 _exit _Exit
@@ -26,9 +27,16 @@ pthread_rwlock_tryrdlock pthread_rwlock_trywrlock pthread_rwlock_unlock
 pthread_key_create pthread_key_delete pthread_setspecific pthread_getspecific pthread_once
 sem_init sem_destroy sem_wait sem_trywait sem_timedwait sem_post sem_getvalue
 
-# One errno per thread, and the locks stdio takes (IDF's).
+# One errno per thread, and the locks stdio takes (IDF's; libc_so.c).
 __errno
 __retarget_lock_init __retarget_lock_init_recursive __retarget_lock_close __retarget_lock_close_recursive
-__retarget_lock_acquire __retarget_lock_acquire_recursive __retarget_lock_try_acquire
-__retarget_lock_try_acquire_recursive __retarget_lock_release __retarget_lock_release_recursive
+__retarget_lock_acquire __retarget_lock_acquire_recursive __retarget_lock_release __retarget_lock_release_recursive
 __lock___libc_recursive_mutex
+
+# libgcc's helpers, which the kernel links (abi_drivers.c, libc_so.c): its S3 build cannot go in a shared object.
+__adddf3 __subdf3 __muldf3 __divdf3 __divdi3 __udivdi3 __moddi3 __umoddi3 __eqdf2 __nedf2
+__gedf2 __gtdf2 __ledf2 __ltdf2 __unorddf2 __extendsfdf2 __truncdfsf2 __fixdfsi __fixdfdi
+__fixunsdfsi __floatsidf __floatunsidf __floatdidf __floatundidf __ashldi3 __ashrdi3 __lshrdi3
+__ffsdi2 __muldc3 __mulsc3 __bswapsi2 __bswapdi2
+__addsf3 __subsf3 __mulsf3 __divsf3 __eqsf2 __nesf2 __ltsf2 __lesf2 __gtsf2 __gesf2 __unordsf2
+__fixsfsi __floatsisf __ieee754_sqrtf __xtensa_libgcc_window_spill

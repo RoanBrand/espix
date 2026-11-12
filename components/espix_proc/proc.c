@@ -300,6 +300,7 @@ esp_err_t espix_proc_init(void)
     espix_app_fault_init();
 
     /* The resolver first: every table below registers into it. */
+    espix_libc_init();
     espix_proc_abi_resolver_register();
 
     espix_proc_abi_cxx_register();
@@ -490,6 +491,7 @@ void espix_proc_release_resources(espix_proc_slot_t *slot)
         if (slot->app->elf_valid) {
             slot->app->elf.init_done = false;     /* no app code runs in teardown */
             esp_elf_deinit(&slot->app->elf);
+            espix_libc_release(slot);
             slot->app->elf_valid = false;
         }
 

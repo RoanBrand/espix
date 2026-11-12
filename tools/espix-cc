@@ -56,22 +56,26 @@ if [[ $target == esp32s31 ]]; then
     lib="$root/user/build"
     skip=()
 else
-    # As an M-mode app is built: its errno is the kernel's, through a call (cmake/espix-app.cmake).
-    # picolibc's headers by path: its specs would also link with picolibc.ld, a static executable's script.
+    # The app's own picolibc (tools/build-libc.sh): errno is a call, so it is the kernel's per thread.
+    libc="$root/build-libc-$target"
     arch=(-mlongcalls)
-    cflags=(-isystem "$bin/../picolibc/include" -ftls-model=local-exec
+    cflags=(-isystem "$libc/include"
             -ffunction-sections -fdata-sections -fPIC -fvisibility=hidden
             -fno-builtin-memcpy -fno-builtin-memset -fno-builtin-bzero
-            -D__PICOLIBC_ERRNO_FUNCTION=__errno -DESPIX_NOMMU_APP=1 "${posix[@]}" "${incs[@]}")
+            -DESPIX_NOMMU_APP=1 "${posix[@]}" "${incs[@]}")
     lib="$root/user/build-$target"
-    # The kernel's: picolibc's stdio and allocator, threads, signals, the screen and audio.
-    skip=(start.c malloc.c pthread.c signal.c gfx.c audio.c lseek32.c)
+    # The kernel's: the allocator, threads, signals, the screen and audio.
+    skip=(start.c malloc.c pthread.c signal.c gfx.c audio.c)
 fi
 
 # libespix.a (and crt0.o for the S31), rebuilt when a source is newer; built aside and moved in, so parallel callers never see half.
 build_lib() {
+    if [[ $target == esp32s3 && ! -f "$libc/include/picolibc.h" ]]; then
+        "$root/tools/build-libc.sh" "$target" >&2
+    fi
     local srcs=("$root"/user/libespix/*.c "$root"/user/libespix/*.h "$root"/user/libespix/*.S "$root"/user/crt0.S
                 "$root"/user/include "$root"/components/espix_proc/include/espix_syscall.h
+                ${libc:+"$libc/include/picolibc.h"}
                 "$root"/components/espix_proc/include/espix_gfx.h
                 "$root"/components/espix_display/include/espix_display.h
                 "$root"/components/espix_audio/include/espix_audio.h "$0")
@@ -123,9 +127,16 @@ if [[ ${1:-} == --build-lib ]]; then
 fi
 
 link=yes
+static=no
+args=()
 for a in "$@"; do
-    case "$a" in -c|-S|-E|-M|-MM) link=no ;; esac
+    case "$a" in
+        -c|-S|-E|-M|-MM) link=no; args+=("$a") ;;
+        -static)         static=yes ;;
+        *)               args+=("$a") ;;
+    esac
 done
+set -- ${args[@]+"${args[@]}"}
 
 if [[ $link == no ]]; then
     exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@"
@@ -140,6 +151,15 @@ if [[ $target == esp32s31 ]]; then
         -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc,--wrap=malloc_usable_size \
         "$lib/crt0.o" -Wl,--whole-archive "$lib/libespix.a" -Wl,--no-whole-archive
 fi
-# A shared object for the loader, as an M-mode app is: what it leaves undefined, the kernel answers.
+# A shared object for the loader: libc's state and allocation in the app, the rest from /lib/libc.so
+# (or all of libc in the app, -static), and the note naming which. What is left, the kernel answers.
+"$root/tools/build-libc.sh" "$target" >/dev/null
+split="$libc/split"
+if [[ $static == yes ]]; then
+    libs=("$libc/lib/libc.a"); note="$split/abi-note-static.o"
+else
+    libs=("$split/libc-app.a"); note="$split/abi-note.o"
+fi
 exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
-    -nostartfiles -nostdlib -shared -e __espix_main -Wl,--gc-sections "$lib/libespix.a"
+    -nostartfiles -nostdlib -shared -e __espix_main -Wl,--gc-sections -Wl,--exclude-libs,ALL \
+    -Wl,--start-group "$lib/libespix.a" "${libs[@]}" -Wl,--end-group "$note"
