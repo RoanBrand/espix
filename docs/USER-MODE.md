@@ -496,8 +496,9 @@ seconds after the last. `errno` is a call, answered per thread by the kernel; th
 allocator is the kernel's per-process arena; `stdin`, `stdout` and `stderr` are
 streams over descriptors 0-2. An app's `.note.espix` names the `libc.so` build it
 was linked against, and another build is refused at `exec`; `espix-cc -static`
-links all of libc instead and needs no `libc.so`. An app resolves `libc.so`'s names
-and the kernel names its libc calls (`user/libc-os.esp32s3`), nothing else.
+links all of libc instead and needs no `libc.so`. An app's own libc and libespix
+are linked hidden, so its names bind inside it; what it leaves undefined resolves
+to `libc.so` first, then the kernel's tables.
 `hello` is 4.6 KB.
 
 **A mapping is a block of the process's memory**, as on Linux without an MMU:
@@ -535,8 +536,10 @@ mosquitto, plasma and Doom are built for the S3 from the same `uapp/` projects,
 as `<name>-u`, the size of their IDF builds (`mosquitto-u` 230 KB against 237 KB);
 `64-gfx` and `62-mqtt` run them on both chips. `mosquitto-u -d` fails there with
 "Error in fork: Function not implemented", as it would on a Linux without an MMU.
-Apps that drive the hardware themselves (neopixel's RMT) stay M-mode apps built
-by IDF, against the symbol tables.
+Apps built by IDF (`project_elf`, neopixel's RMT included) still take their libc
+from the kernel's tables: IDF's headers bind `socket()` and `select()` to lwIP's
+global descriptors, which an app libc over libespix's per-process table cannot
+share.
 
 ## Milestones
 

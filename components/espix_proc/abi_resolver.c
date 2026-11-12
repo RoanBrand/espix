@@ -68,7 +68,7 @@ static uintptr_t espix_symbol_resolver(const char *sym_name)
         return 0;
     }
 
-    /* An app with its own libc gets libc.so and the kernel names that libc calls, nothing else. */
+    /* An app with its own libc: libc.so first, and never the per-process stdio below. */
     const espix_proc_slot_t *const self = espix_proc_self();
     if (self != NULL && self->app != NULL && self->app->abi >= ESPIX_ABI_LIBC) {
         return espix_libc_resolve(sym_name, kernel_lookup);

@@ -1,5 +1,5 @@
 /* /lib/libc.so, the part of an app's libc every app shares: loaded for the first app, kept LINGER_MS after the last. */
-/* Such an app resolves libc.so's names, then only the kernel's in user/libc-os.<target>: never the kernel's own libc. */
+/* Such an app's libc names are its own (linked hidden) or libc.so's, asked first; the rest are the kernel's. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,9 +25,6 @@
 #define NOTE_ESPIX 1        /* espix's own: the app ABI and the libc build */
 #define NOTE_GNU_ID 3       /* NT_GNU_BUILD_ID */
 
-static const char *const k_os_names[] = {
-#include "libc_os_names.inc"
-};
 
 static SemaphoreHandle_t s_lock;
 static esp_elf_t         s_elf;
@@ -349,19 +346,6 @@ void espix_libc_release(espix_proc_slot_t *slot)
     xSemaphoreGive(s_lock);
 }
 
-static bool os_name(const char *name)
-{
-    if (strncmp(name, "espix_", 6) == 0) {
-        return true;
-    }
-    for (size_t i = 0; i < sizeof(k_os_names) / sizeof(k_os_names[0]); i++) {
-        if (strcmp(name, k_os_names[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *name))
 {
     /* Stable while it runs: the app being relocated holds a reference. */
@@ -377,5 +361,5 @@ uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *n
             }
         }
     }
-    return os_name(name) ? kernel(name) : 0;
+    return kernel(name);
 }

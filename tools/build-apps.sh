@@ -119,12 +119,15 @@ for name in "${names[@]}"; do
                     -not -path "*/build-u*" \
                     -not -path "*/managed_components/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
-        # A U-mode build links libespix whole: a runtime newer than it is a reason too.
-        if [ -z "$newer" ] && [ -f "$staged-u" ]; then
+        # Every app links libespix and its libc (the S31's IDF builds aside): a runtime newer than it is a reason too.
+        if [ -z "$newer" ]; then
+            [ -f "$staged-u" ] && oldest="$staged-u" || oldest="$staged"
+            [ "$staged" -ot "$oldest" ] && oldest="$staged"
             newer=$(find "$root/user/libespix" "$root/user/include" "$root/user/crt0.S" "$root/user/uapp.ld" \
                         "$root/components/espix_proc/include/espix_syscall.h" "$root/tools/espix-cc" \
+                        "$root/cmake/espix-app.cmake" \
                         "$root/build-libc-$target/split/libc-app.a" "$root/build-libc-$target/split/abi-note.o" \
-                        -type f -newer "$staged-u" -print -quit 2>/dev/null || true)
+                        -type f -newer "$oldest" -print -quit 2>/dev/null || true)
         fi
         if [ -z "$newer" ]; then
             stage_manifest
@@ -193,6 +196,7 @@ for name in "${names[@]}"; do
             echo "build-apps: sleep at all. See tools/app-abi.defaults." >&2
             exit 1
         fi
+        rm -f "$elf"            # relinked: the link's own dependencies do not include libespix or libc
         "${idf[@]}" elf >> build-apps.log 2>&1 \
             || { echo "build-apps: $name: build failed; see $app/build-apps.log" >&2; exit 1; }
     )

@@ -669,7 +669,7 @@ void espix_libc_init(void);
 /* Take a reference on /lib/libc.so, loading it if needed; NULL, or why not. */
 const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN]);
 void espix_libc_release(espix_proc_slot_t *slot);
-/* A name for an app with its own libc: libc.so's, else the kernel's if its libc may call it. */
+/* A name for an app with its own libc: libc.so's, else the kernel's. */
 uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *name));
 
 /* Publish exit()/_Exit()/_exit()/abort()/__assert_func to apps (abi_exit.c). */
