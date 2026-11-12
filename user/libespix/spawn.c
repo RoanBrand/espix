@@ -14,7 +14,7 @@
 
 #include "sys.h"
 
-_Static_assert(ESPIX_SYS_VFORK == 98, "vfork.S names the number");
+_Static_assert(ESPIX_SYS_VFORK == 2093, "vfork.S names the number");
 
 extern char **environ;
 

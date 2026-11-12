@@ -288,13 +288,20 @@ mapping works wherever the kernel's text lives.
 ## Syscalls
 
 **A number in `a7`, arguments in `a0`-`a5`, the result in `a0`**, negative errno
-on failure, like Linux. The numbers and the structs are espix's own and
-fixed-width; flag and errno values are picolibc's, which both sides use. Socket
-options, flags and sockaddrs are lwIP's and poll's values IDF's, which M-mode
-apps see too: the kernel passes them to lwIP unchanged, `user/include` mirrors
-them, and `umode_net.c` asserts each at build time. The list is
-`include/espix_syscall.h`, one X-macro that the kernel's dispatch table and
-`libespix`'s numbers are generated from.
+on failure, like Linux. A call Linux has with the same arguments and meaning
+takes Linux's rv32 number (`read` 63, `mmap2` 222, `futex_time64` 422); the rest
+are espix's own, from 2048: calls rv32 Linux has only under other arguments
+(`open`, `stat`, the signal calls) and espix's own (the screen, sound). The
+structs are espix's and fixed-width; flag and errno values are picolibc's, which
+both sides use. Socket options, flags and sockaddrs are lwIP's and poll's values
+IDF's: the kernel passes them to lwIP unchanged, `user/include` mirrors them, and
+`umode_net.c` asserts each at build time. The list is `include/espix_syscall.h`,
+two X-macros (Linux's numbers, espix's own) that the kernel's dispatch and
+`libespix`'s numbers are generated from; `tools/syscalls.py` checks each Linux
+number on every build and keeps the table in [POSIX.md](POSIX.md#syscalls).
+An app's `.note.espix` carries the ABI version it was built for, and `exec`
+refuses another, so an app built before a renumbering is told to be rebuilt
+rather than making the wrong calls.
 
 **Each process has its own descriptor table**, as on Linux: small numbers from 0,
 the lowest free one for each open, 0-2 the process's streams, and behind each a

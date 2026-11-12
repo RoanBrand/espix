@@ -762,11 +762,13 @@ umode:
     static const uint8_t k_no_libc[ESPIX_LIBC_ID_LEN];
     uint8_t libc_id[ESPIX_LIBC_ID_LEN];
     slot->app->abi = (uint8_t)espix_app_abi(slot->app->image, slot->info.image_bytes, libc_id);
-    const bool wants_libc = slot->app->abi >= ESPIX_ABI_LIBC &&
-                            memcmp(libc_id, k_no_libc, sizeof(libc_id)) != 0;
-    if (slot->app->abi >= ESPIX_ABI_LIBC) {
-        espix_libc_app_init(slot);
+    const char *const refused = espix_abi_refusal(slot->app->abi);
+    if (refused != NULL) {
+        espix_eprintf(slot->info.session, "espix: %s: %s\n", slot->app->path, refused);
+        goto done;
     }
+    const bool wants_libc = memcmp(libc_id, k_no_libc, sizeof(libc_id)) != 0;
+    espix_libc_app_init(slot);
 
     relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary(), wants_libc ? libc_id : NULL, NULL };
     if (rctx.done == NULL ||

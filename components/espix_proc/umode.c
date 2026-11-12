@@ -965,14 +965,15 @@ static bool image_map(espix_um_proc_t *p, espix_um_image_t *img)
     return true;
 }
 
-/* An app built against /lib/libc.so maps it, a build the note in its image names; a static one does not. */
+/* An app of this kernel's ABI; one built against /lib/libc.so maps the build its note names, a static one none. */
 static const char *libc_map(espix_proc_slot_t *slot, espix_um_proc_t *p)
 {
     static const uint8_t none[ESPIX_LIBC_ID_LEN];
     uint8_t id[ESPIX_LIBC_ID_LEN];
     slot->app->abi = (uint8_t)espix_app_abi(slot->app->image, slot->info.image_bytes, id);
-    if (slot->app->abi < ESPIX_ABI_LIBC || memcmp(id, none, sizeof(id)) == 0) {
-        return NULL;
+    const char *const refused = espix_abi_refusal(slot->app->abi);
+    if (refused != NULL || memcmp(id, none, sizeof(id)) == 0) {
+        return refused;
     }
     const char *why = NULL;
     espix_um_image_t *const img = espix_libc_hold(id, &why);

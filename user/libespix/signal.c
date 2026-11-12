@@ -11,12 +11,10 @@ _Static_assert(sizeof(sigset_t) == sizeof(uint32_t), "a mask is one word");
 _Static_assert(sizeof(siginfo_t) == sizeof(struct espix_siginfo) &&
                offsetof(siginfo_t, si_addr) == offsetof(struct espix_siginfo, addr),
                "siginfo_t is the kernel's");
-_Static_assert(ESPIX_SYS_SIGRETURN == 47, "the restorer's number");
-
 /* Where a handler returns, with sp still at the frame the kernel pushed. */
 __attribute__((naked)) static void restorer(void)
 {
-    __asm__ volatile ("li a7, 47\n\tecall");
+    __asm__ volatile ("li a7, %0\n\tecall" : : "i"(ESPIX_SYS_SIGRETURN));
 }
 
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)

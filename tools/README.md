@@ -305,6 +305,19 @@ until then. It costs the image nothing, which is the whole reason it is not a
 python3 tools/check-abi.py --elf build-esp32s3/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm
 ```
 
+## syscalls.py
+
+Checks the syscall list (`components/espix_proc/include/espix_syscall.h`)
+against Linux's rv32 numbers, which it carries for the calls espix shares: each
+call in the Linux list must be Linux's number, each of espix's own at 2048 or
+above, and no two the same. It also keeps the table in docs/POSIX.md the list.
+The build runs `--check` after check-abi; `--write` rewrites the table after a
+change to the list.
+
+```bash
+python3 tools/syscalls.py --write
+```
+
 ## Deploying an app
 
 Build it on the host, copy it over, run it by name:

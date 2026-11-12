@@ -179,11 +179,13 @@ else
               "$split/libc.syms" - > "$split/libc-provide.ld"
 fi
 
-# The note an app carries: its ABI (2: its own libc) and the libc.so build it needs, none when static.
+# The note an app carries: the ABI it is built for (espix_syscall.h) and the libc.so build it needs, none when static.
+abi=$(sed -n 's/^#define ESPIX_ABI_VERSION \([0-9]*\).*/\1/p' "$root/components/espix_proc/include/espix_syscall.h")
+[[ -n $abi ]] || { echo "build-libc: no ESPIX_ABI_VERSION in espix_syscall.h" >&2; exit 1; }
 id=$("$bin/${tool}readelf" -n "$split/libc.so" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ ${#id} == 40 ]] || { echo "build-libc: libc.so has no build ID" >&2; exit 1; }
 note() {
-    { printf '.section .note.espix,"a",@note\n.balign 4\n.4byte 6, 24, 1\n.asciz "espix"\n.balign 4\n.4byte 2\n'
+    { printf '.section .note.espix,"a",@note\n.balign 4\n.4byte 6, 24, 1\n.asciz "espix"\n.balign 4\n.4byte %s\n' "$abi"
       printf '.byte %s\n' "$(echo "$1" | sed 's/../0x&,/g; s/,$//')"; } > "$split/$2.S"
     "$gcc" "${arch[@]}" -c "$split/$2.S" -o "$split/$2.o"
 }

@@ -2,7 +2,9 @@
  * espix's syscalls: the U-mode half of the app ABI, shared by the kernel and
  * libespix (docs/USER-MODE.md).
  *
- * A number in a7, arguments in a0-a5, the result in a0: negative is -errno.
+ * A number in a7, arguments in a0-a5, the result in a0: negative is -errno. A
+ * call Linux has with the same arguments takes Linux's rv32 number; the rest are
+ * numbered from 2048 (tools/syscalls.py checks both, and lists them).
  * Flag, mode and errno values are the toolchain picolibc's, which both sides
  * use; socket and poll values and sockaddrs are lwIP's and IDF's, which the
  * kernel hands on unchanged and user/include mirrors. Structures that cross
@@ -12,106 +14,116 @@
 
 #include <stdint.h>
 
-#define ESPIX_SYSCALLS(X)       \
-    X(EXIT,          exit,           1)        /* (status) */                                  \
-    X(WRITE,         write,          2)        /* (fd, buf, len) */                            \
-    X(READ,          read,           3)        /* (fd, buf, len) */                            \
-    X(OPEN,          open,           4)        /* (path, flags, mode) */                       \
-    X(CLOSE,         close,          5)        /* (fd) */                                      \
-    X(LSEEK,         lseek,          6)        /* (fd, off_lo, off_hi, whence, uint64_t *pos) */ \
-    X(FSTAT,         fstat,          7)        /* (fd, struct espix_stat *) */                 \
-    X(STAT,          stat,           8)        /* (path, struct espix_stat *) */               \
-    X(UNLINK,        unlink,         9)        /* (path) */                                    \
-    X(RENAME,        rename,        10)        /* (from, to) */                                \
-    X(MKDIR,         mkdir,         11)        /* (path, mode) */                              \
-    X(RMDIR,         rmdir,         12)        /* (path) */                                    \
-    X(TRUNCATE,      truncate,      13)        /* (path, len_lo, len_hi) */                    \
-    X(FTRUNCATE,     ftruncate,     14)        /* (fd, len_lo, len_hi) */                      \
-    X(FSYNC,         fsync,         15)        /* (fd) */                                      \
-    X(UTIME,         utime,         16)        /* (path, const struct espix_utimbuf *) */      \
-    X(CHDIR,         chdir,         17)        /* (path) */                                    \
-    X(GETCWD,        getcwd,        18)        /* (buf, size): the length with its NUL */      \
-    X(CHMOD,         chmod,         19)        /* (path, mode) */                              \
-    X(DUP,           dup,           20)        /* (fd) */                                      \
-    X(DUP2,          dup2,          21)        /* (fd, newfd) */                               \
-    X(FCNTL,         fcntl,         22)        /* (fd, cmd, arg) */                            \
-    X(GETDENTS,      getdents,      23)        /* (fd, buf, len): struct espix_dirent records */ \
-    X(ISATTY,        isatty,        24)        /* (fd) */                                      \
-    X(CLOCK_GETTIME, clock_gettime, 25)        /* (clock, struct espix_timespec *) */          \
-    X(NANOSLEEP,     nanosleep,     26)        /* (const struct espix_timespec *, rem) */      \
-    X(GETPID,        getpid,        27)        /* () */                                        \
-    X(GETPPID,       getppid,       28)        /* () */                                        \
-    X(GETUID,        getuid,        29)        /* () */                                        \
-    X(GETEUID,       geteuid,       30)        /* () */                                        \
-    X(GETGID,        getgid,        31)        /* () */                                        \
-    X(GETEGID,       getegid,       32)        /* () */                                        \
-    X(KILL,          kill,          33)        /* (pid, sig) */                                \
-    X(GETPGRP,       getpgrp,       34)        /* () */                                        \
-    X(GETSID,        getsid,        35)        /* (pid) */                                     \
-    X(BRK,           brk,           36)        /* (addr): the break, moved there if it could be */ \
-    X(THREAD_CREATE, thread_create, 37)        /* (entry, arg, tls, stack or 0, tid word or 0): the tid */ \
-    X(THREAD_EXIT,   thread_exit,   38)        /* (): its tid word is zeroed and woken */        \
-    X(FUTEX,         futex,         39)        /* (uaddr, op, val, const struct espix_timespec *) */ \
-    X(GETTID,        gettid,        40)        /* () */                                        \
-    X(SCHED_YIELD,   sched_yield,   41)        /* () */                                        \
-    X(GETCPU,        getcpu,        42)        /* (): the core the caller runs on */          \
-    X(SIGACTION,     sigaction,     43)        /* (sig, const struct espix_sigaction *, old) */  \
-    X(SIGPROCMASK,   sigprocmask,   44)        /* (how, const uint32_t *set, uint32_t *old): the thread's */ \
-    X(SIGPENDING,    sigpending,    45)        /* (uint32_t *): pending and blocked */          \
-    X(SIGSUSPEND,    sigsuspend,    46)        /* (const uint32_t *mask): -EINTR once a handler is due */ \
-    X(SIGRETURN,     sigreturn,     47)        /* (): a handler's restorer; its frame is at sp */ \
-    X(RAISE,         raise,         48)        /* (sig): to the calling thread */               \
-    X(SETITIMER,     setitimer,     49)        /* (which, const struct espix_itimerval *, old) */ \
-    X(TERM_SIZE,     term_size,     50)        /* (int *cols, int *rows) */                    \
-    X(SOCKET,        socket,        51)        /* (domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol) */ \
-    X(BIND,          bind,          52)        /* (fd, addr, len) */                           \
-    X(LISTEN,        listen,        53)        /* (fd, backlog) */                             \
-    X(ACCEPT,        accept,        54)        /* (fd, addr or 0, socklen_t *len, SOCK_* flags) */ \
-    X(CONNECT,       connect,       55)        /* (fd, addr, len) */                           \
-    X(SENDTO,        sendto,        56)        /* (fd, buf, len, flags, to or 0, tolen) */     \
-    X(RECVFROM,      recvfrom,      57)        /* (fd, buf, len, flags, from or 0, socklen_t *fromlen) */ \
-    X(SHUTDOWN,      shutdown,      58)        /* (fd, how) */                                 \
-    X(GETSOCKOPT,    getsockopt,    59)        /* (fd, level, name, val, socklen_t *len) */    \
-    X(SETSOCKOPT,    setsockopt,    60)        /* (fd, level, name, val, len) */               \
-    X(GETSOCKNAME,   getsockname,   61)        /* (fd, addr, socklen_t *len) */                \
-    X(GETPEERNAME,   getpeername,   62)        /* (fd, addr, socklen_t *len) */                \
-    X(POLL,          poll,          63)        /* (struct pollfd *, nfds, ms or -1) */         \
-    X(GETADDRINFO,   getaddrinfo,   64)        /* (node, service, hints, out, max): a count, -errno or -EAI_* */ \
-    X(GETRANDOM,     getrandom,     65)        /* (buf, len, flags) */                         \
-    X(GETHOSTNAME,   gethostname,   66)        /* (buf, len) */                                \
-    X(IOCTL,         ioctl,         67)        /* (fd, FIONBIO or FIONREAD, int *) */         \
-    X(GETPW,         getpw,         68)        /* (name or 0, uid, struct espix_pwent *, len) */ \
-    X(GETGR,         getgr,         69)        /* (name or 0, gid, struct espix_pwent *, len) */ \
-    X(SYSLOG,        syslog,        70)        /* (priority, ident or 0, message): to the kernel log */ \
-    X(GETIFADDRS,    getifaddrs,    71)        /* (struct espix_ifaddr *, max): how many */ \
-    X(GFX_OPEN,      gfx_open,      72)        /* (full_w, full_h): claims the screen; 0,0 keeps its size */ \
-    X(GFX_CLOSE,     gfx_close,     73)        /* () */                                        \
-    X(GFX_SURFACE,   gfx_surface,   74)        /* (w, h, struct espix_gfx_fb *): a handle; 0,0 is the screen's size */ \
-    X(GFX_FREE,      gfx_free,      75)        /* (handle): its pixels are unmapped */         \
-    X(GFX_PRESENT,   gfx_present,   76)        /* (handle, x, y, w, h): w 0 scales it to fill the screen */ \
-    X(GFX_POLL,      gfx_poll,      77)        /* (struct espix_input *): 1 with an event, 0 without */ \
-    X(AUDIO_OPEN,    audio_open,    78)        /* (const struct espix_audio_fmt *): a handle */  \
-    X(AUDIO_WRITE,   audio_write,   79)        /* (handle, buf, len): bytes taken, blocking while the ring is full */ \
-    X(AUDIO_CTL,     audio_ctl,     80)        /* (handle, ESPIX_AUDIO_*, arg) */               \
-    X(AUDIO_CLOSE,   audio_close,   81)        /* (handle): what is queued plays out */        \
-    X(MEMINFO,       meminfo,       82)        /* (struct espix_meminfo *) */ \
-    X(MMAP,          mmap,          83)        /* (addr, len, prot, flags, fd, offset in pages) */ \
-    X(MUNMAP,        munmap,        84)        /* (addr, len) */                               \
-    X(MPROTECT,      mprotect,      85)        /* (addr, len, prot) */                         \
-    X(MSYNC,         msync,         86)        /* (addr, len, flags) */                        \
-    X(MADVISE,       madvise,       87)        /* (addr, len, advice) */                       \
-    X(PREAD,         pread,         88)        /* (fd, buf, len, off_lo, off_hi) */            \
-    X(PWRITE,        pwrite,        89)        /* (fd, buf, len, off_lo, off_hi) */            \
-    X(MINCORE,       mincore,       90)        /* (addr, len, uint8_t *vec): 1 a page resident */ \
-    X(PIPE2,         pipe2,         91)        /* (int fds[2], O_NONBLOCK | O_CLOEXEC) */       \
-    X(WAIT4,         wait4,         92)        /* (pid, int *status or 0, WNOHANG | WUNTRACED): a child's pid, 0 for none yet */ \
-    X(SETSID,        setsid,        93)        /* (): the new session's id */                  \
-    X(SETPGID,       setpgid,       94)        /* (pid, pgid) */                               \
-    X(GETPGID,       getpgid,       95)        /* (pid) */                                     \
-    X(UMASK,         umask,         96)        /* (mask): the old one */                       \
-    X(FORK,          fork,          97)        /* (): the child's pid, and 0 in the child */   \
-    X(VFORK,         vfork,         98)        /* (): fork, the child borrowing the caller's memory and the caller waiting until it execs or ends */ \
-    X(EXECVE,        execve,        99)        /* (path, argv, envp): returns only with an error */
+/* Linux's calls, by their asm-generic rv32 numbers: the same arguments and meaning (the comment names Linux's, where it differs). */
+#define ESPIX_SYSCALLS_LINUX(X) \
+    X(GETCWD,        getcwd,          17)        /* (buf, size): the length with its NUL */ \
+    X(DUP,           dup,             23)        /* (fd) */ \
+    X(FCNTL,         fcntl,           25)        /* (fd, cmd, arg); Linux's fcntl64 */ \
+    X(IOCTL,         ioctl,           29)        /* (fd, FIONBIO or FIONREAD, int *) */ \
+    X(TRUNCATE,      truncate,        45)        /* (path, len_lo, len_hi); Linux's truncate64 */ \
+    X(FTRUNCATE,     ftruncate,       46)        /* (fd, len_lo, len_hi); Linux's ftruncate64 */ \
+    X(CHDIR,         chdir,           49)        /* (path) */ \
+    X(CLOSE,         close,           57)        /* (fd) */ \
+    X(PIPE2,         pipe2,           59)        /* (int fds[2], O_NONBLOCK | O_CLOEXEC) */ \
+    X(READ,          read,            63)        /* (fd, buf, len) */ \
+    X(WRITE,         write,           64)        /* (fd, buf, len) */ \
+    X(PREAD,         pread,           67)        /* (fd, buf, len, off_lo, off_hi); Linux's pread64 */ \
+    X(PWRITE,        pwrite,          68)        /* (fd, buf, len, off_lo, off_hi); Linux's pwrite64 */ \
+    X(FSYNC,         fsync,           82)        /* (fd) */ \
+    X(EXIT,          exit,            94)        /* (status); Linux's exit_group */ \
+    X(SCHED_YIELD,   sched_yield,    124)        /* () */ \
+    X(KILL,          kill,           129)        /* (pid, sig) */ \
+    X(SIGRETURN,     sigreturn,      139)        /* (): a handler's restorer; its frame is at sp; Linux's rt_sigreturn */ \
+    X(SETPGID,       setpgid,        154)        /* (pid, pgid) */ \
+    X(GETPGID,       getpgid,        155)        /* (pid) */ \
+    X(GETSID,        getsid,         156)        /* (pid) */ \
+    X(SETSID,        setsid,         157)        /* (): the new session's id */ \
+    X(UMASK,         umask,          166)        /* (mask): the old one */ \
+    X(GETPID,        getpid,         172)        /* () */ \
+    X(GETPPID,       getppid,        173)        /* () */ \
+    X(GETUID,        getuid,         174)        /* () */ \
+    X(GETEUID,       geteuid,        175)        /* () */ \
+    X(GETGID,        getgid,         176)        /* () */ \
+    X(GETEGID,       getegid,        177)        /* () */ \
+    X(GETTID,        gettid,         178)        /* () */ \
+    X(SOCKET,        socket,         198)        /* (domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol) */ \
+    X(BIND,          bind,           200)        /* (fd, addr, len) */ \
+    X(LISTEN,        listen,         201)        /* (fd, backlog) */ \
+    X(CONNECT,       connect,        203)        /* (fd, addr, len) */ \
+    X(GETSOCKNAME,   getsockname,    204)        /* (fd, addr, socklen_t *len) */ \
+    X(GETPEERNAME,   getpeername,    205)        /* (fd, addr, socklen_t *len) */ \
+    X(SENDTO,        sendto,         206)        /* (fd, buf, len, flags, to or 0, tolen) */ \
+    X(RECVFROM,      recvfrom,       207)        /* (fd, buf, len, flags, from or 0, socklen_t *fromlen) */ \
+    X(SETSOCKOPT,    setsockopt,     208)        /* (fd, level, name, val, len) */ \
+    X(GETSOCKOPT,    getsockopt,     209)        /* (fd, level, name, val, socklen_t *len) */ \
+    X(SHUTDOWN,      shutdown,       210)        /* (fd, how) */ \
+    X(BRK,           brk,            214)        /* (addr): the break, moved there if it could be */ \
+    X(MUNMAP,        munmap,         215)        /* (addr, len) */ \
+    X(EXECVE,        execve,         221)        /* (path, argv, envp): returns only with an error */ \
+    X(MMAP,          mmap,           222)        /* (addr, len, prot, flags, fd, offset in pages); Linux's mmap2 */ \
+    X(MPROTECT,      mprotect,       226)        /* (addr, len, prot) */ \
+    X(MSYNC,         msync,          227)        /* (addr, len, flags) */ \
+    X(MINCORE,       mincore,        232)        /* (addr, len, uint8_t *vec): 1 a page resident */ \
+    X(MADVISE,       madvise,        233)        /* (addr, len, advice) */ \
+    X(ACCEPT,        accept,         242)        /* (fd, addr or 0, socklen_t *len, SOCK_* flags); Linux's accept4 */ \
+    X(GETRANDOM,     getrandom,      278)        /* (buf, len, flags) */ \
+    X(CLOCK_GETTIME, clock_gettime,  403)        /* (clock, struct espix_timespec *); Linux's clock_gettime64 */ \
+    X(FUTEX,         futex,          422)        /* (uaddr, op, val, const struct espix_timespec *); Linux's futex_time64 */
+
+/* espix's own, from ESPIX_SYS_OWN: calls Linux has under other arguments, or not at all. */
+#define ESPIX_SYS_OWN 2048
+#define ESPIX_SYSCALLS_OWN(X) \
+    X(OPEN,          open,          2048)        /* (path, flags, mode) */ \
+    X(LSEEK,         lseek,         2049)        /* (fd, off_lo, off_hi, whence, uint64_t *pos) */ \
+    X(FSTAT,         fstat,         2050)        /* (fd, struct espix_stat *) */ \
+    X(STAT,          stat,          2051)        /* (path, struct espix_stat *) */ \
+    X(UNLINK,        unlink,        2052)        /* (path) */ \
+    X(RENAME,        rename,        2053)        /* (from, to) */ \
+    X(MKDIR,         mkdir,         2054)        /* (path, mode) */ \
+    X(RMDIR,         rmdir,         2055)        /* (path) */ \
+    X(UTIME,         utime,         2056)        /* (path, const struct espix_utimbuf *) */ \
+    X(CHMOD,         chmod,         2057)        /* (path, mode) */ \
+    X(DUP2,          dup2,          2058)        /* (fd, newfd) */ \
+    X(GETDENTS,      getdents,      2059)        /* (fd, buf, len): struct espix_dirent records */ \
+    X(ISATTY,        isatty,        2060)        /* (fd) */ \
+    X(NANOSLEEP,     nanosleep,     2061)        /* (const struct espix_timespec *, rem) */ \
+    X(GETPGRP,       getpgrp,       2062)        /* () */ \
+    X(THREAD_CREATE, thread_create, 2063)        /* (entry, arg, tls, stack or 0, tid word or 0): the tid */ \
+    X(THREAD_EXIT,   thread_exit,   2064)        /* (): its tid word is zeroed and woken */ \
+    X(GETCPU,        getcpu,        2065)        /* (): the core the caller runs on */ \
+    X(SIGACTION,     sigaction,     2066)        /* (sig, const struct espix_sigaction *, old) */ \
+    X(SIGPROCMASK,   sigprocmask,   2067)        /* (how, const uint32_t *set, uint32_t *old): the thread's */ \
+    X(SIGPENDING,    sigpending,    2068)        /* (uint32_t *): pending and blocked */ \
+    X(SIGSUSPEND,    sigsuspend,    2069)        /* (const uint32_t *mask): -EINTR once a handler is due */ \
+    X(RAISE,         raise,         2070)        /* (sig): to the calling thread */ \
+    X(SETITIMER,     setitimer,     2071)        /* (which, const struct espix_itimerval *, old) */ \
+    X(TERM_SIZE,     term_size,     2072)        /* (int *cols, int *rows) */ \
+    X(POLL,          poll,          2073)        /* (struct pollfd *, nfds, ms or -1) */ \
+    X(GETADDRINFO,   getaddrinfo,   2074)        /* (node, service, hints, out, max): a count, -errno or -EAI_* */ \
+    X(GETHOSTNAME,   gethostname,   2075)        /* (buf, len) */ \
+    X(GETPW,         getpw,         2076)        /* (name or 0, uid, struct espix_pwent *, len) */ \
+    X(GETGR,         getgr,         2077)        /* (name or 0, gid, struct espix_pwent *, len) */ \
+    X(SYSLOG,        syslog,        2078)        /* (priority, ident or 0, message): to the kernel log */ \
+    X(GETIFADDRS,    getifaddrs,    2079)        /* (struct espix_ifaddr *, max): how many */ \
+    X(GFX_OPEN,      gfx_open,      2080)        /* (full_w, full_h): claims the screen; 0,0 keeps its size */ \
+    X(GFX_CLOSE,     gfx_close,     2081)        /* () */ \
+    X(GFX_SURFACE,   gfx_surface,   2082)        /* (w, h, struct espix_gfx_fb *): a handle; 0,0 is the screen's size */ \
+    X(GFX_FREE,      gfx_free,      2083)        /* (handle): its pixels are unmapped */ \
+    X(GFX_PRESENT,   gfx_present,   2084)        /* (handle, x, y, w, h): w 0 scales it to fill the screen */ \
+    X(GFX_POLL,      gfx_poll,      2085)        /* (struct espix_input *): 1 with an event, 0 without */ \
+    X(AUDIO_OPEN,    audio_open,    2086)        /* (const struct espix_audio_fmt *): a handle */ \
+    X(AUDIO_WRITE,   audio_write,   2087)        /* (handle, buf, len): bytes taken, blocking while the ring is full */ \
+    X(AUDIO_CTL,     audio_ctl,     2088)        /* (handle, ESPIX_AUDIO_*, arg) */ \
+    X(AUDIO_CLOSE,   audio_close,   2089)        /* (handle): what is queued plays out */ \
+    X(MEMINFO,       meminfo,       2090)        /* (struct espix_meminfo *) */ \
+    X(WAIT4,         wait4,         2091)        /* (pid, int *status or 0, WNOHANG | WUNTRACED): a child's pid, 0 for none yet */ \
+    X(FORK,          fork,          2092)        /* (): the child's pid, and 0 in the child */ \
+    X(VFORK,         vfork,         2093)        /* (): fork, the child borrowing the caller's memory and the caller waiting until it execs or ends */
+
+#define ESPIX_SYSCALLS(X) ESPIX_SYSCALLS_LINUX(X) ESPIX_SYSCALLS_OWN(X)
+
+/* The app ABI an app is built for, in its .note.espix (tools/build-libc.sh); another is refused at exec. */
+#define ESPIX_ABI_VERSION 3
 
 enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,

@@ -3,7 +3,7 @@
     .global vfork
     .type   vfork, @function
 vfork:
-    li      a7, 98
+    li      a7, 2093            /* ESPIX_SYS_VFORK; spawn.c checks it */
     ecall
     bltz    a0, 1f
     ret

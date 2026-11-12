@@ -1377,20 +1377,53 @@ UM_MMU_ONLY(UM_NOSYS)
 #undef UM_NOSYS
 #endif
 
-#define UM_SYS_ENTRY(name, lname, nr) [nr] = um_sys_##lname,
-static const DRAM_ATTR um_sys_fn s_sys[] = { ESPIX_SYSCALLS(UM_SYS_ENTRY) };
+/* The S31's trap reads these with the cache possibly off: internal RAM there, flash on the S3. */
+#if CONFIG_ESPIX_UMODE
+#define UM_TABLE DRAM_ATTR
+#else
+#define UM_TABLE
+#endif
 
-#define UM_MMU_ENTRY(name, lname) [ESPIX_SYS_##name] = true,
-static const bool s_mmu_only[sizeof(s_sys) / sizeof(s_sys[0])] = { UM_MMU_ONLY(UM_MMU_ENTRY) };
+/* Every call's handler, dense, in the header's order; the numbers map to it through a byte each. */
+enum {
+    UM_NONE_,
+#define UM_IDX(name, lname, nr) UM_##name,
+    ESPIX_SYSCALLS(UM_IDX)
+#undef UM_IDX
+    UM_COUNT_
+};
+_Static_assert(UM_COUNT_ <= 256, "a syscall's index is a byte");
+
+#define UM_FN(name, lname, nr) [UM_##name] = um_sys_##lname,
+static const UM_TABLE um_sys_fn s_sys[UM_COUNT_] = { ESPIX_SYSCALLS(UM_FN) };
+
+#define UM_MMU_ENTRY(name, lname) [UM_##name] = true,
+static const UM_TABLE bool s_mmu_only[UM_COUNT_] = { UM_MMU_ONLY(UM_MMU_ENTRY) };
+
+/* Linux's numbers, up to the highest espix uses (futex_time64); espix's own from ESPIX_SYS_OWN. */
+#define UM_LINUX_END (ESPIX_SYS_FUTEX + 1)
+#define UM_LIN(name, lname, nr) [nr] = UM_##name,
+static const UM_TABLE uint8_t s_linux[UM_LINUX_END] = { ESPIX_SYSCALLS_LINUX(UM_LIN) };
+#define UM_LIN_CHECK(name, lname, nr) _Static_assert((nr) < UM_LINUX_END, #name " is past the Linux map");
+ESPIX_SYSCALLS_LINUX(UM_LIN_CHECK)
+#define UM_OWN(name, lname, nr) [(nr) - ESPIX_SYS_OWN] = UM_##name,
+static const UM_TABLE uint8_t s_own[] = { ESPIX_SYSCALLS_OWN(UM_OWN) };
+
+/* A number's index into s_sys, or 0. */
+static inline __attribute__((always_inline)) unsigned um_index(uint32_t nr)
+{
+    if (nr < UM_LINUX_END) {
+        return s_linux[nr];
+    }
+    return (nr - ESPIX_SYS_OWN < sizeof(s_own)) ? s_own[nr - ESPIX_SYS_OWN] : 0;
+}
 
 #if CONFIG_ESPIX_UMODE
 IRAM_ATTR int32_t espix_um_syscall(espix_um_thread_t *t, RvExcFrame *f)
 {
     um_call_t c = { .t = t, .p = t->proc, .f = f, .a = (const uint32_t *)&f->a0 };
-    if (f->a7 >= sizeof(s_sys) / sizeof(s_sys[0]) || s_sys[f->a7] == NULL) {
-        return -ENOSYS;
-    }
-    return s_sys[f->a7](&c);
+    const unsigned i = um_index(f->a7);
+    return (i != 0) ? s_sys[i](&c) : -ENOSYS;
 }
 #endif
 
@@ -1403,10 +1436,11 @@ int32_t espix_posix_syscall(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2, 
     }
     const uint32_t a[6] = { a0, a1, a2, a3, a4, a5 };
     um_call_t c = { .t = t, .p = t->proc, .f = NULL, .a = a };
-    if (nr >= sizeof(s_sys) / sizeof(s_sys[0]) || s_sys[nr] == NULL || s_mmu_only[nr]) {
+    const unsigned i = um_index(nr);
+    if (i == 0 || s_mmu_only[i]) {
         return -ENOSYS;
     }
-    const int32_t r = s_sys[nr](&c);
+    const int32_t r = s_sys[i](&c);
     /* The delivery point an M-mode app's calls in are: its handlers run here, on its own stack. */
     (void)espix_sigcheck_mask();
     /* A kill asks first: the task that is the process leaves here, holding nothing, as exit() does. vfork may have changed which. */

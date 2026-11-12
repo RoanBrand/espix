@@ -305,6 +305,7 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME}.elf POST_BUILD
     COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check-abi.py"
             --elf "$<TARGET_FILE:${CMAKE_PROJECT_NAME}.elf>"
             --nm "${CMAKE_NM}"
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/syscalls.py" --check
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Checking the layer-below symbols are in the image"
     VERBATIM)

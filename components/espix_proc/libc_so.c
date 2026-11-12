@@ -77,12 +77,12 @@ static const uint8_t *note_find(const uint8_t *p, size_t len, const char *owner,
 int espix_app_abi(const uint8_t *img, size_t len, uint8_t libc_id[ESPIX_LIBC_ID_LEN])
 {
     if (len < 52) {
-        return ESPIX_ABI_KERNEL;
+        return 0;
     }
     const uint32_t shoff = rd32(img + 0x20);
     const uint16_t shentsize = rd16(img + 0x2E), shnum = rd16(img + 0x30);
     if (shentsize < 40 || shoff > len || (size_t)shnum * shentsize > len - shoff) {
-        return ESPIX_ABI_KERNEL;
+        return 0;
     }
     for (uint16_t i = 0; i < shnum; i++) {
         const uint8_t *const sh = img + shoff + (size_t)i * shentsize;
@@ -97,7 +97,17 @@ int espix_app_abi(const uint8_t *img, size_t len, uint8_t libc_id[ESPIX_LIBC_ID_
             return (int)rd32(d);
         }
     }
-    return ESPIX_ABI_KERNEL;
+    return 0;
+}
+
+const char *espix_abi_refusal(int abi)
+{
+    if (abi == ESPIX_ABI_VERSION) {
+        return NULL;
+    }
+    return (abi == 0) ? "not an espix app: build it with espix-cc, or include cmake/espix-app.cmake"
+         : (abi < ESPIX_ABI_VERSION) ? "built for an older espix: rebuild it"
+         : "built for a newer espix than this kernel";
 }
 
 /* libc.so's build ID, read from the file's note sections alone. */

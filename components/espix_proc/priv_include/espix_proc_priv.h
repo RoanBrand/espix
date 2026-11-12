@@ -647,10 +647,12 @@ void espix_proc_exit(int status) __attribute__((noreturn));
 /* Run an M-mode app's destructors once, if `slot` is the calling task's own process. */
 void espix_proc_app_fini(espix_proc_slot_t *slot);
 
-/* An app's ABI, from its espix note: the kernel's libc (no note), or its own (libc_so.c). */
+/* An app's ABI version from its espix note (0 without one), and the libc.so build it names (libc_so.c). */
+#include "espix_syscall.h"      /* ESPIX_ABI_VERSION */
 #define ESPIX_LIBC_ID_LEN 20
-enum { ESPIX_ABI_KERNEL = 0, ESPIX_ABI_LIBC = 2 };
 int espix_app_abi(const uint8_t *img, size_t len, uint8_t libc_id[ESPIX_LIBC_ID_LEN]);
+/* Why an app of that ABI cannot run here, or NULL: ESPIX_ABI_VERSION is the one this kernel's syscalls are. */
+const char *espix_abi_refusal(int abi);
 void espix_libc_init(void);
 /* Give an app with its own libc a libc-wide lock of its own. */
 void espix_libc_app_init(espix_proc_slot_t *slot);

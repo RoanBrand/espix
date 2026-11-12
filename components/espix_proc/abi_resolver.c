@@ -54,7 +54,7 @@ static uintptr_t espix_symbol_resolver(const char *sym_name)
     }
 
     const espix_proc_slot_t *const self = espix_proc_self();
-    if (self != NULL && self->app != NULL && self->app->abi >= ESPIX_ABI_LIBC) {
+    if (self != NULL && self->app != NULL && self->app->abi == ESPIX_ABI_VERSION) {
         return espix_libc_resolve(sym_name, kernel_lookup);
     }
     return kernel_lookup(sym_name);

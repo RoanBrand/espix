@@ -412,6 +412,28 @@ else
     espix_skip "a -static app's getopt state is its own: no testapp-static (make test-app)"
 fi
 
+# An app built for another ABI is refused at exec, by its note, before it can make the wrong syscalls.
+abi_dir=$(espix_mktemp_dir)
+if "$ESPIX_PYTHON" - "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp" "$abi_dir/old" <<'PY'
+import sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+i = b.find(b'espix\0\0\0\x03\0\0\0')     # .note.espix: the name, then the version
+if i < 0:
+    sys.exit(1)
+b[i + 8] = 2
+open(sys.argv[2], 'wb').write(b)
+PY
+then
+    old="/home/$ESPIX_USER/testapp-abi2-$ESPIX_WORKER"
+    dev_push "$abi_dir/old" "$old" >/dev/null
+    assert_contains "an app built for an older ABI is refused at exec" "built for an older espix" \
+        "$(dev_run "chmod 755 $old; $old exit 0" 2>&1)"
+    dev_run "rm $old" >/dev/null
+else
+    espix_skip "an app built for an older ABI is refused at exec: no ABI note in the test app"
+fi
+rm -rf "$abi_dir"
+
 # libc's own lock is each app's: one killed holding it leaves every other app's libc alone.
 pid=$(dev_run "$APP libclock &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
 if [ -n "$pid" ]; then
