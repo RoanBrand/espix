@@ -1,6 +1,6 @@
 --- a/components/esp_driver_ppa/src/ppa_srm.c
 +++ b/components/esp_driver_ppa/src/ppa_srm.c
-@@ -282,7 +282,7 @@
+@@ -326,7 +326,7 @@
          uint32_t out_ext_window_aligned = PPA_ALIGN_DOWN(out_ext_window, out_buf_alignment);
          uint32_t out_ext_window_len = (uint32_t)((uint64_t)config->out.pic_w * new_block_h * out_pixel_depth / 8); // actual ext_window_len must be less than or equal to this, since actual block_h <= new_block_h (may round down)
          assert(out_ext_window + out_ext_window_len <= (uint32_t)config->out.buffer + config->out.buffer_size);

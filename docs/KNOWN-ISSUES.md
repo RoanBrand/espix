@@ -484,6 +484,11 @@ rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
   written back by `msync`, `munmap` and the end; `read`, `write` and other
   mappings of the file do not see it in between.
 
+Under the full suite's load, `testapp vfork` has once printed its faulting
+child's message and then nothing: the parent neither reported a failed check
+nor said `vfork ok` (30-proc, `ESPIX_UAPP=1 tests/run.sh --seed 84799 -j 4`).
+Alone it passed 15 runs of 15.
+
 ## Filesystem
 
 - **An ext listing cannot tell its end from a failure.** lwext4's
@@ -857,7 +862,8 @@ rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
   seen corrupting the heap and taking the board down from an unrelated task. It
   needs the USB layer to quiesce before the release, which is not something espix
   can reach, so it is written up in [UPSTREAM.md](UPSTREAM.md#a-device-pulled-mid-transfer-takes-the-heap-with-it)
-  rather than fixed here.
+  rather than fixed here. Recheck on IDF f011425, whose USB HAL no longer
+  aborts on a pipe error without a halt (e29699fc1).
 
 - **Removing a device can panic inside the library's hub driver.** With an
   external hub on the port, unplugging a device — or the hub — can reach an
@@ -879,7 +885,8 @@ rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
 
 - **A read on the 3.1TB T9 returns different bytes when it is repeated.** This is
   measured, not inferred, and it is the root of everything the listing symptoms
-  looked like.
+  looked like. Recheck on IDF f011425, which caps a transfer at the 17-bit qTD
+  size field (341aaf12f).
 
   A probe read the first 200 single-sector accesses after each mount a second
   time and compared the two buffers. It was removed once it had answered -- 512
@@ -1056,6 +1063,11 @@ rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
     (`display status` names it) and quarantines its output buffer.
   - The JPEG path's reset spin is inside IDF and cannot be bounded: a recurrence
     there is a watchdog reset with a core dump.
+
+  Recheck: IDF's `release/v6.1` at f011425 decides PPA idleness under the engine
+  lock, closing a race that could strand a last transaction (1e90de680), and
+  aborts the AXI and 2D-DMA channels before a software reset (9b4b3a1ae, whose
+  new reset waits are unbounded). Either may be these wedges.
 - **1280x720 video plays only fullscreen on a 1280x800 canvas.**
   - Fullscreen, the frames go to a viewer as the file's own JPEGs, at
     23-24 fps.

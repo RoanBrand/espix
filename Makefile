@@ -59,8 +59,7 @@ LOADER_BUILD := loader/build-$(TARGET)
 # Two esptool facts come from the target, not the partition CSV. The S31
 # reserves its first two flash sectors, so its bootloader goes at 0x2000
 # rather than 0x0, and IDF builds it without the flasher stub
-# (CONFIG_ESPTOOLPY_NO_STUB). Keep in step with espix_target_is_preview in
-# tools/idf.sh.
+# (CONFIG_ESPTOOLPY_NO_STUB).
 BOOT_OFF := $(if $(filter esp32s31,$(TARGET)),0x2000,0x0)
 NO_STUB  := $(if $(filter esp32s31,$(TARGET)),--no-stub)
 

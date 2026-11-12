@@ -564,7 +564,9 @@ Open:
   bus's REE path from the core. Espressif's own U-mode world, ESP-TEE, runs on
   single-core chips only. For Espressif: both, with `uapp amo` as the
   reproducer, and whether the S31 shares the popret issue IDF flags on the C5,
-  C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`).
+  C61, H4 and P4 (`SOC_CPU_ZCMP_POPRET_ISSUE`). Recheck both on IDF f011425,
+  which raises the S31's core voltage (dbias 26 to 28) and turns PVT off by
+  default: they were measured before it.
 - **An app's atomics cost a trap each** while the kernel does them. A toolchain
   with GCC's Zalrsc-only exchange fix ([UPSTREAM](UPSTREAM.md)) lets `espix-cc`
   build without Zaamo, and picolibc and libstdc++ rebuilt the same way, so that

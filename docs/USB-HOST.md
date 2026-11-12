@@ -373,11 +373,10 @@ device was unplugged. Three commands expose the same machinery by hand:
 
 The buffer a read lands in goes on the USB wire unchanged, so it is allocated
 with `MALLOC_CAP_DMA`. On the S3 that means internal RAM: the USB-DWC DMA engine
-cannot reach external RAM, which is why the host stack's
-`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM` is gated on `IDF_TARGET_ESP32P4 &&
-SPIRAM` and cannot be set for this target at all. It would be worth setting on a
-P4, where it moves those buffers off the scarce heap; here it is not an option
-that exists.
+cannot reach external RAM, so the host stack's
+`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM` cannot be set for it. The S31's
+can (`SOC_USB_OTG_PSRAM_DMA_CAPABLE`), and there the option would move those
+buffers off the internal heap; not yet tried.
 
 ## Checking it
 

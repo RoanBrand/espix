@@ -507,7 +507,8 @@ BR/EDR power table on S31 -- `btdm_user_cfg.h` was not included), `ec6c7bea5`
 (delete the unused AVRCP acceptor RCB) and `ca97da138` (Bluetooth Classic CVE
 fixes). Note that the `OLM_LMP ... opcode:54` line **still appears** on the
 branch -- the open simply no longer aborts because of it, so the failure is
-tolerated rather than understood, and the report stays open upstream.
+tolerated rather than understood, and the report stays open upstream. Recheck on
+f011425, which carries BR/EDR LMP procedure fixes (4f124c372).
 
 espix therefore **requires the branch**. `tools/idf.sh` prefers a
 `release-<version>` checkout over the plain tag for exactly this reason, and

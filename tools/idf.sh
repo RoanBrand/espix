@@ -49,7 +49,7 @@ espix_profile_suffix() {
 # (tools/idf_py_actions/constants.py).
 espix_target_is_preview() {
     case "$1" in
-        esp32s31|esp32h21|esp32h4|linux) return 0 ;;
+        esp32h21|esp32h4|linux) return 0 ;;
         *) return 1 ;;
     esac
 }
