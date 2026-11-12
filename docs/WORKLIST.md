@@ -27,13 +27,12 @@ This file came out of a full review of the tree (first commit through
 
 ## Locked decisions
 
-- **D1 — The app ABI stays an allowlist, and it becomes espix's alone.**
-  `elf_loader` can generate a table of every firmware global symbol; espix
-  deliberately types each name instead, because on a chip with no MMU the export
-  table *is* the boundary. The follow-on decision: the names the loader's own
-  libc/IDF tables currently answer for apps -- 62 by the build's own count, not
-  the old estimate of 84 -- are now intercepted by espix (R-P3.1), so
-  that one layer defines the whole surface. See R-P1 and R-P3.1.
+- **D1 — An app carries its own libc; what the kernel publishes is an allowlist.**
+  On a chip with no MMU the names an app can call in the firmware are the
+  boundary, so each is typed in, never generated from the firmware's symbols.
+  libc is the app's (its state linked in, its code the one shared
+  `/lib/libc.so`), so the kernel publishes only OS calls: memory, threads,
+  signals, the screen, sound, and IDF's drivers for an IDF project.
 - **D2 — `fork()` is not built.** The S31 has a real Sv32 MMU (datasheet p.44,
   M/S/U modes; Linux boots on it via OpenSBI). Using it means apps in U-mode, an
   `ecall` boundary, page-fault handling and a frame allocator — a second kernel

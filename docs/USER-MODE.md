@@ -267,7 +267,7 @@ is built the same way.
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
-memory. `hello` is 3.1 KiB of text, 10.6 KiB with `-static`.
+memory. `hello` is 3.2 KB of text, 10.6 KB with `-static`.
 
 **Built without PIE and the hardware loop** (`xespv`, `xesploop`). Only core 1
 has them, and IDF pins a task that uses one to core 1 for good. Without them a
@@ -514,6 +514,19 @@ starts and kept 30 seconds after the last. An app's `.note.espix` names the
   `errno` and libc's locks, it calls hook slots at the app's first text address,
   `0x10000` (`libespix/libc_hooks.S`); `errno` lives in the thread's TLS and the
   allocator is the app's own, as on Linux.
+
+What sharing saves is the libc code an app uses, not the size of `libc.so`:
+`libc.so` is 187 KB of code on the S3 and 234 KB on the S31 (its libgcc
+included), paid once while any app runs, against 7-16 KB each app no longer
+carries. On the S31, in bytes of text:
+
+| app | `-static` | shared |
+|---|---|---|
+| hello | 10,596 | 3,162 |
+| plasma | 11,702 | 4,288 |
+| doom | 162,904 | 150,046 |
+| mosquitto | 169,226 | 154,240 |
+| testapp | 41,940 | 26,088 |
 
 **A mapping is a block of the process's memory**, as on Linux without an MMU:
 exactly the length asked, aligned as `malloc`'s, and given back whole by
