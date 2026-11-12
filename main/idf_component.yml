@@ -20,8 +20,9 @@ dependencies:
   # Runtime ELF loader: relocates and runs natively-compiled apps read off the
   # filesystem, plus dlopen()/dlsym() for shared objects.
   # Supports esp32s3 / esp32p4 / esp32s31, which are espix's three targets.
-  # 1.3.4 is the floor: it stops the S3's app-load cache flush racing a flash op.
-  espressif/elf_loader: "~1.3.5"
+  # 2.1.0 is the floor: it validates every image, fails on an unsupported
+  # relocation, and applies the Xtensa GLOB_DAT/JMP_SLOT addend.
+  espressif/elf_loader: "~2.1.0"
 
   # USB-NCM: Ethernet over the USB-OTG port, so the board is reachable over a
   # cable with no network at all. Espressif's own additions to TinyUSB rather

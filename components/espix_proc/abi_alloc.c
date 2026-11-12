@@ -13,12 +13,7 @@
  * memory comes from (PSRAM first, internal as the fallback) and makes every
  * allocation pass through code espix owns.
  *
- * Why the resolver and not a table
- * --------------------------------
- * elf_loader's own libc table answers for malloc, calloc, realloc and free, and
- * it is searched before any table espix registers -- so a registered entry could
- * never shadow them. The resolver runs first. Same seam sleep, getenv and exit
- * already use; see abi_resolver.c.
+ * These are resolver entries, searched before every table (abi_resolver.c).
  *
  * The arena (R-P1.2)
  * -------------------
@@ -799,10 +794,8 @@ size_t espix_abi_heap_largest(size_t caps)
 /*
  * The names, and why each is here
  * -------------------------------
- * malloc/calloc/realloc/free are the four the loader's own table answers for,
- * which is the whole reason this is a resolver. strdup is the one an app
- * reaches for immediately afterwards and which is not published at all without
- * this -- an app using it failed to *load*.
+ * malloc/calloc/realloc/free must reach the app's arena, never IDF's heap. strdup
+ * allocates too, so it is answered here for the same reason.
  *
  * The C++ allocator is NOT here. abi_cxx.cpp owns those, because they need a
  * C++ translation unit to be spelled at all; see the note there.

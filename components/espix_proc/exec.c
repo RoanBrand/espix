@@ -246,7 +246,7 @@ static esp_err_t copy_env(espix_session_t *session, espix_proc_slot_t *slot)
  * TEMPORARY: recover the unresolved symbol's name from the kernel log.
  *
  * esp_elf_relocate() knows exactly which name it could not find -- it logs
- * `ESP_LOGE(TAG, "Can't find symbol %s")` -- and then returns a generic
+ * `Can't find symbol %s` or `Can't find common %s` -- and then returns a generic
  * failure, so the name never reaches the caller. espix captures esp_log into
  * the klog ring (CONFIG_ESPIX_KLOG_CAPTURE_ESP_LOG), so the line is *here*,
  * and this reads it back out.
@@ -266,7 +266,8 @@ static esp_err_t copy_env(espix_session_t *session, espix_proc_slot_t *slot)
  * bytes, so this is ~96 short strstr calls, and it runs only after a load has
  * already failed. Nothing on a working path reaches it.
  */
-#define ELF_MISSING_SYM_PREFIX "Can't find symbol "
+/* A function, then a variable: the loader words the two differently. */
+static const char *const k_missing_prefix[] = { "Can't find symbol ", "Can't find common " };
 
 typedef struct {
     char name[64];
@@ -275,14 +276,15 @@ typedef struct {
 static bool missing_sym_visit(void *ctx, const espix_klog_entry_t *e)
 {
     missing_sym_t *found = ctx;
-    const char    *at    = strstr(e->text, ELF_MISSING_SYM_PREFIX);
 
     /* Keep looking rather than stopping: the ring is oldest-first and the most
      * recent match is the one this load produced. */
-    if (at != NULL) {
-        strlcpy(found->name, at + strlen(ELF_MISSING_SYM_PREFIX),
-                sizeof(found->name));
-        found->name[strcspn(found->name, " \r\n")] = '\0';
+    for (size_t i = 0; i < sizeof(k_missing_prefix) / sizeof(k_missing_prefix[0]); i++) {
+        const char *const at = strstr(e->text, k_missing_prefix[i]);
+        if (at != NULL) {
+            strlcpy(found->name, at + strlen(k_missing_prefix[i]), sizeof(found->name));
+            found->name[strcspn(found->name, " \r\n")] = '\0';
+        }
     }
     return true;
 }
@@ -388,7 +390,8 @@ static void relocate_task(void *arg)
     /* As a thread of the process for the duration, so espix_proc_self() names
      * it and the resolver hands this process its own stdin/stdout/stderr. */
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, ctx->slot);
-    ctx->rc = esp_elf_relocate(&ctx->slot->app->elf, ctx->slot->app->image);
+    ctx->rc = esp_elf_relocate(&ctx->slot->app->elf, ctx->slot->app->image,
+                               ctx->slot->info.image_bytes);
     vTaskSetThreadLocalStoragePointer(NULL, ESPIX_TLS_PROC_IDX, NULL);
     xSemaphoreGive(ctx->done);
     vTaskDelete(NULL);
@@ -474,6 +477,27 @@ void espix_proc_exit(int status)
     __builtin_unreachable();
 }
 
+static void elf_run_array(void (**array)(void), uint32_t count, bool reverse)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        void (*const fn)(void) = array[reverse ? count - i - 1 : i];
+        if (fn != NULL && (uintptr_t)fn != UINTPTR_MAX) {   /* UINTPTR_MAX: a legacy .ctors sentinel */
+            fn();
+        }
+    }
+}
+
+/* Destructors run on exit() or a return from main, on the process's own task; never in teardown. */
+void espix_proc_app_fini(espix_proc_slot_t *slot)
+{
+    if (slot == NULL || slot->app == NULL || !slot->app->elf_valid || !slot->app->elf.init_done ||
+        slot->info.task != xTaskGetCurrentTaskHandle()) {
+        return;
+    }
+    slot->app->elf.init_done = false;
+    elf_run_array(slot->app->elf.fini_array, slot->app->elf.fini_count, slot->app->elf.fini_reverse);
+}
+
 /* An exec's end of the old program on the process's own task: its image, memory and handles go; the process stays. */
 static void mmode_exec_reset(espix_proc_slot_t *slot)
 {
@@ -481,6 +505,7 @@ static void mmode_exec_reset(espix_proc_slot_t *slot)
     espix_posix_exec_reset(slot);
     espix_proc_sig_exec(slot);
     if (slot->app->elf_valid) {
+        slot->app->elf.init_done = false;     /* an exec runs no destructors */
         esp_elf_deinit(&slot->app->elf);
         slot->app->elf_valid = false;
     }
@@ -808,8 +833,13 @@ umode:
     const int how = setjmp(exit_jb);
     if (how == 0) {
         /* envp too, which a POSIX app's entry sets environ from; an IDF app's app_main() takes two. */
+        esp_elf_t *const elf = &slot->app->elf;
+        elf->init_done = true;
+        elf_run_array(elf->preinit_array, elf->preinit_count, false);
+        elf_run_array(elf->init_array, elf->init_count, elf->init_reverse);
+
         int (*const entry)(int, char **, char **) =
-            (int (*)(int, char **, char **))(void (*)(void))slot->app->elf.entry;
+            (int (*)(int, char **, char **))(void (*)(void))elf->entry;
         status = entry(slot->app->argc, slot->app->argv, slot->app->envp);
 
         /* Returned with a terminating signal still pending -- one that ended a
@@ -818,6 +848,8 @@ umode:
         if (sig != 0) {
             status = 128 + sig;
             slot->term_sig = (uint8_t)sig;
+        } else {
+            espix_proc_app_fini(slot);
         }
     } else if (how == ESPIX_PROC_EXEC_JUMP) {
         /* An exec: the same process, its new program loaded on this task. */

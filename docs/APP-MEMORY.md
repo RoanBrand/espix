@@ -41,11 +41,10 @@ Two more consequences of the same gap:
 
 ## The mechanism is the resolver, not a table
 
-`elf_loader`'s own libc table answers for `malloc` and is searched *before* any
-table espix registers, so a registered entry can never shadow it. The resolver
-runs first — the same seam `sleep`, `getenv` and `exit` already use. That is
-**R-P1.1**, and it is worth doing on its own: it makes an app's allocations
-*visible* before anything is done with them.
+`malloc` and its family are resolver entries, so they are answered before any
+table — the same seam `sleep`, `getenv` and `exit` use. That is **R-P1.1**, and
+it is worth doing on its own: it makes an app's allocations *visible* before
+anything is done with them.
 
 ## The decision: tagged bookkeeping or a private arena
 

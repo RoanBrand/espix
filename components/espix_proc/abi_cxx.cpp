@@ -146,8 +146,7 @@ static esp_elf_symbol_table_t s_cxx_syms[] = {
     { "__cxa_guard_abort",   reinterpret_cast<const void *>(__cxa_guard_abort) },
     { "__cxa_atexit",        reinterpret_cast<const void *>(__cxa_atexit) },
 
-    /* Plain libc the loader's own table happens to omit, and which any app
-     * that prints without a trailing newline needs. */
+    /* Plain libc any app that prints without a trailing newline needs. */
     { "fflush", reinterpret_cast<const void *>(fflush) },
 
     /*
@@ -219,9 +218,7 @@ extern "C" void espix_proc_abi_cxx_register(void)
         return;
     }
 
-    /* The allocator goes through the resolver, not the table above: the table is
-     * searched after the loader's own, and after espix's other tables, while the
-     * resolver is searched before everything. */
+    /* The allocator goes through the resolver, which is searched before every table. */
     espix_abi_resolver_add(s_cxx_alloc_syms,
                            sizeof(s_cxx_alloc_syms) / sizeof(s_cxx_alloc_syms[0]));
 

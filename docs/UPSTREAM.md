@@ -625,64 +625,22 @@ correct. See the console section of [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## `espressif/elf_loader`
 
-### `esp_elf_arch_flush()` writes back the cache outside the lock it then takes
+espix uses 2.1.0.
 
-**Fixed for the S3 in 1.3.4** ("ranged thread-safe cache synchronization"): the
-S3 branch now writes back the loaded `.text` range with `esp_cache_msync()` and
-invalidates the matching instruction-cache range, which is the remedy suggested
-below, and never calls `Cache_WriteBack_All()`. **The S31 branch is unchanged**:
-since 1.3.3 it does a full `Cache_WriteBack_All(CACHE_MAP_L1_DCACHE)` before
-taking the flash lock, the same ordering, though no fault has been seen there.
-What follows is the report as written against 1.3.3.
+### The S31's flush writes back the cache outside the lock it then takes
 
-`esp_elf_adapter.c:129` does, for every target but the S31:
-
-```c
-extern void Cache_WriteBack_All(void);
-Cache_WriteBack_All();
-spi_flash_disable_interrupts_caches_and_other_cpu();
-spi_flash_enable_interrupts_caches_and_other_cpu();
-```
-
-The second and third lines exist only to force an instruction-cache invalidate
-by toggling the flash lock — so the author plainly knew the lock was there. The
-write-back on the first line is outside it. Another task starting a flash
-operation at that moment disables the cache underneath it, and the write-back
-faults with `exccause 0x47 (CacheError)` inside `Cache_WriteBack_Items`.
-
-Reached on espix by loading an app while other tasks were busy: faulting task
-`app:testapp`, `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
-`esp_elf_relocate`. It needs `CONFIG_ELF_LOADER_LOAD_PSRAM`, which is the
-default, and it needs something else touching flash — a filesystem read is
-enough, and on espix every app load *is* a filesystem read, so the window is
-open on every launch.
-
-Ordering it correctly is awkward rather than obvious: the write-back needs the
-cache **on**, and the only public call that excludes concurrent flash
-operations turns the cache **off**. The clean answer is probably
-`esp_cache_msync()` over the relocated image's own address range, which is what
-the S31 branch above stopped doing for a different reason.
-
-**Workaround.** None carried yet; the alternatives all cost something. Turning
-off `CONFIG_ELF_LOADER_LOAD_PSRAM` removes the call entirely but moves every
-loaded app's image into internal RAM, which on a board already carrying eight
-SSH sessions is not free. Recorded in [KNOWN-ISSUES](KNOWN-ISSUES.md) with the
-options.
-
-
-
-Not a defect, but a constraint worth knowing: `elf_find_sym_default()` searches
-the loader's own libc table **first**, and that table already answers for
-`sleep` and `usleep`. A table added with `esp_elf_register_symbol()` is consulted
-after it and cannot shadow them. The component provides
-`elf_set_symbol_resolver()` for exactly this, documented for "symbol
-interception and hooking", so no fork is needed — but a table alone will
-silently fail to override.
+`esp_elf_arch_flush()` on the S31 (`esp_elf_adapter.c:171`) does
+`Cache_WriteBack_All(CACHE_MAP_L1_DCACHE)` and only then takes the flash lock. A
+flash operation that starts in between disables the cache under the write-back.
+On the S3 the same ordering faulted with `exccause 0x47 (CacheError)` in
+`Cache_WriteBack_Items` while an app loaded, until 1.3.4 replaced it there with
+`esp_cache_msync()` over the loaded range. No fault has been seen on the S31;
+the fix would be the S3's.
 
 ### `esp_elf_relocate()` knows the missing symbol and will not say
 
 An app whose ELF references a name no registered table publishes fails to load,
-and the loader logs the name it wanted:
+and the loader logs the name it wanted (`Can't find common` for a variable):
 
     E (41906) ELF: Can't find symbol strtok
 
@@ -699,7 +657,7 @@ into its ring, so the line is available; `missing_symbol_name()` in
 string-matching another component's log text and breaks silently if the wording
 changes — deliberately survivable, since it falls back to the old generic
 message. **Delete `missing_symbol_name()`, `missing_sym_visit()` and
-`ELF_MISSING_SYM_PREFIX` when this lands.**
+`k_missing_prefix` when this lands.**
 
 ## `espressif/usb` and `espressif/usb_host_msc` (the USB host stack)
 
@@ -1299,46 +1257,6 @@ further in; espix registers none of them.
 Upstream, the fix is to declare the struct's sector parameter as `LBA_t` — and,
 with it, to widen every backend's error of omission into the build error espix's
 patch makes it.
-## elf_loader: an Xtensa GLOB_DAT relocation loses its addend
-
-Found 2026-10-06 while chasing "W_GetNumForName: d_introa not found!" on the S3,
-and first misread as a codegen bug in the Xtensa backend.
-
-Reproduction, in an app built for esp32s3 with the v6.1 toolchain
-(xtensa-esp-elf 15.2.0_20251204), under newlib:
-
-    extern const char _ctype_[];
-    volatile char v = 'a';
-    printf("%u %d %d\n", (unsigned char)_ctype_['a' + 1], islower(v), toupper(v));
-
-    S31 (riscv32-esp-elf, same release): 66 1 65
-    S3  (xtensa-esp-elf,  same release): 66 0 97
-
-The table is right -- 66 is 0x42, the lowercase bit is set -- and the macro still
-answers no, so toupper() is the identity. The observable damage: doomgeneric's
-W_LumpNameHash() uppercases through toupper(), so on the S3 a lowercase query
-hashes 32 higher than the uppercase name it was filed under, and
-W_CheckNumForName() -- which has no linear fallback once its hash table exists --
-reports a lump that is present as missing. The game dies in I_Error at the title.
-
-**The cause is the loader, not the compiler.** The code the macro compiles to is
-the same shape under both libcs and is correct: load `table + 1 + c`, mask. The
-difference is in how the table's address reaches the app. The macro indexes from
-`_ctype_ + 1` (picolibc: `_ctype_b + 128`), the offset is folded into a literal-pool
-word, and the linked app carries it as a dynamic relocation *with an addend* --
-`readelf -r` on the S3 mosquitto app shows `R_XTENSA_GLOB_DAT _ctype_b + 80`.
-elf_loader's Xtensa port writes the symbol and drops the addend
-(`src/arch/esp_elf_xtensa.c`), where its RISC-V port adds it and uClibc's Xtensa
-ld.so writes S + A. So the lookup ran one entry early -- `'a'` read the entry for
-`` ` `` -- while the printf's explicit `_ctype_['a' + 1]`, indexed at run time from
-the symbol's start, was right. Every number in the reproduction follows.
-
-Under picolibc the addend is 128, which would misclassify every character in every
-S3 app that uses a ctype macro, so the workaround (Doom built so that toupper and
-friends were calls) is gone and `tools/patch-elf-loader.py` applies the addend;
-`tools/elf_loader-xtensa-addend.patch` is the same change ready to send. Diagnosed
-from the relocations and the loader's source, with the S3 off the bench: confirm on
-hardware with the reproduction above and Doom's title screen.
 
 ## The toolchain: GCC's LR/SC-only exchange stores the `sc` status on a retry
 

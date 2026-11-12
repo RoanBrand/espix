@@ -70,20 +70,6 @@ if(NOT espix_littlefs_patch_result EQUAL 0)
     message(FATAL_ERROR "tools/patch-littlefs.py failed; see the message above")
 endif()
 
-# Make elf_loader apply the addend of an Xtensa GLOB_DAT relocation, which it
-# drops: an S3 app's reference to `_ctype_b + 128` -- every ctype macro -- reads
-# 128 bytes early. RISC-V's port already adds it. See tools/patch-elf-loader.py.
-#
-# After project(), for the same reason as littlefs above. Temporary by
-# construction: tools/elf_loader-xtensa-addend.patch is the change ready to send.
-execute_process(
-    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-elf-loader.py"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE espix_elf_loader_patch_result)
-if(NOT espix_elf_loader_patch_result EQUAL 0)
-    message(FATAL_ERROR "tools/patch-elf-loader.py failed; see the message above")
-endif()
-
 # Expose an ESP-IDF FatFs entry point that mounts without registering a base
 # path. Every esp_vfs_fat_*_mount() ends in esp_vfs_register_fs(), and the ops
 # tables are file-scope static, so FatFs cannot otherwise be mounted *under*

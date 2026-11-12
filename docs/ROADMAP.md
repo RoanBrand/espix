@@ -51,10 +51,21 @@ things are as they are.
   mosquitto's seam (`apps/mosquitto/components/mosquitto_espix/`).
 
 - **`dlopen()` for M-mode apps.** elf_loader has one
-  (`CONFIG_ELF_DYNAMIC_LOAD_SHARED_OBJECT`, off today), which loads a module
-  and resolves it against the ABI tables. A plugin also calls back into the app
-  that loaded it, so the app's own symbols would have to resolve too; then
-  mosquitto's plugins load as they do on Linux.
+  (`CONFIG_ELF_DYNAMIC_LOAD_SHARED_OBJECT`, on), which loads a module and
+  resolves it against the ABI tables; apps get only stubs today. A plugin also
+  calls back into the app that loaded it, so the app's own symbols would have to
+  resolve too; then mosquitto's plugins load as they do on Linux.
+
+- **Load an M-mode app without holding its file.** `exec.c` reads the whole
+  file, then relocates, so a load peaks at the file plus the loaded image (about
+  700 KB for doom or htop). elf_loader's `esp_elf_relocate_source()` reads
+  headers, sections and relocations through a callback instead.
+
+- **Decode an M-mode app's crash PC.** elf_loader can keep an unstripped
+  `.debug` companion per build (`ELF_LOADER_KEEP_DEBUG_ELF`), and its
+  `tool/elf_addr2line.py` maps a PC back given the runtime base
+  (`esp_elf_runtime_base()`). The app-fault report would print the base, and a
+  host target would decode it.
 
 - **`mmap()` for M-mode apps, as nommu Linux has it** (U-mode apps have the
   real one). An anonymous mapping is a page-aligned block of the app's arena; a private file mapping is the file read into one;
@@ -243,16 +254,11 @@ decision with a reason rather than a convenience.
 | **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `atexit` — each with the reason written beside the table it is absent from |
 | **carried elsewhere** | the surface is large, or belongs to a runtime rather than to the kernel | an app's own libraries, or a loadable module: see the Arduino item under **Further out** |
 
-The layering matters as much as the list. elf_loader's own tables used to answer
-for 62 standard names *before* espix's were consulted, which made the loader's
-example list part of the ABI. R-P3.1 turned them off — `Check_abi.py` fails the
-link if a name they answered for is not published by espix — so there is one
-definition now instead of two searched in order. Both mistakes are still reported
-on every link: an entry an earlier table answers for, and a name the loader's
-tables answered for that espix does not publish now that they are off. That is
-what caught `memset`, `strtol` and `ets_printf` sitting unreachable in a
-driver table. The resolver still runs before every table; that is the seam for a
-name espix must *own* rather than merely allow.
+The layering matters as much as the list. elf_loader's own example tables are off
+(R-P3.1), so espix is the one definition; `check-abi.py` fails the link on an
+entry an earlier table answers for, and on a name those tables would answer that
+espix does not publish. The resolver runs before every table; that is the seam
+for a name espix must *own* rather than merely allow.
 
 `components/espix_proc/abi_libc.c` carries the full statement, the list of
 which file owns which name, and why none of this can be a `_Static_assert`; `tools/check-abi.py`
@@ -367,7 +373,9 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   boot. Then sshd resets a few logins at key exchange (status 255), a spawn fails
   with `ESP_ERR_NO_MEM`, and an exec is refused as "Permission denied": the
   ELF-magic check in `espix_fs_mode()` cannot `fopen` the binary, so the file
-  reads as not executable. That last one should say ENOMEM.
+  reads as not executable. That last one should say ENOMEM. At a 31 KB
+  low-water, an `echo two >> file` between two other writes was also lost with
+  no error (10-fs, seed 92866); a write that fails must say so.
 
   Which memory matters, because the fix differs. This is **internal DRAM**, not
   IRAM: IRAM is instruction memory and is already at its whole 16 KB, while what a
@@ -1035,10 +1043,10 @@ other way round.
 
   **The cost worth attacking is that every sketch carries its own copy of the
   runtime.** `elf_loader` ships a dynamic-module API — `dlmod_relocate`,
-  `dlmod_insert`, `dlmod_getaddr`, `dlmod_listname` — which espix uses none of, and
-  `dlmod_getaddr()` is already the last step of the symbol lookup. So a module
-  loaded once is resolvable by every app, with no kernel change at all: that is the
-  "Arduino as a runtime environment" idea, already underneath. The gate is memory
+  `dlmod_insert`, `dlmod_getaddr`, `dlmod_listname` — which espix uses none of.
+  espix's resolver leaves loaded modules out of app lookup, so a shared runtime
+  would be bound on purpose, the way `/lib/libc.so` is planned to be: that is the
+  "Arduino as a runtime environment" idea. The gate is memory
   rather than API. The loader relocates a module into RAM exactly as it does an
   app, so a shared runtime would pin its resident size for the system's lifetime,
   where today it is paid per run and freed at exit. That has to be measured on a

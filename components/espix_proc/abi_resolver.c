@@ -13,11 +13,14 @@
  * is exactly the drift abi_libc.c's header complains about.
  *
  * Why a resolver rather than another symbol table: the resolver runs before
- * every table -- the loader's own and espix's registered ones alike -- which is
- * the loader's documented hook for "symbol interception and hooking". That
- * ordering is what lets one subsystem own a name another table also lists, and
- * it is why tools/check-abi.py calls a table entry whose name an earlier table
- * answers for dead while a resolver entry is exactly the point.
+ * every registered table, which is the loader's documented hook for "symbol
+ * interception and hooking". That ordering is what lets one subsystem own a
+ * name another table also lists, and it is why tools/check-abi.py calls a table
+ * entry whose name an earlier table answers for dead while a resolver entry is
+ * exactly the point.
+ *
+ * Behind it, only espix's registered tables: never a module loaded with
+ * dlopen(), whose names are its loader's business, not an app's.
  */
 
 #include <string.h>
@@ -65,7 +68,7 @@ static uintptr_t espix_symbol_resolver(const char *sym_name)
     }
 
     /* Everything else, including the whole libc and IDF surface, unchanged. */
-    return elf_find_sym_default(sym_name);
+    return esp_elf_find_symbol(sym_name);
 }
 
 void espix_abi_resolver_add(const abi_sym_t *syms, size_t count)

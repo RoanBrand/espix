@@ -252,13 +252,11 @@ project widened the type. The better fix upstream is a Kconfig knob for 64-bit
 
 ## check-abi.py
 
-Fails the build if a symbol an app resolves a layer below is not in the image.
-espix's own tables are the allowlist, but two tables inside `elf_loader` answer for
-62 standard names *first* — and each entry there is what anchors its function into
-the image, so those names are present unless something takes them away: the
-`CONFIG_ELF_LOADER_LIBC_SYMBOLS` / `_ESPIDF_SYMBOLS` options switched off, or a
-newer `elf_loader` that dropped a name. Either way an app finds out as
-`undefined symbol`, at load, on a device.
+Fails the build if the app ABI is inconsistent: a name espix publishes twice, an
+entry an earlier table already answers for, or a name `elf_loader`'s own example
+tables would answer that espix does not publish (those tables are off, so espix
+is the one definition). An app would otherwise find out as `undefined symbol`,
+at load, on a device.
 
 The build runs it after the link — a `POST_BUILD` step rather than a
 configure-time hook like the patch scripts above, because there is no ELF to read

@@ -27,12 +27,9 @@
  * exported for exactly that app, and SIGKILL is the answer when it is somebody
  * else's binary.
  *
- * Why a resolver and not just another symbol table: elf_find_sym_default()
- * searches the loader's own libc table first, and that table already answers
- * for sleep() and usleep(). A table registered with esp_elf_register_symbol()
- * is consulted after it, so it cannot shadow them. elf_set_symbol_resolver() is
- * the loader's documented hook for "symbol interception and hooking", which is
- * precisely this, and it costs no fork of the component.
+ * Why a resolver and not just another symbol table: sleep() and usleep() are
+ * also published as plain libc, and the resolver is searched before every
+ * table, so the interruptible versions here are the ones an app gets.
  *
  * Note that every function here is prefixed and mapped to its POSIX name by
  * that resolver, rather than being *named* signal() and kill(). The names

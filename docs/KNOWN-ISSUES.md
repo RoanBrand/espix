@@ -410,42 +410,12 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
   Nothing espix does reaches it, and nothing stops it either; it is the
   component's, not espix's use of it.
 
-- **Loading an app can fault the cache — fixed for the S3 in `elf_loader`
-  1.3.4, the S31 path unchanged.** 1.3.4 replaced the S3's whole-cache
-  write-back with a ranged `esp_cache_msync()` over the app's `.text`, so the
-  ordering below no longer exists there. The S31 still writes back the whole
-  D-cache before taking the flash lock; no fault has been seen on it. The rest
-  of this entry is the S3 history, kept for the record.
-
-  Faulting task `app:testapp`, `exccause 0x47 (CacheError)` in
-  `Cache_WriteBack_Items` ← `Cache_WriteBack_All` ← `esp_elf_arch_flush` ←
-  `esp_elf_relocate`, seen once in eight parallel test runs. The `elf_loader`
-  component writes back the whole cache *outside* the flash lock it takes on the
-  very next line, so a concurrent flash operation pulled the cache out from
-  under it. Written up in [UPSTREAM.md](UPSTREAM.md).
-
-  `CONFIG_SPIRAM_XIP_FROM_PSRAM` closes the window rather than the bug: a flash
-  operation no longer disables the cache, so there is nothing to be pulled out
-  from under. Three full parallel runs since without a recurrence, which is
-  consistency and not proof — the sample before the change was one occurrence in
-  eight runs, so three clean runs would be unsurprising either way.
-
-  The "no longer disables the cache" half is now measured rather than reasoned
-  — see the `flash mmap: none live` note in the entry above — so what remains
-  unproven here is only whether the window is *fully* closed, not whether it
-  narrowed.
-
-  Before 1.3.4 it stayed here rather than moving to fixed, because the ordering
-  upstream was wrong and the fault returned the moment XIP was off. The three
-  espix-side ways out it listed, none free, apply now only to the S31:
-
-  - Turn off `CONFIG_ELF_LOADER_LOAD_PSRAM`. The flush is not called at all
-    then — but every loaded app's image moves into internal RAM, and this board
-    already spends ~12K of it per open SSH session.
-  - Serialise espix's own flash traffic against app loading. Every file
-    operation already funnels through `espix_fs_access_check()`, so there is one
-    place to put it, at the cost of a lock across all filesystem I/O.
-  - Wait for the component, and pin the version when it is fixed.
+- **Loading an app on the S31 can, in principle, fault the cache.** elf_loader
+  writes the S31's cache back outside the flash lock it then takes; the same
+  ordering faulted the S3 once in eight parallel runs until 1.3.4 fixed it there.
+  Not seen on the S31, where `CONFIG_SPIRAM_XIP_FROM_PSRAM` keeps a flash
+  operation from disabling the cache. See
+  [UPSTREAM.md](UPSTREAM.md#the-s31s-flush-writes-back-the-cache-outside-the-lock-it-then-takes).
 
 - **A login under parallel load occasionally fails, and nothing explains it
   yet.** One login in nine rounds of "open a session, then open four

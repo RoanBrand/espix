@@ -496,12 +496,7 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     /* Monotonic time, which is how Arduino's millis()/micros() are built. */
     ESP_ELFSYM_EXPORT(esp_timer_get_time),
 
-    /*
-     * Heap and libc espix owns outright. memset and strtol used to be listed
-     * here and were answered a layer below, so they were unreachable; with the
-     * loader's own tables off (R-P3.1) they live in abi_libc.c and these are the
-     * names that reach IDF's heap and logging.
-     */
+    /* IDF's heap and logging; plain libc lives in abi_libc.c. */
     ESP_ELFSYM_EXPORT(heap_caps_calloc),
     ESP_ELFSYM_EXPORT(heap_caps_malloc),
     ESP_ELFSYM_EXPORT(heap_caps_free),

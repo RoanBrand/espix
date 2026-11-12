@@ -1,12 +1,9 @@
 /*
  * Time surface for loadable apps.
  *
- * The ELF loader's own table publishes exactly two time symbols,
- * clock_gettime() and strftime(), which between them let an app read a
- * timespec and format a struct tm it has no way to obtain. Everything in the
- * middle -- time(), gettimeofday(), and the conversions -- was missing, so an
- * app calling time(NULL) failed to load rather than failing to work: an
- * unresolved symbol is a load-time error.
+ * Reading the clock, converting between time_t and struct tm, and formatting:
+ * an unresolved symbol is a load-time error, so the set is complete enough
+ * that an app calling time(NULL) loads.
  *
  * Separate from abi_drivers.c on purpose. That file is the *peripheral*
  * surface, and says so at the top; the cost it warns about is linking RMT and

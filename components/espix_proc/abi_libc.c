@@ -238,10 +238,8 @@ static const struct esp_elfsym s_libc_syms[] = {
      * load and then answer ENOSYS or silently do nothing, which is the case
      * abi_fs.c's note on access() argues against.
      *
-     * dup() and dup2() used to be on that list. They are still not in this
-     * table -- IDF answers for neither -- but abi_fs.c claims both, and fcntl,
-     * through the resolver, which is the only seam that can shadow a name the
-     * loader's libc table already defines.
+     * dup(), dup2() and fcntl are not in this table either: IDF answers for none
+     * of them, so abi_fs.c claims all three through the resolver.
      *
      * perror() is not here: like printf and puts, it writes to a standard
      * stream it does not name, so abi_stdio.c answers it per process. Published

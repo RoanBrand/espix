@@ -14,12 +14,8 @@
  *
  * So all five names are claimed here.
  *
- * Why a resolver and not a table
- * ------------------------------
- * elf_find_sym_default() searches the loader's own libc table *first*, and it
- * already answers for \`exit\`. A table registered with esp_elf_register_symbol()
- * is consulted after that and could never shadow it. The resolver runs before
- * all of it -- the same reason sleep() and getenv() are here. See abi_resolver.c.
+ * These are resolver entries, which are searched before every registered
+ * table. See abi_resolver.c.
  *
  * Where "end the process" goes
  * ----------------------------
@@ -29,8 +25,8 @@
  * deleted. It is deliberately not vTaskDelete() from here -- deleting the task
  * at this point is precisely what used to leak the image and lose the status.
  *
- * atexit() is still unpublished, so no handler runs on the way out. That is
- * unchanged, and noted in abi_libc.c.
+ * exit() and a return from the entry run the app's destructors (.fini_array).
+ * atexit() is unpublished, so no handler runs on the way out (abi_libc.c).
  */
 
 #include <stdio.h>
@@ -60,6 +56,7 @@ espix_abi_assert_func(const char *file, int line, const char *func,
  * the last line of output in front of whoever ran the program. */
 static void espix_abi_exit(int status)
 {
+    espix_proc_app_fini(espix_proc_self());
     fflush(espix_proc_stdio(1));
     fflush(espix_proc_stdio(2));
     espix_proc_exit(status);
@@ -105,8 +102,6 @@ espix_abi_assert_func(const char *file, int line, const char *func,
 }
 
 static const abi_sym_t s_exit_syms[] = {
-    /* exit() is answered by the loader's own libc table, so naming it here is
-     * the whole reason this is a resolver rather than another table. */
     ABI_SYM("exit",          espix_abi_exit),
     ABI_SYM("_Exit",         espix_abi_Exit),
     /* The POSIX spelling. libc's exit() calls it, and an app may call it too. */

@@ -261,12 +261,6 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
     /*
      * stdio. `fopen` is the one an app reaches for first, and the rest is what
      * you need to do anything useful once you hold a FILE *.
-     *
-     * The loader's own table has `fprintf`, `fputc`, `fputs`, `fwrite` and
-     * `free` -- output only, which is why an app could print but never read.
-     * Not `fopen`, and not `fclose`: the first app to try this failed to load
-     * on `fclose` specifically, which is a fair illustration of how narrow the
-     * old surface was.
      */
     ESP_ELFSYM_EXPORT(fopen),
     ESP_ELFSYM_EXPORT(fclose),
@@ -360,8 +354,7 @@ static esp_elf_symbol_table_t s_fs_syms[] = {
 
 void espix_proc_abi_fs_register(void)
 {
-    /* First, because a name here shadows the loader's own libc table. See
-     * abi_libc.c for why dup, dup2 and fcntl could not simply be exported. */
+    /* dup, dup2 and fcntl are espix's own; IDF answers for none of them. */
     espix_abi_resolver_add(s_fs_resolver_syms,
                            sizeof(s_fs_resolver_syms) /
                                sizeof(s_fs_resolver_syms[0]));

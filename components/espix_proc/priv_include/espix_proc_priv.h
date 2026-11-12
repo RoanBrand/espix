@@ -654,9 +654,10 @@ espix_pid_t espix_proc_group_for(const espix_proc_slot_t *parent,
  * vTaskDelete(). */
 void espix_proc_exit(int status) __attribute__((noreturn));
 
-/* Publish exit()/_Exit()/_exit()/abort()/__assert_func to apps. See abi_exit.c:
- * this is a resolver table, not a symbol table, because the loader's own libc
- * table answers for `exit` and is searched first. */
+/* Run an M-mode app's destructors once, if `slot` is the calling task's own process. */
+void espix_proc_app_fini(espix_proc_slot_t *slot);
+
+/* Publish exit()/_Exit()/_exit()/abort()/__assert_func to apps (abi_exit.c). */
 void espix_proc_abi_exit_register(void);
 
 /* Publish the allocator an app gets, under libc's names. See abi_alloc.c: it is a
