@@ -92,3 +92,5 @@ _Noreturn void _exit(int status)
     for (;;) {
     }
 }
+
+_Noreturn void _Exit(int status) __attribute__((weak, alias("_exit")));

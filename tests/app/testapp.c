@@ -350,9 +350,6 @@ static int cmd_both(void)
  * Full buffering sends the identical bytes in three or four packets, so the two
  * can be told apart. The output must stay byte-for-byte identical to `out` or
  * the comparison measures two things at once.
- *
- * This did not work until setvbuf was exported to apps -- see
- * components/espix_proc/abi_libc.c, which exists because of this function.
  */
 static int cmd_outbuf(const char *count)
 {
@@ -1216,9 +1213,7 @@ static int cmd_abi(const char *path)
      * an app normally gets here, so this is the property the other commands lean
      * on: the errno an app reads after a syscall is the one espix's layer set.
      *
-     * And perror(), which has to reach *this process's* stderr. Published once as
-     * libc's own, it wrote to the firmware's stderr and the line never arrived;
-     * abi_stdio.c answers it per process now.
+     * And perror(), which has to reach *this process's* stderr.
      */
     FILE *missing = fopen("/nonexistent-abi-probe", "r");
     const int open_err = errno;
@@ -2199,11 +2194,9 @@ int main(int argc, char **argv)
         return (int)strtol(argv[2], NULL, 10);
     }
     /*
-     * exit() itself, which is a different path from the return above and the
-     * one that used to take the board down: the firmware's exit() ends at IDF's
-     * _exit() == abort(). espix claims all of these through its resolver now
-     * (components/espix_proc/abi_exit.c), and each must reach the shell as a
-     * status with the device still running.
+     * exit() itself, which is a different path from the return above: the
+     * app's libc runs atexit and flushes, then the exit syscall. Each must reach
+     * the shell as a status with the device still running.
      *
      * The flush is the test's own, so the line the shell asserts on is there
      * whatever the buffering does -- what is under test is which code path

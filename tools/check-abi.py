@@ -31,8 +31,7 @@ found by the version that also reads ABI_SYM and the written-out tables.
 
 Reading the linked ELF costs the image nothing, and it proves the thing that
 actually matters, which a _Static_assert cannot: naming a function in an
-assertion proves only that the header declares it. The names this guards, and
-the reasoning, live in components/espix_proc/abi_libc.c.
+assertion proves only that the header declares it.
 
 Run by the build, after the link; safe to run by hand.
 """
@@ -46,6 +45,7 @@ REPO = Path(__file__).resolve().parent.parent
 SOURCE = REPO / "managed_components/espressif__elf_loader/src/esp_elf_symbol.c"
 PROC = REPO / "components/espix_proc/proc.c"
 APP_CMAKE = REPO / "cmake/espix-app.cmake"
+LIBESPIX = REPO / "user/libespix"
 
 # The two ways a name reaches an app. Separate because their places in the
 # resolution order differ, which is what decides whether an entry is live.
@@ -61,10 +61,8 @@ def die(msg):
 def strip_comments(text):
     """Comments removed; everything else, string literals included, kept.
 
-    Both halves matter. A comment that *mentions* an export is not one --
-    abi_env.c's header says ESP_ELFSYM_EXPORT(getenv) in prose, and the scanner
-    that matched raw lines counted it, which inflated its total and could have
-    failed the build for a name the loader answers for. And the names inside
+    Both halves matter. A comment that *mentions* an export is not one, and
+    counting it could fail the build for a name the loader answers for. The names inside
     ABI_SYM("...") and { "name", &sym } *are* string literals, so they have to
     survive -- which is also why this is a scanner rather than a regex: a "//"
     inside a string is not a comment.
@@ -188,6 +186,19 @@ def read_config(elf):
     return on
 
 
+def libespix_names():
+    """Functions libespix defines: an app links libespix, so these bind inside it."""
+    names = set()
+    head = re.compile(r"^[A-Za-z_][\w \*]*?\b([A-Za-z_]\w*)\s*\(")
+    for path in sorted(LIBESPIX.glob("*.c")):
+        for line in strip_comments(path.read_text(encoding="utf-8")).splitlines():
+            m = head.match(line)
+            body = "{" in line or line.rstrip().endswith(")")
+            if m and body and not line.startswith(("static", "return", "if", "for", "while", "switch")):
+                names.add(m.group(1))
+    return names
+
+
 def unabsorbed(option, names, found):
     """Names a switched-off loader table answered for that espix does not publish.
 
@@ -195,7 +206,8 @@ def unabsorbed(option, names, found):
     otherwise an app that used one fails to load with "undefined symbol", which is
     the device-side failure this build-time check exists to preempt.
     """
-    missing = [name for name in names if name not in found]
+    answered = libespix_names()
+    missing = [name for name in names if name not in found and name not in answered]
     if not missing:
         return None
     return (f"{option} is off, so espix is the only definition -- but it does not\n"
@@ -422,10 +434,8 @@ def main():
     if not libc_names and not idf_names:
         die(f"no exports found in {SOURCE}; the file moved or changed shape")
 
-    if not libc_on:
-        gap = unabsorbed("CONFIG_ELF_LOADER_LIBC_SYMBOLS", libc_names, found)
-        if gap:
-            problems.append(gap)
+    # libc's names are not checked: every app carries its own libc (libc.so and
+    # libc-app.a), so the kernel answers only for IDF's.
     if not idf_on:
         gap = unabsorbed("CONFIG_ELF_LOADER_ESPIDF_SYMBOLS", idf_names, found)
         if gap:

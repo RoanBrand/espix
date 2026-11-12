@@ -790,25 +790,19 @@ dev_testapp_sync() {
     return 0
 }
 
-# /lib/libc.so, the part of an S3 POSIX app's libc every app shares (tools/build-libc.sh).
-dev_libc_sync() {
-    local local_so="$1" want have home="/home/$ESPIX_USER"
+# Install a file on the device as root, unless the copy there is already this one.
+#   dev_install <local> <absolute path on the device> <mode>
+dev_install() {
+    local local_file="$1" path="$2" mode="$3" want have tmp="/home/$ESPIX_USER/.install.$$"
 
-    [ -f "$local_so" ] || { echo "no libc.so at $local_so"; return 1; }
-    want=$(espix_sha256 "$local_so")
-    have=$(dev_run "cat /lib/libc.so.sha" 2>/dev/null)
+    [ -f "$local_file" ] || { echo "no file at $local_file"; return 1; }
+    want=$(espix_sha256 "$local_file")
+    have=$(dev_run "sha256sum $path" 2>/dev/null | awk '{print $1}')
     [ "$have" = "$want" ] && return 0
 
-    local tmp
-    tmp=$(espix_mktemp_dir)
-    printf '%s\n' "$want" > "$tmp/sha"
-    dev_push "$local_so" "$home/.libc.so" >/dev/null &&
-        dev_push "$tmp/sha" "$home/.libc.so.sha" >/dev/null || { rm -rf "$tmp"; return 1; }
-    rm -rf "$tmp"
-    dev_run "sudo mkdir /lib" >/dev/null 2>&1      # there already, after the first time
-    dev_run "sudo mv $home/.libc.so /lib/libc.so" >/dev/null &&
-        dev_run "sudo chmod 644 /lib/libc.so" >/dev/null &&
-        dev_run "sudo mv $home/.libc.so.sha /lib/libc.so.sha" >/dev/null
+    dev_push "$local_file" "$tmp" >/dev/null || return 1
+    dev_run "sudo mkdir $(dirname "$path")" >/dev/null 2>&1      # there already, usually
+    dev_run "sudo mv $tmp $path" >/dev/null && dev_run "sudo chmod $mode $path" >/dev/null
 }
 
 # ----------------------------------------------------------------- health ---

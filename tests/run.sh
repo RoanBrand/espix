@@ -292,12 +292,21 @@ if dev_session_start; then
     dev_testapp_sync "$ESPIX_ROOT/fsroot/home/$ESPIX_USER/testapp" >/dev/null \
         || printf '  %s test app not staged; suites needing it will skip\n' \
                   "$(_espix_dim note:)"
-    # The S3's POSIX apps share one libc.so.
+    # The S3's apps share one libc.so, and an app is bound to the libc.so it was
+    # built with, so both go over with the firmware they were built beside: every
+    # app tools/build-apps.sh staged for this target, and libc.so.
+    target=$(head -n1 "$ESPIX_ROOT/.espix/active" 2>/dev/null)
     libc_so="$ESPIX_ROOT/build-libc-esp32s3/split/libc.so.staged"
-    if [ "$(head -n1 "$ESPIX_ROOT/.espix/active" 2>/dev/null)" = esp32s3 ] && [ -f "$libc_so" ]; then
-        dev_libc_sync "$libc_so" >/dev/null \
-            || printf '  %s /lib/libc.so not staged; POSIX apps will not start\n' "$(_espix_dim note:)"
+    if [ "$target" = esp32s3 ] && [ -f "$libc_so" ]; then
+        dev_install "$libc_so" /lib/libc.so 644 >/dev/null \
+            || printf '  %s /lib/libc.so not installed; apps will not start\n' "$(_espix_dim note:)"
     fi
+    for stamp in "$ESPIX_ROOT"/fsroot/bin/.espix-target-*; do
+        [ -f "$stamp" ] && [ "$(head -n1 "$stamp")" = "$target" ] || continue
+        app=${stamp##*/.espix-target-}
+        dev_install "$ESPIX_ROOT/fsroot/bin/$app" "/bin/$app" 755 >/dev/null \
+            || printf '  %s /bin/%s not installed\n' "$(_espix_dim note:)" "$app"
+    done
     dev_session_stop
 else
     printf '  %s no preflight session; health baseline taken over one-shots\n' \

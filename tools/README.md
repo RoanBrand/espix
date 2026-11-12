@@ -282,17 +282,15 @@ project widened the type. The better fix upstream is a Kconfig knob for 64-bit
 ## check-abi.py
 
 Fails the build if the app ABI is inconsistent: a name espix publishes twice, an
-entry an earlier table already answers for, or a name `elf_loader`'s own example
-tables would answer that espix does not publish (those tables are off, so espix
-is the one definition). An app would otherwise find out as `undefined symbol`,
+entry an earlier table already answers for, or a name `elf_loader`'s own IDF
+table would answer that neither espix publishes nor libespix defines (those
+tables are off, so espix is the one definition; libc is the app's own). An app would otherwise find out as `undefined symbol`,
 at load, on a device.
 
 The build runs it after the link — a `POST_BUILD` step rather than a
 configure-time hook like the patch scripts above, because there is no ELF to read
 until then. It costs the image nothing, which is the whole reason it is not a
-`_Static_assert`: naming a function to prove it exists is what pulls it in. That
-argument, and the list it guards, are in
-[`components/espix_proc/abi_libc.c`](../components/espix_proc/abi_libc.c).
+`_Static_assert`: naming a function to prove it exists is what pulls it in.
 
 ```bash
 python3 tools/check-abi.py --elf build-esp32s3/espix.elf --nm <toolchain>/xtensa-esp32s3-elf-nm

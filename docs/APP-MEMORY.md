@@ -472,9 +472,8 @@ dying task's reent holds, so a thread's death closed the process's stream -- whi
 needed taking them back out on every exit path.
 
 None of that exists now. A process's stdin, stdout and stderr are three pointers in
-its slot, and an app's `stdout` resolves to its process's one at load
-(`abi_stdio.c`), so every thread of the process shares them the way threads of a
-POSIX process do, and no task's death closes anything. The trampoline only sets
+its slot, behind its descriptors 0-2, so every thread of the process shares them
+the way threads of a POSIX process do, and no task's death closes anything. The trampoline only sets
 the thread's slot pointer, which it needed anyway.
 
 Tested: four threads each add 5000 to one counter under a mutex and the total is

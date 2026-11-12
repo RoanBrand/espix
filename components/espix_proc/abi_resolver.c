@@ -1,26 +1,12 @@
 /*
  * The one symbol resolver, and the tables that feed it.
  *
- * elf_set_symbol_resolver() takes a single function, so there is exactly one
- * hook for the whole system. That hook used to live in abi_signal.c because
- * signals needed it first -- but it was never about signals: the comment there
- * already said "everything else, including the whole libc and IDF surface,
- * unchanged", which is a global resolver's job description.
- *
- * Splitting it out means a subsystem can publish a name that shadows libc
- * without filing it under someone else's heading. abi_env.c is the second
- * customer; putting getenv() in a file called abi_signal.c to reuse its table
- * is exactly the drift abi_libc.c's header complains about.
- *
- * Why a resolver rather than another symbol table: the resolver runs before
- * every registered table, which is the loader's documented hook for "symbol
- * interception and hooking". That ordering is what lets one subsystem own a
- * name another table also lists, and it is why tools/check-abi.py calls a table
- * entry whose name an earlier table answers for dead while a resolver entry is
- * exactly the point.
- *
- * Behind it, only espix's registered tables: never a module loaded with
- * dlopen(), whose names are its loader's business, not an app's.
+ * elf_set_symbol_resolver() takes a single function, so this is the one hook
+ * for every app. An app with its own libc (every app espix builds) is answered
+ * from /lib/libc.so first, then from the kernel: the resolver's own tables,
+ * registered here by a subsystem that has to answer for a name ahead of any
+ * other, then every table registered with the loader. Never a module loaded
+ * with dlopen(), whose names are its loader's business, not an app's.
  */
 
 #include <string.h>
@@ -38,8 +24,7 @@
 
 #define TAG "abi"
 
-/* Small and fixed: one entry per subsystem that publishes overrides, which is
- * two today and will not be many. A miss costs a walk of both. */
+/* Small and fixed: one entry per subsystem that publishes overrides. */
 #define ABI_TABLES_MAX 8
 
 static struct {
@@ -68,16 +53,9 @@ static uintptr_t espix_symbol_resolver(const char *sym_name)
         return 0;
     }
 
-    /* An app with its own libc: libc.so first, and never the per-process stdio below. */
     const espix_proc_slot_t *const self = espix_proc_self();
     if (self != NULL && self->app != NULL && self->app->abi >= ESPIX_ABI_LIBC) {
         return espix_libc_resolve(sym_name, kernel_lookup);
-    }
-
-    /* Per process, so not a table: see abi_stdio.c. */
-    const uintptr_t stdio_var = espix_abi_stdio_var(sym_name);
-    if (stdio_var != 0) {
-        return stdio_var;
     }
     return kernel_lookup(sym_name);
 }

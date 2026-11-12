@@ -310,10 +310,6 @@ typedef struct {
     int               wake_fd;
     int               in_select;      /* atomic */
 
-    /* openlog() and setlogmask() of an M-mode app: ident is the app's own string, as POSIX keeps it. */
-    const char       *log_ident;
-    int               log_opt;
-    int               log_mask;       /* 0: every priority */
     bool              was_kthread;      /* a KTHREAD that became a login's
                                            shell, and is one again after */
 
@@ -328,10 +324,9 @@ typedef struct {
     int64_t           alarm_interval_us;
 
     /*
-     * The process's stdin, stdout and stderr: the variables an app's own
-     * `stdin`, `stdout` and `stderr` resolve to, one set per process and shared
-     * by all of its threads, as on any POSIX system. The kernel's are libc's
-     * globals, which stay the console. See abi_stdio.c.
+     * The process's stdin, stdout and stderr: the streams behind its descriptors
+     * 0-2, one set per process and shared by all of its threads. The kernel's are
+     * libc's globals, which stay the console.
      */
     FILE             *std[3];
     /* The streams espix made for it, closed at its end or when it leaves its session. */
@@ -564,7 +559,6 @@ void espix_proc_abi_cxx_register(void);
 /* Publish the peripheral surface an app needs. See abi_drivers.c: naming a
  * symbol there is also what keeps its driver linked into the firmware. */
 void espix_proc_abi_drivers_register(void);
-void espix_proc_abi_time_register(void);
 
 /* Publish the screen and the input queue to an app. See abi_gfx.c. */
 void espix_proc_abi_gfx_register(void);
@@ -579,20 +573,11 @@ void espix_gfx_recover(espix_pid_t pid);
 struct espix_surface;
 bool espix_gfx_present_rect_of(const struct espix_surface *s, int x, int y, int w, int h);
 
-/* Publish the filesystem an app needs: fopen, open, stat, opendir and the rest,
- * plus espix's own chdir/getcwd because IDF's are stubs. See abi_fs.c -- almost
- * all of it is unwrapped libc, because those calls already dispatch into
- * espix's own VFS. */
-void espix_proc_abi_fs_register(void);
-
 /* Publish the audio engine's stream API: open, write, close, volume. See
  * abi_audio.c -- the sinks and the registry stay firmware-side. */
 void espix_proc_abi_audio_register(void);
 
-/* The app identity calls: getuid/geteuid, getgid/getegid. */
-void espix_proc_abi_ident_register(void);
-void espix_proc_abi_libc_register(void);
-void espix_proc_abi_libm_register(void);
+/* Publish espix_syscall(), the S3's syscall entry for an app (abi_posix.c). */
 void espix_proc_abi_posix_register(void);
 /* One syslog() line into the kernel log under tag (abi_posix.c); a U-mode app's arrives by syscall. */
 void espix_syslog_put(int priority, const char *tag, const char *msg);
@@ -626,7 +611,6 @@ void espix_proc_abi_resolver_register(void);
  * after every espix_abi_resolver_add(). See the note in abi_resolver.c. */
 void espix_proc_abi_watch_arm(void);
 #endif
-void espix_proc_abi_env_register(void);
 
 void espix_proc_abi_signal_register(void);
 
@@ -656,9 +640,8 @@ espix_pid_t espix_proc_group_for(const espix_proc_slot_t *parent,
                                  espix_pid_t asked, espix_pid_t pid);
 
 /* End the calling process with `status`, running the same teardown a return
- * from the app's entry point does. Never returns. Called by the override table
- * in abi_exit.c; see the note there for why it is a longjmp rather than a
- * vTaskDelete(). */
+ * from the app's entry point does: a longjmp to proc_task(), not a
+ * vTaskDelete(). Never returns. */
 void espix_proc_exit(int status) __attribute__((noreturn));
 
 /* Run an M-mode app's destructors once, if `slot` is the calling task's own process. */
@@ -677,9 +660,6 @@ void espix_libc_release(espix_proc_slot_t *slot);
 /* A name for an app with its own libc: libc.so's, else the kernel's. */
 uintptr_t espix_libc_resolve(const char *name, uintptr_t (*kernel)(const char *name));
 
-/* Publish exit()/_Exit()/_exit()/abort()/__assert_func to apps (abi_exit.c). */
-void espix_proc_abi_exit_register(void);
-
 /* Publish the allocator an app gets, under libc's names. See abi_alloc.c: it is a
  * resolver table because the loader's own answers for malloc and is searched
  * first, and it is where the per-process regions (R-P1.2) will attach. */
@@ -690,17 +670,6 @@ void espix_proc_abi_alloc_register(void);
  * this is a resolver table because espix does not own the pthread surface and
  * only the resolver runs first. */
 void espix_proc_abi_pthread_register(void);
-
-/* The calling process's stdin (0), stdout (1) or stderr (2), or libc's global
- * one for a task that is not a process. See abi_stdio.c. */
-FILE *espix_proc_stdio(int fd);
-
-/* The address an app's `stdin`, `stdout` or `stderr` resolves to -- the calling
- * process's own -- or 0 for any other name. Consulted by the resolver. */
-uintptr_t espix_abi_stdio_var(const char *name);
-
-/* Publish the calls that use a standard stream without naming it. */
-void espix_proc_abi_stdio_register(void);
 
 /*
  * The allocator itself, so abi_cxx.cpp's operator new/delete reach the same one

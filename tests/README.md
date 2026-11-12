@@ -402,6 +402,12 @@ first. A suite that fails with `command not found`, or with the app printing its
 usage, means the device is holding the old binary rather than that the app is
 missing -- which read as a broken app twice in one evening.
 
+The same preflight installs what the build staged for the active target: every
+app in `fsroot/bin/` (by its `.espix-target-<name>` stamp) to `/bin`, and on the
+S3 `/lib/libc.so`, each only when the device's copy differs. An app is bound to
+the `libc.so` it was linked with, and `make flash-ota` carries the firmware
+alone.
+
 `tests/app/` is a POSIX app built by `tools/build-test-app.sh` with
 `tools/espix-cc`, on either chip; `tools/build-apps.sh` — which globs
 `apps/*/` — leaves it alone and it never lands in a normal rootfs image. `make

@@ -1,68 +1,18 @@
 /*
- * The filesystem surface for loadable apps.
- *
- * Before this, an app could not open a file. The ELF loader's built-in tables
- * publish `close` and `fwrite` and nothing else of the family -- no `fopen`,
- * `open`, `read`, `stat`, `opendir`, `mkdir`, `unlink` or `rename` -- so an app
- * that touched the filesystem failed to *load*, an unresolved symbol being a
- * load-time error rather than a runtime one. For a system whose point is
- * running cross-compiled apps off its own filesystem, that was the largest gap
- * between the claim and the behaviour.
- *
- * Almost all of it is a plain table with no wrappers, and that is the payoff of
- * espix owning the root VFS. libc's real open(), stat() and opendir() already
- * dispatch into espix's own VFS, so they already get the permission check and
- * the working-directory resolution on the way through. There is nothing left to
- * interpose.
- *
- * Two exceptions, both because ESP-IDF's versions are stubs rather than
- * implementations: chdir() sets errno to ENOSYS and returns -1, and getcwd()
- * unconditionally answers "/" (esp_libc/src/realpath.c). espix has a real
- * per-process working directory, so it publishes its own under those names --
- * neither is in the loader's built-in table, so nothing is being shadowed.
- *
- * chmod is included, having been left out when file modes landed. The reason it
- * was left out was that publishing a permissions call to programs which could
- * not open a file would be scaffolding rather than a feature. That reason is
- * gone.
+ * The working directory, chmod and dup for an app's syscalls (umode_sys.c): the
+ * calls IDF's libc answers with stubs (chdir is ENOSYS, getcwd always "/", chmod
+ * a no-op that reports success), so espix answers them itself.
  */
 
-#include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <utime.h>
-
-#include "esp_elf.h"
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
 #include "espix_proc.h"
 #include "espix_proc_priv.h"
 
-#define TAG "abi"
-
-/* ------------------------------------------------------------------ */
-/* The two espix has to implement                                      */
-/* ------------------------------------------------------------------ */
-
-/*
- * chdir() and getcwd() for an app.
- *
- * These are espix's, not libc's, because IDF's are stubs. They are also the
- * only reason the working directory is visible to an app at all: espix's VFS
- * resolves relative paths against espix_proc_cwd() whether or not the app ever
- * calls these, so a program that just opens "data.txt" works -- but one that
- * wants to move, or to report where it is, needs them.
- *
- * Named with the espix_abi_ prefix and mapped by string below, following
- * abi_signal.c. Defining a function actually called chdir() here would collide
- * with the libc stub at link time.
- */
 int espix_abi_chdir(const char *path)
 {
     if (path == NULL) {
@@ -107,19 +57,6 @@ int espix_abi_chdir(const char *path)
 }
 
 /*
- * chmod() for an app, and this one is not optional either -- for a worse reason
- * than chdir's.
- *
- * ESP-IDF's chmod is `return 0;`, with a comment explaining that
- * std::filesystem throws if it fails so succeeding is friendlier. That means
- * libc's chmod tells an app the mode was set and changes nothing. Exporting it
- * would publish a lie; ENOSYS would at least be true. espix has a real one, so
- * it publishes that.
- *
- * (Same defect shape as pthread_sigmask, which is also a force-linked no-op
- * returning success -- see docs/UPSTREAM.md.)
- */
-/*
  * The root applies here through espix_fs_admin_check(), not through the VFS.
  * This resolves its own path and calls espix_fs_chmod() directly, so resolve()
  * never sees it -- the same reason espix_fs_admin_check() exists for ownership.
@@ -149,11 +86,7 @@ int espix_abi_chmod(const char *path, mode_t mode)
         errno = EINVAL;
         return -1;
     case ESP_ERR_NOT_ALLOWED:
-        /* The refusal espix_fs_chmod() actually returns for a mode change the
-         * caller may not make. Without this it fell to EIO below, so an app
-         * could never tell "not allowed" from "the filesystem broke" -- and a
-         * suite that caught chmod failing under load reported it as EIO and
-         * left nothing to go on. */
+        /* A mode change the caller may not make. */
         errno = EACCES;
         return -1;
     default:
@@ -185,185 +118,8 @@ char *espix_abi_getcwd(char *buf, size_t size)
     return buf;
 }
 
-/* ------------------------------------------------------------------ */
-/* dup, dup2 and fcntl(F_DUPFD)                                         */
-/* ------------------------------------------------------------------ */
-
-/*
- * These three go through the resolver rather than the table below, because
- * IDF defines fcntl(), and the resolver is the seam that runs before any table
- * -- the one place a name the firmware already defines can be answered by
- * espix instead. dup() and dup2() travel with it; picolibc defines neither.
- *
- * espix_fs_dup* own the work; see vfs.c for why a duplicate is a second
- * descriptor carrying the same key. fcntl is intercepted only for its two dup
- * commands -- F_GETFL and the rest still reach IDF, which dispatches into
- * espix's own VFS op.
- */
+/* dup() for the syscall layer: a pipe end, or a second descriptor carrying the same key (vfs.c). */
 int espix_abi_dup(int fd)
 {
     return espix_pipe_is(fd) ? espix_pipe_dup(fd) : espix_fs_dup_fd(fd);
-}
-
-static int espix_abi_dup2(int oldfd, int newfd)
-{
-    return espix_fs_dup2_fd(oldfd, newfd);
-}
-
-static int espix_abi_fcntl(int fd, int cmd, ...)
-{
-    va_list ap;
-    va_start(ap, cmd);
-    const int arg = va_arg(ap, int);
-    va_end(ap);
-
-    if (cmd == F_DUPFD
-#ifdef F_DUPFD_CLOEXEC
-        || cmd == F_DUPFD_CLOEXEC
-#endif
-       ) {
-        return espix_fs_dup_min_fd(fd, arg);
-    }
-    return fcntl(fd, cmd, arg);
-}
-
-/* stdin is the app's terminal; stdout and stderr its own streams, which honour a redirect and keep stderr apart. */
-static ssize_t abi_app_read(int fd, void *buf, size_t n)
-{
-    return read((fd == 0) ? espix_abi_tty_fd(0) : fd, buf, n);
-}
-
-static ssize_t abi_app_write(int fd, const void *buf, size_t n)
-{
-    if ((fd == 1 || fd == 2) && espix_proc_self() != NULL) {
-        FILE *const f = espix_proc_stdio(fd);
-        if (f != ((fd == 1) ? stdout : stderr)) {
-            const size_t put = fwrite(buf, 1, n, f);
-            fflush(f);
-            return (put == 0 && n > 0) ? -1 : (ssize_t)put;
-        }
-    }
-    return write(fd, buf, n);
-}
-
-static const abi_sym_t s_fs_resolver_syms[] = {
-    ABI_SYM("dup",   espix_abi_dup),
-    ABI_SYM("dup2",  espix_abi_dup2),
-    ABI_SYM("fcntl", espix_abi_fcntl),
-};
-
-/* ------------------------------------------------------------------ */
-/* Export                                                              */
-/* ------------------------------------------------------------------ */
-
-static esp_elf_symbol_table_t s_fs_syms[] = {
-
-    /*
-     * stdio. `fopen` is the one an app reaches for first, and the rest is what
-     * you need to do anything useful once you hold a FILE *.
-     */
-    ESP_ELFSYM_EXPORT(fopen),
-    ESP_ELFSYM_EXPORT(fclose),
-    ESP_ELFSYM_EXPORT(fread),
-    ESP_ELFSYM_EXPORT(fgets),
-    ESP_ELFSYM_EXPORT(fseek),
-    ESP_ELFSYM_EXPORT(ftell),
-    ESP_ELFSYM_EXPORT(rewind),
-    ESP_ELFSYM_EXPORT(feof),
-    ESP_ELFSYM_EXPORT(ferror),
-    ESP_ELFSYM_EXPORT(remove),
-    /* The bridge between the two halves of POSIX I/O. Both matter here because
-     * espix's *descriptors* are the ones with the full interface -- open, read,
-     * write, lseek are 64-bit and the FILE * family is not -- so an app that
-     * needs the descriptor under a stdio stream can get at it. */
-    ESP_ELFSYM_EXPORT(fileno),
-    ESP_ELFSYM_EXPORT(fdopen),
-    /* A stream over the app's own calls: how a POSIX app's libespix makes FILEs over its descriptors. */
-    ESP_ELFSYM_EXPORT(funopen),
-
-    /*
-     * POSIX file calls. Unwrapped: each of these enters espix's VFS, which
-     * resolves the path against the calling process's working directory and
-     * asks espix_fs_access_check() before touching the filesystem.
-     */
-    ESP_ELFSYM_EXPORT(open),
-    /* close() came from elf_loader's table until R-P3.1; it is libc's, and it
-     * enters the same VFS the calls below do. */
-    ESP_ELFSYM_EXPORT(close),
-    /* fds 0-2 as the app's own rather than the system's (the console's). */
-    { "read",  (void *)abi_app_read },
-    { "write", (void *)abi_app_write },
-    /* Under the name an app built with cmake/offt64.h asks for: its lseek is
-     * redirected to the 64-bit one, as glibc's is with _FILE_OFFSET_BITS=64. */
-    { "lseek64", (void *)&lseek },
-    ESP_ELFSYM_EXPORT(stat),
-    ESP_ELFSYM_EXPORT(fstat),
-    ESP_ELFSYM_EXPORT(unlink),
-    ESP_ELFSYM_EXPORT(rename),
-    ESP_ELFSYM_EXPORT(mkdir),
-    ESP_ELFSYM_EXPORT(rmdir),
-    ESP_ELFSYM_EXPORT(truncate),
-    ESP_ELFSYM_EXPORT(ftruncate),
-    ESP_ELFSYM_EXPORT(fsync),
-    /*
-     * utime() is here because espix implements it: IDF routes it through
-     * esp_vfs_t's utime_p, which vfs.c fills in, so an app setting a file's
-     * times sets them on the filesystem rather than into a stub.
-     *
-     * lstat() is deliberately absent. IDF has no lstat at all, so an app would
-     * load and then be answered by libc's ENOSYS fallback, and with no symlinks
-     * in espix there is nothing for it to report differently from stat().
-     */
-    ESP_ELFSYM_EXPORT(utime),
-
-    /*
-     * `stat` reports the real mode, so an app sees exactly the bits `ls -l`
-     * shows -- espix's VFS fills them in for every caller rather than only for
-     * its own commands. Which is what makes a `chmod` worth publishing; it is
-     * down with chdir and getcwd, because libc's is a no-op that lies.
-     */
-
-    /*
-     * Directories. `readdir_r` alongside `readdir` for the same reason
-     * abi_time.c exports both localtime forms: the reentrant one is what an app
-     * should prefer, and the plain one is what most example code calls.
-     *
-     * `access` is deliberately absent. LittleFS's port never implemented it, so
-     * espix's VFS leaves it NULL too, and exporting a call that always fails
-     * would be worse than an app failing to load and being told why.
-     */
-    ESP_ELFSYM_EXPORT(opendir),
-    ESP_ELFSYM_EXPORT(readdir),
-    ESP_ELFSYM_EXPORT(readdir_r),
-    ESP_ELFSYM_EXPORT(closedir),
-    ESP_ELFSYM_EXPORT(rewinddir),
-    ESP_ELFSYM_EXPORT(telldir),
-    ESP_ELFSYM_EXPORT(seekdir),
-
-    /*
-     * espix's own, under libc's names, because IDF's three are stubs: chdir
-     * fails with ENOSYS, getcwd always answers "/", and chmod silently returns
-     * success. See the notes on each.
-     */
-    { "chdir",  (const void *)espix_abi_chdir },
-    { "getcwd", (const void *)espix_abi_getcwd },
-    { "chmod",  (const void *)espix_abi_chmod },
-
-    ESP_ELFSYM_END
-};
-
-void espix_proc_abi_fs_register(void)
-{
-    /* dup, dup2 and fcntl are espix's own; IDF answers for none of them. */
-    espix_abi_resolver_add(s_fs_resolver_syms,
-                           sizeof(s_fs_resolver_syms) /
-                               sizeof(s_fs_resolver_syms[0]));
-
-    if (esp_elf_register_symbol(s_fs_syms) != 0) {
-        espix_klog(ESPIX_KLOG_WARN, TAG,
-                   "could not publish the filesystem to apps");
-        return;
-    }
-
-    espix_klog(ESPIX_KLOG_DEBUG, TAG, "filesystem published to apps");
 }

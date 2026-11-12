@@ -25,11 +25,9 @@ assert_contains "arguments arrive in order"      "argv[2] one"  "$argv_out"
 assert_status "an app's exit status reaches the client" 7 dev_status "$APP exit 7"
 assert_status "and zero is zero"                        0 dev_status "$APP exit 0"
 
-# The library exit path, which is a different path from the return above. The
-# firmware's exit() ends at IDF's _exit() == abort(), so these used to reset the
-# board rather than report a status. All of them are claimed by espix's symbol
-# resolver now -- see components/espix_proc/abi_exit.c -- and the assertions
-# that follow each one are also the evidence that the board survived it.
+# The library exit path, which is a different path from the return above: the
+# app's libc, then the exit syscall. The assertions that follow each one are
+# also the evidence that the board survived it.
 assert_status "exit() reaches the client" 5 dev_status "$APP exitcall 5"
 assert_contains "and says so on the way out" "calling exit(5)" \
     "$(dev_run "$APP exitcall 5")"

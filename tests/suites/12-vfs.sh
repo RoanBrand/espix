@@ -122,14 +122,9 @@ else
     printf '%s\n' "$out" | sed -n 's/^fstat /testapp fstat /p'
 fi
 
-# 7. The published ABI, called rather than merely listed. Two ways for it to be
-#    wrong, and they look the same from outside: a symbol missing from espix's
-#    tables stops the app loading at all, while one published over an IDF stub
-#    loads and then answers ENOSYS. abi_libc.c, abi_fs.c and abi_time.c each say
-#    which names are deliberately absent and why -- isatty, dup, dup2, atexit,
-#    access, lstat, clock -- and this is the half of that claim that can be run.
-#    perror was published first as libc's own and removed after this ran; it is
-#    back, answered per process by abi_stdio.c, and checked below.
+# 7. The app's libc and syscalls, called rather than merely listed: a missing
+#    name stops the app loading at all, while a stub loads and then answers
+#    ENOSYS, and the two look the same from outside.
 if ! dev_testapp_present; then
     espix_skip "test app not built -- run 'make test-app'"
 else

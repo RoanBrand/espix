@@ -45,9 +45,9 @@ espix's own calls (graphics, audio, `espix_proc.h`) are headers in
 
 An app that needs ESP-IDF components, such as Arduino's core and its libraries,
 can be an IDF project instead. `neopixel` is one, and the example to copy. Its
-libc and everything else come from the tables the firmware publishes, described
-below, so it shares libc state with the kernel. It runs on the S3 only
-(`neopixel/targets`).
+libc is its own, as a POSIX app's is: `cmake/espix-app.cmake` links libespix and
+the app's part of libc, so only IDF's drivers, FreeRTOS and the C++ runtime come
+from the firmware. It runs on the S3 only (`neopixel/targets`).
 
 `neopixel` is a normal `setup()`/`loop()` sketch with one addition: a
 `teardown()`, called when someone stops the app. An Arduino sketch never needs
@@ -83,85 +83,56 @@ scp build/neopixel.app.elf esp@<host>:/bin/neopixel
 
 ### What an IDF-project app may call
 
-An IDF-project app resolves its undefined symbols at load time against tables
-the firmware publishes: `espix_proc/abi_libc.c` and `abi_libm.c` for libc,
-`espix_net/abi.c` for sockets and name resolution, `espix_proc/abi_cxx.cpp` for
-the C++ runtime, `espix_proc/abi_drivers.c` for peripherals and FreeRTOS.
+Its own code, the IDF and Arduino components it links, its libc (libespix,
+libc's per-app part, and `/lib/libc.so`), and what the firmware publishes:
+`espix_proc/abi_drivers.c` for peripherals, FreeRTOS and IDF's heap and logging,
+`abi_cxx.cpp` for the C++ runtime, `abi_alloc.c`, `abi_pthread.c` and
+`abi_signal.c` for memory, threads and signals, and `abi_gfx.c` and `abi_audio.c`
+for the screen and sound. The firmware publishes no Arduino API: a sketch gets
+Arduino by linking the Arduino component, which is why `apps/neopixel` carries
+that dependency and the firmware does not.
 
-espix publishes **only** libc, libm, FreeRTOS, ESP-IDF and its own calls. It does
-not publish an Arduino API: a sketch gets Arduino by linking the Arduino
-component into the app, which is why `apps/neopixel` carries that dependency and
-the firmware does not.
+IDF's socket headers make `socket()` and the rest inline calls to lwIP's
+`lwip_socket()` and friends. libespix answers those names too, so an IDF
+project's sockets are its process's own, like its files.
 
-libm is published by `espix_proc/abi_libm.c` — `sinf`, `sqrtf`, `atan2f`,
-`powf` and the rest — because an app cannot carry its own. An app is linked
-`-fPIC -shared` and the toolchain's `libm.a` is not PIC, so `ld` refuses it
-("relocation R_RISCV_HI20 ... can not be used when making a shared object").
-The firmware already links `-lm`; naming the calls is what pulls them into the
-image. The S31 has a hardware FPU, so `sqrtf`/`fabsf`/`floorf` are single
-instructions and this is not the compromise it would be on a chip without one.
-
-Anything not in those tables fails the load with `Can't find symbol X` — the
-loader names it, on the line directly above espix's own `relocation failed`, and
-it is in `dmesg` too. Read both lines before going looking; the answer is
-usually already on the screen.
-
-To see what an app needs, before running it:
+Anything else fails the load with `Can't find symbol X`, on the line above
+espix's own `undefined symbol`, and in `dmesg`. To see what an app needs:
 
 ```bash
 xtensa-esp32s3-elf-readelf -sW build/app.app.elf | awk '$7=="UND"{print $8}' | sort -u
 ```
 
-And to see what is actually published, which is the other half of the question:
+`tools/check-abi.py` reads every table on every build and fails it on an entry
+that cannot be reached.
 
-```bash
-grep -ho 'ESP_ELFSYM_EXPORT([a-zA-Z_0-9]*)' components/espix_proc/abi_*.c \
-    | sed 's/.*(\(.*\))/\1/' | sort -u
-```
-
-That grep finds one of the three mechanisms espix publishes through. The
-resolver (`ABI_SYM(...)`) and the tables written out by hand are not
-`ESP_ELFSYM_EXPORT` -- so it misses them, and they are where an entry that
-cannot be reached hides. `tools/check-abi.py` reads all three and runs on every
-build; it is the answer to "is this name actually reachable".
-
-### Why the list is hand-written
-
-elf_loader ships `tool/symbols.py`, which generates a complete table from a
-firmware ELF into `g_customer_elfsyms`. espix leaves it off on purpose.
-
-With no MMU, this table *is* the sandbox: an app shares the address space and is
-bounded only by what it can name. Generating it from the firmware would publish
-the WiFi driver, the flash API and espix's internals to every app. So the tables
-are an allowlist — `abi_fs.c`, `abi_time.c`, `abi_drivers.c` and `abi_libc.c`
-are it being curated. Adding a name is nearly free (a string and a pointer in
-the firmware, nothing in any app), but it should be something that cannot reach
+**Why the tables are hand-written.** With no MMU they are the sandbox: an app
+shares the address space and is bounded by what it can name. elf_loader's
+`tool/symbols.py` would generate a table from the whole firmware and publish the
+WiFi driver, the flash API and espix's internals to every app, so espix leaves it
+off. Adding a name is nearly free, but it should be something that cannot reach
 past the caller's own memory.
 
 ### What its CMakeLists has to say
 
-One line connects an app to the kernel, and it is the app saying *what it is*
-rather than knowing how espix is built:
+One line, after `project()`:
 
 ```cmake
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/espix-app.cmake")
 ```
 
-It is where the two sides agree about the ABI they share — today that means
-`off_t`, and therefore the layout of `struct stat`, which crosses the loader's
-boundary in both directions. An app that leaves it out compiles cleanly, with a
-32-bit `off_t`, and then has `struct stat` written past the end of its buffer.
-Nothing on either side can see that at runtime, so `tools/check-abi.py` fails
-the firmware build when a project under `apps/` or `tests/` does not include
-it. An app author should not have to know any of this; the check exists so they
-do not have to.
+It links the app's libc and sets its entry point, and makes the app agree with
+the kernel about `off_t`, and so about the layout of `struct stat`.
+`tools/check-abi.py` fails the firmware build when a project under `apps/` does
+not include it. It puts the app's libc in `ELF_LIBS`, so an app adds its own link
+options to that variable (`string(APPEND ELF_LIBS " ...")`) rather than setting
+it.
 
 ### Three things that will catch you
 
-**C++ entry points need `extern "C"`.** `project_elf()` links with `-e app_main`
-and compiles with `-Dmain=app_main`. Without `extern "C"`, the entry is
-name-mangled, the linker says *"cannot find entry symbol app_main"*, and you get
-an ELF with no sections.
+**C++ entry points need `extern "C"`.** `project_elf()` compiles with
+`-Dmain=app_main`, and libespix's entry calls `app_main` as `main`. Without
+`extern "C"` the name is mangled and the link fails for want of `app_main`.
 
 **Global constructors need a linker script.** They work, but not for free. The
 loader resolves an address only inside five sections it knows by name —

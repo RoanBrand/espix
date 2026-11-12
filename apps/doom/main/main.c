@@ -29,12 +29,8 @@ espix_gfx_surface_t *doom_surface;
  * instead, and the jump below leaves the loop before any of them runs.
  *
  * This is engine teardown ordering, not process exit, and it is the only jump
- * this app still needs. exit()/abort()/_Exit() used to be overridden here too,
- * because the firmware's exit() ended at IDF's _exit() == abort() and reset the
- * board -- which is why a bad WAD rebooted the machine and a timedemo printed
- * its result and then reset. espix gives them process semantics now, in
- * components/espix_proc/abi_exit.c, so I_Error's exit(-1) and the engine's
- * asserts end the app with a status and leave the board alone.
+ * this app still needs. I_Error's exit(-1) and the engine's asserts end the app
+ * with a status, through the app's own libc.
  */
 static jmp_buf s_quit_jmp;
 

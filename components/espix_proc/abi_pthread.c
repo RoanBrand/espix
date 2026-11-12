@@ -16,8 +16,8 @@
  *
  * Why the resolver: pthread_create has to be espix's, not libc's, so that the
  * thread it makes belongs to the process. The resolver is searched before every
- * table; the rest of the pthread surface is in one (see abi_libc.c). Same seam
- * malloc, sleep and exit use.
+ * table; the rest of the pthread surface is in this file's. Same seam malloc
+ * uses.
  *
  * Why a trampoline rather than recording the handle after the call: IDF creates
  * the task inside pthread_create and it can start running before that call

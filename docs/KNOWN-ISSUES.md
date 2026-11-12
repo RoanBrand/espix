@@ -239,8 +239,7 @@ expects — see [GOTCHAS.md](GOTCHAS.md).
 
   **How it was narrowed, with no debugger.** `getenv` is served only by espix's
   resolver in `abi_resolver.c` — the loader's default table deliberately does
-  not export it (`abi_env.c` explains why publishing newlib's would be
-  backwards). Two facts then separate the possibilities:
+  not export it. Two facts then separate the possibilities:
 
   - `testapp` relocates `getpid` *before* `getenv`, and `getpid` is **also**
     resolver-only. It resolved. So the resolver was installed and running.
@@ -473,6 +472,11 @@ U-mode app and runs as Linux runs a program without an MMU
 ([USER-MODE.md](USER-MODE.md#the-s3-posix-apps-without-an-mmu)). Beyond what that
 rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
 
+- **Count on one large block after a long run**: PSRAM's largest free block is
+  4352 KB after a boot and 3520 KB after the full suite, with libc.so unloaded,
+  so small blocks left behind split it. Doom's 3 MiB zone then sometimes fails
+  ("Unable to allocate 3 MiB of RAM for zone"), as 64-gfx's second Doom did in
+  two of three runs after `make test`; alone it passes.
 - **`exec` from a thread other than the process's first**: it fails with
   `ENOTSUP`, because the new program loads on the frame the first thread keeps.
   A `vfork()`'s child may `exec` from any thread.
@@ -490,6 +494,11 @@ nor said `vfork ok` (30-proc, S31, `tests/run.sh --seed 84799 -j 4`).
 Alone it passed 15 runs of 15.
 
 ## Filesystem
+
+- **65-flashstall's control is not reliable on the S31.** It asks that a 64 KB
+  `coredump erase` take measurably longer than an SSH round trip. After the full
+  suite it measured a 31-38 ms median against round trips of about 40 ms, in two
+  runs; alone, just after, 60 ms. Not found yet.
 
 - **An ext listing cannot tell its end from a failure.** lwext4's
   `ext4_dir_entry_next()` returns `NULL` for both — `ext4.c:3180`, where the same

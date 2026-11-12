@@ -496,7 +496,7 @@ static esp_elf_symbol_table_t s_driver_syms[] = {
     /* Monotonic time, which is how Arduino's millis()/micros() are built. */
     ESP_ELFSYM_EXPORT(esp_timer_get_time),
 
-    /* IDF's heap and logging; plain libc lives in abi_libc.c. */
+    /* IDF's heap and logging; libc is the app's own. */
     ESP_ELFSYM_EXPORT(heap_caps_calloc),
     ESP_ELFSYM_EXPORT(heap_caps_malloc),
     ESP_ELFSYM_EXPORT(heap_caps_free),

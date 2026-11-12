@@ -397,8 +397,8 @@ caller it changed a mode and changed nothing. Same shape as `pthread_sigmask()`
 below: a no-op that reports success is worse than one that reports ENOSYS,
 because only the second can be detected.
 
-espix has a real `chmod`, so `abi_fs.c` publishes its own under that name rather
-than exporting libc's to apps. `chdir()` in the same file at least fails
+espix has a real `chmod`, so an app's `chmod` syscall reaches espix's
+(`abi_fs.c`), never libc's. `chdir()` in the same file at least fails
 honestly with ENOSYS, and `getcwd()` answering `"/"` unconditionally is the
 same trap in a quieter form.
 
@@ -1114,16 +1114,6 @@ kernel can disagree. Where they can is `lseek`: an app built without the header
 would pass a 32-bit offset to the 64-bit one, which is why every app includes it
 through `cmake/espix-app.cmake` and `tools/check-abi.py` fails the build when one
 does not.
-
-**One knock-on, in the app ABI.** `tests/app`'s hexdump parses its offset with
-`strtoll` now that an offset past 4 GiB is something it gets pointed at, so
-`components/espix_proc/abi_libc.c` had to publish it. An app resolves undefined
-symbols against espix's export tables and not against libc, and that table is also
-what pulls a function out of libc in the first place: nothing else in the firmware
-converts 64-bit text, so the linker had no reason to keep `strtoll` and the app
-failed to *load*. The suite found it the way it was meant to — an app that would not
-load, naming the symbol — which is the argument for a hand-written table rather than
-a generated one, stated in that file's header.
 
 **What this fixes, and what it does not.** Every filesystem whose driver can
 express a large file now reports and seeks it correctly: FatFs has `FF_LBA64` and

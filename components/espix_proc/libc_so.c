@@ -1,6 +1,7 @@
 /* /lib/libc.so, the part of an app's libc every app shares: loaded for the first app, kept LINGER_MS after the last. */
 /* Such an app's libc names are its own (linked hidden) or libc.so's, asked first; the rest are the kernel's. */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,7 +122,7 @@ static bool file_build_id(FILE *f, uint8_t id[ESPIX_LIBC_ID_LEN])
     return false;
 }
 
-/* What libc.so calls in the kernel beyond the rest of the app ABI: its locks (below), and libgcc. */
+/* What an app's libc calls in the kernel beyond the rest of the app ABI: errno and its locks (below), and libgcc. */
 extern void __ashldi3(void), __ashrdi3(void), __lshrdi3(void), __umoddi3(void), __ffsdi2(void),
             __fixdfdi(void), __floatundidf(void), __nedf2(void);
 extern _Complex double __muldc3(double, double, double, double);
@@ -253,6 +254,12 @@ static void unload(void)
     esp_elf_deinit(&s_elf);
     s_loaded = false;
     espix_klog(ESPIX_KLOG_INFO, TAG, "%s unloaded", LIBC_PATH);
+}
+
+/* The calling thread's errno: the kernel's picolibc keeps it thread-local, and an app reaches it through this call. */
+static int *app_errno(void)
+{
+    return &errno;
 }
 
 /* exit()'s destructors, for an app whose own libc calls __libc_fini_array (libespix). */
@@ -390,6 +397,7 @@ static void app_lock_release_recursive(_LOCK_T lock)
 
 static const struct esp_elfsym s_libc_hooks[] = {
     ESP_ELFSYM_EXPORT(espix_app_fini),
+    ESP_ELFSYM_EXPORT_NAMED("__errno", app_errno),
     ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_init", app_lock_init),
     ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_init_recursive", app_lock_init_recursive),
     ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_close", app_lock_close),

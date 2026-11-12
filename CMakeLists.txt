@@ -297,7 +297,7 @@ endif()
 # a newer elf_loader dropping a name; an app finds either as "undefined symbol",
 # at load time, on a device.
 #
-# See tools/check-abi.py, and the list it guards in components/espix_proc/abi_libc.c.
+# See tools/check-abi.py.
 #
 # After the link, so this is POST_BUILD rather than configure-time like the patch
 # hooks above: there is no ELF to read until then.

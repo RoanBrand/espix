@@ -239,31 +239,17 @@ being the shortest path.
 
 ### The app ABI: what an app may name, and who answers for it
 
-An app resolves its undefined symbols at load time against tables built into the
-firmware, so a name is reachable only if somebody typed it into one. There is no
-directory of the image's own symbols and no pass-through: a function the firmware
-calls a thousand times an hour is invisible to an app until it is listed. That is
-what makes these tables the sandbox on a chip with no MMU — an app shares the
-address space and can call only what it can name — and it makes every entry a
-decision with a reason rather than a convenience.
+An app carries its own libc (libespix, libc's per-app part and `/lib/libc.so`),
+and makes its OS calls through `espix_syscall()`. What it may name in the
+firmware beyond that is a hand-written list: the allocator, threads and signals,
+the screen and sound, and for an IDF project IDF's drivers, FreeRTOS and the C++
+runtime. With no MMU that list is the sandbox: an app shares the address space
+and can call only what it can name, so each entry is a decision with a reason.
 
-| an entry is | when | what it is for |
-|---|---|---|
-| **published** | the call reaches espix — its VFS, its fd table, its signal delivery — or reaches nothing but the caller's memory | libc's `open()`, `stat()` and `read()`, which arrive in espix's VFS on the way in, so the permission check is not something they can skip |
-| **overridden** | the libc or IDF implementation lies, bypasses espix, or has to become a delivery point | `chdir`, `getcwd` and `chmod` under libc's names because IDF's are stubs; `sleep` and `usleep` so a signal can cut them short |
-| **left out** | espix cannot answer it, or cannot answer it truthfully | `access`, `lstat`, `atexit` — each with the reason written beside the table it is absent from |
-| **carried elsewhere** | the surface is large, or belongs to a runtime rather than to the kernel | an app's own libraries, or a loadable module: see the Arduino item under **Further out** |
-
-The layering matters as much as the list. elf_loader's own example tables are off
-(R-P3.1), so espix is the one definition; `check-abi.py` fails the link on an
-entry an earlier table answers for, and on a name those tables would answer that
-espix does not publish. The resolver runs before every table; that is the seam
-for a name espix must *own* rather than merely allow.
-
-`components/espix_proc/abi_libc.c` carries the full statement, the list of
-which file owns which name, and why none of this can be a `_Static_assert`; `tools/check-abi.py`
-enforces it; `tests/suites/12-vfs.sh` calls the published names from an app, and
-checks that an app is refused what the shell is refused.
+elf_loader's own example tables are off, so espix is the one definition;
+`tools/check-abi.py` fails the link on an entry an earlier table answers for.
+The resolver runs before every table; that is the seam for a name espix must
+*own* rather than merely allow.
 
 ### ext2/3/4, via a port rather than a library
 

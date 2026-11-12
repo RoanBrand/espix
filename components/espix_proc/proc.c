@@ -307,18 +307,11 @@ esp_err_t espix_proc_init(void)
 
     espix_proc_abi_cxx_register();
     espix_proc_abi_drivers_register();
-    espix_proc_abi_time_register();
     espix_proc_abi_signal_register();
     espix_shell_set_proc_ops(&s_shell_ops);
     espix_kthread_set_ops(&g_espix_kthread_ops);   /* adopts the early ones */
-    espix_proc_abi_env_register();
-    espix_proc_abi_exit_register();
     espix_proc_abi_alloc_register();
     espix_proc_abi_pthread_register();
-    espix_proc_abi_stdio_register();
-    espix_proc_abi_fs_register();
-    espix_proc_abi_libc_register();
-    espix_proc_abi_libm_register();
     espix_proc_abi_posix_register();
 
     /* A session's terminal signals its foreground group, and a read on it waits where a signal can end it. */
@@ -331,7 +324,6 @@ esp_err_t espix_proc_init(void)
     espix_tty_set_hooks(&tty_hooks);
     (void)espix_tty_init();
     (void)espix_pipe_init();
-    espix_proc_abi_ident_register();
     espix_proc_abi_gfx_register();
     espix_proc_abi_audio_register();
 

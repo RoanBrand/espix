@@ -46,6 +46,7 @@ set(ELF_COMPONENTS Adafruit_NeoPixel espressif__arduino-esp32)
 #
 # One space-separated string, not a CMake list: project_elf() runs ELF_LIBS
 # through spaces2list(), so a list would arrive as a single "a;b" argument.
-set(ELF_LIBS "-Wl,--wrap=delay -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/ctors.ld")
+# Appended: espix-app.cmake put the app's libc there first.
+string(APPEND ELF_LIBS " -Wl,--wrap=delay -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/ctors.ld")
 
 project_elf(neopixel)

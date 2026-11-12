@@ -79,9 +79,8 @@ static const espix_klog_console_hooks_t *s_console;
  * Under newlib every task had its own `stdout`, and espix_proc pointed a loaded
  * app's at the session it was launched from, so inside an app's task printf()
  * was not the console -- for an SSH session it was the encrypted channel. The
- * kernel's `stdout` is one global now and an app's stream is its process's own
- * (abi_stdio.c), but holding the console's FILE here keeps klog independent of
- * either.
+ * kernel's `stdout` is one global now and an app's stream is its process's own,
+ * but holding the console's FILE here keeps klog independent of either.
  *
  * A kernel log echoing through that plain printf() once re-entered
  * whatever transport the current task happened to own. In the SSH server that

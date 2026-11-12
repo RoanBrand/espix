@@ -5,7 +5,7 @@
 malloc calloc realloc free
 heap_caps_get_free_size heap_caps_get_largest_free_block
 
-# Leaving: the process ends (abi_exit.c). exit() itself is libc's, so atexit runs.
+# Leaving: the process ends (libespix). exit() itself is libc's, so atexit runs.
 _exit _Exit
 
 # Signals and the sleeps they cut short (abi_signal.c).

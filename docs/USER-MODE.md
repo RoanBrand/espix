@@ -532,10 +532,10 @@ mosquitto, plasma and Doom build for the S3 from the same projects as for the S3
 (`mosquitto` is 230 KB); `64-gfx` and `62-mqtt` run them on both chips. `mosquitto
 -d` fails on the S3 with "Error in fork: Function not implemented", as it would on
 a Linux without an MMU.
-Apps built by IDF (`project_elf`, neopixel's RMT included) still take their libc
-from the kernel's tables: IDF's headers bind `socket()` and `select()` to lwIP's
-global descriptors, which an app libc over libespix's per-process table cannot
-share.
+An app built by IDF (`project_elf`, neopixel) links the same libc through
+`cmake/espix-app.cmake`, on the S3 only. IDF's socket headers inline `socket()`
+and the rest to lwIP's names, which libespix answers with the process's own
+sockets.
 
 ## Milestones
 

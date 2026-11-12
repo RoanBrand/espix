@@ -419,10 +419,9 @@ FILE *espix_proc_stdin_open(espix_session_t *s)
 /*
  * End the calling process, the way returning from its entry point would.
  *
- * Called by the exit()/_Exit()/_exit()/abort()/__assert_func overrides an app
- * resolves to (abi_exit.c). It returns to proc_task()'s setjmp, and the normal
- * teardown runs from there -- which is the whole point: an app's own exit must
- * not skip releasing the image or lose the status.
+ * Called by the exit syscall, a fault and a kill. It returns to proc_task()'s
+ * setjmp, and the normal teardown runs from there -- which is the whole point:
+ * an app's own exit must not skip releasing the image or lose the status.
  *
  * The slot lookup is not paranoia. A process is one espix process but may be
  * several FreeRTOS tasks -- an app that called pthread_create() -- and
@@ -562,9 +561,9 @@ static void proc_task(void *arg)
      * own printf() lands where the user is rather than on the serial console,
      * and its getchar() reads what the user sent rather than the UART.
      *
-     * They are the process's own -- slot->std, which is what the app's
-     * `stdin`, `stdout` and `stderr` resolve to (abi_stdio.c) -- so this affects
-     * this process alone, and every thread it makes shares them.
+     * They are the process's own -- slot->std, the streams behind its
+     * descriptors 0-2 -- so this affects this process alone, and every thread it
+     * makes shares them.
      *
      * Three separate objects because they genuinely go to different places:
      * over SSH stdout is CHANNEL_DATA, stderr is CHANNEL_EXTENDED_DATA, and
@@ -837,12 +836,9 @@ umode:
     /*
      * The app runs with a way out that is not "delete this task".
      *
-     * exit(), _Exit(), _exit() and abort() from the app longjmp back here (see
-     * abi_exit.c), so they land on the same teardown a normal return from
-     * app_main() gets -- streams closed, the ELF released, the slot marked
-     * EXITED with the app's status. Before this, the firmware's exit() ended at
-     * IDF's _exit(), which is abort(): calling the most ordinary function in C
-     * reset the board.
+     * The app's exit syscall longjmps back here (espix_proc_exit()), so it lands
+     * on the same teardown a normal return from main() gets -- streams closed,
+     * the ELF released, the slot marked EXITED with the app's status.
      *
      * The jmp_buf is a local, so it is alive exactly as long as this frame is,
      * and exit_jmp is cleared before the teardown so nothing can jump into a
