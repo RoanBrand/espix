@@ -728,12 +728,20 @@ static int supervisor_main(void *arg)
 
             if (u->pid != ESPIX_PID_NONE) {
                 int code = 0;
-                if (espix_proc_wait(u->pid, &code, 0) == ESP_OK) {
+                const esp_err_t w = espix_proc_wait(u->pid, &code, 0);
+                if (w == ESP_OK || w == ESP_ERR_NOT_FOUND) {
                     const espix_pid_t gone = u->pid;
                     u->pid  = ESPIX_PID_NONE;
                     u->stop = false;
-                    espix_klog(ESPIX_KLOG_INFO, TAG, "%s: pid %d exited (%d)",
-                               u->name, (int)gone, code);
+                    if (w == ESP_OK) {
+                        espix_klog(ESPIX_KLOG_INFO, TAG, "%s: pid %d exited (%d)",
+                                   u->name, (int)gone, code);
+                    } else {
+                        /* Its status went from the log of finished processes before this tick. */
+                        code = -1;
+                        espix_klog(ESPIX_KLOG_WARN, TAG, "%s: pid %d exited, status lost",
+                                   u->name, (int)gone);
+                    }
                     unit_exited(u, code);
                 }
             }

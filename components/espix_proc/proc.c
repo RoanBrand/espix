@@ -52,15 +52,16 @@ static espix_pid_t s_next_pid = 2;     /* 1 is init's; see spawn_fn */
  *
  * A reaped entry stays listed: this is a history as well as the zombie store,
  * and 'reaped' only decides whether a wait will return it again. The oldest
- * entry is written over, except one a living app has yet to wait for, which
- * goes last. The whole design is recorded in docs/WORKLIST.md under R-P1.5.
+ * entry is written over, except one a living app or kernel process (init,
+ * which waits for its units) has yet to wait for, which goes last. The whole
+ * design is recorded in docs/WORKLIST.md under R-P1.5.
  */
 static espix_proc_record_t s_done[ESPIX_PROC_DONE_MAX];
 static uint32_t            s_done_seq;    /* total finishes */
 
 static bool ignores_children(const espix_proc_slot_t *p);
 
-/* A status a living app has yet to wait for: written over only when every entry is one. Under the lock. */
+/* A status a living app or kernel process (init, for its units) has yet to wait for: written over only when every entry is one. Under the lock. */
 static bool done_kept(const espix_proc_record_t *r)
 {
     if (r->pid <= 0 || r->reaped) {
@@ -69,7 +70,8 @@ static bool done_kept(const espix_proc_record_t *r)
     for (int i = 0; i < ESPIX_PROC_MAX; i++) {
         const espix_proc_slot_t *const p = &g_espix_proc_table.slots[i];
         if (p->info.state != ESPIX_PROC_FREE && p->info.pid == r->ppid) {
-            return p->info.kind == ESPIX_PROC_APP;
+            /* A shell may never wait for a background job; the rest wait for what they start. */
+            return p->info.kind != ESPIX_PROC_SESSION && p->info.kind != ESPIX_PROC_BUILTIN;
         }
     }
     return false;
