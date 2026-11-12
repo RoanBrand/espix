@@ -11,6 +11,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
@@ -522,15 +523,43 @@ static int cmd_route(espix_session_t *s, int argc, char **argv)
 
 #define PING_DONE_BIT BIT0
 
+/*
+ * Shared by the command and esp_ping's thread, which calls on_ping_end once per
+ * run, possibly after the command has returned and its session is gone. Whoever
+ * finishes last frees it; a detached thread prints nothing.
+ */
 typedef struct {
     espix_session_t   *s;
-    const char        *host;
+    char               host[64];
     EventGroupHandle_t done;
+    SemaphoreHandle_t  lock;
+    bool               detached;
 } ping_ctx_t;
+
+static void ping_ctx_free(ping_ctx_t *c)
+{
+    vEventGroupDelete(c->done);
+    vSemaphoreDelete(c->lock);
+    free(c);
+}
+
+/* Take the lock and say whether the command is still there to print to. */
+static bool ping_attached(ping_ctx_t *c)
+{
+    xSemaphoreTake(c->lock, portMAX_DELAY);
+    if (c->detached) {
+        xSemaphoreGive(c->lock);
+        return false;
+    }
+    return true;
+}
 
 static void ping_success(esp_ping_handle_t hdl, void *args)
 {
     ping_ctx_t *c = args;
+    if (!ping_attached(c)) {
+        return;
+    }
     uint32_t    elapsed = 0, seqno = 0, size = 0;
     uint8_t     ttl = 0;
     ip_addr_t   target;
@@ -560,6 +589,7 @@ static void ping_success(esp_ping_handle_t hdl, void *args)
                      (unsigned)size, from,
                      (unsigned)seqno, (unsigned)ttl, (unsigned)elapsed);
     }
+    xSemaphoreGive(c->lock);
 }
 
 static void ping_timeout(esp_ping_handle_t hdl, void *args)
@@ -567,14 +597,23 @@ static void ping_timeout(esp_ping_handle_t hdl, void *args)
     ping_ctx_t *c = args;
     uint32_t    seqno = 0;
 
+    if (!ping_attached(c)) {
+        return;
+    }
     esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO, &seqno, sizeof(seqno));
     espix_printf(c->s, "Request timeout for icmp_seq %u\n", (unsigned)seqno);
+    xSemaphoreGive(c->lock);
 }
 
 static void ping_end(esp_ping_handle_t hdl, void *args)
 {
     ping_ctx_t *c = args;
     uint32_t    tx = 0, rx = 0, total = 0;
+
+    if (!ping_attached(c)) {
+        ping_ctx_free(c);       /* the command has gone; this was the last use */
+        return;
+    }
 
     esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST, &tx, sizeof(tx));
     esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &rx, sizeof(rx));
@@ -589,6 +628,7 @@ static void ping_end(esp_ping_handle_t hdl, void *args)
                  (unsigned)tx, (unsigned)rx, loss, (unsigned)total);
 
     xEventGroupSetBits(c->done, PING_DONE_BIT);
+    xSemaphoreGive(c->lock);
 }
 
 /*
@@ -689,8 +729,22 @@ static int ping_run(espix_session_t *s, int argc, char **argv, int fam)
         ifindex = (uint32_t)info.index;
     }
 
-    ping_ctx_t ctx = { .s = s, .host = host, .done = xEventGroupCreate() };
-    if (ctx.done == NULL) {
+    ping_ctx_t *const ctx = calloc(1, sizeof(*ctx));
+    if (ctx == NULL) {
+        return 1;
+    }
+    ctx->s    = s;
+    ctx->done = xEventGroupCreate();
+    ctx->lock = xSemaphoreCreateMutex();
+    strlcpy(ctx->host, host, sizeof(ctx->host));
+    if (ctx->done == NULL || ctx->lock == NULL) {
+        if (ctx->done != NULL) {
+            vEventGroupDelete(ctx->done);
+        }
+        if (ctx->lock != NULL) {
+            vSemaphoreDelete(ctx->lock);
+        }
+        free(ctx);
         return 1;
     }
 
@@ -700,7 +754,7 @@ static int ping_run(espix_session_t *s, int argc, char **argv, int fam)
     cfg.interface   = ifindex;
 
     const esp_ping_callbacks_t cbs = {
-        .cb_args         = &ctx,
+        .cb_args         = ctx,
         .on_ping_success = ping_success,
         .on_ping_timeout = ping_timeout,
         .on_ping_end     = ping_end,
@@ -719,7 +773,7 @@ static int ping_run(espix_session_t *s, int argc, char **argv, int fam)
     esp_ping_handle_t hdl = NULL;
     if (esp_ping_new_session(&cfg, &cbs, &hdl) != ESP_OK) {
         espix_eprintf(s, "ping: cannot create session\n");
-        vEventGroupDelete(ctx.done);
+        ping_ctx_free(ctx);
         return 1;
     }
 
@@ -732,22 +786,28 @@ static int ping_run(espix_session_t *s, int argc, char **argv, int fam)
         : pdMS_TO_TICKS((cfg.interval_ms + cfg.timeout_ms) * (count + 2));
     const TickType_t start = xTaskGetTickCount();
 
-    while ((xEventGroupWaitBits(ctx.done, PING_DONE_BIT, pdTRUE, pdTRUE,
-                                pdMS_TO_TICKS(50)) & PING_DONE_BIT) == 0) {
-        if (espix_shell_stopping(s)) {
+    while ((xEventGroupGetBits(ctx->done) & PING_DONE_BIT) == 0) {
+        if (espix_shell_stopping(s) ||
+            (limit != portMAX_DELAY && xTaskGetTickCount() - start >= limit)) {
+            /* A stop lands after the current receive and the interval's wait. */
             esp_ping_stop(hdl);
-            xEventGroupWaitBits(ctx.done, PING_DONE_BIT, pdTRUE, pdTRUE,
-                                pdMS_TO_TICKS(cfg.timeout_ms + 500));
+            xEventGroupWaitBits(ctx->done, PING_DONE_BIT, pdFALSE, pdTRUE,
+                                pdMS_TO_TICKS(cfg.timeout_ms + cfg.interval_ms + 500));
             break;
         }
-        if (limit != portMAX_DELAY && xTaskGetTickCount() - start >= limit) {
-            break;
-        }
+        xEventGroupWaitBits(ctx->done, PING_DONE_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(50));
     }
 
     esp_ping_stop(hdl);
     esp_ping_delete_session(hdl);
-    vEventGroupDelete(ctx.done);
+
+    xSemaphoreTake(ctx->lock, portMAX_DELAY);
+    const bool ended = (xEventGroupGetBits(ctx->done) & PING_DONE_BIT) != 0;
+    ctx->detached = !ended;
+    xSemaphoreGive(ctx->lock);
+    if (ended) {
+        ping_ctx_free(ctx);
+    }
     return 0;
 }
 
