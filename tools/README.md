@@ -151,9 +151,34 @@ not read, which leaves it the size of the same app built by IDF.
 with `-DESPIX_TARGET`.
 
 `libespix.a` is built into `user/build/` (or `user/build-<target>/`) when a
-source is newer. Both use the 64-bit `off_t` of `cmake/offt64.h`. An app on the
+source is newer; `espix-cc --target=<t> --build-lib` builds only that and prints
+its path. Both use the 64-bit `off_t` of `cmake/offt64.h`. An app on the
 screen or audio adds `components/espix_{proc,display,audio}/include` for their
 headers, as its M-mode build does.
+
+## build-libc.sh, libc-split.py
+
+The apps' own picolibc: the source the toolchain's was built from (Espressif's
+`esp-1.8.10_20251204`), with espix's options, into `build-libc-<target>/`.
+Nothing links it yet.
+
+```bash
+./tools/build-libc.sh esp32s3     # fetches the source and meson once, under build-libc-src/
+```
+
+- errno is a call (`__errno`) and nothing is thread-local, so an app's libc
+  state is plain data in the app and errno is the one variable both halves of
+  libc share. stdin, stdout and stderr are streams over fds 0-2; math sets errno;
+  `%b` formats. UTF-8 is off: in this picolibc it makes the double printf read the
+  locale, and a printf that reads per-process state cannot be shared.
+- `libc-split.py` sorts `libc.a` into `split/libc-app.a`, what each app links
+  (members that own data, allocate, call the OS, or need one that does), and
+  `split/libc-shared.a`, pure code with no data at all. The OS is libespix plus
+  what the kernel provides (`user/libc-os.<target>`): picolibc's version of those
+  is never used. `--why <name>` prints the chain that makes a function private.
+- On the S3 the shared part is linked as `split/libc.so`, one copy for every app
+  (`split/libc.syms` lists its names). It reaches outside itself only for
+  `__errno`, stdio's locks and libgcc's helpers, which the kernel answers.
 
 ## patch-umode.py
 

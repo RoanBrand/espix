@@ -8,6 +8,7 @@
 #   tools/espix-cc --target=esp32s3 -Os -o hello hello.c      an app for the S3, without an MMU
 #   tools/espix-cc -c foo.c
 #   tools/espix-cc --strip hello hello.staged
+#   tools/espix-cc --target=esp32s3 --build-lib                prints the path of libespix.a
 #
 # The S31's app is a static executable with picolibc linked in. An app without an
 # MMU is a shared object the kernel's loader relocates: libespix's syscalls are
@@ -112,6 +113,13 @@ if [[ ${1:-} == --strip ]]; then
         exec "$bin/${tool}strip" --strip-all -R .xt.prop -R .xt.lit -R .comment -R .xtensa.info -o "$3" "$2"
     fi
     exec "$bin/${tool}strip" --strip-debug -o "$3" "$2"
+fi
+
+# espix-cc --build-lib: build libespix.a (and crt0.o) only, and say where.
+if [[ ${1:-} == --build-lib ]]; then
+    build_lib
+    echo "$lib/libespix.a"
+    exit 0
 fi
 
 link=yes
