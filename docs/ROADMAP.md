@@ -414,6 +414,28 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   That is a reasonable shape for a device, but it should be a choice rather than
   what happens because there is no alternative.
 
+- **Redirection and `VAR=x` with `&`.** `cmd > f &` and `FOO=1 cmd &` are
+  refused. A redirection is a FILE on the session that every write is routed
+  through, and the line closes it when it returns, so a job that outlives the
+  line cannot have it. Linux's shape is the fix: the shell opens the target into
+  the new process's own descriptors 0-2 and the process owns it from then on, a
+  builtin as well as a program. With that, the session's redirect FILEs and the
+  per-write routing in `espix_session_write()` go.
+
+- **The service manager, closer to Linux's.** `/etc/units` is one line per
+  unit (`once`, `always`, `every=`, `success=`, `requires=`), at most eight, and
+  init polls each unit's pid once a second. Steps, cheapest first:
+  - init reaps its children with `waitpid(-1)` when one ends, rather than
+    polling: restarts are immediate, and no status can be missed;
+  - more than eight units, and a restart delay that grows (`RestartSec`,
+    `StartLimitBurst`) in place of the fixed five restarts;
+  - per-unit `User=`, `WorkingDirectory=` and `Environment=`, so a daemon need
+    not run as root from `/`;
+  - unit files in a directory, with systemd's key names (`ExecStart=`,
+    `Restart=always|on-failure|no`, `SuccessExitStatus=`, `Requires=`/`After=`,
+    and a timer for `every=`), and `systemctl`-style `start`, `stop`, `status`
+    and `enable`, so a unit or a habit from Linux carries over.
+
 - **Commands that take the options and print the output Linux's do.** A script
   or a habit from Linux should work: `kill %1`, `ps -ef`, `ls -la`, exit
   statuses and the shapes of error messages. Each gap is cheap on its own; the
