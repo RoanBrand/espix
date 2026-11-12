@@ -376,4 +376,4 @@ stress: test-app
 #   rm -rf managed_components loader/managed_components external
 # when the configure itself, not just the build, should start from nothing.
 clean:
-	rm -rf $(BUILD) $(LOADER_BUILD) $(SDKCONF) $(SDKCONF).old loader/sdkconfig loader/sdkconfig.old loader/sdkconfig.$(TARGET) apps/*/build apps/*/sdkconfig tests/app/build tests/app/sdkconfig
+	rm -rf $(BUILD) $(LOADER_BUILD) $(SDKCONF) $(SDKCONF).old loader/sdkconfig loader/sdkconfig.old loader/sdkconfig.$(TARGET) apps/*/build apps/*/build-esp32* apps/*/sdkconfig tests/app/testapp

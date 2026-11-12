@@ -1,8 +1,0 @@
-dependencies:
-  # Matches the firmware: an app is built against the same libc and Kconfig
-  # surface -- picolibc, IDF 6.x's default.
-  idf:
-    version: ">=6.1"
-
-  # Needed for the project_elf() CMake helper and the app-side link script.
-  espressif/elf_loader: "~2.1.0"

@@ -25,42 +25,11 @@ if [ -z "$target" ]; then
 fi
 target="${target:-esp32s3}"
 
-[ -f "$app/CMakeLists.txt" ] || { echo "build-test-app: no project at $app" >&2; exit 1; }
-
 mkdir -p "$stage_dir"
 
-# `idf.py elf` needs a Makefiles generator, which is what the apps use too.
-have="" libc=""
-if [ -f "$app/sdkconfig" ]; then
-    have=$(grep '^CONFIG_IDF_TARGET=' "$app/sdkconfig" 2>/dev/null | head -1 | cut -d'"' -f2)
-    libc=$(grep -c '^CONFIG_LIBC_PICOLIBC=y' "$app/sdkconfig" 2>/dev/null || true)
-fi
-if [ "$have" != "$target" ] || [ "$libc" != 1 ]; then
-    # A build directory left by a failed configure is not a CMake build
-    # directory yet, and set-target's implicit fullclean refuses to touch it --
-    # so a (re)configure has to start from nothing. A stale target's config is
-    # the same situation for a different reason, and so is another libc's: a
-    # value saved in the sdkconfig outlives the defaults that chose it.
-    rm -rf "$app/build" "$app/sdkconfig"
-    "$root/tools/idf.sh" -C "$app" -G 'Unix Makefiles' set-target "$target" \
-        > "$app/build-test-app.log" 2>&1 \
-        || { echo "build-test-app: set-target failed; see $app/build-test-app.log" >&2; exit 1; }
-fi
-
-if ! "$root/tools/idf.sh" -C "$app" elf >> "$app/build-test-app.log" 2>&1; then
-    echo "build-test-app: build failed; see $app/build-test-app.log" >&2
-    exit 1
-fi
-
-elf="$app/build/testapp.app.elf"
-[ -f "$elf" ] || { echo "build-test-app: expected $elf" >&2; exit 1; }
-
-cp "$elf" "$stage"
-echo "build-test-app: staged $(basename "$stage") ($(wc -c < "$stage" | tr -d ' ') bytes)"
-
-# And as a POSIX app, the same source through espix-cc (ESPIX_UAPP=1 tests/run.sh): U-mode on the S31,
-# libespix's syscalls without an MMU on the S3.
+# A POSIX app, as every app is: U-mode on the S31, libespix's syscalls without an MMU on the S3.
 "$root/tools/espix-cc" --target="$target" -Os -I"$root/components/espix_proc/include" \
-    -o "$stage_dir/testapp-u" "$app/main/testapp.c" >> "$app/build-test-app.log" 2>&1 \
-    || { echo "build-test-app: the espix-cc build failed; see $app/build-test-app.log" >&2; exit 1; }
-echo "build-test-app: staged testapp-u ($(wc -c < "$stage_dir/testapp-u" | tr -d ' ') bytes)"
+    -o "$app/testapp" "$app/testapp.c" > "$app/build-test-app.log" 2>&1 \
+    || { echo "build-test-app: build failed; see $app/build-test-app.log" >&2; exit 1; }
+"$root/tools/espix-cc" --target="$target" --strip "$app/testapp" "$stage"
+echo "build-test-app: staged $(basename "$stage") ($(wc -c < "$stage" | tr -d ' ') bytes)"

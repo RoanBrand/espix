@@ -1802,7 +1802,6 @@ static int fault(const char *kind)
     return 1;
 }
 
-#if ESPIX_POSIX_APP
 #include <spawn.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -2122,7 +2121,6 @@ static int cmd_atexit(const char *how)
     }
     return 0;
 }
-#endif
 
 static void usage(void)
 {
@@ -2317,7 +2315,6 @@ int main(int argc, char **argv)
         return cmd_dup(argv[2], (argc > 3) ? argv[3] : NULL);
     }
 
-#if ESPIX_POSIX_APP
     if (strcmp(cmd, "mmap") == 0 && argc > 2) {
         return cmd_mmap(argv[2]);
     }
@@ -2345,7 +2342,6 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "atexit") == 0 && argc > 2) {
         return cmd_atexit(argv[2]);
     }
-#endif
     if (strcmp(cmd, "abi") == 0 && argc > 2) {
         return cmd_abi(argv[2]);
     }

@@ -3,7 +3,7 @@
 # ESPIX_TARGET picks the chip: esp32s31 (the default), a static U-mode
 # executable; esp32s3, an app without an MMU.
 #
-#   cmake -S apps/<app>/uapp -B apps/<app>/build-u -DCMAKE_TOOLCHAIN_FILE=cmake/espix-uapp.cmake
+#   cmake -S apps/<app> -B apps/<app>/build -DCMAKE_TOOLCHAIN_FILE=cmake/espix-uapp.cmake
 #   cmake ... -DESPIX_TARGET=esp32s3
 set(CMAKE_SYSTEM_NAME Generic)
 if(NOT ESPIX_TARGET)

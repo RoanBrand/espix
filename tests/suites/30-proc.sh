@@ -372,45 +372,37 @@ assert_status "dup/dup2/F_DUPFD share one open file correctly" 0 \
 assert_contains "and the run leaves no descriptor behind" "dup ok:" \
     "$(dev_run "$APP dup $DUPFILE")"
 
-# dup2 onto a number the app did not open. A U-mode app's table is its own, so its stdin is
-# replaced as on Linux; an M-mode app's is the system's, and 0 is the console's: busy, not closed.
-if [ "${ESPIX_UAPP:-0}" = 1 ]; then
-    assert_contains "dup2 onto an app's own stdin replaces it" "dup2 onto 0: rc=0" \
-        "$(dev_run "$APP dup $DUPFILE onto 0")"
-else
-    assert_contains "dup2 onto a descriptor another holds is refused, not closed" \
-        "dup2 onto 0: rc=-1 errno=16" "$(dev_run "$APP dup $DUPFILE onto 0")"
-fi
+# dup2 onto a number the app did not open: its table is its own, so its stdin is replaced, as on Linux.
+assert_contains "dup2 onto an app's own stdin replaces it" "dup2 onto 0: rc=0" \
+    "$(dev_run "$APP dup $DUPFILE onto 0")"
 
 dev_run "rm $DUPFILE" >/dev/null 2>&1
 
 # mmap, munmap, mprotect, msync, madvise: by pages on the S31, by heap blocks without an MMU.
-if [ "${ESPIX_UAPP:-0}" = 1 ]; then
-    assert_contains "the mapping calls keep their contract" "mmap ok" "$(dev_run "$APP mmap /tmp")"
-    assert_contains "exec keeps the process, its plain descriptors and ignored signals" \
-        "execd: pid same, kept open, cloexec closed, handler default, ignored kept, env passed" \
-        "$(dev_run "$APP exec /tmp")"
-    assert_contains "and twenty in a row each replace the last" "execn: done" "$(dev_run "$APP execn 20")"
-    assert_contains "vfork's child exits, execs, is killed or faults alone; spawn, system, popen, from two threads" \
-        "vfork ok" "$(dev_run "$APP vfork")"
-    VFK=/tmp/espix-vfk-$ESPIX_WORKER
-    vfk_out=$(dev_run "rm -f $VFK; $APP vforkhold 2 $VFK; echo rc=\$?; sleep 5; cat $VFK; rm -f $VFK")
-    assert_contains "a vfork's parent killed by its child ends as killed" "rc=137" "$vfk_out"
-    assert_contains "and the child, on its memory, carries on to the end" "survived" "$vfk_out"
-    assert_not_contains "and the parent never runs again" "parent resumed" "$vfk_out"
+assert_contains "the mapping calls keep their contract" "mmap ok" "$(dev_run "$APP mmap /tmp")"
+assert_contains "exec keeps the process, its plain descriptors and ignored signals" \
+    "execd: pid same, kept open, cloexec closed, handler default, ignored kept, env passed" \
+    "$(dev_run "$APP exec /tmp")"
+assert_contains "and twenty in a row each replace the last" "execn: done" "$(dev_run "$APP execn 20")"
+assert_contains "vfork's child exits, execs, is killed or faults alone; spawn, system, popen, from two threads" \
+    "vfork ok" "$(dev_run "$APP vfork")"
+VFK=/tmp/espix-vfk-$ESPIX_WORKER
+vfk_out=$(dev_run "rm -f $VFK; $APP vforkhold 2 $VFK; echo rc=\$?; sleep 5; cat $VFK; rm -f $VFK")
+assert_contains "a vfork's parent killed by its child ends as killed" "rc=137" "$vfk_out"
+assert_contains "and the child, on its memory, carries on to the end" "survived" "$vfk_out"
+assert_not_contains "and the parent never runs again" "parent resumed" "$vfk_out"
 
-    # An app's libc state is its own: two at once, each sleeping while the other changes it.
-    opts_out=$(dev_run "$APP opts -a A -s 2 -b B & $APP opts -a C -b D; wait")
-    assert_contains "getopt's state is each app's own" "opts: a=A b=B optind=7" "$opts_out"
-    assert_contains "and the other's too" "opts: a=C b=D optind=5" "$opts_out"
-    tz_out=$(dev_run "$APP tz UTC-2 2 & $APP tz UTC+5 0; wait")
-    assert_contains "TZ is each app's own" "tz UTC-2: 14:00" "$tz_out"
-    assert_contains "and the other's too" "tz UTC+5: 07:00" "$tz_out"
-    assert_eq "atexit handlers run on exit(), last first" \
-        "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
-    assert_eq "and on a return from main" \
-        "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit return" | tr '\n' ' ' | sed 's/ $//')"
-fi
+# An app's libc state is its own: two at once, each sleeping while the other changes it.
+opts_out=$(dev_run "$APP opts -a A -s 2 -b B & $APP opts -a C -b D; wait")
+assert_contains "getopt's state is each app's own" "opts: a=A b=B optind=7" "$opts_out"
+assert_contains "and the other's too" "opts: a=C b=D optind=5" "$opts_out"
+tz_out=$(dev_run "$APP tz UTC-2 2 & $APP tz UTC+5 0; wait")
+assert_contains "TZ is each app's own" "tz UTC-2: 14:00" "$tz_out"
+assert_contains "and the other's too" "tz UTC+5: 07:00" "$tz_out"
+assert_eq "atexit handlers run on exit(), last first" \
+    "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "and on a return from main" \
+    "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit return" | tr '\n' ' ' | sed 's/ $//')"
 
 # --- the process tree: a shell is a process, and an app is its child -------
 #

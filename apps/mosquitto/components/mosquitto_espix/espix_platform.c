@@ -43,27 +43,3 @@ int initgroups(const char *user, gid_t group)
     (void)group;
     return 0;
 }
-
-/* ------------------------------------------------------------- processes --
- * A broker daemonises by forking and detaching. A U-mode app has fork(),
- * setsid() and umask() from libespix; an M-mode app has no fork, as on a Linux
- * without an MMU, so there -d fails loudly instead of half-working.
- */
-#if !ESPIX_POSIX_APP
-pid_t fork(void)
-{
-    errno = ENOSYS;
-    return -1;
-}
-
-pid_t setsid(void)
-{
-    return 0;
-}
-
-mode_t umask(mode_t mask)
-{
-    (void)mask;
-    return 0;
-}
-#endif

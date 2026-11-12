@@ -257,9 +257,9 @@ def strip_cmake_comments(text):
 
 
 def app_projects():
-    """Every project in the tree that builds an app rather than the firmware."""
-    return (sorted(REPO.glob("apps/*/CMakeLists.txt"))
-            + sorted(REPO.glob("tests/*/CMakeLists.txt")))
+    """Every IDF project in the tree that builds an app; a POSIX app's off_t is espix-cc's."""
+    return [p for p in sorted(REPO.glob("apps/*/CMakeLists.txt")) + sorted(REPO.glob("tests/*/CMakeLists.txt"))
+            if "project.cmake" in p.read_text(encoding="utf-8")]
 
 
 def apps_without_agreement():

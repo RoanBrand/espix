@@ -1,14 +1,53 @@
 # espix example apps
 
-Each directory here is a **standalone ESP-IDF project**, not part of the espix
-firmware. Each builds to a relocatable ELF that the device loads at runtime.
+Each directory here is a standalone project, not part of the espix firmware. Each
+builds to an ELF that the device loads at runtime. Most are ordinary POSIX
+programs built with `tools/espix-cc`; `neopixel` is an ESP-IDF project, and the
+worked example for building an app that way.
 
 | app | shows |
 |---|---|
 | [hello](hello/) | the minimum: a C app, argv, an exit status |
-| [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, cross-compiled for espix |
 | [plasma](plasma/) | the graphics/input ABI: a full-screen app the desktop launches from an icon |
-| [mosquitto](mosquitto/) | a real server as an app: the Eclipse Mosquitto MQTT broker, built from upstream with a 372-line platform seam and no patches |
+| [doom](doom/) | a large C program from upstream, with sound, input and a video mode of its own |
+| [mosquitto](mosquitto/) | a real server as an app: the Eclipse Mosquitto MQTT broker, built from upstream with a small platform seam and no patches |
+| [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, as an ESP-IDF project |
+
+The firmware build builds and stages these for you: `idf.py build` runs
+`tools/build-apps.sh`, which drops each one into `fsroot/bin/` so
+`make flash-fs` carries it. Skip it with `idf.py -DESPIX_BUILD_APPS=OFF build`.
+The staged binaries are build artifacts and are not committed; the sources here
+are.
+
+## POSIX apps
+
+A POSIX app is C against standard headers, with nothing espix-specific in its
+build. `tools/espix-cc` is its compiler, as `musl-gcc` is for musl, and
+`cmake/espix-uapp.cmake` makes it a CMake project's:
+
+```bash
+cmake -S apps/hello -B apps/hello/build -DCMAKE_TOOLCHAIN_FILE=cmake/espix-uapp.cmake -DESPIX_TARGET=esp32s3
+cmake --build apps/hello/build
+tools/espix-cc --strip apps/hello/build/hello hello.staged
+scp hello.staged esp@<host>:/bin/hello
+```
+
+The same source builds for both chips. On the S31 it is a static U-mode
+executable. On the S3 it is a shared object the kernel relocates: it carries
+libc's state (getopt, the environment, stdio, atexit) and binds libc's code to
+the one `/lib/libc.so` every app shares. `-static` links all of libc into the
+app instead. docs/USER-MODE.md has the details.
+
+espix's own calls (graphics, audio, `espix_proc.h`) are headers in
+`components/*/include`; `apps/plasma/CMakeLists.txt` shows the include lines.
+
+## IDF-project apps
+
+An app that needs ESP-IDF components, such as Arduino's core and its libraries,
+can be an IDF project instead. `neopixel` is one, and the example to copy. Its
+libc and everything else come from the tables the firmware publishes, described
+below, so it shares libc state with the kernel. It runs on the S3 only
+(`neopixel/targets`).
 
 `neopixel` is a normal `setup()`/`loop()` sketch with one addition: a
 `teardown()`, called when someone stops the app. An Arduino sketch never needs
@@ -33,28 +72,21 @@ gives each app a stdout belonging to whoever ran it, where `Serial` would write
 to the physical UART and be invisible over SSH — and delays are multiples of
 10ms, because espix runs a 100Hz tick and Arduino's `delay()` truncates.
 
-The firmware build builds and stages these for you — `idf.py build` runs
-`tools/build-apps.sh`, which drops each ELF into `fsroot/bin/` so `make flash-fs`
-carries them. Skip it with `idf.py -DESPIX_BUILD_APPS=OFF build`.
-
-To build one by hand, or to iterate without reflashing the whole rootfs:
+To build one by hand:
 
 ```bash
-cd apps/hello
+cd apps/neopixel
 idf.py -G 'Unix Makefiles' set-target esp32s3   # once; enables `idf.py elf`
 idf.py elf
-scp build/hello.app.elf esp@<host>:/bin/hello
+scp build/neopixel.app.elf esp@<host>:/bin/neopixel
 ```
 
-The staged binaries are build artifacts and are not committed; the sources here
-are.
+### What an IDF-project app may call
 
-## What an app may call
-
-An app resolves its undefined symbols at load time against tables the firmware
-publishes: the ELF loader's own libc/IDF tables, plus espix's
-(`espix_net/abi.c` for sockets and name resolution, `espix_proc/abi_cxx.cpp` for
-the C++ runtime, `espix_proc/abi_drivers.c` for peripherals and FreeRTOS).
+An IDF-project app resolves its undefined symbols at load time against tables
+the firmware publishes: `espix_proc/abi_libc.c` and `abi_libm.c` for libc,
+`espix_net/abi.c` for sockets and name resolution, `espix_proc/abi_cxx.cpp` for
+the C++ runtime, `espix_proc/abi_drivers.c` for peripherals and FreeRTOS.
 
 espix publishes **only** libc, libm, FreeRTOS, ESP-IDF and its own calls. It does
 not publish an Arduino API: a sketch gets Arduino by linking the Arduino
@@ -83,12 +115,8 @@ xtensa-esp32s3-elf-readelf -sW build/app.app.elf | awk '$7=="UND"{print $8}' | s
 And to see what is actually published, which is the other half of the question:
 
 ```bash
-# bash, not zsh: zsh does not word-split an unquoted variable, so a file list
-# held in one gets searched as a single impossible filename and every symbol
-# looks missing.
-{ grep -o 'ESP_ELFSYM_EXPORT([a-zA-Z_0-9]*)'       managed_components/espressif__elf_loader/src/esp_elf_symbol.c
-  grep -ho 'ESP_ELFSYM_EXPORT([a-zA-Z_0-9]*)' components/espix_proc/abi_*.c
-} | sed 's/.*(\(.*\))//' | sort -u
+grep -ho 'ESP_ELFSYM_EXPORT([a-zA-Z_0-9]*)' components/espix_proc/abi_*.c \
+    | sed 's/.*(\(.*\))/\1/' | sort -u
 ```
 
 That grep finds one of the three mechanisms espix publishes through. The
@@ -110,7 +138,7 @@ are it being curated. Adding a name is nearly free (a string and a pointer in
 the firmware, nothing in any app), but it should be something that cannot reach
 past the caller's own memory.
 
-## What an app's CMakeLists has to say
+### What its CMakeLists has to say
 
 One line connects an app to the kernel, and it is the app saying *what it is*
 rather than knowing how espix is built:
@@ -128,7 +156,7 @@ the firmware build when a project under `apps/` or `tests/` does not include
 it. An app author should not have to know any of this; the check exists so they
 do not have to.
 
-## Three things that will catch you
+### Three things that will catch you
 
 **C++ entry points need `extern "C"`.** `project_elf()` links with `-e app_main`
 and compiles with `-Dmain=app_main`. Without `extern "C"`, the entry is
@@ -158,9 +186,9 @@ load.
 
 ## Stopping cleanly
 
-`kill` asks before it deletes. An app that polls `espix_app_stopping()` gets to
-put its hardware back — see `neopixel`, which turns the LED off rather than
-leaving it lit:
+`kill` asks before it deletes. A POSIX app gets `SIGTERM` and may handle it as
+on Linux. An IDF-project app polls `espix_app_stopping()` to put its hardware
+back — see `neopixel`, which turns the LED off rather than leaving it lit:
 
 ```c
 extern "C" bool espix_app_stopping(void);
@@ -169,8 +197,7 @@ while (!espix_app_stopping()) { /* ... */ }
 /* tidy up here */
 ```
 
-An app that ignores it is deleted a few hundred milliseconds later, exactly as
-before.
+An app that ignores it is deleted a few hundred milliseconds later.
 
 ## Graphics and input
 

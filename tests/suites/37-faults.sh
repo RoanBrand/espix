@@ -1,7 +1,7 @@
-# A fault ends the app with 128 + its signal, never the board: an M-mode app on
-# both targets (components/espix_proc/app_fault.c), a U-mode one on the S31
-# (docs/USER-MODE.md) when ESPIX_UAPP=1 stages that build as the test app. Each
-# assertion that follows a fault is the board answering again.
+# A fault ends the app with 128 + its signal, never the board: the test app on
+# the S3 (components/espix_proc/app_fault.c) and in U-mode on the S31
+# (docs/USER-MODE.md). Each assertion that follows a fault is the board
+# answering again.
 #
 # RESOURCES: none -- every fault is the test app's own.
 

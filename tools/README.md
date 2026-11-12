@@ -91,10 +91,11 @@ iterating on the firmware alone:
 idf.py -DESPIX_BUILD_APPS=OFF build
 ```
 
-An app with a `uapp/` CMake project is also built by `espix-cc` as a POSIX app
-and staged as `<name>-u`: U-mode on the S31, without an MMU on the S3. Its
-build directory is `apps/<name>/build-u-<target>/`, which keeps the symbols for
-`addr2line`; the staged copy is stripped.
+An app is a plain CMake project built by `espix-cc` (`cmake/espix-uapp.cmake`)
+and staged as `<name>`: U-mode on the S31, without an MMU on the S3. Its build
+directory is `apps/<name>/build-<target>/`, which keeps the symbols for
+`addr2line`; the staged copy is stripped. One that is an IDF project instead
+(neopixel) is built by `idf.py`.
 
 An app needing build-time environment beyond `sdkconfig.defaults` puts it in
 `apps/<name>/build.env`; `apps/neopixel/build.env` is the example, carrying the
@@ -131,8 +132,8 @@ the toolchain's gcc with picolibc's headers and `libespix` (espix's OS layer,
 or `ESPIX_NOMMU_APP` for the kind.
 
 ```bash
-./tools/espix-cc -Os -o hello-u apps/hello/main/hello.c                    # the S31
-./tools/espix-cc --target=esp32s3 -Os -o hello-p apps/hello/main/hello.c   # the S3
+./tools/espix-cc -Os -o hello apps/hello/main/hello.c                     # the S31
+./tools/espix-cc --target=esp32s3 -Os -o hello apps/hello/main/hello.c    # the S3
 ```
 
 - **The S31** (the default): a static executable at `0x10000`, linked with

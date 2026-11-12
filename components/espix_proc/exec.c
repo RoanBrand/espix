@@ -1295,8 +1295,7 @@ static void app_task_shape(const char *abs_path, uint32_t *app_stack, BaseType_t
         const char *name;
         uint32_t    stack;
     } app_stacks[] = {
-        { "doom", 262144 },     /* the engine's zone allocator and the WAD walk */
-        { "doom-u", 262144 },   /* its POSIX build; on the S31 a U-mode stack grows instead */
+        { "doom", 262144 },     /* the engine's zone allocator and the WAD walk; on the S31 a U-mode stack grows instead */
     };
 
     *app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;

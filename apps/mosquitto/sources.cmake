@@ -1,10 +1,5 @@
-# The broker's sources, include directories and feature set: one list for the
-# M-mode component (components/mosquitto) and the U-mode build (uapp/), so the
-# two cannot drift. Sets MOSQ, MOSQ_SRC, MOSQ_INC, MOSQ_DEFS and MOSQ_OPTS.
-#
-# CMAKE_CURRENT_LIST_DIR, not _SOURCE_DIR: IDF includes the component's file
-# once in a requirements pass that runs before project(), where the current
-# source directory is the build tree.
+# The broker's sources, include directories and feature set. Sets MOSQ, MOSQ_SRC,
+# MOSQ_INC, MOSQ_DEFS and MOSQ_OPTS.
 set(MOSQ "${CMAKE_CURRENT_LIST_DIR}/third_party/mosquitto")
 
 if(NOT EXISTS "${MOSQ}/src/mosquitto.c")

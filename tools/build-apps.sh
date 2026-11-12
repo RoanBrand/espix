@@ -3,10 +3,10 @@
 # Build every project under apps/ and stage the result into fsroot/bin/, so the
 # rootfs image `make flash-fs` writes actually contains the apps.
 #
-# Apps are separate ESP-IDF projects, not components of the firmware: they build
-# to relocatable ELFs that espix loads at runtime, which is why `idf.py build`
-# at the top level does not produce them. The firmware build calls this script
-# so a fresh clone ends up with a populated /bin instead of an empty one.
+# An app is a POSIX program: a plain CMake project built with tools/espix-cc
+# (cmake/espix-uapp.cmake), into apps/<name>/build-<target>/. One that is an IDF
+# project instead (neopixel, on IDF's drivers) is built by idf.py. The firmware
+# build calls this script so a fresh clone ends up with a populated /bin.
 #
 #   ./tools/build-apps.sh              # all apps
 #   ./tools/build-apps.sh hello        # just one
@@ -23,7 +23,6 @@
 # developer's fsroot, cannot ship a binary without the manifest that explains
 # its data.
 #
-# Requires an activated IDF environment, which the firmware build already has.
 
 set -euo pipefail
 
@@ -68,6 +67,48 @@ stage_manifest() {
     fi
 }
 
+# An IDF project (neopixel): idf.py, against the kernel's ABI constants.
+build_idf_app() {
+    local elf="$app/build/$name.app.elf"
+    # Per-app build environment, for anything that cannot be expressed in
+    # sdkconfig.defaults -- see apps/neopixel/build.env.
+    if [ -f "$app/build.env" ]; then
+        # shellcheck disable=SC1090
+        set -a; . "$app/build.env"; set +a
+    fi
+    # The app must be configured with the kernel's ABI constants, not its own
+    # project defaults; see tools/app-abi.defaults.
+    local fw_hz
+    fw_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' "$root/sdkconfig.defaults" 2>/dev/null | cut -d= -f2)
+    (
+        cd "$app"
+        # Applied after the app's own defaults, so the kernel's constants win.
+        export ESPIX_APP_DEFAULTS="$app/sdkconfig.defaults;$root/tools/app-abi.defaults"
+        # Another target's build dir and sdkconfig load on neither: start from nothing.
+        if [ "$force" = 1 ]; then
+            rm -rf build sdkconfig
+        fi
+        # `idf.py elf` needs the Makefiles generator, which set-target creates.
+        local have="" app_hz="" app_libc=""
+        if [ -f "sdkconfig" ]; then
+            have=$(grep '^CONFIG_IDF_TARGET=' sdkconfig 2>/dev/null | head -1 | cut -d'"' -f2)
+            app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' sdkconfig 2>/dev/null | cut -d= -f2)
+            app_libc=$(grep -c '^CONFIG_LIBC_PICOLIBC=y' sdkconfig 2>/dev/null || true)
+        fi
+        if [ "$have" != "$target" ] || [ "$app_libc" != 1 ] \
+           || { [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; }; then
+            rm -rf build sdkconfig
+            "${idf[@]}" -G 'Unix Makefiles' set-target "$target" > build.log 2>&1 \
+                || { echo "build-apps: $name: set-target failed; see $app/build.log" >&2; exit 1; }
+        fi
+        rm -f "$elf"
+        "${idf[@]}" elf >> build.log 2>&1 \
+            || { echo "build-apps: $name: build failed; see $app/build.log" >&2; exit 1; }
+    )
+    [ -f "$elf" ] || { echo "build-apps: $name: expected $elf, which the build did not produce" >&2; exit 1; }
+    cp "$elf" "$staged"
+}
+
 # Staged ELFs are not target-neutral: an S31 image cannot load an S3 binary.
 # Each app's stamp names the target that staged *it*, checked per app below.
 
@@ -93,41 +134,34 @@ for name in "${names[@]}"; do
     # clearing a binary staged for another target, keeps an image from carrying
     # an app the board cannot load.
     if [ -f "$app/targets" ] && ! grep -qx "$target" "$app/targets"; then
-        rm -f "$stage_dir/$name" "$stage_dir/$name-u" "$stage_dir/.espix-target-$name"
+        rm -f "$stage_dir/$name" "$stage_dir/.espix-target-$name"
         stage_manifest
         echo "build-apps: $name: not for $target (apps/$name/targets)"
         continue
     fi
 
     staged="$stage_dir/$name"
-    elf="$app/build/$name.app.elf"
     stamp="$stage_dir/.espix-target-$name"
+    idf_app=0
+    grep -q 'project.cmake' "$app/CMakeLists.txt" && idf_app=1
 
     # The target that staged *this* app. One shared stamp used to let an app
     # built for a new target mark every foreign binary current.
     force=1
     [ -f "$stamp" ] && [ "$(head -n1 "$stamp" 2>/dev/null || true)" = "$target" ] && force=0
 
-    # Skip when the staged binary is newer than every source that feeds it.
-    # Without this, every firmware build pays for an app build that has nothing
-    # to do. -newer is portable in a way that `find -newermt` and stat(1) are
-    # not, macOS and Linux disagreeing on both.
-    if [ "$force" = 0 ] && [ -f "$staged" ] &&
-       { [ ! -f "$app/uapp/CMakeLists.txt" ] || [ -f "$staged-u" ]; }; then
-        newer=$(find "$app" -type f \
-                    -not -path "*/build/*" \
-                    -not -path "*/build-u*" \
-                    -not -path "*/managed_components/*" \
+    # Skip when the staged binary is newer than every source that feeds it: the
+    # app's own, and the runtime it links (libespix, its libc). -newer is portable
+    # in a way that `find -newermt` and stat(1) are not.
+    if [ "$force" = 0 ] && [ -f "$staged" ]; then
+        newer=$(find "$app" -type f -not -path "*/build*" -not -path "*/managed_components/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
-        # Every app links libespix and its libc (the S31's IDF builds aside): a runtime newer than it is a reason too.
         if [ -z "$newer" ]; then
-            [ -f "$staged-u" ] && oldest="$staged-u" || oldest="$staged"
-            [ "$staged" -ot "$oldest" ] && oldest="$staged"
             newer=$(find "$root/user/libespix" "$root/user/include" "$root/user/crt0.S" "$root/user/uapp.ld" \
                         "$root/components/espix_proc/include/espix_syscall.h" "$root/tools/espix-cc" \
-                        "$root/cmake/espix-app.cmake" \
+                        "$root/cmake/espix-uapp.cmake" "$root/cmake/espix-app.cmake" \
                         "$root/build-libc-$target/split/libc-app.a" "$root/build-libc-$target/split/abi-note.o" \
-                        -type f -newer "$oldest" -print -quit 2>/dev/null || true)
+                        -type f -newer "$staged" -print -quit 2>/dev/null || true)
         fi
         if [ -z "$newer" ]; then
             stage_manifest
@@ -136,93 +170,20 @@ for name in "${names[@]}"; do
         fi
     fi
 
-    # Per-app build environment, for anything that cannot be expressed in
-    # sdkconfig.defaults -- see apps/neopixel/build.env.
-    if [ -f "$app/build.env" ]; then
-        # shellcheck disable=SC1090
-        set -a; . "$app/build.env"; set +a
-    fi
-
-    # The app must be configured with the kernel's ABI constants, not its own
-    # project defaults; see tools/app-abi.defaults.
-    fw_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' "$root/sdkconfig.defaults" 2>/dev/null | cut -d= -f2)
-
     echo "build-apps: building $name"
-    (
-        cd "$app"
-
-        # Applied after the app's own defaults, so the kernel's constants win
-        # over a stale copy there. Named for idf.sh, which clears
-        # SDKCONFIG_DEFAULTS for any project but the firmware's and passes this
-        # through in its place.
-        export ESPIX_APP_DEFAULTS="$app/sdkconfig.defaults;$root/tools/app-abi.defaults"
-
-        # 'force' means the staged binary was built for another target, and a
-        # target change invalidates every object in the build dir -- not just the
-        # sdkconfig. A build dir configured for one target with a sdkconfig for
-        # another configures into something that loads on neither: the S31 was
-        # handed exactly that, and the loader said "relocation failed". Start
-        # from nothing, the same rule the kernel's config follows now.
-        if [ "$force" = 1 ]; then
-            rm -rf build sdkconfig
-        fi
-        # `idf.py elf` is only available under the Makefiles generator, and
-        # set-target is what creates the generator and sdkconfig in the first
-        # place, so it runs once per app rather than on every build.
-        have="" app_hz="" app_libc=""
-        if [ -f "sdkconfig" ]; then
-            have=$(grep '^CONFIG_IDF_TARGET=' sdkconfig 2>/dev/null | head -1 | cut -d'"' -f2)
-            app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' sdkconfig 2>/dev/null | cut -d= -f2)
-            app_libc=$(grep -c '^CONFIG_LIBC_PICOLIBC=y' sdkconfig 2>/dev/null || true)
-        fi
-        if [ "$have" != "$target" ] || [ "$app_libc" != 1 ] \
-           || { [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; }; then
-            # Another target's sdkconfig is stale, and so is one with the wrong
-            # ABI constants or another libc -- a value saved in it outlives the
-            # defaults that chose it; set-target's implicit fullclean refuses a
-            # build dir left by a failed configure, so start from nothing.
-            rm -rf build sdkconfig
-            "${idf[@]}" -G 'Unix Makefiles' set-target "$target" > build-apps.log 2>&1 \
-                || { echo "build-apps: $name: set-target failed; see $app/build-apps.log" >&2; exit 1; }
-        fi
-
-        # Checked before the compile, so it fails in a second rather than after.
-        app_hz=$(grep -m1 '^CONFIG_FREERTOS_HZ=' sdkconfig 2>/dev/null | cut -d= -f2)
-        if [ -n "$fw_hz" ] && [ "$app_hz" != "$fw_hz" ]; then
-            echo "build-apps: $name: CONFIG_FREERTOS_HZ is ${app_hz:-unset}; the kernel's is $fw_hz" >&2
-            echo "build-apps: an app runs inside the kernel's FreeRTOS, so pdMS_TO_TICKS()" >&2
-            echo "build-apps: in the app must use the kernel's rate -- otherwise every delay" >&2
-            echo "build-apps: it computes is wrong, and anything under one tick does not" >&2
-            echo "build-apps: sleep at all. See tools/app-abi.defaults." >&2
-            exit 1
-        fi
-        rm -f "$elf"            # relinked: the link's own dependencies do not include libespix or libc
-        "${idf[@]}" elf >> build-apps.log 2>&1 \
-            || { echo "build-apps: $name: build failed; see $app/build-apps.log" >&2; exit 1; }
-    )
-
-    if [ ! -f "$elf" ]; then
-        echo "build-apps: $name: expected $elf, which the build did not produce" >&2
-        exit 1
-    fi
-
-    cp "$elf" "$staged"
-
-    # An app with a uapp/ project is also built by espix-cc as a POSIX app, staged beside the
-    # M-mode one as <name>-u: U-mode on the S31, without an MMU on the S3 (docs/USER-MODE.md).
-    if [ -f "$app/uapp/CMakeLists.txt" ]; then
-        echo "build-apps: building $name as a POSIX app"
-        bu="$app/build-u-$target"
-        rm -f "$bu/$name"       # relinked: CMake cannot see libespix or libc change under espix-cc
-        { cmake -S "$app/uapp" -B "$bu" -DCMAKE_TOOLCHAIN_FILE="$root/cmake/espix-uapp.cmake" \
-              -DESPIX_TARGET="$target" > "$app/build-u.log" 2>&1 \
-          && cmake --build "$bu" -j "$jobs" >> "$app/build-u.log" 2>&1; } \
-            || { echo "build-apps: $name: the POSIX build failed; see $app/build-u.log" >&2; exit 1; }
-        # Staged without debug info (picolibc's is most of the file); the build keeps it for addr2line.
-        "$root/tools/espix-cc" --target="$target" --strip "$bu/$name" "$staged-u"
-        echo "build-apps: staged $name-u ($(wc -c < "$staged-u" | tr -d ' ') bytes)"
+    if [ "$idf_app" = 0 ]; then
+        bu="$app/build-$target"
+        out="$bu/$name"
+        rm -f "$out"            # relinked: CMake cannot see libespix or libc change under espix-cc
+        { cmake -S "$app" -B "$bu" -DCMAKE_TOOLCHAIN_FILE="$root/cmake/espix-uapp.cmake" \
+              -DESPIX_TARGET="$target" > "$app/build.log" 2>&1 \
+          && cmake --build "$bu" -j "$jobs" >> "$app/build.log" 2>&1; } \
+            || { echo "build-apps: $name: build failed; see $app/build.log" >&2; exit 1; }
+        [ -f "$out" ] || { echo "build-apps: $name: expected $out, which the build did not produce" >&2; exit 1; }
+        # Staged without debug info; the build keeps it for addr2line.
+        "$root/tools/espix-cc" --target="$target" --strip "$out" "$staged"
     else
-        rm -f "$staged-u"
+        build_idf_app
     fi
     printf '%s\n' "$target" > "$stamp"
     stage_manifest

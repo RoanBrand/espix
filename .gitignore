@@ -19,11 +19,8 @@ sdkconfig.*
 !sdkconfig.defaults
 !sdkconfig.defaults.*
 
-# The test app is a separate IDF project, with the same build artefacts.
-tests/app/build/
-tests/app/sdkconfig
-tests/app/sdkconfig.old
-tests/app/managed_components/
+# The test app, built by tools/build-test-app.sh.
+tests/app/testapp
 tests/app/build-test-app.log
 
 # Host unit-test apps (make unit) are separate IDF projects too.
@@ -38,6 +35,7 @@ apps/*/sdkconfig
 apps/*/sdkconfig.old
 apps/*/managed_components/
 apps/*/build-apps.log
+apps/*/build.log
 
 # The rootfs image is staging, not source. Nothing under here is committed.
 #

@@ -1,5 +1,5 @@
 # The screen, from apps: plasma draws and quits on a key from the viewer, and
-# Doom's timedemo plays through, and so do their POSIX builds. On the S31 a U-mode
+# Doom's timedemo plays through, and SIGKILL ends it mid-game. On the S31 a U-mode
 # app's surfaces are mapped into it, unmapped when freed, and given back when the
 # app ends however it ends; an audio stream is paced by its sink (docs/USER-MODE.md).
 #
@@ -71,7 +71,6 @@ gfx_plasma() {
 }
 
 # Doom built as $1, in demo3's timedemo: it draws; then SIGKILL ends it, or with $2 "whole" it plays every tic.
-# SIGKILL, because an M-mode app takes other signals only where it checks for them, and this loop does not.
 gfx_doom() {
     local name="$1-$ESPIX_WORKER" bg pid
     gfx_stage "$GFX_BIN/$1" "$GFX_HOME/$name"
@@ -111,18 +110,9 @@ case $(dev_run "ls /var/lib/doom/doom1.wad") in
 esac
 if [ -n "$GFX_WAD" ]; then
     gfx_doom doom
+    gfx_doom doom whole
 else
     espix_skip "no doom1.wad for the device -- build apps/doom to fetch it"
-fi
-
-# The POSIX builds, U-mode on the S31 and without an MMU on the S3.
-if [ -f "$GFX_BIN/plasma-u" ]; then
-    gfx_plasma plasma-u
-else
-    espix_skip "plasma-u not built -- run 'make apps'"
-fi
-if [ -n "$GFX_WAD" ] && [ -f "$GFX_BIN/doom-u" ]; then
-    gfx_doom doom-u whole
 fi
 
 if [ "$ESPIX_TARGET" = esp32s31 ]; then

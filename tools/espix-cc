@@ -9,11 +9,11 @@
 #   tools/espix-cc -c foo.c
 #   tools/espix-cc --strip hello hello.staged
 #   tools/espix-cc --target=esp32s3 --build-lib                prints the path of libespix.a
+#   tools/espix-cc --target=esp32s3 -static -o hello hello.c  libc linked in whole
 #
 # The S31's app is a static executable with picolibc linked in. An app without an
-# MMU is a shared object the kernel's loader relocates: libespix's syscalls are
-# direct calls, and the rest of libc, malloc, threads and signals are the
-# kernel's, shared by every app, which is why its libc.a is not linked.
+# MMU is a shared object the kernel's loader relocates: it links libc's state
+# (libc-app.a) and binds the rest to the one /lib/libc.so every app shares.
 #
 set -euo pipefail
 

@@ -1,15 +1,13 @@
-# espix example app -- a standalone project, NOT part of the espix firmware.
-#
-# Build product: build/plasma.app.elf, which tools/build-apps.sh stages into
-# fsroot/bin/plasma so `plasma` runs from the shell.
+# Plasma: an animated effect on espix's screen. A POSIX app, built with tools/espix-cc:
+#   cmake -S apps/plasma -B build -DCMAKE_TOOLCHAIN_FILE=cmake/espix-uapp.cmake [-DESPIX_TARGET=esp32s3]
 cmake_minimum_required(VERSION 3.22)
+project(plasma C)
 
-include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(plasma)
+if(NOT ESPIX_UAPP)
+    message(FATAL_ERROR "configure with -DCMAKE_TOOLCHAIN_FILE=<espix>/cmake/espix-uapp.cmake")
+endif()
 
-# An espix app: this one line is what says so, and what makes the app agree with
-# the kernel about the ABI they share. See cmake/espix-app.cmake.
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/espix-app.cmake")
-
-include(elf_loader)
-project_elf(plasma)
+add_executable(plasma main/plasma.c)
+target_include_directories(plasma PRIVATE
+    "${ESPIX_ROOT}/components/espix_proc/include" "${ESPIX_ROOT}/components/espix_display/include")
+target_compile_options(plasma PRIVATE -Og -Wall)

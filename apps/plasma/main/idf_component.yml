@@ -1,4 +1,0 @@
-dependencies:
-  idf:
-    version: ">=6.1"
-  espressif/elf_loader: "~2.1.0"

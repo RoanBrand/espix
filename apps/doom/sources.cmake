@@ -1,6 +1,5 @@
-# The engine's sources and its build settings, shared by the M-mode component
-# (components/doomgeneric) and the U-mode project (uapp/). The engine is fetched,
-# not vendored: fetch-doom.sh pulls it into third_party/.
+# The engine's sources and its build settings. The engine is fetched, not
+# vendored: fetch-doom.sh pulls it into third_party/.
 set(DG_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/doomgeneric/doomgeneric")
 
 # The backends for systems espix does not have are filtered here rather than in

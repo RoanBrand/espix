@@ -28,3 +28,14 @@ if [ "$(cat "$stamp" 2>/dev/null || true)" != "$REV" ]; then
     git -C "$tp/mosquitto" checkout -q "$REV"
     echo "$REV" > "$stamp"
 fi
+
+# cJSON, which the broker's libcommon speaks JSON through.
+CJSON_REPO="https://github.com/DaveGamble/cJSON.git"
+CJSON_TAG="v1.7.19"
+cstamp="$tp/cjson.rev"
+if [ "$(cat "$cstamp" 2>/dev/null || true)" != "$CJSON_TAG" ]; then
+    echo "mosquitto: fetching cJSON $CJSON_TAG..."
+    rm -rf "$tp/cJSON"
+    git clone -q --depth 1 --branch "$CJSON_TAG" "$CJSON_REPO" "$tp/cJSON"
+    echo "$CJSON_TAG" > "$cstamp"
+fi

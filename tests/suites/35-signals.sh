@@ -162,14 +162,8 @@ fi
 log=$(dev_run 'dmesg')
 assert_contains "the grace expired before it was deleted" \
     "pid $pid did not stop when asked" "$log"
-if [ "${ESPIX_UAPP:-0}" = 1 ]; then
-    # Not deleted: a POSIX app ends itself as SIGKILL ends it, on its way back to U or at its next syscall.
-    assert_eq "and then it ended as SIGKILL ends it, so no cleanup ran" "exit 137" "$GONE_STATUS"
-else
-    assert_contains "and then the task was deleted, so no cleanup ran" \
-        "killed pid $pid" "$log"
-fi
-
+# Not deleted: an app ends itself as SIGKILL ends it, on its way back to U or at its next syscall.
+assert_eq "and then it ended as SIGKILL ends it, so no cleanup ran" "exit 137" "$GONE_STATUS"
 # SIGKILL takes the same route with no grace at all.
 pid=$(bg_start ignore)
 sleep 1
@@ -305,12 +299,7 @@ assert_contains "a signal does not break a lock wait" "mutex rc=0" \
     "$(dev_run "$APP sig mutex")"
 ts_out=$(dev_run "$APP sig threadsleep")
 assert_contains "a signal reaches a thread asleep in sleep()" "handler ran" "$ts_out"
-if [ "${ESPIX_UAPP:-0}" = 1 ]; then
-    # One thread takes a process's signal, as on Linux: here the main one, in its join (32-umode's sigasync aims one).
-    espix_skip "a U-mode process's signal goes to one thread, not to each sleeper"
-else
-    assert_contains "and cuts its sleep short, while the join waits" "4 left" "$ts_out"
-fi
+# One thread takes a process's signal, as on Linux: here the main one, in its join (32-umode's sigasync aims one).
 
 # An app's thread is listed under its process: tid in the PID column, the
 # process's name in braces, the process as its parent.

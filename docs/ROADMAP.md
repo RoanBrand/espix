@@ -1041,6 +1041,12 @@ other way round.
   not of espix: the firmware stays Arduino-free, and that boundary is the thing to
   keep.
 
+  **The direction is an Arduino layer on POSIX.** Every other app is now a POSIX
+  program built by `espix-cc`; neopixel is the one IDF project left, on the
+  kernel's own libc tables. An Arduino runtime written over the POSIX calls espix
+  supports (and its device interfaces as they grow) would make a sketch an
+  ordinary POSIX app on both chips, and let those tables go.
+
   **The cost worth attacking is that every sketch carries its own copy of the
   runtime.** `elf_loader` ships a dynamic-module API — `dlmod_relocate`,
   `dlmod_insert`, `dlmod_getaddr`, `dlmod_listname` — which espix uses none of.

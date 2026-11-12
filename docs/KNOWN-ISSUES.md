@@ -486,7 +486,7 @@ rules out (`fork`, isolation, `MAP_FIXED`), it cannot yet:
 
 Under the full suite's load, `testapp vfork` has once printed its faulting
 child's message and then nothing: the parent neither reported a failed check
-nor said `vfork ok` (30-proc, `ESPIX_UAPP=1 tests/run.sh --seed 84799 -j 4`).
+nor said `vfork ok` (30-proc, S31, `tests/run.sh --seed 84799 -j 4`).
 Alone it passed 15 runs of 15.
 
 ## Filesystem
@@ -990,13 +990,13 @@ Alone it passed 15 runs of 15.
 
 ## Display and desktop
 
-- **Each run of the M-mode Doom leaks about 8 KB of internal RAM**, whether it
-  ends on its own or is killed; twenty runs left too little for an SSH key
-  exchange. `doom-u`, plasma, an M-mode app's threads and audio streams leak
-  nothing, so it is something only the M-mode Doom does. Not found yet.
+- **Each killed run of Doom on the S3 leaks about 5 KB of internal RAM**
+  (112 → 107, 106 → 101, 101 → 96 KB over three runs). A killed test app leaks
+  nothing, so it is something only Doom does (its audio or the screen). Not
+  found yet.
 
 - **The bottom row of a scaled surface is noise**: Doom's 320x200 surface on its
-  320x240 canvas ends in a row of stray pixels, in both builds, so the PPA's
+  320x240 canvas ends in a row of stray pixels, so the PPA's
   scale reads or writes past its last row.
 
 - **On a freshly created 320x240 desktop the icons cannot be clicked.** The

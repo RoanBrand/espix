@@ -113,7 +113,7 @@ guard page between mappings:
 **A `malloc` of 128 KiB or more is a mapping of its own**, as glibc's is: it costs
 the pages touched, and `free` gives all of them back. `espix-cc` links
 `libespix`'s allocator over picolibc's with `--wrap`, so libc's own allocations
-take the same path. Doom's 6 MiB zone costs what it touches: `doom-u` holds about
+take the same path. Doom's 6 MiB zone costs what it touches: it holds about
 3.5 MB while it plays.
 
 ## Processes: fork, vfork, exec, wait
@@ -164,7 +164,7 @@ their statuses unclaimed.
 
 **`setsid()` leaves the shell's session.** The process's streams become its
 terminal's own, or `/dev/null` without one, which outlive the session, and the
-session's hangup no longer reaches it. That is how `mosquitto-u -d` serves on
+session's hangup no longer reaches it. That is how `mosquitto -d` serves on
 after the `ssh` command that started it (`62-mqtt`). `setpgid`, `getpgid` and
 `umask` work as on Linux. The umask is per process, inherited, and applied by
 every create.
@@ -250,8 +250,8 @@ layer under it:
   `semaphore.h`, `gettid()`, `popen()`), and in `user/include/common` the ones
   M-mode apps get from espix too (`syslog.h`, `ifaddrs.h`, `dlfcn.h`, `poll.h`).
 
-`espix-cc` defines `ESPIX_UMODE_APP`, for source shared with an M-mode build
-that must tell the two apart (mosquitto's seam defines `fork` only for M-mode).
+`espix-cc` defines `ESPIX_POSIX_APP`, and `ESPIX_UMODE_APP` or `ESPIX_NOMMU_APP`
+for source that must tell the two chips apart.
 
 `tools/espix-cc` compiles and links an app, as `musl-gcc` does for musl, with the
 kernel's 64-bit `off_t`, no `cm.popret` (as IDF builds the kernel; with it
@@ -259,10 +259,10 @@ libespix's mutex deadlocked, [GOTCHAS](GOTCHAS.md)), and the barriers and
 spinlocks picolibc's headers leave out (their feature macros follow what IDF's
 own pthread implements). It links `libespix` whole and ahead of libc, because the
 toolchain's `libc.a` carries weak `nosys` stubs that would otherwise win the
-archive scan. `cmake/espix-uapp.cmake` is the CMake toolchain file over it: an
-app with a `uapp/` CMake project (mosquitto's, plasma's, Doom's) is built that
-way by `tools/build-apps.sh` and staged as `<name>-u`, on the S3 too
-(`-DESPIX_TARGET=esp32s3`).
+archive scan. `cmake/espix-uapp.cmake` is the CMake toolchain file over it: every
+app under `apps/` is a plain CMake project built that way by `tools/build-apps.sh`
+and staged as `<name>`, for either chip (`-DESPIX_TARGET=esp32s3`). The test app
+is built the same way.
 
 App source is unchanged; it includes only standard headers. The kernel's libc
 cannot be shared: its state (stdio, `errno`, `strtok`, time results) is kernel
@@ -272,15 +272,11 @@ memory. `hello` is 10.8 KiB of text.
 has them, and IDF pins a task that uses one to core 1 for good. Without them a
 U-mode app and its threads run on either core.
 
-**M-mode apps stay.** The loader chooses by ELF type: `ET_EXEC` is a U-mode app.
-
-| app | what changes |
-|---|---|
-| hello | nothing beyond the relink |
-| plasma | runs in U-mode as `plasma-u`: the same source, its surface lent to it |
-| doom | runs in U-mode as `doom-u`: the same engine, seam and entry; its sound through audio syscalls |
-| mosquitto | runs in U-mode as `mosquitto-u`: the same sources and seam, through `uapp/` |
-| neopixel | stays M-mode: its RMT callbacks run in an interrupt |
+**The loader chooses by ELF type**: `ET_EXEC` is a U-mode app; a shared object
+is an M-mode one. hello, plasma, Doom and mosquitto are POSIX apps on both chips.
+neopixel, an IDF project whose RMT callbacks run in an interrupt, is the one
+app that is not a POSIX app, and runs on the S3 only. The plan is for it to
+move to an Arduino layer on POSIX ([ROADMAP.md](ROADMAP.md)).
 
 **Built-in programs.** espix's own commands and daemons are processes too, and
 can become U-mode processes later: linked into the kernel image as a section of
@@ -529,13 +525,12 @@ ends it at its next syscall, as SIGKILL would, rather than by deleting its task.
 
 The S3 does not get isolation, asynchronous signals, growing stacks or
 copy-on-write; tests that need them skip there. An app's fault ends only the app
-on both (`37-faults`). `ESPIX_UAPP=1 tests/run.sh` runs the suites with the test
-app's `espix-cc` build on either chip.
+on both (`37-faults`).
 
-mosquitto, plasma and Doom are built for the S3 from the same `uapp/` projects,
-as `<name>-u`, the size of their IDF builds (`mosquitto-u` 230 KB against 237 KB);
-`64-gfx` and `62-mqtt` run them on both chips. `mosquitto-u -d` fails there with
-"Error in fork: Function not implemented", as it would on a Linux without an MMU.
+mosquitto, plasma and Doom build for the S3 from the same projects as for the S31
+(`mosquitto` is 230 KB); `64-gfx` and `62-mqtt` run them on both chips. `mosquitto
+-d` fails on the S3 with "Error in fork: Function not implemented", as it would on
+a Linux without an MMU.
 Apps built by IDF (`project_elf`, neopixel's RMT included) still take their libc
 from the kernel's tables: IDF's headers bind `socket()` and `select()` to lwIP's
 global descriptors, which an app libc over libespix's per-process table cannot
@@ -548,13 +543,13 @@ Each leaves `make test` green on both targets.
 | | what | done when |
 |---|---|---|
 | M1 | vectors patch, address spaces, the loader, `write` and `exit`, the app runtime | done: `tests/suites/32-umode.sh` |
-| M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode`, and `ESPIX_UAPP=1 make test` skips only what M4 and M7 bring |
+| M2 | files, time, identity; `brk` and pages mapped on touch; testapp relinked; the kernel stack measured | done: `32-umode` |
 | M3 | threads, futex wait and wake, TLS; shared tables flushed on both cores | done: `32-umode`, and the thread checks of `30-proc` pass in U-mode |
 | M4 | asynchronous signals, SIGSTOP and Ctrl-Z anywhere, faults to handlers | done: `32-umode`, and `35-signals` in U-mode |
-| M5 | gfx surfaces mapped into the app; audio writes | done: `64-gfx` runs `plasma-u` and `doom-u` |
-| M6 | sockets, select, poll | done: `32-umode`, and `62-mqtt` runs `mosquitto-u` |
-| M7 | growable stacks; `mmap`; shared text between instances | done: `32-umode`; `doom-u` grows its stack and maps its zone |
-| M8 | `fork()` on copy-on-write, `vfork()`, `exec()` in place, `wait`, pipes, sessions | done: `32-umode`, and `62-mqtt` daemonises `mosquitto-u -d` |
+| M5 | gfx surfaces mapped into the app; audio writes | done: `64-gfx` runs plasma and Doom |
+| M6 | sockets, select, poll | done: `32-umode`, and `62-mqtt` runs mosquitto |
+| M7 | growable stacks; `mmap`; shared text between instances | done: `32-umode`; Doom grows its stack and maps its zone |
+| M8 | `fork()` on copy-on-write, `vfork()`, `exec()` in place, `wait`, pipes, sessions | done: `32-umode`, and `62-mqtt` daemonises `mosquitto -d` |
 
 Open:
 - **A null syscall costs 920 cycles (2.9 µs)** round trip (`uapp bench`), about
