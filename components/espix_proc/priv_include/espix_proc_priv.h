@@ -182,6 +182,9 @@ typedef struct {
     /* Whose libc the app links: the kernel's, or its own over /lib/libc.so (libc_so.c). */
     uint8_t abi;
     bool    libc_held;
+    /* The locks the app's libc made, and its own libc-wide lock among them; freed with the image. */
+    struct espix_libc_lock *libc_locks;
+    struct espix_libc_lock *libc_mutex;
 
 #if CONFIG_ESPIX_UMODE
     /* A U-mode app's thread and address space (espix_umode.h); NULL for an M-mode app. */
@@ -666,6 +669,8 @@ void espix_proc_app_fini(espix_proc_slot_t *slot);
 enum { ESPIX_ABI_KERNEL = 0, ESPIX_ABI_LIBC = 2 };
 int espix_app_abi(const uint8_t *img, size_t len, uint8_t libc_id[ESPIX_LIBC_ID_LEN]);
 void espix_libc_init(void);
+/* Give an app with its own libc a libc-wide lock of its own. */
+void espix_libc_app_init(espix_proc_slot_t *slot);
 /* Take a reference on /lib/libc.so, loading it if needed; NULL, or why not. */
 const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN]);
 void espix_libc_release(espix_proc_slot_t *slot);

@@ -121,8 +121,7 @@ static bool file_build_id(FILE *f, uint8_t id[ESPIX_LIBC_ID_LEN])
     return false;
 }
 
-/* What libc.so calls in the kernel beyond the rest of the app ABI: stdio's locks, and libgcc. */
-extern struct __lock __lock___libc_recursive_mutex;
+/* What libc.so calls in the kernel beyond the rest of the app ABI: its locks (below), and libgcc. */
 extern void __ashldi3(void), __ashrdi3(void), __lshrdi3(void), __umoddi3(void), __ffsdi2(void),
             __fixdfdi(void), __floatundidf(void), __nedf2(void);
 extern _Complex double __muldc3(double, double, double, double);
@@ -262,17 +261,144 @@ static void espix_app_fini(void)
     espix_proc_app_fini(espix_proc_self());
 }
 
+/*
+ * An app's libc locks. Each is a mutex of its process, freed with it, so a process
+ * ended while holding one stops no other. The libc-wide lock an app names is a
+ * stand-in for its own process's.
+ */
+struct espix_libc_lock {
+    struct espix_libc_lock *next;
+    StaticSemaphore_t       sem;
+};
+
+static portMUX_TYPE   s_locks_mux = portMUX_INITIALIZER_UNLOCKED;
+static struct __lock  s_app_libc_lock;
+static SemaphoreHandle_t s_stray;       /* the libc-wide lock for a caller with none of its own */
+
+static struct espix_libc_lock *lock_new(espix_proc_app_t *app, bool recursive)
+{
+    struct espix_libc_lock *const l = heap_caps_malloc(sizeof(*l), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (l == NULL) {
+        return NULL;
+    }
+    if (recursive) {
+        xSemaphoreCreateRecursiveMutexStatic(&l->sem);
+    } else {
+        xSemaphoreCreateMutexStatic(&l->sem);
+    }
+    portENTER_CRITICAL(&s_locks_mux);
+    l->next = app->libc_locks;
+    app->libc_locks = l;
+    portEXIT_CRITICAL(&s_locks_mux);
+    return l;
+}
+
+static void locks_free(espix_proc_app_t *app)
+{
+    portENTER_CRITICAL(&s_locks_mux);
+    struct espix_libc_lock *l = app->libc_locks;
+    app->libc_locks = NULL;
+    app->libc_mutex = NULL;
+    portEXIT_CRITICAL(&s_locks_mux);
+    while (l != NULL) {
+        struct espix_libc_lock *const next = l->next;
+        vSemaphoreDelete((SemaphoreHandle_t)&l->sem);
+        free(l);
+        l = next;
+    }
+}
+
+static espix_proc_app_t *self_app(void)
+{
+    espix_proc_slot_t *const self = espix_proc_self();
+    return self != NULL ? self->app : NULL;
+}
+
+static SemaphoreHandle_t lock_of(_LOCK_T lock)
+{
+    if (lock != (_LOCK_T)&s_app_libc_lock) {
+        return (SemaphoreHandle_t)lock;
+    }
+    espix_proc_app_t *const app = self_app();
+    return app != NULL && app->libc_mutex != NULL ? (SemaphoreHandle_t)&app->libc_mutex->sem : s_stray;
+}
+
+static void lock_init(_LOCK_T *lock, bool recursive)
+{
+    espix_proc_app_t *const app = self_app();
+    struct espix_libc_lock *const l = app != NULL ? lock_new(app, recursive) : NULL;
+    *lock = l != NULL ? (_LOCK_T)&l->sem : NULL;
+}
+
+static void app_lock_init(_LOCK_T *lock)           { lock_init(lock, false); }
+static void app_lock_init_recursive(_LOCK_T *lock) { lock_init(lock, true); }
+
+static void app_lock_close(_LOCK_T lock)
+{
+    espix_proc_app_t *const app = self_app();
+    if (lock == NULL || lock == (_LOCK_T)&s_app_libc_lock || app == NULL) {
+        return;
+    }
+    struct espix_libc_lock *found = NULL;
+    portENTER_CRITICAL(&s_locks_mux);
+    for (struct espix_libc_lock **p = &app->libc_locks; *p != NULL; p = &(*p)->next) {
+        if ((_LOCK_T)&(*p)->sem == lock) {
+            found = *p;
+            *p = found->next;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_locks_mux);
+    if (found != NULL) {
+        vSemaphoreDelete((SemaphoreHandle_t)&found->sem);
+        free(found);
+    }
+}
+
+/* A NULL lock is one that could not be made: the app runs unlocked rather than the kernel asserting. */
+static void app_lock_acquire(_LOCK_T lock)
+{
+    SemaphoreHandle_t const s = lock_of(lock);
+    if (s != NULL) {
+        xSemaphoreTake(s, portMAX_DELAY);
+    }
+}
+
+static void app_lock_release(_LOCK_T lock)
+{
+    SemaphoreHandle_t const s = lock_of(lock);
+    if (s != NULL) {
+        xSemaphoreGive(s);
+    }
+}
+
+static void app_lock_acquire_recursive(_LOCK_T lock)
+{
+    SemaphoreHandle_t const s = lock_of(lock);
+    if (s != NULL) {
+        xSemaphoreTakeRecursive(s, portMAX_DELAY);
+    }
+}
+
+static void app_lock_release_recursive(_LOCK_T lock)
+{
+    SemaphoreHandle_t const s = lock_of(lock);
+    if (s != NULL) {
+        xSemaphoreGiveRecursive(s);
+    }
+}
+
 static const struct esp_elfsym s_libc_hooks[] = {
     ESP_ELFSYM_EXPORT(espix_app_fini),
-    ESP_ELFSYM_EXPORT(__retarget_lock_init),
-    ESP_ELFSYM_EXPORT(__retarget_lock_init_recursive),
-    ESP_ELFSYM_EXPORT(__retarget_lock_close),
-    ESP_ELFSYM_EXPORT(__retarget_lock_close_recursive),
-    ESP_ELFSYM_EXPORT(__retarget_lock_acquire),
-    ESP_ELFSYM_EXPORT(__retarget_lock_acquire_recursive),
-    ESP_ELFSYM_EXPORT(__retarget_lock_release),
-    ESP_ELFSYM_EXPORT(__retarget_lock_release_recursive),
-    ESP_ELFSYM_EXPORT(__lock___libc_recursive_mutex),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_init", app_lock_init),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_init_recursive", app_lock_init_recursive),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_close", app_lock_close),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_close_recursive", app_lock_close),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_acquire", app_lock_acquire),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_acquire_recursive", app_lock_acquire_recursive),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_release", app_lock_release),
+    ESP_ELFSYM_EXPORT_NAMED("__retarget_lock_release_recursive", app_lock_release_recursive),
+    ESP_ELFSYM_EXPORT_NAMED("__lock___libc_recursive_mutex", s_app_libc_lock),
     ESP_ELFSYM_EXPORT(__ashldi3),
     ESP_ELFSYM_EXPORT(__ashrdi3),
     ESP_ELFSYM_EXPORT(__lshrdi3),
@@ -293,9 +419,15 @@ static const struct esp_elfsym s_libc_hooks[] = {
 void espix_libc_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
+    s_stray = xSemaphoreCreateRecursiveMutex();
     if (esp_elf_register_symbol(s_libc_hooks) != 0) {
         espix_klog(ESPIX_KLOG_WARN, TAG, "libc.so's kernel names not published");
     }
+}
+
+void espix_libc_app_init(espix_proc_slot_t *slot)
+{
+    slot->app->libc_mutex = lock_new(slot->app, true);
 }
 
 const char *espix_libc_acquire(espix_proc_slot_t *slot, const uint8_t id[ESPIX_LIBC_ID_LEN])
@@ -334,7 +466,11 @@ static void linger_task(void *arg)
 
 void espix_libc_release(espix_proc_slot_t *slot)
 {
-    if (slot->app == NULL || !slot->app->libc_held) {
+    if (slot->app == NULL) {
+        return;
+    }
+    locks_free(slot->app);
+    if (!slot->app->libc_held) {
         return;
     }
     slot->app->libc_held = false;

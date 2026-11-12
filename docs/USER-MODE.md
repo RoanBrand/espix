@@ -489,8 +489,9 @@ The S3 has no MMU, so there it runs as Linux runs a program without one:
 so two apps never share it. Pure code (the `printf` and `scanf` engines, strings,
 math, `qsort`) is one `/lib/libc.so`, loaded when the first app starts and kept 30
 seconds after the last. `errno` is a call, answered per thread by the kernel; the
-allocator is the kernel's per-process arena; `stdin`, `stdout` and `stderr` are
-streams over descriptors 0-2. An app's `.note.espix` names the `libc.so` build it
+allocator is the kernel's per-process arena; libc's locks, its libc-wide one
+included, are mutexes of the process, freed with it; `stdin`, `stdout` and
+`stderr` are streams over descriptors 0-2. An app's `.note.espix` names the `libc.so` build it
 was linked against, and another build is refused at `exec`; `espix-cc -static`
 links all of libc instead and needs no `libc.so`. An app's own libc and libespix
 are linked hidden, so its names bind inside it; what it leaves undefined resolves

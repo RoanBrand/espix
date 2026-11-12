@@ -403,6 +403,16 @@ assert_eq "atexit handlers run on exit(), last first" \
     "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "and on a return from main" \
     "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit return" | tr '\n' ' ' | sed 's/ $//')"
+# libc's own lock is each app's: one killed holding it leaves every other app's libc alone.
+pid=$(dev_run "$APP libclock &" | sed -n 's/^\[\([0-9][0-9]*\)\].*/\1/p')
+if [ -n "$pid" ]; then
+    sleep 1
+    dev_run "kill -9 $pid" >/dev/null
+    assert_eq "an app killed holding libc's lock stops no other app" \
+        "atexit: registered atexit: first atexit: second" "$(dev_run "$APP atexit exit" | tr '\n' ' ' | sed 's/ $//')"
+else
+    espix_fail "an app killed holding libc's lock stops no other app" "no [pid] line"
+fi
 
 # --- the process tree: a shell is a process, and an app is its child -------
 #

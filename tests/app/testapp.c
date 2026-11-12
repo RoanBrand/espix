@@ -2110,6 +2110,19 @@ static void at_first(void)
     printf("atexit: first\n");
 }
 
+/* Sleeps holding libc's own lock (atexit's, getenv's, stdio's set-up), for a kill to end it there. */
+#include <sys/lock.h>
+extern struct __lock __lock___libc_recursive_mutex;
+static int cmd_libclock(void)
+{
+    __retarget_lock_acquire_recursive(&__lock___libc_recursive_mutex);
+    printf("libclock: held\n");
+    fflush(stdout);
+    sleep(60);
+    __retarget_lock_release_recursive(&__lock___libc_recursive_mutex);
+    return 0;
+}
+
 /* atexit handlers run, last registered first, on exit() and on a return from main. */
 static int cmd_atexit(const char *how)
 {
@@ -2341,6 +2354,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "atexit") == 0 && argc > 2) {
         return cmd_atexit(argv[2]);
+    }
+    if (strcmp(cmd, "libclock") == 0) {
+        return cmd_libclock();
     }
     if (strcmp(cmd, "abi") == 0 && argc > 2) {
         return cmd_abi(argv[2]);

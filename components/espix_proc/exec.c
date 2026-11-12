@@ -764,6 +764,9 @@ umode:
     slot->app->abi = (uint8_t)espix_app_abi(slot->app->image, slot->info.image_bytes, libc_id);
     const bool wants_libc = slot->app->abi >= ESPIX_ABI_LIBC &&
                             memcmp(libc_id, k_no_libc, sizeof(libc_id)) != 0;
+    if (slot->app->abi >= ESPIX_ABI_LIBC) {
+        espix_libc_app_init(slot);
+    }
 
     relocate_ctx_t rctx = { slot, -1, xSemaphoreCreateBinary(), wants_libc ? libc_id : NULL, NULL };
     if (rctx.done == NULL ||
