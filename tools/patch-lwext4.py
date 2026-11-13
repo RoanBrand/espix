@@ -5,7 +5,7 @@ two things it needs that upstream lacks.
 
 **Why not the component manager.** It hashes every file of a git dependency,
 including the submodule's `lwext4/.git` file -- and that file holds a relative
-path to the downloader's own cache, so the hash in dependencies.lock only ever
+path to the downloader's own cache, so the hash in the lock file only ever
 matched on the machine that wrote it. Fetching by commit id here gives the same
 guarantee (git verifies the content) without that. The result goes to the
 gitignored external/esp_lwext4, which CMakeLists.txt adds as a component.

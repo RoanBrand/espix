@@ -216,7 +216,7 @@ needs that upstream lacks — both in the *core* rather than in the port around 
 
 It is not a component manager dependency because the manager hashes every file of
 a git dependency, the submodule's `lwext4/.git` file included, and that file holds
-a relative path to the downloader's own cache: the hash in `dependencies.lock`
+a relative path to the downloader's own cache: the hash in the lock file
 matched only on the machine that wrote it, and a fresh clone anywhere else failed
 its first configure with "The downloaded component is corrupted".
 

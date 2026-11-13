@@ -254,13 +254,12 @@ def die(msg):
     sys.exit(1)
 
 
-def check_version(root):
+def check_version(lock):
     """Refuse to patch a version this was not written against.
 
     A dependency bump should be a deliberate act: the anchors below are the
     port's own source, and there is no promise they survive a release.
     """
-    lock = root / "dependencies.lock"
     if not lock.exists():
         return  # first configure, before the manager has written one
     text = lock.read_text(encoding="utf-8")
@@ -317,7 +316,9 @@ def main():
         # component manager runs, and this will be called again.
         return 0
 
-    check_version(root)
+    # The build passes its target's lock; by hand, every target's.
+    for lock in ([Path(sys.argv[1])] if len(sys.argv) > 1 else sorted(root.glob("dependencies.lock.*"))):
+        check_version(lock)
 
     header = comp / "include" / "esp_littlefs.h"
     source = comp / "src" / "esp_littlefs.c"

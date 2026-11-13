@@ -68,12 +68,8 @@ compile_commands.json
 *.log
 *.log.pid
 
-# NOTE: dependencies.lock IS committed, deliberately — it pins the exact
-# component versions so builds are reproducible.
-#
-# Its target: line follows the target last built, because IDF 6.1's build
-# rewrites the lock and offers no per-target lock path. That one line is the
-# whole difference between espix targets -- every component lists all of them,
-# so the resolved set is identical -- and git checkout dependencies.lock
-# loader/dependencies.lock is the way to drop it from a diff after a switch.
+# NOTE: dependencies.lock.<target> IS committed, deliberately — it pins the
+# exact component versions so builds are reproducible. Each target has its own
+# (the root and loader CMakeLists set DEPENDENCIES_LOCK), so building one chip
+# leaves the other's alone, and a lock changes only when a dependency does.
 coredump.bin

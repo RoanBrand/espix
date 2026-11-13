@@ -219,7 +219,7 @@ home directory and the SSH host key — so skipping `make flash-fs` costs you
 `/bin`, not a working system.
 
 There is no separate download or configure step. The first build fetches the
-managed components at the versions pinned in `dependencies.lock` — it needs
+managed components at the versions pinned in `dependencies.lock.<target>` — it needs
 network the first time — and generates `sdkconfig.<target>` from the
 `sdkconfig.defaults*` files. No `menuconfig` required.
 
@@ -472,7 +472,7 @@ to espix:
   with, so that `off_t` can be 64 bits.
 
 Everything espix depends on is fetched by the IDF component manager at the
-versions in `dependencies.lock` — `espressif/elf_loader`,
+versions in `dependencies.lock.<target>` — `espressif/elf_loader`,
 `espressif/esp_linenoise`, `joltwallet/littlefs`, `espressif/esp_tinyusb`,
 `espressif/usb`, `espressif/usb_host_msc` and `espressif/esp_ext_part_tables`.
 `esp_lwext4` and its lwext4 core are fetched at pinned commits into the gitignored

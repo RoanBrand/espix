@@ -10,6 +10,8 @@ cmake_minimum_required(VERSION 3.22)
 # separate artifact with its own release cadence, and it changes far less often.
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+# One lock per target, so a build for one chip leaves the other's pins alone.
+idf_build_set_property(DEPENDENCIES_LOCK "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock.${IDF_TARGET}")
 project(espix_loader)
 
 #

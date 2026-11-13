@@ -28,6 +28,9 @@ endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+# One lock per target, so a build for one chip leaves the other's pins alone.
+idf_build_set_property(DEPENDENCIES_LOCK "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock.${IDF_TARGET}")
+
 # Fetch libsmb2 (tools/fetch-libsmb2.py) for components/libsmb2, which registers
 # its sources itself: upstream's ESP glue predates IDF 5 and does not build.
 # Not in EXTRA_COMPONENT_DIRS, unlike esp_lwext4, because what is registered is
@@ -62,8 +65,9 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/offt64.cmake")
 #
 # Temporary by construction: tools/esp_littlefs-attrs.patch is the same change
 # ready to send upstream, and this hook goes when it lands.
+idf_build_get_property(espix_lock DEPENDENCIES_LOCK)
 execute_process(
-    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-littlefs.py"
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-littlefs.py" "${espix_lock}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     RESULT_VARIABLE espix_littlefs_patch_result)
 if(NOT espix_littlefs_patch_result EQUAL 0)
@@ -228,7 +232,7 @@ endif()
 # After project(), same reasoning as the littlefs hook above: the component
 # manager has to have downloaded the tree first.
 execute_process(
-    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-msc.py"
+    COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/patch-msc.py" "${espix_lock}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     RESULT_VARIABLE espix_msc_patch_result)
 if(NOT espix_msc_patch_result EQUAL 0)
