@@ -261,6 +261,10 @@ if dev_testapp_present; then
         "isatty 1 1, termios ok, canon 1 echo 1, size ok" "$out"
     assert_contains "and the termios it sets reaches the terminal" "raw reached it 1" "$out"
     assert_contains "and poll on stdin waits for a key" "poll 0 after the timeout" "$out"
+    # A key's bytes in one packet, as an escape sequence comes: read takes one, and poll sees the rest at once.
+    out=$(dev_keys "$APP keyburst" "expect:keyburst: ready" "send:1b4f50")
+    assert_contains "a key's bytes are each there for the next read, as poll says" \
+        "first 1 1b, then poll 1, rest 4f 50" "$out"
     assert_contains "over an exec without a pty, stdin is not a terminal" "isatty 0 0, termios none" \
         "$(dev_once "$APP tty")"
 else

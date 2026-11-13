@@ -317,8 +317,9 @@ signal writes the eventfd, and then a handler that is due ends the call with
 EINTR (restarted under `SA_RESTART`, except `poll`, as on Linux), a stop parks
 the thread inside the wait, and a signal whose action is nothing leaves it
 waiting. `SO_RCVTIMEO` and `SO_SNDTIMEO` are the kernel's to keep. A regular
-file in `poll` is always ready; stdin is reported readable until the transports
-have a wake a select can wait on.
+file in `poll` is always ready. stdin on a terminal is its tty: `read` and `poll`
+both go to it, so a key's bytes that arrive together are each there for the next
+read, as `poll` says, and VMIN, VTIME and canonical lines are the tty's.
 
 **The syscall table is part of espix's ABI.** An M-mode app calls kernel functions
 through the symbol tables (`abi_*.c`); a U-mode app reaches the same functions by

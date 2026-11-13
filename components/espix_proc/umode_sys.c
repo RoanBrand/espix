@@ -239,7 +239,7 @@ static int32_t path_in(um_call_t *c, uint32_t uva, char *buf)
     return (r < 0) ? r : 0;
 }
 
-/* stdin as a terminal reads it: up to a newline, or what the end of input leaves. */
+/* stdin with no terminal behind it (an exec without a pty): up to a newline, or what the end of input leaves. */
 static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
 {
     /* Copied out a chunk at a time: getc() may block, so no user page is held across it. */
@@ -273,6 +273,25 @@ static int32_t read_std(um_call_t *c, FILE *in, uint32_t uva, uint32_t len)
         done += n;
     }
     return (int32_t)done;
+}
+
+/*
+ * stdin that is a terminal: the tty's own read, which poll() waits on too, so a byte poll counts is
+ * never held in a stream buffer it cannot see. VMIN, VTIME and canonical lines are the tty's.
+ */
+static int32_t read_tty(um_call_t *c, espix_tty_t *tty, uint32_t uva, uint32_t len)
+{
+    char buf[256];
+    for (;;) {
+        const ssize_t n = espix_tty_read(tty, buf, MIN(len, (uint32_t)sizeof(buf)), false);
+        if (n == -EINTR && !um_sig_due(c)) {
+            continue;       /* nothing for this thread: the wait goes on */
+        }
+        if (n <= 0) {
+            return (int32_t)n;
+        }
+        return (espix_um_copyout(c->p->as, uva, buf, (size_t)n) < 0) ? -EFAULT : (int32_t)n;
+    }
 }
 
 /*
@@ -320,7 +339,11 @@ static int32_t um_sys_read(um_call_t *c)
         return -EBADF;
     }
     if (e->kind == ESPIX_UM_FD_STD) {
-        return (e->std == 0) ? read_std(c, um_std_stream(c, 0), uva, len) : -EBADF;
+        if (e->std != 0) {
+            return -EBADF;
+        }
+        espix_tty_t *const tty = c->t->slot->std_tty;
+        return (tty != NULL) ? read_tty(c, tty, uva, len) : read_std(c, um_std_stream(c, 0), uva, len);
     }
     if (e->kind == ESPIX_UM_FD_SOCK) {
         return um_sock_read(c, c->a[0], uva, len);

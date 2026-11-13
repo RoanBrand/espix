@@ -595,7 +595,7 @@ static int chan_stream_write_err(void *cookie, const char *data, int len)
 static FILE *chan_open_stream(espix_session_t *s, espix_stream_t which)
 {
     if (which == ESPIX_STREAM_IN) {
-        /* Unbuffered: the tty already hands over a line at a time, and a stream buffer would hide input from poll(). */
+        /* picolibc keeps its 128-byte buffer whatever setvbuf says, hidden from poll(): an app reads the tty itself (umode_sys.c). */
         FILE *f = funopen(s, chan_stream_read, NULL, NULL, NULL);
         if (f != NULL) {
             setvbuf(f, NULL, _IONBF, 0);

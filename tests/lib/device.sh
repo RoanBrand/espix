@@ -790,6 +790,15 @@ dev_testapp_sync() {
     return 0
 }
 
+# Run a command on a pty of its own and type at it (tests/lib/keys.py): expect:TEXT, send:HEX, sleep:S, mark.
+#   dev_keys <command> <step>...
+dev_keys() {
+    local cmd="$1"
+    shift
+    "$ESPIX_PYTHON" "$ESPIX_LIB_DIR/keys.py" --host "$ESPIX_HOST" --user "$ESPIX_USER" \
+        --password "$ESPIX_PASS" --timeout "${ESPIX_CMD_TIMEOUT:-60}" --cmd "$cmd" "$@" 2>/dev/null
+}
+
 # Install a file on the device as root, unless the copy there is already this one.
 #   dev_install <local> <absolute path on the device> <mode>
 dev_install() {

@@ -1619,6 +1619,39 @@ static int cmd_tty(void)
     return 0;
 }
 
+/*
+ * A key's bytes, sent in one write, as a terminal app reads them: one read takes the first, and
+ * a poll must then see the rest at once (ncurses parses an escape sequence that way), not wait.
+ */
+static int cmd_keyburst(void)
+{
+    struct termios t, raw;
+    if (tcgetattr(0, &t) != 0) {
+        printf("keyburst: not a terminal\n");
+        return 1;
+    }
+    raw = t;
+    cfmakeraw(&raw);
+    tcsetattr(0, TCSANOW, &raw);
+    printf("keyburst: ready\r\n");
+    fflush(stdout);
+    unsigned char first = 0, rest[8];
+    const ssize_t n1 = read(0, &first, 1);
+    struct pollfd p = { .fd = 0, .events = POLLIN };
+    const int ready = poll(&p, 1, 300);
+    ssize_t n2 = 0;
+    if (ready > 0) {
+        n2 = read(0, rest, sizeof(rest));
+    }
+    tcsetattr(0, TCSANOW, &t);
+    printf("keyburst: first %zd %02x, then poll %d, rest", n1, first, ready);
+    for (ssize_t i = 0; i < n2; i++) {
+        printf(" %02x", rest[i]);
+    }
+    printf("\n");
+    return 0;
+}
+
 /* dup2 onto a number the app did not open: its own table's in U-mode, the system's (and refused) in M-mode. */
 static int cmd_dup_onto(const char *path, int target)
 {
@@ -2313,6 +2346,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "tty") == 0) {
         return cmd_tty();
+    }
+    if (strcmp(cmd, "keyburst") == 0) {
+        return cmd_keyburst();
     }
     if (strcmp(cmd, "dup") == 0 && argc > 4 && strcmp(argv[3], "onto") == 0) {
         return cmd_dup_onto(argv[2], atoi(argv[4]));

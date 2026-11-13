@@ -450,6 +450,20 @@ Not a defect — worth recording only because its presence suggests a POSIX laye
 that is not there. Upstream never implemented signals either, so it is not a
 source to draw on.
 
+### picolibc's `setvbuf()` does nothing to a `funopen()` stream, and says it worked
+
+picolibc's `funopen()` gives every stream a `BUFSIZ` (128-byte) buffer, and
+`__bufio_setvbuf()` (`tinystdio/bufio.c`) returns 0 without touching a stream
+whose size is already set. IDF's wrapper (`esp_libc/src/picolibc/bufio_setvbuf.c`)
+calls it, sees its own 1-byte buffer unused, and frees it. So `setvbuf(f, NULL,
+_IONBF, 0)` on a `funopen()` stream succeeds and the stream stays fully buffered.
+
+espix met it as stdin on a terminal: the session's input stream asked for no
+buffer, and a key's later bytes sat in the stream where `poll()` on the tty
+could not see them, so ncurses timed out mid escape sequence. An app's terminal
+read now goes to the tty itself (`components/espix_proc/umode_sys.c`); the
+kernel's other `setvbuf()` calls on `funopen()` streams still do nothing.
+
 ### A JPEG operation can wedge the 2D-DMA, and the next one spins in a reset
 
 Seen twice on the S31, from a shell command decoding a 640x480 baseline JPEG
