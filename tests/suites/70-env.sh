@@ -89,7 +89,8 @@ assert_contains "a quoted ';' is an argument, not an operator" "a;b" \
 assert_eq "HOME is the account's home" "/home/$ESPIX_USER" "$(dev_run 'echo $HOME')"
 assert_eq "USER is the login name"     "$ESPIX_USER"       "$(dev_run 'echo $USER')"
 assert_eq "PATH defaults to /bin"      "/bin"              "$(dev_run 'echo $PATH')"
-assert_contains "TERM is set for an SSH session" "xterm"   "$(dev_run 'echo $TERM')"
+# As Linux's sshd does, TERM is the client's own; the harness's ssh runs with TERM=dumb.
+assert_eq "TERM is the SSH client's own"  "dumb"             "$(dev_run 'echo $TERM')"
 
 # TZ is not a session variable: it belongs to the machine, lives in the system
 # environment where tzset() reads it, and `env` shows it because a process

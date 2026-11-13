@@ -225,6 +225,9 @@ struct espix_session {
      */
     bool        ansi;
 
+    /* The terminal's type as its client named it (SSH's pty-req), or empty for the shell's default. */
+    char        term[32];
+
     void       *transport;                 /* implementation-owned */
     espix_pid_t fg_pgid;                   /* foreground job's group, or NONE */
     espix_pid_t pid;                       /* the shell's own process, for $$ */

@@ -142,7 +142,8 @@ static bool file_build_id(FILE *f, uint8_t id[ESPIX_LIBC_ID_LEN])
 #if !CONFIG_ESPIX_UMODE
 /* What an app's libc calls in the kernel beyond the rest of the app ABI: errno and its locks (below), and libgcc. */
 extern void __ashldi3(void), __ashrdi3(void), __lshrdi3(void), __umoddi3(void), __ffsdi2(void),
-            __fixdfdi(void), __floatundidf(void), __nedf2(void);
+            __fixdfdi(void), __fixunsdfdi(void), __fixsfdi(void), __fixunssfdi(void), __floatdisf(void),
+            __floatundisf(void), __floatundidf(void), __nedf2(void);
 extern _Complex double __muldc3(double, double, double, double);
 extern _Complex float  __mulsc3(float, float, float, float);
 #if CONFIG_IDF_TARGET_ARCH_XTENSA
@@ -453,7 +454,13 @@ static const struct esp_elfsym s_libc_hooks[] = {
     ESP_ELFSYM_EXPORT(__lshrdi3),
     ESP_ELFSYM_EXPORT(__umoddi3),
     ESP_ELFSYM_EXPORT(__ffsdi2),
+    /* Every 64-bit integer conversion, which an app's own code reaches for as much as libc's. */
     ESP_ELFSYM_EXPORT(__fixdfdi),
+    ESP_ELFSYM_EXPORT(__fixunsdfdi),
+    ESP_ELFSYM_EXPORT(__fixsfdi),
+    ESP_ELFSYM_EXPORT(__fixunssfdi),
+    ESP_ELFSYM_EXPORT(__floatdisf),
+    ESP_ELFSYM_EXPORT(__floatundisf),
     ESP_ELFSYM_EXPORT(__floatundidf),
     ESP_ELFSYM_EXPORT(__nedf2),
     ESP_ELFSYM_EXPORT(__muldc3),

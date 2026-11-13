@@ -34,9 +34,13 @@ actually matters, which a _Static_assert cannot: naming a function in an
 assertion proves only that the header declares it.
 
 Run by the build, after the link; safe to run by hand.
+
+`--app <app>` checks one S3 app instead: every name it needs is libc.so's or
+the kernel's, so it loads (tools/build-apps.sh runs it on each).
 """
 
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -301,7 +305,7 @@ def apps_without_agreement():
 PUB_ESP = re.compile(r"ESP_ELFSYM_EXPORT\((\w+)\)")
 PUB_RESOLVER = re.compile(r'ABI_SYM\(\s*"([^"]+)"')
 PUB_EXPLICIT = re.compile(
-    r'^\s*\{\s*"([A-Za-z_]\w*)",\s*(?:\(const void \*\)|\(void \*\)|reinterpret_cast)')
+    r'^\s*\{\s*"([A-Za-z_]\w*)",\s*(?:\(const void \*\)|\(void \*\)|reinterpret_cast|$)')
 
 
 def publications():
@@ -363,9 +367,67 @@ def dead_entries(found, below, order):
     return dead
 
 
+LIBC_SO_C = REPO / "components/espix_proc/libc_so.c"
+PUB_NAMED = re.compile(r'ESP_ELFSYM_EXPORT_NAMED\(\s*"([^"]+)"')
+TOOLCHAIN = {"esp32s3": ("xtensa-esp-elf", "xtensa-esp-elf-readelf")}
+
+
+def dyn_symbols(readelf, elf, defined):
+    """An ELF's dynamic names: those it defines, or those it needs (weak ones need nothing)."""
+    try:
+        out = subprocess.run([readelf, "--dyn-syms", "-W", str(elf)], capture_output=True,
+                             text=True, check=True).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        die(f"{readelf} failed on {elf}: {exc}")
+    names = set()
+    for line in out.splitlines():
+        p = line.split()                    # Num: Value Size Type Bind Vis Ndx Name
+        if len(p) < 8 or not p[0].endswith(":"):
+            continue
+        if defined and p[6] != "UND":
+            names.add(p[7].split("@")[0])
+        elif not defined and p[6] == "UND" and p[4] != "WEAK":
+            names.add(p[7].split("@")[0])
+    return names
+
+
+def check_app(app, target):
+    """An app without an MMU resolves at load: each name it needs must be libc.so's or the kernel's."""
+    triple, readelf_name = TOOLCHAIN[target]
+    found = sorted(Path.home().glob(f".espressif/tools/{triple}/*/{triple}/bin/{readelf_name}"))
+    readelf = shutil.which(readelf_name) or (str(found[-1]) if found else readelf_name)
+    libc_so = REPO / f"build-libc-{target}/split/libc.so"
+    if not libc_so.is_file():
+        die(f"{libc_so} does not exist; tools/build-libc.sh {target} makes it")
+
+    answered = set(publications()) | dyn_symbols(readelf, libc_so, True)
+    hooks = strip_comments(LIBC_SO_C.read_text(encoding="utf-8"))
+    answered |= set(PUB_ESP.findall(hooks)) | set(PUB_NAMED.findall(hooks))
+    on = read_config(REPO / f"build-{target}/espix.elf")
+    source = SOURCE.read_text(encoding="utf-8") if SOURCE.is_file() else ""
+    for var, option in (("g_esp_libc_elfsyms", "CONFIG_ELF_LOADER_LIBC_SYMBOLS"),
+                        ("g_esp_espidf_elfsyms", "CONFIG_ELF_LOADER_ESPIDF_SYMBOLS")):
+        if source and (on is None or option in on):
+            answered |= set(table_names(source, var, True))
+
+    missing = sorted(dyn_symbols(readelf, app, False) - answered)
+    if missing:
+        die(f"{app} needs names that neither libc.so nor the kernel answers, so it fails to\n"
+            "  load with 'undefined symbol':\n    " + "\n    ".join(missing)
+            + "\n  A libgcc helper belongs in components/espix_proc/libc_so.c's table.")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     elf = nm = None
+
+    if "--app" in argv:
+        i = argv.index("--app")
+        target = argv[argv.index("--target") + 1] if "--target" in argv else "esp32s3"
+        if i + 1 >= len(argv) or target not in TOOLCHAIN:
+            die("usage: check-abi.py --app <app> [--target esp32s3]")
+        return check_app(Path(argv[i + 1]), target)
 
     if "--elf" in argv:
         i = argv.index("--elf")

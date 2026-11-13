@@ -428,6 +428,19 @@ paths onto descriptors. See [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
   work is a sweep of every builtin against coreutils, procps and bash, fixing
   what is cheap and listing what is not.
 
+- **A terminfo database, then ncurses as a library espix provides.** htop
+  builds its own ncurses with `xterm` and `xterm-256color` compiled in, and those
+  compiled-in entries need two fixes (`apps/htop/build.sh`): a GNU-only sed in
+  their generator, and `xterm-256color`'s 65,536 colour pairs cut to 256, as a
+  narrow ncurses keeps them in 16 bits. Linux keeps them on disk instead:
+  ncurses reads `/usr/share/terminfo`, and its reader caps a number that does
+  not fit. So the first step is a small database on the rootfs (`xterm`,
+  `xterm-256color`, `vt100`, `linux`, `screen`, `tmux`, `dumb`, a few tens of
+  KB), compiled on the host from the pinned ncurses source, which drops both
+  fixes. The second is ncurses built once, as libc is, and linked by `espix-cc`
+  with `-lncurses`, so any curses app builds as it would on Linux and htop's
+  build stops building ncurses.
+
 ## Platform
 
 - **The S31 can use the flasher stub, and the Makefile should probably say so.**
@@ -937,6 +950,19 @@ matters.
   small. Worth writing the registration interface early, so caches are born able
   to be evicted instead of retrofitted.
 
+- **An S3 app's `realloc` of an escaped block.** When no arena region can hold a
+  request, the block comes from the global heap and is recorded, so exit frees
+  it (`abi_alloc.c`). `realloc` of one goes to `heap_caps_realloc`, which may move
+  it while the record keeps the old pointer, and exit then frees memory that is
+  no longer the app's. Not yet seen on a board; the fix is to update the record
+  when the block moves.
+
+- **S3 app stacks sized by measurement.** An app's stack is what it links for
+  (`-z stack-size`) or 16 KB, and one that needs less still gets 16 KB, because
+  every syscall's kernel frames share it and their depth is unmeasured. Measured,
+  that depth would let a small app ask for less, as Linux takes the size given.
+  Doom's 256 KB is carried over rather than measured.
+
 - **Swap, for U-mode apps on the S31.** Once apps run in their own address
   spaces with refcounted frames ([USER-MODE.md](USER-MODE.md)), an anonymous page
   can be written out and its PTE cleared; the next touch faults and reads it back
@@ -1123,11 +1149,15 @@ next steps need more than that. In rough order of what it would buy:
   probably right: it covers light, heavy and double variants without a font of
   its own, and lines land on exact pixel boundaries at any cell size.
 - **256 and true colour.** SGR 38;5;N and 38;2;r;g;b are reduced to the nearest
-  of the sixteen, which is honest but lossy. Carrying the real value means a wider
-  attribute -- two bytes a cell, or an attribute byte that indexes a palette --
-  and the renderers draw a row as runs of one colour today, so more colours per
-  row costs more text calls. The measurement to make first is how much of a
-  screenful a colour-heavy program like ls --color actually splits into runs.
+  of the sixteen, which is honest but lossy, and is what Linux's own console
+  does. A terminal emulator's standard is 256 colours and 24-bit colour,
+  advertised as `TERM=xterm-256color` and `COLORTERM=truecolor`, and that is the
+  goal here. The screen is RGB565, so a cell's colours stored as RGB565 (two
+  bytes each) carry both: a 256-colour index is looked up once, true colour
+  loses only what the panel cannot show. The renderers draw a row as runs of
+  one colour today, so more colours per row costs more text calls. The
+  measurement to make first is how much of a screenful a colour-heavy program
+  like ls --color actually splits into runs.
 - **Wide, combining and non-ASCII text.** Everything outside ASCII becomes a
   space, and there is no double-width handling, so a CJK line would be four
   columns of nothing.

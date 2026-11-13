@@ -115,6 +115,7 @@ typedef struct {
 
     /* Whether the client asked for a terminal: the input is then a terminal tty, and stderr shares stdout's stream. */
     bool        has_pty;
+    char        term[32];   /* the client's TERM, from its pty-req */
 
     /* The client has sent CHANNEL_EOF: no more input, but output still goes. */
     bool        eof_seen;
@@ -808,6 +809,19 @@ static esp_err_t reply_request(ssh_chan_t *ch, bool ok)
     return send_simple(ch, ok ? SSH_MSG_CHANNEL_SUCCESS : SSH_MSG_CHANNEL_FAILURE);
 }
 
+/* A terminfo name: letters, digits and . _ + -, nothing a client could use to say more. */
+static bool term_name_ok(const uint8_t *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '+' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
 {
     ssh_get_u32(in);                    /* recipient channel */
@@ -822,7 +836,13 @@ static esp_err_t handle_channel_request(ssh_chan_t *ch, ssh_buf_t *in)
 #define REQ_IS(s) (type_len == strlen(s) && memcmp(type, (s), type_len) == 0)
 
     if (REQ_IS("pty-req")) {
-        ssh_get_string(in, NULL);       /* TERM */
+        size_t               tlen = 0;
+        const uint8_t *const term = ssh_get_string(in, &tlen);
+        ch->term[0] = '\0';
+        if (term != NULL && tlen > 0 && tlen < sizeof(ch->term) && term_name_ok(term, tlen)) {
+            memcpy(ch->term, term, tlen);
+            ch->term[tlen] = '\0';
+        }
         {
             const uint32_t cols = ssh_get_u32(in);
             const uint32_t rows = ssh_get_u32(in);
@@ -1551,6 +1571,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
             .tty       = ch->tty,
         };
         strlcpy(session.user, c->user, sizeof(session.user));
+        strlcpy(session.term, ch->term, sizeof(session.term));
         apply_account(&session, c->user);
         ch->session = &session;
 
@@ -1667,6 +1688,7 @@ esp_err_t ssh_channel_run(ssh_conn_t *c)
         .tty       = ch->tty,
     };
     strlcpy(session.user, c->user, sizeof(session.user));
+    strlcpy(session.term, ch->term, sizeof(session.term));
     ch->session = &session;
 
     /*

@@ -11,6 +11,7 @@ worked example for building an app that way.
 | [plasma](plasma/) | the graphics/input ABI: a full-screen app the desktop launches from an icon |
 | [doom](doom/) | a large C program from upstream, with sound, input and a video mode of its own |
 | [mosquitto](mosquitto/) | a real server as an app: the Eclipse Mosquitto MQTT broker, built from upstream with a small platform seam and no patches |
+| [htop](htop/) | a full-screen terminal program from upstream: htop over ncurses, both autotools projects, built by the app's own `build.sh` |
 | [neopixel](neopixel/) | an Arduino sketch and a real Arduino library, as an ESP-IDF project |
 
 The firmware build builds and stages these for you: `idf.py build` runs

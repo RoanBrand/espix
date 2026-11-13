@@ -34,3 +34,5 @@ target_include_directories(doom PRIVATE ${DG_INC} "${PLATFORM}"
 target_compile_definitions(doom PRIVATE ${DG_DEFS} ESPIX_SFX_TRACE=0)
 target_compile_options(doom PRIVATE -Og -Wall)
 target_link_libraries(doom m)
+# The zone allocator and the WAD walk; an S3 app's stack is this size, as on Linux without an MMU.
+target_link_options(doom PRIVATE -Wl,-z,stack-size=262144)

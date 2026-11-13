@@ -5,8 +5,10 @@
 #
 # An app is a POSIX program: a plain CMake project built with tools/espix-cc
 # (cmake/espix-uapp.cmake), into apps/<name>/build-<target>/. One that is an IDF
-# project instead (neopixel, on IDF's drivers) is built by idf.py. The firmware
-# build calls this script so a fresh clone ends up with a populated /bin.
+# project instead (neopixel, on IDF's drivers) is built by idf.py, and one with a
+# build.sh of its own (htop, over autotools) by that, given the target and where
+# to stage. The firmware build calls this script so a fresh clone ends up with a
+# populated /bin.
 #
 #   ./tools/build-apps.sh              # all apps
 #   ./tools/build-apps.sh hello        # just one
@@ -118,13 +120,13 @@ if [ $# -gt 0 ]; then
 else
     names=()
     for d in "$apps_dir"/*/; do
-        [ -f "${d}CMakeLists.txt" ] && names+=("$(basename "$d")")
+        { [ -f "${d}CMakeLists.txt" ] || [ -x "${d}build.sh" ]; } && names+=("$(basename "$d")")
     done
 fi
 
 for name in "${names[@]}"; do
     app="$apps_dir/$name"
-    if [ ! -f "$app/CMakeLists.txt" ]; then
+    if [ ! -f "$app/CMakeLists.txt" ] && [ ! -x "$app/build.sh" ]; then
         echo "build-apps: $name: not an app project" >&2
         exit 1
     fi
@@ -143,7 +145,7 @@ for name in "${names[@]}"; do
     staged="$stage_dir/$name"
     stamp="$stage_dir/.espix-target-$name"
     idf_app=0
-    grep -q 'project.cmake' "$app/CMakeLists.txt" && idf_app=1
+    [ -f "$app/CMakeLists.txt" ] && grep -q 'project.cmake' "$app/CMakeLists.txt" && idf_app=1
 
     # The target that staged *this* app. One shared stamp used to let an app
     # built for a new target mark every foreign binary current.
@@ -154,7 +156,8 @@ for name in "${names[@]}"; do
     # app's own, and the runtime it links (libespix, its libc). -newer is portable
     # in a way that `find -newermt` and stat(1) are not.
     if [ "$force" = 0 ] && [ -f "$staged" ]; then
-        newer=$(find "$app" -type f -not -path "*/build*" -not -path "*/managed_components/*" \
+        newer=$(find "$app" -type f -not -path "$app/build/*" -not -path "$app/build-*" -not -name "*.log" \
+                    -not -path "*/managed_components/*" -not -path "*/third_party/*" \
                     -newer "$staged" -print -quit 2>/dev/null || true)
         if [ -z "$newer" ]; then
             newer=$(find "$root/user/libespix" "$root/user/include" "$root/user/crt0.S" "$root/user/uapp.ld" \
@@ -171,7 +174,10 @@ for name in "${names[@]}"; do
     fi
 
     echo "build-apps: building $name"
-    if [ "$idf_app" = 0 ]; then
+    if [ -x "$app/build.sh" ]; then
+        "$app/build.sh" "$target" "$staged" > "$app/build.log" 2>&1 \
+            || { echo "build-apps: $name: build failed; see $app/build.log" >&2; exit 1; }
+    elif [ "$idf_app" = 0 ]; then
         bu="$app/build-$target"
         out="$bu/$name"
         rm -f "$out"            # relinked: CMake cannot see libespix or libc change under espix-cc
@@ -191,6 +197,11 @@ for name in "${names[@]}"; do
         "$root/tools/espix-cc" --target="$target" --strip "$out" "$staged"
     else
         build_idf_app
+    fi
+    # Without an MMU an app resolves at load, so a name nothing answers is found here rather than on the board.
+    if [ "$target" = esp32s3 ] && ! python3 "$root/tools/check-abi.py" --app "$staged" --target "$target"; then
+        rm -f "$staged"
+        exit 1
     fi
     printf '%s\n' "$target" > "$stamp"
     stage_manifest

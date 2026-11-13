@@ -298,7 +298,8 @@ IDF's: the kernel passes them to lwIP unchanged, `user/include` mirrors them, an
 `umode_net.c` asserts each at build time. The list is `include/espix_syscall.h`,
 two X-macros (Linux's numbers, espix's own) that the kernel's dispatch and
 `libespix`'s numbers are generated from; `tools/syscalls.py` checks each Linux
-number on every build and keeps the table in [POSIX.md](POSIX.md#syscalls).
+number on every build and keeps the table in [POSIX.md](POSIX.md#syscalls) and
+`<sys/syscall.h>`'s `SYS_` names, which `syscall()` takes.
 An app's `.note.espix` carries the ABI version it was built for, and `exec`
 refuses another, so an app built before a renumbering is told to be rebuilt
 rather than making the wrong calls.
@@ -551,9 +552,19 @@ ends it, and either way the parent resumes at the `setjmp` with the child's pid.
 **Threads and signals are an M-mode app's**: IDF's pthreads behind the ABI, and
 handlers run when the app calls in, which every syscall's return is. A syscall
 runs on the calling thread's own stack, where Linux has a kernel stack beside
-it, so a thread gets the main task's 16 KB in PSRAM unless the app asks for a
-size, and a size it asks for gets 8 KB more. A kill the app does not answer
-ends it at its next syscall, as SIGKILL would, rather than by deleting its task.
+it, so a thread gets 16 KB in PSRAM unless the app asks for a size, and a size
+it asks for gets 8 KB more. A kill the app does not answer ends it at its next
+syscall, as SIGKILL would, rather than by deleting its task.
+
+**The main stack is one block, sized when the app is linked**, as Linux without
+an MMU sizes it: FDPIC's loader reads `PT_GNU_STACK`'s size, and so does
+espix's. `-Wl,-z,stack-size=N` asks for N bytes; an app that asks for less, or
+nothing, gets 16 KB in PSRAM. Every syscall runs on it too, so N covers the
+kernel's frames as well as the app's: htop asks for 32 KB (it reaches 22) and
+Doom for 256 KB. Nothing guards its end. An overrun damages the heap block below
+it, which the `heapdebug` profile reports with the block's owner and bytes
+(`crash heap` shows one), and a process that exits having used all but 512
+bytes of its stack is named in `dmesg`.
 
 The S3 does not get isolation, asynchronous signals, growing stacks or
 copy-on-write; tests that need them skip there. An app's fault ends only the app

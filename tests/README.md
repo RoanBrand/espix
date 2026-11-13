@@ -103,6 +103,9 @@ and it is why a green run means something only when the skips were expected.
 - **`dev_console_run`** for the serial console. That session is **root**, which
   is its point: it exercises privileged paths without unlocking the root
   account for the network.
+- **`dev_keys`** for a full-screen program: one command on a pty of its own,
+  waited on and typed at step by step (`lib/keys.py`), as a person at a
+  terminal does.
 - **`dev_push` / `dev_pull` / `dev_sftp`** for transfers.
 - **`dev_capture`** when the output is large. It writes on the device and fetches
   the file, instead of reading a long answer back over the channel — output big

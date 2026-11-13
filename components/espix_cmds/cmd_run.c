@@ -12,10 +12,16 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_heap_caps.h"
 
 #include "espix_appdata.h"
 #include "espix_cmds_priv.h"
@@ -613,6 +619,21 @@ static int cmd_crash(espix_session_t *s, int argc, char **argv)
         return 1;
     }
 #endif
+#if CONFIG_ESPIX_HEAP_CHECK_MS > 0
+    /* `crash heap` overruns a heap block, so the periodic check can be seen catching one. */
+    if (argc == 2 && strcmp(argv[1], "heap") == 0) {
+        espix_printf(s, "overrunning a 24-byte block by two bytes — expect a heap report\n");
+        espix_klog(ESPIX_KLOG_WARN, "crash", "deliberate heap overrun");
+        /* Into its tail canary and no further: past it is the next block's header, which the allocator itself trips on. */
+        volatile uint8_t *const b = heap_caps_malloc(24, MALLOC_CAP_SPIRAM);
+        for (int i = 0; b != NULL && i < 26; i++) {
+            b[i] = (uint8_t)('A' + i);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));    /* the check runs at the lowest priority */
+        espix_printf(s, "no report — the check did not run\n");
+        return 1;
+    }
+#endif
     (void)argc;
     (void)argv;
 
@@ -843,7 +864,7 @@ static espix_cmd_t s_run_cmds[] = {
       .usage = "kill [-SIG|-l] <pid|-pgid|%job>..." },
     { .name = "crash", .fn = cmd_crash,
       .help = "fault on purpose, to test fault reporting",
-      .usage = "crash [abi]" },
+      .usage = "crash [abi|heap]" },
     { .name = "jobs", .fn = cmd_jobs, .shell = true,
       .help = "list this session's background jobs",
       .usage = "jobs" },

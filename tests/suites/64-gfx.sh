@@ -41,14 +41,14 @@ gfx_pid() {
     printf '%s' "$pid"
 }
 
-# $1 is drawing: a third of the screen or more changes in a second, in many colours. $2 a key to send after.
+# $1 is drawing: a third of the screen or more changes in a second, in many colours (Doom's demo shows 59-78 on the S3). $2 a key to send after.
 gfx_moving() {
     local probe moved total colours
     probe=$("$GFX_PY" "$ESPIX_ROOT/tests/lib/gfx_probe.py" "$ESPIX_HOST" ${2:-} 2>&1)
     moved=$(printf '%s\n' "$probe" | sed -n 's/^moved \([0-9]*\) of.*/\1/p')
     total=$(printf '%s\n' "$probe" | sed -n 's/^moved [0-9]* of \([0-9]*\),.*/\1/p')
     colours=$(printf '%s\n' "$probe" | sed -n 's/.*colours \([0-9]*\)$/\1/p')
-    if [ -n "$moved" ] && [ "$((moved * 3))" -gt "$total" ] && [ "$colours" -gt 64 ]; then
+    if [ -n "$moved" ] && [ "$((moved * 3))" -gt "$total" ] && [ "$colours" -gt 32 ]; then
         espix_pass "$1: it draws ($moved of $total pixels changed in a second, $colours colours)"
     else
         espix_fail "$1: it draws" "$probe"

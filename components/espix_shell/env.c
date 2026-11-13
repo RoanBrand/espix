@@ -359,10 +359,6 @@ void espix_env_set_login_defaults(espix_session_t *s)
     (void)espix_env_set(s, "HOME", (s->home[0] != '\0') ? s->home : "/", true);
     (void)espix_env_set(s, "PATH", "/bin", true);
 
-    /*
-     * The transport already decided this: `ansi` is what esp_linenoise probed
-     * on the console and what an SSH session always has. Publishing it as TERM
-     * is how a program that is not the shell gets to know.
-     */
-    (void)espix_env_set(s, "TERM", s->ansi ? "xterm" : "dumb", true);
+    /* The client's own TERM when it sent one, as Linux's sshd passes it on; term.c reduces 256 colours to 16. */
+    (void)espix_env_set(s, "TERM", !s->ansi ? "dumb" : (s->term[0] != '\0') ? s->term : "xterm-256color", true);
 }

@@ -161,12 +161,13 @@ if [[ $target == esp32s31 ]]; then
     # libc-provide.ld binds what the app does not define itself to libc.so's fixed addresses.
     [[ $static == yes ]] || note+=("$split/libc-provide.ld")
     exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
-        -nostdlib -nostartfiles -static -T "$root/user/uapp.ld" -Wl,--gc-sections \
+        -nostdlib -nostartfiles -static -T "$root/user/uapp.ld" -Wl,--gc-sections -Wl,-z,noexecstack \
         -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc,--wrap=malloc_usable_size \
         "$lib/crt0.o" -Wl,--whole-archive "$lib/libespix.a" -Wl,--no-whole-archive \
         -Wl,--start-group "${libs[@]}" -lgcc -Wl,--end-group "${note[@]}"
 fi
-# A shared object for the loader; what libc.so does not answer, the kernel does.
+# A shared object for the loader; what libc.so does not answer, the kernel does. Its stack is
+# PT_GNU_STACK's size when the app links with -z stack-size, as on Linux without an MMU.
 exec "$gcc" "${arch[@]}" "${cflags[@]}" "$@" \
-    -nostartfiles -nostdlib -shared -e __espix_main -Wl,--gc-sections -Wl,--exclude-libs,ALL \
+    -nostartfiles -nostdlib -shared -e __espix_main -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,-z,noexecstack \
     -Wl,--start-group "$lib/libespix.a" "${libs[@]}" -Wl,--end-group "${note[@]}"

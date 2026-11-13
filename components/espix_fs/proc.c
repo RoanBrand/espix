@@ -517,20 +517,29 @@ static const char *kind_str(espix_proc_kind_t kind)
 
 static bool proc_info(espix_pid_t pid, espix_proc_info_t *out)
 {
-    const espix_proc_info_t *live;
-    size_t                   n;
-    if (!proc_cache_acquire_infos(&live, &n)) {
-        return false;
-    }
-    bool found = false;
-    for (size_t i = 0; i < n && !found; i++) {
-        if (live[i].pid == pid) {
-            *out  = live[i];
-            found = true;
+    /* A miss is checked once against a fresh snapshot: the cached one may predate a process just started. */
+    for (int pass = 0; pass < 2; pass++) {
+        const espix_proc_info_t *live;
+        size_t                   n;
+        if (!proc_cache_acquire_infos(&live, &n)) {
+            return false;
+        }
+        bool found = false;
+        for (size_t i = 0; i < n && !found; i++) {
+            if (live[i].pid == pid) {
+                *out  = live[i];
+                found = true;
+            }
+        }
+        if (!found) {
+            s_info_at -= PROC_CACHE_TTL_US;
+        }
+        proc_cache_release();
+        if (found) {
+            return true;
         }
     }
-    proc_cache_release();
-    return found;
+    return false;
 }
 
 /* Up to `max` tasks of `pid`: its own, then its threads, with their tids. */

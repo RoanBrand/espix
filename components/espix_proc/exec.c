@@ -908,6 +908,16 @@ done:
      * Nothing of this process may touch the session after espix_proc_finish().
      */
     {
+#if !CONFIG_ESPIX_UMODE
+        /* Nothing guards the end of a stack without an MMU; one used to its last bytes has likely overrun. */
+        const UBaseType_t left = uxTaskGetStackHighWaterMark(NULL);
+        if (left < 512) {
+            espix_klog(ESPIX_KLOG_WARN, TAG,
+                       "pid %d: only %u bytes of its stack went unused, so it may have overrun it; "
+                       "link it with -Wl,-z,stack-size=",
+                       (int)slot->info.pid, (unsigned)left);
+        }
+#endif
         /* What the app had as stdout and stderr may not be ours -- the console's,
          * or a stream it opened and assigned -- and returning from main() is
          * exit(), which flushes them. Ours are flushed by their fclose below. */
@@ -1278,28 +1288,33 @@ esp_err_t espix_proc_spawn_elf(const char *abs_path, int argc, char **argv,
 }
 
 /* The task an app at abs_path runs on: its stack size and core. */
+/* The stack an app links itself to ask for (-z stack-size), as Linux's no-MMU loader reads it: PT_GNU_STACK's size, or 0. */
+static uint32_t elf_stack_size(const char *path)
+{
+    elf32_hdr_t eh;
+    uint32_t    size = 0;
+    FILE *const f    = fopen(path, "rb");
+    if (f != NULL && fread(&eh, 1, sizeof(eh), f) == sizeof(eh) && eh.phentsize == sizeof(elf32_phdr_t)) {
+        for (int i = 0; i < eh.phnum; i++) {
+            elf32_phdr_t ph;
+            if (fseek(f, (long)(eh.phoff + i * sizeof(ph)), SEEK_SET) != 0 || fread(&ph, 1, sizeof(ph), f) != sizeof(ph)) {
+                break;
+            }
+            if (ph.type == PT_GNU_STACK) {
+                size = ph.memsz;
+                break;
+            }
+        }
+    }
+    if (f != NULL) {
+        fclose(f);
+    }
+    return size;
+}
+
 static void app_task_shape(const char *abs_path, uint32_t *app_stack, BaseType_t *core)
 {
-    /*
-     * How much stack the app gets.
-     *
-     * One default for every app, and a name-keyed override for the one that
-     * needs a quarter of a megabyte. The default used to *be* the quarter
-     * megabyte, so hello and neopixel each committed 256 KB of PSRAM for their
-     * whole life to run a few hundred bytes of work.
-     *
-     * The honest shape is an app declaring its own requirement -- an exported
-     * symbol the loader reads, or a line in the manifest that already ships
-     * beside it -- and this table is where that goes once it exists. A basename
-     * is at least the thing a person edits.
-     */
-    static const struct {
-        const char *name;
-        uint32_t    stack;
-    } app_stacks[] = {
-        { "doom", 262144 },     /* the engine's zone allocator and the WAD walk; on the S31 a U-mode stack grows instead */
-    };
-
+    /* Without an MMU the stack cannot grow, and a syscall runs on it too: the default, or more if the app asks. */
     *app_stack = CONFIG_ESPIX_PROC_STACK_SIZE;
     /* Core 1 unless U-mode; see espix_proc_spawn_elf(). */
     *core = 1;
@@ -1312,14 +1327,9 @@ static void app_task_shape(const char *abs_path, uint32_t *app_stack, BaseType_t
     } else
 #endif
     {
-        const char *slash = strrchr(abs_path, '/');
-        const char *base  = (slash != NULL) ? slash + 1 : abs_path;
-
-        for (size_t i = 0; i < sizeof(app_stacks) / sizeof(app_stacks[0]); i++) {
-            if (strcmp(app_stacks[i].name, base) == 0) {
-                *app_stack = app_stacks[i].stack;
-                break;
-            }
+        const uint32_t asked = elf_stack_size(abs_path);
+        if (asked > *app_stack) {
+            *app_stack = (asked + 15u) & ~15u;
         }
     }
 }

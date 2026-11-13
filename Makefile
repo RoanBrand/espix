@@ -358,7 +358,7 @@ test-panic: test-app
 # suites would contend for. Each runs alone.
 test-apps: test-app
 	@eval "$$(./tools/idf.sh --env)"; rc=0; \
-	for s in mqtt gfx; do \
+	for s in mqtt gfx htop; do \
 	    ESPIX_PYTHON="$$ESPIX_PYTHON" ./tests/run.sh --apps --suite $$s || rc=1; \
 	done; exit $$rc
 

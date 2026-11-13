@@ -95,7 +95,13 @@ An app is a plain CMake project built by `espix-cc` (`cmake/espix-uapp.cmake`)
 and staged as `<name>`: U-mode on the S31, without an MMU on the S3. Its build
 directory is `apps/<name>/build-<target>/`, which keeps the symbols for
 `addr2line`; the staged copy is stripped. One that is an IDF project instead
-(neopixel) is built by `idf.py`.
+(neopixel) is built by `idf.py`, and one with an executable `build.sh` and no
+CMake project (htop, over autotools) builds itself: `build.sh <target> <staged>`,
+its output in `apps/<name>/build.log`.
+
+An S3 app resolves its names when it is loaded, so a missing one would fail
+only on the board. Each is checked once staged: `check-abi.py --app` fails the
+build for a name that neither `libc.so` nor the kernel's tables answer.
 
 An app needing build-time environment beyond `sdkconfig.defaults` puts it in
 `apps/<name>/build.env`; `apps/neopixel/build.env` is the example, carrying the

@@ -23,7 +23,7 @@ merely missing.
 | Background jobs `&` | **yes** | `&`, `$!`, `jobs`/`fg`/`bg`/`wait`, Ctrl-Z stops the foreground app into a job; a job that reads the terminal stops on SIGTTIN (EIO if it ignores or blocks it), over SSH, on the serial console and in a VNC terminal; a job still dies at logout by design |
 | Pipes <code>&#124;</code> | **yes** | builtins only; one StreamBuffer per pipe, and a writer fails once its reader is done (`cat f \| head -1`) |
 | Input redirection `<` | **yes** | attached or separated (`<file`); a builtin that reads stdin uses it |
-| Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv` |
+| Environment variables, `env`, `export`, `unset` | **yes** | a per-session table; `PATH` is consulted when running a program, and an app gets `getenv`, `setenv`, `unsetenv` and `putenv`. `TERM` is the SSH client's own, as sshd passes it on, else `xterm-256color` (`dumb` without escape sequences) |
 | Globbing `*` | **planned** | |
 | Shell scripts, `#!`, control flow | **planned** | the executable bit is now real, so `#!` needs only the dispatch: a file that is executable but not an ELF is where the interpreter line would be read |
 
