@@ -24,9 +24,9 @@ BEGIN, END = "<!-- syscalls.py: begin -->", "<!-- syscalls.py: end -->"
 # espix shares: rv32 has only the time64 calls, and passes a 64-bit offset as a register pair.
 RV32 = {
     "getcwd": 17, "dup": 23, "fcntl64": 25, "ioctl": 29, "truncate64": 45, "ftruncate64": 46,
-    "chdir": 49, "close": 57, "pipe2": 59, "read": 63, "write": 64, "pread64": 67, "pwrite64": 68,
-    "fsync": 82, "exit_group": 94, "sched_yield": 124, "kill": 129, "rt_sigreturn": 139,
-    "setpgid": 154, "getpgid": 155, "getsid": 156, "setsid": 157, "umask": 166, "getpid": 172,
+    "chdir": 49, "openat": 56, "close": 57, "pipe2": 59, "read": 63, "write": 64, "pread64": 67, "pwrite64": 68,
+    "readlinkat": 78, "fsync": 82, "exit_group": 94, "sched_yield": 124, "kill": 129, "rt_sigreturn": 139,
+    "setpgid": 154, "getpgid": 155, "getsid": 156, "setsid": 157, "uname": 160, "umask": 166, "getpid": 172,
     "getppid": 173, "getuid": 174, "geteuid": 175, "getgid": 176, "getegid": 177, "gettid": 178,
     "socket": 198, "bind": 200, "listen": 201, "connect": 203, "getsockname": 204,
     "getpeername": 205, "sendto": 206, "recvfrom": 207, "setsockopt": 208, "getsockopt": 209,

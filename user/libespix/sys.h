@@ -34,6 +34,7 @@ static inline long espix_sys6(long n, long a, long b, long c, long d, long e, lo
 #define espix_sys1(n, a)          espix_sys6((n), (long)(a), 0, 0, 0, 0, 0)
 #define espix_sys2(n, a, b)       espix_sys6((n), (long)(a), (long)(b), 0, 0, 0, 0)
 #define espix_sys3(n, a, b, c)    espix_sys6((n), (long)(a), (long)(b), (long)(c), 0, 0, 0)
+#define espix_sys4(n, a, b, c, d) espix_sys6((n), (long)(a), (long)(b), (long)(c), (long)(d), 0, 0)
 #define espix_sys5(n, a, b, c, d, e) \
     espix_sys6((n), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), 0)
 

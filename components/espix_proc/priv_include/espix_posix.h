@@ -48,6 +48,7 @@ typedef struct {
         DIR *dir;
         espix_um_sock_t *sock;
     };
+    char   *dir_path;   /* a directory's absolute path, for openat(); this entry's own */
 } espix_um_fd_t;
 
 typedef struct espix_um_waiter espix_um_waiter_t;

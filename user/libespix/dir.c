@@ -1,6 +1,7 @@
 /* Directories over getdents, and the working directory. */
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -15,6 +16,34 @@ typedef struct {
     struct dirent ent;
     char          buf[512] __attribute__((aligned(4)));
 } espix_dir_t;
+
+int dirfd(DIR *dir)
+{
+    if (dir == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    return ((espix_dir_t *)dir)->fd;
+}
+
+DIR *fdopendir(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return NULL;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return NULL;
+    }
+    espix_dir_t *d = calloc(1, sizeof(*d));
+    if (d == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    d->fd = fd;
+    return &d->dir;
+}
 
 DIR *opendir(const char *path)
 {
@@ -108,4 +137,64 @@ char *getcwd(char *buf, size_t size)
 int chmod(const char *path, mode_t mode)
 {
     return espix_ret(espix_sys2(ESPIX_SYS_CHMOD, path, mode));
+}
+
+/* realpath(): espix has no symlinks, so the path joined to the cwd and normalised is the real one, if it exists. */
+char *realpath(const char *path, char *resolved)
+{
+    if (path == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (path[0] == '\0') {
+        errno = ENOENT;
+        return NULL;
+    }
+    char in[PATH_MAX], out[PATH_MAX];
+    if (path[0] == '/') {
+        in[0] = '\0';
+    } else if (getcwd(in, sizeof(in)) == NULL) {
+        return NULL;
+    }
+    if (strlcat(in, "/", sizeof(in)) >= sizeof(in) || strlcat(in, path, sizeof(in)) >= sizeof(in)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    size_t n = 0;               /* out is "/a/b", without a trailing slash; empty is the root */
+    for (const char *seg = in; *seg != '\0';) {
+        while (*seg == '/') {
+            seg++;
+        }
+        const char *end = seg;
+        while (*end != '\0' && *end != '/') {
+            end++;
+        }
+        const size_t len = (size_t)(end - seg);
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            while (n > 0 && out[--n] != '/') {
+            }
+        } else if (len > 0 && !(len == 1 && seg[0] == '.')) {
+            if (n + 1 + len >= sizeof(out)) {
+                errno = ENAMETOOLONG;
+                return NULL;
+            }
+            out[n++] = '/';
+            memcpy(out + n, seg, len);
+            n += len;
+        }
+        seg = end;
+    }
+    if (n == 0) {
+        out[n++] = '/';
+    }
+    out[n] = '\0';
+    struct stat st;
+    if (stat(out, &st) != 0) {
+        return NULL;
+    }
+    if (resolved == NULL) {
+        return strdup(out);
+    }
+    memcpy(resolved, out, n + 1);
+    return resolved;
 }

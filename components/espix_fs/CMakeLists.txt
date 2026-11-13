@@ -18,6 +18,7 @@ set(espix_fs_srcs
     "synth.c"
     "dev.c"
     "proc.c"
+    "sys.c"
     "wake.c"
     "fat.c"
     "part.c"
@@ -38,6 +39,8 @@ idf_component_register(
         esp_blockdev
     PRIV_REQUIRES
         esp_partition
+        esp_driver_tsens
+        esp_hw_support
         fatfs
         esp_lwext4
         espix_kernel

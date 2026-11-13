@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -46,7 +47,9 @@ long sysconf(int name)
         return 4096;
     case _SC_NPROCESSORS_ONLN:
     case _SC_NPROCESSORS_CONF:
-        return 2;   /* the S31's cores, the one U-mode target */
+        return 2;   /* both chips' cores */
+    case _SC_CLK_TCK:
+        return ESPIX_USER_HZ;   /* /proc's clock, not the kernel's tick */
     case _SC_HOST_NAME_MAX:
         return 64;
     case _SC_GETPW_R_SIZE_MAX:
@@ -94,3 +97,48 @@ _Noreturn void _exit(int status)
 }
 
 _Noreturn void _Exit(int status) __attribute__((weak, alias("_exit")));
+
+/* Limits on a file: espix's paths and names, its pipes' atomic write, and no disabling character. */
+long fpathconf(int fd, int name)
+{
+    (void)fd;
+    switch (name) {
+    case _PC_NAME_MAX:
+        return 255;
+    case _PC_PATH_MAX:
+        return ESPIX_SYS_PATH_MAX;
+    case _PC_PIPE_BUF:
+        return 512;
+    case _PC_LINK_MAX:
+        return 1;
+    case _PC_VDISABLE:
+        return 0;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+long pathconf(const char *path, int name)
+{
+    (void)path;
+    return fpathconf(-1, name);
+}
+
+/* No Unix priority exists yet: a read is 0, as Linux gives with errno cleared, and a set is refused. */
+int getpriority(int which, id_t who)
+{
+    (void)which;
+    (void)who;
+    errno = 0;
+    return 0;
+}
+
+int setpriority(int which, id_t who, int prio)
+{
+    (void)which;
+    (void)who;
+    (void)prio;
+    errno = EPERM;
+    return -1;
+}

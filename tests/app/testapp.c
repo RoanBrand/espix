@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/utsname.h>
 #include <termios.h>
 #include <time.h>
 #include <pthread.h>
@@ -1652,6 +1653,36 @@ static int cmd_keyburst(void)
     return 0;
 }
 
+/* The *at calls, /proc's links and the machine, as a process viewer uses them. */
+static int cmd_at(void)
+{
+    const int dir = open("/proc", O_RDONLY | O_DIRECTORY);
+    const int fd = (dir >= 0) ? openat(dir, "self/stat", O_RDONLY) : -1;
+    char stat[64] = "";
+    if (fd >= 0) {
+        const ssize_t n = read(fd, stat, sizeof(stat) - 1);
+        stat[n > 0 ? n : 0] = '\0';
+        close(fd);
+    }
+    printf("at: self/stat pid %d, mine %d\n", atoi(stat), (int)getpid());
+    if (dir >= 0) {
+        close(dir);
+    }
+    char exe[128] = "";
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    exe[n > 0 ? n : 0] = '\0';
+    printf("at: exe %s\n", exe);
+    char *dot = realpath("/proc/../bin/./", NULL);
+    printf("at: realpath %s\n", dot != NULL ? dot : "(none)");
+    free(dot);
+    struct utsname u;
+    if (uname(&u) == 0) {
+        printf("at: uname %s %s\n", u.sysname, u.machine);
+    }
+    printf("at: clk_tck %ld\n", sysconf(_SC_CLK_TCK));
+    return 0;
+}
+
 /* dup2 onto a number the app did not open: its own table's in U-mode, the system's (and refused) in M-mode. */
 static int cmd_dup_onto(const char *path, int target)
 {
@@ -2349,6 +2380,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "keyburst") == 0) {
         return cmd_keyburst();
+    }
+    if (strcmp(cmd, "at") == 0) {
+        return cmd_at();
     }
     if (strcmp(cmd, "dup") == 0 && argc > 4 && strcmp(argv[3], "onto") == 0) {
         return cmd_dup_onto(argv[2], atoi(argv[4]));

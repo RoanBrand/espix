@@ -1,3 +1,9 @@
+if(CONFIG_IDF_TARGET_ARCH_RISCV)
+    set(ESPIX_RISCV_DEP riscv)
+else()
+    set(ESPIX_RISCV_DEP)
+endif()
+
 idf_component_register(
     SRCS
         "proc.c"
@@ -18,6 +24,7 @@ idf_component_register(
         "libc_so.c"
         "abi_fs.c"
         "ident.c"
+        "cpu_acct.c"
         "abi_posix.c"
         "abi_signal.c"
         "abi_gfx.c"
@@ -55,6 +62,9 @@ idf_component_register(
         # process's slot.
         pthread
         esp_timer
+        # cpu_acct.c's tick hook; and on RISC-V the trap's privilege, to split user from system time.
+        esp_system
+        ${ESPIX_RISCV_DEP}
         # abi_drivers.c wraps select() around esp_vfs_select() and names
         # eventfd().
         vfs

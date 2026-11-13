@@ -23,12 +23,14 @@
     X(TRUNCATE,      truncate,        45)        /* (path, len_lo, len_hi); Linux's truncate64 */ \
     X(FTRUNCATE,     ftruncate,       46)        /* (fd, len_lo, len_hi); Linux's ftruncate64 */ \
     X(CHDIR,         chdir,           49)        /* (path) */ \
+    X(OPENAT,        openat,          56)        /* (dirfd or AT_FDCWD, path, flags, mode) */ \
     X(CLOSE,         close,           57)        /* (fd) */ \
     X(PIPE2,         pipe2,           59)        /* (int fds[2], O_NONBLOCK | O_CLOEXEC) */ \
     X(READ,          read,            63)        /* (fd, buf, len) */ \
     X(WRITE,         write,           64)        /* (fd, buf, len) */ \
     X(PREAD,         pread,           67)        /* (fd, buf, len, off_lo, off_hi); Linux's pread64 */ \
     X(PWRITE,        pwrite,          68)        /* (fd, buf, len, off_lo, off_hi); Linux's pwrite64 */ \
+    X(READLINKAT,    readlinkat,      78)        /* (dirfd or AT_FDCWD, path, buf, len): the target's length, no NUL */ \
     X(FSYNC,         fsync,           82)        /* (fd) */ \
     X(EXIT,          exit,            94)        /* (status); Linux's exit_group */ \
     X(SCHED_YIELD,   sched_yield,    124)        /* () */ \
@@ -38,6 +40,7 @@
     X(GETPGID,       getpgid,        155)        /* (pid) */ \
     X(GETSID,        getsid,         156)        /* (pid) */ \
     X(SETSID,        setsid,         157)        /* (): the new session's id */ \
+    X(UNAME,         uname,          160)        /* (struct espix_utsname *): Linux's struct new_utsname */ \
     X(UMASK,         umask,          166)        /* (mask): the old one */ \
     X(GETPID,        getpid,         172)        /* () */ \
     X(GETPPID,       getppid,        173)        /* () */ \
@@ -122,6 +125,12 @@
 
 #define ESPIX_SYSCALLS(X) ESPIX_SYSCALLS_LINUX(X) ESPIX_SYSCALLS_OWN(X)
 
+/* The longest path a syscall takes, with its NUL: the kernel's ESPIX_PATH_MAX. */
+#define ESPIX_SYS_PATH_MAX 128
+
+/* The clock /proc counts in, and sysconf(_SC_CLK_TCK): Linux's USER_HZ, whatever the kernel's tick. */
+#define ESPIX_USER_HZ 100
+
 /* The app ABI an app is built for, in its .note.espix (tools/build-libc.sh); another is refused at exec. */
 #define ESPIX_ABI_VERSION 3
 
@@ -129,6 +138,17 @@ enum {
 #define ESPIX_SYS_ENUM_(name, lname, nr) ESPIX_SYS_##name = nr,
     ESPIX_SYSCALLS(ESPIX_SYS_ENUM_)
 #undef ESPIX_SYS_ENUM_
+};
+
+/* uname's fields: Linux's struct new_utsname. */
+#define ESPIX_UTS_LEN 65
+struct espix_utsname {
+    char sysname[ESPIX_UTS_LEN];
+    char nodename[ESPIX_UTS_LEN];
+    char release[ESPIX_UTS_LEN];
+    char version[ESPIX_UTS_LEN];
+    char machine[ESPIX_UTS_LEN];
+    char domainname[ESPIX_UTS_LEN];
 };
 
 /* mmap's protections and flags, and madvise's advice: Linux's (user/include/sys/mman.h). */

@@ -44,10 +44,11 @@
 
 static const char *TAG = "synth";
 
-/* How long a generated file may be. Every /proc file espix publishes is a few
- * hundred bytes; a longer one is truncated rather than allocated, because the
- * point of /proc here is to cost nothing at rest. */
-#define SYNTH_TEXT_MAX 512
+/* How long a generated file may be. /proc/stat for two cores and meminfo with
+ * its Linux keys are the longest, and both fit with room; a longer file is
+ * truncated rather than allocated, because the point of /proc here is to cost
+ * nothing at rest. */
+#define SYNTH_TEXT_MAX 1024
 
 static const synth_tree_t *s_trees[ESPIX_SYNTH_TREES_MAX];
 static int                 s_tree_count;
@@ -63,7 +64,7 @@ typedef struct {
     const synth_tree_t *tree;
     int                 cursor;
     bool                in_use;
-    char                path[32];   /* a directory below the tree's, or "" */
+    char                path[64];   /* a directory below the tree's, or "" */
 } synth_dir_t;
 
 static synth_slot_t      s_slots[ESPIX_SYNTH_FD_COUNT];
@@ -84,8 +85,11 @@ void espix_synth_init(void)
         s_lock = xSemaphoreCreateMutex();
     }
     if (s_tree_count == 0) {
+        espix_fs_sys_init();
+        espix_fs_proc_init();
         espix_synth_register_tree(espix_fs_dev_tree());
         espix_synth_register_tree(espix_fs_proc_tree());
+        espix_synth_register_tree(espix_fs_sys_tree());
     }
 }
 
@@ -226,6 +230,12 @@ void espix_synth_dir_stat(struct stat *st)
     st->st_nlink   = 2;
     st->st_size    = 0;
     st->st_blksize = 4096;
+}
+
+bool espix_synth_stat_path(const char *abs_path, struct stat *st)
+{
+    const synth_tree_t *tr = under_tree(abs_path);
+    return (tr != NULL && tr->dyn_stat != NULL && tr->dyn_stat(abs_path, st));
 }
 
 bool espix_synth_mode(const char *abs_path, mode_t *out)

@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -27,6 +28,7 @@
 
 #include "espix_fs.h"
 #include "espix_kernel.h"
+#include "espix_proc.h"
 #include "espix_syscall.h"
 #include "espix_tty.h"
 #include "espix_posix.h"
@@ -90,6 +92,7 @@ int um_fd_release(espix_um_fd_t *e)
         r = um_kret(close(e->kfd));
     } else if (e->kind == ESPIX_UM_FD_DIR) {
         r = um_kret(closedir(e->dir));
+        free(e->dir_path);
     } else if (e->kind == ESPIX_UM_FD_SOCK) {
         r = um_sock_close(e->sock);
     }
@@ -232,6 +235,8 @@ static int32_t fd_dup_from(espix_um_proc_t *p, const espix_um_fd_t *e, uint32_t 
 /* ------------------------------------------------------------------ */
 /* Files                                                               */
 /* ------------------------------------------------------------------ */
+
+_Static_assert(ESPIX_SYS_PATH_MAX == ESPIX_PATH_MAX, "the app-facing path limit is the kernel's");
 
 static int32_t path_in(um_call_t *c, uint32_t uva, char *buf)
 {
@@ -462,11 +467,39 @@ static int32_t file_at(um_call_t *c, bool out)
 static int32_t um_sys_pread(um_call_t *c)  { return file_at(c, false); }
 static int32_t um_sys_pwrite(um_call_t *c) { return file_at(c, true); }
 
-static int32_t um_sys_open(um_call_t *c)
+/* The absolute path the user path at uva names: from the cwd (AT_FDCWD), or a directory descriptor's. */
+static int32_t at_path(um_call_t *c, int dirfd, uint32_t uva, char *abs)
 {
     char path[ESPIX_PATH_MAX];
-    int32_t r = path_in(c, c->a[0], path);
-    const int flags = (int)c->a[1];
+    int32_t r = path_in(c, uva, path);
+    if (r < 0) {
+        return r;
+    }
+    if (path[0] == '\0') {
+        return -ENOENT;
+    }
+    const char *from = espix_proc_cwd();
+    char base[ESPIX_PATH_MAX];
+    if (path[0] != '/' && dirfd != AT_FDCWD) {
+        xSemaphoreTake(c->p->lock, portMAX_DELAY);
+        const espix_um_fd_t *const e = um_fd_get(c->p, (uint32_t)dirfd);
+        r = (e == NULL) ? -EBADF : (e->kind != ESPIX_UM_FD_DIR || e->dir_path == NULL) ? -ENOTDIR : 0;
+        if (r == 0) {
+            strlcpy(base, e->dir_path, sizeof(base));
+        }
+        xSemaphoreGive(c->p->lock);
+        if (r < 0) {
+            return r;
+        }
+        from = base;
+    }
+    return (espix_fs_resolve(from, path, abs, ESPIX_PATH_MAX) == ESP_OK) ? 0 : -ENAMETOOLONG;
+}
+
+static int32_t open_at(um_call_t *c, int dirfd, uint32_t uva, int flags, int mode)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = at_path(c, dirfd, uva, path);
     if (r < 0) {
         return r;
     }
@@ -477,9 +510,10 @@ static int32_t um_sys_open(um_call_t *c)
         if (e.dir == NULL) {
             return -errno;
         }
+        e.dir_path = strdup(path);
     } else {
         e.kind = ESPIX_UM_FD_FILE;
-        e.kfd  = open(path, flags & ~(O_CLOEXEC | O_DIRECTORY), (int)c->a[2]);
+        e.kfd  = open(path, flags & ~(O_CLOEXEC | O_DIRECTORY), mode);
         if (e.kfd < 0) {
             return -errno;
         }
@@ -489,6 +523,56 @@ static int32_t um_sys_open(um_call_t *c)
         um_fd_release(&e);
     }
     return fd;
+}
+
+static int32_t um_sys_open(um_call_t *c)   { return open_at(c, AT_FDCWD, c->a[0], (int)c->a[1], (int)c->a[2]); }
+static int32_t um_sys_openat(um_call_t *c) { return open_at(c, (int)c->a[0], c->a[1], (int)c->a[2], (int)c->a[3]); }
+
+/* readlinkat(): espix has no symlinks; the one link it has is /proc's exe, to the program a process runs. */
+static int32_t um_sys_readlinkat(um_call_t *c)
+{
+    char path[ESPIX_PATH_MAX];
+    int32_t r = at_path(c, (int)c->a[0], c->a[1], path);
+    if (r < 0) {
+        return r;
+    }
+    espix_pid_t pid = ESPIX_PID_NONE;
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        pid = espix_proc_self_pid();
+    } else if (strncmp(path, "/proc/", 6) == 0) {
+        char *end = NULL;
+        const long v = strtol(path + 6, &end, 10);
+        if (v > 0 && end != path + 6 && strcmp(end, "/exe") == 0) {
+            pid = (espix_pid_t)v;
+        }
+    }
+    if (pid == ESPIX_PID_NONE) {
+        return -EINVAL;
+    }
+    char target[ESPIX_PATH_MAX];
+    const size_t len = espix_proc_exe(pid, target, sizeof(target));
+    if (len == 0) {
+        return -ENOENT;
+    }
+    const size_t n = MIN(len, (size_t)c->a[3]);
+    return (espix_um_copyout(c->p->as, c->a[2], target, n) < 0) ? -EFAULT : (int32_t)n;
+}
+
+/* uname(): uname(1)'s fields, from the same places; the release is the version, the version the build. */
+static int32_t um_sys_uname(um_call_t *c)
+{
+    struct espix_utsname u = { 0 };
+    strlcpy(u.sysname, "espix", sizeof(u.sysname));
+    strlcpy(u.nodename, espix_nodename(), sizeof(u.nodename));
+    strlcpy(u.release, espix_version(), sizeof(u.release));
+    snprintf(u.version, sizeof(u.version), "#%s", espix_build_is_release() ? "1" : espix_build_id());
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
+    strlcpy(u.machine, "xtensa", sizeof(u.machine));
+#else
+    strlcpy(u.machine, "riscv32", sizeof(u.machine));
+#endif
+    strlcpy(u.domainname, "(none)", sizeof(u.domainname));
+    return espix_um_copyout(c->p->as, c->a[0], &u, sizeof(u));
 }
 
 static int32_t um_sys_close(um_call_t *c)
