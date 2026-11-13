@@ -21,12 +21,8 @@ macOS's does not: `build.sh` takes Homebrew's (`brew install ncurses`).
   their numbers with GNU sed's `\<`, which BSD sed reads as nothing, and
   `xterm-256color`'s 65,536 colour pairs become 256, because a narrow ncurses
   keeps the numbers in 16 bits, where 65,536 is 0 and means no colour.
-- **htop**: Linux's platform code as it is, with `CRT.c` taught `ESC [ A`-`D`
-  for the arrows as well as `ESC O A`-`D`, since a terminal not in keypad mode
-  sends those. `compat/linux/capability.h` gives htop's `capget()` call the
-  structures it names (the call answers ENOSYS), and `sensors/` is the
-  libsensors calls htop makes, over the kernel's thermal zone, for the
-  temperature meter.
+- **htop**: Linux's platform code as it is. `sensors/` is the libsensors calls
+  htop makes, over the kernel's thermal zone, for the temperature meter.
 - **The S3**: an app there links as a shared object, which leaves a missing
   function for load time, so its `configure` cannot see one. It takes the S31
   `configure`'s answers about functions instead (the same libc and libespix);

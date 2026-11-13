@@ -1758,7 +1758,16 @@ static int cmd_id(espix_session_t *s, int argc, char **argv)
     } else if (want_g) {
         espix_printf(s, "%u\n", (unsigned)s->gid);
     } else {
-        espix_printf(s, "uid=%u(%s) gid=%u(%s)\n", (unsigned)s->uid, ubuf, (unsigned)s->gid, gname);
+        espix_printf(s, "uid=%u(%s) gid=%u(%s)", (unsigned)s->uid, ubuf, (unsigned)s->gid, gname);
+        /* The supplementary groups, as Linux's id lists them: an unnamed one as its number alone. */
+        for (int i = 0; i < s->ngroups; i++) {
+            const char *const g = espix_auth_group_name(s->groups[i]);
+            espix_printf(s, "%s%u", (i == 0) ? " groups=" : ",", (unsigned)s->groups[i]);
+            if (g != NULL) {
+                espix_printf(s, "(%s)", g);
+            }
+        }
+        espix_printf(s, "\n");
     }
     return 0;
 }

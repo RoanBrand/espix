@@ -45,16 +45,30 @@ things are as they are.
   the process carries on as init's child, so `mosquitto -d` would daemonise on
   the S3 as M8 makes it on the S31.
 
-- **Credentials and the process calls a daemon makes.** `setuid()`,
-  `setgid()` and `setgroups()` for a process running as root, a per-process
-  `umask()` that every create applies, and `setsid()`. They are what is left of
-  mosquitto's seam (`apps/mosquitto/components/mosquitto_espix/`).
+- **The privilege model: changing credentials, then capabilities.** A process
+  keeps the uid and groups it started with (`espix_proc_info_t`, read lock-free
+  by every permission check). First, `setuid()`, `setgid()` and `setgroups()`
+  with Linux's rules (root may become anyone, anyone else only itself) and
+  libespix's `initgroups()`: what a daemon calls to drop root, and what retires
+  mosquitto's seam (`apps/mosquitto/components/mosquitto_espix/`). Then
+  `capset()`, which needs a capability set per process that privileged checks
+  consult instead of `uid == 0` (`capget()` answers from the uid today); then
+  saved uids and set-uid executables.
 
 - **`dlopen()` for M-mode apps.** elf_loader has one
   (`CONFIG_ELF_DYNAMIC_LOAD_SHARED_OBJECT`, on), which loads a module and
   resolves it against the ABI tables; apps get only stubs today. A plugin also
   calls back into the app that loaded it, so the app's own symbols would have to
   resolve too; then mosquitto's plugins load as they do on Linux.
+
+- **Libraries built with the kernel, served as files.** Code the firmware
+  already carries could reach apps as a library with no build or package step of
+  its own, as Linux's vDSO does. On the S3 the loader can satisfy a library's
+  name from kernel tables, with no file at all; on the S31 the code must run in
+  U-mode, so it is an image built with the firmware, kept in flash, synthesised
+  under `/lib` the way `/proc` is, and mapped as `libc.so` is. A minimal
+  libsensors over the thermal zone is the first candidate; until a second app
+  wants it, htop carries its own (`apps/htop/sensors/`).
 
 - **Load an M-mode app without holding its file.** `exec.c` reads the whole
   file, then relocates, so a load peaks at the file plus the loaded image (about
@@ -962,6 +976,13 @@ matters.
   every syscall's kernel frames share it and their depth is unmeasured. Measured,
   that depth would let a small app ask for less, as Linux takes the size given.
   Doom's 256 KB is carried over rather than measured.
+
+- **VNC keeps a descriptor for the boot.** Its wake eventfd (`rfb.c`,
+  `wake_open()`) is made by the first `vnc start` and never closed, so it holds
+  one of the S31's 16 free descriptors after `vnc stop`, and a `-j4` test run
+  after that sees ENFILE: why 63-desktop-term runs with the app suites. Closing
+  it at stop needs the damage hook (`rfb_damage_hook()`, set once and never
+  removed) and the close ordered under one lock.
 
 - **Swap, for U-mode apps on the S31.** Once apps run in their own address
   spaces with refcounted frames ([USER-MODE.md](USER-MODE.md)), an anonymous page

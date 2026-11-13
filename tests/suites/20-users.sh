@@ -41,3 +41,26 @@ else
         assert_eq "an app's uid is the shell's" "$shell_uid" "$app_uid"
     fi
 fi
+
+# capget, as Linux answers it for espix's model: uid 0 holds every capability and anyone else none.
+if dev_testapp_present; then
+    CAPS="/home/$ESPIX_USER/testapp caps"
+    out=$(dev_run "$CAPS")
+    assert_contains "capget: a user's process holds no capability" \
+        "rc 0 errno 0 permitted 0000000000000000 effective 0000000000000000" "$out"
+    assert_contains "capget refuses a version it does not know, and names its own" \
+        "bad version rc -1 errno 22 version 20080522" "$out"
+    assert_contains "capget: root holds every capability, and inherits none" \
+        "rc 0 errno 0 permitted 000001ffffffffff effective 000001ffffffffff inheritable 0000000000000000" \
+        "$(dev_run "sudo $CAPS")"
+    assert_contains "capget reads another process: init, which is root" \
+        "pid 1 rc 0 errno 0 permitted 000001ffffffffff" "$(dev_run "$CAPS 1")"
+    assert_contains "capget of a process that is gone is ESRCH" "pid 99999 rc -1 errno 3" \
+        "$(dev_run "$CAPS 99999")"
+
+    # getgroups() agrees with id's groups, the same list by another road.
+    want=$(dev_run 'id' | sed -n 's/.*groups=//p' | tr ',' '\n' | sed 's/(.*//' | sort -n | tr '\n' ' ')
+    got=$(printf '%s\n' "$out" | sed -n 's/^caps: groups [0-9]* (count [0-9]*)://p' | tr ' ' '\n' | sed '/^$/d' |
+          sort -n | tr '\n' ' ')
+    assert_eq "getgroups() lists the groups id does" "$want" "$got"
+fi

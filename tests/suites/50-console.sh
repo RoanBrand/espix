@@ -125,4 +125,10 @@ assert_contains "the console can read a root-only file" "root:" \
 
 # The sigil is the other half of the prompt change: root gets '#'.
 
+# An app on the console reads a key's bytes whole, as over SSH (15-streams): the pacing is the editor's.
+if dev_testapp_present; then
+    assert_contains "an app on the console reads a key's bytes whole" "first 1 1b, then poll 1, rest 4f 50" \
+        "$(dev_console_run "@after ready 1b4f50 /home/$ESPIX_USER/testapp keyburst")"
+fi
+
 console_restore

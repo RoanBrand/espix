@@ -34,6 +34,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
+#include <sys/syscall.h>
+#include <linux/capability.h>
 #include <termios.h>
 #include <time.h>
 #include <pthread.h>
@@ -1623,9 +1625,20 @@ static int cmd_tty(void)
 /*
  * A key's bytes, sent in one write, as a terminal app reads them: one read takes the first, and
  * a poll must then see the rest at once (ncurses parses an escape sequence that way), not wait.
+ * `app` asks the terminal for its keypad-mode keys first (DECCKM), as ncurses' keypad() does;
+ * a path also gets the result, for a terminal no test can read back.
  */
-static int cmd_keyburst(void)
+static int cmd_keyburst(int argc, char **argv)
 {
+    bool app = false;
+    const char *out = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "app") == 0) {
+            app = true;
+        } else {
+            out = argv[i];
+        }
+    }
     struct termios t, raw;
     if (tcgetattr(0, &t) != 0) {
         printf("keyburst: not a terminal\n");
@@ -1634,7 +1647,7 @@ static int cmd_keyburst(void)
     raw = t;
     cfmakeraw(&raw);
     tcsetattr(0, TCSANOW, &raw);
-    printf("keyburst: ready\r\n");
+    printf("%skeyburst: ready\r\n", app ? "\x1b[?1h" : "");
     fflush(stdout);
     unsigned char first = 0, rest[8];
     const ssize_t n1 = read(0, &first, 1);
@@ -1645,9 +1658,40 @@ static int cmd_keyburst(void)
         n2 = read(0, rest, sizeof(rest));
     }
     tcsetattr(0, TCSANOW, &t);
-    printf("keyburst: first %zd %02x, then poll %d, rest", n1, first, ready);
-    for (ssize_t i = 0; i < n2; i++) {
-        printf(" %02x", rest[i]);
+    char line[96];
+    int len = snprintf(line, sizeof(line), "keyburst: first %zd %02x, then poll %d, rest", n1, first, ready);
+    for (ssize_t i = 0; i < n2 && len < (int)sizeof(line) - 4; i++) {
+        len += snprintf(line + len, sizeof(line) - (size_t)len, " %02x", rest[i]);
+    }
+    printf("%s%s\n", app ? "\x1b[?1l" : "", line);
+    FILE *const f = (out != NULL) ? fopen(out, "w") : NULL;
+    if (f != NULL) {
+        fprintf(f, "%s\n", line);
+        fclose(f);
+    }
+    return 0;
+}
+
+/* capget() of a pid (0, the caller) as htop makes it, a version it refuses, and getgroups(). */
+static int cmd_caps(int argc, char **argv)
+{
+    const int pid = (argc > 0) ? atoi(argv[0]) : 0;
+    struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, pid };
+    struct __user_cap_data_struct d[2] = { { 0 } };
+    errno = 0;
+    const long r = syscall(SYS_capget, &h, d);
+    printf("caps: pid %d rc %ld errno %d permitted %08x%08x effective %08x%08x inheritable %08x%08x\n", pid, r, errno,
+           (unsigned)d[1].permitted, (unsigned)d[0].permitted, (unsigned)d[1].effective,
+           (unsigned)d[0].effective, (unsigned)d[1].inheritable, (unsigned)d[0].inheritable);
+    struct __user_cap_header_struct bad = { 0x12345678, 0 };
+    errno = 0;
+    const long rb = syscall(SYS_capget, &bad, NULL);
+    printf("caps: bad version rc %ld errno %d version %08x\n", rb, errno, (unsigned)bad.version);
+    gid_t g[32];
+    const int n = getgroups(32, g);
+    printf("caps: groups %d (count %d):", n, getgroups(0, NULL));
+    for (int i = 0; i < n; i++) {
+        printf(" %d", (int)g[i]);
     }
     printf("\n");
     return 0;
@@ -2379,7 +2423,10 @@ int main(int argc, char **argv)
         return cmd_tty();
     }
     if (strcmp(cmd, "keyburst") == 0) {
-        return cmd_keyburst();
+        return cmd_keyburst(argc - 2, argv + 2);
+    }
+    if (strcmp(cmd, "caps") == 0) {
+        return cmd_caps(argc - 2, argv + 2);
     }
     if (strcmp(cmd, "at") == 0) {
         return cmd_at();

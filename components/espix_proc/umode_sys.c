@@ -966,6 +966,69 @@ static int32_t um_sys_geteuid(um_call_t *c) { (void)c; return (int32_t)geteuid()
 static int32_t um_sys_getgid(um_call_t *c)  { (void)c; return (int32_t)getgid(); }
 static int32_t um_sys_getegid(um_call_t *c) { (void)c; return (int32_t)getegid(); }
 static int32_t um_sys_getpgrp(um_call_t *c) { (void)c; return espix_abi_getpgrp(); }
+
+/* The supplementary groups, as 32-bit ids: the count, or only that when size is 0. */
+static int32_t um_sys_getgroups(um_call_t *c)
+{
+    const espix_proc_info_t *const in = &c->t->slot->info;
+    const int32_t size = (int32_t)c->a[0];
+    if (size < 0 || (size > 0 && size < in->ngroups)) {
+        return -EINVAL;
+    }
+    if (size == 0) {
+        return in->ngroups;
+    }
+    uint32_t list[ESPIX_NGROUPS_MAX];
+    for (int i = 0; i < in->ngroups; i++) {
+        list[i] = in->groups[i];
+    }
+    return (espix_um_copyout(c->p->as, c->a[1], list, in->ngroups * sizeof(list[0])) < 0) ? -EFAULT
+                                                                                        : in->ngroups;
+}
+
+/* capget(): uid 0 holds every capability, as Linux's root does, and anyone else none; Linux's versions and errors. */
+#define CAP_V1   0x19980330u
+#define CAP_V2   0x20071026u
+#define CAP_V3   0x20080522u
+#define CAP_LAST 40             /* CAP_CHECKPOINT_RESTORE */
+static int32_t um_sys_capget(um_call_t *c)
+{
+    uint32_t hdr[2];            /* version, pid */
+    if (espix_um_copyin(c->p->as, hdr, c->a[0], sizeof(hdr)) < 0) {
+        return -EFAULT;
+    }
+    if (hdr[0] != CAP_V1 && hdr[0] != CAP_V2 && hdr[0] != CAP_V3) {
+        const uint32_t v3 = CAP_V3;     /* the version the caller should ask with */
+        return (espix_um_copyout(c->p->as, c->a[0], &v3, sizeof(v3)) < 0) ? -EFAULT : -EINVAL;
+    }
+    const int32_t pid = (int32_t)hdr[1];
+    if (pid < 0) {
+        return -EINVAL;
+    }
+    uint16_t uid = c->t->slot->info.uid;
+    if (pid != 0 && pid != (int32_t)c->t->slot->info.pid) {
+        xSemaphoreTake(g_espix_proc_lock, portMAX_DELAY);
+        const espix_proc_slot_t *const s = espix_proc_find((espix_pid_t)pid);
+        const bool found = (s != NULL);
+        if (found) {
+            uid = s->info.uid;
+        }
+        xSemaphoreGive(g_espix_proc_lock);
+        if (!found) {
+            return -ESRCH;
+        }
+    }
+    if (c->a[1] == 0) {
+        return 0;               /* a probe of the version alone */
+    }
+    uint32_t data[2][3] = { { 0 } };     /* each word: effective, permitted, inheritable */
+    if (uid == 0) {
+        data[0][0] = data[0][1] = 0xFFFFFFFFu;
+        data[1][0] = data[1][1] = (1u << (CAP_LAST - 31)) - 1u;
+    }
+    const size_t words = (hdr[0] == CAP_V1) ? 1 : 2;
+    return (espix_um_copyout(c->p->as, c->a[1], data, words * sizeof(data[0])) < 0) ? -EFAULT : 0;
+}
 static int32_t um_sys_getsid(um_call_t *c)  { return um_kret(espix_abi_getsid((pid_t)c->a[0])); }
 /* A string from the app, cut to size rather than refused: a log line may be long. */
 static int32_t str_in_cut(um_call_t *c, uint32_t uva, char *buf, size_t size)

@@ -16,6 +16,25 @@ gid_t getgid(void)  { return (gid_t)espix_sys0(ESPIX_SYS_GETGID); }
 gid_t getegid(void) { return (gid_t)espix_sys0(ESPIX_SYS_GETEGID); }
 pid_t getpgrp(void) { return (pid_t)espix_sys0(ESPIX_SYS_GETPGRP); }
 
+/* The supplementary groups: the kernel's 32-bit ids, in the app's gid_t. */
+int getgroups(int size, gid_t list[])
+{
+    const int n = espix_ret(espix_sys2(ESPIX_SYS_GETGROUPS, 0, NULL));
+    if (n <= 0 || size == 0) {
+        return n;
+    }
+    if (size < n) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint32_t ids[n];
+    const int got = espix_ret(espix_sys2(ESPIX_SYS_GETGROUPS, n, ids));
+    for (int i = 0; i < got; i++) {
+        list[i] = (gid_t)ids[i];
+    }
+    return got;
+}
+
 pid_t getsid(pid_t pid)
 {
     return (pid_t)espix_ret(espix_sys1(ESPIX_SYS_GETSID, pid));

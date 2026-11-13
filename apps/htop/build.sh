@@ -34,20 +34,6 @@ PATH="$(dirname "$tic_bin"):$PATH"
 "$here/fetch-htop.sh"
 "$here/fetch-ncurses.sh"
 
-# A terminal that ignores keypad mode sends the arrows as ESC [ A, not ESC O A: take both, as Linux's terminals do.
-python3 - "$here/third_party/htop/CRT.c" <<'PY'
-import sys
-p = sys.argv[1]
-t = open(p).read()
-if 'define_key("\\033[A", KEY_UP)' not in t:
-    old = '      define_key("\\033OP", KEY_F(1));'
-    if old not in t:
-        sys.exit('htop: CRT.c F1 define_key not found')
-    new = ''.join(f'      define_key("\\033[{c}", {k});\n' for c, k in
-                  (("A", "KEY_UP"), ("B", "KEY_DOWN"), ("C", "KEY_RIGHT"), ("D", "KEY_LEFT"))) + old
-    open(p, 'w').write(t.replace(old, new, 1))
-PY
-
 # ncurses' MKfallback.sh widens its numbers with GNU sed's \<short\>, which BSD sed reads as nothing.
 python3 - "$here/third_party/ncurses/ncurses/tinfo/MKfallback.sh" <<'PY'
 import sys
@@ -109,7 +95,7 @@ $cc -Os -I"$here/sensors" -c "$here/sensors/libsensors_espix.c" -o "$build/libse
 echo "htop: htop for $target"
 cache=$(cache_for "$build/htop" htop)
 # 32 KB of stack: htop and ncurses reach 22 KB, and an S3 app's stack cannot grow.
-(cd "$build/htop" && CC="$cc" CFLAGS="-Os -ffunction-sections -fdata-sections -I$here/compat" \
+(cd "$build/htop" && CC="$cc" CFLAGS="-Os -ffunction-sections -fdata-sections" \
     CPPFLAGS="-I$here/sensors" LDFLAGS="-L$build/lib -Wl,-z,stack-size=32768" \
     CURSES_CFLAGS="-I$nc/include" CURSES_LIBS="$nc/lib/libncurses.a $nc/lib/libtinfo.a" \
     "$here/third_party/htop/configure" --cache-file="$cache" --host="$htop_host" \

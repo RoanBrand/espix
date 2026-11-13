@@ -75,7 +75,8 @@ class Console:
             if not alive:
                 raise TimeoutError(f"no console prompt; got: {buf[-300:]!r}")
 
-    def run(self, command):
+    def run(self, command, after=None):
+        """Run one command; with after=(marker, data), type data once marker is printed."""
         if ";" in command:
             raise ValueError("espix's shell has no ';' -- one command per call")
 
@@ -93,7 +94,18 @@ class Console:
 
         self.ser.write(command.encode() + b"\r")
         self.ser.flush()
-        raw = self.wait_prompt()
+        raw = b""
+        if after is not None:
+            marker, data = after
+            deadline = time.time() + self.timeout
+            while marker not in ANSI.sub(b"", raw):
+                chunk, alive = self._pump(deadline)
+                raw += chunk
+                if not alive:
+                    raise TimeoutError(f"never saw {marker!r}; got: {raw[-300:]!r}")
+            self.ser.write(data)            # in one write, as a key's bytes arrive
+            self.ser.flush()
+        raw += self.wait_prompt()
 
         text = ANSI.sub(b"", raw).decode("utf-8", "replace")
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -228,9 +240,14 @@ def main():
             cmd = line.rstrip("\n")
             if not cmd:
                 continue
+            # "@after MARKER HEX COMMAND": run COMMAND, and type HEX's bytes once MARKER is printed.
+            after = None
+            if cmd.startswith("@after "):
+                _, marker, data, cmd = cmd.split(" ", 3)
+                after = (marker.encode(), bytes.fromhex(data))
             print(f"<<<ESPIX-CMD {n}>>>", flush=True)
             try:
-                print(c.run(cmd), flush=True)
+                print(c.run(cmd, after), flush=True)
             except Exception as exc:               # noqa: BLE001
                 print(f"console.py: {exc}", file=sys.stderr)
                 rc = 1

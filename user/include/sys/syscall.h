@@ -18,6 +18,7 @@
 #define SYS_pwrite64 68
 #define SYS_readlinkat 78
 #define SYS_fsync 82
+#define SYS_capget 90
 #define SYS_exit_group 94
 #define SYS_sched_yield 124
 #define SYS_kill 129
@@ -26,6 +27,7 @@
 #define SYS_getpgid 155
 #define SYS_getsid 156
 #define SYS_setsid 157
+#define SYS_getgroups 158
 #define SYS_uname 160
 #define SYS_umask 166
 #define SYS_getpid 172
@@ -61,7 +63,6 @@
 
 #define SYS_ioprio_set 30
 #define SYS_ioprio_get 31
-#define SYS_capget 90
 #define SYS_capset 91
 
 long syscall(long number, ...);

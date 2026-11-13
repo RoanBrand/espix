@@ -87,6 +87,8 @@ struct espix_term {
     char    app_reply[24];
     uint8_t app_reply_len;
     int    esc;                 /* 0 outside an escape, 1 after ESC, 2 inside CSI */
+    bool   priv;                /* this CSI began with '?', a DEC private mode */
+    bool   app_cursor;          /* DECCKM: the arrows as ESC O, as an app in keypad mode asks */
 
     uint16_t params[8];
     int      nparam;
@@ -536,6 +538,13 @@ static void term_csi(espix_term_t *t, char final)
 
     case 'm': term_sgr(t, (int)t->nparam); break;
 
+    case 'h':
+    case 'l':
+        if (t->priv && a == 1) {
+            t->app_cursor = (final == 'h');    /* DECCKM, which ncurses' keypad() sets */
+        }
+        break;
+
     default:  break;    /* the rest: recognised, and nothing to render */
     }
 
@@ -580,6 +589,7 @@ static void term_putc_inner(espix_term_t *t, char c)
         t->esc    = 1;
         t->nparam = 0;
         t->param  = 0;
+        t->priv   = false;
         return;
     }
     if (t->esc == 1) {
@@ -587,7 +597,9 @@ static void term_putc_inner(espix_term_t *t, char c)
         return;
     }
     if (t->esc == 2) {
-        if (c >= '0' && c <= '9') {
+        if (c == '?' && t->nparam == 0 && t->param == 0) {
+            t->priv = true;
+        } else if (c >= '0' && c <= '9') {
             t->param = t->param * 10 + (c - '0');
             if (t->param > 9999) {
                 t->param = 9999;
@@ -854,22 +866,37 @@ void espix_term_key(espix_term_t *t, uint32_t keysym, bool down)
         static const struct {
             uint32_t    keysym;
             const char *seq;
+            const char *app;            /* under DECCKM, where it differs */
         } s_key_seq[] = {
-            { 0xFF52, "\x1b[A"  },      /* Up */
-            { 0xFF54, "\x1b[B"  },      /* Down */
-            { 0xFF53, "\x1b[C"  },      /* Right */
-            { 0xFF51, "\x1b[D"  },      /* Left */
-            { 0xFF50, "\x1b[1~" },      /* Home */
-            { 0xFF57, "\x1b[4~" },      /* End */
-            { 0xFF55, "\x1b[5~" },      /* Page Up */
-            { 0xFF56, "\x1b[6~" },      /* Page Down */
-            { 0xFF63, "\x1b[2~" },      /* Insert */
-            { 0xFF9F, "\x1b[3~" },      /* Delete */
+            { 0xFF52, "\x1b[A",   "\x1bOA" },   /* Up */
+            { 0xFF54, "\x1b[B",   "\x1bOB" },   /* Down */
+            { 0xFF53, "\x1b[C",   "\x1bOC" },   /* Right */
+            { 0xFF51, "\x1b[D",   "\x1bOD" },   /* Left */
+            { 0xFF50, "\x1b[1~",  "\x1bOH" },   /* Home */
+            { 0xFF57, "\x1b[4~",  "\x1bOF" },   /* End */
+            { 0xFF55, "\x1b[5~",  NULL },       /* Page Up */
+            { 0xFF56, "\x1b[6~",  NULL },       /* Page Down */
+            { 0xFF63, "\x1b[2~",  NULL },       /* Insert */
+            { 0xFF9F, "\x1b[3~",  NULL },       /* Delete */
+            { 0xFFBE, "\x1bOP",   NULL },       /* F1-F12, as xterm sends them */
+            { 0xFFBF, "\x1bOQ",   NULL },
+            { 0xFFC0, "\x1bOR",   NULL },
+            { 0xFFC1, "\x1bOS",   NULL },
+            { 0xFFC2, "\x1b[15~", NULL },
+            { 0xFFC3, "\x1b[17~", NULL },
+            { 0xFFC4, "\x1b[18~", NULL },
+            { 0xFFC5, "\x1b[19~", NULL },
+            { 0xFFC6, "\x1b[20~", NULL },
+            { 0xFFC7, "\x1b[21~", NULL },
+            { 0xFFC8, "\x1b[23~", NULL },
+            { 0xFFC9, "\x1b[24~", NULL },
         };
 
         for (size_t i = 0; i < sizeof(s_key_seq) / sizeof(s_key_seq[0]); i++) {
             if (s_key_seq[i].keysym == keysym) {
-                (void)espix_tty_input(t->tty, s_key_seq[i].seq, strlen(s_key_seq[i].seq));
+                const char *const seq = (t->app_cursor && s_key_seq[i].app != NULL) ? s_key_seq[i].app
+                                                                                     : s_key_seq[i].seq;
+                (void)espix_tty_input(t->tty, seq, strlen(seq));
                 return;
             }
         }
@@ -1112,6 +1139,7 @@ static int term_read_line(espix_session_t *s, const char *prompt,
     edit = cooked;
     espix_tty_make_editing(&edit);
     espix_tty_setattr(t->tty, TCSANOW, &edit);
+    t->app_cursor = false;      /* an app that died in keypad mode leaves the editor its own arrows */
     const esp_err_t err = esp_linenoise_get_line(t->editor, buf, len);
     const int saved = errno;
     espix_tty_setattr(t->tty, TCSANOW, &cooked);

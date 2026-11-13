@@ -32,6 +32,7 @@
     X(PWRITE,        pwrite,          68)        /* (fd, buf, len, off_lo, off_hi); Linux's pwrite64 */ \
     X(READLINKAT,    readlinkat,      78)        /* (dirfd or AT_FDCWD, path, buf, len): the target's length, no NUL */ \
     X(FSYNC,         fsync,           82)        /* (fd) */ \
+    X(CAPGET,        capget,          90)        /* (cap_user_header_t, cap_user_data_t): uid 0 holds every capability */ \
     X(EXIT,          exit,            94)        /* (status); Linux's exit_group */ \
     X(SCHED_YIELD,   sched_yield,    124)        /* () */ \
     X(KILL,          kill,           129)        /* (pid, sig) */ \
@@ -40,6 +41,7 @@
     X(GETPGID,       getpgid,        155)        /* (pid) */ \
     X(GETSID,        getsid,         156)        /* (pid) */ \
     X(SETSID,        setsid,         157)        /* (): the new session's id */ \
+    X(GETGROUPS,     getgroups,      158)        /* (size, uint32_t *list): the count; size 0 only counts */ \
     X(UNAME,         uname,          160)        /* (struct espix_utsname *): Linux's struct new_utsname */ \
     X(UMASK,         umask,          166)        /* (mask): the old one */ \
     X(GETPID,        getpid,         172)        /* () */ \
